@@ -127,8 +127,12 @@ pub(crate) struct ExternalSubagentSpec {
     /// Backends present it as instructions.
     pub(crate) skills: Option<String>,
     /// Resume target for session continuity: a backend session id resolved at
-    /// dispatch time from `backend_continue_from`. `None` starts a fresh run.
+    /// dispatch time from `backend_continue_from`, whose deferred side-notes
+    /// have already been prepended to `prompt`. `None` starts a fresh run.
     pub(crate) resume_session: Option<String>,
+    /// Deferred side-note queue files whose contents are already in `prompt`.
+    /// Keep them queued until the backend process spawns successfully.
+    pub(crate) side_note_files: Vec<PathBuf>,
     /// Parent's resolved reasoning-effort tier, in the provider-neutral wire
     /// vocabulary (`low`, `medium`, `high`, `xhigh`, `max`). Backends map it to
     /// their own control; `None` keeps the backend default.
@@ -282,6 +286,7 @@ mod tests {
             model: None,
             skills: Some(oversized),
             resume_session: None,
+            side_note_files: Vec::new(),
             reasoning_effort: None,
             image_files: Vec::new(),
             phase_slot: None,
@@ -302,6 +307,7 @@ mod tests {
             model: None,
             skills: Some("x".repeat(1024)),
             resume_session: None,
+            side_note_files: Vec::new(),
             reasoning_effort: None,
             image_files: Vec::new(),
             phase_slot: None,

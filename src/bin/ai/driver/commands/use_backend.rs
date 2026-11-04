@@ -152,6 +152,7 @@ pub(crate) fn try_handle_reset_command(
             app.pending_skill_continuation = None;
         }
     }
+    crate::ai::tools::enable_tools::clear_task_family_explicitly_enabled_tools(&app.session_id);
     super::session::persist_session_runtime_state(app);
     print_use_state(app);
     Ok(true)
@@ -385,6 +386,79 @@ mod tests {
         assert_eq!(stored.model.as_deref(), Some("parent-model"));
         assert_eq!(stored.agent.as_deref(), Some("parent-agent"));
         assert_eq!(stored.reasoning_effort.as_deref(), Some("off"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reset_command_drops_task_family_explicit_enables_only() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("rust-tools-reset-task-tools-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let history_file = root.join("history.sqlite");
+        let mut app = test_app();
+        app.config.base_history_file = history_file.clone();
+        app.config.history_file = history_file.clone();
+        app.session_id = "reset-task-tools".to_string();
+        app.session_history_file =
+            SessionStore::new(&history_file).session_history_file(&app.session_id);
+        app.session_default_subagent_backend = SubagentBackend::TraeCli;
+        app.session_default_skills = vec!["agent-team".to_string()];
+        // The reset clears every Builtin-tagged member of the `task` and
+        // `agent_team` groups, so derive the `agent_team` members from the same
+        // registry metadata instead of hardcoding a list that could drift.
+        let agent_team_tools: Vec<String> = crate::ai::tools::tool_definitions_for_groups(&[
+            crate::ai::tools::ToolGroup::AgentTeam,
+        ])
+        .into_iter()
+        .map(|definition| definition.function.name)
+        .filter(|name| {
+            crate::ai::tools::registry::tool_metadata::tool_groups(name)
+                .contains(&crate::ai::tools::ToolGroup::Builtin)
+        })
+        .collect();
+        assert!(
+            agent_team_tools.iter().any(|name| name == "manage_team")
+                && agent_team_tools
+                    .iter()
+                    .any(|name| name == "run_agent_graph"),
+            "agent_team group must expose the multi-agent orchestration tools, got {agent_team_tools:?}"
+        );
+        let mut seeded_tools = vec![
+            "task_spawn".to_string(),
+            "task_wait".to_string(),
+            "knowledge_search".to_string(),
+        ];
+        seeded_tools.extend(agent_team_tools.iter().cloned());
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+            (app.session_id.clone(), 0),
+            || {
+                crate::ai::tools::enable_tools::set_explicit_enabled_tool_names(seeded_tools);
+            },
+        );
+
+        assert!(try_handle_reset_command(&mut app, "/reset").unwrap());
+
+        let remaining = crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+            (app.session_id.clone(), 0),
+            crate::ai::tools::enable_tools::explicit_enabled_tool_names,
+        );
+        assert!(!remaining.iter().any(|name| name == "task_spawn"));
+        assert!(!remaining.iter().any(|name| name == "task_wait"));
+        for name in &agent_team_tools {
+            assert!(
+                !remaining
+                    .iter()
+                    .any(|remaining_name| remaining_name == name),
+                "reset must drop agent_team tool {name} from explicit enables"
+            );
+        }
+        assert!(remaining.iter().any(|name| name == "knowledge_search"));
+        // Drop the fake owner's global explicit-enable entry so no state
+        // outlives this test.
+        crate::ai::tools::enable_tools::clear_explicitly_enabled_tools(&app.session_id);
         let _ = fs::remove_dir_all(root);
     }
 

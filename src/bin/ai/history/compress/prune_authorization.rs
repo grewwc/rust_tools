@@ -11,7 +11,8 @@
 
 use rustc_hash::FxHashSet;
 
-/// Every runtime-minted task id starts with this prefix (`next_task_id`).
+/// Asynchronous task ids use this prefix (`next_task_id`); synchronous tasks
+/// use bare UUIDs (`handle_task_tool` in driver/tools/sync_task.rs).
 const TASK_ID_PREFIX: &str = "task_";
 
 /// Markers the runtime itself writes into subagent results: `[task_id=X]` for
@@ -23,7 +24,7 @@ const TASK_ID_PREFIX: &str = "task_";
 ///
 /// This list is the only producer of the id set, so a shape that is missing
 /// here can never be authorized and its results stay inline permanently. Add a
-/// marker only for fields carrying a runtime-minted `task_<id>`: ids from
+/// marker only for fields carrying a runtime-minted task id: ids from
 /// another id space (for example graph team ids such as `g-<uuid>`) are dropped
 /// by [`task_id_token`] and would only make more results un-prunable.
 const TASK_ID_MARKERS: [&str; 8] = [
@@ -64,10 +65,12 @@ fn task_id_token(rest: &str) -> &str {
         .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
         .unwrap_or(rest.len());
     let token = &rest[..end];
-    // Only the ids the runtime itself mints (`task_<id>`) count. A marker
+    // Only prefixed task ids or bare UUIDs count. A marker
     // followed by prose must not yield a phantom id, which would make an
     // ordinary result un-prunable forever.
-    if token.starts_with(TASK_ID_PREFIX) {
+    if token.starts_with(TASK_ID_PREFIX)
+        || (matches!(token.len(), 32 | 36) && uuid::Uuid::parse_str(token).is_ok())
+    {
         token
     } else {
         ""
@@ -141,8 +144,42 @@ mod tests {
             vec!["task_worker".to_string()]
         );
         assert_eq!(
-            referenced_task_ids("{\n  \"pool_task_id\": \"task_pool\",\n  \"phase\": \"advance\"\n}"),
+            referenced_task_ids(
+                "{\n  \"pool_task_id\": \"task_pool\",\n  \"phase\": \"advance\"\n}"
+            ),
             vec!["task_pool".to_string()]
+        );
+    }
+
+    #[test]
+    fn extracts_sync_uuid_ids_without_accepting_other_id_spaces() {
+        let simple = "0123456789abcdef0123456789abcdef";
+        let hyphenated = "01234567-89ab-cdef-0123-456789abcdef";
+        assert_eq!(
+            referenced_task_ids(&format!(
+                "[task_id={simple}]\n{{\"task_id\":\"{hyphenated}\"}}\n[task_id=task_async]"
+            )),
+            vec![
+                simple.to_string(),
+                "task_async".to_string(),
+                hyphenated.to_string()
+            ]
+        );
+        for invalid in [
+            "graph-0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdeg",
+            "0123456789abcdef0123456789abcdef-extra",
+            "documented",
+        ] {
+            assert!(referenced_task_ids(&format!("task_id={invalid}")).is_empty());
+        }
+        assert!(
+            !set(&["task_async"])
+                .allows_subagent_result(&format!("[task_id={simple}]\n[task_id=task_async]"))
+        );
+        assert!(
+            set(&[simple, "task_async"])
+                .allows_subagent_result(&format!("[task_id={simple}]\n[task_id=task_async]"))
         );
     }
 
@@ -165,13 +202,13 @@ mod tests {
     fn authorizes_only_fully_integrated_results() {
         let authorization = set(&["task_a", "task_b"]);
         assert!(authorization.allows_subagent_result("[task_id=task_a]\nbody"));
-        assert!(authorization.allows_subagent_result(
-            "[task_id=task_a]\nbody\n[task_id=task_b]\nbody"
-        ));
+        assert!(
+            authorization.allows_subagent_result("[task_id=task_a]\nbody\n[task_id=task_b]\nbody")
+        );
         // One un-integrated delivery keeps the whole result inline.
-        assert!(!authorization.allows_subagent_result(
-            "[task_id=task_a]\nbody\n[task_id=task_c]\nbody"
-        ));
+        assert!(
+            !authorization.allows_subagent_result("[task_id=task_a]\nbody\n[task_id=task_c]\nbody")
+        );
         assert!(!authorization.allows_subagent_result("plain tool output"));
     }
 

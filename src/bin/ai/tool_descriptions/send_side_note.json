@@ -1,12 +1,12 @@
 {
   "name": "send_side_note",
-  "description": "Send a real-time side-note to a running subagent task to guide it when it drifts. The note is injected at the next iteration before the subagent's next LLM request.",
+  "description": "Send guidance to any running subagent owned by the current process and session. Notes are queued without interrupting the active run, then injected before its next model iteration or prepended to the next follow-up prompt that resumes its session. Notes awaiting a resume survive completion or cancellation until that continuation.",
   "parameters": {
     "type": "object",
     "properties": {
       "task_id": {
         "type": "string",
-        "description": "Target subagent task id (from `task` / `task_spawn`). For foreground guidance use empty or omit."
+        "description": "Running subagent task id (from `task` / `task_spawn`), owned by the current process and session. Omit or use an empty string for foreground guidance."
       },
       "note": {
         "type": "string",

@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
-use crate::ai::files::{diff_line_tags, extract_key_lines, preview_anchor, split_line_number_prefix};
+use crate::ai::files::{
+    diff_line_tags, extract_key_lines, preview_anchor, split_line_number_prefix,
+};
 use crate::ai::{
     history::HistoryMessageSummarizer,
     tools::{
@@ -27,6 +29,7 @@ use super::persisted::{
     ARCHIVE_DIRECTORY_PATH_PREFIX, ARCHIVE_FILE_PATH_PREFIX, archive_directory_path_from_line,
     archive_file_path_from_line,
 };
+use super::prune_authorization::referenced_task_ids;
 use super::text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
 use super::tool_groups::{recent_tool_group_message_indices, recent_tool_result_groups};
 use super::{
@@ -41,8 +44,194 @@ use super::{
 };
 
 pub(super) const PRESERVED_TOOL_OVERFLOW_STUB_PREFIX: &str = "[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]";
+const PRESERVED_TOOL_OVERFLOW_HISTORY_RECOVERY_LINE: &str =
+    "- recovery: canonical history; locate the full result using the retained task ids.";
+/// Automatic lossless folding must leave modest results readable inline.
+pub(super) const TOOL_RESULT_FOLD_MIN_CHARS: usize = 4_096;
 const LEGACY_PRESERVED_TOOL_OVERFLOW_STUB_PREFIX: &str =
     "Output preserved for non-compressible tool `";
+
+/// Large results remain compressible; task stubs retain their review anchors.
+pub(super) fn tool_result_can_fold(_tool_name: &str, text: &str) -> bool {
+    text.chars().count() > TOOL_RESULT_FOLD_MIN_CHARS
+}
+
+fn task_evidence_recall_lines(tool_name: &str, content: &str) -> Vec<String> {
+    if tool_name != "task_evidence_read"
+        && tool_history_policy(tool_name).prune_policy()
+            != crate::ai::tools::registry::common::ToolPrunePolicy::AfterIntegration
+    {
+        return Vec::new();
+    }
+    task_evidence_review_lines(content)
+}
+
+fn task_evidence_object<'a>(value: &'a Value, task_id: &str) -> Option<&'a Value> {
+    match value {
+        Value::Object(object) => {
+            if ["task_id", "runtime_task_id", "pool_task_id"]
+                .into_iter()
+                .any(|key| object.get(key).and_then(Value::as_str) == Some(task_id))
+            {
+                Some(value)
+            } else {
+                object
+                    .values()
+                    .find_map(|value| task_evidence_object(value, task_id))
+            }
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| task_evidence_object(value, task_id)),
+        _ => None,
+    }
+}
+
+/// Keep task identity, reported state, and a bounded excerpt together with the
+/// evidence source locator, even when a generic budget backstop runs later.
+///
+/// The review block is appended to preserved stubs, which bypass the physical
+/// tool-result cap, and a result may name arbitrarily many task ids. Aggregation
+/// therefore stops at the first of these bounds and records how many tasks were
+/// left out. Worst case is 8 KiB of review lines plus one marker line, which
+/// stays well below the 64 KiB raw-result hard cap even together with the stub
+/// header, fingerprint, and preview.
+const TASK_EVIDENCE_REVIEW_MAX_TASKS: usize = 16;
+const TASK_EVIDENCE_REVIEW_MAX_LINES: usize = 3 * TASK_EVIDENCE_REVIEW_MAX_TASKS;
+const TASK_EVIDENCE_REVIEW_MAX_CHARS: usize = 8 * 1024;
+
+pub(super) fn task_evidence_review_lines(content: &str) -> Vec<String> {
+    let envelope = serde_json::from_str::<Value>(content).ok();
+    let mut task_ids = referenced_task_ids(content);
+    let total_tasks = task_ids.len();
+    task_ids.truncate(TASK_EVIDENCE_REVIEW_MAX_TASKS);
+    let mut lines = Vec::new();
+    let mut used_chars = 0usize;
+    let mut processed_tasks = 0usize;
+    for task_id in &task_ids {
+        let mut task_lines = Vec::new();
+        'task: {
+            let review_field = |prefix: &str| {
+                let prefix = format!("{prefix}task_id={task_id}; ");
+                content
+                    .lines()
+                    .find_map(|line| line.trim_start().strip_prefix(&prefix))
+            };
+            let review_status = review_field("- task_status: ");
+            let review_conclusion = review_field("- task_conclusion: ");
+            if review_status.is_some() || review_conclusion.is_some() {
+                // Review fields already bind each excerpt to its task. Preserve that
+                // binding and its existing recovery source instead of parsing the
+                // first status token or inventing a delivered-evidence locator.
+                for prefix in [
+                    "- task_evidence: ",
+                    "- task_status: ",
+                    "- task_conclusion: ",
+                ] {
+                    if let Some(value) = review_field(prefix) {
+                        task_lines.push(format!("{prefix}task_id={task_id}; {value}"));
+                    }
+                }
+                break 'task;
+            }
+            let record = envelope
+                .as_ref()
+                .and_then(|value| task_evidence_object(value, task_id));
+            let marker = format!("[task_id={task_id}]");
+            let body = content
+                .split_once(&marker)
+                .map(|(_, rest)| rest.split("[task_id=").next().unwrap_or(rest).trim())
+                .unwrap_or(content);
+            let status = record
+                .and_then(|value| {
+                    ["terminal_status", "status", "state"]
+                        .into_iter()
+                        .find_map(|key| value.get(key).and_then(Value::as_str))
+                })
+                .map(str::to_string)
+                .or_else(|| {
+                    body.lines().find_map(|line| {
+                        line.trim_start()
+                            .strip_prefix("[Task: ")?
+                            .rsplit_once("] ")?
+                            .1
+                            .split_once(" after ")
+                            .map(|(status, _)| status.trim().to_ascii_lowercase())
+                    })
+                })
+                .or_else(|| {
+                    [
+                        "status=",
+                        "\"terminal_status\":",
+                        "\"status\":",
+                        "\"state\":",
+                    ]
+                    .into_iter()
+                    .find_map(|marker| {
+                        let rest = body.split_once(marker)?.1.trim_start_matches([' ', '"']);
+                        let token = rest
+                            .split(|ch: char| !ch.is_ascii_alphabetic() && ch != '_')
+                            .next()?;
+                        (!token.is_empty()).then(|| token.to_string())
+                    })
+                });
+            let excerpt = record
+                .and_then(|value| value.get("payload").or_else(|| value.get("output")))
+                .map(value_to_string)
+                .unwrap_or_else(|| body.to_string());
+            let excerpt = excerpt
+                .trim_end_matches(crate::ai::tools::task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER)
+                .trim();
+            let source = record
+                .and_then(|value| value.get("source"))
+                .or_else(|| envelope.as_ref().and_then(|value| value.get("source")))
+                .and_then(Value::as_str)
+                .filter(|source| matches!(*source, "progress" | "delivered"))
+                .unwrap_or_else(|| {
+                    // Older persisted progress snapshots predate the source field.
+                    if record.is_some_and(|value| {
+                        value.get("phase").is_some() && value.get("timeline").is_some()
+                    }) {
+                        "progress"
+                    } else {
+                        "delivered"
+                    }
+                });
+            let arguments = serde_json::json!({"task_id": task_id, "source": source});
+            task_lines.push(format!(
+                "- task_evidence: task_id={task_id}; task_evidence_read({arguments})"
+            ));
+            // Missing state is explicit rather than inferring successful completion.
+            task_lines.push(format!(
+                "- task_status: task_id={task_id}; status={}",
+                truncate_to_chars(
+                    &normalize_whitespace(status.as_deref().unwrap_or("unknown")),
+                    32
+                )
+            ));
+            task_lines.push(format!(
+                "- task_conclusion: task_id={task_id}; {}",
+                keep_ends_by_chars(&normalize_whitespace(excerpt), 360)
+            ));
+        }
+        let task_chars: usize = task_lines.iter().map(|line| line.chars().count() + 1).sum();
+        if lines.len() + task_lines.len() > TASK_EVIDENCE_REVIEW_MAX_LINES
+            || used_chars + task_chars > TASK_EVIDENCE_REVIEW_MAX_CHARS
+        {
+            break;
+        }
+        used_chars += task_chars;
+        lines.extend(task_lines);
+        processed_tasks += 1;
+    }
+    if processed_tasks < total_tasks {
+        lines.push(format!(
+            "- review lines truncated: {} more task(s)",
+            total_tasks - processed_tasks
+        ));
+    }
+    lines
+}
 
 pub(super) async fn build_persisted_summary_text_with_app(
     app: &App,
@@ -56,8 +245,7 @@ pub(super) async fn build_persisted_summary_text_with_app(
     prepare_tool_messages_structured(
         &mut prepared,
         360,
-        // No overflow dir here: non-compressible results cannot spill, so the
-        // floor cannot apply.
+        // The shared size floor still applies without an overflow sink.
         0,
         KEEP_RECENT_TOOL_GROUPS,
         None,
@@ -90,8 +278,8 @@ pub(super) fn normalize_internal_notes_for_summary_model(messages: &mut Vec<Mess
 /// (`read_file`, `execute_command`, ...) that exceed both `max_chars_per_msg` and
 /// `spill_min_chars` spill to `overflow_dir` as preview stubs.
 ///
-/// `spill_min_chars = 0` keeps the legacy threshold, which is what a caller that
-/// must reach a hard target still wants.
+/// `spill_min_chars = 0` uses the shared per-result floor. Large task evidence
+/// keeps its delivery locator and review excerpt in the replacement stub.
 pub(super) fn prepare_tool_messages_structured(
     messages: &mut [Message],
     max_chars_per_msg: usize,
@@ -125,6 +313,9 @@ pub(super) fn prepare_tool_messages_structured(
             .as_deref()
             .and_then(|id| id_to_tool_name.get(id))
             .map(|s| s.as_str());
+        if !tool_result_can_fold(tool_name.unwrap_or("unknown_tool"), &text) {
+            continue;
+        }
         if let Some(name) = tool_name
             && is_non_compressible_tool(name)
         {
@@ -246,7 +437,8 @@ pub(in crate::ai) fn cap_oversized_tool_results_for_context(
         if keep_recent_groups > 0 && protected.contains(&idx) {
             continue;
         }
-        if content_char_len(&messages[idx].content) > hard_cap_chars {
+        if content_char_len(&messages[idx].content) > hard_cap_chars.max(TOOL_RESULT_FOLD_MIN_CHARS)
+        {
             has_oversized = true;
             break;
         }
@@ -265,7 +457,9 @@ pub(in crate::ai) fn cap_oversized_tool_results_for_context(
         }
         // Fast length gate without cloning; only oversized results pay the
         // value_to_string allocation.
-        if content_char_len(&messages[idx].content) <= hard_cap_chars {
+        if content_char_len(&messages[idx].content)
+            <= hard_cap_chars.max(TOOL_RESULT_FOLD_MIN_CHARS)
+        {
             continue;
         }
         let text = value_to_string(&messages[idx].content);
@@ -313,6 +507,12 @@ pub(in crate::ai) fn cap_oversized_tool_results_for_context(
                 for line in &recall_lines {
                     stub.push('\n');
                     stub.push_str(line);
+                }
+                for line in task_evidence_recall_lines(tool_name, &text) {
+                    if !recall_lines.contains(&line) {
+                        stub.push('\n');
+                        stub.push_str(&line);
+                    }
                 }
                 stub.push('\n');
                 stub.push_str(&build_overflow_content_preview(&text));
@@ -380,7 +580,7 @@ pub(super) fn enforce_protected_precision_group_budget(
                 break;
             }
             let text = value_to_string(&messages[idx].content);
-            if text.trim().is_empty() || is_preserved_tool_overflow_stub(&text) {
+            if !tool_result_can_fold(&tool_name, &text) || is_preserved_tool_overflow_stub(&text) {
                 continue;
             }
             // protected (current-turn) results stay as-is by default to remain
@@ -491,6 +691,9 @@ pub(super) fn spill_protected_precision_to_fit(
             }
             let tool_name = id_to_tool_name.get(id)?;
             let text = value_to_string(&message.content);
+            if !tool_result_can_fold(tool_name, &text) || is_preserved_tool_overflow_stub(&text) {
+                return None;
+            }
             // If the current turn reads this session's archive directly, Path C
             // must not copy the original again. Reusing the original asset's
             // pointer both preserves the hard target and avoids the "spill →
@@ -861,6 +1064,9 @@ pub(super) fn plan_noncompressible_tool_result_for_fold(
     if is_preserved_tool_overflow_stub(content) {
         return Some((content.to_string(), None));
     }
+    if !tool_result_can_fold(tool_name, content) {
+        return None;
+    }
     let overflow_dir = overflow_dir?;
     let safe_tool = sanitize_overflow_name_component(tool_name);
     let identity = format!("{tool_call_id}\0{content}");
@@ -1002,7 +1208,39 @@ pub(super) fn build_preserved_tool_overflow_stub(
     full_content: &str,
     recall_lines: &[String],
 ) -> String {
-    let archive_display = stub_archive_display_path(path);
+    build_preserved_tool_overflow_stub_with_archive(
+        Some(path),
+        tool_name,
+        full_content,
+        recall_lines,
+    )
+}
+
+fn preserved_tool_overflow_stub_header(
+    archive_display: Option<&str>,
+    tool_name: &str,
+    archive_notice: bool,
+) -> String {
+    let notice = if archive_display.is_some() && archive_notice {
+        " (context-budget fold). Full historical result saved to session asset:"
+    } else {
+        "."
+    };
+    let recovery = archive_display
+        .map(|path| format!("- file_path: {path}"))
+        .unwrap_or_else(|| PRESERVED_TOOL_OVERFLOW_HISTORY_RECOVERY_LINE.to_string());
+    format!(
+        "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\nOutput preserved for tool `{tool_name}`{notice}\n{recovery}"
+    )
+}
+
+pub(super) fn build_preserved_tool_overflow_stub_with_archive(
+    path: Option<&Path>,
+    tool_name: &str,
+    full_content: &str,
+    recall_lines: &[String],
+) -> String {
+    let archive_display = path.map(stub_archive_display_path);
     // The full text is still spilled to disk to control context size, but the
     // stub keeps a head+tail preview so later turns own a "recall anchor" — the
     // model can judge whether it really needs to read_file again, avoiding the
@@ -1011,14 +1249,7 @@ pub(super) fn build_preserved_tool_overflow_stub(
     // full content is needed", preventing the LLM from unconditionally
     // re-reading on sight of a file_path and looping spill → re-read → spill
     // again forever.
-    let preview = build_overflow_content_preview(full_content);
-    let tool_hint = preserved_tool_overflow_hint(tool_name, recall_lines, true);
-    let mut out = format!(
-        "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\n\
-         Output preserved for tool `{tool_name}` (context-budget fold). Full historical result saved to session asset:\n\
-         - file_path: {}",
-        archive_display,
-    );
+    let mut out = preserved_tool_overflow_stub_header(archive_display.as_deref(), tool_name, true);
     if let Some(fingerprint) = stub_fingerprint_line(full_content) {
         out.push('\n');
         out.push_str(&fingerprint);
@@ -1027,10 +1258,22 @@ pub(super) fn build_preserved_tool_overflow_stub(
         out.push('\n');
         out.push_str(line);
     }
-    out.push('\n');
-    out.push_str(tool_hint);
-    out.push('\n');
-    out.push_str(&preview);
+    for line in task_evidence_recall_lines(tool_name, full_content) {
+        if !recall_lines.contains(&line) {
+            out.push('\n');
+            out.push_str(&line);
+        }
+    }
+    if path.is_some() {
+        out.push('\n');
+        out.push_str(preserved_tool_overflow_hint(tool_name, recall_lines, true));
+        out.push('\n');
+        out.push_str(&build_overflow_content_preview(full_content));
+    } else {
+        // Archive previews refer to a file, so keep only review anchors when
+        // the optional write fails. Canonical history remains the recovery source.
+        out.push_str("\nOutput folded out of inline context for budget reasons; no archive file was written. Recover full historical output from canonical history or the retained task recovery instructions where available.");
+    }
     out
 }
 
@@ -1209,6 +1452,20 @@ pub(super) fn build_tool_overflow_recall_lines(tool_name: &str, arguments: &str)
                 )]
             })
             .unwrap_or_default(),
+        "task_evidence_read" => args
+            .get("task_id")
+            .and_then(Value::as_str)
+            .map(|task_id| {
+                let source = args
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("progress");
+                let arguments = serde_json::json!({"task_id": task_id, "source": source});
+                vec![format!(
+                    "- task_evidence: task_id={task_id}; task_evidence_read({arguments})"
+                )]
+            })
+            .unwrap_or_default(),
         "execute_command" | "run_command" | "shell" | "bash" => {
             let mut lines = Vec::with_capacity(2);
             if let Some(command) = value_string_from_keys(&args, &["command"]) {
@@ -1254,10 +1511,76 @@ fn read_file_range_summary(args: &Value) -> Option<(&'static str, String)> {
     }
 }
 
+/// Maximum size accepted as a preserved stub. Fresh stubs are bounded by the
+/// header, fingerprint, an 8 KiB review block, the recall hint, and a preview
+/// of at most 20 key lines plus a handful of probes (roughly 17 KiB worst
+/// case). Anything larger is treated as raw tool output and stays subject to
+/// `cap_oversized_tool_results_for_context`; without this bound a forged
+/// marker/`file_path` pair could exempt an arbitrarily large result.
+const PRESERVED_TOOL_OVERFLOW_STUB_MAX_CHARS: usize = 24_000;
+
+/// Whether `text` starts with the complete structural header emitted by
+/// `preserved_tool_overflow_stub_header`: the protocol marker, the tool line
+/// with one of the two known notices, and a recovery locator on the third line.
+fn has_preserved_tool_overflow_stub_header(text: &str) -> bool {
+    const ARCHIVE_NOTICE: &str =
+        " (context-budget fold). Full historical result saved to session asset:";
+    let mut lines = text.lines();
+    if lines.next().map(str::trim) != Some(PRESERVED_TOOL_OVERFLOW_STUB_PREFIX) {
+        return false;
+    }
+    let Some(tool_line) = lines.next().map(str::trim_end) else {
+        return false;
+    };
+    let Some(rest) = tool_line.strip_prefix("Output preserved for tool `") else {
+        return false;
+    };
+    let Some((tool_name, suffix)) = rest.split_once('`') else {
+        return false;
+    };
+    if tool_name.is_empty() {
+        return false;
+    }
+    let archive_notice = suffix == ARCHIVE_NOTICE;
+    if suffix != "." && !archive_notice {
+        return false;
+    }
+    let Some(locator) = lines.next().map(str::trim_start) else {
+        return false;
+    };
+    let has_file_path = locator
+        .strip_prefix("- file_path: ")
+        .is_some_and(|path| !path.trim().is_empty());
+    let has_history_recovery = locator == PRESERVED_TOOL_OVERFLOW_HISTORY_RECOVERY_LINE;
+    // The archive notice is emitted together with an asset pointer; the plain
+    // form carries either a pointer (minimized stubs) or history recovery.
+    if archive_notice {
+        has_file_path
+    } else {
+        has_file_path || has_history_recovery
+    }
+}
+
 pub(super) fn is_preserved_tool_overflow_stub(text: &str) -> bool {
-    let text = text.trim_start();
-    if text.starts_with(PRESERVED_TOOL_OVERFLOW_STUB_PREFIX) {
-        return text.contains("\n- file_path: ");
+    let mut text = text.trim_start();
+    // Recognize only the complete recovery annotation used around a stub, not
+    // a quoted stub appearing after new findings or followed by more output.
+    if let Some(annotated) = text.strip_prefix("Recovered tool output:\n```text\n") {
+        let Some((body, suffix)) = annotated.split_once("\n```") else {
+            return false;
+        };
+        if !suffix.trim().is_empty() {
+            return false;
+        }
+        text = body.trim_start();
+    }
+    // Bound the body before validating the header so a forged header cannot
+    // exempt an oversized result from the physical cap.
+    if text.chars().count() > PRESERVED_TOOL_OVERFLOW_STUB_MAX_CHARS {
+        return false;
+    }
+    if has_preserved_tool_overflow_stub_header(text) {
+        return true;
     }
     // Legacy formats (older sessions):
     // - "Output preserved for non-compressible tool `..."  (pre-refactor)
@@ -1311,19 +1634,14 @@ pub(super) fn collapse_overflow_stub_to_anchor(text: &str) -> Option<String> {
         .lines()
         .find_map(|line| line.trim_start().strip_prefix("- file_path: "))
         .map(str::trim)
-        .filter(|p| !p.is_empty())?;
+        .filter(|p| !p.is_empty());
     let recall_lines = text
         .lines()
         .map(str::trim_start)
-        .filter(|line| line.starts_with("- original_"))
+        .filter(|line| line.starts_with("- original_") || is_task_evidence_review_line(line))
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let tool_hint = preserved_tool_overflow_hint(&tool_name, &recall_lines, false);
-    let mut out = format!(
-        "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\n\
-         Output preserved for tool `{tool_name}` (context-budget fold). Full historical result saved to session asset:\n\
-         - file_path: {file_path}"
-    );
+    let mut out = preserved_tool_overflow_stub_header(file_path, &tool_name, true);
     for line in &recall_lines {
         out.push('\n');
         out.push_str(line);
@@ -1337,8 +1655,14 @@ pub(super) fn collapse_overflow_stub_to_anchor(text: &str) -> Option<String> {
         out.push_str(fp.trim());
         out.push('\n');
     }
-    out.push('\n');
-    out.push_str(tool_hint);
+    if file_path.is_some() {
+        out.push('\n');
+        out.push_str(preserved_tool_overflow_hint(
+            &tool_name,
+            &recall_lines,
+            false,
+        ));
+    }
     Some(out)
 }
 
@@ -1364,12 +1688,16 @@ pub(super) fn minimize_overflow_stub_to_pointer(text: &str) -> Option<String> {
         .lines()
         .find_map(|line| line.trim_start().strip_prefix("- file_path: "))
         .map(str::trim)
-        .filter(|path| !path.is_empty())?;
-    let mut out = format!(
-        "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\n\
-         Output preserved for tool `{tool_name}`.\n\
-         - file_path: {file_path}"
-    );
+        .filter(|path| !path.is_empty());
+    let mut out = preserved_tool_overflow_stub_header(file_path, tool_name, false);
+    for line in text
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| is_task_evidence_review_line(line))
+    {
+        out.push('\n');
+        out.push_str(line);
+    }
     // Carry the content fingerprint into the final pointer form so even the most
     // compressed stub keeps retrieval signal; legacy stubs simply omit it.
     if let Some(fp) = text
@@ -1380,6 +1708,19 @@ pub(super) fn minimize_overflow_stub_to_pointer(text: &str) -> Option<String> {
         out.push_str(fp.trim());
     }
     Some(out)
+}
+
+pub(super) fn is_task_evidence_review_line(line: &str) -> bool {
+    [
+        "- task_evidence: ",
+        "- task_status: ",
+        "- task_conclusion: ",
+        // The truncation marker belongs to the review block so collapse and
+        // pointer minimization keep reporting that tasks were omitted.
+        "- review lines truncated: ",
+    ]
+    .into_iter()
+    .any(|prefix| line.starts_with(prefix))
 }
 
 pub(super) fn minimize_overflow_stubs_for_hard_budget(messages: &mut [Message]) {
@@ -1398,9 +1739,11 @@ pub(super) fn minimize_overflow_stubs_for_hard_budget(messages: &mut [Message]) 
 }
 
 pub(super) fn is_preserved_tool_overflow_content(content: &Value) -> bool {
-    content
-        .as_str()
-        .is_some_and(is_preserved_tool_overflow_stub)
+    match content {
+        Value::String(text) => is_preserved_tool_overflow_stub(text),
+        Value::Array(_) => is_preserved_tool_overflow_stub(&value_to_string(content)),
+        _ => false,
+    }
 }
 
 /// Age-folds the preview body of overflow stubs "outside the protected tail
@@ -2667,11 +3010,7 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
     let head_cap = max_chars.saturating_sub(tail_used + tool_reserve + 2);
     let mut head: Vec<String> = Vec::new();
     if !initial_goal.is_empty() {
-        let _ = push_line_with_budget(
-            &mut head,
-            format!("Main request: {initial_goal}"),
-            head_cap,
-        );
+        let _ = push_line_with_budget(&mut head, format!("Main request: {initial_goal}"), head_cap);
     }
     for s in pre_summary_lines.into_iter().take(3) {
         if !push_line_with_budget(&mut head, s, head_cap) {

@@ -297,6 +297,7 @@ pub(super) struct TaskWaitState {
     pub(super) deadline: Instant,
     pub(super) timeout_secs: u64,
     pub(super) expired: bool,
+    pub(super) agent_team_mode: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct OutstandingTaskSnapshot {
@@ -327,6 +328,10 @@ pub(crate) struct OsTaskGoal {
     /// recursive fan-out.
     #[serde(default)]
     pub(crate) spawn_depth: usize,
+    /// Parent-facing evidence policy captured before the child removes mode skills.
+    /// Old task goals retain the full evidence format.
+    #[serde(default)]
+    pub(crate) parent_agent_team_mode: bool,
     /// Optional JSON Schema for the subagent's final response; stays compatible with old task
     /// payloads where it is missing.
     #[serde(default)]

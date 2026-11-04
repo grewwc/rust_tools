@@ -1,5 +1,130 @@
 use super::*;
 
+#[test]
+fn stream_response_discards_valid_tools_on_any_explicit_truncation_signal() {
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    crate::ai::driver::signal::clear_request_interrupt();
+
+    for (finish_reason, incomplete, malformed) in [
+        (Some("stop"), false, true),
+        (Some("length"), false, false),
+        (None, true, false),
+        (Some("length"), true, false),
+    ] {
+        let mut app = test_app();
+        let markers = StreamMarkers::new();
+        let mut state = StreamProcessingState::new();
+        let mut current_history = String::new();
+        state.content.assistant_text = "partial output".to_string();
+        state.content.finish_reason_seen = finish_reason.is_some();
+        state.content.finish_reason_value = finish_reason.map(str::to_string);
+        state.content.response_incomplete = incomplete;
+        state.content.tool_calls_map.insert(
+            0,
+            ToolCallBuilder {
+                id: "call-valid".to_string(),
+                tool_type: "function".to_string(),
+                function_name: "run_shell".to_string(),
+                arguments: r#"{"command":"pwd"}"#.to_string(),
+                ..Default::default()
+            },
+        );
+        if malformed {
+            state.content.tool_calls_map.insert(
+                1,
+                ToolCallBuilder {
+                    id: "call-cut".to_string(),
+                    tool_type: "function".to_string(),
+                    function_name: "write_file".to_string(),
+                    arguments: r#"{"path":"/tmp/x","content":"aaa"#.to_string(),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let result =
+            finalize_stream_response(&mut app, &mut current_history, &markers, state).unwrap();
+
+        assert_eq!(result.outcome, StreamOutcome::Truncated);
+        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.assistant_text, "partial output");
+        assert_eq!(result.truncated_by_length, finish_reason == Some("length"));
+        assert!(!result.stream_error);
+    }
+}
+
+#[test]
+fn stream_response_does_not_recover_inline_tools_from_incomplete_output() {
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    crate::ai::driver::signal::clear_request_interrupt();
+    let inline_call = r#"{"name":"read_file","arguments":{"path":"/tmp/x"}}"#;
+    for finish_reason in [Some("length"), None] {
+        let mut app = test_app();
+        let markers = StreamMarkers::new();
+        let mut state = StreamProcessingState::new();
+        let mut current_history = String::new();
+        state.content.assistant_text = inline_call.to_string();
+        state.content.finish_reason_seen = finish_reason.is_some();
+        state.content.finish_reason_value = finish_reason.map(str::to_string);
+        state.content.response_incomplete = finish_reason.is_none();
+
+        let result =
+            finalize_stream_response(&mut app, &mut current_history, &markers, state).unwrap();
+
+        assert_eq!(result.outcome, StreamOutcome::Truncated);
+        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.assistant_text, inline_call);
+    }
+}
+
+#[tokio::test]
+async fn stream_response_decode_error_fallback_always_retries_and_discards_tools() {
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    crate::ai::driver::signal::clear_request_interrupt();
+    for tool_arguments in [None, Some(r#"{"command":"pwd"}"#), Some(r#"{"command":"#)] {
+        let mut app = test_app();
+        let markers = StreamMarkers::new();
+        let mut state = StreamProcessingState::new();
+        state.framing.decode_error_count = MAX_DECODE_ERRORS;
+        state.content.assistant_text = "partial output".to_string();
+        state.content.reasoning_text = "partial reasoning".to_string();
+        state.content.finish_reason_seen = true;
+        state.content.finish_reason_value = Some("stop".to_string());
+        if let Some(arguments) = tool_arguments {
+            state.content.tool_calls_map.insert(
+                0,
+                ToolCallBuilder {
+                    id: "call-unconfirmed".to_string(),
+                    tool_type: "function".to_string(),
+                    function_name: "run_shell".to_string(),
+                    arguments: arguments.to_string(),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let result = handle_stream_decode_error(&mut app, &markers, &mut state, "read failed")
+            .await
+            .expect("exceeding the consecutive read-error threshold must return a retryable result");
+
+        assert_eq!(result.outcome, StreamOutcome::Truncated);
+        assert!(result.stream_error);
+        assert!(result.tool_calls.is_empty());
+        assert!(state.content.tool_calls_map.is_empty());
+        assert_eq!(result.assistant_text, "partial output");
+        assert_eq!(result.reasoning_text, "partial reasoning");
+        assert!(result.skip_response_drain);
+        assert!(!result.truncated_by_length);
+        assert_eq!(state.framing.decode_error_count, MAX_DECODE_ERRORS + 1);
+    }
+}
+
 #[tokio::test]
 async fn stream_response_returns_after_finish_reason_without_eof() {
     let _signal_guard = crate::ai::test_support::ENV_LOCK
@@ -64,7 +189,7 @@ async fn stream_response_returns_after_finish_reason_without_eof() {
 }
 
 #[tokio::test]
-async fn stream_response_marks_length_finish_reason_as_truncated() {
+async fn stream_response_marks_length_finish_reason_with_visible_text_as_truncated() {
     let _signal_guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -113,13 +238,11 @@ async fn stream_response_marks_length_finish_reason_as_truncated() {
     .expect("stream_response should return after finish_reason grace window")
     .unwrap();
 
-    // Key assertion: text present but finish_reason=length is treated as Completed. Reasoning models
-    // often exhaust the output budget on reasoning tokens, yielding finish_reason=length while the
-    // visible assistant_text is actually complete; retrying would only truncate again for nothing. Only
-    // truncated tool call arguments JSON (dropped_malformed_tool_call) or no visible output at all
-    // should escalate to Truncated and trigger a retry.
-    assert_eq!(result.outcome, StreamOutcome::Completed);
+    // An explicit output-cap stop must retry even when the response already contains visible text.
+    assert_eq!(result.outcome, StreamOutcome::Truncated);
     assert_eq!(result.assistant_text, "partial output");
+    assert!(result.truncated_by_length);
+    assert!(!result.stream_error);
 
     drop(response);
     let _ = done_tx.send(());

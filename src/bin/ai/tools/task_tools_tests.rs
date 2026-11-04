@@ -127,6 +127,8 @@ fn progress_snapshot(sequence: u64, elapsed_secs: u64, phase: &str) -> SubagentP
     SubagentProgressSnapshot {
         phase: phase.to_string(),
         checkpoint_summary: None,
+        checkpoint_excerpt: None,
+        checkpoint_revision: 0,
         elapsed: Duration::from_secs(elapsed_secs),
         stale_for: Duration::ZERO,
         checkpoint_due: false,
@@ -338,7 +340,7 @@ fn task_wait_no_hint_after_newer_spawn() {
     super::reset_last_spawn_batch_for_test();
 }
 
-fn test_app_with_model(current_model: String) -> App {
+pub(super) fn test_app_with_model(current_model: String) -> App {
     App {
         cli: ParsedCli::default(),
         scoped_preflight_required: Vec::new(),
@@ -613,6 +615,207 @@ fn prepare_subagent_task_uses_session_default_backend() {
     assert_eq!(prepared.backend_model.as_deref(), Some("GPT-6.1-Sol"));
     assert!(prepared.reasoning_effort.is_none());
     assert!(prepared.show_backend_launch_tag);
+}
+
+#[test]
+fn traecli_model_attribution_agrees_across_spawn_status_and_delivery() {
+    const CHILD_ENV: &str = "RUST_TOOLS_MODEL_ATTRIBUTION_TEST_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        // Default-model resolution requires process-global environment changes.
+        // Isolate them from concurrent fake-backend subprocess tests.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ai::tools::task_tools::tests::traecli_model_attribution_agrees_across_spawn_status_and_delivery",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated attribution test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "the isolated attribution test must execute its assertions"
+        );
+        return;
+    }
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    struct RestoreEnv([(&'static str, Option<std::ffi::OsString>); 2]);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+    let _restore_env = RestoreEnv([
+        ("TRAECLI_BIN", std::env::var_os("TRAECLI_BIN")),
+        ("TRAECLI_MODEL", std::env::var_os("TRAECLI_MODEL")),
+    ]);
+    let backend_model = "backend-test-model";
+    unsafe {
+        // Admission only checks this file exists; no backend process runs in this test.
+        std::env::set_var("TRAECLI_BIN", std::env::current_exe().unwrap());
+        std::env::set_var("TRAECLI_MODEL", backend_model);
+    }
+    let parent_model = crate::ai::model_names::all()
+        .first()
+        .map(|model| crate::ai::model_names::model_handle(model))
+        .expect("model registry must contain at least one model");
+    let root = std::env::temp_dir().join(format!(
+        "task-model-attribution-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut app = test_app_with_model(parent_model.clone());
+    app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    app.config.history_file = root.join("history.sqlite");
+    app.session_default_subagent_backend = SubagentBackend::TraeCli;
+    let owner_pid = app.os.lock().unwrap().begin_foreground(
+        "parent".to_string(),
+        "goal".to_string(),
+        10,
+        8,
+        None,
+    );
+    let context = DriverContext::new(
+        app.clone(),
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(vec![manifest(
+            "navigator",
+            "Read-only codebase navigation agent",
+            AgentMode::Subagent,
+        )]),
+    );
+    crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+        (app.session_id.clone(), 0usize),
+        || {
+            DRIVER_CTX.sync_scope(context, || {
+                let mut args = serde_json::json!({
+                    "description": "Inspect attribution",
+                    "prompt": "Find task model attribution.",
+                    "agent": "navigator",
+                    "model": parent_model
+                });
+                let prepared = prepare_subagent_task(&args).unwrap();
+                assert_eq!(prepared.model, parent_model);
+                assert_ne!(prepared.model, backend_model);
+                assert_eq!(prepared.backend_model.as_deref(), Some(backend_model));
+                assert!(prepared.reasoning_effort.is_none());
+                unsafe { std::env::set_var("TRAECLI_MODEL", "later-backend-model") };
+                let frozen = super::spawn_subagent_kernel_task(&prepared).unwrap();
+
+                args["backend_model"] = serde_json::json!(backend_model);
+                let spawned: serde_json::Value = serde_json::from_str(
+                    &execute_task_spawn(&serde_json::json!({"tasks": [args.clone()]})).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(spawned["tasks"][0]["model"], backend_model);
+                let task_id = spawned["tasks"][0]["task_id"].as_str().unwrap();
+                let audit = crate::ai::history::read_task_spawn_audit(
+                    &app.config.history_file,
+                    &app.session_id,
+                )
+                .unwrap();
+                assert_eq!(audit.len(), 1);
+                assert_eq!(audit[0].model, backend_model);
+
+                let task_ids = [frozen.task_id.as_str(), task_id];
+                for task_id in task_ids {
+                    let entry = super::with_task_entry(task_id, Clone::clone).unwrap();
+                    assert_eq!(entry.model, backend_model);
+                    set_task_reasoning_effort(task_id, Some("xhigh".to_string()));
+                    let os = app.os.lock().unwrap();
+                    let goal = super::decode_os_task_goal(&os.get_process(entry.pid).unwrap().goal)
+                        .unwrap();
+                    assert_eq!(goal.model, parent_model);
+                    assert_eq!(goal.backend_model.as_deref(), Some(backend_model));
+                }
+                let snapshots = super::subagent_status_snapshots(&app.session_id);
+                let statuses =
+                    super::subagent_terminal_statuses(app.os.lock().unwrap().as_mut(), snapshots);
+                assert_eq!(statuses.len(), 2);
+                assert!(statuses.iter().all(|status| {
+                    status.model.as_deref() == Some(backend_model)
+                        && status.reasoning_effort.as_deref() == Some("xhigh")
+                }));
+                let pending = execute_task_status(&serde_json::json!({})).unwrap();
+                for task_id in task_ids {
+                    let row = pending
+                        .lines()
+                        .find(|line| line.starts_with(task_id))
+                        .unwrap();
+                    assert_eq!(row.split_whitespace().nth(3), Some(backend_model));
+                    let entry = super::with_task_entry(task_id, Clone::clone).unwrap();
+                    app.os
+                        .lock()
+                        .unwrap()
+                        .channel_send(
+                            Some(owner_pid),
+                            ChannelId(entry.result_channel_id),
+                            serde_json::json!({"status": "completed", "output": "confirmed result"})
+                                .to_string(),
+                        )
+                        .unwrap();
+                }
+                let delivered = execute_task_status(&serde_json::json!({})).unwrap();
+                let header = format!(
+                    "[Task: Inspect attribution via navigator @ {backend_model} (effort: xhigh)]"
+                );
+                assert_eq!(delivered.matches(&header).count(), 2);
+                let reason = format!("model_reason=backend model '{backend_model}'");
+                assert_eq!(delivered.matches(&reason).count(), 2);
+                assert!(!delivered.contains("model_reason=explicit model override"));
+                let evidence = crate::ai::history::read_task_spawn_audit(
+                    &app.config.history_file,
+                    &app.session_id,
+                )
+                .unwrap()
+                .into_iter()
+                .filter(|record| {
+                    record.delivered_at_unix_ms > 0 && record.integrated_at_unix_ms.is_none()
+                })
+                .collect::<Vec<_>>();
+                assert_eq!(evidence.len(), 2);
+                assert!(evidence.iter().all(|record| {
+                    record.model == backend_model
+                        && record.payload.contains(&header)
+                        && record.payload.contains(&reason)
+                }));
+
+                unsafe { std::env::set_var("TRAECLI_BIN", root.join("absent-traecli")) };
+                let mut kernel_args = args.clone();
+                kernel_args["backend"] = serde_json::json!("kernel");
+                let failed_batch: serde_json::Value = serde_json::from_str(
+                    &execute_task_spawn(&serde_json::json!({"tasks": [kernel_args, args]}))
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(failed_batch["failed"], 1);
+                assert_eq!(failed_batch["tasks"][0]["model"], parent_model);
+                assert_eq!(failed_batch["tasks"][1]["model"], backend_model);
+                discard_tasks_for_session(&app.session_id);
+                super::reset_last_spawn_batch_for_test();
+            })
+        },
+    );
+    let sessions_root = crate::ai::history::SessionStore::new(&app.config.history_file)
+        .sessions_root()
+        .to_path_buf();
+    let _ = std::fs::remove_dir_all(sessions_root);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2906,6 +3109,7 @@ fn encoded_task_goal_prefix_is_detectable_without_decoding() {
         auto_model_fallback: None,
         selection_explanation: "explicit agent/model override".to_string(),
         spawn_depth: 0,
+        parent_agent_team_mode: false,
         response_schema: None,
         backend: None,
         backend_model: None,
@@ -2917,6 +3121,57 @@ fn encoded_task_goal_prefix_is_detectable_without_decoding() {
 
     assert!(is_encoded_task_goal(&goal));
     assert!(!is_encoded_task_goal("plain foreground goal"));
+}
+
+#[test]
+fn kernel_parent_policy_is_frozen_at_spawn() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut app = crate::ai::middleware::test_util::test_app();
+    app.session_id = format!("kernel-parent-policy-{}", uuid::Uuid::new_v4().simple());
+    app.os
+        .lock()
+        .unwrap()
+        .begin_foreground("parent".to_string(), "goal".to_string(), 10, 8, None);
+    let context = DriverContext::new(
+        app.clone(),
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+    );
+    let prepared = prepared_retry_task();
+    crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope((app.session_id.clone(), 0), || {
+        DRIVER_CTX.sync_scope(context, || {
+            for team_parent in [true, false] {
+                crate::ai::driver::runtime_ctx::set_active_skill_names(if team_parent {
+                    vec!["AgEnT-TeAm".to_string()]
+                } else {
+                    Vec::new()
+                });
+                let spawned = super::spawn_subagent_kernel_task(&prepared).unwrap();
+                crate::ai::driver::runtime_ctx::set_active_skill_names(if team_parent {
+                    Vec::new()
+                } else {
+                    vec!["agent-team".to_string()]
+                });
+                let goal = {
+                    let os = app.os.lock().unwrap();
+                    super::decode_os_task_goal(&os.get_process(spawned.pid).unwrap().goal).unwrap()
+                };
+                assert_eq!(goal.parent_agent_team_mode, team_parent);
+                assert!(!SubagentBackend::from_stored(goal.backend.as_deref()).is_traecli());
+                let mut legacy = serde_json::to_value(&goal).unwrap();
+                legacy
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("parent_agent_team_mode");
+                let legacy: OsTaskGoal = serde_json::from_value(legacy).unwrap();
+                assert!(!legacy.parent_agent_team_mode);
+            }
+            discard_tasks_for_session(&app.session_id);
+        });
+    });
 }
 
 #[test]
@@ -3380,11 +3635,10 @@ fn side_note_target_resolves_child_history_file() {
     assert!(remove_task_entry(&task_id).is_some());
 }
 
-/// External backends run outside the in-process turn loop and never drain the
-/// side-note queue, so the tool must refuse instead of reporting a delivery
-/// that can never happen.
+/// TraeCLI accepts deferred notes in the parent's queue and exposes their
+/// pending count while retaining the normal ownership and terminal checks.
 #[test]
-fn side_note_target_rejects_external_backend() {
+fn side_note_target_queues_external_backend_for_continuation() {
     let _env_guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -3436,18 +3690,142 @@ fn side_note_target_rejects_external_backend() {
         },
     );
 
-    let parent_history = std::path::Path::new("/sessions/lead.sqlite");
-    let err = crate::ai::driver::runtime_ctx::TURN_IDENTITY
-        .sync_scope((app.session_id.clone(), 0usize), || {
-            resolve_side_note_history_file(&task_id, parent_history)
-        })
-        .expect_err("external backend must reject side-notes");
-    assert!(
-        err.contains("no in-turn side-note channel"),
-        "unexpected error: {err}"
+    let root = std::env::temp_dir().join(format!("traecli-side-note-{task_id}"));
+    app.session_history_file = root.join("lead.sqlite");
+    let parent_history = app.session_history_file.clone();
+    let context = DriverContext::from_app_snapshot(
+        &app,
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
     );
+    crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+        (app.session_id.clone(), 0usize),
+        || {
+            DRIVER_CTX.sync_scope(context, || {
+                assert_eq!(
+                    resolve_side_note_history_file(&task_id, &parent_history).unwrap(),
+                    Some(parent_history.clone())
+                );
+                let send = |note: &str| {
+                    crate::ai::tools::service::side_note::execute_send_side_note(
+                        &serde_json::json!({"task_id": task_id, "note": note}),
+                    )
+                };
+                assert!(send(" ").unwrap_err().contains("empty"));
+                assert!(send(&"x".repeat(8001)).unwrap_err().contains("8000"));
+                let output = send("Keep the parser behavior.").unwrap();
+                assert!(output.contains("backend_continue_from"), "{output}");
+                assert!(output.contains("does not interrupt"), "{output}");
+                assert!(
+                    output.contains("retained after completion or cancellation"),
+                    "{output}"
+                );
+                let queue =
+                    crate::ai::driver::side_note::side_note_file(&parent_history, Some(&task_id));
+                assert!(queue.exists());
+                let status = execute_task_status(&serde_json::json!({})).unwrap();
+                assert!(status.contains("pending side-notes: 1"), "{status}");
+                crate::ai::driver::runtime_ctx::set_active_skill_names(vec!["agent-team".into()]);
+                let quiet_status = execute_task_status(&serde_json::json!({})).unwrap();
+                assert!(
+                    quiet_status.contains("pending side-notes: 1"),
+                    "{quiet_status}"
+                );
+                {
+                    let mut os = app.os.lock().unwrap();
+                    os.set_current_pid(Some(owner_pid));
+                    os.kill_process(child_pid, "test cancellation".into())
+                        .unwrap();
+                    os.set_current_pid(Some(owner_pid));
+                }
+                let error = send("New guidance").unwrap_err();
+                assert!(error.contains("already finished"), "{error}");
+                assert!(error.contains("backend_continue_from"), "{error}");
+                assert!(queue.exists(), "cancellation must retain queued notes");
+                assert!(remove_task_entry(&task_id).is_some());
+                assert!(queue.exists(), "collection must retain queued notes");
+                let queued = std::fs::read_to_string(&queue).unwrap();
+                assert!(
+                    super::prepare_traecli_continuation(
+                        Some(&task_id),
+                        &parent_history,
+                        "Continue the task."
+                    )
+                    .is_err()
+                );
+                assert_eq!(std::fs::read_to_string(&queue).unwrap(), queued);
+                super::record_traecli_session(&task_id, Some(uuid::Uuid::new_v4().to_string()));
+                let (resume_session, prompt, side_note_files) =
+                    super::prepare_traecli_continuation(
+                        Some(&task_id),
+                        &parent_history,
+                        "Continue the task.",
+                    )
+                    .unwrap();
+                assert!(prompt.contains("Keep the parser behavior."), "{prompt}");
+                assert_eq!(std::fs::read_to_string(&queue).unwrap(), queued);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
 
-    assert!(remove_task_entry(&task_id).is_some());
+                    let spec = super::ExternalSubagentSpec {
+                        prompt: prompt.clone(),
+                        cwd: root.clone(),
+                        workspace_allowed: true,
+                        model: Some("test-model".into()),
+                        skills: None,
+                        resume_session,
+                        side_note_files,
+                        reasoning_effort: None,
+                        image_files: Vec::new(),
+                        phase_slot: None,
+                    };
+                    let error = super::traecli::run_traecli_blocking_with(
+                        &spec,
+                        Arc::new(AtomicBool::new(false)),
+                        root.join("absent-traecli").to_str().unwrap(),
+                        Duration::from_secs(2),
+                        Vec::new(),
+                    )
+                    .unwrap_err();
+                    assert!(error.contains("failed to spawn traecli"), "{error}");
+                    assert_eq!(std::fs::read_to_string(&queue).unwrap(), queued);
+
+                    let script = root.join("traecli.sh");
+                    std::fs::write(
+                        &script,
+                        format!(
+                            r#"#!/bin/sh
+cat > "$0.prompt"
+test ! -e "lead.assets/side_notes/{task_id}.jsonl" || exit 1
+/bin/echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"ok"}}}}'
+"#
+                        ),
+                    )
+                    .unwrap();
+                    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                    let outcome = super::traecli::run_traecli_blocking_with(
+                        &spec,
+                        Arc::new(AtomicBool::new(false)),
+                        script.to_str().unwrap(),
+                        Duration::from_secs(2),
+                        Vec::new(),
+                    )
+                    .unwrap();
+                    assert_eq!(outcome.result, "ok");
+                    assert!(!queue.exists(), "successful spawn must clear queued notes");
+                    assert_eq!(
+                        std::fs::read_to_string(root.join("traecli.sh.prompt")).unwrap(),
+                        prompt
+                    );
+                }
+                super::traecli::forget_traecli_session(&task_id);
+            });
+        },
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// After the wait budget expires, `wait_policy=any` must not hide tasks that
@@ -3588,4 +3966,315 @@ fn task_wait_any_after_budget_reports_ready_and_pending() {
     os.set_current_pid(Some(owner_pid));
     let _ = os.kill_process(done_pid, "test cleanup".to_string());
     let _ = os.kill_process(pending_pid, "test cleanup".to_string());
+}
+
+struct ParentCheckpointTask {
+    kernel: aios_kernel::SharedKernel,
+    session_id: String,
+    task_id: String,
+    owner_pid: u64,
+    child_pid: u64,
+    channel: u64,
+    futex: FutexAddr,
+    slot: crate::ai::driver::runtime_ctx::SubagentPhaseSlot,
+    _os_guard: OsToolsGlobalGuard,
+}
+
+impl ParentCheckpointTask {
+    fn new() -> Self {
+        let app = test_app_with_model(String::new());
+        let kernel = app.os.clone();
+        let os_guard = init_os_tools_guard(kernel.clone());
+        let session_id = format!("checkpoint-session-{}", uuid::Uuid::new_v4().simple());
+        let task_id = format!("checkpoint-task-{}", uuid::Uuid::new_v4().simple());
+        let (owner_pid, child_pid, channel, futex) = {
+            let mut os = kernel.lock().unwrap();
+            let owner = os.begin_foreground("owner".into(), "goal".into(), 10, 8, None);
+            let child = os
+                .spawn(
+                    Some(owner),
+                    "child".into(),
+                    "goal".into(),
+                    20,
+                    4,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let channel = os.channel_create(Some(child), 1, "checkpoint-result".into());
+            let futex = os.futex_create(0, "checkpoint-complete".into());
+            os.set_current_pid(Some(owner));
+            (owner, child, channel.raw(), futex)
+        };
+        insert_task_entry_for_test(
+            task_id.clone(),
+            AsyncTaskEntry {
+                session_id: session_id.clone(),
+                owner_pid,
+                pid: child_pid,
+                result_channel_id: channel,
+                completion_futex_addr: futex,
+                description: "checkpoint task".into(),
+                agent_name: "build".into(),
+                backend: None,
+                model: String::new(),
+                is_model_auto_selected: false,
+                auto_model_fallback: None,
+                selection_explanation: String::new(),
+                inherit: InheritOptions::default(),
+                abort_handle: None,
+                last_progress_notification_at: None,
+                last_progress_persisted_at: None,
+                cancel_stream: Arc::new(AtomicBool::new(false)),
+                started_at: Instant::now(),
+            },
+        );
+        let slot = crate::ai::driver::runtime_ctx::new_subagent_progress_slot();
+        super::TASK_PROGRESS_REGISTRY
+            .lock()
+            .unwrap()
+            .insert(task_id.clone(), slot.clone());
+        Self {
+            kernel,
+            session_id,
+            task_id,
+            owner_pid,
+            child_pid,
+            channel,
+            futex,
+            slot,
+            _os_guard: os_guard,
+        }
+    }
+
+    fn publish(&self, body: &str) {
+        use crate::ai::driver::runtime_ctx::{
+            SUBAGENT_PHASE, SUBAGENT_TASK_ID, publish_subagent_checkpoint_summary,
+        };
+        SUBAGENT_TASK_ID.sync_scope(self.task_id.clone(), || {
+            SUBAGENT_PHASE.sync_scope(self.slot.clone(), || {
+                publish_subagent_checkpoint_summary("saved checkpoint", body);
+            });
+        });
+    }
+
+    fn wait(&self) -> String {
+        self.kernel
+            .lock()
+            .unwrap()
+            .set_current_pid(Some(self.owner_pid));
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY
+            .sync_scope((self.session_id.clone(), 0), || {
+                execute_task_wait(&serde_json::json!({
+                    "task_ids": [self.task_id.clone()],
+                    "timeout_secs": 60,
+                }))
+            })
+            .unwrap()
+    }
+
+    fn status(&self) -> String {
+        self.kernel
+            .lock()
+            .unwrap()
+            .set_current_pid(Some(self.owner_pid));
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY
+            .sync_scope((self.session_id.clone(), 0), || {
+                execute_task_status(&serde_json::json!({}))
+            })
+            .unwrap()
+    }
+
+    fn finish(&self, output: &str) {
+        self.kernel
+            .lock()
+            .unwrap()
+            .channel_send(
+                Some(self.child_pid),
+                ChannelId(self.channel),
+                serde_json::json!({"status": "completed", "output": output}).to_string(),
+            )
+            .unwrap();
+    }
+}
+
+impl Drop for ParentCheckpointTask {
+    fn drop(&mut self) {
+        remove_task_entry(&self.task_id);
+        super::TASK_PROGRESS_REGISTRY
+            .lock()
+            .unwrap()
+            .remove(&self.task_id);
+        super::clear_task_wait_state(&task_wait_key(
+            &self.session_id,
+            self.owner_pid,
+            &WaitPolicy::Any,
+            &[self.task_id.clone()],
+        ));
+        let mut os = self.kernel.lock().unwrap();
+        os.set_current_pid(Some(self.owner_pid));
+        let _ = os.channel_destroy(None, ChannelId(self.channel));
+        let _ = os.futex_destroy(self.futex);
+        let _ = os.kill_process(self.child_pid, "test cleanup".into());
+    }
+}
+
+#[test]
+fn task_wait_parked_delivers_checkpoint_excerpt() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let task = ParentCheckpointTask::new();
+    task.publish("first saved line\nsecond\u{1b}[31m\u{7}\r line");
+
+    let parked = task.wait();
+    assert!(parked.contains("[task_wait PARKED]"), "{parked}");
+    assert!(parked.contains(
+        "Assistant-authored progress (partial checkpoint excerpt; unverified):\n    first saved line\n    second [31m   line"
+    ), "{parked}");
+    assert_eq!(parked.matches("first saved line").count(), 1);
+    assert!(!parked.contains('\u{1b}'));
+    assert!(!parked.contains('\u{7}'));
+    assert!(!parked.contains('\r'));
+    assert!(matches!(
+        task.kernel
+            .lock()
+            .unwrap()
+            .get_process(task.owner_pid)
+            .unwrap()
+            .state,
+        aios_kernel::kernel::ProcessState::Waiting { .. }
+    ));
+}
+
+#[test]
+fn task_wait_repeated_parks_deduplicate_checkpoint_revision() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let task = ParentCheckpointTask::new();
+    task.publish("same checkpoint body");
+    assert_eq!(task.wait().matches("same checkpoint body").count(), 1);
+
+    let repeated = task.wait();
+    assert!(repeated.contains("[task_wait PARKED]"), "{repeated}");
+    assert!(!repeated.contains("same checkpoint body"), "{repeated}");
+    assert!(!task.status().contains("same checkpoint body"));
+
+    // Identical text saved again is a new revision, so body-based deduplication is incorrect.
+    task.publish("same checkpoint body");
+    assert_eq!(task.wait().matches("same checkpoint body").count(), 1);
+    assert!(!task.wait().contains("same checkpoint body"));
+}
+
+#[test]
+fn task_wait_budget_elapsed_delivers_checkpoint_once() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let task = ParentCheckpointTask::new();
+    assert!(task.wait().contains("[task_wait PARKED]"));
+    task.publish("saved during wait budget");
+    expire_task_wait_states_for_test();
+
+    let elapsed = task.wait();
+    assert!(elapsed.contains("[task_wait BUDGET ELAPSED]"), "{elapsed}");
+    assert_eq!(elapsed.matches("saved during wait budget").count(), 1);
+    assert!(!task.status().contains("saved during wait budget"));
+    let repeated = task.wait();
+    assert!(repeated.contains("[task_wait PARKED]"), "{repeated}");
+    assert!(!repeated.contains("saved during wait budget"));
+    let os = task.kernel.lock().unwrap();
+    assert!(os.channel_meta(ChannelId(task.channel)).is_some());
+    assert!(os.get_process(task.child_pid).is_some_and(|process| {
+        !matches!(process.state, aios_kernel::kernel::ProcessState::Terminated)
+    }));
+}
+
+#[test]
+fn timeout_wake_note_delivers_checkpoint_once_without_publication_wake() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let task = ParentCheckpointTask::new();
+    assert!(task.wait().contains("[task_wait PARKED]"));
+    task.publish("saved before timeout wake");
+    {
+        let os = task.kernel.lock().unwrap();
+        let owner = os.get_process(task.owner_pid).unwrap();
+        assert!(matches!(
+            owner.state,
+            aios_kernel::kernel::ProcessState::Waiting { .. }
+        ));
+        assert!(
+            owner.mailbox.is_empty(),
+            "publication must only refresh progress"
+        );
+    }
+    expire_task_wait_states_for_test();
+    wake_expired_task_waits();
+    wake_expired_task_waits();
+    {
+        let os = task.kernel.lock().unwrap();
+        let owner = os.get_process(task.owner_pid).unwrap();
+        assert!(matches!(
+            owner.state,
+            aios_kernel::kernel::ProcessState::Ready
+        ));
+        let notes = owner
+            .mailbox
+            .iter()
+            .filter(|note| note.contains("[TASK_WAIT_TIMEOUT]"))
+            .collect::<Vec<_>>();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].matches("saved before timeout wake").count(), 1);
+        assert!(notes[0].contains("partial checkpoint excerpt; unverified"));
+    }
+    let elapsed = task.wait();
+    assert!(elapsed.contains("[task_wait BUDGET ELAPSED]"), "{elapsed}");
+    assert!(!elapsed.contains("saved before timeout wake"));
+    assert!(!task.status().contains("saved before timeout wake"));
+}
+
+#[test]
+fn task_status_delivers_checkpoint_body_once_per_revision() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let task = ParentCheckpointTask::new();
+    task.publish("status checkpoint body");
+    let first = task.status();
+    assert!(
+        first.contains(&format!("progress[{}]", task.task_id)),
+        "{first}"
+    );
+    assert!(first.contains("partial checkpoint excerpt; unverified"));
+    assert_eq!(first.matches("status checkpoint body").count(), 1);
+    let repeated = task.status();
+    assert!(!repeated.contains("status checkpoint body"), "{repeated}");
+    assert!(
+        repeated.contains("saved checkpoint"),
+        "ordinary progress remains pollable"
+    );
+    assert!(!task.wait().contains("status checkpoint body"));
+
+    task.publish("status checkpoint body");
+    assert_eq!(task.status().matches("status checkpoint body").count(), 1);
+    assert!(!task.status().contains("status checkpoint body"));
+}
+
+#[test]
+fn task_status_suppresses_excerpt_when_delivering_terminal_result() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let task = ParentCheckpointTask::new();
+    task.publish("final shared body");
+    task.finish("final shared body");
+    let status = task.status();
+    assert!(status.contains("Completed task results below"), "{status}");
+    assert_eq!(status.matches("final shared body").count(), 1);
+    assert!(!status.contains("partial checkpoint excerpt"), "{status}");
+    assert!(remove_task_entry(&task.task_id).is_none());
+}
+
+#[test]
+fn task_wait_suppresses_excerpt_when_delivering_terminal_result() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let task = ParentCheckpointTask::new();
+    task.publish("final wait shared body");
+    task.finish("final wait shared body");
+    let result = task.wait();
+    assert_eq!(result.matches("final wait shared body").count(), 1);
+    assert!(!result.contains("partial checkpoint excerpt"), "{result}");
+    assert!(!result.contains("[task_wait PARKED]"), "{result}");
+    assert!(remove_task_entry(&task.task_id).is_none());
 }

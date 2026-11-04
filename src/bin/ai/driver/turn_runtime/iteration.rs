@@ -1006,8 +1006,21 @@ fn clear_outstanding_task_anchor(messages: &mut Vec<Message>) {
 
 fn refresh_outstanding_task_anchor(messages: &mut Vec<Message>, session_id: &str) {
     clear_outstanding_task_anchor(messages);
-    let Ok(Some(note)) = task_tools::build_outstanding_task_anchor(session_id) else {
-        return;
+    let agent_team_mode = task_tools::is_agent_team_mode();
+    let note = if agent_team_mode {
+        match task_tools::build_agent_team_outstanding_task_anchor(session_id) {
+            Ok(Some(note)) => note,
+            Ok(None) => return,
+            Err(error) => format!(
+                "{}\nTask state error: {error}. Inspect `task_status`; full evidence: `task_evidence_read` (source=\"delivered\", task_id).",
+                task_tools::outstanding_task_anchor_prefix()
+            ),
+        }
+    } else {
+        let Ok(Some(note)) = task_tools::build_outstanding_task_anchor(session_id) else {
+            return;
+        };
+        note
     };
     messages.push(Message {
         role: ROLE_INTERNAL_NOTE.to_string(),
@@ -1674,13 +1687,18 @@ async fn finalize_stream_interaction(
     app: &mut App,
     source_model: &str,
     response: &mut reqwest::Response,
-    stream_result: StreamResult,
+    mut stream_result: StreamResult,
     turn_messages: &[Message],
     one_shot_mode: bool,
     persisted_turn_messages: &mut usize,
     should_quit: bool,
     _force_final_response: bool,
 ) -> Result<IterationExecution, Box<dyn std::error::Error>> {
+    // Normalize legacy completion paths before either drain-timeout or normal outcome dispatch.
+    if stream_result.outcome == StreamOutcome::Completed && stream_result.stream_error {
+        stream_result.outcome = StreamOutcome::Truncated;
+        stream_result.tool_calls.clear();
+    }
     input::clear_stdin_buffer();
 
     if stream_result.outcome == StreamOutcome::Cancelled {

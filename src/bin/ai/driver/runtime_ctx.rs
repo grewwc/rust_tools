@@ -50,6 +50,7 @@ use crate::ai::{
     agents::AgentManifest, mcp::SharedMcpClient, models::AutoModelFallbackSpec,
     skills::SkillManifest, types::App,
 };
+use rust_tools::commonw::FastMap;
 use tokio::sync::Mutex;
 
 /// Result published by a subagent to its parent. `parent_payload` may contain tool evidence for the parent to reuse;
@@ -68,8 +69,11 @@ pub(crate) type SubagentResultSlot = Arc<Mutex<SubagentResult>>;
 
 const SUBAGENT_PROGRESS_TIMELINE_CAPACITY: usize = 12;
 const SUBAGENT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
+const SUBAGENT_CHECKPOINT_EXCERPT_MAX_CHARS: usize = 800;
+const SUBAGENT_CHECKPOINT_EXCERPT_MAX_LINES: usize = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum SubagentProgressEventKind {
     Phase,
     Activity,
@@ -86,21 +90,37 @@ impl SubagentProgressEventKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct SubagentProgressEvent {
     pub(crate) sequence: u64,
     pub(crate) kind: SubagentProgressEventKind,
+    #[serde(
+        rename = "elapsed_ms",
+        deserialize_with = "deserialize_progress_duration"
+    )]
     pub(crate) elapsed: Duration,
     pub(crate) summary: String,
 }
 
 /// Structured snapshot shared by all parent-observable paths. Display, wakeup, persistence, and hard-timeout recovery
 /// all project from here, preventing each path from assembling a semantically inconsistent state of its own.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct SubagentProgressSnapshot {
     pub(crate) phase: String,
     pub(crate) checkpoint_summary: Option<String>,
+    #[serde(default)]
+    pub(crate) checkpoint_excerpt: Option<String>,
+    #[serde(default)]
+    pub(crate) checkpoint_revision: u64,
+    #[serde(
+        rename = "elapsed_ms",
+        deserialize_with = "deserialize_progress_duration"
+    )]
     pub(crate) elapsed: Duration,
+    #[serde(
+        rename = "stale_for_ms",
+        deserialize_with = "deserialize_progress_duration"
+    )]
     pub(crate) stale_for: Duration,
     pub(crate) checkpoint_due: bool,
     pub(crate) sequence: u64,
@@ -109,6 +129,24 @@ pub(crate) struct SubagentProgressSnapshot {
 
 impl SubagentProgressSnapshot {
     pub(crate) fn display(&self) -> String {
+        let mut display = self.display_status_line();
+        if let Some(excerpt) = self
+            .checkpoint_excerpt
+            .as_deref()
+            .filter(|text| !text.is_empty())
+        {
+            display.push_str(
+                "\n  Assistant-authored progress (partial checkpoint excerpt; unverified):",
+            );
+            for line in bounded_checkpoint_excerpt(excerpt).lines() {
+                display.push_str("\n    ");
+                display.push_str(line);
+            }
+        }
+        display
+    }
+
+    pub(crate) fn display_status_line(&self) -> String {
         let activity = self
             .timeline
             .iter()
@@ -161,11 +199,21 @@ impl SubagentProgressSnapshot {
     }
 }
 
+fn deserialize_progress_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <u64 as serde::Deserialize>::deserialize(deserializer).map(Duration::from_millis)
+}
+
 /// A subagent's live progress. The event timeline stays bounded; long-term diagnostic evidence is persisted at low frequency by the task layer.
 #[derive(Debug, Clone)]
 pub(crate) struct SubagentProgress {
     phase: String,
     checkpoint_summary: Option<String>,
+    checkpoint_excerpt: Option<String>,
+    checkpoint_revision: u64,
+    delivered_checkpoint_revision: u64,
     started_at: Instant,
     updated_at: Instant,
     last_checkpoint_at: Option<Instant>,
@@ -188,6 +236,9 @@ impl SubagentProgress {
         Self {
             phase,
             checkpoint_summary: None,
+            checkpoint_excerpt: None,
+            checkpoint_revision: 0,
+            delivered_checkpoint_revision: 0,
             started_at: now,
             updated_at: now,
             last_checkpoint_at: None,
@@ -216,6 +267,8 @@ impl SubagentProgress {
         SubagentProgressSnapshot {
             phase: self.phase.clone(),
             checkpoint_summary: self.checkpoint_summary.clone(),
+            checkpoint_excerpt: self.checkpoint_excerpt.clone(),
+            checkpoint_revision: self.checkpoint_revision,
             elapsed: now.saturating_duration_since(self.started_at),
             stale_for: now.saturating_duration_since(self.updated_at),
             checkpoint_due: now.saturating_duration_since(checkpoint_reference)
@@ -250,6 +303,9 @@ pub(crate) struct DriverContext {
     /// turn guard is (re)built. External subagents scope their skill overlay
     /// to this set instead of inheriting the whole manifest catalog.
     pub(crate) active_skill_names: Arc<std::sync::RwLock<Vec<String>>>,
+    /// Status delivery cursor scoped to this parent turn, including parallel tool workers.
+    pub(crate) agent_team_task_status_cursor:
+        std::sync::Mutex<FastMap<String, (String, String, u64, u64)>>,
 }
 
 impl DriverContext {
@@ -265,6 +321,7 @@ impl DriverContext {
             skill_manifests,
             agent_manifests,
             active_skill_names: Arc::new(std::sync::RwLock::new(Vec::new())),
+            agent_team_task_status_cursor: std::sync::Mutex::new(FastMap::default()),
         })
     }
 
@@ -281,6 +338,7 @@ impl DriverContext {
             skill_manifests,
             agent_manifests,
             active_skill_names: Arc::new(std::sync::RwLock::new(Vec::new())),
+            agent_team_task_status_cursor: std::sync::Mutex::new(FastMap::default()),
         })
     }
 }
@@ -498,13 +556,9 @@ pub(crate) fn publish_subagent_activity_to_slot(
                 guard.phase = phase.clone();
                 guard.push_event(SubagentProgressEventKind::Phase, phase, now);
             }
-            let duplicate = guard
-                .timeline
-                .back()
-                .is_some_and(|event| {
-                    event.kind == SubagentProgressEventKind::Activity
-                        && event.summary == activity
-                });
+            let duplicate = guard.timeline.back().is_some_and(|event| {
+                event.kind == SubagentProgressEventKind::Activity && event.summary == activity
+            });
             if !duplicate {
                 guard.push_event(SubagentProgressEventKind::Activity, activity, now);
             }
@@ -519,10 +573,19 @@ pub(crate) fn publish_subagent_activity_to_slot(
 
 /// The most recent work plan successfully persisted. Phase changes only update `phase`, never losing this
 /// task-level progress available for parent display.
-pub(crate) fn publish_subagent_checkpoint_summary(summary: &str) {
+pub(crate) fn publish_subagent_checkpoint_summary(summary: &str, body: &str) {
     let Ok(slot) = SUBAGENT_PHASE.try_with(|slot| slot.clone()) else {
         return;
     };
+    publish_subagent_checkpoint_to_slot(&slot, summary, body);
+}
+
+/// External runners share the bounded checkpoint carrier without requiring a task-local phase.
+pub(crate) fn publish_subagent_checkpoint_to_slot(
+    slot: &SubagentPhaseSlot,
+    summary: &str,
+    body: &str,
+) {
     let summary = summary
         .strip_prefix("working_checkpoint:")
         .unwrap_or(summary)
@@ -532,6 +595,9 @@ pub(crate) fn publish_subagent_checkpoint_summary(summary: &str) {
         Ok(mut guard) => {
             let now = Instant::now();
             guard.checkpoint_summary = Some(summary.clone());
+            let excerpt = bounded_checkpoint_excerpt(body);
+            guard.checkpoint_excerpt = (!excerpt.is_empty()).then_some(excerpt);
+            guard.checkpoint_revision = guard.checkpoint_revision.saturating_add(1);
             guard.last_checkpoint_at = Some(now);
             guard.push_event(SubagentProgressEventKind::Checkpoint, summary, now);
             Some(guard.snapshot(now))
@@ -555,7 +621,7 @@ pub(crate) fn new_subagent_progress_slot() -> SubagentPhaseSlot {
 }
 
 pub(crate) fn subagent_progress_snapshot(slot: &SubagentPhaseSlot) -> Option<String> {
-    subagent_progress_state_snapshot(slot).map(|progress| progress.display())
+    subagent_progress_state_snapshot(slot).map(|progress| progress.display_status_line())
 }
 
 pub(crate) fn subagent_progress_state_snapshot(
@@ -564,6 +630,49 @@ pub(crate) fn subagent_progress_state_snapshot(
     slot.lock()
         .ok()
         .map(|progress| progress.snapshot(Instant::now()))
+}
+
+/// Consume only the checkpoint excerpt delivery edge; ordinary progress remains pollable.
+pub(crate) fn take_subagent_parent_progress_snapshot(
+    slot: &SubagentPhaseSlot,
+    pending: bool,
+) -> Option<SubagentProgressSnapshot> {
+    let mut progress = slot.lock().ok()?;
+    let mut snapshot = progress.snapshot(Instant::now());
+    if !pending || snapshot.checkpoint_revision <= progress.delivered_checkpoint_revision {
+        snapshot.checkpoint_excerpt = None;
+    } else if snapshot.checkpoint_excerpt.is_some() {
+        progress.delivered_checkpoint_revision = snapshot.checkpoint_revision;
+    }
+    Some(snapshot)
+}
+
+/// Only explicit saved checkpoint bodies enter this path, never general tool output or reasoning.
+fn bounded_checkpoint_excerpt(body: &str) -> String {
+    const MARKER: &str = "… [truncated]";
+    let mut excerpt = String::new();
+    let mut count = 0;
+    let mut lines = 1;
+    for ch in body.trim().chars() {
+        if count == SUBAGENT_CHECKPOINT_EXCERPT_MAX_CHARS
+            || (ch == '\n' && lines == SUBAGENT_CHECKPOINT_EXCERPT_MAX_LINES)
+        {
+            let keep = count.min(SUBAGENT_CHECKPOINT_EXCERPT_MAX_CHARS - MARKER.chars().count());
+            excerpt = excerpt.chars().take(keep).collect();
+            excerpt.push_str(MARKER);
+            return excerpt;
+        }
+        excerpt.push(if ch.is_control() && ch != '\n' {
+            ' '
+        } else {
+            ch
+        });
+        count += 1;
+        if ch == '\n' {
+            lines += 1;
+        }
+    }
+    excerpt
 }
 
 /// Checkpoints for long tasks are driven by runtime state, not by the model remembering fixed turn counts.
@@ -874,7 +983,10 @@ mod tests {
     fn subagent_progress_keeps_saved_plan_while_phase_changes() {
         let slot = new_subagent_progress_slot();
         let rendered = SUBAGENT_PHASE.sync_scope(slot.clone(), || {
-            publish_subagent_checkpoint_summary("working_checkpoint: inspect the task path");
+            publish_subagent_checkpoint_summary(
+                "working_checkpoint: inspect the task path",
+                "Saved task plan",
+            );
             publish_subagent_phase("calling model");
             subagent_progress_snapshot(&slot)
         });
@@ -883,6 +995,98 @@ mod tests {
         assert!(rendered.starts_with("calling model · plan: inspect the task path"));
         assert!(rendered.contains("elapsed "));
         assert!(rendered.contains("last activity "));
+        assert!(
+            !rendered.contains("Saved task plan"),
+            "status lines omit excerpts"
+        );
+    }
+
+    #[test]
+    fn checkpoint_revision_advances_only_when_published() {
+        let slot = new_subagent_progress_slot();
+        SUBAGENT_PHASE.sync_scope(slot.clone(), || {
+            {
+                let mut progress = slot.lock().unwrap();
+                progress.started_at = Instant::now() - SUBAGENT_CHECKPOINT_INTERVAL;
+            }
+            publish_subagent_activity_to_slot(&slot, "working", "reading a file");
+            assert!(take_subagent_checkpoint_due_reminder());
+            let before = subagent_progress_state_snapshot(&slot).unwrap();
+            assert!(before.checkpoint_due);
+            assert_eq!(before.checkpoint_revision, 0);
+
+            publish_subagent_checkpoint_summary(
+                "saved plan",
+                "Confirmed the saved checkpoint path.",
+            );
+            let first = subagent_progress_state_snapshot(&slot).unwrap();
+            assert_eq!(first.checkpoint_revision, 1);
+            assert!(!first.checkpoint_due);
+            assert_eq!(
+                first.checkpoint_excerpt.as_deref(),
+                Some("Confirmed the saved checkpoint path.")
+            );
+
+            publish_subagent_activity_to_slot(&slot, "working", "editing a file");
+            let activity = subagent_progress_state_snapshot(&slot).unwrap();
+            assert!(activity.sequence > first.sequence);
+            assert_eq!(activity.checkpoint_revision, 1);
+            publish_subagent_checkpoint_summary("saved plan", "The edit is ready to verify.");
+            assert_eq!(
+                subagent_progress_state_snapshot(&slot)
+                    .unwrap()
+                    .checkpoint_revision,
+                2
+            );
+        });
+    }
+
+    #[test]
+    fn checkpoint_excerpt_is_bounded_and_sanitized() {
+        let exact = "界".repeat(SUBAGENT_CHECKPOINT_EXCERPT_MAX_CHARS);
+        assert_eq!(bounded_checkpoint_excerpt(&exact), exact);
+        for body in [
+            "界".repeat(SUBAGENT_CHECKPOINT_EXCERPT_MAX_CHARS + 1),
+            (0..20).map(|index| format!("line {index}\n")).collect(),
+        ] {
+            let excerpt = bounded_checkpoint_excerpt(&body);
+            assert!(excerpt.chars().count() <= SUBAGENT_CHECKPOINT_EXCERPT_MAX_CHARS);
+            assert!(excerpt.lines().count() <= SUBAGENT_CHECKPOINT_EXCERPT_MAX_LINES);
+            assert!(excerpt.ends_with("… [truncated]"));
+        }
+        assert_eq!(
+            bounded_checkpoint_excerpt("first\n\u{1b}[31m\u{7}\rsecond"),
+            "first\n [31m  second"
+        );
+
+        let mut snapshot = SubagentProgress::new("working").snapshot(Instant::now());
+        snapshot.checkpoint_excerpt = Some("x".repeat(2_000));
+        let rendered = snapshot.display();
+        assert!(rendered.contains(
+            "\n  Assistant-authored progress (partial checkpoint excerpt; unverified):\n    "
+        ));
+        assert!(rendered.ends_with("… [truncated]"));
+    }
+
+    #[test]
+    fn old_progress_snapshot_json_defaults_checkpoint_fields() {
+        let snapshot: SubagentProgressSnapshot = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "task_id": "older-task",
+            "phase": "working",
+            "checkpoint_summary": "saved summary",
+            "elapsed_ms": 12_000,
+            "stale_for_ms": 3_000,
+            "checkpoint_due": false,
+            "sequence": 1,
+            "timeline": [{ "sequence": 1, "kind": "phase", "elapsed_ms": 0, "summary": "working" }]
+        }))
+        .unwrap();
+        assert_eq!(snapshot.checkpoint_excerpt, None);
+        assert_eq!(snapshot.checkpoint_revision, 0);
+        assert_eq!(snapshot.elapsed, Duration::from_secs(12));
+        assert_eq!(snapshot.stale_for, Duration::from_secs(3));
+        assert_eq!(snapshot.timeline[0].kind, SubagentProgressEventKind::Phase);
     }
 
     #[test]

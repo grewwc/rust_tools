@@ -1337,6 +1337,37 @@ fn build_skill_activation_history_reminder(events: &[SkillActivationEvent]) -> O
     Some(reminder)
 }
 
+fn build_agent_team_mode_notice(
+    events: &[SkillActivationEvent],
+    active_skills: &[&SkillManifest],
+) -> Option<String> {
+    // The notice revokes the parent's delegation requirement in its own
+    // projection. A subagent inherits the parent's activation history but not
+    // its turn policy, so replaying the notice there would only describe a
+    // decision the child never made.
+    if crate::ai::driver::runtime_ctx::current_subagent_depth() > 0 {
+        return None;
+    }
+    if active_skills
+        .iter()
+        .any(|skill| skill.name.eq_ignore_ascii_case("agent-team"))
+    {
+        return None;
+    }
+    events
+        .iter()
+        .any(|event| {
+            event.outcome == "injected"
+                && event
+                    .injected_skill
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("agent-team"))
+        })
+        .then(|| {
+            "Agent-team mode is not active in this session. Earlier agent-team instructions are historical only: do not apply their delegation requirement or spawn subagents merely because of that history. Follow the current request and the current tool policy.".to_string()
+        })
+}
+
 fn build_system_prompt(
     active_agent: Option<&AgentManifest>,
     skills: &[&SkillManifest],
@@ -1918,8 +1949,11 @@ fn build_skill_turn_guard(
     };
     let mut builder =
         prompt_builder_for_turn(active_agent.as_ref(), skills, &available_tools, &ctx);
+    let quiet_task_wait_resume = crate::ai::tools::task_tools::is_agent_team_mode()
+        && crate::ai::tools::task_tools::is_agent_team_wait_deadline_message(question);
     if !pure_mode
         && super::runtime_ctx::is_resume_turn()
+        && !quiet_task_wait_resume
         && let Some(guidance) =
             super::process_context::wakeup_task_guidance(|name| has_tool(&available_tools, name))
     {
@@ -1976,9 +2010,13 @@ fn build_skill_turn_guard(
             session_context_prompt(&app.session_id),
         );
     }
-    if !pure_mode
-        && let Ok(events) = history::read_skill_activation_events_sqlite(&app.session_history_file)
-        && let Some(reminder) = build_skill_activation_history_reminder(&events)
+    let skill_activation_events = if !pure_mode {
+        history::read_skill_activation_events_sqlite(&app.session_history_file).ok()
+    } else {
+        None
+    };
+    if let Some(events) = skill_activation_events.as_deref()
+        && let Some(reminder) = build_skill_activation_history_reminder(events)
     {
         builder.push_labeled(
             ContextKind::Fact,
@@ -2012,10 +2050,21 @@ fn build_skill_turn_guard(
         session_context_guidance_was_sticky: residency.session_context_guidance,
         ..SkillTurnGuard::default()
     };
-    // Rendered last so the section is the final policy entry, the same position
-    // a mid-turn load appends it at.
+    // Seed resident scoped instructions before the session mode notice. Scoped
+    // instruction updates replace their existing policy section in place.
     if !pure_mode {
         guard.seed_scoped_instruction_dirs(residency.scoped_instruction_dirs);
+        if let Some(events) = skill_activation_events.as_deref()
+            && let Some(notice) = build_agent_team_mode_notice(events, skills)
+        {
+            // Build-derived policy is not a turn section: rebuilding must
+            // reevaluate active skills instead of replaying a stale or duplicate notice.
+            guard
+                .builder
+                .push_labeled(ContextKind::Policy, "agent_team_mode_notice", notice);
+            // Scoped instruction seeding may have cached the prompt before this policy.
+            guard.cached_system_prompt = None;
+        }
     }
     guard
 }

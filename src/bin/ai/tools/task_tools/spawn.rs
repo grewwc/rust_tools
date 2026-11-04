@@ -162,15 +162,28 @@ pub(crate) struct PreparedSubagentTask {
     pub(crate) inherit: InheritOptions,
     pub(crate) backend: SubagentBackend,
     pub(crate) show_backend_launch_tag: bool,
-    /// Optional model override for external backends; ignored by the kernel runner.
+    /// Frozen execution model for TraeCLI; ignored by the kernel runner.
     pub(crate) backend_model: Option<String>,
     /// Optional resume target for external backends (a previous task_id or a
-    /// raw backend session id); resolved at dispatch time. Ignored by kernel.
+    /// raw backend session id); resolved at dispatch time, when its queued
+    /// side-notes are prepended to the follow-up prompt. Ignored by kernel.
     pub(crate) backend_continue_from: Option<String>,
     /// Original images attached to the parent turn. The kernel path attaches
     /// them to the child's first message; external backends receive them as
     /// image arguments and absolute paths in the prompt.
     pub(crate) image_files: Vec<String>,
+}
+
+impl PreparedSubagentTask {
+    pub(super) fn execution_model(&self) -> &str {
+        if self.backend.is_traecli() {
+            self.backend_model
+                .as_deref()
+                .expect("TraeCLI execution model is resolved during task preparation")
+        } else {
+            &self.model
+        }
+    }
 }
 
 pub(in crate::ai) fn capped_subagent_manifest(agent: &AgentManifest) -> AgentManifest {
@@ -319,6 +332,11 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
             None
         }
     });
+    let backend_model = if backend.is_traecli() {
+        Some(traecli_model_for(backend_model.as_deref()))
+    } else {
+        backend_model
+    };
     let show_backend_launch_tag = explicit_backend.is_some()
         || backend.is_traecli()
         || matches!(session_backend, SubagentBackend::TraeCli);
@@ -465,6 +483,7 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
     retry_of: Option<&str>,
 ) -> Result<SpawnedSubagentTask, String> {
     let parent_depth = crate::ai::driver::runtime_ctx::current_subagent_depth();
+    let parent_agent_team_mode = is_agent_team_mode();
     let child_depth = parent_depth + 1;
     if child_depth > MAX_SUBAGENT_SPAWN_DEPTH {
         return Err(format!(
@@ -523,6 +542,7 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
             auto_model_fallback: prepared.auto_model_fallback,
             selection_explanation: prepared.selection_explanation.clone(),
             spawn_depth: child_depth,
+            parent_agent_team_mode,
             response_schema: prepared.response_schema.clone(),
             backend: prepared
                 .show_backend_launch_tag
@@ -571,13 +591,7 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
                 // External backends run on their own model, so records and the
                 // status line report that instead of the unused kernel-side
                 // selection. Kernel entries keep the provider model.
-                model: if prepared.backend.is_traecli() {
-                    crate::ai::tools::task_tools::traecli_model_for(
-                        prepared.backend_model.as_deref(),
-                    )
-                } else {
-                    prepared.model.clone()
-                },
+                model: prepared.execution_model().to_string(),
                 is_model_auto_selected: prepared.is_model_auto_selected,
                 auto_model_fallback: prepared.auto_model_fallback,
                 selection_explanation: prepared.selection_explanation.clone(),
@@ -654,7 +668,7 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
                     "task_id": spawned.task_id,
                     "pid": spawned.pid,
                     "agent": task.agent_name,
-                    "model": task.model,
+                    "model": task.execution_model(),
                     "inherit": task.inherit.describe(),
                 });
                 if let Some(effort) = &task.reasoning_effort {
@@ -674,7 +688,7 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
                     "status": "failed",
                     "error": error,
                     "agent": task.agent_name,
-                    "model": task.model,
+                    "model": task.execution_model(),
                     "inherit": task.inherit.describe(),
                 });
                 if let Some(effort) = &task.reasoning_effort {

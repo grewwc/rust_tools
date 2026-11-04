@@ -247,8 +247,8 @@ pub(in crate::ai) const PATH_C_PER_MSG_CAP: usize = 8_000;
 /// Folding a smaller result frees too little budget to pay for the risk that the
 /// model reads the preview as the content and skips re-reading the original,
 /// while genuine bloat (large file reads, big command output) is far above this
-/// threshold and still folds. Step 3 (`shrink_messages_to_fit`) keeps the legacy
-/// threshold, so the bytes are still available when the budget truly needs them.
+/// threshold and still folds. Step 3 (`shrink_messages_to_fit`) uses the shared
+/// per-result floor, while large task evidence keeps recovery and review anchors.
 pub(in crate::ai) const MID_TURN_SPILL_MIN_CHARS: usize = 6_000;
 
 /// Mid-turn LLM summary backstop: called when the lossless/weakly-lossy pipeline

@@ -15,7 +15,7 @@ pub(super) fn record_subagent_spawn_audit(task_id: &str, prepared: &PreparedSuba
         task_id,
         &prepared.description,
         &prepared.agent_name,
-        &prepared.model,
+        prepared.execution_model(),
     );
 }
 

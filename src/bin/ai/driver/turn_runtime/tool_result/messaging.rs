@@ -58,7 +58,13 @@ pub(super) fn record_hidden_self_note(
     for (index, checkpoint) in checkpoints.into_iter().enumerate() {
         let summary = truncate_checkpoint_summary(&checkpoint.summary);
         let marker = match save_context_checkpoint(app, index, &summary, &checkpoint.body) {
-            Ok(path) => format!("[context_checkpoint path={}] {}", path.display(), summary),
+            Ok(path) => {
+                crate::ai::driver::runtime_ctx::publish_subagent_checkpoint_summary(
+                    &summary,
+                    &checkpoint.body,
+                );
+                format!("[context_checkpoint path={}] {}", path.display(), summary)
+            }
             Err(error) => {
                 if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
                     eprintln!("failed to save context checkpoint: {error}");
@@ -129,8 +135,8 @@ struct ContextCheckpoint {
     body: String,
 }
 
-/// 从隐藏元信息中摘出模型主动保存的长期结论。格式刻意保持纯文本，避免模型为
-/// 生成 checkpoint 还要学习 JSON 转义规则：首行是 `summary: ...`，其余为正文。
+/// Extract explicitly saved conclusions from hidden metadata. The first line is
+/// `summary: ...` and the remaining text is the body, avoiding JSON escaping.
 fn extract_context_checkpoints(hidden_meta: &str) -> (Vec<ContextCheckpoint>, String) {
     let mut checkpoints = Vec::new();
     let mut remaining = String::new();
@@ -140,7 +146,7 @@ fn extract_context_checkpoints(hidden_meta: &str) -> (Vec<ContextCheckpoint>, St
         remaining.push_str(&cursor[..start]);
         let after_open = &cursor[start + CONTEXT_CHECKPOINT_OPEN.len()..];
         let Some(end) = after_open.find(CONTEXT_CHECKPOINT_CLOSE) else {
-            // 标签不完整时不要吞掉模型笔记，按普通 self_note 保存。
+            // Preserve incomplete tags as ordinary self-notes.
             remaining.push_str(&cursor[start..]);
             return (checkpoints, remaining);
         };
@@ -158,7 +164,7 @@ fn extract_context_checkpoints(hidden_meta: &str) -> (Vec<ContextCheckpoint>, St
                 body: body.to_string(),
             });
         } else {
-            // 不完整 checkpoint 同样退化为普通笔记，避免悄悄丢失结论。
+            // Preserve incomplete checkpoints as ordinary notes without losing conclusions.
             remaining.push_str(
                 &cursor[start
                     ..start + CONTEXT_CHECKPOINT_OPEN.len() + end + CONTEXT_CHECKPOINT_CLOSE.len()],
@@ -297,7 +303,7 @@ fn working_checkpoint_message_for_plan(
     let body = build_plan_working_checkpoint_body(app, tool_call, args.as_ref(), state.as_ref());
     let marker = match save_working_context_checkpoint(app, &summary, &body) {
         Ok(path) => {
-            crate::ai::driver::runtime_ctx::publish_subagent_checkpoint_summary(&summary);
+            publish_saved_plan_checkpoint(&summary, &body);
             format!("[context_checkpoint path={}] {}", path.display(), summary)
         }
         Err(error) => {
@@ -345,11 +351,21 @@ fn refresh_working_checkpoint_after_plan_update(app: &App, tool_call: &ToolCall)
         fallback_title,
     ));
     let body = build_plan_working_checkpoint_body(app, tool_call, args.as_ref(), Some(&state));
-    if let Err(error) = save_working_context_checkpoint(app, &summary, &body)
-        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
-    {
-        eprintln!("failed to refresh working context checkpoint: {error}");
+    match save_working_context_checkpoint(app, &summary, &body) {
+        Ok(_) => publish_saved_plan_checkpoint(&summary, &body),
+        Err(error) if crate::ai::driver::runtime_ctx::terminal_output_enabled() => {
+            eprintln!("failed to refresh working context checkpoint: {error}");
+        }
+        Err(_) => {}
     }
+}
+
+fn publish_saved_plan_checkpoint(summary: &str, body: &str) {
+    // Publish the saved step progress rather than using the excerpt budget for file metadata.
+    let excerpt = body
+        .split_once("\n## Next Steps\n")
+        .map_or(body, |(_, steps)| steps);
+    crate::ai::driver::runtime_ctx::publish_subagent_checkpoint_summary(summary, excerpt);
 }
 
 fn plan_checkpoint_summary(
@@ -1457,7 +1473,7 @@ mod tests {
         prepare_tool_results_for_history, strip_legacy_prune_directives,
     };
     use super::{
-        WORKING_CHECKPOINT_FILE_NAME, extract_context_checkpoints,
+        WORKING_CHECKPOINT_FILE_NAME, extract_context_checkpoints, record_hidden_self_note,
         refresh_working_checkpoint_after_plan_update, save_context_checkpoint_in_dir,
         smart_truncate_to_sentence, truncate_checkpoint_summary,
         working_checkpoint_message_for_plan,
@@ -1958,9 +1974,26 @@ mod tests {
             "plan",
             serde_json::json!({ "summary": "Inspect checkpoint flow", "steps": steps }),
         );
+        let progress = crate::ai::driver::runtime_ctx::new_subagent_progress_slot();
         let message =
-            working_checkpoint_message_for_plan(&app, &plan_call, "Plan: Inspect checkpoint flow")
-                .expect("plan result should create a working checkpoint marker");
+            crate::ai::driver::runtime_ctx::SUBAGENT_PHASE.sync_scope(progress.clone(), || {
+                working_checkpoint_message_for_plan(
+                    &app,
+                    &plan_call,
+                    "Plan: Inspect checkpoint flow",
+                )
+                .expect("plan result should create a working checkpoint marker")
+            });
+        let initial_progress =
+            crate::ai::driver::runtime_ctx::subagent_progress_state_snapshot(&progress).unwrap();
+        assert_eq!(initial_progress.checkpoint_revision, 1);
+        assert!(
+            initial_progress
+                .checkpoint_excerpt
+                .as_deref()
+                .unwrap()
+                .contains("Progress: 0/2 steps done.")
+        );
         let marker = message.content.as_str().unwrap_or_default().to_string();
         assert!(marker.contains("working_checkpoint: Inspect checkpoint flow"));
         assert!(marker.contains(WORKING_CHECKPOINT_FILE_NAME));
@@ -2002,7 +2035,19 @@ mod tests {
             )
             .is_none()
         );
-        refresh_working_checkpoint_after_plan_update(&app, &update_call);
+        crate::ai::driver::runtime_ctx::SUBAGENT_PHASE.sync_scope(progress.clone(), || {
+            refresh_working_checkpoint_after_plan_update(&app, &update_call);
+        });
+        let updated_progress =
+            crate::ai::driver::runtime_ctx::subagent_progress_state_snapshot(&progress).unwrap();
+        assert_eq!(updated_progress.checkpoint_revision, 2);
+        assert!(
+            updated_progress
+                .checkpoint_excerpt
+                .as_deref()
+                .unwrap()
+                .contains("Progress: 1/2 steps done.")
+        );
 
         let refreshed = std::fs::read_to_string(&path).expect("refreshed working checkpoint body");
         assert!(refreshed.contains("Progress: 1/2 steps done."));
@@ -2598,6 +2643,38 @@ mod tests {
         assert!(!short.contains('\n'));
         assert!(short.ends_with('…'));
         assert!(short.chars().count() <= 241);
+    }
+
+    #[test]
+    fn saved_self_note_checkpoint_publishes_body_only_after_successful_save() {
+        let root =
+            std::env::temp_dir().join(format!("ai-checkpoint-progress-{}", uuid::Uuid::new_v4()));
+        let mut app = test_app(root.join("history.sqlite"));
+        let progress = crate::ai::driver::runtime_ctx::new_subagent_progress_slot();
+        let mut notes = Vec::new();
+        let input = "<context_checkpoint>\nsummary: Saved finding\nConfirmed the publication boundary.\n</context_checkpoint>";
+        crate::ai::driver::runtime_ctx::SUBAGENT_PHASE.sync_scope(progress.clone(), || {
+            record_hidden_self_note(&app, &mut notes, input);
+            let snapshot =
+                crate::ai::driver::runtime_ctx::subagent_progress_state_snapshot(&progress)
+                    .unwrap();
+            assert_eq!(snapshot.checkpoint_revision, 1);
+            assert_eq!(
+                snapshot.checkpoint_excerpt.as_deref(),
+                Some("Confirmed the publication boundary.")
+            );
+            let blocker = root.join("blocker");
+            std::fs::write(&blocker, "not a directory").unwrap();
+            app.config.history_file = blocker.join("history.sqlite");
+            record_hidden_self_note(&app, &mut notes, input);
+            assert_eq!(
+                crate::ai::driver::runtime_ctx::subagent_progress_state_snapshot(&progress)
+                    .unwrap()
+                    .checkpoint_revision,
+                1
+            );
+        });
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

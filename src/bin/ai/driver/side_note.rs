@@ -73,6 +73,18 @@ pub fn has_pending_side_notes(history_file: &Path, target: Option<&str>) -> bool
         .unwrap_or(false)
 }
 
+/// Read-only count for deferred-backend progress; plain-text queue lines also count.
+pub(crate) fn pending_side_note_count(history_file: &Path, target: Option<&str>) -> usize {
+    fs::read_to_string(side_note_file(history_file, target))
+        .map(|content| {
+            content
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 fn sanitize_task_id(id: &str) -> String {
     id.chars()
         .map(|c| {

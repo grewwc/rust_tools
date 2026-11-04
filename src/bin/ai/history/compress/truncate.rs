@@ -1,7 +1,21 @@
 //! Mutable-message truncation to fit budgets: per-field truncation,
 //! overflow pointer building, and emergency caps.
 
+use super::tool_overflow::{
+    TOOL_RESULT_FOLD_MIN_CHARS, build_preserved_tool_overflow_stub_with_archive,
+    task_evidence_review_lines,
+};
 use super::*;
+
+fn mutable_content_can_truncate(message: &Message, allow_small_tool_results: bool) -> bool {
+    allow_small_tool_results
+        || message.role != "tool"
+        || value_len_chars(&message.content) > TOOL_RESULT_FOLD_MIN_CHARS
+        || message
+            .content
+            .as_str()
+            .is_some_and(is_context_overflow_truncated_stub)
+}
 
 /// The last-resort hard-budget escape valve: keep the system/user and tool-call
 /// pairing structure intact and only shorten rebuildable assistant/tool bodies,
@@ -9,6 +23,8 @@ use super::*;
 /// protected first; if the target is still not met, truncating those results is
 /// allowed. If the untrimmable system/user content itself is already over the
 /// limit, return false.
+/// Small-result floors apply to soft compaction only; the hard backstop must
+/// also shrink accumulated small results to enforce the final budget.
 pub(in crate::ai) fn truncate_mutable_messages_to_fit(
     messages: &mut Vec<Message>,
     max_chars: usize,
@@ -64,6 +80,7 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
                 let content_chars = value_len_chars(&message.content);
                 if !message_contains_image(&message.content)
                     && !is_preserved_tool_overflow_content(&message.content)
+                    && mutable_content_can_truncate(message, allow_protected_fallback)
                     && content_chars > 160
                     && !blocked_fields.contains(&(index, MutableMessageField::Content))
                 {
@@ -104,12 +121,13 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
                 break;
             };
             let reduce_by = excess.min(reducible).max(1);
-            if !truncate_mutable_field(
+            if !truncate_mutable_field_with_policy(
                 &mut messages[message_index],
                 field,
                 reduce_by,
                 overflow_dir,
                 FieldArchivePolicy::BestEffort,
+                allow_protected_fallback,
             ) {
                 // A fixed marker / archive path may already be the smallest
                 // form the field can reach. Skip the no-progress field and try
@@ -175,12 +193,13 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
             && !is_preserved_tool_overflow_content(&message.content)
             && content_chars > per_field_cap
         {
-            truncated_any |= truncate_mutable_field(
+            truncated_any |= truncate_mutable_field_with_policy(
                 message,
                 MutableMessageField::Content,
                 content_chars - per_field_cap,
                 overflow_dir,
                 FieldArchivePolicy::BestEffort,
+                true,
             );
         }
         if let Some(reasoning_chars) = message
@@ -409,6 +428,24 @@ pub(in crate::ai) fn truncate_mutable_field(
     overflow_dir: Option<&Path>,
     archive_policy: FieldArchivePolicy,
 ) -> bool {
+    truncate_mutable_field_with_policy(
+        message,
+        field,
+        reduce_by,
+        overflow_dir,
+        archive_policy,
+        false,
+    )
+}
+
+fn truncate_mutable_field_with_policy(
+    message: &mut Message,
+    field: MutableMessageField,
+    reduce_by: usize,
+    overflow_dir: Option<&Path>,
+    archive_policy: FieldArchivePolicy,
+    allow_small_tool_results: bool,
+) -> bool {
     // The archive path can be derived directly from overflow_dir (same source
     // as OverflowSink::new), so size the stub against that path first and do
     // the real archive write last: if the stub would not be strictly shorter
@@ -422,12 +459,40 @@ pub(in crate::ai) fn truncate_mutable_field(
     });
     match field {
         MutableMessageField::Content => {
-            if is_preserved_tool_overflow_content(&message.content) {
+            if is_preserved_tool_overflow_content(&message.content)
+                || !mutable_content_can_truncate(message, allow_small_tool_results)
+            {
                 return false;
             }
             let text = value_to_string(&message.content);
             let original_chars = text.chars().count();
             let target = original_chars.saturating_sub(reduce_by).max(160);
+            let task_review_lines = if message.role == "tool" {
+                task_evidence_review_lines(&text)
+            } else {
+                Vec::new()
+            };
+            if !task_review_lines.is_empty() && !is_context_overflow_truncated_stub(&text) {
+                // Both archive outcomes use the same terminal stub protocol so
+                // later passes cannot reassign reviews by folding a stub again.
+                let build_stub = |path: Option<&str>| {
+                    build_preserved_tool_overflow_stub_with_archive(
+                        path.map(Path::new),
+                        "unknown_tool",
+                        &text,
+                        &task_review_lines,
+                    )
+                };
+                if build_stub(archive_path_hint.as_deref()).chars().count() >= original_chars {
+                    return false;
+                }
+                let archived = archive_truncated_field_to_overflow(message, field, overflow_dir);
+                if archived.is_none() && archive_policy == FieldArchivePolicy::Required {
+                    return false;
+                }
+                message.content = Value::String(build_stub(archived.as_deref()));
+                return true;
+            }
             // BestEffort fields may reuse an embedded archive path. Required
             // fields take the trusted re-archive path below instead.
             if is_context_overflow_truncated_stub(&text) {
@@ -490,6 +555,20 @@ pub(in crate::ai) fn truncate_mutable_field(
                     });
                 let preview_budget = target.saturating_sub(prefix.chars().count());
                 if preview_budget < MIN_CONTENT_PREVIEW_CHARS {
+                    // The hard backstop may keep only the recovery pointer when
+                    // a long archive path leaves no room for an inline preview.
+                    if allow_small_tool_results {
+                        return match path {
+                            Some(path) => build_context_overflow_pointer(
+                                &format!(
+                                    "{CONTEXT_OVERFLOW_TRUNCATED_PREFIX} full original archived at: {path}"
+                                ),
+                                target,
+                            ),
+                            None => (CONTEXT_OVERFLOW_UNARCHIVED_POINTER.chars().count() <= target)
+                                .then(|| CONTEXT_OVERFLOW_UNARCHIVED_POINTER.to_string()),
+                        };
+                    }
                     return None;
                 }
                 Some(format!(

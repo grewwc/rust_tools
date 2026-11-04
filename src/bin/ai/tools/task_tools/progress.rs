@@ -17,16 +17,56 @@ pub(crate) fn task_progress_slot(
 }
 
 pub(super) fn current_task_progress(task_id: &str) -> Option<String> {
+    let progress = task_progress_slot(task_id)
+        .and_then(|slot| crate::ai::driver::runtime_ctx::subagent_progress_snapshot(&slot))
+        .filter(|value| !value.is_empty());
+    match (progress, pending_task_side_note_progress(task_id)) {
+        (Some(progress), Some(pending)) => Some(format!("{progress} · {pending}")),
+        (progress, pending) => progress.or(pending),
+    }
+}
+
+pub(super) fn pending_task_side_note_progress(task_id: &str) -> Option<String> {
+    let deferred = with_task_entry(task_id, |entry| {
+        entry.backend.is_some_and(SubagentBackend::is_traecli)
+    })?;
+    if !deferred {
+        return None;
+    }
+    let ctx = crate::ai::driver::runtime_ctx::try_current()?;
+    let count = crate::ai::driver::side_note::pending_side_note_count(
+        &ctx.app_proto.session_history_file,
+        Some(task_id),
+    );
+    (count > 0).then(|| format!("pending side-notes: {count} (queued for backend_continue_from)"))
+}
+
+pub(super) fn current_task_parent_progress(os: &mut dyn Kernel, task_id: &str) -> Option<String> {
+    // Parent delivery paths pass their already-locked kernel borrow so terminal-state checks
+    // never acquire the kernel mutex again. The progress registry only supplies a cloned slot;
+    // its lock is released before the slot consumes the checkpoint revision for this response.
     let slot = task_progress_slot(task_id)?;
-    let value = crate::ai::driver::runtime_ctx::subagent_progress_snapshot(&slot)?;
+    let pending = with_task_entry(task_id, |entry| (entry.pid, entry.result_channel_id))
+        .is_some_and(|(pid, channel)| {
+            read_task_result(os, channel, false).is_ok_and(|result| result.is_none())
+                && is_task_pending(os, pid).unwrap_or(false)
+        });
+    let snapshot =
+        crate::ai::driver::runtime_ctx::take_subagent_parent_progress_snapshot(&slot, pending)?;
+    let value = snapshot.display();
     (!value.is_empty()).then_some(value)
 }
 
-pub(super) fn append_task_progress_snapshots(output: &mut String, task_ids: &[String]) {
+pub(super) fn append_task_progress_snapshots(
+    os: &mut dyn Kernel,
+    output: &mut String,
+    task_ids: &[String],
+) {
     let snapshots = task_ids
         .iter()
         .filter_map(|task_id| {
-            current_task_progress(task_id).map(|progress| format!("- {task_id}: {progress}"))
+            let progress = current_task_parent_progress(os, task_id)?;
+            Some(format!("- {task_id}: {progress}"))
         })
         .collect::<Vec<_>>();
     if snapshots.is_empty() {
@@ -138,8 +178,11 @@ pub(super) fn persist_subagent_progress_snapshot_at(
     let value = serde_json::json!({
         "version": 1,
         "task_id": task_id,
+        "source": "progress",
         "phase": snapshot.phase,
         "checkpoint_summary": snapshot.checkpoint_summary,
+        "checkpoint_excerpt": snapshot.checkpoint_excerpt,
+        "checkpoint_revision": snapshot.checkpoint_revision,
         "elapsed_ms": elapsed_ms,
         "stale_for_ms": snapshot.stale_for.as_millis().min(u64::MAX as u128) as u64,
         "checkpoint_due": snapshot.checkpoint_due,
@@ -171,4 +214,150 @@ pub(super) fn persist_subagent_progress_snapshot_at(
         return Err(error.to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::driver::runtime_ctx::{
+        SUBAGENT_PHASE, new_subagent_progress_slot, publish_subagent_activity_to_slot,
+        publish_subagent_checkpoint_summary, subagent_progress_state_snapshot,
+    };
+
+    struct ProgressTestGuard {
+        previous_kernel: Option<SharedKernel>,
+        task_id: String,
+    }
+
+    impl Drop for ProgressTestGuard {
+        fn drop(&mut self) {
+            *lock_unpoisoned(&GLOBAL_OS) = self.previous_kernel.take();
+            remove_task_entry(&self.task_id);
+            lock_unpoisoned(&TASK_PROGRESS_REGISTRY).remove(&self.task_id);
+        }
+    }
+
+    #[test]
+    fn checkpoint_excerpts_emit_once_and_stop_at_terminal_result() {
+        let _env_guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let kernel = crate::ai::driver::new_local_kernel();
+        let task_id = format!("checkpoint-test-{}", Uuid::new_v4().simple());
+        let _guard = ProgressTestGuard {
+            previous_kernel: lock_unpoisoned(&GLOBAL_OS).replace(kernel.clone()),
+            task_id: task_id.clone(),
+        };
+        let (pid, channel, futex) = {
+            let mut os = kernel.lock().unwrap();
+            let pid = os.begin_foreground("test".into(), "test".into(), 10, 8, None);
+            os.set_current_pid(Some(pid));
+            let channel = os.channel_create(Some(pid), 1, "checkpoint-test".into());
+            let futex = os.futex_create(0, "checkpoint-test".into());
+            (pid, channel.raw(), futex)
+        };
+        insert_task_entry_for_test(
+            task_id.clone(),
+            AsyncTaskEntry {
+                session_id: String::new(),
+                owner_pid: pid,
+                pid,
+                result_channel_id: channel,
+                completion_futex_addr: futex,
+                description: "checkpoint test".into(),
+                agent_name: "build".into(),
+                backend: None,
+                model: String::new(),
+                is_model_auto_selected: false,
+                auto_model_fallback: None,
+                selection_explanation: String::new(),
+                inherit: InheritOptions::default(),
+                abort_handle: None,
+                cancel_stream: Arc::new(AtomicBool::new(false)),
+                started_at: Instant::now(),
+                last_progress_notification_at: None,
+                last_progress_persisted_at: None,
+            },
+        );
+        let slot = new_subagent_progress_slot();
+        lock_unpoisoned(&TASK_PROGRESS_REGISTRY).insert(task_id.clone(), slot.clone());
+        SUBAGENT_PHASE.sync_scope(slot.clone(), || {
+            publish_subagent_checkpoint_summary("checkpoint", "first saved body");
+            let mut locked_output = String::new();
+            {
+                let mut kernel_lock = kernel.lock().unwrap();
+                append_task_progress_snapshots(
+                    kernel_lock.as_mut(),
+                    &mut locked_output,
+                    &[task_id.clone()],
+                );
+            }
+            // A cooperative wait owns the kernel lock while building its parent response;
+            // borrowing that kernel must deliver the new revision without recursive locking.
+            assert!(locked_output.contains("\n    first saved body"));
+            let mut first = String::new();
+            append_task_progress_snapshots(
+                kernel.lock().unwrap().as_mut(),
+                &mut first,
+                &[task_id.clone()],
+            );
+            assert!(!first.contains("first saved body"));
+            publish_subagent_activity_to_slot(&slot, "working", "reading next file");
+            let mut repeated = String::new();
+            append_task_progress_snapshots(
+                kernel.lock().unwrap().as_mut(),
+                &mut repeated,
+                &[task_id.clone()],
+            );
+            assert!(!repeated.contains("first saved body"));
+            assert!(repeated.contains("reading next file"));
+            publish_subagent_checkpoint_summary("checkpoint", "second saved body");
+            let mut second = String::new();
+            append_task_progress_snapshots(
+                kernel.lock().unwrap().as_mut(),
+                &mut second,
+                &[task_id.clone()],
+            );
+            assert!(second.contains("\n    second saved body"));
+
+            let root = std::env::temp_dir()
+                .join(format!("checkpoint-persist-{}", Uuid::new_v4().simple()));
+            let snapshot = subagent_progress_state_snapshot(&slot).unwrap();
+            let path = root.join("task.json");
+            persist_subagent_progress_snapshot_at(&path, &task_id, &snapshot).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap()["source"],
+                "progress"
+            );
+            let persisted: crate::ai::driver::runtime_ctx::SubagentProgressSnapshot =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(persisted.checkpoint_excerpt, snapshot.checkpoint_excerpt);
+            assert_eq!(persisted.checkpoint_revision, 2);
+            fs::remove_dir_all(root).unwrap();
+
+            publish_subagent_checkpoint_summary("checkpoint", "undelivered terminal excerpt");
+            kernel
+                .lock()
+                .unwrap()
+                .channel_send(
+                    Some(pid),
+                    ChannelId(channel),
+                    serde_json::json!({"status": "completed", "output": "final result"})
+                        .to_string(),
+                )
+                .unwrap();
+            let mut terminal = String::new();
+            append_task_progress_snapshots(
+                kernel.lock().unwrap().as_mut(),
+                &mut terminal,
+                &[task_id.clone()],
+            );
+            assert!(!terminal.contains("undelivered terminal excerpt"));
+            assert!(
+                !current_task_progress(&task_id)
+                    .unwrap()
+                    .contains("undelivered terminal excerpt")
+            );
+        });
+    }
 }

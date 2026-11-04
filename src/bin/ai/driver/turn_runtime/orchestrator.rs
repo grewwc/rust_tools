@@ -2078,13 +2078,17 @@ async fn run_turn_body(
                     retry.consecutive_stream_errors = 0;
                     retry.consecutive_truncations += 1;
 
-                    // Zero-output truncation detection: completion=0 + finish_reason=length means the
-                    // server rejected the max_tokens value (typically a relay/compatibility layer
+                    // Zero-output truncation detection requires no body or tools as well as
+                    // completion=0 + finish_reason=length, since missing usage also defaults to zero.
+                    // Such an empty response can mean the server rejected max_tokens (a relay/compatibility layer
                     // returns an empty response for an oversized max_tokens instead of an error).
                     // Lowering reasoning_effort or disabling thinking is useless here — the problem is
                     // not that the model outputs too much but that max_tokens itself is rejected by
                     // the server. Strategy: halve max_tokens and retry until the server accepts it.
                     let is_zero_completion = stream_result.usage_completion_tokens == 0
+                        && stream_result.assistant_text.trim().is_empty()
+                        && stream_result.reasoning_text.trim().is_empty()
+                        && stream_result.tool_calls.is_empty()
                         && stream_result
                             .finish_reason_value
                             .as_deref()

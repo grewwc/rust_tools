@@ -95,6 +95,100 @@ pub(crate) fn build_outstanding_task_anchor(session_id: &str) -> Result<Option<S
     Ok(Some(render_outstanding_task_anchor(&snapshots)))
 }
 
+struct AgentTeamOutstandingTaskDigest {
+    task_id: String,
+    status: String,
+    phase: String,
+    idle_secs: u64,
+}
+
+fn render_agent_team_outstanding_task_anchor(
+    tasks: &[AgentTeamOutstandingTaskDigest],
+) -> Option<String> {
+    if tasks.is_empty() {
+        return None;
+    }
+    let mut lines = vec![OUTSTANDING_SUBAGENT_TASKS_NOTE_PREFIX.to_string()];
+    for task in tasks {
+        let task_id = if task
+            .task_id
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+        {
+            serde_json::to_string(&task.task_id).expect("serializing a string cannot fail")
+        } else {
+            task.task_id.clone()
+        };
+        let status = task.status.split_whitespace().collect::<Vec<_>>().join(" ");
+        let phase = task.phase.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut phase_chars = phase.chars();
+        let mut phase: String = phase_chars.by_ref().take(80).collect();
+        if phase_chars.next().is_some() {
+            phase.pop();
+            phase.push('…');
+        }
+        lines.push(format!(
+            "{} status={} phase={} idle={}s",
+            task_id, status, phase, task.idle_secs
+        ));
+    }
+    lines.push(
+        "Collect with `task_wait`; full evidence: `task_evidence_read` (source=\"delivered\", task_id). Handle failures before finishing."
+            .to_string(),
+    );
+    Some(lines.join("\n"))
+}
+
+pub(crate) fn build_agent_team_outstanding_task_anchor(
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    let Some(owner_pid) = with_os_kernel(|os| Ok(os.current_process_id()))? else {
+        return Ok(None);
+    };
+    // Copy only the identity/state inputs, then release the registry before taking the kernel lock.
+    let tracked = {
+        let registry = lock_task_registry();
+        registry
+            .iter()
+            .filter(|(_, entry)| task_entry_owned_by(entry, session_id, owner_pid))
+            .map(|(task_id, entry)| {
+                (
+                    task_id.clone(),
+                    entry.result_channel_id,
+                    entry.pid,
+                    entry.started_at,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    if tracked.is_empty() {
+        return Ok(None);
+    }
+    with_os_kernel(|os| {
+        let tasks = tracked
+            .iter()
+            .map(|(task_id, channel, pid, started_at)| {
+                let progress = task_progress_slot(task_id).and_then(|slot| {
+                    crate::ai::driver::runtime_ctx::subagent_progress_state_snapshot(&slot)
+                });
+                AgentTeamOutstandingTaskDigest {
+                    task_id: task_id.clone(),
+                    // Preserve the ID and diagnostic even when one child's stored result is invalid.
+                    status: task_state_string(os, *channel, *pid)
+                        .unwrap_or_else(|error| format!("error({error})")),
+                    phase: progress
+                        .as_ref()
+                        .map_or_else(|| "-".to_string(), |progress| progress.phase.clone()),
+                    idle_secs: progress
+                        .map_or_else(|| started_at.elapsed(), |progress| progress.stale_for)
+                        .as_secs(),
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(render_agent_team_outstanding_task_anchor(&tasks))
+    })
+}
+
 /// When the iteration hard cap is reached and control will no longer be handed back to the model,
 /// fold the still-uncollected subtask states into the final answer so uncollected results are not
 /// silently dropped. Shares the snapshot collection with `build_outstanding_task_anchor`, but the
@@ -202,4 +296,49 @@ pub(super) fn read_task_result(
             result_channel_id, err
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_team_parent_context_task_note_is_compact_and_keeps_terminal_state() {
+        let tasks = vec![
+            AgentTeamOutstandingTaskDigest {
+                task_id: "task-running".to_string(),
+                status: "running".to_string(),
+                phase: format!("read\nfiles {}", "界".repeat(100)),
+                idle_secs: 12,
+            },
+            AgentTeamOutstandingTaskDigest {
+                task_id: "task-failed".to_string(),
+                status: "failed".to_string(),
+                phase: "verify".to_string(),
+                idle_secs: 25,
+            },
+            AgentTeamOutstandingTaskDigest {
+                task_id: "task-invalid".to_string(),
+                status: "error(Failed to decode\nstored task result)".to_string(),
+                phase: "-".to_string(),
+                idle_secs: 3,
+            },
+        ];
+        let note = render_agent_team_outstanding_task_anchor(&tasks).unwrap();
+        assert!(note.starts_with(OUTSTANDING_SUBAGENT_TASKS_NOTE_PREFIX));
+        assert_eq!(note.lines().count(), tasks.len() + 2);
+        assert!(note.contains("task-running status=running phase=read files "));
+        assert!(note.contains("… idle=12s"));
+        assert!(note.contains("task-failed status=failed phase=verify idle=25s"));
+        assert!(note.contains("task-invalid status=error(Failed to decode stored task result)"));
+        assert!(note.contains("task_evidence_read"));
+        assert!(note.contains("source=\"delivered\""));
+        assert!(!note.contains("model="));
+        assert!(!note.contains("progress:"));
+    }
+
+    #[test]
+    fn agent_team_parent_context_task_note_empty_is_absent() {
+        assert!(render_agent_team_outstanding_task_anchor(&[]).is_none());
+    }
 }

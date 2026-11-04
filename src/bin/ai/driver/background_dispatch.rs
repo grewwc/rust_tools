@@ -114,7 +114,7 @@ impl Drop for BackgroundSubagentHistoryGuard {
 /// so it cannot interleave with foreground output.
 pub(super) struct SubagentStatusLine {
     last_line: Option<String>,
-    last_serve_line: Option<String>,
+    last_serve_key: Option<Vec<serde_json::Value>>,
     is_tty: bool,
 }
 
@@ -142,7 +142,7 @@ impl SubagentStatusLine {
     pub(super) fn new() -> Self {
         Self {
             last_line: None,
-            last_serve_line: None,
+            last_serve_key: None,
             is_tty: std::io::stdout().is_terminal(),
         }
     }
@@ -218,14 +218,13 @@ impl SubagentStatusLine {
         }
 
         let status_line = render_subagent_status_line(&statuses);
-        if crate::ai::background::serve_live_streaming()
-            && self.last_serve_line.as_deref() != Some(status_line.as_str())
-        {
-            crate::ai::background::publish_serve_frame(
-                crate::ai::background::ServeLiveKind::SubagentProgress,
-                &status_line,
-            );
-            self.last_serve_line = Some(status_line.clone());
+        if crate::ai::background::serve_live_streaming() {
+            self.publish_status_if_changed(&statuses, &status_line, |status_line| {
+                crate::ai::background::publish_serve_frame(
+                    crate::ai::background::ServeLiveKind::SubagentProgress,
+                    status_line,
+                );
+            });
         }
 
         // The side-note composer (Ctrl+G) owns the footer row / DECSTBM scroll
@@ -239,6 +238,20 @@ impl SubagentStatusLine {
             &status_line,
             crate::ai::stream::side_note_input::side_note_composer_active(),
         );
+    }
+
+    fn publish_status_if_changed(
+        &mut self,
+        statuses: &[crate::ai::tools::task_tools::SubagentTerminalStatus],
+        status_line: &str,
+        publish: impl FnOnce(&str),
+    ) {
+        let key = subagent_status_semantic_key(statuses);
+        if self.last_serve_key.as_ref() == Some(&key) {
+            return;
+        }
+        publish(status_line);
+        self.last_serve_key = Some(key);
     }
 
     /// In-place TTY redraw of the status line, gated on the side-note composer.
@@ -269,7 +282,7 @@ impl SubagentStatusLine {
     /// Before the foreground resumes streaming output or the input box, finalize
     /// and end the dynamic line so it no longer occupies a cursor row.
     pub(super) fn finish(&mut self) {
-        self.last_serve_line = None;
+        self.last_serve_key = None;
         self.finish_status_line(crate::ai::stream::side_note_input::side_note_composer_active());
     }
 
@@ -297,6 +310,50 @@ impl SubagentStatusLine {
             let _ = out.flush();
         }
     }
+}
+
+fn subagent_status_semantic_key(
+    statuses: &[crate::ai::tools::task_tools::SubagentTerminalStatus],
+) -> Vec<serde_json::Value> {
+    statuses
+        .iter()
+        .map(|status| {
+            let progress = status.progress.as_deref().unwrap_or_default();
+            let plan = progress.split_once(" · plan: ").map(|(_, plan)| {
+                let summary = plan
+                    .rsplit_once(" · elapsed ")
+                    .map_or(plan, |(summary, _)| summary);
+                sanitize_status_field(summary)
+            });
+            let (phase, latest) = match parse_activity_progress(status) {
+                Some(activity) => (activity.phase, Some(activity.latest)),
+                None => (
+                    sanitize_status_field(
+                        &progress
+                            .split(" · ")
+                            .filter(|field| {
+                                !field.starts_with("elapsed ")
+                                    && !field.starts_with("last activity ")
+                                    && !field.starts_with("updates ")
+                                    && *field != "checkpoint due"
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                    ),
+                    None,
+                ),
+            };
+            serde_json::json!({
+                "task": [status.description, status.agent_name, status.backend,
+                    status.model, status.reasoning_effort],
+                "state": status.state,
+                "phase": phase,
+                "latest": latest,
+                "plan": plan,
+                "checkpoint_due": progress.ends_with(" · checkpoint due"),
+            })
+        })
+        .collect()
 }
 
 fn render_subagent_status_line(
@@ -804,6 +861,97 @@ mod tests {
     }
 
     #[test]
+    fn live_status_dedup_ignores_elapsed_and_activity_age() {
+        for (initial, later) in [
+            (
+                "command: rg -n foo src · last activity 1s ago · running command · updates 2 · elapsed 5s",
+                "command: rg -n foo src · last activity 4s ago · running command · updates 9 · elapsed 8s",
+            ),
+            (
+                "calling model · plan: inspect task path · elapsed 5s · last activity 1s ago",
+                "calling model · plan: inspect task path · elapsed 8s · last activity 4s ago",
+            ),
+            (
+                "command: rg -n foo src · last activity 1s ago · running command · updates 2 · plan: inspect task path · elapsed 5s",
+                "command: rg -n foo src · last activity 4s ago · running command · updates 9 · plan: inspect  task\tpath · elapsed 8s",
+            ),
+            (
+                "calling model · plan: inspect task path · elapsed 5s · last activity 1s ago",
+                "calling model · plan: inspect  task\tpath · elapsed 8s · last activity 4s ago",
+            ),
+        ] {
+            let mut status = SubagentTerminalStatus {
+                description: "inspect".to_string(),
+                agent_name: "explorer".to_string(),
+                backend: Some("traecli".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                reasoning_effort: None,
+                state: "running".to_string(),
+                elapsed_secs: 5,
+                progress: Some(initial.to_string()),
+            };
+            let mut line = SubagentStatusLine::new();
+            let mut published = Vec::new();
+            let first = render_subagent_status_line_at_width(&[status.clone()], 120);
+            line.publish_status_if_changed(&[status.clone()], &first, |payload| {
+                published.push(payload.to_string());
+            });
+            line.publish_status_if_changed(&[status.clone()], &first, |payload| {
+                published.push(payload.to_string());
+            });
+            assert_eq!(published, vec![first.clone()]);
+
+            status.elapsed_secs = 8;
+            status.progress = Some(later.to_string());
+            let later = render_subagent_status_line_at_width(&[status.clone()], 120);
+            assert_ne!(first, later);
+            line.publish_status_if_changed(&[status], &later, |payload| {
+                published.push(payload.to_string());
+            });
+            assert_eq!(published, vec![first]);
+        }
+    }
+
+    #[test]
+    fn live_status_dedup_publishes_semantic_changes_and_resets_on_finish() {
+        let mut status = SubagentTerminalStatus {
+            description: "inspect".to_string(),
+            agent_name: "explorer".to_string(),
+            backend: Some("traecli".to_string()),
+            model: Some("gpt-5.5".to_string()),
+            reasoning_effort: None,
+            state: "running".to_string(),
+            elapsed_secs: 5,
+            progress: None,
+        };
+        let mut line = SubagentStatusLine::new();
+        line.is_tty = false;
+        let mut published = 0;
+        for progress in [
+            "command: rg -n foo src · last activity 1s ago · running command · elapsed 5s",
+            "command: rg -n foo src · last activity 1s ago · processing output · elapsed 5s",
+            "completed: rg -n foo src · exit 0 · last activity 1s ago · processing output · elapsed 5s",
+            "completed: rg -n foo src · exit 0 · last activity 1s ago · processing output · plan: inspect task path · elapsed 5s",
+            "completed: rg -n foo src · exit 0 · last activity 1s ago · processing output · plan: verify task path · elapsed 5s",
+            "completed: rg -n foo src · exit 0 · last activity 1s ago · processing output · plan: verify task path · elapsed 5s · checkpoint due",
+        ] {
+            status.progress = Some(progress.to_string());
+            let rendered = render_subagent_status_line_at_width(&[status.clone()], 120);
+            line.publish_status_if_changed(&[status.clone()], &rendered, |_| published += 1);
+        }
+        assert_eq!(published, 6);
+
+        status.description = "inspect another task".to_string();
+        let rendered = render_subagent_status_line_at_width(&[status.clone()], 120);
+        line.publish_status_if_changed(&[status.clone()], &rendered, |_| published += 1);
+        assert_eq!(published, 7);
+        line.finish();
+        assert!(line.last_serve_key.is_none());
+        line.publish_status_if_changed(&[status], &rendered, |_| published += 1);
+        assert_eq!(published, 8);
+    }
+
+    #[test]
     fn subagent_status_line_shows_counts_elapsed_and_truncates_details() {
         let statuses = vec![
             SubagentTerminalStatus {
@@ -907,7 +1055,7 @@ mod tests {
             state: "running".to_string(),
             elapsed_secs: 598,
             progress: Some(
-                "completed: rg -n \"backend\" src/bin/ai/driver/background_dispatch.rs · last activity 2s ago · running command · updates 60 · plan: preserve compatibility · elapsed 9m58s"
+                "completed: rg -n \"backend\" src/bin/ai/driver/background_dispatch.rs · last activity 2s ago · processing output · updates 60 · plan: preserve compatibility · elapsed 9m58s"
                     .to_string(),
             ),
         };
@@ -924,7 +1072,10 @@ mod tests {
         assert!(lines[0].contains("(effort: xhigh)"), "{block}");
         assert!(lines[1].starts_with("↳ latest: completed:"), "{block}");
         assert!(lines[1].ends_with(" · 2s ago"), "{block}");
-        assert!(lines[2].starts_with("↳ phase: running command"), "{block}");
+        assert!(
+            lines[2].starts_with("↳ phase: processing output"),
+            "{block}"
+        );
         assert!(lines[2].contains("updates 60"), "{block}");
         assert!(lines[2].contains("task: "), "{block}");
         assert!(block.contains('…'), "{block}");
@@ -1259,6 +1410,7 @@ pub(super) fn dispatch_background_batch(
         bool,
         bool,
         bool,
+        bool,
         Option<String>,
         Option<String>,
         Vec<String>,
@@ -1344,6 +1496,9 @@ pub(super) fn dispatch_background_batch(
                 .and_then(|goal| goal.response_schema.clone()),
             task_goal.as_ref().and_then(|goal| goal.auto_model_fallback),
             task_goal.as_ref().map(|goal| goal.spawn_depth).unwrap_or(0),
+            task_goal
+                .as_ref()
+                .is_some_and(|goal| goal.parent_agent_team_mode),
             is_resume_wakeup,
             initialize_history,
             task_goal.as_ref().is_some_and(|goal| {
@@ -1380,6 +1535,7 @@ pub(super) fn dispatch_background_batch(
         response_schema,
         auto_model_fallback,
         spawn_depth,
+        parent_agent_team_mode,
         is_resume_wakeup,
         initialize_history,
         is_traecli_backend,
@@ -1552,20 +1708,20 @@ pub(super) fn dispatch_background_batch(
         };
         let traecli_cancel = task_app.cancel_stream.clone();
         let traecli_workspace_allowed = inherit.cwd;
+        let traecli_parent_history = original_history_file.clone();
 
         let inner_fut = TASK_PID.scope(Some(pid), async move {
             crate::ai::tools::registry::common::clear_tool_cancel();
-            // Resolve `backend_continue_from` before branching: kernel goals can
-            // never carry one (spawn rejects that combination), so this only
-            // runs a map lookup for TraeCLI tasks and fails the task closed on
-            // unknown references.
-            let traecli_resume_session: Result<Option<String>, String> = if is_traecli_backend {
-                backend_continue_from
-                    .as_deref()
-                    .map(crate::ai::tools::task_tools::resolve_continue_target)
-                    .transpose()
+            // Resolve continuity and read deferred notes only for TraeCLI.
+            // Unknown references fail closed before touching the queue.
+            let traecli_continuation = if is_traecli_backend {
+                crate::ai::tools::task_tools::prepare_traecli_continuation(
+                    backend_continue_from.as_deref(),
+                    &traecli_parent_history,
+                    &proc_question,
+                )
             } else {
-                Ok(None)
+                Ok((None, String::new(), Vec::new()))
             };
             // Subagent backend branch: TraeCLI runs a headless subprocess while
             // the kernel path below keeps the exact in-process `run_turn` flow.
@@ -1586,7 +1742,7 @@ pub(super) fn dispatch_background_batch(
                 Option<String>,
                 Option<String>,
             ) = if is_traecli_backend {
-                match traecli_resume_session {
+                match traecli_continuation {
                     Err(err) => (
                         Err(err),
                         String::new(),
@@ -1595,9 +1751,9 @@ pub(super) fn dispatch_background_batch(
                         None,
                         None,
                     ),
-                    Ok(resume_session) => {
+                    Ok((resume_session, prompt, side_note_files)) => {
                         let spec = crate::ai::tools::task_tools::ExternalSubagentSpec {
-                            prompt: proc_question,
+                            prompt,
                             cwd: traecli_cwd,
                             workspace_allowed: traecli_workspace_allowed,
                             model: backend_model,
@@ -1606,6 +1762,7 @@ pub(super) fn dispatch_background_batch(
                                 &active_skill_names,
                             ),
                             resume_session,
+                            side_note_files,
                             reasoning_effort: backend_reasoning_effort,
                             image_files: image_files.clone(),
                             phase_slot: Some(phase_slot_for_backend),
@@ -1653,6 +1810,8 @@ pub(super) fn dispatch_background_batch(
                         false,
                     ),
                 );
+                let run = turn_runtime::SUBAGENT_PARENT_AGENT_TEAM_MODE
+                    .scope(parent_agent_team_mode, run);
                 let result = if let Some(spec) = auto_model_fallback {
                     runtime_ctx::AUTO_MODEL_FALLBACK.scope(spec, run).await
                 } else {

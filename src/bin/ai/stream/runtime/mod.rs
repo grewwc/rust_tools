@@ -728,10 +728,18 @@ fn finalize_stream_response(
     let (mut tool_calls, dropped_malformed) =
         collect_valid_tool_calls(&mut state.content.tool_calls_map);
     state.content.dropped_malformed_tool_call = dropped_malformed;
-    if stream_error || state.content.tool_args_cap_exceeded {
+    let truncated_by_length = state
+        .content
+        .finish_reason_value
+        .as_deref()
+        .is_some_and(|reason| reason.eq_ignore_ascii_case("length"));
+    let response_truncated =
+        dropped_malformed || truncated_by_length || state.content.response_incomplete;
+    if stream_error || state.content.tool_args_cap_exceeded || response_truncated {
         // Idle timeout before finish_reason does not prove the tool call is complete; even if the current
         // arguments happen to be valid JSON, an operation that may still be generating must not run early. The same
-        // applies when arguments were cut off by hitting the cap: the model was force-stopped, so arguments may be incomplete.
+        // applies to an output cap, dropped arguments or a provider-declared incomplete response:
+        // discard every call from the interrupted response before retrying, including otherwise-valid calls.
         tool_calls.clear();
     }
 
@@ -739,7 +747,11 @@ fn finalize_stream_response(
     // delta.tool_calls[]. When streaming parse misses, do one conservative recovery pass over the full assistant_text.
     // Same principle as idle timeout when arguments were cut off at the cap: the model was force-stopped, so any
     // suspected inline tool call in assistant_text is equally untrustworthy and is skipped, keeping the drop logic intact.
-    if !stream_error && !state.content.tool_args_cap_exceeded && tool_calls.is_empty() {
+    if !stream_error
+        && !state.content.tool_args_cap_exceeded
+        && !response_truncated
+        && tool_calls.is_empty()
+    {
         if let Some(recovered) = recover_inline_tool_calls(&state.content.assistant_text) {
             tool_calls = recovered;
             // The protocol payload is neither assistant body nor a model self_note. After successful recovery, drop it
@@ -748,11 +760,6 @@ fn finalize_stream_response(
         }
     }
 
-    let truncated_by_length = state
-        .content
-        .finish_reason_value
-        .as_deref()
-        .is_some_and(|reason| reason.eq_ignore_ascii_case("length"));
     let degenerate_repetition = state
         .content
         .finish_reason_value
@@ -766,6 +773,10 @@ fn finalize_stream_response(
 
     let outcome = if stream_error {
         StreamOutcome::Truncated
+    } else if response_truncated {
+        // Any explicit truncation signal takes priority over valid tool calls and visible text.
+        // Keep the partial body so the existing retry path can append its shrink hint.
+        StreamOutcome::Truncated
     } else if provider_control_leak {
         // A leaked provider envelope makes the whole response structurally ambiguous.
         // Never execute even otherwise-valid calls accumulated before the leak.
@@ -775,34 +786,7 @@ fn finalize_stream_response(
     } else {
         let has_text = !state.content.assistant_text.trim().is_empty();
         let has_reasoning = !state.content.reasoning_text.trim().is_empty();
-        // Truncation takes priority: this turn had no valid tool calls, but some were dropped (half-cut arguments JSON).
-        // Ending such an "interrupted mid-work" turn silently as Completed would make large-file write_file
-        // operations vanish. Escalate to retryable Truncated so the upper layer injects a shrink hint and retries.
-        //
-        // Note: finish_reason=length (hitting the output cap) alone does NOT trigger Truncated, because reasoning models
-        // often return finish_reason=length after reasoning tokens filled the output budget while the displayable
-        // assistant_text is actually complete. With both visible text and finish_reason=length, treat it as
-        // Completed to avoid pointless retry loops. Only when there is no visible output at all is length truncation
-        // retried as Truncated (the model may have been cut off right as it started outputting).
         if degenerate_repetition {
-            StreamOutcome::Truncated
-        } else if state.content.dropped_malformed_tool_call {
-            StreamOutcome::Truncated
-        } else if state.content.response_incomplete {
-            // The provider itself declared this response incomplete (Responses wire
-            // `response.incomplete`, or a terminal event whose status is not `completed`). That is
-            // the server stating the model was stopped rather than finished, so the visible text is
-            // a partial generation — treating it as Completed is what ends a cut-off "announced the
-            // work, then stopped" turn silently. Escalate to retryable Truncated so the upper layer
-            // injects the shrink hint and retries.
-            //
-            // The `finish_reason=length` rule below keeps its existing scope: several reasoning
-            // models report `length` on top of a complete visible body, and only the provider's own
-            // terminal declaration separates those from a generation that was actually cut.
-            StreamOutcome::Truncated
-        } else if truncated_by_length && !has_text {
-            // finish_reason=length with no visible text: the model may have produced only reasoning
-            // before being cut off, or produced nothing. Retry at a lower effort so budget goes to actual content.
             StreamOutcome::Truncated
         } else if has_reasoning && !has_text && !state.content.finish_reason_seen {
             // Reasoning-only early stop: the stream ended (idle timeout / early EOF, common for GLM and other
@@ -811,7 +795,7 @@ fn finalize_stream_response(
             // "cut off mid-thinking" turn silently as Completed would leave the answer empty. Escalate to
             // retryable Truncated; the upper layer downgrades / disables thinking and retries.
             //
-            // Complementary to the length branch above: length is an explicit server-side truncation; here the
+            // Complementary to the explicit truncation signals above: here the
             // stream stopped early without ever seeing the end marker. Distinct from a normal finish_reason=stop
             // reasoning-only response — there finish_reason_seen=true, so this branch is not entered and it stays Completed.
             StreamOutcome::Truncated
@@ -1053,15 +1037,10 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         let _ = state.render.markdown.flush_pending();
     }
 
-    let (tool_calls, dropped_malformed) =
-        collect_valid_tool_calls(&mut state.content.tool_calls_map);
-    // The decode-error fallback path is itself the product of a stream cut mid-way; if tool calls were also dropped,
-    // mark it as truncation to trigger the upper-layer automatic retry instead of silently finishing.
-    let outcome = if dropped_malformed {
-        StreamOutcome::Truncated
-    } else {
-        StreamOutcome::Completed
-    };
+    // Repeated read failures cut the response before its completion can be trusted.
+    // Discard all unconfirmed calls and replay through the existing stream-error retry path.
+    state.content.tool_calls_map.clear();
+    let outcome = StreamOutcome::Truncated;
     let assistant_text = std::mem::take(&mut state.content.assistant_text);
     // Serve children keep provisional prose private: a failed attempt must not
     // escape through stdout after its live FIFO deliberately withheld it.
@@ -1080,7 +1059,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
 
     Some(StreamResult {
         outcome,
-        tool_calls,
+        tool_calls: Vec::new(),
         assistant_text,
         hidden_meta: String::new(),
         reasoning_text: std::mem::take(&mut state.content.reasoning_text),

@@ -37,6 +37,7 @@ mod dispatch;
 mod epoll;
 mod outstanding;
 mod progress;
+mod quiet;
 mod registry;
 mod spawn;
 mod traecli;
@@ -53,10 +54,13 @@ pub(crate) use dispatch::*;
 pub(crate) use epoll::*;
 pub(crate) use outstanding::*;
 pub(crate) use progress::*;
+pub(crate) use quiet::{is_agent_team_mode, is_agent_team_wait_deadline_message};
 pub(crate) use registry::*;
 pub(crate) use spawn::*;
+#[cfg(test)]
+pub(crate) use traecli::resolve_continue_target;
 pub(crate) use traecli::{
-    normalize_traecli_reasoning_effort, record_traecli_session, resolve_continue_target,
+    normalize_traecli_reasoning_effort, prepare_traecli_continuation, record_traecli_session,
     traecli_binary, traecli_binary_available, traecli_model_for,
 };
 pub(crate) use traecli_models::traecli_model_names;

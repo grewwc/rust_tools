@@ -115,12 +115,18 @@ pub(super) fn build_background_process_question(
 /// Build the shared foreground/background wake-up prompt. Tool-specific
 /// handling rules are added after the resumed turn's schema is resolved.
 pub(super) fn format_wakeup_prompt(pid: u64, goal: &str, messages: &[String]) -> String {
-    format!(
-        "[Process {} Woke Up] Original goal: {}\nNew mailbox messages:\n{}\n\nWake-up handling rules:\n- Call only tools present in the current schema. Mailbox tool recommendations are conditional on those tools being available.\n- If a required tool is missing, use an available tool-loading facility to restore access; if none is available, report the missing capability.\n- A cooperative scheduler yield is normal waiting, not a stall. Preserve unfinished subagent tasks.\n- Prefer continuing reasoning immediately when the wake-up messages already identify the relevant finished tasks.\n\nResume execution based on the goal and these messages.",
-        pid,
-        goal,
-        messages.join("\n---\n")
-    )
+    if messages.len() == 1
+        && crate::ai::tools::task_tools::is_agent_team_wait_deadline_message(&messages[0])
+    {
+        messages[0].clone()
+    } else {
+        format!(
+            "[Process {} Woke Up] Original goal: {}\nNew mailbox messages:\n{}\n\nWake-up handling rules:\n- Call only tools present in the current schema. Mailbox tool recommendations are conditional on those tools being available.\n- If a required tool is missing, use an available tool-loading facility to restore access; if none is available, report the missing capability.\n- A cooperative scheduler yield is normal waiting, not a stall. Preserve unfinished subagent tasks.\n- Prefer continuing reasoning immediately when the wake-up messages already identify the relevant finished tasks.\n\nResume execution based on the goal and these messages.",
+            pid,
+            goal,
+            messages.join("\n---\n")
+        )
+    }
 }
 
 /// Render task wake-up instructions from the schema actually sent to the model.
@@ -190,6 +196,24 @@ pub(super) fn finalize_turn_quota(
 mod tests {
     use super::*;
     use aios_kernel::kernel::{KernelInternal, Syscall};
+
+    #[test]
+    fn agent_team_quiet_deadline_wakeup_omits_goal_and_guidance() {
+        let notice = "[task-wait] still running: task-a(idle=12s,phase=read)";
+        assert_eq!(
+            format_wakeup_prompt(1, "original goal", &[notice.to_string()]),
+            notice
+        );
+        for messages in [
+            vec!["[EVENT_WAKE] terminal task event".to_string()],
+            vec![notice.to_string(), "terminal error".to_string()],
+        ] {
+            let prompt = format_wakeup_prompt(1, "original goal", &messages);
+            assert!(prompt.contains("Original goal: original goal"));
+            assert!(prompt.contains("Wake-up handling rules:"));
+            assert!(prompt.contains(messages.last().unwrap()));
+        }
+    }
 
     #[test]
     fn process_history_path_preserves_sqlite_extension() {

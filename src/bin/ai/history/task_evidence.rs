@@ -15,6 +15,10 @@ const TASK_LEDGER_MAX_RECORDS: usize = 8;
 const TASK_LEDGER_FOOTER_RESERVE_CHARS: usize = 256;
 const TASK_LEDGER_INDEX_MAX_CHARS: usize = 6_000;
 const TASK_LEDGER_ID_MAX_CHARS: usize = 512;
+const AGENT_TEAM_TASK_LEDGER_MAX_CHARS: usize = 6_000;
+const AGENT_TEAM_TASK_LEDGER_MAX_DETAILS: usize = 2;
+const AGENT_TEAM_TASK_LEDGER_DETAIL_MAX_CHARS: usize = 400;
+const AGENT_TEAM_TASK_LEDGER_CONCLUSION_MAX_CHARS: usize = 160;
 const TASK_EVIDENCE_COLUMNS: &[&str] = &[
     "task_id",
     "description",
@@ -551,7 +555,123 @@ pub(in crate::ai) fn render_unintegrated_task_evidence(
             .ok()
             .flatten()
     });
-    Ok(Some(render_task_evidence_ledger(&records, plan.as_ref())))
+    let agent_team_mode = crate::ai::tools::task_tools::is_agent_team_mode();
+    Ok(Some(if agent_team_mode {
+        render_agent_team_task_evidence_ledger(&records, plan.as_ref())
+    } else {
+        render_task_evidence_ledger(&records, plan.as_ref())
+    }))
+}
+
+fn render_agent_team_task_evidence_ledger(
+    records: &[TaskEvidenceRecord],
+    plan: Option<&crate::ai::tools::plan_state::PlanState>,
+) -> String {
+    let failures = records
+        .iter()
+        .filter(|record| record.status != "completed")
+        .count();
+    let mut output = format!(
+        "[task-evidence-ledger]\nUnintegrated results: {}; failures={failures}. Unverified assistant evidence.\n\
+         Full payloads: `task_evidence_read` (source=\"delivered\", exact task_id).\n\
+         Record disposition with `task_integrate`; `task_audit` lists all exact IDs and statuses.\n",
+        records.len()
+    );
+    let body_limit =
+        AGENT_TEAM_TASK_LEDGER_MAX_CHARS.saturating_sub(TASK_LEDGER_FOOTER_RESERVE_CHARS);
+    let mut used_chars = output.chars().count();
+    let mut indexed = Vec::new();
+    let mut index_records = records.iter().collect::<Vec<_>>();
+    index_records.sort_by_key(|record| record.status == "completed");
+    for record in index_records {
+        // Identifiers are lossless. Oversized indexes always expose their omission count and locator.
+        if record.task_id.chars().count() > TASK_LEDGER_ID_MAX_CHARS {
+            continue;
+        }
+        let identity = format!(
+            "- {} [{}] ",
+            ledger_task_id(&record.task_id),
+            ledger_field(&record.status, 32)
+        );
+        let identity_chars = identity.chars().count() + 1;
+        if used_chars + identity_chars <= body_limit {
+            used_chars += identity_chars;
+            indexed.push((record, identity));
+        }
+    }
+    // Budget all exact IDs before excerpts, so long conclusions cannot crowd out another task.
+    let remaining = body_limit.saturating_sub(used_chars);
+    let detail_reserve = if remaining >= 1_000 + indexed.len() * 40 {
+        1_000
+    } else {
+        0
+    };
+    let conclusion_limit = AGENT_TEAM_TASK_LEDGER_CONCLUSION_MAX_CHARS
+        .min(remaining.saturating_sub(detail_reserve) / indexed.len().max(1));
+    for (record, identity) in &indexed {
+        output.push_str(identity);
+        let conclusion = agent_team_task_evidence_conclusion(record)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        output.push_str(&truncate_chars(&conclusion, conclusion_limit));
+        output.push('\n');
+    }
+
+    let mut ranked = indexed
+        .iter()
+        .rev()
+        .map(|(record, _)| *record)
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|record| {
+        (
+            record.status == "completed",
+            plan_mention_priority(plan, &record.task_id),
+        )
+    });
+    let mut detailed = 0;
+    used_chars = output.chars().count();
+    for record in ranked {
+        if detailed == AGENT_TEAM_TASK_LEDGER_MAX_DETAILS {
+            break;
+        }
+        let entry = format!(
+            "\n## task_id={} [{}]\n{}\n",
+            ledger_task_id(&record.task_id),
+            ledger_field(&record.status, 32),
+            truncate_chars(
+                &agent_team_task_evidence_conclusion(record),
+                AGENT_TEAM_TASK_LEDGER_DETAIL_MAX_CHARS
+            ),
+        );
+        let entry_chars = entry.chars().count();
+        if used_chars + entry_chars <= body_limit {
+            output.push_str(&entry);
+            used_chars += entry_chars;
+            detailed += 1;
+        }
+    }
+    output.push_str(&format!(
+        "\nIndex: {}/{} exact IDs; {} omitted for size (enumerate with `task_audit`). \
+         Details: {detailed}/{}. Ellipses mark excerpts; full payloads: `task_evidence_read` source=\"delivered\".\n",
+        indexed.len(), records.len(), records.len() - indexed.len(), records.len(),
+    ));
+    debug_assert!(output.chars().count() <= AGENT_TEAM_TASK_LEDGER_MAX_CHARS);
+    output
+}
+
+fn agent_team_task_evidence_conclusion(record: &TaskEvidenceRecord) -> String {
+    if record.status != "completed"
+        && let Some(reason) = record
+            .payload
+            .lines()
+            .find(|line| line.starts_with("Failure reason: "))
+    {
+        // The delivered envelope can put the diagnostic before the final-answer marker.
+        format!("{reason}\n{}", record.summary)
+    } else {
+        record.summary.clone()
+    }
 }
 
 fn render_task_evidence_ledger(
@@ -840,6 +960,149 @@ mod tests {
     }
 
     #[test]
+    fn agent_team_parent_context_ledger_bounds_ids_conclusions_and_details() {
+        let mut records = (0..12).map(ledger_record).collect::<Vec<_>>();
+        for (index, record) in records.iter_mut().enumerate() {
+            record.summary = format!("conclusion-{index}\n{}", "界".repeat(1_000));
+        }
+        records[0].status = "failed".to_string();
+        records[0].payload =
+            "Failure reason: verification failed\n[Subagent final answer]\nlooks successful"
+                .to_string();
+        let out = render_agent_team_task_evidence_ledger(&records, None);
+        assert!(out.chars().count() <= AGENT_TEAM_TASK_LEDGER_MAX_CHARS);
+        for record in &records {
+            assert!(out.contains(&format!("- {} [{}] ", record.task_id, record.status)));
+        }
+        assert_eq!(
+            out.lines().filter(|line| line.starts_with("- ")).count(),
+            12
+        );
+        assert!(out.contains("Index: 12/12 exact IDs; 0 omitted"));
+        assert!(out.contains("- task-00 [failed] Failure reason: verification failed"));
+        assert!(out.contains("failures=1"));
+        let details = out.split("\n## task_id=").skip(1).collect::<Vec<_>>();
+        assert_eq!(details.len(), 2);
+        assert!(details[0].starts_with("task-00 [failed]\n"));
+        for detail in details {
+            let (_, excerpt) = detail.split_once('\n').unwrap();
+            let excerpt = excerpt.split("\nIndex:").next().unwrap().trim();
+            assert!(excerpt.chars().count() <= 400);
+            assert!(excerpt.ends_with('…'));
+        }
+        assert!(out.contains("task_evidence_read"));
+        assert!(out.contains("source=\"delivered\""));
+        assert!(!out.contains("test-model"));
+        assert!(!out.contains("review parser"));
+
+        let mut registry_sized = (0..100).map(ledger_record).collect::<Vec<_>>();
+        for (index, record) in registry_sized.iter_mut().enumerate() {
+            record.task_id = format!("task_{index:032x}");
+            record.summary = "long conclusion ".repeat(100);
+        }
+        let out = render_agent_team_task_evidence_ledger(&registry_sized, None);
+        assert!(out.chars().count() <= AGENT_TEAM_TASK_LEDGER_MAX_CHARS);
+        assert!(out.contains("Index: 100/100 exact IDs; 0 omitted"));
+        for record in &registry_sized {
+            assert!(out.contains(&record.task_id));
+        }
+        for line in out.lines().filter(|line| line.starts_with("- ")) {
+            assert!(!line.split_once("] ").unwrap().1.is_empty());
+        }
+    }
+
+    #[test]
+    fn agent_team_parent_context_ledger_overflow_keeps_exact_recovery_locators() {
+        let mut records = (0..400).map(ledger_record).collect::<Vec<_>>();
+        records[0].task_id = "界🙂".repeat(6_000);
+        records[1].task_id = "quoted\"\n界🙂".to_string();
+        for record in &mut records {
+            record.summary = "large\nconclusion 界🙂".repeat(1_000);
+        }
+        let out = render_agent_team_task_evidence_ledger(&records, None);
+        assert!(out.chars().count() <= AGENT_TEAM_TASK_LEDGER_MAX_CHARS);
+        assert!(out.contains(&serde_json::to_string(&records[1].task_id).unwrap()));
+        assert!(!out.contains("Index: 400/400"));
+        assert!(out.contains("omitted for size (enumerate with `task_audit`)"));
+        assert!(out.contains("task_evidence_read"));
+        assert!(out.contains("source=\"delivered\""));
+        assert!(out.matches("\n## task_id=").count() <= 2);
+    }
+
+    #[test]
+    fn agent_team_parent_context_ledger_mode_preserves_normal_and_payloads() {
+        use crate::ai::driver::runtime_ctx;
+        use std::sync::{Arc, Mutex};
+
+        let _env_guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = std::env::temp_dir().join(format!("team-ledger-{}", uuid::Uuid::new_v4()));
+        let mut app = crate::ai::middleware::test_util::test_app();
+        app.config.history_file = root.join("history.sqlite");
+        app.session_id = "team-ledger".to_string();
+        let context = runtime_ctx::DriverContext::new(
+            app,
+            Arc::new(Mutex::new(crate::ai::mcp::McpClient::new())),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+        );
+        runtime_ctx::DRIVER_CTX.sync_scope(context.clone(), || {
+            let app = &context.app_proto;
+            runtime_ctx::set_active_skill_names(vec!["agent-team".to_string()]);
+            assert!(
+                render_unintegrated_task_evidence(&app.config.history_file, &app.session_id)
+                    .unwrap()
+                    .is_none()
+            );
+            let payload = format!(
+                "[Subagent final answer]\n{}",
+                "full evidence 界\n".repeat(800)
+            );
+            record_delivered_task_evidence(
+                &app.config.history_file,
+                &app.session_id,
+                DeliveredTaskEvidence {
+                    task_id: "task-1",
+                    description: "review parser",
+                    agent_name: "build",
+                    model: "test-model",
+                    status: "failed",
+                    payload: &payload,
+                },
+            )
+            .unwrap();
+            let records =
+                read_unintegrated_task_evidence(&app.config.history_file, &app.session_id).unwrap();
+            let compact =
+                render_unintegrated_task_evidence(&app.config.history_file, &app.session_id)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                compact,
+                render_agent_team_task_evidence_ledger(&records, None)
+            );
+            assert_eq!(
+                read_task_evidence_status_payload(
+                    &app.config.history_file,
+                    &app.session_id,
+                    "task-1"
+                )
+                .unwrap()
+                .unwrap(),
+                ("failed".to_string(), payload)
+            );
+            runtime_ctx::set_active_skill_names(vec!["other".to_string()]);
+            let normal =
+                render_unintegrated_task_evidence(&app.config.history_file, &app.session_id)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(normal, render_task_evidence_ledger(&records, None));
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn task_ledger_keeps_oldest_id_and_prioritizes_only_active_plan_mentions() {
         use crate::ai::tools::plan_state::{PlanState, StepStatus};
         let records = (0..12).map(ledger_record).collect::<Vec<_>>();
@@ -969,8 +1232,10 @@ mod tests {
 
     #[test]
     fn uncollected_terminal_status_updates_audit_without_delivering_evidence() {
-        let root = std::env::temp_dir()
-            .join(format!("task-uncollected-{}", uuid::Uuid::new_v4().simple()));
+        let root = std::env::temp_dir().join(format!(
+            "task-uncollected-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         let history_file = root.join("history.sqlite");
         let session_id = "uncollected-terminal-status";
         record_task_spawn_audit(
@@ -1327,8 +1592,14 @@ mod tests {
         )
         .unwrap();
         assert!(
-            integrate_task_evidence(&history_file, session_id, "task-pending", "accepted", "used")
-                .unwrap()
+            integrate_task_evidence(
+                &history_file,
+                session_id,
+                "task-pending",
+                "accepted",
+                "used"
+            )
+            .unwrap()
         );
         assert!(
             read_integrated_task_ids(&history_file, session_id)

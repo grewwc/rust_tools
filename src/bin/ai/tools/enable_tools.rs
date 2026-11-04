@@ -177,6 +177,28 @@ pub(crate) fn clear_explicitly_enabled_tools(session_id: &str) {
     }
 }
 
+/// Drop the subagent-orchestration tool family from a session's explicit
+/// enables. `/reset` leaves the agent-team mode, and these tools must not stay
+/// pinned in later requests just because an earlier turn enabled them: an
+/// explicit enable survives across turns independently of the skill that first
+/// made the tools useful.
+pub(crate) fn clear_task_family_explicitly_enabled_tools(session_id: &str) {
+    let mut family = group_members(ToolGroup::Task);
+    family.extend(group_members(ToolGroup::AgentTeam));
+    family.sort_unstable();
+    family.dedup();
+    if let Ok(mut s) = STATE.write()
+        && let Some(explicit) = s.explicit.get_mut(&(session_id.to_string(), None))
+    {
+        explicit
+            .tool_names
+            .retain(|name| !family.iter().any(|family_name| family_name == name));
+        explicit
+            .tool_age
+            .retain(|name, _| !family.iter().any(|family_name| family_name == name));
+    }
+}
+
 /// 在 turn 末调用：把"本 turn 被实际调用过"的 explicit tool 计数清零，
 /// 其它 explicit tool 计数 +1；超过 `EXPLICIT_TOOL_DEMOTE_AGE` 就从 explicit
 /// list 中 demote。

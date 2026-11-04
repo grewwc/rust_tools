@@ -16,6 +16,8 @@ use super::{TurnOutcome, persistence::persist_pending_turn_messages_for_model};
 const SUBAGENT_TOOL_EVIDENCE_MAX_CALLS: usize = 8;
 const SUBAGENT_TOOL_EVIDENCE_MAX_CHARS_PER_RESULT: usize = 700;
 const SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS: usize = 4_000;
+const AGENT_TEAM_SUBAGENT_TOOL_EVIDENCE_MAX_CALLS: usize = 4;
+const AGENT_TEAM_SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS: usize = 1_200;
 const MODEL_CONTEXT_ECHO_PREFIX: &str = "[Model-authored note from an earlier turn;";
 static SESSION_TITLE_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
     LazyLock::new(|| Mutex::new(FastSet::default()));
@@ -24,6 +26,12 @@ static SESSION_TITLE_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
 /// finalize may overlap with the next round's defensive compression in prepare).
 static SESSION_COMPACTION_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
     LazyLock::new(|| Mutex::new(FastSet::default()));
+
+tokio::task_local! {
+    /// The spawning parent scopes its formatting policy around the child turn.
+    /// Child skills do not determine how evidence is delivered to the parent.
+    pub(in crate::ai::driver) static SUBAGENT_PARENT_AGENT_TEAM_MODE: bool;
+}
 
 /// The title task must derive the sessions root from the base history file; do not pass the
 /// parent directory of the current session database, or a nested `.sessions` path is built by mistake.
@@ -171,6 +179,32 @@ fn format_subagent_result_for_parent(
     final_assistant_text: &str,
     turn_messages: &[Message],
 ) -> String {
+    let parent_agent_team_mode = SUBAGENT_PARENT_AGENT_TEAM_MODE
+        .try_with(|mode| *mode)
+        .unwrap_or(false);
+    format_subagent_result_for_parent_with_policy(
+        final_assistant_text,
+        turn_messages,
+        parent_agent_team_mode,
+    )
+}
+
+fn format_subagent_result_for_parent_with_policy(
+    final_assistant_text: &str,
+    turn_messages: &[Message],
+    parent_agent_team_mode: bool,
+) -> String {
+    if parent_agent_team_mode {
+        format_agent_team_subagent_result_for_parent(final_assistant_text, turn_messages)
+    } else {
+        format_full_subagent_result_for_parent(final_assistant_text, turn_messages)
+    }
+}
+
+fn format_full_subagent_result_for_parent(
+    final_assistant_text: &str,
+    turn_messages: &[Message],
+) -> String {
     let final_assistant_text = final_assistant_text.trim();
     let evidence = collect_subagent_tool_evidence(turn_messages);
     if evidence.is_empty() {
@@ -201,6 +235,88 @@ fn format_subagent_result_for_parent(
     output.push_str("\n\n");
     output.push_str("[Subagent final answer]\n");
     output.push_str(final_assistant_text);
+    output
+}
+
+fn agent_team_evidence_line(text: &str, max_chars: usize) -> String {
+    let sanitized: String = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    truncate_chars(
+        &sanitized.split_whitespace().collect::<Vec<_>>().join(" "),
+        max_chars,
+    )
+}
+
+fn format_agent_team_subagent_result_for_parent(
+    final_assistant_text: &str,
+    turn_messages: &[Message],
+) -> String {
+    use super::tool_result::completion_tool_result_succeeded;
+    use rust_tools::commonw::FastMap;
+
+    let final_assistant_text = final_assistant_text.trim();
+    let calls: FastMap<_, _> = turn_messages
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .map(|call| (call.id.as_str(), call))
+        .collect();
+    let mut evidence = Vec::new();
+    for message in turn_messages.iter().rev() {
+        if message.role != "tool" {
+            continue;
+        }
+        let Some(call) = message.tool_call_id.as_deref().and_then(|id| calls.get(id)) else {
+            continue;
+        };
+        let content = value_to_string(&message.content);
+        if content.trim().is_empty() {
+            continue;
+        }
+        let failed = !completion_tool_result_succeeded(&message.content);
+        evidence.push((failed, *call, content));
+    }
+    if evidence.is_empty() {
+        return final_assistant_text.to_string();
+    }
+    // Inspect the entire turn before selecting excerpts: a late failure must not be hidden by successes.
+    evidence.sort_by_key(|(failed, _, _)| !*failed);
+    let failures = evidence.iter().filter(|(failed, _, _)| *failed).count();
+    let shown = evidence
+        .len()
+        .min(AGENT_TEAM_SUBAGENT_TOOL_EVIDENCE_MAX_CALLS);
+    let mut output = format!(
+        "[Subagent tool evidence]\nUnverified excerpts: {shown}/{} results; failures={failures}, \
+         failure excerpts shown={}.\n",
+        evidence.len(),
+        failures.min(shown),
+    );
+    let pointer = "Full delivered payload: `task_evidence_read` (source=\"delivered\", this task's id). Ellipses mark excerpts.\n";
+    let line_limit = AGENT_TEAM_SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS
+        .saturating_sub(output.chars().count() + pointer.chars().count())
+        / shown;
+    for (failed, call, content) in evidence.iter().take(shown) {
+        let prefix = format!(
+            "- {}({}){} => ",
+            agent_team_evidence_line(&call.function.name, 40),
+            agent_team_evidence_line(&normalized_tool_args(&call.function.arguments), 60),
+            if *failed { " [failed]" } else { "" },
+        );
+        output.push_str(&prefix);
+        output.push_str(&agent_team_evidence_line(
+            content,
+            line_limit.saturating_sub(prefix.chars().count() + 1),
+        ));
+        output.push('\n');
+    }
+    output.push_str(pointer);
+    debug_assert!(output.chars().count() <= AGENT_TEAM_SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS);
+    if !final_assistant_text.is_empty() {
+        output.push_str("\n[Subagent final answer]\n");
+        output.push_str(final_assistant_text);
+    }
     output
 }
 
@@ -909,6 +1025,331 @@ mod tests {
                 arguments: arguments.to_string(),
             },
         }
+    }
+
+    fn agent_team_tool_messages(results: &[String]) -> Vec<Message> {
+        let mut messages = vec![Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(
+                (0..results.len())
+                    .map(|index| {
+                        tool_call(
+                            &format!("call-{index}"),
+                            "read_file",
+                            serde_json::json!({"file_path": format!("file-{index}.rs")}),
+                        )
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        messages.extend(results.iter().enumerate().map(|(index, result)| Message {
+            role: "tool".to_string(),
+            content: Value::String(result.clone()),
+            tool_calls: None,
+            tool_call_id: Some(format!("call-{index}")),
+            reasoning_content: None,
+        }));
+        messages
+    }
+
+    #[test]
+    fn agent_team_parent_context_evidence_bounds_and_preserves_late_errors_and_final() {
+        let mut results = (0..10)
+            .map(|index| format!("result-{index}\n{}", "界".repeat(1_000)))
+            .collect::<Vec<_>>();
+        results[9] = format!("Error: late read failed\n{}", "界".repeat(1_000));
+        let messages = agent_team_tool_messages(&results);
+        let final_text = "full final answer 界\n".repeat(1_000);
+        let output = format_agent_team_subagent_result_for_parent(&final_text, &messages);
+        let (evidence, final_answer) = output.split_once("\n[Subagent final answer]\n").unwrap();
+        assert!(evidence.chars().count() <= 1_200);
+        assert_eq!(
+            evidence
+                .lines()
+                .filter(|line| line.starts_with("- "))
+                .count(),
+            4
+        );
+        assert!(evidence.contains("4/10 results; failures=1, failure excerpts shown=1"));
+        assert!(evidence.contains("[failed] => Error: late read failed"));
+        assert!(evidence.contains("task_evidence_read"));
+        assert!(evidence.contains("source=\"delivered\""));
+        assert_eq!(final_answer, final_text.trim());
+
+        for result in &mut results {
+            *result = "Error: failed read".to_string();
+        }
+        let output =
+            format_agent_team_subagent_result_for_parent("", &agent_team_tool_messages(&results));
+        assert!(output.chars().count() <= 1_200);
+        assert!(output.contains("failures=10, failure excerpts shown=4"));
+        assert_eq!(output.matches("[failed] => Error:").count(), 4);
+        assert!(!output.contains("[Subagent final answer]"));
+        assert_eq!(
+            format_agent_team_subagent_result_for_parent("done", &[]),
+            "done"
+        );
+        assert_eq!(format_agent_team_subagent_result_for_parent("", &[]), "");
+    }
+
+    #[test]
+    fn agent_team_parent_context_evidence_mode_preserves_normal_formatter() {
+        use crate::ai::driver::runtime_ctx;
+        use std::sync::Arc;
+
+        let _env_guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let context = runtime_ctx::DriverContext::new(
+            crate::ai::middleware::test_util::test_app(),
+            Arc::new(Mutex::new(crate::ai::mcp::McpClient::new())),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+        );
+        let messages = agent_team_tool_messages(&vec!["observed evidence".to_string(); 10]);
+        runtime_ctx::DRIVER_CTX.sync_scope(context, || {
+            assert_eq!(
+                format_subagent_result_for_parent("done", &messages),
+                format_full_subagent_result_for_parent("done", &messages)
+            );
+            assert_eq!(collect_subagent_tool_evidence(&messages).len(), 8);
+            runtime_ctx::set_active_skill_names(vec!["agent-team".to_string()]);
+            assert_eq!(
+                format_subagent_result_for_parent("done", &messages),
+                format_full_subagent_result_for_parent("done", &messages)
+            );
+            runtime_ctx::set_active_skill_names(vec!["other".to_string()]);
+            assert_eq!(
+                format_subagent_result_for_parent("done", &messages),
+                format_full_subagent_result_for_parent("done", &messages)
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn agent_team_parent_context_policy_uses_parent_for_kernel_child() {
+        use crate::ai::driver::runtime_ctx;
+        use std::sync::Arc;
+
+        let _env_guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut app = crate::ai::middleware::test_util::test_app();
+        app.session_default_skills = vec!["agent-team".to_string()];
+        let parent = runtime_ctx::DriverContext::new(
+            app,
+            Arc::new(Mutex::new(crate::ai::mcp::McpClient::new())),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+        );
+        let parent_agent_team_mode = runtime_ctx::DRIVER_CTX.sync_scope(parent.clone(), || {
+            runtime_ctx::set_active_skill_names(vec!["agent-team".to_string()]);
+            crate::ai::tools::task_tools::is_agent_team_mode()
+        });
+        let child_app = parent.app_proto.fork_for_subagent();
+        assert!(child_app.session_default_skills.is_empty());
+        let child = runtime_ctx::DriverContext::new(
+            child_app,
+            parent.mcp_client.clone(),
+            parent.skill_manifests.clone(),
+            parent.agent_manifests.clone(),
+        );
+        let messages = agent_team_tool_messages(&vec!["observed evidence".to_string(); 10]);
+        runtime_ctx::DRIVER_CTX
+            .scope(child, async {
+                assert!(!crate::ai::tools::task_tools::is_agent_team_mode());
+                let output = SUBAGENT_PARENT_AGENT_TEAM_MODE
+                    .scope(parent_agent_team_mode, async {
+                        tokio::task::yield_now().await;
+                        subagent_result_payload_for_parent("done", &messages).unwrap()
+                    })
+                    .await;
+                assert_eq!(
+                    output,
+                    format_agent_team_subagent_result_for_parent("done", &messages)
+                );
+                assert!(output.contains("4/10 results"));
+                assert!(output.contains("task_evidence_read"));
+                assert_eq!(
+                    subagent_result_payload_for_parent("done", &messages).unwrap(),
+                    format_full_subagent_result_for_parent("done", &messages)
+                );
+                runtime_ctx::set_active_skill_names(vec!["agent-team".to_string()]);
+                SUBAGENT_PARENT_AGENT_TEAM_MODE
+                    .scope(false, async {
+                        assert_eq!(
+                            subagent_result_payload_for_parent("done", &messages).unwrap(),
+                            format_full_subagent_result_for_parent("done", &messages)
+                        );
+                    })
+                    .await;
+            })
+            .await;
+    }
+
+    async fn assert_kernel_parent_policy_result(team_parent: bool) {
+        use crate::ai::driver::runtime_ctx;
+        use std::sync::Arc;
+
+        let _env_guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut app = crate::ai::middleware::test_util::test_app();
+        if team_parent {
+            app.session_default_skills = vec!["agent-team".to_string()];
+        }
+        let parent = runtime_ctx::DriverContext::new(
+            app,
+            Arc::new(Mutex::new(crate::ai::mcp::McpClient::new())),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+        );
+        let parent_agent_team_mode = runtime_ctx::DRIVER_CTX.sync_scope(parent.clone(), || {
+            runtime_ctx::set_active_skill_names(if team_parent {
+                vec!["agent-team".to_string()]
+            } else {
+                Vec::new()
+            });
+            crate::ai::tools::task_tools::is_agent_team_mode()
+        });
+        assert_eq!(parent_agent_team_mode, team_parent);
+        let child_app = parent.app_proto.fork_for_subagent();
+        assert!(
+            !child_app
+                .session_default_skills
+                .iter()
+                .any(|skill| skill == "agent-team")
+        );
+        let child = runtime_ctx::DriverContext::new(
+            child_app,
+            parent.mcp_client.clone(),
+            parent.skill_manifests.clone(),
+            parent.agent_manifests.clone(),
+        );
+        let tool_error = "Error: failed to inspect kernel fixture";
+        let mut results = vec!["observed kernel evidence".to_string(); 10];
+        results[0] = tool_error.to_string();
+        let messages = agent_team_tool_messages(&results);
+        let original_messages = serde_json::to_value(&messages).unwrap();
+        let final_text = format!("  {}  ", "Complete answer 界\n".repeat(1_000));
+        let result_slot = Arc::new(tokio::sync::Mutex::new(
+            runtime_ctx::SubagentResult::default(),
+        ));
+        let runtime_error = "unchanged kernel runtime error";
+        let result = runtime_ctx::DRIVER_CTX
+            .scope(
+                child,
+                runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot.clone(), async {
+                    assert!(!crate::ai::tools::task_tools::is_agent_team_mode());
+                    super::super::SUBAGENT_PARENT_AGENT_TEAM_MODE
+                        .scope(parent_agent_team_mode, async {
+                            tokio::task::yield_now().await;
+                            let payload =
+                                subagent_result_payload_for_parent(&final_text, &messages).unwrap();
+                            runtime_ctx::publish_subagent_result(&payload, &final_text).await;
+                            Err::<(), _>(runtime_error)
+                        })
+                        .await
+                }),
+            )
+            .await;
+        assert_eq!(result, Err(runtime_error));
+        assert!(SUBAGENT_PARENT_AGENT_TEAM_MODE.try_with(|_| ()).is_err());
+        let captured = result_slot.lock().await;
+        assert_eq!(captured.final_assistant_text, final_text);
+        let (evidence, answer) = captured
+            .parent_payload
+            .split_once("[Subagent final answer]\n")
+            .unwrap();
+        assert_eq!(answer, final_text.trim());
+        assert!(evidence.contains(tool_error));
+        let expected =
+            format_subagent_result_for_parent_with_policy(&final_text, &messages, team_parent);
+        assert_eq!(captured.parent_payload, expected);
+        if team_parent {
+            assert!(evidence.chars().count() <= AGENT_TEAM_SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS);
+            assert!(evidence.contains("4/10 results; failures=1, failure excerpts shown=1"));
+            assert!(evidence.contains("[failed] => Error:"));
+        } else {
+            assert_eq!(
+                captured.parent_payload,
+                format_full_subagent_result_for_parent(&final_text, &messages)
+            );
+            assert_eq!(
+                evidence
+                    .lines()
+                    .filter(|line| line.starts_with("- "))
+                    .count(),
+                8
+            );
+        }
+        assert_eq!(serde_json::to_value(&messages).unwrap(), original_messages);
+    }
+
+    #[tokio::test]
+    async fn kernel_parent_policy_team_parent_compacts_child_evidence() {
+        assert_kernel_parent_policy_result(true).await;
+    }
+
+    #[tokio::test]
+    async fn kernel_parent_policy_non_team_parent_preserves_full_child_evidence() {
+        assert_kernel_parent_policy_result(false).await;
+    }
+
+    #[tokio::test]
+    async fn kernel_parent_policy_scope_is_isolated_and_restored() {
+        use std::{future::Future, task::Poll};
+
+        assert!(SUBAGENT_PARENT_AGENT_TEAM_MODE.try_with(|_| ()).is_err());
+        SUBAGENT_PARENT_AGENT_TEAM_MODE
+            .scope(false, async {
+                let (team, normal) = tokio::join!(
+                    SUBAGENT_PARENT_AGENT_TEAM_MODE.scope(true, async {
+                        tokio::task::yield_now().await;
+                        SUBAGENT_PARENT_AGENT_TEAM_MODE.with(|mode| *mode)
+                    }),
+                    SUBAGENT_PARENT_AGENT_TEAM_MODE.scope(false, async {
+                        tokio::task::yield_now().await;
+                        SUBAGENT_PARENT_AGENT_TEAM_MODE.with(|mode| *mode)
+                    }),
+                );
+                assert_eq!((team, normal), (true, false));
+                assert!(!SUBAGENT_PARENT_AGENT_TEAM_MODE.with(|mode| *mode));
+                {
+                    let mut cancelled =
+                        Box::pin(SUBAGENT_PARENT_AGENT_TEAM_MODE.scope(true, async {
+                            assert!(SUBAGENT_PARENT_AGENT_TEAM_MODE.with(|mode| *mode));
+                            std::future::pending::<()>().await;
+                        }));
+                    std::future::poll_fn(|cx| {
+                        assert!(cancelled.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                }
+                assert!(!SUBAGENT_PARENT_AGENT_TEAM_MODE.with(|mode| *mode));
+                {
+                    let mut panicking =
+                        Box::pin(SUBAGENT_PARENT_AGENT_TEAM_MODE.scope(true, async {
+                            assert!(SUBAGENT_PARENT_AGENT_TEAM_MODE.with(|mode| *mode));
+                            panic!("expected kernel parent policy scope panic");
+                        }));
+                    std::future::poll_fn(|cx| {
+                        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            panicking.as_mut().poll(cx)
+                        }));
+                        assert!(panic.is_err());
+                        Poll::Ready(())
+                    })
+                    .await;
+                }
+                assert!(!SUBAGENT_PARENT_AGENT_TEAM_MODE.with(|mode| *mode));
+            })
+            .await;
+        assert!(SUBAGENT_PARENT_AGENT_TEAM_MODE.try_with(|_| ()).is_err());
     }
 
     #[test]

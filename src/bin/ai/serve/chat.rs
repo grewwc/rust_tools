@@ -2734,6 +2734,7 @@ fn render_turn_stream_to_with_confirm(
     // newline, or a live thinking status). Footer/message lines must start
     // on a fresh row instead of gluing onto the answer's last line.
     let mut line_open = false;
+    let mut observer_rows = ObserverRowState::default();
     // End-of-stream metrics summaries (`↳ cache` / `↳ speed`) are discarded
     // here: a multi-round turn emits one pair per model stream, and printing
     // them all buries the answer tail in stale per-round summaries. The local
@@ -2752,10 +2753,12 @@ fn render_turn_stream_to_with_confirm(
     // is also printed on stream retries, so only a header after a committed
     // turn starts a new one.
     let mut turn_committed = false;
-    loop {
+    let stream_result = loop {
         raw.clear();
-        if reader.read_line(&mut raw)? == 0 {
-            break;
+        match reader.read_line(&mut raw) {
+            Ok(0) => break Ok(()),
+            Ok(_) => {}
+            Err(err) => break Err(Box::<dyn std::error::Error>::from(err)),
         }
         let line = raw.strip_suffix('\n').unwrap_or(raw.as_str());
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -2774,6 +2777,22 @@ fn render_turn_stream_to_with_confirm(
             continue;
         };
         let payload = data.strip_prefix(' ').unwrap_or(data);
+        if matches!(
+            event_kind.as_str(),
+            "error"
+                | "done"
+                | "thinking_start"
+                | "thinking"
+                | "thinking_done"
+                | "answer_pending"
+                | "delta"
+                | "confirm_request"
+                | "replace"
+                | "subagent_progress"
+        ) {
+            observer_rows.close_tool_row(&mut line_open, out);
+            observer_rows.hide_context_budget_row(&mut line_open, tty, out);
+        }
         // The subagent status occupies the active row, so any event that
         // renders output or ends the turn supersedes it. Clear it first so
         // answer/footer bytes never land on top of a stale progress row.
@@ -2787,42 +2806,14 @@ fn render_turn_stream_to_with_confirm(
         }
         match event_kind.as_str() {
             "error" => {
-                // Best effort: surface the partial answer before failing.
-                hide_answer_pending_status(&mut answer_pending_drawn, &mut line_open, tty, out);
-                if tty {
-                    let _ = markdown.flush_pending_to(out);
-                }
-                close_thinking_status(
-                    &mut thinking_active,
-                    &mut line_open,
-                    thinking_summary(thinking_newlines, thinking_chars),
-                    &mut thinking_body,
-                    tty,
-                    out,
-                );
-                close_open_line(&mut line_open, out);
                 let msg = serde_json::from_str::<serde_json::Value>(payload)
                     .ok()
                     .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
                     .unwrap_or_else(|| payload.to_string());
-                return Err(format!("turn failed: {msg}").into());
+                break Err(format!("turn failed: {msg}").into());
             }
             "done" => {
-                // End of turn: emit whatever the renderer still holds.
-                hide_answer_pending_status(&mut answer_pending_drawn, &mut line_open, tty, out);
-                if tty {
-                    let _ = markdown.flush_pending_to(out);
-                }
-                close_thinking_status(
-                    &mut thinking_active,
-                    &mut line_open,
-                    thinking_summary(thinking_newlines, thinking_chars),
-                    &mut thinking_body,
-                    tty,
-                    out,
-                );
-                close_open_line(&mut line_open, out);
-                return Ok(());
+                break Ok(());
             }
             "thinking_start" => {
                 // A second thinking block in one turn closes the previous
@@ -2840,6 +2831,7 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_body,
                     tty,
                     out,
+                    &mut observer_rows,
                 );
                 thinking_active = true;
                 thinking_newlines = 0;
@@ -2902,6 +2894,7 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_body,
                     tty,
                     out,
+                    &mut observer_rows,
                 );
                 show_answer_pending_status(
                     answer_pending,
@@ -2946,6 +2939,7 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_body,
                     tty,
                     out,
+                    &mut observer_rows,
                 );
                 let text = serde_json::from_str::<serde_json::Value>(payload)
                     .ok()
@@ -2959,6 +2953,7 @@ fn render_turn_stream_to_with_confirm(
                     let _ = write!(out, "{text}");
                 }
                 if !text.is_empty() {
+                    observer_rows.last_thinking_summary = None;
                     streamed_body.push_str(&text);
                     line_open = !text.ends_with('\n');
                 }
@@ -2981,6 +2976,7 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_body,
                     tty,
                     out,
+                    &mut observer_rows,
                 );
                 if line_open {
                     let _ = writeln!(out);
@@ -3013,6 +3009,7 @@ fn render_turn_stream_to_with_confirm(
                         );
                     }
                 }
+                observer_rows.last_thinking_summary = None;
                 line_open = false;
                 let _ = out.flush();
                 show_answer_pending_status(
@@ -3050,12 +3047,14 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_body,
                     tty,
                     out,
+                    &mut observer_rows,
                 );
                 let text = serde_json::from_str::<serde_json::Value>(payload)
                     .ok()
                     .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
                     .unwrap_or_default();
                 if text.is_empty() {
+                    observer_rows.last_thinking_summary = None;
                     // An empty accepted body means the turn produced no
                     // user-visible answer (or the final gate rejected it).
                     // The provisional deltas are not authoritative, and
@@ -3073,6 +3072,7 @@ fn render_turn_stream_to_with_confirm(
                     let _ = out.flush();
                 } else if let Some(suffix) = text.strip_prefix(streamed_body.as_str()) {
                     if !suffix.is_empty() {
+                        observer_rows.last_thinking_summary = None;
                         if tty {
                             let _ = markdown.write_chunk_to(out, suffix, false);
                         } else {
@@ -3082,6 +3082,7 @@ fn render_turn_stream_to_with_confirm(
                         let _ = out.flush();
                     }
                 } else {
+                    observer_rows.last_thinking_summary = None;
                     // The accepted body is not an extension of the streamed
                     // text (a gate rewrote it). The provisional draft may
                     // never have reached the screen (or may have been
@@ -3133,7 +3134,10 @@ fn render_turn_stream_to_with_confirm(
                     // Flush first so the footer starts after the rendered
                     // body; a completed row means no extra guard newline.
                     let _ = markdown.flush_pending_to(out);
-                    if markdown.at_line_start() {
+                    if markdown.at_line_start()
+                        && observer_rows.open_tool_row.is_none()
+                        && !observer_rows.context_budget_drawn
+                    {
                         line_open = false;
                     }
                 }
@@ -3144,44 +3148,98 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_body,
                     tty,
                     out,
+                    &mut observer_rows,
                 );
                 // Metrics summaries are discarded (see above): they must neither
                 // tear the answer's open line nor bury the answer tail.
                 // Every other observer row keeps the previous inline behavior.
                 if is_metrics_footer(payload) {
+                    observer_rows.close_tool_row(&mut line_open, out);
+                    observer_rows.hide_context_budget_row(&mut line_open, tty, out);
                     let _ = out.flush();
                 } else {
-                    // Body deltas carry no trailing newline, so the first footer
-                    // line would otherwise glue onto the answer's last line.
-                    if line_open {
-                        let _ = writeln!(out);
+                    let width = if tty {
+                        crossterm::terminal::size()
+                            .map(|(cols, _)| usize::from(cols))
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let decision = decide_observer_row(
+                        payload,
+                        &mut observer_rows,
+                        tty,
+                        width,
+                        turn_committed,
+                    );
+                    if decision.close_tool_row {
+                        close_open_line(&mut line_open, out);
+                    }
+                    if !matches!(decision.action, ObserverRowAction::ContextBudget { .. }) {
+                        observer_rows.hide_context_budget_row(&mut line_open, tty, out);
+                    }
+                    // `replace` commits the prior turn; only its following
+                    // header starts the pending side-note's next turn. Retry
+                    // headers must keep the answer buffer and dedupe key.
+                    if decision.new_turn {
+                        observer_rows.finish_context_budget_row(&mut line_open, out);
+                        streamed_body.clear();
+                        turn_committed = false;
                     }
                     // The turn header (`print_info` in `request/transport.rs`)
                     // is forwarded as a plain stdout row, so without a marker
                     // the serve-chat scrollback is indistinguishable from a
                     // local run. Annotate only that row; every other observer
                     // row stays byte-identical.
-                    let row = if is_turn_header_row(payload) {
-                        // A serve child can run several turns on one SSE
-                        // stream (a pending side-note is flushed as the next
-                        // user input). Only a header after a committed turn
-                        // starts a new one: `print_info` also runs inside the
-                        // stream retry loop, and clearing the buffer there
-                        // would duplicate the answer already painted for the
-                        // same turn.
-                        if turn_committed {
-                            streamed_body.clear();
-                            turn_committed = false;
-                        }
+                    let row = if decision.header {
                         annotate_remote_turn_header(payload, tty)
                     } else {
                         payload.to_string()
                     };
-                    let _ = writeln!(out, "{row}");
-                    // The appended newline closes the output line even when the
-                    // stdout-derived payload has no line terminator of its own.
-                    line_open = false;
+                    match decision.action {
+                        ObserverRowAction::SkipDuplicate => {}
+                        ObserverRowAction::ReplaceOpenToolRow => {
+                            let _ = write!(out, "\r\x1b[2K");
+                            let _ = writeln!(out, "{row}");
+                            line_open = false;
+                        }
+                        ObserverRowAction::OpenToolRow => {
+                            close_open_line(&mut line_open, out);
+                            let _ = write!(out, "{row}");
+                            line_open = true;
+                        }
+                        ObserverRowAction::ContextBudget { replace, draw } => {
+                            if replace {
+                                let _ = write!(out, "\r\x1b[2K");
+                                line_open = false;
+                            } else {
+                                close_open_line(&mut line_open, out);
+                            }
+                            observer_rows.context_budget_row = Some(row);
+                            observer_rows.context_budget_drawn = draw;
+                            if draw {
+                                let _ = write!(
+                                    out,
+                                    "{}",
+                                    observer_rows
+                                        .context_budget_row
+                                        .as_deref()
+                                        .unwrap_or_default()
+                                );
+                                line_open = true;
+                            }
+                        }
+                        ObserverRowAction::Print => {
+                            close_open_line(&mut line_open, out);
+                            let _ = writeln!(out, "{row}");
+                            line_open = false;
+                        }
+                    }
                     let _ = out.flush();
+                }
+                if tty && answer_pending && !thinking_active {
+                    observer_rows.close_tool_row(&mut line_open, out);
+                    observer_rows.hide_context_budget_row(&mut line_open, tty, out);
                 }
                 show_answer_pending_status(
                     answer_pending,
@@ -3193,8 +3251,10 @@ fn render_turn_stream_to_with_confirm(
                 );
             }
         }
-    }
-    // Stream ended without a `done` event: same end-of-turn flush.
+    };
+    // Done, EOF and read/server errors all share cleanup, including open tools.
+    observer_rows.close_tool_row(&mut line_open, out);
+    observer_rows.hide_context_budget_row(&mut line_open, tty, out);
     hide_subagent_status(&mut subagent_status_drawn, &mut line_open, tty, out);
     hide_answer_pending_status(&mut answer_pending_drawn, &mut line_open, tty, out);
     if tty {
@@ -3207,9 +3267,168 @@ fn render_turn_stream_to_with_confirm(
         &mut thinking_body,
         tty,
         out,
+        &mut observer_rows,
     );
     close_open_line(&mut line_open, out);
-    Ok(())
+    observer_rows.finish_context_budget_row(&mut line_open, out);
+    stream_result
+}
+
+#[derive(Default)]
+struct ObserverRowState {
+    last_header_key: Option<String>,
+    last_thinking_summary: Option<String>,
+    last_context_budget: Option<String>,
+    open_tool_row: Option<String>,
+    context_budget_row: Option<String>,
+    context_budget_drawn: bool,
+}
+
+impl ObserverRowState {
+    fn close_tool_row(&mut self, line_open: &mut bool, out: &mut dyn std::io::Write) {
+        if self.open_tool_row.take().is_some() {
+            close_open_line(line_open, out);
+        }
+    }
+
+    fn hide_context_budget_row(
+        &mut self,
+        line_open: &mut bool,
+        tty: bool,
+        out: &mut dyn std::io::Write,
+    ) {
+        // Budget notes use the same transient-row lifecycle as live progress.
+        hide_subagent_status(&mut self.context_budget_drawn, line_open, tty, out);
+    }
+
+    fn finish_context_budget_row(&mut self, line_open: &mut bool, out: &mut dyn std::io::Write) {
+        if let Some(row) = self.context_budget_row.take() {
+            close_open_line(line_open, out);
+            let _ = writeln!(out, "{row}");
+            self.last_thinking_summary = None;
+            let _ = out.flush();
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ObserverRowAction {
+    Print,
+    SkipDuplicate,
+    OpenToolRow,
+    ReplaceOpenToolRow,
+    ContextBudget { replace: bool, draw: bool },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ObserverRowDecision {
+    action: ObserverRowAction,
+    close_tool_row: bool,
+    header: bool,
+    new_turn: bool,
+}
+
+/// Decide only from display text/state; ANSI bytes are preserved when printing.
+fn decide_observer_row(
+    payload: &str,
+    state: &mut ObserverRowState,
+    tty: bool,
+    width: usize,
+    turn_committed: bool,
+) -> ObserverRowDecision {
+    use unicode_width::UnicodeWidthStr;
+
+    let plain = strip_ansi_escapes(payload);
+    let normalized = plain.trim();
+    let header_text = normalized
+        .strip_suffix("(remote)")
+        .unwrap_or(normalized)
+        .trim_end();
+    let header = is_turn_header_row(header_text);
+    let new_turn = header && turn_committed;
+    if new_turn {
+        state.last_header_key = None;
+        state.last_thinking_summary = None;
+        state.last_context_budget = None;
+    }
+    let thinking_summary = normalized
+        .strip_prefix("✓ thinking (")
+        .and_then(|tail| tail.strip_suffix(')'))
+        .and_then(|tail| tail.split_once(' '))
+        .is_some_and(|(count, unit)| {
+            count.parse::<usize>().is_ok() && matches!(unit, "line" | "lines" | "line(s)")
+        });
+    let completion_name = normalized
+        .strip_prefix('✓')
+        .and_then(|tail| tail.split_whitespace().next());
+    let replace_tool = !thinking_summary
+        && completion_name.is_some()
+        && state.open_tool_row.as_deref() == completion_name;
+    let close_tool_row = state.open_tool_row.take().is_some() && !replace_tool;
+    let fits = width > 0 && !plain.chars().any(char::is_control) && plain.width() < width;
+    let action = if header {
+        // Identity is the bracketed model/effort/title, excluding any clocks
+        // outside it and the client's `(remote)` suffix. Changed fields remain
+        // visible, including automatic model/effort fallback.
+        let key = header_text
+            .rfind(']')
+            .map(|end| &header_text[..=end])
+            .unwrap_or(header_text);
+        if state.last_header_key.as_deref() == Some(key) {
+            ObserverRowAction::SkipDuplicate
+        } else {
+            state.last_header_key = Some(key.to_string());
+            state.last_thinking_summary = None;
+            ObserverRowAction::Print
+        }
+    } else if thinking_summary {
+        if state.last_thinking_summary.as_deref() == Some(normalized) {
+            ObserverRowAction::SkipDuplicate
+        } else {
+            state.last_thinking_summary = Some(normalized.to_string());
+            ObserverRowAction::Print
+        }
+    } else if normalized.starts_with("│ context-budget:") {
+        state.last_thinking_summary = None;
+        let duplicate = state.last_context_budget.as_deref() == Some(normalized);
+        state.last_context_budget = Some(normalized.to_string());
+        if tty {
+            // A transient note is erased before other output. Only the latest
+            // note is committed at the turn boundary; wrapped notes wait for
+            // that final print so erasure never crosses into another row.
+            let action = ObserverRowAction::ContextBudget {
+                replace: state.context_budget_drawn,
+                draw: fits,
+            };
+            state.context_budget_drawn = fits;
+            action
+        } else if duplicate {
+            ObserverRowAction::SkipDuplicate
+        } else {
+            ObserverRowAction::Print
+        }
+    } else {
+        state.last_thinking_summary = None;
+        if replace_tool {
+            ObserverRowAction::ReplaceOpenToolRow
+        } else if let Some(name) = normalized
+            .strip_prefix('●')
+            .and_then(|tail| tail.split_whitespace().next())
+            .filter(|_| tty && fits)
+        {
+            state.open_tool_row = Some(name.to_string());
+            ObserverRowAction::OpenToolRow
+        } else {
+            // Pipes keep both rows: they cannot erase an earlier output row.
+            ObserverRowAction::Print
+        }
+    };
+    ObserverRowDecision {
+        action,
+        close_tool_row,
+        header,
+        new_turn,
+    }
 }
 
 /// Approximate folded-thinking line count for the summary row.
@@ -3418,6 +3637,7 @@ fn close_thinking_status(
     body: &mut String,
     tty: bool,
     out: &mut dyn std::io::Write,
+    observer_rows: &mut ObserverRowState,
 ) {
     if !*active {
         return;
@@ -3431,7 +3651,12 @@ fn close_thinking_status(
     // only retained row.
     body.clear();
     let unit = if lines == 1 { "line" } else { "lines" };
-    let _ = writeln!(out, "{}", dim(&format!("✓ thinking ({lines} {unit})"), tty));
+    let summary = format!("✓ thinking ({lines} {unit})");
+    if decide_observer_row(&summary, observer_rows, tty, 0, false).action
+        != ObserverRowAction::SkipDuplicate
+    {
+        let _ = writeln!(out, "{}", dim(&summary, tty));
+    }
     *line_open = false;
     let _ = out.flush();
 }
@@ -5091,6 +5316,288 @@ mod tests {
     }
 
     #[test]
+    fn observer_rows_dedupe_identical_headers() {
+        let mut state = ObserverRowState::default();
+        let header = "[model (effort: max) · topic]";
+        assert_eq!(
+            decide_observer_row(header, &mut state, true, 80, false).action,
+            ObserverRowAction::Print
+        );
+        for duplicate in [
+            header,
+            "\x1b[32m[model (effort: max) · topic]\x1b[0m (remote)",
+            "[model (effort: max) · topic] 12:34:56",
+        ] {
+            assert_eq!(
+                decide_observer_row(duplicate, &mut state, true, 80, false).action,
+                ObserverRowAction::SkipDuplicate,
+                "{duplicate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn observer_rows_keep_changed_header_fields_and_new_turns() {
+        let mut state = ObserverRowState::default();
+        for header in [
+            "[model (effort: max) · topic]",
+            "[fallback (effort: max) · topic]",
+            "[fallback (effort: off) · topic]",
+            "[fallback (effort: off) · next topic]",
+        ] {
+            assert_eq!(
+                decide_observer_row(header, &mut state, false, 80, false).action,
+                ObserverRowAction::Print,
+                "{header}"
+            );
+        }
+        let next = decide_observer_row(
+            "[fallback (effort: off) · next topic]",
+            &mut state,
+            false,
+            80,
+            true,
+        );
+        assert!(next.new_turn);
+        assert_eq!(next.action, ObserverRowAction::Print);
+    }
+
+    #[test]
+    fn observer_rows_replace_matching_tool_completion() {
+        let mut state = ObserverRowState::default();
+        assert_eq!(
+            decide_observer_row(
+                "  \x1b[34m●\x1b[0m cmd · target",
+                &mut state,
+                true,
+                80,
+                false
+            )
+            .action,
+            ObserverRowAction::OpenToolRow
+        );
+        assert_eq!(state.open_tool_row.as_deref(), Some("cmd"));
+        let done = decide_observer_row(
+            "\r\x1b[2K  \x1b[32m✓\x1b[0m cmd · 2s",
+            &mut state,
+            true,
+            80,
+            false,
+        );
+        assert_eq!(done.action, ObserverRowAction::ReplaceOpenToolRow);
+        assert!(!done.close_tool_row);
+        assert!(state.open_tool_row.is_none());
+    }
+
+    #[test]
+    fn observer_rows_close_tool_before_unrelated_row() {
+        let mut state = ObserverRowState::default();
+        assert_eq!(
+            decide_observer_row("● cmd", &mut state, true, 80, false).action,
+            ObserverRowAction::OpenToolRow
+        );
+        let other = decide_observer_row("  │ command output", &mut state, true, 80, false);
+        assert!(other.close_tool_row, "the started row needs a newline");
+        assert_eq!(other.action, ObserverRowAction::Print);
+        assert_eq!(
+            decide_observer_row("✓ cmd", &mut state, true, 80, false).action,
+            ObserverRowAction::Print
+        );
+    }
+
+    #[test]
+    fn observer_rows_keep_piped_and_wrapped_tool_rows() {
+        let mut state = ObserverRowState::default();
+        for row in ["● cmd", "✓ cmd"] {
+            assert_eq!(
+                decide_observer_row(row, &mut state, false, 80, false).action,
+                ObserverRowAction::Print
+            );
+        }
+        for (row, width) in [
+            ("● cmd", 5),
+            ("● 文件", 6),
+            ("● cmd\targ", 80),
+            ("● cmd", 0),
+        ] {
+            assert_eq!(
+                decide_observer_row(row, &mut state, true, width, false).action,
+                ObserverRowAction::Print,
+                "unsafe single-row erase: {row:?}, width={width}"
+            );
+        }
+    }
+
+    #[test]
+    fn observer_rows_suppress_consecutive_thinking_summaries() {
+        let mut state = ObserverRowState::default();
+        let summary = "✓ thinking (3 lines)";
+        assert_eq!(
+            decide_observer_row(summary, &mut state, false, 80, false).action,
+            ObserverRowAction::Print
+        );
+        assert_eq!(
+            decide_observer_row(
+                "\x1b[2m✓ thinking (3 lines)\x1b[0m",
+                &mut state,
+                false,
+                80,
+                false
+            )
+            .action,
+            ObserverRowAction::SkipDuplicate
+        );
+        assert_eq!(
+            decide_observer_row("  │ unrelated", &mut state, false, 80, false).action,
+            ObserverRowAction::Print
+        );
+        assert_eq!(
+            decide_observer_row(summary, &mut state, false, 80, false).action,
+            ObserverRowAction::Print
+        );
+    }
+
+    #[test]
+    fn observer_rows_replace_or_dedupe_context_budget_notes() {
+        let first = "  \x1b[2m│ context-budget: projection refreshed: 1 -> 2 chars\x1b[0m";
+        let second = "  │ context-budget: projection refreshed: 2 -> 3 chars";
+        let mut state = ObserverRowState::default();
+        assert_eq!(
+            decide_observer_row(first, &mut state, true, 80, false).action,
+            ObserverRowAction::ContextBudget {
+                replace: false,
+                draw: true
+            }
+        );
+        assert_eq!(
+            decide_observer_row(second, &mut state, true, 80, false).action,
+            ObserverRowAction::ContextBudget {
+                replace: true,
+                draw: true
+            }
+        );
+        assert_eq!(
+            decide_observer_row(first, &mut state, true, 20, false).action,
+            ObserverRowAction::ContextBudget {
+                replace: true,
+                draw: false
+            }
+        );
+        let mut piped = ObserverRowState::default();
+        for note in [first, second] {
+            assert_eq!(
+                decide_observer_row(note, &mut piped, false, 80, false).action,
+                ObserverRowAction::Print
+            );
+        }
+        assert_eq!(
+            decide_observer_row(second, &mut piped, false, 80, false).action,
+            ObserverRowAction::SkipDuplicate
+        );
+        assert_eq!(
+            decide_observer_row("│ ordinary continuation", &mut piped, false, 80, false).action,
+            ObserverRowAction::Print
+        );
+    }
+
+    #[test]
+    fn sse_repeated_headers_reset_only_after_committed_turn() {
+        let body = concat!(
+            "data: [model (effort: max) · topic]\n\n",
+            "data: [model (effort: max) · topic]\n\n",
+            "event: delta\ndata: {\"delta\": \"first\"}\n\n",
+            "data: [model (effort: max) · topic]\n\n",
+            "data: [fallback (effort: max) · topic]\n\n",
+            "event: replace\ndata: {\"text\": \"first\"}\n\n",
+            "data: [fallback (effort: max) · topic]\n\n",
+            "event: delta\ndata: {\"delta\": \"second\"}\n\n",
+            "event: replace\ndata: {\"text\": \"second\"}\n\n",
+            "event: done\ndata: \n\n",
+        );
+        let resp = reqwest::blocking::get(serve_body_once(body)).unwrap();
+        let mut out = Vec::new();
+        render_turn_stream_to(resp, &mut out, false).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            concat!(
+                "[model (effort: max) · topic] (remote)\n",
+                "first\n",
+                "[fallback (effort: max) · topic] (remote)\n",
+                "[fallback (effort: max) · topic] (remote)\n",
+                "second\n",
+            )
+        );
+    }
+
+    #[test]
+    fn sse_budget_notes_keep_only_latest_tty_note_and_continuations() {
+        // Overwide notes are deferred, so this fixture is independent of the
+        // test runner's terminal geometry and still checks footer ordering.
+        let first = format!("  │ context-budget: old {}", "a".repeat(70_000));
+        let latest = format!(
+            "  \x1b[2m│ context-budget: latest {}\x1b[0m",
+            "b".repeat(70_000)
+        );
+        let body = format!(
+            "data: {first}\n\ndata:   │ ordinary continuation\n\ndata: {latest}\n\nevent: delta\ndata: {{\"delta\": \"answer\"}}\n\ndata: ↳ speed · dropped\n\nevent: done\ndata: \n\n"
+        );
+        let resp =
+            reqwest::blocking::get(serve_body_once(Box::leak(body.into_boxed_str()))).unwrap();
+        let mut out = Vec::new();
+        render_turn_stream_to(resp, &mut out, true).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("context-budget: old"), "stale note retained");
+        assert_eq!(out.matches("context-budget: latest").count(), 1);
+        assert!(out.contains("  │ ordinary continuation\n"));
+        assert!(
+            out.ends_with(&format!("{latest}\n")),
+            "final note lost ANSI or newline"
+        );
+        assert!(!out.contains("↳ speed"));
+    }
+
+    #[test]
+    fn sse_thinking_summary_dedupe_covers_live_and_observer_rows() {
+        let body = concat!(
+            "event: thinking_start\ndata: \n\n",
+            "event: thinking\ndata: {\"text\": \"first\"}\n\n",
+            "event: thinking_done\ndata: \n\n",
+            "data: ✓ thinking (1 line)\n\n",
+            "event: thinking_start\ndata: \n\n",
+            "event: thinking\ndata: {\"text\": \"second\"}\n\n",
+            "event: thinking_done\ndata: \n\n",
+            "event: delta\ndata: {\"delta\": \"answer\"}\n\n",
+            "event: done\ndata: \n\n",
+        );
+        for tty in [false, true] {
+            let resp = reqwest::blocking::get(serve_body_once(body)).unwrap();
+            let mut out = Vec::new();
+            render_turn_stream_to(resp, &mut out, tty).unwrap();
+            let out = String::from_utf8(out).unwrap();
+            assert_eq!(out.matches("✓ thinking (1 line)").count(), 1, "{out:?}");
+            assert!(out.contains("answer"));
+        }
+    }
+
+    #[test]
+    fn sse_answer_and_confirmation_break_thinking_summary_dedupe() {
+        for intervening in [
+            "event: replace\ndata: {\"text\": \"answer\"}\n\n",
+            "event: confirm_request\ndata: {}\n\n",
+        ] {
+            let body = format!(
+                "event: thinking_start\ndata: \n\nevent: thinking\ndata: {{\"text\": \"reasoning\"}}\n\n{intervening}data: ✓ thinking (1 line)\n\nevent: done\ndata: \n\n"
+            );
+            let resp =
+                reqwest::blocking::get(serve_body_once(Box::leak(body.into_boxed_str()))).unwrap();
+            let mut out = Vec::new();
+            render_turn_stream_to(resp, &mut out, false).unwrap();
+            let out = String::from_utf8(out).unwrap();
+            assert_eq!(out.matches("✓ thinking (1 line)").count(), 2, "{out:?}");
+        }
+    }
+
+    #[test]
     fn sse_tool_rows_keep_child_indent_verbatim() {
         // Regression net for the serve-chat indent report: footer/message rows
         // (tool status, long command echoes) must reach the terminal
@@ -5265,7 +5772,15 @@ mod tests {
         let mut active = true;
         let mut line_open = true;
         let mut buf = Vec::new();
-        close_thinking_status(&mut active, &mut line_open, 100, &mut body, false, &mut buf);
+        close_thinking_status(
+            &mut active,
+            &mut line_open,
+            100,
+            &mut body,
+            false,
+            &mut buf,
+            &mut ObserverRowState::default(),
+        );
         let out = String::from_utf8(buf).expect("utf8");
         assert_eq!(out, "✓ thinking (100 lines)\n");
         assert!(body.is_empty(), "body must drain exactly once");
@@ -5278,7 +5793,15 @@ mod tests {
         let mut active = true;
         let mut line_open = true;
         let mut buf = Vec::new();
-        close_thinking_status(&mut active, &mut line_open, 3, &mut body, false, &mut buf);
+        close_thinking_status(
+            &mut active,
+            &mut line_open,
+            3,
+            &mut body,
+            false,
+            &mut buf,
+            &mut ObserverRowState::default(),
+        );
         let out = String::from_utf8(buf).expect("utf8");
         assert_eq!(out, "✓ thinking (3 lines)\n");
     }

@@ -34,6 +34,7 @@ pub(in crate::ai) mod tool_result;
 mod turn_signals;
 mod types;
 
+pub(super) use finalize::SUBAGENT_PARENT_AGENT_TEAM_MODE;
 pub(super) use orchestrator::run_turn;
 // `/history last` replay (driver/input.rs, serve/chat.rs) paints the stored
 // body through the same display-only post-processing as the live turn path

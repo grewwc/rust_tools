@@ -38,7 +38,7 @@ use crate::ai::{
     driver::{runtime_ctx, turn_runtime},
     history,
     tools::task_tools,
-    types::ToolResult,
+    types::{App, ToolResult},
 };
 
 use super::super::runtime_ctx::DriverContext;
@@ -157,6 +157,19 @@ const SUBAGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 type BoxedSubagentFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
+fn fork_sync_subagent_with_parent_policy(ctx: &DriverContext) -> (App, bool) {
+    // Capture the caller's active mode before the fork removes its team skill.
+    let parent_agent_team_mode = task_tools::is_agent_team_mode();
+    (ctx.app_proto.fork_for_subagent(), parent_agent_team_mode)
+}
+
+fn scope_sync_subagent_parent_policy(
+    parent_agent_team_mode: bool,
+    wrapped: BoxedSubagentFuture,
+) -> BoxedSubagentFuture {
+    Box::pin(turn_runtime::SUBAGENT_PARENT_AGENT_TEAM_MODE.scope(parent_agent_team_mode, wrapped))
+}
+
 fn suppress_subagent_terminal_output(wrapped: BoxedSubagentFuture) -> BoxedSubagentFuture {
     Box::pin(runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(true, wrapped))
 }
@@ -246,7 +259,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
         "task tool requires an active driver turn (DRIVER_CTX is not set)".to_string()
     })?;
 
-    let mut task_app = ctx.app_proto.fork_for_subagent();
+    let (mut task_app, parent_agent_team_mode) = fork_sync_subagent_with_parent_policy(&ctx);
     // Driver-internal dispatch options (the task tool schema seen by model calls has neither
     // field, so they never match):
     // - `image_files`: attaches images directly to the sub-agent's first user message so a VL
@@ -488,11 +501,15 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     let backend_model = prepared.backend_model.clone();
     let traecli_reasoning_effort = log_reasoning_effort.clone();
     let subagent_image_files = prepared.image_files.clone();
-    let traecli_resume_session: Result<Option<String>, String> = prepared
-        .backend_continue_from
-        .as_deref()
-        .map(crate::ai::tools::task_tools::resolve_continue_target)
-        .transpose();
+    let traecli_continuation = if is_traecli_backend {
+        crate::ai::tools::task_tools::prepare_traecli_continuation(
+            prepared.backend_continue_from.as_deref(),
+            &parent_history_path,
+            &prompt,
+        )
+    } else {
+        Ok((None, String::new(), Vec::new()))
+    };
     let traecli_result_slot = result_slot.clone();
     let traecli_session_slot: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -505,9 +522,9 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
         // the kernel path keeps the exact in-process `run_turn` flow. Both
         // publish through the same result-slot/validation logic below.
         let result: Result<(), String> = if is_traecli_backend {
-            match traecli_resume_session {
+            match traecli_continuation {
                 Err(err) => Err(err),
-                Ok(resume_session) => {
+                Ok((resume_session, prompt, side_note_files)) => {
                     let spec = crate::ai::tools::task_tools::ExternalSubagentSpec {
                         prompt,
                         cwd: traecli_cwd,
@@ -518,6 +535,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
                             &crate::ai::driver::runtime_ctx::active_skill_names(),
                         ),
                         resume_session,
+                        side_note_files,
                         reasoning_effort: traecli_reasoning_effort,
                         image_files: subagent_image_files,
                         phase_slot: Some(phase_slot_for_backend),
@@ -585,6 +603,9 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
         wrapped = Box::pin(runtime_ctx::SUBAGENT_WRAP_UP_SIGNAL.scope(wrap_up_signal, wrapped));
     }
     wrapped = Box::pin(runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot_for_scope, wrapped));
+    // Scope the spawned future, including finalization and result publication. The parent's
+    // block_in_place calls only wait for this task; they do not execute the child turn.
+    wrapped = scope_sync_subagent_parent_policy(parent_agent_team_mode, wrapped);
     wrapped = Box::pin(runtime_ctx::SUBAGENT_DEPTH.scope(child_depth, wrapped));
     if is_traecli_backend {
         wrapped = Box::pin(runtime_ctx::SUBAGENT_TASK_ID.scope(task_id.clone(), wrapped));
@@ -1168,6 +1189,132 @@ fn subagent_history_path(base: &std::path::Path, task_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_task_parent_policy_captures_parent_before_fork_and_scopes_child() {
+        let _env_guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // Exercise the sync fork/spawn/blocking boundary without a model request. The
+        // kernel_parent_policy_* tests in finalize.rs verify the selected formatter's output.
+        for team_parent in [true, false] {
+            let mut app = crate::ai::middleware::test_util::test_app();
+            // A session default alone must not override the caller's active mode.
+            app.session_default_skills = vec!["agent-team".to_string()];
+            let parent = DriverContext::new(
+                app,
+                Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+            );
+            let (child_app, parent_agent_team_mode) =
+                runtime_ctx::DRIVER_CTX.sync_scope(parent.clone(), || {
+                    runtime_ctx::set_active_skill_names(if team_parent {
+                        vec!["agent-team".to_string()]
+                    } else {
+                        Vec::new()
+                    });
+                    fork_sync_subagent_with_parent_policy(&parent)
+                });
+            assert_eq!(parent_agent_team_mode, team_parent);
+            assert!(child_app.session_default_skills.is_empty());
+            let child = DriverContext::new(
+                child_app,
+                parent.mcp_client.clone(),
+                parent.skill_manifests.clone(),
+                parent.agent_manifests.clone(),
+            );
+
+            for expected_result in [Ok(()), Err("unchanged sync kernel error".to_string())] {
+                let result_slot: runtime_ctx::SubagentResultSlot = Arc::new(
+                    tokio::sync::Mutex::new(runtime_ctx::SubagentResult::default()),
+                );
+                let child_result = expected_result.clone();
+                let run: BoxedSubagentFuture = Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    assert!(!task_tools::is_agent_team_mode());
+                    assert_eq!(
+                        turn_runtime::SUBAGENT_PARENT_AGENT_TEAM_MODE.with(|mode| *mode),
+                        team_parent,
+                    );
+                    assert!(!runtime_ctx::terminal_output_enabled());
+                    runtime_ctx::publish_subagent_result(
+                        "unchanged parent payload",
+                        "{\"ok\":true}",
+                    )
+                    .await;
+                    child_result
+                });
+                let wrapped = scope_sync_subagent_parent_policy(parent_agent_team_mode, run);
+                let wrapped = suppress_subagent_terminal_output(wrapped);
+                let handle = tokio::spawn(runtime_ctx::DRIVER_CTX.scope(
+                    child.clone(),
+                    runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot.clone(), wrapped),
+                ));
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(handle)
+                })
+                .expect("child should finish without panicking");
+                assert_eq!(result, expected_result);
+                let captured = result_slot.lock().await;
+                assert_eq!(captured.parent_payload, "unchanged parent payload");
+                assert_eq!(captured.final_assistant_text, "{\"ok\":true}");
+                task_tools::validate_subagent_response(
+                    Some(&serde_json::json!({
+                        "type": "object",
+                        "required": ["ok"],
+                        "properties": { "ok": { "type": "boolean" } },
+                    })),
+                    &captured.final_assistant_text,
+                )
+                .expect("validation should still receive the original final answer");
+                assert!(
+                    turn_runtime::SUBAGENT_PARENT_AGENT_TEAM_MODE
+                        .try_with(|_| ())
+                        .is_err()
+                );
+                assert!(runtime_ctx::terminal_output_enabled());
+            }
+
+            for panic_child in [false, true] {
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                let run: BoxedSubagentFuture = Box::pin(async move {
+                    assert_eq!(
+                        turn_runtime::SUBAGENT_PARENT_AGENT_TEAM_MODE.with(|mode| *mode),
+                        team_parent,
+                    );
+                    ready_tx.send(()).expect("parent should still wait");
+                    if panic_child {
+                        panic!("expected sync parent policy test panic");
+                    }
+                    std::future::pending::<Result<(), String>>().await
+                });
+                let handle = tokio::spawn(runtime_ctx::DRIVER_CTX.scope(
+                    child.clone(),
+                    scope_sync_subagent_parent_policy(parent_agent_team_mode, run),
+                ));
+                ready_rx.await.expect("child should enter the policy scope");
+                if !panic_child {
+                    handle.abort();
+                }
+                let error = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(handle)
+                })
+                .expect_err("child should be cancelled or panic");
+                assert_eq!(error.is_panic(), panic_child);
+                assert_eq!(error.is_cancelled(), !panic_child);
+                assert!(
+                    turn_runtime::SUBAGENT_PARENT_AGENT_TEAM_MODE
+                        .try_with(|_| ())
+                        .is_err()
+                );
+            }
+            runtime_ctx::DRIVER_CTX.sync_scope(parent, || {
+                assert_eq!(task_tools::is_agent_team_mode(), team_parent);
+            });
+        }
+    }
 
     #[test]
     fn subagent_effort_accepts_the_reasoning_floor_and_keeps_the_shared_tiers() {

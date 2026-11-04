@@ -13,8 +13,8 @@ use super::super::types::{Message, ROLE_INTERNAL_NOTE, ROLE_SYSTEM, retained_tur
 use super::text_utils::truncate_to_chars;
 use super::tool_overflow::{
     build_tool_overflow_recall_lines, is_non_compressible_tool, is_preserved_tool_overflow_stub,
-    is_preserved_user_or_image_stub, plan_noncompressible_tool_result_for_fold,
-    stub_archive_display_path,
+    is_preserved_user_or_image_stub, is_task_evidence_review_line,
+    plan_noncompressible_tool_result_for_fold, stub_archive_display_path, tool_result_can_fold,
 };
 use super::{
     COMPRESSED_TOOL_EVIDENCE_MARKER, PlannedArchiveWrite, content_sha256_hex,
@@ -244,6 +244,27 @@ fn plan_tool_call_group_fold(
     if tool_calls.is_empty() {
         return None;
     }
+    // Whole-group folding must not bypass the per-result spill floor. Existing
+    // lossy summaries already replaced a large result; their small protocol
+    // text is safe to fold.
+    if group.iter().skip(1).any(|idx| {
+        let message = &messages[*idx];
+        let Some(call) = tool_calls
+            .iter()
+            .find(|call| message.tool_call_id.as_deref() == Some(call.id.as_str()))
+        else {
+            return false;
+        };
+        let text = value_to_string(&message.content);
+        let already_summarized = !is_non_compressible_tool(&call.function.name)
+            && text.starts_with("tool_output_lines: ");
+        !text.trim().is_empty()
+            && !is_preserved_tool_overflow_stub(&text)
+            && !already_summarized
+            && !tool_result_can_fold(&call.function.name, &text)
+    }) {
+        return None;
+    }
 
     let mut archives = Vec::new();
     let archive_file_path = if let Some(dir) = overflow_dir {
@@ -273,7 +294,10 @@ fn plan_tool_call_group_fold(
         tool_calls.len()
     ));
     lines.push("context_budget_note: folded for budget; not a file/command limit.".to_string());
-    lines.push("recovery_guidance: use evidence/archive before re-running; split large reads/patches.".to_string());
+    lines.push(
+        "recovery_guidance: use evidence/archive before re-running; split large reads/patches."
+            .to_string(),
+    );
     lines.push(COMPRESSED_TOOL_EVIDENCE_MARKER.to_string());
     if let Some(path) = archive_file_path.as_deref() {
         lines.push(format!(
@@ -304,7 +328,17 @@ fn plan_tool_call_group_fold(
     ));
     lines.push("evidence:".to_string());
 
-    for tc in tool_calls.iter().take(8) {
+    let mut omitted = 0usize;
+    for (index, tc) in tool_calls.iter().enumerate() {
+        // Task recovery locators must survive even beyond the ordinary recall
+        // display limit; the group archive retains every other omitted result.
+        if index >= 8
+            && crate::ai::tools::tool_history_policy(&tc.function.name).prune_policy()
+                != crate::ai::tools::registry::common::ToolPrunePolicy::AfterIntegration
+        {
+            omitted += 1;
+            continue;
+        }
         let result_text = group
             .iter()
             .skip(1)
@@ -325,11 +359,8 @@ fn plan_tool_call_group_fold(
             tc.function.name, target, invocation, recall
         ));
     }
-    if tool_calls.len() > 8 {
-        lines.push(format!(
-            "- ... ({} more tools omitted)",
-            tool_calls.len() - 8
-        ));
+    if omitted > 0 {
+        lines.push(format!("- ... ({omitted} more tools omitted)"));
     }
     // The `reuse evidence` guidance is only truthful when the group keeps a
     // recoverable pointer (a non-compressible tool spill, or an already-spilled
@@ -508,10 +539,7 @@ fn tool_result_recall_text(
     archives: &mut Vec<PlannedArchiveWrite>,
 ) -> Option<String> {
     let tool_name = tool_call.function.name.as_str();
-    let already_archived = result_text
-        .lines()
-        .map(str::trim)
-        .any(|line| line.starts_with("- file_path:") || line.starts_with("file_path:"));
+    let already_archived = is_preserved_tool_overflow_stub(result_text);
     if !is_non_compressible_tool(tool_name) || result_text.trim().is_empty() {
         let recall = tool_result_recall_one_liner(result_text);
         return Some(if already_archived {
@@ -615,7 +643,7 @@ fn collect_original_recall_lines(tool_call: &ToolCall, preserved: &str) -> Vec<S
         build_tool_overflow_recall_lines(&tool_call.function.name, &tool_call.function.arguments);
     let from_preserved = preserved.lines().filter_map(|line| {
         let line = line.trim();
-        line.starts_with("- original_").then_some(line)
+        (line.starts_with("- original_") || is_task_evidence_review_line(line)).then_some(line)
     });
 
     for line in from_call.iter().map(String::as_str).chain(from_preserved) {

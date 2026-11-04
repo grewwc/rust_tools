@@ -666,7 +666,9 @@ fn context_projection_fingerprint(
     // budget for the newest correction/pending tasks before older history.
     // Snapshots built under v17 may carry a mislabeled archive pointer or a
     // draft that dropped the latest intent, so they must be rebuilt.
-    const PROJECTION_VERSION: u8 = 18;
+    // v19: automatic tool-result folding has a shared size floor; task stubs
+    // retain task IDs, status, bounded conclusions, and evidence recovery locators.
+    const PROJECTION_VERSION: u8 = 19;
     projection_cache_key(
         PROJECTION_VERSION,
         history_max_chars,
@@ -1078,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_cache_key_is_versioned_and_v18_never_reuses_v17_snapshots() {
+    fn projection_cache_key_is_versioned_and_v19_never_reuses_older_snapshots() {
         let params = (
             8_000usize,
             2usize,
@@ -1088,23 +1090,22 @@ mod tests {
         let v17_key = projection_cache_key(17, params.0, params.1, params.2, params.3);
         let v18_key = projection_cache_key(18, params.0, params.1, params.2, params.3);
         assert_ne!(
-            v17_key,
-            v18_key,
+            v17_key, v18_key,
             "identical projection parameters must not collide across projection versions"
         );
         assert!(v17_key.starts_with("v17|"));
         assert!(v18_key.starts_with("v18|"));
-        // The live fingerprint must carry the current version, so a snapshot
-        // materialized under v17 (which could mislabel a transformed command
-        // result with its input archive, or drop the latest correction from
-        // the persisted summary draft) can no longer be looked up after the
-        // v18 reuse-gate and newest-first budget change. Updating the v18 literal is a
-        // deliberate tripwire for the next projection-strategy change.
+        // The live fingerprint must carry v19 so snapshots materialized under
+        // v18 and earlier are rebuilt with the shared tool-result folding floor
+        // and retained task evidence. Updating the v19 literal is a deliberate
+        // tripwire for the next projection-strategy change.
         let live = context_projection_fingerprint(params.0, params.1, params.2, params.3);
         assert_eq!(
             live,
-            projection_cache_key(18, params.0, params.1, params.2, params.3)
+            projection_cache_key(19, params.0, params.1, params.2, params.3)
         );
+        assert_ne!(live, v17_key);
+        assert_ne!(live, v18_key);
     }
 
     #[test]

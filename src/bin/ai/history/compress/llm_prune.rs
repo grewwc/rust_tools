@@ -36,7 +36,7 @@ use crate::ai::history::types::Message;
 use super::PruneAuthorization;
 use super::tool_overflow::{
     build_tool_call_arguments_index, build_tool_call_name_index, build_tool_overflow_recall_lines,
-    is_preserved_tool_overflow_stub, preserve_pruned_tool_result_stable,
+    is_preserved_tool_overflow_stub, preserve_pruned_tool_result_stable, tool_result_can_fold,
 };
 
 /// How many cumulative marks are needed before a message is offloaded/pruned.
@@ -51,7 +51,7 @@ pub(crate) const PRUNE_THRESHOLD: u8 = 2;
 
 /// Minimum inline size worth offloading after the recent-results window expires.
 /// The actual replacement still compares against the generated stub, ensuring the text only ever shrinks on every path.
-const PRUNE_MIN_CONTENT_CHARS: usize = 4_096;
+const PRUNE_MIN_CONTENT_CHARS: usize = super::tool_overflow::TOOL_RESULT_FOLD_MIN_CHARS;
 
 /// Tool results at or above this size are offloaded after a **single** model
 /// mark instead of [`PRUNE_THRESHOLD`].
@@ -492,7 +492,7 @@ fn active_raw_prunable_tool_ids(
             if message
                 .content
                 .as_str()
-                .is_none_or(|content| content.chars().count() < PRUNE_MIN_CONTENT_CHARS)
+                .is_none_or(|content| content.chars().count() <= PRUNE_MIN_CONTENT_CHARS)
             {
                 return None;
             }
@@ -505,6 +505,9 @@ fn active_raw_prunable_tool_ids(
             // authorization; an unresolvable name never reaches this point
             // because `protected_tool_call_ids` already protects it.
             let name = id_to_tool_name.get(id)?;
+            if !tool_result_can_fold(name, message.content.as_str()?) {
+                return None;
+            }
             super::folded_prune::tool_allows_explicit_prune_now(
                 name,
                 message.content.as_str()?,
@@ -696,7 +699,12 @@ pub(crate) fn explain_rejected_prune_mark_authorized(
     if message
         .content
         .as_str()
-        .is_none_or(|content| content.chars().count() < PRUNE_MIN_CONTENT_CHARS)
+        .is_none_or(|content| content.chars().count() <= PRUNE_MIN_CONTENT_CHARS)
+    {
+        return Some("below the minimum size for pruning");
+    }
+    if let Some(name) = id_to_tool_name.get(tool_call_id)
+        && !tool_result_can_fold(name, content)
     {
         return Some("below the minimum size for pruning");
     }
@@ -885,6 +893,7 @@ fn offload_raw_result(
     let id = message.tool_call_id.as_deref()?;
     let content = message.content.as_str()?;
     if is_preserved_tool_overflow_stub(content)
+        || !tool_result_can_fold(tool_name, content)
         || !super::folded_prune::tool_allows_explicit_prune_now(tool_name, content, authorization)
     {
         return None;
@@ -942,7 +951,7 @@ pub(crate) fn reclaim_under_pressure_authorized(
             && is_prunable_message(message)
             && !id.starts_with(super::folded_prune::FOLD_ID_PREFIX)
             && !is_preserved_tool_overflow_stub(content)
-            && chars >= PRUNE_MIN_CONTENT_CHARS
+            && chars > PRUNE_MIN_CONTENT_CHARS
         {
             candidates.push((index, id.to_string(), chars, None));
         }
@@ -1493,8 +1502,10 @@ mod tests {
             .find_map(|line| line.trim().strip_prefix("- file_path: "))
             .expect("stub must carry an archived file_path");
         let archived_path = super::super::tool_overflow::archived_asset_path_from_raw(
-            path_line.trim(), &overflow_dir,
-        ).expect("stub must resolve to a session archive");
+            path_line.trim(),
+            &overflow_dir,
+        )
+        .expect("stub must resolve to a session archive");
         let archived = std::fs::read_to_string(&archived_path).unwrap();
         assert!(archived.contains("very long outdated result that should be pruned"));
         // call_keep's content unchanged (count < threshold)
@@ -1555,7 +1566,7 @@ mod tests {
         let build = || {
             vec![
                 make_assistant_tool_call("call_old", "read_file"),
-                make_tool_message("call_old", &"stable archived body\n".repeat(100)),
+                make_tool_message("call_old", &"stable archived body\n".repeat(400)),
                 make_assistant_tool_call("call_r1", "execute_command"),
                 make_tool_message("call_r1", "recent 1"),
                 make_assistant_tool_call("call_r2", "execute_command"),
@@ -1633,7 +1644,7 @@ mod tests {
             make_user_message("important user question"),
             make_assistant_message("important assistant response"),
             make_assistant_tool_call("call_1", "execute_command"),
-            make_tool_message("call_1", &"outdated tool result\n".repeat(100)),
+            make_tool_message("call_1", &"outdated tool result\n".repeat(400)),
             make_assistant_tool_call("call_2", "execute_command"),
             make_tool_message("call_2", "current tool result"),
             make_assistant_tool_call("call_3", "execute_command"),
@@ -1868,7 +1879,7 @@ mod tests {
         let mut messages = vec![make_user_message("request")];
         messages.extend([
             make_assistant_tool_call("call_old", "execute_command"),
-            make_tool_message("call_old", &"old result ".repeat(200)),
+            make_tool_message("call_old", &"old result ".repeat(800)),
         ]);
         for index in 0..4 {
             let id = format!("call_recent_{index}");
@@ -1905,12 +1916,12 @@ mod tests {
 
         let mut messages = vec![
             make_assistant_tool_call("call_1", "execute_command"),
-            // Keep payloads larger than their archive pointers and recall previews.
-            make_tool_message("call_1", &"result 1\n".repeat(300)),
+            // Keep payloads above the shared floor and larger than their archive pointers.
+            make_tool_message("call_1", &"result 1\n".repeat(1_000)),
             make_assistant_tool_call("call_2", "execute_command"),
-            make_tool_message("call_2", &"result 2\n".repeat(300)),
+            make_tool_message("call_2", &"result 2\n".repeat(1_000)),
             make_assistant_tool_call("call_3", "execute_command"),
-            make_tool_message("call_3", &"result 3\n".repeat(300)),
+            make_tool_message("call_3", &"result 3\n".repeat(1_000)),
             make_assistant_tool_call("call_4", "execute_command"),
             make_tool_message("call_4", "old unmarked result"),
             make_assistant_tool_call("call_5", "execute_command"),
@@ -2148,7 +2159,7 @@ mod tests {
         let mut content = String::new();
         for task_id in task_ids {
             content.push_str(&format!("[task_id={task_id}]\n"));
-            content.push_str(&"subagent conclusion line\n".repeat(300));
+            content.push_str(&"subagent conclusion line\n".repeat(3_000));
         }
         content
     }
@@ -2166,6 +2177,61 @@ mod tests {
             messages.push(make_tool_message(&id, "recent result"));
         }
         messages
+    }
+
+    #[test]
+    fn test_integrated_task_evidence_keeps_small_results_inline() {
+        let overflow_dir = make_overflow_dir();
+        let authorization = integration_authorization(&["task_a"]);
+        for name in ["task_wait", "task_evidence_read"] {
+            let cap = super::super::tool_overflow::TOOL_RESULT_FOLD_MIN_CHARS;
+            let prefix = "[task_id=task_a]\n";
+            let content = format!("{prefix}{}", "e".repeat(cap - prefix.chars().count()));
+            let mut messages = vec![
+                make_assistant_tool_call("call_sub", name),
+                make_tool_message("call_sub", &content),
+            ];
+            for index in 0..4 {
+                let id = format!("call_recent_{index}");
+                messages.push(make_assistant_tool_call(&id, "read_file"));
+                messages.push(make_tool_message(&id, "recent result"));
+            }
+            assert!(
+                !active_prunable_tool_ids_authorized(&messages, &authorization)
+                    .contains("call_sub")
+            );
+            assert_eq!(
+                reclaim_under_pressure_authorized(
+                    &mut messages,
+                    Some(&overflow_dir),
+                    &authorization
+                )
+                .pruned_count,
+                0
+            );
+            assert_eq!(messages[1].content.as_str().unwrap(), content);
+            messages[1].content = Value::String(format!("{content}e"));
+            assert!(
+                active_prunable_tool_ids_authorized(&messages, &authorization).contains("call_sub")
+            );
+            assert_eq!(
+                reclaim_under_pressure_authorized(
+                    &mut messages,
+                    Some(&overflow_dir),
+                    &authorization
+                )
+                .pruned_count,
+                1
+            );
+            assert!(
+                messages[1]
+                    .content
+                    .as_str()
+                    .unwrap()
+                    .contains("task_evidence_read(")
+            );
+        }
+        let _ = std::fs::remove_dir_all(overflow_dir);
     }
 
     #[test]
@@ -2263,9 +2329,8 @@ mod tests {
             1
         );
 
-        // The stub no longer carries the task markers, so retention follows how
-        // the stub was created; deriving it from the stub text instead would drop
-        // the mark and make the offload flap on the next request.
+        // Retention follows how the stub was created; its recovery task markers
+        // must not make the archived result a new offload candidate.
         assert!(retained_prune_ids_authorized(&messages, &authorization).contains("call_sub"));
         assert!(
             !active_prunable_tool_ids_authorized(&messages, &authorization).contains("call_sub")
@@ -2391,8 +2456,9 @@ mod tests {
             .find_map(|line| line.trim().strip_prefix("- file_path: "))
             .expect("stub must carry an archived file_path")
             .trim();
-        let archived_path = super::super::tool_overflow::archived_asset_path_from_raw(raw, &overflow_dir)
-            .expect("stub must resolve to a session archive");
+        let archived_path =
+            super::super::tool_overflow::archived_asset_path_from_raw(raw, &overflow_dir)
+                .expect("stub must resolve to a session archive");
         assert!(
             std::fs::read_to_string(&archived_path)
                 .unwrap()
@@ -2464,7 +2530,7 @@ mod tests {
             make_tool_message("call_recent_4", "recent 4"),
         ];
         // Eligible backlog: 44K + 35K. The plan body (60K), the subagent
-        // delivery (~60K), and the newest-window result (57K) are all larger
+        // delivery (>64K), and the newest-window result (57K) are all larger
         // than the first eligible pick.
 
         let report = reclaim_under_pressure_authorized(

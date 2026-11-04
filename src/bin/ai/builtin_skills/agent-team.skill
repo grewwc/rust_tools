@@ -17,8 +17,8 @@ tool_groups:
 
 ### Non-negotiable first action
 
-Before any tool call other than `plan`, the parent must call `task`/`task_spawn`
-(use `task_spawn` in this mode), or write one line:
+Before any tool call other than `plan`, the parent must call `task_spawn`, or
+write one line:
 `Delegation skip: <concrete reason delegation is impossible or unsafe>.`
 Apply this checkpoint before gathering context; delegate using the supplied
 URL, file path, or command without reading or running it first.
@@ -38,7 +38,8 @@ For every request, perform a delegation checkpoint before any execution:
 identify the goal, constraints, acceptance criteria, and responsibilities the
 parent must keep. Delegate every piece of execution that can be specified in a
 self-contained prompt, including breakdown and implementation design, and keep
-the parent focused on scope, scheduling, review, and the user-facing answer.
+the parent focused on scope, scheduling, acceptance, and synthesis of the
+user-facing answer.
 
 This is a requirement, not a quota: do not invent work, but the bar for keeping
 work in the parent is "delegation is impossible or unsafe", not "it looks
@@ -51,14 +52,14 @@ Maximize delegation. When a subagent backend is available, hand every work item
 that can be specified in a self-contained prompt to a worker — including
 discovery, small edits, bounded investigations, verification runs, and
 documentation. Default to a requirement-level handoff: give the goal,
-constraints, and acceptance criteria; have the worker propose the breakdown
-and implementation design. Do not require a concrete design or full task
-breakdown from the parent before delegating.
+constraints, and acceptance criteria; have the worker propose the implementation
+breakdown and design. Do not require a concrete solution design from the parent;
+the parent defines the evidence split and write ownership, not the solution.
 
 Keep in the parent only:
 
-- scheduling and acceptance;
-- product or scope decisions that steer the work;
+- scope, scheduling, and acceptance;
+- product decisions that steer the work;
 - coordinating overlapping writes: assign each writer disjoint ownership, or
   hand the whole tightly coupled edit to one worker instead of doing it in the
   parent;
@@ -72,12 +73,13 @@ If the parent catches itself reading files, running verification, or editing
 code without delegation, it must delegate the remaining work with the context
 already gathered and disclose the skipped step.
 
-Bounded exception, trivial atomic actions: a single tool call with no
-investigation benefit, whose output needs no analysis and where spawning a
-worker costs more than the work itself, should stay in the parent, e.g. one
-`git status`, one `git push`, or one short file read to verify an edit. It is
-never a file edit (writes keep single-writer ownership). Anything needing
-search, analysis, multiple steps, or context isolation is still delegated.
+Bounded exception, trivial atomic actions: a single scheduling or acceptance
+tool call whose output needs no analysis and where spawning a worker costs more
+than the work itself, should stay in the parent, e.g. one `git status` before
+dispatch or one `git push` after acceptance. It is never a file edit (writes
+keep single-writer ownership), and a read that gathers or verifies evidence
+belongs to a worker. Anything needing search, analysis, multiple steps, or
+context isolation is still delegated.
 
 ## Priority over generic heuristics
 
@@ -107,17 +109,56 @@ A worker branch must be sized to its own bounded turn budget: the default subage
 
 ## Orchestration strategy
 
-1. Delegate requirements: have workers propose the breakdown and implementation
-   design, then execute within the requirements. Split known independent
-   workstreams for parallel throughput; use a planning-first worker when the
-   split needs investigation. Keep the final cross-worker split, scope and
-   product decisions, consequential-risk decisions, scheduling, acceptance,
-   final review, and synthesis in the parent; coordinate overlapping edits
-   through disjoint ownership.
-2. Use `task_spawn` with a `tasks` array for every delegation, including a single worker. Do not use the synchronous `task` tool in this mode: it blocks the parent and hides whether a worker actually started. `task_spawn`'s immediate per-task status confirms registration; a `failed` entry is a definite preflight failure (including a missing backend binary), and a whole-batch preflight failure comes back as a tool-level error. Then use `task_status` to confirm spawned workers reached `running`; a backend that cannot start transitions to `failed` within the startup watchdog, so do not wait for the full `task_wait` budget to notice. Use `task_wait` only when the parent is blocked on results.
-3. Use `manage_team` only for durable, dependency-aware multi-phase work where named roles, task ownership, messaging, or resumable orchestration add real value.
-4. Use `run_agent_graph` only when an explicit DAG, reducer, conditional path, or structured multi-perspective pooling is materially better than ordinary task delegation.
-5. Do not delegate from a subagent. Subagents are leaf workers; the parent owns orchestration.
+### Dispatch, wait, and stop discipline
+
+- Enumerate all independent branches before dispatch, then send them together
+  in one `task_spawn` call (up to 8); never spawn-wait-spawn-wait independent work.
+- Prefer fewer, larger branches, each owning a self-contained deliverable sized
+  to the subagent iteration budget, over many small tasks.
+- While useful parent-side work remains, poll with non-blocking `task_status`.
+  Call `task_wait` only when blocked on results, using `wait_policy=all` and one
+  generous budget, then re-check `task_status`; budget expiry or `PARKED` is normal.
+- Once a branch's decision is settled or its scope is superseded, use
+  `task_cancel` instead of waiting. Do not cancel needed work that is advancing.
+- Allow at most 2 rework rounds per branch; then narrow its scope or finish in
+  the parent.
+- Use `task_evidence_read` only for delivered claims the parent will reuse; do
+  not request exhaustive logs.
+
+1. Define the evidence split up front — each branch's question, scope, inputs,
+   and acceptance criteria — then dispatch all independent branches in ONE
+   `task_spawn` call (up to 8). Never drip-feed one task and wait before
+   spawning the next, and never serialize independent spawns. When the split
+   itself needs investigation, run one planning-first worker, then batch the
+   resulting branches. For implementation work, let workers propose the
+   breakdown and design. Keep the final cross-worker split, scope and product
+   decisions, consequential-risk decisions, scheduling, acceptance, final
+   review, and synthesis in the parent; coordinate overlapping edits through
+   disjoint ownership.
+2. For a code review or audit, start with 3-5 broad, disjoint evidence branches
+   — for example subsystem A, subsystem B, contracts/tests, and adversarial
+   verification — instead of many single-question micro-tasks. The parent
+   integrates the returned evidence, then spawns follow-ups only for specific
+   gaps.
+3. Use `task_spawn` with a `tasks` array for every delegation, including a single worker. Do not use the synchronous `task` tool in this mode: it blocks the parent and hides whether a worker actually started. `task_spawn`'s immediate per-task status confirms registration; a `failed` entry is a definite preflight failure (including a missing backend binary), and a whole-batch preflight failure comes back as a tool-level error. Then use `task_status` to confirm spawned workers reached `running`; a backend that cannot start transitions to `failed` within the startup watchdog, so do not wait for the full `task_wait` budget to notice.
+4. Use `manage_team` only for durable, dependency-aware multi-phase work where named roles, task ownership, messaging, or resumable orchestration add real value.
+5. Use `run_agent_graph` only when an explicit DAG, reducer, conditional path, or structured multi-perspective pooling is materially better than ordinary task delegation.
+6. Do not delegate from a subagent. Subagents are leaf workers; the parent owns orchestration.
+
+## Quiet mode
+
+This workflow takes precedence over routine startup checks, status polling, and
+post-wait status rechecks described elsewhere in this skill.
+
+- When blocked on results, prefer one `task_wait` with `wait_policy=all`. The
+  runtime uses a 240s quiet deadline and delivers terminal results as they arrive;
+  deadline expiry is normal scheduling and does not prove a stall.
+- Avoid `task_status` polling. Request a targeted status snapshot only when a
+  scheduling or cancellation decision needs the current state.
+- Use `task_evidence_read` for detail, including `source=delivered` for claims
+  taken from a delivered result; compact previews are recovery locators.
+- Ask subagents for short summaries, remaining uncertainty, and artifact paths.
+  Keep detailed logs and large excerpts in artifacts for selective recovery.
 
 ## Subagent contract
 
@@ -138,11 +179,10 @@ Network and workspace access follow `inherit` for fresh traecli runs: without `c
 ## Parent responsibilities
 
 - Centralize scope and product decisions; coordinate overlapping writes. Parallel writers must have disjoint files or explicitly non-overlapping ownership.
-- Default to maximum delegation: before executing anything, check whether a worker could do it from a self-contained prompt.
-- Treat subagent output as evidence to review, not authority. Double-check decision-bearing claims and inspect edits before accepting them.
+- Do not let scheduling expand into execution: outside the trivial atomic exception, do not run a read or command that gathers or verifies evidence; if a worker could do it from a self-contained prompt, delegate it.
+- Treat subagent output as evidence to review, not authority. Double-check decision-bearing claims and inspect the edits workers report before accepting them.
 - A folded, truncated, or checkpointed task result is a locator, not evidence. Before repeating numbers, quoted output, or absence claims, read the delivered payload with `task_evidence_read(source=delivered)` or the named archive; the inline preview is only a recall anchor. Do not mark a task integrated until that read is done and the claims you will reuse are checked.
-- Follow the runtime task-tool guidance for integration, status, waiting, cancellation, evidence recovery, and retries. Confirm startup with `task_status` instead of blocking on `task_wait`.
-- Cancel on progress, not on wait budget. A `task_wait` timeout is normal scheduling, not a stall signal. While `task_status` shows recent `last activity` or advancing progress snapshots, do not cancel; keep waiting with `task_wait`/`task_status`. Consider `task_cancel` only when the branch is no longer needed, its scope changed, or it failed, or after a sustained period of zero progress where a fresh `task_status` snapshot confirms it is genuinely stalled rather than slow.
+- Follow the runtime task-tool guidance for integration, evidence recovery, and retries. Wait only when blocked on results, with the full 240s `task_wait` budget; `PARKED` or `TIMEOUT` is normal scheduling, not a stall signal, and is never a reason to cancel. While `task_status` shows recent `last activity` or advancing progress, keep waiting. Cancel a branch when its scope changed, it failed, a fresh `task_status` snapshot confirms sustained zero progress, or its result is no longer needed; once the task's acceptance criteria are met, cancel remaining low-value or superseded branches instead of awaiting them.
 - Synthesize one coherent final answer. Do not dump raw subagent transcripts or make the user coordinate the team.
 
 ## Backend selection and rework loop
@@ -150,15 +190,19 @@ Network and workspace access follow `inherit` for fresh traecli runs: without `c
 - Leave `backend` at its default unless a branch needs isolated execution or a resumable session; choose per branch, not per turn.
 - Omit `backend_model` unless the branch clearly needs a non-default model.
 - When rework is needed, batch all review comments into one follow-up and send it back to the same session via `backend_continue_from` with the previous `task_id`, instead of spawning a fresh task.
-- Bound the loop: at most 2 rework rounds per branch; if it still does not converge, narrow the scope or finish the work in the parent only when delegation is impossible or unsafe.
+- Bound the loop: at most 2 rework rounds per branch and at most 2 evidence rounds per disputed claim. If a claim is still unresolved after 2 evidence rounds, report the conflict, the competing evidence, and what would settle it; do not spawn another round. If rework still does not converge, narrow the scope or report the unresolved item; move work into the parent only when delegation is impossible or unsafe.
 
 ## Anti-patterns
 
-- retain executable work in the parent when a worker could do it, including discovery, edits, and verification;
+- retain executable work in the parent when a worker could do it, including discovery reads, commands, edits, and verification;
 - stretch the trivial atomic action exception to cover search, analysis, multi-step work, or edits;
 - spawn a worker for one trivial atomic action whose spawn costs more than the work;
 - treat delegation as reserved for large or multi-branch work;
-- cancel a worker whose progress is still advancing, or only because `task_wait` timed out;
+- drip-feed one task and wait before spawning the next, or serialize independent spawns instead of one batch;
+- start a review with many single-question micro-tasks instead of 3-5 broad disjoint evidence branches;
+- keep awaiting low-value or superseded branches after the acceptance criteria are met;
+- spawn a third evidence round on a disputed claim instead of reporting the unresolved conflict;
+- cancel a worker whose progress is still advancing while its result is still needed, or only because `task_wait` timed out;
 - keep a tightly coupled edit in the parent instead of assigning the whole edit to one worker;
 - split one tightly coupled edit across multiple writers;
 - delegate several versions of the same tightly coupled edit;

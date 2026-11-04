@@ -1,12 +1,12 @@
-use super::tool_overflow::is_preserved_tool_overflow_stub;
+use super::tool_overflow::{
+    TOOL_RESULT_FOLD_MIN_CHARS, build_preserved_tool_overflow_stub_with_archive,
+    is_preserved_tool_overflow_stub, task_evidence_review_lines,
+};
 use super::*;
 use crate::ai::types::{FunctionCall, ToolCall};
 use rustc_hash::FxHashSet;
 
-/// Legacy-threshold wrapper for the tests below: they exercise the spill
-/// mechanics, so every non-compressible result over the per-message cap folds
-/// regardless of size. Floor-aware behavior is asserted by the
-/// `mid_turn_spill_floor_*` tests, which call the parent module directly.
+/// Fallback wrapper: a zero caller threshold still observes the shared floor.
 fn prepare_tool_messages_structured(
     messages: &mut [Message],
     max_chars_per_msg: usize,
@@ -39,6 +39,7 @@ fn mid_turn_spill_floor_keeps_small_results_inline() {
         .join("\n");
     assert!(doc.chars().count() > 480);
     assert!(doc.chars().count() < MID_TURN_SPILL_MIN_CHARS);
+    assert!(doc.chars().count() < TOOL_RESULT_FOLD_MIN_CHARS);
     let mut messages = vec![
         assistant_call("old", "read_file"),
         tool_result("old", &doc),
@@ -57,11 +58,782 @@ fn mid_turn_spill_floor_keeps_small_results_inline() {
     );
 
     assert_eq!(value_to_string(&messages[1].content), doc);
+    // Exercise each fallback, including whole-group folding with no retention
+    // window. A small but spillable preview-shaped read must stay verbatim.
+    super::prepare_tool_messages_structured(
+        &mut messages,
+        480,
+        0,
+        0,
+        Some(&overflow_dir),
+        None,
+        &FxHashSet::default(),
+    );
+    let protected = ["old".to_string()].into_iter().collect();
+    enforce_protected_precision_group_budget(
+        &mut messages,
+        2,
+        0,
+        Some(&overflow_dir),
+        None,
+        &protected,
+        true,
+    );
+    assert_eq!(
+        spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected,),
+        0
+    );
+    let (folded, count) =
+        fold_early_tool_groups(&messages, 0, Some(&overflow_dir), &FxHashSet::default());
+    assert_eq!(count, 0);
+    assert_eq!(value_to_string(&folded[1].content), doc);
+    let shrunk = shrink_messages_to_fit(messages, 1, Some(&overflow_dir), None, &protected);
+    assert!(
+        shrunk
+            .iter()
+            .any(|message| message.tool_call_id.as_deref() == Some("old")
+                && value_to_string(&message.content) == doc)
+    );
     let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
     assert!(
         !archive_dir.exists() || std::fs::read_dir(&archive_dir).unwrap().count() == 0,
         "a below-floor result must not be archived"
     );
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn small_tool_results_survive_soft_compaction_and_automatic_caps() {
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-generic-truncation-floor-{}",
+        uuid::Uuid::new_v4()
+    ));
+    for chars in [
+        3_000,
+        TOOL_RESULT_FOLD_MIN_CHARS - 1,
+        TOOL_RESULT_FOLD_MIN_CHARS,
+    ] {
+        for name in ["read_file", "text_grep", "task_wait"] {
+            let content = "文".repeat(chars);
+            let original = vec![
+                assistant_call("small", name),
+                tool_result("small", &content),
+            ];
+            let protected = ["small".to_string()].into_iter().collect();
+            for ids in [&FxHashSet::default(), &protected] {
+                let mut direct = original[1].clone();
+                assert!(!truncate_mutable_field(
+                    &mut direct,
+                    MutableMessageField::Content,
+                    chars,
+                    Some(&overflow_dir),
+                    FieldArchivePolicy::BestEffort
+                ));
+                assert_eq!(value_to_string(&direct.content), content);
+                let mut soft = original.clone();
+                assert!(!truncate_unprotected_messages_to_fit(
+                    &mut soft,
+                    128,
+                    Some(&overflow_dir),
+                    ids
+                ));
+                let shrunk =
+                    shrink_messages_to_fit(original.clone(), 128, Some(&overflow_dir), None, ids);
+                for candidate in [soft, shrunk] {
+                    assert!(
+                        candidate
+                            .iter()
+                            .any(|message| message.tool_call_id.as_deref() == Some("small")
+                                && value_to_string(&message.content) == content),
+                        "{name}, {chars}: a generic backstop changed the result"
+                    );
+                }
+            }
+            let mut capped = original;
+            assert_eq!(
+                cap_oversized_tool_results_for_context(
+                    &mut capped,
+                    160,
+                    0,
+                    Some(&overflow_dir),
+                    None
+                ),
+                0
+            );
+            assert_eq!(value_to_string(&capped[1].content), content);
+        }
+    }
+    assert!(
+        !overflow_dir.exists(),
+        "small raw results must not create archives"
+    );
+
+    let content = "large result\n".repeat(500);
+    for emergency in [false, true] {
+        let mut candidate = vec![
+            assistant_call("large", "text_grep"),
+            tool_result("large", &content),
+        ];
+        if emergency {
+            emergency_cap_messages_to_fit(
+                &mut candidate,
+                700,
+                600,
+                Some(&overflow_dir),
+                &FxHashSet::default(),
+            );
+        } else {
+            truncate_mutable_messages_to_fit(
+                &mut candidate,
+                700,
+                Some(&overflow_dir),
+                &FxHashSet::default(),
+            );
+        }
+        let result = candidate
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("large"))
+            .unwrap();
+        assert!(value_to_string(&result.content).chars().count() < content.chars().count());
+        assert!(value_to_string(&result.content).contains("archived at:"));
+    }
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn accumulated_small_current_turn_results_fit_the_hard_budget() {
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-small-results-hard-budget-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let mut original = vec![Message {
+        role: "user".to_string(),
+        content: Value::from("Inspect these results."),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let mut protected = FxHashSet::default();
+    for index in 0..8 {
+        let id = format!("small-{index}");
+        protected.insert(id.clone());
+        original.push(assistant_call_args(
+            &id,
+            "text_grep",
+            &serde_json::json!({"pattern": format!("result-{index}")}).to_string(),
+        ));
+        original.push(tool_result(
+            &id,
+            &format!("result {index}: {}", "文".repeat(3_000)),
+        ));
+    }
+    let budget = 12_000;
+    assert!(messages_total_chars(&original) > budget);
+    for ids in [&FxHashSet::default(), &protected] {
+        let mut soft = original.clone();
+        assert!(!truncate_unprotected_messages_to_fit(
+            &mut soft,
+            budget,
+            Some(&overflow_dir),
+            ids
+        ));
+        assert_eq!(
+            soft, original,
+            "soft compaction must still preserve the floor"
+        );
+        for path in ["hard", "emergency", "final"] {
+            let mut candidate = original.clone();
+            match path {
+                "hard" => assert!(truncate_mutable_messages_to_fit(
+                    &mut candidate,
+                    budget,
+                    Some(&overflow_dir),
+                    ids
+                )),
+                "emergency" => {
+                    emergency_cap_messages_to_fit(
+                        &mut candidate,
+                        budget,
+                        TOOL_RESULT_FOLD_MIN_CHARS,
+                        Some(&overflow_dir),
+                        ids,
+                    );
+                }
+                _ => {
+                    candidate = shrink_messages_to_fit_with_summary(
+                        candidate,
+                        budget,
+                        0,
+                        Some(&overflow_dir),
+                        None,
+                        ids,
+                    )
+                }
+            }
+            assert!(messages_total_chars(&candidate) <= budget, "{path}");
+            assert!(candidate.iter().any(|message| message.role == "user"
+                && value_to_string(&message.content) == "Inspect these results."));
+            for index in 0..8 {
+                let id = format!("small-{index}");
+                assert!(
+                    candidate
+                        .iter()
+                        .any(|message| message.tool_call_id.as_deref() == Some(id.as_str())),
+                    "{path}: {id}"
+                );
+                assert!(
+                    candidate.iter().any(|message| message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| calls.iter().any(|call| call.id == id))),
+                    "{path}: {id}"
+                );
+            }
+            let oldest = candidate
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some("small-0"))
+                .unwrap();
+            assert!(
+                value_to_string(&oldest.content).contains("archived at:"),
+                "{path}"
+            );
+            let newest = candidate
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some("small-7"))
+                .unwrap();
+            assert_eq!(newest.content, original.last().unwrap().content, "{path}");
+        }
+    }
+    let archive = std::fs::read_to_string(overflow_dir.join(OVERFLOW_HISTORY_FILENAME)).unwrap();
+    assert!(archive.contains(&value_to_string(&original[2].content)));
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn synchronous_task_results_keep_uuid_review_and_recovery() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-sync-task-review-{}", uuid::Uuid::new_v4()));
+    for task_id in [
+        "0123456789abcdef0123456789abcdef",
+        "01234567-89ab-cdef-0123-456789abcdef",
+        "task_async",
+    ] {
+        let content = format!(
+            "[task_id={task_id}]\n[Task: inspect via worker @ model] COMPLETED after 1.0s\nConclusion: verified synchronous task.\n{}\nFinal conclusion: retain recovery.",
+            "supporting evidence\n".repeat(500)
+        );
+        let mut candidate = vec![
+            assistant_call("sync", "task"),
+            tool_result("sync", &content),
+        ];
+        prepare_tool_messages_structured(
+            &mut candidate,
+            480,
+            0,
+            Some(&overflow_dir),
+            None,
+            &FxHashSet::default(),
+        );
+        let stub = value_to_string(&candidate[1].content);
+        assert!(is_preserved_tool_overflow_stub(&stub), "{stub}");
+        assert!(stub.chars().count() < content.chars().count());
+        for retained in [
+            stub.clone(),
+            collapse_overflow_stub_to_anchor(&stub).unwrap(),
+            minimize_overflow_stub_to_pointer(&stub).unwrap(),
+        ] {
+            assert!(
+                retained.contains(&format!("task_id={task_id}; status=completed")),
+                "{retained}"
+            );
+            assert!(
+                retained.contains("Conclusion: verified synchronous task."),
+                "{retained}"
+            );
+            assert!(
+                retained.contains("Final conclusion: retain recovery."),
+                "{retained}"
+            );
+            assert!(
+                retained.contains(&format!(
+                    "task_evidence_read({})",
+                    serde_json::json!({"task_id": task_id, "source": "delivered"})
+                )),
+                "{retained}"
+            );
+            assert_eq!(
+                task_evidence_review_lines(&retained),
+                task_evidence_review_lines(&content)
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn large_progress_evidence_keeps_progress_recovery_through_compression() {
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-progress-evidence-review-{}",
+        uuid::Uuid::new_v4()
+    ));
+    for explicit_source in [false, true] {
+        let mut evidence = serde_json::json!({
+            "version": 1, "task_id": "task_progress", "status": "running", "phase": "working",
+            "checkpoint_excerpt": "Confirmed the running task path.", "checkpoint_revision": 2,
+            "timeline": [{"summary": "supporting progress detail".repeat(300)}]
+        });
+        if explicit_source {
+            evidence["source"] = Value::from("progress");
+        }
+        let content = evidence.to_string();
+        assert!(content.chars().count() > TOOL_RESULT_FOLD_MIN_CHARS);
+        let mut candidate = vec![
+            assistant_call_args(
+                "progress",
+                "task_evidence_read",
+                r#"{"task_id":"task_progress","source":"progress"}"#,
+            ),
+            tool_result("progress", &content),
+        ];
+        prepare_tool_messages_structured(
+            &mut candidate,
+            480,
+            0,
+            Some(&overflow_dir),
+            None,
+            &FxHashSet::default(),
+        );
+        let stub = value_to_string(&candidate[1].content);
+        assert!(stub.chars().count() < content.chars().count(), "{stub}");
+        assert!(is_preserved_tool_overflow_stub(&stub), "{stub}");
+        let pointer = format!(
+            "task_evidence_read({})",
+            serde_json::json!({
+                "task_id": "task_progress", "source": "progress"
+            })
+        );
+        for retained in [
+            stub.clone(),
+            collapse_overflow_stub_to_anchor(&stub).unwrap(),
+            minimize_overflow_stub_to_pointer(&stub).unwrap(),
+        ] {
+            assert!(retained.contains(&pointer), "{retained}");
+            assert!(retained.contains("task_id=task_progress"), "{retained}");
+            assert!(retained.contains("status=running"), "{retained}");
+            assert!(
+                retained.contains("Confirmed the running task path."),
+                "{retained}"
+            );
+            assert!(!retained.contains(r#""source":"delivered""#), "{retained}");
+        }
+        let (folded, count) =
+            fold_early_tool_groups(&candidate, 0, Some(&overflow_dir), &FxHashSet::default());
+        assert_eq!(count, 1);
+        assert!(value_to_string(&folded[0].content).contains(&pointer));
+    }
+    std::fs::remove_dir_all(overflow_dir).unwrap();
+}
+
+#[test]
+fn large_task_evidence_compresses_with_review_and_delivery_recovery() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-task-evidence-review-{}", uuid::Uuid::new_v4()));
+    for name in ["task_wait", "task_evidence_read"] {
+        for status in ["completed", "failed", "timeout", "cancelled"] {
+            let conclusion = format!(
+                "Conclusion: {status} findings verified.\n{}\nFinal conclusion: retain the review evidence.\n{}",
+                "supporting detail\n".repeat(700),
+                crate::ai::tools::task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER
+            );
+            let content = if name == "task_wait" {
+                format!(
+                    "[task_id=task_review]\n[Task: review via worker @ model] {} after 1.0s\n{conclusion}",
+                    status.to_uppercase()
+                )
+            } else {
+                serde_json::json!({"task_id": "task_review", "source": "delivered", "status": "delivered", "terminal_status": status, "payload": conclusion}).to_string()
+            };
+            assert!(content.chars().count() > TOOL_RESULT_FOLD_MIN_CHARS);
+            assert!(content.chars().count() < super::persisted::TOOL_RESULT_RAW_HARD_CAP_CHARS);
+            let original = vec![
+                assistant_call_args(
+                    "review",
+                    name,
+                    r#"{"task_id":"task_review","source":"delivered"}"#,
+                ),
+                tool_result("review", &content),
+            ];
+            for generic in [false, true] {
+                let mut candidate = original.clone();
+                if generic {
+                    assert!(truncate_mutable_field(
+                        &mut candidate[1],
+                        MutableMessageField::Content,
+                        content.chars().count(),
+                        Some(&overflow_dir),
+                        FieldArchivePolicy::BestEffort
+                    ));
+                } else {
+                    prepare_tool_messages_structured(
+                        &mut candidate,
+                        480,
+                        0,
+                        Some(&overflow_dir),
+                        None,
+                        &FxHashSet::default(),
+                    );
+                }
+                let stub = value_to_string(&candidate[1].content);
+                assert!(stub.chars().count() < content.chars().count(), "{stub}");
+                assert!(is_preserved_tool_overflow_stub(&stub), "{stub}");
+                for retained in [
+                    stub.clone(),
+                    collapse_overflow_stub_to_anchor(&stub).unwrap(),
+                    minimize_overflow_stub_to_pointer(&stub).unwrap(),
+                ] {
+                    assert!(retained.contains("task_id=task_review"), "{retained}");
+                    assert!(retained.contains(&format!("status={status}")), "{retained}");
+                    assert!(retained.contains("Conclusion:"), "{retained}");
+                    assert!(retained.contains("Final conclusion:"), "{retained}");
+                    assert!(
+                        retained.contains(&format!(
+                            "task_evidence_read({})",
+                            serde_json::json!({"task_id": "task_review", "source": "delivered"})
+                        )),
+                        "{retained}"
+                    );
+                }
+                let (folded, count) = fold_early_tool_groups(
+                    &candidate,
+                    0,
+                    Some(&overflow_dir),
+                    &FxHashSet::default(),
+                );
+                assert_eq!(count, 1);
+                let recall = value_to_string(&folded[0].content);
+                assert!(
+                    recall.contains(&format!("status={status}"))
+                        && recall.contains("task_evidence_read(")
+                        && recall.contains("Conclusion:"),
+                    "{recall}"
+                );
+                let archived = std::fs::read_to_string(resolve_stub_archive_path(
+                    stub.lines()
+                        .find_map(|line| line.strip_prefix("- file_path: "))
+                        .unwrap(),
+                    &overflow_dir,
+                ))
+                .unwrap();
+                assert!(
+                    archived.contains(&content),
+                    "archive must retain the full result"
+                );
+            }
+        }
+    }
+    let aggregate = serde_json::json!({"tasks": [
+        {"runtime_task_id": "task_first", "state": "completed", "output": "first conclusion"},
+        {"pool_task_id": "task_second", "status": "failed", "output": "second conclusion"}
+    ]})
+    .to_string();
+    let stub = build_preserved_tool_overflow_stub(
+        &overflow_dir.join("aggregate.txt"),
+        "task_wait",
+        &aggregate,
+        &[],
+    );
+    let minimal = minimize_overflow_stub_to_pointer(&stub).unwrap();
+    for expected in [
+        "- task_status: task_id=task_first; status=completed",
+        "- task_status: task_id=task_second; status=failed",
+        "- task_conclusion: task_id=task_first; first conclusion",
+        "- task_conclusion: task_id=task_second; second conclusion",
+    ] {
+        assert!(minimal.contains(expected), "{minimal}");
+    }
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn archive_unavailable_task_evidence_stub_preserves_each_review_across_passes() {
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-task-evidence-unavailable-{}",
+        uuid::Uuid::new_v4()
+    ));
+    // Enough bounded task reviews remain above the floor to exercise the
+    // terminal-stub guard independently of the raw-result size guard.
+    let content = (0..12)
+        .map(|index| {
+            let status = if index % 2 == 0 { "completed" } else { "failed" };
+            format!(
+                "[task_id=task_review_{index}]\n[Task: review via worker @ model] {} after 1.0s\nConclusion: {status} findings for task_review_{index}.\n{}\nFinal conclusion: retain task_review_{index} evidence.\n{}",
+                status.to_uppercase(),
+                "supporting detail\n".repeat(400),
+                crate::ai::tools::task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let expected_reviews = task_evidence_review_lines(&content);
+    let legacy_fallback = format!(
+        "Task evidence folded for context budget.\n{}",
+        expected_reviews.join("\n")
+    );
+    assert!(legacy_fallback.chars().count() > TOOL_RESULT_FOLD_MIN_CHARS);
+    assert_eq!(
+        task_evidence_review_lines(&legacy_fallback),
+        expected_reviews
+    );
+
+    // A file in place of the sink directory forces an actual archive failure.
+    std::fs::write(&overflow_dir, "unavailable archive directory").unwrap();
+    for sink in [None, Some(overflow_dir.as_path())] {
+        let mut messages = vec![
+            assistant_call("review", "task_wait"),
+            tool_result("review", &content),
+        ];
+        assert!(truncate_mutable_field(
+            &mut messages[1],
+            MutableMessageField::Content,
+            content.chars().count(),
+            sink,
+            FieldArchivePolicy::BestEffort,
+        ));
+        let first_stub = value_to_string(&messages[1].content);
+        assert!(first_stub.chars().count() > TOOL_RESULT_FOLD_MIN_CHARS);
+        assert!(first_stub.chars().count() < content.chars().count());
+        assert!(is_preserved_tool_overflow_stub(&first_stub), "{first_stub}");
+        assert!(first_stub.contains("- recovery: canonical history;"));
+        assert!(!first_stub.contains("- file_path: "));
+        assert!(!first_stub.contains("Full historical result saved to session asset:"));
+        assert_eq!(task_evidence_review_lines(&first_stub), expected_reviews);
+        for index in 0..12 {
+            let status = if index % 2 == 0 {
+                "completed"
+            } else {
+                "failed"
+            };
+            assert!(first_stub.contains(&format!(
+                "- task_status: task_id=task_review_{index}; status={status}"
+            )));
+            assert!(first_stub.contains(&format!(
+                "Conclusion: {status} findings for task_review_{index}."
+            )));
+            assert!(first_stub.contains(&format!(
+                "Final conclusion: retain task_review_{index} evidence."
+            )));
+        }
+        let minimal = minimize_overflow_stub_to_pointer(&first_stub).unwrap();
+        assert!(is_preserved_tool_overflow_stub(&minimal));
+        assert!(minimal.contains("- recovery: canonical history;"));
+        assert!(!minimal.contains("- file_path: "));
+        assert_eq!(task_evidence_review_lines(&minimal), expected_reviews);
+
+        prepare_tool_messages_structured(&mut messages, 480, 0, sink, None, &FxHashSet::default());
+        assert!(!truncate_mutable_field(
+            &mut messages[1],
+            MutableMessageField::Content,
+            first_stub.chars().count(),
+            sink,
+            FieldArchivePolicy::BestEffort,
+        ));
+        let second_stub = value_to_string(&messages[1].content);
+        assert_eq!(second_stub, first_stub);
+        assert_eq!(task_evidence_review_lines(&second_stub), expected_reviews);
+    }
+    assert!(overflow_dir.is_file());
+    std::fs::remove_file(overflow_dir).unwrap();
+}
+
+/// A result may name arbitrarily many tasks; the review block appended to a
+/// preserved stub must stay bounded and say how much it dropped.
+#[test]
+fn task_evidence_review_lines_bound_many_task_ids() {
+    let task_count = 200;
+    let content = (0..task_count)
+        .map(|index| {
+            format!(
+                "[task_id=task_many_{index}]\n[Task: bulk review @ model] COMPLETED after 1.0s\nConclusion: detail for task_many_{index}.\nFinal conclusion: retain bulk evidence."
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let lines = task_evidence_review_lines(&content);
+    assert_eq!(lines, task_evidence_review_lines(&content), "deterministic");
+    assert!(lines.len() <= 49, "line cap: {}", lines.len());
+    let emitted_chars: usize = lines.iter().map(|line| line.chars().count() + 1).sum();
+    assert!(emitted_chars <= 8 * 1024 + 64, "char cap: {emitted_chars}");
+
+    let marker = lines.last().expect("non-empty review block");
+    let remaining: usize = marker
+        .strip_prefix("- review lines truncated: ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("expected truncation marker, got {marker}"));
+    let emitted_tasks = lines
+        .iter()
+        .filter(|line| line.starts_with("- task_evidence: "))
+        .count();
+    assert_eq!(emitted_tasks + remaining, task_count);
+
+    // The same bound keeps a freshly built stub recognizable and well under the
+    // 64 KiB physical cap.
+    let stub = build_preserved_tool_overflow_stub(
+        Path::new("/tmp/many-tasks.txt"),
+        "task_wait",
+        &content,
+        &[],
+    );
+    assert!(is_preserved_tool_overflow_stub(&stub));
+    assert!(
+        stub.chars().count() < 24_000,
+        "stub size: {}",
+        stub.chars().count()
+    );
+}
+
+#[test]
+fn authentic_preserved_stub_round_trips_recognition() {
+    let full = "line\n".repeat(200);
+    for path in [Some(Path::new("/tmp/session/round-trip.txt")), None] {
+        let stub = build_preserved_tool_overflow_stub_with_archive(path, "read_file", &full, &[]);
+        assert!(is_preserved_tool_overflow_stub(&stub), "{stub}");
+        let annotated = format!("Recovered tool output:\n```text\n  {stub}\n```");
+        assert!(is_preserved_tool_overflow_stub(&annotated), "{annotated}");
+        if path.is_some() {
+            let anchor = collapse_overflow_stub_to_anchor(&stub).expect("collapse");
+            assert!(is_preserved_tool_overflow_stub(&anchor), "{anchor}");
+            let pointer = minimize_overflow_stub_to_pointer(&stub).expect("minimize");
+            assert!(is_preserved_tool_overflow_stub(&pointer), "{pointer}");
+        }
+    }
+}
+
+#[test]
+fn archived_task_evidence_above_floor_keeps_each_review_field() {
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-task-evidence-archive-review-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let content = serde_json::json!({"tasks": [
+        {"runtime_task_id": "task_first", "state": "completed", "output": format!(
+            "Conclusion: first task completed.\n{}\nFinal conclusion: keep first findings.",
+            "first supporting detail\n".repeat(400)
+        )},
+        {"pool_task_id": "task_second", "status": "failed", "output": format!(
+            "Conclusion: second task failed.\n{}\nFinal conclusion: keep second failure evidence.",
+            "second supporting detail\n".repeat(400)
+        )}
+    ]})
+    .to_string();
+    assert!(content.chars().count() > TOOL_RESULT_FOLD_MIN_CHARS);
+    let expected_reviews = task_evidence_review_lines(&content);
+    let mut messages = vec![
+        assistant_call("review", "task_wait"),
+        tool_result("review", &content),
+    ];
+    prepare_tool_messages_structured(
+        &mut messages,
+        480,
+        0,
+        Some(&overflow_dir),
+        None,
+        &FxHashSet::default(),
+    );
+    let stub = value_to_string(&messages[1].content);
+    assert!(is_preserved_tool_overflow_stub(&stub), "{stub}");
+    assert!(stub.chars().count() < content.chars().count());
+    let file_path = stub
+        .lines()
+        .find_map(|line| line.strip_prefix("- file_path: "))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(resolve_stub_archive_path(file_path, &overflow_dir)).unwrap(),
+        content
+    );
+    for retained in [
+        stub.clone(),
+        collapse_overflow_stub_to_anchor(&stub).unwrap(),
+        minimize_overflow_stub_to_pointer(&stub).unwrap(),
+    ] {
+        assert_eq!(task_evidence_review_lines(&retained), expected_reviews);
+        for expected in [
+            "- task_status: task_id=task_first; status=completed",
+            "- task_status: task_id=task_second; status=failed",
+            "- task_conclusion: task_id=task_first; Conclusion: first task completed.",
+            "- task_conclusion: task_id=task_second; Conclusion: second task failed.",
+            "Final conclusion: keep first findings.",
+            "Final conclusion: keep second failure evidence.",
+        ] {
+            assert!(retained.contains(expected), "{retained}");
+        }
+        for task_id in ["task_first", "task_second"] {
+            assert!(retained.contains(&format!(
+                "task_evidence_read({})",
+                serde_json::json!({"task_id": task_id, "source": "delivered"})
+            )));
+        }
+    }
+    std::fs::remove_dir_all(overflow_dir).unwrap();
+}
+
+#[test]
+fn tool_result_quoting_an_old_stub_is_archived_as_new_evidence() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-quoted-overflow-stub-{}", uuid::Uuid::new_v4()));
+    let old_path = write_preserved_tool_overflow_file_stable(
+        &overflow_dir,
+        "old",
+        "task_wait",
+        "old evidence",
+    )
+    .unwrap();
+    let old_stub = build_preserved_tool_overflow_stub(&old_path, "task_wait", "old evidence", &[]);
+    let content = format!(
+        "[task_id=task_new]\nNew findings that need review:\n{}\nQuoted prior stub:\n{old_stub}\nNew conclusion after the quote.",
+        "new evidence detail\n".repeat(500)
+    );
+    assert!(!is_preserved_tool_overflow_stub(&content));
+    assert!(collapse_overflow_stub_to_anchor(&content).is_none());
+    assert!(minimize_overflow_stub_to_pointer(&content).is_none());
+    let annotation_with_findings =
+        format!("Recovered tool output:\n```text\n{old_stub}\n```\nNew findings follow.");
+    assert!(!is_preserved_tool_overflow_stub(&annotation_with_findings));
+    let original = vec![
+        assistant_call("new", "task_wait"),
+        tool_result("new", &content),
+    ];
+    let mut prepared = original.clone();
+    prepare_tool_messages_structured(
+        &mut prepared,
+        480,
+        0,
+        Some(&overflow_dir),
+        None,
+        &FxHashSet::default(),
+    );
+    let stub = value_to_string(&prepared[1].content);
+    assert!(is_preserved_tool_overflow_stub(&stub));
+    let path = resolve_stub_archive_path(
+        stub.lines()
+            .find_map(|line| line.strip_prefix("- file_path: "))
+            .unwrap(),
+        &overflow_dir,
+    );
+    assert_ne!(path, old_path);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), content);
+    let (folded, count) =
+        fold_early_tool_groups(&original, 0, Some(&overflow_dir), &FxHashSet::default());
+    assert_eq!(count, 1);
+    assert!(value_to_string(&folded[0].content).contains("task_id=task_new"));
+    assert!(
+        std::fs::read_dir(overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR))
+            .unwrap()
+            .any(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap() == content)
+    );
+    assert_eq!(std::fs::read_to_string(old_path).unwrap(), "old evidence");
+    let _ = std::fs::remove_dir_all(overflow_dir);
 }
 
 #[test]
@@ -154,7 +926,7 @@ fn preserved_tool_overflow_stub_is_not_spilled_again() {
         std::env::temp_dir().join(format!("ai-tool-overflow-stub-{}", uuid::Uuid::new_v4()));
     let mut messages = vec![
         assistant_call("old", "read_file"),
-        tool_result("old", &"x".repeat(1_000)),
+        tool_result("old", &"x".repeat(8_000)),
         assistant_call("recent", "read_file"),
         tool_result("recent", "recent result"),
     ];
@@ -181,6 +953,44 @@ fn preserved_tool_overflow_stub_is_not_spilled_again() {
         &FxHashSet::default(),
     );
     assert_eq!(value_to_string(&messages[1].content), first_stub);
+    assert_eq!(std::fs::read_dir(&overflow_path).unwrap().count(), 1);
+
+    let annotated = format!("Recovered tool output:\n```text\n  {first_stub}\n```");
+    assert!(is_preserved_tool_overflow_stub(&annotated));
+    messages[1].content = Value::String(annotated.clone());
+    prepare_tool_messages_structured(
+        &mut messages,
+        80,
+        0,
+        Some(&overflow_dir),
+        None,
+        &FxHashSet::default(),
+    );
+    let protected = ["old".to_string()].into_iter().collect();
+    assert_eq!(
+        spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected,),
+        0
+    );
+    assert_eq!(
+        cap_oversized_tool_results_for_context(&mut messages, 80, 0, Some(&overflow_dir), None,),
+        0
+    );
+    assert_eq!(value_to_string(&messages[1].content), annotated);
+    assert_eq!(std::fs::read_dir(&overflow_path).unwrap().count(), 1);
+    let wrapped = serde_json::json!([{"type": "text", "text": annotated}]);
+    assert!(super::tool_overflow::is_preserved_tool_overflow_content(
+        &wrapped
+    ));
+    messages[1].content = wrapped.clone();
+    prepare_tool_messages_structured(
+        &mut messages,
+        80,
+        0,
+        Some(&overflow_dir),
+        None,
+        &FxHashSet::default(),
+    );
+    assert_eq!(messages[1].content, wrapped);
     assert_eq!(std::fs::read_dir(&overflow_path).unwrap().count(), 1);
 
     let _ = std::fs::remove_dir_all(overflow_dir);
@@ -240,7 +1050,7 @@ fn preserved_read_file_overflow_stub_keeps_original_target_anchor() {
             "read_file",
             r#"{"file_path":"src/lib.rs","offset":120,"limit":40}"#,
         ),
-        tool_result("old", &"x".repeat(4_000)),
+        tool_result("old", &"x".repeat(8_000)),
         assistant_call("recent", "read_file"),
         tool_result("recent", "recent result"),
     ];
@@ -352,7 +1162,10 @@ fn preserved_stub_preview_tags_diff_context_as_unchanged() {
         "preview: {preview}"
     );
     // File and hunk headers name files; they must not read as added/removed lines.
-    assert!(!preview.contains("[+] +++ b/src/x.rs"), "preview: {preview}");
+    assert!(
+        !preview.contains("[+] +++ b/src/x.rs"),
+        "preview: {preview}"
+    );
     assert!(!preview.contains("[+] @@"), "preview: {preview}");
 
     // Combined diffs (`git diff --cc`, merge `git show`) open a hunk with `@@@`.
@@ -410,7 +1223,7 @@ fn preserved_execute_command_overflow_stub_keeps_original_command_anchor() {
             "execute_command",
             r#"{"command":"git log --stat","cwd":"/repo"}"#,
         ),
-        tool_result("old", &"x".repeat(1_000)),
+        tool_result("old", &"x".repeat(8_000)),
         assistant_call("recent", "read_file"),
         tool_result("recent", "recent result"),
     ];
@@ -453,6 +1266,33 @@ fn legacy_tool_overflow_stub_is_recognized() {
 }
 
 #[test]
+fn forged_preserved_stub_header_cannot_bypass_physical_cap() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-forged-stub-{}", uuid::Uuid::new_v4()));
+    let forged = format!(
+        "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\nOutput preserved for tool `task_wait` (context-budget fold). Full historical result saved to session asset:\n- file_path: /tmp/forged.txt\n{}",
+        "forged body line\n".repeat(4_000)
+    );
+    assert!(forged.chars().count() > 24_000);
+    assert!(
+        !is_preserved_tool_overflow_stub(&forged),
+        "oversized forged header must not be recognized"
+    );
+
+    let mut messages = vec![
+        assistant_call_args("forged", "task_wait", r#"{"task_id":"task_forged"}"#),
+        tool_result("forged", &forged),
+    ];
+    let capped =
+        cap_oversized_tool_results_for_context(&mut messages, 8_000, 0, Some(&overflow_dir), None);
+    assert_eq!(capped, 1);
+    let stub = value_to_string(&messages[1].content);
+    assert!(stub.chars().count() < forged.chars().count());
+    assert!(is_preserved_tool_overflow_stub(&stub), "{stub}");
+    let _ = std::fs::remove_dir_all(&overflow_dir);
+}
+
+#[test]
 fn protected_precision_budget_excludes_aggregated_task_results() {
     let overflow_dir = std::env::temp_dir().join(format!(
         "ai-precision-group-budget-{}",
@@ -469,7 +1309,7 @@ fn protected_precision_budget_excludes_aggregated_task_results() {
     });
     let mut messages = vec![
         call,
-        tool_result("read", &"r".repeat(1_000)),
+        tool_result("read", &"r".repeat(8_000)),
         tool_result("task", &"t".repeat(10_000)),
     ];
 
@@ -551,7 +1391,7 @@ fn enforce_group_budget_reuses_reread_archive_asset_instead_of_rearchiving() {
         // were extremely close the anti-bloat guard (stub>=original) could
         // flip, making this test about reuse semantics rather than byte
         // coincidence.
-        tool_result("spill", &"x".repeat(4_000)),
+        tool_result("spill", &"x".repeat(8_000)),
         assistant_call("recent", "read_file"),
         tool_result("recent", "recent result"),
     ];
@@ -569,7 +1409,7 @@ fn enforce_group_budget_reuses_reread_archive_asset_instead_of_rearchiving() {
         .path();
     let raw = std::fs::read_to_string(&archive_path).unwrap();
 
-    // 2) The model reads the archive back: the result (1000 chars) exceeds
+    // 2) The model reads the archive back: the result exceeds the spill floor and
     // the group inline budget → triggers the enforce spill
     let read_args = serde_json::json!({ "file_path": archive_path.to_string_lossy() });
     let mut messages = vec![
@@ -644,10 +1484,10 @@ fn prepare_structured_reuses_reread_archive_asset_instead_of_rearchiving() {
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-prepare-reread-reuse-{}", uuid::Uuid::new_v4()));
     // 1) First let prepare write an archive asset (an old read_file result,
-    // over the 480 threshold and outside the tail window)
+    // above the shared spill floor and outside the tail window)
     let mut messages = vec![
         assistant_call("first", "read_file"),
-        tool_result("first", &"z".repeat(2_000)),
+        tool_result("first", &"z".repeat(8_000)),
     ];
     prepare_tool_messages_structured(
         &mut messages,
@@ -710,7 +1550,7 @@ fn prepare_structured_spill_is_deterministic_across_reprojections() {
     // A single very long line: after line truncation the preview makes the
     // stub significantly smaller than the original → it does spill (the
     // anti-bloat guard does not trigger).
-    let big = "b".repeat(4_000);
+    let big = "b".repeat(8_000);
     let build = || {
         vec![
             assistant_call("spill", "read_file"),
@@ -881,7 +1721,11 @@ fn cap_does_not_reuse_input_archive_for_transformed_command_output() {
         .unwrap()
         .unwrap()
         .path();
-    let input_name = input_path.file_name().unwrap().to_string_lossy().into_owned();
+    let input_name = input_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
 
     // `awk '{print "DIFF:" $0}' <archive>`: every output line differs from the
     // input, so no existing archive may be reused.
@@ -1100,28 +1944,248 @@ fn path_c_spills_aggregated_task_wait_result_losslessly() {
     ));
     let mut protected = FxHashSet::default();
     protected.insert("wait".to_string());
+    let content = format!(
+        "[task_id=task_one]\n[task_id=task_two]\n{}",
+        "aggregated subagent conclusion\n".repeat(3_000)
+    );
+    assert!(content.chars().count() > super::persisted::TOOL_RESULT_RAW_HARD_CAP_CHARS);
     let mut messages = vec![
         assistant_call("wait", "task_wait"),
-        tool_result("wait", &"aggregated subagent conclusion\n".repeat(600)),
+        tool_result("wait", &content),
     ];
 
     let spilled =
         spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected);
 
-    assert_eq!(spilled, 1, "task_wait 大结果应被 Path C 无损外溢");
+    assert_eq!(
+        spilled, 1,
+        "a large task_wait result must spill losslessly in Path C"
+    );
     let stub = value_to_string(&messages[1].content);
     assert!(
         is_preserved_tool_overflow_stub(&stub),
-        "外溢后应替换为 overflow stub"
+        "a spilled result must become an overflow stub"
     );
     let file_path = stub
         .lines()
         .find_map(|line| line.trim_start().strip_prefix("- file_path: "))
-        .expect("overflow stub 必须保留可召回的 file_path 指针");
+        .expect("an overflow stub must retain a recoverable file_path");
     assert!(
         resolve_stub_archive_path(file_path, &overflow_dir).is_file(),
-        "外溢原文必须落盘"
+        "the original spilled text must be archived"
     );
+    assert_eq!(
+        std::fs::read_to_string(resolve_stub_archive_path(file_path, &overflow_dir)).unwrap(),
+        content
+    );
+    for retained in [
+        stub.clone(),
+        collapse_overflow_stub_to_anchor(&stub).unwrap(),
+        minimize_overflow_stub_to_pointer(&stub).unwrap(),
+    ] {
+        for task_id in ["task_one", "task_two"] {
+            assert!(
+                retained.contains(&format!("task_id={task_id}")),
+                "{retained}"
+            );
+            assert!(
+                retained.contains(&format!(
+                    "task_evidence_read({})",
+                    serde_json::json!({"task_id": task_id, "source": "delivered"})
+                )),
+                "{retained}"
+            );
+        }
+    }
+    let (folded, count) =
+        fold_early_tool_groups(&messages, 0, Some(&overflow_dir), &FxHashSet::default());
+    assert_eq!(count, 1);
+    let recall = value_to_string(&folded[0].content);
+    assert!(recall.contains("task_evidence_read("), "{recall}");
+    assert!(
+        recall.contains("task_id=task_one") && recall.contains("task_id=task_two"),
+        "{recall}"
+    );
+    assert_eq!(
+        std::fs::read_dir(overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR))
+            .unwrap()
+            .count(),
+        1
+    );
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn task_evidence_read_recovery_stays_inline_through_floor() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-task-recovery-floor-{}", uuid::Uuid::new_v4()));
+    let cap = TOOL_RESULT_FOLD_MIN_CHARS;
+    for name in ["task_evidence_read", "task_wait"] {
+        let prefix = "[task_id=task_recover]\n";
+        let content = if name == "task_evidence_read" {
+            let envelope = serde_json::json!({"task_id": "task_recover", "source": "delivered", "status": "delivered", "payload": ""});
+            let overhead = envelope.to_string().chars().count();
+            serde_json::json!({"task_id": "task_recover", "source": "delivered", "status": "delivered", "payload": "e".repeat(cap - overhead)}).to_string()
+        } else {
+            format!("{prefix}{}", "e".repeat(cap - prefix.chars().count()))
+        };
+        assert_eq!(content.chars().count(), cap);
+        let mut messages = vec![
+            assistant_call_args(
+                "evidence",
+                name,
+                r#"{"task_id":"task_recover","source":"delivered"}"#,
+            ),
+            tool_result("evidence", &content),
+        ];
+        let protected = ["evidence".to_string()].into_iter().collect();
+        super::prepare_tool_messages_structured(
+            &mut messages,
+            480,
+            0,
+            0,
+            Some(&overflow_dir),
+            None,
+            &FxHashSet::default(),
+        );
+        enforce_protected_precision_group_budget(
+            &mut messages,
+            1,
+            0,
+            Some(&overflow_dir),
+            None,
+            &protected,
+            true,
+        );
+        assert_eq!(
+            spill_protected_precision_to_fit(
+                &mut messages,
+                0,
+                Some(&overflow_dir),
+                None,
+                &protected,
+            ),
+            0
+        );
+        assert_eq!(
+            cap_oversized_tool_results_for_context(
+                &mut messages,
+                cap,
+                0,
+                Some(&overflow_dir),
+                None,
+            ),
+            0
+        );
+        let (folded, count) =
+            fold_early_tool_groups(&messages, 0, Some(&overflow_dir), &FxHashSet::default());
+        assert_eq!(count, 0);
+        assert_eq!(value_to_string(&folded[1].content), content);
+        assert!(!overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR).exists());
+
+        let oversized = if name == "task_evidence_read" {
+            let mut envelope: Value = serde_json::from_str(&content).unwrap();
+            envelope["payload"] =
+                Value::String(format!("{}e", envelope["payload"].as_str().unwrap()));
+            envelope.to_string()
+        } else {
+            format!("{content}e")
+        };
+        messages[1].content = Value::String(oversized.clone());
+        let (folded, count) =
+            fold_early_tool_groups(&messages, 0, Some(&overflow_dir), &FxHashSet::default());
+        assert_eq!(count, 1);
+        let recall = value_to_string(&folded[0].content);
+        assert!(
+            recall.contains("task_id=task_recover") && recall.contains("task_evidence_read("),
+            "{recall}"
+        );
+        for use_projection_cap in [false, true] {
+            let mut candidate = messages.clone();
+            let spilled = if use_projection_cap {
+                cap_oversized_tool_results_for_context(
+                    &mut candidate,
+                    cap,
+                    0,
+                    Some(&overflow_dir),
+                    None,
+                )
+            } else {
+                spill_protected_precision_to_fit(
+                    &mut candidate,
+                    0,
+                    Some(&overflow_dir),
+                    None,
+                    &protected,
+                )
+            };
+            assert_eq!(spilled, 1);
+            let stub = value_to_string(&candidate[1].content);
+            assert!(is_preserved_tool_overflow_stub(&stub), "{stub}");
+            let path = stub
+                .lines()
+                .find_map(|line| line.strip_prefix("- file_path: "))
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(resolve_stub_archive_path(path, &overflow_dir)).unwrap(),
+                oversized
+            );
+            assert!(
+                stub.contains("task_id=task_recover") && stub.contains("task_evidence_read("),
+                "{stub}"
+            );
+            assert_eq!(
+                spill_protected_precision_to_fit(
+                    &mut candidate,
+                    0,
+                    Some(&overflow_dir),
+                    None,
+                    &protected
+                ),
+                0
+            );
+        }
+        std::fs::remove_dir_all(&overflow_dir).unwrap();
+    }
+}
+
+#[test]
+fn shared_tool_result_fold_floor_counts_characters_at_boundary() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-fold-boundary-{}", uuid::Uuid::new_v4()));
+    for chars in [
+        TOOL_RESULT_FOLD_MIN_CHARS - 1,
+        TOOL_RESULT_FOLD_MIN_CHARS,
+        TOOL_RESULT_FOLD_MIN_CHARS + 1,
+    ] {
+        let content = "é".repeat(chars);
+        let mut messages = vec![
+            assistant_call("read", "read_file"),
+            tool_result("read", &content),
+        ];
+        prepare_tool_messages_structured(
+            &mut messages,
+            480,
+            0,
+            Some(&overflow_dir),
+            None,
+            &FxHashSet::default(),
+        );
+        let inline = value_to_string(&messages[1].content);
+        if chars <= TOOL_RESULT_FOLD_MIN_CHARS {
+            assert_eq!(inline, content);
+        } else {
+            assert!(is_preserved_tool_overflow_stub(&inline), "{inline}");
+            let path = inline
+                .lines()
+                .find_map(|line| line.strip_prefix("- file_path: "))
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(resolve_stub_archive_path(path, &overflow_dir)).unwrap(),
+                content
+            );
+        }
+    }
     let _ = std::fs::remove_dir_all(overflow_dir);
 }
 
@@ -1165,7 +2229,9 @@ fn user_msg(text: &str) -> Message {
 /// (see `stub_archive_display_path`).
 fn resolve_stub_archive_path(raw: &str, overflow_dir: &std::path::Path) -> std::path::PathBuf {
     let raw = raw.trim();
-    if let Some(path) = crate::ai::tools::storage::file_store::session_asset_for_alias(raw, overflow_dir) {
+    if let Some(path) =
+        crate::ai::tools::storage::file_store::session_asset_for_alias(raw, overflow_dir)
+    {
         return path;
     }
     let path = std::path::Path::new(raw);
@@ -1376,8 +2442,7 @@ fn cap_oversized_spills_only_results_outside_recent_group_window() {
     // The unconditional size gate must leave the most recent complete tool
     // group raw while spilling an equally oversized older result: recent
     // evidence stays directly usable and only aged output gets archived.
-    let overflow_dir =
-        std::env::temp_dir().join(format!("ai-cap-recent-{}", uuid::Uuid::new_v4()));
+    let overflow_dir = std::env::temp_dir().join(format!("ai-cap-recent-{}", uuid::Uuid::new_v4()));
     let mut messages = vec![
         assistant_call("old", "read_file"),
         tool_result("old", &"y".repeat(70_000)),
@@ -1402,8 +2467,7 @@ fn cap_oversized_spills_only_results_outside_recent_group_window() {
 fn cap_no_oversized_returns_zero_and_keeps_messages_unchanged() {
     // Fast path: when every result is below the cap, the pre-scan must
     // short-circuit before index building / content cloning and touch nothing.
-    let overflow_dir =
-        std::env::temp_dir().join(format!("ai-cap-fast-{}", uuid::Uuid::new_v4()));
+    let overflow_dir = std::env::temp_dir().join(format!("ai-cap-fast-{}", uuid::Uuid::new_v4()));
     let mut messages = vec![
         user_msg("q1"),
         assistant_call("a", "read_file"),
@@ -1415,8 +2479,12 @@ fn cap_no_oversized_returns_zero_and_keeps_messages_unchanged() {
     let capped =
         cap_oversized_tool_results_for_context(&mut messages, 32_000, 0, Some(&overflow_dir), None);
     assert_eq!(capped, 0);
-    assert!(!is_preserved_tool_overflow_stub(&value_to_string(&messages[2].content)));
-    assert!(!is_preserved_tool_overflow_stub(&value_to_string(&messages[5].content)));
+    assert!(!is_preserved_tool_overflow_stub(&value_to_string(
+        &messages[2].content
+    )));
+    assert!(!is_preserved_tool_overflow_stub(&value_to_string(
+        &messages[5].content
+    )));
     let _ = std::fs::remove_dir_all(&overflow_dir);
 }
 
@@ -1444,7 +2512,9 @@ fn shortened_stub_carries_typed_archive_alias_for_session_archives() {
         "line\n".repeat(50).as_str(),
         &[],
     );
-    assert!(stub.contains("- file_path: session-asset:tool-overflow-compressed/spilled-read_file-deadbeef12345678.txt"));
+    assert!(stub.contains(
+        "- file_path: session-asset:tool-overflow-compressed/spilled-read_file-deadbeef12345678.txt"
+    ));
     assert!(!stub.contains("/sessions/abc.assets"));
 }
 
@@ -1495,10 +2565,8 @@ fn shortened_stub_alias_covers_all_archive_dirs_and_round_trips() {
 
 #[test]
 fn archived_asset_reuse_accepts_typed_aliases_and_legacy_paths_safely() {
-    let overflow_dir = std::env::temp_dir().join(format!(
-        "ai-bare-name-reuse-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-bare-name-reuse-{}", uuid::Uuid::new_v4()));
     let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archived = archive_dir.join("spilled-read_file-aaaaaaaaaaaaaaaa.txt");
@@ -1507,12 +2575,18 @@ fn archived_asset_reuse_accepts_typed_aliases_and_legacy_paths_safely() {
 
     // Legacy absolute stubs keep working.
     assert_eq!(
-        super::tool_overflow::archived_asset_path_from_raw(&canonical.to_string_lossy(), &overflow_dir),
+        super::tool_overflow::archived_asset_path_from_raw(
+            &canonical.to_string_lossy(),
+            &overflow_dir
+        ),
         Some(canonical.clone())
     );
     // Shortened bare names resolve under this session's overflow dir.
     assert_eq!(
-        super::tool_overflow::archived_asset_path_from_raw("spilled-read_file-aaaaaaaaaaaaaaaa.txt", &overflow_dir),
+        super::tool_overflow::archived_asset_path_from_raw(
+            "spilled-read_file-aaaaaaaaaaaaaaaa.txt",
+            &overflow_dir
+        ),
         Some(canonical.clone())
     );
     // The generated alias must resolve to the original asset, not a new archive.
@@ -1541,20 +2615,30 @@ fn archived_asset_reuse_accepts_typed_aliases_and_legacy_paths_safely() {
         std::os::unix::fs::symlink(&outside, archive_dir.join("escape.txt")).unwrap();
         assert_eq!(
             super::tool_overflow::archived_asset_path_from_raw(
-                "session-asset:tool-overflow-compressed/escape.txt", &overflow_dir,
+                "session-asset:tool-overflow-compressed/escape.txt",
+                &overflow_dir,
             ),
             None,
         );
     }
     // Traversal, absolute outsiders, and missing files stay rejected.
-    assert_eq!(super::tool_overflow::archived_asset_path_from_raw("../evil.txt", &overflow_dir), None);
+    assert_eq!(
+        super::tool_overflow::archived_asset_path_from_raw("../evil.txt", &overflow_dir),
+        None
+    );
     assert_eq!(
         super::tool_overflow::archived_asset_path_from_raw("sub/dir.txt", &overflow_dir),
         None
     );
-    assert_eq!(super::tool_overflow::archived_asset_path_from_raw("/tmp/elsewhere.txt", &overflow_dir), None);
     assert_eq!(
-        super::tool_overflow::archived_asset_path_from_raw("spilled-missing-bbbbbbbbbbbbbbbb.txt", &overflow_dir),
+        super::tool_overflow::archived_asset_path_from_raw("/tmp/elsewhere.txt", &overflow_dir),
+        None
+    );
+    assert_eq!(
+        super::tool_overflow::archived_asset_path_from_raw(
+            "spilled-missing-bbbbbbbbbbbbbbbb.txt",
+            &overflow_dir
+        ),
         None
     );
     let _ = std::fs::remove_dir_all(&overflow_dir);

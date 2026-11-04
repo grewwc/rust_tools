@@ -267,6 +267,11 @@ pub(crate) fn validate_side_note_target(task_id: &str) -> Result<(), String> {
         Err(_) => return Ok(()),
     };
     if let Some(status) = finished_status {
+        if entry.backend.is_some_and(SubagentBackend::is_traecli) {
+            return Err(format!(
+                "Task `{trimmed}` already finished (status={status}); put new guidance in a follow-up `task`/`task_spawn` with `backend_continue_from`. Previously queued side-notes are retained for that continuation."
+            ));
+        }
         return Err(format!(
             "Task `{trimmed}` already finished (status={status}); a side-note would never be seen. Spawn a follow-up task or use `task_retry` for a new linked attempt instead."
         ));
@@ -282,8 +287,8 @@ pub(crate) fn validate_side_note_target(task_id: &str) -> Result<(), String> {
 /// drains the queue under its own history file; writing to the lead's file
 /// would leave the note unread while still reporting success.
 ///
-/// External backends run outside the in-process turn loop and never drain this
-/// queue, so they are rejected instead of silently dropping the note.
+/// TraeCLI queues stay under the parent's history and are drained when
+/// `backend_continue_from` dispatches a continuation, not during the active run.
 pub(crate) fn resolve_side_note_history_file(
     task_id: &str,
     foreground_history: &std::path::Path,
@@ -299,13 +304,8 @@ pub(crate) fn resolve_side_note_history_file(
                 "Unknown task_id `{trimmed}`: no active subagent with this id in the current session."
             )
         })?;
-    if let Some(backend) = backend {
-        return Err(format!(
-            "Task `{trimmed}` runs on the `{}` backend, which has no in-turn side-note channel; \
-             the note would never be seen. Put the guidance in a follow-up `task`/`task_spawn` \
-             prompt, or wait for the current result.",
-            backend.as_str()
-        ));
+    if backend.is_some_and(SubagentBackend::is_traecli) {
+        return Ok(Some(foreground_history.to_path_buf()));
     }
     Ok(Some(crate::ai::driver::process_history_path(
         foreground_history,

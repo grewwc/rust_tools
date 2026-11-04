@@ -86,6 +86,7 @@ pub(crate) fn reset_last_spawn_batch_for_test() {
 pub(super) fn load_or_create_task_wait_state(
     key: &TaskWaitKey,
     timeout_secs: u64,
+    agent_team_mode: bool,
 ) -> TaskWaitState {
     let now = Instant::now();
     let mut states = lock_unpoisoned(&TASK_WAIT_STATES);
@@ -96,8 +97,18 @@ pub(super) fn load_or_create_task_wait_state(
             deadline: now + Duration::from_secs(timeout_secs),
             timeout_secs,
             expired: false,
+            agent_team_mode,
         }
     });
+    if state.agent_team_mode != agent_team_mode {
+        *state = TaskWaitState {
+            deadline: now + Duration::from_secs(timeout_secs),
+            timeout_secs,
+            expired: false,
+            agent_team_mode,
+        };
+        inserted = true;
+    }
     if now >= state.deadline {
         state.expired = true;
     }
@@ -188,12 +199,18 @@ pub(crate) fn wake_expired_task_waits() {
             if !woken.insert(key.owner_pid) {
                 continue;
             }
-            let task_ids = key.task_ids.join(", ");
-            let mut message = format!(
-                "[TASK_WAIT_TIMEOUT]\nWall-clock task_wait budget elapsed after {}s. Re-call `task_wait` with the same task_ids to collect any ready results and receive the budget-elapsed status. task_ids=[{}]",
-                state.timeout_secs, task_ids
-            );
-            append_task_progress_snapshots(&mut message, &key.task_ids);
+            let message = if state.agent_team_mode {
+                super::quiet::format_agent_team_task_wait(&key.task_ids)
+            } else {
+                let task_ids = key.task_ids.join(", ");
+                let mut message = format!(
+                    "[TASK_WAIT_TIMEOUT]\nWall-clock task_wait budget elapsed after {}s. Re-call `task_wait` with the same task_ids to collect any ready results and receive the budget-elapsed status. task_ids=[{}]",
+                    state.timeout_secs, task_ids
+                );
+                append_task_progress_snapshots(os, &mut message, &key.task_ids);
+                append_pending_task_side_note_summaries(&mut message, &key.task_ids);
+                message
+            };
             let _ = os.wake_process(key.owner_pid, message);
         }
         Ok(orphaned)
@@ -244,6 +261,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     // a timeout only means this call did not get the result; the subagent keeps running and no
     // resources are released.
     let (timeout_secs, wait_policy) = parse_task_wait_options(args)?;
+    let agent_team_mode = is_agent_team_mode();
 
     // wait_policy: "any" | "all", default "any", so the foreground is not held up by the slowest
     // task.
@@ -371,7 +389,11 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     }
     // lone-spawn normative hint: computed only once (consuming the hinted flag), then uniformly
     // appended at every later return point.
-    let lone_spawn_hint = lone_spawn_hint_note(&task_ids);
+    let lone_spawn_hint = if agent_team_mode {
+        None
+    } else {
+        lone_spawn_hint_note(&task_ids)
+    };
     let wait_key = task_wait_key(
         &current_session_id,
         current_owner_pid,
@@ -381,11 +403,12 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     // A real wait (still-pending tasks) proves the model is not stuck polling delivered ids, so
     // reset the no-op escalation counter for this key.
     reset_task_wait_noop_count(&wait_key);
-    let wait_state = load_or_create_task_wait_state(&wait_key, timeout_secs);
+    let wait_state = load_or_create_task_wait_state(&wait_key, timeout_secs, agent_team_mode);
     let wait_budget_elapsed = wait_state.expired;
 
     let mut ready = Vec::new();
     let mut pending = Vec::new();
+    let return_on_ready = agent_team_mode || wait_policy == WaitPolicy::Any;
     // Collect the task_ids finished in this call (success / failure, channel/futex destroyed,
     // needing removal from the registry); the suspended and budget-elapsed early-return paths also
     // use it for cleanup.
@@ -454,10 +477,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
 
         // With `any`, once the first scan already collected a result, we must return immediately
         // instead of being suspended by the remaining pending tasks.
-        if !pending.is_empty()
-            && !wait_budget_elapsed
-            && !(wait_policy == WaitPolicy::Any && !ready.is_empty())
-        {
+        if !pending.is_empty() && !wait_budget_elapsed && !(return_on_ready && !ready.is_empty()) {
             let pending_ids = pending
                 .iter()
                 .map(|(tid, _)| tid.clone())
@@ -499,10 +519,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             // the full timeout_secs), otherwise the model would misread "timeout right after
             // starting to wait" as "subtask stuck" and give up early to fall back to manual
             // analysis.
-            if !pending.is_empty()
-                && wait.suspended
-                && !(wait_policy == WaitPolicy::Any && !ready.is_empty())
-            {
+            if !pending.is_empty() && wait.suspended && !(return_on_ready && !ready.is_empty()) {
                 let mut parts = Vec::new();
                 if !ready.is_empty() {
                     parts.push(ready.join("\n\n---\n\n"));
@@ -515,8 +532,11 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                     .iter()
                     .map(|(tid, _)| tid.clone())
                     .collect::<Vec<_>>();
-                let mut parked_message = format!(
-                    "[task_wait PARKED] Yielded CPU so {} pending subagent task(s) can run. \
+                let parked_message = if agent_team_mode {
+                    super::quiet::format_agent_team_task_wait(&still_pending)
+                } else {
+                    let mut parked_message = format!(
+                        "[task_wait PARKED] Yielded CPU so {} pending subagent task(s) can run. \
                     This is normal cooperative scheduling, NOT a timeout and NOT a stall — the wait budget \
                     ({timeout_secs}s, wait_policy={policy_label}) has NOT elapsed. The scheduler will wake this \
                     agent as soon as a result is ready. \
@@ -524,15 +544,18 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                     Do NOT assume the subagents are stuck and do NOT abandon them to work around this; \
                     when woken, re-call `task_wait` with the same task_ids to collect results, or use \
                     `task_status` for a non-blocking snapshot.",
-                    still_pending.len(),
-                    still_pending.join(", "),
-                    wait.event_ids
-                        .iter()
-                        .map(|id| id.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                append_task_progress_snapshots(&mut parked_message, &still_pending);
+                        still_pending.len(),
+                        still_pending.join(", "),
+                        wait.event_ids
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    append_task_progress_snapshots(os, &mut parked_message, &still_pending);
+                    append_pending_task_side_note_summaries(&mut parked_message, &still_pending);
+                    parked_message
+                };
                 parts.push(parked_message);
                 return Ok(Some(parts.join("\n\n---\n\n")));
             }
@@ -548,6 +571,20 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     let wait_message = wait_result?;
     if let Some(message) = wait_message {
         return Ok(append_lone_spawn_hint(message, lone_spawn_hint.as_deref()));
+    }
+    if agent_team_mode && !ready.is_empty() {
+        // Deliver terminal evidence immediately, including partial `all` waits. The quiet
+        // deadline must never postpone a result or an error already collected from the channel.
+        let mut parts = vec![ready.join("\n\n---\n\n")];
+        if !pending.is_empty() {
+            let pending_ids = pending
+                .iter()
+                .map(|(tid, _)| tid.clone())
+                .collect::<Vec<_>>();
+            parts.push(super::quiet::format_agent_team_task_wait(&pending_ids));
+        }
+        clear_task_wait_state(&wait_key);
+        return Ok(parts.join("\n\n---\n\n"));
     }
     // `any` exists to return the first finisher without blocking on the rest. Once the wait
     // budget has already elapsed, the owner was woken for the timeout, so returning ready
@@ -574,17 +611,26 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             WaitPolicy::Any => "any",
             WaitPolicy::All => "all",
         };
-        let mut elapsed_message = format!(
-            "[task_wait BUDGET ELAPSED] {} pending subagent task(s) still running in the background. \
+        let elapsed_message = if agent_team_mode {
+            super::quiet::format_agent_team_task_wait(&pending_ids)
+        } else {
+            let mut elapsed_message = format!(
+                "[task_wait BUDGET ELAPSED] {} pending subagent task(s) still running in the background. \
             wait_policy={policy_label}, timeout_secs={timeout_secs}. The subagent(s) are NOT stalled and NOT cancelled; \
             their result channels and completion futexes remain alive. \
             Pending task_ids: [{}]. \
             Next steps: call `task_status` for a snapshot, or call `task_wait` again with the same task_ids to keep waiting \
             (consider `wait_policy=\"any\"` if you only need the first finisher).",
-            pending.len(),
-            pending_ids.join(", ")
-        );
-        append_task_progress_snapshots(&mut elapsed_message, &pending_ids);
+                pending.len(),
+                pending_ids.join(", ")
+            );
+            with_os_kernel(|os| {
+                append_task_progress_snapshots(os, &mut elapsed_message, &pending_ids);
+                Ok(())
+            })?;
+            append_pending_task_side_note_summaries(&mut elapsed_message, &pending_ids);
+            elapsed_message
+        };
         parts.push(elapsed_message);
         clear_task_wait_state(&wait_key);
         return Ok(append_lone_spawn_hint(
@@ -606,6 +652,22 @@ pub(super) fn append_lone_spawn_hint(mut text: String, hint: Option<&str>) -> St
         text.push_str(hint);
     }
     text
+}
+
+// Queued backend notes remain visible after a checkpoint revision has been delivered.
+fn append_pending_task_side_note_summaries(output: &mut String, task_ids: &[String]) {
+    let snapshots = task_ids
+        .iter()
+        .filter_map(|task_id| {
+            pending_task_side_note_progress(task_id)
+                .map(|pending| format!("- {task_id}: {pending}"))
+        })
+        .collect::<Vec<_>>();
+    if snapshots.is_empty() {
+        return;
+    }
+    output.push_str("\nPending side-note summaries:\n");
+    output.push_str(&snapshots.join("\n"));
 }
 
 /// Writes a terminal result to a subagent's result channel and terminates its kernel process.
@@ -729,7 +791,20 @@ pub(super) fn format_task_result(
         result.status.to_uppercase(),
         duration_secs
     )];
-    parts.push(entry.selection_explanation.clone());
+    let selection_explanation = if entry.backend.is_some_and(SubagentBackend::is_traecli) {
+        let agent_reason = entry
+            .selection_explanation
+            .split_once('\n')
+            .map(|(agent_reason, _)| agent_reason)
+            .unwrap_or(&entry.selection_explanation);
+        format!(
+            "{agent_reason}\nmodel_reason=backend model '{}'",
+            entry.model
+        )
+    } else {
+        entry.selection_explanation.clone()
+    };
+    parts.push(selection_explanation);
     if let Some(error) = result.error
         && !error.trim().is_empty()
     {
@@ -783,6 +858,193 @@ mod tests {
     use aios_kernel::kernel::{KernelInternal, Syscall};
     use aios_kernel::local::LocalOS;
     use aios_kernel::primitives::{FutexOps, IpcOps};
+
+    struct NormalProgressTestGuard {
+        session_id: String,
+        task_id: String,
+    }
+
+    impl Drop for NormalProgressTestGuard {
+        fn drop(&mut self) {
+            remove_task_entry(&self.task_id);
+            lock_unpoisoned(&TASK_PROGRESS_REGISTRY).remove(&self.task_id);
+            lock_unpoisoned(&TASK_WAIT_STATES).retain(|key, _| key.session_id != self.session_id);
+        }
+    }
+
+    #[test]
+    fn agent_team_quiet_normal_task_paths_deliver_checkpoints_once_per_revision() {
+        use crate::ai::driver::runtime_ctx;
+
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let mut app = super::super::tests::test_app_with_model("test-model".to_string());
+        app.session_id = format!("normal-progress-{}", Uuid::new_v4().simple());
+        let task_id = format!("task-{}", Uuid::new_v4().simple());
+        let _guard = NormalProgressTestGuard {
+            session_id: app.session_id.clone(),
+            task_id: task_id.clone(),
+        };
+        let (owner_pid, pid, channel, futex) = {
+            let mut os = app.os.lock().unwrap();
+            let owner_pid = os.begin_foreground("parent".into(), "goal".into(), 10, 8, None);
+            let pid = os
+                .spawn(
+                    Some(owner_pid),
+                    "child".into(),
+                    "goal".into(),
+                    20,
+                    4,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let channel = os.channel_create(Some(pid), 1, "normal-result".into());
+            let futex = os.futex_create(0, "normal-complete".into());
+            os.set_current_pid(Some(owner_pid));
+            (owner_pid, pid, channel.raw(), futex)
+        };
+        insert_task_entry_for_test(
+            task_id.clone(),
+            AsyncTaskEntry {
+                session_id: app.session_id.clone(),
+                owner_pid,
+                pid,
+                result_channel_id: channel,
+                completion_futex_addr: futex,
+                description: "normal progress test".into(),
+                agent_name: "build".into(),
+                backend: None,
+                model: "test-model".into(),
+                is_model_auto_selected: false,
+                auto_model_fallback: None,
+                selection_explanation: "test selection".into(),
+                inherit: InheritOptions::default(),
+                abort_handle: None,
+                cancel_stream: Arc::new(AtomicBool::new(false)),
+                started_at: Instant::now(),
+                last_progress_notification_at: None,
+                last_progress_persisted_at: None,
+            },
+        );
+        let slot = runtime_ctx::new_subagent_progress_slot();
+        lock_unpoisoned(&TASK_PROGRESS_REGISTRY).insert(task_id.clone(), slot.clone());
+        let checkpoint_body = "normal checkpoint body";
+        runtime_ctx::publish_subagent_checkpoint_to_slot(
+            &slot,
+            "saved checkpoint",
+            checkpoint_body,
+        );
+        let context = runtime_ctx::DriverContext::new(
+            app,
+            Arc::new(Mutex::new(crate::ai::mcp::McpClient::new())),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+        );
+        let wait_args = serde_json::json!({"task_ids": [task_id.clone()], "timeout_secs": 60});
+        runtime_ctx::TURN_IDENTITY.sync_scope((context.app_proto.session_id.clone(), 0), || {
+            runtime_ctx::DRIVER_CTX.sync_scope(context.clone(), || {
+                assert!(!is_agent_team_mode());
+                let mut outputs = Vec::new();
+                for _ in 0..2 {
+                    let status = execute_task_status(&serde_json::json!({})).unwrap();
+                    assert!(status.starts_with("TaskID"), "{status}");
+                    outputs.push(status);
+                }
+                let parked = execute_task_wait(&wait_args).unwrap();
+                assert!(parked.contains("[task_wait PARKED]"), "{parked}");
+                outputs.push(parked);
+
+                let key = task_wait_key(
+                    &context.app_proto.session_id,
+                    owner_pid,
+                    &WaitPolicy::Any,
+                    &[task_id.clone()],
+                );
+                lock_unpoisoned(&TASK_WAIT_STATES)
+                    .get_mut(&key)
+                    .unwrap()
+                    .deadline = Instant::now() - Duration::from_secs(1);
+                wake_expired_task_waits();
+                let timeout = context
+                    .app_proto
+                    .os
+                    .lock()
+                    .unwrap()
+                    .get_process(owner_pid)
+                    .unwrap()
+                    .mailbox
+                    .iter()
+                    .find(|message| message.contains("[TASK_WAIT_TIMEOUT]"))
+                    .cloned()
+                    .expect("normal wait deadline must wake the parent");
+                outputs.push(timeout);
+                context
+                    .app_proto
+                    .os
+                    .lock()
+                    .unwrap()
+                    .set_current_pid(Some(owner_pid));
+                let elapsed = execute_task_wait(&wait_args).unwrap();
+                assert!(elapsed.contains("[task_wait BUDGET ELAPSED]"), "{elapsed}");
+                outputs.push(elapsed);
+
+                for (index, output) in outputs.iter().enumerate() {
+                    assert!(output.contains("saved checkpoint"), "{output}");
+                    if index == 0 {
+                        assert_eq!(output.matches(checkpoint_body).count(), 1, "{output}");
+                        assert!(
+                            output.contains("partial checkpoint excerpt; unverified"),
+                            "{output}"
+                        );
+                    } else {
+                        assert!(!output.contains(checkpoint_body), "{output}");
+                        assert!(!output.contains("partial checkpoint excerpt"), "{output}");
+                    }
+                }
+
+                // Saving identical text creates a new revision that must be delivered again.
+                runtime_ctx::publish_subagent_checkpoint_to_slot(
+                    &slot,
+                    "saved checkpoint",
+                    checkpoint_body,
+                );
+                let revised = execute_task_wait(&wait_args).unwrap();
+                assert!(revised.contains("[task_wait PARKED]"), "{revised}");
+                assert_eq!(revised.matches(checkpoint_body).count(), 1, "{revised}");
+                assert!(
+                    revised.contains("partial checkpoint excerpt; unverified"),
+                    "{revised}"
+                );
+                context
+                    .app_proto
+                    .os
+                    .lock()
+                    .unwrap()
+                    .set_current_pid(Some(owner_pid));
+                let repeated_status = execute_task_status(&serde_json::json!({})).unwrap();
+                assert!(
+                    repeated_status.contains("saved checkpoint"),
+                    "{repeated_status}"
+                );
+                assert!(
+                    !repeated_status.contains(checkpoint_body),
+                    "{repeated_status}"
+                );
+                let repeated_wait = execute_task_wait(&wait_args).unwrap();
+                assert!(
+                    repeated_wait.contains("[task_wait PARKED]"),
+                    "{repeated_wait}"
+                );
+                assert!(!repeated_wait.contains(checkpoint_body), "{repeated_wait}");
+                assert!(
+                    runtime_ctx::take_subagent_parent_progress_snapshot(&slot, true)
+                        .unwrap()
+                        .checkpoint_excerpt
+                        .is_none()
+                );
+            });
+        });
+    }
 
     #[test]
     fn traecli_terminal_results_surface_session_after_collection() {

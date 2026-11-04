@@ -151,7 +151,8 @@ pub(crate) fn reap_timed_out_subagents() {
     // Step 3: hold only the kernel lock and check each process; if still running, kill it + write
     // the timeout terminal state.
     let _ = with_os_kernel(|os| {
-        for (task_id, session_id, pid, result_channel_id, completion_futex_addr, _, _) in candidates {
+        for (task_id, session_id, pid, result_channel_id, completion_futex_addr, _, _) in candidates
+        {
             if !is_task_pending(os, pid)? {
                 // The process already ended (completed normally / failed / killed by someone
                 // else); skip it — result and resource cleanup are handled by the collector.
@@ -415,12 +416,9 @@ pub(super) fn execute_task_integrate(args: &Value) -> Result<String, String> {
             summary.to_string(),
         ));
     }
-    let unknown = crate::ai::history::integrate_task_evidence_batch(
-        history_file,
-        session_id,
-        &integrated,
-    )
-    .map_err(|error| format!("failed to integrate task results: {error}"))?;
+    let unknown =
+        crate::ai::history::integrate_task_evidence_batch(history_file, session_id, &integrated)
+            .map_err(|error| format!("failed to integrate task results: {error}"))?;
     if let Some(task_id) = unknown.first() {
         return Err(format!(
             "Unknown task_id in durable task evidence ledger (no delivered result): {task_id}. \
@@ -739,6 +737,14 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
             .map(|(tid, entry)| (tid.clone(), entry.clone()))
             .collect::<Vec<_>>()
     };
+    if is_agent_team_mode() {
+        super::quiet::execute_agent_team_task_status(&tracked)
+    } else {
+        execute_full_task_status(tracked)
+    }
+}
+
+fn execute_full_task_status(tracked: Vec<(String, AsyncTaskEntry)>) -> Result<String, String> {
     if tracked.is_empty() {
         return Ok("No async tasks currently tracked.".to_string());
     }
@@ -776,7 +782,14 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
                 state_str,
                 entry.description
             ));
-            if let Some(progress) = current_task_progress(tid) {
+            let progress = match (
+                current_task_parent_progress(os, tid),
+                pending_task_side_note_progress(tid),
+            ) {
+                (Some(progress), Some(pending)) => Some(format!("{progress} · {pending}")),
+                (progress, pending) => progress.or(pending),
+            };
+            if let Some(progress) = progress {
                 lines.push(format!("  progress[{tid}]: {progress}"));
                 printed_progress = true;
             }

@@ -2,8 +2,7 @@ use super::*;
 use crate::ai::types::{FunctionCall, ToolCall};
 use rustc_hash::FxHashSet;
 
-/// Legacy-threshold wrapper: these tests replicate `shrink_messages_to_fit`,
-/// which folds every non-compressible result over the per-message cap.
+/// Fallback wrapper: a zero caller threshold still observes the shared floor.
 fn prepare_tool_messages_structured(
     messages: &mut [Message],
     max_chars_per_msg: usize,
@@ -30,6 +29,18 @@ fn msg(role: &str, content: &str) -> Message {
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
+    }
+}
+
+fn large_fold_result(content: &str) -> String {
+    format!("{content}\n{}", "fold fixture padding\n".repeat(400))
+}
+
+fn tool_result_for_fold(id: &str, content: &str) -> Message {
+    if super::tool_overflow::is_preserved_tool_overflow_stub(content) || content.trim().is_empty() {
+        tool_result(id, content)
+    } else {
+        tool_result(id, &large_fold_result(content))
     }
 }
 
@@ -117,7 +128,7 @@ fn resolve_stub_locator_for_test(
 #[test]
 fn folded_group_archive_uses_short_content_hash_name() {
     let dir = std::env::temp_dir().join(format!("ai-fold-short-name-{}", uuid::Uuid::new_v4()));
-    let messages = single_turn_with_groups(6, 2_000);
+    let messages = single_turn_with_groups(6, 8_000);
     let (folded, count) = fold_early_tool_groups(&messages, 4, Some(&dir), &FxHashSet::default());
     assert_eq!(count, 2);
     for note in folded
@@ -159,7 +170,7 @@ fn recursive_file_count(path: &std::path::Path) -> usize {
 
 #[test]
 fn folds_early_groups_in_a_single_bloated_turn() {
-    let messages = single_turn_with_groups(10, 2_000);
+    let messages = single_turn_with_groups(10, 8_000);
     let before = messages_total_chars(&messages);
 
     let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
@@ -178,9 +189,8 @@ fn folds_early_groups_in_a_single_bloated_turn() {
 #[test]
 fn compact_fold_guidance_keeps_each_record_self_describing_and_archived() {
     let dir = std::env::temp_dir().join(format!("ai-compact-fold-{}", uuid::Uuid::new_v4()));
-    let messages = single_turn_with_groups(6, 2_000);
-    let (folded, count) =
-        fold_early_tool_groups(&messages, 4, Some(&dir), &FxHashSet::default());
+    let messages = single_turn_with_groups(6, 8_000);
+    let (folded, count) = fold_early_tool_groups(&messages, 4, Some(&dir), &FxHashSet::default());
     assert_eq!(count, 2);
     let notes = folded
         .iter()
@@ -245,7 +255,7 @@ fn accepted_fold_archives_are_idempotent_across_rebuilds() {
     for index in 0..8 {
         let id = format!("long-read-{index}");
         messages.push(assistant_call(&id, "read_file"));
-        messages.push(tool_result(&id, &format!("{index}:{}", "x".repeat(2_000))));
+        messages.push(tool_result(&id, &format!("{index}:{}", "x".repeat(8_000))));
     }
 
     let (first, first_groups) = fold_early_tool_groups(
@@ -288,7 +298,7 @@ fn fold_archive_failure_keeps_raw_tool_group() {
     for index in 0..5 {
         let id = format!("failed-archive-read-{index}");
         messages.push(assistant_call(&id, "read_file"));
-        messages.push(tool_result(&id, &"x".repeat(2_000)));
+        messages.push(tool_result(&id, &"x".repeat(8_000)));
     }
     let before = serde_json::to_string(&messages).unwrap();
 
@@ -348,7 +358,7 @@ fn removable_messages_are_archived_in_one_batch() {
 
 #[test]
 fn preserves_user_message_verbatim() {
-    let messages = single_turn_with_groups(8, 1_500);
+    let messages = single_turn_with_groups(8, 8_000);
     let (folded, _) = fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
 
     let user = folded
@@ -360,20 +370,20 @@ fn preserves_user_message_verbatim() {
 
 #[test]
 fn keeps_recent_groups_verbatim() {
-    let messages = single_turn_with_groups(8, 1_500);
+    let messages = single_turn_with_groups(8, 8_000);
     let (folded, _) = fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
 
     // Eight groups with one result each: keep the latest four complete groups and fold the first four into stubs.
     let full_tool_results = folded
         .iter()
-        .filter(|m| m.role == "tool" && value_to_string(&m.content) == "x".repeat(1_500))
+        .filter(|m| m.role == "tool" && value_to_string(&m.content) == "x".repeat(8_000))
         .count();
     assert_eq!(full_tool_results, 4);
 }
 
 #[test]
 fn no_op_when_group_count_within_keep_window() {
-    let messages = single_turn_with_groups(3, 1_000);
+    let messages = single_turn_with_groups(3, 8_000);
     let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
 
     assert_eq!(folded_groups, 0);
@@ -385,7 +395,7 @@ fn no_op_when_group_count_within_keep_window() {
 /// counts and expose only half its results, prompting unnecessary reruns of the other half.
 #[test]
 fn fold_never_crosses_recent_tool_message_protection_window() {
-    let messages = single_turn_with_groups(10, 1_200);
+    let messages = single_turn_with_groups(10, 8_000);
 
     // keep_recent_groups=0 requests folding all ten groups.
     let (folded, folded_groups) = fold_early_tool_groups(&messages, 0, None, &FxHashSet::default());
@@ -394,7 +404,7 @@ fn fold_never_crosses_recent_tool_message_protection_window() {
     assert_eq!(folded_groups, 10);
     let full_tool_results = folded
         .iter()
-        .filter(|m| m.role == "tool" && value_to_string(&m.content) == "x".repeat(1_200))
+        .filter(|m| m.role == "tool" && value_to_string(&m.content) == "x".repeat(8_000))
         .count();
     assert_eq!(
         full_tool_results, 0,
@@ -444,7 +454,8 @@ fn folded_read_file_group_keeps_preview_and_original_target_anchor() {
     ));
     messages.push(tool_result(
         "read-prompt",
-        "1\tuse std::{\n\
+        &large_fold_result(
+            "1\tuse std::{\n\
          2\t    fs,\n\
          3\t    io::{self, BufRead},\n\
          4\t    path::{Path, PathBuf},\n\
@@ -456,6 +467,7 @@ fn folded_read_file_group_keeps_preview_and_original_target_anchor() {
          114\t    }\n\
          115\t    self.read_multi_line_tui()\n\
          116\t}\n",
+        ),
     ));
     for i in 0..4 {
         let id = format!("later-{i}");
@@ -519,14 +531,16 @@ fn folded_archived_precision_tools_keep_original_invocation_anchors() {
     ];
     for (id, name, arguments) in cases {
         messages.push(assistant_call_args(id, name, arguments));
-        messages.push(tool_result(
-            id,
-            &format!(
-                "[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]\n\
-                 Output preserved for tool `{name}`. Full result saved to session asset:\n\
-                 - file_path: /tmp/session/{id}.txt"
-            ),
-        ));
+        let archive_path = std::path::PathBuf::from(format!("/tmp/session/{id}.txt"));
+        // Omit recall lines so folding must reconstruct anchors from the tool call.
+        let stub = super::tool_overflow::build_preserved_tool_overflow_stub(
+            &archive_path,
+            name,
+            "archived result",
+            &[],
+        );
+        assert!(super::tool_overflow::is_preserved_tool_overflow_stub(&stub));
+        messages.push(tool_result(id, &stub));
     }
     for i in 0..4 {
         let id = format!("later-{i}");
@@ -572,14 +586,16 @@ fn folded_archived_precision_tools_keep_original_invocation_anchors() {
 fn folded_command_failure_keeps_diagnostics_and_full_output_pointer() {
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-command-fold-{}", uuid::Uuid::new_v4()));
-    let command_output = "Exit code: 101\n\
+    let command_output = large_fold_result(
+        "Exit code: 101\n\
         Checking rust_tools v0.1.0 (/repo)\n\
         error[E0425]: cannot find value `missing` in this scope\n\
         error: could not compile `rust_tools` (bin \"a\") due to 1 previous error\n\
-        test result: FAILED. 0 passed; 1 failed";
+        test result: FAILED. 0 passed; 1 failed",
+    );
     let mut messages = vec![msg("system", "s"), msg("user", "修复编译失败")];
     messages.push(assistant_call("command", "execute_command"));
-    messages.push(tool_result("command", command_output));
+    messages.push(tool_result("command", &command_output));
     // Push the command outside the latest four groups, modeling LLM summarization after many reads/searches in one turn.
     for i in 0..4 {
         let id = format!("later-{i}");
@@ -833,8 +849,9 @@ fn path_c_preserves_encrypted_replay_reasoning_verbatim() {
         "summary": []
     })];
     let mut assistant = assistant_call("spark-call", "read_file");
-    assistant.reasoning_content =
-        Some(encode_encrypted_reasoning_replay_state(model, None, &raw_items));
+    assistant.reasoning_content = Some(encode_encrypted_reasoning_replay_state(
+        model, None, &raw_items,
+    ));
     let encoded = assistant
         .reasoning_content
         .clone()
@@ -1369,7 +1386,9 @@ fn folded_tool_group_keeps_assistant_checkpoint_and_evidence_targets() {
     ));
     messages.push(tool_result(
         "read-history",
-        "     1\t[\n     2\t{\"role\":\"user\"}\n... [truncated: showing lines 1-120 of 6393]",
+        &large_fold_result(
+            "     1\t[\n     2\t{\"role\":\"user\"}\n... [truncated: showing lines 1-120 of 6393]",
+        ),
     ));
     for i in 0..4 {
         let id = format!("later-{i}");
@@ -1429,7 +1448,7 @@ fn folded_tool_group_points_to_raw_group_archive() {
         r#"{"pattern":"needle","path":"src/bin/ai"}"#,
         "准备按 needle 搜索目标模块。",
     ));
-    messages.push(tool_result(
+    messages.push(tool_result_for_fold(
         "grep-raw",
         "src/bin/ai/example.rs:42: unique raw grep result",
     ));
@@ -1483,7 +1502,7 @@ fn folded_lossy_group_advises_archive_read_and_archive_header_is_honest() {
     let overflow_dir = std::env::temp_dir().join(format!("ai-lossy-fold-{}", uuid::Uuid::new_v4()));
     let mut messages = vec![msg("system", "s"), msg("user", "查看项目结构")];
     messages.push(assistant_call("tree-lossy", "tree"));
-    messages.push(tool_result(
+    messages.push(tool_result_for_fold(
         "tree-lossy",
         "src\n  bin/a.rs\n  lib.rs\n  ... [truncated: 398 lines omitted]",
     ));
@@ -1546,7 +1565,7 @@ fn folded_lossy_group_advises_archive_read_and_archive_header_is_honest() {
 fn lossy_fold_without_archive_does_not_reference_nonexistent_archive() {
     let mut messages = vec![msg("system", "s"), msg("user", "查看项目结构")];
     messages.push(assistant_call("tree-noarchive", "tree"));
-    messages.push(tool_result(
+    messages.push(tool_result_for_fold(
         "tree-noarchive",
         "src\n  bin/a.rs\n  lib.rs\n  ... [truncated: 398 lines omitted]",
     ));
@@ -1589,7 +1608,7 @@ fn lossy_fold_without_archive_does_not_reference_nonexistent_archive() {
 /// budget) that `prepare_tool_messages_structured` replaces it with a summary.
 fn big_lossy_text(prefix: &str) -> String {
     (0..16)
-        .map(|i| format!("{prefix} line {i:04} padding padding padding"))
+        .map(|i| format!("{prefix} line {i:04} {}", "padding ".repeat(100)))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1696,11 +1715,10 @@ fn protected_precision_group_archives_full_text_so_header_must_not_claim_stub_on
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-precision-ladder-{}", uuid::Uuid::new_v4()));
     let mut messages = vec![msg("system", "s"), msg("user", "读取代码")];
-    // Precision results must be large enough that the spill stub (head-8 +
-    // tail-4 preview) is genuinely smaller than the text, otherwise the
-    // anti-bloat guard keeps the full text and prepare never spills.
+    // Precision results must exceed the shared floor and be larger than their
+    // spill stubs; otherwise prepare keeps the full text inline.
     let big_text = |prefix: &str| {
-        (0..60)
+        (0..120)
             .map(|i| format!("{prefix} line {i:04} padding padding padding"))
             .collect::<Vec<_>>()
             .join("\n")
@@ -1766,7 +1784,7 @@ fn protected_precision_group_archives_full_text_so_header_must_not_claim_stub_on
         // Groups spilled by prepare (A, B) were stubs before folding: their
         // archived copy is the stub carrying the spill pointer, never the full
         // text re-archived. `line 0055` lies inside the preview-omitted middle
-        // (head 4 + tail 2 of 60), so its presence proves full text.
+        // (head 4 + tail 2 of 120), so its presence proves full text.
         assert!(
             !archived.contains("read-A line 0055"),
             "prepare-spilled precision results must archive the stub, not the full text: {archived}"
@@ -1804,7 +1822,9 @@ fn folded_tool_group_ignores_reasoning_when_content_empty() {
     messages.push(call);
     messages.push(tool_result(
         "read-history",
-        "     1\t[\n     2\t{\"role\":\"user\"}\n... [truncated: showing lines 1-120 of 6393]",
+        &large_fold_result(
+            "     1\t[\n     2\t{\"role\":\"user\"}\n... [truncated: showing lines 1-120 of 6393]",
+        ),
     ));
     for i in 0..4 {
         let id = format!("later-{i}");
@@ -1863,11 +1883,11 @@ fn folded_tool_group_reconstructs_checkpoint_when_tool_call_has_no_text() {
             },
         });
     messages.push(call);
-    messages.push(tool_result(
+    messages.push(tool_result_for_fold(
         "read-history",
         "     1\t[\n     2\t{\"role\":\"user\"}\n... [truncated: showing lines 1-120 of 6393]",
     ));
-    messages.push(tool_result("opaque-call", "opaque result"));
+    messages.push(tool_result_for_fold("opaque-call", "opaque result"));
     for i in 0..4 {
         let id = format!("later-{i}");
         messages.push(assistant_call(&id, "text_grep"));
@@ -2169,7 +2189,7 @@ fn persisted_shrink_caps_evidence_created_during_the_same_pass() {
         })
         .to_string();
         messages.push(assistant_call_args(&id, "text_grep", &args));
-        messages.push(tool_result(&id, "matching line"));
+        messages.push(tool_result_for_fold(&id, "matching line"));
     }
     messages.push(msg("user", "latest turn"));
 
@@ -2213,7 +2233,7 @@ fn mid_turn_shrink_caps_evidence_created_during_the_same_pass() {
         })
         .to_string();
         messages.push(assistant_call_args(&id, "text_grep", &args));
-        messages.push(tool_result(&id, "matching line"));
+        messages.push(tool_result_for_fold(&id, "matching line"));
     }
 
     let (compressed, before_chars, after_chars) =
@@ -2252,7 +2272,7 @@ fn folded_command_keeps_invocation_for_empty_success() {
     ));
     messages.push(tool_result(
         "git-log",
-        "(command succeeded with exit code 0 and produced no output)",
+        &"(command succeeded with exit code 0 and produced no output)\n".repeat(100),
     ));
     for i in 0..4 {
         let id = format!("later-{i}");
@@ -2325,7 +2345,7 @@ fn preserves_read_file_for_pending_patch_path() {
         "read_file",
         r#"{"file_path":"/a.rs"}"#,
     ));
-    messages.push(tool_result(
+    messages.push(tool_result_for_fold(
         "call-rf",
         "PENDING_READ_SENTINEL\nOutput preserved for non-compressible tool `read_file`.\n- file_path: /a.rs\n- use read_file to inspect exact content.",
     ));
@@ -2343,7 +2363,7 @@ fn preserves_read_file_for_pending_patch_path() {
     for i in 0..6 {
         let id = format!("call-{i}");
         messages.push(assistant_call(&id, "text_grep"));
-        messages.push(tool_result(&id, "recent"));
+        messages.push(tool_result_for_fold(&id, "recent"));
     }
 
     let (folded, folded_groups) = fold_early_tool_groups(
@@ -2352,7 +2372,10 @@ fn preserves_read_file_for_pending_patch_path() {
         Some(overflow_dir.as_path()),
         &FxHashSet::default(),
     );
-    assert!(folded_groups >= 1, "应至少折叠 apply_patch/grep 组");
+    assert!(
+        folded_groups >= 1,
+        "at least one apply_patch/grep group must fold"
+    );
     // The read_file group must remain verbatim, not become a ROLE_INTERNAL_NOTE stub.
     let rf = folded
         .iter()

@@ -11,7 +11,9 @@ use super::{
     skill_authoring_referenced, tool_uses_mcp_server,
 };
 use crate::ai::agents::{AgentManifest, AgentMode};
-use crate::ai::driver::runtime_ctx::{RESUME_SKILL_NAMES, SUBAGENT_CWD, SUBAGENT_DEPTH};
+use crate::ai::driver::runtime_ctx::{
+    RESUME_SKILL_NAMES, SUBAGENT_CWD, SUBAGENT_DEPTH, TURN_IDENTITY,
+};
 use crate::ai::history::SkillActivationEvent;
 use crate::ai::mcp::McpClient;
 use crate::ai::skills::SkillManifest;
@@ -436,6 +438,46 @@ fn runtime_enabled_task_tools_drop_out_of_hidden_catalog_and_gate_guidance() {
         .nth(2)
         .unwrap_or_default();
     assert!(!catalog_line.contains("`task_spawn`"));
+}
+
+#[test]
+fn reset_command_drops_explicit_task_tools_from_the_next_turn() {
+    let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
+    let root = std::env::temp_dir().join(format!(
+        "reset-task-tools-next-turn-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let history_file = root.join("history.sqlite");
+    let mut app = super::super::tests::test_app("build");
+    app.config.base_history_file = history_file.clone();
+    app.config.history_file = history_file.clone();
+    app.session_id = "reset-task-tools-next-turn".to_string();
+    app.session_history_file =
+        crate::ai::history::SessionStore::new(&history_file).session_history_file(&app.session_id);
+    app.session_default_skills = vec!["agent-team".to_string()];
+    TURN_IDENTITY.sync_scope((app.session_id.clone(), 0), || {
+        set_explicit_enabled_tool_names(vec!["task_spawn".to_string(), "task_wait".to_string()]);
+        crate::ai::driver::commands::try_handle_reset_command(&mut app, "/reset").unwrap();
+        let mcp_client = McpClient::new();
+        let _guard =
+            super::prepare_skill_for_turn(&mut app, &mcp_client, &[], "plain follow-up").unwrap();
+        let loaded = app
+            .agent_context
+            .as_ref()
+            .map(|context| {
+                context
+                    .tools
+                    .iter()
+                    .map(|tool| tool.function.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        assert!(!loaded.iter().any(|name| name == "task_spawn"));
+        assert!(!loaded.iter().any(|name| name == "task_wait"));
+    });
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -2521,6 +2563,194 @@ fn skill_activation_history_reminder_keeps_six_recent_unique_selections() {
     assert!(!history.contains("old-source"));
     assert!(history.contains("\"skill-6\""));
     assert!(!history.contains("\"skill-1\""));
+}
+
+#[test]
+fn agent_team_mode_notice_appears_after_injected_activation() {
+    let events = [SkillActivationEvent {
+        requested_skill: "traecli".to_string(),
+        injected_skill: Some("AgEnT-TeAm".to_string()),
+        source: "session-default".to_string(),
+        outcome: "injected".to_string(),
+    }];
+    let other_skill = skill("other", "another workflow");
+
+    let notice = super::build_agent_team_mode_notice(&events, &[&other_skill]).unwrap();
+
+    assert_eq!(
+        notice,
+        "Agent-team mode is not active in this session. Earlier agent-team instructions are historical only: do not apply their delegation requirement or spawn subagents merely because of that history. Follow the current request and the current tool policy."
+    );
+}
+
+#[test]
+fn agent_team_mode_notice_is_absent_while_agent_team_is_active() {
+    let events = [SkillActivationEvent {
+        requested_skill: "agent-team".to_string(),
+        injected_skill: Some("agent-team".to_string()),
+        source: "session-default".to_string(),
+        outcome: "injected".to_string(),
+    }];
+    let other_skill = skill("other", "another workflow");
+    let agent_team = skill("AgEnT-TeAm", "delegate work");
+
+    assert!(super::build_agent_team_mode_notice(&events, &[&other_skill, &agent_team]).is_none());
+}
+
+#[test]
+fn agent_team_mode_notice_is_absent_for_subagent_turns() {
+    let root = temp_dir("agent_team_mode_notice_subagent");
+    let history = root.join("history.sqlite");
+    let event = SkillActivationEvent {
+        requested_skill: "agent-team".to_string(),
+        injected_skill: Some("agent-team".to_string()),
+        source: "session-default".to_string(),
+        outcome: "injected".to_string(),
+    };
+    crate::ai::history::append_skill_activation_event_sqlite(&history, &event).unwrap();
+
+    let mcp_client = McpClient::new();
+    let mut app = super::super::tests::test_app("build");
+    app.session_history_file = history;
+    SUBAGENT_DEPTH.sync_scope(1, || {
+        // The same injected activation yields the notice for a top-level turn;
+        // a subagent must not inherit the parent's turn policy.
+        let prompt = super::build_skill_turn_guard(&mut app, &mcp_client, &[], "plain follow-up")
+            .system_prompt()
+            .to_string();
+        assert!(!prompt.contains("<agent_team_mode_notice>"));
+    });
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn agent_team_mode_notice_requires_successful_agent_team_injection() {
+    assert!(super::build_agent_team_mode_notice(&[], &[]).is_none());
+    let events = [
+        SkillActivationEvent {
+            requested_skill: "agent-team".to_string(),
+            injected_skill: Some("agent-team".to_string()),
+            source: "session-default".to_string(),
+            outcome: "not-found".to_string(),
+        },
+        SkillActivationEvent {
+            requested_skill: "agent-team".to_string(),
+            injected_skill: None,
+            source: "session-default".to_string(),
+            outcome: "injected".to_string(),
+        },
+        SkillActivationEvent {
+            requested_skill: "agent-team".to_string(),
+            injected_skill: Some("other".to_string()),
+            source: "session-default".to_string(),
+            outcome: "injected".to_string(),
+        },
+    ];
+
+    assert!(super::build_agent_team_mode_notice(&events, &[]).is_none());
+}
+
+#[test]
+fn agent_team_mode_notice_stays_single_and_follows_scoped_instructions() {
+    let root = temp_dir("agent_team_mode_notice");
+    let driver_dir = root.join("src/driver");
+    let tools_file = root.join("src/tools/read.rs");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(&driver_dir).unwrap();
+    fs::create_dir_all(tools_file.parent().unwrap()).unwrap();
+    fs::write(root.join("AGENTS.md"), "Root rules.\n").unwrap();
+    fs::write(driver_dir.join("AGENTS.md"), "Driver rules.\n").unwrap();
+    fs::write(root.join("src/tools/AGENTS.md"), "Tool rules.\n").unwrap();
+    fs::write(&tools_file, "// tools\n").unwrap();
+    let history = root.join("history.sqlite");
+    let event = SkillActivationEvent {
+        requested_skill: "agent-team".to_string(),
+        injected_skill: Some("agent-team".to_string()),
+        source: "session-default".to_string(),
+        outcome: "injected".to_string(),
+    };
+    for _ in 0..3 {
+        crate::ai::history::append_skill_activation_event_sqlite(&history, &event).unwrap();
+    }
+    let mut residency = crate::ai::history::read_prompt_residency_sqlite(&history)
+        .unwrap()
+        .unwrap_or_default();
+    residency.scoped_instruction_dirs = vec![fs::canonicalize(&driver_dir).unwrap()];
+    crate::ai::history::write_prompt_residency_sqlite(&history, &residency).unwrap();
+
+    SUBAGENT_CWD.sync_scope(root.clone(), || {
+        let mcp_client = McpClient::new();
+        let mut app = super::super::tests::test_app("build");
+        app.session_history_file = history;
+        let notice = super::build_agent_team_mode_notice(&[event], &[]).unwrap();
+        let notice_tail =
+            format!("<agent_team_mode_notice>\n{notice}\n</agent_team_mode_notice>\n</policy>\n");
+        let mut guard =
+            super::build_skill_turn_guard(&mut app, &mcp_client, &[], "plain follow-up");
+        let prompt = guard.system_prompt().to_string();
+        assert!(prompt.ends_with(&notice_tail));
+        assert_eq!(prompt.matches("<agent_team_mode_notice>").count(), 1);
+        assert_eq!(prompt.matches(&notice).count(), 1);
+        assert!(
+            prompt
+                .find("</target_scoped_project_instructions>")
+                .unwrap()
+                < prompt.find("<agent_team_mode_notice>").unwrap()
+        );
+        assert!(
+            !guard
+                .context_reminder()
+                .unwrap_or_default()
+                .contains(&notice)
+        );
+        assert!(guard.turn_sections.is_empty());
+
+        // A later scoped load updates the seeded policy without moving it after the notice.
+        assert!(guard.push_scoped_project_instructions(&[], std::slice::from_ref(&tools_file)));
+        let prompt = guard.system_prompt().to_string();
+        assert!(prompt.contains("Tool rules."));
+        assert!(prompt.ends_with(&notice_tail));
+
+        guard.push_labeled_section(ContextKind::Behavior, "turn_guidance", "Prepared guidance.");
+        for _ in 0..3 {
+            let mut rebuilt =
+                super::build_skill_turn_guard(&mut app, &mcp_client, &[], "plain follow-up");
+            rebuilt.inherit_turn_state(&guard);
+            assert!(rebuilt.push_scoped_project_instructions(&[], &[]));
+            assert_eq!(rebuilt.system_prompt(), guard.system_prompt());
+            assert_eq!(
+                rebuilt
+                    .system_prompt()
+                    .matches("<agent_team_mode_notice>")
+                    .count(),
+                1
+            );
+            guard = rebuilt;
+        }
+
+        let agent_team = skill("agent-team", "delegate work");
+        let mut reactivated =
+            super::build_skill_turn_guard(&mut app, &mcp_client, &[&agent_team], "active mode");
+        reactivated.inherit_turn_state(&guard);
+        assert!(
+            !reactivated
+                .system_prompt()
+                .contains("<agent_team_mode_notice>")
+        );
+
+        let mut pure_agent = agent("pure", vec![]);
+        pure_agent.pure = true;
+        app.current_agent_manifest = Some(pure_agent);
+        let mut pure_guard =
+            super::build_skill_turn_guard(&mut app, &mcp_client, &[], "pure follow-up");
+        assert!(
+            !pure_guard
+                .system_prompt()
+                .contains("<agent_team_mode_notice>")
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

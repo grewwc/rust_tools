@@ -434,12 +434,21 @@ fn folded_prune_protects_plan_task_unknown_and_mixed_groups_past_preview_cutoff(
             assert!(!canonical_fold_ids(&raw).contains(&id));
             if mixed {
                 let text = note.content.as_str().unwrap();
-                assert!(text.contains("1 more tools omitted"));
-                assert!(
-                    !text
-                        .lines()
-                        .any(|line| line.starts_with(&format!("- {protected}")))
-                );
+                if super::tool_prune_is_conditional(protected) {
+                    // Task calls retain their recovery details beyond the ordinary cutoff.
+                    assert!(!text.contains("1 more tools omitted"));
+                    assert!(
+                        text.lines()
+                            .any(|line| line.starts_with(&format!("- {protected}")))
+                    );
+                } else {
+                    assert!(text.contains("1 more tools omitted"));
+                    assert!(
+                        !text
+                            .lines()
+                            .any(|line| line.starts_with(&format!("- {protected}")))
+                    );
+                }
             }
             let mut request = old_fold_projection(note);
             let before = request.clone();
