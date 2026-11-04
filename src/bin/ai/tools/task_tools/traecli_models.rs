@@ -13,8 +13,10 @@ const CACHE_TTL: Duration = Duration::from_secs(60);
 /// Negative-cache TTL for failed/empty discoveries. A transient spawn failure
 /// or timeout must not blank completion for the full success TTL, while
 /// back-to-back Tab presses still must not respawn a missing CLI every time.
-const FAILURE_CACHE_TTL: Duration = Duration::from_secs(5);
-const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(500);
+const FAILURE_CACHE_TTL: Duration = Duration::from_millis(500);
+// TraeCLI cold starts can exceed 500 ms while loading credentials and runtime
+// state. Keep discovery bounded without rejecting a normal cold start.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_OUTPUT_BYTES: u64 = 128 * 1024;
 
 #[derive(Default)]
@@ -280,7 +282,7 @@ mod tests {
         assert!(cache.get_or_refresh("absent", now, Vec::new).is_empty());
         assert!(
             cache
-                .get_or_refresh("absent", now + Duration::from_secs(1), || panic!(
+                .get_or_refresh("absent", now + Duration::from_millis(100), || panic!(
                     "failed lookup must be cached"
                 ))
                 .is_empty()
@@ -334,12 +336,25 @@ mod tests {
             ["GPT-5.5", "GPT-6.1-Sol"]
         );
 
+        // This exercises the production subprocess path, not the completion
+        // test hook. A normal cold start above the old 500 ms limit must still
+        // produce candidates.
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\nsleep 1\nprintf 'GPT-6.1-Sol\\nGPT-6-Astra\\n'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            discover_model_names(binary.to_str().unwrap()),
+            ["GPT-6.1-Sol", "GPT-6-Astra"]
+        );
+
         std::fs::write(&binary, "#!/bin/sh\nprintf 'partial-model\\n'\nexit 1\n").unwrap();
         assert!(discover_model_names(binary.to_str().unwrap()).is_empty());
         std::fs::write(&binary, "#!/bin/sh\nexec sleep 5\n").unwrap();
         let start = Instant::now();
         assert!(discover_model_names(binary.to_str().unwrap()).is_empty());
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < Duration::from_secs(4));
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -2790,6 +2790,10 @@ fn render_turn_stream_to_with_confirm(
                 | "replace"
                 | "subagent_progress"
         ) {
+            // Header deduplication is only for adjacent retry copies. Once
+            // the stream reports model activity, the next request header is
+            // useful context again even when its fields are unchanged.
+            observer_rows.last_header_key = None;
             observer_rows.close_tool_row(&mut line_open, out);
             observer_rows.hide_context_budget_row(&mut line_open, tty, out);
         }
@@ -3154,6 +3158,9 @@ fn render_turn_stream_to_with_confirm(
                 // tear the answer's open line nor bury the answer tail.
                 // Every other observer row keeps the previous inline behavior.
                 if is_metrics_footer(payload) {
+                    // Metrics end one model stream. Although the row itself is
+                    // hidden, it separates this request's header from the next.
+                    observer_rows.last_header_key = None;
                     observer_rows.close_tool_row(&mut line_open, out);
                     observer_rows.hide_context_budget_row(&mut line_open, tty, out);
                     let _ = out.flush();
@@ -3350,6 +3357,10 @@ fn decide_observer_row(
         state.last_header_key = None;
         state.last_thinking_summary = None;
         state.last_context_budget = None;
+    } else if !header {
+        // Suppress only consecutive copies (normally request retries). Tool,
+        // thinking, and other observer rows make a later header informative.
+        state.last_header_key = None;
     }
     let thinking_summary = normalized
         .strip_prefix("✓ thinking (")
@@ -3368,8 +3379,8 @@ fn decide_observer_row(
     let fits = width > 0 && !plain.chars().any(char::is_control) && plain.width() < width;
     let action = if header {
         // Identity is the bracketed model/effort/title, excluding any clocks
-        // outside it and the client's `(remote)` suffix. Changed fields remain
-        // visible, including automatic model/effort fallback.
+        // outside it and the client's `(remote)` suffix. Only adjacent copies
+        // are hidden; later model rounds remain visible even when unchanged.
         let key = header_text
             .rfind(']')
             .map(|end| &header_text[..=end])
@@ -5316,7 +5327,7 @@ mod tests {
     }
 
     #[test]
-    fn observer_rows_dedupe_identical_headers() {
+    fn observer_rows_dedupe_only_adjacent_identical_headers() {
         let mut state = ObserverRowState::default();
         let header = "[model (effort: max) · topic]";
         assert_eq!(
@@ -5334,6 +5345,14 @@ mod tests {
                 "{duplicate:?}"
             );
         }
+        assert_eq!(
+            decide_observer_row("│ tool output", &mut state, true, 80, false).action,
+            ObserverRowAction::Print
+        );
+        assert_eq!(
+            decide_observer_row(header, &mut state, true, 80, false).action,
+            ObserverRowAction::Print
+        );
     }
 
     #[test]
@@ -5501,7 +5520,7 @@ mod tests {
     }
 
     #[test]
-    fn sse_repeated_headers_reset_only_after_committed_turn() {
+    fn sse_repeated_headers_dedupe_only_without_intervening_activity() {
         let body = concat!(
             "data: [model (effort: max) · topic]\n\n",
             "data: [model (effort: max) · topic]\n\n",
@@ -5522,6 +5541,7 @@ mod tests {
             concat!(
                 "[model (effort: max) · topic] (remote)\n",
                 "first\n",
+                "[model (effort: max) · topic] (remote)\n",
                 "[fallback (effort: max) · topic] (remote)\n",
                 "[fallback (effort: max) · topic] (remote)\n",
                 "second\n",

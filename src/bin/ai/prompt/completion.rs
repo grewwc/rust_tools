@@ -1351,6 +1351,23 @@ impl CommandCompleter {
                 }
             } else if matches!(first, "/use" | ":use") {
                 match words.next() {
+                    None if token == "traecli" => {
+                        let models = Self::traecli_model_candidates("");
+                        if models.is_empty() {
+                            vec![CompletionCandidate {
+                                display: "traecli".to_string(),
+                                replacement: "traecli ".to_string(),
+                            }]
+                        } else {
+                            models
+                                .into_iter()
+                                .map(|candidate| CompletionCandidate {
+                                    display: candidate.display,
+                                    replacement: format!("traecli {}", candidate.replacement),
+                                })
+                                .collect()
+                        }
+                    }
                     None => Self::plain_candidates(
                         Self::use_backends()
                             .iter()
@@ -4082,6 +4099,19 @@ mod tests {
     }
 
     #[test]
+    fn exact_traecli_model_backend_still_completes_when_discovery_fails() {
+        crate::ai::tools::task_tools::with_traecli_model_names_for_test(Vec::new(), || {
+            for line in ["/use traecli", ":use traecli"] {
+                let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
+                assert_eq!(start, line.find("traecli").unwrap());
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].display, "traecli");
+                assert_eq!(candidates[0].replacement, "traecli ");
+            }
+        });
+    }
+
+    #[test]
     fn use_command_completion_lists_live_traecli_models() {
         crate::ai::tools::task_tools::with_traecli_model_names_for_test(
             vec![
@@ -4098,6 +4128,22 @@ mod tests {
                         .map(|candidate| candidate.replacement.as_str())
                         .collect();
                     assert_eq!(labels, ["GPT-5.5", "GPT-6.1-Sol", "Seed-Evolving"]);
+                }
+                for line in ["/use traecli", ":use traecli"] {
+                    let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
+                    assert_eq!(start, line.find("traecli").unwrap());
+                    let replacements: Vec<_> = candidates
+                        .iter()
+                        .map(|candidate| candidate.replacement.as_str())
+                        .collect();
+                    assert_eq!(
+                        replacements,
+                        [
+                            "traecli GPT-5.5",
+                            "traecli GPT-6.1-Sol",
+                            "traecli Seed-Evolving"
+                        ]
+                    );
                 }
                 let line = "/use traecli gpt-6";
                 let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());

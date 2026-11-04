@@ -61,16 +61,19 @@ fn build_multiline_completion_context(textarea: &TextArea<'_>) -> Option<Pending
 
 fn should_open_popup_on_first_tab(ctx: &PendingTabCompletion) -> bool {
     let trimmed = ctx.line[..ctx.col].trim();
-    // `/model` (including its `effort` subcommand), `/effort` and serve-chat
-    // `/resume` all pick one value from a fixed candidate list, so the first Tab
-    // opens the panel directly instead of the silent-first-then-popup flow used
-    // for ambiguous completions.
+    // `/model` (including its `effort` subcommand), `/effort`, `/use traecli`,
+    // and serve-chat `/resume` all pick one value from a fixed candidate list,
+    // so the first Tab opens the panel directly instead of the
+    // silent-first-then-popup flow used for ambiguous completions.
     (matches!(trimmed, "/model" | ":model")
         || trimmed.starts_with("/model ")
         || trimmed.starts_with(":model ")
         || matches!(trimmed, "/effort" | ":effort")
         || trimmed.starts_with("/effort ")
         || trimmed.starts_with(":effort ")
+        || matches!(trimmed, "/use traecli" | ":use traecli")
+        || trimmed.starts_with("/use traecli ")
+        || trimmed.starts_with(":use traecli ")
         || matches!(trimmed, "/resume")
         || trimmed.starts_with("/resume "))
         || is_skill_reference_trigger(trimmed)
@@ -260,6 +263,31 @@ mod tests {
         assert_eq!(panel.selected_index, 0);
         assert_eq!(panel.items[0].replacement, format!("/model {current}"));
         assert!(panel.items[0].display.contains("current"));
+    }
+
+    #[test]
+    fn traecli_model_completion_opens_popup_without_trailing_space() {
+        crate::ai::tools::task_tools::with_traecli_model_names_for_test(
+            vec!["GPT-6.1-Sol".to_string(), "GPT-6-Astra".to_string()],
+            || {
+                let mut textarea = TextArea::new(vec!["/use traecli".to_string()]);
+                textarea.move_cursor(CursorMove::End);
+                let mut pending = None;
+                let mut panel = None;
+
+                let status =
+                    apply_multiline_completion(&mut textarea, &mut pending, &mut panel).unwrap();
+
+                assert!(status.contains("发现"));
+                let panel = panel.expect("TraeCLI models should open on the first tab");
+                let replacements: Vec<_> = panel
+                    .items
+                    .iter()
+                    .map(|candidate| candidate.replacement.as_str())
+                    .collect();
+                assert_eq!(replacements, ["traecli GPT-6.1-Sol", "traecli GPT-6-Astra"]);
+            },
+        );
     }
 
     #[test]
