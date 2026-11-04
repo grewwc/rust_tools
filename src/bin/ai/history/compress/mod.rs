@@ -47,7 +47,7 @@ use tool_overflow::{
 use tool_overflow::{
     age_out_overflow_stub_previews, build_persisted_summary_text,
     build_persisted_summary_text_with_app,
-    enforce_protected_precision_group_budget, is_non_compressible_tool,
+    enforce_protected_precision_group_budget,
     is_preserved_tool_overflow_content, merge_old_user_overflow_stubs,
     minimize_overflow_stubs_for_hard_budget,
     normalize_preserved_message_stubs_for_model, prepare_tool_messages_structured,

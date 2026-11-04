@@ -426,6 +426,12 @@ fn large_progress_evidence_keeps_progress_recovery_through_compression() {
             );
             assert!(!retained.contains(r#""source":"delivered""#), "{retained}");
         }
+        // The spilled result is small; reclaim the old assistant replay while
+        // keeping its review block readable in the folded note.
+        candidate[0].reasoning_content = Some(encode_reasoning_replay_state(
+            "synthetic-replay",
+            &"r".repeat(8_000),
+        ));
         let (folded, count) =
             fold_early_tool_groups(&candidate, 0, Some(&overflow_dir), &FxHashSet::default());
         assert_eq!(count, 1);
@@ -503,6 +509,10 @@ fn large_task_evidence_compresses_with_review_and_delivery_recovery() {
                         "{retained}"
                     );
                 }
+                candidate[0].reasoning_content = Some(encode_reasoning_replay_state(
+                    "synthetic-replay",
+                    &"r".repeat(8_000),
+                ));
                 let (folded, count) = fold_early_tool_groups(
                     &candidate,
                     0,
@@ -1997,6 +2007,10 @@ fn path_c_spills_aggregated_task_wait_result_losslessly() {
             );
         }
     }
+    messages[0].reasoning_content = Some(encode_reasoning_replay_state(
+        "synthetic-replay",
+        &"r".repeat(8_000),
+    ));
     let (folded, count) =
         fold_early_tool_groups(&messages, 0, Some(&overflow_dir), &FxHashSet::default());
     assert_eq!(count, 1);

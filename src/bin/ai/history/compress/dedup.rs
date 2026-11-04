@@ -428,6 +428,41 @@ fn is_content_overflow_archived_stub(content: &Value) -> bool {
 /// with it so persisted stubs are never re-rendered into nested stubs.
 const DEDUP_STUB_MARKER_PREFIX: &str = "[deduped:";
 
+/// True when the content is already a dedup back-reference stub. Hard-budget
+/// compaction must leave these alone: truncating the stub would replace the
+/// pointer to the canonical copy with a second-hand pointer and lose the
+/// `No need to re-read` guidance the model relies on.
+pub(super) fn is_dedup_tool_stub(content: &Value) -> bool {
+    match content {
+        Value::String(text) => text.starts_with(DEDUP_STUB_MARKER_PREFIX),
+        _ => value_to_string(content).starts_with(DEDUP_STUB_MARKER_PREFIX),
+    }
+}
+
+/// True when a text body is a dedup back-reference stub.
+pub(super) fn is_dedup_stub_text(text: &str) -> bool {
+    text.starts_with(DEDUP_STUB_MARKER_PREFIX)
+}
+
+/// One bounded recall line for a dedup stub embedded in a fold note. The full
+/// stub remains in the group archive; copying it verbatim made the note no
+/// smaller than the stubs it replaced, so whole-group folding refused to run
+/// and duplicates kept their full excerpt size in the projection.
+pub(super) fn dedup_stub_fold_recall_line(text: &str) -> String {
+    let header = text.lines().next().unwrap_or_default().trim();
+    let canonical = text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("- canonical_tool_call_id:"))
+        .unwrap_or_default();
+    let mut out = truncate_to_chars(&normalize_whitespace(header), 200);
+    if !canonical.is_empty() {
+        out.push(' ');
+        out.push_str(&truncate_to_chars(canonical, 80));
+    }
+    out
+}
+
 /// Hard cap for the raw content prefix embedded in byte-identical dedup stubs.
 /// Each stub carries its own bounded excerpt so it stays useful even after the
 /// canonical occurrence gets folded away in a later pass (historical failure

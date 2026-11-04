@@ -10,6 +10,7 @@ use std::path::Path;
 use crate::ai::types::ToolCall;
 
 use super::super::types::{Message, ROLE_INTERNAL_NOTE, ROLE_SYSTEM, retained_turn_start};
+use super::overflow_sink::{ArchivedNoteWindowPlan, plan_compressed_tool_evidence_window};
 use super::text_utils::truncate_to_chars;
 use super::tool_overflow::{
     build_tool_overflow_recall_lines, is_non_compressible_tool, is_preserved_tool_overflow_stub,
@@ -19,8 +20,8 @@ use super::tool_overflow::{
 use super::{
     COMPRESSED_TOOL_EVIDENCE_MARKER, PlannedArchiveWrite, content_sha256_hex,
     is_archive_note_message, is_compressed_tool_evidence_note, is_context_checkpoint_marker,
-    is_summary_message, keep_recent_user_turns_when_trimming, normalize_whitespace,
-    value_to_string,
+    is_persisted_reasoning_replay, is_summary_message, keep_recent_user_turns_when_trimming,
+    message_billable_chars, normalize_whitespace, value_to_string,
 };
 
 pub(super) const FOLDED_TOOL_GROUP_ARCHIVE_DIR: &str = "folded-tool-groups";
@@ -62,6 +63,7 @@ pub(super) struct ToolGroupFoldPlan {
     messages: Vec<Message>,
     folded_groups: usize,
     archives: Vec<PlannedArchiveWrite>,
+    evidence_window: Option<ArchivedNoteWindowPlan>,
 }
 
 impl ToolGroupFoldPlan {
@@ -70,11 +72,25 @@ impl ToolGroupFoldPlan {
             messages: messages.to_vec(),
             folded_groups: 0,
             archives: Vec::new(),
+            evidence_window: None,
         }
     }
 
     pub(super) fn messages(&self) -> &[Message] {
-        &self.messages
+        self.evidence_window
+            .as_ref()
+            .map_or(&self.messages, ArchivedNoteWindowPlan::messages)
+    }
+
+    pub(super) fn with_capped_evidence(mut self, overflow_dir: Option<&Path>) -> Self {
+        // Without a sink, keep the notes inline; the regular trimming path
+        // reports MissingArchiveSink rather than assuming demotion succeeded.
+        if self.folded_groups > 0
+            && let Ok(plan) = plan_compressed_tool_evidence_window(&self.messages, overflow_dir)
+        {
+            self.evidence_window = plan;
+        }
+        self
     }
 
     pub(super) fn folded_groups(&self) -> usize {
@@ -83,10 +99,18 @@ impl ToolGroupFoldPlan {
 
     pub(super) fn commit(&self) -> bool {
         self.archives.iter().all(PlannedArchiveWrite::commit)
+            && self
+                .evidence_window
+                .as_ref()
+                .is_none_or(ArchivedNoteWindowPlan::commit)
     }
 
     pub(super) fn into_result(self) -> (Vec<Message>, usize) {
-        (self.messages, self.folded_groups)
+        let messages = match self.evidence_window {
+            Some(plan) => plan.into_messages(),
+            None => self.messages,
+        };
+        (messages, self.folded_groups)
     }
 }
 
@@ -244,27 +268,49 @@ fn plan_tool_call_group_fold(
     if tool_calls.is_empty() {
         return None;
     }
-    // Whole-group folding must not bypass the per-result spill floor. Existing
-    // lossy summaries already replaced a large result; their small protocol
-    // text is safe to fold.
-    if group.iter().skip(1).any(|idx| {
-        let message = &messages[*idx];
-        let Some(call) = tool_calls
-            .iter()
-            .find(|call| message.tool_call_id.as_deref() == Some(call.id.as_str()))
-        else {
-            return false;
-        };
-        let text = value_to_string(&message.content);
-        let already_summarized = !is_non_compressible_tool(&call.function.name)
-            && text.starts_with("tool_output_lines: ");
-        !text.trim().is_empty()
-            && !is_preserved_tool_overflow_stub(&text)
-            && !already_summarized
-            && !tool_result_can_fold(&call.function.name, &text)
-    }) {
-        return None;
+    // The spill floor protects individual results, not the assistant's replay
+    // state or arguments. A group archive lets small results remain verbatim
+    // inline while reclaiming that assistant bulk. Without it, retain the
+    // original group whenever short raw results or exact replay need recovery.
+    if overflow_dir.is_none() {
+        let has_replay = assistant
+            .reasoning_content
+            .as_deref()
+            .is_some_and(is_persisted_reasoning_replay);
+        let has_short_raw_result = group.iter().skip(1).any(|idx| {
+            let message = &messages[*idx];
+            let Some(call) = tool_calls
+                .iter()
+                .find(|call| message.tool_call_id.as_deref() == Some(call.id.as_str()))
+            else {
+                return false;
+            };
+            let text = value_to_string(&message.content);
+            let already_summarized = !is_non_compressible_tool(&call.function.name)
+                && text.starts_with("tool_output_lines: ");
+            !text.trim().is_empty()
+                && !is_preserved_tool_overflow_stub(&text)
+                && !already_summarized
+                && !tool_result_can_fold(&call.function.name, &text)
+        });
+        // A dedup stub carries the only inline copy of a repeated result's
+        // excerpt. Without a group archive, folding it would replace that
+        // excerpt with a summary the model cannot read back.
+        let has_dedup_stub = group.iter().skip(1).any(|idx| {
+            messages.get(*idx).is_some_and(|message| {
+                // Match the recall branch, which detects the stub in the
+                // stringified content: structured tool results are not `as_str`.
+                super::dedup::is_dedup_stub_text(&value_to_string(&message.content))
+            })
+        });
+        if has_replay || has_short_raw_result || has_dedup_stub {
+            return None;
+        }
     }
+    let original_chars = group
+        .iter()
+        .map(|idx| message_billable_chars(&messages[*idx]))
+        .sum::<usize>();
 
     let mut archives = Vec::new();
     let archive_file_path = if let Some(dir) = overflow_dir {
@@ -330,15 +376,6 @@ fn plan_tool_call_group_fold(
 
     let mut omitted = 0usize;
     for (index, tc) in tool_calls.iter().enumerate() {
-        // Task recovery locators must survive even beyond the ordinary recall
-        // display limit; the group archive retains every other omitted result.
-        if index >= 8
-            && crate::ai::tools::tool_history_policy(&tc.function.name).prune_policy()
-                != crate::ai::tools::registry::common::ToolPrunePolicy::AfterIntegration
-        {
-            omitted += 1;
-            continue;
-        }
         let result_text = group
             .iter()
             .skip(1)
@@ -351,7 +388,25 @@ fn plan_tool_call_group_fold(
                 }
             })
             .unwrap_or_default();
-        let recall = tool_result_recall_text(tc, &result_text, overflow_dir, &mut archives)?;
+        // Task recovery locators and modest results remain inline beyond the
+        // ordinary recall limit; the group archive retains other omitted output.
+        let retain_short_result =
+            archive_file_path.is_some() && !tool_result_can_fold(&tc.function.name, &result_text);
+        if index >= 8
+            && !retain_short_result
+            && crate::ai::tools::tool_history_policy(&tc.function.name).prune_policy()
+                != crate::ai::tools::registry::common::ToolPrunePolicy::AfterIntegration
+        {
+            omitted += 1;
+            continue;
+        }
+        let recall = tool_result_recall_text(
+            tc,
+            &result_text,
+            overflow_dir,
+            archive_file_path.is_some(),
+            &mut archives,
+        )?;
         let invocation = tool_call_invocation_recall(tc);
         let target = tool_call_target_recall(tc);
         lines.push(format!(
@@ -401,6 +456,11 @@ fn plan_tool_call_group_fold(
         group,
         archive_file_path.as_deref(),
     );
+    // Account for all fields, including the note's provenance. Reject plans
+    // that merely exchange a small group for larger recovery boilerplate.
+    if message_billable_chars(&note) >= original_chars {
+        return None;
+    }
     Some((note, archives))
 }
 
@@ -536,9 +596,38 @@ fn tool_result_recall_text(
     tool_call: &ToolCall,
     result_text: &str,
     overflow_dir: Option<&Path>,
+    group_archived: bool,
     archives: &mut Vec<PlannedArchiveWrite>,
 ) -> Option<String> {
     let tool_name = tool_call.function.name.as_str();
+    if super::dedup::is_dedup_stub_text(result_text) {
+        // A dedup stub is already a pointer plus a bounded excerpt. Embedding it
+        // whole made the fold note no smaller than the stubs it replaced, so the
+        // net-growth guard refused the fold and duplicates kept full stub size.
+        //
+        // The short line is a locator, not the evidence: it drops the stub's raw
+        // excerpt. Use it only when the group archive keeps the full stub
+        // reachable; otherwise keep the stub verbatim so the projection retains
+        // the original path and excerpt.
+        if group_archived {
+            return Some(super::dedup::dedup_stub_fold_recall_line(result_text));
+        }
+        return Some(append_original_recall_lines(
+            result_text.to_string(),
+            tool_call,
+            result_text,
+        ));
+    }
+    // Keep modest results (including generic truncation stubs) byte-exact in
+    // the evidence note. The group archive recovers the original protocol and
+    // assistant state, so no per-result spill or second stub is needed.
+    if group_archived && !tool_result_can_fold(tool_name, result_text) {
+        return Some(append_original_recall_lines(
+            result_text.to_string(),
+            tool_call,
+            result_text,
+        ));
+    }
     let already_archived = is_preserved_tool_overflow_stub(result_text);
     if !is_non_compressible_tool(tool_name) || result_text.trim().is_empty() {
         let recall = tool_result_recall_one_liner(result_text);
@@ -1126,6 +1215,7 @@ pub(super) fn plan_early_tool_groups(
         messages: out,
         folded_groups,
         archives,
+        evidence_window: None,
     }
 }
 

@@ -42,7 +42,7 @@ pub(in crate::ai) use blob::{
 #[allow(unused_imports)]
 pub(in crate::ai) use checkpoint::{
     CheckpointBranch, CheckpointHead, CheckpointInfo, CheckpointStore,
-    MAX_CHECKPOINTS_PER_SESSION, MAX_CHECKPOINT_STORAGE_BYTES, checkpoint_status_label,
+    MAX_CHECKPOINT_STORAGE_BYTES, MAX_CHECKPOINTS_PER_SESSION, checkpoint_status_label,
     is_reserved_checkpoint_name,
 };
 #[allow(unused_imports)]
@@ -293,6 +293,11 @@ pub(in crate::ai) fn delete_subagent_memory(memory_path: &Path) -> io::Result<()
 pub(in crate::ai) use sqlite::read_context_history_sqlite;
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::read_recent_turn_window_sqlite;
+pub(in crate::ai) use sqlite::{
+    ENCRYPTED_REASONING_REPLAY_REJECTIONS_MAX_ENTRIES,
+    read_encrypted_reasoning_replay_rejections_sqlite,
+    write_encrypted_reasoning_replay_rejections_sqlite,
+};
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::{
     append_interrupted_stream_diagnostic_sqlite, append_skill_activation_event_sqlite,
@@ -304,11 +309,6 @@ pub(in crate::ai) use sqlite::{
 };
 pub(in crate::ai) use sqlite::{read_image_digest_sqlite, upsert_image_digest_sqlite};
 pub(in crate::ai) use sqlite::{read_prompt_residency_sqlite, write_prompt_residency_sqlite};
-pub(in crate::ai) use sqlite::{
-    ENCRYPTED_REASONING_REPLAY_REJECTIONS_MAX_ENTRIES,
-    read_encrypted_reasoning_replay_rejections_sqlite,
-    write_encrypted_reasoning_replay_rejections_sqlite,
-};
 #[allow(unused_imports)]
 pub(in crate::ai) use suspended::{
     SuspendedSessionEntry, SuspendedSessionStore, current_terminal_key,
@@ -318,19 +318,18 @@ pub(in crate::ai) use suspended::{
 pub(in crate::ai) use task_evidence::render_unintegrated_task_evidence;
 pub(in crate::ai) use task_evidence::{
     DeliveredTaskEvidence, integrate_task_evidence, integrate_task_evidence_batch,
-    read_integrated_task_ids,
-    read_task_evidence_status_payload, read_task_spawn_audit, record_delivered_task_evidence,
-    record_task_spawn_audit, record_uncollected_task_terminal_status,
-    render_unintegrated_task_evidence_resilient, task_evidence_exists,
+    read_integrated_task_ids, read_task_evidence_status_payload, read_task_spawn_audit,
+    record_delivered_task_evidence, record_task_spawn_audit,
+    record_uncollected_task_terminal_status, render_unintegrated_task_evidence_resilient,
+    task_evidence_exists,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use types::{
     CODE_INSPECTION_MEMORY_PREFIX, COLON, MAX_HISTORY_TURNS, Message, NEWLINE,
     SkillActivationEvent, ToolExecutionOutcome, attach_request_reminder,
-    clear_runtime_message_metadata, has_runtime_message_metadata,
-    is_code_inspection_memory_text, is_runtime_synthetic_user_message, last_real_user_index,
-    prepend_request_reminder, redact_inline_image_data, request_reminder,
-    runtime_synthetic_user_message,
+    clear_runtime_message_metadata, has_runtime_message_metadata, is_code_inspection_memory_text,
+    is_runtime_synthetic_user_message, last_real_user_index, prepend_request_reminder,
+    redact_inline_image_data, request_reminder, runtime_synthetic_user_message,
 };
 
 pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;
@@ -668,7 +667,10 @@ fn context_projection_fingerprint(
     // draft that dropped the latest intent, so they must be rebuilt.
     // v19: automatic tool-result folding has a shared size floor; task stubs
     // retain task IDs, status, bounded conclusions, and evidence recovery locators.
-    const PROJECTION_VERSION: u8 = 19;
+    // v20: group folds preserve short results inline, archive assistant replay
+    // and arguments, and require a net reduction including provenance. Window
+    // selection accounts for capped evidence before reducing recent groups.
+    const PROJECTION_VERSION: u8 = 20;
     projection_cache_key(
         PROJECTION_VERSION,
         history_max_chars,
@@ -1080,7 +1082,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_cache_key_is_versioned_and_v19_never_reuses_older_snapshots() {
+    fn projection_cache_key_is_versioned_and_v20_never_reuses_older_snapshots() {
         let params = (
             8_000usize,
             2usize,
@@ -1089,23 +1091,26 @@ mod tests {
         );
         let v17_key = projection_cache_key(17, params.0, params.1, params.2, params.3);
         let v18_key = projection_cache_key(18, params.0, params.1, params.2, params.3);
+        let v19_key = projection_cache_key(19, params.0, params.1, params.2, params.3);
         assert_ne!(
             v17_key, v18_key,
             "identical projection parameters must not collide across projection versions"
         );
         assert!(v17_key.starts_with("v17|"));
         assert!(v18_key.starts_with("v18|"));
-        // The live fingerprint must carry v19 so snapshots materialized under
-        // v18 and earlier are rebuilt with the shared tool-result folding floor
-        // and retained task evidence. Updating the v19 literal is a deliberate
-        // tripwire for the next projection-strategy change.
+        assert!(v19_key.starts_with("v19|"));
+        // The live fingerprint must carry v20 so snapshots materialized under
+        // v19 and earlier are rebuilt with group-fold evidence and provenance
+        // semantics. Updating the v20 literal is a deliberate tripwire for the
+        // next projection-strategy change.
         let live = context_projection_fingerprint(params.0, params.1, params.2, params.3);
         assert_eq!(
             live,
-            projection_cache_key(19, params.0, params.1, params.2, params.3)
+            projection_cache_key(20, params.0, params.1, params.2, params.3)
         );
         assert_ne!(live, v17_key);
         assert_ne!(live, v18_key);
+        assert_ne!(live, v19_key);
     }
 
     #[test]

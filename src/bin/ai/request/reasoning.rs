@@ -23,7 +23,6 @@ use super::super::{
     },
     types::{App, ReasoningItemMap},
 };
-use super::current_budget::is_water_meter_text;
 use super::types::extract_displayable_text;
 use crate::commonw::{FastSet, configw};
 
@@ -828,7 +827,6 @@ pub(super) fn apply_prompt_cache_breakpoints(messages: &mut [Value]) {
         .find(|message| {
             matches!(role_of(message).as_deref(), Some("user" | "tool"))
                 && !is_code_inspection_memory_message(message)
-                && !is_water_meter_message(message)
         })
         .and_then(|message| message.get_mut("content"))
     {
@@ -843,16 +841,6 @@ pub(super) fn is_code_inspection_memory_message(message: &Value) -> bool {
         && message.get("content").is_some_and(|content| {
             is_code_inspection_memory_text(&extract_displayable_text(content))
         })
-}
-
-/// The water-meter note is request-only tail context. It changes with the
-/// context band, so leaving a rolling breakpoint on it would re-bill the
-/// conversation prefix whenever the band changes.
-pub(super) fn is_water_meter_message(message: &Value) -> bool {
-    message.get("role").and_then(Value::as_str) == Some("user")
-        && message
-            .get("content")
-            .is_some_and(|content| is_water_meter_text(&extract_displayable_text(content)))
 }
 
 /// Marks `content` as a cache breakpoint: a non-empty plain string becomes a

@@ -451,6 +451,42 @@ pub(super) fn trim_compressed_tool_evidence_with_status(
     )
 }
 
+pub(super) struct ArchivedNoteWindowPlan {
+    messages: Vec<Message>,
+    dropped: Vec<Message>,
+    overflow_dir: PathBuf,
+}
+
+impl ArchivedNoteWindowPlan {
+    pub(super) fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    pub(super) fn commit(&self) -> bool {
+        let mut sink = OverflowSink::new(&self.overflow_dir);
+        sink.push_messages(&self.dropped);
+        sink.flush()
+    }
+
+    pub(super) fn into_messages(self) -> Vec<Message> {
+        self.messages
+    }
+}
+
+/// Compose this pure plan with a tool-group fold before comparing budgets, so
+/// transient folded notes do not force an unnecessarily small recent window.
+pub(super) fn plan_compressed_tool_evidence_window(
+    messages: &[Message],
+    overflow_dir: Option<&Path>,
+) -> Result<Option<ArchivedNoteWindowPlan>, ContextCompressionStatus> {
+    plan_archived_note_window(
+        messages,
+        overflow_dir,
+        MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS,
+        is_compressed_tool_evidence_note,
+    )
+}
+
 /// Keep the most recent contiguous window of source-bound memory increments that
 /// fits `inline_char_cap`.
 ///
@@ -475,7 +511,12 @@ pub(super) fn trim_incremental_summary_notes_with_status(
     overflow_dir: Option<&Path>,
     inline_char_cap: usize,
 ) -> (Vec<Message>, Option<ContextCompressionStatus>) {
-    trim_archived_note_window(messages, overflow_dir, inline_char_cap, is_incremental_summary)
+    trim_archived_note_window(
+        messages,
+        overflow_dir,
+        inline_char_cap,
+        is_incremental_summary,
+    )
 }
 
 /// Both capped note windows retain their newest record and archive older records
@@ -487,13 +528,33 @@ fn trim_archived_note_window(
     inline_char_cap: usize,
     is_note: fn(&Message) -> bool,
 ) -> (Vec<Message>, Option<ContextCompressionStatus>) {
+    let plan = match plan_archived_note_window(&messages, overflow_dir, inline_char_cap, is_note) {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return (messages, None),
+        Err(status) => return (messages, Some(status)),
+    };
+    if !plan.commit() {
+        return (
+            messages,
+            Some(ContextCompressionStatus::ArchiveCommitFailed),
+        );
+    }
+    (plan.into_messages(), None)
+}
+
+fn plan_archived_note_window(
+    messages: &[Message],
+    overflow_dir: Option<&Path>,
+    inline_char_cap: usize,
+    is_note: fn(&Message) -> bool,
+) -> Result<Option<ArchivedNoteWindowPlan>, ContextCompressionStatus> {
     let sizes: Vec<usize> = messages
         .iter()
         .filter(|message| is_note(message))
         .map(message_billable_chars)
         .collect();
     if sizes.iter().sum::<usize>() <= inline_char_cap {
-        return (messages, None);
+        return Ok(None);
     }
     let mut keep_from = sizes.len();
     let mut kept_chars = 0usize;
@@ -506,11 +567,11 @@ fn trim_archived_note_window(
         }
     }
     if keep_from == 0 {
-        return (messages, None);
+        return Ok(None);
     }
     // Demoting without an archive sink would lose the records silently.
     let Some(overflow_dir) = overflow_dir else {
-        return (messages, Some(ContextCompressionStatus::MissingArchiveSink));
+        return Err(ContextCompressionStatus::MissingArchiveSink);
     };
 
     let dropped: Vec<Message> = messages
@@ -519,13 +580,7 @@ fn trim_archived_note_window(
         .take(keep_from)
         .cloned()
         .collect();
-    let mut sink = OverflowSink::new(overflow_dir);
-    sink.push_messages(&dropped);
-    if !sink.flush() {
-        return (messages, Some(ContextCompressionStatus::ArchiveCommitFailed));
-    }
-
-    let mut messages = messages;
+    let mut messages = messages.to_vec();
     let mut ordinal = 0usize;
     messages.retain(|message| {
         if !is_note(message) {
@@ -537,9 +592,17 @@ fn trim_archived_note_window(
     });
     insert_archive_note_if_missing(
         &mut messages,
-        build_overflow_placeholder(&sink.file_path().to_string_lossy()),
+        build_overflow_placeholder(
+            &overflow_dir
+                .join(OVERFLOW_HISTORY_FILENAME)
+                .to_string_lossy(),
+        ),
     );
-    (messages, None)
+    Ok(Some(ArchivedNoteWindowPlan {
+        messages,
+        dropped,
+        overflow_dir: overflow_dir.to_path_buf(),
+    }))
 }
 
 pub(super) fn build_overflow_placeholder(file_path: &str) -> String {

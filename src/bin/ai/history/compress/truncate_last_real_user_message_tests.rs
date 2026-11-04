@@ -385,3 +385,188 @@ fn corrupted_fingerprint_index_falls_back_to_plain_append() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn archive_note_overhead_does_not_retire_a_shrinking_field() {
+    let dir = overflow_dir("archive-note-tax");
+    // The first successful truncation in a call inserts the request-level
+    // archive note when overflow-history.md exists. That one-time tax can exceed
+    // a one-char cut, and must not be mistaken for a field that cannot shrink.
+    std::fs::write(dir.join(OVERFLOW_HISTORY_FILENAME), "archived").unwrap();
+
+    let mut messages = vec![
+        msg("system", Value::String("s".repeat(20))),
+        msg("user", Value::String("u".repeat(20))),
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: Some("r".repeat(5_000)),
+        },
+    ];
+    let before = crate::ai::history::messages_total_chars_pub(&messages);
+    let max_chars = before - 1;
+    let met = truncate_mutable_messages_to_fit(
+        &mut messages,
+        max_chars,
+        Some(&dir),
+        &rustc_hash::FxHashSet::default(),
+    );
+    let after = crate::ai::history::messages_total_chars_pub(&messages);
+    assert!(
+        messages.iter().any(|message| message
+            .content
+            .as_str()
+            .is_some_and(|text| text.contains("overflow-history.md"))),
+        "the one-time archive note must be present for this regression"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        met,
+        "a one-char excess must still converge after the archive note: {after} > {max_chars}"
+    );
+}
+
+#[test]
+fn byte_length_cache_does_not_hide_a_char_shorter_preview() {
+    let dir = overflow_dir("byte-equal-preview");
+    std::fs::write(dir.join(OVERFLOW_HISTORY_FILENAME), "archived").unwrap();
+
+    let mut messages = vec![
+        msg("system", Value::String("s".repeat(20))),
+        msg("user", Value::String("u".repeat(20))),
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: Some("r".repeat(4_000)),
+        },
+    ];
+    let before = crate::ai::history::messages_total_chars_pub(&messages);
+    // A two-char cut is byte-neutral: 3998 chars plus the three-byte ellipsis is
+    // still 4000 bytes, so a byte-length staleness check cannot see the edit.
+    let max_chars = before - 2;
+    let met = truncate_mutable_messages_to_fit(
+        &mut messages,
+        max_chars,
+        Some(&dir),
+        &rustc_hash::FxHashSet::default(),
+    );
+    let reasoning_chars = messages
+        .iter()
+        .find(|message| message.role == "assistant")
+        .and_then(|message| message.reasoning_content.as_deref())
+        .map(|text| text.chars().count());
+    let after = crate::ai::history::messages_total_chars_pub(&messages);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        met,
+        "the pass must converge: after={after} max={max_chars} reasoning={reasoning_chars:?}"
+    );
+    assert!(
+        reasoning_chars.is_some_and(|chars| chars < 4_000),
+        "the reasoning field must actually shrink: {reasoning_chars:?}"
+    );
+}
+
+#[test]
+fn path_c_cap_keeps_protected_tool_arguments_verbatim() {
+    use crate::ai::types::{FunctionCall, ToolCall};
+
+    let protected_id = "call_patch_protected";
+    let unprotected_id = "call_read_unprotected";
+    let protected_arguments = format!(r#"{{"patch":"{}"}}"#, "P".repeat(20_000));
+    let unprotected_arguments = "R".repeat(20_000);
+    let mut messages = vec![
+        msg("system", Value::String("system".to_string())),
+        msg("user", Value::String("apply the patch".to_string())),
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![
+                ToolCall {
+                    id: protected_id.to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "patch".to_string(),
+                        arguments: protected_arguments.clone(),
+                    },
+                },
+                ToolCall {
+                    id: unprotected_id.to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: unprotected_arguments.clone(),
+                    },
+                },
+            ]),
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "tool".to_string(),
+            content: Value::String("ok".to_string()),
+            tool_calls: None,
+            tool_call_id: Some(protected_id.to_string()),
+            reasoning_content: None,
+        },
+        Message {
+            role: "tool".to_string(),
+            content: Value::String("ok".to_string()),
+            tool_calls: None,
+            tool_call_id: Some(unprotected_id.to_string()),
+            reasoning_content: None,
+        },
+    ];
+    let mut protected = rustc_hash::FxHashSet::default();
+    protected.insert(protected_id.to_string());
+
+    let _ = emergency_cap_messages_to_fit(&mut messages, usize::MAX, 8_000, None, &protected);
+
+    let calls = messages[2].tool_calls.as_ref().unwrap();
+    assert_eq!(
+        calls[0].function.arguments, protected_arguments,
+        "a protected patch/command argument is grounding evidence and must stay verbatim"
+    );
+    assert!(
+        calls[1].function.arguments.chars().count() <= 8_000,
+        "an unprotected oversized argument is still capped: {}",
+        calls[1].function.arguments.chars().count()
+    );
+}
+
+#[test]
+fn blocked_fields_follow_messages_past_the_inserted_archive_note() {
+    let mut blocked = rustc_hash::FxHashMap::default();
+    blocked.insert((0, MutableMessageField::Content), true);
+    blocked.insert((1, MutableMessageField::Reasoning), false);
+    blocked.insert((4, MutableMessageField::ToolArguments(0)), true);
+
+    super::truncate::shift_blocked_fields_after_note(&mut blocked, 1);
+
+    assert!(blocked.contains_key(&(0, MutableMessageField::Content)));
+    assert!(blocked.contains_key(&(2, MutableMessageField::Reasoning)));
+    assert!(blocked.contains_key(&(5, MutableMessageField::ToolArguments(0))));
+    assert_eq!(blocked.len(), 3);
+}
+
+#[test]
+fn terminal_blocked_fields_survive_a_successful_cut() {
+    let mut blocked = rustc_hash::FxHashMap::default();
+    blocked.insert((0, MutableMessageField::Content), true);
+    blocked.insert((1, MutableMessageField::Reasoning), false);
+
+    super::truncate::retain_terminal_blocked_fields(&mut blocked);
+
+    assert!(
+        blocked.contains_key(&(0, MutableMessageField::Content)),
+        "a field that cannot shrink at any target must stay blocked"
+    );
+    assert!(
+        !blocked.contains_key(&(1, MutableMessageField::Reasoning)),
+        "a target-dependent failure must be retried after a later cut"
+    );
+}

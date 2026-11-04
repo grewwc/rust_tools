@@ -67,8 +67,11 @@ pub(in crate::ai) fn fold_noncompressible_tool_groups_to_fit(
         if anchor_count <= keep_recent {
             continue;
         }
+        // Compare the final evidence window, including its recovery pointer,
+        // before reducing the number of recent verbatim tool groups.
         let plan =
-            plan_early_tool_groups(messages, keep_recent, overflow_dir, protected_tool_call_ids);
+            plan_early_tool_groups(messages, keep_recent, overflow_dir, protected_tool_call_ids)
+                .with_capped_evidence(overflow_dir);
         if plan.folded_groups() == 0 {
             continue;
         }
@@ -109,6 +112,7 @@ pub(in crate::ai) fn fold_noncompressible_tool_groups_to_fit(
             Some((window, plan)) if window == keep_recent => plan,
             _ => {
                 plan_early_tool_groups(messages, keep_recent, overflow_dir, protected_tool_call_ids)
+                    .with_capped_evidence(overflow_dir)
             }
         };
         if plan.folded_groups() > 0
@@ -392,11 +396,16 @@ pub(in crate::ai) fn shrink_messages_to_fit(
     insert_overflow_archive_note_if_exists(&mut messages, overflow_dir);
 
     if messages_total_chars(&messages) > max_chars {
+        // `protected_tool_call_ids` is the inline precision tail. Lossless results
+        // outside it were eligible for spilling/folding above, but must not be
+        // lossy-truncated here: union them in for the truncation pass alone.
+        let mut truncate_protected = protected_tool_call_ids.clone();
+        truncate_protected.extend(current_turn_lossless_tool_call_ids(&messages));
         truncate_unprotected_messages_to_fit(
             &mut messages,
             max_chars,
             overflow_dir,
-            protected_tool_call_ids,
+            &truncate_protected,
         );
     }
 

@@ -43,8 +43,7 @@ impl ContextLimits {
         }
     }
 
-    /// Model-derived limits shared by budget measurement and the water
-    /// meter's display band, so the two can never disagree on the allowance.
+    /// Model-derived limits shared by budget measurement and compaction.
     pub(crate) fn for_model(model: &str, output_override: Option<u32>) -> Self {
         Self::new(
             models::context_window_tokens(model),
@@ -54,78 +53,12 @@ impl ContextLimits {
     }
 }
 
-/// Display-only context occupancy band for the water meter note.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WaterBand {
-    Comfortable,
-    Elevated,
-    Pressure,
-    Critical,
-}
-
-impl WaterBand {
-    /// Derive guidance from the same calibrated upper interval and allowance
-    /// that compression uses, so model-visible pressure cannot contradict the
-    /// runtime's current request budget.
-    pub(crate) fn for_budget(budget: CurrentRequestBudget) -> Self {
-        Self::for_upper(budget.upper_tokens(), budget.limits.input_allowance_tokens)
-    }
-
-    /// Fixed band edges as permille of the input allowance: 600/800/1000.
-    /// Pure function of a request upper bound: prompt growth is append-only
-    /// within a stable calibration chain, so the band is monotonic and no
-    /// hysteresis state is needed (edges sit 20% of the allowance apart
-    /// while the note itself is ~50 tokens).
-    pub(crate) fn for_upper(upper_tokens: usize, allowance_tokens: usize) -> Self {
-        if allowance_tokens == 0 {
-            return Self::Critical;
-        }
-        let permille =
-            (upper_tokens as u128).saturating_mul(1000) / (allowance_tokens as u128);
-        if permille < 600 {
-            Self::Comfortable
-        } else if permille < 800 {
-            Self::Elevated
-        } else if permille < 1000 {
-            Self::Pressure
-        } else {
-            Self::Critical
-        }
-    }
-}
-
-/// Prefix of the request-only water-meter note.
-///
-/// The note travels as a synthetic user message at the request tail, so a band
-/// change never moves the cached system/tool prefix. Cache breakpoint selection
-/// identifies it by this prefix.
-pub(crate) const WATER_METER_PREFIX: &str = "[context-water-meter:";
-
-/// Whether `text` is a water-meter note.
-pub(crate) fn is_water_meter_text(text: &str) -> bool {
-    text.trim_start().starts_with(WATER_METER_PREFIX)
-}
-
-/// Fixed water meter note per band. The note is request-only tail context and
-/// is trimmed from calibration/prefix-reuse comparisons, so changing bands only
-/// changes the tail message; it never moves the cached system/tool prefix.
-/// Fixed edge labels (no measured numbers) also keep the note byte-stable
-/// within a band, so repeated requests reuse the same tail bytes.
-pub(crate) fn water_note(band: WaterBand) -> &'static str {
-    match band {
-        WaterBand::Comfortable => "[context-water-meter: comfortable] Conservative context occupancy is below 60% of the input allowance. No action needed.",
-        WaterBand::Elevated => "[context-water-meter: elevated] Conservative context occupancy is at 60-80% of the input allowance. Prefer narrow reads and smaller result sets.",
-        WaterBand::Pressure => "[context-water-meter: pressure] Conservative context occupancy is at 80-100% of the input allowance. Checkpoint key findings now, avoid spawning subagents, and narrow further reads.",
-        WaterBand::Critical => "[context-water-meter: critical] Conservative context occupancy meets or exceeds the input allowance; compression is imminent or active. Checkpoint key findings immediately and converge the answer.",
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CurrentRequestBudget {
     pub(crate) prompt_tokens: usize,
-    /// Pessimistic twin of `prompt_tokens` for the water meter's display
-    /// interval. Budgets, clamps, and compression keep reading `prompt_tokens`
-    /// only. Legacy snapshots deserialize this as 0; use
+    /// Pessimistic twin of `prompt_tokens`, reported as the interval's upper
+    /// bound only. Budgets, clamps, and compression keep reading
+    /// `prompt_tokens` only. Legacy snapshots deserialize this as 0; use
     /// [`upper_tokens`](Self::upper_tokens) so the interval can
     /// never invert.
     #[serde(default)]
@@ -191,9 +124,9 @@ impl CurrentRequestBudget {
         self.prompt_tokens > self.limits.input_allowance_tokens
     }
 
-    /// Display-only upper bound of the prompt-token interval. Clamped to
-    /// `prompt_tokens` so legacy snapshots (whose field deserializes as 0)
-    /// degrade to a degenerate interval instead of an inverted one.
+    /// Upper bound of the prompt-token interval. Clamped to `prompt_tokens` so
+    /// legacy snapshots (whose field deserializes as 0) degrade to a degenerate
+    /// interval instead of an inverted one.
     pub(crate) fn upper_tokens(self) -> usize {
         self.prompt_tokens_upper.max(self.prompt_tokens)
     }
@@ -385,34 +318,4 @@ mod tests {
         assert_eq!(cjk.upper_tokens(), cjk.prompt_tokens);
     }
 
-    #[test]
-    fn water_band_edges_follow_fixed_percille() {
-        use super::{WaterBand, water_note};
-        let band = |upper: usize| WaterBand::for_upper(upper, 10_000);
-        assert_eq!(band(0), WaterBand::Comfortable);
-        assert_eq!(band(5_999), WaterBand::Comfortable);
-        assert_eq!(band(6_000), WaterBand::Elevated);
-        assert_eq!(band(7_999), WaterBand::Elevated);
-        assert_eq!(band(8_000), WaterBand::Pressure);
-        assert_eq!(band(9_999), WaterBand::Pressure);
-        assert_eq!(band(10_000), WaterBand::Critical);
-        assert_eq!(band(50_000), WaterBand::Critical);
-        // Degenerate allowance degrades to critical, never panics.
-        assert_eq!(WaterBand::for_upper(0, 0), WaterBand::Critical);
-        // Notes are fixed per band: byte-identical across calls and ASCII-only
-        // so text-only normalization is a no-op for them.
-        for b in [
-            WaterBand::Comfortable,
-            WaterBand::Elevated,
-            WaterBand::Pressure,
-            WaterBand::Critical,
-        ] {
-            assert_eq!(water_note(b), water_note(b));
-            assert!(water_note(b).is_ascii());
-        }
-        assert_ne!(
-            water_note(WaterBand::Comfortable),
-            water_note(WaterBand::Critical)
-        );
-    }
 }

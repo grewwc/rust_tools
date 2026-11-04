@@ -169,6 +169,316 @@ fn recursive_file_count(path: &std::path::Path) -> usize {
 }
 
 #[test]
+fn fold_archives_assistant_bulk_and_keeps_short_results_inline() {
+    for name in ["read_file", "plan"] {
+        for bulk in ["exact", "encrypted", "arguments"] {
+            let dir = std::env::temp_dir().join(format!(
+                "ai-short-result-fold-{bulk}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let mut assistant = assistant_call("old", name);
+            let payload = "opaque assistant state ".repeat(400);
+            match bulk {
+                "exact" => {
+                    assistant.reasoning_content =
+                        Some(encode_reasoning_replay_state("synthetic-replay", &payload));
+                }
+                "encrypted" => {
+                    assistant.reasoning_content = Some(encode_encrypted_reasoning_replay_state(
+                        "synthetic-replay",
+                        None,
+                        &[serde_json::json!({
+                            "type": "reasoning",
+                            "encrypted_content": payload,
+                            "summary": []
+                        })],
+                    ));
+                }
+                _ => {
+                    assistant.tool_calls.as_mut().unwrap()[0].function.arguments =
+                        serde_json::json!({
+                            "file_path": "src/example.rs",
+                            "context": payload
+                        })
+                        .to_string();
+                }
+            }
+            let result = "Exit code: 101\nerror: missing input\nkeep this exact diagnostic";
+            let messages = vec![
+                assistant,
+                tool_result("old", result),
+                assistant_call("recent", name),
+                tool_result("recent", "recent result"),
+            ];
+            let original = serde_json::to_string(&messages).unwrap();
+            let plan = plan_early_tool_groups(&messages, 1, Some(&dir), &FxHashSet::default());
+            assert_eq!(plan.folded_groups(), 1, "{name}, {bulk}");
+            assert!(!dir.exists(), "planning must remain pure");
+            assert!(plan.commit());
+            let folded = plan.messages();
+            let text = value_to_string(&folded[0].content);
+            assert!(text.contains(result), "{name}, {bulk}: {text}");
+            assert!(!text.contains("opaque assistant state"), "{text}");
+            let locator = archive_file_path_from_text(&text);
+            let archive =
+                std::fs::read_to_string(resolve_stub_locator_for_test(&dir, &locator)).unwrap();
+            assert!(archive.contains(&serde_json::to_string_pretty(&messages[..2]).unwrap()));
+            assert_eq!(recursive_file_count(&dir), 1, "no per-result spill");
+            assert!(messages_total_chars(folded) < messages_total_chars(&messages));
+            assert_eq!(serde_json::to_string(&messages).unwrap(), original);
+            assert_eq!(&folded[1..], &messages[2..]);
+            assert_tool_pairs_consistent(folded);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+#[test]
+fn fold_reclaims_replay_even_when_entire_group_is_below_result_floor() {
+    let dir = std::env::temp_dir().join(format!("ai-modest-replay-fold-{}", uuid::Uuid::new_v4()));
+    let assistant = assistant_call_with_reasoning(
+        "old",
+        "read_file",
+        &encode_reasoning_replay_state("synthetic-replay", &"r".repeat(2_800)),
+    );
+    let messages = vec![assistant, tool_result("old", "1\tfn observed() {}")];
+    assert!(messages_total_chars(&messages) < super::tool_overflow::TOOL_RESULT_FOLD_MIN_CHARS);
+    let (folded, count) = fold_early_tool_groups(&messages, 0, Some(&dir), &FxHashSet::default());
+    assert_eq!(count, 1);
+    assert!(value_to_string(&folded[0].content).contains("1\tfn observed() {}"));
+    assert!(messages_total_chars(&folded) < messages_total_chars(&messages));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn folded_short_overflow_stub_keeps_original_locator_without_respilling() {
+    let dir = std::env::temp_dir().join(format!("ai-short-stub-fold-{}", uuid::Uuid::new_v4()));
+    let result = "[context-overflow-truncated] full original archived at: \
+                  session-asset:overflow-history.md\n- field: content\noriginal diagnostic";
+    let messages = vec![
+        assistant_call_with_reasoning(
+            "old",
+            "execute_command",
+            &encode_reasoning_replay_state("synthetic-replay", &"r".repeat(6_000)),
+        ),
+        tool_result("old", result),
+    ];
+    let (folded, count) = fold_early_tool_groups(&messages, 0, Some(&dir), &FxHashSet::default());
+    assert_eq!(count, 1);
+    let text = value_to_string(&folded[0].content);
+    assert!(text.contains(result), "{text}");
+    assert_eq!(
+        recursive_file_count(&dir),
+        1,
+        "do not archive a stub as new output"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn mixed_tool_group_folds_without_short_result_veto() {
+    let dir = std::env::temp_dir().join(format!("ai-mixed-result-fold-{}", uuid::Uuid::new_v4()));
+    let mut assistant = assistant_call("short", "execute_command");
+    assistant.tool_calls.as_mut().unwrap().push(
+        assistant_call("large", "read_file")
+            .tool_calls
+            .unwrap()
+            .remove(0),
+    );
+    let messages = vec![
+        assistant,
+        tool_result("short", "Exit code: 0\nunchanged"),
+        tool_result("large", &"exact large result\n".repeat(800)),
+    ];
+    let (folded, count) = fold_early_tool_groups(&messages, 0, Some(&dir), &FxHashSet::default());
+    assert_eq!(count, 1);
+    let text = value_to_string(&folded[0].content);
+    assert!(text.contains("Exit code: 0\nunchanged"), "{text}");
+    assert_eq!(
+        recursive_file_count(&dir),
+        2,
+        "one group and one large result archive"
+    );
+    assert!(messages_total_chars(&folded) < messages_total_chars(&messages));
+    assert_tool_pairs_consistent(&folded);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn folded_group_keeps_short_results_past_recall_display_limit() {
+    let dir = std::env::temp_dir().join(format!("ai-parallel-short-fold-{}", uuid::Uuid::new_v4()));
+    let mut assistant = assistant_call_with_reasoning(
+        "short-0",
+        "read_file",
+        &encode_reasoning_replay_state("synthetic-replay", &"r".repeat(20_000)),
+    );
+    for index in 1..10 {
+        assistant.tool_calls.as_mut().unwrap().push(
+            assistant_call(&format!("short-{index}"), "read_file")
+                .tool_calls
+                .unwrap()
+                .remove(0),
+        );
+    }
+    let mut messages = vec![assistant];
+    for index in 0..10 {
+        messages.push(tool_result(
+            &format!("short-{index}"),
+            &format!("exact small result {index}\nunique observation {index}"),
+        ));
+    }
+    let (folded, count) = fold_early_tool_groups(&messages, 0, Some(&dir), &FxHashSet::default());
+    assert_eq!(count, 1);
+    let text = value_to_string(&folded[0].content);
+    for message in &messages[1..] {
+        assert!(text.contains(message.content.as_str().unwrap()), "{text}");
+    }
+    assert_eq!(recursive_file_count(&dir), 1);
+    assert_tool_pairs_consistent(&folded);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn short_result_fold_requires_committed_group_archive() {
+    let blocked =
+        std::env::temp_dir().join(format!("ai-short-fold-blocked-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&blocked, "not a directory").unwrap();
+    for name in ["read_file", "plan"] {
+        let messages = vec![
+            assistant_call_with_reasoning(
+                "old",
+                name,
+                &encode_reasoning_replay_state("synthetic-replay", &"r".repeat(8_000)),
+            ),
+            tool_result("old", "exact short result"),
+        ];
+        for sink in [None, Some(blocked.as_path())] {
+            let (folded, count) = fold_early_tool_groups(&messages, 0, sink, &FxHashSet::default());
+            assert_eq!(count, 0);
+            assert_eq!(folded, messages, "{name}: preserve the whole group");
+            assert_tool_pairs_consistent(&folded);
+        }
+    }
+    // Replay cannot be discarded without an archive even when its tool result
+    // independently passes the ordinary per-result folding floor.
+    let messages = vec![
+        assistant_call_with_reasoning(
+            "old",
+            "plan",
+            &encode_reasoning_replay_state("synthetic-replay", &"r".repeat(8_000)),
+        ),
+        tool_result("old", &"large result\n".repeat(800)),
+    ];
+    let (folded, count) = fold_early_tool_groups(&messages, 0, None, &FxHashSet::default());
+    assert_eq!(count, 0);
+    assert_eq!(folded, messages);
+    let _ = std::fs::remove_file(blocked);
+}
+
+#[test]
+fn fold_rejects_net_expansion_after_preserving_short_results() {
+    let dir = std::env::temp_dir().join(format!("ai-expanding-fold-{}", uuid::Uuid::new_v4()));
+    let mut assistant = assistant_call("short-0", "read_file");
+    let mut messages = Vec::new();
+    for index in 1..8 {
+        assistant.tool_calls.as_mut().unwrap().push(
+            assistant_call(&format!("short-{index}"), "read_file")
+                .tool_calls
+                .unwrap()
+                .remove(0),
+        );
+    }
+    messages.push(assistant);
+    for index in 0..8 {
+        messages.push(tool_result(&format!("short-{index}"), &"x".repeat(600)));
+    }
+    let plan = plan_early_tool_groups(&messages, 0, Some(&dir), &FxHashSet::default());
+    assert_eq!(plan.folded_groups(), 0);
+    assert_eq!(plan.messages(), messages.as_slice());
+    assert!(plan.commit());
+    assert!(!dir.exists(), "rejected candidates must not write archives");
+}
+
+#[test]
+fn request_compression_reclaims_old_replay_groups_with_short_results() {
+    let dir = std::env::temp_dir().join(format!("ai-replay-budget-fold-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![msg("system", "runtime policy")];
+    for index in 0..240 {
+        if index == 236 {
+            messages.push(msg("user", "continue the original task"));
+        }
+        let id = format!("call-{index}");
+        let mut assistant = assistant_call_with_reasoning(
+            &id,
+            "execute_command",
+            &encode_reasoning_replay_state(
+                "synthetic-replay",
+                &format!("state-{index}:{}", "r".repeat(3_600)),
+            ),
+        );
+        assistant.tool_calls.as_mut().unwrap()[0].function.arguments =
+            serde_json::json!({ "command": format!("inspect item-{index}"), "cwd": "/repo" })
+                .to_string();
+        messages.push(assistant);
+        messages.push(tool_result(
+            &id,
+            &format!(
+                "[context-overflow-truncated] full original archived at: \
+                 session-asset:overflow-history.md\nitem-{index} observed"
+            ),
+        ));
+    }
+    let original = serde_json::to_string(&messages).unwrap();
+    let recent = messages[messages.len() - 2 * KEEP_RECENT_TOOL_GROUPS..].to_vec();
+    let user = messages
+        .iter()
+        .find(|message| message.role == "user")
+        .unwrap()
+        .clone();
+    let outcome = compress_messages_for_context_with_outcome(
+        messages.clone(),
+        200_000,
+        256,
+        8_000,
+        Some(dir.clone()),
+        None,
+    );
+    assert!(
+        outcome.before_chars > 900_000,
+        "fixture must reproduce the bloated projection"
+    );
+    assert!(
+        outcome.budget_met(),
+        "{:?}: {} chars",
+        outcome.status,
+        outcome.after_chars
+    );
+    assert_eq!(outcome.status, ContextCompressionStatus::Complete);
+    assert!(outcome.diagnostic().is_none());
+    assert!(
+        outcome.messages.ends_with(&recent),
+        "the normal recent replay window remains exact when it fits after evidence archival"
+    );
+    assert!(
+        outcome.messages.contains(&user),
+        "latest user remains exact"
+    );
+    assert_eq!(serde_json::to_string(&messages).unwrap(), original);
+    assert_tool_pairs_consistent(&outcome.messages);
+    println!(
+        "replay projection: {} -> {} chars; retained {} replay groups",
+        outcome.before_chars,
+        outcome.after_chars,
+        outcome
+            .messages
+            .iter()
+            .filter(|message| message.tool_calls.is_some())
+            .count()
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn folds_early_groups_in_a_single_bloated_turn() {
     let messages = single_turn_with_groups(10, 8_000);
     let before = messages_total_chars(&messages);
@@ -184,6 +494,103 @@ fn folds_early_groups_in_a_single_bloated_turn() {
         "folding must reduce size: {after} !< {before}"
     );
     assert_tool_pairs_consistent(&folded);
+}
+
+#[test]
+fn dedup_stubs_fold_instead_of_pinning_the_hard_target() {
+    let dir = std::env::temp_dir().join(format!("ai-dedup-fold-{}", uuid::Uuid::new_v4()));
+    let body = "same read_file body\n".repeat(116);
+    let mut messages = vec![msg("system", "s"), msg("user", "repeat the same read")];
+    for index in 0..60 {
+        let id = format!("dup-read-{index}");
+        messages.push(assistant_call(&id, "read_file"));
+        messages.push(tool_result(&id, &body));
+    }
+    super::dedup::dedup_repeated_tool_results(&mut messages, &FxHashSet::default());
+    let before = messages_total_chars(&messages);
+    assert!(
+        before > 120_000,
+        "fixture must reproduce the pinned duplicate projection: {before}"
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| super::dedup::is_dedup_tool_stub(&message.content))
+            .count(),
+        59
+    );
+
+    let shrunk = shrink_messages_to_fit(
+        messages.clone(),
+        40_000,
+        Some(dir.as_path()),
+        None,
+        &FxHashSet::default(),
+    );
+    let after = messages_total_chars(&shrunk);
+    assert!(
+        after <= 40_000,
+        "the hard target must hold for repeated identical results: {before} -> {after}"
+    );
+    assert_tool_pairs_consistent(&shrunk);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn dedup_stubs_stay_verbatim_without_an_archive_to_recover_them() {
+    let body = "same read_file body\n".repeat(116);
+    let mut messages = vec![msg("system", "s"), msg("user", "repeat the same read")];
+    for index in 0..60 {
+        let id = format!("dup-read-{index}");
+        messages.push(assistant_call(&id, "read_file"));
+        messages.push(tool_result(&id, &body));
+    }
+    super::dedup::dedup_repeated_tool_results(&mut messages, &FxHashSet::default());
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| super::dedup::is_dedup_tool_stub(&message.content))
+            .count(),
+        59
+    );
+
+    let shrunk =
+        shrink_messages_to_fit(messages.clone(), 40_000, None, None, &FxHashSet::default());
+    assert!(
+        !shrunk.iter().any(|message| message
+            .content
+            .as_str()
+            .is_some_and(|text| text.starts_with("compressed_tool_round:"))),
+        "a dedup stub carries the only inline excerpt; without an archive the fold must keep it"
+    );
+}
+
+#[test]
+fn structured_dedup_stubs_stay_verbatim_without_an_archive() {
+    let body = "same read_file body\n".repeat(116);
+    let mut messages = vec![msg("system", "s"), msg("user", "repeat the same read")];
+    for index in 0..60 {
+        let id = format!("dup-read-{index}");
+        messages.push(assistant_call(&id, "read_file"));
+        messages.push(tool_result(&id, &body));
+    }
+    super::dedup::dedup_repeated_tool_results(&mut messages, &FxHashSet::default());
+    for message in &mut messages {
+        if super::dedup::is_dedup_tool_stub(&message.content) {
+            let text = value_to_string(&message.content);
+            message.content = serde_json::json!([{"type": "text", "text": text}]);
+        }
+    }
+
+    let shrunk =
+        shrink_messages_to_fit(messages.clone(), 40_000, None, None, &FxHashSet::default());
+    assert!(
+        !shrunk.iter().any(|message| message
+            .content
+            .as_str()
+            .is_some_and(|text| text.starts_with("compressed_tool_round:"))),
+        "structured dedup stubs must not fold without an archive"
+    );
 }
 
 #[test]
@@ -245,6 +652,57 @@ fn rejected_speculative_fold_has_no_archive_side_effects() {
         !overflow_dir.exists(),
         "planning a rejected fold must not create archives"
     );
+}
+
+#[test]
+fn fold_evidence_window_is_pure_until_the_candidate_is_committed() {
+    let dir = std::env::temp_dir().join(format!("ai-fold-window-plan-{}", uuid::Uuid::new_v4()));
+    let messages = single_turn_with_groups(24, 8_000);
+    let original = messages.clone();
+    let fold = plan_early_tool_groups(&messages, 4, Some(&dir), &FxHashSet::default());
+    assert!(compressed_tool_evidence_exceeds_inline_budget(
+        fold.messages()
+    ));
+    let plan = fold.with_capped_evidence(Some(&dir));
+    assert_eq!(plan.folded_groups(), 20);
+    assert!(!compressed_tool_evidence_exceeds_inline_budget(
+        plan.messages()
+    ));
+    assert!(plan.messages().ends_with(&messages[messages.len() - 8..]));
+    assert!(plan.messages().iter().any(is_archive_note_message));
+    assert!(!dir.exists(), "speculative window selection must not write");
+
+    assert!(plan.commit());
+    let archived = std::fs::read_to_string(dir.join(OVERFLOW_HISTORY_FILENAME)).unwrap();
+    assert!(archived.contains(COMPRESSED_TOOL_EVIDENCE_MARKER));
+    assert!(
+        archived.contains("call-0"),
+        "removed notes retain their provenance"
+    );
+    assert!(dir.join(FOLDED_TOOL_GROUP_ARCHIVE_DIR).is_dir());
+    assert_eq!(messages, original);
+    assert_tool_pairs_consistent(plan.messages());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn fold_evidence_archive_failure_preserves_the_entire_raw_projection() {
+    let dir = std::env::temp_dir().join(format!("ai-fold-window-blocked-{}", uuid::Uuid::new_v4()));
+    // Group archives can be committed, but the selected evidence-window append
+    // cannot. Neither stage may cause the candidate to replace the raw context.
+    std::fs::create_dir_all(dir.join(OVERFLOW_HISTORY_FILENAME)).unwrap();
+    let mut messages = single_turn_with_groups(24, 8_000);
+    let original = messages.clone();
+
+    assert!(!fold_noncompressible_tool_groups_to_fit(
+        &mut messages,
+        80_000,
+        Some(&dir),
+        &FxHashSet::default(),
+    ));
+    assert_eq!(messages, original);
+    assert_tool_pairs_consistent(&messages);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -417,7 +875,12 @@ fn fold_never_crosses_recent_tool_message_protection_window() {
 fn stub_preserves_file_path_recall_anchor() {
     let mut messages = vec![msg("system", "s"), msg("user", "干活")];
     // Early group: the read_file result is already offloaded; its file_path pointer must survive in the stub.
-    messages.push(assistant_call("call-old", "read_file"));
+    messages.push(assistant_call_args_with_content(
+        "call-old",
+        "read_file",
+        "{}",
+        &"earlier activity ".repeat(400),
+    ));
     messages.push(tool_result(
             "call-old",
             "Output preserved for non-compressible tool `read_file`.\n- file_path: /tmp/session/xyz.txt\n- use read_file to inspect exact content.",
@@ -530,7 +993,12 @@ fn folded_archived_precision_tools_keep_original_invocation_anchors() {
         ("list", "tree", r#"{"path":"src/bin/ai"}"#),
     ];
     for (id, name, arguments) in cases {
-        messages.push(assistant_call_args(id, name, arguments));
+        messages.push(assistant_call_args_with_content(
+            id,
+            name,
+            arguments,
+            &"earlier activity ".repeat(400),
+        ));
         let archive_path = std::path::PathBuf::from(format!("/tmp/session/{id}.txt"));
         // Omit recall lines so folding must reconstruct anchors from the tool call.
         let stub = super::tool_overflow::build_preserved_tool_overflow_stub(
@@ -971,9 +1439,7 @@ fn encrypted_reasoning_replay_rejects_cross_model() {
     let encoded =
         encode_encrypted_reasoning_replay_state("muse-spark-1.2-contributor", None, &items);
     // Switching/falling back to another model must decode to None, never passing model A's encrypted state to B.
-    assert!(
-        decode_encrypted_reasoning_replay_for_model("gpt-5.6-terra", None, &encoded).is_none()
-    );
+    assert!(decode_encrypted_reasoning_replay_for_model("gpt-5.6-terra", None, &encoded).is_none());
     // The exact-replay decoder must also reject payloads with the encrypted prefix.
     assert!(decode_reasoning_replay_for_model("muse-spark-1.2-contributor", &encoded).is_none());
 }
@@ -1628,10 +2094,21 @@ fn tightened_ladder_rung_archives_full_text_and_advises_archive_read() {
     // B is also outside recent-4 (summarized), C and D are inside recent-4 at
     // prepare time (kept full) but outside keep=2 at fold time (folded with
     // their full text), and E/F stay inside the protected window (not folded).
-    messages.push(assistant_call("tree-A", "tree"));
+    // Narration makes folding worthwhile after the old results are summarized.
+    messages.push(assistant_call_args_with_content(
+        "tree-A",
+        "tree",
+        "{}",
+        &"earlier activity ".repeat(400),
+    ));
     messages.push(tool_result("tree-A", &big_lossy_text("TREE-A")));
     for id in ["grep-B", "grep-C", "grep-D", "grep-E", "grep-F"] {
-        messages.push(assistant_call(id, "text_grep"));
+        messages.push(assistant_call_args_with_content(
+            id,
+            "text_grep",
+            "{}",
+            &"earlier activity ".repeat(400),
+        ));
         let text = if matches!(id, "grep-E" | "grep-F") {
             "later".to_string()
         } else {
@@ -1723,10 +2200,21 @@ fn protected_precision_group_archives_full_text_so_header_must_not_claim_stub_on
             .collect::<Vec<_>>()
             .join("\n")
     };
-    messages.push(assistant_call("read-A", "read_file"));
+    // Narration makes folding worthwhile after the old results are spilled.
+    messages.push(assistant_call_args_with_content(
+        "read-A",
+        "read_file",
+        "{}",
+        &"earlier activity ".repeat(400),
+    ));
     messages.push(tool_result("read-A", &big_text("read-A")));
     for id in ["read-B", "read-C", "read-D", "read-E", "read-F"] {
-        messages.push(assistant_call(id, "read_file"));
+        messages.push(assistant_call_args_with_content(
+            id,
+            "read_file",
+            "{}",
+            &"earlier activity ".repeat(400),
+        ));
         let text = if matches!(id, "read-E" | "read-F") {
             "later".to_string()
         } else {

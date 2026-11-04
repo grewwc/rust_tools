@@ -709,3 +709,80 @@ fn mid_turn_compress_keeps_small_reference_docs_and_still_folds_big_results() {
         })
         .unwrap_or_else(|| panic!("folded big result must point at its full archive: {text}"));
 }
+
+#[test]
+fn mid_turn_compress_spills_reads_outside_the_precision_tail() {
+    // One user turn can accumulate many tool groups. `read_file` forbids lossy
+    // compaction, but its results are still recoverable through the archive, so
+    // only the newest 120K precision tail must stay verbatim. Merging the wider
+    // lossless policy set into the inline protection set made every read
+    // ineligible for the lossless spill and the group fold, so the ladder could
+    // never shrink a long single turn.
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-midturn-long-turn-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String("system prompt".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("read the whole crate".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+    for i in 0..16usize {
+        let id = format!("call_{i}");
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![ToolCall {
+                id: id.clone(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: format!(
+                        r#"{{"filePath":"src/lib.rs","startLine":{},"endLine":{}}}"#,
+                        i + 1,
+                        i + 400
+                    ),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+        messages.push(Message {
+            role: "tool".to_string(),
+            content: Value::String(format!("chunk-{i:02}\n{}", "y".repeat(30_000))),
+            tool_calls: None,
+            tool_call_id: Some(id),
+            reasoning_content: None,
+        });
+    }
+    let before = super::super::history::messages_total_chars_pub(&messages);
+    let (compressed, _, after) = mid_turn_compress(messages, 120_000, Some(&overflow_dir), None);
+    let _ = std::fs::remove_dir_all(&overflow_dir);
+    assert!(
+        after * 2 < before,
+        "a long single turn must compact below half of {before} chars, got {after}"
+    );
+    let newest = compressed
+        .iter()
+        .rev()
+        .find(|message| {
+            message
+                .content
+                .as_str()
+                .is_some_and(|text| text.starts_with("chunk-15"))
+        })
+        .expect("the newest read must stay inline");
+    assert!(
+        !newest.content.as_str().unwrap_or_default().contains("PRESERVED_TOOL_OVERFLOW_STUB_V1"),
+        "the precision tail must stay verbatim"
+    );
+}

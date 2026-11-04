@@ -7,10 +7,14 @@ use super::tool_overflow::{
 };
 use super::*;
 
-fn mutable_content_can_truncate(message: &Message, allow_small_tool_results: bool) -> bool {
+fn mutable_content_can_truncate(
+    message: &Message,
+    content_chars: usize,
+    allow_small_tool_results: bool,
+) -> bool {
     allow_small_tool_results
         || message.role != "tool"
-        || value_len_chars(&message.content) > TOOL_RESULT_FOLD_MIN_CHARS
+        || content_chars > TOOL_RESULT_FOLD_MIN_CHARS
         || message
             .content
             .as_str()
@@ -40,6 +44,134 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit(
     )
 }
 
+/// Billing counters for one message, cached across candidate scans.
+///
+/// Byte lengths are only a hint: a char-shorter preview can keep the same byte
+/// length because the truncation ellipsis is three bytes. A successful field
+/// truncation therefore refreshes its entry explicitly; the byte check only
+/// catches replacements made outside this pass. A value with no cheap byte
+/// length is marked unknown and always recomputed.
+struct MessageFieldCounts {
+    entries: Vec<FieldCountEntry>,
+}
+
+struct FieldCountEntry {
+    content_chars: usize,
+    content_bytes: Option<usize>,
+    content_is_dedup_stub: bool,
+    content_is_preserved_overflow: bool,
+    reasoning_chars: usize,
+    reasoning_bytes: Option<usize>,
+    argument_chars: Vec<usize>,
+    argument_bytes: Vec<Option<usize>>,
+}
+
+/// Byte length of a value when it is a string; composite values have no cheap
+/// length and therefore never match a cached entry.
+fn value_byte_len(value: &Value) -> Option<usize> {
+    match value {
+        Value::String(text) => Some(text.len()),
+        _ => None,
+    }
+}
+
+/// Cross-checks a cached entry against a fresh count so a stale cache fails
+/// loudly in tests instead of silently changing which field gets truncated.
+#[cfg(test)]
+fn debug_assert_field_counts(entry: &FieldCountEntry, message: &Message) {
+    let fresh = MessageFieldCounts::entry(message);
+    assert_eq!(entry.content_chars, fresh.content_chars);
+    assert_eq!(entry.content_is_dedup_stub, fresh.content_is_dedup_stub);
+    assert_eq!(
+        entry.content_is_preserved_overflow,
+        fresh.content_is_preserved_overflow
+    );
+    assert_eq!(entry.reasoning_chars, fresh.reasoning_chars);
+    assert_eq!(entry.argument_chars, fresh.argument_chars);
+}
+
+impl MessageFieldCounts {
+    fn collect(messages: &[Message]) -> Self {
+        Self {
+            entries: messages.iter().map(Self::entry).collect(),
+        }
+    }
+
+    fn entry(message: &Message) -> FieldCountEntry {
+        let tool_calls = message.tool_calls.as_deref().unwrap_or_default();
+        FieldCountEntry {
+            content_chars: value_len_chars(&message.content),
+            content_bytes: value_byte_len(&message.content),
+            content_is_dedup_stub: super::dedup::is_dedup_tool_stub(&message.content),
+            content_is_preserved_overflow: super::tool_overflow::is_preserved_tool_overflow_content(
+                &message.content,
+            ),
+            reasoning_chars: message
+                .reasoning_content
+                .as_deref()
+                .map(|reasoning| reasoning.chars().count())
+                .unwrap_or_default(),
+            reasoning_bytes: message.reasoning_content.as_deref().map(str::len),
+            argument_chars: tool_calls
+                .iter()
+                .map(|call| call.function.arguments.chars().count())
+                .collect(),
+            argument_bytes: tool_calls
+                .iter()
+                .map(|call| Some(call.function.arguments.len()))
+                .collect(),
+        }
+    }
+
+    fn refresh(&mut self, index: usize, message: &Message) -> &FieldCountEntry {
+        let stale = {
+            let entry = &self.entries[index];
+            let tool_calls = message.tool_calls.as_deref().unwrap_or_default();
+            entry.content_bytes != value_byte_len(&message.content)
+                || entry.reasoning_bytes != message.reasoning_content.as_deref().map(str::len)
+                || entry.argument_chars.len() != tool_calls.len()
+                || entry
+                    .argument_bytes
+                    .iter()
+                    .zip(tool_calls)
+                    .any(|(cached, call)| *cached != Some(call.function.arguments.len()))
+        };
+        if stale {
+            self.entries[index] = Self::entry(message);
+        }
+        &self.entries[index]
+    }
+
+    fn insert(&mut self, index: usize, message: &Message) {
+        self.entries.insert(index, Self::entry(message));
+    }
+}
+
+/// Moves blocked-field entries past a freshly inserted archive note. The note
+/// is inserted at index 0 or 1, so every later message shifts by one; a stale
+/// entry would make the candidate scan skip the wrong field.
+pub(super) fn shift_blocked_fields_after_note(
+    blocked_fields: &mut rustc_hash::FxHashMap<(usize, MutableMessageField), bool>,
+    inserted_at: usize,
+) {
+    *blocked_fields = std::mem::take(blocked_fields)
+        .into_iter()
+        .map(|((index, field), blocks_forever)| {
+            (
+                (
+                    if index >= inserted_at {
+                        index + 1
+                    } else {
+                        index
+                    },
+                    field,
+                ),
+                blocks_forever,
+            )
+        })
+        .collect();
+}
+
 pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
     messages: &mut Vec<Message>,
     max_chars: usize,
@@ -57,17 +189,25 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
     // never touch that minimal protocol.
     minimize_overflow_stubs_for_hard_budget(messages);
     minimize_truncated_previews_for_hard_budget(messages);
-    if messages_total_chars(messages) <= max_chars {
+    let mut total_chars = messages_total_chars(messages);
+    if total_chars <= max_chars {
         return true;
     }
 
-    let mut blocked_fields = rustc_hash::FxHashSet::default();
+    let mut blocked_fields = rustc_hash::FxHashMap::default();
+    // The overflow archive note is inserted at most once. Remember that it is
+    // present so a long truncate loop does not rescan the whole history after
+    // every successful field cut just to rediscover the same note.
+    let mut overflow_archive_note_present = false;
+    // A candidate scan can run once per edited field; recounting the whole
+    // history each time makes a large session quadratic in its own bytes.
+    let mut counts = MessageFieldCounts::collect(messages);
     for include_protected in [false, true] {
         if include_protected && !allow_protected_fallback {
             break;
         }
-        while messages_total_chars(messages) > max_chars {
-            let excess = messages_total_chars(messages).saturating_sub(max_chars);
+        while total_chars > max_chars {
+            let excess = total_chars.saturating_sub(max_chars);
             let mut best: Option<(usize, MutableMessageField, usize)> = None;
             for (index, message) in messages.iter().enumerate() {
                 if is_system_like_role(&message.role) || message.role == "user" {
@@ -77,12 +217,20 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
                 if is_protected && !include_protected {
                     continue;
                 }
-                let content_chars = value_len_chars(&message.content);
+                let counts_entry = counts.refresh(index, message);
+                #[cfg(test)]
+                debug_assert_field_counts(counts_entry, message);
+                let content_chars = counts_entry.content_chars;
                 if !message_contains_image(&message.content)
-                    && !is_preserved_tool_overflow_content(&message.content)
-                    && mutable_content_can_truncate(message, allow_protected_fallback)
+                    && !counts_entry.content_is_preserved_overflow
+                    && !counts_entry.content_is_dedup_stub
+                    && mutable_content_can_truncate(
+                        message,
+                        content_chars,
+                        allow_protected_fallback,
+                    )
                     && content_chars > 160
-                    && !blocked_fields.contains(&(index, MutableMessageField::Content))
+                    && !blocked_fields.contains_key(&(index, MutableMessageField::Content))
                 {
                     choose_larger_mutable_field(
                         &mut best,
@@ -91,23 +239,27 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
                 }
                 if let Some(reasoning) = message.reasoning_content.as_deref()
                     && !is_persisted_reasoning_replay(reasoning)
-                    && reasoning.chars().count() > 160
-                    && !blocked_fields.contains(&(index, MutableMessageField::Reasoning))
+                    && counts_entry.reasoning_chars > 160
+                    && !blocked_fields.contains_key(&(index, MutableMessageField::Reasoning))
                 {
                     choose_larger_mutable_field(
                         &mut best,
                         (
                             index,
                             MutableMessageField::Reasoning,
-                            reasoning.chars().count() - 160,
+                            counts_entry.reasoning_chars - 160,
                         ),
                     );
                 }
                 if let Some(tool_calls) = &message.tool_calls {
-                    for (call_index, call) in tool_calls.iter().enumerate() {
-                        let argument_chars = call.function.arguments.chars().count();
+                    for call_index in 0..tool_calls.len() {
+                        let argument_chars = counts_entry
+                            .argument_chars
+                            .get(call_index)
+                            .copied()
+                            .unwrap_or_default();
                         let field = MutableMessageField::ToolArguments(call_index);
-                        if argument_chars > 160 && !blocked_fields.contains(&(index, field)) {
+                        if argument_chars > 160 && !blocked_fields.contains_key(&(index, field)) {
                             choose_larger_mutable_field(
                                 &mut best,
                                 (index, field, argument_chars - 160),
@@ -121,31 +273,87 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
                 break;
             };
             let reduce_by = excess.min(reducible).max(1);
-            if !truncate_mutable_field_with_policy(
+            let message_chars_before = message_billable_chars(&messages[message_index]);
+            let outcome = truncate_mutable_field_with_policy(
                 &mut messages[message_index],
                 field,
                 reduce_by,
                 overflow_dir,
                 FieldArchivePolicy::BestEffort,
                 allow_protected_fallback,
-            ) {
+            );
+            if outcome != FieldTruncateOutcome::Truncated {
                 // A fixed marker / archive path may already be the smallest
                 // form the field can reach. Skip the no-progress field and try
                 // other candidates instead of re-selecting the same one.
-                blocked_fields.insert((message_index, field));
+                blocked_fields.insert((message_index, field), outcome.blocks_forever());
                 continue;
             }
-            insert_overflow_archive_note_if_exists(messages, overflow_dir);
-            // The archive note is created after the entry de-preview pass. Keep
-            // its path but remove verbose guidance before measuring convergence.
-            minimize_truncated_previews_for_hard_budget(messages);
-            // Inserting the archive note the first time may shift message indices;
-            // re-evaluate candidates after a successful shrink.
-            blocked_fields.clear();
+            // A two-char cut leaves `len()` unchanged: 4000 ASCII chars become
+            // 3998 chars plus the three-byte ellipsis, still 4000 bytes. The
+            // byte-only staleness check cannot see that edit, so refresh the
+            // entry here instead of letting the next scan use the old count.
+            counts.entries[message_index] = MessageFieldCounts::entry(&messages[message_index]);
+            let archive_note_index = if !overflow_archive_note_present
+                && overflow_dir.is_some_and(|dir| dir.join(OVERFLOW_HISTORY_FILENAME).is_file())
+            {
+                let len_before_archive_note = messages.len();
+                insert_overflow_archive_note_if_exists(messages, overflow_dir);
+                // Whether this call inserted the note or found an existing one,
+                // the note is present from now on. The overflow path is stable
+                // for the rest of the loop.
+                overflow_archive_note_present = true;
+                (messages.len() > len_before_archive_note).then_some(len_before_archive_note.min(1))
+            } else {
+                None
+            };
+            if let Some(note_index) = archive_note_index {
+                shift_blocked_fields_after_note(&mut blocked_fields, note_index);
+            }
+            let shifted_message_index =
+                if archive_note_index.is_some_and(|note_index| note_index <= message_index) {
+                    message_index + 1
+                } else {
+                    message_index
+                };
+            // Only the edited message and a freshly inserted note can differ
+            // from the fully minimized snapshot taken before the loop. Every
+            // other message is already at its idempotent fixed point; running
+            // the whole-history pass here made each field cut a full rescan.
+            minimize_truncated_preview_for_hard_budget(&mut messages[shifted_message_index]);
+            if let Some(note_index) = archive_note_index {
+                minimize_truncated_preview_for_hard_budget(&mut messages[note_index]);
+                counts.insert(note_index, &messages[note_index]);
+            }
+            let message_chars_after = message_billable_chars(&messages[shifted_message_index]);
+            let previous_total = total_chars;
+            total_chars -= message_chars_before;
+            total_chars += message_chars_after;
+            if let Some(note_index) = archive_note_index {
+                total_chars += message_billable_chars(&messages[note_index]);
+            }
+            #[cfg(test)]
+            debug_assert_eq!(total_chars, messages_total_chars(messages));
+            if total_chars >= previous_total {
+                // The first archive note can outweigh a minimal field cut. That is
+                // note overhead, not field no-progress: only retire the field when
+                // its own chars failed to shrink. Otherwise the next iteration can
+                // cut it again now that the note is already present.
+                if message_chars_after >= message_chars_before {
+                    // No own shrink at this cut; retry after a later successful
+                    // cut, matching the previous clear-on-success behavior.
+                    blocked_fields.insert((shifted_message_index, field), false);
+                }
+            } else {
+                // Inserting the archive note the first time may shift message
+                // indices; re-evaluate candidates after a real shrink. Terminal
+                // fields cannot shrink under any target, so they stay blocked.
+                retain_terminal_blocked_fields(&mut blocked_fields);
+            }
         }
     }
 
-    messages_total_chars(messages) <= max_chars
+    total_chars <= max_chars
 }
 
 /// Soft compaction trims only unprotected fields; the current turn's
@@ -182,15 +390,20 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
     minimize_truncated_previews_for_hard_budget(messages);
     let mut truncated_any = false;
     for message in messages.iter_mut() {
-        if is_system_like_role(&message.role)
-            || message.role == "user"
-            || protected_tool_context_message(message, protected_tool_call_ids)
-        {
+        if is_system_like_role(&message.role) || message.role == "user" {
             continue;
         }
+        // Precision protection covers the grounding content (tool arguments and
+        // their results), not the model's own reasoning trace. Skipping the
+        // whole message let a protected assistant message keep an arbitrarily
+        // large reasoning chain: no spill path owns reasoning text, so the
+        // projection could never reach the hard target.
+        let content_protected = protected_tool_context_message(message, protected_tool_call_ids);
         let content_chars = value_len_chars(&message.content);
-        if !message_contains_image(&message.content)
+        if !content_protected
+            && !message_contains_image(&message.content)
             && !is_preserved_tool_overflow_content(&message.content)
+            && !super::dedup::is_dedup_tool_stub(&message.content)
             && content_chars > per_field_cap
         {
             truncated_any |= truncate_mutable_field_with_policy(
@@ -200,7 +413,8 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
                 overflow_dir,
                 FieldArchivePolicy::BestEffort,
                 true,
-            );
+            )
+            .truncated();
         }
         if let Some(reasoning_chars) = message
             .reasoning_content
@@ -219,13 +433,21 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
         }
         let tool_call_count = message.tool_calls.as_ref().map(Vec::len).unwrap_or(0);
         for call_index in 0..tool_call_count {
-            let argument_chars = message
+            let call = message
                 .tool_calls
                 .as_ref()
-                .and_then(|calls| calls.get(call_index))
+                .and_then(|calls| calls.get(call_index));
+            let argument_chars = call
                 .map(|call| call.function.arguments.chars().count())
                 .unwrap_or(0);
-            if argument_chars > per_field_cap {
+            // Precision protection is keyed by tool-call id and covers the
+            // arguments that ground the request (patch bodies, command text),
+            // not just the result message. Capping a protected call here would
+            // replace it with an archive stub even when trimming reasoning had
+            // already brought the request under budget.
+            let arguments_protected =
+                call.is_some_and(|call| protected_tool_call_ids.contains(&call.id));
+            if !arguments_protected && argument_chars > per_field_cap {
                 truncated_any |= truncate_mutable_field(
                     message,
                     MutableMessageField::ToolArguments(call_index),
@@ -257,28 +479,36 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
 /// strictly smaller than the preview they replace.
 fn minimize_truncated_previews_for_hard_budget(messages: &mut [Message]) {
     for message in messages.iter_mut() {
-        // Archive notes are system-like and therefore exempt from generic field
-        // truncation. Keep only their stable recovery key at the hard backstop.
-        if message.role == crate::ai::history::ROLE_INTERNAL_NOTE
-            && let Value::String(text) = &message.content
-            && let Some(file_path) = archive_note_file_path(text)
-        {
-            let shortened = build_minimal_archive_file_pointer(file_path);
-            if shortened.chars().count() < text.chars().count() {
-                message.content = Value::String(shortened);
-            }
+        minimize_truncated_preview_for_hard_budget(message);
+    }
+}
+
+/// Apply the idempotent de-preview rules to one message. Callers that already
+/// minimized the rest of the history can use this to update only the message
+/// they just edited, instead of rescanning the whole history per field cut.
+fn minimize_truncated_preview_for_hard_budget(message: &mut Message) {
+    // Archive notes are system-like and therefore exempt from generic field
+    // truncation. Keep only their stable recovery key at the hard backstop.
+    if message.role == crate::ai::history::ROLE_INTERNAL_NOTE
+        && let Value::String(text) = &message.content
+        && let Some(file_path) = archive_note_file_path(text)
+    {
+        let shortened = build_minimal_archive_file_pointer(file_path);
+        if shortened.chars().count() < text.chars().count() {
+            message.content = Value::String(shortened);
         }
-        // Fold stubs are system-like and never enter the generic truncation loop,
-        // but their two guidance lines are static boilerplate (~350 chars per
-        // stub), not evidence: the full group content lives behind
-        // archive_file_path. Shrink them to short budget notes so the hard
-        // target stays reachable when several folded groups accumulate.
-        if message.role == crate::ai::history::ROLE_INTERNAL_NOTE
-            && let Value::String(text) = &message.content
-            && text.contains("compressed_tool_round")
-            && text.contains("context_budget_note:")
-        {
-            let shortened = text
+    }
+    // Fold stubs are system-like and never enter the generic truncation loop,
+    // but their two guidance lines are static boilerplate (~350 chars per
+    // stub), not evidence: the full group content lives behind
+    // archive_file_path. Shrink them to short budget notes so the hard
+    // target stays reachable when several folded groups accumulate.
+    if message.role == crate::ai::history::ROLE_INTERNAL_NOTE
+        && let Value::String(text) = &message.content
+        && text.contains("compressed_tool_round")
+        && text.contains("context_budget_note:")
+    {
+        let shortened = text
                 .replace(
                     "context_budget_note: earlier tool outputs were folded out of inline context because the request exceeded its tool/context budget; this does not mean the target file or command output is too large or broken.",
                     "context_budget_note: folded for budget; not a file/command limit.",
@@ -287,31 +517,30 @@ fn minimize_truncated_previews_for_hard_budget(messages: &mut [Message]) {
                     "recovery_guidance: use the evidence, previews, and original_* anchors before repeating tools. For code edits, continue with smaller targeted reads and split patches instead of re-reading the same archive/log.",
                     "recovery_guidance: use evidence/archive before re-running; split large reads/patches.",
                 );
-            if shortened.chars().count() < text.chars().count() {
-                message.content = Value::String(shortened);
-            }
+        if shortened.chars().count() < text.chars().count() {
+            message.content = Value::String(shortened);
         }
-        if is_system_like_role(&message.role) || message.role == "user" {
-            continue;
-        }
-        if let Value::String(text) = &message.content
-            && is_context_overflow_truncated_stub(text)
-            && let Some(pointer) = build_context_overflow_pointer(text, usize::MAX)
-            && pointer.chars().count() < text.chars().count()
-        {
-            message.content = Value::String(pointer);
-        }
-        if let Some(calls) = message.tool_calls.as_mut() {
-            for call in calls.iter_mut() {
-                if is_context_overflow_truncated_tool_arguments(&call.function.arguments)
-                    && let Some(pointer) = build_context_overflow_tool_arguments_pointer(
-                        &call.function.arguments,
-                        usize::MAX,
-                    )
-                    && pointer.chars().count() < call.function.arguments.chars().count()
-                {
-                    call.function.arguments = pointer;
-                }
+    }
+    if is_system_like_role(&message.role) || message.role == "user" {
+        return;
+    }
+    if let Value::String(text) = &message.content
+        && is_context_overflow_truncated_stub(text)
+        && let Some(pointer) = build_context_overflow_pointer(text, usize::MAX)
+        && pointer.chars().count() < text.chars().count()
+    {
+        message.content = Value::String(pointer);
+    }
+    if let Some(calls) = message.tool_calls.as_mut() {
+        for call in calls.iter_mut() {
+            if is_context_overflow_truncated_tool_arguments(&call.function.arguments)
+                && let Some(pointer) = build_context_overflow_tool_arguments_pointer(
+                    &call.function.arguments,
+                    usize::MAX,
+                )
+                && pointer.chars().count() < call.function.arguments.chars().count()
+            {
+                call.function.arguments = pointer;
             }
         }
     }
@@ -436,6 +665,54 @@ pub(in crate::ai) fn truncate_mutable_field(
         archive_policy,
         false,
     )
+    .truncated()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FieldTruncateOutcome {
+    Truncated,
+    NoProgress,
+    Retryable,
+}
+
+impl FieldTruncateOutcome {
+    /// A target-dependent failure at the gentlest cut (`reduce_by == 1`) already
+    /// used the largest allowed target; a later, gentler cut cannot succeed.
+    /// Failures at more aggressive cuts may still succeed once the excess
+    /// shrinks and the target grows.
+    fn target_dependent(reduce_by: usize) -> Self {
+        if reduce_by <= 1 {
+            Self::NoProgress
+        } else {
+            Self::Retryable
+        }
+    }
+
+    /// Archive writes can fail transiently, so keep them retryable while a sink
+    /// exists. Without an overflow directory no retry can ever succeed.
+    fn archive_dependent(overflow_dir: Option<&Path>) -> Self {
+        if overflow_dir.is_some() {
+            Self::Retryable
+        } else {
+            Self::NoProgress
+        }
+    }
+
+    fn blocks_forever(self) -> bool {
+        self == Self::NoProgress
+    }
+
+    fn truncated(self) -> bool {
+        self == Self::Truncated
+    }
+}
+
+/// Terminal failures stay blocked across later successful cuts; retryable
+/// failures are released so a gentler target can be attempted.
+pub(super) fn retain_terminal_blocked_fields(
+    blocked_fields: &mut rustc_hash::FxHashMap<(usize, MutableMessageField), bool>,
+) {
+    blocked_fields.retain(|_, blocks_forever| *blocks_forever);
 }
 
 fn truncate_mutable_field_with_policy(
@@ -445,7 +722,7 @@ fn truncate_mutable_field_with_policy(
     overflow_dir: Option<&Path>,
     archive_policy: FieldArchivePolicy,
     allow_small_tool_results: bool,
-) -> bool {
+) -> FieldTruncateOutcome {
     // The archive path can be derived directly from overflow_dir (same source
     // as OverflowSink::new), so size the stub against that path first and do
     // the real archive write last: if the stub would not be strictly shorter
@@ -460,9 +737,13 @@ fn truncate_mutable_field_with_policy(
     match field {
         MutableMessageField::Content => {
             if is_preserved_tool_overflow_content(&message.content)
-                || !mutable_content_can_truncate(message, allow_small_tool_results)
+                || !mutable_content_can_truncate(
+                    message,
+                    value_len_chars(&message.content),
+                    allow_small_tool_results,
+                )
             {
-                return false;
+                return FieldTruncateOutcome::NoProgress;
             }
             let text = value_to_string(&message.content);
             let original_chars = text.chars().count();
@@ -484,14 +765,14 @@ fn truncate_mutable_field_with_policy(
                     )
                 };
                 if build_stub(archive_path_hint.as_deref()).chars().count() >= original_chars {
-                    return false;
+                    return FieldTruncateOutcome::NoProgress;
                 }
                 let archived = archive_truncated_field_to_overflow(message, field, overflow_dir);
                 if archived.is_none() && archive_policy == FieldArchivePolicy::Required {
-                    return false;
+                    return FieldTruncateOutcome::archive_dependent(overflow_dir);
                 }
                 message.content = Value::String(build_stub(archived.as_deref()));
-                return true;
+                return FieldTruncateOutcome::Truncated;
             }
             // BestEffort fields may reuse an embedded archive path. Required
             // fields take the trusted re-archive path below instead.
@@ -511,29 +792,29 @@ fn truncate_mutable_field_with_policy(
                             .filter(|pointer| pointer.chars().count() < original_chars)
                     };
                     let Some(path_hint) = archive_path_hint.as_deref() else {
-                        return false;
+                        return FieldTruncateOutcome::NoProgress;
                     };
                     if pointer_for_path(path_hint).is_none() {
-                        return false;
+                        return FieldTruncateOutcome::target_dependent(reduce_by);
                     }
                     let Some(archive_file_path) =
                         archive_truncated_field_to_overflow(message, field, overflow_dir)
                     else {
-                        return false;
+                        return FieldTruncateOutcome::archive_dependent(overflow_dir);
                     };
                     let Some(pointer) = pointer_for_path(&archive_file_path) else {
-                        return false;
+                        return FieldTruncateOutcome::target_dependent(reduce_by);
                     };
                     message.content = Value::String(pointer);
-                    return true;
+                    return FieldTruncateOutcome::Truncated;
                 }
                 if let Some(pointer) = build_context_overflow_pointer(&text, target) {
                     if pointer.chars().count() < original_chars {
                         message.content = Value::String(pointer);
-                        return true;
+                        return FieldTruncateOutcome::Truncated;
                     }
                 }
-                return false;
+                return FieldTruncateOutcome::target_dependent(reduce_by);
             }
             // When the preview budget is too small, the stub would be only a
             // long path with no actual content (a fake truncation): a small
@@ -579,7 +860,7 @@ fn truncate_mutable_field_with_policy(
             let Some(truncated) = build_truncated(archive_path_hint.as_deref())
                 .filter(|candidate| candidate.chars().count() < original_chars)
             else {
-                return false;
+                return FieldTruncateOutcome::target_dependent(reduce_by);
             };
             // Truncate only when the archived form keeps a meaningful preview;
             // only after the archive write actually failed may we degrade to
@@ -592,22 +873,22 @@ fn truncate_mutable_field_with_policy(
             // the instruction and could never be read back. Refuse and keep
             // the original so the caller can surface the error.
             if archive_file_path.is_none() && archive_policy == FieldArchivePolicy::Required {
-                return false;
+                return FieldTruncateOutcome::archive_dependent(overflow_dir);
             }
             let truncated = build_truncated(archive_file_path.as_deref()).unwrap_or(truncated);
             message.content = Value::String(truncated);
-            true
+            FieldTruncateOutcome::Truncated
         }
         MutableMessageField::Reasoning => {
             let Some(reasoning) = message.reasoning_content.as_deref() else {
-                return false;
+                return FieldTruncateOutcome::NoProgress;
             };
             // Exact/encrypted replay payloads must remain byte-for-byte intact.
             // Keeping the marker while truncating its payload would break
             // decoding in the request layer, so callers must shrink another
             // field instead.
             if is_persisted_reasoning_replay(reasoning) {
-                return false;
+                return FieldTruncateOutcome::NoProgress;
             }
             let original_chars = reasoning.chars().count();
             let target = original_chars.saturating_sub(reduce_by).max(160);
@@ -632,18 +913,18 @@ fn truncate_mutable_field_with_policy(
             let Some(truncated) = build_truncated(archive_path_hint.as_deref())
                 .filter(|candidate| candidate.chars().count() < original_chars)
             else {
-                return false;
+                return FieldTruncateOutcome::target_dependent(reduce_by);
             };
             let archive_file_path =
                 archive_truncated_field_to_overflow(message, field, overflow_dir);
             // Required policy: an unarchived stub must never replace the only
             // copy of the field; refuse so the caller keeps the original.
             if archive_file_path.is_none() && archive_policy == FieldArchivePolicy::Required {
-                return false;
+                return FieldTruncateOutcome::archive_dependent(overflow_dir);
             }
             let truncated = build_truncated(archive_file_path.as_deref()).unwrap_or(truncated);
             message.reasoning_content = Some(truncated);
-            true
+            FieldTruncateOutcome::Truncated
         }
         MutableMessageField::ToolArguments(call_index) => {
             let Some(arguments) = message
@@ -652,7 +933,7 @@ fn truncate_mutable_field_with_policy(
                 .and_then(|calls| calls.get(call_index))
                 .map(|call| call.function.arguments.clone())
             else {
-                return false;
+                return FieldTruncateOutcome::NoProgress;
             };
             let original_chars = arguments.chars().count();
             let target = original_chars.saturating_sub(reduce_by).max(160);
@@ -660,17 +941,17 @@ fn truncate_mutable_field_with_policy(
                 let Some(pointer) =
                     build_context_overflow_tool_arguments_pointer(&arguments, target)
                 else {
-                    return false;
+                    return FieldTruncateOutcome::target_dependent(reduce_by);
                 };
                 let Some(call) = message
                     .tool_calls
                     .as_mut()
                     .and_then(|calls| calls.get_mut(call_index))
                 else {
-                    return false;
+                    return FieldTruncateOutcome::NoProgress;
                 };
                 call.function.arguments = pointer;
-                return true;
+                return FieldTruncateOutcome::Truncated;
             }
             // A fixed JSON prefix plus a long archive path can consume the
             // entire target. Reject empty or near-empty previews: they contain
@@ -705,14 +986,14 @@ fn truncate_mutable_field_with_policy(
                     .then_some(candidate)
             };
             let Some(truncated) = build_candidate(archive_path_hint.as_deref()) else {
-                return false;
+                return FieldTruncateOutcome::target_dependent(reduce_by);
             };
             let archive_file_path =
                 archive_truncated_field_to_overflow(message, field, overflow_dir);
             // Required policy: an unarchived stub must never replace the only
             // copy of the field; refuse so the caller keeps the original.
             if archive_file_path.is_none() && archive_policy == FieldArchivePolicy::Required {
-                return false;
+                return FieldTruncateOutcome::archive_dependent(overflow_dir);
             }
             // Recompute the preview against the no-path stub after the archive
             // write failed, so a dead path does not eat the preview budget.
@@ -722,12 +1003,12 @@ fn truncate_mutable_field_with_policy(
                 .as_mut()
                 .and_then(|calls| calls.get_mut(call_index))
             else {
-                return false;
+                return FieldTruncateOutcome::NoProgress;
             };
             // Arguments must remain valid JSON; slicing the string directly
             // would make the provider reject the request.
             call.function.arguments = truncated;
-            true
+            FieldTruncateOutcome::Truncated
         }
     }
 }

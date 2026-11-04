@@ -293,12 +293,42 @@ pub(super) fn prepare_tool_messages_structured(
     let id_to_tool_args = build_tool_call_arguments_index(messages);
     let indices = tool_message_indices(messages);
     let protected_indices = recent_tool_group_message_indices(messages, keep_recent_groups);
-    for &idx in &indices {
-        let message = &mut messages[idx];
+    // Older byte-identical copies are left for the dedup back-reference pass:
+    // spilling them first replaces the content with an archive stub, and dedup
+    // refuses to fold an already-archived stub, so the "reuse the canonical
+    // full result" pointer the model needs would never be written.
+    let mut newest_identical: rustc_hash::FxHashMap<u64, usize> =
+        rustc_hash::FxHashMap::default();
+    // The canonical copy may itself be protected (and therefore absent from
+    // `indices`), so index every tool result, not only the spill candidates.
+    for (idx, message) in messages.iter().enumerate() {
+        if message.role != "tool" {
+            continue;
+        }
         let text = value_to_string(&message.content);
         if text.trim().is_empty() {
             continue;
         }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&text, &mut hasher);
+        newest_identical.insert(std::hash::Hasher::finish(&hasher), idx);
+    }
+    for &idx in &indices {
+        let text = value_to_string(&messages[idx].content);
+        if text.trim().is_empty() {
+            continue;
+        }
+        let identical_to_newer = {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&text, &mut hasher);
+            newest_identical
+                .get(&std::hash::Hasher::finish(&hasher))
+                .copied()
+                .is_some_and(|newest| {
+                    newest != idx && value_to_string(&messages[newest].content) == text
+                })
+        };
+        let message = &mut messages[idx];
         // Already-spilled precision tool results are stable pointers; a stub
         // must not be spilled again as if it were the original result.
         // Otherwise every compaction round would write a new `stub -> stub`
@@ -332,6 +362,8 @@ pub(super) fn prepare_tool_messages_structured(
                 .as_ref()
                 .is_some_and(|id| protected_tool_call_ids.contains(id));
             if !is_explicitly_protected
+                && !identical_to_newer
+                && !super::dedup::is_dedup_tool_stub(&message.content)
                 && !protected_indices.contains(&idx)
                 && text.chars().count() > max_chars_per_msg
                 && text.chars().count() >= spill_min_chars

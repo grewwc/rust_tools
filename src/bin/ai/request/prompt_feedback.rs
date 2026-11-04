@@ -3,7 +3,6 @@
 use std::hash::{Hash, Hasher};
 
 use super::RequestBody;
-use super::current_budget::WATER_METER_PREFIX;
 use crate::ai::history::{Message, is_code_inspection_memory_text};
 use crate::ai::history::compress::BillableCounts;
 use crate::ai::models;
@@ -45,7 +44,7 @@ pub(crate) struct PromptTokenFeedback {
     estimated_prompt_tokens: usize,
     /// Pessimistic twin of `estimated_prompt_tokens`: identical inputs, every
     /// component projected with its `_upper` variant. Upper-bound input for
-    /// the context water meter only; calibration and budgets keep the lower
+    /// interval reporting only; calibration and budgets keep the lower
     /// estimate. Always `>= estimated_prompt_tokens` by construction.
     estimated_prompt_tokens_upper: usize,
     message_counts: BillableCounts,
@@ -59,9 +58,7 @@ fn is_request_only_note(message: &Message) -> bool {
     message.role == "user"
         && matches!(
             &message.content,
-            Value::String(text)
-                if is_code_inspection_memory_text(text)
-                    || text.trim_start().starts_with(WATER_METER_PREFIX)
+            Value::String(text) if is_code_inspection_memory_text(text)
         )
 }
 
@@ -419,16 +416,6 @@ impl PromptTokenFeedback {
         self.prefix_reuse
     }
 
-    /// Whether the captured request contains this exact message. The water
-    /// meter uses this to recover its prior band from the request tail, where
-    /// the note lives so band changes cannot move the cached system prefix.
-    pub(super) fn contains_message(&self, message: &Message) -> bool {
-        let fingerprint = fingerprint_message(message);
-        self.messages
-            .as_ref()
-            .is_some_and(|messages| messages.contains(&fingerprint))
-    }
-
     /// Consume the pending observation even when usage is missing or mismatched.
     /// A later response must never fill an earlier request's empty usage slot.
     pub(crate) fn record_usage(
@@ -493,7 +480,7 @@ impl PromptTokenFeedback {
     /// the verified prefix stays exact (`actual`), only the growth is
     /// projected with the upper estimate. The trailing `max` keeps the
     /// interval valid (`upper >= lower`) even if a future ratio change ever
-    /// narrows the pessimistic projection. Read by the water meter only.
+    /// narrows the pessimistic projection. Not read by calibration or budgets.
     pub(super) fn context_prompt_tokens_upper(&self, previous: Option<&Self>) -> usize {
         let lower = self.context_prompt_tokens(previous);
         let Some((previous, actual)) = previous.and_then(|previous| {
@@ -609,7 +596,7 @@ mod tests {
             message("user", "stable request"),
             message(
                 "user",
-                "[context-water-meter: elevated] Conservative context occupancy is at 60-80%.",
+                "Current code-inspection working memory:\n- read src/lib.rs",
             ),
         ];
         let current_messages = vec![
@@ -617,7 +604,7 @@ mod tests {
             message("user", "next append-only request"),
             message(
                 "user",
-                "[context-water-meter: pressure] Conservative context occupancy is at 80-100%.",
+                "Current code-inspection working memory:\n- read src/main.rs",
             ),
         ];
         let previous = capture(&model, &previous_messages, None);

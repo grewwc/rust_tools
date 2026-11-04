@@ -594,10 +594,12 @@ fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files()
         archive_path.exists(),
         "overflow file path from stub should exist: {file_path}"
     );
-    // The stub must keep a content preview as a recall anchor so later turns do not "forget".
+    // Under a short budget the optional preview is dropped first; the archive
+    // file remains the source of truth, and the fingerprint keeps a parseable
+    // recall anchor in the stub.
     assert!(
-        stub.contains("Preview (for recall"),
-        "stub should contain a content preview: {stub}"
+        stub.contains("Preview (for recall") || stub.contains("- fingerprint: sha="),
+        "stub should keep a preview or fingerprint recall anchor: {stub}"
     );
 }
 
@@ -617,7 +619,9 @@ fn overflow_stub_recall_anchor_survives_compaction() {
         reasoning_content: None,
     }];
 
-    // 60 early read_file groups, each result 4000 chars — any single one over the threshold must be spilled into a preview stub.
+    // 60 early read_file groups, each result 4000 chars. That is below the 6K
+    // per-result spill threshold, so the early groups fold as one recoverable
+    // group instead of becoming individual spill stubs.
     for i in 0..60usize {
         let id = format!("call_{i}");
         messages.push(Message {
@@ -674,21 +678,30 @@ fn overflow_stub_recall_anchor_survives_compaction() {
         .filter_map(|m| m.content.as_str().map(str::to_string))
         .collect::<Vec<_>>()
         .join("\n");
-    // At least one spill temp file must be written to disk (read_file results spill with zero compression).
-    let overflow_files: Vec<_> = std::fs::read_dir(overflow_dir.join("tool-overflow-compressed"))
-        .map(|rd| rd.filter_map(Result::ok).collect())
-        .unwrap_or_default();
+    // Whichever lossless path ran (whole-message archive, individual spill, or
+    // group fold), the compacted history must keep a pointer to a recoverable
+    // archive rather than only a summary of what was read.
     assert!(
-        !overflow_files.is_empty(),
-        "read_file outputs should be spilled to session temp files"
+        overflow_dir.join("overflow-history.md").exists()
+            || joined.contains("folded-tool-groups")
+            || joined.contains("tool-overflow-compressed"),
+        "compacted history must point at a lossless archive: {joined}"
     );
-    // A recall lead survives folding: at least one of a compressed_tool_round note or a stub anchor.
-    assert!(
-        joined.contains("compressed_tool_round")
-            || joined.contains("Output preserved for tool")
-            || joined.contains("read_file"),
-        "compacted history must retain read_file recall anchors"
-    );
+    // The result bodies may be archived, but the assistant tool calls keep the
+    // original read targets, so every early read remains identifiable inline.
+    let retained_targets = compressed
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flat_map(|calls| calls.iter())
+        .map(|call| call.function.arguments.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for i in 0..60 {
+        assert!(
+            retained_targets.contains(&format!("src/file_{i}.rs")),
+            "missing retained read target src/file_{i}.rs"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&overflow_dir);
 }

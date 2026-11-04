@@ -50,27 +50,55 @@ pub(in crate::ai) fn truncate_last_real_user_message_to_fit(
     )
 }
 
+/// Char budget of the precision tail. The newest tool groups stay verbatim up to
+/// this size; anything older is still recoverable through the archive, so
+/// protecting it in place only freezes the ladder in a long single turn.
+pub(in crate::ai) const PRECISION_TAIL_MAX_CHARS: usize = 120_000;
+
 pub(in crate::ai) fn current_turn_precision_tool_call_ids(
     messages: &[Message],
 ) -> rustc_hash::FxHashSet<String> {
     let mut out = rustc_hash::FxHashSet::default();
-    // Synthetic user messages do not form a turn boundary: otherwise precision
-    // tool results from earlier turns of this round would lose protection and be
-    // lossy truncated by Path C. If there is no real user at all, the whole
-    // history counts as the current synthetic turn, consistent with
-    // retained_turn_start's conservative boundary.
+    // Synthetic user messages do not form a turn boundary, but the tail budget
+    // does: walking newest groups first and stopping once the budget is spent
+    // keeps recent precision intact while leaving superseded results foldable.
+    // A single newest group larger than the budget stays protected whole:
+    // splitting one result is the lossy path's job, not this window's.
     let current_turn_start = last_real_user_index(messages).unwrap_or(0);
+    let mut id_to_name: rustc_hash::FxHashMap<&str, &str> = rustc_hash::FxHashMap::default();
     for message in messages.iter().skip(current_turn_start) {
         let Some(tool_calls) = &message.tool_calls else {
             continue;
         };
         for tool_call in tool_calls {
-            if is_non_compressible_tool(&tool_call.function.name)
-                && crate::ai::tools::tool_history_policy(&tool_call.function.name)
-                    .counts_toward_precision_inline_budget()
-            {
-                out.insert(tool_call.id.clone());
-            }
+            id_to_name.insert(tool_call.id.as_str(), tool_call.function.name.as_str());
+        }
+    }
+    let mut budget = PRECISION_TAIL_MAX_CHARS;
+    for index in (current_turn_start..messages.len()).rev() {
+        if messages[index].role != "tool" {
+            continue;
+        }
+        let Some(id) = messages[index].tool_call_id.as_ref() else {
+            continue;
+        };
+        let Some(name) = id_to_name.get(id.as_str()).copied() else {
+            continue;
+        };
+        if !super::tool_overflow::is_non_compressible_tool(name)
+            || !crate::ai::tools::tool_history_policy(name)
+                .counts_toward_precision_inline_budget()
+        {
+            continue;
+        }
+        let chars = messages[index]
+            .content
+            .as_str()
+            .map_or(0, |text| text.chars().count());
+        budget = budget.saturating_sub(chars);
+        out.insert(id.clone());
+        if budget == 0 {
+            break;
         }
     }
     out
@@ -185,7 +213,12 @@ pub(in crate::ai) fn mid_turn_compress(
         let after = messages_total_chars(&out);
         return (out, before, after);
     }
-    // 1. Dedupe tool results with the same signature
+    // 1. Dedupe tool results with the same signature. Only the inline precision
+    //    tail belongs in this set: spilling and group folding keep the original
+    //    recoverable through the archive, so results outside the tail must stay
+    //    eligible even when their tool forbids *lossy* compaction. The lossy
+    //    truncation pass in `shrink_messages_to_fit` re-adds the lossless ids
+    //    where truncating in place would actually lose evidence.
     let protected_tool_call_ids = current_turn_precision_tool_call_ids(&out);
     dedup_repeated_tool_results(&mut out, &protected_tool_call_ids);
     if messages_total_chars(&out) <= soft_threshold {
@@ -202,6 +235,9 @@ pub(in crate::ai) fn mid_turn_compress(
     //    Results below MID_TURN_SPILL_MIN_CHARS stay inline: folding them frees
     //    too little budget to pay for the risk that the model trusts the preview
     //    instead of the original.
+    //    Dedup runs first: a back-reference stub must point at a still-raw
+    //    canonical copy, and an already-archived copy can no longer be folded.
+    dedup_repeated_tool_results(&mut out, &protected_tool_call_ids);
     prepare_tool_messages_structured(
         &mut out,
         480,

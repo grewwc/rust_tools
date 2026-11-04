@@ -533,8 +533,7 @@ pub(super) fn estimate_request_prompt_tokens(
 
 /// Pessimistic twin of [`estimate_request_prompt_tokens`]: same inputs,
 /// projected from the same counts walk. Stored on the wire body next to the
-/// lower estimate (via `PromptTokenFeedback`) for the water meter's display
-/// interval.
+/// lower estimate (via `PromptTokenFeedback`) as the interval's upper bound.
 pub(super) fn estimate_request_prompt_upper(
     messages: &[Message],
     tools: Option<&Value>,
@@ -737,7 +736,7 @@ pub(super) fn build_request_body_from_parts<'a>(
     // whenever the side channel carries it; a cross-dialect fallback that
     // drops it on the wire only overestimates.
     // One traversal yields both the lower bound used by the clamp/budget and
-    // the pessimistic bound the water meter publishes; `PromptTokenFeedback`
+    // the pessimistic bound reported as the interval upper; `PromptTokenFeedback`
     // reads the upper bound off the body instead of re-walking the prompt.
     let prompt_counts = measure_request_prompt(messages, tools.as_ref(), reasoning_items);
     let est_prompt = prompt_counts.lower_tokens();
