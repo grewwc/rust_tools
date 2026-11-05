@@ -47,8 +47,10 @@ pub(super) fn note_function_call_item_lifecycle(
     }
     let Some(name) = event_type else { return };
     if name.eq_ignore_ascii_case("response.output_item.added") {
+        content.mark_output_started();
         content.open_output_items = content.open_output_items.saturating_add(1);
     } else if name.eq_ignore_ascii_case("response.output_item.done") {
+        content.generation_finished_at = Some(Instant::now());
         content.open_output_items = content.open_output_items.saturating_sub(1);
     }
 }
@@ -164,9 +166,7 @@ pub(super) fn process_external_tool_calls_delta(
             if render_chunk.open_line {
                 let _ = open_tool_call_line(state, index, &render_chunk.function_name);
             }
-            state
-                .content
-                .count_tool_arg_delta(estimate_stream_tokens(&render_chunk.arguments));
+            state.content.count_tool_arg_delta(&render_chunk.arguments);
             let _ = write_tool_call_arguments_stream(&render_chunk.arguments);
             let _ = refresh_tool_call_rate_hint(state, &render_chunk.function_name);
         }
@@ -265,9 +265,7 @@ pub(super) fn process_internal_tool_calls(
                 };
 
                 let _ = write_tool_call_arguments_stream(&chunk);
-                state
-                    .content
-                    .count_tool_arg_delta(estimate_stream_tokens(&chunk));
+                state.content.count_tool_arg_delta(&chunk);
                 let _ = refresh_tool_call_rate_hint(state, &function_name);
             }
             InternalToolCallStreamEvent::End => {

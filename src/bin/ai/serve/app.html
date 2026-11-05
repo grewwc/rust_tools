@@ -3678,11 +3678,11 @@ function recoveredProgressView() {
     box,
     endThinking,
     sealAnswerSegment,
-    thinkingText(text) {
+    thinkingText(text, rate = "") {
       sealAnswerSegment();
       thinking += text;
       if (!think) think = createThinkingFold(box, phaseBubble);
-      think.set("thinking", thinking.length > 6000 ? "…" + thinking.slice(-6000) : thinking);
+      think.set(rate ? "thinking · " + rate : "thinking", thinking.length > 6000 ? "…" + thinking.slice(-6000) : thinking);
       activity.setPhase("Thinking…");
       paintPhase();
     },
@@ -3698,7 +3698,11 @@ function recoveredProgressView() {
 function handleReplayEvent(sid, kind, payload, view) {
   if (sid !== sessionId) return;
   if (kind === "thinking") {
-    try { const text = JSON.parse(payload).text || ""; if (text) view.thinkingText(text); } catch (_) {}
+    try {
+      const event = JSON.parse(payload);
+      const text = event.text || "";
+      if (text) view.thinkingText(text, typeof event.rate === "string" ? event.rate : "");
+    } catch (_) {}
   } else if (kind === "thinking_done") {
     view.endThinking();
     view.phase("Processing…");
@@ -4220,6 +4224,7 @@ async function send() {
   };
   let think = null;
   let thinkRaw = "";
+  let thinkRate = "";
   const thinkingFolds = [];
   let answerDirty = false;
   let progressDirty = false;
@@ -4248,6 +4253,7 @@ async function send() {
     }
     if (thinkingDirty && think) {
       think.body.textContent = thinkRaw;
+      think.box.querySelector("summary").textContent = thinkRate ? "thinking… · " + thinkRate : "thinking…";
       thinkingDirty = false;
     }
     if (thinkingDoneDirty && think) {
@@ -4304,6 +4310,7 @@ async function send() {
     flushPaint();
     think = null;
     thinkRaw = "";
+    thinkRate = "";
   };
   const mutateTranscript = (mutation) => {
     const follow = sid === sessionId && shouldFollowOutput();
@@ -4439,7 +4446,8 @@ async function send() {
         }
         else if (kind === "thinking") {
           try {
-            const text = JSON.parse(payload).text || "";
+            const event = JSON.parse(payload);
+            const text = event.text || "";
             if (text) {
               setPhase("Thinking…");
               sealAnswerSegment();
@@ -4448,6 +4456,7 @@ async function send() {
                 thinkingFolds.push(think);
               });
               thinkRaw += text;
+              thinkRate = typeof event.rate === "string" ? event.rate : "";
               thinkingDirty = true;
               schedulePaint();
             }

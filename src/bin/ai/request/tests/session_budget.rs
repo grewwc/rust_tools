@@ -1,5 +1,5 @@
-use super::common::test_app;
 use super::super::*;
+use super::common::test_app;
 use serde_json::Value;
 
 
@@ -313,6 +313,90 @@ fn stream_usage_derives_prompt_from_total_and_reasoning_only_details() {
     assert_eq!(usage.prompt_tokens, 888);
     assert_eq!(usage.completion_tokens, 512);
     assert_eq!(usage.total_tokens, 1400);
+}
+
+#[test]
+fn stream_usage_merges_total_only_snapshots_without_double_counting() {
+    let mut usage = StreamUsage {
+        prompt_tokens: 80,
+        completion_tokens: 10,
+        total_tokens: 90,
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        usage.merge_snapshot(StreamUsage {
+            total_tokens: 100,
+            ..Default::default()
+        });
+        assert_eq!(usage.prompt_tokens, 80);
+        assert_eq!(usage.completion_tokens, 20);
+        assert_eq!(usage.total_tokens, 100);
+    }
+    for _ in 0..2 {
+        usage.merge_snapshot(StreamUsage {
+            prompt_tokens: 80,
+            completion_tokens: 30,
+            total_tokens: 110,
+            ..Default::default()
+        });
+        assert_eq!(usage.prompt_tokens + usage.completion_tokens, 110);
+        assert_eq!(usage.total_tokens, 110);
+    }
+}
+
+#[test]
+fn stream_usage_total_only_waits_for_a_known_component() {
+    let mut usage = StreamUsage {
+        total_tokens: 100,
+        ..Default::default()
+    }
+    .normalized();
+    assert_eq!(usage.prompt_tokens, 0);
+    assert_eq!(usage.completion_tokens, 0);
+    usage.merge_snapshot(StreamUsage {
+        prompt_tokens: 80,
+        ..Default::default()
+    });
+    assert_eq!(usage.prompt_tokens, 80);
+    assert_eq!(usage.completion_tokens, 20);
+}
+
+#[test]
+fn stream_usage_normalizes_top_level_cache_counts_once() {
+    let usage: StreamUsage = serde_json::from_value(serde_json::json!({
+        "prompt_tokens": 1000,
+        "completion_tokens": 30,
+        "cached_tokens": 600,
+    }))
+    .unwrap();
+    let usage = usage.normalized().normalized();
+    assert_eq!(usage.prompt_tokens, 1000);
+    assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, 600);
+
+    let usage: StreamUsage = serde_json::from_value(serde_json::json!({
+        "input_tokens": 100,
+        "output_tokens": 30,
+        "cache_read_input_tokens": 600,
+        "cache_creation_input_tokens": 300,
+    }))
+    .unwrap();
+    let usage = usage.normalized().normalized();
+    assert_eq!(usage.prompt_tokens, 1000);
+    assert_eq!(usage.total_tokens, 1030);
+    assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, 600);
+
+    let usage: StreamUsage = serde_json::from_value(serde_json::json!({
+        "prompt_tokens": 1000,
+        "input_tokens": 100,
+        "completion_tokens": 30,
+        "cache_read_input_tokens": 600,
+        "cache_creation_input_tokens": 300,
+    }))
+    .unwrap();
+    let usage = usage.normalized();
+    assert_eq!(usage.prompt_tokens, 1000);
+    assert_eq!(usage.total_tokens, 1030);
+    assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, 600);
 }
 
 #[test]

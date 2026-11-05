@@ -372,6 +372,68 @@ fn anthropic_usage_merge_keeps_message_start_prompt_tokens() {
 }
 
 #[test]
+fn usage_merge_total_only_chunks_keep_request_prompt_and_completion() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+    for payload in [
+        r#"{"usage":{"prompt_tokens":80,"completion_tokens":10,"total_tokens":90}}"#,
+        r#"{"usage":{"total_tokens":100}}"#,
+        r#"{"usage":{"total_tokens":100}}"#,
+    ] {
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            provider::openai_adapter(),
+            None,
+            payload,
+        )
+        .unwrap();
+    }
+    let (_, usage) = state.pending_llm_usage.as_ref().unwrap();
+    assert_eq!(
+        (
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens
+        ),
+        (80, 20, 100)
+    );
+}
+
+#[test]
+fn token_throughput_metrics_hidden_items_start_generation_timing() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+    for payload in [
+        r#"{"type":"response.output_item.added","item":{"type":"reasoning","id":"r1","status":"in_progress"}}"#,
+        r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"r1","status":"completed"}}"#,
+        r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"c1","name":"read_file","status":"in_progress"}}"#,
+    ] {
+        let event = serde_json::from_str::<serde_json::Value>(payload).unwrap();
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            provider::openai_adapter(),
+            event.get("type").and_then(|name| name.as_str()),
+            payload,
+        )
+        .unwrap();
+    }
+    assert!(state.content.reasoning_started_at.is_some());
+    assert!(state.content.output_started_at.is_some());
+    assert!(state.content.generation_finished_at.is_some());
+    assert!(!state.content.interleaved_generation);
+}
+
+#[test]
 fn repeated_reasoning_deltas_preserve_model_output() {
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();

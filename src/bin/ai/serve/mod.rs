@@ -714,13 +714,14 @@ fn setup_live_fifo(_session_id: &str) -> Option<LiveFifo> {
 /// 4 = thinking done, 5 = output complete, 6 = confirmation request,
 /// 7 = confirmation resolved, 8 = subagent progress, 9 = input request,
 /// 10 = input resolved, 11 = assistant body pending, 12 = tool lifecycle,
-/// 13 = committed body, 14/15/16 = chunked committed body start/chunk/end).
+/// 13 = committed body, 14/15/16 = chunked committed body start/chunk/end,
+/// 17 = server-computed live thinking rate).
 #[derive(Debug, PartialEq, Eq)]
 #[cfg(feature = "serve")]
 enum ServeLiveEvent {
     Delta(String),
     ThinkingStart,
-    Thinking(String),
+    Thinking(String, Option<String>),
     ThinkingDone,
     OutputComplete,
     /// Raw JSON payload of a remote confirmation request.
@@ -757,6 +758,7 @@ enum ServeLiveEvent {
 #[cfg(feature = "serve")]
 struct ServeFrameDecoder {
     buf: Vec<u8>,
+    thinking_rate: Option<String>,
     /// In-flight chunked committed body, present between `ReplaceStart` and
     /// `ReplaceEnd`.
     pending_replace: Option<String>,
@@ -792,6 +794,7 @@ impl ServeFrameDecoder {
             let known = kind == background::ServeLiveKind::Delta as u8
                 || kind == background::ServeLiveKind::ThinkingStart as u8
                 || kind == background::ServeLiveKind::Thinking as u8
+                || kind == background::ServeLiveKind::ThinkingRate as u8
                 || kind == background::ServeLiveKind::ThinkingDone as u8
                 || kind == background::ServeLiveKind::OutputComplete as u8
                 || kind == background::ServeLiveKind::ConfirmRequest as u8
@@ -819,12 +822,18 @@ impl ServeFrameDecoder {
                     Some(ServeLiveEvent::Delta(payload))
                 }
                 k if k == background::ServeLiveKind::ThinkingStart as u8 => {
+                    self.thinking_rate = None;
                     Some(ServeLiveEvent::ThinkingStart)
                 }
-                k if k == background::ServeLiveKind::Thinking as u8 => {
-                    Some(ServeLiveEvent::Thinking(payload))
+                k if k == background::ServeLiveKind::Thinking as u8 => Some(
+                    ServeLiveEvent::Thinking(payload, self.thinking_rate.clone()),
+                ),
+                k if k == background::ServeLiveKind::ThinkingRate as u8 => {
+                    self.thinking_rate = Some(payload);
+                    None
                 }
                 k if k == background::ServeLiveKind::ThinkingDone as u8 => {
+                    self.thinking_rate = None;
                     Some(ServeLiveEvent::ThinkingDone)
                 }
                 k if k == background::ServeLiveKind::ConfirmRequest as u8 => {
@@ -933,14 +942,15 @@ fn live_event(event: ServeLiveEvent) -> Option<ServeSse> {
     match event {
         ServeLiveEvent::Delta(text) => Some(delta_event(text)),
         ServeLiveEvent::ThinkingStart => Some(ServeSse::new("thinking_start", "")),
-        ServeLiveEvent::Thinking(text) => Some(ServeSse::new(
-            "thinking",
-            serde_json::json!({"text": text}).to_string(),
-        )),
-        ServeLiveEvent::ThinkingDone => Some(ServeSse::new("thinking_done", "")),
-        ServeLiveEvent::AssistantBodyPending => {
-            Some(ServeSse::new("answer_pending", ""))
+        ServeLiveEvent::Thinking(text, rate) => {
+            let mut payload = serde_json::json!({"text": text});
+            if let Some(rate) = rate {
+                payload["rate"] = serde_json::Value::String(rate);
+            }
+            Some(ServeSse::new("thinking", payload.to_string()))
         }
+        ServeLiveEvent::ThinkingDone => Some(ServeSse::new("thinking_done", "")),
+        ServeLiveEvent::AssistantBodyPending => Some(ServeSse::new("answer_pending", "")),
         ServeLiveEvent::Replace(text) => Some(ServeSse::new(
             "replace",
             serde_json::json!({"text": text}).to_string(),
@@ -952,9 +962,7 @@ fn live_event(event: ServeLiveEvent) -> Option<ServeSse> {
         | ServeLiveEvent::ConfirmDone(_)
         | ServeLiveEvent::InputRequest(_)
         | ServeLiveEvent::InputDone(_) => None,
-        ServeLiveEvent::SubagentProgress(line) => {
-            Some(ServeSse::new("subagent_progress", line))
-        }
+        ServeLiveEvent::SubagentProgress(line) => Some(ServeSse::new("subagent_progress", line)),
         ServeLiveEvent::Tool(payload) => Some(ServeSse::new("tool", payload)),
         ServeLiveEvent::OutputComplete => None,
     }

@@ -443,6 +443,26 @@ pub(super) struct TerminalDedupeState {
     pub(super) buffered_terminal_output: String,
 }
 
+/// Text-based live estimate with one rounding step across all received chunks.
+#[derive(Default)]
+pub(super) struct StreamTokenEstimate {
+    ascii: u64,
+    non_ascii: u64,
+}
+
+impl StreamTokenEstimate {
+    pub(super) fn observe(&mut self, text: &str) -> u64 {
+        for ch in text.chars() {
+            if ch.is_ascii() {
+                self.ascii = self.ascii.saturating_add(1);
+            } else {
+                self.non_ascii = self.non_ascii.saturating_add(1);
+            }
+        }
+        self.non_ascii.saturating_add(self.ascii.div_ceil(4))
+    }
+}
+
 pub(super) struct StreamContentState {
     pub(super) thinking_open: bool,
     pub(super) empty_choice_chunks: usize,
@@ -484,13 +504,16 @@ pub(super) struct StreamContentState {
     /// First observed reasoning/output timestamps, used for display-only throughput metrics.
     pub(super) reasoning_started_at: Option<Instant>,
     pub(super) output_started_at: Option<Instant>,
+    /// Last generated text/item arrival, excluding trailing usage and socket grace.
+    pub(super) generation_finished_at: Option<Instant>,
+    pub(super) interleaved_generation: bool,
     /// Approximate reasoning token total used by the in-progress thinking-fold header
     /// rate before provider usage arrives.
     pub(super) live_reasoning_tokens: u64,
     /// Approximate non-reasoning (output) token total used by the deferred-body
-    /// "generating…" rate hint before provider usage arrives. Incremented wherever
-    /// `mark_output_started` fires (non-thinking body commits); tool-call arguments
-    /// never enter `assistant_text` and are not counted.
+    /// "generating…" rate hint before provider usage arrives. Counts committed
+    /// non-thinking body text; arguments use a separate live counter while
+    /// sharing the output timing window.
     pub(super) live_output_tokens: u64,
     /// First received argument delta of the tool call currently named on the receiving hint
     /// (`receiving `X` arguments…`) and the approximate token total of the arguments received
@@ -499,6 +522,9 @@ pub(super) struct StreamContentState {
     /// reset when the hint opens for another tool call.
     pub(super) tool_args_started_at: Option<Instant>,
     pub(super) live_tool_arg_tokens: u64,
+    reasoning_token_estimate: StreamTokenEstimate,
+    output_token_estimate: StreamTokenEstimate,
+    tool_arg_token_estimate: StreamTokenEstimate,
     pub(super) tool_calls_map: SkipMap<usize, ToolCallBuilder>,
     /// Composite key resolved for the most recent tool call without an `index`,
     /// used to attach later parameter-continuation deltas (which have neither id
@@ -583,10 +609,15 @@ impl StreamContentState {
             saw_reasoning_output: false,
             reasoning_started_at: None,
             output_started_at: None,
+            generation_finished_at: None,
+            interleaved_generation: false,
             live_reasoning_tokens: 0,
             live_output_tokens: 0,
             tool_args_started_at: None,
             live_tool_arg_tokens: 0,
+            reasoning_token_estimate: StreamTokenEstimate::default(),
+            output_token_estimate: StreamTokenEstimate::default(),
+            tool_arg_token_estimate: StreamTokenEstimate::default(),
             tool_calls_map: SkipMap::default(),
             last_indexless_tool_call_key: None,
             assistant_text: String::new(),
@@ -608,14 +639,31 @@ impl StreamContentState {
     }
 
     pub(super) fn mark_reasoning_started(&mut self) {
+        self.interleaved_generation |= self.output_started_at.is_some();
+        self.generation_finished_at = Some(Instant::now());
         if self.reasoning_started_at.is_none() {
-            self.reasoning_started_at = Some(Instant::now());
+            self.reasoning_started_at = self.generation_finished_at;
         }
     }
 
     pub(super) fn mark_output_started(&mut self) {
+        self.generation_finished_at = Some(Instant::now());
         if self.output_started_at.is_none() {
-            self.output_started_at = Some(Instant::now());
+            self.output_started_at = self.generation_finished_at;
+        }
+    }
+
+    pub(super) fn count_reasoning_delta(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.mark_reasoning_started();
+            self.live_reasoning_tokens = self.reasoning_token_estimate.observe(text);
+        }
+    }
+
+    pub(super) fn count_output_delta(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.mark_output_started();
+            self.live_output_tokens = self.output_token_estimate.observe(text);
         }
     }
 
@@ -624,18 +672,20 @@ impl StreamContentState {
     pub(super) fn reset_tool_args_metrics(&mut self) {
         self.tool_args_started_at = None;
         self.live_tool_arg_tokens = 0;
+        self.tool_arg_token_estimate = StreamTokenEstimate::default();
     }
 
     /// Record one received tool-call argument delta: the first one stamps the window start,
     /// every one adds to the estimate the receiving hint's `~N tok @ R tok/s` text is built from.
-    pub(super) fn count_tool_arg_delta(&mut self, tokens: u64) {
-        if tokens == 0 {
+    pub(super) fn count_tool_arg_delta(&mut self, text: &str) {
+        if text.is_empty() {
             return;
         }
+        self.mark_output_started();
         if self.tool_args_started_at.is_none() {
             self.tool_args_started_at = Some(Instant::now());
         }
-        self.live_tool_arg_tokens = self.live_tool_arg_tokens.saturating_add(tokens);
+        self.live_tool_arg_tokens = self.tool_arg_token_estimate.observe(text);
     }
 }
 

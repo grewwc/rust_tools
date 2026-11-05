@@ -570,6 +570,8 @@ pub(crate) enum ServeLiveKind {
     ReplaceChunk = 15,
     /// Last chunk of a chunked committed body; completes the replacement.
     ReplaceEnd = 16,
+    /// Server-computed live rate attached to subsequent thinking text frames.
+    ThinkingRate = 17,
 }
 
 /// Max payload bytes per serve frame: header (5) + payload stays under the

@@ -106,12 +106,8 @@ pub(super) fn maybe_print_prompt_cache_metrics(usage: &crate::ai::request::Strea
     }
 }
 
-/// Print a heuristic generation-throughput line after a stream finishes. The timing split is an
-/// estimate, not server-reported: the reasoning window ends at the first visible output token, so
-/// interleaved thinking after output starts (or idle gaps between phases) skews the reasoning
-/// rate. `completion_tokens` includes reasoning tokens and tool-call argument tokens; the output
-/// slice is the non-reasoning remainder after subtracting
-/// `completion_tokens_details.reasoning_tokens`, so it can exceed what was rendered.
+/// Print provider token counts over observed generation windows. These are arrival
+/// rates, not provider decoding timings; output includes tool-call arguments.
 pub(super) fn maybe_print_token_throughput_metrics(
     usage: &crate::ai::request::StreamUsage,
     content: &StreamContentState,
@@ -121,6 +117,17 @@ pub(super) fn maybe_print_token_throughput_metrics(
         return;
     }
 
+    let Some(line) = token_throughput_metrics(usage, content, finished_at) else {
+        return;
+    };
+    print_output_line(&format!("  {}{line}{RESET}", theme::current().accent_muted));
+}
+
+pub(super) fn token_throughput_metrics(
+    usage: &crate::ai::request::StreamUsage,
+    content: &StreamContentState,
+    finished_at: Instant,
+) -> Option<String> {
     let reasoning_tokens = usage
         .completion_tokens_details
         .as_ref()
@@ -128,23 +135,39 @@ pub(super) fn maybe_print_token_throughput_metrics(
         .unwrap_or(0)
         .min(usage.completion_tokens);
     let output_tokens = usage.completion_tokens.saturating_sub(reasoning_tokens);
-    let reasoning_end = content.output_started_at.unwrap_or(finished_at);
+    let generation_end = content.generation_finished_at.unwrap_or(finished_at);
+    if content.interleaved_generation
+        || (content.reasoning_started_at.is_some() && reasoning_tokens == 0)
+    {
+        let started = content
+            .reasoning_started_at
+            .into_iter()
+            .chain(content.output_started_at)
+            .min();
+        let elapsed = started.map(|start| generation_end.saturating_duration_since(start));
+        // Interleaved phases or an unknown reasoning slice have no trustworthy
+        // split. Use the complete generation window for the completion count.
+        return (usage.completion_tokens > 0 && elapsed.is_some()).then(|| {
+            format!(
+                "↳ speed · generation {}",
+                format_token_throughput_segment(usage.completion_tokens, elapsed),
+            )
+        });
+    }
+    let reasoning_end = content.output_started_at.unwrap_or(generation_end);
     let reasoning_elapsed = content
         .reasoning_started_at
         .map(|started| reasoning_end.saturating_duration_since(started));
     let output_elapsed = content
         .output_started_at
-        .map(|started| finished_at.saturating_duration_since(started));
+        .map(|started| generation_end.saturating_duration_since(started));
 
-    let Some(line) = format_token_throughput_metrics(
+    format_token_throughput_metrics(
         reasoning_tokens,
         output_tokens,
         reasoning_elapsed,
         output_elapsed,
-    ) else {
-        return;
-    };
-    print_output_line(&format!("  {}{line}{RESET}", theme::current().accent_muted));
+    )
 }
 
 /// Live reasoning-rate text for the in-progress thinking-fold header. It is
@@ -157,10 +180,12 @@ pub(super) fn fold_header_rate(content: &StreamContentState, now: Instant) -> Op
         return None;
     }
     let elapsed = content.reasoning_started_at.map(|started| {
-        content
-            .output_started_at
-            .unwrap_or(now)
-            .saturating_duration_since(started)
+        let end = if content.interleaved_generation {
+            now
+        } else {
+            content.output_started_at.unwrap_or(now)
+        };
+        end.saturating_duration_since(started)
     });
     Some(format!(
         "~{} tok @ {} tok/s",
@@ -172,20 +197,9 @@ pub(super) fn fold_header_rate(content: &StreamContentState, now: Instant) -> Op
 /// Approximate token count for live throughput display (heuristic, prefixed with `~`):
 /// ASCII text averages ~4 chars/token, CJK characters ~1 token each (3 UTF-8 bytes each).
 /// A pure byte/4 estimate under-counts CJK by ~25%, so split by character class instead.
+#[cfg(test)]
 pub(super) fn estimate_stream_tokens(text: &str) -> u64 {
-    if text.is_empty() {
-        return 0;
-    }
-    let mut ascii = 0u64;
-    let mut non_ascii = 0u64;
-    for ch in text.chars() {
-        if ch.is_ascii() {
-            ascii += 1;
-        } else {
-            non_ascii += 1;
-        }
-    }
-    non_ascii + ascii.div_ceil(4)
+    super::state::StreamTokenEstimate::default().observe(text)
 }
 
 /// Pure formatter for the split reasoning/output throughput line.
@@ -204,24 +218,29 @@ pub(super) fn format_token_throughput_metrics(
     }
 
     let mut segments = Vec::with_capacity(2);
-    if reasoning_tokens > 0 {
-        segments.push(format!(
-            "reasoning {} tok @ {} tok/s",
-            format_compact_token_count(reasoning_tokens),
-            format_token_rate(reasoning_tokens, reasoning_elapsed)
-        ));
-    }
-    if output_tokens > 0 {
-        segments.push(format!(
-            "output {} tok @ {} tok/s",
-            format_compact_token_count(output_tokens),
-            format_token_rate(output_tokens, output_elapsed)
-        ));
+    for (label, tokens, elapsed) in [
+        ("reasoning", reasoning_tokens, reasoning_elapsed),
+        ("output", output_tokens, output_elapsed),
+    ] {
+        if tokens > 0 {
+            segments.push(format!(
+                "{label} {}",
+                format_token_throughput_segment(tokens, elapsed)
+            ));
+        }
     }
     Some(format!("↳ speed · {}", segments.join(" · ")))
 }
 
-/// Minimum elapsed window before an instantaneous rate is reported; shorter windows
+fn format_token_throughput_segment(tokens: u64, elapsed: Option<Duration>) -> String {
+    format!(
+        "{} tok @ {} tok/s",
+        format_compact_token_count(tokens),
+        format_token_rate(tokens, elapsed),
+    )
+}
+
+/// Minimum elapsed window before an arrival rate is reported; shorter windows
 /// (e.g. the first chunk right after output starts) would print misleadingly large rates.
 pub(super) const MIN_RATE_WINDOW: Duration = Duration::from_millis(500);
 
@@ -259,7 +278,10 @@ pub(super) fn format_compact_rate(rate: f64) -> String {
 
 /// Pure function: build a readable cache-hit line from prompt_tokens / cached_tokens.
 /// Returns Some only when there really was a hit (cached > 0), to avoid pointless noise.
-pub(super) fn format_prompt_cache_metrics(prompt_tokens: u64, cached_tokens: u64) -> Option<String> {
+pub(super) fn format_prompt_cache_metrics(
+    prompt_tokens: u64,
+    cached_tokens: u64,
+) -> Option<String> {
     if cached_tokens == 0 || prompt_tokens == 0 {
         return None;
     }

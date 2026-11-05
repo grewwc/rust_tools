@@ -36,7 +36,7 @@ pub(super) fn write_thinking_content_folded(
         // thinking lines would be indistinguishable from the answer. Frame
         // the thinking lifecycle instead and keep it off stdout (the SSE
         // line pump would otherwise forward it as plain message events).
-        return write_thinking_content_serve(content, markers);
+        return write_thinking_content_serve(content, &state.content, markers);
     }
     let fold = &mut state.render.thinking_fold;
 
@@ -113,12 +113,18 @@ pub(super) fn split_serve_thinking_chunk<'a>(
 /// related reaches child stdout.
 pub(super) fn write_thinking_content_serve(
     content: &str,
+    metrics: &StreamContentState,
     markers: &StreamMarkers,
 ) -> io::Result<()> {
-    use crate::ai::background::publish_serve_frame;
+    use crate::ai::background::{ServeLiveKind, publish_serve_frame};
     for (kind, text) in
         split_serve_thinking_chunk(content, &markers.thinking_tag, &markers.end_thinking_tag)
     {
+        if kind == ServeLiveKind::Thinking
+            && let Some(rate) = fold_header_rate(metrics, Instant::now())
+        {
+            publish_serve_frame(ServeLiveKind::ThinkingRate, &rate);
+        }
         publish_serve_frame(kind, text);
     }
     Ok(())

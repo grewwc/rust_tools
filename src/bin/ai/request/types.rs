@@ -1,8 +1,6 @@
-//! 流式响应解析类型与辅助函数。
+//! Streaming response types and helpers shared by request handling and rendering.
 //!
-//! 包含 OpenAI-compatible 流式响应的反序列化结构（`StreamChunk` / `StreamUsage`
-//! / `StreamChoice` 等）、serde 辅助函数以及推理片段合并逻辑。
-//! 这些类型被 `request` 内部各子模块以及 `stream` 渲染层共享。
+//! Includes OpenAI-compatible response shapes, serde helpers and reasoning merging.
 
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
@@ -112,24 +110,120 @@ pub(crate) struct StreamChunk {
 /// After deserialization, always call [`StreamUsage::normalized`] to fill in
 /// components that the provider omitted but can be derived from `total_tokens`.
 #[derive(Debug, Default, Clone, Deserialize)]
+#[serde(from = "StreamUsageWire")]
 pub(crate) struct StreamUsage {
-    #[serde(default, alias = "input_tokens", alias = "prompt_token_count")]
     pub(crate) prompt_tokens: u64,
-    #[serde(default, alias = "output_tokens", alias = "completion_token_count")]
     pub(crate) completion_tokens: u64,
-    #[serde(default, alias = "total_token_count")]
     pub(crate) total_tokens: u64,
     /// OpenAI newer format: prompt_tokens_details.cached_tokens
-    #[serde(default, alias = "input_tokens_details")]
     pub(crate) prompt_tokens_details: Option<StreamPromptTokensDetails>,
     /// OpenAI reasoning models / qwen thinking mode report the reasoning slice
     /// here. It is a subset of `completion_tokens`, not an additional amount;
     /// normalization therefore uses it only as a floor instead of adding it.
-    #[serde(default, alias = "output_tokens_details")]
     pub(crate) completion_tokens_details: Option<StreamCompletionTokensDetails>,
+    pub(crate) cached_tokens: u64,
+}
+
+#[derive(Deserialize)]
+struct StreamUsageWire {
+    #[serde(default, alias = "prompt_token_count")]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default, alias = "output_tokens", alias = "completion_token_count")]
+    completion_tokens: u64,
+    #[serde(default, alias = "total_token_count")]
+    total_tokens: u64,
+    #[serde(default, alias = "input_tokens_details")]
+    prompt_tokens_details: Option<StreamPromptTokensDetails>,
+    #[serde(default, alias = "output_tokens_details")]
+    completion_tokens_details: Option<StreamCompletionTokensDetails>,
+    #[serde(
+        default,
+        alias = "cached_prompt_tokens",
+        alias = "prompt_cache_hit_tokens"
+    )]
+    cached_tokens: u64,
+    /// Anthropic input_tokens excludes both cache reads and cache creation.
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+}
+
+impl From<StreamUsageWire> for StreamUsage {
+    fn from(wire: StreamUsageWire) -> Self {
+        // Canonical prompt_tokens already includes cache tokens. Only the
+        // Anthropic input_tokens spelling needs the cache slices added.
+        let prompt_tokens = wire
+            .prompt_tokens
+            .or_else(|| {
+                wire.input_tokens.map(|input| {
+                    input
+                        .saturating_add(wire.cache_read_input_tokens)
+                        .saturating_add(wire.cache_creation_input_tokens)
+                })
+            })
+            .unwrap_or(0);
+        Self {
+            prompt_tokens,
+            completion_tokens: wire.completion_tokens,
+            total_tokens: wire.total_tokens,
+            prompt_tokens_details: wire.prompt_tokens_details,
+            completion_tokens_details: wire.completion_tokens_details,
+            cached_tokens: wire.cached_tokens.max(wire.cache_read_input_tokens),
+        }
+    }
 }
 
 impl StreamUsage {
+    fn normalize_cache_counts(&mut self) {
+        let cached = std::mem::take(&mut self.cached_tokens);
+        if cached > 0 {
+            let details = self
+                .prompt_tokens_details
+                .get_or_insert_with(Default::default);
+            details.cached_tokens = details.cached_tokens.max(cached);
+        }
+    }
+
+    /// Merge cumulative snapshots within one request, then derive missing counts.
+    /// A total-only update uses the known prompt count instead of inventing a new
+    /// prompt that would be added to the previous completion count.
+    pub(crate) fn merge_snapshot(&mut self, mut snapshot: Self) {
+        snapshot.normalize_cache_counts();
+        if snapshot.total_tokens > 0 {
+            if snapshot.prompt_tokens == 0 && snapshot.completion_tokens == 0 {
+                snapshot.prompt_tokens = self.prompt_tokens;
+                if snapshot.prompt_tokens > 0 {
+                    snapshot.completion_tokens =
+                        snapshot.total_tokens.saturating_sub(snapshot.prompt_tokens);
+                }
+            } else if snapshot.prompt_tokens > 0 && snapshot.completion_tokens == 0 {
+                snapshot.completion_tokens =
+                    snapshot.total_tokens.saturating_sub(snapshot.prompt_tokens);
+            } else if snapshot.prompt_tokens == 0 && snapshot.completion_tokens > 0 {
+                snapshot.prompt_tokens = snapshot
+                    .total_tokens
+                    .saturating_sub(snapshot.completion_tokens);
+            }
+        }
+        if snapshot.prompt_tokens > 0 {
+            self.prompt_tokens = snapshot.prompt_tokens;
+        }
+        if snapshot.completion_tokens > 0 {
+            self.completion_tokens = snapshot.completion_tokens;
+        }
+        if let Some(details) = snapshot.prompt_tokens_details {
+            self.prompt_tokens_details = Some(details);
+        }
+        if let Some(details) = snapshot.completion_tokens_details {
+            self.completion_tokens_details = Some(details);
+        }
+        self.total_tokens = self.total_tokens.max(snapshot.total_tokens);
+        *self = std::mem::take(self).normalized();
+    }
+
     /// Backfill omitted token components from whatever the provider did report,
     /// so downstream accounting does not under-count.
     ///
@@ -138,8 +232,10 @@ impl StreamUsage {
     ///   covers the other, derive the missing component as the remainder.
     /// - Treat a separate `reasoning_tokens` slice as a floor for completion;
     ///   reasoning is already included by providers that report completion.
+    /// - Leave a total-only report unallocated until a component is known.
     /// - Keep `total_tokens` consistent (>= prompt + completion) for display.
     pub(crate) fn normalized(mut self) -> Self {
+        self.normalize_cache_counts();
         // Derive a missing component from the total when the total is larger
         // than the single component we do have. This must happen before applying
         // the reasoning floor: reasoning is only a subset of completion, so using
@@ -161,7 +257,10 @@ impl StreamUsage {
 
         // If the provider supplied only total + reasoning details, the floor
         // above gives us enough information to recover the prompt remainder.
-        if self.prompt_tokens == 0 && self.total_tokens > self.completion_tokens {
+        if self.prompt_tokens == 0
+            && self.completion_tokens > 0
+            && self.total_tokens > self.completion_tokens
+        {
             self.prompt_tokens = self.total_tokens - self.completion_tokens;
         }
 

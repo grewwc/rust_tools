@@ -84,8 +84,14 @@ fn fold_header_rate_tracks_live_reasoning_throughput() {
 
 #[test]
 fn token_rate_under_minimum_window_is_unmeasurable() {
-    assert_eq!(format_token_rate(10_000, Some(Duration::from_millis(200))), "—");
-    assert_eq!(format_token_rate(10_000, Some(Duration::from_secs(2))), "5.0k");
+    assert_eq!(
+        format_token_rate(10_000, Some(Duration::from_millis(200))),
+        "—"
+    );
+    assert_eq!(
+        format_token_rate(10_000, Some(Duration::from_secs(2))),
+        "5.0k"
+    );
 }
 
 #[test]
@@ -157,8 +163,8 @@ fn tool_call_rate_hint_reports_argument_throughput() {
     state.render.waiting_hint_line = tool_call_hint_label("apply_patch", None);
     // The counter is fed directly so the assertion does not depend on real stream timing,
     // while the window itself is deterministic.
-    state.content.count_tool_arg_delta(600);
-    state.content.count_tool_arg_delta(400);
+    state.content.count_tool_arg_delta(&"a".repeat(2_400));
+    state.content.count_tool_arg_delta(&"a".repeat(1_600));
     state.content.tool_args_started_at = Some(Instant::now() - Duration::from_secs(2));
 
     refresh_tool_call_rate_hint(&mut state, "apply_patch").unwrap();
@@ -206,7 +212,7 @@ fn tool_call_rate_hint_is_gated_and_throttled() {
 #[test]
 fn tool_arg_metrics_reset_when_the_hint_switches_calls() {
     let mut state = StreamProcessingState::new();
-    state.content.count_tool_arg_delta(120);
+    state.content.count_tool_arg_delta(&"a".repeat(480));
     assert_eq!(state.content.live_tool_arg_tokens, 120);
     assert!(state.content.tool_args_started_at.is_some());
 
@@ -228,6 +234,104 @@ fn live_token_estimate_splits_cjk_and_ascii() {
     assert_eq!(estimate_stream_tokens("你好世界"), 4);
     assert_eq!(estimate_stream_tokens("Hello 世界"), 4); // 6 ascii -> 2 + 2 CJK
     assert_eq!(estimate_stream_tokens("Hello world"), 3); // 11 ascii -> ceil(11/4)
+}
+
+#[test]
+fn live_token_estimate_is_independent_of_chunk_boundaries() {
+    for text in ["a".repeat(400), "ab中文c😀def世界ghi".to_string()] {
+        let expected = estimate_stream_tokens(&text);
+        let mut state = StreamProcessingState::new();
+        for ch in text.chars() {
+            let chunk = ch.to_string();
+            state.content.count_reasoning_delta(&chunk);
+            state.content.count_output_delta(&chunk);
+            state.content.count_tool_arg_delta(&chunk);
+        }
+        assert_eq!(state.content.live_reasoning_tokens, expected, "{text}");
+        assert_eq!(state.content.live_output_tokens, expected, "{text}");
+        assert_eq!(state.content.live_tool_arg_tokens, expected, "{text}");
+    }
+}
+
+#[test]
+fn token_throughput_metrics_excludes_trailing_usage_wait() {
+    let now = Instant::now();
+    let mut state = StreamProcessingState::new();
+    state.content.reasoning_started_at = Some(now - Duration::from_secs(10));
+    state.content.output_started_at = Some(now - Duration::from_secs(8));
+    state.content.generation_finished_at = Some(now - Duration::from_secs(7));
+    let usage = serde_json::from_value(serde_json::json!({
+        "completion_tokens": 1200,
+        "completion_tokens_details": {"reasoning_tokens": 800},
+    }))
+    .unwrap();
+    assert_eq!(
+        token_throughput_metrics(&usage, &state.content, now).as_deref(),
+        Some("↳ speed · reasoning 800 tok @ 400 tok/s · output 400 tok @ 400 tok/s")
+    );
+}
+
+#[test]
+fn token_throughput_metrics_interleaved_phases_use_generation_window() {
+    let now = Instant::now();
+    let mut state = StreamProcessingState::new();
+    state.content.count_reasoning_delta("first thought");
+    state.content.count_output_delta("answer");
+    state.content.count_reasoning_delta("later thought");
+    assert!(state.content.interleaved_generation);
+    state.content.reasoning_started_at = Some(now - Duration::from_secs(3));
+    state.content.output_started_at = Some(now - Duration::from_secs(2));
+    state.content.generation_finished_at = Some(now);
+    let usage = serde_json::from_value(serde_json::json!({
+        "completion_tokens": 900,
+        "completion_tokens_details": {"reasoning_tokens": 300},
+    }))
+    .unwrap();
+    assert_eq!(
+        token_throughput_metrics(&usage, &state.content, now).as_deref(),
+        Some("↳ speed · generation 900 tok @ 300 tok/s")
+    );
+    state.content.live_reasoning_tokens = 90;
+    assert_eq!(
+        fold_header_rate(&state.content, now).as_deref(),
+        Some("~90 tok @ 30.0 tok/s")
+    );
+}
+
+#[test]
+fn token_throughput_metrics_tool_only_output_has_timing() {
+    let now = Instant::now();
+    let mut state = StreamProcessingState::new();
+    state.content.count_tool_arg_delta("{}");
+    assert!(state.content.output_started_at.is_some());
+    assert!(state.content.generation_finished_at.is_some());
+    state.content.output_started_at = Some(now - Duration::from_secs(2));
+    state.content.generation_finished_at = Some(now);
+    let usage = crate::ai::request::StreamUsage {
+        completion_tokens: 400,
+        ..Default::default()
+    };
+    assert_eq!(
+        token_throughput_metrics(&usage, &state.content, now).as_deref(),
+        Some("↳ speed · output 400 tok @ 200 tok/s")
+    );
+}
+
+#[test]
+fn token_throughput_metrics_missing_reasoning_usage_uses_generation_window() {
+    let now = Instant::now();
+    let mut state = StreamProcessingState::new();
+    state.content.reasoning_started_at = Some(now - Duration::from_secs(6));
+    state.content.output_started_at = Some(now - Duration::from_secs(1));
+    state.content.generation_finished_at = Some(now);
+    let usage = crate::ai::request::StreamUsage {
+        completion_tokens: 1200,
+        ..Default::default()
+    };
+    assert_eq!(
+        token_throughput_metrics(&usage, &state.content, now).as_deref(),
+        Some("↳ speed · generation 1.2k tok @ 200 tok/s")
+    );
 }
 
 #[test]

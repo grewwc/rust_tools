@@ -2777,6 +2777,22 @@ fn render_turn_stream_to_with_confirm(
     tty: bool,
     confirm: Option<&ServeConfirmChannel>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    render_turn_stream_to_with_width(resp, out, tty, confirm, || {
+        crossterm::terminal::size()
+            .map(|(cols, _)| usize::from(cols))
+            .unwrap_or(0)
+    })
+}
+
+/// Probe each observer row at dispatch time; tests can replay live resizes
+/// without changing process-wide terminal state or the SSE protocol.
+fn render_turn_stream_to_with_width(
+    resp: reqwest::blocking::Response,
+    out: &mut dyn std::io::Write,
+    tty: bool,
+    confirm: Option<&ServeConfirmChannel>,
+    mut terminal_width: impl FnMut() -> usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::BufRead;
     // `blocking::Response` implements `Read`, so lines are parsed (and
     // printed) as soon as the server flushes them, not after the whole turn.
@@ -2814,11 +2830,9 @@ fn render_turn_stream_to_with_confirm(
     // on a fresh row instead of gluing onto the answer's last line.
     let mut line_open = false;
     let mut observer_rows = ObserverRowState::default();
-    // End-of-stream metrics summaries (`↳ cache` / `↳ speed`) are discarded
-    // here: a multi-round turn emits one pair per model stream, and printing
-    // them all buries the answer tail in stale per-round summaries. The local
-    // run keeps them; the serve-chat scrollback keeps the answer and tool
-    // rows only.
+    // Stdout and live-body frames use separate pumps, so a metrics row can
+    // overtake the last body delta. Retain it until a body/round boundary.
+    let mut pending_metrics = Vec::new();
     // Local-equivalent Markdown rendering: on a TTY the body deltas go
     // through the shared streaming renderer (tables, code blocks, math),
     // exactly like the local turn output. Piped output stays raw so
@@ -2877,6 +2891,12 @@ fn render_turn_stream_to_with_confirm(
             event_has_data = true;
         };
         let payload = payload.as_str();
+        if matches!(event_kind.as_str(), "" | "message") && is_metrics_footer(payload) {
+            pending_metrics.push(payload.to_string());
+            observer_rows.last_header_key = None;
+            event_kind.clear();
+            continue;
+        }
         if matches!(
             event_kind.as_str(),
             "error"
@@ -2937,6 +2957,7 @@ fn render_turn_stream_to_with_confirm(
                     out,
                     &mut observer_rows,
                 );
+                flush_metrics_footers(&mut pending_metrics, &mut line_open, tty, out);
                 if tty {
                     close_open_line(&mut line_open, out);
                 }
@@ -2957,8 +2978,9 @@ fn render_turn_stream_to_with_confirm(
                 if tty {
                     let _ = markdown.flush_pending_to(out);
                 }
-                let text = serde_json::from_str::<serde_json::Value>(payload)
-                    .ok()
+                let thinking = serde_json::from_str::<serde_json::Value>(payload).ok();
+                let text = thinking
+                    .as_ref()
                     .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
                     .unwrap_or_else(|| payload.to_string());
                 if !thinking_active {
@@ -2975,6 +2997,15 @@ fn render_turn_stream_to_with_confirm(
                 thinking_newlines = thinking_newlines.saturating_add(text.matches('\n').count());
                 thinking_chars = thinking_chars.saturating_add(text.chars().count());
                 if tty {
+                    thinking_region.header_rate = thinking
+                        .as_ref()
+                        .and_then(|v| v.get("rate").and_then(|rate| rate.as_str()))
+                        .map(|rate| {
+                            rate.chars()
+                                .filter(|ch| !ch.is_control())
+                                .take(128)
+                                .collect()
+                        });
                     thinking_region.append(&text);
                     thinking_region.redraw(out);
                     line_open = true;
@@ -3081,6 +3112,7 @@ fn render_turn_stream_to_with_confirm(
                     let _ = writeln!(out);
                 }
                 let question = serde_json::from_str::<serde_json::Value>(payload).ok();
+                flush_metrics_footers(&mut pending_metrics, &mut line_open, tty, out);
                 let parsed = question.as_ref().and_then(|v| {
                     Some((
                         v.get("id")?.as_u64()?,
@@ -3206,6 +3238,13 @@ fn render_turn_stream_to_with_confirm(
                 }
                 streamed_body = text;
                 turn_committed = true;
+                if tty && !pending_metrics.is_empty() {
+                    let _ = markdown.flush_pending_to(out);
+                    if markdown.at_line_start() {
+                        line_open = false;
+                    }
+                }
+                flush_metrics_footers(&mut pending_metrics, &mut line_open, tty, out);
             }
             "subagent_progress" => {
                 // Serve frames carry the whole parent-observed status line
@@ -3249,24 +3288,18 @@ fn render_turn_stream_to_with_confirm(
                     out,
                     &mut observer_rows,
                 );
-                // Metrics summaries are discarded (see above): they must neither
-                // tear the answer's open line nor bury the answer tail.
-                // Every other observer row keeps the previous inline behavior.
+                // Unnamed stdout metrics normally take the buffering path above.
+                // Tolerate named observer events carrying the same footer too.
                 if is_metrics_footer(payload) {
-                    // Metrics end one model stream. Although the row itself is
-                    // hidden, it separates this request's header from the next.
+                    pending_metrics.push(payload.to_string());
                     observer_rows.last_header_key = None;
                     observer_rows.close_tool_row(&mut line_open, out);
                     observer_rows.hide_context_budget_row(&mut line_open, tty, out);
                     let _ = out.flush();
                 } else {
-                    let width = if tty {
-                        crossterm::terminal::size()
-                            .map(|(cols, _)| usize::from(cols))
-                            .unwrap_or(0)
-                    } else {
-                        0
-                    };
+                    flush_metrics_footers(&mut pending_metrics, &mut line_open, tty, out);
+                    let width = if tty { terminal_width() } else { 0 };
+                    let previous_tool_text = observer_rows.open_tool_text.take();
                     let decision = decide_observer_row(
                         payload,
                         &mut observer_rows,
@@ -3284,30 +3317,43 @@ fn render_turn_stream_to_with_confirm(
                     // header starts the pending side-note's next turn. Retry
                     // headers must keep the answer buffer and dedupe key.
                     if decision.new_turn {
-                        observer_rows.finish_context_budget_row(&mut line_open, out);
+                        observer_rows.finish_context_budget_row(&mut line_open, tty, width, out);
                         streamed_body.clear();
                         turn_committed = false;
                     }
                     // The turn header (`print_info` in `request/transport.rs`)
                     // is forwarded as a plain stdout row, so without a marker
                     // the serve-chat scrollback is indistinguishable from a
-                    // local run. Annotate only that row; every other observer
-                    // row stays byte-identical.
+                    // local run. Clip after appending the marker so the entire
+                    // displayed row fits the client's current terminal.
                     let row = if decision.header {
                         annotate_remote_turn_header(payload, tty)
                     } else {
                         payload.to_string()
                     };
+                    let row = clamp_observer_row(&row, tty, width);
                     match decision.action {
                         ObserverRowAction::SkipDuplicate => {}
                         ObserverRowAction::ReplaceOpenToolRow => {
                             let _ = write!(out, "\r\x1b[2K");
+                            // A row left open at a wider size may have reflowed
+                            // before this completion arrives. Erase its whole
+                            // current footprint, not just the cursor's row.
+                            let rows = previous_tool_text
+                                .as_deref()
+                                .filter(|_| width > 0)
+                                .map(|text| thinking_physical_rows(text, width))
+                                .unwrap_or(1);
+                            for _ in 1..rows {
+                                let _ = write!(out, "\x1b[1A\r\x1b[2K");
+                            }
                             let _ = writeln!(out, "{row}");
                             line_open = false;
                         }
                         ObserverRowAction::OpenToolRow => {
                             close_open_line(&mut line_open, out);
                             let _ = write!(out, "{row}");
+                            observer_rows.open_tool_text = Some(strip_ansi_escapes(&row));
                             line_open = true;
                         }
                         ObserverRowAction::ContextBudget { replace, draw } => {
@@ -3317,17 +3363,12 @@ fn render_turn_stream_to_with_confirm(
                             } else {
                                 close_open_line(&mut line_open, out);
                             }
-                            observer_rows.context_budget_row = Some(row);
+                            // Keep the source for the deferred commit, which
+                            // may happen after another terminal resize.
+                            observer_rows.context_budget_row = Some(payload.to_string());
                             observer_rows.context_budget_drawn = draw;
                             if draw {
-                                let _ = write!(
-                                    out,
-                                    "{}",
-                                    observer_rows
-                                        .context_budget_row
-                                        .as_deref()
-                                        .unwrap_or_default()
-                                );
+                                let _ = write!(out, "{row}");
                                 line_open = true;
                             }
                         }
@@ -3373,7 +3414,9 @@ fn render_turn_stream_to_with_confirm(
         &mut observer_rows,
     );
     close_open_line(&mut line_open, out);
-    observer_rows.finish_context_budget_row(&mut line_open, out);
+    let width = if tty { terminal_width() } else { 0 };
+    observer_rows.finish_context_budget_row(&mut line_open, tty, width, out);
+    flush_metrics_footers(&mut pending_metrics, &mut line_open, tty, out);
     stream_result
 }
 
@@ -3383,12 +3426,14 @@ struct ObserverRowState {
     last_thinking_summary: Option<String>,
     last_context_budget: Option<String>,
     open_tool_row: Option<String>,
+    open_tool_text: Option<String>,
     context_budget_row: Option<String>,
     context_budget_drawn: bool,
 }
 
 impl ObserverRowState {
     fn close_tool_row(&mut self, line_open: &mut bool, out: &mut dyn std::io::Write) {
+        self.open_tool_text = None;
         if self.open_tool_row.take().is_some() {
             close_open_line(line_open, out);
         }
@@ -3412,9 +3457,16 @@ impl ObserverRowState {
         *line_open = false;
     }
 
-    fn finish_context_budget_row(&mut self, line_open: &mut bool, out: &mut dyn std::io::Write) {
+    fn finish_context_budget_row(
+        &mut self,
+        line_open: &mut bool,
+        tty: bool,
+        width: usize,
+        out: &mut dyn std::io::Write,
+    ) {
         if let Some(row) = self.context_budget_row.take() {
             close_open_line(line_open, out);
+            let row = clamp_observer_row(&row, tty, width);
             let _ = writeln!(out, "{row}");
             self.last_thinking_summary = None;
             let _ = out.flush();
@@ -3439,7 +3491,7 @@ struct ObserverRowDecision {
     new_turn: bool,
 }
 
-/// Decide only from display text/state; ANSI bytes are preserved when printing.
+/// Decide from the complete source text before presentation truncation.
 fn decide_observer_row(
     payload: &str,
     state: &mut ObserverRowState,
@@ -3552,13 +3604,30 @@ fn thinking_summary(newlines: usize, chars: usize) -> usize {
 }
 
 /// Whether a stdout-derived footer row is an end-of-stream metrics summary.
-/// These (`↳ cache …`, `↳ speed …`) are discarded by the serve-chat client;
+/// These (`↳ cache …`, `↳ speed …`) are buffered until a body/round boundary;
 /// matching on the marker (not the full line) keeps this robust to the
 /// child's indent/ANSI styling. Body text never reaches this path (it arrives
 /// as `delta` events), so a quoted marker in the answer cannot be
 /// misclassified here.
 fn is_metrics_footer(payload: &str) -> bool {
     payload.contains("↳ cache") || payload.contains("↳ speed")
+}
+
+fn flush_metrics_footers(
+    pending: &mut Vec<String>,
+    line_open: &mut bool,
+    tty: bool,
+    out: &mut dyn std::io::Write,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    close_open_line(line_open, out);
+    for row in pending.drain(..) {
+        let row = if tty { row } else { strip_ansi_escapes(&row) };
+        let _ = writeln!(out, "{row}");
+    }
+    let _ = out.flush();
 }
 
 /// Whether a stdout-derived row is the turn header printed by `print_info`
@@ -3630,6 +3699,85 @@ fn annotate_remote_turn_header(payload: &str, tty: bool) -> String {
     } else {
         format!("{payload} (remote)")
     }
+}
+
+/// Preserve SGR styling while fitting each observer line to the local width.
+/// Pipes and unknown geometry retain the original bytes. State/deduplication
+/// always sees the complete source row, including any hidden suffix.
+fn clamp_observer_row(row: &str, tty: bool, width: usize) -> String {
+    if !tty || width == 0 {
+        return row.to_string();
+    }
+    row.split('\n')
+        .map(|line| {
+            let mut plain = String::with_capacity(line.len());
+            let mut styles = Vec::new();
+            let mut chars = line.char_indices();
+            while let Some((start, ch)) = chars.next() {
+                if ch == '\x1b' {
+                    match chars.next() {
+                        Some((_, '[')) => {
+                            for (end, next) in chars.by_ref() {
+                                if ('@'..='~').contains(&next) {
+                                    if next == 'm'
+                                        && line[start + 2..end]
+                                            .bytes()
+                                            .all(|b| b.is_ascii_digit() || matches!(b, b';' | b':'))
+                                    {
+                                        styles.push((plain.len(), &line[start..end + 1]));
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        Some((_, ']' | 'P' | 'X' | '^' | '_')) => {
+                            for (_, next) in chars.by_ref() {
+                                if next == '\x07' {
+                                    break;
+                                }
+                                if next == '\x1b' {
+                                    let _ = chars.next();
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                match ch {
+                    '\r' => {}
+                    '\t' => plain.push_str("    "),
+                    ch if ch.is_control() => plain.extend(ch.escape_default()),
+                    ch => plain.push(ch),
+                }
+            }
+            // Reuse the existing plain-row clamp and the shared renderer's
+            // terminal_cell_width semantics, including CJK and emoji.
+            let clamped = clamp_thinking_row(&plain, width);
+            let truncated = clamped != plain;
+            let kept = if truncated {
+                clamped.len() - '…'.len_utf8()
+            } else {
+                plain.len()
+            };
+            let styled = !styles.is_empty();
+            let mut result = String::with_capacity(line.len());
+            let mut copied = 0;
+            for (at, style) in styles.into_iter().take_while(|(at, _)| *at <= kept) {
+                result.push_str(&plain[copied..at]);
+                result.push_str(style);
+                copied = at;
+            }
+            result.push_str(&clamped[copied..]);
+            if truncated && styled {
+                // The child's trailing reset may be beyond the cut point.
+                result.push_str("\x1b[0m");
+            }
+            result
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Close the answer's open row at end-of-turn so the scrollback ends on a
@@ -3783,6 +3931,7 @@ struct ThinkingLiveRegion {
     tail: VecDeque<char>,
     tail_truncated: bool,
     drawn_rows: Vec<String>,
+    header_rate: Option<String>,
     max_visible_lines: usize,
     terminal_width_override: Option<usize>,
 }
@@ -3793,6 +3942,7 @@ impl ThinkingLiveRegion {
             tail: VecDeque::new(),
             tail_truncated: false,
             drawn_rows: Vec::new(),
+            header_rate: None,
             max_visible_lines,
             terminal_width_override,
         }
@@ -3802,6 +3952,7 @@ impl ThinkingLiveRegion {
         self.tail.clear();
         self.tail_truncated = false;
         self.drawn_rows.clear();
+        self.header_rate = None;
     }
 
     /// Append model text after making every terminal control byte inert.
@@ -3883,8 +4034,12 @@ impl ThinkingLiveRegion {
         }
 
         let mut rows = Vec::with_capacity(visible.len() + 2);
+        let header = match self.header_rate.as_deref() {
+            Some(rate) => format!("  ○ thinking · {rate}"),
+            None => "  ○ thinking".to_string(),
+        };
         rows.push(clamp_thinking_row(
-            "  ○ thinking",
+            &header,
             width
                 .saturating_sub(SERVE_THINKING_RIGHT_MARGIN_COLS)
                 .max(1),
@@ -5108,6 +5263,10 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
 }
 
 #[cfg(test)]
+#[path = "chat_test_terminal.rs"]
+mod test_terminal;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -5861,45 +6020,100 @@ mod tests {
     }
 
     #[test]
-    fn sse_metrics_footers_are_dropped() {
-        // Metrics summaries never reach the serve-chat scrollback: the body
-        // stays, its open row is still terminated, and the footers vanish.
+    fn sse_metrics_footers_follow_the_answer() {
         let url = serve_body_once(
             "event: delta\ndata: {\"delta\": \"hi there\"}\n\ndata: ↳ cache · 1k\n\ndata: ↳ speed · output 10 tok/s\n\nevent: done\ndata: \n\n",
         );
         let resp = reqwest::blocking::get(url).expect("get canned SSE");
         let mut buf = Vec::new();
         render_turn_stream_to(resp, &mut buf, false).expect("render");
-        assert_eq!(String::from_utf8(buf).expect("utf8"), "hi there\n");
+        assert_eq!(
+            String::from_utf8(buf).expect("utf8"),
+            "hi there\n↳ cache · 1k\n↳ speed · output 10 tok/s\n"
+        );
     }
 
     #[test]
-    fn sse_metrics_footer_between_chunks_is_dropped() {
-        // Regression net for the serve-chat interleave report: a metrics
-        // footer (`↳ speed`) arriving between two body chunks of one sentence
-        // is discarded, so the sentence stays contiguous (`读` + `不到。`)
-        // and no footer lands after it.
+    fn sse_metrics_footer_between_chunks_waits_for_body_boundary() {
+        // The stdout pump can overtake live-body frames. Keep the sentence
+        // contiguous while retaining the metrics after its final chunk.
         let url = serve_body_once(
             "event: delta\ndata: {\"delta\": \"读\"}\n\ndata: ↳ speed · reasoning 601 tok @ 108 tok/s\n\nevent: delta\ndata: {\"delta\": \"不到。\"}\n\nevent: done\ndata: \n\n",
         );
         let resp = reqwest::blocking::get(url).expect("get canned SSE");
         let mut buf = Vec::new();
         render_turn_stream_to(resp, &mut buf, false).expect("render");
-        assert_eq!(String::from_utf8(buf).expect("utf8"), "读不到。\n");
+        assert_eq!(
+            String::from_utf8(buf).expect("utf8"),
+            "读不到。\n↳ speed · reasoning 601 tok @ 108 tok/s\n"
+        );
     }
 
     #[test]
-    fn sse_multi_round_metrics_are_dropped() {
-        // A multi-round turn emits one cache/speed pair per model stream. The
-        // client drops them all, so the answer tail keeps the viewport
-        // instead of a wall of stale per-round summaries.
+    fn sse_metrics_multi_round_preserves_each_request_summary() {
         let url = serve_body_once(
             "event: delta\ndata: {\"delta\": \"done\"}\n\ndata: ↳ cache · 1k\n\ndata: ↳ speed · round one\n\ndata: ↳ cache · 2k\n\ndata: ↳ speed · round two\n\nevent: done\ndata: \n\n",
         );
         let resp = reqwest::blocking::get(url).expect("get canned SSE");
         let mut buf = Vec::new();
         render_turn_stream_to(resp, &mut buf, false).expect("render");
-        assert_eq!(String::from_utf8(buf).expect("utf8"), "done\n");
+        assert_eq!(
+            String::from_utf8(buf).expect("utf8"),
+            "done\n↳ cache · 1k\n↳ speed · round one\n↳ cache · 2k\n↳ speed · round two\n"
+        );
+    }
+
+    #[test]
+    fn sse_thinking_rate_shows_server_sample_and_true_footer() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let body = concat!(
+            "event: thinking_start\ndata: \n\n",
+            "event: thinking\ndata: {\"text\":\"abcd\",\"rate\":\"~8 tok @ 4.00 tok/s\"}\n\n",
+            "event: thinking_done\ndata: \n\n",
+            "event: delta\ndata: {\"delta\":\"answer\"}\n\n",
+            "data: ↳ speed · reasoning 800 tok @ 400 tok/s\n\n",
+            "event: done\ndata: \n\n",
+        );
+        for tty in [false, true] {
+            let url = serve_body_once(body);
+            let resp = reqwest::blocking::get(url).unwrap();
+            let mut out = Vec::new();
+            render_turn_stream_to(resp, &mut out, tty).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert_eq!(text.contains("~8 tok @ 4.00 tok/s"), tty, "{text:?}");
+            assert_eq!(
+                text.matches("↳ speed · reasoning 800 tok @ 400 tok/s")
+                    .count(),
+                1,
+                "{text:?}"
+            );
+            assert!(
+                text.find("answer").unwrap() < text.find("↳ speed").unwrap(),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_metrics_flush_before_next_thinking_round_and_strip_pipe_ansi() {
+        let url = serve_body_once(concat!(
+            "event: delta\ndata: {\"delta\":\"first\"}\n\n",
+            "data: \u{1b}[2m↳ speed · output 20 tok @ 10 tok/s\u{1b}[0m\n\n",
+            "event: thinking_start\ndata: \n\n",
+            "event: thinking\ndata: {\"text\":\"next thought\"}\n\n",
+            "event: thinking_done\ndata: \n\n",
+            "event: delta\ndata: {\"delta\":\"second\"}\n\n",
+            "event: done\ndata: \n\n",
+        ));
+        let resp = reqwest::blocking::get(url).unwrap();
+        let mut out = Vec::new();
+        render_turn_stream_to(resp, &mut out, false).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "first\n↳ speed · output 20 tok @ 10 tok/s\n✓ thinking (1 line)\nsecond\n"
+        );
     }
 
     #[test]
@@ -6250,14 +6464,282 @@ mod tests {
     }
 
     #[test]
+    fn sse_observer_rows_ellipsis_use_local_width_and_preserve_pipes() {
+        const COLS: usize = 40;
+        let header = "\x1b[32m[model (effort: max) · topics🙂]\x1b[0m";
+        let running = "  \x1b[34m●\x1b[0m execute_command";
+        let command = format!(
+            "  │ $ \x1b[32mrg -n \"{}\" src/bin/ai/history/sqlite/rollback.rs\x1b[0m",
+            "backup|reflink|界🙂|clone_file|".repeat(6)
+        );
+        let health = format!(
+            "  \x1b[2m│ agent-health: required delegation is overdue: {}\x1b[0m",
+            "delegate discovery before continuing exploration ".repeat(3)
+        );
+        let done = "  \x1b[32m✓\x1b[0m execute_command";
+        let reading = "  \x1b[34m●\x1b[0m read_file · target";
+        let read_done = format!(
+            "  \x1b[32m✓\x1b[0m read_file · src/bin/ai/history/{} 1415..1604",
+            "文件🙂/".repeat(6)
+        );
+        let controls = "  │ controls\t中🙂\x08\r\x1b[2Ksafe\x1b]0;hidden-title\x07";
+        let child = format!("    │ {}\n    │ child 中🙂", "child 界🙂 ".repeat(10));
+        let body: &'static str = Box::leak(
+            format!(
+                "data: {header}\n\ndata: {header}\n\ndata: {running}\n\ndata: {command}\n\ndata: {health}\n\ndata: {done}\n\ndata: {reading}\n\ndata: {read_done}\n\ndata: {controls}\n\ndata: {}\n\nevent: answer_pending\ndata: \n\nevent: delta\ndata: {{\"delta\":\"answer-one\\n\"}}\n\ndata: {header}\n\nevent: delta\ndata: {{\"delta\":\"answer-two\\n\"}}\n\nevent: replace\ndata: {{\"text\":\"answer-one\\nanswer-two\\n\"}}\n\nevent: done\ndata: \n\n",
+                child.replace('\n', "\ndata: ")
+            )
+            .into_boxed_str(),
+        );
+        let header_plain = strip_ansi_escapes(header);
+        assert!(header_plain.chars().map(thinking_cell_width).sum::<usize>() <= COLS);
+        assert!(
+            format!("{header_plain} (remote)")
+                .chars()
+                .map(thinking_cell_width)
+                .sum::<usize>()
+                > COLS,
+            "only appending (remote) should make this header overflow"
+        );
+        let replay = |tty, width| {
+            let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+            test_terminal::render(resp, tty, &[width])
+        };
+        // Resolve preview rewrites and live rows before counting visible
+        // answers; raw ANSI contains both the preview and its final paint.
+        let (narrow, rows) = replay(true, COLS);
+        for row in &rows {
+            assert!(
+                row.chars().map(thinking_cell_width).sum::<usize>() <= COLS,
+                "observer row would wrap: {row:?}"
+            );
+        }
+        let headers = rows
+            .iter()
+            .filter(|row| row.starts_with('['))
+            .collect::<Vec<_>>();
+        assert_eq!(headers.len(), 2, "adjacent retry deduplication: {rows:?}");
+        for row in headers {
+            assert!(
+                row.contains(" (rem"),
+                "marker appended before clipping: {row:?}"
+            );
+            assert!(row.ends_with('…'), "header must end in ellipsis: {row:?}");
+        }
+        for prefix in [
+            "  │ $ rg -n",
+            "  │ agent-health:",
+            "  ✓ read_file",
+            "    │ child 界",
+        ] {
+            let matches = rows
+                .iter()
+                .filter(|row| row.starts_with(prefix))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matches.len(),
+                1,
+                "missing/duplicated history: {prefix:?}, {rows:?}"
+            );
+            assert!(
+                matches[0].ends_with('…'),
+                "long row not clipped: {matches:?}"
+            );
+        }
+        assert!(
+            rows.iter().any(|row| row == "    │ child 中🙂"),
+            "child indent: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row == "  ● execute_command"),
+            "running history: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row == "  ✓ execute_command"),
+            "completion history: {rows:?}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("● read_file") || row.contains("finalizing response")),
+            "live row residue: {rows:?}"
+        );
+        assert!(!narrow.contains("hidden-title"), "OSC control leaked");
+        let visible = rows.join("\n");
+        for answer in ["answer-one", "answer-two"] {
+            assert_eq!(
+                visible.matches(answer).count(),
+                1,
+                "answer duplicated on terminal: {visible:?}"
+            );
+        }
+        assert!(
+            !narrow.contains("final answer was revised"),
+            "retry cleared the body buffer"
+        );
+        assert!(narrow.ends_with('\n'), "cursor left on a live row");
+
+        let (wide, wide_rows) = replay(true, 400);
+        for row in [
+            running,
+            command.as_str(),
+            health.as_str(),
+            done,
+            read_done.as_str(),
+        ] {
+            assert!(wide.contains(row), "wide TTY changed source bytes: {row:?}");
+        }
+        let wide_plain = wide_rows.join("\n");
+        assert_eq!(
+            wide_plain
+                .matches(&format!("{header_plain} (remote)"))
+                .count(),
+            2
+        );
+        assert!(
+            !wide_plain
+                .lines()
+                .any(|line| line.rsplit('\r').next().unwrap().ends_with('…'))
+        );
+
+        // Negative control: the exact same old-server replay at unknown
+        // geometry retains an overwide row. Removing the clamp therefore
+        // fails the narrow assertions above without changing the fixture.
+        let (unknown, _) = replay(true, 0);
+        assert!(
+            unknown.contains(&format!("{command}\n")),
+            "unknown width must preserve bytes"
+        );
+        assert!(
+            strip_ansi_escapes(&command)
+                .chars()
+                .map(thinking_cell_width)
+                .sum::<usize>()
+                > COLS
+        );
+        let (piped, _) = replay(false, COLS);
+        assert_eq!(
+            piped,
+            format!(
+                "{header} (remote)\n{running}\n{command}\n{health}\n{done}\n{reading}\n{read_done}\n{controls}\n{child}\nanswer-one\n{header} (remote)\nanswer-two\n"
+            ),
+            "piped observer bytes must remain complete, including controls and ANSI"
+        );
+    }
+
+    #[test]
+    fn sse_observer_rows_ellipsis_follow_resize_and_erase_open_tool() {
+        let header = "[model (effort: max) · topics🙂]";
+        let history = "  │ history before resize 界🙂";
+        let running = format!("  \x1b[34m●\x1b[0m read_file · {}", "文件🙂/".repeat(12));
+        let done = format!(
+            "  \x1b[32m✓\x1b[0m read_file · {} 640..719",
+            "文件🙂/".repeat(14)
+        );
+        let command = format!("  │ $ rg -n backup|clone_file {}", "目录🙂/".repeat(10));
+        let health = "  │ agent-health: required delegation is overdue: delegate discovery before continuing exploration";
+        let body: &'static str = Box::leak(
+            format!(
+                "data: {header}\n\ndata: {history}\n\ndata: {running}\n\ndata: {done}\n\ndata: {health}\n\ndata: {command}\n\ndata: {command}\n\ndata: {header}\n\nevent: answer_pending\ndata: \n\nevent: delta\ndata: {{\"delta\":\"answer-after-resize\\n\"}}\n\nevent: replace\ndata: {{\"text\":\"answer-after-resize\\n\"}}\n\nevent: done\ndata: \n\n"
+            ).into_boxed_str(),
+        );
+        let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+        // Resize before the completion, then grow before another command
+        // arrives. There is no server-side geometry update in this replay.
+        let (out, rows) = test_terminal::render(resp, true, &[140, 140, 140, 40, 40, 40, 140, 140]);
+        let old_plain = strip_ansi_escapes(&running);
+        assert!(old_plain.chars().map(thinking_cell_width).sum::<usize>() < 140);
+        let old_rows = thinking_physical_rows(&old_plain, 40);
+        assert!(old_rows > 1, "fixture must reflow the live running row");
+        assert_eq!(
+            out.matches("\x1b[1A\r\x1b[2K").count(),
+            old_rows - 1,
+            "completion must erase every reflowed running row: {out:?}"
+        );
+        for prefix in ["  ✓ read_file", "  │ agent-health:"] {
+            let row = rows
+                .iter()
+                .find(|row| row.starts_with(prefix))
+                .expect("narrow row");
+            assert!(
+                row.ends_with('…'),
+                "resize used stale wide geometry: {row:?}"
+            );
+            assert!(row.chars().map(thinking_cell_width).sum::<usize>() <= 40);
+        }
+        let commands = rows
+            .iter()
+            .filter(|row| row.starts_with("  │ $ rg -n"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commands.len(),
+            2,
+            "each incoming command appears once: {rows:?}"
+        );
+        assert!(commands[0].ends_with('…'), "narrow command not clamped");
+        assert!(commands[0].chars().map(thinking_cell_width).sum::<usize>() <= 40);
+        assert_eq!(
+            commands[1], &command,
+            "growing should display the complete new row"
+        );
+        assert!(
+            rows.iter().any(|row| row == history),
+            "committed history rewritten"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| *row == &format!("{header} (remote)"))
+                .count(),
+            2
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("● read_file") || row.contains("finalizing response")),
+            "live row residue: {rows:?}"
+        );
+        assert_eq!(rows.join("\n").matches("answer-after-resize").count(), 1);
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn observer_row_ellipsis_preserves_sgr_controls_and_cell_boundaries() {
+        let row = "  \x1b[38;2;1;2;3m界🙂界🙂\x1b[0m";
+        assert_eq!(
+            clamp_observer_row(row, true, 10),
+            row,
+            "exact fit must keep source bytes"
+        );
+        assert_eq!(
+            clamp_observer_row(row, true, 9),
+            "  \x1b[38;2;1;2;3m界🙂界…\x1b[0m"
+        );
+        assert_eq!(clamp_observer_row(row, true, 1), "…\x1b[0m");
+        assert_eq!(clamp_observer_row("⚠️⚠️", true, 3), "⚠️…");
+        let controls = "  │ a\tb\x08\r\x1b[2Kc\x1b]0;hidden-title\x07\x1b[31";
+        assert_eq!(clamp_observer_row(controls, true, 80), "  │ a    b\\u{8}c");
+        assert_eq!(clamp_observer_row(controls, true, 0), controls);
+        assert_eq!(clamp_observer_row(controls, false, 5), controls);
+        let children = clamp_observer_row("    │ child 界🙂\n    │ second 界🙂", true, 12);
+        assert_eq!(children.lines().count(), 2);
+        for child in children.lines() {
+            assert!(
+                child.starts_with("    │ ") && child.ends_with('…'),
+                "{child:?}"
+            );
+            assert!(child.chars().map(thinking_cell_width).sum::<usize>() <= 12);
+        }
+    }
+
+    #[test]
     fn sse_tool_rows_keep_child_indent_verbatim() {
         // Regression net for the serve-chat indent report: footer/message rows
         // (tool status, long command echoes) must reach the terminal
         // byte-identical to the child bytes the server forwarded: leading
         // two-space indent, inline ANSI, and over-long rows included. The
-        // client neither re-indents nor clamps these rows; soft-wrap of a row
-        // wider than the terminal is the terminal's own layout, identical to
-        // a local run of the same turn. Metrics summaries (`↳ cache` /
+        // client preserves all source bytes when piped or when the row fits
+        // the TTY; the narrow-TTY behavior has a separate regression above.
+        // Metrics summaries (`↳ cache` /
         // `↳ speed`) are dropped instead, so they can never tear the answer's
         // open line or bury the answer tail; the tool rows stay byte-identical.
         let cache = "  \u{1b}[2m↳ cache · 4.1k/22.0k tokens · 19% hit\u{1b}[0m";
@@ -6287,7 +6769,7 @@ mod tests {
         let url = serve_body_once(canned);
         let resp = reqwest::blocking::get(url).expect("get canned SSE");
         let mut buf = Vec::new();
-        render_turn_stream_to(resp, &mut buf, true).expect("render");
+        render_turn_stream_to_with_width(resp, &mut buf, true, None, || 400).expect("render");
         let out = String::from_utf8(buf).expect("utf8");
         for row in [done, running, long_cmd.as_str(), failed] {
             assert!(row.starts_with("  "), "fixture lost indent: {row:?}");

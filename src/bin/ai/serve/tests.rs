@@ -2637,7 +2637,7 @@ fn transactional_serve_body_frame_decoder_reassembles_pending() {
         vec![
             ServeLiveEvent::Delta("héllo".to_string()),
             ServeLiveEvent::ThinkingStart,
-            ServeLiveEvent::Thinking("带来".to_string()),
+            ServeLiveEvent::Thinking("带来".to_string(), None),
             ServeLiveEvent::ThinkingDone,
             ServeLiveEvent::AssistantBodyPending,
             ServeLiveEvent::Replace("final".to_string()),
@@ -2649,6 +2649,47 @@ fn transactional_serve_body_frame_decoder_reassembles_pending() {
     let mut cut = ServeFrameDecoder::default();
     assert_eq!(cut.push(&wire[..10]), vec![]);
     assert_eq!(cut.finish(), vec![]);
+}
+
+#[tokio::test]
+async fn serve_thinking_rate_frames_attach_metrics_without_changing_legacy_text() {
+    use crate::ai::background::ServeLiveKind;
+    let rate = "~8 tok @ 4.00 tok/s";
+    let wire = [
+        test_frame(ServeLiveKind::ThinkingStart, b""),
+        test_frame(ServeLiveKind::ThinkingRate, rate.as_bytes()),
+        test_frame(ServeLiveKind::Thinking, b"first"),
+        test_frame(ServeLiveKind::ThinkingDone, b""),
+        test_frame(ServeLiveKind::ThinkingStart, b""),
+        test_frame(ServeLiveKind::Thinking, b"legacy"),
+        test_frame(ServeLiveKind::ThinkingDone, b""),
+    ]
+    .concat();
+    let mut decoder = ServeFrameDecoder::default();
+    let events: Vec<_> = wire
+        .iter()
+        .flat_map(|byte| decoder.push(&[*byte]))
+        .collect();
+    assert_eq!(
+        events[1],
+        ServeLiveEvent::Thinking("first".to_string(), Some(rate.to_string()))
+    );
+    assert_eq!(
+        events[4],
+        ServeLiveEvent::Thinking("legacy".to_string(), None)
+    );
+    let response = Sse::new(stream::iter(events.into_iter().map(|event| {
+        Ok::<_, std::convert::Infallible>(live_event(event).unwrap().into_event())
+    })))
+    .into_response();
+    let bytes = axum::body::to_bytes(response.into_body(), 16384)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(text.matches("event: thinking\n").count(), 2, "{text}");
+    assert_eq!(text.matches("\"rate\"").count(), 1, "{text}");
+    assert!(text.contains(rate), "{text}");
+    assert!(text.contains("legacy"), "{text}");
 }
 
 #[test]

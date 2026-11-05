@@ -473,10 +473,7 @@ fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
     let (residual_reasoning, residual_content) = state.content.content_think_demuxer.flush();
     state.content.reasoning_text.push_str(&residual_reasoning);
     state.content.assistant_text.push_str(&residual_content);
-    state.content.live_reasoning_tokens = state
-        .content
-        .live_reasoning_tokens
-        .saturating_add(estimate_stream_tokens(&residual_reasoning));
+    state.content.count_reasoning_delta(&residual_reasoning);
 
     if runtime_ctx::terminal_output_enabled() {
         let _ = clear_waiting_hint(state);
@@ -674,10 +671,7 @@ fn finalize_stream_response(
     let (residual_reasoning, residual_content) = state.content.content_think_demuxer.flush();
     if !residual_reasoning.is_empty() {
         state.content.reasoning_text.push_str(&residual_reasoning);
-        state.content.live_reasoning_tokens = state
-            .content
-            .live_reasoning_tokens
-            .saturating_add(estimate_stream_tokens(&residual_reasoning));
+        state.content.count_reasoning_delta(&residual_reasoning);
     }
     if !residual_content.is_empty() {
         commit_visible_content(app, current_history, markers, &mut state, residual_content)?;
@@ -1149,11 +1143,7 @@ fn commit_visible_content(
         if !text.is_empty() {
             // Output timing starts only when real visible text is committed; a pure
             // end_thinking_tag separator (or trimmed-away residue) must not count as output.
-            state.content.mark_output_started();
-            state.content.live_output_tokens = state
-                .content
-                .live_output_tokens
-                .saturating_add(estimate_stream_tokens(text));
+            state.content.count_output_delta(text);
             current_history.push_str(text);
             state.content.assistant_text.push_str(text);
             // Live output for a real-time `/bg` handoff (best-effort, no-op
@@ -1189,11 +1179,7 @@ fn commit_visible_content(
         content
     };
     if !text.is_empty() {
-        state.content.mark_output_started();
-        state.content.live_output_tokens = state
-            .content
-            .live_output_tokens
-            .saturating_add(estimate_stream_tokens(&text));
+        state.content.count_output_delta(&text);
     }
     current_history.reserve(text.len());
     state.content.assistant_text.reserve(text.len());
@@ -1659,9 +1645,12 @@ fn process_stream_payload(
                 // wire streams nothing for that thinking, so the silence must not be read as a stalled
                 // stream (see `stream_silence_timeout_secs`).
                 if open {
+                    state.content.mark_reasoning_started();
                     state.content.open_output_items =
                         state.content.open_output_items.saturating_add(1);
                 } else {
+                    state.content.interleaved_generation |= state.content.output_started_at.is_some();
+                    state.content.generation_finished_at = Some(Instant::now());
                     state.content.open_output_items =
                         state.content.open_output_items.saturating_sub(1);
                 }
@@ -1718,27 +1707,13 @@ fn process_stream_payload(
     // previous value when the new chunk reports 0 for a component prevents the
     // delta-only snapshot from zeroing out the prompt count.
     if let Some(ref usage) = chunk.usage {
-        let usage = usage.clone().normalized();
         match &mut state.pending_llm_usage {
             Some((_, prev)) => {
-                if usage.prompt_tokens > 0 {
-                    prev.prompt_tokens = usage.prompt_tokens;
-                }
-                if usage.completion_tokens > 0 {
-                    prev.completion_tokens = usage.completion_tokens;
-                }
-                if let Some(details) = usage.prompt_tokens_details {
-                    prev.prompt_tokens_details = Some(details);
-                }
-                if let Some(details) = usage.completion_tokens_details {
-                    prev.completion_tokens_details = Some(details);
-                }
-                // Keep the total honest: never under-report prompt + completion.
-                prev.total_tokens = prev
-                    .total_tokens
-                    .max(prev.prompt_tokens.saturating_add(prev.completion_tokens));
+                prev.merge_snapshot(usage.clone());
             }
-            None => state.pending_llm_usage = Some((chunk.model.clone(), usage)),
+            None => {
+                state.pending_llm_usage = Some((chunk.model.clone(), usage.clone().normalized()));
+            }
         }
     }
 
@@ -1812,6 +1787,7 @@ fn process_stream_payload(
         // unchanged: skip the demuxer push to avoid its full-chunk to_string copy.
         && !state.content.content_think_demuxer.is_passthrough()
     {
+        state.content.mark_reasoning_started();
         let (reasoning, content) = state
             .content
             .content_think_demuxer
@@ -1845,13 +1821,9 @@ fn process_stream_payload(
     let reasoning_progress = !emitted_reasoning.is_empty();
 
     if !original_reasoning.is_empty() {
-        state.content.mark_reasoning_started();
         state.content.saw_reasoning_output = true;
         state.content.reasoning_text.push_str(&emitted_reasoning);
-        state.content.live_reasoning_tokens = state
-            .content
-            .live_reasoning_tokens
-            .saturating_add(estimate_stream_tokens(&emitted_reasoning));
+        state.content.count_reasoning_delta(&emitted_reasoning);
 
         if state
             .content
