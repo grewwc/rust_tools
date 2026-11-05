@@ -4,7 +4,7 @@ use crate::ai::theme;
 /// box-drawing, braille, etc.) as single-column; only true Wide/fullwidth characters (CJK, etc.) take 2 columns.
 /// `width_cjk` counts every ambiguous character as 2 columns, shifting table borders and cursor-up heights overall
 /// (especially dragging right borders of cells containing `→` off by a line). So this module consistently uses `width` (ambiguous=1).
-pub(super) fn terminal_cell_width(ch: char) -> usize {
+pub(in crate::ai) fn terminal_cell_width(ch: char) -> usize {
     // The emoji variation selector (U+FE0F) has width 0 itself, but it forces the preceding base symbol from
     // text presentation (1 column) into emoji presentation (2 columns). Real terminals render it that way; e.g. `⚠️`
     // (U+26A0 + U+FE0F) takes 2 columns. Counting it as unicode-width's 0 would make tables/previews one column

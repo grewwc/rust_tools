@@ -1496,13 +1496,19 @@ fn required_delegation_without_tool_calls_is_not_violated() {
 }
 
 #[test]
-fn required_delegation_advisory_fires_on_first_read_only_round() {
+fn required_delegation_advisory_fires_on_third_read_only_round() {
     for required in [true, false] {
         let mut supervisor = TurnSupervisor::default();
         supervisor.progress.delegation_required = required;
         let mut messages = Vec::new();
         let mut advisory_count = 0;
-        for round in 1..=(REQUIRED_DELEGATION_READ_ONLY_TARGETS + 2) {
+        for (round, required_signal) in [
+            (1, ToolLoopSignal::None),
+            (2, ToolLoopSignal::None),
+            (3, ToolLoopSignal::DelegationRequired),
+            (4, ToolLoopSignal::None),
+            (5, ToolLoopSignal::None),
+        ] {
             supervisor.next_iteration();
             pb_successful_read_round(
                 &mut messages,
@@ -1512,8 +1518,8 @@ fn required_delegation_advisory_fires_on_first_read_only_round() {
                 &format!("new evidence {round}"),
             );
             let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
-            let expected = if required && round == 1 {
-                ToolLoopSignal::DelegationRequired
+            let expected = if required {
+                required_signal
             } else {
                 ToolLoopSignal::None
             };
@@ -1526,6 +1532,11 @@ fn required_delegation_advisory_fires_on_first_read_only_round() {
                 );
                 inject_delegation_exploration_advisory(&mut messages);
             }
+            assert_eq!(
+                advisory_count,
+                usize::from(required && round >= 3),
+                "required={required}, round={round}"
+            );
             assert_eq!(supervisor.progress.consecutive_no_progress, 0);
             assert_eq!(
                 supervisor.progress.delegation_requirement_violated(),
@@ -1534,10 +1545,10 @@ fn required_delegation_advisory_fires_on_first_read_only_round() {
             );
         }
         assert_eq!(advisory_count, usize::from(required));
-        assert_eq!(supervisor.progress.delegation_advisory_injected, required);
+        assert_eq!(supervisor.progress.delegation_advisory.injected, required);
         assert_eq!(
             supervisor.progress.work_rounds_before_delegation,
-            usize::from(required)
+            if required { 5 } else { 0 }
         );
         assert_eq!(
             supervisor.progress.delegation_requirement_violated(),
@@ -1553,7 +1564,7 @@ fn required_delegation_advisory_fires_on_first_read_only_round() {
             assert!(note.contains("does not require the parent to finish discovery first"));
             assert!(note.contains("Tools remain available"));
             supervisor.progress.reset_after_truncation();
-            assert!(supervisor.progress.delegation_advisory_injected);
+            assert!(supervisor.progress.delegation_advisory.injected);
             let mutation = pb_apply_patch_msg("later-patch");
             assert!(
                 !supervisor
@@ -1582,15 +1593,31 @@ fn required_delegation_advisory_fires_on_unclassified_command_round() {
     assert_eq!(supervisor.progress.delegation_calls_this_turn, 0);
     assert_eq!(supervisor.progress.mutation_calls_this_turn, 0);
 
-    supervisor.next_iteration();
-    let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
-    assert_eq!(signal, ToolLoopSignal::DelegationRequired);
-    assert_eq!(
-        signal.intervention(),
-        Some(("delegation_required", SignalKind::Advisory))
-    );
+    for round in 1..=REQUIRED_DELEGATION_WORK_ROUNDS {
+        if round > 1 {
+            pb_execute_command_round(&mut messages, command, &format!("insearch-{round}"));
+        }
+        supervisor.next_iteration();
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        assert_eq!(
+            signal,
+            if round == REQUIRED_DELEGATION_WORK_ROUNDS {
+                ToolLoopSignal::DelegationRequired
+            } else {
+                ToolLoopSignal::None
+            },
+            "round={round}"
+        );
+        assert!(supervisor.progress.delegation_requirement_violated());
+        assert_eq!(supervisor.progress.work_rounds_before_delegation, round);
+        assert_eq!(supervisor.progress.consecutive_no_progress, 0);
+    }
+    assert!(supervisor.progress.delegation_advisory.injected);
     assert!(supervisor.progress.delegation_requirement_violated());
-    assert_eq!(supervisor.progress.work_rounds_before_delegation, 1);
+    assert_eq!(
+        supervisor.progress.work_rounds_before_delegation,
+        REQUIRED_DELEGATION_WORK_ROUNDS
+    );
     assert_eq!(supervisor.progress.consecutive_no_progress, 0);
 
     inject_delegation_exploration_advisory(&mut messages);
@@ -1634,7 +1661,7 @@ fn required_delegation_advisory_skips_coordination_only_rounds() {
             ToolLoopSignal::None,
             "coordination tool: {name}"
         );
-        assert!(!supervisor.progress.delegation_advisory_injected, "{name}");
+        assert!(!supervisor.progress.delegation_advisory.injected, "{name}");
         assert_eq!(supervisor.progress.work_rounds_before_delegation, 0);
         assert!(
             !supervisor.progress.delegation_requirement_violated(),
@@ -1653,7 +1680,7 @@ fn required_delegation_read_only_violation_clears_after_delegation() {
         pb_successful_read_round(&mut messages, "src/discovery.rs", 0, "read", "new evidence");
         assert_eq!(
             supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
-            ToolLoopSignal::DelegationRequired,
+            ToolLoopSignal::None,
         );
         assert_eq!(supervisor.progress.mutation_calls_this_turn, 0);
         assert!(supervisor.progress.delegation_requirement_violated());
@@ -1672,7 +1699,7 @@ fn required_delegation_read_only_violation_clears_after_delegation() {
 fn required_delegation_advisory_checks_broad_batches_and_repeated_targets() {
     let mut batch_supervisor = TurnSupervisor::default();
     batch_supervisor.progress.delegation_required = true;
-    let calls = (0..REQUIRED_DELEGATION_READ_ONLY_TARGETS)
+    let calls = (0..12)
         .flat_map(|target| {
             pb_read_msg(&format!("src/batch_{target}.rs"), &format!("read-{target}"))
                 .tool_calls
@@ -1684,15 +1711,18 @@ fn required_delegation_advisory_checks_broad_batches_and_repeated_targets() {
     batch_supervisor.next_iteration();
     assert_eq!(
         batch_supervisor.record_tool_signatures(&[batch], PROGRESS_FREE_EXPLORE_ROUNDS),
-        ToolLoopSignal::DelegationRequired,
+        ToolLoopSignal::None,
     );
     assert_eq!(batch_supervisor.progress.work_rounds_before_delegation, 1);
+    assert_eq!(batch_supervisor.progress.seen_targets.len(), 12);
+    assert!(!batch_supervisor.progress.delegation_advisory.injected);
     assert!(batch_supervisor.progress.delegation_requirement_violated());
 
     let mut supervisor = TurnSupervisor::default();
     supervisor.progress.delegation_required = true;
     let mut messages = Vec::new();
-    for round in 1..=REQUIRED_DELEGATION_READ_ONLY_TARGETS {
+    let rounds = REQUIRED_DELEGATION_WORK_ROUNDS + 2;
+    for round in 1..=rounds {
         supervisor.next_iteration();
         pb_successful_read_round(
             &mut messages,
@@ -1705,19 +1735,19 @@ fn required_delegation_advisory_checks_broad_batches_and_repeated_targets() {
         let signal = supervisor.assess_progress(&messages, &messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         assert_eq!(
             signal,
-            if round == 1 {
+            if round == REQUIRED_DELEGATION_WORK_ROUNDS {
                 ToolLoopSignal::DelegationRequired
             } else {
                 ToolLoopSignal::None
             }
         );
-        if round == 2 {
+        if round == REQUIRED_DELEGATION_WORK_ROUNDS + 1 {
             supervisor.progress.reset_after_truncation();
-            assert!(supervisor.progress.delegation_advisory_injected);
+            assert!(supervisor.progress.delegation_advisory.injected);
         }
     }
     assert_eq!(supervisor.progress.seen_targets.len(), 1);
-    assert_eq!(supervisor.progress.work_rounds_before_delegation, 1);
+    assert_eq!(supervisor.progress.work_rounds_before_delegation, rounds);
     assert!(supervisor.progress.delegation_requirement_violated());
 }
 
@@ -1737,23 +1767,252 @@ fn required_delegation_exploration_advisory_skips_mutation_round() {
         supervisor.record_tool_signatures(&[mutation], PROGRESS_FREE_EXPLORE_ROUNDS),
         ToolLoopSignal::None,
     );
-    assert!(!supervisor.progress.delegation_advisory_injected);
+    assert!(!supervisor.progress.delegation_advisory.injected);
     assert_eq!(supervisor.progress.work_rounds_before_delegation, 0);
 
     let mut messages = Vec::new();
-    supervisor.next_iteration();
-    pb_successful_read_round(
-        &mut messages,
-        "src/after_patch_discovery.rs",
-        0,
-        "read-after-patch",
-        "new evidence",
+    for round in 1..=REQUIRED_DELEGATION_WORK_ROUNDS {
+        supervisor.next_iteration();
+        pb_successful_read_round(
+            &mut messages,
+            &format!("src/after_patch_discovery_{round}.rs"),
+            0,
+            &format!("read-after-patch-{round}"),
+            "new evidence",
+        );
+        assert_eq!(
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            if round == REQUIRED_DELEGATION_WORK_ROUNDS {
+                ToolLoopSignal::DelegationRequired
+            } else {
+                ToolLoopSignal::None
+            },
+        );
+        assert_eq!(supervisor.progress.work_rounds_before_delegation, round);
+    }
+}
+
+fn delegation_test_message(role: &str, content: serde_json::Value) -> history::Message {
+    history::Message {
+        role: role.to_string(),
+        content,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }
+}
+
+#[test]
+fn required_delegation_skip_matches_only_assistant_line_prefixes() {
+    for text in [
+        "Delegation skip: unsafe dependency",
+        "Context\n \t dElEgAtIoN sKiP: shared state \r\nNext step",
+        "Delegation skip:",
+    ] {
+        for content in [
+            serde_json::json!(text),
+            serde_json::json!([{"type": "text", "text": text}]),
+        ] {
+            let mut state = DelegationAdvisoryState::default();
+            state.observe_current_turn_messages(&[delegation_test_message("assistant", content)]);
+            assert!(state.skipped, "{text}");
+            assert!(!state.try_inject());
+            assert!(!state.injected);
+        }
+    }
+    for (role, text) in [
+        ("user", "Delegation skip: user quoting policy"),
+        ("tool", "Delegation skip: file content"),
+        (history::ROLE_INTERNAL_NOTE, "Delegation skip: runtime note"),
+        ("assistant", "Quoted Delegation skip: unsafe"),
+        ("assistant", "Delegation skip without a colon"),
+        ("assistant", "委派 skip: dependency"),
+    ] {
+        let mut state = DelegationAdvisoryState::default();
+        state.observe_current_turn_messages(&[delegation_test_message(
+            role,
+            serde_json::json!(text),
+        )]);
+        assert!(!state.skipped, "role={role}, text={text}");
+    }
+}
+
+#[test]
+fn required_delegation_skip_silences_current_turn_and_rearms_next_turn() {
+    let mut canonical = vec![
+        delegation_test_message("user", serde_json::json!("first task")),
+        delegation_test_message(
+            "assistant",
+            serde_json::json!("Delegation skip: the next step needs exclusive state"),
+        ),
+        history::runtime_synthetic_user_message(serde_json::json!("child result")),
+    ];
+    let mut supervisor = TurnSupervisor::default();
+    supervisor.progress.delegation_required = true;
+    supervisor
+        .progress
+        .delegation_advisory
+        .observe_current_turn_messages(&canonical);
+    assert!(supervisor.progress.delegation_advisory.skipped);
+    let mut messages = Vec::new();
+    for round in 1..=5 {
+        supervisor.next_iteration();
+        pb_successful_read_round(
+            &mut messages,
+            &format!("src/skipped_{round}.rs"),
+            0,
+            &format!("read-{round}"),
+            "evidence",
+        );
+        assert_eq!(
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::None
+        );
+        assert!(!supervisor.progress.delegation_advisory.injected);
+        assert_eq!(supervisor.progress.work_rounds_before_delegation, round);
+        assert!(supervisor.progress.delegation_requirement_violated());
+    }
+    supervisor.progress.reset_after_truncation();
+    assert_eq!(supervisor.progress.work_rounds_before_delegation, 5);
+    let mutation = pb_apply_patch_msg("skipped-patch");
+    assert!(
+        !supervisor
+            .progress
+            .observe_delegation_calls(mutation.tool_calls.as_deref().unwrap())
     );
-    assert_eq!(
-        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
-        ToolLoopSignal::DelegationRequired,
+    assert_eq!(supervisor.progress.mutation_calls_this_turn, 1);
+    assert!(!supervisor.progress.delegation_advisory.injected);
+
+    canonical.push(delegation_test_message(
+        "user",
+        serde_json::json!("second task"),
+    ));
+    canonical.push(delegation_test_message(
+        "assistant",
+        serde_json::json!("Working on it."),
+    ));
+    let mut next_turn = TurnSupervisor::default();
+    next_turn.progress.delegation_required = true;
+    next_turn
+        .progress
+        .delegation_advisory
+        .observe_current_turn_messages(&canonical);
+    assert!(!next_turn.progress.delegation_advisory.skipped);
+    for round in 1..=3 {
+        next_turn.next_iteration();
+        pb_successful_read_round(
+            &mut messages,
+            &format!("src/rearmed_{round}.rs"),
+            0,
+            &format!("next-read-{round}"),
+            "evidence",
+        );
+        assert_eq!(
+            next_turn.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            if round == 3 {
+                ToolLoopSignal::DelegationRequired
+            } else {
+                ToolLoopSignal::None
+            }
+        );
+    }
+}
+
+#[test]
+fn required_delegation_skip_reads_execution_before_narration_truncation() {
+    let text = format!(
+        "{}\nDelegation skip: exclusive state",
+        "narration ".repeat(100)
     );
-    assert_eq!(supervisor.progress.work_rounds_before_delegation, 1);
+    let mut state = DelegationAdvisoryState::default();
+    let execution =
+        IterationExecution::ToolCall(crate::ai::driver::turn_runtime::types::ToolCallExecution {
+            stream_result: crate::ai::types::StreamResult {
+                assistant_text: text,
+                ..crate::ai::types::StreamResult::default()
+            },
+            allowed_tool_names: FastSet::default(),
+        });
+    state.observe_execution(&execution);
+    assert!(state.skipped);
+    let mut progress = ProgressLedger {
+        delegation_required: true,
+        delegation_advisory: state,
+        ..ProgressLedger::default()
+    };
+    let mutation = pb_apply_patch_msg("same-response-patch");
+    assert!(!progress.observe_delegation_calls(mutation.tool_calls.as_deref().unwrap()));
+    assert!(!progress.delegation_advisory.injected);
+    assert!(progress.delegation_requirement_violated());
+}
+
+#[test]
+fn required_delegation_advisory_state_survives_recursive_body() {
+    for skip in [false, true] {
+        let mut first_body = TurnSupervisor::default();
+        first_body.progress.delegation_required = true;
+        if skip {
+            first_body
+                .progress
+                .delegation_advisory
+                .observe_assistant_text("Delegation skip: exclusive state");
+        }
+        let mut messages = Vec::new();
+        let mut advisory_count = 0;
+        for round in 1..=REQUIRED_DELEGATION_WORK_ROUNDS {
+            first_body.next_iteration();
+            pb_successful_read_round(
+                &mut messages,
+                &format!("src/first_body_{round}.rs"),
+                0,
+                &format!("first-read-{round}"),
+                "evidence",
+            );
+            if first_body.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS)
+                == ToolLoopSignal::DelegationRequired
+            {
+                advisory_count += 1;
+                inject_delegation_exploration_advisory(&mut messages);
+            }
+        }
+        // Mirror run_turn_body: rebuild the supervisor while passing its advisory state.
+        let mut recursive_body = TurnSupervisor::default();
+        recursive_body.progress.delegation_required = true;
+        recursive_body.progress.delegation_advisory = first_body.progress.delegation_advisory;
+        for round in 1..=(REQUIRED_DELEGATION_WORK_ROUNDS + 2) {
+            recursive_body.next_iteration();
+            pb_successful_read_round(
+                &mut messages,
+                &format!("src/recursive_body_{round}.rs"),
+                0,
+                &format!("recursive-read-{round}"),
+                "evidence",
+            );
+            assert_eq!(
+                recursive_body.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+                ToolLoopSignal::None
+            );
+        }
+        assert!(recursive_body.progress.delegation_requirement_violated());
+        let mutation = pb_apply_patch_msg("recursive-patch");
+        assert!(
+            !recursive_body
+                .progress
+                .observe_delegation_calls(mutation.tool_calls.as_deref().unwrap())
+        );
+        assert_eq!(advisory_count, usize::from(!skip));
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.content.as_str().is_some_and(|text| {
+                    text.starts_with("[delegation-required-exploration-advisory]")
+                }))
+                .count(),
+            usize::from(!skip)
+        );
+        assert_eq!(recursive_body.progress.delegation_advisory.skipped, skip);
+        assert_eq!(recursive_body.progress.delegation_advisory.injected, !skip);
+    }
 }
 
 #[test]
@@ -1783,7 +2042,7 @@ fn required_delegation_advisory_stands_down_after_delegation() {
             );
 
             let mut messages = Vec::new();
-            for round in 1..=(REQUIRED_DELEGATION_READ_ONLY_TARGETS + 2) {
+            for round in 1..=(REQUIRED_DELEGATION_WORK_ROUNDS + 2) {
                 supervisor.next_iteration();
                 pb_successful_read_round(
                     &mut messages,
@@ -1797,7 +2056,7 @@ fn required_delegation_advisory_stands_down_after_delegation() {
                     ToolLoopSignal::None,
                 );
             }
-            assert!(!supervisor.progress.delegation_advisory_injected);
+            assert!(!supervisor.progress.delegation_advisory.injected);
             assert_eq!(supervisor.progress.work_rounds_before_delegation, 0);
             assert_eq!(supervisor.progress.delegation_calls_this_turn, 1);
             assert!(!supervisor.progress.delegation_requirement_violated());

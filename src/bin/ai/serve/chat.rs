@@ -7,6 +7,7 @@
 //! arrives instead of waiting for the whole turn.
 
 use std::{
+    collections::VecDeque,
     io::IsTerminal,
     path::{Path, PathBuf},
     sync::{
@@ -2666,12 +2667,11 @@ mod serve_history_tests {
 
 /// Render one SSE turn stream progressively: message lines print as they
 /// arrive, `delta` events (live body chunks) print without a trailing
-/// newline, thinking frames collapse into one live status line while the
-/// block is open and print only the `✓ thinking (N lines)` summary on close
-/// (local-fold parity: the body is discarded), subagent progress redraws one
-/// clamped live row in place instead of appending scrollback, error events
-/// abort with the server detail, and the done event (or the end of the body)
-/// ends the turn.
+/// newline, thinking frames maintain the same width-wrapped multi-row tail as
+/// a local terminal and collapse to one `✓ thinking (N lines)` summary on
+/// close, subagent progress redraws one clamped live row in place instead of
+/// appending scrollback, error events abort with the server detail, and the
+/// done event (or the end of the body) ends the turn.
 fn render_turn_stream(resp: reqwest::blocking::Response) -> Result<(), Box<dyn std::error::Error>> {
     render_turn_stream_with_confirm(resp, None)
 }
@@ -2722,14 +2722,20 @@ fn render_turn_stream_to_with_confirm(
     let mut event_data = String::new();
     let mut event_has_data = false;
     let mut raw = String::new();
-    // Folded-thinking state: the body text stays buffered in the status
-    // buffer until the block closes, so it never mixes with the answer.
-    // Line count is approximate (chunks split mid-line); it only feeds the
-    // summary row.
+    // Folded-thinking state: retain only a sanitized display tail plus source
+    // character/newline counters for the approximate summary. The transient
+    // rows never mix with the answer, and display memory stays bounded even
+    // for a runaway reasoning stream.
     let mut thinking_active = false;
     let mut thinking_newlines = 0usize;
     let mut thinking_chars = 0usize;
-    let mut thinking_body = String::new();
+    let configured_thinking_lines = crate::ai::stream::resolve_thinking_fold_max_visible_lines(
+        tty,
+        configw::get_all_config()
+            .get_opt(AiConfig::OUTPUT_THINKING_MAX_VISIBLE_LINES)
+            .as_deref(),
+    );
+    let mut thinking_region = ThinkingLiveRegion::new(configured_thinking_lines, None);
     let mut answer_pending = false;
     let mut answer_pending_drawn = false;
     // How many terminal rows the subagent progress block currently occupies.
@@ -2859,18 +2865,20 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_active,
                     &mut line_open,
                     thinking_summary(thinking_newlines, thinking_chars),
-                    &mut thinking_body,
+                    &mut thinking_region,
                     tty,
                     out,
                     &mut observer_rows,
                 );
+                if tty {
+                    close_open_line(&mut line_open, out);
+                }
                 thinking_active = true;
                 thinking_newlines = 0;
                 thinking_chars = 0;
-                thinking_body.clear();
+                thinking_region.reset();
                 if tty {
-                    let _ = write!(out, "\x1b[2m◌ thinking…\x1b[0m");
-                    let _ = out.flush();
+                    thinking_region.redraw(out);
                     line_open = true;
                 }
             }
@@ -2888,33 +2896,26 @@ fn render_turn_stream_to_with_confirm(
                     .unwrap_or_else(|| payload.to_string());
                 if !thinking_active {
                     // Tolerate start-less frames (older servers never send
-                    // them, but a folded line beats a leaked one).
+                    // them, but a folded region beats leaked reasoning).
+                    if tty {
+                        close_open_line(&mut line_open, out);
+                    }
                     thinking_active = true;
                     thinking_newlines = 0;
                     thinking_chars = 0;
-                    thinking_body.clear();
+                    thinking_region.reset();
                 }
-                thinking_newlines += text.matches('\n').count();
-                thinking_chars += text.chars().count();
-                thinking_body.push_str(&text);
+                thinking_newlines = thinking_newlines.saturating_add(text.matches('\n').count());
+                thinking_chars = thinking_chars.saturating_add(text.chars().count());
                 if tty {
-                    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                    let tail: String = flat
-                        .chars()
-                        .rev()
-                        .take(60)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect();
-                    let _ = write!(out, "\r\x1b[K\x1b[2m◌ thinking… {tail}\x1b[0m");
-                    let _ = out.flush();
+                    thinking_region.append(&text);
+                    thinking_region.redraw(out);
                     line_open = true;
                 }
             }
             "thinking_done" => {
-                // The buffered body (if any) is complete: discard it and print
-                // only the fold summary row.
+                // The live body (if any) is complete: erase the transient
+                // region and retain only the fold summary row.
                 if tty {
                     let _ = markdown.flush_pending_to(out);
                 }
@@ -2922,7 +2923,7 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_active,
                     &mut line_open,
                     thinking_summary(thinking_newlines, thinking_chars),
-                    &mut thinking_body,
+                    &mut thinking_region,
                     tty,
                     out,
                     &mut observer_rows,
@@ -2967,7 +2968,7 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_active,
                     &mut line_open,
                     thinking_summary(thinking_newlines, thinking_chars),
-                    &mut thinking_body,
+                    &mut thinking_region,
                     tty,
                     out,
                     &mut observer_rows,
@@ -3004,7 +3005,7 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_active,
                     &mut line_open,
                     thinking_summary(thinking_newlines, thinking_chars),
-                    &mut thinking_body,
+                    &mut thinking_region,
                     tty,
                     out,
                     &mut observer_rows,
@@ -3075,7 +3076,7 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_active,
                     &mut line_open,
                     thinking_summary(thinking_newlines, thinking_chars),
-                    &mut thinking_body,
+                    &mut thinking_region,
                     tty,
                     out,
                     &mut observer_rows,
@@ -3176,7 +3177,7 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_active,
                     &mut line_open,
                     thinking_summary(thinking_newlines, thinking_chars),
-                    &mut thinking_body,
+                    &mut thinking_region,
                     tty,
                     out,
                     &mut observer_rows,
@@ -3299,7 +3300,7 @@ fn render_turn_stream_to_with_confirm(
         &mut thinking_active,
         &mut line_open,
         thinking_summary(thinking_newlines, thinking_chars),
-        &mut thinking_body,
+        &mut thinking_region,
         tty,
         out,
         &mut observer_rows,
@@ -3700,19 +3701,258 @@ fn erase_status_rows(rows: usize, out: &mut dyn std::io::Write) {
     }
 }
 
-/// Close the live thinking status line (if open) and print only the folded
-/// summary, mirroring the local `✓ thinking (N lines)` row. The buffered
-/// thinking body is discarded, never printed: the local client erases the
-/// fold body entirely, and printing even a bounded recap leaves a wall of
-/// dimmed rows in the serve-chat scrollback. No-op when no thinking block
-/// is open. Takes the body so every close path
-/// (done/error/follow-up block/late delta or footer) renders it exactly
-/// once.
+const SERVE_THINKING_BODY_INDENT: &str = "    ";
+const SERVE_THINKING_BODY_INDENT_WIDTH: usize = 4;
+const SERVE_THINKING_RIGHT_MARGIN_COLS: usize = 2;
+const SERVE_THINKING_VIEWPORT_RESERVED_ROWS: usize = 3;
+const SERVE_THINKING_TAIL_CHAR_CAP: usize = 131_072;
+
+/// Bounded display-only state for the serve-chat thinking fold.
+///
+/// Canonical reasoning remains on the server. The client needs only enough
+/// sanitized tail text to project the live window plus the plain rows from
+/// the prior frame so a resize can recompute their current physical height.
+struct ThinkingLiveRegion {
+    tail: VecDeque<char>,
+    tail_truncated: bool,
+    drawn_rows: Vec<String>,
+    max_visible_lines: usize,
+    terminal_width_override: Option<usize>,
+}
+
+impl ThinkingLiveRegion {
+    fn new(max_visible_lines: usize, terminal_width_override: Option<usize>) -> Self {
+        Self {
+            tail: VecDeque::new(),
+            tail_truncated: false,
+            drawn_rows: Vec::new(),
+            max_visible_lines,
+            terminal_width_override,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.tail.clear();
+        self.tail_truncated = false;
+        self.drawn_rows.clear();
+    }
+
+    /// Append model text after making every terminal control byte inert.
+    /// Newlines remain structural; tabs become four spaces, and every other
+    /// control is rendered through its visible Rust escape.
+    fn append(&mut self, text: &str) {
+        for ch in text.chars() {
+            match ch {
+                '\n' => self.push_display_char('\n'),
+                '\t' => {
+                    for _ in 0..4 {
+                        self.push_display_char(' ');
+                    }
+                }
+                ch if ch.is_control() => {
+                    for escaped in ch.escape_default() {
+                        self.push_display_char(escaped);
+                    }
+                }
+                ch => self.push_display_char(ch),
+            }
+        }
+    }
+
+    fn push_display_char(&mut self, ch: char) {
+        if self.tail.len() == SERVE_THINKING_TAIL_CHAR_CAP {
+            self.tail.pop_front();
+            self.tail_truncated = true;
+        }
+        self.tail.push_back(ch);
+    }
+
+    fn terminal_width(&self) -> usize {
+        self.terminal_width_override
+            .unwrap_or_else(crate::ai::stream::raw_terminal_cols)
+            .max(1)
+    }
+
+    /// Keep the region inside the live viewport, matching the local fold's
+    /// protection against cursor-up being clamped after a tall frame scrolls.
+    fn visible_body_row_budget(&self) -> usize {
+        let viewport_budget = if self.terminal_width_override.is_some() {
+            usize::MAX
+        } else {
+            crossterm::terminal::size()
+                .ok()
+                .map(|(_, rows)| {
+                    usize::from(rows)
+                        .saturating_sub(SERVE_THINKING_VIEWPORT_RESERVED_ROWS)
+                        .max(1)
+                })
+                .unwrap_or(usize::MAX)
+        };
+        self.max_visible_lines.min(viewport_budget)
+    }
+
+    /// Project the latest configured number of physical rows at `width`.
+    /// The marker is outside that budget, as in the local fold.
+    fn projected_rows(&self, width: usize) -> Vec<String> {
+        let content_width = width
+            .saturating_sub(SERVE_THINKING_BODY_INDENT_WIDTH + SERVE_THINKING_RIGHT_MARGIN_COLS)
+            .max(1);
+        let body_budget = self.visible_body_row_budget();
+        let tail: String = self.tail.iter().collect();
+        let mut visible = VecDeque::new();
+        let mut hidden = self.tail_truncated;
+        for line in tail.split('\n').filter(|line| !line.trim().is_empty()) {
+            for row in wrap_thinking_line(line, content_width) {
+                if visible.len() == body_budget {
+                    visible.pop_front();
+                    hidden = true;
+                }
+                if body_budget > 0 {
+                    visible.push_back(row);
+                } else {
+                    hidden = true;
+                }
+            }
+        }
+
+        let mut rows = Vec::with_capacity(visible.len() + 2);
+        rows.push(clamp_thinking_row(
+            "  ○ thinking",
+            width
+                .saturating_sub(SERVE_THINKING_RIGHT_MARGIN_COLS)
+                .max(1),
+        ));
+        if hidden {
+            rows.push(format!(
+                "{SERVE_THINKING_BODY_INDENT}{}",
+                clamp_thinking_row("… more", content_width)
+            ));
+        }
+        rows.extend(
+            visible
+                .into_iter()
+                .map(|row| format!("{SERVE_THINKING_BODY_INDENT}{row}")),
+        );
+        rows
+    }
+
+    fn rendered_physical_rows(&self, width: usize) -> usize {
+        self.drawn_rows
+            .iter()
+            .map(|row| thinking_physical_rows(row, width))
+            .sum()
+    }
+
+    fn erase_at_width(&mut self, width: usize, out: &mut dyn std::io::Write) {
+        let rows = self.rendered_physical_rows(width);
+        if rows > 0 {
+            erase_status_rows(rows, out);
+        }
+        self.drawn_rows.clear();
+    }
+
+    fn erase(&mut self, out: &mut dyn std::io::Write) {
+        let width = self.terminal_width();
+        self.erase_at_width(width, out);
+    }
+
+    fn redraw(&mut self, out: &mut dyn std::io::Write) {
+        let width = self.terminal_width();
+        self.erase_at_width(width, out);
+        let rows = self.projected_rows(width);
+        for (index, row) in rows.iter().enumerate() {
+            if index > 0 {
+                let _ = write!(out, "\r\n");
+            }
+            let _ = write!(out, "{}", dim(row, true));
+        }
+        let _ = out.flush();
+        self.drawn_rows = rows;
+    }
+}
+
+fn thinking_cell_width(ch: char) -> usize {
+    crate::ai::stream::terminal_cell_width(ch)
+}
+
+fn wrap_thinking_line(line: &str, cols: usize) -> Vec<String> {
+    let cols = cols.max(1);
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for ch in line.chars() {
+        let width = thinking_cell_width(ch);
+        if width > cols {
+            if !current.is_empty() {
+                rows.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            rows.push("?".to_string());
+            continue;
+        }
+        if current_width > 0 && current_width + width > cols {
+            rows.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += width;
+    }
+    rows.push(current);
+    rows
+}
+
+fn clamp_thinking_row(line: &str, cols: usize) -> String {
+    let cols = cols.max(1);
+    let width = line.chars().map(thinking_cell_width).sum::<usize>();
+    if width <= cols {
+        return line.to_string();
+    }
+    if cols == 1 {
+        return "…".to_string();
+    }
+    let budget = cols - 1;
+    let mut row = String::new();
+    let mut used = 0usize;
+    for ch in line.chars() {
+        let width = thinking_cell_width(ch);
+        if used + width > budget {
+            break;
+        }
+        row.push(ch);
+        used += width;
+    }
+    row.push('…');
+    row
+}
+
+fn thinking_physical_rows(line: &str, cols: usize) -> usize {
+    let cols = cols.max(1);
+    let mut rows = 1usize;
+    let mut used = 0usize;
+    for ch in line.chars() {
+        let width = thinking_cell_width(ch);
+        if used > 0 && used + width > cols {
+            rows += 1;
+            used = width;
+        } else {
+            used += width;
+        }
+    }
+    rows
+}
+
+/// Erase the complete live thinking region (if open) and print only the
+/// folded summary, mirroring the local `✓ thinking (N lines)` close state.
+/// Every close path (done/error/follow-up block/late delta or footer) shares
+/// this helper so the summary is emitted at most once.
 fn close_thinking_status(
     active: &mut bool,
     line_open: &mut bool,
     lines: usize,
-    body: &mut String,
+    region: &mut ThinkingLiveRegion,
     tty: bool,
     out: &mut dyn std::io::Write,
     observer_rows: &mut ObserverRowState,
@@ -3722,14 +3962,16 @@ fn close_thinking_status(
     }
     *active = false;
     if tty {
-        let _ = write!(out, "\r\x1b[K");
+        region.erase(out);
     }
-    // Discard the buffered body unread: the live status line already hinted
-    // at progress while the block was open, and the summary below is the
-    // only retained row.
-    body.clear();
+    region.reset();
     let unit = if lines == 1 { "line" } else { "lines" };
     let summary = format!("✓ thinking ({lines} {unit})");
+    // An active close is always a genuine block completion. Clear any prior
+    // block's key before classification so equal-sized blocks both print;
+    // classification then seeds the key again for the server-mirrored
+    // observer row that may follow this close.
+    observer_rows.last_thinking_summary = None;
     if decide_observer_row(&summary, observer_rows, tty, 0, false).action
         != ObserverRowAction::SkipDuplicate
     {
@@ -5341,13 +5583,149 @@ mod tests {
     #[test]
     fn sse_thinking_frames_fold_and_end_turn() {
         // Thinking lifecycle interleaved with the answer: the renderer must
-        // accept it and finish on `done` (under test stdout is piped, so the
-        // summary row prints plain without ANSI rewrites).
+        // keep piped behavior summary-only and finish on `done`.
         let url = serve_body_once(
             "event: thinking_start\ndata: \n\nevent: thinking\ndata: {\"text\": \"reasoning here\"}\n\nevent: thinking_done\ndata: \n\nevent: delta\ndata: {\"delta\": \"answer\"}\n\nevent: done\ndata: \n\n",
         );
         let resp = reqwest::blocking::get(url).expect("get canned SSE");
-        assert!(render_turn_stream(resp).is_ok());
+        let mut out = Vec::new();
+        render_turn_stream_to(resp, &mut out, false).expect("render");
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "✓ thinking (1 line)\nanswer\n"
+        );
+    }
+
+    #[test]
+    fn thinking_live_region_wraps_sanitizes_and_erases_after_resize() {
+        let thought = "hidden-first-line\nmiddle-row-that-also-wraps\nsafe\x1b[31m\r\tend";
+        let mut region = ThinkingLiveRegion::new(2, Some(20));
+        region.append(thought);
+
+        let frame = region.projected_rows(20);
+        assert_eq!(frame[0], "  ○ thinking");
+        assert_eq!(frame[1], "    … more");
+        assert_eq!(frame.len(), 4, "header + marker + two body rows: {frame:?}");
+        let visible = frame.join("\n");
+        assert!(!visible.contains("hidden-first-line"), "{visible:?}");
+        assert!(!visible.contains("middle-row"), "{visible:?}");
+        assert!(
+            visible.contains(r"\u{1b}"),
+            "ESC must be visible: {visible:?}"
+        );
+        assert!(visible.contains(r"\r"), "CR must be visible: {visible:?}");
+        assert!(
+            !visible.chars().any(|ch| matches!(ch, '\x1b' | '\r' | '\t')),
+            "projected model text contains a terminal control: {visible:?}"
+        );
+
+        let mut out = Vec::new();
+        region.redraw(&mut out);
+        // Simulate a narrowing between the last frame and close. Erasure must
+        // count how the already-written plain rows reflow at the new width.
+        let resized_rows = region.rendered_physical_rows(12);
+        region.terminal_width_override = Some(12);
+        let mut active = true;
+        let mut line_open = true;
+        close_thinking_status(
+            &mut active,
+            &mut line_open,
+            3,
+            &mut region,
+            true,
+            &mut out,
+            &mut ObserverRowState::default(),
+        );
+        writeln!(&mut out, "answer").unwrap();
+
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(!out.contains("hidden-first-line"), "{out:?}");
+        assert!(!out.contains("\x1b[31m"), "model ESC leaked: {out:?}");
+        assert_eq!(
+            out.matches("\x1b[1A\r\x1b[K").count(),
+            resized_rows.saturating_sub(1),
+            "erase must move up only within its reflowed region: {out:?}"
+        );
+        assert_eq!(out.matches("✓ thinking (3 lines)").count(), 1, "{out:?}");
+        assert!(
+            out.ends_with("✓ thinking (3 lines)\x1b[0m\nanswer\n"),
+            "summary must be the only retained row before the answer: {out:?}"
+        );
+        assert!(region.drawn_rows.is_empty());
+        assert!(region.tail.is_empty());
+    }
+
+    #[test]
+    fn thinking_live_region_vs16_rows_match_terminal_oracle_across_resize() {
+        // Independent oracle: each `⚠️` is two cells (base + VS16) and `界`
+        // is two. At width 16 the ten-cell body fits its ten-cell content
+        // budget. At width 12 it wraps into two six-cell-budget body rows.
+        const NARROW: usize = 12;
+        const WIDE: usize = 16;
+        let mut region = ThinkingLiveRegion::new(usize::MAX, Some(WIDE));
+        region.append("⚠️⚠️⚠️⚠️界");
+        let mut out = Vec::new();
+
+        region.redraw(&mut out);
+        let wide_frame = std::str::from_utf8(&out).unwrap();
+        assert_eq!(
+            wide_frame.matches("\r\n").count() + 1,
+            2,
+            "wide redraw must emit one header and one body row: {wide_frame:?}"
+        );
+
+        let mut offset = out.len();
+        region.terminal_width_override = Some(NARROW);
+        region.redraw(&mut out);
+        {
+            let narrow_redraw = std::str::from_utf8(&out[offset..]).unwrap();
+            let frame_start = narrow_redraw.find("\x1b[2m").unwrap();
+            let erase = &narrow_redraw[..frame_start];
+            let frame = &narrow_redraw[frame_start..];
+            // The old body was fourteen cells including indentation, so it
+            // reflows to two physical rows at width 12; the header is one.
+            assert_eq!(erase.matches("\x1b[K").count(), 3, "{erase:?}");
+            assert_eq!(erase.matches("\x1b[1A").count(), 2, "{erase:?}");
+            assert_eq!(
+                frame.matches("\r\n").count() + 1,
+                3,
+                "narrow redraw must emit one header and two body rows: {frame:?}"
+            );
+        }
+
+        offset = out.len();
+        region.terminal_width_override = Some(WIDE);
+        region.redraw(&mut out);
+        {
+            let wide_redraw = std::str::from_utf8(&out[offset..]).unwrap();
+            let frame_start = wide_redraw.find("\x1b[2m").unwrap();
+            let erase = &wide_redraw[..frame_start];
+            let frame = &wide_redraw[frame_start..];
+            // The narrow frame consists of three hard rows; widening must
+            // erase all three before replacing them with two wide rows.
+            assert_eq!(erase.matches("\x1b[K").count(), 3, "{erase:?}");
+            assert_eq!(erase.matches("\x1b[1A").count(), 2, "{erase:?}");
+            assert_eq!(frame.matches("\r\n").count() + 1, 2, "{frame:?}");
+        }
+
+        offset = out.len();
+        let mut active = true;
+        let mut line_open = true;
+        close_thinking_status(
+            &mut active,
+            &mut line_open,
+            1,
+            &mut region,
+            true,
+            &mut out,
+            &mut ObserverRowState::default(),
+        );
+        let close = std::str::from_utf8(&out[offset..]).unwrap();
+        let summary_start = close.find("\x1b[2m").unwrap();
+        let erase = &close[..summary_start];
+        assert_eq!(erase.matches("\x1b[K").count(), 2, "{erase:?}");
+        assert_eq!(erase.matches("\x1b[1A").count(), 1, "{erase:?}");
+        assert_eq!(close.matches("✓ thinking (1 line)").count(), 1, "{close:?}");
     }
 
     #[test]
@@ -5701,8 +6079,23 @@ mod tests {
             let mut out = Vec::new();
             render_turn_stream_to(resp, &mut out, tty).unwrap();
             let out = String::from_utf8(out).unwrap();
-            assert_eq!(out.matches("✓ thinking (1 line)").count(), 1, "{out:?}");
-            assert!(out.contains("answer"));
+            let summaries = out
+                .match_indices("✓ thinking (1 line)")
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                summaries.len(),
+                2,
+                "each real block prints once while the first mirrored observer row is deduped: {out:?}"
+            );
+            let answer = out.find("answer").unwrap();
+            assert!(
+                summaries[0] < summaries[1] && summaries[1] < answer,
+                "{out:?}"
+            );
+            if !tty {
+                assert_eq!(out, "✓ thinking (1 line)\n✓ thinking (1 line)\nanswer\n");
+            }
         }
     }
 
@@ -5892,10 +6285,12 @@ mod tests {
     fn thinking_close_print_caps_a_long_body() {
         // A 100-line thinking block must not leave any body rows in the
         // scrollback: only the summary row stays, like the local fold.
-        let mut body = (1..=100)
+        let body = (1..=100)
             .map(|i| format!("thought line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
+        let mut region = ThinkingLiveRegion::new(2, Some(80));
+        region.append(&body);
         let mut active = true;
         let mut line_open = true;
         let mut buf = Vec::new();
@@ -5903,20 +6298,21 @@ mod tests {
             &mut active,
             &mut line_open,
             100,
-            &mut body,
+            &mut region,
             false,
             &mut buf,
             &mut ObserverRowState::default(),
         );
         let out = String::from_utf8(buf).expect("utf8");
         assert_eq!(out, "✓ thinking (100 lines)\n");
-        assert!(body.is_empty(), "body must drain exactly once");
+        assert!(region.tail.is_empty(), "body must drain exactly once");
     }
 
     #[test]
     fn thinking_close_print_keeps_a_short_body_whole() {
         // Even a short body leaves no body rows: only the summary stays.
-        let mut body = "a\nb\nc".to_string();
+        let mut region = ThinkingLiveRegion::new(2, Some(80));
+        region.append("a\nb\nc");
         let mut active = true;
         let mut line_open = true;
         let mut buf = Vec::new();
@@ -5924,7 +6320,7 @@ mod tests {
             &mut active,
             &mut line_open,
             3,
-            &mut body,
+            &mut region,
             false,
             &mut buf,
             &mut ObserverRowState::default(),

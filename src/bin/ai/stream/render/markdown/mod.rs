@@ -7,7 +7,7 @@ use crate::ai::stream::render::html::{
     contains_close_table_tag, contains_open_table_tag, parse_html_table, render_html_table,
 };
 use crate::ai::stream::render::inline::{
-    render_inline_md, terminal_cell_width, visible_width, wrap_md_cell,
+    render_inline_md, visible_width, wrap_md_cell,
 };
 use crate::ai::stream::render::table::{
     TableAlign, TableState, compute_table_widths, is_table_row, is_table_row_candidate,
@@ -1496,6 +1496,7 @@ mod tests;
 // Re-export externally-visible / test-visible measurement helpers through the
 // `markdown` module root so `render::markdown::X` paths (stream runtime) and the
 // inline `tests` module (via `use super::*`) keep their pre-split names.
+pub(in crate::ai) use crate::ai::stream::render::inline::terminal_cell_width;
 pub(in crate::ai) use width::{
     TerminalWidthSnapshot, clamp_line_to_terminal_row, clamp_line_to_terminal_row_with_reserve,
     live_preview_cursor_rows, raw_terminal_rows, wrap_line_to_terminal_rows_with_reserve,

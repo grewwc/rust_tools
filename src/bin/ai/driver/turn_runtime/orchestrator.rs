@@ -188,11 +188,9 @@ const REASONING_BUDGET_DOMINANCE_RATIO: f64 = 0.5;
 /// Free-exploration rounds: before this many rounds, even continuous no-progress never prompts
 /// (locating code before deleting it, or exploring an unfamiliar codebase first, is normal).
 const PROGRESS_FREE_EXPLORE_ROUNDS: usize = 20;
-/// A delegation-required skill governs the whole turn, so the first undelegated tool-work
-/// round is already a divergence. The old six-round/six-target threshold only caught broad sweeps;
-/// the scheduling advisory must not wait for the generic exploration grace.
-const REQUIRED_DELEGATION_WORK_ROUNDS: usize = 1;
-const REQUIRED_DELEGATION_READ_ONLY_TARGETS: usize = 6;
+/// Allow a few undelegated tool-work rounds before the scheduling advisory, independently
+/// of target breadth and the generic exploration grace.
+const REQUIRED_DELEGATION_WORK_ROUNDS: usize = 3;
 /// Touching many distinct targets without converging suggests the task may be sliding from
 /// "gathering key evidence" into "endlessly expanding branches". This threshold injects a single
 /// non-blocking breadth check only; it never counts new targets as no-progress, so legitimate
@@ -466,6 +464,68 @@ impl ToolLoopSignal {
     }
 }
 
+/// Advisory state belongs to the user turn and survives recursive bodies. It does not
+/// waive delegation tracking or the final-response gate.
+#[derive(Default)]
+struct DelegationAdvisoryState {
+    skipped: bool,
+    injected: bool,
+}
+
+impl DelegationAdvisoryState {
+    fn observe_assistant_text(&mut self, text: &str) {
+        const PREFIX: &str = "Delegation skip:";
+        self.skipped |= text.lines().any(|line| {
+            line.trim()
+                .get(..PREFIX.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+        });
+    }
+
+    fn observe_current_turn_messages(&mut self, messages: &[history::Message]) {
+        let start = history::last_real_user_index(messages).map_or(0, |index| index + 1);
+        for message in &messages[start..] {
+            if message.role != "assistant" {
+                continue;
+            }
+            match &message.content {
+                serde_json::Value::String(text) => self.observe_assistant_text(text),
+                serde_json::Value::Array(parts) => {
+                    for part in parts {
+                        if part.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                            && let Some(text) = part.get("text").and_then(serde_json::Value::as_str)
+                        {
+                            self.observe_assistant_text(text);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn observe_execution(&mut self, execution: &IterationExecution) {
+        let response = match execution {
+            IterationExecution::ToolCall(execution) => &execution.stream_result,
+            IterationExecution::FinalResponse(response)
+            | IterationExecution::Truncated(response)
+            | IterationExecution::RequestDeadlineExceeded(response) => response,
+            _ => return,
+        };
+        // Read the raw response before projection truncation so a same-round skip takes effect.
+        // The request projection may truncate narration; canonical history preserves the full text.
+        self.observe_assistant_text(&response.assistant_text);
+    }
+
+    fn try_inject(&mut self) -> bool {
+        if self.skipped || self.injected {
+            return false;
+        }
+        self.injected = true;
+        true
+    }
+}
+
 /// Runtime state for the Progress Budget, held on `TurnSupervisor`. Charged by "information gain"
 /// rather than number of actions; only "unexplained, progress-free repetition" is penalized.
 /// Progress is a behavioral signal: touching a new target resource this round or calling a
@@ -496,8 +556,9 @@ struct ProgressLedger {
     delegation_required: bool,
     mutation_calls_this_turn: usize,
     delegation_calls_this_turn: usize,
-    delegation_advisory_injected: bool,
-    /// Tool-work rounds before the first delegation; progress and truncation resets preserve it.
+    delegation_advisory: DelegationAdvisoryState,
+    /// Tool-work rounds before the first delegation; advisory suppression, progress and
+    /// truncation resets preserve counting so the final-response gate remains independent.
     work_rounds_before_delegation: usize,
     /// Whether any project mutation happened this turn. Once true, the pure read-only divergence hard
     /// stop permanently yields (read+modify tasks are not bound by that brake). plan / task lifecycle
@@ -535,8 +596,8 @@ impl ProgressLedger {
                 }
                 "apply_patch" | "patch_file" | "write_file" => {
                     self.mutation_calls_this_turn = self.mutation_calls_this_turn.saturating_add(1);
-                    if self.delegation_calls_this_turn == 0 && !self.delegation_advisory_injected {
-                        self.delegation_advisory_injected = true;
+                    if self.delegation_calls_this_turn == 0 && self.delegation_advisory.try_inject()
+                    {
                         inject_advisory = true;
                     }
                 }
@@ -559,10 +620,7 @@ impl ProgressLedger {
         &mut self,
         tool_calls: &[crate::ai::types::ToolCall],
     ) -> ToolLoopSignal {
-        if !self.delegation_required
-            || self.delegation_calls_this_turn > 0
-            || self.delegation_advisory_injected
-        {
+        if !self.delegation_required || self.delegation_calls_this_turn > 0 {
             return ToolLoopSignal::None;
         }
         // Direct mutations already have their own delegation advisory. Shell commands must
@@ -581,11 +639,10 @@ impl ProgressLedger {
         }
         self.work_rounds_before_delegation = self.work_rounds_before_delegation.saturating_add(1);
         if self.work_rounds_before_delegation < REQUIRED_DELEGATION_WORK_ROUNDS
-            && self.seen_targets.len() < REQUIRED_DELEGATION_READ_ONLY_TARGETS
+            || !self.delegation_advisory.try_inject()
         {
             return ToolLoopSignal::None;
         }
-        self.delegation_advisory_injected = true;
         ToolLoopSignal::DelegationRequired
     }
 
@@ -1275,6 +1332,7 @@ pub(in crate::ai::driver) async fn run_turn(
                             one_shot_mode,
                             self_generated_audit,
                             should_quit,
+                            DelegationAdvisoryState::default(),
                         ),
                     )
                     .await
@@ -1440,6 +1498,7 @@ async fn run_turn_body(
     one_shot_mode: bool,
     self_generated_audit: Option<bool>,
     should_quit: bool,
+    delegation_advisory: DelegationAdvisoryState,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
     // Clear the previous round's interrupt flag at the start of every round so it
     // reflects only whether THIS round was interrupted by Ctrl+C.
@@ -1508,6 +1567,7 @@ async fn run_turn_body(
     // explicitly per stage when needed.
 
     let mut supervisor = TurnSupervisor::default();
+    supervisor.progress.delegation_advisory = delegation_advisory;
     supervisor.progress.delegation_required =
         crate::ai::driver::runtime_ctx::current_subagent_depth() == 0
             && crate::ai::skills::delegation_required(
@@ -1678,6 +1738,10 @@ async fn run_turn_body(
         // directly — so every drained note is plain guidance.
         drain_side_notes_and_inject(&app.session_history_file, &mut messages, &mut turn_messages);
         drain_talk_and_inject(&app.session_history_file, &mut messages, &mut turn_messages);
+        supervisor
+            .progress
+            .delegation_advisory
+            .observe_current_turn_messages(&turn_messages);
         let active_skill_name = skill_turn.primary_skill_name().map(str::to_string);
         let compression_report = CompressionReport::default();
         let mut response_model = None;
@@ -1803,6 +1867,10 @@ async fn run_turn_body(
         };
         let was_final_response = matches!(&execution, IterationExecution::FinalResponse(_));
         let had_tool_call_execution = matches!(&execution, IterationExecution::ToolCall(_));
+        supervisor
+            .progress
+            .delegation_advisory
+            .observe_execution(&execution);
         // Piggyback collection: while the image digest is unresolved, cache this round's
         // untruncated tool-call response text (assistant_text + reasoning_text). At the top
         // of the next loop round we try to parse a digest from it; a hit saves one fallback
@@ -2796,6 +2864,7 @@ async fn run_turn_body(
                             one_shot_mode,
                             None,
                             should_quit,
+                            supervisor.progress.delegation_advisory,
                         ))
                         .await;
                     }

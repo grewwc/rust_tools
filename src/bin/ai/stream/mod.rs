@@ -33,8 +33,16 @@ pub(crate) fn project_visible_body(text: &str) -> String {
 }
 
 pub(super) use render::markdown::MarkdownStreamRenderer;
-pub(in crate::ai) use render::markdown::clamp_line_to_terminal_row_with_reserve;
-pub(in crate::ai) use render::markdown::raw_terminal_cols;
+pub(in crate::ai) use render::markdown::{
+    clamp_line_to_terminal_row_with_reserve, raw_terminal_cols, terminal_cell_width,
+};
+
+pub(in crate::ai) fn resolve_thinking_fold_max_visible_lines(
+    is_tty: bool,
+    raw: Option<&str>,
+) -> usize {
+    runtime::resolve_thinking_fold_max_visible_lines(is_tty, raw)
+}
 
 pub(in crate::ai) const PROVIDER_CONTROL_LEAK_FINISH_REASON: &str = "provider_control_leak";
 

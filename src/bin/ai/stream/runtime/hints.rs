@@ -125,7 +125,10 @@ pub(super) fn configure_subagent_preview_fold(
     }
 }
 
-pub(super) fn resolve_thinking_fold_max_visible_lines(is_tty: bool, raw: Option<&str>) -> usize {
+pub(in crate::ai) fn resolve_thinking_fold_max_visible_lines(
+    is_tty: bool,
+    raw: Option<&str>,
+) -> usize {
     if !is_tty {
         return usize::MAX;
     }
