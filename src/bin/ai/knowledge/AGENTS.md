@@ -2,20 +2,16 @@
 
 ## Scope
 
-Applies to `src/bin/ai/knowledge/**`. Shared types and the semantic-index
-building blocks: `types.rs` (`Category`), `entry.rs` (path-leak guard),
-`config.rs` (hybrid-search weight), `indexing/similarity.rs` (lexical scoring +
-vector similarity), `indexing/embedder.rs` (remote OpenAI-compatible embedding
-provider), `storage/vector_store.rs`
-(SQLite-backed vector index), and `distilled.rs` (verified distilled entries for
-automatic recall, see invariant 3). The orchestration layer lives in
-`tools/storage/rag_store.rs` (rebuild + hybrid merge) and the
-`knowledge_semantic_search` / `knowledge_rebuild_index` tools in `tools/rag_tools.rs`.
+Applies to `src/bin/ai/knowledge/**`: shared entry types, derived semantic-index
+building blocks, and verified distilled entries for automatic recall. Rebuild
+and hybrid-search orchestration belongs to `tools/storage/rag_store.rs`; the
+Tools guide owns schemas and execution for the `knowledge_*` family.
 
 ## Key invariants
 
-1. **Public vs internal tools.** All registry tools are `knowledge_*`
-   (`knowledge_save`/`forget`/`search`/`list`/`consolidate`); there are no separate
+1. **Public vs internal tools.** Registry knowledge tools follow the existing
+   `knowledge_*` family, including `knowledge_save` and `knowledge_consolidate`
+   (see **Names & paths** in `src/bin/ai/tools/AGENTS.md`); there are no separate
    `memory_*` tools — agent-internal memory uses the same `knowledge_*` tools
    scoped by `MemoryOwnerScope` (e.g. the `agent_memory_save` path in
    `tools/service/memory.rs`).
@@ -34,8 +30,8 @@ automatic recall, see invariant 3). The orchestration layer lives in
    General knowledge is read through explicit `knowledge_*` tool calls. The driver
    may automatically select verified, current-project distilled entries for real
    foreground tasks, subject to knowledge permissions. Recalled content is bounded
-   historical reference data in the request projection, never canonical history.
-   Lexical ranking
+   historical reference data in the request projection under **History is truth**
+   and **Derived-context provenance** in `src/bin/ai/AGENTS.md`. Lexical ranking
    stays in `MemoryStore::search` (BM25 + priority weight); hybrid search merges
    that with the vector index using `hybrid_vector_weight`. The notebook
    (`a -n` / `-ns` memo search, `driver/note_search.rs`) is an independent

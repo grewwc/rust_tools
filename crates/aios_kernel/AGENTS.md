@@ -23,22 +23,24 @@ src/types.rs        # FastMap / FastSet (rustc-hash re-exports)
 
 ## Build / Test
 
-Use the root ladder's narrowest targets: `cargo check -p aios_kernel`,
+Crate targets: `cargo check -p aios_kernel`,
 `cargo test -p aios_kernel <test_name>`.
 
 ## Invariants (do not break)
 
-1. **Runtime-agnostic core.** `aios_kernel` must not depend on tokio or any
-   async runtime. Blocking waits are implemented agent-side; futex wait uses the
-   waker-token pattern (or a sync `try_wait`), never a lock held across `.await`.
+1. **Runtime-agnostic core.** `aios_kernel` must not depend on the root
+   `rust_tools` crate, tokio, or any async runtime. Blocking waits are implemented
+   agent-side; futex wait uses the waker-token pattern (or a sync `try_wait`), never
+   a lock held across `.await`.
 2. **One `Kernel` trait = Syscall + KernelInternal + all primitives ops.** New
    capability = a new trait in `primitives.rs` (or a method on an existing
    trait) + an impl on `LocalOS`; don't special-case callers.
 3. **PID identity is runtime-provided.** `current_process_id()` resolves through
    `register_current_pid_provider` (task-local in `a`). Kernel code must not
    assume a global PID.
-4. **Module boundaries**: `pub(super)` / `pub(crate)`; keep the public surface
-   minimal (`lib.rs` re-exports the four modules).
+4. **Public surface.** Export kernel/primitive traits and shared types through
+   `src/lib.rs`; keep implementation details private. Collections come from
+   `crate::types::{FastMap, FastSet}` (`src/types.rs`), also exported by `src/lib.rs`.
 5. **`LocalOS` state is guarded by the caller** via
    `SharedKernel = Arc<Mutex<Box<dyn Kernel + Send>>>` - kernel methods must
    not block or await.

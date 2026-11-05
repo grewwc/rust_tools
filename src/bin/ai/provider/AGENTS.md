@@ -2,12 +2,11 @@
 
 ## Scope
 
-Applies to `src/bin/ai/provider/**`. `mod.rs` defines the `ApiProvider` enum
-(`compatible`, `alibaba`, `openai`, `opencode`) + shared types; `adapter/` holds
-the `ProviderAdapter` trait and its impls — one per enum variant, plus
-`openrouter` (an endpoint variant of OpenAI wire format, selected by
-`adapter_for` when the endpoint contains `openrouter.ai`; no enum entry, only a
-different log label) and `thinking.rs`, the orthogonal thinking-dialect axis.
+Applies to `src/bin/ai/provider/**`. `ApiProvider` (`mod.rs`) defines the request
+adapter axis; `ProviderAdapter` and `adapter_for` (`adapter/mod.rs`) own wire
+adaptation and dispatch. Endpoint variants such as OpenRouter can use adapter
+dispatch without a new `ApiProvider` variant. Keep the thinking dialect
+orthogonal to provider selection.
 
 ## Key invariants
 
@@ -16,5 +15,7 @@ different log label) and `thinking.rs`, the orthogonal thinking-dialect axis.
 2. **Adapter vs platform.** `ApiProvider` is the request `adapter` axis; model
    metadata (reasoning flags, endpoints, rare `platform` branding) lives in
    model registry, and request behavior keys off the adapter.
-3. **Wire-format tests.** Request-body or stream-format changes need focused
-   tests, especially when formats differ across providers.
+3. **Wire-format gate.** Request-body or stream-format behavior changes need
+   focused regression coverage for the affected adapters, including differing
+   wire formats. Provider wire-shape fixtures live in
+   `src/bin/ai/stream/runtime/tests/`.

@@ -11,6 +11,9 @@ Product framing: this is the *desktop* counterpart of `mcp_browser` (which drive
 one browser). It is deliberately app-agnostic — it drives whatever is on screen —
 so it is the fallback path for any GUI that has no dedicated MCP server.
 
+Shared transport, text delivery, error wording, and timeout contracts live in
+[the mcp_stdio guide](../mcp_stdio/AGENTS.md).
+
 ## Layout
 
 ```text
@@ -42,11 +45,10 @@ src/backend/unsupported.rs # every call reports a clear "no backend on this OS" 
    ImageMagick's `import`) is an error naming the limitation, never a dropped
    argument. Placeholders models send for unused optionals (`""`, `[]`, an
    all-zero `region`, `window_id`/`display` ≤ 0) are invalid values on every
-   backend and mean "not given"; rejecting them wasted most real screenshot calls.
-3. **Screenshots return a path, not image content.** Only `content[0].text`
-   reaches the model (`crates/mcp_stdio/AGENTS.md` invariant 4), so the path
-   plus `a`'s image-aware `read_file` is what shows the frame to a vision
-   model. `frame.rs` binds each `frame_id` to its capture scope; unchanged
+   backend and mean "not given"; normalize them before backend dispatch.
+3. **Screenshots return a path.** Follow shared **Text delivery** in
+   `crates/mcp_stdio/AGENTS.md`; `a`'s image-aware `read_file` shows the saved frame
+   to a vision model. `frame.rs` binds each `frame_id` to its capture scope; unchanged
    probe files are deleted. A kept HiDPI frame is stored at one pixel per point
    (the report's click formula always describes the stored file); the
    `frame_id` digest and OCR use the native pixels. Kept frames are scratch:
@@ -58,15 +60,14 @@ src/backend/unsupported.rs # every call reports a clear "no backend on this OS" 
    line matches, and for window captures it activates and verifies the exact
    window — before the fresh OCR frame and again immediately before input.
    An activation failure returns without a click; `find_text` never activates.
-4. **Error text must avoid the host's transport trigger words** (the list lives
-   in `crates/mcp_stdio/AGENTS.md` invariant 2). Helper stderr is forwarded to
-   the model, so each backend scans it (`sanitize`) first; forwarding one of
-   those phrases makes the host kill and restart this server.
+4. **Helper error boundary.** Each backend's `sanitize` scans helper stderr
+   before forwarding it; apply shared **Error wording** in
+   `crates/mcp_stdio/AGENTS.md` at this boundary.
 5. **Backend calls run under `with_timeout` on a blocking thread.** Capture and
    injection block (subprocess + sleeps), so `tools.rs` goes through `spawn_blocking`:
    run inline they would hold the server's only executor thread and the per-op cap
-   (default 90s, `MCP_COMPUTER_OP_TIMEOUT_MS`) could never fire. Keep the cap below
-   the host's *configured* `request_timeout_ms` (see `mcp_stdio` invariant 5).
+   from `op_timeout_ms` (`src/tools.rs`) could never fire. Shared timeout ordering
+   is defined in `crates/mcp_stdio/AGENTS.md`.
    On timeout the helper is left running to completion — the cap bounds what the
    model waits for, not the platform.
 6. **Permissions are reported, not assumed.** `screen_info` states whether
@@ -76,12 +77,14 @@ src/backend/unsupported.rs # every call reports a clear "no backend on this OS" 
 
 ## Build / verify
 
+Crate type-check target:
+
 ```bash
 cargo check -p mcp_computer                 # macOS backend
-cargo build -p mcp_computer --release && cp target/release/mcp_computer bin/mcp_computer
 ```
 
-Smoke test (no host needed), replacing `<bin>` with the built path:
+Protocol/schema dispatch changes require a built-server smoke (no host needed),
+replacing `<bin>` with the built path:
 
 ```bash
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
@@ -89,6 +92,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"screen_info","arguments":{}}}' \
   | <bin>
 ```
+
+Capture, coordinate mapping, OCR targeting, input injection, window activation,
+or permission-reporting changes additionally require the affected tool round-trip
+in a real desktop session on the affected OS.
 
 `src/backend/linux.rs` is `cfg(target_os = "linux")`, so a macOS build never parses
 it. It is std-only and free of `use super::*` so it can be type-checked on macOS:
@@ -100,11 +107,19 @@ rustc --edition 2024 --crate-type lib --emit=metadata -o /dev/null \
 
 That check proves it compiles, not that the Linux helpers behave.
 
-## Status / known gaps
+## Deployment
 
-- Linux backend is compile-checked only (never run on a Linux host); a real
-  Linux session (X11 and Wayland) still has to be exercised before claiming Linux
-  support.
+Build and install the release artifact when deploying:
+
+```bash
+cargo build -p mcp_computer --release
+cp target/release/mcp_computer bin/mcp_computer
+```
+
+## Platform verification notes
+
+- Compile checks do not establish Linux helper behavior; exercise the affected
+  X11 or Wayland session before claiming support for it.
 - Pixels-per-point must be taken from the display *mode* (`CGDisplayCopyDisplayMode` +
   `CGDisplayMode::pixel_width`); `CGDisplayPixelsWide` returns the *point* size on a
   HiDPI mode. `frame.rs` also measures the ratio from the decoded capture against the

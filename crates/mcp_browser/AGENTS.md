@@ -4,37 +4,58 @@
 
 Standalone stdio JSON-RPC **MCP server** for browser automation (navigate/click/type/extract/screenshot). Not a library — spawned as MCP subprocess via `mcp_stdio::run()`.
 
-**Two drivers, one server:** `MCP_BROWSER_DRIVER=applescript` (default macOS, drives user's running Chrome via `osascript`) vs `cdp` (`chromiumoxide`/CDP; non-macOS default, or forced by `MCP_BROWSER_WS_URL`). `MCP_BROWSER_WS_URL` may be `ws://` or `http://host:port`/bare `host:port` (fetches `webSocketDebuggerUrl`). The AppleScript driver and CDP-attach (`MCP_BROWSER_WS_URL`) reuse the user's real cookies/login; a CDP controlled launch uses a throwaway profile. `close_browser` only closes the session tab — never quits the user's browser.
+**Two drivers, one tool surface:** AppleScript drives the user's Chrome via
+`osascript`; CDP uses `chromiumoxide` to attach or launch. Driver selection and
+environment settings are owned by the symbols in **Environment variables**.
 
 ## Layout
 
 ```text
 src/main.rs      # #[tokio::main(multi_thread)]; BrowserServer { mode, session } + impl McpServer; gc_stale_profiles() + mcp_stdio::run()
 src/browser.rs   # BrowserSession + launch()/ensure_session()/shutdown() + Session enum + DriverMode::from_env()
-src/applescript.rs # AppleScript driver: ApplescriptSession + osascript runner + 13 tool impls
-src/tools.rs     # initialize/tools_list schemas + handle_tools_call dispatch + 13 tool impls
+src/applescript.rs # AppleScript driver: ApplescriptSession + osascript runner + tools
+src/tools.rs     # initialize/tools_list schemas + handle_tools_call dispatch + tools
 ```
 
-Transport (`JsonRpcErr`/`cap_text(24K)`/`with_timeout(90s)`/dispatch loop) lives in `mcp_stdio`.
+Shared transport, text delivery, error wording, and timeout contracts live in
+[the mcp_stdio guide](../mcp_stdio/AGENTS.md).
 
 ## Build / Test
 
+Capability-gating and AppleScript error-translation helpers have focused tests
+that run without Chrome. Protocol/schema dispatch changes require this binary
+smoke:
+
 ```bash
-cargo build -p mcp_browser   # ~9 min cold (chromiumoxide)
+cargo build -p mcp_browser
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | ./target/debug/mcp_browser
 ```
 
-Unit tests in `src/main.rs` (capability gating) and `src/applescript.rs` (error translation) run without Chrome; there are no end-to-end tests (they need real Chrome). Gate = build + smoke test above; add `tools/call navigate` for full round-trip (`MCP_BROWSER_HEADLESS=1` to avoid window). AppleScript smoke: with JS-from-Apple-Events enabled, verify one tab opens/closes without touching others.
+Changes to launch/connect, tab ownership, AppleScript execution, DOM interaction
+or extraction, human-action detection, or screenshots additionally require a
+round-trip through the affected driver in real Chrome. Add `tools/call navigate`
+and the affected operation; CDP may use headless mode where applicable. For
+AppleScript, enable JS-from-Apple-Events and verify that only the session tab
+opens/closes.
 
 ## Invariants (do not break)
 
-1. **Server cap < host timeout** (`crates/mcp_stdio/AGENTS.md` invariant 5). No per-tool override — every CDP/osascript op stays under the **90s** cap, which must stay below the host's *configured* `request_timeout_ms`. `MCP_BROWSER_OP_TIMEOUT_MS` may only *lower* that cap: `op_timeout_ms()` (`src/browser.rs`) clamps it to 90_000, because the server cannot read the host's configured timeout.
-2. **Error wording avoids host transport triggers** — the trigger list and the shared timeout wording live in `crates/mcp_stdio/AGENTS.md` invariant 2.
-3. **Only `content[0].text` reaches the model** (see `crates/mcp_stdio/AGENTS.md` invariant 4). Screenshots save to disk and return the path, never image bytes.
+1. **Browser timeout policy.** Operations share `op_timeout_ms`
+   (`src/browser.rs`), which clamps environment overrides to the ceiling defined
+   in code; do not introduce per-tool cap overrides. Shared ordering is defined
+   by **Per-op timeout < host timeout** in `crates/mcp_stdio/AGENTS.md`.
+2. **Error translation.** `translate_err` (`src/applescript.rs`) and CDP error
+   construction obey **Error wording** in `crates/mcp_stdio/AGENTS.md`.
+3. **Screenshot results.** Save captures to disk and return the path, never
+   inline image bytes; shared delivery is defined by **Text delivery** in
+   `crates/mcp_stdio/AGENTS.md`.
 4. **Sequential + Handler polling.** `main` owns one `Session` (`Option<Session>`) by `&mut`; host serializes requests so one reused `Page` keeps cookies. CDP `Handler` must be continuously polled, else all CDP hangs.
 5. **launch vs connect.** `Browser::launch` = new controlled Chrome (throwaway profile). `Browser::connect` (when `MCP_BROWSER_WS_URL` set) = attach existing `--remote-debugging` instance. Default is launch. `owns_browser` records which one happened: shutdown closes the whole browser only when this process launched it, an attached browser only ever loses its session tab.
-6. **Per-pid profile dir + startup GC.** A shared profile path collides (`SingletonLock`), and the host usually SIGKILLs the subprocess so `shutdown()` never runs — `launch()` uses a per-pid dir and `gc_stale_profiles()` at startup removes dirs whose pid is dead. Do not revert to a shared dir. Callers run `launch()` outside `with_timeout`, so it carries its own per-op cap; a failed `new_page` closes the browser and aborts the handler task instead of leaking both.
+6. **Per-pid profile dir + startup GC.** Controlled launches use per-pid profiles;
+   `gc_stale_profiles` (`src/browser.rs`) reclaims dead owners' directories, never
+   explicit user profiles. Keep the startup deadline and failed-page cleanup in
+   `BrowserSession::launch` (`src/browser.rs`), which runs outside the tool wrapper.
 7. **Human-required detection + `wait_for_human`.**
    - **Detect** captcha/slider/sms_otp/twofa/login_required/payment_verify/
      identity_verify in `get_text`/`get_html` and after every mutating call
@@ -63,7 +84,7 @@ Unit tests in `src/main.rs` (capability gating) and `src/applescript.rs` (error 
 
 ## AppleScript driver specifics
 
-Same 13 tools/args as CDP; `wait_for_human` never `unavailable`. Dedicated invariants:
+Same tools/args as CDP; `wait_for_human` never `unavailable`. Dedicated invariants:
 
 1. **Never steal focus.** No `activate`; `open_tab` records the frontmost app before creating the tab and restores it afterwards (skip when already in Chrome). Ops address `window id W` + `whose id is "T"` (int window id + quoted tab id; a stale reference fails with the -1728 `can't get` error that the server maps to a rebuild hint) → stray events fail dry instead of mutating foreign tabs. Chrome self-activates on a new tab — hence the restore.
 2. **Allow JavaScript from Apple Events** (View > Developer). Chrome reads this preference **at startup only**: enabling it in a running browser (or editing the profile on disk) changes nothing, so the error must name the required full Chrome restart, not just the menu path. The wording lives in one shared constant (`JS_APPLE_EVENTS_HINT` in `src/applescript.rs`) used by both error paths, so they cannot drift.
@@ -71,25 +92,24 @@ Same 13 tools/args as CDP; `wait_for_human` never `unavailable`. Dedicated invar
 4. **One session tab, reused.** `navigate` re-sets `URL of` tab unless vanished (then fresh tab in session window; first session uses front window). Tab becomes active tab *of its window* (for `screencapture -l`) but window stays background.
 5. **Synthetic events only.** JS `click()`, native-setter `value`+`input`/`change`, `KeyboardEvent` dispatch (Enter also `form.requestSubmit()`). No OS key chords / drag&drop. `full_page` degrades to a window screenshot.
 6. **Screenshot TCC preflight.** `screenshot` probes Screen Recording permission first: without it the window capture fails while the region/full-screen fallbacks still exit 0 with a wallpaper-only image that looks like success — so the server must error out with authorization instructions instead of returning a useless frame. The probe and fallback chain live in `src/applescript.rs`; the grant applies only after fully quitting and restarting the host app.
-7. **Every osascript call wrapped in `with_timeout` (90s).** CDP-only env vars don't apply.
+7. **AppleScript timeout wrapper.** `handle_tools_call` (`src/applescript.rs`)
+   wraps operations with `with_timeout` using the shared browser cap; CDP-only
+   environment options do not apply.
 8. **Results are decoded, not escaped.** `get_text`/`get_html` parse the `JSON.stringify` envelope, so the model sees real newlines and real HTML instead of `\n` and `\"`.
 
 ## Environment variables
 
-| Var | Default | Meaning |
-|---|---|---|
-| `MCP_BROWSER_DRIVER` | auto `applescript`/else `cdp` | driver; `MCP_BROWSER_WS_URL` forces `cdp` |
-| `MCP_BROWSER_HEADLESS` | `0` | `1`/`true` = headless (CDP only) |
-| `MCP_BROWSER_CHROME` | auto-detected per OS | Explicit Chrome/Chromium executable (CDP) |
-| `MCP_BROWSER_WS_URL` | (unset) | attach via `Browser::connect` |
-| `MCP_BROWSER_USER_DATA_DIR` | (unset) | explicit profile (reused, never GC'd; don't share) |
-| `MCP_BROWSER_OP_TIMEOUT_MS` | `90000` | per-op cap; clamped to ≤ 90000, must stay < host timeout |
-| `MCP_BROWSER_SCREENSHOT_DIR` | `<temp>/mcp_browser` | screenshot dir |
+Driver selection and CDP launch/attach settings belong to `DriverMode::from_env`
+and `BrowserSession::launch` (`src/browser.rs`). Timeout defaults and clamps
+belong to `op_timeout_ms` there; screenshot path settings belong to
+`resolve_screenshot_path` (`src/tools.rs`). Keep option values/defaults in those
+symbols rather than copying them into this guide.
 
-## chromiumoxide 0.9 notes
+## Keyboard focus
 
 Keyboard/typing must go through **`Element`**; `Page` has no `press_key`. `Element::press_key` sends a page-level `Input.dispatchKeyEvent`, so the key lands on the **focused** element — never focus `body` first, that would move focus off the input the model just typed into. Focus `body` only when nothing else is focused. The element/screenshot API details live in `src/tools.rs`.
 
 ## Host registration
 
-`~/.config/mcp.json` → `mcpServers` (tools `mcp_browser_*`). Keep `request_timeout_ms` above the 90s server cap (invariant 1).
+Host tool family: `mcp_browser_*`. Shared configuration is described in
+**Host registration** in `crates/mcp_stdio/AGENTS.md`.

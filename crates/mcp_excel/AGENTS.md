@@ -9,18 +9,19 @@ Standalone stdio JSON-RPC **MCP server** driving real Microsoft Excel via AppleS
 ```text
 src/main.rs   # #[tokio::main(flavor = "multi_thread")]; ExcelServer + impl McpServer; no session state
 src/osa.rs    # osascript wrapper + AppleScript templates — every Excel quirk lives here
-src/tools.rs  # tools_list + handle_tools_call dispatch + 9 tool impls + CSV helpers
+src/tools.rs  # tools_list + handle_tools_call dispatch + tools + CSV helpers
 ```
 
-Transport and its invariants (per-op cap < host timeout, error wording, text cap) live in `crates/mcp_stdio` — see its `AGENTS.md`.
+Shared transport, text delivery, error wording, and timeout contracts live in
+[the mcp_stdio guide](../mcp_stdio/AGENTS.md).
 
 ## Build / Test
 
-```bash
-cargo build -p mcp_excel   # deps: tokio + serde_json + local mcp_stdio
-```
-
-`cargo check --bin a` unaffected (not a dep). No unit tests — needs real Excel. Gate: build + smoke-test cold-Excel round-trip `open_workbook -> read_range -> write_cell -> read_cell -> export_csv -> close_workbook`.
+Crate type-check target: `cargo check -p mcp_excel`. Protocol/schema dispatch
+changes require a binary protocol smoke. Changes to AppleScript execution,
+workbook lifecycle, reads/writes, or CSV export additionally require
+`cargo build -p mcp_excel` and a cold-Excel round-trip on a test workbook:
+`open_workbook -> read_range -> write_cell -> read_cell -> export_csv -> close_workbook`.
 
 ## AppleScript rules (binding — do not simplify)
 
@@ -35,12 +36,18 @@ diagnostic). The three that cost the most when broken:
 ## Invariants (do not break)
 
 1. **No session / no shutdown hook.** Excel owns state across one-shot `osascript -e` calls; `main` holds no state; idempotent `open_workbook` (reuse-if-open) stitches calls.
-2. **Raw AppleScript errors pass verbatim.** `-50`/`-10003` are diagnostics, not host transport triggers; never wrap them in wording the host kills on (`mcp_stdio`).
-3. **Large ranges must be exported to disk, not returned inline** — only `content[0].text` reaches the model (`crates/mcp_stdio/AGENTS.md` invariant 4).
+2. **Raw AppleScript diagnostics.** Preserve `-50`/`-10003` verbatim while
+   obeying shared **Error wording** in `crates/mcp_stdio/AGENTS.md`.
+3. **Large ranges use CSV export.** Export large ranges to disk under shared
+   **Text delivery** in `crates/mcp_stdio/AGENTS.md`.
 4. **Persist via `export_csv`, not `save_workbook`.** Sandboxed `save workbook as` → systemic `-50` in non-interactive context (not a syntax bug — do not re-attempt); `export_csv` reads range then Rust writes file; `save_workbook` stays EXPERIMENTAL.
 
-## Environment / Tool set / Host
+## Environment / Tool surface
 
-- `MCP_EXCEL_OP_TIMEOUT_MS` per-op cap (default 90000; keep below the host's *configured* `request_timeout_ms` — see `mcp_stdio` invariant 5). macOS-only (Excel + `osascript`).
-- 9 verbs (no raw AppleScript): `open_workbook` · `list_sheets` · `read_cell` · `read_range` · `write_cell` · `write_range` · `export_csv` · `save_workbook` (experimental) · `close_workbook` — reads/writes are in-memory; `export_csv` persists.
-- `~/.config/mcp.json` → `mcpServers` (tools `mcp_excel_*`).
+- macOS-only (Excel + `osascript`). `op_timeout_ms` (`src/tools.rs`) owns the
+  operation-cap environment setting; shared ordering lives in the mcp_stdio guide.
+- Tool schemas belong to `tools_list_result` (`src/tools.rs`); expose workbook
+  operations rather than raw AppleScript. Reads/writes are in-memory;
+  `export_csv` persists and `save_workbook` remains experimental.
+- Host tool family: `mcp_excel_*`; shared configuration is described in
+  **Host registration** in `crates/mcp_stdio/AGENTS.md`.

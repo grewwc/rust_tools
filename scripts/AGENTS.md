@@ -8,10 +8,9 @@ its own header.
 Display-only filter for the agent's terminal body text; rules live in the
 script header (`scripts/postprocess_terminal.py`).
 
-Integration: `ai.output.postprocess_command` (see `src/bin/ai/AGENTS.md`
-invariant 11) applies it at both render sites — the live turn
-(`driver/turn_runtime/finalize.rs`) and the `/history last` replay
-(`driver/input.rs`, so replays render what the live turn painted).
+Runtime integration belongs to **Output post-processing is display-only** in
+`src/bin/ai/AGENTS.md`. Keep the filter's rendered output consistent between live
+turns and `/history last` replay.
 
 ## prompt_eval.py
 
@@ -33,6 +32,5 @@ repo root; details in the script header.
 
 ## test_memory_feature.sh
 
-Quick smoke test for memory / knowledge-base retrieval (compile check plus
-`/memory` save/recent/search round-trips via `cargo run --bin a`); details in
-the script header.
+Opt-in smoke script for memory / knowledge-base retrieval; its supported command
+sequence and invocation live in the `scripts/test_memory_feature.sh` header.

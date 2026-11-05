@@ -1,12 +1,26 @@
 # AGENTS.md - rust_tools Project Guide
 
-Root-level overview and repo-wide invariants only; the nearest scoped
-`AGENTS.md` supplies subsystem rules.
+Root-level overview, repo-wide invariants, and verification policy.
 
 Rust 2024 workspace: utility library + CLI binaries. Primary product is `a`, an
 LLM-based AI agent runtime (AIOS) with process scheduling, agent/skill routing,
-tool registry, and MCP integration. macOS-first (`objc2` deps); core library
-cross-platform.
+tool registry, and MCP integration. macOS-first (`objc2*` dependencies are
+macOS-only); core library cross-platform.
+
+## Instruction hierarchy
+
+- Read this guide and the scoped guides on the path to the target directory,
+  root-to-deep. Child guides own local mechanisms and explicitly scoped gates;
+  sibling guides apply only through an explicit reference.
+- Scoped rules cannot weaken the Build / Test prohibitions, English code-comment
+  rule, protection of others' Git changes, AGENTS.md maintenance rules,
+  or the runtime-session inspection boundary linked below. Other refinements
+  must stay within their scope and any exception stated by the owning rule.
+- The root verification ladder selects Cargo checks. Local gates add targeted
+  integration evidence only for the behavior changes they name; they do not
+  replace required checks or apply to docs-only changes. Command examples are
+  scoped targets, not unconditional gates. Release builds and installation are
+  deployment steps.
 
 ## Layout
 
@@ -21,8 +35,9 @@ Workspace members are the root crate plus the `crates/*` below.
 - `crates/rust_tools_macros/`, `crates/re/`, `scripts/`, `tests/`, `models/`:
   macros, memo CLI, helpers, integration tests, and runtime model registry.
 
-The `mcp_*` crates are not dependencies of `a`; new OS-app servers should reuse
-`mcp_stdio` when possible. `src/bin/mcp_ocr.rs` is a hand-rolled exception.
+The `mcp_*` crates are not dependencies of `a`; their shared server contract lives
+in [the mcp_stdio guide](crates/mcp_stdio/AGENTS.md).
+`src/bin/mcp_ocr.rs` is a hand-rolled exception.
 
 ## Build / Test
 
@@ -41,6 +56,7 @@ cargo test -p aios_kernel test_name  # run one targeted test in a crate
 ```
 
 **Verification ladder:**
+
 1. **No code change / docs-only**: no Cargo command required.
 2. **Type-level / compile-risk / mechanical refactor**: narrowest `cargo check`.
 3. **Runtime behavior changed, focused test exists**: run that named test.
@@ -64,37 +80,29 @@ make install-all
 a --serve-restart
 ```
 
-`a --serve-restart` run from inside a serve turn is *deferred*: a detached
-helper restarts after the turn exits, so the restart cannot be confirmed in
-the same turn.
-Verify it later with `a --serve-status` (new pid/uptime) plus the daemon
-binary's hash: `/proc/<pid>/exe` on Linux; on macOS (no `/proc`) compare the
-frozen-copy name under `<state-dir>/run/a-<content-hash>` instead. Read
-`src/bin/ai/serve/AGENTS.md` before restarting from a turn.
+Read [the Serve guide](src/bin/ai/serve/AGENTS.md) for restart timing and
+verification before using this entry point.
 
 ## Global Engineering Rules
 
-1. **Module boundaries**: `pub(super)` / `pub(crate)`.
+1. **Module boundaries**: prefer `pub(super)` / `pub(crate)` for implementation
+   details; use `pub` for the crate's intentional public API.
 2. **English comments**: all line, block, and doc comments must be English; when
    modifying code, translate any Chinese comments you touch.
-3. **Collections**: `rustc-hash` FastMap/FastSet via re-exports
-   (`rust_tools::commonw::{FastMap, FastSet}`).
-4. **Config keys**: add only in `src/bin/ai/config_schema.rs`.
-5. **Tests**: keep close to changed module; serial tests use
-   `test_support::ENV_LOCK` (`src/bin/ai/mod.rs`).
-6. **Extensibility**: data-driven/registration-based over hardcoded `if`/`else`.
-7. **AGENTS.md maintenance**: update only superseded nearby rules, in place; never
+3. **Collections**: use `rustc-hash` FastMap/FastSet through the owning crate's
+   exports; `rust_tools::commonw::{FastMap, FastSet}` is the root-crate example,
+   not a dependency requirement for standalone crates.
+4. **Tests**: keep close to the changed module; binary-specific test facilities
+   belong in that binary's guide.
+5. **Extensibility**: data-driven/registration-based over hardcoded `if`/`else`.
+6. **AGENTS.md maintenance**: update only superseded nearby rules, in place; never
    append history. Keep injected instructions concise and delete stale rules.
    Reference code by symbol + file, never by line number (line refs rot on any
    edit); keep tuning numbers in code, only structure and invariants in docs.
-8. **Git safety**: never `stash`/`stash drop` others' uncommitted changes. Use temp branch/worktree or stash only your own.
-9. **Architecture-first**: many fallbacks = wrong data flow — refactor the happy path instead.
+7. **Git safety**: never `stash`/`stash drop` others' uncommitted changes. Use temp branch/worktree or stash only your own.
+8. **Architecture-first**: many fallbacks = wrong data flow — refactor the happy path instead.
 
-## High-Value Pitfalls
+## Runtime-session inspection
 
-1. `src/bin/ai/builtin_agents/*.agent` and `src/bin/ai/builtin_skills/*.skill`
-   are compiled via `include_str!`; user `.skill` files load at runtime.
-2. `objc2*` dependencies are macOS-only.
-3. Runtime sessions live in the session store, reachable only through the
-   `session` tools; `history.sessions/` at the repo root is gitignored test
-   data, not the runtime store — never search it for sessions.
+Inspect runtime sessions only through the `session` tools; the full boundary is
+in [the AI guide](src/bin/ai/AGENTS.md#session-inspection--sessionid-debugging).

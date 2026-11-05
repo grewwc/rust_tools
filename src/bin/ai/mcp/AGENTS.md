@@ -2,8 +2,9 @@
 
 ## Scope
 
-Applies to `src/bin/ai/mcp/**` (flat module: `client.rs`, `connection.rs`,
-`config.rs`, `http.rs`, `io.rs`, `jsonrpc.rs`).
+Applies to `src/bin/ai/mcp/**`: live host connections, request correlation,
+discovery, and restart behavior. Local stdio servers' result/error/timeout
+contract lives in `crates/mcp_stdio/AGENTS.md`; this guide owns the host side.
 
 ## Key invariants
 
@@ -21,7 +22,10 @@ Applies to `src/bin/ai/mcp/**` (flat module: `client.rs`, `connection.rs`,
    missing or `null` ids; some servers emit spurious initialized acknowledgments
    that otherwise consume the next request's response slot.
 5. **Timeouts are behavior.** Request timeouts and restart logic can interrupt
-   long-running flows; treat changes as user-visible.
+   long-running flows; treat changes as user-visible. `McpClient`'s
+   `is_transport_error`, `is_protocol_desync_error`, and `is_user_interrupt_error`
+   (`client.rs`) own restart classification; the shared stdio guide references
+   these classifiers instead of copying their phrase set.
 6. **Lazy MCP schemas.** Per-turn tool schemas include MCP tools only when a
    skill/agent declares an explicit `mcp_servers` allowlist. Otherwise expose the
    hidden MCP catalog and load tools on demand through `enable_tools`.
