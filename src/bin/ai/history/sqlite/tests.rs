@@ -1562,7 +1562,7 @@ fn rewind_keeps_promoted_projection_for_a_deeper_rewind() {
 }
 
 #[test]
-fn rollback_clears_context_snapshot_history() {
+fn rollback_retains_context_projection_and_clears_rewind_ring() {
     const PROJECTION: &str = "rollback-previous";
     let dir = std::env::temp_dir().join(format!(
         "rollback_previous_snapshot_test_{}_{}",
@@ -1596,10 +1596,11 @@ fn rollback_clears_context_snapshot_history() {
     )
     .unwrap();
     let second_source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    let retained_projection = vec![msg(ROLE_INTERNAL_NOTE, "[summary] second turn")];
     assert!(
         write_context_snapshot_sqlite(
             &path,
-            &[msg(ROLE_INTERNAL_NOTE, "[summary] second turn")],
+            &retained_projection,
             second_source.source_message_id,
             second_source.canonical_generation,
             PROJECTION,
@@ -1607,8 +1608,8 @@ fn rollback_clears_context_snapshot_history() {
         .unwrap()
     );
 
-    // A checkpoint restore rewrites canonical history; every derived snapshot
-    // must go, including the archived rewind ring.
+    // A checkpoint restore retains its projection with a rebased generation,
+    // while clearing the archived rewind ring.
     let conn = open_history_db(&path).unwrap();
     let generation_before = super::revision::history_generation(&conn).unwrap();
     let archived: i64 = conn
@@ -1630,29 +1631,50 @@ fn rollback_clears_context_snapshot_history() {
     )
     .unwrap();
     let conn = open_history_db(&path).unwrap();
-    assert!(super::revision::history_generation(&conn).unwrap() > generation_before);
-    for table in [
-        "context_snapshot",
-        "context_messages",
-        "context_snapshot_history",
-    ] {
-        let count: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(count, 0, "{table} should be cleared by the rollback rebase");
-    }
+    let generation_after = super::revision::history_generation(&conn).unwrap();
+    assert_eq!(generation_after, generation_before + 1);
+    let row_counts: (i64, i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM context_snapshot),
+                    (SELECT COUNT(*) FROM context_messages),
+                    (SELECT COUNT(*) FROM context_snapshot_history)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row_counts, (1, retained_projection.len() as i64, 0));
+    let snapshot: (i64, i64, String) = conn
+        .query_row(
+            "SELECT source_message_id, source_generation, projection_fingerprint
+             FROM context_snapshot WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        snapshot,
+        (
+            second_source.source_message_id,
+            generation_after,
+            PROJECTION.to_string(),
+        )
+    );
     drop(conn);
-    // With no derived snapshot left, the next read rebuilds from canonical
-    // history instead of serving the pre-rollback projection.
-    let rebuilt = read_context_history_sqlite(&path, PROJECTION).unwrap();
-    assert_eq!(rebuilt.messages.len(), 4);
-    assert!(
-        rebuilt
-            .messages
-            .iter()
-            .all(|message| message.role != ROLE_INTERNAL_NOTE)
+    // The retained projection is current, so the next read needs no canonical
+    // rebuild and serves the checkpoint's summary directly.
+    let retained = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert!(retained.snapshot_is_current);
+    assert_eq!(retained.source_message_id, second_source.source_message_id);
+    assert_eq!(retained.canonical_generation, generation_after);
+    assert_eq!(retained.messages, retained_projection);
+    assert_eq!(
+        read_all_messages_sqlite(&path).unwrap(),
+        vec![
+            msg("user", "first"),
+            msg("assistant", "first answer"),
+            msg("user", "second"),
+            msg("assistant", "second answer"),
+        ]
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

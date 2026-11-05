@@ -26,6 +26,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex, RwLock},
+    time::{Instant, SystemTime},
 };
 
 use base64::Engine as _;
@@ -101,6 +102,87 @@ static CHECKPOINT_SESSION_LOCKS: LazyLock<Mutex<FastMap<PathBuf, Arc<Mutex<()>>>
 static CHECKPOINT_ROOT_LOCKS: LazyLock<Mutex<FastMap<PathBuf, Arc<RwLock<()>>>>> =
     LazyLock::new(|| Mutex::new(FastMap::default()));
 
+const CHECKPOINT_DIRECTORY_CACHE_LIMIT: usize = 32;
+const CHECKPOINT_DIRECTORY_ENTRY_CACHE_LIMIT: usize = MAX_CHECKPOINTS_PER_SESSION * 4;
+const CHECKPOINT_MANIFEST_CACHE_LIMIT: usize =
+    CHECKPOINT_DIRECTORY_CACHE_LIMIT * MAX_CHECKPOINTS_PER_SESSION;
+const CHECKPOINT_MANIFEST_CACHE_MAX_BYTES: u64 = 64 * 1024;
+
+/// Namespace snapshots survive store reconstruction before each prompt. File
+/// identities are checked on every refresh; only directory scans and manifest
+/// contents are cached, so edits inside an existing generation remain visible.
+static CHECKPOINT_READ_CACHE: LazyLock<Mutex<CheckpointReadCache>> =
+    LazyLock::new(|| Mutex::new(CheckpointReadCache::default()));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheckpointMetadataIdentity {
+    modified: SystemTime,
+    len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    ctime: (i64, i64),
+}
+
+impl CheckpointMetadataIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Some(Self {
+            modified: metadata.modified().ok()?,
+            len: metadata.len(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CheckpointDirectoryEntry {
+    name: String,
+    file_type: fs::FileType,
+}
+
+type CheckpointDirectoryEntries = Arc<Vec<CheckpointDirectoryEntry>>;
+
+struct CachedCheckpointDirectory {
+    identity: CheckpointMetadataIdentity,
+    entries: CheckpointDirectoryEntries,
+    last_used: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GenerationManifestIdentity {
+    directory: CheckpointMetadataIdentity,
+    manifest: CheckpointMetadataIdentity,
+}
+
+struct CachedGenerationManifest {
+    identity: GenerationManifestIdentity,
+    manifest: Option<GenerationManifest>,
+    last_used: Instant,
+}
+
+#[derive(Default)]
+struct CheckpointReadCache {
+    directories: FastMap<PathBuf, CachedCheckpointDirectory>,
+    manifests: FastMap<PathBuf, CachedGenerationManifest>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CHECKPOINT_CACHE_IO: std::cell::Cell<(usize, usize)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::ai) struct CheckpointInfo {
     pub(in crate::ai) name: String,
@@ -174,6 +256,9 @@ pub(in crate::ai) struct CheckpointStore {
     session_assets: PathBuf,
     /// The checkpoint directory of this session.
     dir: PathBuf,
+    /// Recovery and listing share one namespace snapshot while the session
+    /// lock is held. Unlocked stores always leave this unset.
+    directory_entries: Option<CheckpointDirectoryEntries>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +297,7 @@ impl CheckpointStore {
             session_file,
             session_assets,
             dir,
+            directory_entries: None,
         }
     }
 
@@ -226,9 +312,7 @@ impl CheckpointStore {
     /// Whether a saved generation omitted disposable `assets/tmp` scratch to
     /// stay within the storage quota.
     pub(in crate::ai) fn checkpoint_omitted_scratch(&self, generation: &Path) -> bool {
-        generation
-            .join(GENERATION_SCRATCH_OMITTED_MARKER)
-            .is_file()
+        generation.join(GENERATION_SCRATCH_OMITTED_MARKER).is_file()
     }
 
     fn generation_dir(&self, name: &str) -> PathBuf {
@@ -430,6 +514,23 @@ impl CheckpointStore {
         self.with_locked(|store| store.list_unlocked())
     }
 
+    /// Best-effort completion refresh under one lock and one namespace scan,
+    /// including refreshes that recover an interrupted checkpoint mutation.
+    pub(in crate::ai) fn completion_names(&self) -> (Vec<String>, Vec<String>) {
+        self.with_locked(|store| {
+            let names = store
+                .list_unlocked()
+                .map(|checkpoints| checkpoints.into_iter().map(|cp| cp.name).collect())
+                .unwrap_or_default();
+            let branches = store
+                .list_branches_unlocked()
+                .map(|branches| branches.into_iter().map(|branch| branch.name).collect())
+                .unwrap_or_default();
+            Ok((names, branches))
+        })
+        .unwrap_or_default()
+    }
+
     /// Roll the checkpoint named `name` back into the current session
     /// (overwrites the live history).
     pub(in crate::ai) fn rollback(&self, name: &str) -> io::Result<()> {
@@ -509,10 +610,8 @@ impl CheckpointStore {
             }
             Ok(
                 Self::read_optional_ref_unlocked(&store.dir.join(BASE_REF_FILE))?.is_some()
-                    || Self::read_optional_ref_unlocked(
-                        &store.dir.join(PREV_HEAD_REF_FILE),
-                    )?
-                    .is_some(),
+                    || Self::read_optional_ref_unlocked(&store.dir.join(PREV_HEAD_REF_FILE))?
+                        .is_some(),
             )
         })
     }
@@ -662,6 +761,7 @@ impl CheckpointStore {
                 ));
             }
             let generation = store.generation_dir(&normalized_name);
+            invalidate_checkpoint_read_cache(&store.dir, Some(&normalized_name));
             let mut deleted = false;
             match fs::remove_dir_all(generation) {
                 Ok(()) => deleted = true,
@@ -692,6 +792,7 @@ impl CheckpointStore {
     pub(in crate::ai) fn clear(&self) -> io::Result<usize> {
         self.with_locked(|store| {
             let count = store.list_unlocked()?.len();
+            invalidate_checkpoint_read_cache(&store.dir, None);
             for entry in fs::read_dir(&store.dir)? {
                 let path = entry?.path();
                 if path.file_name().and_then(|name| name.to_str()) == Some(BASE_REF_FILE) {
@@ -916,8 +1017,7 @@ impl CheckpointStore {
     /// A previous attached branch is left alone: the caller reports the
     /// dangling branch by name instead.
     fn clear_previous_if_points_to_unlocked(&self, normalized_name: &str) -> io::Result<()> {
-        let previous_points_here =
-            matches!(self.previous_head_state_unlocked()?, Some(CheckpointHead::Detached(Some(target))) if target == normalized_name);
+        let previous_points_here = matches!(self.previous_head_state_unlocked()?, Some(CheckpointHead::Detached(Some(target))) if target == normalized_name);
         if previous_points_here {
             match fs::remove_file(self.dir.join(PREV_HEAD_REF_FILE)) {
                 Ok(()) => {}
@@ -1138,6 +1238,7 @@ impl CheckpointStore {
                 format!("checkpoint '{normalized_name}' not found"),
             ));
         };
+        invalidate_checkpoint_read_cache(&self.dir, Some(normalized_name));
         match source {
             CheckpointSource::Legacy { sqlite } => {
                 if let Some(parent) = self.session_file.parent() {
@@ -1172,10 +1273,15 @@ impl CheckpointStore {
 
     fn with_locked<T>(&self, operation: impl FnOnce(&Self) -> io::Result<T>) -> io::Result<T> {
         with_checkpoint_lock(&self.dir, || {
-            self.recover_live_rollbacks_unlocked()?;
-            self.recover_incomplete_generations_unlocked()?;
-            self.initialize_default_branch_unlocked()?;
-            operation(self)
+            let mut entries = checkpoint_directory_entries(&self.dir)?;
+            self.recover_live_rollbacks_unlocked(&mut entries)?;
+            self.recover_incomplete_generations_unlocked(&mut entries)?;
+            let store = Self {
+                directory_entries: Some(entries),
+                ..self.clone()
+            };
+            store.initialize_default_branch_unlocked()?;
+            operation(&store)
         })
     }
 
@@ -1198,17 +1304,40 @@ impl CheckpointStore {
     /// checkpoint. An unborn history is clean only while it remains empty.
     pub(in crate::ai) fn live_matches_base(&self, live: &[Message]) -> io::Result<bool> {
         self.with_locked(|store| {
-            if matches!(
-                store.head_state_unlocked()?,
-                CheckpointHead::Attached { target: None, .. }
-            ) {
-                return Ok(live.is_empty());
-            }
-            let Some(base) = store.base_target_unlocked()? else {
-                return Ok(live.is_empty());
-            };
-            store.live_matches_checkpoint_unlocked(live, &base)
+            store
+                .live_matches_base_unlocked(live, None)
+                .map(|(matches, _)| matches)
         })
+    }
+
+    /// Retain the diff from a full BASE comparison when BASE is also the switch target.
+    /// Count mismatches still avoid reading the checkpoint messages; callers compute
+    /// the target diff separately when no full comparison was needed.
+    pub(in crate::ai) fn live_matches_base_with_target_diff(
+        &self,
+        live: &[Message],
+        target: &str,
+    ) -> io::Result<(bool, Option<(usize, usize)>)> {
+        self.with_locked(|store| store.live_matches_base_unlocked(live, Some(target)))
+    }
+
+    fn live_matches_base_unlocked(
+        &self,
+        live: &[Message],
+        diff_target: Option<&str>,
+    ) -> io::Result<(bool, Option<(usize, usize)>)> {
+        if matches!(
+            self.head_state_unlocked()?,
+            CheckpointHead::Attached { target: None, .. }
+        ) {
+            return Ok((live.is_empty(), None));
+        }
+        let Some(base) = self.base_target_unlocked()? else {
+            return Ok((live.is_empty(), None));
+        };
+        let (matches, diff) = self.live_matches_checkpoint_and_diff_unlocked(live, &base)?;
+        let diff = diff.filter(|_| diff_target.is_some_and(|target| sanitize_name(target) == base));
+        Ok((matches, diff))
     }
 
     /// Summary of what switching to `name` would replace.
@@ -1240,29 +1369,32 @@ impl CheckpointStore {
             }
         };
         let target = read_all_messages_sqlite_read_only(sqlite)?;
-        let common = live
-            .iter()
-            .zip(target.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
-        Ok(Some((target.len(), common)))
+        Ok(Some(Self::canonical_message_diff(live, &target)))
     }
 
     fn live_matches_checkpoint_unlocked(&self, live: &[Message], name: &str) -> io::Result<bool> {
+        self.live_matches_checkpoint_and_diff_unlocked(live, name)
+            .map(|(matches, _)| matches)
+    }
+
+    fn live_matches_checkpoint_and_diff_unlocked(
+        &self,
+        live: &[Message],
+        name: &str,
+    ) -> io::Result<(bool, Option<(usize, usize)>)> {
         let normalized = sanitize_name(name);
         // Manifest count first: avoids opening the snapshot SQLite entirely
         // when a new turn already proves dirty. Falls back below for
         // pre-caching manifests and legacy layouts.
         if generation_is_ready(&self.generation_dir(&normalized))
-            && let Some(cached) =
-                read_generation_manifest(&self.generation_dir(&normalized))
-                    .and_then(|manifest| manifest.message_count)
+            && let Some(cached) = read_generation_manifest(&self.generation_dir(&normalized))
+                .and_then(|manifest| manifest.message_count)
             && cached != live.len()
         {
-            return Ok(false);
+            return Ok((false, None));
         }
         let Some(source) = self.checkpoint_source_unlocked(&normalized)? else {
-            return Ok(false);
+            return Ok((false, None));
         };
         let sqlite = match &source {
             CheckpointSource::Generation { sqlite, .. } | CheckpointSource::Legacy { sqlite } => {
@@ -1275,30 +1407,54 @@ impl CheckpointStore {
         if let Ok(count) = message_count_sqlite_read_only(sqlite)
             && count != live.len()
         {
-            return Ok(false);
+            return Ok((false, None));
         }
-        Ok(read_all_messages_sqlite_read_only(sqlite)?.as_slice() == live)
+        let target = read_all_messages_sqlite_read_only(sqlite)?;
+        let (target_len, common) = Self::canonical_message_diff(live, &target);
+        // Equal lengths and a prefix covering both histories preserve full decoded
+        // Message equality, including tool calls and runtime reasoning metadata.
+        Ok((
+            common == target_len && common == live.len(),
+            Some((target_len, common)),
+        ))
+    }
+
+    fn canonical_message_diff(live: &[Message], target: &[Message]) -> (usize, usize) {
+        let common = live
+            .iter()
+            .zip(target.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        (target.len(), common)
     }
 
     fn list_unlocked(&self) -> io::Result<Vec<CheckpointInfo>> {
-        let entries = match fs::read_dir(&self.dir) {
-            Ok(v) => v,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(err),
+        let entries = match &self.directory_entries {
+            Some(entries) => Arc::clone(entries),
+            None => checkpoint_directory_entries(&self.dir)?,
         };
         let mut out: Vec<(CheckpointInfo, Option<Option<String>>)> = Vec::new();
         let mut legacy_entries = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            let metadata = match entry.metadata() {
+        for entry in entries.iter() {
+            // Recovery namespaces never reach metadata reads or completion.
+            if entry.name.starts_with('.') {
+                continue;
+            }
+            let path = self.dir.join(&entry.name);
+            let metadata = match fs::symlink_metadata(&path) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if metadata.is_dir() && generation_is_ready(&path) {
-                let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-                    continue;
+            if metadata.is_dir() {
+                let manifest_metadata = match fs::metadata(path.join(GENERATION_MANIFEST_FILE)) {
+                    Ok(metadata) if metadata.is_file() => metadata,
+                    _ => continue,
                 };
+                if !path.join(GENERATION_SQLITE_FILE).is_file()
+                    || !path.join(GENERATION_ASSETS_DIR).is_dir()
+                {
+                    continue;
+                }
                 // `None` here means pre-tracking (v1); the save-order fallback
                 // below fills it in after sorting. `SAVED` shows when the
                 // snapshot was taken, not the directory mtime: reads used to
@@ -1308,9 +1464,10 @@ impl CheckpointStore {
                 // tag. Manifests without a timestamp fall back to the manifest
                 // file mtime (creating sidecars never rewrites that file),
                 // then to the directory mtime.
-                let known = read_generation_manifest(&path);
-                let manifest_mtime = fs::metadata(path.join(GENERATION_MANIFEST_FILE))
-                    .and_then(|m| m.modified())
+                let known =
+                    read_generation_manifest_with_metadata(&path, &metadata, &manifest_metadata);
+                let manifest_mtime = manifest_metadata
+                    .modified()
                     .ok()
                     .map(DateTime::<Local>::from);
                 let mtime = metadata.modified().ok().map(DateTime::<Local>::from);
@@ -1327,7 +1484,7 @@ impl CheckpointStore {
                 let message = known.as_ref().and_then(|manifest| manifest.message.clone());
                 out.push((
                     CheckpointInfo {
-                        name: name.to_string(),
+                        name: entry.name.clone(),
                         message,
                         modified_local: manifest_saved_time(known.as_ref())
                             .or(manifest_mtime)
@@ -1338,7 +1495,9 @@ impl CheckpointStore {
                     },
                     known.map(|manifest| manifest.parent),
                 ));
-            } else if path.extension().and_then(|s| s.to_str()) == Some("sqlite") {
+            } else if metadata.is_file()
+                && path.extension().and_then(|s| s.to_str()) == Some("sqlite")
+            {
                 legacy_entries.push((path, metadata));
             }
         }
@@ -1479,6 +1638,7 @@ impl CheckpointStore {
     }
 
     fn publish_generation(&self, name: &str, staged: &Path) -> io::Result<()> {
+        invalidate_checkpoint_read_cache(&self.dir, Some(name));
         let destination = self.generation_dir(name);
         let previous = self.dir.join(format!(
             ".{name}{GENERATION_PREVIOUS_MARKER}{}",
@@ -1570,11 +1730,7 @@ impl CheckpointStore {
         result.map(|()| transaction)
     }
 
-    fn stage_live_rollback(
-        &self,
-        sqlite: &Path,
-        source_name: Option<&str>,
-    ) -> io::Result<PathBuf> {
+    fn stage_live_rollback(&self, sqlite: &Path, source_name: Option<&str>) -> io::Result<PathBuf> {
         // Only the SQLite snapshot is staged: generation assets are immutable,
         // so `complete_live_rollback` restores them from the source generation
         // (recorded in the manifest) instead of paying a second full-tree copy
@@ -1611,6 +1767,7 @@ impl CheckpointStore {
                 transaction.display()
             )));
         }
+        invalidate_checkpoint_read_cache(&self.dir, None);
         if live_rollback_transaction_is_published(&self.session_file, &transaction_id)? {
             // Assets are restored before the marker-bearing SQLite DB is
             // published, so a matching marker means only cleanup remains.
@@ -1650,30 +1807,23 @@ impl CheckpointStore {
             }
             None => {}
         }
-        restore_staged_sqlite_after_rollback(
-            &sqlite,
-            &self.session_file,
-            &transaction_id,
-        )?;
+        restore_staged_sqlite_after_rollback(&sqlite, &self.session_file, &transaction_id)?;
         cleanup_live_rollback_transaction(transaction);
         Ok(())
     }
 
-    fn recover_live_rollbacks_unlocked(&self) -> io::Result<()> {
-        let entries = match fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            if !entry.file_type()?.is_dir() || !name.starts_with(LIVE_ROLLBACK_PREFIX) {
-                continue;
-            }
+    fn recover_live_rollbacks_unlocked(
+        &self,
+        entries: &mut CheckpointDirectoryEntries,
+    ) -> io::Result<()> {
+        let transactions: Vec<_> = entries
+            .iter()
+            .filter(|entry| {
+                entry.file_type.is_dir() && entry.name.starts_with(LIVE_ROLLBACK_PREFIX)
+            })
+            .map(|entry| self.dir.join(&entry.name))
+            .collect();
+        for path in transactions {
             if live_rollback_is_ready(&path) {
                 self.complete_live_rollback(&path)?;
             } else {
@@ -1681,81 +1831,216 @@ impl CheckpointStore {
                 // replacement until the staged source is complete. A malformed
                 // directory therefore has no rollback to resume and must not
                 // block every later checkpoint operation.
-                fs::remove_dir_all(path)?;
+                fs::remove_dir_all(&path)?;
+            }
+            // A failed best-effort cleanup must remain discoverable next time.
+            if !path.exists() {
+                update_checkpoint_directory_entry(entries, &path, None);
             }
         }
         Ok(())
     }
 
-    fn recover_incomplete_generations_unlocked(&self) -> io::Result<()> {
-        let entries = match fs::read_dir(&self.dir) {
-            Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-        };
+    fn recover_incomplete_generations_unlocked(
+        &self,
+        entries: &mut CheckpointDirectoryEntries,
+    ) -> io::Result<()> {
         let mut staged = Vec::new();
         let mut previous = Vec::new();
-        for entry in &entries {
-            if !entry.file_type()?.is_dir() {
+        for entry in entries.iter() {
+            if !entry.file_type.is_dir() {
                 continue;
             }
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
+            let name = entry.name.as_str();
             if let Some(base) = staged_generation_base(name, GENERATION_STAGE_MARKER) {
-                staged.push((base.to_string(), entry.path()));
+                staged.push((base.to_string(), self.dir.join(name)));
             } else if let Some(base) = staged_generation_base(name, GENERATION_PREVIOUS_MARKER) {
-                previous.push((base.to_string(), entry.path()));
+                previous.push((base.to_string(), self.dir.join(name)));
             }
         }
 
         for (name, stage) in staged {
             if !generation_is_ready(&stage) || !generation_is_publish_ready(&stage) {
-                fs::remove_dir_all(stage)?;
+                fs::remove_dir_all(&stage)?;
+                update_checkpoint_directory_entry(entries, &stage, None);
                 continue;
             }
             let destination = self.generation_dir(&name);
             if destination.exists() {
-                fs::remove_dir_all(stage)?;
+                fs::remove_dir_all(&stage)?;
+                update_checkpoint_directory_entry(entries, &stage, None);
                 continue;
             }
             fs::rename(&stage, &destination)?;
+            update_checkpoint_directory_entry(entries, &stage, Some(&destination));
             let _ = fs::remove_dir(destination.join(GENERATION_PUBLISH_READY_MARKER));
             if let Some(index) = previous
                 .iter()
                 .position(|(previous_name, _)| previous_name == &name)
             {
                 let (_, old) = previous.swap_remove(index);
-                let _ = fs::remove_dir_all(old);
+                if fs::remove_dir_all(&old).is_ok() {
+                    update_checkpoint_directory_entry(entries, &old, None);
+                }
             }
         }
 
         for (name, old) in previous {
             let destination = self.generation_dir(&name);
             if destination.exists() {
-                fs::remove_dir_all(old)?;
+                fs::remove_dir_all(&old)?;
+                update_checkpoint_directory_entry(entries, &old, None);
             } else {
-                fs::rename(old, destination)?;
+                fs::rename(&old, &destination)?;
+                update_checkpoint_directory_entry(entries, &old, Some(&destination));
             }
         }
 
         // Once a generation is published, leftover legacy `.sqlite` / `.assets`
         // are no longer recoverable state and must be reclaimed so they cannot
         // bypass quota accounting.
-        for entry in entries {
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("sqlite") {
-                continue;
-            }
+        let legacy: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.file_type.is_file() && entry.name.ends_with(".sqlite"))
+            .map(|entry| self.dir.join(&entry.name))
+            .collect();
+        for path in legacy {
             let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
                 continue;
             };
             if generation_is_ready(&self.generation_dir(name)) {
                 self.remove_legacy_checkpoint(name)?;
+                update_checkpoint_directory_entry(entries, &path, None);
             }
         }
         Ok(())
+    }
+}
+
+fn checkpoint_directory_entries(dir: &Path) -> io::Result<CheckpointDirectoryEntries> {
+    let canonical = match fs::canonicalize(dir) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(Arc::new(Vec::new()));
+        }
+        Err(error) => return Err(error),
+    };
+    let identity = CheckpointMetadataIdentity::from_metadata(&fs::metadata(&canonical)?);
+    if let Some(identity) = identity {
+        let mut cache = CHECKPOINT_READ_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = cache.directories.get_mut(&canonical)
+            && cached.identity == identity
+        {
+            cached.last_used = Instant::now();
+            return Ok(Arc::clone(&cached.entries));
+        }
+    }
+
+    let directory = fs::read_dir(&canonical)?;
+    #[cfg(test)]
+    CHECKPOINT_CACHE_IO.with(|counts| {
+        let (scans, reads) = counts.get();
+        counts.set((scans + 1, reads));
+    });
+    let mut entries = Vec::new();
+    for entry in directory {
+        let entry = entry?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let generation = name != BRANCHES_DIR
+            && !is_reserved_checkpoint_name(&name)
+            && !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+        let recovery = name.starts_with(LIVE_ROLLBACK_PREFIX)
+            || staged_generation_base(&name, GENERATION_STAGE_MARKER).is_some()
+            || staged_generation_base(&name, GENERATION_PREVIOUS_MARKER).is_some();
+        let legacy = !name.starts_with('.') && name.ends_with(".sqlite");
+        // Filter the namespace before probing types or opening metadata. The
+        // legacy flat SQLite layout is the intentional non-directory exception.
+        if !generation && !recovery && !legacy {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if (file_type.is_dir() && (generation || recovery)) || (file_type.is_file() && legacy) {
+            entries.push(CheckpointDirectoryEntry { name, file_type });
+        }
+    }
+    let entries = Arc::new(entries);
+    // A scan racing an external writer must not bless a partial namespace with
+    // the writer's newer stamp. Oversized namespaces remain uncached, without
+    // truncating listings or changing the existing completion candidate cap.
+    if let Some(identity) = identity
+        && Some(identity)
+            == fs::metadata(&canonical)
+                .ok()
+                .as_ref()
+                .and_then(CheckpointMetadataIdentity::from_metadata)
+        && entries.len() <= CHECKPOINT_DIRECTORY_ENTRY_CACHE_LIMIT
+    {
+        let mut cache = CHECKPOINT_READ_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.directories.len() >= CHECKPOINT_DIRECTORY_CACHE_LIMIT
+            && !cache.directories.contains_key(&canonical)
+            && let Some(evicted) = cache
+                .directories
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(path, _)| path.clone())
+        {
+            cache.directories.remove(&evicted);
+        }
+        cache.directories.insert(
+            canonical,
+            CachedCheckpointDirectory {
+                identity,
+                entries: Arc::clone(&entries),
+                last_used: Instant::now(),
+            },
+        );
+    }
+    Ok(entries)
+}
+
+fn update_checkpoint_directory_entry(
+    entries: &mut CheckpointDirectoryEntries,
+    source: &Path,
+    destination: Option<&Path>,
+) {
+    let source = source.file_name().and_then(|name| name.to_str());
+    let entries = Arc::make_mut(entries);
+    if let Some(destination) = destination.and_then(|path| path.file_name()) {
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| Some(entry.name.as_str()) == source)
+        {
+            entry.name = destination.to_string_lossy().into_owned();
+        }
+    } else {
+        entries.retain(|entry| Some(entry.name.as_str()) != source);
+    }
+}
+
+fn invalidate_checkpoint_read_cache(dir: &Path, generation: Option<&str>) {
+    let Ok(canonical) = fs::canonicalize(dir) else {
+        return;
+    };
+    let mut cache = CHECKPOINT_READ_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.directories.remove(&canonical);
+    match generation {
+        Some(name) => {
+            cache.manifests.remove(&canonical.join(name));
+        }
+        None => cache
+            .manifests
+            .retain(|path, _| !path.starts_with(&canonical)),
     }
 }
 
@@ -2300,8 +2585,7 @@ fn write_asset_index(path: &Path, index: &AssetIndex) -> io::Result<u64> {
 
 #[cfg(not(target_os = "macos"))]
 fn asset_index_entry_bytes(relative: &Path) -> u64 {
-    (path_bytes(relative).len() as u64)
-        .saturating_add(ASSET_INDEX_ENTRY_FIXED_BYTES)
+    (path_bytes(relative).len() as u64).saturating_add(ASSET_INDEX_ENTRY_FIXED_BYTES)
 }
 
 fn read_asset_index(path: &Path) -> Option<AssetIndex> {
@@ -2510,21 +2794,20 @@ fn copy_directory_incremental(
         let len = metadata.len();
         copy.logical = copy.logical.saturating_add(len);
         let fingerprint = file_type.is_file().then(|| asset_fingerprint(&metadata));
-        let mut linked = false;
-        if let (Some(fingerprint), Some(parent)) = (fingerprint, parent)
+        let copied = if let (Some(fingerprint), Some(parent)) = (fingerprint, parent)
             && parent.index.entries.get(&relative_path) == Some(&fingerprint)
         {
             // Link from the immutable parent generation, never from the live
             // tree: a later in-place write to a live file must not change an
             // older checkpoint's content. Timestamps can collide for a
-            // same-length rewrite, so compare the bytes before reusing.
+            // same-length rewrite, so compare the live bytes before reusing.
             let parent_path = parent.assets.join(&relative_path);
-            if files_equal(&path, &parent_path).unwrap_or(false) {
-                linked = fs::hard_link(&parent_path, &destination_path).is_ok();
-            }
-        }
-        if !linked {
+            !copy_snapshot_file_from_parent(&path, &destination_path, &parent_path)?
+        } else {
             super::sessions::copy_file_fast(&path, &destination_path)?;
+            true
+        };
+        if copied {
             copy.copied = copy.copied.saturating_add(len);
         }
         if let Some(fingerprint) = fingerprint {
@@ -2532,6 +2815,23 @@ fn copy_directory_incremental(
         }
     }
     Ok(())
+}
+
+/// Compare the live bytes with the immutable parent before copying. Equal
+/// files reuse the parent through a hard link; a mismatch, comparison error,
+/// or failed hard link falls back to copying the live file. Only the immutable
+/// parent generation is eligible to supply a hard link.
+#[cfg(not(target_os = "macos"))]
+fn copy_snapshot_file_from_parent(
+    source: &Path,
+    destination: &Path,
+    parent: &Path,
+) -> io::Result<bool> {
+    if files_equal(source, parent).unwrap_or(false) && fs::hard_link(parent, destination).is_ok() {
+        return Ok(true);
+    }
+    super::sessions::copy_file_fast(source, destination)?;
+    Ok(false)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2698,8 +2998,9 @@ fn restore_checkpoint_assets(
 /// fingerprint is a cheap prefilter. The bytes are compared before a live file
 /// is left alone because a same-length rewrite can share every timestamp tick
 /// with the save. Files without an index entry (legacy generations, symlinks,
-/// scratch paths) are replaced as before. On APFS each replacement is another
-/// COW clone rather than a full byte copy.
+/// scratch paths) are replaced as before. On non-macOS, compare the checkpoint
+/// with the live file before staging a replacement. On APFS each replacement
+/// is another COW clone rather than a full byte copy.
 fn copy_dir_skip_identical(
     source: &Path,
     destination: &Path,
@@ -2716,18 +3017,14 @@ fn copy_dir_skip_identical(
             fs::create_dir_all(&to)?;
             copy_dir_skip_identical(&from, &to, &relative_path, index)?;
         } else {
-            let unchanged = index
+            let may_match = index
                 .and_then(|index| index.entries.get(&relative_path))
                 .is_some_and(|expected| {
                     fs::symlink_metadata(&to).is_ok_and(|metadata| {
-                        metadata.file_type().is_file()
-                            && asset_fingerprint(&metadata) == *expected
-                            && files_equal(&from, &to).unwrap_or(false)
+                        metadata.file_type().is_file() && asset_fingerprint(&metadata) == *expected
                     })
                 });
-            if !unchanged {
-                replace_snapshot_file(&from, &to)?;
-            }
+            replace_snapshot_file(&from, &to, may_match)?;
         }
     }
     Ok(())
@@ -2770,7 +3067,10 @@ fn read_file_chunk(file: &mut fs::File, buffer: &mut [u8]) -> io::Result<usize> 
 }
 
 #[cfg(target_os = "macos")]
-fn replace_snapshot_file(source: &Path, destination: &Path) -> io::Result<()> {
+fn replace_snapshot_file(source: &Path, destination: &Path, may_match: bool) -> io::Result<()> {
+    if may_match && files_equal(source, destination).unwrap_or(false) {
+        return Ok(());
+    }
     let temporary = destination.with_extension(format!("restore-{}", uuid::Uuid::new_v4()));
     let source_c = CString::new(source.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "asset path contains NUL"))?;
@@ -2785,7 +3085,29 @@ fn replace_snapshot_file(source: &Path, destination: &Path) -> io::Result<()> {
         return Ok(());
     }
     let _ = fs::remove_file(&temporary);
-    replace_file_via_temporary(source, destination)
+    replace_file_via_temporary(source, destination, false)
+}
+
+/// Own the staged copy before copying starts so partial copies and failed
+/// renames both remove their temporary file.
+struct TemporaryAssetCopy {
+    path: PathBuf,
+}
+
+impl TemporaryAssetCopy {
+    fn new(source: &Path, destination: &Path, purpose: &str) -> io::Result<Self> {
+        let temporary = Self {
+            path: destination.with_extension(format!("{purpose}-{}", uuid::Uuid::new_v4())),
+        };
+        fs::copy(source, &temporary.path)?;
+        Ok(temporary)
+    }
+}
+
+impl Drop for TemporaryAssetCopy {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 /// Replace `destination` with `source` without truncating an existing
@@ -2793,23 +3115,25 @@ fn replace_snapshot_file(source: &Path, destination: &Path) -> io::Result<()> {
 /// fails with `EACCES` when both the snapshot and the live copy are read-only
 /// (npm cache entries use mode 0444). Copy to a sibling temporary file and
 /// rename it over the destination instead; rename only requires write
-/// permission on the containing directory.
-fn replace_file_via_temporary(source: &Path, destination: &Path) -> io::Result<()> {
-    let temporary = destination.with_extension(format!("restore-{}", uuid::Uuid::new_v4()));
-    if let Err(error) = fs::copy(source, &temporary) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
+/// permission on the containing directory. On a fingerprint match, compare
+/// the source with the live destination first; equal files retain the live
+/// inode without creating a temporary copy.
+fn replace_file_via_temporary(
+    source: &Path,
+    destination: &Path,
+    may_match: bool,
+) -> io::Result<()> {
+    if may_match && files_equal(source, destination).unwrap_or(false) {
+        return Ok(());
     }
-    if let Err(error) = fs::rename(&temporary, destination) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
+    let temporary = TemporaryAssetCopy::new(source, destination, "restore")?;
+    fs::rename(&temporary.path, destination)?;
     Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn replace_snapshot_file(source: &Path, destination: &Path) -> io::Result<()> {
-    replace_file_via_temporary(source, destination)
+fn replace_snapshot_file(source: &Path, destination: &Path, may_match: bool) -> io::Result<()> {
+    replace_file_via_temporary(source, destination, may_match)
 }
 
 /// Normalize a checkpoint name into a safe file name (alphanumeric, `-`, `_`;
@@ -2842,6 +3166,7 @@ fn sanitize_name(name: &str) -> String {
 /// size walk and the dirty check skip opening the snapshot SQLite on a count
 /// mismatch. `None` means a pre-caching manifest and falls back to the existing
 /// walk/query behavior.
+#[derive(Clone)]
 struct GenerationManifest {
     parent: Option<String>,
     message: Option<String>,
@@ -2855,7 +3180,84 @@ struct GenerationManifest {
 /// Returns `None` when the checkpoint predates parent tracking
 /// (`checkpoint-v1`), has no manifest, or the manifest is unparseable.
 fn read_generation_manifest(generation: &Path) -> Option<GenerationManifest> {
-    let content = fs::read_to_string(generation.join(GENERATION_MANIFEST_FILE)).ok()?;
+    let directory_metadata = fs::metadata(generation).ok()?;
+    let manifest_metadata = fs::metadata(generation.join(GENERATION_MANIFEST_FILE)).ok()?;
+    read_generation_manifest_with_metadata(generation, &directory_metadata, &manifest_metadata)
+}
+
+fn read_generation_manifest_with_metadata(
+    generation: &Path,
+    directory_metadata: &fs::Metadata,
+    manifest_metadata: &fs::Metadata,
+) -> Option<GenerationManifest> {
+    let canonical = fs::canonicalize(generation).ok();
+    let identity = CheckpointMetadataIdentity::from_metadata(directory_metadata)
+        .zip(CheckpointMetadataIdentity::from_metadata(manifest_metadata))
+        .map(|(directory, manifest)| GenerationManifestIdentity {
+            directory,
+            manifest,
+        });
+    if let (Some(canonical), Some(identity)) = (&canonical, identity) {
+        let mut cache = CHECKPOINT_READ_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = cache.manifests.get_mut(canonical)
+            && cached.identity == identity
+        {
+            cached.last_used = Instant::now();
+            return cached.manifest.clone();
+        }
+    }
+
+    let manifest_path = generation.join(GENERATION_MANIFEST_FILE);
+    let content = fs::read_to_string(&manifest_path).ok()?;
+    #[cfg(test)]
+    CHECKPOINT_CACHE_IO.with(|counts| {
+        let (scans, reads) = counts.get();
+        counts.set((scans, reads + 1));
+    });
+    let manifest = parse_generation_manifest(&content);
+    // Never cache a read that raced a rewrite. Invalid v1/garbage contents can
+    // be cached, but failed reads retry on the next refresh.
+    if let (Some(canonical), Some(identity)) = (canonical, identity)
+        && manifest_metadata.len() <= CHECKPOINT_MANIFEST_CACHE_MAX_BYTES
+        && fs::metadata(generation)
+            .ok()
+            .as_ref()
+            .and_then(CheckpointMetadataIdentity::from_metadata)
+            == Some(identity.directory)
+        && fs::metadata(&manifest_path)
+            .ok()
+            .as_ref()
+            .and_then(CheckpointMetadataIdentity::from_metadata)
+            == Some(identity.manifest)
+    {
+        let mut cache = CHECKPOINT_READ_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.manifests.len() >= CHECKPOINT_MANIFEST_CACHE_LIMIT
+            && !cache.manifests.contains_key(&canonical)
+            && let Some(evicted) = cache
+                .manifests
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(path, _)| path.clone())
+        {
+            cache.manifests.remove(&evicted);
+        }
+        cache.manifests.insert(
+            canonical,
+            CachedGenerationManifest {
+                identity,
+                manifest: manifest.clone(),
+                last_used: Instant::now(),
+            },
+        );
+    }
+    manifest
+}
+
+fn parse_generation_manifest(content: &str) -> Option<GenerationManifest> {
     let mut lines = content.lines();
     if lines.next()? != "checkpoint-v2" {
         return None;
@@ -3040,6 +3442,269 @@ mod tests {
         p.push(unique);
         p.push("history.sqlite");
         p
+    }
+
+    fn checkpoint_cache_io_counts() -> (usize, usize) {
+        CHECKPOINT_CACHE_IO.with(std::cell::Cell::get)
+    }
+
+    fn checkpoint_cache_io_since(before: (usize, usize)) -> (usize, usize) {
+        let after = checkpoint_cache_io_counts();
+        (after.0 - before.0, after.1 - before.1)
+    }
+
+    fn write_listing_generation(store: &CheckpointStore, name: &str) -> PathBuf {
+        let generation = store.dir.join(name);
+        fs::create_dir_all(generation.join(GENERATION_ASSETS_DIR)).unwrap();
+        fs::write(generation.join(GENERATION_SQLITE_FILE), b"listing fixture").unwrap();
+        fs::write(
+            generation.join(GENERATION_MANIFEST_FILE),
+            generation_manifest_body(None, 100, Some(64), Some(64), Some(0), Some("first")),
+        )
+        .unwrap();
+        generation
+    }
+
+    #[test]
+    fn checkpoint_metadata_cache_reuses_listing_and_manifest_across_stores() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "cache-hit");
+        store.recover().unwrap();
+        write_listing_generation(&store, "stable");
+
+        let before = checkpoint_cache_io_counts();
+        let listed = store.list().unwrap();
+        assert_eq!(listed[0].name, "stable");
+        assert_eq!(listed[0].message.as_deref(), Some("first"));
+        assert_eq!(checkpoint_cache_io_since(before), (1, 1));
+
+        let before = checkpoint_cache_io_counts();
+        let reconstructed = CheckpointStore::new(&history_file, "cache-hit");
+        assert_eq!(reconstructed.list().unwrap()[0].name, "stable");
+        assert_eq!(
+            reconstructed.completion_names(),
+            (vec!["stable".to_string()], vec!["main".to_string()])
+        );
+        assert_eq!(
+            read_generation_parent(&store.generation_dir("stable")),
+            Some(None)
+        );
+        let aliased = CheckpointStore::from_session_paths(
+            store.session_file.clone(),
+            store.session_assets.clone(),
+            store.dir.join("."),
+        );
+        assert_eq!(aliased.list().unwrap()[0].name, "stable");
+        assert_eq!(checkpoint_cache_io_since(before), (0, 0));
+        let _ = fs::remove_dir_all(history_file.parent().unwrap());
+    }
+
+    #[test]
+    fn checkpoint_metadata_cache_invalidates_mtime_size_and_directory_changes() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "cache-stamps");
+        store.recover().unwrap();
+        let generation = write_listing_generation(&store, "stable");
+        let manifest = generation.join(GENERATION_MANIFEST_FILE);
+        store.list().unwrap();
+        let modified = fs::metadata(&manifest).unwrap().modified().unwrap()
+            + std::time::Duration::from_secs(1);
+        let original_len = fs::metadata(&manifest).unwrap().len();
+        fs::write(
+            &manifest,
+            generation_manifest_body(None, 100, Some(64), Some(64), Some(0), Some("other")),
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&manifest)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(fs::metadata(&manifest).unwrap().len(), original_len);
+        let before = checkpoint_cache_io_counts();
+        assert_eq!(store.list().unwrap()[0].message.as_deref(), Some("other"));
+        assert_eq!(checkpoint_cache_io_since(before), (0, 1));
+        let before = checkpoint_cache_io_counts();
+        store.list().unwrap();
+        assert_eq!(checkpoint_cache_io_since(before), (0, 0));
+
+        fs::write(
+            &manifest,
+            generation_manifest_body(
+                None,
+                100,
+                Some(64),
+                Some(64),
+                Some(0),
+                Some("longer subject"),
+            ),
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&manifest)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let before = checkpoint_cache_io_counts();
+        assert_eq!(
+            store.list().unwrap()[0].message.as_deref(),
+            Some("longer subject")
+        );
+        assert_eq!(checkpoint_cache_io_since(before), (0, 1));
+
+        fs::write(generation.join("extra-file"), b"directory mutation").unwrap();
+        #[cfg(unix)]
+        fs::File::open(&generation)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let before = checkpoint_cache_io_counts();
+        store.list().unwrap();
+        assert_eq!(checkpoint_cache_io_since(before), (0, 1));
+        let _ = fs::remove_dir_all(history_file.parent().unwrap());
+    }
+
+    #[test]
+    fn checkpoint_metadata_cache_invalidates_save_restore_delete_and_clear() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "cache-lifecycle");
+        append_history_messages(&store.session_file, &[lineage_msg("first")]).unwrap();
+        store.save("first").unwrap();
+        store.list().unwrap();
+        append_history_messages(&store.session_file, &[lineage_msg("second")]).unwrap();
+        store.save("second").unwrap();
+        let before = checkpoint_cache_io_counts();
+        assert_eq!(store.list().unwrap().len(), 2);
+        assert_eq!(checkpoint_cache_io_since(before), (1, 1));
+
+        let second = store.generation_dir("second");
+        let second_identity =
+            CheckpointMetadataIdentity::from_metadata(&fs::metadata(&second).unwrap());
+        store.rollback("first").unwrap();
+        assert_eq!(
+            CheckpointMetadataIdentity::from_metadata(&fs::metadata(&second).unwrap()),
+            second_identity,
+            "restoring first must leave the second generation untouched"
+        );
+        let before = checkpoint_cache_io_counts();
+        assert_eq!(store.list().unwrap().len(), 2);
+        assert_eq!(checkpoint_cache_io_since(before), (1, 2));
+        let before = checkpoint_cache_io_counts();
+        store.completion_names();
+        assert_eq!(checkpoint_cache_io_since(before), (0, 0));
+
+        assert!(store.delete("first").unwrap());
+        let before = checkpoint_cache_io_counts();
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "second");
+        assert_eq!(listed[0].parent.as_deref(), Some("first"));
+        assert_eq!(checkpoint_cache_io_since(before), (1, 0));
+        assert_eq!(store.clear().unwrap(), 1);
+        assert!(store.list().unwrap().is_empty());
+        let _ = fs::remove_dir_all(history_file.parent().unwrap());
+    }
+
+    #[test]
+    fn checkpoint_metadata_cache_prunes_names_types_and_missing_metadata() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "cache-pruning");
+        store.recover().unwrap();
+        write_listing_generation(&store, "stable");
+        for name in [".outside", "outside.prefix", BRANCHES_DIR, "fake.sqlite"] {
+            write_listing_generation(&store, name);
+        }
+        let missing = write_listing_generation(&store, "missing-metadata");
+        fs::remove_file(missing.join(GENERATION_MANIFEST_FILE)).unwrap();
+        fs::write(store.dir.join("regular-file"), b"not a generation").unwrap();
+
+        let before = checkpoint_cache_io_counts();
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "stable");
+        assert_eq!(checkpoint_cache_io_since(before), (1, 1));
+        let _ = fs::remove_dir_all(history_file.parent().unwrap());
+    }
+
+    #[test]
+    fn checkpoint_metadata_cache_refreshes_new_metadata_and_external_deletion() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "cache-external");
+        store.recover().unwrap();
+        let stable = write_listing_generation(&store, "stable");
+        let pending = write_listing_generation(&store, "pending");
+        let pending_manifest = pending.join(GENERATION_MANIFEST_FILE);
+        fs::remove_file(&pending_manifest).unwrap();
+        assert_eq!(
+            store.current_status_label().unwrap(),
+            Some("main@-".to_string())
+        );
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        fs::write(
+            &pending_manifest,
+            generation_manifest_body(None, 200, Some(64), Some(64), Some(0), None),
+        )
+        .unwrap();
+        let before = checkpoint_cache_io_counts();
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].name, "pending");
+        assert_eq!(checkpoint_cache_io_since(before), (0, 1));
+
+        fs::remove_dir_all(stable).unwrap();
+        let before = checkpoint_cache_io_counts();
+        assert_eq!(store.list().unwrap()[0].name, "pending");
+        assert_eq!(checkpoint_cache_io_since(before), (1, 0));
+        fs::remove_file(pending_manifest).unwrap();
+        let before = checkpoint_cache_io_counts();
+        assert!(store.list().unwrap().is_empty());
+        assert_eq!(checkpoint_cache_io_since(before), (0, 0));
+        let _ = fs::remove_dir_all(history_file.parent().unwrap());
+    }
+
+    #[test]
+    fn checkpoint_metadata_cache_over_capacity_keeps_listing_complete() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "cache-capacity");
+        store.recover().unwrap();
+        for index in 0..=CHECKPOINT_DIRECTORY_ENTRY_CACHE_LIMIT {
+            write_listing_generation(&store, &format!("entry-{index:04}"));
+        }
+        let before = checkpoint_cache_io_counts();
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), CHECKPOINT_DIRECTORY_ENTRY_CACHE_LIMIT + 1);
+        assert_eq!(listed[0].name, "entry-0200");
+        assert_eq!(checkpoint_cache_io_since(before).0, 1);
+        assert!(
+            !CHECKPOINT_READ_CACHE
+                .lock()
+                .unwrap()
+                .directories
+                .contains_key(&fs::canonicalize(&store.dir).unwrap())
+        );
+        let before = checkpoint_cache_io_counts();
+        assert_eq!(store.list().unwrap().len(), listed.len());
+        assert_eq!(checkpoint_cache_io_since(before).0, 1);
+        let _ = fs::remove_dir_all(history_file.parent().unwrap());
+    }
+
+    #[test]
+    fn checkpoint_metadata_cache_completion_recovers_from_one_scan() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "cache-recovery");
+        store.recover().unwrap();
+        let staged = write_listing_generation(&store, ".stable.stage-interrupted");
+        store.mark_generation_publish_ready(&staged).unwrap();
+        let before = checkpoint_cache_io_counts();
+        let (names, branches) = store.completion_names();
+        assert_eq!(names, vec!["stable".to_string()]);
+        assert_eq!(branches, vec!["main".to_string()]);
+        assert!(!staged.exists());
+        assert_eq!(checkpoint_cache_io_since(before), (1, 1));
+        let _ = fs::remove_dir_all(history_file.parent().unwrap());
     }
 
     #[test]
@@ -3803,8 +4468,16 @@ mod tests {
         store.save("verified_tag").unwrap();
         store.switch_branch(DEFAULT_BRANCH_NAME).unwrap();
 
-        assert!(build_message_arr(10, &store.session_file).unwrap().is_empty());
-        assert!(!SessionStore::new(&history_file).is_empty_session(session_id).unwrap());
+        assert!(
+            build_message_arr(10, &store.session_file)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !SessionStore::new(&history_file)
+                .is_empty_session(session_id)
+                .unwrap()
+        );
 
         if let Some(grandparent) = history_file.parent() {
             let _ = fs::remove_dir_all(grandparent);
@@ -4151,6 +4824,177 @@ mod tests {
         if let Some(grandparent) = history_file.parent() {
             let _ = fs::remove_dir_all(grandparent);
         }
+    }
+
+    #[test]
+    fn checkpoint_live_match_equal_count_checks_every_message_field() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-equal-count");
+        let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role": "user", "content": "request"},
+            {
+                "role": "assistant",
+                "content": {"text": "answer", "version": 1},
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}
+                }],
+                "tool_call_id": "reply-1",
+                "reasoning_content": "original reasoning"
+            },
+            {"role": "tool", "content": "result", "tool_call_id": "call-1"}
+        ]))
+        .unwrap();
+        append_history_messages(&store.session_file, &messages).unwrap();
+        store.save("c1").unwrap();
+        assert!(store.live_matches_checkpoint(&messages, "c1").unwrap());
+
+        let mutations: [(&str, fn(&mut Message)); 9] = [
+            ("role", |message| message.role = "tool".to_string()),
+            ("content", |message| {
+                message.content["version"] = Value::from(2)
+            }),
+            ("tool_calls", |message| message.tool_calls = None),
+            ("tool_call_id", |message| message.tool_call_id = None),
+            ("reasoning_content", |message| {
+                message.reasoning_content = None
+            }),
+            ("tool call id", |message| {
+                message.tool_calls.as_mut().unwrap()[0].id = "call-2".to_string();
+            }),
+            ("tool call type", |message| {
+                message.tool_calls.as_mut().unwrap()[0].tool_type = "other".to_string();
+            }),
+            ("tool function name", |message| {
+                message.tool_calls.as_mut().unwrap()[0].function.name = "write_file".to_string();
+            }),
+            ("tool arguments", |message| {
+                message.tool_calls.as_mut().unwrap()[0].function.arguments =
+                    "{ \"path\": \"a.rs\" }".to_string();
+            }),
+        ];
+        for (field, mutate) in mutations {
+            let mut live = messages.clone();
+            mutate(&mut live[1]);
+            assert!(
+                !store.live_matches_checkpoint(&live, "c1").unwrap(),
+                "{field}"
+            );
+            assert!(!store.live_matches_base(&live).unwrap(), "{field}");
+            assert_eq!(
+                store
+                    .live_matches_base_with_target_diff(&live, "c1")
+                    .unwrap(),
+                (false, Some((3, 1))),
+                "{field}"
+            );
+            assert_eq!(
+                store.checkpoint_live_diff(&live, "c1").unwrap(),
+                Some((3, 1)),
+                "{field}"
+            );
+        }
+        let _ = fs::remove_dir_all(history_file.parent().unwrap());
+    }
+
+    #[test]
+    fn checkpoint_live_match_retains_diff_only_for_compared_base_target() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-cached-diff");
+        assert_eq!(
+            store.live_matches_base_with_target_diff(&[], "c1").unwrap(),
+            (true, None)
+        );
+        let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role": "user", "content": "request"},
+            {"role": "assistant", "content": "answer"}
+        ]))
+        .unwrap();
+        append_history_messages(&store.session_file, &messages).unwrap();
+        assert_eq!(
+            store
+                .live_matches_base_with_target_diff(&messages, "c1")
+                .unwrap(),
+            (false, None)
+        );
+        store.save("c1").unwrap();
+        assert_eq!(
+            store
+                .live_matches_base_with_target_diff(&messages, "c1")
+                .unwrap(),
+            (true, Some((2, 2)))
+        );
+        assert_eq!(
+            store
+                .live_matches_base_with_target_diff(&messages, "other")
+                .unwrap(),
+            (true, None)
+        );
+
+        let mut longer = messages.clone();
+        longer.push(messages[0].clone());
+        assert_eq!(
+            store
+                .live_matches_base_with_target_diff(&longer, "c1")
+                .unwrap(),
+            (false, None)
+        );
+        assert_eq!(
+            store.checkpoint_live_diff(&longer, "c1").unwrap(),
+            Some((2, 2))
+        );
+        assert_eq!(
+            store.checkpoint_live_diff(&messages, "missing").unwrap(),
+            None
+        );
+        let _ = fs::remove_dir_all(history_file.parent().unwrap());
+    }
+
+    #[test]
+    fn checkpoint_live_match_preserves_decoded_json_semantics() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-decoded-match");
+        let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role": "user", "content": "plain text"},
+            {"role": "assistant", "content": {"a": 1, "b": 2}}
+        ]))
+        .unwrap();
+        append_history_messages(&store.session_file, &messages).unwrap();
+        store.save("c1").unwrap();
+        let source = store.checkpoint_source_unlocked("c1").unwrap().unwrap();
+        let sqlite = match source {
+            CheckpointSource::Generation { sqlite, .. } | CheckpointSource::Legacy { sqlite } => {
+                sqlite
+            }
+        };
+        let conn = rusqlite::Connection::open(&sqlite).unwrap();
+        // Raw text and malformed tool calls retain the existing tolerant decoding.
+        conn.execute(
+            "UPDATE messages SET content = ?1, tool_calls = ?2 WHERE id = 1",
+            rusqlite::params!["plain text", "invalid tool calls"],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE messages SET content = ?1 WHERE id = 2",
+            ["{ \"b\": 2, \"a\": 1 }"],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            read_all_messages_sqlite_read_only(&sqlite).unwrap(),
+            messages
+        );
+        assert!(store.live_matches_checkpoint(&messages, "c1").unwrap());
+        assert!(store.live_matches_base(&messages).unwrap());
+        assert_eq!(
+            store
+                .live_matches_base_with_target_diff(&messages, "c1")
+                .unwrap(),
+            (true, Some((2, 2)))
+        );
+        let _ = fs::remove_dir_all(history_file.parent().unwrap());
     }
 
     #[test]
@@ -4609,10 +5453,8 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn snapshot_estimate_charges_only_changed_files() {
-        let root = std::env::temp_dir().join(format!(
-            "ai-checkpoint-estimate-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("ai-checkpoint-estimate-{}", uuid::Uuid::new_v4()));
         let source = root.join("assets");
         let parent = root.join("parent-assets");
         fs::create_dir_all(&source).unwrap();
@@ -4630,8 +5472,7 @@ mod tests {
             assets: parent,
             index: parent_index,
         };
-        let estimate =
-            estimate_snapshot_bytes(&source, Some(&base), SnapshotScope::All).unwrap();
+        let estimate = estimate_snapshot_bytes(&source, Some(&base), SnapshotScope::All).unwrap();
         let index_bytes = ASSET_INDEX_HEADER_BYTES
             .saturating_add(asset_index_entry_bytes(Path::new("stable.bin")))
             .saturating_add(asset_index_entry_bytes(Path::new("changed.bin")));
@@ -4651,8 +5492,7 @@ mod tests {
         fs::create_dir_all(&store.session_assets).unwrap();
         fs::write(store.session_assets.join("big.bin"), vec![0u8; 64]).unwrap();
 
-        let error =
-            preflight_checkpoint_storage(&store, 0, 0, None, None, None, 32).unwrap_err();
+        let error = preflight_checkpoint_storage(&store, 0, 0, None, None, None, 32).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
         let staged = store.dir.exists() && fs::read_dir(&store.dir).unwrap().next().is_some();
         assert!(!staged, "preflight must fail before staging");
@@ -4674,9 +5514,8 @@ mod tests {
             estimate.copied < 128,
             "the asset estimate alone must fit under the cap"
         );
-        let error =
-            preflight_checkpoint_storage(&store, 0, 0, None, None, Some(&message), 128)
-                .unwrap_err();
+        let error = preflight_checkpoint_storage(&store, 0, 0, None, None, Some(&message), 128)
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
         let _ = fs::remove_dir_all(history_file.parent().unwrap());
     }
@@ -4730,8 +5569,7 @@ mod tests {
         .unwrap();
         assert!(durable < all);
         let max = durable + (all - durable) / 2;
-        let scope =
-            preflight_checkpoint_storage(&store, 0, 0, None, None, None, max).unwrap();
+        let scope = preflight_checkpoint_storage(&store, 0, 0, None, None, None, max).unwrap();
         assert_eq!(scope, SnapshotScope::DurableOnly);
 
         let staged = store
@@ -4894,6 +5732,135 @@ mod tests {
             fs::metadata(parent_assets.join("same.md")).unwrap().ino(),
             "different content must be copied, not hard-linked"
         );
+        assert_eq!(
+            fs::read_dir(&destination).unwrap().count(),
+            1,
+            "publishing changed bytes must not leave a temporary copy"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn incremental_snapshot_reuses_parent_without_temporary_residue() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "ai-checkpoint-link-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = root.join("source");
+        let parent_assets = root.join("parent");
+        let destination = root.join("destination");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&parent_assets).unwrap();
+        let live_file = source.join("same.md");
+        let parent_file = parent_assets.join("same.md");
+        fs::write(&live_file, "snapshot").unwrap();
+        fs::write(&parent_file, "snapshot").unwrap();
+        let mut parent_index = AssetIndex::default();
+        parent_index.entries.insert(
+            PathBuf::from("same.md"),
+            asset_fingerprint(&fs::metadata(&live_file).unwrap()),
+        );
+        let parent = SnapshotBase {
+            assets: parent_assets,
+            index: parent_index,
+        };
+
+        let copy = copy_directory_snapshot(
+            &source,
+            &destination,
+            &root.join(GENERATION_ASSET_INDEX_FILE),
+            Some(&parent),
+            SnapshotScope::All,
+        )
+        .unwrap();
+
+        let saved_file = destination.join("same.md");
+        assert_eq!(
+            fs::metadata(&saved_file).unwrap().ino(),
+            fs::metadata(&parent_file).unwrap().ino()
+        );
+        assert_ne!(
+            fs::metadata(&saved_file).unwrap().ino(),
+            fs::metadata(&live_file).unwrap().ino(),
+            "mutable live assets must not supply a hard link"
+        );
+        assert_eq!(copy.copied, copy.index_bytes);
+        assert_eq!(
+            fs::read_dir(&destination).unwrap().count(),
+            1,
+            "reusing the parent must not leave temporary copies"
+        );
+        fs::write(&live_file, "modified").unwrap();
+        assert_eq!(fs::read_to_string(&parent_file).unwrap(), "snapshot");
+        assert_eq!(fs::read_to_string(&saved_file).unwrap(), "snapshot");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn incremental_snapshot_copies_live_bytes_after_hardlink_failure() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "ai-checkpoint-link-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        let parent = root.join("parent");
+        let destination = root.join("destination");
+        fs::write(&source, "snapshot").unwrap();
+        fs::write(&parent, "snapshot").unwrap();
+        // An existing destination makes hard_link fail, while copy_file_fast
+        // can still copy the live bytes.
+        fs::write(&destination, "old").unwrap();
+
+        assert!(!copy_snapshot_file_from_parent(&source, &destination, &parent).unwrap());
+
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "snapshot");
+        assert_ne!(
+            fs::metadata(&destination).unwrap().ino(),
+            fs::metadata(&parent).unwrap().ino()
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn incremental_snapshot_hardlinks_unchanged_assets_without_creating_a_temporary_copy() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "ai-checkpoint-link-no-copy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("live");
+        let parent = root.join("parent");
+        // The asset name fits the filesystem's 255-byte component limit,
+        // while adding a temporary-copy extension would exceed that limit.
+        let destination = root.join("a".repeat(240));
+        fs::write(&source, "snapshot").unwrap();
+        fs::write(&parent, "snapshot").unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o444)).unwrap();
+        let parent_before = fs::metadata(&parent).unwrap();
+
+        assert!(copy_snapshot_file_from_parent(&source, &destination, &parent).unwrap());
+
+        let saved = fs::metadata(&destination).unwrap();
+        assert_eq!(saved.dev(), parent_before.dev());
+        assert_eq!(saved.ino(), parent_before.ino());
+        assert_ne!(saved.ino(), fs::metadata(&source).unwrap().ino());
+        assert_eq!(saved.nlink(), parent_before.nlink() + 1);
+        assert_eq!(saved.modified().unwrap(), parent_before.modified().unwrap());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
+        fs::write(&source, "modified").unwrap();
+        assert_eq!(fs::read_to_string(&parent).unwrap(), "snapshot");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "snapshot");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4925,9 +5892,7 @@ mod tests {
             asset_fingerprint(&fs::symlink_metadata(live.join("changed.md")).unwrap()),
         );
         let same_inode = fs::symlink_metadata(live.join("same.md")).unwrap().ino();
-        let changed_inode = fs::symlink_metadata(live.join("changed.md"))
-            .unwrap()
-            .ino();
+        let changed_inode = fs::symlink_metadata(live.join("changed.md")).unwrap().ino();
 
         fs::write(live.join("changed.md"), "modified").unwrap();
         restore_checkpoint_assets(&source, &live, Some(&index)).unwrap();
@@ -4943,11 +5908,62 @@ mod tests {
             "snapshot"
         );
         assert_ne!(
-            fs::symlink_metadata(live.join("changed.md"))
-                .unwrap()
-                .ino(),
+            fs::symlink_metadata(live.join("changed.md")).unwrap().ino(),
             changed_inode,
             "a changed asset must be replaced"
+        );
+        assert_eq!(
+            fs::read_dir(&live).unwrap().count(),
+            2,
+            "equal and changed restores must not leave temporary copies"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn restore_skips_unchanged_assets_without_creating_a_temporary_copy() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "ai-checkpoint-restore-no-copy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = root.join("checkpoint");
+        let live = root.join("live");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&live).unwrap();
+        // The asset name fits the filesystem's 255-byte component limit,
+        // while adding a restore extension would exceed that limit.
+        let name = "a".repeat(240);
+        let live_file = live.join(&name);
+        fs::write(source.join(&name), "snapshot").unwrap();
+        fs::write(&live_file, "snapshot").unwrap();
+        fs::set_permissions(&live_file, fs::Permissions::from_mode(0o444)).unwrap();
+        let live_before = fs::metadata(&live_file).unwrap();
+        let mut index = AssetIndex::default();
+        index
+            .entries
+            .insert(PathBuf::from(name), asset_fingerprint(&live_before));
+
+        restore_checkpoint_assets(&source, &live, Some(&index)).unwrap();
+
+        let live_after = fs::metadata(&live_file).unwrap();
+        assert_eq!(live_after.dev(), live_before.dev());
+        assert_eq!(live_after.ino(), live_before.ino());
+        assert_eq!(live_after.nlink(), live_before.nlink());
+        assert_eq!(
+            live_after.modified().unwrap(),
+            live_before.modified().unwrap()
+        );
+        assert_eq!(live_after.mode(), live_before.mode());
+        assert_eq!(fs::read_to_string(&live_file).unwrap(), "snapshot");
+        assert_eq!(
+            fs::read_dir(&live)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>(),
+            vec![live_file]
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -5020,7 +6036,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_replaces_same_length_content_when_fingerprint_matches() {
+    fn restoring_checkpoint_assets_replaces_same_length_content_when_fingerprint_matches() {
         let root = std::env::temp_dir().join(format!(
             "ai-checkpoint-restore-collision-{}",
             uuid::Uuid::new_v4()
@@ -5044,6 +6060,55 @@ mod tests {
             "snapshot",
             "matching metadata must not suppress the byte comparison"
         );
+        assert_eq!(
+            fs::read_dir(&live).unwrap().count(),
+            1,
+            "different staged bytes must be renamed without temporary residue"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restoring_checkpoint_assets_cleans_temporary_after_copy_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-checkpoint-restore-copy-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        let error =
+            replace_file_via_temporary(&root.join("missing"), &root.join("destination"), false)
+                .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restoring_checkpoint_assets_cleans_temporary_after_rename_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-checkpoint-restore-rename-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = root.join("checkpoint");
+        let live = root.join("live");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(live.join("asset")).unwrap();
+        fs::write(source.join("asset"), "snapshot").unwrap();
+        fs::write(live.join("asset").join("concurrent.md"), "keep").unwrap();
+
+        assert!(restore_checkpoint_assets(&source, &live, None).is_err());
+
+        assert_eq!(
+            fs::read_to_string(source.join("asset")).unwrap(),
+            "snapshot"
+        );
+        assert_eq!(
+            fs::read_to_string(live.join("asset").join("concurrent.md")).unwrap(),
+            "keep"
+        );
+        assert_eq!(fs::read_dir(&live).unwrap().count(), 1);
         let _ = fs::remove_dir_all(root);
     }
 }

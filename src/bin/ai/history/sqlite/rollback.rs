@@ -120,16 +120,21 @@ pub(in crate::ai) fn read_live_rollback_metadata(path: &Path) -> io::Result<Live
     })
 }
 
-/// Called after `backup_sqlite` overwrites the live DB with a checkpoint: clear the derived snapshots
-/// (canonical has rolled back to the checkpoint, so the old snapshots no longer match), and raise the three monotonic counters
-/// above their pre-rollback live values, guaranteeing:
+/// Rebase a whole checkpoint database before publishing it over the live path.
+/// Its canonical messages and singleton context projection come from the same
+/// SQLite snapshot, so retain the projection and stamp it with the rebased
+/// generation. Clear orphan context rows and the archived rewind ring.
+///
+/// Raise the three monotonic counters above their pre-rollback live values,
+/// guaranteeing:
 /// - `history_generation` is strictly greater than the live value -> any
 ///     stale snapshot write still holding an old generation is rejected by fencing (the
 ///     generation comparison in `write_context_snapshot_sqlite` returns false).
 /// - `turn_seq` is not lower than the live value -> turn numbers allocated after the rollback never reuse already-used numbers.
 /// - `history_revision` is strictly greater than the live value -> cross-connection file caches observe the change and reload.
-/// Everything commits in a single Immediate transaction, avoiding an inconsistent window of
-/// “rolled back but counters not raised” after the overwrite.
+/// Re-stamping the retained projection does not change the writer fence: a
+/// writer holding a pre-rollback generation still fails the generation check.
+/// Everything commits in one Immediate transaction before atomic publication.
 pub(super) fn rebase_metadata_after_rollback(
     path: &Path,
     live_generation: i64,
@@ -143,14 +148,7 @@ pub(super) fn rebase_metadata_after_rollback(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| io::Error::other(e.to_string()))?;
-        // canonical has rolled back, so the old derived snapshots (possibly tagged with the generation at checkpoint time)
-        // no longer match; clear them to force the next read to recompute from canonical.
-        tx.execute("DELETE FROM context_messages", [])
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        tx.execute("DELETE FROM context_snapshot", [])
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        // The rewind ring is derived state too; a checkpoint restore must not
-        // leave a projection that a later truncation could promote.
+        // Rewind fallbacks are not carried across a checkpoint restore.
         tx.execute("DELETE FROM context_snapshot_history", [])
             .map_err(|e| io::Error::other(e.to_string()))?;
         // Each counter takes MAX(checkpoint value, live value) then +1 (generation/revision must strictly
@@ -164,6 +162,24 @@ pub(super) fn rebase_metadata_after_rollback(
             params![bump_gen.to_string()],
         )
         .map_err(|e| io::Error::other(e.to_string()))?;
+        // Use the stored generation because the checkpoint's counter can be
+        // greater than the pre-rollback live counter. Keep its watermark and
+        // fingerprint so readers still merge the canonical tail and reject a
+        // projection produced under a different compression policy.
+        let retained_snapshot = tx
+            .execute(
+                "UPDATE context_snapshot
+                 SET source_generation = (
+                     SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'history_generation'
+                 )
+                 WHERE singleton = 1",
+                [],
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        if retained_snapshot == 0 {
+            tx.execute("DELETE FROM context_messages", [])
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        }
         tx.execute(
             "INSERT INTO meta (key, value) VALUES ('turn_seq', ?1)
              ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS INTEGER), CAST(?1 AS INTEGER))",
@@ -290,7 +306,41 @@ fn try_clone_staged_sqlite(source: &Path, target: &Path) -> bool {
     unsafe { libc::clonefile(source.as_ptr(), target.as_ptr(), 0) == 0 }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn try_clone_staged_sqlite(source: &Path, target: &Path) -> bool {
+    use std::{
+        fs::{File, OpenOptions},
+        os::unix::io::AsRawFd,
+    };
+
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = source.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        if !matches!(Path::new(&sidecar).try_exists(), Ok(false)) {
+            return false;
+        }
+    }
+    let result = (|| -> io::Result<()> {
+        let source = File::open(source)?;
+        let target = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target)?;
+        // SAFETY: Both descriptors remain open for the call. FICLONE
+        // (_IOW(0x94, 9, int)) creates independent copy-on-write file contents.
+        if unsafe { libc::ioctl(target.as_raw_fd(), 0x40049409, source.as_raw_fd()) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(target);
+    }
+    result.is_ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn try_clone_staged_sqlite(_source: &Path, _target: &Path) -> bool {
     false
 }
@@ -316,9 +366,8 @@ pub(in crate::ai) fn backup_sqlite(source: &Path, target: &Path) -> io::Result<(
     let temporary = parent.join(format!(".{file_name}.backup-{}.tmp", uuid::Uuid::new_v4()));
 
     let result = (|| {
-        let source_conn =
-            Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+        let source_conn = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| io::Error::other(e.to_string()))?;
         source_conn
             .backup(rusqlite::MAIN_DB, &temporary, None)
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -353,8 +402,304 @@ fn publish_rebased_sqlite(source: &Path, target: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
+mod projection_tests {
+    use super::super::{
+        append_history_sqlite, read_all_messages_sqlite, read_context_history_sqlite,
+        write_context_snapshot_sqlite,
+    };
+    use super::*;
+    use crate::ai::history::Message;
+
+    const PROJECTION: &str = "checkpoint-restore-projection";
+
+    struct Fixture {
+        dir: PathBuf,
+        checkpoint: PathBuf,
+        live: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("rollback_projection_{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            Self {
+                checkpoint: dir.join("checkpoint.sqlite"),
+                live: dir.join("live.sqlite"),
+                dir,
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn msg(role: &str, content: &str) -> Message {
+        Message {
+            role: role.to_string(),
+            content: serde_json::json!(content),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn initialize_history(path: &Path, generation: i64) -> Vec<Message> {
+        let messages = vec![
+            msg("user", "canonical question"),
+            msg("assistant", "canonical answer"),
+        ];
+        append_history_sqlite(path, messages.clone()).unwrap();
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('history_generation', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![generation.to_string()],
+        )
+        .unwrap();
+        messages
+    }
+
+    fn save_projection(path: &Path, content: &str) -> i64 {
+        let source = read_context_history_sqlite(path, PROJECTION).unwrap();
+        assert!(
+            write_context_snapshot_sqlite(
+                path,
+                &[msg("assistant", content)],
+                source.source_message_id,
+                source.canonical_generation,
+                PROJECTION,
+            )
+            .unwrap()
+        );
+        source.source_message_id
+    }
+
+    #[test]
+    fn checkpoint_restore_preserves_context_projection_and_writer_fence() {
+        for (checkpoint_generation, live_generation) in [(2, 7), (11, 2)] {
+            let fixture = Fixture::new();
+            let canonical = initialize_history(&fixture.checkpoint, checkpoint_generation);
+            initialize_history(&fixture.live, live_generation);
+            save_projection(&fixture.checkpoint, "older projection");
+            let watermark = save_projection(&fixture.checkpoint, "saved projection");
+            let stale = read_context_history_sqlite(&fixture.live, PROJECTION).unwrap();
+
+            restore_sqlite_after_rollback(&fixture.checkpoint, &fixture.live).unwrap();
+
+            let conn = Connection::open(&fixture.live).unwrap();
+            let generation = super::super::revision::history_generation(&conn).unwrap();
+            assert_eq!(generation, checkpoint_generation.max(live_generation + 1));
+            assert!(generation > stale.canonical_generation);
+            let snapshot: (i64, i64, String) = conn
+                .query_row(
+                    "SELECT source_message_id, source_generation, projection_fingerprint
+                     FROM context_snapshot WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(snapshot, (watermark, generation, PROJECTION.to_string()));
+            let row_counts: (i64, i64) = conn
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM context_messages),
+                            (SELECT COUNT(*) FROM context_snapshot_history)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(row_counts, (1, 0));
+            drop(conn);
+
+            let restored = read_context_history_sqlite(&fixture.live, PROJECTION).unwrap();
+            assert!(restored.snapshot_is_current);
+            assert_eq!(restored.source_message_id, watermark);
+            assert_eq!(restored.canonical_generation, generation);
+            assert_eq!(
+                restored.messages,
+                vec![msg("assistant", "saved projection")]
+            );
+            assert_eq!(read_all_messages_sqlite(&fixture.live).unwrap(), canonical);
+            assert!(
+                !write_context_snapshot_sqlite(
+                    &fixture.live,
+                    &[msg("assistant", "stale live projection")],
+                    stale.source_message_id,
+                    stale.canonical_generation,
+                    PROJECTION,
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                read_context_history_sqlite(&fixture.live, PROJECTION)
+                    .unwrap()
+                    .messages,
+                restored.messages
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_restore_without_snapshot_clears_orphan_context_messages() {
+        let fixture = Fixture::new();
+        let canonical = initialize_history(&fixture.checkpoint, 3);
+        initialize_history(&fixture.live, 1);
+        save_projection(&fixture.checkpoint, "older projection");
+        save_projection(&fixture.checkpoint, "orphan projection");
+        let conn = Connection::open(&fixture.checkpoint).unwrap();
+        conn.execute("DELETE FROM context_snapshot", []).unwrap();
+        drop(conn);
+
+        restore_sqlite_after_rollback(&fixture.checkpoint, &fixture.live).unwrap();
+
+        let conn = Connection::open(&fixture.live).unwrap();
+        let row_counts: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM context_messages),
+                        (SELECT COUNT(*) FROM context_snapshot),
+                        (SELECT COUNT(*) FROM context_snapshot_history)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row_counts, (0, 0, 0));
+        drop(conn);
+        let restored = read_context_history_sqlite(&fixture.live, PROJECTION).unwrap();
+        assert!(!restored.snapshot_is_current);
+        assert_eq!(restored.messages, canonical);
+    }
+
+    #[test]
+    fn checkpoint_restore_reader_reuses_projection_and_canonical_tail() {
+        let fixture = Fixture::new();
+        let mut canonical = initialize_history(&fixture.checkpoint, 2);
+        initialize_history(&fixture.live, 4);
+        let watermark = save_projection(&fixture.checkpoint, "saved projection");
+        let tail = msg("user", "uncompacted tail");
+        append_history_sqlite(&fixture.checkpoint, vec![tail.clone()]).unwrap();
+        canonical.push(tail.clone());
+
+        restore_sqlite_after_rollback(&fixture.checkpoint, &fixture.live).unwrap();
+
+        let conn = Connection::open(&fixture.live).unwrap();
+        let stored_watermark: i64 = conn
+            .query_row(
+                "SELECT source_message_id FROM context_snapshot WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_watermark, watermark);
+        drop(conn);
+        let restored = read_context_history_sqlite(&fixture.live, PROJECTION).unwrap();
+        assert!(!restored.snapshot_is_current);
+        assert_eq!(restored.source_message_id, watermark + 1);
+        assert_eq!(
+            restored.messages,
+            vec![msg("assistant", "saved projection"), tail]
+        );
+
+        let changed_policy = read_context_history_sqlite(&fixture.live, "changed-policy").unwrap();
+        assert!(!changed_policy.snapshot_is_current);
+        assert_eq!(changed_policy.messages, canonical);
+    }
+}
+
+#[cfg(test)]
 mod copy_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollback_staged_clone_keeps_source_isolated() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = std::env::temp_dir().join(format!("rollback_clone_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.sqlite");
+        let target = dir.join("clone.sqlite");
+        let conn = Connection::open(&source).unwrap();
+        conn.execute_batch("CREATE TABLE proof(value); INSERT INTO proof VALUES(42);")
+            .unwrap();
+        drop(conn);
+        let original = fs::read(&source).unwrap();
+
+        if try_clone_staged_sqlite(&source, &target) {
+            assert_eq!(fs::read(&target).unwrap(), original);
+        } else {
+            assert!(!target.exists(), "failed clones must leave no working file");
+            backup_sqlite(&source, &target).unwrap();
+        }
+        assert_ne!(
+            fs::metadata(&source).unwrap().ino(),
+            fs::metadata(&target).unwrap().ino()
+        );
+        let conn = Connection::open(&target).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT value FROM proof", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
+        conn.execute("UPDATE proof SET value = 99", []).unwrap();
+        drop(conn);
+        assert_eq!(fs::read(&source).unwrap(), original);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollback_staged_clone_rejects_each_sidecar() {
+        let dir = std::env::temp_dir().join(format!("rollback_sidecars_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.sqlite");
+        let target = dir.join("clone.sqlite");
+        fs::write(&source, b"snapshot bytes").unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = source.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            fs::write(&sidecar, b"sidecar bytes").unwrap();
+            assert!(!try_clone_staged_sqlite(&source, &target), "{suffix}");
+            assert!(!target.exists());
+            fs::remove_file(sidecar).unwrap();
+        }
+        assert_eq!(fs::read(&source).unwrap(), b"snapshot bytes");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollback_staged_clone_cleans_up_open_and_ioctl_errors() {
+        let dir =
+            std::env::temp_dir().join(format!("rollback_clone_errors_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.sqlite");
+        let target = dir.join("clone.sqlite");
+
+        fs::write(&target, b"stale working file").unwrap();
+        assert!(!try_clone_staged_sqlite(&source, &target));
+        assert!(
+            !target.exists(),
+            "source open errors must remove the target"
+        );
+
+        fs::write(&source, b"snapshot bytes").unwrap();
+        fs::write(&target, b"stale working file").unwrap();
+        assert!(!try_clone_staged_sqlite(&source, &target));
+        assert!(
+            !target.exists(),
+            "target open errors must remove the target"
+        );
+
+        // A directory opens read-only on Linux, but cannot be reflinked.
+        assert!(!try_clone_staged_sqlite(&dir, &target));
+        assert!(!target.exists(), "ioctl errors must remove the target");
+        assert_eq!(fs::read(&source).unwrap(), b"snapshot bytes");
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[cfg(unix)]
     #[test]

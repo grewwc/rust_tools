@@ -571,7 +571,9 @@ pub fn try_handle_checkpoint_command(
             let mut preserved_as: Option<String> = None;
             let mut already_on_target = false;
             let mut clean_base: Option<String> = None;
-            let live_is_clean = match store.live_matches_base(&live_messages) {
+            let (live_is_clean, target_diff) = match store
+                .live_matches_base_with_target_diff(&live_messages, &name)
+            {
                 Ok(matches) => matches,
                 Err(err) => {
                     println!(
@@ -599,7 +601,8 @@ pub fn try_handle_checkpoint_command(
             let preparation = switch_preparation(live_len, live_is_clean, discard, explicit_save);
             if preparation == SwitchPreparation::RefuseDirty {
                 let operation = if is_switch { "switch" } else { "checkout" };
-                match checkpoint_switch_diff(&store, &live_messages, &name) {
+                match target_diff.or_else(|| checkpoint_switch_diff(&store, &live_messages, &name))
+                {
                     Some((target_len, common)) => {
                         let dropped = live_len.saturating_sub(common);
                         println!(
@@ -664,7 +667,9 @@ pub fn try_handle_checkpoint_command(
                     None => false,
                 };
                 if !base_matches {
-                    let prompt = match checkpoint_switch_diff(&store, &live_messages, &name) {
+                    let prompt = match target_diff
+                        .or_else(|| checkpoint_switch_diff(&store, &live_messages, &name))
+                    {
                         Some((target_len, common)) => {
                             let dropped = live_len.saturating_sub(common);
                             let restored = target_len.saturating_sub(common);
@@ -984,10 +989,9 @@ fn print_tree(app: &App, store: &CheckpointStore) -> Result<(), Box<dyn std::err
         CheckpointHead::Detached(target) => (None, target),
     };
     let base = store.base_target().unwrap_or(None);
-    let live_messages = SessionStore::new(app.config.history_file.as_path())
-        .read_all_messages(&app.session_id)
+    let live_len = SessionStore::new(app.config.history_file.as_path())
+        .read_message_count(&app.session_id)
         .unwrap_or_default();
-    let live_len = live_messages.len();
     let total_size: u64 = checkpoints
         .iter()
         .map(|cp| cp.storage_bytes)
@@ -1001,10 +1005,7 @@ fn print_tree(app: &App, store: &CheckpointStore) -> Result<(), Box<dyn std::err
         MAX_CHECKPOINT_STORAGE_BYTES / (1024 * 1024)
     );
     // Live is working state, not a commit or an extra edge in the graph.
-    let live_detail = match &base {
-        Some(parent) => format!("{live_len} messages (current session, based on '{parent}')"),
-        None => format!("{live_len} messages (current session)"),
-    };
+    let live_detail = live_tree_detail(live_len, base.as_deref());
     println!("  {}  {}", "@ live".green().bold(), live_detail.dimmed());
     // The table row below shows HEAD with `→` + `[HEAD]`; a second pointer
     // line would repeat the same name twice. HEAD never dangles: it falls
@@ -1208,6 +1209,13 @@ fn print_tree(app: &App, store: &CheckpointStore) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+fn live_tree_detail(live_len: usize, base: Option<&str>) -> String {
+    match base {
+        Some(parent) => format!("{live_len} messages (current session, based on '{parent}')"),
+        None => format!("{live_len} messages (current session)"),
+    }
+}
+
 /// Format bytes as `1.9 MiB` instead of a raw count so the tree column stays
 /// aligned for large snapshots.
 fn format_human_bytes(bytes: u64) -> String {
@@ -1328,15 +1336,8 @@ fn is_latest_alias(name: &str) -> bool {
 /// completion sits on the hot path and cannot rescan the disk on every Tab,
 /// so the driver publishes fresh names before each prompt and after mutations.
 pub(super) fn publish_checkpoint_names(store: &CheckpointStore) {
-    let names = store
-        .list()
-        .map(|checkpoints| checkpoints.into_iter().map(|cp| cp.name).collect())
-        .unwrap_or_default();
+    let (names, branches) = store.completion_names();
     crate::ai::prompt::completion::CommandCompleter::set_checkpoint_name_candidates(names);
-    let branches = store
-        .list_branches()
-        .map(|branches| branches.into_iter().map(|branch| branch.name).collect())
-        .unwrap_or_default();
     crate::ai::prompt::completion::CommandCompleter::set_checkpoint_branch_candidates(branches);
 }
 
@@ -1560,13 +1561,30 @@ mod tests {
     use super::{
         BranchRow, SwitchPreparation, branch_rows, checkpoint_message_subject, commit_graph,
         effective_head, format_human_bytes, is_head_alias, is_latest_alias, is_previous_alias,
-        parse_navigation_args, parse_save_args, split_quoted_args, switch_preparation,
-        truncate_middle,
+        live_tree_detail, parse_navigation_args, parse_save_args, split_quoted_args,
+        switch_preparation, truncate_middle,
     };
     use crate::ai::history::{CheckpointBranch, CheckpointInfo};
 
     fn args(words: &[&str]) -> Vec<String> {
         words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn checkpoint_tree_live_detail_preserves_output() {
+        assert_eq!(live_tree_detail(0, None), "0 messages (current session)");
+        assert_eq!(
+            live_tree_detail(4096, None),
+            "4096 messages (current session)"
+        );
+        assert_eq!(
+            live_tree_detail(4096, Some("base")),
+            "4096 messages (current session, based on 'base')"
+        );
+        assert_eq!(
+            live_tree_detail(0, Some("base")),
+            "0 messages (current session, based on 'base')"
+        );
     }
 
     #[test]
@@ -1764,15 +1782,20 @@ mod tests {
         // Quoteless input splits exactly like whitespace splitting.
         for plain in ["", "  ", "main", "  main   --discard  ", "-b feature main"] {
             let words = split_quoted_args(plain, "checkout arguments").unwrap();
-            let expected: Vec<String> =
-                plain.split_whitespace().map(str::to_string).collect();
-            assert_eq!(words, expected, "plain input must split like before: {plain:?}");
+            let expected: Vec<String> = plain.split_whitespace().map(str::to_string).collect();
+            assert_eq!(
+                words, expected,
+                "plain input must split like before: {plain:?}"
+            );
         }
 
         // Malformed quoting is a clear error naming the argument list,
         // not a silently wrong name.
         let err = split_quoted_args("main --save \"oops", "checkout arguments").unwrap_err();
-        assert!(err.contains("checkout arguments"), "unexpected error: {err}");
+        assert!(
+            err.contains("checkout arguments"),
+            "unexpected error: {err}"
+        );
         assert!(split_quoted_args("main\\", "switch arguments").is_err());
     }
 

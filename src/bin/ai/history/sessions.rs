@@ -19,8 +19,8 @@ use super::{
     compress::is_preserved_user_or_image_stub,
     markdown::messages_to_markdown,
     sqlite::{
-        MarkMessageUpdate, SessionListMetadata, backup_sqlite, read_all_messages_sqlite,
-        read_first_user_prompt_sqlite, read_session_archived_sqlite,
+        MarkMessageUpdate, SessionListMetadata, backup_sqlite, message_count_sqlite_read_only,
+        read_all_messages_sqlite, read_first_user_prompt_sqlite, read_session_archived_sqlite,
         read_session_list_metadata_sqlite, read_session_mark_message_sqlite,
         read_session_marked_sqlite, read_session_serve_config_sqlite,
         read_session_title_origin_sqlite, read_session_title_sqlite,
@@ -1283,6 +1283,16 @@ impl SessionStore {
         read_all_messages_sqlite(&path)
     }
 
+    /// Count canonical messages without decoding their payloads or modifying the session.
+    pub(in crate::ai) fn read_message_count(&self, session_id: &str) -> io::Result<usize> {
+        Self::validate_session_id(session_id)?;
+        let path = self.session_history_file(session_id);
+        if !path.exists() {
+            return Ok(0);
+        }
+        message_count_sqlite_read_only(&path)
+    }
+
     /// Copy the full state while holding the source and destination session
     /// locks, and let the caller keep modifying the new branch afterwards.
     /// Multi-session locks are acquired in directory order so two forks in
@@ -2231,6 +2241,37 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
         }
+    }
+
+    #[test]
+    fn checkpoint_message_count_reads_large_canonical_history() {
+        let history_file = temp_history_file();
+        let store = SessionStore::new(&history_file);
+        let session_id = "large-count";
+        assert_eq!(store.read_message_count(session_id).unwrap(), 0);
+        assert!(!store.sessions_root().exists());
+        assert!(store.read_message_count("../invalid").is_err());
+
+        let payload = "x".repeat(1024);
+        let messages: Vec<Message> = (0..4096)
+            .map(|index| Message {
+                role: ["user", "assistant", "tool", "internal_note"][index % 4].to_string(),
+                content: serde_json::json!([{"type": "text", "text": format!("{index}: {payload}")}]),
+                tool_calls: None,
+                tool_call_id: (index % 4 == 2).then(|| format!("call-{index}")),
+                reasoning_content: (index % 4 == 1).then(|| format!("reasoning-{index}")),
+            })
+            .collect();
+        append_history_messages(&store.session_history_file(session_id), &messages).unwrap();
+
+        assert_eq!(
+            store.read_message_count(session_id).unwrap(),
+            messages.len()
+        );
+        assert_eq!(store.read_all_messages(session_id).unwrap(), messages);
+        assert_eq!(store.read_message_count("missing").unwrap(), 0);
+        assert!(!store.session_history_file("missing").exists());
+        let _ = fs::remove_dir_all(store.sessions_root());
     }
 
     #[test]
