@@ -19,7 +19,9 @@ pub(crate) enum HistoryRewindTarget {
 /// checked by each history source.
 pub(crate) fn parse_history_rewind_target(args: &[&str]) -> Result<HistoryRewindTarget, String> {
     let Some(first) = args.first().copied() else {
-        return Err("missing rewind target. try: /history rewind u3".into());
+        return Err(
+            "missing rewind target. try: /history rewind last or /history rewind u3".into(),
+        );
     };
     if first == "last" || first == "latest" {
         return Ok(HistoryRewindTarget::LatestUser);
@@ -101,7 +103,7 @@ mod tests {
         );
         assert_eq!(
             parse_history_rewind_target(&[]).unwrap_err(),
-            "missing rewind target. try: /history rewind u3"
+            "missing rewind target. try: /history rewind last or /history rewind u3"
         );
         assert_eq!(
             parse_history_rewind_target(&["u0"]).unwrap_err(),

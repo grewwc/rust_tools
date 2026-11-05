@@ -1170,6 +1170,10 @@ impl CommandCompleter {
         ]
     }
 
+    fn history_rewind_targets() -> &'static [&'static str] {
+        &["last", "latest", "grep"]
+    }
+
     /// Session-id candidates for `/history <session> ...` (best-effort).
     /// Lists persisted session databases under the sessions root derived
     /// from the configured history file; an unreadable root yields no
@@ -1477,10 +1481,12 @@ impl CommandCompleter {
                     _ => Vec::new(),
                 }
             } else if matches!(first, "/history" | ":history") {
-                match words.next() {
+                let second = words.next();
+                let third = words.next();
+                match (second, third) {
                     // `/history <TAB>`: subcommands plus session ids, so a stored
                     // session can be picked without leaving the line.
-                    None => {
+                    (None, _) => {
                         let mut candidates = Self::plain_candidates(
                             Self::history_subcommands()
                                 .iter()
@@ -1490,18 +1496,27 @@ impl CommandCompleter {
                         candidates.extend(Self::history_session_id_candidates(token));
                         candidates
                     }
+                    // `/history rewind <TAB>`: complete only the local rewind
+                    // target grammar. Cross-session forms remain read-only and
+                    // fall through to no candidates below.
+                    (Some("rewind"), None) => Self::plain_candidates(
+                        Self::history_rewind_targets()
+                            .iter()
+                            .filter(|c| c.starts_with(token))
+                            .map(|c| c.to_string()),
+                    ),
                     // `/history <session> <TAB>`: complete the second-position
                     // display verbs (`last`, `replay`, filters, `grep`, ...).
                     // `rewind` is intentionally omitted: cross-session history
                     // is read-only and the parser rejects it.
-                    Some(_) if words.next().is_none() => Self::plain_candidates(
+                    (Some(_), None) => Self::plain_candidates(
                         Self::history_subcommands()
                             .iter()
                             .filter(|c| **c != "rewind")
                             .filter(|c| c.starts_with(token))
                             .map(|c| c.to_string()),
                     ),
-                    _ => Vec::new(),
+                    (Some(_), Some(_)) => Vec::new(),
                 }
             } else if matches!(first, "/git" | ":git") {
                 match words.next() {
@@ -3282,6 +3297,81 @@ mod tests {
         assert!(pairs.iter().any(|pair| pair.replacement == "rewind"));
         assert!(!pairs.iter().any(|pair| pair.replacement == "undo"));
         assert!(pairs.iter().any(|pair| pair.replacement == "last"));
+    }
+
+    #[test]
+    fn history_rewind_completion_lists_static_targets() {
+        let line = "/history rewind ";
+        let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
+        let replacements: Vec<_> = candidates
+            .into_iter()
+            .map(|candidate| candidate.replacement)
+            .collect();
+
+        assert_eq!(start, line.len());
+        assert_eq!(replacements, vec!["last", "latest", "grep"]);
+        assert!(
+            !replacements
+                .iter()
+                .any(|candidate| candidate.as_str() == "full")
+        );
+        assert!(
+            !replacements
+                .iter()
+                .any(|candidate| candidate.as_str() == "user")
+        );
+    }
+
+    #[test]
+    fn history_rewind_completion_filters_static_targets() {
+        let line = "/history rewind l";
+        let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
+        let replacements: Vec<_> = candidates
+            .into_iter()
+            .map(|candidate| candidate.replacement)
+            .collect();
+
+        assert_eq!(&line[start..], "l");
+        assert_eq!(replacements, vec!["last", "latest"]);
+    }
+
+    #[test]
+    fn history_rewind_completion_stops_after_target_or_grep() {
+        for line in ["/history rewind last ", "/history rewind grep "] {
+            let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
+            assert!(candidates.is_empty(), "{line}");
+        }
+    }
+
+    #[test]
+    fn history_rewind_completion_keeps_top_level_history_behavior() {
+        let line = "/history ";
+        let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
+        let replacements: Vec<_> = candidates
+            .into_iter()
+            .map(|candidate| candidate.replacement)
+            .collect();
+
+        assert!(
+            replacements
+                .iter()
+                .any(|candidate| candidate.as_str() == "rewind")
+        );
+        assert!(
+            replacements
+                .iter()
+                .any(|candidate| candidate.as_str() == "full")
+        );
+        assert!(
+            replacements
+                .iter()
+                .any(|candidate| candidate.as_str() == "user")
+        );
+        assert!(
+            replacements
+                .iter()
+                .any(|candidate| candidate.as_str() == "last")
+        );
     }
 
     #[test]
