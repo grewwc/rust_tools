@@ -56,6 +56,59 @@ fn stream_response_discards_valid_tools_on_any_explicit_truncation_signal() {
 }
 
 #[test]
+fn stream_end_flush_restores_unclosed_bare_xml_candidate() {
+    let mut app = test_app();
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut current_history = String::new();
+    let input = "before\n`/use x\\n<task>after";
+
+    let (cleaned, events) = state.content.bare_xml_tool_call_streamer.push(input);
+    assert!(events.is_empty());
+    state.content.assistant_text.push_str(&cleaned);
+    state.content.finish_reason_seen = true;
+    state.content.finish_reason_value = Some("stop".to_string());
+    current_history.push_str(&cleaned);
+
+    let result = finalize_stream_response(&mut app, &mut current_history, &markers, state).unwrap();
+
+    assert_eq!(result.outcome, StreamOutcome::Completed);
+    assert_eq!(result.assistant_text, input);
+    assert_eq!(current_history, input);
+    assert!(result.tool_calls.is_empty());
+}
+
+#[test]
+fn stream_end_cancel_does_not_publish_unclosed_bare_xml_candidate() {
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    crate::ai::driver::signal::clear_request_interrupt();
+
+    let mut app = test_app();
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut current_history = String::new();
+    let input = "before\n`/use x\\n<task>after";
+
+    let (cleaned, events) = state.content.bare_xml_tool_call_streamer.push(input);
+    assert!(events.is_empty());
+    state.content.assistant_text.push_str(&cleaned);
+    current_history.push_str(&cleaned);
+    app.cancel_stream
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let result = finalize_stream_response(&mut app, &mut current_history, &markers, state).unwrap();
+
+    assert_eq!(result.outcome, StreamOutcome::Cancelled);
+    assert_eq!(result.assistant_text, cleaned);
+    assert_eq!(current_history, cleaned);
+    assert!(result.tool_calls.is_empty());
+    assert!(!app.cancel_stream.load(std::sync::atomic::Ordering::Relaxed));
+    crate::ai::driver::signal::clear_request_interrupt();
+}
+
+#[test]
 fn stream_response_does_not_recover_inline_tools_from_incomplete_output() {
     let _signal_guard = crate::ai::test_support::ENV_LOCK
         .lock()

@@ -29,7 +29,10 @@ use super::super::{
     cli::ParsedCli,
     config_schema::AiConfig,
     driver::{
-        commands::{ServeInputRoute, classify_serve_input},
+        commands::{
+            ServeInputRoute, classify_serve_input, serve_command_title_seed,
+            use_backend::{parse_use_arguments, validate_reset_arguments},
+        },
         history_rewind::{
             HistoryRewindTarget, count_real_users, parse_history_rewind_target, real_user_index,
             real_user_ordinal_entries,
@@ -1931,6 +1934,69 @@ fn run_serve_cd_command(
     Ok(())
 }
 
+fn run_serve_subagent_config_request(
+    request: reqwest::blocking::RequestBuilder,
+) -> Result<(), String> {
+    let response = request
+        .send()
+        .map_err(|err| format!("subagent config request failed: {err}"))?;
+    let status = response.status();
+    let text = response.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(server_error_message(status, &text));
+    }
+    let body: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|err| format!("serve returned an unexpected config body: {err}"))?;
+    let output = body
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "serve config response is missing output".to_string())?;
+    print!("{output}");
+    Ok(())
+}
+
+fn run_serve_use_command(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    arg: &str,
+) -> Result<(), String> {
+    let command_line = arg.split_once('\n').map_or(arg, |(head, _)| head);
+    let (backend, model) = parse_use_arguments(command_line)?;
+    let url = format!("{base}/sessions/{session_id}/config");
+    let request = match backend {
+        Some(backend) => client.post(url).json(&serde_json::json!({
+            "subagents": {"action": "use", "backend": backend, "model": model},
+        })),
+        None => client.get(url),
+    };
+    run_serve_subagent_config_request(auth(request, token))
+}
+
+fn run_serve_reset_command(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    arg: &str,
+) -> Result<(), String> {
+    validate_reset_arguments(arg).map_err(str::to_string)?;
+    let request = client
+        .post(format!("{base}/sessions/{session_id}/config"))
+        .json(&serde_json::json!({"subagents": {"action": "reset"}}));
+    run_serve_subagent_config_request(auth(request, token))
+}
+
+/// Preserve the child input while extracting title intent from nested commands and skills.
+fn serve_use_turn_input(input: &str) -> Option<(&str, String)> {
+    let tail = input.trim().split_once('\n')?.1.trim();
+    if tail.is_empty() {
+        return None;
+    }
+    Some((tail, serve_command_title_seed(input).unwrap_or_default()))
+}
+
 /// Fetch `/cd` Tab-completion candidates for `fragment` from the remote
 /// server: directories only, `dir/`-suffixed, in the exact shape the local
 /// completer would produce against the server's filesystem.
@@ -2626,7 +2692,8 @@ mod serve_history_tests {
                 "{input}"
             );
         }
-        // `/use` and `/reset` show or update defaults in the server turn child.
+        // The classifier keeps these routes for compatibility; the client
+        // intercepts `/use` and `/reset` with dedicated config branches.
         for input in [
             "/use",
             ":use",
@@ -4278,6 +4345,7 @@ fn post_turn_stream(
     token: &str,
     session_id: &str,
     prompt: &str,
+    title_seed: Option<&str>,
     history_file: &Path,
     selection: &mut ServeTurnSelection,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4324,6 +4392,7 @@ fn post_turn_stream(
     )
     .json(&serde_json::json!({
         "prompt": prompt,
+        "title_seed": title_seed,
         "images": images,
         "model": if selection.model.trim().is_empty() {
             serde_json::Value::Null
@@ -4880,6 +4949,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                         &token,
                         &session_id,
                         &question,
+                        None,
                         &app_config.history_file,
                         &mut selection,
                     ) {
@@ -4909,6 +4979,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                         &token,
                         &session_id,
                         &question,
+                        None,
                         &app_config.history_file,
                         &mut selection,
                     ) {
@@ -4948,6 +5019,36 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                     eprintln!("[serve-chat] {err}");
                 }
             }
+            "/use" | ":use" => {
+                // Preserve the newline after a bare command: the generic
+                // argument view trims it away and would treat the tail as a backend.
+                let arg = &trimmed[cmd.len()..];
+                match run_serve_use_command(&client, &base, &token, &session_id, arg) {
+                    Ok(()) => {
+                        if let Some((tail, title_seed)) = serve_use_turn_input(&trimmed) {
+                            if let Err(err) = post_turn_stream(
+                                &client,
+                                &base,
+                                &token,
+                                &session_id,
+                                tail,
+                                Some(&title_seed),
+                                &app_config.history_file,
+                                &mut selection,
+                            ) {
+                                eprintln!("[serve-chat] {err}");
+                            }
+                        }
+                    }
+                    Err(err) => eprintln!("[serve-chat] {err}"),
+                }
+            }
+            "/reset" | ":reset" => {
+                if let Err(err) = run_serve_reset_command(&client, &base, &token, &session_id, arg)
+                {
+                    eprintln!("[serve-chat] {err}");
+                }
+            }
             _ => {
                 let route = classify_serve_input(&trimmed);
                 let prompt = routed_prompt_text(&route, &input, &trimmed);
@@ -4974,15 +5075,22 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                     }
                     // `/memo`, `/task`, `/discuss`, `/goal`, `/audit`,
                     // `/distill-session`, `/mark`, `/unmark`, `/archive`,
-                    // `/title`, `/use`, and `/reset` execute in the server turn
-                    // child; everything else is ordinary prompt text.
+                    // `/title` execute in the server turn child; everything
+                    // else is ordinary prompt text. State commands have their
+                    // own HTTP branches above.
                     ServeInputRoute::ServerCommand | ServeInputRoute::Prompt => {
+                        let title_seed = if route == ServeInputRoute::ServerCommand {
+                            serve_command_title_seed(&trimmed)
+                        } else {
+                            None
+                        };
                         if let Err(err) = post_turn_stream(
                             &client,
                             &base,
                             &token,
                             &session_id,
                             prompt,
+                            title_seed.as_deref(),
                             &app_config.history_file,
                             &mut selection,
                         ) {
@@ -5051,10 +5159,16 @@ mod tests {
         format!("http://{addr}/sessions/x/turns/stream")
     }
 
-    /// Same canned-response trick, but also captures the request head (request
-    /// line + headers) so the interrupt route and its auth header can be
-    /// asserted offline.
+    /// Same canned-response trick, but also captures the request and JSON body
+    /// so routing, auth, and submitted intent can be asserted offline.
     fn serve_capture_once(
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
+        serve_capture_status_once("200 OK", body)
+    }
+
+    fn serve_capture_status_once(
+        status: &'static str,
         body: &'static str,
     ) -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
         use std::io::BufRead;
@@ -5074,12 +5188,24 @@ mod tests {
                     }
                     head.push_str(&line);
                 }
+                let content_length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("content length"))
+                    })
+                    .unwrap_or(0);
+                let mut request_body = vec![0; content_length];
+                std::io::Read::read_exact(&mut reader, &mut request_body).expect("request body");
+                head.push_str("\r\n");
+                head.push_str(&String::from_utf8(request_body).expect("request utf8"));
             }
             if let Ok(mut sink) = sink.lock() {
                 *sink = head;
             }
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(response.as_bytes());
@@ -6876,6 +7002,152 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("not a /cd command"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn serve_chat_subagent_commands_use_config_route() {
+        let client = reqwest::blocking::Client::new();
+        for (arg, method) in [
+            ("", "GET"),
+            ("\nfix login", "GET"),
+            (" \nfix login", "GET"),
+            ("traecli GPT-5.5\nfix login", "POST"),
+            ("kernel", "POST"),
+        ] {
+            let (base, captured) = serve_capture_once(r#"{"output":"server state\n"}"#);
+            run_serve_use_command(&client, &base, "tk", "s1", arg).expect("use config");
+            let request = captured.lock().unwrap().clone();
+            assert!(
+                request.starts_with(&format!("{method} /sessions/s1/config HTTP/1.1")),
+                "{request}"
+            );
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer tk")
+            );
+            let (_, body) = request.split_once("\r\n\r\n").expect("request body seam");
+            if method == "POST" {
+                let body: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(body["subagents"]["action"], "use");
+                assert!(!body.to_string().contains("fix login"));
+                assert!(body.get("prompt").is_none());
+                assert!(body.get("title_seed").is_none());
+                if arg.starts_with("traecli") {
+                    assert_eq!(body["subagents"]["backend"], "traecli");
+                    assert_eq!(body["subagents"]["model"], "GPT-5.5");
+                } else {
+                    assert_eq!(body["subagents"]["backend"], "kernel");
+                    assert!(body["subagents"]["model"].is_null());
+                }
+            } else {
+                assert!(body.is_empty());
+            }
+        }
+        let (base, captured) = serve_capture_once(r#"{"output":"reset state\n"}"#);
+        run_serve_reset_command(&client, &base, "tk", "s1", "").expect("reset config");
+        let request = captured.lock().unwrap().clone();
+        assert!(request.starts_with("POST /sessions/s1/config HTTP/1.1"));
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body, serde_json::json!({"subagents": {"action": "reset"}}));
+        assert!(
+            run_serve_reset_command(&client, &base, "tk", "s1", "\nquestion")
+                .unwrap_err()
+                .contains("no arguments or trailing prompt")
+        );
+        assert!(
+            run_serve_use_command(&client, &base, "tk", "s1", "traecli model extra")
+                .unwrap_err()
+                .contains("Too many arguments")
+        );
+        let (base, _) = serve_capture_status_once(
+            "400 Bad Request",
+            r#"{"error":"unknown backend from server"}"#,
+        );
+        let error = run_serve_use_command(&client, &base, "tk", "s1", "unknown").unwrap_err();
+        assert!(error.contains("unknown backend from server"), "{error}");
+    }
+
+    #[test]
+    fn serve_chat_use_tail_preserves_child_input_and_extracts_nested_question() {
+        for (input, tail, seed) in [
+            (
+                "/use kernel\n/task 3 fix login",
+                "/task 3 fix login",
+                "fix login",
+            ),
+            (
+                ":use traecli\n:audit --fast inspect login",
+                ":audit --fast inspect login",
+                "inspect login",
+            ),
+            (
+                "/use kernel\n/task 3 fix @Skill:review login",
+                "/task 3 fix @Skill:review login",
+                "fix  login",
+            ),
+            ("/use kernel\n/title t", "/title t", ""),
+            (
+                "/use kernel\n/use traecli\n/task 3 fix login",
+                "/use traecli\n/task 3 fix login",
+                "fix login",
+            ),
+        ] {
+            let (child_input, title_seed) = serve_use_turn_input(input).expect("use tail");
+            assert_eq!(child_input, tail);
+            assert_eq!(title_seed, seed);
+        }
+        assert!(serve_use_turn_input("/use kernel").is_none());
+        assert!(serve_use_turn_input("/use kernel\n  ").is_none());
+    }
+
+    #[test]
+    fn serve_chat_turn_stream_sends_explicit_title_seed() {
+        let client = reqwest::blocking::Client::new();
+        let history_file = std::env::temp_dir().join(format!(
+            "a-serve-title-wire-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        for (prompt, title_seed) in [
+            ("/task 3 fix login", Some("fix login")),
+            ("/title t", Some("")),
+            ("/mark m", Some("")),
+            ("  ordinary question  ", None),
+        ] {
+            let (base, captured) = serve_capture_once("event: done\ndata: \n\n");
+            let mut selection = ServeTurnSelection {
+                model: String::new(),
+                agent: String::new(),
+                reasoning_effort: None,
+                skills: vec!["code-review".to_string()],
+            };
+            let route = classify_serve_input(prompt);
+            let extracted = if route == ServeInputRoute::ServerCommand {
+                serve_command_title_seed(prompt)
+            } else {
+                None
+            };
+            assert_eq!(extracted.as_deref(), title_seed);
+            post_turn_stream(
+                &client,
+                &base,
+                "tk",
+                "s1",
+                prompt,
+                extracted.as_deref(),
+                &history_file,
+                &mut selection,
+            )
+            .expect("turn stream");
+            let request = captured.lock().unwrap().clone();
+            assert!(request.starts_with("POST /sessions/s1/turns/stream HTTP/1.1"));
+            let body: serde_json::Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body["prompt"], prompt);
+            assert_eq!(body["title_seed"], serde_json::json!(title_seed));
+            assert_eq!(body["skills"], serde_json::json!(["code-review"]));
+        }
     }
 
     #[test]

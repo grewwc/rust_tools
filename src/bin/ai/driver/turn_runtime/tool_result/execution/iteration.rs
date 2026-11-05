@@ -56,7 +56,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
         terminal_dedupe_candidate,
         &mut final_validation_status,
         &mut final_gate_state,
-        false,
         _no_active_skill,
         iteration,
         max_iterations,
@@ -83,7 +82,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
     terminal_dedupe_candidate: &mut Option<String>,
     final_validation_status: &mut Option<crate::ai::request::TransientStatusLine>,
     final_gate_state: &mut FinalGateState,
-    delegation_requirement_violated: bool,
     _no_active_skill: bool,
     iteration: usize,
     max_iterations: usize,
@@ -286,11 +284,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 iteration,
                 max_iterations,
             );
-            let delegation_reopen_allowed = final_gate_state.can_reopen_delegation(
-                *force_final_response,
-                iteration,
-                max_iterations,
-            );
             let echo_action = if !final_gate_reopen_allowed
                 && looks_like_injected_context_echo(&stream_result.assistant_text)
             {
@@ -381,21 +374,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 }
                 FinalCitationGateAction::Warn => true,
             };
-            if preflight_delegation_requirement_gate_action(
-                messages,
-                delegation_requirement_violated,
-                !delegation_reopen_allowed,
-            ) == OutstandingWorkGateAction::Reopen
-            {
-                final_gate_state.consume_delegation_retry();
-                drop(final_validation_status.take());
-                print_tool_note_line(
-                    "final-gate",
-                    "required delegation missing; reopening final response (1/1)",
-                );
-                *terminal_dedupe_candidate = None;
-                return Ok(TurnLoopStep::Continue);
-            }
             let warn_outstanding_work = match outstanding_work_gate_action(
                 app,
                 messages,

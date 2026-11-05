@@ -1,6 +1,22 @@
 //! Session lifecycle routes: list/create/fork/delete, title, config.
 
 use super::*;
+use crate::ai::driver::commands::use_backend::{
+    apply_subagent_use, format_use_state, reset_subagent_config,
+};
+
+fn session_config_response(config: &SessionServeConfig) -> serde_json::Value {
+    let kernel_model = config.model.clone().unwrap_or_else(default_turn_model);
+    serde_json::json!({
+        "model": config.model.as_deref().unwrap_or_default(),
+        "agent": config.agent.as_deref().unwrap_or_default(),
+        "reasoning_effort": config.reasoning_effort.as_deref().unwrap_or_default(),
+        "subagent_backend": config.subagent_backend.as_deref().unwrap_or_default(),
+        "subagent_model": config.subagent_model.as_deref().unwrap_or_default(),
+        "default_skills": config.default_skills,
+        "output": format_use_state(config, &kernel_model),
+    })
+}
 
 pub(crate) async fn list_sessions(
     State(state): State<ServeState>,
@@ -187,9 +203,9 @@ pub(crate) async fn set_session_title(
 }
 
 /// Read the session's persisted serve-mode config (`GET /sessions/{id}/config`):
-/// the model/agent/reasoning-effort picks the mobile client shows for this
-/// session. An empty field means "server default"; a session that does not
-/// exist yet reads as all-defaults.
+/// the model/agent/reasoning-effort picks and subagent defaults for this session.
+/// An empty field means "server default"; a session that does not exist yet
+/// reads as all-defaults. `output` mirrors the local `/use` state text.
 pub(crate) async fn get_session_config(
     State(state): State<ServeState>,
     headers: HeaderMap,
@@ -203,15 +219,7 @@ pub(crate) async fn get_session_config(
     }
     let store = SessionStore::new(state.history_file.as_path());
     match store.read_session_serve_config(&id) {
-        Ok(config) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "model": config.model.unwrap_or_default(),
-                "agent": config.agent.unwrap_or_default(),
-                "reasoning_effort": config.reasoning_effort.unwrap_or_default(),
-            })),
-        )
-            .into_response(),
+        Ok(config) => (StatusCode::OK, Json(session_config_response(&config))).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": err.to_string()})),
@@ -223,8 +231,9 @@ pub(crate) async fn get_session_config(
 /// Update the session's persisted serve-mode config (`POST /sessions/{id}/config`):
 /// a field absent from the body keeps its stored value, a blank field clears
 /// it, and a non-blank field is validated like a per-turn override before it
-/// is stored. The three keys are written in one transaction, so a crash cannot
-/// leave a half-updated session config. Writing to a session that does not
+/// is stored. Subagent defaults use the local `/use` and `/reset` rules. All
+/// keys are written in one transaction, so a crash cannot leave a half-updated
+/// session config. Writing to a session that does not
 /// exist yet materializes it (same as `POST /sessions/{id}/title`).
 pub(crate) async fn set_session_config(
     State(state): State<ServeState>,
@@ -250,6 +259,10 @@ pub(crate) async fn set_session_config(
         Ok(update) => update,
         Err(e) => return bad_request(e).into_response(),
     };
+    // A turn child persists its runtime snapshot before exiting. Hold the same
+    // session lock across this read and write so that snapshot cannot undo a patch.
+    let lock = session_lock(&state, &id).await;
+    let _guard = lock.lock().await;
     let store = SessionStore::new(state.history_file.as_path());
     let mut config = match store.read_session_serve_config(&id) {
         Ok(config) => config,
@@ -270,16 +283,28 @@ pub(crate) async fn set_session_config(
     if let Some(value) = reasoning_effort {
         config.reasoning_effort = value;
     }
+    if let Some(subagents) = req.subagents {
+        match subagents.action.as_str() {
+            "use" => {
+                let Some(backend) = subagents.backend.as_deref() else {
+                    return bad_request("backend is required for subagents use".to_string())
+                        .into_response();
+                };
+                if let Err(err) =
+                    apply_subagent_use(&mut config, backend, subagents.model.as_deref())
+                {
+                    return bad_request(err).into_response();
+                }
+            }
+            "reset" => reset_subagent_config(&mut config),
+            _ => {
+                return bad_request("subagents action must be use|reset".to_string())
+                    .into_response();
+            }
+        }
+    }
     match store.write_session_serve_config(&id, &config) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "model": config.model.unwrap_or_default(),
-                "agent": config.agent.unwrap_or_default(),
-                "reasoning_effort": config.reasoning_effort.unwrap_or_default(),
-            })),
-        )
-            .into_response(),
+        Ok(()) => (StatusCode::OK, Json(session_config_response(&config))).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": err.to_string()})),

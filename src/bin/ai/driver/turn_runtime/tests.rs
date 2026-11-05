@@ -1463,7 +1463,6 @@ fn required_delegation_advisory_fires_once_on_first_parent_mutation() {
             .as_str()
             .is_some_and(|text| text.contains("Hand the edit to a subagent"))
     );
-    assert!(progress.delegation_requirement_violated());
 }
 
 #[test]
@@ -1479,20 +1478,20 @@ fn delegation_tracking_is_noop_without_required_declaration() {
     };
 
     assert!(!progress.observe_delegation_calls(&[mutation]));
-    assert_eq!(progress.mutation_calls_this_turn, 0);
-    assert!(!progress.delegation_requirement_violated());
+    assert_eq!(progress.delegation_calls_this_turn, 0);
+    assert!(!progress.delegation_advisory.injected);
 }
 
 #[test]
-fn required_delegation_without_tool_calls_is_not_violated() {
+fn required_delegation_without_tool_calls_stays_idle() {
     let progress = ProgressLedger {
         delegation_required: true,
         ..ProgressLedger::default()
     };
 
-    assert_eq!(progress.mutation_calls_this_turn, 0);
+    assert_eq!(progress.delegation_calls_this_turn, 0);
     assert_eq!(progress.work_rounds_before_delegation, 0);
-    assert!(!progress.delegation_requirement_violated());
+    assert!(!progress.delegation_advisory.injected);
 }
 
 #[test]
@@ -1538,21 +1537,12 @@ fn required_delegation_advisory_fires_on_third_read_only_round() {
                 "required={required}, round={round}"
             );
             assert_eq!(supervisor.progress.consecutive_no_progress, 0);
-            assert_eq!(
-                supervisor.progress.delegation_requirement_violated(),
-                required,
-                "required={required}, round={round}"
-            );
         }
         assert_eq!(advisory_count, usize::from(required));
         assert_eq!(supervisor.progress.delegation_advisory.injected, required);
         assert_eq!(
             supervisor.progress.work_rounds_before_delegation,
             if required { 5 } else { 0 }
-        );
-        assert_eq!(
-            supervisor.progress.delegation_requirement_violated(),
-            required
         );
         if required {
             let note = messages
@@ -1591,7 +1581,6 @@ fn required_delegation_advisory_fires_on_unclassified_command_round() {
             .observe_delegation_calls(messages[0].tool_calls.as_deref().unwrap())
     );
     assert_eq!(supervisor.progress.delegation_calls_this_turn, 0);
-    assert_eq!(supervisor.progress.mutation_calls_this_turn, 0);
 
     for round in 1..=REQUIRED_DELEGATION_WORK_ROUNDS {
         if round > 1 {
@@ -1608,12 +1597,10 @@ fn required_delegation_advisory_fires_on_unclassified_command_round() {
             },
             "round={round}"
         );
-        assert!(supervisor.progress.delegation_requirement_violated());
         assert_eq!(supervisor.progress.work_rounds_before_delegation, round);
         assert_eq!(supervisor.progress.consecutive_no_progress, 0);
     }
     assert!(supervisor.progress.delegation_advisory.injected);
-    assert!(supervisor.progress.delegation_requirement_violated());
     assert_eq!(
         supervisor.progress.work_rounds_before_delegation,
         REQUIRED_DELEGATION_WORK_ROUNDS
@@ -1663,15 +1650,11 @@ fn required_delegation_advisory_skips_coordination_only_rounds() {
         );
         assert!(!supervisor.progress.delegation_advisory.injected, "{name}");
         assert_eq!(supervisor.progress.work_rounds_before_delegation, 0);
-        assert!(
-            !supervisor.progress.delegation_requirement_violated(),
-            "{name}"
-        );
     }
 }
 
 #[test]
-fn required_delegation_read_only_violation_clears_after_delegation() {
+fn required_delegation_tracks_work_rounds_until_delegation() {
     for name in ["task", "task_spawn"] {
         let mut supervisor = TurnSupervisor::default();
         supervisor.progress.delegation_required = true;
@@ -1682,8 +1665,7 @@ fn required_delegation_read_only_violation_clears_after_delegation() {
             supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
             ToolLoopSignal::None,
         );
-        assert_eq!(supervisor.progress.mutation_calls_this_turn, 0);
-        assert!(supervisor.progress.delegation_requirement_violated());
+        assert_eq!(supervisor.progress.delegation_calls_this_turn, 0);
 
         let mut delegation = pb_read_msg("unused", "delegate");
         let calls = delegation.tool_calls.as_mut().unwrap();
@@ -1691,7 +1673,7 @@ fn required_delegation_read_only_violation_clears_after_delegation() {
         assert!(!supervisor.progress.observe_delegation_calls(calls));
         assert_eq!(supervisor.progress.delegation_calls_this_turn, 1);
         assert_eq!(supervisor.progress.work_rounds_before_delegation, 1);
-        assert!(!supervisor.progress.delegation_requirement_violated());
+        assert!(!supervisor.progress.delegation_advisory.injected);
     }
 }
 
@@ -1716,7 +1698,6 @@ fn required_delegation_advisory_checks_broad_batches_and_repeated_targets() {
     assert_eq!(batch_supervisor.progress.work_rounds_before_delegation, 1);
     assert_eq!(batch_supervisor.progress.seen_targets.len(), 12);
     assert!(!batch_supervisor.progress.delegation_advisory.injected);
-    assert!(batch_supervisor.progress.delegation_requirement_violated());
 
     let mut supervisor = TurnSupervisor::default();
     supervisor.progress.delegation_required = true;
@@ -1748,7 +1729,6 @@ fn required_delegation_advisory_checks_broad_batches_and_repeated_targets() {
     }
     assert_eq!(supervisor.progress.seen_targets.len(), 1);
     assert_eq!(supervisor.progress.work_rounds_before_delegation, rounds);
-    assert!(supervisor.progress.delegation_requirement_violated());
 }
 
 #[test]
@@ -1870,7 +1850,6 @@ fn required_delegation_skip_silences_current_turn_and_rearms_next_turn() {
         );
         assert!(!supervisor.progress.delegation_advisory.injected);
         assert_eq!(supervisor.progress.work_rounds_before_delegation, round);
-        assert!(supervisor.progress.delegation_requirement_violated());
     }
     supervisor.progress.reset_after_truncation();
     assert_eq!(supervisor.progress.work_rounds_before_delegation, 5);
@@ -1880,7 +1859,6 @@ fn required_delegation_skip_silences_current_turn_and_rearms_next_turn() {
             .progress
             .observe_delegation_calls(mutation.tool_calls.as_deref().unwrap())
     );
-    assert_eq!(supervisor.progress.mutation_calls_this_turn, 1);
     assert!(!supervisor.progress.delegation_advisory.injected);
 
     canonical.push(delegation_test_message(
@@ -1943,7 +1921,6 @@ fn required_delegation_skip_reads_execution_before_narration_truncation() {
     let mutation = pb_apply_patch_msg("same-response-patch");
     assert!(!progress.observe_delegation_calls(mutation.tool_calls.as_deref().unwrap()));
     assert!(!progress.delegation_advisory.injected);
-    assert!(progress.delegation_requirement_violated());
 }
 
 #[test]
@@ -1993,7 +1970,6 @@ fn required_delegation_advisory_state_survives_recursive_body() {
                 ToolLoopSignal::None
             );
         }
-        assert!(recursive_body.progress.delegation_requirement_violated());
         let mutation = pb_apply_patch_msg("recursive-patch");
         assert!(
             !recursive_body
@@ -2059,7 +2035,6 @@ fn required_delegation_advisory_stands_down_after_delegation() {
             assert!(!supervisor.progress.delegation_advisory.injected);
             assert_eq!(supervisor.progress.work_rounds_before_delegation, 0);
             assert_eq!(supervisor.progress.delegation_calls_this_turn, 1);
-            assert!(!supervisor.progress.delegation_requirement_violated());
         }
     }
 }

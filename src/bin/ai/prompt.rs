@@ -22,6 +22,7 @@ mod multiline;
 use completion::{CommandCompleter, LineEditor};
 #[allow(unused_imports)]
 pub(super) use multiline::MultilineHistoryState;
+pub(in crate::ai) use multiline::SingleRowFrame;
 
 const LINE_REPL_HISTORY_FILE: &str = "~/.liner_history";
 const MAX_INPUT_CHARS: usize = 4000;

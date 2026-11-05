@@ -212,12 +212,12 @@ fn probe_foreground_subagent() -> ForegroundSubagentProbe {
     cancel_flag.store(true, Ordering::Relaxed);
     // Targeted cancellation only flips the target sub-agent's private cancel flag
     // and wakes its waiters; it does not set the process-level
-    // REQUEST_INTERRUPT_FLAG/futex, so concurrent background turns will not read
-    // the global flag and mistake it for "this turn was canceled". The target
+    // REQUEST_INTERRUPT_FLAG/futex or SigCancel. The parent must keep executing
+    // tools after the canceled task returns, and concurrent background turns
+    // must not mistake this interrupt for "this turn was canceled". The target
     // sub-agent's wait path re-checks its private cancel_stream after being woken,
     // via wait_for_interrupt_sources' cancel_flag parameter.
     notify_request_interrupt_waiters();
-    let _ = crate::ai::tools::registry::common::try_request_tool_cancel();
     ForegroundSubagentProbe::Cancelled
 }
 
@@ -546,6 +546,17 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    struct GlobalOsRestoreGuard(Option<aios_kernel::kernel::SharedKernel>);
+
+    impl Drop for GlobalOsRestoreGuard {
+        fn drop(&mut self) {
+            super::clear_request_interrupt();
+            *super::GLOBAL_OS
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = self.0.take();
+        }
+    }
+
     #[test]
     fn sigint_cancels_streaming_turn() {
         let shutdown = AtomicBool::new(false);
@@ -687,22 +698,100 @@ mod tests {
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        let kernel = crate::ai::driver::new_local_kernel();
+        let _os_guard =
+            GlobalOsRestoreGuard(super::GLOBAL_OS.lock().unwrap().replace(kernel.clone()));
+        let tool_cancel_futex = {
+            let mut os = kernel.lock().unwrap();
+            let pid = os.begin_foreground(
+                "foreground".to_string(),
+                "continue after task cancellation".to_string(),
+                10,
+                usize::MAX,
+                None,
+            );
+            crate::ai::tools::registry::common::ensure_process_tool_cancel_futex(os.as_mut(), pid)
+                .unwrap()
+        };
         super::clear_request_interrupt();
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let _registration = ForegroundSubagentGuard::register(cancel.clone());
+        let registration = ForegroundSubagentGuard::register(cancel.clone());
+        let turn = ForegroundTurnGuard::enter();
+        let shutdown = AtomicBool::new(false);
+        let streaming = AtomicBool::new(false);
+        let cancel_stream = AtomicBool::new(false);
+        let mut notified = Box::pin(super::request_interrupt_notify().notified());
+        notified.as_mut().enable();
 
         // First SIGINT: targeted cancellation of the sub-agent — flip its own
-        // cancel flag, leave global shutdown untouched.
-        assert_eq!(
-            probe_foreground_subagent(),
-            ForegroundSubagentProbe::Cancelled
-        );
+        // cancel flag, wake its waiters, and leave the parent turn running.
+        handle_sigint(&shutdown, &streaming, &cancel_stream);
         assert!(cancel.load(Ordering::Relaxed));
+        assert!(futures_util::FutureExt::now_or_never(notified).is_some());
+        assert!(!shutdown.load(Ordering::Relaxed));
+        assert!(!cancel_stream.load(Ordering::Relaxed));
+        assert!(!super::request_interrupt_ready());
+        assert!(!crate::ai::tools::registry::common::is_tool_cancel_requested());
+        assert_eq!(
+            kernel.lock().unwrap().futex_load(tool_cancel_futex),
+            Some(0)
+        );
 
         // Second SIGINT: the sub-agent is still on the stack (stuck) → not
         // consumed; classified as stuck.
         assert_eq!(probe_foreground_subagent(), ForegroundSubagentProbe::Stuck);
+
+        // Returning from the synchronous task unregisters the target. Subsequent
+        // tool calls in this same parent turn must still execute.
+        drop(registration);
+        let tool_calls: Vec<_> = (0..2)
+            .map(|index| crate::ai::types::ToolCall {
+                id: format!("after-cancel-{index}"),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "ps_processes".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            })
+            .collect();
+        let mcp = crate::ai::mcp::McpClient::new();
+        let shared_mcp = Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+        let execute = || {
+            crate::ai::driver::tools::execute_tool_calls(
+                "targeted-sigint",
+                &mcp,
+                &shared_mcp,
+                &tool_calls,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let result = execute();
+        assert_eq!(result.executed_tool_calls.len(), tool_calls.len());
+        assert_eq!(result.tool_results.len(), tool_calls.len());
+        assert!(!result.had_error);
+
+        // Without a foreground sub-agent, Ctrl+C still cancels the whole turn
+        // and prevents the remaining tools from running.
+        handle_sigint(&shutdown, &streaming, &cancel_stream);
+        assert!(cancel_stream.load(Ordering::Relaxed));
+        assert!(!shutdown.load(Ordering::Relaxed));
+        assert!(crate::ai::tools::registry::common::is_tool_cancel_requested());
+        assert!(execute().executed_tool_calls.is_empty());
+
+        drop(turn);
+        cancel_stream.store(false, Ordering::Relaxed);
+        crate::ai::tools::registry::common::clear_tool_cancel();
+        super::clear_request_interrupt();
+
+        // Idle shutdown must retain its tool cancellation side channel as well.
+        handle_sigint(&shutdown, &streaming, &cancel_stream);
+        assert!(shutdown.load(Ordering::Relaxed));
+        assert!(crate::ai::tools::registry::common::is_tool_cancel_requested());
+        assert!(execute().executed_tool_calls.is_empty());
+        assert!(take_sigint_shutdown_request());
 
         super::clear_request_interrupt();
     }

@@ -1,4 +1,5 @@
 use ratatui::{
+    backend::Backend,
     buffer::Buffer,
     layout::Alignment,
     layout::{Constraint, Direction, Layout},
@@ -14,43 +15,46 @@ use unicode_width::UnicodeWidthStr;
 use super::completion_panel::CompletionPanel;
 use crate::ai::prompt::MAX_INPUT_CHARS;
 
+/// Keep the transient prompt in the cursor's logical line group. xterm leaves
+/// that group to the application during resize instead of pushing its wraps
+/// into transcript scrollback. The renderer reserves both outer columns; two
+/// contiguous spaces at the right edge link the next row without visible ink.
+/// The application still lays out each chrome item on exactly one screen row.
+pub(in crate::ai::prompt::multiline) fn preserve_prompt_cursor_group<B: Backend>(
+    backend: &mut B,
+    area: Rect,
+    live_width: u16,
+) -> Result<bool, B::Error> {
+    if area.x != 0 || live_width < 2 || area.height < 2 {
+        return Ok(false);
+    }
+    let link = ratatui::buffer::Cell::new("  ");
+    let blank = ratatui::buffer::Cell::default();
+    let edge = live_width - 1;
+    backend.draw((area.top()..area.bottom() - 1).flat_map(|y| {
+        // The second write restores the edge to one ordinary blank cell in
+        // both the terminal and buffer-based backends, preserving the row link.
+        [(edge, y, &link), (edge, y, &blank)]
+    }))?;
+    Ok(true)
+}
+
 /// Maximum number of candidate lines the completion panel shows at once (overflow scrolls with the selection).
 const COMPLETION_WINDOW: usize = 12;
 
 /// Column budget for the informational model/topic line.
 ///
-/// Every row is terminal content, so a row painted wider than the terminal is
-/// re-wrapped on each narrowing: the terminal pushes the transcript up by the
-/// extra rows and the input box follows. Widening back does not undo that — the
-/// box's rows are rewritten by the app, so the terminal has no wrapped-line
-/// group left to rejoin. Capping this line keeps the re-wrap a no-op for
-/// narrowings down to roughly this many columns, but the budget covers the text
-/// only: the row also carries the centered popup's left offset, which is 1-2
-/// columns up to ~182-column terminals and grows by one column per two columns
-/// of terminal width beyond that.
-///
-/// 120 was chosen over the original 80 so a typical session title (~15 CJK
-/// characters = ~30 columns after the 59-column prefix) renders in full: the
-/// trade-off is that the no-reflow floor rises from ~82 to ~122 terminal
-/// columns, so an IDE terminal narrowed below 122 columns re-wraps this one
-/// row once (transcript shifts up a line until the next repaint). That is the
-/// explicit cost of showing longer titles; keep this number as low as the
-/// longest title users actually need.
+/// Keep identity and title text readable on wide terminals, with synchronous
+/// ellipses on narrower application frames. Cursor-group preservation handles
+/// terminal-owned reflow independently of this presentation budget.
 const MODEL_LINE_MAX_COLUMNS: u16 = 120;
 
 /// Columns the chrome rows (model/topic line, help line, transient status
 /// line) deliberately leave clear at the terminal's right edge.
 ///
-/// A painted row that reaches the last terminal column is soft-wrapped by the
-/// terminal into two visual rows on the next narrowing, even when the app
-/// repaints nothing: the wrap shows the row's tail as an extra line (the
-/// "folded" status line), the cursor-row probe then reads the wrapped row as
-/// the truth, and the fixed viewport re-anchors one row lower. Rebuilds only
-/// ever move the box down, so every fold cycle strands it one row lower and
-/// the blank gap above the input box grows monotonically while idle. The
-/// live-size jitter tolerance intentionally keeps painting through one-column
-/// narrowings, so the truncation budgets below hold back this margin: a stale
-/// paint stays at least two columns short of even the narrowed edge.
+/// Leave room for one-column geometry jitter and for the blank edge writes
+/// that preserve the prompt's cursor group. Chrome never writes visible text
+/// into those reserved columns.
 const CHROME_EDGE_MARGIN: u16 = 2;
 
 /// Styles only cells occupied by input text.
@@ -81,6 +85,32 @@ fn style_input_text(textarea: &mut TextArea<'_>, lines: &[String]) {
         };
         // tui-textarea highlight offsets are UTF-8 byte offsets.
         textarea.custom_highlight(((row, 0), (row, line.len())), style, 1);
+    }
+}
+
+fn render_textarea_with_full_caret(textarea: &mut TextArea<'_>, area: Rect, buffer: &mut Buffer) {
+    Widget::render(&*textarea, area, buffer);
+    let Some(position) = textarea.rendered_cursor_position() else {
+        return;
+    };
+    let (row, column) = textarea.cursor();
+    let caret_width = textarea.lines()[row]
+        .chars()
+        .nth(column)
+        .and_then(UnicodeWidthChar::width)
+        .unwrap_or(1)
+        .max(1) as u16;
+    let overflow = position
+        .x
+        .saturating_add(caret_width)
+        .saturating_sub(area.right());
+    if caret_width <= area.width && overflow > 0 {
+        // The widget scrolls for the caret's first column only. A wide glyph at
+        // the right edge is then dropped by Paragraph; expose its whole cell
+        // without moving the logical cursor or retaining the first paint's ink.
+        textarea.scroll((0, overflow as i16));
+        Clear.render(area, buffer);
+        Widget::render(&*textarea, area, buffer);
     }
 }
 
@@ -256,10 +286,9 @@ fn popup_geometry(
 ///
 /// The vertical split depends only on the viewport height and the editor
 /// state, never on the width, so a narrowing rebuild can recompute the span
-/// its last frame drew without the original frame. The span marks the rows
-/// that keep wrapping across a repaint: chrome rows (title, help, rules)
-/// repaint truncated to an ellipsis, so their old soft-wraps must not move
-/// the anchor (see `reflowed_place_rows` in `multiline_ui.rs`).
+/// its last frame drew without the original frame. Tests use the span to
+/// distinguish textarea rows from the dedicated chrome slots.
+#[cfg(test)]
 pub(in crate::ai::prompt::multiline) fn textarea_row_range(
     area_height: u16,
     current_lines: &[String],
@@ -539,11 +568,11 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
     // parked-cursor anchor exists to avoid). A single left-column glyph can never
     // reach the right margin, so it survives width changes without leaving
     // ghost boxes.
-    let input_bar = Block::default().borders(Borders::LEFT).border_style(
-        Style::default().fg(Color::Rgb(74, 92, 112)),
-    );
+    let input_bar = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(Color::Rgb(74, 92, 112)));
     f.render_widget(&input_bar, textarea_area);
-    f.render_widget(&*textarea, geometry.textarea_inner);
+    render_textarea_with_full_caret(textarea, geometry.textarea_inner, f.buffer_mut());
     // Reuse tui-textarea's own rendering plan for the visual caret position.
     // This avoids a duplicate CJK-width calculation that can disagree with the
     // widget's internal screen map.
@@ -713,8 +742,8 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
             };
             if status_area.width > 0 {
                 // Same edge margin as the other chrome rows.
-                let status_width = (status_area.width as usize)
-                    .saturating_sub(CHROME_EDGE_MARGIN as usize);
+                let status_width =
+                    (status_area.width as usize).saturating_sub(CHROME_EDGE_MARGIN as usize);
                 let status_text = truncate_with_ellipsis(msg, status_width);
                 let status_para = Paragraph::new(Line::from(Span::styled(
                     status_text,
@@ -762,7 +791,7 @@ pub(in crate::ai::prompt::multiline) fn measure_multiline_cursor_offset(
     style_input_text(&mut measured, &current_lines);
     measured.set_cursor_render_mode(CursorRenderMode::Hidden);
     let mut buffer = Buffer::empty(area);
-    Widget::render(&measured, geometry.textarea_inner, &mut buffer);
+    render_textarea_with_full_caret(&mut measured, geometry.textarea_inner, &mut buffer);
     measured.rendered_cursor_position()
 }
 
@@ -851,9 +880,9 @@ fn truncate_line_to_width<'a>(line: &Line<'a>, max_width: usize) -> Line<'a> {
     // the reservation can never disagree with the line's own column accounting.
     let ellipsis = "…";
     let ellipsis_width = UnicodeWidthStr::width_cjk(ellipsis);
-    // A row too narrow for text plus marker is cut hard: overflowing the budget
-    // is worse than an unmarked cut.
-    let reserve = if max_width > ellipsis_width {
+    // A marker may occupy the entire budget. Only a narrower budget needs a
+    // hard cut to avoid overflowing its row.
+    let reserve = if max_width >= ellipsis_width {
         ellipsis_width
     } else {
         0
@@ -911,8 +940,9 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
         return text.to_string();
     }
 
-    let ellipsis_w = UnicodeWidthStr::width_cjk("...");
-    if max_width <= ellipsis_w {
+    let ellipsis = "…";
+    let ellipsis_w = UnicodeWidthStr::width_cjk(ellipsis);
+    if max_width < ellipsis_w {
         return " ".repeat(max_width);
     }
 
@@ -931,7 +961,7 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
         width += ch_w;
     }
 
-    out.push_str("...");
+    out.push_str(ellipsis);
     out
 }
 
@@ -980,7 +1010,15 @@ mod tests {
             terminal
                 .draw(|frame| {
                     render_multiline_popup(
-                        frame, &mut textarea, None, None, "", "model", false, "high", None,
+                        frame,
+                        &mut textarea,
+                        None,
+                        None,
+                        "",
+                        "model",
+                        false,
+                        "high",
+                        None,
                     );
                 })
                 .unwrap();
@@ -1011,33 +1049,43 @@ mod tests {
             Some(Style::default().fg(Color::Green)),
             "the marker belongs to the clipped span"
         );
+        assert_eq!(
+            truncate_line_to_width(&line, 2)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "…",
+            "a row with room only for the marker must still show truncation"
+        );
     }
 
     #[test]
     fn test_truncate_cjk() {
         // Test CJK truncation
         let result = truncate_with_ellipsis("已补全为 /agent", 10);
-        assert!(result.ends_with("..."));
+        assert!(result.ends_with('…'));
         assert!(display_width(&result) <= 10);
     }
 
     #[test]
     fn test_truncate_ascii() {
         assert_eq!(truncate_with_ellipsis("Copied!", 20), "Copied!");
-        assert_eq!(truncate_with_ellipsis("Hello World!", 8), "Hello...");
+        assert_eq!(truncate_with_ellipsis("Hello World!", 8), "Hello …");
     }
 
     #[test]
     fn test_truncate_empty() {
         assert_eq!(truncate_with_ellipsis("test", 0), "");
-        assert_eq!(truncate_with_ellipsis("test", 2), "  ");
+        // The Unicode marker fits this budget; the former three-dot marker did not.
+        assert_eq!(truncate_with_ellipsis("test", 2), "…");
     }
 
     #[test]
     fn test_truncate_unicode() {
         // Test assorted Unicode characters
         let result = truncate_with_ellipsis("日本語テスト", 8);
-        assert!(result.ends_with("..."));
+        assert!(result.ends_with('…'));
         assert!(display_width(&result) <= 8);
     }
 
@@ -1189,12 +1237,10 @@ mod tests {
 
         // The title row sits above the help row, which is the viewport tail.
         let title_row_y = viewport_area.bottom() - 2;
-        let title_row =
-            buffer_row(terminal.backend(), title_row_y, 0, viewport_area.width);
+        let title_row = buffer_row(terminal.backend(), title_row_y, 0, viewport_area.width);
         // Cells holding a wide character exist per column, so compare the row
         // with its whitespace removed instead of as a contiguous substring.
-        let dense: String =
-            title_row.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let dense: String = title_row.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert!(
             title_row.contains('…'),
             "truncated title without a marker: {title_row:?}"
@@ -1209,18 +1255,18 @@ mod tests {
             dense.contains(&head),
             "title row drops the topic head: {title_row:?}"
         );
-        // 116-column text budget holds 58 wide chars plus the marker; the
+        // Reserve the marker inside the 116-column budget before fitting wide
+        // characters; an odd remaining column cannot fit another wide glyph. The
         // whitespace-filtered row must end there, not at the topic end. (The
         // tail of the first copy repeats mid-row, so absence is unassertable.)
         assert_eq!(
             dense.chars().count(),
-            58 + 1,
+            (116 - 1) / 2 + 1,
             "title row paints past its budget: {title_row:?}"
         );
         // The identity row keeps only model/agent info: no topic, no marker.
         let model_row_y = viewport_area.bottom() - 3;
-        let model_row =
-            buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
+        let model_row = buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
         assert!(model_row.contains("(max)"), "{model_row:?}");
         assert!(
             !model_row.contains(&head),
@@ -1266,10 +1312,8 @@ mod tests {
 
         // The title row sits above the help row, which is the viewport tail.
         let title_row_y = viewport_area.bottom() - 2;
-        let title_row =
-            buffer_row(terminal.backend(), title_row_y, 0, viewport_area.width);
-        let dense: String =
-            title_row.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let title_row = buffer_row(terminal.backend(), title_row_y, 0, viewport_area.width);
+        let dense: String = title_row.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert_eq!(dense, topic, "{title_row:?}");
         assert!(
             !title_row.contains('…'),
@@ -1277,9 +1321,11 @@ mod tests {
         );
         // The identity row above it carries the model info, not the topic.
         let model_row_y = viewport_area.bottom() - 3;
-        let model_row =
-            buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
-        assert!(model_row.contains("deepseek-v4.1-flash-volcano"), "{model_row:?}");
+        let model_row = buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
+        assert!(
+            model_row.contains("deepseek-v4.1-flash-volcano"),
+            "{model_row:?}"
+        );
         assert!(
             !model_row.contains(topic),
             "topic leaks into the identity row: {model_row:?}"
@@ -1332,10 +1378,8 @@ mod tests {
             "topic leaks into the identity row: {row:?}"
         );
         let title_row_y = viewport_area.bottom() - 2;
-        let title_row =
-            buffer_row(terminal.backend(), title_row_y, 0, viewport_area.width);
-        let title_dense: String =
-            title_row.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let title_row = buffer_row(terminal.backend(), title_row_y, 0, viewport_area.width);
+        let title_dense: String = title_row.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert_eq!(title_dense, "LeetCode第一题", "{title_row:?}");
     }
 
@@ -1413,8 +1457,7 @@ mod tests {
         // spaces, so display-column math cannot measure it. Assert on content
         // chars instead: 17 wide chars fit the 34-column text budget, plus
         // the marker. The edge margin is checked cell by cell below.
-        let title_dense: String =
-            title_row.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let title_dense: String = title_row.chars().filter(|ch| !ch.is_whitespace()).collect();
         let title_head: String = topic.chars().take(10).collect();
         assert!(
             title_dense.contains(&title_head),
@@ -1433,7 +1476,11 @@ mod tests {
         let title_y = viewport_area.bottom() - 2;
         for x in (viewport_area.width - 2)..viewport_area.width {
             assert_eq!(
-                terminal.backend().buffer().cell((x, title_y)).map(|c| c.symbol()),
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((x, title_y))
+                    .map(|c| c.symbol()),
                 Some(" "),
                 "title row touches the last column: x={x} {title_row:?}"
             );
@@ -1457,7 +1504,7 @@ mod tests {
     }
 
     #[test]
-    fn textarea_row_range_marks_the_wrapping_rows() {
+    fn textarea_row_range_excludes_the_chrome_slots() {
         // Empty-input production shape: 2 textarea rows plus model/title/help chrome.
         let lines = vec![String::new()];
         let (start, len) = textarea_row_range(5, &lines, None, false, true);
@@ -1467,8 +1514,7 @@ mod tests {
             "range escapes the viewport: start={start} len={len}"
         );
         // The chrome rows surround the textarea, so the span is a strict
-        // interior slice, never the whole box: otherwise placement would
-        // count the title/help wraps it must ignore.
+        // interior slice, never the whole box.
         assert!(
             start >= 1 || start.saturating_add(len) < 5,
             "span covers the chrome rows too: start={start} len={len}"
@@ -1511,11 +1557,13 @@ mod tests {
         let title_y = stale_frame_area.bottom() - 2;
         let live_row = buffer_row(terminal.backend(), title_y, 0, 40);
         let stale_tail = buffer_row(terminal.backend(), title_y, 40, 80);
-        assert!(live_row.contains('…'), "title was not truncated: {live_row:?}");
+        assert!(
+            live_row.contains('…'),
+            "title was not truncated: {live_row:?}"
+        );
         // Continuation cells read back as spaces, so count content chars:
         // 17 wide chars fit the 34-column live budget, plus the marker.
-        let live_dense: String =
-            live_row.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let live_dense: String = live_row.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert!(
             live_dense.chars().count() <= 19,
             "title paints past its live budget: {live_row:?}"
@@ -1524,7 +1572,11 @@ mod tests {
         // 40-column frame carry no ink.
         for x in 38..40u16 {
             assert_eq!(
-                terminal.backend().buffer().cell((x, title_y)).map(|c| c.symbol()),
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((x, title_y))
+                    .map(|c| c.symbol()),
                 Some(" "),
                 "title reaches the live terminal edge: x={x} {live_row:?}"
             );
@@ -1911,6 +1963,48 @@ mod tests {
         assert!(caret_cell.modifier.contains(Modifier::REVERSED));
     }
 
+    #[test]
+    fn cjk_caret_remains_visible_at_narrow_horizontal_scroll_edge() {
+        let draft = vec![
+            "DRAFT_WIDE 中文宽字符测试 mixed ASCII 0123456789 中文尾部".to_owned(),
+            "第二行 abcdefghijklmnopqrstuvwxyz".to_owned(),
+        ];
+        let mut textarea = TextArea::from(draft.clone());
+        for cycle in 1..=4 {
+            textarea.move_cursor(CursorMove::Jump(0, 10 + cycle));
+            let cursor = textarea.cursor();
+            for width in [80, 12] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+                let mut caret = None;
+                terminal
+                    .draw(|frame| {
+                        caret = render_multiline_popup(
+                            frame,
+                            &mut textarea,
+                            None,
+                            None,
+                            "fixture-agent",
+                            "fixture-model",
+                            false,
+                            "high",
+                            Some("fixture-topic"),
+                        );
+                    })
+                    .unwrap();
+                let visible = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .filter(|cell| cell.modifier.contains(Modifier::REVERSED | Modifier::BOLD))
+                    .count();
+                assert_eq!(visible, 1, "cycle={cycle} width={width} caret={caret:?}");
+                assert_eq!(textarea.cursor(), cursor, "cycle={cycle} width={width}");
+                assert_eq!(textarea.lines(), draft);
+            }
+        }
+    }
+
     /// The serve-chat remote-mode marker renders in its own lavender-bold
     /// span, distinct from the model-name green, so `(remote)` no longer
     /// blends into the model it follows.
@@ -1964,5 +2058,4 @@ mod tests {
         let name_cell = &buffer[(viewport_area.x + name_at as u16, model_row_y)];
         assert_eq!(name_cell.fg, Color::Rgb(134, 194, 166));
     }
-
 }

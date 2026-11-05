@@ -280,6 +280,11 @@ pub(crate) struct HistoryQuery {
 #[derive(Debug, Deserialize)]
 pub(crate) struct TurnReq {
     pub(crate) prompt: String,
+    /// Title seed for this turn. Absent = legacy client (use `prompt`).
+    /// Some("") = this turn has no user question (state command); generate no title from it.
+    /// Some(text) = extract-only question; title generation must use this text.
+    #[serde(default)]
+    pub(crate) title_seed: Option<String>,
     /// Per-turn model override for serve-chat `/model` switching. `None`
     /// (or absent, for old clients) keeps the server default reported by
     /// `GET /info`; `Some(id)` is forwarded as the child `--model` flag so
@@ -326,6 +331,14 @@ pub(crate) struct TurnReq {
     /// mobile clients) keeps the server-side default.
     #[serde(default, deserialize_with = "deserialize_term_cols")]
     pub(crate) cols: Option<u16>,
+}
+
+/// Resolve the title seed before applying skill prefixes to the child input.
+pub(crate) fn turn_title_seed(req: &TurnReq) -> crate::ai::driver::turn_runtime::SessionTitleSeed {
+    crate::ai::driver::turn_runtime::SessionTitleSeed::from_optional(
+        req.title_seed.as_deref(),
+        Some(&req.prompt),
+    )
 }
 
 /// Max length for one per-turn model/agent override: identifiers are short
@@ -556,6 +569,19 @@ pub(crate) struct SessionConfigReq {
     pub(crate) agent: Option<String>,
     #[serde(default)]
     pub(crate) reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub(crate) subagents: Option<SubagentsReq>,
+}
+
+/// A session subagent-default command, independent of turn submission.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct SubagentsReq {
+    #[serde(default)]
+    pub(crate) action: String,
+    #[serde(default)]
+    pub(crate) backend: Option<String>,
+    #[serde(default)]
+    pub(crate) model: Option<String>,
 }
 
 /// Normalize one model/agent field of a session-config update. A blank value

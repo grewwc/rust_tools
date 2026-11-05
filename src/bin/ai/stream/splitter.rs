@@ -624,6 +624,8 @@ enum BareXmlPhase {
     Idle,
     InBody {
         name: String,
+        buffered_prefix: String,
+        open_tag: String,
     },
 }
 
@@ -682,10 +684,15 @@ impl BareXmlToolCallStreamer {
                     let tag_end = lt + gt_rel;
                     let tag = self.pending[lt..=tag_end].to_string();
                     if let Some(name) = super::inline_recovery::parse_bare_xml_open_tag(&tag) {
-                        let trimmed = before.trim_end_matches([' ', '\t', '\r', '\n']);
-                        cleaned.push_str(trimmed);
+                        let visible_len = before.trim_end_matches([' ', '\t', '\r', '\n']).len();
+                        cleaned.push_str(&before[..visible_len]);
+                        let buffered_prefix = before[visible_len..].to_string();
                         self.pending.drain(..=tag_end);
-                        self.phase = BareXmlPhase::InBody { name };
+                        self.phase = BareXmlPhase::InBody {
+                            name,
+                            buffered_prefix,
+                            open_tag: tag,
+                        };
                         continue;
                     }
 
@@ -694,7 +701,7 @@ impl BareXmlToolCallStreamer {
                     self.pending.drain(..=tag_end);
                     continue;
                 }
-                BareXmlPhase::InBody { name } => {
+                BareXmlPhase::InBody { name, .. } => {
                     let close_tag = format!("</{name}>");
                     if let Some(pos) = self.pending.find(&close_tag) {
                         let body = self.pending[..pos].to_string();
@@ -719,6 +726,25 @@ impl BareXmlToolCallStreamer {
         }
 
         (cleaned, events)
+    }
+
+    /// Return an unfinished candidate as visible text when the response ends.
+    /// Incomplete candidates must never execute as tool calls.
+    pub(super) fn flush(&mut self) -> String {
+        let pending = std::mem::take(&mut self.pending);
+        match std::mem::take(&mut self.phase) {
+            BareXmlPhase::Idle => pending,
+            BareXmlPhase::InBody {
+                buffered_prefix,
+                open_tag,
+                ..
+            } => {
+                let mut visible = buffered_prefix;
+                visible.push_str(&open_tag);
+                visible.push_str(&pending);
+                visible
+            }
+        }
     }
 }
 
@@ -1328,6 +1354,19 @@ mod tests {
         let (cleaned, events) = s.push("a <div>demo</div> b");
         assert_eq!(cleaned, "a <div>demo</div> b");
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn bare_xml_streamer_flushes_unclosed_registered_tool_as_visible_text() {
+        let mut s = BareXmlToolCallStreamer::new();
+        let input = "before\n`/use x\\n<task>after";
+        let (first, first_events) = s.push("before\n`/use x\\n<ta");
+        let (second, second_events) = s.push("sk>after");
+
+        assert!(first_events.is_empty());
+        assert!(second_events.is_empty());
+        assert_eq!(format!("{first}{second}{}", s.flush()), input);
+        assert!(s.flush().is_empty(), "flush must reset the streamer");
     }
 
     // ── Hallucinated "tool result" protocol markers (bug A/B fix) ──────────────────────────

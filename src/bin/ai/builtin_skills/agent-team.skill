@@ -2,7 +2,7 @@
 name: "agent-team"
 description: "Opt-in aggressive orchestration mode. Delegates all feasible, safe execution — breakdown, implementation design, discovery, edits, verification, and documentation — to subagents, keeping only the final cross-worker split, scope and product decisions, consequential-risk decisions, scheduling, acceptance, final review, integration, and synthesis in the parent."
 author: "rust_tools"
-version: "1.0.7"
+version: "1.0.8"
 priority: 20
 delegation: required
 model_invocable: false
@@ -179,7 +179,7 @@ Every delegated prompt must be self-contained and include:
 - scope boundaries, relevant paths or inputs, and explicit exclusions;
 - whether the work is read-only or may edit files;
 - required invariants and edge cases;
-- the expected result format: concise conclusion, key evidence paths/lines or commands, changes made if any, remaining uncertainty, and recommended verification.
+- the expected result format: concise conclusion, key evidence paths/lines or commands, exact verification scope for each check (what ran, where, and under which configuration or scenario), changes made if any, remaining uncertainty and what it does not cover, and recommended verification.
 
 `inherit: cwd,skills` already supplies the workspace and the parent's active skills, so do not paste AGENTS.md or skill bodies into the prompt. Use `inherit: history` only when the worker genuinely needs the full prior conversation; otherwise a background brief is cheaper and more focused.
 
@@ -194,6 +194,8 @@ Fetch authenticated data in the parent before spawning and pass it in the prompt
 - Centralize scope and product decisions; coordinate overlapping writes. Parallel writers must have disjoint files or explicitly non-overlapping ownership.
 - Do not let scheduling expand into execution: outside the trivial atomic exception, do not run a read or command that gathers or verifies evidence; if a worker could do it from a self-contained prompt, delegate it.
 - Treat subagent output as evidence to review, not authority. Double-check decision-bearing claims and inspect the edits workers report before accepting them.
+- Own the verification contract: delegation changes who runs a check, never what the result proves. A worker PASS proves only the exact subject it measured — command, target, configuration, inputs, and scenario — never the user-visible claim by itself.
+- Before accepting, restate the claim and the scope it must hold in, then require matching evidence: for fix or behavior-change claims, the same failure reproduced before the change and the same scenario passing after, or a documented reason reproduction is impossible plus what would settle it; for read-only or analysis claims, evidence measured on the same subject and scope. Prefer one mechanism-covering or boundary/repeated-operation case over several adjacent green checks. State what the evidence does not cover; never promote a scoped PASS into a broader claim.
 - A folded, truncated, or checkpointed task result is a locator, not evidence. Before repeating numbers, quoted output, or absence claims, read the delivered payload with `task_evidence_read(source=delivered)` or the named archive; the inline preview is only a recall anchor. Do not mark a task integrated until that read is done and the claims you will reuse are checked.
 - Follow the runtime task-tool guidance for integration, evidence recovery, and retries. Wait only when blocked on results, using `wait_policy=all` and `timeout_secs=300`; `PARKED` or budget expiry is normal scheduling, not a stall signal, and is never a reason to cancel. While `task_status` shows recent `last activity` or advancing progress, keep waiting. Cancel a branch when its scope changed, it failed, a fresh `task_status` snapshot confirms sustained zero progress, or its result is no longer needed; once the task's acceptance criteria are met, cancel remaining low-value or superseded branches instead of awaiting them.
 - Synthesize one coherent final answer. Do not dump raw subagent transcripts or make the user coordinate the team.
@@ -223,6 +225,8 @@ Fetch authenticated data in the parent before spawning and pass it in the prompt
 - ask workers for exhaustive logs or large source excerpts when a compact evidence-backed result is enough;
 - quote figures, quoted output, or absence claims from a folded preview without reading the delivered payload;
 - accept a consensus of weakly grounded answers as verification.
+- accept a worker PASS without matching its exact verification scope against the user-visible claim;
+- report a scoped green check as proof that the reported failure is fixed when the failure was never reproduced.
 
 Closing invariant: if the parent has already performed undelegated work, it
 must not rationalize it after the fact. It must delegate the remaining work

@@ -44,26 +44,6 @@ pub(in crate::ai::driver::turn_runtime) enum OutstandingWorkGateAction {
     Warn(String),
 }
 
-pub(in crate::ai::driver::turn_runtime) fn preflight_delegation_requirement_gate_action(
-    messages: &mut Vec<Message>,
-    requirement_violated: bool,
-    retry_consumed: bool,
-) -> OutstandingWorkGateAction {
-    if !requirement_violated || retry_consumed {
-        return OutstandingWorkGateAction::Allow;
-    }
-    messages.push(Message {
-        role: ROLE_INTERNAL_NOTE.to_string(),
-        content: serde_json::Value::String(format!(
-            "{DELEGATION_REQUIRED_RETRY_MARKER}\nThis turn requires delegation, but the parent performed the work itself without using `task` or `task_spawn`. Delegate the remaining work now, or state the concrete reason delegation is unsafe."
-        )),
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-    });
-    OutstandingWorkGateAction::Reopen
-}
-
 pub(in crate::ai::driver::turn_runtime) fn outstanding_work_gate_action(
     app: &App,
     messages: &mut Vec<Message>,

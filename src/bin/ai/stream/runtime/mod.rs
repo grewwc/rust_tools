@@ -650,7 +650,23 @@ fn finalize_stream_response(
         finalize_subagent_preview_fold(&mut state)?;
     }
 
-    flush_inline_markup_normalizer(app, current_history, markers, &mut state)?;
+    let deferred_bare_xml =
+        flush_inline_markup_normalizer(app, current_history, markers, &mut state)?;
+
+    // This check is the finalization linearization point for an interrupt. Keep an
+    // unfinished bare-XML candidate private until after it so a Cancelled result
+    // cannot publish protocol-shaped residue.
+    if take_stream_cancelled(app) {
+        let result = cancelled_stream_result(&mut state);
+        return Ok(result);
+    }
+
+    if !deferred_bare_xml.is_empty() {
+        let content = normalize_stream_text(deferred_bare_xml);
+        if !content.is_empty() {
+            commit_visible_content(app, current_history, markers, &mut state, content)?;
+        }
+    }
 
     // Flush whatever the inline `response` splitter still holds. Still capturing means `response` never arrived:
     // under withhold the whole buffer safely falls back as **content** (better to degrade to "thinking leaked into body"
@@ -677,11 +693,6 @@ fn finalize_stream_response(
         // Residual content committed below may have re-shown the deferred-body hint;
         // the stream is over, so clear it before the driver renders the final answer.
         clear_waiting_hint(&mut state)?;
-    }
-
-    if take_stream_cancelled(app) {
-        let result = cancelled_stream_result(&mut state);
-        return Ok(result);
     }
 
     let metrics_finished_at = Instant::now();
@@ -1232,24 +1243,27 @@ fn normalize_end_thinking_boundary(
 }
 
 /// At stream end, flush the tail cached by `InlineMarkupNormalizer` (a complete marker whose closing was never
-/// delivered, or plain text) through the same parse chain as streaming: recognized tool calls go into
-/// tool_calls_map and remaining visible text is appended to assistant_text, so no half-cut marker or
-/// buffered content is lost.
+/// delivered, or plain text) through the same parse chain as streaming. Recognized tool calls go into
+/// tool_calls_map and ordinary visible text is appended to assistant_text. An unfinished bare-XML
+/// candidate is returned separately so finalization can commit it only after cancellation is ruled out.
 fn flush_inline_markup_normalizer(
     app: &mut App,
     current_history: &mut String,
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error>> {
     let normalized = state.content.inline_markup_normalizer.flush();
-    if normalized.is_empty() {
-        return Ok(());
-    }
-    let (cleaned, mut tool_events) = state.content.hermes_tool_call_streamer.push(&normalized);
-    let (cleaned, anthropic_events) = state.content.anthropic_tool_call_streamer.push(&cleaned);
-    let (cleaned, bare_xml_events) = state.content.bare_xml_tool_call_streamer.push(&cleaned);
-    tool_events.extend(anthropic_events);
-    tool_events.extend(bare_xml_events);
+    let (cleaned, tool_events) = if normalized.is_empty() {
+        (String::new(), Vec::new())
+    } else {
+        let (cleaned, mut tool_events) = state.content.hermes_tool_call_streamer.push(&normalized);
+        let (cleaned, anthropic_events) = state.content.anthropic_tool_call_streamer.push(&cleaned);
+        let (cleaned, bare_xml_events) = state.content.bare_xml_tool_call_streamer.push(&cleaned);
+        tool_events.extend(anthropic_events);
+        tool_events.extend(bare_xml_events);
+        (cleaned, tool_events)
+    };
+    let deferred_bare_xml = state.content.bare_xml_tool_call_streamer.flush();
     if !tool_events.is_empty() {
         // The stream is over during flush, so we cannot stop and retry; even if a hallucination marker were detected,
         // the streamer already stripped the whole block and cleaned contains no protocol markers, so the return value is ignored (no hallucinated body persisted).
@@ -1261,7 +1275,7 @@ fn flush_inline_markup_normalizer(
             commit_visible_content(app, current_history, markers, state, content)?;
         }
     }
-    Ok(())
+    Ok(deferred_bare_xml)
 }
 
 fn flush_terminal_splitter(

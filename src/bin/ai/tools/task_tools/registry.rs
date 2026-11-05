@@ -129,6 +129,8 @@ pub(crate) fn with_task_entry_by_pid<R>(
 /// `task_status`, keeping background tasks from contending for the terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SubagentTerminalStatus {
+    pub(crate) task_id: String,
+    pub(crate) started_at: Instant,
     pub(crate) description: String,
     pub(crate) agent_name: String,
     pub(crate) backend: Option<String>,
@@ -206,6 +208,8 @@ pub(crate) fn subagent_terminal_statuses(
         .into_iter()
         .filter(|snapshot| snapshot.owner_pid == owner_pid)
         .map(|snapshot| SubagentTerminalStatus {
+            task_id: snapshot.task_id,
+            started_at: snapshot.started_at,
             description: snapshot.description,
             agent_name: snapshot.agent_name,
             backend: snapshot.backend,

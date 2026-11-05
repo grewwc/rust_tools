@@ -33,7 +33,10 @@ use crate::commonw::configw;
 #[cfg(feature = "serve")]
 use super::driver::side_note::push_side_note;
 #[cfg(feature = "serve")]
-use super::driver::turn_runtime::stale_patch_targets_from_messages;
+use super::driver::turn_runtime::{
+    SERVE_TITLE_SEED_ENV, SERVE_TITLE_SESSION_ENV, SessionTitleSeed,
+    stale_patch_targets_from_messages,
+};
 #[cfg(feature = "serve")]
 use super::{
     agents,
@@ -109,12 +112,27 @@ fn apply_term_cols_env(cmd: &mut std::process::Command, term_cols: Option<u16>) 
 }
 
 #[cfg(feature = "serve")]
+fn apply_title_seed_env(
+    cmd: &mut std::process::Command,
+    session_id: &str,
+    seed: &SessionTitleSeed,
+) {
+    cmd.env_remove(SERVE_TITLE_SEED_ENV);
+    cmd.env_remove(SERVE_TITLE_SESSION_ENV);
+    if let Some(value) = seed.child_env_value() {
+        cmd.env(SERVE_TITLE_SEED_ENV, value);
+        cmd.env(SERVE_TITLE_SESSION_ENV, session_id);
+    }
+}
+
+#[cfg(feature = "serve")]
 fn run_one_shot_turn(
     session_id: &str,
     prompt: &str,
     overrides: &TurnOverrides,
     cwd: &std::path::Path,
     term_cols: Option<u16>,
+    title_seed: &SessionTitleSeed,
 ) -> std::io::Result<String> {
     let exe = runtime_exe()?;
     let mut cmd = std::process::Command::new(exe);
@@ -122,6 +140,7 @@ fn run_one_shot_turn(
     // The child renders the rows this client displays; its own stdout is a
     // pipe, so the client's width travels through the environment.
     apply_term_cols_env(&mut cmd, term_cols);
+    apply_title_seed_env(&mut cmd, session_id, title_seed);
     let out = cmd
         // The turn runs in the session's virtual cwd, so relative paths in
         // every tool resolve per session rather than against the daemon's.
@@ -161,6 +180,7 @@ async fn post_turn(
     if prompt.trim().is_empty() {
         return bad_request("prompt is empty".to_string()).into_response();
     }
+    let title_seed = turn_title_seed(&req);
     if let Err(err) = stage_turn_images(
         &SessionStore::new(&state.history_file).session_assets_dir(&id),
         &req.images,
@@ -174,6 +194,8 @@ async fn post_turn(
     // Display width the client reports for this turn: the child lays its rows
     // out for the screen the client draws on, not for its own piped stdout.
     let term_cols = turn_term_cols(&req);
+    let lock = session_lock(&state, &id).await;
+    let guard = lock.lock().await;
     // A per-turn override wins; absent fields fall back to the session's
     // persisted serve config (then to the server default), so a turn spawned
     // without client flags still runs with the session's picks.
@@ -184,8 +206,6 @@ async fn post_turn(
     // skills exactly like the local REPL.
     let prompt = apply_turn_skills_prefix(&prompt, &overrides.skills);
     let title_model = overrides.model.clone();
-    let lock = session_lock(&state, &id).await;
-    let guard = lock.lock().await;
     // Kick off the model title request in parallel with the turn child: the
     // title task never takes the session lock, and the pending prompt seeds it
     // before the child persists its first message.
@@ -193,12 +213,20 @@ async fn post_turn(
         state.history_file.clone(),
         id.clone(),
         title_model.clone(),
-        Some(prompt.clone()),
+        title_seed.clone(),
     );
     let session_id = id.clone();
     let session_cwd = session_cwd(&state, &id);
+    let child_title_seed = title_seed.clone();
     let output = tokio::task::spawn_blocking(move || {
-        run_one_shot_turn(&session_id, &prompt, &overrides, &session_cwd, term_cols)
+        run_one_shot_turn(
+            &session_id,
+            &prompt,
+            &overrides,
+            &session_cwd,
+            term_cols,
+            &child_title_seed,
+        )
     })
     .await
     .map_err(|err| {
@@ -222,7 +250,12 @@ async fn post_turn(
     // its whole run, in case the parallel attempt above failed or raced an
     // empty history. No-ops when a title already settled.
     drop(guard);
-    spawn_session_title_task(state.history_file.clone(), id.clone(), title_model, None);
+    spawn_session_title_task(
+        state.history_file.clone(),
+        id.clone(),
+        title_model,
+        title_seed,
+    );
     (
         StatusCode::OK,
         Json(TurnResp {
@@ -308,6 +341,7 @@ async fn post_turn_sse(
     if prompt.trim().is_empty() {
         return bad_request("prompt is empty".to_string()).into_response();
     }
+    let title_seed = turn_title_seed(&req);
     if let Err(err) = stage_turn_images(
         &SessionStore::new(&state.history_file).session_assets_dir(&id),
         &req.images,
@@ -321,10 +355,6 @@ async fn post_turn_sse(
     // Display width the client reports for this turn: the child lays its rows
     // out for the screen the client draws on, not for its own piped stdout.
     let term_cols = turn_term_cols(&req);
-    // A per-turn override wins; absent fields fall back to the session's
-    // persisted serve config (then to the server default).
-    let store = SessionStore::new(state.history_file.as_path());
-    merge_session_config(&mut overrides, &read_session_config_or_default(&store, &id));
     // Same `@skills:` prompt splice as the one-shot route above: the stream
     // child parses it through the local inline-reference path.
     let prompt = apply_turn_skills_prefix(&prompt, &overrides.skills);
@@ -361,20 +391,26 @@ async fn post_turn_sse(
     // writers on one session.
     let history_file = state.history_file.clone();
     let title_session_id = session_id.clone();
-    let title_model = overrides.model.clone();
-    // Kick off the model title request in parallel with the turn child; the
-    // pending prompt seeds it before the child persists its first message.
-    spawn_session_title_task(
-        state.history_file.clone(),
-        id.clone(),
-        title_model.clone(),
-        Some(prompt.clone()),
-    );
     // The turn child runs in the session's virtual cwd: every relative path
     // in its tools then resolves per session, not against the daemon's cwd.
     let session_cwd = session_cwd(&state, &id);
     tokio::task::spawn(async move {
         let guard = lock.lock().await;
+        // Read defaults only after the previous writer has finished, including
+        // config patches queued behind a running turn.
+        let store = SessionStore::new(&history_file);
+        merge_session_config(
+            &mut overrides,
+            &read_session_config_or_default(&store, &title_session_id),
+        );
+        let title_model = overrides.model.clone();
+        // The title seed stays separate from the skill-prefixed child input.
+        spawn_session_title_task(
+            history_file.clone(),
+            title_session_id.clone(),
+            title_model.clone(),
+            title_seed.clone(),
+        );
         let event_log = bus.begin(&bus_session);
         tokio::spawn(async move {
             let mut client_alive = true;
@@ -388,6 +424,7 @@ async fn post_turn_sse(
             }
             event_log.finish();
         });
+        let child_title_seed = title_seed.clone();
         let _ = tokio::task::spawn_blocking(move || {
             stream_child_turn(
                 session_id,
@@ -401,6 +438,7 @@ async fn post_turn_sse(
                 native_client,
                 session_cwd,
                 term_cols,
+                child_title_seed,
             )
         })
         .await;
@@ -408,7 +446,7 @@ async fn post_turn_sse(
         // for its whole run, in case the parallel attempt failed. No-ops when
         // a title already settled.
         drop(guard);
-        spawn_session_title_task(history_file, title_session_id, title_model, None);
+        spawn_session_title_task(history_file, title_session_id, title_model, title_seed);
     });
     let stream = stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|event| (event, rx))
@@ -438,6 +476,7 @@ fn stream_child_turn(
     native_client: bool,
     session_cwd: std::path::PathBuf,
     term_cols: Option<u16>,
+    title_seed: SessionTitleSeed,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -467,6 +506,7 @@ fn stream_child_turn(
     };
     let mut cmd = std::process::Command::new(&exe);
     push_turn_args(&mut cmd, &session_id, &prompt, &overrides);
+    apply_title_seed_env(&mut cmd, &session_id, &title_seed);
     // Run in the session's virtual cwd (see `serve/session_cwd.rs`), so
     // tools, MCP children and the prompt all see that session's directory.
     cmd.current_dir(&session_cwd);

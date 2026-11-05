@@ -114,7 +114,10 @@ impl Drop for BackgroundSubagentHistoryGuard {
 /// so it cannot interleave with foreground output.
 pub(super) struct SubagentStatusLine {
     last_line: Option<String>,
+    last_columns: Option<usize>,
+    cursor_queries_disabled: bool,
     last_serve_key: Option<Vec<serde_json::Value>>,
+    agent_team_mode: bool,
     is_tty: bool,
 }
 
@@ -140,10 +143,14 @@ fn sanitize_status_field(value: &str) -> String {
 
 impl SubagentStatusLine {
     pub(super) fn new() -> Self {
+        let is_tty = std::io::stdout().is_terminal();
         Self {
             last_line: None,
+            last_columns: None,
+            cursor_queries_disabled: false,
             last_serve_key: None,
-            is_tty: std::io::stdout().is_terminal(),
+            agent_team_mode: false,
+            is_tty,
         }
     }
 
@@ -213,11 +220,23 @@ impl SubagentStatusLine {
             }
         }
 
+        self.agent_team_mode = app
+            .session_default_skills
+            .iter()
+            .chain(&app.forced_skills)
+            .any(|name| name.eq_ignore_ascii_case("agent-team"));
         if statuses.is_empty() {
             return;
         }
 
-        let status_line = render_subagent_status_line(&statuses);
+        let status_line = if self.agent_team_mode {
+            render_agent_team_subagent_status_block_at_width(
+                &statuses,
+                crate::ai::stream::raw_terminal_cols(),
+            )
+        } else {
+            render_subagent_status_line(&statuses)
+        };
         if crate::ai::background::serve_live_streaming() {
             self.publish_status_if_changed(&statuses, &status_line, |status_line| {
                 crate::ai::background::publish_serve_frame(
@@ -246,7 +265,11 @@ impl SubagentStatusLine {
         status_line: &str,
         publish: impl FnOnce(&str),
     ) {
-        let key = subagent_status_semantic_key(statuses);
+        let key = if self.agent_team_mode {
+            agent_team_subagent_status_semantic_key(statuses)
+        } else {
+            subagent_status_semantic_key(statuses)
+        };
         if self.last_serve_key.as_ref() == Some(&key) {
             return;
         }
@@ -257,26 +280,50 @@ impl SubagentStatusLine {
     /// In-place TTY redraw of the status line, gated on the side-note composer.
     /// While `composer_active` the composer owns the footer row / DECSTBM scroll
     /// region, so the write is deferred (see `status_line_redraw_deferred`):
-    /// its bare `\r\x1b[2K` would displace the output cursor and erase the
+    /// its row erase would displace the output cursor and erase the
     /// composer draft, and the deferred line is not recorded.
     fn redraw_status_line(&mut self, status_line: &str, composer_active: bool) {
-        let line = clamp_status_block(status_line);
-        if status_line_redraw_deferred(
-            composer_active,
-            self.last_line.as_deref(),
-            &line,
-            self.is_tty,
-        ) {
+        if composer_active || !self.is_tty {
             return;
         }
+        // The raw side-note listener must yield before a CPR query. Acquire
+        // input before stdout so its shutdown cannot wait on our output lock.
+        let _stdin_owner = crate::commonw::prompt::acquire_foreground_stdin();
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
         if crate::ai::stream::side_note_input::side_note_composer_active() {
             return;
         }
-        let _ = redraw_status_block(&mut out, self.last_line.as_deref(), &line);
-        let _ = out.flush();
-        self.last_line = Some(line);
+        let cols = self.emulator_columns(&mut out);
+        let line = clamp_status_block_at_width(status_line, cols);
+        if status_line_redraw_deferred(
+            composer_active,
+            self.last_line
+                .as_deref()
+                .filter(|_| self.last_columns == Some(cols)),
+            &line,
+            self.is_tty,
+        ) {
+            return;
+        }
+        if redraw_status_block(&mut out, self.last_line.as_deref(), &line, true).is_ok() {
+            self.last_line = Some(line);
+            self.last_columns = Some(cols);
+        }
+    }
+
+    fn emulator_columns(&mut self, out: &mut impl Write) -> usize {
+        if !self.cursor_queries_disabled && std::io::stdin().is_terminal() {
+            match crate::ai::prompt::SingleRowFrame::measure_columns(out, || {
+                crossterm::cursor::position().map(|(column, _)| column)
+            }) {
+                Ok(cols) => return usize::from(cols),
+                // Unsupported terminals must not pay a query timeout on every
+                // scheduler refresh. Auto-wrap stays disabled on that path.
+                Err(_) => self.cursor_queries_disabled = true,
+            }
+        }
+        crate::ai::stream::raw_terminal_cols()
     }
 
     /// Before the foreground resumes streaming output or the input box, finalize
@@ -300,15 +347,23 @@ impl SubagentStatusLine {
             return;
         };
         if self.is_tty {
+            let _stdin_owner = crate::commonw::prompt::acquire_foreground_stdin();
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
             if crate::ai::stream::side_note_input::side_note_composer_active() {
                 self.last_line = Some(line);
                 return;
             }
+            // Hard line feeds restore independent transcript rows before the
+            // cursor leaves this temporary group. Otherwise its padded edge
+            // links would become ordinary reflowable transcript content.
+            let cols = self.emulator_columns(&mut out);
+            let final_line = clamp_status_block_at_width(&line, cols);
+            let _ = redraw_status_block(&mut out, Some(&line), &final_line, false);
             let _ = writeln!(out);
             let _ = out.flush();
         }
+        self.last_columns = None;
     }
 }
 
@@ -354,6 +409,173 @@ fn subagent_status_semantic_key(
             })
         })
         .collect()
+}
+
+fn agent_team_subagent_status_semantic_key(
+    statuses: &[crate::ai::tools::task_tools::SubagentTerminalStatus],
+) -> Vec<serde_json::Value> {
+    let active_statuses = sorted_active_subagent_statuses(statuses);
+    let mut key = vec![serde_json::json!({
+        "total": statuses.len(),
+        "active": active_statuses.len(),
+    })];
+    key.extend(active_statuses.into_iter().map(|status| {
+        serde_json::json!({
+            "task_id": status.task_id,
+            "status": subagent_status_semantic_key(std::slice::from_ref(status)),
+            "updates": parse_activity_progress(status).and_then(|activity| activity.updates),
+        })
+    }));
+    key
+}
+
+/// Preserve spawn order across refreshes; task id breaks the unlikely timestamp
+/// tie. Progress event arrival, adding a task, or removing a task therefore
+/// cannot reorder the remaining entries.
+fn sorted_active_subagent_statuses(
+    statuses: &[crate::ai::tools::task_tools::SubagentTerminalStatus],
+) -> Vec<&crate::ai::tools::task_tools::SubagentTerminalStatus> {
+    let mut active_statuses = statuses
+        .iter()
+        .filter(|status| !is_terminal_subagent_state(&status.state))
+        .collect::<Vec<_>>();
+    active_statuses.sort_by(|a, b| {
+        a.started_at
+            .cmp(&b.started_at)
+            .then_with(|| a.task_id.cmp(&b.task_id))
+    });
+    active_statuses
+}
+
+fn render_agent_team_subagent_status_block_at_width(
+    statuses: &[crate::ai::tools::task_tools::SubagentTerminalStatus],
+    width: usize,
+) -> String {
+    let active_statuses = sorted_active_subagent_statuses(statuses);
+    let count = if active_statuses.len() == statuses.len() {
+        format!("subagents · {} active", active_statuses.len())
+    } else {
+        format!(
+            "subagents · {}/{} active",
+            active_statuses.len(),
+            statuses.len()
+        )
+    };
+    let mut lines = vec![truncate_status_field_to_width(&count, width)];
+    let last_index = active_statuses.len().saturating_sub(1);
+    for (index, status) in active_statuses.into_iter().enumerate() {
+        let is_last = index == last_index;
+        lines.push(render_agent_team_subagent_header(status, is_last, width));
+        if let Some(detail) = render_agent_team_subagent_detail(status, is_last, width) {
+            lines.push(detail);
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_agent_team_subagent_header(
+    status: &crate::ai::tools::task_tools::SubagentTerminalStatus,
+    is_last: bool,
+    width: usize,
+) -> String {
+    let prefix = if is_last { "└─ " } else { "├─ " };
+    let mut identity = String::new();
+    if let Some(backend) = status.backend.as_deref() {
+        identity.push_str(&format!("[backend={}] ", sanitize_status_field(backend)));
+    }
+    identity.push_str(&sanitize_status_field(&status.agent_name));
+    if let Some(model) = status.model.as_deref() {
+        identity.push_str(&format!(" ({})", sanitize_status_field(model)));
+    }
+    if let Some(effort) = status.reasoning_effort.as_deref() {
+        identity.push_str(&format!(" (effort: {})", sanitize_status_field(effort)));
+    }
+    let state = format!(
+        " · {} {}",
+        sanitize_status_field(&status.state),
+        format_subagent_elapsed(status.elapsed_secs)
+    );
+    let task_prefix = " · task: ";
+    let content_width = width
+        .saturating_sub(display_width(prefix))
+        .saturating_sub(display_width(&state))
+        .saturating_sub(display_width(task_prefix));
+    let task_budget = content_width / 2;
+    let identity_budget = content_width.saturating_sub(task_budget);
+    let identity = truncate_status_field_to_width(&identity, identity_budget);
+    let task = truncate_status_field_to_width(&status.description, task_budget);
+    truncate_status_field_to_width(
+        &format!("{prefix}{identity}{state}{task_prefix}{task}"),
+        width,
+    )
+}
+
+fn render_agent_team_subagent_detail(
+    status: &crate::ai::tools::task_tools::SubagentTerminalStatus,
+    is_last: bool,
+    width: usize,
+) -> Option<String> {
+    let prefix = if is_last { "   ↳ " } else { "│  ↳ " };
+    if let Some(activity) = parse_activity_progress(status) {
+        let phase_prefix = "phase: ";
+        let updates = activity
+            .updates
+            .map(|updates| format!(" · updates {updates}"))
+            .unwrap_or_default();
+        let latest_prefix = format!("{updates} · latest: ");
+        let age = sanitize_status_field(&activity.age);
+        let age_suffix = if age.ends_with("ago") {
+            format!(" · {age}")
+        } else {
+            format!(" · {age} ago")
+        };
+        let content_width = width
+            .saturating_sub(display_width(prefix))
+            .saturating_sub(display_width(&phase_prefix))
+            .saturating_sub(display_width(&latest_prefix))
+            .saturating_sub(display_width(&age_suffix));
+        let phase_budget = content_width / 3;
+        let latest_budget = content_width.saturating_sub(phase_budget);
+        let phase = truncate_status_field_to_width(&activity.phase, phase_budget);
+        let latest = truncate_status_field_to_width(&activity.latest, latest_budget);
+        return Some(render_status_line_with_prefix(
+            prefix,
+            &format!("{phase_prefix}{phase}{latest_prefix}{latest}{age_suffix}"),
+            width,
+        ));
+    }
+
+    let progress = status.progress.as_deref().map(status_progress_text)?;
+    if progress.trim().is_empty() {
+        return None;
+    }
+    Some(render_status_line_with_prefix(
+        prefix,
+        &format!("progress: {progress}"),
+        width,
+    ))
+}
+
+/// Tree indentation is trusted static text. Keep it outside field sanitization,
+/// which intentionally folds whitespace and would otherwise collapse or remove
+/// the spaces that align detail arrows across entries.
+fn render_status_line_with_prefix(prefix: &str, content: &str, width: usize) -> String {
+    let prefix_width = display_width(prefix);
+    if prefix_width > width {
+        let mut rendered = String::new();
+        let mut rendered_width = 0;
+        for ch in prefix.chars() {
+            let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if rendered_width + char_width > width {
+                break;
+            }
+            rendered.push(ch);
+            rendered_width += char_width;
+        }
+        return rendered;
+    }
+    let content = truncate_status_field_to_width(content, width - prefix_width);
+    format!("{prefix}{content}")
 }
 
 fn render_subagent_status_line(
@@ -714,12 +936,15 @@ fn available_field_width(width: usize, prefix: &str, suffix: &str) -> usize {
 }
 
 fn truncate_status_field_to_width(value: &str, max_width: usize) -> String {
+    truncate_status_row_to_width(&sanitize_status_field(value), max_width)
+}
+
+fn truncate_status_row_to_width(value: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
     }
-    let value = sanitize_status_field(value);
     if display_width(&value) <= max_width {
-        return value;
+        return value.to_string();
     }
     let budget = max_width.saturating_sub(1);
     let mut width = 0;
@@ -743,10 +968,14 @@ fn truncate_status_field_to_width(value: &str, max_width: usize) -> String {
 }
 
 fn clamp_status_block(status: &str) -> String {
+    clamp_status_block_at_width(status, crate::ai::stream::raw_terminal_cols())
+}
+
+fn clamp_status_block_at_width(status: &str, cols: usize) -> String {
+    let width = cols.saturating_sub(2).max(1);
     status
         .lines()
-        .take(3)
-        .map(|line| crate::ai::stream::clamp_line_to_terminal_row_with_reserve(line, 0))
+        .map(|line| truncate_status_row_to_width(line, width))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -755,19 +984,58 @@ fn redraw_status_block(
     out: &mut impl Write,
     previous: Option<&str>,
     status: &str,
+    preserve_group: bool,
 ) -> std::io::Result<()> {
-    write!(out, "\r\x1b[2K")?;
-    for _ in 1..previous.map_or(1, |line| line.lines().count()) {
-        write!(out, "\x1b[1A\r\x1b[2K")?;
+    let mut frame = crate::ai::prompt::SingleRowFrame::begin(out)?;
+    let previous_rows = previous.map_or(1, |line| line.lines().count().max(1));
+    let current_rows = status.lines().count().max(1);
+    // ECH preserves isWrapped; full-line EL would sever the cursor group.
+    // Its saturated count erases the actual emulator width, including when
+    // the PTY still reports the width of the preceding frame.
+    write!(frame.output(), "\r\x1b[65535X")?;
+    for _ in 1..previous_rows {
+        write!(frame.output(), "\x1b[1A\r\x1b[65535X")?;
+    }
+    if current_rows > previous_rows {
+        if previous_rows > 1 {
+            write!(frame.output(), "\x1b[{}B", previous_rows - 1)?;
+        }
+        // Reserve new rows before visible ink is written. These hard LFs
+        // cannot reflow a partially painted status into the transcript.
+        for _ in previous_rows..current_rows {
+            write!(frame.output(), "\r\n")?;
+        }
+        write!(frame.output(), "\x1b[{}A\r", current_rows - 1)?;
+    } else if current_rows < previous_rows {
+        // Detach only the released rows, whose cells have already been erased.
+        write!(frame.output(), "\x1b[{}B", current_rows)?;
+        for row in current_rows..previous_rows {
+            write!(frame.output(), "\r\x1b[2K")?;
+            if row + 1 < previous_rows {
+                write!(frame.output(), "\x1b[1B")?;
+            }
+        }
+        write!(frame.output(), "\x1b[{}A\r", previous_rows - 1)?;
+    }
+    if preserve_group && previous.is_none_or(|_| current_rows != previous_rows) {
+        frame.prepare_cursor_group(current_rows)?;
     }
     let mut lines = status.lines();
     if let Some(first) = lines.next() {
-        write!(out, "{first}")?;
+        write!(frame.output(), "{first}")?;
     }
     for line in lines {
-        write!(out, "\r\n{line}")?;
+        if !preserve_group {
+            write!(frame.output(), "\r\n")?;
+        } else {
+            // LF resets xterm's isWrapped flag. Reuse rows with cursor motion
+            // so a resize partway through painting cannot split the group.
+            write!(frame.output(), "\r\x1b[1B")?;
+        }
+        write!(frame.output(), "{line}")?;
     }
-    Ok(())
+    write!(frame.output(), "\r")?;
+    frame.finish()
 }
 
 fn is_terminal_subagent_state(state: &str) -> bool {
@@ -846,9 +1114,11 @@ impl Drop for SubagentStatusLine {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackgroundSubagentHistoryGuard, SubagentStatusLine, format_subagent_elapsed,
-        redraw_status_block, render_subagent_status_line, render_subagent_status_line_at_width,
-        sanitize_status_field, status_line_redraw_deferred,
+        BackgroundSubagentHistoryGuard, SubagentStatusLine,
+        agent_team_subagent_status_semantic_key, clamp_status_block, format_subagent_elapsed,
+        redraw_status_block, render_agent_team_subagent_status_block_at_width,
+        render_subagent_status_line, render_subagent_status_line_at_width, sanitize_status_field,
+        sorted_active_subagent_statuses, status_line_redraw_deferred,
     };
     use crate::ai::tools::task_tools::SubagentTerminalStatus;
 
@@ -938,6 +1208,8 @@ mod tests {
             ),
         ] {
             let mut status = SubagentTerminalStatus {
+                task_id: "task-focus".to_string(),
+                started_at: std::time::Instant::now(),
                 description: "inspect".to_string(),
                 agent_name: "explorer".to_string(),
                 backend: Some("traecli".to_string()),
@@ -972,6 +1244,8 @@ mod tests {
     #[test]
     fn live_status_dedup_publishes_semantic_changes_and_resets_on_finish() {
         let mut status = SubagentTerminalStatus {
+            task_id: "task-focus".to_string(),
+            started_at: std::time::Instant::now(),
             description: "inspect".to_string(),
             agent_name: "explorer".to_string(),
             backend: Some("traecli".to_string()),
@@ -1012,6 +1286,8 @@ mod tests {
     fn subagent_status_line_shows_counts_elapsed_and_truncates_details() {
         let statuses = vec![
             SubagentTerminalStatus {
+                task_id: "task-review-stream".to_string(),
+                started_at: std::time::Instant::now(),
                 description: "review stream".to_string(),
                 agent_name: "explorer".to_string(),
                 backend: None,
@@ -1022,6 +1298,8 @@ mod tests {
                 progress: Some("using read_file · src/bin/ai/driver.rs".to_string()),
             },
             SubagentTerminalStatus {
+                task_id: "task-review-driver".to_string(),
+                started_at: std::time::Instant::now(),
                 description: "review driver".to_string(),
                 agent_name: "explorer".to_string(),
                 backend: None,
@@ -1032,6 +1310,8 @@ mod tests {
                 progress: None,
             },
             SubagentTerminalStatus {
+                task_id: "task-compile-check".to_string(),
+                started_at: std::time::Instant::now(),
                 description: "compile check".to_string(),
                 agent_name: "executor".to_string(),
                 backend: None,
@@ -1042,6 +1322,8 @@ mod tests {
                 progress: None,
             },
             SubagentTerminalStatus {
+                task_id: "task-extra".to_string(),
+                started_at: std::time::Instant::now(),
                 description: "extra task".to_string(),
                 agent_name: "executor".to_string(),
                 backend: None,
@@ -1064,6 +1346,8 @@ mod tests {
     #[test]
     fn subagent_status_line_labels_external_backends_only() {
         let kernel = SubagentTerminalStatus {
+            task_id: "task-kernel".to_string(),
+            started_at: std::time::Instant::now(),
             description: "inspect".to_string(),
             agent_name: "explorer".to_string(),
             backend: None,
@@ -1079,6 +1363,8 @@ mod tests {
         );
 
         let mut external = SubagentTerminalStatus {
+            task_id: "task-external".to_string(),
+            started_at: std::time::Instant::now(),
             description: "inspect".to_string(),
             agent_name: "explorer".to_string(),
             backend: Some("traecli".to_string()),
@@ -1103,6 +1389,8 @@ mod tests {
     #[test]
     fn subagent_status_block_is_three_width_bounded_lines_with_live_activity() {
         let status = SubagentTerminalStatus {
+            task_id: "task-live".to_string(),
+            started_at: std::time::Instant::now(),
             description:
                 "更新任务派发说明，同时保留每一个已有的内核兼容行为".to_string(),
             agent_name: "build-and-validation-worker".to_string(),
@@ -1193,8 +1481,117 @@ mod tests {
     }
 
     #[test]
+    fn agent_team_status_block_shows_all_active_subagents_stably() {
+        let spawned = std::time::Instant::now();
+        let status = |task_id: &str, label: &str, spawn_offset_secs: u64| SubagentTerminalStatus {
+            task_id: task_id.to_string(),
+            started_at: spawned + std::time::Duration::from_secs(spawn_offset_secs),
+            description: format!("{label} task"),
+            agent_name: format!("worker-{label}"),
+            backend: Some("traecli".to_string()),
+            model: Some("test-model".to_string()),
+            reasoning_effort: Some("max".to_string()),
+            state: "running".to_string(),
+            elapsed_secs: 8,
+            progress: Some(format!(
+                "completed: {label} command · exit 0 · last activity 2s ago · processing {label} · updates 7 · elapsed 8s"
+            )),
+        };
+        let statuses = vec![
+            status("task-m", "gamma", 2),
+            status("task-z", "alpha", 0),
+            status("task-a", "beta", 1),
+        ];
+
+        let block = render_agent_team_subagent_status_block_at_width(&statuses, 160);
+        let lines = block.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 7, "{block}");
+        assert_eq!(clamp_status_block(&block).lines().count(), 7, "{block}");
+        assert_eq!(lines[0], "subagents · 3 active");
+        for (offset, label) in ["alpha", "beta", "gamma"].into_iter().enumerate() {
+            let header = lines[1 + offset * 2];
+            let detail = lines[2 + offset * 2];
+            assert!(header.contains(label), "{block}");
+            assert!(detail.contains(&format!("processing {label}")), "{block}");
+            assert!(detail.contains(&format!("{label} command")), "{block}");
+            for other in ["alpha", "beta", "gamma"] {
+                if other != label {
+                    assert!(!header.contains(other), "{block}");
+                    assert!(!detail.contains(other), "{block}");
+                }
+            }
+        }
+        assert!(lines[1].starts_with("├─ "), "{block}");
+        assert!(lines[5].starts_with("└─ "), "{block}");
+        assert!(lines[2].starts_with("│  ↳ "), "{block}");
+        assert!(lines[4].starts_with("│  ↳ "), "{block}");
+        assert!(lines[6].starts_with("   ↳ "), "{block}");
+        for detail in [lines[2], lines[4], lines[6]] {
+            assert_eq!(
+                detail.chars().position(|ch| ch == '↳'),
+                Some(3),
+                "detail arrow is misaligned: {detail:?}"
+            );
+        }
+        assert!(!block.contains(" more"), "{block}");
+
+        let mut reordered = statuses.clone();
+        reordered.reverse();
+        let ordered_ids = |items: &[SubagentTerminalStatus]| {
+            sorted_active_subagent_statuses(items)
+                .into_iter()
+                .map(|status| status.task_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let expected_order = ["task-z", "task-a", "task-m"].map(str::to_string);
+        assert_eq!(ordered_ids(&statuses), expected_order);
+        assert_eq!(ordered_ids(&reordered), expected_order);
+        let semantic_key = agent_team_subagent_status_semantic_key(&statuses);
+        assert_eq!(
+            semantic_key,
+            agent_team_subagent_status_semantic_key(&reordered)
+        );
+        for task_id in ["task-z", "task-a", "task-m"] {
+            let mut updated = reordered.clone();
+            let progress = updated
+                .iter_mut()
+                .find(|status| status.task_id == task_id)
+                .unwrap()
+                .progress
+                .as_mut()
+                .unwrap();
+            *progress = progress.replace("updates 7", "updates 8");
+            assert_ne!(
+                semantic_key,
+                agent_team_subagent_status_semantic_key(&updated),
+                "an update from {task_id} must refresh the frame"
+            );
+        }
+
+        let changed = vec![
+            status("task-d", "delta", 3),
+            status("task-m", "gamma", 2),
+            status("task-z", "alpha", 0),
+        ];
+        assert_eq!(
+            ordered_ids(&changed),
+            ["task-z", "task-m", "task-d"].map(str::to_string)
+        );
+        let narrow = render_agent_team_subagent_status_block_at_width(&changed, 72);
+        assert_eq!(narrow.lines().count(), 7, "{narrow}");
+        for line in narrow.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(line) <= 72,
+                "line exceeds width: {line:?}"
+            );
+        }
+    }
+
+    #[test]
     fn kernel_status_without_activity_is_byte_identical_to_legacy_format() {
         let status = SubagentTerminalStatus {
+            task_id: "task-kernel".to_string(),
+            started_at: std::time::Instant::now(),
             description: "inspect scheduler".to_string(),
             agent_name: "explorer".to_string(),
             backend: None,
@@ -1214,6 +1611,110 @@ mod tests {
         );
     }
 
+    /// Real production status output for an external PTY/emulator driver.
+    /// Set RUST_TOOLS_STATUS_FIXTURE=1, send r to refresh, and q to finish.
+    /// OSC 777 status;frame carries the sampled width and rendered rows.
+    #[test]
+    #[ignore]
+    fn subagent_status_pty_fixture() -> std::io::Result<()> {
+        use std::io::{IsTerminal, Read, Write};
+
+        if std::env::var("RUST_TOOLS_STATUS_FIXTURE").as_deref() != Ok("1") {
+            return Ok(());
+        }
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            return Err(std::io::Error::other("status fixture requires a PTY"));
+        }
+        struct RestoreTerminal;
+        impl Drop for RestoreTerminal {
+            fn drop(&mut self) {
+                let _ = crossterm::terminal::disable_raw_mode();
+            }
+        }
+        crossterm::terminal::enable_raw_mode()?;
+        let _restore = RestoreTerminal;
+        {
+            let mut out = std::io::stdout().lock();
+            for index in 0..96 {
+                write!(
+                    out,
+                    "TRANSCRIPT{index:02}: unchanged response text abcdefghijklmnopqrstuvwxyz0123456789\r\n"
+                )?;
+            }
+            write!(out, "BODY_END\r\n")?;
+            out.flush()?;
+        }
+        let mut status = SubagentTerminalStatus {
+            task_id: "status-fixture".to_string(),
+            started_at: std::time::Instant::now(),
+            description: "Audit false compile-pass claim and independently verify every resize frame".to_string(),
+            agent_name: "build".to_string(),
+            backend: Some("traecli".to_string()),
+            model: Some("fixture-model".to_string()),
+            reasoning_effort: Some("max".to_string()),
+            state: "running".to_string(),
+            elapsed_secs: 123,
+            progress: Some("completed: git diff --check and verify the terminal rendering path · last activity 2s ago · processing output · updates 91 · elapsed 2m3s".to_string()),
+        };
+        let mut display = SubagentStatusLine::new();
+        let mut sequence = 0;
+        loop {
+            sequence += 1;
+            let cols = crate::ai::stream::raw_terminal_cols();
+            let block = render_agent_team_subagent_status_block_at_width(&[status.clone()], cols);
+            display.redraw_status_line(&block, false);
+            let metadata = serde_json::json!({
+                "sequence": sequence,
+                "cols": cols,
+                "lines": display.last_line,
+            });
+            let mut out = std::io::stdout().lock();
+            write!(out, "\x1b]777;status;frame;{metadata}\x07")?;
+            out.flush()?;
+            drop(out);
+            let mut key = [0];
+            std::io::stdin().read_exact(&mut key)?;
+            if key[0] == b'q' {
+                display.finish();
+                return Ok(());
+            }
+            status.elapsed_secs += 1;
+        }
+    }
+
+    #[test]
+    fn status_block_direct_ellipsis_reserves_the_link_columns() {
+        let block = "subagents · 1 active\n└─ task: Audit false compile-pass claim\n   ↳ latest: completed validation";
+        let narrow = super::clamp_status_block_at_width(block, 12);
+        assert_eq!(narrow.lines().count(), 3);
+        assert!(narrow.lines().all(|line| line.ends_with('…')));
+        assert!(narrow.lines().all(|line| super::display_width(line) <= 10));
+        assert!(narrow.lines().nth(1).unwrap().starts_with("└─ "));
+        assert!(narrow.lines().nth(2).unwrap().starts_with("   ↳ "));
+    }
+
+    #[test]
+    fn status_block_refresh_keeps_existing_rows_in_the_cursor_group() {
+        let mut bytes = Vec::new();
+        redraw_status_block(
+            &mut bytes,
+            Some("count\nheader\nprogress"),
+            "new count\nnew header\nnew progress",
+            true,
+        )
+        .unwrap();
+        // Hard LF would sever the group while the first row already has ink,
+        // allowing xterm to reflow it during the rest of the frame.
+        assert!(!bytes.contains(&b'\n'));
+        assert_eq!(
+            bytes
+                .windows(4)
+                .filter(|bytes| *bytes == b"\x1b[1B")
+                .count(),
+            2
+        );
+    }
+
     #[test]
     fn status_block_redraw_clears_every_previous_row() {
         let mut output = Vec::new();
@@ -1221,12 +1722,13 @@ mod tests {
             &mut output,
             Some("old one\nold two\nold three"),
             "new one\nnew two",
+            false,
         )
         .unwrap();
 
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "\r\x1b[2K\x1b[1A\r\x1b[2K\x1b[1A\r\x1b[2Knew one\r\nnew two"
+            "\x1b[?2026h\x1b[?7l\r\x1b[65535X\x1b[1A\r\x1b[65535X\x1b[1A\r\x1b[65535X\x1b[2B\r\x1b[2K\x1b[2A\rnew one\r\nnew two\r\x1b[?7h\x1b[?2026l"
         );
     }
 

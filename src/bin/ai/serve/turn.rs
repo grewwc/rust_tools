@@ -20,8 +20,8 @@ pub(crate) fn default_turn_model() -> String {
 /// Generate the session's model title for a served turn.
 ///
 /// The daemon calls this twice per turn: at the start, in parallel with the
-/// turn child (`pending_prompt` seeds the request so it does not wait for the
-/// child's writes), and after the child was reaped, as a retry when the
+/// turn child (an explicit question is authoritative without the child's
+/// writes), and after the child was reaped, as a retry when the
 /// parallel attempt failed. Turn children deliberately skip the title
 /// round-trip: they hold the session's turn lock until they exit, so the extra
 /// request would stall the session's next turn. Best-effort by construction:
@@ -31,8 +31,11 @@ pub(crate) fn spawn_session_title_task(
     history_file: PathBuf,
     session_id: String,
     model: Option<String>,
-    pending_prompt: Option<String>,
+    title_seed: SessionTitleSeed,
 ) {
+    if title_seed == SessionTitleSeed::Disabled {
+        return;
+    }
     // A per-turn `--model` override is resolved through the registry in the
     // child too, so resolve it here to keep the title request on the same
     // model the turn actually ran with.
@@ -44,7 +47,7 @@ pub(crate) fn spawn_session_title_task(
             history_file.as_path(),
             &session_id,
             &model,
-            pending_prompt.as_deref(),
+            &title_seed,
         )
         .await;
     });

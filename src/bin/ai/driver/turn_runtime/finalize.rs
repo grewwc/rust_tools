@@ -20,6 +20,51 @@ const SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS: usize = 4_000;
 const AGENT_TEAM_SUBAGENT_TOOL_EVIDENCE_MAX_CALLS: usize = 4;
 const AGENT_TEAM_SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS: usize = 1_200;
 const MODEL_CONTEXT_ECHO_PREFIX: &str = "[Model-authored note from an earlier turn;";
+pub(crate) const SERVE_TITLE_SEED_ENV: &str = "A_SERVE_TITLE_SEED";
+pub(crate) const SERVE_TITLE_SESSION_ENV: &str = "A_SERVE_TITLE_SESSION";
+
+/// The submitted title policy remains distinct from the turn child's command input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionTitleSeed {
+    Legacy(Option<String>),
+    Disabled,
+    Explicit(String),
+}
+
+impl SessionTitleSeed {
+    pub(crate) fn from_optional(seed: Option<&str>, pending_input: Option<&str>) -> Self {
+        match seed.map(str::trim) {
+            None => Self::Legacy(pending_input.map(str::to_string)),
+            Some("") => Self::Disabled,
+            Some(question) => Self::Explicit(question.to_string()),
+        }
+    }
+
+    pub(crate) fn child_env_value(&self) -> Option<&str> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Disabled => Some(""),
+            Self::Explicit(question) => Some(question),
+        }
+    }
+}
+
+fn session_title_seed_for_process(
+    session_id: &str,
+    pending_input: Option<&str>,
+) -> SessionTitleSeed {
+    if !crate::ai::background::is_serve_child()
+        || std::env::var(SERVE_TITLE_SESSION_ENV).ok().as_deref() != Some(session_id)
+    {
+        return SessionTitleSeed::from_optional(None, pending_input);
+    }
+    match std::env::var(SERVE_TITLE_SEED_ENV) {
+        Ok(seed) => SessionTitleSeed::from_optional(Some(&seed), pending_input),
+        Err(std::env::VarError::NotPresent) => SessionTitleSeed::from_optional(None, pending_input),
+        Err(std::env::VarError::NotUnicode(_)) => SessionTitleSeed::Disabled,
+    }
+}
+
 static SESSION_TITLE_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
     LazyLock::new(|| Mutex::new(FastSet::default()));
 /// In-flight dedup mirroring the title task: prevents the same session from running persisted
@@ -518,6 +563,20 @@ fn session_title_messages(
     persisted_messages
 }
 
+/// Only legacy clients load the persisted transcript. Explicit intent is the whole source.
+fn session_title_source(
+    seed: &SessionTitleSeed,
+    load_legacy: impl FnOnce(Option<&str>) -> Option<Vec<Message>>,
+) -> Option<Vec<Message>> {
+    match seed {
+        SessionTitleSeed::Legacy(pending) => load_legacy(pending.as_deref()),
+        SessionTitleSeed::Disabled => None,
+        SessionTitleSeed::Explicit(question) => {
+            Some(session_title_messages(Vec::new(), Some(question)))
+        }
+    }
+}
+
 fn has_session_title_source(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
         message.role == "user"
@@ -771,14 +830,19 @@ pub(super) async fn finalize_turn(
 /// After a turn ends, attempt to generate a summary session title with the LLM.
 /// Conditions: at least 1 user turn, and no generated title yet or the existing title is low quality.
 pub(super) async fn maybe_generate_session_title(app: &App, run_in_background: bool) {
+    let title_seed = session_title_seed_for_process(&app.session_id, None);
+    if title_seed == SessionTitleSeed::Disabled {
+        return;
+    }
     let store = session_title_store(&app.config.history_file);
     // A restored session that already has a model title need not decode the whole canonical history just to check for a title.
     if store.has_generated_title(&app.session_id) {
         return;
     }
-    if !store
-        .read_all_messages(&app.session_id)
-        .is_ok_and(|messages| has_session_title_source(&messages))
+    if matches!(title_seed, SessionTitleSeed::Legacy(_))
+        && !store
+            .read_all_messages(&app.session_id)
+            .is_ok_and(|messages| has_session_title_source(&messages))
     {
         // A brand-new session has no history; do not hold the in-flight marker, or when the user submits
         // the first input right away, the actually needed title task may be blocked by this empty one.
@@ -792,46 +856,54 @@ pub(super) async fn maybe_generate_session_title(app: &App, run_in_background: b
         let task_app = app.snapshot_for_detached_helper();
         let session_id = task_app.session_id.clone();
         tokio::spawn(async move {
-            generate_session_title_if_missing(&task_app, None).await;
+            generate_session_title_if_missing(&task_app, &title_seed).await;
             mark_session_title_generation_finished(&session_id);
         });
         return;
     }
 
-    generate_session_title_if_missing(app, None).await;
+    generate_session_title_if_missing(app, &title_seed).await;
     mark_session_title_generation_finished(&app.session_id);
 }
 
 /// Dispatch title generation immediately after the user submits input, without waiting for this turn's history to persist or for the model response.
 pub(super) async fn maybe_generate_session_title_for_input(app: &App, user_input: &str) {
-    if user_input.trim().is_empty() || !mark_session_title_generation_started(&app.session_id) {
+    let title_seed = session_title_seed_for_process(&app.session_id, Some(user_input));
+    if title_seed == SessionTitleSeed::Disabled
+        || user_input.trim().is_empty()
+        || !mark_session_title_generation_started(&app.session_id)
+    {
         return;
     }
 
     let task_app = app.snapshot_for_detached_helper();
     let session_id = task_app.session_id.clone();
-    let user_input = user_input.to_string();
     tokio::spawn(async move {
-        generate_session_title_if_missing(&task_app, Some(&user_input)).await;
+        generate_session_title_if_missing(&task_app, &title_seed).await;
         mark_session_title_generation_finished(&session_id);
     });
 }
 
-async fn generate_session_title_if_missing(app: &App, pending_user_input: Option<&str>) {
+async fn generate_session_title_if_missing(app: &App, title_seed: &SessionTitleSeed) {
     // SessionStore takes the base history file and derives `<stem>.sessions/` from it.
     // Passing the parent directory of the current session sqlite would append an extra `.sessions`
     // layer, leaving the title task unable to read the current session's messages.
     let store = session_title_store(&app.config.history_file);
 
-    let persisted_messages = match store.read_all_messages(&app.session_id) {
-        Ok(messages) => messages,
-        // When triggered by the first input, the session sqlite may not have been created by the main turn yet;
-        // the pending input alone is enough to generate a title, so treat "no history file yet" as empty
-        // history instead of missing the entire first round.
-        Err(_) if pending_user_input.is_some() => Vec::new(),
-        Err(_) => return,
+    let Some(all_messages) = session_title_source(title_seed, |pending_user_input| {
+        let persisted_messages = match store.read_all_messages(&app.session_id) {
+            Ok(messages) => messages,
+            // The first submitted input can arrive before the session exists.
+            Err(_) if pending_user_input.is_some() => Vec::new(),
+            Err(_) => return None,
+        };
+        Some(session_title_messages(
+            persisted_messages,
+            pending_user_input,
+        ))
+    }) else {
+        return;
     };
-    let all_messages = session_title_messages(persisted_messages, pending_user_input);
     if !has_session_title_source(&all_messages) {
         return;
     }
@@ -850,9 +922,9 @@ async fn generate_session_title_if_missing(app: &App, pending_user_input: Option
     // `total_ms - done_ms` tail in the serve log) would stall the next turn
     // even though `done` already streamed. This covers both turn endpoints
     // (SSE with or without a live FIFO, and plain turns), which all set
-    // `A_SERVE_CHILD`. Serve sessions keep the cheap local fallback title
-    // written below; the serve daemon generates the model title once this
-    // child was reaped and the lock released
+    // `A_SERVE_CHILD`. Any child fallback below uses the same submitted title
+    // policy as the daemon; disabled turns never reach this point. The daemon
+    // generates the model title after the child exits and releases the lock
     // (`generate_session_title_outside_turn`), and opening the session locally
     // upgrades it the same way.
     let model_title = if crate::ai::background::is_serve_child() {
@@ -917,8 +989,7 @@ async fn generate_session_title_if_missing(app: &App, pending_user_input: Option
 /// Generate and persist the model session title for a served session.
 ///
 /// The serve daemon calls this both at the start of a turn — in parallel with
-/// the turn child, seeding the request with `pending_user_input` so it does not
-/// depend on the child's writes — and once the child was reaped and its
+/// the turn child, using the submitted `title_seed` policy — and once the child was reaped and its
 /// per-session lock released, as a retry when the parallel attempt failed. See
 /// the `is_serve_child` branch in `generate_session_title_if_missing` for why
 /// the child itself must not make this request. The request never needed that
@@ -931,8 +1002,35 @@ pub(crate) async fn generate_session_title_outside_turn(
     history_file: &std::path::Path,
     session_id: &str,
     current_model: &str,
-    pending_user_input: Option<&str>,
+    title_seed: &SessionTitleSeed,
 ) -> bool {
+    generate_session_title_outside_turn_with_request(
+        history_file,
+        session_id,
+        title_seed,
+        |messages| async move {
+            let Ok(config) = crate::ai::config::load_config() else {
+                return None;
+            };
+            request_outside_turn_title(session_id, current_model, &config, &messages).await
+        },
+    )
+    .await
+}
+
+async fn generate_session_title_outside_turn_with_request<F, Fut>(
+    history_file: &std::path::Path,
+    session_id: &str,
+    title_seed: &SessionTitleSeed,
+    request: F,
+) -> bool
+where
+    F: FnOnce(Vec<Message>) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    if title_seed == &SessionTitleSeed::Disabled {
+        return false;
+    }
     let store = session_title_store(history_file);
     // Settle the cheap cases before decoding the canonical history: the daemon
     // runs this after every served turn, and a title that is already
@@ -949,34 +1047,32 @@ pub(crate) async fn generate_session_title_outside_turn(
     }) {
         return false;
     }
-    let Ok(config) = crate::ai::config::load_config() else {
+    let Some(messages) = session_title_source(title_seed, |pending_user_input| {
+        let messages = match store.read_all_messages(session_id) {
+            Ok(messages) => messages,
+            // A legacy client's pending prompt can precede the first session write.
+            Err(_)
+                if pending_user_input
+                    .map(str::trim)
+                    .is_some_and(|s| !s.is_empty()) =>
+            {
+                Vec::new()
+            }
+            Err(_) => return None,
+        };
+        // Legacy behavior appends a pending prompt only when it is not already stored.
+        let pending = pending_user_input
+            .map(str::trim)
+            .filter(|input| !input.is_empty())
+            .filter(|input| {
+                !messages.last().is_some_and(|m| {
+                    m.role == "user" && value_to_string(&m.content).trim() == *input
+                })
+            });
+        Some(session_title_messages(messages, pending))
+    }) else {
         return false;
     };
-    let messages = match store.read_all_messages(session_id) {
-        Ok(messages) => messages,
-        // The parallel pre-turn call can race the child's first write (the
-        // session file may not exist yet); the pending input alone still seeds
-        // the request, mirroring `generate_session_title_if_missing`.
-        Err(_)
-            if pending_user_input
-                .map(str::trim)
-                .is_some_and(|s| !s.is_empty()) =>
-        {
-            Vec::new()
-        }
-        Err(_) => return false,
-    };
-    // The child may already have persisted this input by now; avoid seeding the
-    // title request with a duplicate user message.
-    let pending = pending_user_input
-        .map(str::trim)
-        .filter(|input| !input.is_empty())
-        .filter(|input| {
-            !messages
-                .last()
-                .is_some_and(|m| m.role == "user" && value_to_string(&m.content).trim() == *input)
-        });
-    let messages = session_title_messages(messages, pending.as_deref());
     if !has_session_title_source(&messages) {
         return false;
     }
@@ -989,7 +1085,7 @@ pub(crate) async fn generate_session_title_outside_turn(
     if !mark_session_title_generation_started(session_id) {
         return false;
     }
-    let generated = request_outside_turn_title(session_id, current_model, &config, &messages).await;
+    let generated = request(messages).await;
     mark_session_title_generation_finished(session_id);
 
     let Some(title) = generated else {
@@ -1612,6 +1708,213 @@ mod tests {
         assert!(output.contains("pub mod ai;"));
         assert!(output.contains("[Subagent final answer]\n"));
         assert!(output.ends_with(&long_final));
+    }
+
+    fn session_title_test_store(
+        input: &str,
+    ) -> (crate::ai::history::SessionStore, std::path::PathBuf, String) {
+        let root = std::env::temp_dir().join(format!("a-title-policy-{}", uuid::Uuid::new_v4()));
+        let history_file = root.join("history.sqlite");
+        let store = session_title_store(&history_file);
+        store.ensure_root_dir().unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        crate::ai::history::append_history_messages(
+            &store.session_history_file(&session_id),
+            &session_title_messages(Vec::new(), Some(input)),
+        )
+        .unwrap();
+        (store, history_file, session_id)
+    }
+
+    #[tokio::test]
+    async fn session_title_disabled_seed_skips_persisted_audit_and_retry() {
+        let command = "/audit inspect the current diff";
+        let (store, history_file, session_id) = session_title_test_store(command);
+        let seed = SessionTitleSeed::from_optional(Some(""), Some(command));
+        let requests = std::sync::atomic::AtomicUsize::new(0);
+        for _ in 0..2 {
+            let generated = generate_session_title_outside_turn_with_request(
+                &history_file,
+                &session_id,
+                &seed,
+                |_| {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    std::future::ready(Some("Audit findings".to_string()))
+                },
+            )
+            .await;
+            assert!(!generated);
+            assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert!(
+                store
+                    .read_session_title_with_origin(&session_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            value_to_string(&store.read_all_messages(&session_id).unwrap()[0].content),
+            command
+        );
+        let _ = std::fs::remove_dir_all(history_file.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn session_title_explicit_seed_overrides_persisted_command_and_keeps_title_guards() {
+        let command = "/audit inspect the current diff";
+        let question = "Restore login after timeout";
+        let (store, history_file, session_id) = session_title_test_store(command);
+        let seed = SessionTitleSeed::from_optional(Some(question), Some(command));
+        let generated = generate_session_title_outside_turn_with_request(
+            &history_file,
+            &session_id,
+            &seed,
+            |messages| {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].role, "user");
+                assert_eq!(value_to_string(&messages[0].content), question);
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| value_to_string(&message.content).contains("/audit"))
+                );
+                std::future::ready(Some("Login timeout recovery".to_string()))
+            },
+        )
+        .await;
+        assert!(generated);
+        let title = store
+            .read_session_title_with_origin(&session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(title.text, "Login timeout recovery");
+        assert_eq!(title.origin, SessionTitleOrigin::Model);
+        assert_eq!(
+            value_to_string(&store.read_all_messages(&session_id).unwrap()[0].content),
+            command
+        );
+        for origin in [SessionTitleOrigin::User, SessionTitleOrigin::Model] {
+            store
+                .write_session_title_with_origin(&session_id, "Keep this title", origin)
+                .unwrap();
+            let requests = std::sync::atomic::AtomicUsize::new(0);
+            assert!(
+                !generate_session_title_outside_turn_with_request(
+                    &history_file,
+                    &session_id,
+                    &seed,
+                    |_| {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        std::future::ready(Some("Replacement title".to_string()))
+                    },
+                )
+                .await
+            );
+            assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 0);
+            let title = store
+                .read_session_title_with_origin(&session_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(title.text, "Keep this title");
+            assert_eq!(title.origin, origin);
+        }
+        let _ = std::fs::remove_dir_all(history_file.parent().unwrap());
+    }
+
+    struct ServeTitleTestEnv {
+        old_seed: Option<std::ffi::OsString>,
+        old_session: Option<std::ffi::OsString>,
+        old_child: bool,
+    }
+
+    impl Drop for ServeTitleTestEnv {
+        fn drop(&mut self) {
+            // Tests hold ENV_LOCK for the full lifetime of this guard.
+            unsafe {
+                match &self.old_seed {
+                    Some(seed) => std::env::set_var(SERVE_TITLE_SEED_ENV, seed),
+                    None => std::env::remove_var(SERVE_TITLE_SEED_ENV),
+                }
+                match &self.old_session {
+                    Some(session) => std::env::set_var(SERVE_TITLE_SESSION_ENV, session),
+                    None => std::env::remove_var(SERVE_TITLE_SESSION_ENV),
+                }
+            }
+            crate::ai::background::set_serve_child_for_test(self.old_child);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_title_serve_child_fallback_obeys_seed_policy() {
+        let _env_lock = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _env_restore = ServeTitleTestEnv {
+            old_seed: std::env::var_os(SERVE_TITLE_SEED_ENV),
+            old_session: std::env::var_os(SERVE_TITLE_SESSION_ENV),
+            old_child: crate::ai::background::is_serve_child(),
+        };
+        crate::ai::background::set_serve_child_for_test(true);
+        let command = "/audit inspect the current diff";
+        for value in [Some(""), Some("Login recovery"), None] {
+            // ENV_LOCK serializes these process-policy changes with other tests.
+            unsafe {
+                match value {
+                    Some(seed) => std::env::set_var(SERVE_TITLE_SEED_ENV, seed),
+                    None => std::env::remove_var(SERVE_TITLE_SEED_ENV),
+                }
+            }
+            let (store, history_file, session_id) = session_title_test_store(command);
+            // Bind the handoff to the served App, including when workers share its process.
+            unsafe {
+                std::env::set_var(SERVE_TITLE_SESSION_ENV, &session_id);
+            }
+            let mut app = crate::ai::middleware::test_util::test_app();
+            app.config.history_file = history_file.clone();
+            app.config.base_history_file = history_file.clone();
+            app.session_id = session_id.clone();
+            app.session_history_file = store.session_history_file(&session_id);
+            let seed = session_title_seed_for_process(&session_id, Some(command));
+            assert_eq!(seed, SessionTitleSeed::from_optional(value, Some(command)));
+            assert_eq!(
+                session_title_seed_for_process("another-session", Some("Worker request")),
+                SessionTitleSeed::Legacy(Some("Worker request".to_string()))
+            );
+            crate::ai::background::set_serve_child_for_test(false);
+            assert_eq!(
+                session_title_seed_for_process(&session_id, Some(command)),
+                SessionTitleSeed::Legacy(Some(command.to_string()))
+            );
+            crate::ai::background::set_serve_child_for_test(true);
+            maybe_generate_session_title(&app, false).await;
+            let title = store.read_session_title_with_origin(&session_id).unwrap();
+            if value == Some("") {
+                maybe_generate_session_title_for_input(&app, command).await;
+                assert!(title.is_none());
+                assert!(
+                    store
+                        .read_session_title_with_origin(&session_id)
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                let title = title.expect("child fallback");
+                assert_eq!(title.origin, SessionTitleOrigin::Fallback);
+                assert_eq!(
+                    title.text,
+                    value
+                        .map(str::to_string)
+                        .unwrap_or_else(|| fallback_session_title(
+                            &store.read_all_messages(&session_id).unwrap()
+                        ))
+                );
+            }
+            assert_eq!(
+                value_to_string(&store.read_all_messages(&session_id).unwrap()[0].content),
+                command
+            );
+            let _ = std::fs::remove_dir_all(history_file.parent().unwrap());
+        }
     }
 
     #[test]

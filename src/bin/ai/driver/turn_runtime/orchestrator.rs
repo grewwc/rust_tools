@@ -465,7 +465,7 @@ impl ToolLoopSignal {
 }
 
 /// Advisory state belongs to the user turn and survives recursive bodies. It does not
-/// waive delegation tracking or the final-response gate.
+/// waive delegation tracking.
 #[derive(Default)]
 struct DelegationAdvisoryState {
     skipped: bool,
@@ -554,11 +554,10 @@ struct ProgressLedger {
     hard_injected: bool,
     read_only_breadth_injected: bool,
     delegation_required: bool,
-    mutation_calls_this_turn: usize,
     delegation_calls_this_turn: usize,
     delegation_advisory: DelegationAdvisoryState,
-    /// Tool-work rounds before the first delegation; advisory suppression, progress and
-    /// truncation resets preserve counting so the final-response gate remains independent.
+    /// Tool-work rounds before the first delegation; advisory suppression, progress, and
+    /// truncation resets preserve the count.
     work_rounds_before_delegation: usize,
     /// Whether any project mutation happened this turn. Once true, the pure read-only divergence hard
     /// stop permanently yields (read+modify tasks are not bound by that brake). plan / task lifecycle
@@ -595,7 +594,6 @@ impl ProgressLedger {
                         self.delegation_calls_this_turn.saturating_add(1);
                 }
                 "apply_patch" | "patch_file" | "write_file" => {
-                    self.mutation_calls_this_turn = self.mutation_calls_this_turn.saturating_add(1);
                     if self.delegation_calls_this_turn == 0 && self.delegation_advisory.try_inject()
                     {
                         inject_advisory = true;
@@ -605,15 +603,6 @@ impl ProgressLedger {
             }
         }
         inject_advisory
-    }
-
-    /// A pure Q&A or decision turn executes no tools, leaving both work counters at zero and
-    /// bypassing the final-response gate. Even one undelegated tool-work round must
-    /// prompt once before the final response, just like an undelegated mutation.
-    fn delegation_requirement_violated(&self) -> bool {
-        self.delegation_required
-            && self.delegation_calls_this_turn == 0
-            && (self.mutation_calls_this_turn > 0 || self.work_rounds_before_delegation > 0)
     }
 
     fn observe_delegation_exploration(
@@ -2368,8 +2357,6 @@ async fn run_turn_body(
                     .observe_delegation_calls(&tool_call_execution.stream_result.tool_calls),
                 _ => false,
             };
-            let delegation_requirement_violated =
-                supervisor.progress.delegation_requirement_violated();
             let step = match handle_iteration_execution_for_model(
                 app,
                 response_model.as_deref().unwrap_or(&next_model),
@@ -2387,7 +2374,6 @@ async fn run_turn_body(
                 &mut output.terminal_dedupe_candidate,
                 &mut output.validation_status,
                 &mut output.gate,
-                delegation_requirement_violated,
                 skill_turn.matched_skill_names().is_empty(),
                 iteration,
                 effective_max_iterations,

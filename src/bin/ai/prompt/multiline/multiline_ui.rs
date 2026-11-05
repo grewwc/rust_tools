@@ -13,8 +13,8 @@ use crossterm::{
     },
     execute,
     terminal::{
-        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode, size as terminal_size,
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        size as terminal_size,
     },
 };
 use ratatui::{
@@ -27,14 +27,14 @@ use ratatui::{
 use tui_textarea::TextArea;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+#[cfg(test)]
+use super::render::{preserve_prompt_cursor_group, render_multiline_popup};
 use super::{
-    MultilineHistoryState,
+    MultilineHistoryState, SingleRowFrame,
     completion_panel::{CompletionPanel, PendingTabCompletion},
     events::{EventLoopAction, RecentTextInput, handle_multiline_event},
-    render::{render_multiline_popup_with_checkpoint, textarea_row_range},
+    render::render_multiline_popup_with_checkpoint,
 };
-#[cfg(test)]
-use super::render::render_multiline_popup;
 use crate::ai::prompt::{PromptEditor, interrupted_error};
 use crate::commonw::prompt::acquire_foreground_stdin;
 
@@ -83,6 +83,21 @@ fn multiline_viewport_height(terminal_rows: u16, prefill: Option<&str>) -> u16 {
     let textarea = content_rows.clamp(base_textarea, MAX_TEXTAREA_LINES);
     let viewport = textarea.saturating_add(VIEWPORT_CHROME_LINES);
     viewport.min(available_rows).min(MAX_VIEWPORT_HEIGHT)
+}
+
+/// Keep growth while a draft remains, but release its extra rows when it is
+/// completely deleted. Blank logical lines still count as draft content.
+fn content_viewport_height(terminal_rows: u16, current_height: u16, lines: &[String]) -> u16 {
+    if lines.len() <= 1 && lines.first().is_none_or(String::is_empty) {
+        return multiline_viewport_height(terminal_rows, None);
+    }
+    let available = terminal_rows.saturating_sub(2).max(1);
+    let needed = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(VIEWPORT_CHROME_LINES)
+        .min(MAX_VIEWPORT_HEIGHT)
+        .min(available);
+    current_height.max(needed)
 }
 
 /// Viewport height needed while the completion panel is active: extra space for
@@ -260,19 +275,16 @@ struct PromptScreen {
     /// rows inside the viewport) re-wrap into exactly one row. Widths accumulate
     /// because the terminal keeps cells written by earlier frames, and
     /// `prepare_viewport` drops the record whenever the box's rows are cleared.
+    /// While the record is empty, the cursor remains at the cleared box top;
+    /// only a painted frame parks it at the bottom.
     box_row_widths: Vec<u16>,
-    /// Span of the textarea rows inside `box_row_widths`, as
-    /// `(start, len, total)`: `start` is the first textarea row index, `len`
-    /// its row count, `total` the viewport height that geometry was built for.
-    /// `None` means no frame has recorded one yet.
-    ///
-    /// A width reflow must place the rebuilt box only by the rows that keep
-    /// wrapping across a repaint (the textarea). Chrome rows (title, help,
-    /// rules) repaint truncated to an ellipsis, so counting their old
-    /// soft-wraps in the anchor offset lifts the box a little higher on every
-    /// fold-to-ellipsis narrowing. The full count is still needed to blank the
-    /// old wraps above the new top; see `rebuild_after_terminal_reflow`.
-    wrap_row_span: Option<(u16, u16, u16)>,
+    /// A painted prompt linked into the cursor's logical line group does not
+    /// gain terminal-owned wraps. Keep its original bottom offset separately
+    /// from the width record used to erase shortened input.
+    cursor_group_height: Option<u16>,
+    /// Geometry of the last cleared or painted viewport. Stored tops may only
+    /// clear the main screen while this geometry still matches the terminal.
+    viewport_geometry: Option<(Rect, Size)>,
 }
 
 impl PromptScreen {
@@ -287,8 +299,7 @@ impl PromptScreen {
     /// delivered or lost with the link, so it no longer competes.
     fn replies_settled(&mut self, now: Instant) -> bool {
         prune_expired_cpr_replies(&mut self.pending_cpr_replies, now);
-        self
-            .pending_cpr_replies
+        self.pending_cpr_replies
             .back()
             .is_none_or(|query| now.duration_since(*query) >= CPR_PROBE_QUIET_PERIOD)
     }
@@ -301,14 +312,9 @@ impl PromptScreen {
         cursor_offset_row: u16,
         mode: ViewportRebuildMode,
         clear_existing_viewport: bool,
-        previous_top_row: Option<u16>,
+        previous_area: Option<Rect>,
         verify_anchor: bool,
-    ) -> io::Result<Rect> {
-        // Single funnel for the painted-row record: this call is about to clear
-        // the box's rows, so nothing on screen carries their widths forward.
-        if clear_existing_viewport {
-            self.box_row_widths.clear();
-        }
+    ) -> io::Result<(Rect, Size)> {
         let now = Instant::now();
         if !self.queries_disabled && self.replies_settled(now) {
             match prepare_anchored_viewport(
@@ -318,10 +324,20 @@ impl PromptScreen {
                 cursor_offset_row,
                 mode,
                 clear_existing_viewport,
+                previous_area,
+                &self.box_row_widths,
+                self.cursor_group_height,
                 verify_anchor,
                 &mut self.pending_cpr_replies,
             ) {
-                Ok(area) => return Ok(area),
+                Ok(prepared) => {
+                    if clear_existing_viewport {
+                        self.box_row_widths.clear();
+                        self.cursor_group_height = None;
+                    }
+                    self.viewport_geometry = Some(prepared);
+                    return Ok(prepared);
+                }
                 Err(err) if PromptEditor::is_cursor_position_timeout(&err) => {
                     // A stalled round-trip is usually a transient link hiccup, so
                     // retry once before paying for the alternate screen. Fresh
@@ -339,10 +355,20 @@ impl PromptScreen {
                             cursor_offset_row,
                             mode,
                             clear_existing_viewport,
+                            previous_area,
+                            &self.box_row_widths,
+                            self.cursor_group_height,
                             verify_anchor,
                             &mut self.pending_cpr_replies,
                         ) {
-                            Ok(area) => return Ok(area),
+                            Ok(prepared) => {
+                                if clear_existing_viewport {
+                                    self.box_row_widths.clear();
+                                    self.cursor_group_height = None;
+                                }
+                                self.viewport_geometry = Some(prepared);
+                                return Ok(prepared);
+                            }
                             Err(err) if PromptEditor::is_cursor_position_timeout(&err) => {
                                 self.queries_disabled = true;
                             }
@@ -352,22 +378,23 @@ impl PromptScreen {
                         self.queries_disabled = true;
                     }
                 }
+                Err(err) if previous_area.is_none() && is_unstable_prompt_geometry(&err) => {
+                    // A new prompt has no inline frame to preserve. Bootstrap
+                    // on the known alternate-screen coordinates after the limit.
+                    self.queries_disabled = true;
+                }
                 Err(err) => return Err(err),
             }
         }
         if !self.alternate {
-            // The inline box is already drawn on the main screen when a
-            // mid-editing rebuild falls back here. The emulator saves the main
-            // screen on EnterAlternateScreen and restores it verbatim on
-            // LeaveAlternateScreen at exit, so the old box (including the
-            // drawn caret cell) would come back as a permanent ghost over the
-            // transcript. Clear it first: transcript rows sit ABOVE the box
-            // top, so this touches nothing but the box. (If a width reflow
-            // has already moved the box down, a few re-wrapped transcript
-            // tail rows may also be blanked; a DSR query is the only way to
-            // tell, and it just timed out.)
-            if let Some(top_row) = previous_top_row {
-                backend.set_cursor_position(Position::new(0, top_row))?;
+            // Clear the old inline box only while its stored geometry is still
+            // valid. A failed query cannot locate its top after another resize.
+            let live_size = backend.size()?;
+            if let Some((area, size)) = self.viewport_geometry
+                && Some(area) == previous_area
+                && size == live_size
+            {
+                backend.set_cursor_position(Position::new(0, area.y))?;
                 backend.clear_region(BackendClearType::AfterCursor)?;
                 backend.flush()?;
             }
@@ -379,7 +406,13 @@ impl PromptScreen {
         // Keep every rebuild query-free for the rest of this prompt in either
         // case; the next prompt start can reconsider recovery after cleanup.
         self.queries_disabled = true;
-        prepare_query_free_viewport(backend, terminal_size, requested_height, &self.tail)
+        let terminal_size = backend.size()?;
+        let area =
+            prepare_query_free_viewport(backend, terminal_size, requested_height, &self.tail)?;
+        self.box_row_widths.clear();
+        self.cursor_group_height = None;
+        self.viewport_geometry = Some((area, terminal_size));
+        Ok((area, terminal_size))
     }
 }
 
@@ -439,7 +472,11 @@ fn draw_alternate_tail<B: Backend>(
     if tail.is_empty() || width == 0 || bottom_row == 0 {
         return Ok(());
     }
-    let rows = alternate_tail_rows(tail, width, bottom_row.min(MAX_ALTERNATE_TAIL_ROWS) as usize);
+    let rows = alternate_tail_rows(
+        tail,
+        width,
+        bottom_row.min(MAX_ALTERNATE_TAIL_ROWS) as usize,
+    );
     if rows.is_empty() {
         return Ok(());
     }
@@ -638,6 +675,56 @@ fn verified_cursor_row(
     ))
 }
 
+/// Verify replies without taking the cursor outside its protected prompt group.
+/// An absolute probe elsewhere on the screen would expose the whole group to
+/// reflow if a resize landed during the round trip. Relative probes stay inside
+/// the old prompt even when transcript reflow moves its screen coordinates.
+fn verified_prompt_cursor_row(
+    query_row: &mut impl FnMut() -> io::Result<u16>,
+    save: &mut impl FnMut() -> io::Result<()>,
+    restore: &mut impl FnMut() -> io::Result<()>,
+    move_up: &mut impl FnMut(u16) -> io::Result<()>,
+    move_down: &mut impl FnMut(u16) -> io::Result<()>,
+    height: u16,
+    pending: &mut VecDeque<Instant>,
+) -> io::Result<u16> {
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    static PROMPT_PROBE_SEQUENCE: AtomicU16 = AtomicU16::new(0);
+    if height < 2 {
+        return tracked_cursor_query(pending, query_row);
+    }
+    for _ in 0..VERIFIED_ANCHOR_ATTEMPTS {
+        save()?;
+        let offset = 1 + PROMPT_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed) % (height - 1);
+        let probe = (|| -> io::Result<(u16, u16, u16)> {
+            let bottom = tracked_cursor_query(pending, &mut *query_row)?;
+            move_up(offset)?;
+            let low = tracked_cursor_query(pending, &mut *query_row)?;
+            move_down(1)?;
+            let high = tracked_cursor_query(pending, &mut *query_row)?;
+            Ok((bottom, low, high))
+        })();
+        let restored = restore();
+        let (bottom, low, high) = match probe {
+            Ok(rows) => {
+                restored?;
+                rows
+            }
+            Err(err) => return Err(err),
+        };
+        if bottom >= offset && low == bottom - offset && high == low + 1 {
+            pending.clear();
+            return tracked_cursor_query(pending, query_row);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "The cursor position could not be read within a normal duration",
+    ))
+}
+
+#[cfg(test)]
 fn prepare_fixed_viewport<B: Backend>(
     backend: &mut B,
     terminal_size: Size,
@@ -664,6 +751,144 @@ fn prepare_fixed_viewport<B: Backend>(
     )
 }
 
+/// Bound cursor-query and pre-paint retries so input polling remains reachable.
+const PROMPT_GEOMETRY_RETRIES: usize = 3;
+
+#[derive(Debug)]
+struct UnstablePromptGeometry;
+
+impl std::fmt::Display for UnstablePromptGeometry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Terminal geometry changed while preparing the prompt")
+    }
+}
+
+impl std::error::Error for UnstablePromptGeometry {}
+
+fn unstable_prompt_geometry() -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock, UnstablePromptGeometry)
+}
+
+fn is_unstable_prompt_geometry(err: &io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(|source| source.is::<UnstablePromptGeometry>())
+}
+
+fn defer_unstable_prompt_geometry<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if is_unstable_prompt_geometry(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Validate the cursor reply's geometry before computing an offset or clearing.
+/// A resize during the query keeps the old frame intact and queries again at
+/// the new size. Both resize passes use this seam and the same old width record.
+#[cfg(test)]
+fn prepare_fixed_viewport_with_query<B: Backend>(
+    backend: &mut B,
+    terminal_size: Size,
+    requested_height: u16,
+    cursor_offset_row: u16,
+    mode: ViewportRebuildMode,
+    clear_existing_viewport: bool,
+    previous_area: Option<Rect>,
+    row_widths: &[u16],
+    pending: &mut VecDeque<Instant>,
+    query: impl FnMut(&mut B, Size, &mut VecDeque<Instant>) -> io::Result<Position>,
+) -> io::Result<(Rect, Size)> {
+    prepare_cursor_group_viewport_with_query(
+        backend,
+        terminal_size,
+        requested_height,
+        cursor_offset_row,
+        mode,
+        clear_existing_viewport,
+        previous_area,
+        row_widths,
+        None,
+        pending,
+        query,
+    )
+}
+
+fn prepare_cursor_group_viewport_with_query<B: Backend>(
+    backend: &mut B,
+    mut terminal_size: Size,
+    requested_height: u16,
+    cursor_offset_row: u16,
+    mode: ViewportRebuildMode,
+    clear_existing_viewport: bool,
+    previous_area: Option<Rect>,
+    row_widths: &[u16],
+    cursor_group_height: Option<u16>,
+    pending: &mut VecDeque<Instant>,
+    mut query: impl FnMut(&mut B, Size, &mut VecDeque<Instant>) -> io::Result<Position>,
+) -> io::Result<(Rect, Size)> {
+    for _ in 0..PROMPT_GEOMETRY_RETRIES {
+        let cursor_position = query(backend, terminal_size, pending)?;
+        let live_size = backend
+            .size()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        if live_size != terminal_size {
+            terminal_size = live_size;
+            continue;
+        }
+        // A painted frame parks at its bottom. A cleared frame keeps the cursor
+        // at its top until paint, so another resize can move that top naturally.
+        let cursor_offset_row = if previous_area.is_some() && row_widths.is_empty() {
+            0
+        } else if let Some(height) = cursor_group_height {
+            height.saturating_sub(1)
+        } else {
+            previous_area.map_or(cursor_offset_row, |area| {
+                reflowed_anchor_offset(
+                    Some(area),
+                    requested_height,
+                    row_widths,
+                    terminal_size.width,
+                )
+            })
+        };
+        let area = prepare_fixed_viewport_at(
+            backend,
+            terminal_size,
+            requested_height,
+            cursor_offset_row,
+            mode,
+            clear_existing_viewport,
+            cursor_position,
+        )
+        .map_err(|err| io::Error::other(err.to_string()))?;
+        return Ok((area, terminal_size));
+    }
+    Err(unstable_prompt_geometry())
+}
+
+/// Check again after clearing and immediately before painting fixed coordinates.
+/// Each successful re-anchor commits its new size. Exhaustion defers this frame
+/// to the input poll, keeping its last valid anchor and width record intact.
+fn prepare_prompt_paint<T>(
+    state: &mut T,
+    applied_size: &mut Size,
+    mut read_size: impl FnMut(&mut T) -> io::Result<Size>,
+    mut reanchor: impl FnMut(&mut T) -> io::Result<Size>,
+) -> io::Result<Size> {
+    for _ in 0..PROMPT_GEOMETRY_RETRIES {
+        let live_size = read_size(state)?;
+        if live_size_matches_applied(live_size, *applied_size) {
+            return Ok(live_size);
+        }
+        *applied_size = reanchor(state)?;
+    }
+    let live_size = read_size(state)?;
+    if live_size_matches_applied(live_size, *applied_size) {
+        return Ok(live_size);
+    }
+    Err(unstable_prompt_geometry())
+}
+
 /// Builds the fixed viewport for a cursor position the caller already read,
 /// without querying the terminal itself.
 fn prepare_fixed_viewport_at<B: Backend>(
@@ -686,6 +911,7 @@ fn prepare_fixed_viewport_at<B: Backend>(
         backend.set_cursor_position(Position::new(0, terminal_size.height.saturating_sub(1)))?;
         backend.append_lines(lines_to_scroll)?;
     }
+    backend.set_cursor_position(Position::new(area.x, area.y))?;
     if clear_existing_viewport {
         // The box is always the last thing drawn, so every transcript row sits
         // ABOVE `area.y`: clearing from there to the end of the screen cannot
@@ -698,7 +924,6 @@ fn prepare_fixed_viewport_at<B: Backend>(
         // Width reflow callers include the old rows' extra wraps in the parked
         // offset. Without that correction this clear starts inside the old box
         // and leaves its first rows between the transcript and the new frame.
-        backend.set_cursor_position(Position::new(0, area.y))?;
         backend.clear_region(BackendClearType::AfterCursor)?;
     }
     backend.flush()?;
@@ -737,19 +962,45 @@ fn prepare_anchored_viewport(
     cursor_offset_row: u16,
     mode: ViewportRebuildMode,
     clear_existing_viewport: bool,
+    previous_area: Option<Rect>,
+    row_widths: &[u16],
+    cursor_group_height: Option<u16>,
     verify_anchor: bool,
     pending: &mut VecDeque<Instant>,
-) -> io::Result<Rect> {
-    if !reply_stream_is_verified(cursor_offset_row, mode, verify_anchor) {
-        return prepare_fixed_viewport(
-            backend,
-            terminal_size,
-            requested_height,
-            cursor_offset_row,
-            mode,
-            clear_existing_viewport,
-            pending,
-        );
+) -> io::Result<(Rect, Size)> {
+    let verify_reply = reply_stream_is_verified(cursor_offset_row, mode, verify_anchor);
+    prepare_cursor_group_viewport_with_query(
+        backend,
+        terminal_size,
+        requested_height,
+        cursor_offset_row,
+        mode,
+        clear_existing_viewport,
+        previous_area,
+        row_widths,
+        cursor_group_height,
+        pending,
+        |backend, size, pending| {
+            query_anchored_cursor_position(
+                backend,
+                size,
+                cursor_group_height,
+                verify_reply,
+                pending,
+            )
+        },
+    )
+}
+
+fn query_anchored_cursor_position(
+    backend: &mut CrosstermBackend<io::Stdout>,
+    terminal_size: Size,
+    cursor_group_height: Option<u16>,
+    verify_reply: bool,
+    pending: &mut VecDeque<Instant>,
+) -> io::Result<Position> {
+    if !verify_reply {
+        return tracked_cursor_query(pending, || backend.get_cursor_position());
     }
     let last_screen_row = terminal_size.height.saturating_sub(1);
     // The verification closures outlive each other, so they share the caller's
@@ -774,24 +1025,36 @@ fn prepare_anchored_viewport(
             let position = guard.get_cursor_position()?;
             Ok(position.y)
         };
-        verified_cursor_row(
-            &mut query_row,
-            &mut save,
-            &mut restore,
-            &mut set_row,
-            last_screen_row,
-            pending,
-        )?
+        if let Some(height) = cursor_group_height {
+            let mut move_up = |rows: u16| -> io::Result<()> {
+                let mut guard = shared.borrow_mut();
+                execute!(&mut *guard, cursor::MoveUp(rows))
+            };
+            let mut move_down = |rows: u16| -> io::Result<()> {
+                let mut guard = shared.borrow_mut();
+                execute!(&mut *guard, cursor::MoveDown(rows))
+            };
+            verified_prompt_cursor_row(
+                &mut query_row,
+                &mut save,
+                &mut restore,
+                &mut move_up,
+                &mut move_down,
+                height.min(terminal_size.height),
+                pending,
+            )?
+        } else {
+            verified_cursor_row(
+                &mut query_row,
+                &mut save,
+                &mut restore,
+                &mut set_row,
+                last_screen_row,
+                pending,
+            )?
+        }
     };
-    prepare_fixed_viewport_at(
-        backend,
-        terminal_size,
-        requested_height,
-        cursor_offset_row,
-        mode,
-        clear_existing_viewport,
-        Position::new(0, row),
-    )
+    Ok(Position::new(0, row))
 }
 
 fn terminal_with_fixed_viewport<B: Backend>(
@@ -823,48 +1086,6 @@ fn parked_anchor_offset(last_drawn_area: Option<Rect>, new_height: u16) -> u16 {
         .unwrap_or_else(|| new_height.saturating_sub(1))
 }
 
-/// Whether a reflow rebuild must return the box to the screen's last row.
-///
-/// Only a WIDENING re-wrap needs this: the transcript above re-wraps into fewer
-/// rows and the rows released by that wrap stay below the box, so the parked row
-/// can recover a top further up the screen than where the input area was.
-/// Rebuilding there leaves the box floating above a blank gap, and the next
-/// re-wrap strands it again from that higher row. A box that was already flush
-/// with the bottom goes back to the bottom instead; the rows between the
-/// recovered top and the new bottom hold nothing but the old box's own rows,
-/// which the rebuild clears.
-///
-/// A NARROWING must not be glued back to the bottom. The parked offset already
-/// counts the extra rows the old frame's own rows wrap into (see
-/// `reflowed_extra_rows`) before recovering the top, and on a narrowing that
-/// lands exactly on the first row of the reflowed box, flush under the
-/// transcript, because the re-wrap moved both down by the same count. Gluing the
-/// box down to the screen bottom again moves it by those extra rows a second
-/// time and leaves them blank between the transcript and the box; every further
-/// narrowing then adds another blank band, which is the gap that opens above the
-/// input area while a VS Code terminal narrows.
-fn reflow_pins_box_to_bottom(
-    previous_size: Size,
-    terminal_size: Size,
-    last_drawn_area: Option<Rect>,
-    alternate: bool,
-) -> bool {
-    !alternate
-        && terminal_size.width > previous_size.width
-        && last_drawn_area
-            .is_some_and(|area| area.y.saturating_add(area.height) >= previous_size.height)
-}
-
-/// Moves `area` down to the screen's last row, keeping its width and height.
-fn bottom_glued_area(area: Rect, screen_height: u16) -> Rect {
-    Rect::new(
-        area.x,
-        screen_height.saturating_sub(area.height),
-        area.width,
-        area.height,
-    )
-}
-
 /// Builds a fixed viewport immediately below the preceding output.
 ///
 /// Ratatui's inline viewport calls `append_lines` on every real terminal resize,
@@ -890,7 +1111,7 @@ fn build_fixed_terminal(
     }
     let mut backend = CrosstermBackend::new(io::stdout());
     let terminal_size = backend.size()?;
-    let area = screen.prepare_viewport(
+    let (area, terminal_size) = screen.prepare_viewport(
         &mut backend,
         terminal_size,
         height,
@@ -907,6 +1128,7 @@ fn build_fixed_terminal(
 
 /// Blanks the rows in `[from_row, to_row)` one line at a time, leaving every
 /// row outside that range untouched.
+#[cfg(test)]
 fn clear_row_range<B: Backend>(
     backend: &mut B,
     from_row: u16,
@@ -925,17 +1147,8 @@ fn clear_row_range<B: Backend>(
 /// Re-anchors a fixed viewport after terminal reflow or a requested height
 /// change without reserving another full block of terminal lines.
 ///
-/// `clear_previous_extent` is reserved for explicit viewport-height changes,
-/// where the box keeps its top row and may shrink; the rows a shorter box no
-/// longer covers must be blanked. Width reflow moves the whole box together
-/// with the transcript above it, so resize handling must leave it false —
-/// clearing the previous extent there would erase re-wrapped transcript.
-///
-/// `pin_to_bottom` is set by the width-reflow caller for a box that was flush
-/// with the screen bottom before the re-wrap (see `reflow_pins_box_to_bottom`).
-/// That build blanked every row from the recovered top downwards, so moving the
-/// frame onto the last rows repaints over the old box's own rows and the rows the
-/// re-wrap released below it — never over transcript.
+/// Clearing from the recovered top already blanks every released row. Keep the
+/// cursor at that top until paint so a subsequent reflow cannot lose the anchor.
 fn rebuild_fixed_viewport(
     terminal: &mut MultilineTerminal,
     screen: &mut PromptScreen,
@@ -943,41 +1156,22 @@ fn rebuild_fixed_viewport(
     new_height: u16,
     cursor_offset_row: u16,
     mode: ViewportRebuildMode,
-    previous_top_row: Option<u16>,
-    clear_previous_extent: bool,
-    pin_to_bottom: bool,
+    previous_area: Option<Rect>,
     verify_anchor: bool,
-) -> io::Result<Rect> {
-    let area = screen.prepare_viewport(
+) -> io::Result<(Rect, Size)> {
+    let (area, terminal_size) = screen.prepare_viewport(
         terminal.backend_mut(),
         terminal_size,
         new_height,
         cursor_offset_row,
         mode,
         true,
-        previous_top_row,
+        previous_area,
         verify_anchor,
     )?;
-    let area = if pin_to_bottom {
-        bottom_glued_area(area, terminal_size.height)
-    } else {
-        area
-    };
     *terminal = terminal_with_fixed_viewport(CrosstermBackend::new(io::stdout()), area)
         .map_err(|err| io::Error::other(err.to_string()))?;
-    // A height change keeps the box top fixed, so a SHRINKING box leaves its
-    // former bottom rows on screen as ghosts. Blank exactly that remainder;
-    // rows above the box hold transcript and must never be touched.
-    if clear_previous_extent && !screen.alternate {
-        if let Some(previous_top) = previous_top_row {
-            // The parked anchor sits on the previous box's bottom row, so its
-            // offset identifies that box's height.
-            let previous_bottom = previous_top.saturating_add(cursor_offset_row.saturating_add(1));
-            let new_bottom = area.y.saturating_add(area.height);
-            clear_row_range(terminal.backend_mut(), new_bottom, previous_bottom)?;
-        }
-    }
-    Ok(area)
+    Ok((area, terminal_size))
 }
 
 /// Re-anchor the existing fixed viewport after terminal width/height reflow.
@@ -992,94 +1186,49 @@ fn rebuild_after_terminal_reflow(
     base_viewport_height: u16,
     fitted_completion_items: Option<usize>,
     last_drawn_area: Option<Rect>,
-    previous_size: Size,
     verify_anchor: bool,
 ) -> io::Result<(Rect, Size)> {
     let terminal_size = terminal.backend().size()?;
-    // `previous_size` is the geometry the last frame was built for, which is what
-    // tells a box that was flush with the bottom apart from one that already sat
-    // above it. See `reflow_pins_box_to_bottom` for why that decides the row.
-    let pin_to_bottom =
-        reflow_pins_box_to_bottom(previous_size, terminal_size, last_drawn_area, screen.alternate);
     let requested_height = viewport_height_with_completion(
         terminal_size.height,
         base_viewport_height,
         fitted_completion_items,
     );
-    // Read the painted row widths BEFORE the rebuild: it clears the box's rows
-    // and resets the record, so afterwards there is nothing left to derive the
-    // re-wrapped row count from.
-    let extra_rows = match last_drawn_area {
-        Some(previous_area) if !screen.alternate => {
-            reflowed_extra_rows(previous_area, &screen.box_row_widths, terminal_size.width)
-        }
-        _ => 0,
-    };
-    // Placement must ignore the chrome rows' transient soft-wraps: the title,
-    // help and rule rows repaint truncated to an ellipsis, so their old wraps
-    // collapse on the next frame. Counting them in the anchor offset lifts the
-    // box a little higher on every fold-to-ellipsis narrowing, which reads as
-    // the input area drifting up with a growing blank band. Only the textarea
-    // rows keep wrapping, so only they place the box. The span is trusted only
-    // when it was recorded for this exact box height; otherwise fall back to
-    // the whole-box count.
-    let place_span = match (last_drawn_area, screen.wrap_row_span) {
-        (Some(previous_area), Some((start, len, total)))
-            if total == previous_area.height =>
-        {
-            Some((start, len))
-        }
-        _ => None,
-    };
-    let place_rows = match last_drawn_area {
-        Some(previous_area) if !screen.alternate => reflowed_place_rows(
-            previous_area,
-            &screen.box_row_widths,
-            terminal_size.width,
-            place_span,
-        ),
-        _ => 0,
-    };
-    // Locate the FIRST row of the reflowed old box, not a new-height box ending
-    // at the parked cursor. Clearing and rebuilding there removes all its visible
-    // fragments without moving transcript rows relative to scrollback. A global
-    // ScrollDown would insert blank rows at that boundary instead of repairing it.
-    let cursor_offset = parked_anchor_offset(last_drawn_area, requested_height)
-        .saturating_add(place_rows);
-    let rebuilt_area = rebuild_fixed_viewport(
+    // A painted prompt is one protected cursor group: xterm clips it at resize
+    // and lets this replacement supply the ellipses. Its bottom offset remains
+    // height - 1, so clearing cannot turn transient UI wraps into scrollback.
+    // Preserve the old phase and width record until the query validates geometry;
+    // an unprotected old frame still needs its full wrap correction before clear.
+    let (rebuilt_area, terminal_size) = rebuild_fixed_viewport(
         terminal,
         screen,
         terminal_size,
         requested_height,
-        cursor_offset,
+        parked_anchor_offset(last_drawn_area, requested_height),
         // Reflow moves an already-reserved viewport; it must never append more
         // terminal rows. Appending here makes every delayed resize notification
         // scroll the inline editor and strands the previously drawn caret.
         ViewportRebuildMode::ReflowOnly,
-        last_drawn_area.map(|area| area.y),
-        false,
-        pin_to_bottom,
+        last_drawn_area,
         verify_anchor,
     )?;
-    park_reflow_anchor(terminal, rebuilt_area)?;
-    // The rebuild clears from the new (placed) top downwards, so the chrome
-    // wraps between the old reflowed top and the new top would stay on screen
-    // as a blank band above the box. Blank exactly those rows: the old top is
-    // flush under the transcript on a narrowing, so this range holds only the
-    // old box's own wraps, never history. It rests on the same anchor trust
-    // as the rebuild itself.
-    let released = extra_rows.saturating_sub(place_rows);
-    if released > 0 {
-        let new_top = rebuilt_area.y;
-        clear_row_range(
-            terminal.backend_mut(),
-            new_top.saturating_sub(released),
-            new_top,
-        )?;
-    }
-    // A resize during the blocking cursor query belongs to the next rebuild;
-    // callers must not mark a fresh backend size as already applied here.
+    // The cleared top follows transcript reflow until paint re-establishes the
+    // protected bottom anchor. Record only the size validated for this phase.
     Ok((rebuilt_area, terminal_size))
+}
+
+/// Recover the first physical row of the old prompt from its parked cursor,
+/// regardless of how many rows its replacement will paint.
+fn reflowed_anchor_offset(
+    last_drawn_area: Option<Rect>,
+    requested_height: u16,
+    row_widths: &[u16],
+    new_width: u16,
+) -> u16 {
+    let extra_rows = last_drawn_area
+        .map(|area| reflowed_extra_rows(area, row_widths, new_width))
+        .unwrap_or(0);
+    parked_anchor_offset(last_drawn_area, requested_height).saturating_add(extra_rows)
 }
 
 /// Extra rows between the old box's first row and its parked bottom-row anchor
@@ -1096,65 +1245,21 @@ fn rebuild_after_terminal_reflow(
 /// saturates at row zero; ordinary screen erasure cannot recover those hidden
 /// input rows without also mutating the transcript's scrollback.
 fn reflowed_extra_rows(previous_area: Rect, row_widths: &[u16], new_width: u16) -> u16 {
-    reflowed_rows(previous_area, row_widths, new_width, None)
-}
-
-/// Rows of the old box that keep their wraps across a repaint, counted for
-/// anchor placement: only `place_span` (`Some((start, len))` indices into the
-/// old box's rows) contributes. Chrome rows repaint truncated to an ellipsis,
-/// so their transient soft-wraps must not lift the anchor; `None` keeps the
-/// historical whole-box count.
-fn reflowed_place_rows(
-    previous_area: Rect,
-    row_widths: &[u16],
-    new_width: u16,
-    place_span: Option<(u16, u16)>,
-) -> u16 {
-    reflowed_rows(previous_area, row_widths, new_width, place_span)
-}
-
-fn reflowed_rows(
-    previous_area: Rect,
-    row_widths: &[u16],
-    new_width: u16,
-    only: Option<(u16, u16)>,
-) -> u16 {
     // A row cannot be painted wider than the box it was drawn in, so nothing can
     // re-wrap once the box fits; a zero width would also divide by zero.
     if new_width == 0 || previous_area.width <= new_width {
         return 0;
     }
-    let in_span = |index: u16| match only {
-        None => true,
-        Some((start, len)) => index >= start && index < start.saturating_add(len),
-    };
-    let mut reflowed = 0u16;
-    let mut above = 0u16;
-    for index in 0..previous_area.height {
-        if !in_span(index) {
-            continue;
-        }
+    let mut extra_rows = 0u16;
+    // The bottom row's trailing wraps are below the column-zero anchor.
+    for index in 0..previous_area.height.saturating_sub(1) {
         // An unknown row (never recorded, or blank) re-wraps into one row.
         let width = row_widths.get(index as usize).copied().unwrap_or(0);
-        reflowed = reflowed.saturating_add(width.div_ceil(new_width).max(1));
-        if index + 1 < previous_area.height {
-            above = above.saturating_add(1);
-        }
+        extra_rows = extra_rows.saturating_add(width.div_ceil(new_width).saturating_sub(1));
     }
-    let bottom = previous_area.height.saturating_sub(1);
-    let last = if in_span(bottom) {
-        row_widths
-            .get(bottom as usize)
-            .copied()
-            .unwrap_or(0)
-            .div_ceil(new_width)
-            .max(1)
-    } else {
-        0
-    };
     // Saturating: a 65535-row box whose rows nearly all re-wrap must not wrap the
     // counter around into an incorrect anchor offset.
-    reflowed.saturating_sub(above.saturating_add(last))
+    extra_rows
 }
 
 /// Width of each box row as the terminal sees it: the furthest column the frame
@@ -1282,41 +1387,48 @@ mod width_reflow_geometry_tests {
         assert_eq!(reflowed_extra_rows(previous_area, &widths, 20), 4);
     }
 
-    /// Fold-to-ellipsis must not place the box: a wide chrome row (title or
-    /// help) repaints truncated, so its transient soft-wrap collapses on the
-    /// next frame. The full count still covers it for clearing.
+    /// Chrome wraps move the parked cursor even though the replacement frame
+    /// truncates those rows. Count them to recover the first old prompt row;
+    /// the former textarea-only offset left one blank row above the prompt.
     #[test]
-    fn chrome_wraps_count_for_clearing_but_not_for_placement() {
+    fn chrome_wraps_count_for_anchor_placement() {
         // Five-row box narrowed 40 -> 20: rows 1-2 are the (empty) textarea,
         // rows 3-4 are full-width chrome.
         let previous_area = Rect::new(0, 7, 40, 5);
         let widths = [0, 0, 0, 40, 40];
         assert_eq!(reflowed_extra_rows(previous_area, &widths, 20), 1);
-        assert_eq!(
-            reflowed_place_rows(previous_area, &widths, 20, Some((1, 2))),
-            0
+        let offset = reflowed_anchor_offset(Some(previous_area), 5, &widths, 20);
+        assert_eq!(offset, 5);
+        let (area, scroll) = fixed_viewport_area(
+            Size::new(20, 20),
+            Position::new(0, 12),
+            5,
+            offset,
+            ViewportRebuildMode::ReflowOnly,
         );
+        assert_eq!(area, Rect::new(0, 7, 20, 5));
+        assert_eq!(scroll, 0);
     }
 
-    /// Textarea rows keep wrapping, so they still place the box.
+    /// Textarea and chrome wraps both move the same parked anchor.
     #[test]
     fn textarea_wraps_still_place_the_box() {
         let previous_area = Rect::new(0, 7, 40, 5);
         let widths = [0, 40, 40, 40, 0];
         assert_eq!(
-            reflowed_place_rows(previous_area, &widths, 20, Some((1, 2))),
-            2
+            reflowed_anchor_offset(Some(previous_area), 5, &widths, 20),
+            7
         );
     }
 
-    /// Without a recorded span, placement keeps the historical whole-box count.
+    /// Changing the requested height does not change the old anchor offset.
     #[test]
-    fn unfiltered_placement_matches_the_clearing_count() {
+    fn reflow_placement_uses_the_old_height_and_all_row_widths() {
         let previous_area = Rect::new(0, 7, 40, 5);
         let widths = [40, 0, 40, 0, 40];
         assert_eq!(
-            reflowed_place_rows(previous_area, &widths, 20, None),
-            reflowed_extra_rows(previous_area, &widths, 20)
+            reflowed_anchor_offset(Some(previous_area), 3, &widths, 20),
+            previous_area.height - 1 + reflowed_extra_rows(previous_area, &widths, 20)
         );
     }
 
@@ -1324,10 +1436,13 @@ mod width_reflow_geometry_tests {
     #[test]
     fn reflowed_top_saturates_at_the_visible_screen_without_scrolling() {
         let previous = Rect::new(0, 7, 40, 5);
-        let offset = parked_anchor_offset(Some(previous), 5)
-            + reflowed_extra_rows(previous, &[40; 5], 20);
+        let offset =
+            parked_anchor_offset(Some(previous), 5) + reflowed_extra_rows(previous, &[40; 5], 20);
         let (area, scroll) = fixed_viewport_area(
-            Size::new(20, 12), Position::new(0, 6), 5, offset,
+            Size::new(20, 12),
+            Position::new(0, 6),
+            5,
+            offset,
             ViewportRebuildMode::ReflowOnly,
         );
         assert_eq!(area, Rect::new(0, 0, 20, 5));
@@ -1354,12 +1469,18 @@ mod width_reflow_geometry_tests {
         }
         backend.set_cursor_position(Position::new(0, 10)).unwrap();
         let previous = Rect::new(0, 7, 40, 5);
-        let offset = parked_anchor_offset(Some(previous), 5)
-            + reflowed_extra_rows(previous, &[40; 5], 20);
+        let offset =
+            parked_anchor_offset(Some(previous), 5) + reflowed_extra_rows(previous, &[40; 5], 20);
         let area = prepare_fixed_viewport(
-            &mut backend, Size::new(20, 14), 5, offset,
-            ViewportRebuildMode::ReflowOnly, true, &mut VecDeque::new(),
-        ).unwrap();
+            &mut backend,
+            Size::new(20, 14),
+            5,
+            offset,
+            ViewportRebuildMode::ReflowOnly,
+            true,
+            &mut VecDeque::new(),
+        )
+        .unwrap();
         assert_eq!(area, Rect::new(0, 2, 20, 5));
         assert_eq!(backend.scrollback(), &scrollback);
         for row in 0..2 {
@@ -1368,6 +1489,1317 @@ mod width_reflow_geometry_tests {
         for row in 2..14 {
             assert_eq!(backend.buffer()[(0, row)].symbol(), " ");
         }
+    }
+
+    fn assert_immediate_resize_frames(
+        widths: &[u16],
+        has_status: bool,
+        settle_after_cycles: bool,
+        notify_resize: bool,
+    ) {
+        use ratatui::backend::TestBackend;
+
+        const HEIGHT: u16 = 24;
+        const PROMPT_HEIGHT: u16 = 6;
+        let transcript = ["model response stays directly above the prompt", "END"];
+        let mut backend = TestBackend::new(80, HEIGHT);
+        // Keep real scrollback as well as visible output: neither may change
+        // during a prompt rebuild.
+        backend
+            .draw(std::iter::once((0, 0, &Cell::new("H"))))
+            .unwrap();
+        backend
+            .set_cursor_position(Position::new(0, HEIGHT - 1))
+            .unwrap();
+        backend.append_lines(1).unwrap();
+        let scrollback_height = backend.scrollback().area.height;
+        let mut area = Rect::new(0, 2, 80, PROMPT_HEIGHT);
+        let mut terminal = terminal_with_fixed_viewport(backend, area).unwrap();
+        let mut textarea = TextArea::default();
+        let frames_drawn = std::cell::Cell::new(0usize);
+        let mut paint_prompt = |terminal: &mut Terminal<TestBackend>| {
+            let mut widths = Vec::new();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render_multiline_popup_with_checkpoint(
+                        frame,
+                        &mut textarea,
+                        has_status.then_some("a long status message for this prompt"),
+                        None,
+                        "agent",
+                        "fixture-model-with-a-long-name",
+                        false,
+                        "high",
+                        Some("a long session title for this prompt"),
+                        None,
+                        area.width,
+                        "",
+                    );
+                    widths = painted_row_widths(frame.buffer_mut(), area);
+                })
+                .unwrap();
+            frames_drawn.set(frames_drawn.get() + 1);
+            let area = terminal.get_frame().area();
+            park_reflow_anchor(terminal, area).unwrap();
+            widths
+        };
+        let mut row_widths = paint_prompt(&mut terminal);
+        if has_status {
+            for y in area.bottom() - 3..area.bottom() {
+                let row = (0..area.width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>();
+                assert!(
+                    !row.contains('…'),
+                    "wide chrome should fit before resizing: {row:?}"
+                );
+            }
+        }
+        let (input_start, input_len) = super::super::render::textarea_row_range(
+            PROMPT_HEIGHT,
+            &[String::new()],
+            None,
+            has_status,
+            true,
+        );
+        let mut resize_state = PromptResizeState::default();
+        let mut applied_size = Size::new(80, HEIGHT);
+        let now = Instant::now();
+
+        for &width in widths {
+            let narrowing = width < area.width;
+            // TestBackend clips on resize rather than reflowing. Split the
+            // actual previous frame into physical rows to model the emulator,
+            // including the bottom status row's fragments BELOW its anchor.
+            let mut physical_rows = Vec::new();
+            let mut anchor_row = 0;
+            for (index, written_width) in row_widths.iter().copied().enumerate() {
+                if index + 1 == area.height as usize {
+                    anchor_row = physical_rows.len() as u16;
+                }
+                let row = (0..written_width)
+                    .map(|x| terminal.backend().buffer()[(x, area.y + index as u16)].clone())
+                    .collect::<Vec<_>>();
+                if row.is_empty() {
+                    physical_rows.push(Vec::new());
+                } else {
+                    physical_rows.extend(row.chunks(width as usize).map(|chunk| chunk.to_vec()));
+                }
+            }
+            if narrowing {
+                assert!(
+                    row_widths[input_start as usize..(input_start + input_len) as usize]
+                        .iter()
+                        .all(|written| *written <= width),
+                    "textarea must not wrap"
+                );
+                assert!(
+                    row_widths[area.height as usize - 2] > width,
+                    "title must wrap"
+                );
+                assert!(
+                    row_widths[area.height as usize - 1] > width,
+                    "status must wrap"
+                );
+            }
+            terminal.backend_mut().resize(width, HEIGHT);
+            terminal
+                .backend_mut()
+                .clear_region(BackendClearType::All)
+                .unwrap();
+            let transcript_rows = transcript
+                .iter()
+                .flat_map(|line| line.as_bytes().chunks(width as usize))
+                .collect::<Vec<_>>();
+            let top = transcript_rows.len() as u16;
+            assert!(top + physical_rows.len() as u16 <= HEIGHT);
+            for (y, row) in transcript_rows.iter().enumerate() {
+                let cells = row
+                    .iter()
+                    .map(|byte| Cell::from(*byte as char))
+                    .collect::<Vec<_>>();
+                terminal
+                    .backend_mut()
+                    .draw(
+                        cells
+                            .iter()
+                            .enumerate()
+                            .map(|(x, cell)| (x as u16, y as u16, cell)),
+                    )
+                    .unwrap();
+            }
+            for (y, row) in physical_rows.iter().enumerate() {
+                terminal
+                    .backend_mut()
+                    .draw(
+                        row.iter()
+                            .enumerate()
+                            .map(|(x, cell)| (x as u16, top + y as u16, cell)),
+                    )
+                    .unwrap();
+            }
+            let before = terminal.backend().buffer().clone();
+            let scrollback = terminal.backend().scrollback().clone();
+            let parked = Position::new(0, top + anchor_row);
+            terminal.backend_mut().set_cursor_position(parked).unwrap();
+            let offset = reflowed_anchor_offset(Some(area), PROMPT_HEIGHT, &row_widths, width);
+            let size = Size::new(width, HEIGHT);
+            // Feed the same event and draw gate as the input loop. No clock
+            // advancement or idle poll is allowed before the first frame.
+            let mut redraw_requested = if notify_resize {
+                resize_state.notify_resize(&Event::Resize(width, HEIGHT), applied_size)
+            } else {
+                // A foreground title/input update can observe new geometry
+                // before its Resize notification is consumed.
+                true
+            };
+            assert!(take_redraw_request(&mut redraw_requested, false));
+            assert!(!resize_state.rebuild_is_due(now, size, applied_size));
+            let kind = resize_state
+                .take_frame_rebuild(now, size, applied_size)
+                .unwrap();
+            assert_eq!(kind, ResizeFrameRebuild::Immediate);
+            let frames_before = frames_drawn.get();
+            let (expected, appended) = fixed_viewport_area(
+                size,
+                parked,
+                PROMPT_HEIGHT,
+                offset,
+                ViewportRebuildMode::ReflowOnly,
+            );
+            assert_eq!(
+                expected.y, top,
+                "gap after resizing {} -> {width}",
+                area.width
+            );
+            assert_eq!(appended, 0);
+            area = prepare_fixed_viewport(
+                terminal.backend_mut(),
+                size,
+                PROMPT_HEIGHT,
+                offset,
+                ViewportRebuildMode::ReflowOnly,
+                true,
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+            assert_eq!(area, expected);
+            resize_state.finish_rebuild(kind, now, size);
+            applied_size = size;
+            // All old fragments, including rows released below the replacement
+            // frame, are cleared before painting. No prefix is left as a gap.
+            for y in top..HEIGHT {
+                for x in 0..width {
+                    assert_eq!(terminal.backend().buffer()[(x, y)].symbol(), " ");
+                }
+            }
+            terminal = terminal_with_fixed_viewport(terminal.backend().clone(), area).unwrap();
+            park_reflow_anchor(&mut terminal, area).unwrap();
+            terminal
+                .backend_mut()
+                .assert_cursor_position(Position::new(0, area.bottom() - 1));
+            row_widths = paint_prompt(&mut terminal);
+            assert_eq!(frames_drawn.get(), frames_before + 1);
+            assert!(
+                row_widths[PROMPT_HEIGHT as usize - 3..]
+                    .iter()
+                    .all(|written| *written < width),
+                "repainted chrome must stay inside its single row"
+            );
+            if narrowing {
+                for y in area.bottom() - 3..area.bottom() {
+                    let row = (0..width)
+                        .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                        .collect::<String>();
+                    assert!(row.trim_end().ends_with('…'), "first resize frame: {row:?}");
+                }
+            }
+            terminal
+                .backend_mut()
+                .assert_cursor_position(Position::new(0, area.bottom() - 1));
+            assert!(!terminal.backend().cursor_visible());
+            assert_eq!(terminal.backend().scrollback(), &scrollback);
+            assert_eq!(
+                terminal.backend().scrollback().area.height,
+                scrollback_height
+            );
+            for y in 0..top {
+                for x in 0..width {
+                    assert_eq!(terminal.backend().buffer()[(x, y)], before[(x, y)]);
+                }
+            }
+            for y in area.bottom()..HEIGHT {
+                for x in 0..width {
+                    assert_eq!(terminal.backend().buffer()[(x, y)].symbol(), " ");
+                }
+            }
+            assert!(resize_state.pending());
+            assert!(!resize_state.notify_resize(&Event::Resize(width, HEIGHT), applied_size));
+            assert!(
+                resize_state.pending(),
+                "a duplicate must retain reconciliation"
+            );
+            assert_eq!(resize_state.take_frame_rebuild(now, size, size), None);
+        }
+
+        if !settle_after_cycles {
+            return;
+        }
+        // A single same-size settling pass consumes the new frame's widths.
+        // It must not count the wide chrome again or move any transcript cell.
+        let before = terminal.backend().buffer().clone();
+        let scrollback = terminal.backend().scrollback().clone();
+        let settled = now + RESIZE_SETTLE_DELAY;
+        let kind = resize_state
+            .take_frame_rebuild(settled, applied_size, applied_size)
+            .unwrap();
+        assert_eq!(kind, ResizeFrameRebuild::Reconcile);
+        let offset = reflowed_anchor_offset(Some(area), PROMPT_HEIGHT, &row_widths, area.width);
+        let rebuilt = prepare_fixed_viewport(
+            terminal.backend_mut(),
+            applied_size,
+            PROMPT_HEIGHT,
+            offset,
+            ViewportRebuildMode::ReflowOnly,
+            true,
+            &mut VecDeque::new(),
+        )
+        .unwrap();
+        assert_eq!(rebuilt, area);
+        terminal = terminal_with_fixed_viewport(terminal.backend().clone(), rebuilt).unwrap();
+        paint_prompt(&mut terminal);
+        resize_state.finish_rebuild(kind, settled, applied_size);
+        assert_eq!(terminal.backend().buffer(), &before);
+        assert_eq!(terminal.backend().scrollback(), &scrollback);
+        assert!(!resize_state.pending());
+        assert_eq!(
+            resize_state.take_frame_rebuild(
+                settled + RESIZE_SETTLE_DELAY,
+                applied_size,
+                applied_size
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn resize_event_draws_ellipsis_before_the_settle_timer() {
+        assert_immediate_resize_frames(&[20], true, false, true);
+        assert_immediate_resize_frames(&[20], false, false, true);
+    }
+
+    #[test]
+    fn live_resize_rebuilds_before_a_queued_notification() {
+        assert_immediate_resize_frames(&[20], true, false, false);
+    }
+
+    #[test]
+    fn chrome_reflow_cycles_keep_prompt_adjacent_and_transcript_unchanged() {
+        assert_immediate_resize_frames(&[20, 40, 12, 40, 20, 40, 12, 40], true, true, true);
+    }
+
+    #[test]
+    fn width_reflow_resize_during_cursor_query_keeps_both_frames_adjacent() {
+        use ratatui::{backend::TestBackend, buffer::Buffer};
+
+        const HEIGHT: u16 = 24;
+        const PROMPT_HEIGHT: u16 = 6;
+        let transcript = ["model response stays directly above the prompt", "END"];
+        let mut backend = TestBackend::new(80, HEIGHT);
+        backend
+            .draw(std::iter::once((0, 0, &Cell::new("H"))))
+            .unwrap();
+        backend
+            .set_cursor_position(Position::new(0, HEIGHT - 1))
+            .unwrap();
+        backend.append_lines(1).unwrap();
+        let scrollback = backend.scrollback().clone();
+        let mut area = Rect::new(0, 2, 80, PROMPT_HEIGHT);
+        let mut terminal = terminal_with_fixed_viewport(backend, area).unwrap();
+        let mut textarea = TextArea::default();
+        let mut paint_prompt = |terminal: &mut Terminal<TestBackend>| {
+            let mut widths = Vec::new();
+            terminal
+                .draw(|frame| {
+                    let frame_area = frame.area();
+                    render_multiline_popup_with_checkpoint(
+                        frame,
+                        &mut textarea,
+                        Some("a long status message for this prompt"),
+                        None,
+                        "agent",
+                        "fixture-model-with-a-long-name",
+                        false,
+                        "high",
+                        Some("a long session title for this prompt"),
+                        None,
+                        frame_area.width,
+                        "",
+                    );
+                    widths = painted_row_widths(frame.buffer_mut(), frame_area);
+                })
+                .unwrap();
+            let frame_area = terminal.get_frame().area();
+            park_reflow_anchor(terminal, frame_area).unwrap();
+            widths
+        };
+        let mut row_widths = paint_prompt(&mut terminal);
+        let mut old_frame = terminal.backend().buffer().clone();
+        // TestBackend clips instead of reflowing. Model a resize from the actual
+        // old frame, including the status fragments below its column-zero anchor.
+        let reflow = |backend: &mut TestBackend,
+                      width: u16,
+                      previous: Rect,
+                      old_frame: &Buffer,
+                      row_widths: &[u16]| {
+            let mut rows = Vec::new();
+            let mut anchor_row = 0;
+            for (index, written) in row_widths.iter().copied().enumerate() {
+                if index + 1 == previous.height as usize {
+                    anchor_row = rows.len() as u16;
+                }
+                let row = (0..written)
+                    .map(|x| old_frame[(x, previous.y + index as u16)].clone())
+                    .collect::<Vec<_>>();
+                if row.is_empty() {
+                    rows.push(Vec::new());
+                } else {
+                    rows.extend(row.chunks(width as usize).map(|chunk| chunk.to_vec()));
+                }
+            }
+            backend.resize(width, HEIGHT);
+            backend.clear_region(BackendClearType::All).unwrap();
+            let transcript_rows = transcript
+                .iter()
+                .flat_map(|line| line.as_bytes().chunks(width as usize))
+                .collect::<Vec<_>>();
+            let top = transcript_rows.len() as u16;
+            assert!(top + rows.len() as u16 <= HEIGHT);
+            for (y, row) in transcript_rows.iter().enumerate() {
+                let cells = row
+                    .iter()
+                    .map(|byte| Cell::from(*byte as char))
+                    .collect::<Vec<_>>();
+                backend
+                    .draw(
+                        cells
+                            .iter()
+                            .enumerate()
+                            .map(|(x, cell)| (x as u16, y as u16, cell)),
+                    )
+                    .unwrap();
+            }
+            for (y, row) in rows.iter().enumerate() {
+                backend
+                    .draw(
+                        row.iter()
+                            .enumerate()
+                            .map(|(x, cell)| (x as u16, top + y as u16, cell)),
+                    )
+                    .unwrap();
+            }
+            backend
+                .set_cursor_position(Position::new(0, top + anchor_row))
+                .unwrap();
+            top
+        };
+        reflow(terminal.backend_mut(), 40, area, &old_frame, &row_widths);
+        let now = Instant::now();
+        let mut applied_size = Size::new(80, HEIGHT);
+        let mut resize_state = PromptResizeState::default();
+        assert!(resize_state.notify_resize(&Event::Resize(40, HEIGHT), applied_size));
+
+        for (at, sampled_width, reply_width, expected_kind) in [
+            (now, 40, 20, ResizeFrameRebuild::Immediate),
+            (
+                now + RESIZE_SETTLE_DELAY,
+                20,
+                12,
+                ResizeFrameRebuild::Reconcile,
+            ),
+        ] {
+            let sampled_size = terminal.backend().size().unwrap();
+            assert_eq!(sampled_size.width, sampled_width);
+            let kind = resize_state
+                .take_frame_rebuild(at, sampled_size, applied_size)
+                .unwrap();
+            assert_eq!(kind, expected_kind);
+            assert!(
+                reflowed_anchor_offset(Some(area), PROMPT_HEIGHT, &row_widths, reply_width)
+                    > reflowed_anchor_offset(Some(area), PROMPT_HEIGHT, &row_widths, sampled_width)
+            );
+            let mut queries = 0;
+            let mut reflowed_frame = None;
+            let mut reflowed_scrollback = None;
+            let mut expected_top = 0;
+            let (rebuilt, validated_size) = prepare_fixed_viewport_with_query(
+                terminal.backend_mut(),
+                sampled_size,
+                PROMPT_HEIGHT,
+                parked_anchor_offset(Some(area), PROMPT_HEIGHT),
+                ViewportRebuildMode::ReflowOnly,
+                true,
+                Some(area),
+                &row_widths,
+                &mut VecDeque::new(),
+                |backend, query_size, pending| {
+                    if queries == 0 {
+                        assert_eq!(query_size.width, sampled_width);
+                        expected_top = reflow(backend, reply_width, area, &old_frame, &row_widths);
+                        reflowed_frame = Some(backend.buffer().clone());
+                        reflowed_scrollback = Some(backend.scrollback().clone());
+                    } else {
+                        assert_eq!(query_size.width, reply_width);
+                        assert_eq!(
+                            backend.buffer(),
+                            reflowed_frame.as_ref().unwrap(),
+                            "a changed-size reply must not clear any old prompt row"
+                        );
+                    }
+                    queries += 1;
+                    Ok(tracked_cursor_query(pending, || backend.get_cursor_position()).unwrap())
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                queries, 2,
+                "query again before clearing at the changed width"
+            );
+            assert_eq!(validated_size, Size::new(reply_width, HEIGHT));
+            assert_eq!(
+                rebuilt,
+                Rect::new(0, expected_top, reply_width, PROMPT_HEIGHT)
+            );
+            let before_clear = reflowed_frame.unwrap();
+            // TestBackend also resizes scrollback columns. Compare the rebuild
+            // against the emulator's new-width state, while its row count stays fixed.
+            let resized_scrollback = reflowed_scrollback.unwrap();
+            assert_eq!(resized_scrollback.area.height, scrollback.area.height);
+            for y in 0..expected_top {
+                for x in 0..reply_width {
+                    assert_eq!(terminal.backend().buffer()[(x, y)], before_clear[(x, y)]);
+                }
+            }
+            for y in expected_top..HEIGHT {
+                for x in 0..reply_width {
+                    assert_eq!(terminal.backend().buffer()[(x, y)].symbol(), " ");
+                }
+            }
+            assert_eq!(
+                terminal.backend().scrollback(),
+                &resized_scrollback,
+                "no rows may be appended"
+            );
+            area = rebuilt;
+            terminal = terminal_with_fixed_viewport(terminal.backend().clone(), area).unwrap();
+            row_widths = paint_prompt(&mut terminal);
+            terminal
+                .backend_mut()
+                .assert_cursor_position(Position::new(0, area.bottom() - 1));
+            assert!(!terminal.backend().cursor_visible());
+            assert_eq!(terminal.backend().scrollback(), &resized_scrollback);
+            for y in 0..expected_top {
+                for x in 0..reply_width {
+                    assert_eq!(terminal.backend().buffer()[(x, y)], before_clear[(x, y)]);
+                }
+            }
+            for y in area.bottom()..HEIGHT {
+                for x in 0..reply_width {
+                    assert_eq!(terminal.backend().buffer()[(x, y)].symbol(), " ");
+                }
+            }
+            for y in area.bottom() - 3..area.bottom() {
+                let row = (0..reply_width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>();
+                assert!(row.trim_end().ends_with('…'), "resize frame: {row:?}");
+            }
+            old_frame = terminal.backend().buffer().clone();
+            resize_state.finish_rebuild(kind, at, validated_size);
+            applied_size = validated_size;
+        }
+        assert!(!resize_state.pending());
+    }
+
+    #[test]
+    fn same_size_reconciliation_recovers_an_immediate_anchor_that_moved() {
+        use ratatui::backend::TestBackend;
+
+        let now = Instant::now();
+        let size = Size::new(20, 18);
+        let mut resize_state = PromptResizeState::default();
+        assert!(resize_state.notify_resize(&Event::Resize(20, 18), Size::new(40, 18)));
+        let kind = resize_state
+            .take_frame_rebuild(now, size, Size::new(40, 18))
+            .unwrap();
+        assert_eq!(kind, ResizeFrameRebuild::Immediate);
+        resize_state.finish_rebuild(kind, now, size);
+        let kind = resize_state
+            .take_frame_rebuild(now + RESIZE_SETTLE_DELAY, size, size)
+            .unwrap();
+        assert_eq!(kind, ResizeFrameRebuild::Reconcile);
+
+        // A late terminal reflow moved both the transcript and the immediate
+        // prompt down two rows without another size notification.
+        let previous = Rect::new(0, 4, 20, 6);
+        let mut backend = TestBackend::new(20, 18);
+        for y in 0..6 {
+            backend
+                .draw(std::iter::once((0, y, &Cell::new("K"))))
+                .unwrap();
+        }
+        for y in 6..12 {
+            backend
+                .draw(std::iter::once((0, y, &Cell::new("X"))))
+                .unwrap();
+        }
+        backend.set_cursor_position(Position::new(0, 11)).unwrap();
+        let scrollback = backend.scrollback().clone();
+        let offset = reflowed_anchor_offset(Some(previous), 6, &[3, 1, 1, 18, 18, 18], 20);
+        let area = prepare_fixed_viewport(
+            &mut backend,
+            size,
+            6,
+            offset,
+            ViewportRebuildMode::ReflowOnly,
+            true,
+            &mut VecDeque::new(),
+        )
+        .unwrap();
+        assert_eq!(area, Rect::new(0, 6, 20, 6));
+        assert_eq!(backend.scrollback(), &scrollback);
+        for y in 0..6 {
+            assert_eq!(backend.buffer()[(0, y)].symbol(), "K");
+        }
+        for y in 6..18 {
+            assert_eq!(backend.buffer()[(0, y)].symbol(), " ");
+        }
+        let mut terminal = terminal_with_fixed_viewport(backend, area).unwrap();
+        park_reflow_anchor(&mut terminal, area).unwrap();
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(0, 11));
+        resize_state.finish_rebuild(kind, now + RESIZE_SETTLE_DELAY, size);
+        assert!(!resize_state.pending());
+    }
+
+    #[test]
+    fn width_reflow_anchor_probe_stays_inside_prompt_group() {
+        let row = std::cell::Cell::new(23_u16);
+        let saved = std::cell::Cell::new(23_u16);
+        let visited = RefCell::new(Vec::new());
+        let mut query = || {
+            visited.borrow_mut().push(row.get());
+            Ok(row.get())
+        };
+        let result = verified_prompt_cursor_row(
+            &mut query,
+            &mut || {
+                saved.set(row.get());
+                Ok(())
+            },
+            &mut || {
+                row.set(saved.get());
+                Ok(())
+            },
+            &mut |offset| {
+                row.set(row.get() - offset);
+                Ok(())
+            },
+            &mut |offset| {
+                row.set(row.get() + offset);
+                Ok(())
+            },
+            6,
+            &mut VecDeque::new(),
+        )
+        .unwrap();
+        assert_eq!(result, 23);
+        assert_eq!(row.get(), 23);
+        assert_eq!(visited.borrow().len(), 4);
+        assert!(visited.borrow().iter().all(|row| (18..24).contains(row)));
+    }
+
+    #[test]
+    fn width_reflow_bottom_scrollback_round_trips_keep_prompt_and_caret() {
+        use ratatui::backend::WindowSize;
+
+        // Model the xterm buffer contract, including its cursor-line exemption.
+        // With scrollback, reflow inserts rows by advancing baseY rather than
+        // advancing the cursor's screen row, even when blank rows follow it.
+        #[derive(Clone)]
+        struct Line {
+            cells: Vec<Cell>,
+            written: usize,
+            wrapped: bool,
+        }
+        impl Line {
+            fn blank(width: u16) -> Self {
+                Self {
+                    cells: vec![Cell::default(); width as usize],
+                    written: 0,
+                    wrapped: false,
+                }
+            }
+        }
+        #[derive(Clone)]
+        struct ReflowBackend {
+            size: Size,
+            lines: Vec<Line>,
+            base_y: usize,
+            cursor: Position,
+            cursor_visible: bool,
+        }
+        impl ReflowBackend {
+            fn new() -> Self {
+                let size = Size::new(80, 24);
+                let base_y = 32;
+                let mut lines = vec![Line::blank(size.width); base_y + size.height as usize];
+                for line in &mut lines[..base_y + 18] {
+                    line.cells[0] = Cell::new("T");
+                    line.written = 1;
+                }
+                Self {
+                    size,
+                    lines,
+                    base_y,
+                    cursor: Position::new(0, 18),
+                    cursor_visible: false,
+                }
+            }
+            fn resize(&mut self, width: u16) {
+                let absolute_cursor = self.base_y + self.cursor.y as usize;
+                let old_len = self.lines.len();
+                let old_width = self.size.width;
+                let mut reflowed = Vec::new();
+                let mut index = 0;
+                while index < self.lines.len() {
+                    let start = index;
+                    index += 1;
+                    while index < self.lines.len() && self.lines[index].wrapped {
+                        index += 1;
+                    }
+                    if (start..index).contains(&absolute_cursor) {
+                        // xterm leaves the active logical line to the application.
+                        for line in &self.lines[start..index] {
+                            let mut line = line.clone();
+                            line.cells.resize(width as usize, Cell::default());
+                            line.written = line.written.min(width as usize);
+                            reflowed.push(line);
+                        }
+                        continue;
+                    }
+                    let mut content = Vec::new();
+                    for (offset, line) in self.lines[start..index].iter().enumerate() {
+                        let used = if offset + 1 < index - start {
+                            old_width as usize
+                        } else {
+                            line.written
+                        };
+                        content.extend_from_slice(&line.cells[..used]);
+                    }
+                    if content.is_empty() {
+                        reflowed.push(Line::blank(width));
+                    } else {
+                        for (part, cells) in content.chunks(width as usize).enumerate() {
+                            let mut line = Line::blank(width);
+                            line.cells[..cells.len()].clone_from_slice(cells);
+                            line.written = cells.len();
+                            line.wrapped = part > 0;
+                            reflowed.push(line);
+                        }
+                    }
+                }
+                if reflowed.len() >= old_len {
+                    self.base_y += reflowed.len() - old_len;
+                } else {
+                    self.base_y = self.base_y.saturating_sub(old_len - reflowed.len());
+                }
+                self.lines = reflowed;
+                self.size.width = width;
+                self.cursor.x = self.cursor.x.min(width - 1);
+            }
+            fn assert_caret(&self, area: Rect) {
+                let carets = (0..self.size.height)
+                    .flat_map(|y| {
+                        self.lines[self.base_y + y as usize]
+                            .cells
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, cell)| {
+                                cell.symbol() == " "
+                                    && cell.modifier.contains(Modifier::REVERSED | Modifier::BOLD)
+                            })
+                            .map(move |(x, _)| Position::new(x as u16, y))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(carets.len(), 1, "carets={carets:?}");
+                assert_eq!(carets[0].y, area.y);
+                assert!(!self.cursor_visible);
+                for line in &self.lines[self.base_y + area.bottom() as usize..] {
+                    assert!(
+                        line.cells
+                            .iter()
+                            .all(|cell| cell.symbol().trim().is_empty())
+                    );
+                }
+            }
+        }
+        impl Backend for ReflowBackend {
+            type Error = io::Error;
+
+            fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+            where
+                I: Iterator<Item = (u16, u16, &'a Cell)>,
+            {
+                for (x, y, cell) in content {
+                    let row = self.base_y + y as usize;
+                    if x + 1 == self.size.width && cell.symbol() == "  " {
+                        // Two contiguous spaces at the right edge naturally wrap
+                        // onto the following row, as Crossterm's Print does.
+                        self.lines[row].cells[x as usize] = Cell::default();
+                        self.lines[row].written = self.size.width as usize;
+                        self.lines[row + 1].cells[0] = Cell::default();
+                        self.lines[row + 1].wrapped = true;
+                    } else {
+                        self.lines[row].cells[x as usize] = cell.clone();
+                        self.lines[row].written = self.lines[row].written.max(x as usize + 1);
+                    }
+                }
+                Ok(())
+            }
+            fn hide_cursor(&mut self) -> io::Result<()> {
+                self.cursor_visible = false;
+                Ok(())
+            }
+            fn show_cursor(&mut self) -> io::Result<()> {
+                self.cursor_visible = true;
+                Ok(())
+            }
+            fn get_cursor_position(&mut self) -> io::Result<Position> {
+                Ok(self.cursor)
+            }
+            fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+                self.cursor = position.into();
+                Ok(())
+            }
+            fn clear(&mut self) -> io::Result<()> {
+                self.clear_region(BackendClearType::All)
+            }
+            fn clear_region(&mut self, clear_type: BackendClearType) -> io::Result<()> {
+                let from = match clear_type {
+                    BackendClearType::All => self.base_y,
+                    BackendClearType::AfterCursor => self.base_y + self.cursor.y as usize,
+                    _ => return Err(io::Error::other("unsupported reflow-fixture clear")),
+                };
+                for line in &mut self.lines[from..] {
+                    *line = Line::blank(self.size.width);
+                }
+                Ok(())
+            }
+            fn append_lines(&mut self, count: u16) -> io::Result<()> {
+                self.base_y += count as usize;
+                self.lines
+                    .extend((0..count).map(|_| Line::blank(self.size.width)));
+                Ok(())
+            }
+            fn size(&self) -> io::Result<Size> {
+                Ok(self.size)
+            }
+            fn window_size(&mut self) -> io::Result<WindowSize> {
+                Ok(WindowSize {
+                    columns_rows: self.size,
+                    pixels: Size::ZERO,
+                })
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn paint(terminal: &mut Terminal<ReflowBackend>, widths: &mut Vec<u16>) {
+            let mut textarea = TextArea::default();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render_multiline_popup_with_checkpoint(
+                        frame,
+                        &mut textarea,
+                        Some("status message with a long explanatory label that needs an ellipsis"),
+                        None,
+                        "fixture-agent",
+                        "fixture-model-with-a-long-name",
+                        false,
+                        "high",
+                        Some("session topic with a long descriptive label that also needs an ellipsis"),
+                        None,
+                        area.width,
+                        "fixture-backend",
+                    );
+                    *widths = painted_row_widths(frame.buffer_mut(), area);
+                })
+                .unwrap();
+            let area = terminal.get_frame().area();
+            assert!(
+                preserve_prompt_cursor_group(terminal.backend_mut(), area, area.width).unwrap()
+            );
+            park_reflow_anchor(terminal, area).unwrap();
+            terminal.backend().assert_caret(area);
+            if area.width == 40 {
+                for y in area.bottom() - 3..area.bottom() {
+                    let row = &terminal.backend().lines[terminal.backend().base_y + y as usize];
+                    let text = row.cells.iter().map(Cell::symbol).collect::<String>();
+                    assert!(text.trim_end().ends_with('…'), "chrome={text:?}");
+                }
+            }
+        }
+
+        let mut terminal =
+            terminal_with_fixed_viewport(ReflowBackend::new(), Rect::new(0, 18, 80, 6)).unwrap();
+        let mut area = terminal.get_frame().area();
+        let mut widths = Vec::new();
+        paint(&mut terminal, &mut widths);
+        let initial_top = area.y;
+        let initial_cursor = terminal.backend().cursor.y;
+        let initial_base = terminal.backend().base_y;
+        let mut tops = vec![initial_top];
+        let mut cursors = vec![initial_cursor];
+        let mut bases = vec![initial_base];
+        let mut applied = Size::new(80, 24);
+        let mut resize = PromptResizeState::default();
+        let mut now = Instant::now();
+        for _ in 0..4 {
+            for width in [40, 80] {
+                terminal.backend_mut().resize(width);
+                let size = terminal.backend().size().unwrap();
+                assert!(resize.notify_resize(&Event::Resize(width, size.height), applied));
+                let kind = resize.take_frame_rebuild(now, size, applied).unwrap();
+                let (next_area, size) = prepare_cursor_group_viewport_with_query(
+                    terminal.backend_mut(),
+                    size,
+                    6,
+                    parked_anchor_offset(Some(area), 6),
+                    ViewportRebuildMode::ReflowOnly,
+                    true,
+                    Some(area),
+                    &widths,
+                    Some(area.height),
+                    &mut VecDeque::new(),
+                    |backend, _, _| backend.get_cursor_position(),
+                )
+                .unwrap();
+                area = next_area;
+                applied = size;
+                resize.finish_rebuild(kind, now, size);
+                widths.clear();
+                terminal = terminal_with_fixed_viewport(terminal.backend().clone(), area).unwrap();
+                paint(&mut terminal, &mut widths);
+                if width == 80 {
+                    tops.push(area.y);
+                    cursors.push(terminal.backend().cursor.y);
+                    bases.push(terminal.backend().base_y);
+                }
+                now += Duration::from_millis(25);
+            }
+        }
+        assert_eq!(
+            tops,
+            vec![initial_top; 5],
+            "cursor rows={cursors:?}, baseY={bases:?}"
+        );
+        assert_eq!(cursors, vec![initial_cursor; 5]);
+        assert_eq!(bases, vec![initial_base; 5]);
+        eprintln!("width round trips: top={tops:?}, cursor={cursors:?}, baseY={bases:?}");
+
+        now += RESIZE_SETTLE_DELAY;
+        let kind = resize.take_frame_rebuild(now, applied, applied).unwrap();
+        assert_eq!(kind, ResizeFrameRebuild::Reconcile);
+        let (area, size) = prepare_cursor_group_viewport_with_query(
+            terminal.backend_mut(),
+            applied,
+            6,
+            5,
+            ViewportRebuildMode::ReflowOnly,
+            true,
+            Some(area),
+            &widths,
+            Some(area.height),
+            &mut VecDeque::new(),
+            |backend, _, _| backend.get_cursor_position(),
+        )
+        .unwrap();
+        resize.finish_rebuild(kind, now, size);
+        terminal = terminal_with_fixed_viewport(terminal.backend().clone(), area).unwrap();
+        paint(&mut terminal, &mut widths);
+        assert_eq!(area.y, initial_top);
+        assert_eq!(terminal.backend().cursor.y, initial_cursor);
+        assert_eq!(terminal.backend().base_y, initial_base);
+        assert!(!resize.pending());
+    }
+
+    #[test]
+    fn width_reflow_post_clear_resize_reanchors_before_paint() {
+        use ratatui::backend::TestBackend;
+
+        const HEIGHT: u16 = 32;
+        const PROMPT_HEIGHT: u16 = 6;
+        struct Fixture {
+            terminal: Terminal<TestBackend>,
+            area: Rect,
+            size: Size,
+            widths: Vec<u16>,
+            transcript: Vec<String>,
+            scrollback_rows: u16,
+        }
+        impl Fixture {
+            fn new() -> Self {
+                let mut backend = TestBackend::new(40, HEIGHT);
+                backend
+                    .draw(std::iter::once((0, 0, &Cell::new("H"))))
+                    .unwrap();
+                backend
+                    .set_cursor_position(Position::new(0, HEIGHT - 1))
+                    .unwrap();
+                backend.append_lines(1).unwrap();
+                let scrollback_rows = backend.scrollback().area.height;
+                let transcript = (0..12)
+                    .map(|index| format!("output {index}"))
+                    .chain(std::iter::once(
+                        "last model response wraps 0123456789 abcdef".to_owned(),
+                    ))
+                    .collect::<Vec<_>>();
+                let top = transcript
+                    .iter()
+                    .map(|line| line.len().div_ceil(40))
+                    .sum::<usize>() as u16;
+                let area = Rect::new(0, top, 40, PROMPT_HEIGHT);
+                let mut fixture = Self {
+                    terminal: terminal_with_fixed_viewport(backend, area).unwrap(),
+                    area,
+                    size: Size::new(40, HEIGHT),
+                    widths: Vec::new(),
+                    transcript,
+                    scrollback_rows,
+                };
+                fixture.resize(40);
+                fixture.paint();
+                fixture
+            }
+            fn top(&self) -> u16 {
+                let width = self.terminal.backend().size().unwrap().width as usize;
+                self.transcript
+                    .iter()
+                    .map(|line| line.len().div_ceil(width))
+                    .sum::<usize>() as u16
+            }
+            fn assert_transcript(&self) {
+                let width = self.terminal.backend().size().unwrap().width;
+                let rows = self
+                    .transcript
+                    .iter()
+                    .flat_map(|line| line.as_bytes().chunks(width as usize));
+                for (y, row) in rows.enumerate() {
+                    for x in 0..width {
+                        let expected = row
+                            .get(x as usize)
+                            .map_or(Cell::new(" "), |byte| Cell::from(*byte as char));
+                        assert_eq!(self.terminal.backend().buffer()[(x, y as u16)], expected);
+                    }
+                }
+            }
+            fn resize(&mut self, width: u16) {
+                let old_frame = self.terminal.backend().buffer().clone();
+                let mut rows = Vec::new();
+                let mut anchor_row = 0;
+                for index in 0..self.area.height {
+                    if index + 1 == self.area.height && !self.widths.is_empty() {
+                        anchor_row = rows.len() as u16;
+                    }
+                    let written = self.widths.get(index as usize).copied().unwrap_or(0);
+                    let row = (0..written)
+                        .map(|x| old_frame[(x, self.area.y + index)].clone())
+                        .collect::<Vec<_>>();
+                    if row.is_empty() {
+                        rows.push(Vec::new());
+                    } else {
+                        rows.extend(row.chunks(width as usize).map(|chunk| chunk.to_vec()));
+                    }
+                }
+                self.terminal.backend_mut().resize(width, HEIGHT);
+                self.terminal
+                    .backend_mut()
+                    .clear_region(BackendClearType::All)
+                    .unwrap();
+                let output = self
+                    .transcript
+                    .iter()
+                    .flat_map(|line| line.as_bytes().chunks(width as usize))
+                    .collect::<Vec<_>>();
+                let top = output.len() as u16;
+                assert!(top + rows.len() as u16 <= HEIGHT);
+                for (y, row) in output.iter().enumerate() {
+                    let cells = row
+                        .iter()
+                        .map(|byte| Cell::from(*byte as char))
+                        .collect::<Vec<_>>();
+                    self.terminal
+                        .backend_mut()
+                        .draw(
+                            cells
+                                .iter()
+                                .enumerate()
+                                .map(|(x, cell)| (x as u16, y as u16, cell)),
+                        )
+                        .unwrap();
+                }
+                for (y, row) in rows.iter().enumerate() {
+                    self.terminal
+                        .backend_mut()
+                        .draw(
+                            row.iter()
+                                .enumerate()
+                                .map(|(x, cell)| (x as u16, top + y as u16, cell)),
+                        )
+                        .unwrap();
+                }
+                self.terminal
+                    .backend_mut()
+                    .set_cursor_position(Position::new(0, top + anchor_row))
+                    .unwrap();
+            }
+            fn clear(&mut self) -> io::Result<Size> {
+                let before = self.terminal.backend().scrollback().clone();
+                let size = self.terminal.backend().size().unwrap();
+                let (area, size) = prepare_fixed_viewport_with_query(
+                    self.terminal.backend_mut(),
+                    size,
+                    PROMPT_HEIGHT,
+                    parked_anchor_offset(Some(self.area), PROMPT_HEIGHT),
+                    ViewportRebuildMode::ReflowOnly,
+                    true,
+                    Some(self.area),
+                    &self.widths,
+                    &mut VecDeque::new(),
+                    |backend, _, pending| {
+                        Ok(
+                            tracked_cursor_query(pending, || backend.get_cursor_position())
+                                .unwrap(),
+                        )
+                    },
+                )?;
+                self.area = area;
+                self.size = size;
+                self.widths.clear();
+                self.terminal =
+                    terminal_with_fixed_viewport(self.terminal.backend().clone(), area).unwrap();
+                assert_eq!(
+                    self.area.y,
+                    self.top(),
+                    "clear must recover the first old prompt row"
+                );
+                self.terminal
+                    .backend_mut()
+                    .assert_cursor_position(Position::new(0, self.area.y));
+                self.assert_transcript();
+                for y in self.top()..HEIGHT {
+                    for x in 0..size.width {
+                        assert_eq!(self.terminal.backend().buffer()[(x, y)].symbol(), " ");
+                    }
+                }
+                assert_eq!(
+                    self.terminal.backend().scrollback(),
+                    &before,
+                    "no appended rows"
+                );
+                Ok(size)
+            }
+            fn paint(&mut self) {
+                let mut textarea = TextArea::default();
+                let mut widths = Vec::new();
+                self.terminal
+                    .draw(|frame| {
+                        let area = frame.area();
+                        render_multiline_popup_with_checkpoint(
+                            frame,
+                            &mut textarea,
+                            Some("status text that must truncate directly at the new width"),
+                            None,
+                            "agent",
+                            "fixture-model-with-a-long-name",
+                            false,
+                            "high",
+                            Some("session title that must truncate directly at the new width"),
+                            None,
+                            area.width,
+                            "",
+                        );
+                        widths = painted_row_widths(frame.buffer_mut(), area);
+                    })
+                    .unwrap();
+                self.widths = widths;
+                park_reflow_anchor(&mut self.terminal, self.area).unwrap();
+                assert_eq!(
+                    self.area.y,
+                    self.top(),
+                    "a painted prompt must be adjacent to output"
+                );
+                assert_eq!(self.area.width, self.size.width);
+                self.terminal
+                    .backend_mut()
+                    .assert_cursor_position(Position::new(0, self.area.bottom() - 1));
+                assert!(!self.terminal.backend().cursor_visible());
+                self.assert_transcript();
+                assert_eq!(
+                    self.terminal.backend().scrollback().area.height,
+                    self.scrollback_rows
+                );
+                for y in self.area.bottom()..HEIGHT {
+                    for x in 0..self.size.width {
+                        assert_eq!(self.terminal.backend().buffer()[(x, y)].symbol(), " ");
+                    }
+                }
+                for y in self.area.bottom() - 3..self.area.bottom() {
+                    let row = (0..self.size.width)
+                        .map(|x| self.terminal.backend().buffer()[(x, y)].symbol())
+                        .collect::<String>();
+                    assert!(
+                        row.trim_end().ends_with('…'),
+                        "first paint at new width: {row:?}"
+                    );
+                }
+            }
+        }
+        let mut fixture = Fixture::new();
+        let mut resize_state = PromptResizeState::default();
+        let mut now = Instant::now();
+        for _ in 0..4 {
+            let painted_width = fixture.size.width;
+            let notified_width = if painted_width == 40 { 20 } else { 40 };
+            fixture.resize(notified_width);
+            assert!(
+                resize_state.notify_resize(&Event::Resize(notified_width, HEIGHT), fixture.size)
+            );
+            for kind in [ResizeFrameRebuild::Immediate, ResizeFrameRebuild::Reconcile] {
+                let live = fixture.terminal.backend().size().unwrap();
+                assert_eq!(
+                    resize_state.take_frame_rebuild(now, live, fixture.size),
+                    Some(kind)
+                );
+                let size = fixture.clear().unwrap();
+                resize_state.finish_rebuild(kind, now, size);
+                let target_width = if kind == ResizeFrameRebuild::Immediate {
+                    painted_width
+                } else {
+                    notified_width
+                };
+                let mut applied = fixture.size;
+                let mut injected = false;
+                prepare_prompt_paint(
+                    &mut fixture,
+                    &mut applied,
+                    |fixture| {
+                        if !injected {
+                            assert!(
+                                fixture.widths.is_empty(),
+                                "inject only after the validated clear"
+                            );
+                            fixture.resize(target_width);
+                            injected = true;
+                        }
+                        Ok(fixture.terminal.backend().size().unwrap())
+                    },
+                    |fixture| {
+                        let size = fixture.clear()?;
+                        resize_state.finish_rebuild(ResizeFrameRebuild::Immediate, now, size);
+                        Ok(size)
+                    },
+                )
+                .unwrap();
+                assert_eq!(applied, fixture.size);
+                assert_eq!(applied.width, target_width);
+                fixture.paint();
+                assert!(
+                    resize_state.pending(),
+                    "a new pre-paint resize owes reconciliation"
+                );
+                now += RESIZE_SETTLE_DELAY;
+            }
+        }
+        assert_eq!(
+            resize_state.take_frame_rebuild(now, fixture.size, fixture.size),
+            Some(ResizeFrameRebuild::Reconcile)
+        );
+        let size = fixture.clear().unwrap();
+        resize_state.finish_rebuild(ResizeFrameRebuild::Reconcile, now, size);
+        let mut applied = fixture.size;
+        prepare_prompt_paint(
+            &mut fixture,
+            &mut applied,
+            |fixture| Ok(fixture.terminal.backend().size().unwrap()),
+            |fixture| fixture.clear(),
+        )
+        .unwrap();
+        fixture.paint();
+        assert!(!resize_state.pending());
+    }
+
+    #[test]
+    fn width_reflow_continuous_post_clear_resize_defers_paint() {
+        let mut live = Size::new(20, 24);
+        let mut applied = live;
+        let mut reanchors = 0;
+        let result = prepare_prompt_paint(
+            &mut live,
+            &mut applied,
+            |live| {
+                live.width = if live.width == 20 { 40 } else { 20 };
+                Ok(*live)
+            },
+            |live| {
+                reanchors += 1;
+                Ok(*live)
+            },
+        );
+        assert!(defer_unstable_prompt_geometry(result).unwrap().is_none());
+        assert_eq!(reanchors, PROMPT_GEOMETRY_RETRIES);
+    }
+
+    #[test]
+    fn width_reflow_continuous_query_resize_keeps_old_prompt_intact() {
+        use ratatui::backend::TestBackend;
+        let mut backend = TestBackend::new(20, 10);
+        backend
+            .draw(std::iter::once((0, 9, &Cell::new("X"))))
+            .unwrap();
+        backend.set_cursor_position(Position::new(0, 9)).unwrap();
+        let mut queries = 0;
+        let mut last_resized_frame = None;
+        let result = prepare_fixed_viewport_with_query(
+            &mut backend,
+            Size::new(20, 10),
+            6,
+            5,
+            ViewportRebuildMode::ReflowOnly,
+            true,
+            Some(Rect::new(0, 4, 20, 6)),
+            &[1; 6],
+            &mut VecDeque::new(),
+            |backend, size, pending| {
+                queries += 1;
+                backend.resize(if size.width == 20 { 40 } else { 20 }, 10);
+                last_resized_frame = Some(backend.buffer().clone());
+                Ok(tracked_cursor_query(pending, || backend.get_cursor_position()).unwrap())
+            },
+        );
+        assert!(defer_unstable_prompt_geometry(result).unwrap().is_none());
+        assert_eq!(queries, PROMPT_GEOMETRY_RETRIES);
+        // TestBackend reshapes its buffer on resize. Every old cell must remain
+        // intact after the final resize, including the prompt sentinel.
+        let expected = last_resized_frame.unwrap();
+        assert!(expected.content.iter().any(|cell| cell.symbol() == "X"));
+        assert_eq!(backend.buffer(), &expected);
+        assert_eq!(backend.scrollback().area.height, 0);
     }
 
     /// `painted_row_widths` reports where the frame stopped writing: text, a
@@ -1446,7 +2878,80 @@ fn update_pending_resize_rebuild(
     // anchor without any real reflow and leave the drawn caret behind. If a
     // resize burst returns to the applied size before rebuilding, cancel the
     // pending rebuild for the same reason.
-    *pending_resize_rebuild = notified_terminal_size != last_applied_terminal_size;
+    *pending_resize_rebuild =
+        !live_size_matches_applied(notified_terminal_size, last_applied_terminal_size);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResizeFrameRebuild {
+    Immediate,
+    Reconcile,
+}
+
+#[derive(Default)]
+struct PromptResizeState {
+    immediate: bool,
+    reconcile: bool,
+    settle: ResizeSettle,
+}
+
+impl PromptResizeState {
+    /// Explicit size notifications repaint before polling for another event.
+    /// A duplicate must neither redraw nor cancel the owed settling pass.
+    fn notify_resize(&mut self, event: &Event, applied_size: Size) -> bool {
+        let Event::Resize(width, height) = event else {
+            return false;
+        };
+        update_pending_resize_rebuild(
+            &mut self.immediate,
+            applied_size,
+            Size::new(*width, *height),
+        );
+        if self.immediate {
+            self.settle.restart();
+        }
+        self.immediate
+    }
+
+    fn pending(&self) -> bool {
+        self.immediate || self.reconcile
+    }
+
+    fn rebuild_is_due(&mut self, now: Instant, live_size: Size, applied_size: Size) -> bool {
+        if self.reconcile && live_size_matches_applied(live_size, applied_size) {
+            // The immediate frame already applied this width. Its final
+            // cursor check must not be canceled just because the size matches.
+            self.settle.observe(now, live_size)
+        } else {
+            resize_rebuild_is_due(&mut self.settle, now, live_size, applied_size)
+        }
+    }
+
+    fn take_frame_rebuild(
+        &mut self,
+        now: Instant,
+        live_size: Size,
+        applied_size: Size,
+    ) -> Option<ResizeFrameRebuild> {
+        if take_standalone_resize_rebuild(&mut self.immediate, false)
+            || !live_size_matches_applied(live_size, applied_size)
+        {
+            // A title/input redraw can beat the queued Resize event. It must
+            // not paint fixed coordinates from the old terminal geometry.
+            Some(ResizeFrameRebuild::Immediate)
+        } else if self.rebuild_is_due(now, live_size, applied_size) {
+            Some(ResizeFrameRebuild::Reconcile)
+        } else {
+            None
+        }
+    }
+
+    fn finish_rebuild(&mut self, kind: ResizeFrameRebuild, now: Instant, sampled_size: Size) {
+        self.reconcile = kind == ResizeFrameRebuild::Immediate;
+        if self.reconcile {
+            self.settle.observe(now, sampled_size);
+        }
+    }
 }
 
 fn clear_fixed_viewport<B: Backend>(
@@ -1473,9 +2978,9 @@ fn clear_fixed_viewport<B: Backend>(
 ///
 /// After terminal reflow the terminal may still show a deleted character, while
 /// ratatui's previous-frame buffer already considers that position blank, so a
-/// regular diff would not emit a space there again. Use `AlwaysUpdate` only on
-/// the frame after the input got shorter: it wipes such ghosts and avoids a full
-/// redraw every frame. The wipe reaches only as far as `forced_repaint_widths`
+/// regular diff would not emit a space there again. Use `AlwaysUpdate` after
+/// input shortens or an emulator-width change clears the protected rows. The
+/// wipe reaches only as far as `forced_repaint_widths`
 /// says ink can exist, so it does not stretch a short row to the full width.
 fn force_frame_repaint(frame: &mut ratatui::Frame<'_>, previous: &[u16]) -> Vec<u16> {
     let area = frame.area();
@@ -1522,10 +3027,10 @@ fn resize_redraw_after_idle(
 /// Every sighting counts, including one that reads the already-applied size
 /// again: geometry that moved back is a move, and it restarts the window instead
 /// of leaving the earlier sightings standing. A geometry that matches the applied
-/// one still asks for no rebuild. Both the draw path and the idle poll ask this
-/// question, so the window is shared: a foreground redraw (keystroke, background
-/// title update, status-message change) must not re-anchor on the first sight of a
-/// new size either. A live width within one column of the applied width still
+/// one still asks for no rebuild. The idle poll uses this window for the final
+/// reconciliation. `PromptResizeState` bypasses it for explicit resize events
+/// and foreground redraws that observe changed geometry. A live width within
+/// one column of the applied width still
 /// asks for no rebuild either (see `live_size_matches_applied`): that is the
 /// emulator's async re-wrap timing, not a real resize.
 fn resize_rebuild_is_due(
@@ -1537,15 +3042,13 @@ fn resize_rebuild_is_due(
     settle.observe(now, live_size) && !live_size_matches_applied(live_size, applied_size)
 }
 
-/// How long the live geometry must hold still before a resize rebuild may run.
+/// How long live geometry must hold still before the final anchor reconciliation.
 ///
-/// The emulator re-wraps its scrollback asynchronously after the resize events,
-/// so a rebuild issued while that re-wrap is still pending computes its clear on
-/// the pre-reflow layout and paints the box at a width the emulator has not
-/// adopted yet: the re-wrap that follows then moves the box out from under the
-/// frame just painted and leaves the old frame above the new one, its widest rows
-/// re-wrapped into fragments. Wall clock rather than poll count, because the draw
-/// path and the idle poll both observe this window at unrelated rates.
+/// If further reflow moves the immediate frame before the display settles,
+/// re-query its parked anchor with the immediate frame's width record. This also
+/// guards live geometry changes that arrive before an explicit notification.
+/// Wall clock rather than poll count, because the draw path and idle poll
+/// observe this window at unrelated rates.
 const RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
 /// Live geometry seen for a pending resize, and since when it has held still.
@@ -1585,8 +3088,7 @@ impl ResizeSettle {
 /// while a spurious re-anchor is not. Height differences always reflect panel
 /// changes and are never ignored.
 fn live_size_matches_applied(live: Size, applied: Size) -> bool {
-    live == applied
-        || (live.height == applied.height && live.width.abs_diff(applied.width) <= 1)
+    live == applied || (live.height == applied.height && live.width.abs_diff(applied.width) <= 1)
 }
 
 /// Consume a deferred resize at a redraw safe point.
@@ -1594,10 +3096,7 @@ fn live_size_matches_applied(live: Size, applied: Size) -> bool {
 /// This must run before height or completion changes clear the old painted-row
 /// record. Only an earlier reflow rebuild can consume that geometry; a height
 /// rebuild is not a substitute for applying the old width's anchor correction.
-fn take_standalone_resize_rebuild(
-    pending_resize_rebuild: &mut bool,
-    reflow_rebuilt: bool,
-) -> bool {
+fn take_standalone_resize_rebuild(pending_resize_rebuild: &mut bool, reflow_rebuilt: bool) -> bool {
     let needs_rebuild = *pending_resize_rebuild && !reflow_rebuilt;
     *pending_resize_rebuild = false;
     needs_rebuild
@@ -1651,10 +3150,7 @@ fn submitted_input_preview_lines(content: &str) -> Vec<String> {
 /// so the echoed user input must carry its own hue to stay recognizable as
 /// the user's own text. The `❯` title on the top border reuses `accent.prompt`
 /// rather than `accent.success` so green keeps meaning "done" everywhere.
-fn submitted_input_preview_lines_with_width(
-    content: &str,
-    term_cols: usize,
-) -> Vec<String> {
+fn submitted_input_preview_lines_with_width(content: &str, term_cols: usize) -> Vec<String> {
     // Two borders plus one padding cell per side.
     const OVERHEAD: usize = 4;
     // Keeps at least one dash after the `❯` title on the top border. The floor
@@ -1692,10 +3188,7 @@ fn submitted_input_preview_lines_with_width(
             " ".repeat(pad)
         ));
     }
-    rendered.push(format!(
-        "\x1b[1m{bar}╰{}╯\x1b[0m",
-        "─".repeat(total - 2)
-    ));
+    rendered.push(format!("\x1b[1m{bar}╰{}╯\x1b[0m", "─".repeat(total - 2)));
     rendered
 }
 
@@ -1798,18 +3291,15 @@ impl PromptEditor {
             // characters left by desync between the ratatui buffer and the real
             // terminal.
             let mut force_repaint_next_frame = false;
+            let mut last_painted_terminal_width: Option<u16> = None;
             // Consume this flag after each frame so poll timeouts do not redraw
             // an unchanged input screen. Resize and title events explicitly
             // request the next frame.
             let mut redraw_requested = true;
-            // Set only when a resize notification changes the terminal size. The
-            // rebuild runs after an idle poll, before the next foreground redraw
-            // (including a background title update), or before non-resize input.
-            // The idle poll coalesces a resize burst without waiting for a key.
-            let mut pending_resize_rebuild = false;
-            // How long the live geometry has held still for that pending
-            // rebuild; see `ResizeSettle`.
-            let mut resize_settle = ResizeSettle::default();
+            // Resize paints immediately, then checks the parked anchor once
+            // more after the geometry settles. The second pass uses the new
+            // frame's widths, so it cannot count old chrome wraps twice.
+            let mut resize_state = PromptResizeState::default();
             // A background title update that arrives while a resize is pending
             // waits for settled geometry instead of painting immediately (see
             // the deferral at the top of the loop); this carries that owed
@@ -1820,8 +3310,7 @@ impl PromptEditor {
             // instead of guessed. File only, never stdout (display-safe); a
             // no-op unless RUST_TOOLS_EDITOR_DRIFT_LOG points at a path.
             let drift_log = |event: &str| {
-                let path =
-                    std::env::var("RUST_TOOLS_EDITOR_DRIFT_LOG").unwrap_or_default();
+                let path = std::env::var("RUST_TOOLS_EDITOR_DRIFT_LOG").unwrap_or_default();
                 if path.is_empty() {
                     return;
                 }
@@ -1857,27 +3346,13 @@ impl PromptEditor {
                         self.session_topic
                     ));
                 }
-                // A title-only repaint must yield to a pending resize: the box
-                // is still anchored at the pre-reflow geometry while the
-                // emulator re-wraps, so painting now leaves the old frame above
-                // the new one and strands the drawn caret (idle drift). Gate
-                // the owed repaint on settled geometry and fall through to the
-                // poll below while it settles; the topic value is already
-                // stored. Frames that already owe a redraw (keystroke, status)
-                // are not deferred: input latency matters, and the pre-input
-                // path below re-anchors for those first.
+                // A title-only update yields to the final resize anchor check.
+                // Explicit resize events already owe an immediate frame; input
+                // also re-anchors before painting if reconciliation is pending.
                 let mut paint_title_now = false;
-                if title_repaint_owed && !redraw_requested && pending_resize_rebuild {
+                if title_repaint_owed && !redraw_requested && resize_state.pending() {
                     let live_size = terminal.backend().size()?;
-                    if live_size_matches_applied(live_size, last_applied_terminal_size) {
-                        // Delayed duplicate: no reflow is coming, drop the flag
-                        // and paint with the stored topic below.
-                        let _ =
-                            take_standalone_resize_rebuild(&mut pending_resize_rebuild, false);
-                        paint_title_now = true;
-                        title_repaint_owed = false;
-                    } else if resize_rebuild_is_due(
-                        &mut resize_settle,
+                    if resize_state.rebuild_is_due(
                         Instant::now(),
                         live_size,
                         last_applied_terminal_size,
@@ -1905,224 +3380,256 @@ impl PromptEditor {
                 }
 
                 if take_redraw_request(&mut redraw_requested, paint_title_now) {
-                    // Consume old-screen width geometry before a completion or
-                    // content-height rebuild clears its painted-width record.
-                    // A foreground redraw can beat the queued Resize event.
-                    let mut terminal_size = last_applied_terminal_size;
-                    // A resize notification is not on its own evidence that the
-                    // emulator reflowed: it can be a delayed duplicate for a size
-                    // that was already applied, and rebuilding for it re-anchors
-                    // the box without any real reflow and leaves the drawn caret
-                    // behind. Only the live geometry decides whether a rebuild may
-                    // run, and only once it held still: the emulator re-wraps its
-                    // scrollback asynchronously, so rebuilding on the first sight
-                    // of a new size computes the clear from the pre-reflow layout.
-                    let live_size = terminal.backend().size()?;
-                    if live_size_matches_applied(live_size, last_applied_terminal_size) {
-                        let _ = take_standalone_resize_rebuild(&mut pending_resize_rebuild, false);
-                    }
-                    if resize_rebuild_is_due(
-                        &mut resize_settle,
-                        Instant::now(),
-                        live_size,
-                        last_applied_terminal_size,
-                    ) {
-                        let (rebuilt_area, sampled_size) = rebuild_after_terminal_reflow(
-                            &mut terminal,
-                            &mut screen,
-                            base_viewport_height,
-                            fitted_completion_items,
-                            last_drawn_area,
+                    let frame_result = (|| -> io::Result<()> {
+                        // Consume old-screen width geometry before a completion or
+                        // content-height rebuild clears its painted-width record.
+                        // A foreground redraw can beat the queued Resize event.
+                        let mut terminal_size = last_applied_terminal_size;
+                        // Explicit Resize events bypass the settling delay. Query a
+                        // fresh anchor and rebuild before the first paint, using the
+                        // live width in case a burst already advanced past the event.
+                        let live_size = terminal.backend().size()?;
+                        if let Some(kind) = resize_state.take_frame_rebuild(
+                            Instant::now(),
+                            live_size,
                             last_applied_terminal_size,
-                            true,
-                        )?;
-                        let _ = take_standalone_resize_rebuild(&mut pending_resize_rebuild, false);
-                        last_drawn_area = Some(rebuilt_area);
-                        last_applied_terminal_size = sampled_size;
-                        terminal_size = sampled_size;
-                        force_repaint_next_frame = false;
-                    }
-                    // When the panel state changes, resize the fixed viewport to
-                    // match the height the panel needs.
-                    let current_items = completion_panel.as_ref().map(|p| p.items.len());
-                    if current_items != fitted_completion_items {
-                        let new_height = viewport_height_with_completion(
-                            terminal_size.height,
-                            base_viewport_height,
-                            current_items,
-                        );
-                        let rebuilt_area = rebuild_fixed_viewport(
-                            &mut terminal,
-                            &mut screen,
-                            terminal_size,
-                            new_height,
-                            parked_anchor_offset(last_drawn_area, new_height),
-                            ViewportRebuildMode::ReserveMissingRows,
-                            last_drawn_area.map(|area| area.y),
-                            true,
-                            false,
-                            false,
-                        )?;
-                        // Re-park immediately: the rebuild moved the hardware
-                        // cursor, and a resize arriving before the next draw
-                        // would otherwise anchor to a stale row.
-                        park_reflow_anchor(&mut terminal, rebuilt_area)?;
-                        last_drawn_area = Some(rebuilt_area);
-                        last_applied_terminal_size = terminal_size;
-                        fitted_completion_items = current_items;
-                        force_repaint_next_frame = false;
-                    }
-
-                    // Auto-grow the viewport when content exceeds the textarea capacity
-                    // (grow only, never shrink, to avoid frequent flicker).
-                    let content_lines = textarea.lines().len() as u16;
-                    // Content rows that fit = viewport height minus the
-                    // model/help chrome rows (the left-edge marker bar occupies
-                    // a column, not a row).
-                    let textarea_capacity =
-                        base_viewport_height.saturating_sub(VIEWPORT_CHROME_LINES);
-                    if content_lines > textarea_capacity
-                        && base_viewport_height < MAX_VIEWPORT_HEIGHT
-                    {
-                        let available = terminal_size.height.saturating_sub(2).max(1);
-                        let new_height = content_lines
-                            .saturating_add(VIEWPORT_CHROME_LINES)
-                            .min(MAX_VIEWPORT_HEIGHT)
-                            .min(available);
-                        if new_height > base_viewport_height {
-                            let rebuilt_area = rebuild_fixed_viewport(
+                        ) {
+                            let (rebuilt_area, sampled_size) = rebuild_after_terminal_reflow(
+                                &mut terminal,
+                                &mut screen,
+                                base_viewport_height,
+                                fitted_completion_items,
+                                last_drawn_area,
+                                true,
+                            )?;
+                            resize_state.finish_rebuild(kind, Instant::now(), sampled_size);
+                            last_drawn_area = Some(rebuilt_area);
+                            last_applied_terminal_size = sampled_size;
+                            terminal_size = sampled_size;
+                            force_repaint_next_frame = false;
+                        }
+                        // When the panel state changes, resize the fixed viewport to
+                        // match the height the panel needs.
+                        let current_items = completion_panel.as_ref().map(|p| p.items.len());
+                        if current_items != fitted_completion_items {
+                            let new_height = viewport_height_with_completion(
+                                terminal_size.height,
+                                base_viewport_height,
+                                current_items,
+                            );
+                            let (rebuilt_area, validated_size) = rebuild_fixed_viewport(
                                 &mut terminal,
                                 &mut screen,
                                 terminal_size,
                                 new_height,
                                 parked_anchor_offset(last_drawn_area, new_height),
                                 ViewportRebuildMode::ReserveMissingRows,
-                                last_drawn_area.map(|area| area.y),
-                                true,
-                                false,
+                                last_drawn_area,
                                 false,
                             )?;
-                            park_reflow_anchor(&mut terminal, rebuilt_area)?;
+                            // The cleared top remains the anchor until paint.
                             last_drawn_area = Some(rebuilt_area);
-                            last_applied_terminal_size = terminal_size;
-                            base_viewport_height = new_height;
+                            terminal_size = validated_size;
+                            last_applied_terminal_size = validated_size;
+                            fitted_completion_items = current_items;
                             force_repaint_next_frame = false;
                         }
-                    }
 
-                    let force_repaint = force_repaint_next_frame;
-                    // A fixed ratatui viewport keeps its old width until the
-                    // settled resize rebuild. Clamp this frame to the current
-                    // terminal width so a narrowing title is ellipsized on the
-                    // first paint instead of soft-wrapping for one frame.
-                    let live_paint_width = terminal
-                        .backend()
-                        .size()
-                        .map(|size| size.width)
-                        .unwrap_or(terminal_size.width)
-                        .min(terminal_size.width)
-                        .max(1);
-                    let mut drawn_viewport_area = Rect::ZERO;
-                    let mut drawn_row_widths: Vec<u16> = Vec::new();
-                    // The visible editing caret is drawn into the buffer (see
-                    // render.rs), so it cannot jump mid-draw. The hardware
-                    // cursor is hidden while ratatui applies the frame diff and
-                    // then parked at the box bottom by `park_reflow_anchor`.
-                    // Room badge suffix for the title row. The badge was
-                    // computed once when the input box opened, so combining
-                    // here costs one short format per frame and survives
-                    // background title updates that replace the topic
-                    // mid-typing.
-                    let topic_with_badge: Option<String> = match (
-                        self.session_topic.as_deref(),
-                        self.room_badge.as_deref(),
-                    ) {
-                        (Some(topic), Some(badge)) => Some(format!("{topic} {badge}")),
-                        (Some(topic), None) => Some(topic.to_owned()),
-                        (None, Some(badge)) => Some(badge.to_owned()),
-                        (None, None) => None,
-                    };
-                    terminal.hide_cursor()?;
-                    terminal
-                        .draw(|f| {
-                            let area = f.area();
-                            drawn_viewport_area = area;
-                            last_drawn_area = Some(area);
-                            let _ = render_multiline_popup_with_checkpoint(
-                                f,
-                                &mut textarea,
-                                status_msg.as_deref(),
-                                completion_panel.as_ref(),
-                                &self.current_agent_label,
-                                &self.current_model_label,
-                                self.model_remote,
-                                &self.current_reasoning_effort_label,
-                                topic_with_badge.as_deref(),
-                                checkpoint_label.as_deref(),
-                                live_paint_width,
-                                &self.current_backend_label,
+                        let content_height = content_viewport_height(
+                            terminal_size.height,
+                            base_viewport_height,
+                            textarea.lines(),
+                        );
+                        if content_height != base_viewport_height {
+                            let new_height = viewport_height_with_completion(
+                                terminal_size.height,
+                                content_height,
+                                current_items,
                             );
-                            drawn_row_widths = if force_repaint {
-                                force_frame_repaint(f, &screen.box_row_widths)
-                            } else {
-                                painted_row_widths(f.buffer_mut(), area)
-                            };
-                        })
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    // Accumulate, never shrink: the terminal keeps cells written
-                    // by earlier frames, so the widest row content seen since the
-                    // rows were last erased is what re-wraps.
-                    if screen.box_row_widths.len() < drawn_row_widths.len() {
-                        screen.box_row_widths.resize(drawn_row_widths.len(), 0);
-                    }
-                    for (slot, width) in screen.box_row_widths.iter_mut().zip(&drawn_row_widths) {
-                        *slot = (*slot).max(*width);
-                    }
-                    // Record which width slots belong to the textarea, so a later
-                    // narrowing rebuild can tell wrapping rows (which must move the
-                    // anchor) from chrome rows (which repaint truncated and must
-                    // not). Recomputed every frame because the textarea height
-                    // follows the content.
-                    let current_lines = textarea.lines().to_vec();
-                    let (wrap_start, wrap_len) = textarea_row_range(
-                        drawn_viewport_area.height,
-                        &current_lines,
-                        completion_panel.as_ref().map(|panel| panel.items.len()),
-                        status_msg.is_some(),
-                        !self.current_model_label.is_empty()
-                            || !self.current_agent_label.is_empty(),
-                    );
-                    screen.wrap_row_span =
-                        Some((wrap_start, wrap_len, drawn_viewport_area.height));
-                    park_reflow_anchor(&mut terminal, drawn_viewport_area)?;
-                    drift_log(&format!(
-                        "frame drawn: area={drawn_viewport_area:?} title={paint_title_now} resize_pending={pending_resize_rebuild} applied={last_applied_terminal_size:?}"
-                    ));
-                    self.notify_first_render();
-                    // Emit only after the real draw and anchor writes complete,
-                    // so an external PTY driver can synchronize without keys.
-                    #[cfg(test)]
-                    if std::env::var("RUST_TOOLS_EDITOR_FIXTURE").as_deref() == Ok("1") {
-                        use std::io::Write;
-
-                        fixture_frame_sequence += 1;
-                        let area = drawn_viewport_area;
-                        let metadata = serde_json::json!({
-                            "sequence": fixture_frame_sequence,
-                            "size": [last_applied_terminal_size.width, last_applied_terminal_size.height],
-                            "frame": {"x": area.x, "y": area.y, "width": area.width, "height": area.height},
-                            "alternate": screen.alternate,
-                            "cursor": textarea.cursor(),
-                            "content": textarea.lines().join("\n"),
-                        });
-                        let mut out = io::stdout().lock();
-                        write!(out, "\x1b]777;editor;frame;{metadata}\x07")?;
-                        if fixture_frame_sequence == 1 {
-                            write!(out, "\x1b]777;editor;ready\x07")?;
+                            let (rebuilt_area, validated_size) = rebuild_fixed_viewport(
+                                &mut terminal,
+                                &mut screen,
+                                terminal_size,
+                                new_height,
+                                parked_anchor_offset(last_drawn_area, new_height),
+                                ViewportRebuildMode::ReserveMissingRows,
+                                last_drawn_area,
+                                false,
+                            )?;
+                            last_drawn_area = Some(rebuilt_area);
+                            terminal_size = validated_size;
+                            last_applied_terminal_size = validated_size;
+                            base_viewport_height = content_height;
+                            force_repaint_next_frame = false;
                         }
-                        out.flush()?;
+
+                        let mut drawn_viewport_area = Rect::ZERO;
+                        let mut drawn_row_widths: Vec<u16> = Vec::new();
+                        // The visible editing caret is drawn into the buffer (see
+                        // render.rs), so it cannot jump mid-draw. The hardware
+                        // cursor is hidden while ratatui applies the frame diff and
+                        // then parked at the box bottom by `park_reflow_anchor`.
+                        // Room badge suffix for the title row. The badge was
+                        // computed once when the input box opened, so combining
+                        // here costs one short format per frame and survives
+                        // background title updates that replace the topic
+                        // mid-typing.
+                        let topic_with_badge: Option<String> =
+                            match (self.session_topic.as_deref(), self.room_badge.as_deref()) {
+                                (Some(topic), Some(badge)) => Some(format!("{topic} {badge}")),
+                                (Some(topic), None) => Some(topic.to_owned()),
+                                (None, Some(badge)) => Some(badge.to_owned()),
+                                (None, None) => None,
+                            };
+                        terminal.hide_cursor()?;
+                        let prepared_paint_size = prepare_prompt_paint(
+                            &mut terminal,
+                            &mut terminal_size,
+                            |terminal| terminal.backend().size(),
+                            |terminal| {
+                                let (area, size) = rebuild_after_terminal_reflow(
+                                    terminal,
+                                    &mut screen,
+                                    base_viewport_height,
+                                    fitted_completion_items,
+                                    last_drawn_area,
+                                    true,
+                                )?;
+                                last_drawn_area = Some(area);
+                                last_applied_terminal_size = size;
+                                resize_state.finish_rebuild(
+                                    ResizeFrameRebuild::Immediate,
+                                    Instant::now(),
+                                    size,
+                                );
+                                force_repaint_next_frame = false;
+                                Ok(size)
+                            },
+                        )?;
+                        let live_paint_width = if !screen.queries_disabled
+                            && screen.replies_settled(Instant::now())
+                        {
+                            let measured =
+                                tracked_cursor_query(&mut screen.pending_cpr_replies, || {
+                                    SingleRowFrame::measure_columns(terminal.backend_mut(), || {
+                                        cursor::position().map(|(column, _)| column)
+                                    })
+                                });
+                            match measured {
+                                Ok(width) => width,
+                                Err(err) if PromptEditor::is_cursor_position_timeout(&err) => {
+                                    screen.queries_disabled = true;
+                                    prepared_paint_size.width.max(1)
+                                }
+                                Err(err) => return Err(err),
+                            }
+                        } else {
+                            prepared_paint_size.width.max(1)
+                        };
+                        let paint_width_changed = last_painted_terminal_width
+                            .is_some_and(|width| width != live_paint_width);
+                        let force_repaint = force_repaint_next_frame || paint_width_changed;
+                        let mut output_frame = SingleRowFrame::begin(io::stdout())?;
+                        // Establish the cursor group before any visible ink is
+                        // written. A resize during the first frame must leave
+                        // these rows to the application as well.
+                        if !screen.alternate || paint_width_changed {
+                            let group_area = terminal.get_frame().area();
+                            terminal
+                                .backend_mut()
+                                .set_cursor_position(Position::new(group_area.x, group_area.y))?;
+                            if !screen.alternate {
+                                output_frame.prepare_cursor_group(group_area.height as usize)?;
+                            }
+                            if paint_width_changed {
+                                // Clear before drawing the new caret: a diff
+                                // can otherwise paint it before clearing the
+                                // old position when the PTY width still lags.
+                                output_frame.clear_cursor_group(group_area.height as usize)?;
+                            }
+                        }
+                        terminal
+                            .draw(|f| {
+                                let area = f.area();
+                                drawn_viewport_area = area;
+                                last_drawn_area = Some(area);
+                                let _ = render_multiline_popup_with_checkpoint(
+                                    f,
+                                    &mut textarea,
+                                    status_msg.as_deref(),
+                                    completion_panel.as_ref(),
+                                    &self.current_agent_label,
+                                    &self.current_model_label,
+                                    self.model_remote,
+                                    &self.current_reasoning_effort_label,
+                                    topic_with_badge.as_deref(),
+                                    checkpoint_label.as_deref(),
+                                    live_paint_width,
+                                    &self.current_backend_label,
+                                );
+                                drawn_row_widths = if force_repaint {
+                                    force_frame_repaint(f, &screen.box_row_widths)
+                                } else {
+                                    painted_row_widths(f.buffer_mut(), area)
+                                };
+                            })
+                            .map_err(|e| io::Error::other(e.to_string()))?;
+                        // Accumulate, never shrink: the terminal keeps cells written
+                        // by earlier frames, so the widest row content seen since the
+                        // rows were last erased is what re-wraps.
+                        if screen.box_row_widths.len() < drawn_row_widths.len() {
+                            screen.box_row_widths.resize(drawn_row_widths.len(), 0);
+                        }
+                        for (slot, width) in screen.box_row_widths.iter_mut().zip(&drawn_row_widths)
+                        {
+                            *slot = (*slot).max(*width);
+                        }
+                        screen.cursor_group_height = if !screen.alternate {
+                            Some(drawn_viewport_area.height)
+                        } else {
+                            None
+                        };
+                        park_reflow_anchor(&mut terminal, drawn_viewport_area)?;
+                        output_frame.finish()?;
+                        last_painted_terminal_width = Some(live_paint_width);
+                        screen.viewport_geometry = Some((drawn_viewport_area, terminal_size));
+                        let resize_pending = resize_state.pending();
+                        drift_log(&format!(
+                            "frame drawn: area={drawn_viewport_area:?} title={paint_title_now} resize_pending={resize_pending} applied={last_applied_terminal_size:?}"
+                        ));
+                        self.notify_first_render();
+                        // Emit only after the real draw and anchor writes complete,
+                        // so an external PTY driver can synchronize without keys.
+                        #[cfg(test)]
+                        if std::env::var("RUST_TOOLS_EDITOR_FIXTURE").as_deref() == Ok("1") {
+                            use std::io::Write;
+
+                            fixture_frame_sequence += 1;
+                            let area = drawn_viewport_area;
+                            let metadata = serde_json::json!({
+                                "sequence": fixture_frame_sequence,
+                                "size": [last_applied_terminal_size.width, last_applied_terminal_size.height],
+                                "frame": {"x": area.x, "y": area.y, "width": area.width, "height": area.height},
+                                "alternate": screen.alternate,
+                                "cursor": textarea.cursor(),
+                                "content": textarea.lines().join("\n"),
+                            });
+                            let mut out = io::stdout().lock();
+                            write!(out, "\x1b]777;editor;frame;{metadata}\x07")?;
+                            if fixture_frame_sequence == 1 {
+                                write!(out, "\x1b]777;editor;ready\x07")?;
+                            }
+                            out.flush()?;
+                        }
+                        force_repaint_next_frame = false;
+                        Ok(())
+                    })();
+                    if defer_unstable_prompt_geometry(frame_result)?.is_none() {
+                        // Yield to input before trying another bounded frame.
+                        redraw_requested = true;
+                        resize_state.immediate = true;
+                        resize_state.settle.restart();
                     }
-                    force_repaint_next_frame = false;
                 }
 
                 let prompt_event = read_prompt_event(
@@ -2138,20 +3645,14 @@ impl PromptEditor {
                 )?;
                 let Some(event) = prompt_event else {
                     if resize_redraw_after_idle(
-                        pending_resize_rebuild,
+                        resize_state.pending(),
                         &self.pending_terminal_events,
                     ) {
-                        // The notification alone does not prove a reflow: an
-                        // emulator that restored the previous size can still
-                        // deliver a delayed duplicate, and redrawing for it moves
-                        // the box across a screen it no longer matches, leaving
-                        // its old caret ink behind. Only a live geometry that
-                        // differs from the applied one and has stopped moving may
-                        // re-anchor the box, and only while nobody waits for the
-                        // frame.
+                        // One settling pass also reconciles a parked anchor
+                        // that moved after the immediate frame, even when the
+                        // terminal width now matches that frame's applied size.
                         let live_size = terminal.backend().size()?;
-                        if resize_rebuild_is_due(
-                            &mut resize_settle,
+                        if resize_state.rebuild_is_due(
                             Instant::now(),
                             live_size,
                             last_applied_terminal_size,
@@ -2164,54 +3665,61 @@ impl PromptEditor {
                     } else {
                         // Nothing left to settle: either no rebuild is pending or
                         // a foreground path already consumed the notification.
-                        resize_settle.restart();
+                        resize_state.settle.restart();
                     }
                     // Keep the active fallback visible and responsive. A cursor
                     // query may block, so recovery waits for the next prompt.
                     continue;
                 };
                 if let Event::Resize(width, height) = event {
-                    // Do not rebuild here: the emulator (VS Code / xterm.js)
-                    // rewraps the scrollback asynchronously after the resize
-                    // events, so a DSR cursor query issued now can return the
-                    // pre-reflow row. Ignore delayed same-size notifications and
-                    // defer a real resize until an idle poll or foreground work
-                    // requests a redraw.
-                    update_pending_resize_rebuild(
-                        &mut pending_resize_rebuild,
-                        last_applied_terminal_size,
-                        Size::new(width, height),
-                    );
-                    // A new notification restarts the window, so a sighting from
-                    // an earlier resize cannot shorten it.
-                    resize_settle.restart();
+                    // Return directly to the draw block before polling again:
+                    // the first frame uses the new width and synchronous chrome
+                    // ellipses. Keep one later pass to reconcile cursor movement.
+                    redraw_requested |=
+                        resize_state.notify_resize(&event, last_applied_terminal_size);
                     drift_log(&format!(
                         "resize notified: {width}x{height} applied={last_applied_terminal_size:?}"
                     ));
                     continue;
                 }
-                if pending_resize_rebuild {
-                    pending_resize_rebuild = false;
-                    // Phantom 1-column live jitter must not re-anchor the box:
-                    // without a real reflow the rebuild moves the frame and
-                    // strands the drawn caret. Only a geometry outside the
-                    // jitter tolerance earns a reflow rebuild here.
+                if resize_state.pending() {
                     let live_size = terminal.backend().size()?;
-                    if !live_size_matches_applied(live_size, last_applied_terminal_size) {
-                        let (rebuilt_area, sampled_size) = rebuild_after_terminal_reflow(
-                            &mut terminal,
-                            &mut screen,
-                            base_viewport_height,
-                            fitted_completion_items,
-                            last_drawn_area,
-                            last_applied_terminal_size,
-                            false,
-                        )?;
-                        last_drawn_area = Some(rebuilt_area);
-                        last_applied_terminal_size = sampled_size;
-                        drift_log(&format!(
-                            "reflow rebuild (pre-input): area={rebuilt_area:?} sampled={sampled_size:?}"
-                        ));
+                    let settled = resize_state.rebuild_is_due(
+                        Instant::now(),
+                        live_size,
+                        last_applied_terminal_size,
+                    );
+                    // Input stays responsive while the final pass is pending,
+                    // but its frame must use the live parked row too.
+                    if (resize_state.reconcile
+                        && live_size_matches_applied(live_size, last_applied_terminal_size))
+                        || !live_size_matches_applied(live_size, last_applied_terminal_size)
+                    {
+                        let prepared =
+                            defer_unstable_prompt_geometry(rebuild_after_terminal_reflow(
+                                &mut terminal,
+                                &mut screen,
+                                base_viewport_height,
+                                fitted_completion_items,
+                                last_drawn_area,
+                                false,
+                            ))?;
+                        if let Some((rebuilt_area, sampled_size)) = prepared {
+                            last_drawn_area = Some(rebuilt_area);
+                            last_applied_terminal_size = sampled_size;
+                            if settled {
+                                resize_state.finish_rebuild(
+                                    ResizeFrameRebuild::Reconcile,
+                                    Instant::now(),
+                                    sampled_size,
+                                );
+                            }
+                            drift_log(&format!(
+                                "reflow rebuild (pre-input): area={rebuilt_area:?} sampled={sampled_size:?}"
+                            ));
+                        } else {
+                            resize_state.immediate = true;
+                        }
                     }
                 }
 
@@ -2236,16 +3744,38 @@ impl PromptEditor {
             }
         })();
 
-        // Exiting the TUI: clear from the fixed viewport's reflowed top and leave
-        // the cursor there, so the submit preview follows the previous output.
+        // A final resize may have arrived after input handling. Clear only a
+        // current stored top, or recover it with a bounded query first.
         let _ = terminal.hide_cursor();
-        let cleared_viewport =
-            clear_fixed_viewport(&mut terminal, last_drawn_area.map(|area| area.y))
-                .unwrap_or(false);
-        drop(terminal);
-        if !cleared_viewport {
-            let _ = execute!(io::stdout(), Clear(ClearType::FromCursorDown));
+        if screen.alternate {
+            let _ = terminal.backend_mut().clear_region(BackendClearType::All);
+        } else if let Some(area) = last_drawn_area {
+            let live_size = terminal.backend().size().ok();
+            if screen.viewport_geometry == Some((area, last_applied_terminal_size))
+                && live_size == Some(last_applied_terminal_size)
+            {
+                let _ = clear_fixed_viewport(&mut terminal, Some(area.y));
+            } else if !screen.queries_disabled && screen.replies_settled(Instant::now()) {
+                if let Some(size) = live_size {
+                    // This path clears from the queried top and leaves the
+                    // cursor there; it never parks again at stored coordinates.
+                    let _ = prepare_anchored_viewport(
+                        terminal.backend_mut(),
+                        size,
+                        area.height,
+                        parked_anchor_offset(Some(area), area.height),
+                        ViewportRebuildMode::ReflowOnly,
+                        true,
+                        Some(area),
+                        &screen.box_row_widths,
+                        screen.cursor_group_height,
+                        true,
+                        &mut screen.pending_cpr_replies,
+                    );
+                }
+            }
         }
+        drop(terminal);
         self.cursor_position_queries_disabled = screen.queries_disabled;
         // Carry the unaccounted replies into later prompts: an orphan ESC only
         // surfaces on the next standalone Escape, which a non-Escape submission
@@ -2288,13 +3818,12 @@ mod tests {
     };
 
     use super::{
-        VERIFIED_ANCHOR_ATTEMPTS, ViewportRebuildMode, bottom_glued_area, clear_fixed_viewport,
-        clear_row_range, fixed_viewport_area, force_frame_repaint, multiline_viewport_height,
-        park_reflow_anchor, parked_anchor_offset, prepare_fixed_viewport,
-        reflow_pins_box_to_bottom, submitted_input_preview_lines,
-        submitted_input_preview_lines_with_width, take_redraw_request,
-        take_standalone_resize_rebuild, terminal_with_fixed_viewport, update_pending_resize_rebuild,
-        verified_cursor_row, viewport_height_with_completion,
+        VERIFIED_ANCHOR_ATTEMPTS, ViewportRebuildMode, clear_fixed_viewport, clear_row_range,
+        fixed_viewport_area, force_frame_repaint, multiline_viewport_height, park_reflow_anchor,
+        parked_anchor_offset, prepare_fixed_viewport, reflowed_anchor_offset,
+        submitted_input_preview_lines, submitted_input_preview_lines_with_width,
+        take_redraw_request, take_standalone_resize_rebuild, terminal_with_fixed_viewport,
+        update_pending_resize_rebuild, verified_cursor_row, viewport_height_with_completion,
     };
 
     fn key(code: KeyCode) -> Event {
@@ -2324,7 +3853,9 @@ mod tests {
         let draft = match std::env::var("RUST_TOOLS_REFLOW_DRAFT").as_deref() {
             Ok("empty") | Err(std::env::VarError::NotPresent) => "",
             Ok("multiline") => "DRAFT_LINE_1 alpha\nDRAFT_LINE_2 beta\nDRAFT_LINE_3 gamma",
-            Ok("wide") => "DRAFT_WIDE 中文宽字符测试 mixed ASCII 0123456789 中文尾部\n第二行 abcdefghijklmnopqrstuvwxyz",
+            Ok("wide") => {
+                "DRAFT_WIDE 中文宽字符测试 mixed ASCII 0123456789 中文尾部\n第二行 abcdefghijklmnopqrstuvwxyz"
+            }
             _ => return Err(io::Error::other("unknown RUST_TOOLS_REFLOW_DRAFT")),
         };
         struct RestoreFixture(std::path::PathBuf);
@@ -2433,7 +3964,8 @@ mod tests {
         impl Drop for RestoreTerminal {
             fn drop(&mut self) {
                 let _ = crossterm::execute!(
-                    io::stdout(), crossterm::cursor::Show,
+                    io::stdout(),
+                    crossterm::cursor::Show,
                     crossterm::cursor::SetCursorStyle::DefaultUserShape,
                 );
                 let _ = crossterm::terminal::disable_raw_mode();
@@ -2446,15 +3978,23 @@ mod tests {
             write!(out, "BODY_BEGIN\r\n")?;
             for index in 0..96 {
                 write!(out, "MARK{index:02}:English transcript 中文正文保持连续 ")?;
-                write!(out, "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ ")?;
-                write!(out, "another-long-ASCII-segment-0123456789 END{index:02}\r\n")?;
+                write!(
+                    out,
+                    "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ "
+                )?;
+                write!(
+                    out,
+                    "another-long-ASCII-segment-0123456789 END{index:02}\r\n"
+                )?;
             }
             write!(out, "BODY_END\r\n")?;
             out.flush()?;
         }
         let draft = match std::env::var("RUST_TOOLS_REFLOW_DRAFT").as_deref() {
             Ok("multiline") => "DRAFT_LINE_1 alpha\nDRAFT_LINE_2 beta\nDRAFT_LINE_3 gamma",
-            Ok("wide") => "DRAFT_WIDE 中文宽字符测试 mixed ASCII 0123456789 中文尾部\n第二行 abcdefghijklmnopqrstuvwxyz",
+            Ok("wide") => {
+                "DRAFT_WIDE 中文宽字符测试 mixed ASCII 0123456789 中文尾部\n第二行 abcdefghijklmnopqrstuvwxyz"
+            }
             _ => "",
         };
         let mut textarea = if draft.is_empty() {
@@ -2469,7 +4009,8 @@ mod tests {
         let (_, rows) = crossterm::terminal::size()?;
         let base_height = multiline_viewport_height(rows, Some(draft));
         let mut screen = super::PromptScreen::default();
-        let (mut terminal, mut sampled_size) = super::build_fixed_terminal(base_height, &mut screen)?;
+        let (mut terminal, mut sampled_size) =
+            super::build_fixed_terminal(base_height, &mut screen)?;
         let mut area = terminal.get_frame().area();
         let mut phase = "ready";
         let mut pending = VecDeque::new();
@@ -2479,11 +4020,24 @@ mod tests {
             terminal.draw(|frame| {
                 area = frame.area();
                 caret = super::render_multiline_popup(
-                    frame, &mut textarea, None, None, "", "fixture-model", false, "high",
+                    frame,
+                    &mut textarea,
+                    None,
+                    None,
+                    "",
+                    "fixture-model",
+                    false,
+                    "high",
                     Some("fixture-topic"),
                 );
                 screen.box_row_widths = super::painted_row_widths(frame.buffer_mut(), area);
             })?;
+            screen.cursor_group_height = super::preserve_prompt_cursor_group(
+                terminal.backend_mut(),
+                area,
+                sampled_size.width,
+            )?
+            .then_some(area.height);
             park_reflow_anchor(&mut terminal, area)?;
             assert_eq!(textarea.lines(), original_lines.as_slice());
             assert_eq!(textarea.cursor(), original_cursor);
@@ -2499,12 +4053,17 @@ mod tests {
             });
             {
                 let mut out = io::stdout().lock();
-                write!(out, "\x1b]777;reflow;meta;{metadata}\x07\x1b]777;reflow;{phase}\x07")?;
+                write!(
+                    out,
+                    "\x1b]777;reflow;meta;{metadata}\x07\x1b]777;reflow;{phase}\x07"
+                )?;
                 out.flush()?;
             }
             loop {
                 let event = super::read_prompt_event(
-                    &mut pending, &mut screen.pending_cpr_replies, |timeout| {
+                    &mut pending,
+                    &mut screen.pending_cpr_replies,
+                    |timeout| {
                         if crossterm::event::poll(timeout)? {
                             crossterm::event::read().map(Some)
                         } else {
@@ -2522,7 +4081,6 @@ mod tests {
                                     base_height,
                                     None,
                                     Some(area),
-                                    sampled_size,
                                     false,
                                 )?;
                                 phase = "resized";
@@ -2816,9 +4374,11 @@ mod tests {
         let mut input = VecDeque::from([key(KeyCode::Esc)]);
         input.extend("[13;1R".chars().map(|ch| key(KeyCode::Char(ch))));
         assert_eq!(
-            super::read_prompt_event(&mut VecDeque::new(), &mut screen.pending_cpr_replies, |_| {
-                Ok(input.pop_front())
-            })
+            super::read_prompt_event(
+                &mut VecDeque::new(),
+                &mut screen.pending_cpr_replies,
+                |_| { Ok(input.pop_front()) }
+            )
             .unwrap(),
             None
         );
@@ -3020,6 +4580,9 @@ mod tests {
         assert!(!pending);
 
         update_pending_resize_rebuild(&mut pending, applied, ratatui::layout::Size::new(79, 24));
+        assert!(!pending);
+
+        update_pending_resize_rebuild(&mut pending, applied, ratatui::layout::Size::new(78, 24));
         assert!(pending);
 
         // A resize burst that returns to the applied dimensions before the
@@ -3078,8 +4641,8 @@ mod tests {
         let size = Size::new(80, 24);
         let start = Instant::now();
         let mut settle = super::ResizeSettle::default();
-        // A pending resize may rebuild only after the geometry held still long
-        // enough for the emulator to finish re-wrapping its scrollback.
+        // Final reconciliation waits for stable geometry; the immediate resize
+        // frame bypasses this window.
         assert!(!settle.observe(start, size));
         assert!(!settle.observe(start + Duration::from_millis(250), size));
         assert!(settle.observe(start + Duration::from_millis(600), size));
@@ -3370,65 +4933,43 @@ mod tests {
     }
 
     #[test]
-    fn width_reflow_pins_only_a_box_that_was_flush_with_the_bottom() {
-        let previous = Size::new(80, 24);
-        // Flush with the last row: the re-wrap released rows under the box, so
-        // the input area goes back to the bottom instead of floating above them.
-        assert!(reflow_pins_box_to_bottom(
-            previous,
-            Size::new(120, 24),
-            Some(Rect::new(0, 20, 80, 4)),
-            false,
-        ));
-        // A narrowing is never glued back to the bottom: the parked offset
-        // already counts the extra rows the old frame's own rows wrap into, so
-        // the recovered top lands flush under the transcript.
-        assert!(!reflow_pins_box_to_bottom(
-            Size::new(120, 24),
-            Size::new(80, 24),
-            Some(Rect::new(0, 20, 120, 4)),
-            false,
-        ));
-        // Already above the bottom row: the recovered top is where it belongs.
-        assert!(!reflow_pins_box_to_bottom(
-            previous,
-            Size::new(120, 24),
-            Some(Rect::new(0, 12, 80, 4)),
-            false,
-        ));
-        // A height-only change keeps the anchor's row untouched.
-        assert!(!reflow_pins_box_to_bottom(
-            previous,
-            Size::new(80, 30),
-            Some(Rect::new(0, 20, 80, 4)),
-            false,
-        ));
-        // Nothing drawn yet, and the alternate screen, never pin.
-        assert!(!reflow_pins_box_to_bottom(
-            previous,
-            Size::new(120, 24),
-            None,
-            false
-        ));
-        assert!(!reflow_pins_box_to_bottom(
-            previous,
-            Size::new(120, 24),
-            Some(Rect::new(0, 20, 80, 4)),
-            true,
-        ));
+    fn width_reflow_keeps_the_first_old_prompt_row_even_after_bottom_flush() {
+        // The old bottom-pinning policy moved a widening prompt below its
+        // recovered first row and opened a gap. Its replacement always keeps
+        // the live anchor's top, whether the old prompt touched the bottom or not.
+        for (previous, size, cursor_row, expected_top) in [
+            (Rect::new(0, 20, 80, 4), Size::new(120, 24), 13, 10),
+            (Rect::new(0, 12, 80, 4), Size::new(120, 24), 8, 5),
+            (Rect::new(0, 20, 120, 4), Size::new(80, 24), 20, 14),
+            (Rect::new(0, 20, 80, 4), Size::new(80, 30), 23, 20),
+        ] {
+            let offset =
+                reflowed_anchor_offset(Some(previous), 4, &[previous.width; 4], size.width);
+            let (area, appended) = fixed_viewport_area(
+                size,
+                Position::new(0, cursor_row),
+                4,
+                offset,
+                ViewportRebuildMode::ReflowOnly,
+            );
+            assert_eq!(area, Rect::new(0, expected_top, size.width, 4));
+            assert_eq!(appended, 0);
+        }
     }
 
     #[test]
-    fn bottom_glued_area_moves_the_frame_onto_the_last_row() {
-        assert_eq!(
-            bottom_glued_area(Rect::new(0, 9, 20, 4), 24),
-            Rect::new(0, 20, 20, 4)
+    fn reflow_only_viewport_clamps_an_oversized_box_without_scrolling() {
+        // Bottom gluing no longer determines placement. The existing fixed
+        // viewport bounds still keep an oversized frame inside the screen.
+        let (area, appended) = fixed_viewport_area(
+            Size::new(20, 24),
+            Position::new(0, 23),
+            30,
+            29,
+            ViewportRebuildMode::ReflowOnly,
         );
-        // A box taller than the screen saturates at the top row.
-        assert_eq!(
-            bottom_glued_area(Rect::new(0, 0, 20, 30), 24),
-            Rect::new(0, 0, 20, 30)
-        );
+        assert_eq!(area, Rect::new(0, 0, 20, 24));
+        assert_eq!(appended, 0);
     }
 
     #[test]
@@ -3534,9 +5075,8 @@ mod tests {
         // Widening reflow: the transcript re-wraps and shrinks, so the box moves
         // up. Clearing from the new top down must wipe the old (now lower)
         // viewport copy while keeping the shorter transcript visible.
-        // The reflow caller pins a box that was already flush with the screen
-        // bottom (see `reflow_pins_box_to_bottom`); this primitive keeps the row
-        // the parked anchor recovers.
+        // Keep the row the parked anchor recovers even if the old box was
+        // flush with the bottom: pinning it down again would open a gap.
         let mut backend = TestBackend::new(12, 10);
 
         // Old layout before widening: transcript rows [0,5), viewport [5,9).
@@ -3642,6 +5182,114 @@ mod tests {
             .backend_mut()
             .assert_cursor_position(Position::new(0, 6));
         assert!(!terminal.backend().cursor_visible());
+    }
+
+    #[test]
+    fn prepaint_guard_tolerates_one_column_jitter() {
+        let original = Size::new(80, 24);
+        let mut applied = original;
+        let mut reanchors = 0;
+        for width in [79, 81, 80, 79] {
+            let mut live = Size::new(width, 24);
+            let paint_size = super::prepare_prompt_paint(
+                &mut live,
+                &mut applied,
+                |live| Ok(*live),
+                |live| {
+                    reanchors += 1;
+                    Ok(*live)
+                },
+            )
+            .unwrap();
+            assert_eq!(paint_size, live);
+            assert_eq!(applied, original);
+        }
+        assert_eq!(reanchors, 0);
+
+        for live in [Size::new(78, 24), Size::new(80, 25)] {
+            let mut live = live;
+            super::prepare_prompt_paint(
+                &mut live,
+                &mut applied,
+                |live| Ok(*live),
+                |live| {
+                    reanchors += 1;
+                    Ok(*live)
+                },
+            )
+            .unwrap();
+            assert_eq!(applied, live);
+        }
+        assert_eq!(reanchors, 2);
+
+        let mut resize = super::PromptResizeState::default();
+        assert!(!resize.notify_resize(&Event::Resize(79, 24), original));
+        assert!(!resize.notify_resize(&Event::Resize(81, 24), original));
+        assert!(!resize.pending());
+        let now = std::time::Instant::now();
+        resize.finish_rebuild(super::ResizeFrameRebuild::Immediate, now, original);
+        assert!(!resize.rebuild_is_due(now, Size::new(79, 24), original));
+        assert_eq!(
+            resize.take_frame_rebuild(
+                now + super::RESIZE_SETTLE_DELAY,
+                Size::new(79, 24),
+                original,
+            ),
+            Some(super::ResizeFrameRebuild::Reconcile),
+        );
+    }
+
+    #[test]
+    fn empty_input_collapses_grown_viewport() {
+        let lines = (0..8)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>();
+        let grown = super::content_viewport_height(24, 6, &lines);
+        assert_eq!(grown, 11);
+        assert_eq!(
+            super::content_viewport_height(24, grown, &["remaining".into()]),
+            grown
+        );
+        assert_eq!(
+            super::content_viewport_height(24, grown, &[String::new(), String::new()]),
+            grown
+        );
+
+        let mut textarea = tui_textarea::TextArea::from(lines);
+        textarea.select_all();
+        textarea.delete_char();
+        assert_eq!(textarea.lines(), &[String::new()]);
+        let collapsed = super::content_viewport_height(24, grown, textarea.lines());
+        assert_eq!(collapsed, 6);
+        assert_eq!(
+            super::content_viewport_height(4, grown, textarea.lines()),
+            2
+        );
+
+        let mut backend = TestBackend::new(80, 24);
+        backend.set_cursor_position(Position::new(0, 23)).unwrap();
+        backend
+            .draw(std::iter::once((3, 22, &Cell::new("ghost"))))
+            .unwrap();
+        let area = prepare_fixed_viewport(
+            &mut backend,
+            Size::new(80, 24),
+            collapsed,
+            parked_anchor_offset(Some(Rect::new(0, 13, 80, grown)), collapsed),
+            ViewportRebuildMode::ReserveMissingRows,
+            true,
+            &mut VecDeque::new(),
+        )
+        .unwrap();
+        assert_eq!(area, Rect::new(0, 13, 80, 6));
+        assert!(
+            backend
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| cell.symbol() == " ")
+        );
+        assert_eq!(backend.scrollback().area.height, 0);
     }
 
     #[test]
@@ -3906,7 +5554,13 @@ mod tests {
         assert_eq!(row.unwrap(), 17);
         assert_eq!(terminal.borrow().queries, 5);
         // Both attempts put the cursor back, including the rejected one.
-        assert_eq!(calls.iter().filter(|call| call.as_str() == "restore").count(), 2);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "restore")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -3941,11 +5595,8 @@ mod tests {
         // flight. The net count stays constant; its timestamps must be renewed.
         let terminal = RefCell::new(ScriptedAnchor::new(vec![8; count], 17));
         terminal.borrow_mut().queued = Some(VecDeque::new());
-        let (row, _) = run_verified_anchor_with_pending(
-            &terminal,
-            23,
-            &mut screen.pending_cpr_replies,
-        );
+        let (row, _) =
+            run_verified_anchor_with_pending(&terminal, 23, &mut screen.pending_cpr_replies);
         assert!(row.is_err());
         assert_eq!(terminal.borrow().queries as usize, count);
         screen.queries_disabled = true;
@@ -3964,7 +5615,11 @@ mod tests {
         let mut input = VecDeque::new();
         for row in queued {
             input.push_back(key(KeyCode::Esc));
-            input.extend(format!("[{};1R", row + 1).chars().map(|ch| key(KeyCode::Char(ch))));
+            input.extend(
+                format!("[{};1R", row + 1)
+                    .chars()
+                    .map(|ch| key(KeyCode::Char(ch))),
+            );
         }
         input.extend([key(KeyCode::Char('x')), key(KeyCode::Esc)]);
         let mut pending = VecDeque::new();
@@ -4016,13 +5671,19 @@ mod tests {
         let terminal = RefCell::new(ScriptedAnchor::new([], 17));
         terminal.borrow_mut().timeout_at = Some(1);
         let mut pending = VecDeque::new();
-        assert!(run_verified_anchor_with_pending(&terminal, 23, &mut pending).0.is_err());
+        assert!(
+            run_verified_anchor_with_pending(&terminal, 23, &mut pending)
+                .0
+                .is_err()
+        );
         assert_eq!(pending.len(), 1);
 
         // The timed-out reply was lost. A matching probe pair on the retry
         // establishes a clean stream and retires the old conservative entry.
         assert_eq!(
-            run_verified_anchor_with_pending(&terminal, 23, &mut pending).0.unwrap(),
+            run_verified_anchor_with_pending(&terminal, 23, &mut pending)
+                .0
+                .unwrap(),
             17
         );
         assert!(pending.is_empty());
@@ -4056,7 +5717,10 @@ mod tests {
         let mut pending = VecDeque::from(vec![old; super::MAX_PENDING_CPR_REPLIES]);
         super::tracked_cursor_query(&mut pending, || Ok::<_, io::Error>(17)).unwrap();
         assert_eq!(pending.len(), super::MAX_PENDING_CPR_REPLIES);
-        assert_eq!(pending.iter().filter(|at| **at == old).count(), pending.len() - 1);
+        assert_eq!(
+            pending.iter().filter(|at| **at == old).count(),
+            pending.len() - 1
+        );
         assert!(*pending.back().unwrap() > old);
 
         let result = super::tracked_cursor_query(&mut pending, || {
@@ -4077,10 +5741,16 @@ mod tests {
         assert!(crate::ai::prompt::PromptEditor::is_cursor_position_timeout(
             &row.unwrap_err()
         ));
-        assert_eq!(terminal.borrow().queries, 2 * u32::from(VERIFIED_ANCHOR_ATTEMPTS));
+        assert_eq!(
+            terminal.borrow().queries,
+            2 * u32::from(VERIFIED_ANCHOR_ATTEMPTS)
+        );
         // Every attempt put the cursor back before the next probe ran.
         assert_eq!(
-            calls.iter().filter(|call| call.as_str() == "restore").count(),
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "restore")
+                .count(),
             usize::from(VERIFIED_ANCHOR_ATTEMPTS)
         );
 

@@ -33,8 +33,10 @@ pub(crate) fn project_visible_body(text: &str) -> String {
 }
 
 pub(super) use render::markdown::MarkdownStreamRenderer;
+#[cfg(any(feature = "serve", feature = "serve-client"))]
+pub(in crate::ai) use render::markdown::terminal_cell_width;
 pub(in crate::ai) use render::markdown::{
-    clamp_line_to_terminal_row_with_reserve, raw_terminal_cols, terminal_cell_width,
+    clamp_line_to_terminal_row_with_reserve, raw_terminal_cols,
 };
 
 pub(in crate::ai) fn resolve_thinking_fold_max_visible_lines(

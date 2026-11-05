@@ -364,9 +364,59 @@ pub(super) struct SelectedSubagent<'a> {
     pub(super) score: i32,
 }
 
-/// Picks the subagent for one `task` call. An explicit `agent` name always wins;
-/// otherwise every candidate with `auto_select: false` is excluded before scoring
-/// and only the survivors compete on lexical similarity.
+/// An explicit agent wins. Otherwise inherit the parent's agent type, subject to
+/// the same availability and auto-selection restrictions as any other candidate.
+/// An ineligible parent requires an explicit choice; only a missing parent identity
+/// falls back to lexical selection, so delegation cannot silently change agent type.
+pub(super) fn select_subagent_for_parent<'a>(
+    all_agents: &'a [AgentManifest],
+    requested_agent: Option<&str>,
+    parent_agent: Option<&str>,
+    description: &str,
+    prompt: &str,
+) -> Result<SelectedSubagent<'a>, String> {
+    if requested_agent.is_some() {
+        return select_subagent(all_agents, requested_agent, description, prompt);
+    }
+    let Some(parent_name) = parent_agent.map(str::trim).filter(|name| !name.is_empty()) else {
+        return select_subagent(all_agents, None, description, prompt);
+    };
+    let agent = all_agents
+        .iter()
+        .find(|agent| agent.name.eq_ignore_ascii_case(parent_name))
+        .ok_or_else(|| {
+            format!(
+                "Cannot auto-select parent agent '{parent_name}': it is unavailable. \
+                 Specify an available subagent explicitly in the agent field."
+            )
+        })?;
+    let ineligible_reason = if agent.disabled {
+        Some("it is disabled")
+    } else if agent.hidden {
+        Some("it is hidden")
+    } else if !agent.is_subagent() {
+        Some("it is not a subagent")
+    } else if !agent.auto_select {
+        Some("it sets auto_select: false")
+    } else {
+        None
+    };
+    if let Some(reason) = ineligible_reason {
+        return Err(format!(
+            "Cannot auto-select parent agent '{}': {reason}. \
+             Specify an available subagent explicitly in the agent field.",
+            agent.name
+        ));
+    }
+    Ok(SelectedSubagent {
+        agent,
+        auto_selected: true,
+        score: 0,
+    })
+}
+
+/// Select an explicit subagent or score candidates when no parent identity is
+/// available. Candidates with `auto_select: false` never compete on similarity.
 pub(super) fn select_subagent<'a>(
     all_agents: &'a [AgentManifest],
     requested_agent: Option<&str>,
@@ -478,17 +528,37 @@ pub(super) fn format_quality_tier(tier: crate::ai::provider::ModelQualityTier) -
     }
 }
 
+#[cfg(test)]
 pub(super) fn build_selection_explanation(
     selected: &SelectedSubagent<'_>,
     selected_model: &str,
     model_override: Option<&str>,
     inherited_parent_model: bool,
 ) -> String {
+    build_selection_explanation_for_parent(
+        selected,
+        selected_model,
+        model_override,
+        inherited_parent_model,
+        None,
+    )
+}
+
+pub(super) fn build_selection_explanation_for_parent(
+    selected: &SelectedSubagent<'_>,
+    selected_model: &str,
+    model_override: Option<&str>,
+    inherited_parent_model: bool,
+    parent_agent: Option<&str>,
+) -> String {
     let agent_reason = if selected.auto_selected {
-        format!(
-            "agent_reason=auto-selected as the best available subagent (score={})",
-            selected.score
-        )
+        match parent_agent.map(str::trim).filter(|name| !name.is_empty()) {
+            Some(parent) => format!("agent_reason=inherited parent agent type '{parent}'"),
+            None => format!(
+                "agent_reason=auto-selected as the best available subagent (parent agent unavailable; score={})",
+                selected.score
+            ),
+        }
     } else {
         "agent_reason=explicit agent override".to_string()
     };
@@ -512,4 +582,137 @@ pub(super) fn build_selection_explanation(
     };
 
     format!("{agent_reason}\n{model_reason}")
+}
+
+#[cfg(test)]
+mod parent_selection_tests {
+    use super::*;
+
+    const DESCRIPTION: &str = "Quick fix with minimal reasoning";
+    const PROMPT: &str = "Quick fix with minimal reasoning and fast execution.";
+
+    fn manifests() -> Vec<AgentManifest> {
+        serde_json::from_value(serde_json::json!([
+            {"name": "build", "description": "Default agent for all tasks", "mode": "all"},
+            {"name": "sharp", "description": DESCRIPTION, "prompt": PROMPT, "mode": "all"},
+            {"name": "audit", "description": "Contract-bound reviewer", "mode": "all", "auto_select": false}
+        ]))
+        .unwrap()
+    }
+
+    #[test]
+    fn auto_selection_inherits_build_despite_sharp_matching_the_task_better() {
+        let all_agents = manifests();
+        let scored = select_subagent(&all_agents, None, DESCRIPTION, PROMPT).unwrap();
+        assert_eq!(scored.agent.name, "sharp");
+
+        let selected =
+            select_subagent_for_parent(&all_agents, None, Some("build"), DESCRIPTION, PROMPT)
+                .unwrap();
+        assert_eq!(selected.agent.name, "build");
+        assert!(selected.auto_selected);
+        let explanation = build_selection_explanation_for_parent(
+            &selected,
+            "parent-model",
+            None,
+            true,
+            Some("build"),
+        );
+        assert!(explanation.contains("agent_reason=inherited parent agent type 'build'"));
+        assert!(explanation.contains("model_reason=inherited parent agent current model"));
+        assert!(!explanation.contains("score="));
+    }
+
+    #[test]
+    fn auto_selection_respects_explicit_sharp_and_contract_bound_agents() {
+        let all_agents = manifests();
+        for requested in ["SHARP", "audit"] {
+            for parent in [Some("build"), Some("missing"), None] {
+                let selected = select_subagent_for_parent(
+                    &all_agents,
+                    Some(requested),
+                    parent,
+                    DESCRIPTION,
+                    PROMPT,
+                )
+                .unwrap();
+                assert!(selected.agent.name.eq_ignore_ascii_case(requested));
+                assert!(!selected.auto_selected);
+                let explanation = build_selection_explanation_for_parent(
+                    &selected,
+                    "chosen-model",
+                    Some("chosen-model"),
+                    false,
+                    parent,
+                );
+                assert!(explanation.contains("agent_reason=explicit agent override"));
+                assert!(explanation.contains("model_reason=explicit model override"));
+            }
+        }
+    }
+
+    #[test]
+    fn auto_selection_rejects_ineligible_parent_instead_of_picking_sharp() {
+        for (field, value, reason) in [
+            ("disabled", serde_json::json!(true), "disabled"),
+            ("hidden", serde_json::json!(true), "hidden"),
+            ("mode", serde_json::json!("primary"), "not a subagent"),
+            (
+                "auto_select",
+                serde_json::json!(false),
+                "auto_select: false",
+            ),
+        ] {
+            let mut all_agents = manifests();
+            let mut parent = serde_json::to_value(&all_agents[0]).unwrap();
+            parent[field] = value;
+            all_agents[0] = serde_json::from_value(parent).unwrap();
+            let error =
+                select_subagent_for_parent(&all_agents, None, Some("build"), DESCRIPTION, PROMPT)
+                    .unwrap_err();
+            assert!(error.contains("parent agent 'build'"), "{error}");
+            assert!(error.contains(reason), "{error}");
+            assert!(error.contains("explicitly in the agent field"), "{error}");
+        }
+        let all_agents = manifests();
+        for (parent, reason) in [("missing", "unavailable"), ("audit", "auto_select: false")] {
+            let error =
+                select_subagent_for_parent(&all_agents, None, Some(parent), DESCRIPTION, PROMPT)
+                    .unwrap_err();
+            assert!(error.contains(reason), "{error}");
+        }
+    }
+
+    #[test]
+    fn auto_selection_sharp_parent_keeps_its_own_identity() {
+        let all_agents = manifests();
+        let selected = select_subagent_for_parent(
+            &all_agents,
+            None,
+            Some("SHARP"),
+            "Build",
+            "Build a project",
+        )
+        .unwrap();
+        assert_eq!(selected.agent.name, "sharp");
+        assert!(selected.auto_selected);
+    }
+
+    #[test]
+    fn auto_selection_missing_parent_identity_keeps_documented_scoring_fallback() {
+        let all_agents = manifests();
+        for parent in [None, Some(""), Some("  ")] {
+            let selected =
+                select_subagent_for_parent(&all_agents, None, parent, DESCRIPTION, PROMPT).unwrap();
+            assert_eq!(selected.agent.name, "sharp");
+            let explanation = build_selection_explanation_for_parent(
+                &selected,
+                "parent-model",
+                None,
+                true,
+                parent,
+            );
+            assert!(explanation.contains("parent agent unavailable; score="));
+        }
+    }
 }

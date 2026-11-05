@@ -962,6 +962,7 @@ async fn session_config_roundtrips_and_merges_per_field() {
             model: Some("deepseek-r1".to_string()),
             agent: None,
             reasoning_effort: Some("high".to_string()),
+            subagents: None,
         }),
     )
     .await
@@ -976,6 +977,7 @@ async fn session_config_roundtrips_and_merges_per_field() {
             model: None,
             agent: Some("build".to_string()),
             reasoning_effort: None,
+            subagents: None,
         }),
     )
     .await
@@ -997,6 +999,7 @@ async fn session_config_roundtrips_and_merges_per_field() {
             model: Some(String::new()),
             agent: None,
             reasoning_effort: None,
+            subagents: None,
         }),
     )
     .await
@@ -1025,6 +1028,192 @@ async fn session_config_roundtrips_and_merges_per_field() {
     assert_eq!(v["reasoning_effort"], "high");
 }
 
+async fn session_config_test_response(
+    state: super::ServeState,
+    id: &str,
+    update: Option<serde_json::Value>,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    let response = match update {
+        Some(body) => super::set_session_config(
+            axum::extract::State(state),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(id.to_string()),
+            axum::Json(serde_json::from_value(body).expect("config request")),
+        )
+        .await
+        .into_response(),
+        None => super::get_session_config(
+            axum::extract::State(state),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(id.to_string()),
+        )
+        .await
+        .into_response(),
+    };
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("config response body");
+    (
+        status,
+        serde_json::from_slice(&body).expect("config response json"),
+    )
+}
+
+#[tokio::test]
+async fn session_config_subagents_use_reset_roundtrip() {
+    let state = lifecycle_test_state();
+    let store = super::SessionStore::new(&state.history_file);
+    let id = "subagent-config";
+    let (_, fresh) = session_config_test_response(state.clone(), id, None).await;
+    assert_eq!(fresh["subagent_backend"], "");
+    assert_eq!(fresh["subagent_model"], "");
+    assert_eq!(fresh["default_skills"], serde_json::json!([]));
+    let fresh_output = fresh["output"].as_str().unwrap();
+    assert!(fresh_output.starts_with("Session default subagent backend: kernel\n"));
+    assert!(fresh_output.contains("TraeCLI worker model: "));
+    assert!(fresh_output.ends_with("Sticky agent-team: off\n"));
+    let initial = super::SessionServeConfig {
+        model: Some("parent-model".to_string()),
+        agent: Some("build".to_string()),
+        reasoning_effort: Some("high".to_string()),
+        default_skills: vec![
+            "first".to_string(),
+            "AGENT-TEAM".to_string(),
+            "agent-team".to_string(),
+        ],
+        ..super::SessionServeConfig::default()
+    };
+    store.write_session_serve_config(id, &initial).unwrap();
+    for (backend, model) in [
+        ("traecli", Some("worker-model")),
+        ("traecli", None),
+        ("kernel", None),
+    ] {
+        let mut subagents = serde_json::json!({"action": "use", "backend": backend});
+        if let Some(model) = model {
+            subagents["model"] = serde_json::json!(model);
+        }
+        let (status, body) = session_config_test_response(
+            state.clone(),
+            id,
+            Some(serde_json::json!({"subagents": subagents})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let saved = store.read_session_serve_config(id).unwrap();
+        assert_eq!(saved.subagent_model.as_deref(), Some("worker-model"));
+        assert_eq!(saved.default_skills, ["first", "AGENT-TEAM"]);
+        assert_eq!(saved.model, initial.model);
+        assert_eq!(saved.agent, initial.agent);
+        assert_eq!(saved.reasoning_effort, initial.reasoning_effort);
+        assert_eq!(
+            super::super::tools::task_tools::BackendId::from_stored(
+                saved.subagent_backend.as_deref()
+            )
+            .as_str(),
+            backend
+        );
+        assert!(
+            body["output"]
+                .as_str()
+                .unwrap()
+                .contains("Sticky agent-team: active\n")
+        );
+        assert!(
+            body["output"]
+                .as_str()
+                .unwrap()
+                .contains("TraeCLI worker model: worker-model\n")
+        );
+        let (status, read) = session_config_test_response(state.clone(), id, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(read, body);
+    }
+    let before = store.read_session_serve_config(id).unwrap();
+    for subagents in [
+        serde_json::json!({"action": "use", "backend": "unknown"}),
+        serde_json::json!({"action": "use", "backend": "TRAECLI"}),
+        serde_json::json!({"action": "use", "backend": "kernel", "model": "worker"}),
+        serde_json::json!({"action": "use"}),
+        serde_json::json!({"action": "unknown"}),
+    ] {
+        let (status, body) = session_config_test_response(
+            state.clone(),
+            id,
+            Some(serde_json::json!({"model": "must-not-save", "subagents": subagents})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].is_string());
+        assert_eq!(store.read_session_serve_config(id).unwrap(), before);
+    }
+    let (status, reset) = session_config_test_response(
+        state.clone(),
+        id,
+        Some(serde_json::json!({"subagents": {"action": "reset"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let saved = store.read_session_serve_config(id).unwrap();
+    assert_eq!(saved.subagent_backend, None);
+    assert_eq!(saved.subagent_model, None);
+    assert_eq!(saved.default_skills, ["first"]);
+    assert_eq!(saved.model, initial.model);
+    assert_eq!(saved.agent, initial.agent);
+    assert_eq!(saved.reasoning_effort, initial.reasoning_effort);
+    assert_eq!(reset["output"], fresh["output"]);
+    let (_, read) = session_config_test_response(state.clone(), id, None).await;
+    assert_eq!(read, reset);
+    assert!(store.read_session_title_with_origin(id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn session_config_subagents_patch_waits_for_turn_snapshot() {
+    let state = lifecycle_test_state();
+    let id = "subagent-lock";
+    let lock = super::session_lock(&state, id).await;
+    let guard = lock.lock().await;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let patch_state = state.clone();
+    let patch = tokio::spawn(async move {
+        started_tx.send(()).unwrap();
+        session_config_test_response(
+            patch_state,
+            id,
+            Some(serde_json::json!({
+                "subagents": {"action": "use", "backend": "kernel"},
+            })),
+        )
+        .await
+    });
+    started_rx.await.unwrap();
+    tokio::task::yield_now().await;
+    assert!(
+        !patch.is_finished(),
+        "config patch must wait for the running turn"
+    );
+    // Simulate the child persisting its latest snapshot while it owns the lock.
+    let store = super::SessionStore::new(&state.history_file);
+    let snapshot = super::SessionServeConfig {
+        model: Some("latest-parent-model".to_string()),
+        subagent_model: Some("latest-worker-model".to_string()),
+        default_skills: vec!["latest-skill".to_string()],
+        ..super::SessionServeConfig::default()
+    };
+    store.write_session_serve_config(id, &snapshot).unwrap();
+    drop(guard);
+    let (status, _) = tokio::time::timeout(std::time::Duration::from_secs(2), patch)
+        .await
+        .expect("patch finished after turn")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    let saved = store.read_session_serve_config(id).unwrap();
+    assert_eq!(saved.model, snapshot.model);
+    assert_eq!(saved.subagent_model, snapshot.subagent_model);
+    assert_eq!(saved.default_skills, ["latest-skill", "agent-team"]);
+}
+
 /// Config updates are validated like per-turn overrides: unknown effort
 /// levels and flag-shaped or oversized names are refused with 400, and the
 /// rejected write changes nothing.
@@ -1043,6 +1232,7 @@ async fn session_config_rejects_invalid_values() {
                 model: Some("--evil".to_string()),
                 agent: None,
                 reasoning_effort: None,
+                subagents: None,
             },
             StatusCode::BAD_REQUEST,
         ),
@@ -1051,6 +1241,7 @@ async fn session_config_rejects_invalid_values() {
                 model: Some("x".repeat(super::MAX_TURN_OVERRIDE_CHARS + 1)),
                 agent: None,
                 reasoning_effort: None,
+                subagents: None,
             },
             StatusCode::BAD_REQUEST,
         ),
@@ -1059,6 +1250,7 @@ async fn session_config_rejects_invalid_values() {
                 model: None,
                 agent: None,
                 reasoning_effort: Some("turbo".to_string()),
+                subagents: None,
             },
             StatusCode::BAD_REQUEST,
         ),
@@ -2035,6 +2227,7 @@ async fn server_info_reports_runtime_labels() {
 fn turn_req(model: Option<&str>, agent: Option<&str>, reasoning_effort: Option<&str>) -> TurnReq {
     TurnReq {
         prompt: "hi".to_string(),
+        title_seed: None,
         model: model.map(str::to_string),
         agent: agent.map(str::to_string),
         reasoning_effort: reasoning_effort.map(str::to_string),
@@ -2042,6 +2235,80 @@ fn turn_req(model: Option<&str>, agent: Option<&str>, reasoning_effort: Option<&
         confirm: None,
         skills: Vec::new(),
         cols: None,
+    }
+}
+
+#[test]
+fn turn_title_seed_separates_child_input_at_endpoint_seam() {
+    let prompt = "/task 3 fix login\n  preserve indentation  ";
+    for (seed, expected) in [
+        (None, SessionTitleSeed::Legacy(Some(prompt.to_string()))),
+        (
+            Some(serde_json::Value::Null),
+            SessionTitleSeed::Legacy(Some(prompt.to_string())),
+        ),
+        (Some(serde_json::json!("")), SessionTitleSeed::Disabled),
+        (
+            Some(serde_json::json!(" \n\t ")),
+            SessionTitleSeed::Disabled,
+        ),
+        (
+            Some(serde_json::json!("  fix login\n  second line  ")),
+            SessionTitleSeed::Explicit("fix login\n  second line".to_string()),
+        ),
+    ] {
+        let mut body = serde_json::json!({"prompt": prompt, "skills": ["code-review"]});
+        if let Some(seed) = seed {
+            body["title_seed"] = seed;
+        }
+        let req: TurnReq = serde_json::from_value(body).expect("turn request");
+        // Both turn endpoints resolve this seed before changing the child prompt.
+        assert_eq!(super::turn_title_seed(&req), expected);
+        assert_eq!(req.prompt, prompt);
+        let overrides = turn_overrides(&req).expect("valid overrides");
+        assert_eq!(
+            super::apply_turn_skills_prefix(&req.prompt, &overrides.skills),
+            format!("@skills:code-review {prompt}"),
+        );
+    }
+}
+
+#[test]
+fn turn_title_seed_child_environment_preserves_three_states() {
+    for (seed, expected) in [
+        (SessionTitleSeed::Legacy(Some("/audit".to_string())), None),
+        (SessionTitleSeed::Disabled, Some("")),
+        (
+            SessionTitleSeed::Explicit("Login recovery".to_string()),
+            Some("Login recovery"),
+        ),
+    ] {
+        let mut cmd = std::process::Command::new("a");
+        cmd.env(super::SERVE_TITLE_SEED_ENV, "stale question");
+        cmd.env(super::SERVE_TITLE_SESSION_ENV, "stale-session");
+        super::push_turn_args(
+            &mut cmd,
+            "s1",
+            "/audit -f",
+            &super::TurnOverrides::default(),
+        );
+        super::apply_title_seed_env(&mut cmd, "s1", &seed);
+        let value = cmd
+            .get_envs()
+            .find(|(key, _)| *key == super::SERVE_TITLE_SEED_ENV)
+            .expect("title policy environment entry")
+            .1;
+        assert_eq!(value.and_then(std::ffi::OsStr::to_str), expected);
+        let owner = cmd
+            .get_envs()
+            .find(|(key, _)| *key == super::SERVE_TITLE_SESSION_ENV)
+            .expect("title policy session entry")
+            .1;
+        assert_eq!(
+            owner.and_then(std::ffi::OsStr::to_str),
+            expected.map(|_| "s1")
+        );
+        assert_eq!(cmd.get_args().last().unwrap(), "/audit -f");
     }
 }
 

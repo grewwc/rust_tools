@@ -127,21 +127,24 @@ pub(super) async fn maybe_generate_session_title_for_input(app: &super::App, use
     finalize::maybe_generate_session_title_for_input(app, user_input).await;
 }
 
+pub(crate) use finalize::SessionTitleSeed;
+#[cfg(feature = "serve")]
+pub(crate) use finalize::{SERVE_TITLE_SEED_ENV, SERVE_TITLE_SESSION_ENV};
+
 /// Generate the model session title for a served session, outside its turn
 /// child. See [`finalize::generate_session_title_outside_turn`] for why this
-/// must run outside the child. `pending_user_input` seeds the request when the
-/// child has not persisted it yet (the parallel pre-turn spawn).
+/// must run outside the child. The title policy stays distinct from the child's input.
 pub(crate) async fn generate_session_title_outside_turn(
     history_file: &std::path::Path,
     session_id: &str,
     current_model: &str,
-    pending_user_input: Option<&str>,
+    title_seed: &SessionTitleSeed,
 ) -> bool {
     finalize::generate_session_title_outside_turn(
         history_file,
         session_id,
         current_model,
-        pending_user_input,
+        title_seed,
     )
     .await
 }

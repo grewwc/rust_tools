@@ -255,56 +255,6 @@ fn final_gate_state_keeps_outstanding_reopen_independent() {
     assert!(!FinalGateState::default().can_reopen_outstanding_work(false, 16, 16));
 }
 
-#[test]
-fn required_delegation_reopens_once_then_passes() {
-    let mut messages = Vec::new();
-    let mut state = FinalGateState::default();
-
-    assert_eq!(
-        preflight_delegation_requirement_gate_action(
-            &mut messages,
-            true,
-            !state.can_reopen_delegation(false, 1, 16),
-        ),
-        OutstandingWorkGateAction::Reopen
-    );
-    assert!(last_note(&messages).contains("the parent performed the work itself"));
-    assert!(last_note(&messages).contains("without using `task` or `task_spawn`"));
-    assert!(last_note(&messages).contains("Delegate the remaining work now"));
-    assert!(last_note(&messages).contains("state the concrete reason delegation is unsafe"));
-    state.consume_delegation_retry();
-    assert_eq!(
-        preflight_delegation_requirement_gate_action(
-            &mut messages,
-            true,
-            !state.can_reopen_delegation(false, 2, 16),
-        ),
-        OutstandingWorkGateAction::Allow
-    );
-    assert_eq!(
-        messages
-            .iter()
-            .filter(|message| message
-                .content
-                .as_str()
-                .is_some_and(|text| text.starts_with(DELEGATION_REQUIRED_RETRY_MARKER)))
-            .count(),
-        1
-    );
-}
-
-#[test]
-fn delegation_without_divergence_allows_final_without_note() {
-    for retry_consumed in [false, true] {
-        let mut messages = Vec::new();
-        assert_eq!(
-            preflight_delegation_requirement_gate_action(&mut messages, false, retry_consumed),
-            OutstandingWorkGateAction::Allow
-        );
-        assert!(messages.is_empty());
-    }
-}
-
 /// Run `f` as if inside session turn `turn_id` (the scope `run_turn` installs).
 fn in_turn<R>(app: &App, turn_id: usize, f: impl FnOnce() -> R) -> R {
     crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope((app.session_id.clone(), turn_id), f)

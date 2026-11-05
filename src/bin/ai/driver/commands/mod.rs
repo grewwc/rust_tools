@@ -133,11 +133,12 @@ pub fn is_local_command_start(token: &str) -> bool {
     )
 }
 
-/// Commands serve-chat forwards to the turn child even though the local REPL
-/// also recognizes them. The child executes them server-side: `/memo` after
-/// pre-turn dispatch, `/audit` and `/distill-session` in the turn dispatcher,
-/// `/mark`, `/unmark`, `/archive`, `/title`, `/export`, `/use`, and `/reset` in
-/// the pre-turn local-command path, and `/task`, `/discuss`, and `/goal` inject a
+/// Commands classified as server-owned even though the local REPL recognizes
+/// them. Serve-chat intercepts `/use` and `/reset` through the config endpoint;
+/// their classifier routes remain compatible. The turn child executes `/memo`
+/// after pre-turn dispatch, `/audit` and `/distill-session` in the turn
+/// dispatcher, and `/mark`, `/unmark`, `/archive`, `/title`, and `/export` in the
+/// pre-turn local-command path. `/task`, `/discuss`, and `/goal` inject a
 /// `forced_question` into the turn.
 fn is_serve_forwarded_command_start(token: &str) -> bool {
     if memo::memo_command_args(token).is_some() {
@@ -170,7 +171,7 @@ fn is_serve_forwarded_command_start(token: &str) -> bool {
 
 /// True when `token` starts a local command that serve-chat must not forward
 /// as a turn. Commands in [`is_serve_forwarded_command_start`] run server-side
-/// and are forwarded like a prompt instead.
+/// through a dedicated client branch or the turn child.
 pub(crate) fn is_serve_local_command_start(token: &str) -> bool {
     is_local_command_start(token) && !is_serve_forwarded_command_start(token)
 }
@@ -202,6 +203,88 @@ pub(crate) fn classify_serve_input(input: &str) -> ServeInputRoute {
         return ServeInputRoute::UnknownCommand;
     }
     ServeInputRoute::Prompt
+}
+
+/// Extract only the question from a forwarded command for serve title generation.
+/// `None` keeps ordinary prompts on the legacy path; an empty seed has no question.
+pub(crate) fn serve_command_title_seed(input: &str) -> Option<String> {
+    let mut extraction_input = input.trim().to_string();
+    crate::ai::driver::input::extract_forced_skill_references(&mut extraction_input);
+    let trimmed = extraction_input.trim();
+    let word = local_command_word(trimmed);
+    match word {
+        "distill-session" | "export" | "mark" | "unmark" | "archive" | "title" | "reset"
+        | "memo" => Some(String::new()),
+        "use" => {
+            let tail = trimmed
+                .split_once('\n')
+                .map(|(_, tail)| tail.trim())
+                .unwrap_or("");
+            if looks_like_slash_command(tail) {
+                Some(serve_command_title_seed(tail).unwrap_or_default())
+            } else {
+                Some(tail.to_string())
+            }
+        }
+        "audit" => {
+            // Reuse audit's flag grammar on the extraction copy.
+            let normalized = trimmed[1..].trim_start();
+            let remainder = normalized[word.len()..].trim();
+            let extraction_input = format!("/audit {remainder}");
+            match audit::parse_audit_command(&extraction_input) {
+                Some(audit::AuditCommand::Run { instruction, .. }) => {
+                    Some(instruction.trim().to_string())
+                }
+                Some(audit::AuditCommand::SelfGenerated { .. }) | None => Some(String::new()),
+            }
+        }
+        "task" | "discuss" | "goal" => {
+            let combined = match word {
+                "task" => split_combined_command(trimmed, &["/task", ":task"]),
+                "discuss" => split_combined_command(trimmed, &["/discuss", ":discuss"]),
+                _ => None,
+            };
+            let command = combined
+                .as_ref()
+                .map(|(command, _)| command.trim())
+                .unwrap_or(trimmed);
+            let normalized = command
+                .strip_prefix('/')
+                .or_else(|| command.strip_prefix(':'))?
+                .trim_start();
+            let mut question = normalized[word.len()..].trim();
+            if matches!(word, "task" | "discuss") {
+                if question == "status"
+                    || question.starts_with("status ")
+                    || matches!(
+                        question,
+                        "help"
+                            | "h"
+                            | "--help"
+                            | "start"
+                            | "assign"
+                            | "collect"
+                            | "broadcast"
+                            | "close"
+                            | "end"
+                    )
+                {
+                    return Some(String::new());
+                }
+                let first = question.split_whitespace().next().unwrap_or("");
+                if first.parse::<usize>().is_ok() {
+                    question = question[first.len()..].trim();
+                }
+            } else if ["status", "exit", "off", "stop", "quit"]
+                .iter()
+                .any(|state| question.eq_ignore_ascii_case(state))
+            {
+                return Some(String::new());
+            }
+            Some(question.to_string())
+        }
+        _ => None,
+    }
 }
 
 /// Dash-flag tokens owned by the named local command's own grammar.
@@ -611,6 +694,99 @@ pub(crate) fn apply_embedded_skills(app: &mut App, names: &[String], same_turn: 
 #[cfg(test)]
 mod tests {
     use super::looks_like_slash_command;
+
+    #[test]
+    fn serve_command_title_seed_uses_child_skill_extractor_everywhere() {
+        use super::serve_command_title_seed;
+        for (input, expected) in [
+            ("/task 3 fix @skill:code-review login", "fix  login"),
+            (":discuss compare @SKILLS:review APIs", "compare  APIs"),
+            (
+                "/goal @Skill:review restore login @skills:extra",
+                "restore login",
+            ),
+            (
+                "/audit @SkIlLs:review -f inspect @sKiLl:extra login",
+                "inspect  login",
+            ),
+            ("/use kernel\nrestore @Skill:review login", "restore  login"),
+            ("/audit @Skill:review", ""),
+        ] {
+            let forwarded = input.to_string();
+            assert_eq!(
+                serve_command_title_seed(&forwarded).as_deref(),
+                Some(expected),
+                "{input}"
+            );
+            assert_eq!(forwarded, input);
+        }
+    }
+
+    #[test]
+    fn serve_command_title_seed_extracts_questions_and_state() {
+        use super::serve_command_title_seed;
+
+        for (input, expected) in [
+            ("/use x\nq", "q"),
+            (
+                ":use traecli GPT-5.5\n  first\n  second  ",
+                "first\n  second",
+            ),
+            ("/use kernel", ""),
+            ("/task 3 goal", "goal"),
+            ("/task 3 status", "status"),
+            (
+                ":task 3 @skills:code-review @skills:bytedcli fix login",
+                "fix login",
+            ),
+            ("/task fix login\n/skills code-review", "fix login"),
+            ("/task status", ""),
+            (":task status room", ""),
+            ("/task", ""),
+            ("/task 3", ""),
+            ("/discuss 2 API choices", "API choices"),
+            (":discuss @skills:code-review API choices", "API choices"),
+            ("/discuss status room", ""),
+            ("/discuss", ""),
+            ("/goal @skills:bytedcli fix login", "fix login"),
+            (":goal fix login", "fix login"),
+            ("/goal", ""),
+            ("/goal STATUS", ""),
+            ("/goal off", ""),
+            ("/audit -f @skills:code-review review diff", "review diff"),
+            (
+                ":audit @skills:code-review --fast review diff",
+                "review diff",
+            ),
+            (":audit --fast review diff", "review diff"),
+            ("/audit --fastly review diff", "--fastly review diff"),
+            ("/audit", ""),
+            ("/audit --fast", ""),
+            ("/audit -f @skills:code-review", ""),
+            ("/title t", ""),
+            ("/mark m", ""),
+            (":unmark m", ""),
+            ("/archive last", ""),
+            ("/export out.md", ""),
+            ("/distill-session current", ""),
+            ("/memo remember this", ""),
+            ("/reset", ""),
+        ] {
+            assert_eq!(
+                serve_command_title_seed(input).as_deref(),
+                Some(expected),
+                "{input}"
+            );
+        }
+        for input in [
+            "ordinary question",
+            "/tmp/foo",
+            "/tasks 3 goal",
+            "/unknown q",
+        ] {
+            assert_eq!(serve_command_title_seed(input), None, "{input}");
+        }
+    }
 
     #[test]
     fn slash_command_shape_detects_commands_but_not_paths_or_text() {

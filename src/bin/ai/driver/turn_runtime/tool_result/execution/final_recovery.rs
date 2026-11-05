@@ -25,15 +25,12 @@ pub(in crate::ai::driver::turn_runtime) const INJECTED_CONTEXT_ECHO_STOP: &str =
 /// unsettled plan steps have their own bounded retry budget so another gate cannot
 /// suppress the plan reminder or make it spin to the iteration cap.
 pub(in crate::ai::driver::turn_runtime) const OUTSTANDING_WORK_MAX_REOPENS: usize = 3;
-pub(in crate::ai::driver::turn_runtime) const DELEGATION_REQUIRED_RETRY_MARKER: &str =
-    "[delegation-required-final]";
 
 #[derive(Debug, Default)]
 pub(in crate::ai::driver::turn_runtime) struct FinalGateState {
     retry_consumed: bool,
     no_tool_retry_consumed: bool,
     outstanding_work_reopens: usize,
-    delegation_retry_consumed: bool,
 }
 
 impl FinalGateState {
@@ -57,10 +54,6 @@ impl FinalGateState {
                 messages,
                 OUTSTANDING_WORK_REQUIRED_MARKER,
             )),
-            delegation_retry_consumed: current_turn_has_internal_marker(
-                messages,
-                DELEGATION_REQUIRED_RETRY_MARKER,
-            ),
         }
     }
 
@@ -95,21 +88,6 @@ impl FinalGateState {
         self.retry_consumed = true;
         self.outstanding_work_reopens = self.outstanding_work_reopens.saturating_add(1);
         self.outstanding_work_reopens
-    }
-
-    pub(super) fn can_reopen_delegation(
-        &self,
-        force_final_response: bool,
-        iteration: usize,
-        max_iterations: usize,
-    ) -> bool {
-        !self.delegation_retry_consumed
-            && self.can_reopen_outstanding_work(force_final_response, iteration, max_iterations)
-    }
-
-    pub(super) fn consume_delegation_retry(&mut self) -> usize {
-        self.delegation_retry_consumed = true;
-        self.consume_outstanding_work_retry()
     }
 
     pub(super) fn no_tool_retry_consumed(&self) -> bool {

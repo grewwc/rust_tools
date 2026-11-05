@@ -1,13 +1,14 @@
 use crate::ai::{
+    history::SessionServeConfig,
     tools::task_tools::{BackendId, ModelContext, backends::backend_registry},
     types::App,
 };
 
-fn ensure_agent_team_sticky(app: &mut App) {
+fn ensure_agent_team_sticky(config: &mut SessionServeConfig) {
     // Keep the first stored spelling and drop later case variants so the sticky
     // selection stays a set even if the persisted vector already holds duplicates.
     let mut seen = false;
-    app.session_default_skills.retain(|name| {
+    config.default_skills.retain(|name| {
         if name.eq_ignore_ascii_case("agent-team") {
             if seen {
                 return false;
@@ -17,31 +18,80 @@ fn ensure_agent_team_sticky(app: &mut App) {
         true
     });
     if !seen {
-        app.session_default_skills.push("agent-team".to_string());
+        config.default_skills.push("agent-team".to_string());
     }
 }
 
-fn print_use_state(app: &App) {
-    let backend = app.session_default_subagent_backend;
-    println!("Session default subagent backend: {}", backend.as_str());
+pub(crate) fn parse_use_arguments(args: &str) -> Result<(Option<&str>, Option<&str>), String> {
+    let mut parts = args.split_whitespace();
+    let backend = parts.next();
+    let model = parts.next();
+    if parts.next().is_some() {
+        return Err(format!(
+            "Too many arguments. Usage: {}",
+            backend_registry().use_usage()
+        ));
+    }
+    Ok((backend, model))
+}
+
+/// Apply the same backend validation and sticky-skill rule for local and HTTP commands.
+pub(crate) fn apply_subagent_use(
+    config: &mut SessionServeConfig,
+    name: &str,
+    model: Option<&str>,
+) -> Result<(), String> {
+    let Some(backend) = backend_registry().use_id(name) else {
+        return Err(format!(
+            "Unknown backend '{name}'. Usage: {}",
+            backend_registry().use_usage()
+        ));
+    };
+    let implementation = backend.resolve();
+    let descriptor = implementation.descriptor();
+    if model.is_some() && !descriptor.supports_worker_model {
+        return Err(format!(
+            "{} does not take a worker model. Usage: /use {}",
+            descriptor.text.display_name, descriptor.use_names[0]
+        ));
+    }
+    config.subagent_backend = backend.stored_value();
+    if let Some(model) = model {
+        config.subagent_model = Some(model.to_string());
+    }
+    ensure_agent_team_sticky(config);
+    Ok(())
+}
+
+pub(crate) fn reset_subagent_config(config: &mut SessionServeConfig) {
+    config.subagent_backend = None;
+    config.subagent_model = None;
+    config
+        .default_skills
+        .retain(|name| !name.eq_ignore_ascii_case("agent-team"));
+}
+
+pub(crate) fn format_use_state(config: &SessionServeConfig, kernel_model: &str) -> String {
+    let backend = BackendId::from_stored(config.subagent_backend.as_deref());
+    let mut output = format!("Session default subagent backend: {}\n", backend.as_str());
     if let Some(worker_backend) = backend_registry().worker_backend_for(backend) {
         let implementation = worker_backend.resolve();
         if let Some(label) = implementation.descriptor().text.worker_model_label {
             let identity = implementation.attribution(&ModelContext {
-                kernel_model: &app.current_model,
-                backend_model: app.session_default_subagent_model.as_deref(),
+                kernel_model,
+                backend_model: config.subagent_model.as_deref(),
                 session_worker_model: None,
                 kernel_reasoning_effort: None,
                 backend_reasoning_effort: None,
                 selection_explanation: "",
             });
-            println!("{label}: {}", identity.model);
+            output.push_str(&format!("{label}: {}\n", identity.model));
         }
     }
-    println!(
-        "Sticky agent-team: {}",
-        if app
-            .session_default_skills
+    output.push_str(&format!(
+        "Sticky agent-team: {}\n",
+        if config
+            .default_skills
             .iter()
             .any(|name| name.eq_ignore_ascii_case("agent-team"))
         {
@@ -49,6 +99,30 @@ fn print_use_state(app: &App) {
         } else {
             "off"
         }
+    ));
+    output
+}
+
+fn app_subagent_config(app: &App) -> SessionServeConfig {
+    SessionServeConfig {
+        subagent_backend: app.session_default_subagent_backend.stored_value(),
+        subagent_model: app.session_default_subagent_model.clone(),
+        default_skills: app.session_default_skills.clone(),
+        ..SessionServeConfig::default()
+    }
+}
+
+fn apply_app_subagent_config(app: &mut App, config: SessionServeConfig) {
+    app.session_default_subagent_backend =
+        BackendId::from_stored(config.subagent_backend.as_deref());
+    app.session_default_subagent_model = config.subagent_model;
+    app.session_default_skills = config.default_skills;
+}
+
+fn print_use_state(app: &App) {
+    print!(
+        "{}",
+        format_use_state(&app_subagent_config(app), &app.current_model)
     );
 }
 
@@ -77,43 +151,26 @@ pub(crate) fn try_handle_use_command(
     if parts.next() != Some("use") {
         return Ok(false);
     }
-    let Some(arg) = parts.next() else {
+    let (arg, model) = match parse_use_arguments(&normalized.trim_start()["use".len()..]) {
+        Ok(args) => args,
+        Err(usage) => {
+            println!("{usage}");
+            return Ok(true);
+        }
+    };
+    let Some(arg) = arg else {
         print_use_state(app);
         if prompt.is_some_and(|prompt| !prompt.is_empty()) {
             app.forced_question = prompt.map(str::to_string);
         }
         return Ok(true);
     };
-    let model = parts.next();
-    if parts.next().is_some() {
-        println!(
-            "Too many arguments. Usage: {}",
-            backend_registry().use_usage()
-        );
+    let mut config = app_subagent_config(app);
+    if let Err(usage) = apply_subagent_use(&mut config, arg, model) {
+        println!("{usage}");
         return Ok(true);
     }
-
-    let Some(backend) = backend_registry().use_id(arg) else {
-        println!(
-            "Unknown backend '{arg}'. Usage: {}",
-            backend_registry().use_usage()
-        );
-        return Ok(true);
-    };
-    let implementation = backend.resolve();
-    let descriptor = implementation.descriptor();
-    if model.is_some() && !descriptor.supports_worker_model {
-        println!(
-            "{} does not take a worker model. Usage: /use {}",
-            descriptor.text.display_name, descriptor.use_names[0]
-        );
-        return Ok(true);
-    }
-    app.session_default_subagent_backend = backend;
-    if let Some(model) = model {
-        app.session_default_subagent_model = Some(model.to_string());
-    }
-    ensure_agent_team_sticky(app);
+    apply_app_subagent_config(app, config);
     super::session::persist_session_runtime_state(app);
     print_use_state(app);
     if prompt.is_some_and(|prompt| !prompt.is_empty()) {
@@ -131,11 +188,17 @@ fn parse_reset_command(input: &str) -> Option<Result<(), &'static str>> {
     if parts.next() != Some("reset") {
         return None;
     }
-    Some(if parts.next().is_some() {
+    Some(validate_reset_arguments(
+        &normalized.trim_start()["reset".len()..],
+    ))
+}
+
+pub(crate) fn validate_reset_arguments(args: &str) -> Result<(), &'static str> {
+    if !args.trim().is_empty() {
         Err("Usage: /reset (no arguments or trailing prompt)")
     } else {
         Ok(())
-    })
+    }
 }
 
 pub(crate) fn try_handle_reset_command(
@@ -150,10 +213,9 @@ pub(crate) fn try_handle_reset_command(
         return Ok(true);
     }
 
-    app.session_default_subagent_backend = BackendId::default();
-    app.session_default_subagent_model = None;
-    app.session_default_skills
-        .retain(|name| !name.eq_ignore_ascii_case("agent-team"));
+    let mut config = app_subagent_config(app);
+    reset_subagent_config(&mut config);
+    apply_app_subagent_config(app, config);
     if let Some(continuation) = app.pending_skill_continuation.as_mut() {
         continuation
             .skill_names

@@ -63,6 +63,7 @@ struct PtyEditor {
     master: File,
     output: Vec<u8>,
     root: PathBuf,
+    columns: u16,
     /// Cursor queries already answered. Each query gets exactly one reply;
     /// queries below the caller's withheld index stay unanswered on purpose.
     answered: usize,
@@ -124,6 +125,7 @@ impl PtyEditor {
             master,
             output: Vec::new(),
             root,
+            columns: size.ws_col,
             answered: 0,
         }
     }
@@ -211,33 +213,43 @@ impl PtyEditor {
             .count()
     }
 
-    fn assert_query_count(&self, expected: usize) {
+    fn assert_query_columns(&self, expected: &[u16]) {
+        let columns: Vec<_> = (0..self.query_count())
+            .map(|index| self.position_for_query(index).unwrap().1)
+            .collect();
         assert_eq!(
-            self.query_count(),
+            columns,
             expected,
-            "unexpected DSR query count: {}",
+            "unexpected DSR query sequence: {}",
             String::from_utf8_lossy(&self.output)
         );
     }
 
-    /// The row the child commanded just before its `index`-th cursor query,
-    /// read from the nearest preceding `ESC[<row+1>;1H`.
-    fn row_for_query(&self, index: usize) -> Option<u16> {
+    /// Anchor probes command a row in column 1. Width probes use a saturating
+    /// CHA (`ESC[65535G`), which the terminal clamps to its actual last column.
+    fn position_for_query(&self, index: usize) -> Option<(u16, u16)> {
         let text = String::from_utf8_lossy(&self.output);
         let mut from = 0usize;
         for seen in 0..=index {
             let at = from + text[from..].find(CURSOR_QUERY)?;
             if seen == index {
-                return last_move_to_row(&text[..at]);
+                let prefix = &text[..at];
+                let row = last_move_to_row(prefix)?;
+                let column = if prefix.ends_with("\x1b[65535G") {
+                    self.columns
+                } else {
+                    1
+                };
+                return Some((row, column));
             }
             from = at + CURSOR_QUERY.len();
         }
         None
     }
 
-    /// Answers every query from `first` onwards, each with the row the child
-    /// commanded for it. Queries below `first` are left unanswered so they
-    /// time out, which is what a stalled-link test needs.
+    /// Answers every query from `first` onwards, each with the row and column
+    /// the child commanded for it. Queries below `first` are left unanswered
+    /// so they time out, which is what a stalled-link test needs.
     ///
     /// `verified_cursor_row` only accepts a reply landing exactly on the row it
     /// moved to, and that row comes from a per-process counter, so a canned
@@ -246,10 +258,10 @@ impl PtyEditor {
     fn answer_queries_from(&mut self, first: usize) {
         self.answered = self.answered.max(first);
         while self.answered < self.query_count() {
-            let Some(row) = self.row_for_query(self.answered) else {
+            let Some((row, column)) = self.position_for_query(self.answered) else {
                 break;
             };
-            let reply = format!("\x1b[{row};1R");
+            let reply = format!("\x1b[{row};{column}R");
             self.send(reply.as_bytes());
             self.answered += 1;
         }
@@ -469,61 +481,65 @@ fn responsive_cursor_query_keeps_inline_editor() {
     pty.submit();
     pty.result(0, "draft");
     pty.finish(false);
-    pty.assert_query_count(3);
-    }
-
-    #[test]
-    fn cursor_query_retry_keeps_editor_inline_after_one_stalled_round_trip() {
-        let mut pty = PtyEditor::start(1);
-        pty.wait_for("\x1b[6n");
-        // Withhold the first reply so the query times out, then answer the retry:
-        // one stalled round-trip must not cost the whole session its transcript.
-        let deadline = Instant::now() + Duration::from_secs(4);
-        while pty.query_count() < 2 && Instant::now() < deadline {
-            pty.pump(Duration::from_millis(20));
-        }
-        assert_eq!(pty.query_count(), 2, "the timed-out query was not retried");
-        // Only the retry is answered: the first query keeps its timeout, and a
-        // successful retry costs the verified anchor its low/high/final probes.
-        pty.ready_responsive(0, 1);
-        assert!(
-            !pty.contains("\x1b[?1049h"),
-            "a retried query must keep the inline editor: {}",
-            String::from_utf8_lossy(&pty.output)
-        );
-        pty.submit();
-        pty.result(0, "draft");
-        pty.finish(false);
-        pty.assert_query_count(4);
+    // The fresh anchor needs low/high/final probes, followed by one width
+    // measurement at the emulator's right edge before the initial paint.
+    pty.assert_query_columns(&[1, 1, 1, pty.columns]);
 }
 
-    #[test]
-    fn recovery_probe_restores_the_main_screen_after_the_link_recovers() {
-        let mut pty = PtyEditor::start(2);
-        pty.wait_for("\x1b[6n");
-        // Withhold every reply: both round-0 queries time out and the editor
-        // pays for the alternate screen.
-        pty.ready(0);
-        assert!(pty.contains("\x1b[?1049h"), "the editor never degraded");
-        // Recovery re-enables queries only at the next prompt start, and only
-        // once no reply is still outstanding (CPR_PROBE_QUIET_PERIOD).
-        pty.pump(Duration::from_secs(3));
-        pty.submit();
-        pty.result(0, "draft");
-        pty.wait_for("\x1b[?1049l");
-        // The recovered prompt answers its own probe and must stay on the main
-        // screen rather than open a second alternate screen.
-        pty.ready_responsive(1, 2);
-        assert_eq!(
-            pty.count("\x1b[?1049h"),
-            1,
-            "the recovered prompt degraded again: {}",
-            String::from_utf8_lossy(&pty.output)
-        );
-        pty.still_editing(1);
-        pty.submit();
-        // The prefill was consumed by round 0, so round 1 only has to come back
-        // with a result to prove the recovered prompt still completes.
-        pty.wait_for("PTY_RESULT_1=");
-        pty.finish(true);
+#[test]
+fn cursor_query_retry_keeps_editor_inline_after_one_stalled_round_trip() {
+    let mut pty = PtyEditor::start(1);
+    pty.wait_for("\x1b[6n");
+    // Withhold the first reply so the query times out, then answer the retry:
+    // one stalled round-trip must not cost the whole session its transcript.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while pty.query_count() < 2 && Instant::now() < deadline {
+        pty.pump(Duration::from_millis(20));
     }
+    assert_eq!(pty.query_count(), 2, "the timed-out query was not retried");
+    // Only the retry is answered: the first query keeps its timeout, and a
+    // successful retry costs the verified anchor its low/high/final probes.
+    pty.ready_responsive(0, 1);
+    assert!(
+        !pty.contains("\x1b[?1049h"),
+        "a retried query must keep the inline editor: {}",
+        String::from_utf8_lossy(&pty.output)
+    );
+    pty.submit();
+    pty.result(0, "draft");
+    pty.finish(false);
+    // One unanswered low probe, the retry's low/high/final probes, then
+    // the same single right-edge measurement as the responsive path.
+    pty.assert_query_columns(&[1, 1, 1, 1, pty.columns]);
+}
+
+#[test]
+fn recovery_probe_restores_the_main_screen_after_the_link_recovers() {
+    let mut pty = PtyEditor::start(2);
+    pty.wait_for("\x1b[6n");
+    // Withhold every reply: both round-0 queries time out and the editor
+    // pays for the alternate screen.
+    pty.ready(0);
+    assert!(pty.contains("\x1b[?1049h"), "the editor never degraded");
+    // Recovery re-enables queries only at the next prompt start, and only
+    // once no reply is still outstanding (CPR_PROBE_QUIET_PERIOD).
+    pty.pump(Duration::from_secs(3));
+    pty.submit();
+    pty.result(0, "draft");
+    pty.wait_for("\x1b[?1049l");
+    // The recovered prompt answers its own probe and must stay on the main
+    // screen rather than open a second alternate screen.
+    pty.ready_responsive(1, 2);
+    assert_eq!(
+        pty.count("\x1b[?1049h"),
+        1,
+        "the recovered prompt degraded again: {}",
+        String::from_utf8_lossy(&pty.output)
+    );
+    pty.still_editing(1);
+    pty.submit();
+    // The prefill was consumed by round 0, so round 1 only has to come back
+    // with a result to prove the recovered prompt still completes.
+    pty.wait_for("PTY_RESULT_1=");
+    pty.finish(true);
+}

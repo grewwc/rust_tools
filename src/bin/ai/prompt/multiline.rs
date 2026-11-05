@@ -6,6 +6,10 @@ mod events;
 mod multiline_ui;
 #[path = "multiline/render.rs"]
 mod render;
+#[path = "multiline/terminal_frame.rs"]
+mod terminal_frame;
+
+pub(in crate::ai) use terminal_frame::SingleRowFrame;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(in super::super) struct MultilineHistoryState {

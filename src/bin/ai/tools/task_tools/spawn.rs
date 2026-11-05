@@ -401,7 +401,11 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
         owned_fallback = agents::load_all_agents();
         &owned_fallback
     };
-    let selected = select_subagent(all_agents, agent, description, prompt)?;
+    let parent_agent = cached
+        .as_ref()
+        .map(|ctx| ctx.app_proto.current_agent.as_str());
+    let selected =
+        select_subagent_for_parent(all_agents, agent, parent_agent, description, prompt)?;
     if response_schema.is_some() && is_evidence_gated_audit_agent(&selected.agent.name) {
         // The review agents publish a machine-checked `<audit_report>` envelope as their
         // final response; a `response_schema` contract on the same body contradicts it.
@@ -431,11 +435,12 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
                 !choice.is_auto_selected,
             )
         };
-    let selection_explanation = build_selection_explanation(
+    let selection_explanation = build_selection_explanation_for_parent(
         &selected,
         &selected_model,
         model_override,
         inherited_parent_model,
+        parent_agent,
     );
     let kernel_reasoning_effort = crate::ai::request::reasoning_effort_display_label_for_subagent(
         &selected.agent.name,
@@ -480,6 +485,68 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
         backend_continue_from,
         image_files,
     })
+}
+
+#[cfg(test)]
+mod parent_selection_tests {
+    use super::*;
+    use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext};
+
+    #[test]
+    fn auto_selection_task_preparation_uses_parent_identity_for_agent_and_effort() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let current_model = crate::ai::model_names::all()
+            .first()
+            .map(|model| crate::ai::model_names::model_handle(model))
+            .expect("model registry must contain at least one model");
+        for (parent, requested, expected) in [
+            ("build", None, "build"),
+            ("build", Some(" "), "build"),
+            ("build", Some("sharp"), "sharp"),
+            ("sharp", None, "sharp"),
+        ] {
+            let mut app = super::super::tests::test_app_with_model(current_model.clone());
+            app.current_agent = parent.to_string();
+            app.cli.reasoning_effort_override = Some(None);
+            let all_agents = serde_json::from_value(serde_json::json!([
+                {"name": "build", "description": "Default agent for all tasks", "mode": "all"},
+                {"name": "sharp", "description": "Quick fix", "prompt": "Quick fix.", "mode": "all"}
+            ]))
+            .unwrap();
+            let ctx = DriverContext::new(
+                app,
+                Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+                Arc::new(Vec::new()),
+                Arc::new(all_agents),
+            );
+            let args = serde_json::json!({
+                "description": "Quick fix",
+                "prompt": "Quick fix.",
+                "agent": requested,
+                "backend": "kernel",
+            });
+            let prepared = DRIVER_CTX
+                .sync_scope(ctx, || prepare_subagent_task(&args))
+                .unwrap();
+            assert_eq!(prepared.agent_name, expected);
+            let expected_effort = if expected == "sharp" {
+                "low"
+            } else {
+                models::default_reasoning_effort(&prepared.model)
+                    .map(|effort| effort.as_str())
+                    .unwrap_or("server default")
+            };
+            assert_eq!(prepared.reasoning_effort.as_deref(), Some(expected_effort));
+            let expected_reason = if requested.is_some_and(|name| !name.trim().is_empty()) {
+                "agent_reason=explicit agent override".to_string()
+            } else {
+                format!("agent_reason=inherited parent agent type '{parent}'")
+            };
+            assert!(prepared.selection_explanation.contains(&expected_reason));
+        }
+    }
 }
 
 pub(crate) struct SpawnedSubagentTask {
