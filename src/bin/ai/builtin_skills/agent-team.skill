@@ -123,8 +123,9 @@ A worker branch must be sized to its own bounded turn budget: the default subage
 - Prefer fewer, larger branches, each owning a self-contained deliverable sized
   to the subagent iteration budget, over many small tasks.
 - While useful parent-side work remains, poll with non-blocking `task_status`.
-  Call `task_wait` only when blocked on results, using `wait_policy=all` and one
-  generous budget, then re-check `task_status`; budget expiry or `PARKED` is normal.
+  Call `task_wait` only when blocked on results, using `wait_policy=all` and
+  `timeout_secs=300`; completion events still wake the parent early, while budget
+  expiry or `PARKED` is normal.
 - Once a branch's decision is settled or its scope is superseded, use
   `task_cancel` instead of waiting. Do not cancel needed work that is advancing.
 - Allow at most 2 rework rounds per branch; then narrow its scope or finish in
@@ -158,9 +159,9 @@ This workflow takes precedence over routine startup checks, status polling, and
 post-wait status rechecks described elsewhere in this skill.
 
 - When blocked on results, prefer one `task_wait` with `wait_policy=all`. The
-  runtime uses a 30s default budget per call (60s maximum) and delivers terminal
-  results as they arrive; budget expiry is normal scheduling and does not prove
-  a stall.
+  runtime permits a five-minute budget and delivers terminal results as they
+  arrive; use `timeout_secs=300` to avoid waking the parent model only to renew
+  a wait. Budget expiry is normal scheduling and does not prove a stall.
 - Avoid `task_status` polling. Request a targeted status snapshot only when a
   scheduling or cancellation decision needs the current state.
 - Use `task_evidence_read` for detail, including `source=delivered` for claims
@@ -194,7 +195,7 @@ Fetch authenticated data in the parent before spawning and pass it in the prompt
 - Do not let scheduling expand into execution: outside the trivial atomic exception, do not run a read or command that gathers or verifies evidence; if a worker could do it from a self-contained prompt, delegate it.
 - Treat subagent output as evidence to review, not authority. Double-check decision-bearing claims and inspect the edits workers report before accepting them.
 - A folded, truncated, or checkpointed task result is a locator, not evidence. Before repeating numbers, quoted output, or absence claims, read the delivered payload with `task_evidence_read(source=delivered)` or the named archive; the inline preview is only a recall anchor. Do not mark a task integrated until that read is done and the claims you will reuse are checked.
-- Follow the runtime task-tool guidance for integration, evidence recovery, and retries. Wait only when blocked on results, with a `task_wait` budget of 30s by default (60s maximum per call); `PARKED` or budget expiry is normal scheduling, not a stall signal, and is never a reason to cancel. While `task_status` shows recent `last activity` or advancing progress, keep waiting. Cancel a branch when its scope changed, it failed, a fresh `task_status` snapshot confirms sustained zero progress, or its result is no longer needed; once the task's acceptance criteria are met, cancel remaining low-value or superseded branches instead of awaiting them.
+- Follow the runtime task-tool guidance for integration, evidence recovery, and retries. Wait only when blocked on results, using `wait_policy=all` and `timeout_secs=300`; `PARKED` or budget expiry is normal scheduling, not a stall signal, and is never a reason to cancel. While `task_status` shows recent `last activity` or advancing progress, keep waiting. Cancel a branch when its scope changed, it failed, a fresh `task_status` snapshot confirms sustained zero progress, or its result is no longer needed; once the task's acceptance criteria are met, cancel remaining low-value or superseded branches instead of awaiting them.
 - Synthesize one coherent final answer. Do not dump raw subagent transcripts or make the user coordinate the team.
 
 ## Backend selection and rework loop

@@ -781,7 +781,7 @@ mod tests {
         let mut fixture = RuntimeFixture::new();
         let task_id = fixture.spawn();
         let args = serde_json::json!({
-            "task_ids": [task_id.clone()], "timeout_secs": 60, "wait_policy": "all"
+            "task_ids": [task_id.clone()], "timeout_secs": 300, "wait_policy": "all"
         });
         record_last_spawn_batch(vec![task_id.clone()]);
         let before_wait = Instant::now();
@@ -805,9 +805,9 @@ mod tests {
             let mut states = lock_unpoisoned(&TASK_WAIT_STATES);
             let state = states.get_mut(&key).unwrap();
             assert!(state.agent_team_mode);
-            assert_eq!(state.timeout_secs, 60);
-            assert!(state.deadline >= before_wait + Duration::from_secs(60));
-            assert!(state.deadline <= after_wait + Duration::from_secs(60));
+            assert_eq!(state.timeout_secs, 300);
+            assert!(state.deadline >= before_wait + Duration::from_secs(300));
+            assert!(state.deadline <= after_wait + Duration::from_secs(300));
             state.deadline = Instant::now() - Duration::from_secs(1);
         }
         fixture.scope(wake_expired_task_waits);
@@ -818,7 +818,7 @@ mod tests {
             assert_eq!(owner.mailbox.len(), 1);
             let notice = owner.mailbox.front().unwrap();
             assert!(notice.contains("reason=budget_elapsed"));
-            assert!(waited_secs(notice) >= 60);
+            assert!(waited_secs(notice) >= 300);
             assert_eq!(notice.lines().count(), 1);
             assert!(notice.chars().count() <= TASK_WAIT_LINE_MAX_CHARS);
             assert!(!notice.contains("TASK_WAIT_TIMEOUT"));

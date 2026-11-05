@@ -40,15 +40,17 @@ pub(crate) const SUBAGENT_BLOCKED_PARENT_GUIDANCE: &str = "Parent action require
 /// with the parent agent's own work instead of suspending the parent for minutes right after
 /// task_spawn.
 pub(super) const DEFAULT_TASK_WAIT_TIMEOUT_SECS: u64 = 30;
-/// Hard upper bound for `task_wait.timeout_secs`, so the model cannot set an astronomically large
-/// timeout that would block the driver indefinitely. After at most 60 seconds, control must return
-/// to the parent agent, which re-evaluates whether to continue local work, check status
-/// non-blockingly, or genuinely wait again.
+/// Hard upper bound for ordinary `task_wait.timeout_secs`, so the model cannot block the driver
+/// indefinitely before re-evaluating its foreground work.
 pub(super) const MAX_TASK_WAIT_TIMEOUT_SECS: u64 = 60;
+/// Agent-team mode delegates all substantive work before waiting. A five-minute budget lets that
+/// work stay event-driven instead of repeatedly waking the parent model solely to renew a short
+/// wait; task completion, interruption, cancellation, and side notes still wake the parent early.
+pub(super) const MAX_AGENT_TEAM_TASK_WAIT_TIMEOUT_SECS: u64 = 5 * 60;
 
 /// Wall-clock lifetime cap for a subagent. Unlike a single task_wait's `timeout_secs` (default 30s,
-/// max 60s), this is a process-level hard limit: when a subagent outlives it (typically by getting
-/// stuck in a single tool execution that never returns, where a single turn has no wall-clock
+/// max five minutes), this is a process-level hard limit: when a subagent outlives it (typically by
+/// getting stuck in a single tool execution that never returns, where a single turn has no wall-clock
 /// timeout), the task_wait entry point proactively terminates it and writes a timeout terminal
 /// result, so the main agent does not spin in a "timeout -> wait again -> timeout" loop or leave
 /// background processes holding resources forever. One hour far exceeds normal completion times

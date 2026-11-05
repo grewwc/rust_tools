@@ -233,12 +233,20 @@ pub(crate) fn wake_expired_task_waits() {
         }
     }
 }
-pub(super) fn parse_task_wait_options(args: &Value) -> Result<(u64, WaitPolicy), String> {
+pub(super) fn parse_task_wait_options(
+    args: &Value,
+    agent_team_mode: bool,
+) -> Result<(u64, WaitPolicy), String> {
+    let max_timeout_secs = if agent_team_mode {
+        MAX_AGENT_TEAM_TASK_WAIT_TIMEOUT_SECS
+    } else {
+        MAX_TASK_WAIT_TIMEOUT_SECS
+    };
     let timeout_secs = args
         .get("timeout_secs")
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_TASK_WAIT_TIMEOUT_SECS)
-        .clamp(1, MAX_TASK_WAIT_TIMEOUT_SECS);
+        .clamp(1, max_timeout_secs);
     let wait_policy = match args.get("wait_policy").and_then(Value::as_str) {
         Some("any") | None => WaitPolicy::Any,
         Some("all") => WaitPolicy::All,
@@ -269,8 +277,8 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     // Wait budget for this single task_wait call. See the DEFAULT_TASK_WAIT_TIMEOUT_SECS comment —
     // a timeout only means this call did not get the result; the subagent keeps running and no
     // resources are released.
-    let (timeout_secs, wait_policy) = parse_task_wait_options(args)?;
     let agent_team_mode = is_agent_team_mode();
+    let (timeout_secs, wait_policy) = parse_task_wait_options(args, agent_team_mode)?;
 
     // wait_policy: "any" | "all", default "any", so the foreground is not held up by the slowest
     // task.

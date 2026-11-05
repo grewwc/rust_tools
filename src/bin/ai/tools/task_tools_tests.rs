@@ -186,13 +186,17 @@ fn concurrent_progress_persistence_keeps_newest_valid_snapshot() {
 
 #[test]
 fn task_wait_defaults_are_short_and_resume_on_first_result() {
-    let (timeout_secs, wait_policy) = parse_task_wait_options(&serde_json::json!({})).unwrap();
-    let (clamped_timeout_secs, _) =
-        parse_task_wait_options(&serde_json::json!({ "timeout_secs": 900 })).unwrap();
+    let (timeout_secs, wait_policy) =
+        parse_task_wait_options(&serde_json::json!({}), false).unwrap();
+    let (ordinary_timeout_secs, _) =
+        parse_task_wait_options(&serde_json::json!({ "timeout_secs": 900 }), false).unwrap();
+    let (agent_team_timeout_secs, _) =
+        parse_task_wait_options(&serde_json::json!({ "timeout_secs": 900 }), true).unwrap();
 
     assert_eq!(timeout_secs, 30);
     assert_eq!(wait_policy, WaitPolicy::Any);
-    assert_eq!(clamped_timeout_secs, 60);
+    assert_eq!(ordinary_timeout_secs, 60);
+    assert_eq!(agent_team_timeout_secs, 300);
 }
 
 #[test]
