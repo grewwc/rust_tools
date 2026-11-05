@@ -160,9 +160,9 @@ pub(crate) struct PreparedSubagentTask {
     pub(crate) auto_model_fallback: Option<models::AutoModelFallbackSpec>,
     pub(crate) selection_explanation: String,
     pub(crate) inherit: InheritOptions,
-    pub(crate) backend: SubagentBackend,
+    pub(crate) backend: BackendId,
     pub(crate) show_backend_launch_tag: bool,
-    /// Frozen execution model for TraeCLI; ignored by the kernel runner.
+    /// Frozen execution model for the backend; ignored by the kernel runner.
     pub(crate) backend_model: Option<String>,
     /// Optional resume target for external backends (a previous task_id or a
     /// raw backend session id); resolved at dispatch time, when its queued
@@ -176,10 +176,16 @@ pub(crate) struct PreparedSubagentTask {
 
 impl PreparedSubagentTask {
     pub(super) fn execution_model(&self) -> &str {
-        if self.backend.is_traecli() {
+        if self
+            .backend
+            .id()
+            .resolve()
+            .descriptor()
+            .supports_worker_model
+        {
             self.backend_model
                 .as_deref()
-                .expect("TraeCLI execution model is resolved during task preparation")
+                .expect("backend execution model is resolved during task preparation")
         } else {
             &self.model
         }
@@ -344,7 +350,7 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
     let response_schema = parse_response_schema(args)?;
     let backend_model = parse_backend_model(args.get("backend_model"))?;
     let backend_continue_from = parse_backend_continue_from(args.get("backend_continue_from"))?;
-    let explicit_backend = SubagentBackend::parse_optional(args.get("backend"))?;
+    let explicit_backend = BackendId::parse_optional(args.get("backend"))?;
     let cached = crate::ai::driver::runtime_ctx::try_current();
     let session_backend = cached
         .as_ref()
@@ -352,15 +358,17 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
         .unwrap_or_default();
     let backend = explicit_backend.unwrap_or_else(|| {
         if backend_continue_from.is_some() {
-            SubagentBackend::TraeCli
+            backends::backend_registry().resume_backend_for(session_backend)
         } else {
             session_backend
         }
     });
+    let implementation = backend.resolve();
+    let descriptor = implementation.descriptor();
     // The worker model belongs to the external backend, never to the main
     // agent's model registry. Per-call choices override the session pick.
     let backend_model = backend_model.or_else(|| {
-        if backend.is_traecli() {
+        if descriptor.supports_worker_model {
             cached
                 .as_ref()
                 .and_then(|ctx| ctx.app_proto.session_default_subagent_model.clone())
@@ -368,17 +376,12 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
             None
         }
     });
-    let backend_model = if backend.is_traecli() {
-        Some(traecli_model_for(backend_model.as_deref()))
-    } else {
-        backend_model
-    };
     let show_backend_launch_tag = explicit_backend.is_some()
-        || backend.is_traecli()
-        || matches!(session_backend, SubagentBackend::TraeCli);
-    if backend_continue_from.is_some() && matches!(explicit_backend, Some(SubagentBackend::Kernel))
+        || implementation.execution_mode() == ExecutionMode::External
+        || session_backend.resolve().execution_mode() == ExecutionMode::External;
+    if backend_continue_from.is_some() && explicit_backend.is_some() && !descriptor.supports_resume
     {
-        return Err("'backend_continue_from' needs backend 'traecli'".to_string());
+        return Err(backends::backend_registry().resume_required_error());
     }
 
     // Prefer the agent_manifests cached in DRIVER_CTX, so each task_spawn does not re-read the
@@ -434,20 +437,27 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
         model_override,
         inherited_parent_model,
     );
-    let reasoning_effort = if backend.is_traecli() {
-        None
+    let kernel_reasoning_effort = crate::ai::request::reasoning_effort_display_label_for_subagent(
+        &selected.agent.name,
+        &selected_model,
+    );
+    let identity = implementation.attribution(&ModelContext {
+        kernel_model: &selected_model,
+        backend_model: backend_model.as_deref(),
+        session_worker_model: None,
+        kernel_reasoning_effort: Some(kernel_reasoning_effort),
+        backend_reasoning_effort: None,
+        selection_explanation: &selection_explanation,
+    });
+    let backend_model = if descriptor.supports_worker_model {
+        Some(identity.model)
     } else {
-        Some(
-            crate::ai::request::reasoning_effort_display_label_for_subagent(
-                &selected.agent.name,
-                &selected_model,
-            )
-            .to_string(),
-        )
+        backend_model
     };
+    let reasoning_effort = identity.reasoning_effort;
 
     let prompt = wrap_subagent_prompt(description, prompt, response_schema.as_ref());
-    let prompt = if backend.is_traecli() {
+    let prompt = if implementation.execution_mode() == ExecutionMode::External {
         append_image_files_hint(prompt, &image_files)
     } else {
         prompt
@@ -538,12 +548,10 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
             ));
         }
     }
-    if prepared.backend.is_traecli() && !traecli_binary_available() {
-        return Err(format!(
-            "traecli backend requested but binary '{}' was not found; install traecli or set TRAECLI_BIN",
-            traecli_binary()
-        ));
-    }
+    let implementation = prepared.backend.id().resolve();
+    implementation.preflight(&Admission {
+        external_spec: None,
+    })?;
     let task_id = next_task_id();
     let mut pending_ipc = None;
     let spawned = with_os_kernel(|os| {
@@ -588,7 +596,7 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
             // Snapshot now: background dispatch may run after this turn ends,
             // when the live driver context no longer carries the guard state.
             // Kernel tasks never read it, so their payload keeps the old shape.
-            active_skill_names: if prepared.backend.is_traecli() {
+            active_skill_names: if implementation.execution_mode() == ExecutionMode::External {
                 crate::ai::driver::runtime_ctx::active_skill_names()
             } else {
                 Vec::new()
@@ -623,7 +631,8 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
                 completion_futex_addr,
                 description: prepared.description.clone(),
                 agent_name: prepared.agent_name.clone(),
-                backend: prepared.backend.is_traecli().then_some(prepared.backend),
+                backend: (implementation.execution_mode() == ExecutionMode::External)
+                    .then_some(prepared.backend),
                 // External backends run on their own model, so records and the
                 // status line report that instead of the unused kernel-side
                 // selection. Kernel entries keep the provider model.
@@ -640,7 +649,7 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
             },
         );
     }
-    if !prepared.backend.is_traecli() {
+    if implementation.execution_mode() == ExecutionMode::KernelDriver {
         set_task_reasoning_effort(&task_id, prepared.reasoning_effort.clone());
     }
     lock_unpoisoned(&TASK_PROGRESS_REGISTRY).insert(

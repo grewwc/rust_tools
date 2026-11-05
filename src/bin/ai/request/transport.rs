@@ -616,6 +616,23 @@ async fn prepare_projection_core(
     messages: &[Message],
     tools_enabled: bool,
 ) -> ProjectionCore {
+    prepare_projection_core_with_thinking(
+        app,
+        model,
+        messages,
+        tools_enabled,
+        async |question_source: &[Message]| resolve_thinking(app, model, question_source).await,
+    )
+    .await
+}
+
+async fn prepare_projection_core_with_thinking(
+    app: &App,
+    model: &str,
+    messages: &[Message],
+    tools_enabled: bool,
+    thinking_resolver: impl std::ops::AsyncFnOnce(&[Message]) -> bool,
+) -> ProjectionCore {
     let mut normalized_messages = normalize_messages_for_model(model, messages);
     // Revision-cached: the outcomes table only changes when a tool result is
     // appended or history is rewritten (both bump `history_revision`), so
@@ -631,7 +648,9 @@ async fn prepare_projection_core(
         .unwrap_or_default();
     strip_unavailable_tool_hints_from_messages(&mut normalized_messages, &request_tool_names);
     let thinking_start = Instant::now();
-    let enable_thinking = resolve_thinking(app, model, &normalized_messages).await;
+    // The raw source retains synthetic origins and internal-note roles;
+    // normalization clears those markers and adds user-role context handoffs.
+    let enable_thinking = thinking_resolver(messages).await;
     crate::ai::agent_hang_debug!(
         "pre-fix",
         "G",
@@ -1016,6 +1035,92 @@ async fn send_with_key_rotation(
         })),
         first_key_idx,
     )
+}
+
+#[cfg(test)]
+mod thinking_tests {
+    use super::super::normalize::{DERIVED_CONTEXT_HANDOFF, DERIVED_CONTEXT_RETURN};
+    use super::super::thinking::{
+        latest_user_message_text, local_thinking_decision, resolve_thinking_static,
+    };
+    use super::*;
+    use crate::ai::provider::ThinkingOffCapability;
+    use futures_util::FutureExt;
+
+    #[test]
+    fn auto_thinking_uses_real_user_question_after_compressed_tool_round() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let app = super::super::tests::test_app();
+        let model = crate::ai::model_names::all()
+            .into_iter()
+            .find(|entry| !models::reasoning_encrypted_replay_enabled(&entry.key))
+            .expect("registry must contain a model without encrypted reasoning replay");
+        let question = "hi";
+        let message = |role: &str, content: &str| Message {
+            role: role.to_string(),
+            content: Value::String(content.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let messages = vec![
+            message("system", "base system"),
+            message("user", question),
+            message(
+                crate::ai::history::ROLE_INTERNAL_NOTE,
+                "compressed_tool_round: 1 tool call (folded for context budget)\n\
+                 assistant_checkpoint: prior tool result retained",
+            ),
+        ];
+        let normalized = normalize_messages_for_model(&model.key, &messages);
+        assert_eq!(
+            normalized[2].content.as_str(),
+            Some(DERIVED_CONTEXT_HANDOFF)
+        );
+        assert_eq!(normalized[4].content.as_str(), Some(DERIVED_CONTEXT_RETURN));
+        assert_eq!(
+            latest_user_message_text(&normalized).as_deref(),
+            Some(DERIVED_CONTEXT_RETURN)
+        );
+        assert_eq!(local_thinking_decision(question), Some(false));
+        assert_eq!(local_thinking_decision(DERIVED_CONTEXT_RETURN), Some(true));
+
+        // Exercise auto thinking without a default effort independently of the
+        // live registry, whose thinking models currently bypass the heuristic.
+        let static_decision = resolve_thinking_static(
+            false,
+            None,
+            ThinkingOffCapability::RealSwitch,
+            false,
+            true,
+            true,
+            None,
+        );
+        assert_eq!(static_decision, None);
+        let mut selected_question = None;
+        let projection = prepare_projection_core_with_thinking(
+            &app,
+            &model.key,
+            &messages,
+            false,
+            async |question_source: &[Message]| {
+                let text = latest_user_message_text(question_source).unwrap();
+                let decision = static_decision
+                    .or_else(|| local_thinking_decision(&text))
+                    .expect("nonempty questions must be decided locally");
+                selected_question = Some(text);
+                decision
+            },
+        )
+        .now_or_never()
+        .expect("projection preparation must finish without an auxiliary model");
+
+        assert!(!projection.enable_thinking);
+        assert_eq!(selected_question.as_deref(), Some(question));
+        assert_eq!(projection.messages, normalized);
+    }
 }
 
 #[cfg(test)]

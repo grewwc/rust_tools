@@ -1,8 +1,8 @@
-use super::common::{test_app};
+use super::super::normalize::HISTORICAL_TOOL_EVIDENCE_CONTEXT_HEADER;
 use super::super::*;
+use super::common::test_app;
 use crate::ai::provider::{ReasoningEffort, ThinkingOffCapability};
 use serde_json::Value;
-
 
 #[test]
 fn test_parse_thinking_gate_output_bool() {
@@ -61,7 +61,11 @@ fn effort_off_turns_off_thinking_for_switch_dialects() {
         true,
         Some(ReasoningEffort::Max),
     );
-    assert_eq!(enabled, Some(false), "effort off must disable thinking for RealSwitch dialects");
+    assert_eq!(
+        enabled,
+        Some(false),
+        "effort off must disable thinking for RealSwitch dialects"
+    );
 }
 
 #[test]
@@ -79,7 +83,11 @@ fn effort_off_keeps_local_flag_for_effort_only_dialects() {
         true,
         Some(ReasoningEffort::Max),
     );
-    assert_eq!(enabled, Some(true), "NoThinkingDialect keeps the local flag (wire off happens via effort none)");
+    assert_eq!(
+        enabled,
+        Some(true),
+        "NoThinkingDialect keeps the local flag (wire off happens via effort none)"
+    );
     assert_eq!(
         super::super::reasoning::resolve_reasoning_effort_from_parts(
             Some(None),
@@ -401,5 +409,36 @@ fn thinking_gate_uses_latest_user_message_only() {
     assert_eq!(
         latest_user_message_text(&messages).as_deref(),
         Some("为什么天是蓝的？")
+    );
+}
+
+#[test]
+fn latest_user_message_text_skips_projected_tool_evidence() {
+    let question = "Why is the sky blue?";
+    let messages = vec![
+        Message {
+            role: "user".to_string(),
+            content: Value::String(question.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String(format!(
+                "{HISTORICAL_TOOL_EVIDENCE_CONTEXT_HEADER}\n- tool_call_id=call_orphan: historical output"
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+
+    assert!(!crate::ai::history::is_runtime_synthetic_user_message(
+        &messages[1]
+    ));
+    assert_eq!(
+        latest_user_message_text(&messages).as_deref(),
+        Some(question)
     );
 }

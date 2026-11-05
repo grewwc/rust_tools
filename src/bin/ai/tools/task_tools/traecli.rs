@@ -47,8 +47,12 @@ use serde_json::Value;
 use rust_tools::commonw::{FastMap, FastSet};
 
 use super::backend::{
-    ExternalSubagentOutcome, ExternalSubagentRunner, ExternalSubagentSpec, SubagentBackend,
+    BackendId, ContinueContext, ExternalSubagentOutcome, ExternalSubagentRunner,
+    ExternalSubagentSpec, SubagentBackend,
 };
+#[cfg(test)]
+use super::backend_session::SessionState as TraeCliSessionState;
+use super::backend_session::{self, SessionSlot as TraeCliSessionSlot};
 use super::registry::lock_unpoisoned;
 
 /// Parsed outcome of a TraeCLI `exec --json` run.
@@ -63,6 +67,8 @@ pub(crate) struct TraeCliOutcome {
     pub(crate) input_tokens: Option<u64>,
     pub(crate) output_tokens: Option<u64>,
 }
+
+pub(super) type TraeCliEvidenceSlot = Arc<Mutex<Option<TraeCliOutcome>>>;
 
 pub(crate) fn traecli_binary() -> String {
     let raw = std::env::var("TRAECLI_BIN")
@@ -385,14 +391,52 @@ async fn run_traecli_subagent_with(
     binary: &str,
     startup_timeout: Duration,
 ) -> Result<TraeCliOutcome, String> {
+    run_traecli_subagent_with_session(spec, cancel, binary, startup_timeout, None, None).await
+}
+
+/// The registered adapter supplies a session slot explicitly so failures retain
+/// streamed discovery even when no task-local task ID is installed.
+pub(super) async fn run_traecli_subagent_with_events(
+    spec: &ExternalSubagentSpec,
+    cancel: Arc<AtomicBool>,
+    session_slot: TraeCliSessionSlot,
+    evidence_slot: TraeCliEvidenceSlot,
+) -> Result<TraeCliOutcome, String> {
+    run_traecli_subagent_with_session(
+        spec,
+        cancel,
+        &traecli_binary(),
+        TRAECLI_STARTUP_TIMEOUT,
+        Some(session_slot),
+        Some(evidence_slot),
+    )
+    .await
+}
+
+async fn run_traecli_subagent_with_session(
+    spec: &ExternalSubagentSpec,
+    cancel: Arc<AtomicBool>,
+    binary: &str,
+    startup_timeout: Duration,
+    supplied_session_slot: Option<TraeCliSessionSlot>,
+    evidence_slot: Option<TraeCliEvidenceSlot>,
+) -> Result<TraeCliOutcome, String> {
     if spec.prompt.trim().is_empty() {
         return Err("traecli subagent prompt is empty".to_string());
     }
     let original_resume_session = spec.resume_session.clone();
     let mut attempt_spec = spec.clone();
-    let session_slot = crate::ai::driver::runtime_ctx::try_subagent_task_id()
-        .map(|task_id| track_traecli_session(&task_id))
-        .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+    let session_slot = match supplied_session_slot {
+        Some(slot) => {
+            if let Some(task_id) = crate::ai::driver::runtime_ctx::try_subagent_task_id() {
+                backend_session::track_session_slot(BackendId::TRAECLI, &task_id, slot.clone());
+            }
+            slot
+        }
+        None => crate::ai::driver::runtime_ctx::try_subagent_task_id()
+            .map(|task_id| track_traecli_session(&task_id))
+            .unwrap_or_else(|| Arc::new(Mutex::new(None))),
+    };
     let total_attempts = TRAECLI_MAX_RETRIES + 1;
     for attempt in 1..=total_attempts {
         if cancel.load(Ordering::Acquire) {
@@ -407,6 +451,7 @@ async fn run_traecli_subagent_with(
         let worker_cancel = cancel.clone();
         let worker_slot = session_slot.clone();
         let worker_attempt_slot = attempt_session_slot.clone();
+        let worker_evidence_slot = evidence_slot.clone();
         let worker_task_id = crate::ai::driver::runtime_ctx::try_subagent_task_id();
         let worker_context = crate::ai::driver::runtime_ctx::try_current();
         let binary = binary.to_string();
@@ -414,12 +459,13 @@ async fn run_traecli_subagent_with(
             // Blocking workers do not inherit Tokio task locals. Carry the task and session
             // scopes so checkpoint events use the same persistence/notification path.
             let run = || {
-                run_traecli_blocking_with(
+                run_traecli_blocking_with_evidence(
                     &owned,
                     worker_cancel,
                     &binary,
                     startup_timeout,
                     vec![worker_slot, worker_attempt_slot],
+                    worker_evidence_slot,
                 )
             };
             let run = || match worker_context {
@@ -558,6 +604,17 @@ pub(super) fn run_traecli_blocking_with(
     startup_timeout: Duration,
     session_slots: Vec<TraeCliSessionSlot>,
 ) -> Result<TraeCliOutcome, String> {
+    run_traecli_blocking_with_evidence(spec, cancel, binary, startup_timeout, session_slots, None)
+}
+
+fn run_traecli_blocking_with_evidence(
+    spec: &ExternalSubagentSpec,
+    cancel: Arc<AtomicBool>,
+    binary: &str,
+    startup_timeout: Duration,
+    session_slots: Vec<TraeCliSessionSlot>,
+    evidence_slot: Option<TraeCliEvidenceSlot>,
+) -> Result<TraeCliOutcome, String> {
     let with_sandbox_hint = |mut error: String, stderr: &str| {
         if let Some(hint) = read_only_sandbox_hint(spec, true, &[error.as_str(), stderr]) {
             error.push_str(hint);
@@ -575,9 +632,7 @@ pub(super) fn run_traecli_blocking_with(
         .spawn()
         .map_err(|err| format!("failed to spawn traecli: {err}"))?;
 
-    for file in &spec.side_note_files {
-        let _ = std::fs::remove_file(file);
-    }
+    backend_session::DeferredNotes::consume_after_spawn(&spec.side_note_files);
 
     publish_traecli_activity(
         spec,
@@ -689,6 +744,9 @@ pub(super) fn run_traecli_blocking_with(
     drop(stdin_handle);
     let stderr_text = take_stderr_snapshot(stderr_handle, &stderr_shared);
     if let Some(outcome) = parse_stream_json_output(&stdout_text) {
+        if let Some(slot) = evidence_slot {
+            *lock_unpoisoned(&slot) = Some(outcome.clone());
+        }
         if outcome.result.trim().is_empty() {
             return Err(with_sandbox_hint(
                 "traecli produced an empty result".to_string(),
@@ -1202,30 +1260,14 @@ impl ExternalSubagentRunner for TraeCliRunner {
     }
 }
 
-type TraeCliSessionSlot = Arc<Mutex<Option<String>>>;
-
-enum TraeCliSessionState {
-    Pending(TraeCliSessionSlot),
-    Terminal(String),
-}
-
-/// Parent task id -> TraeCLI session (`thread_id`) for pending and terminal runs.
-/// Follow-up tasks resolve `backend_continue_from` through this map, so the
-/// model chains by task id without handling raw session UUIDs. Lifetime
-/// matches task ids: process-local, since task ids do not survive a restart
-/// either. Only terminal entries can be resolved, so a still-running task
-/// cannot be resumed by mistake.
-static TRAECLI_SESSIONS: LazyLock<Mutex<FastMap<String, TraeCliSessionState>>> =
-    LazyLock::new(|| Mutex::new(FastMap::default()));
+/// Compatibility test view of the shared, backend-scoped session index.
+#[cfg(test)]
+static TRAECLI_SESSIONS: LazyLock<backend_session::SessionIndex> =
+    LazyLock::new(|| backend_session::session_index(BackendId::TRAECLI));
 
 /// Keep streamed session discovery alive even if the async runner is aborted.
 pub(super) fn track_traecli_session(task_id: &str) -> TraeCliSessionSlot {
-    let slot = Arc::new(Mutex::new(None));
-    lock_unpoisoned(&TRAECLI_SESSIONS).insert(
-        task_id.to_string(),
-        TraeCliSessionState::Pending(slot.clone()),
-    );
-    slot
+    backend_session::track_session(BackendId::TRAECLI, task_id)
 }
 
 fn capture_traecli_session(slot: &TraeCliSessionSlot, line: &str) {
@@ -1244,41 +1286,27 @@ fn capture_traecli_session(slot: &TraeCliSessionSlot, line: &str) {
 /// returned an error or its async wrapper was aborted, use the streamed slot.
 /// Unknown sessions are discarded immediately; teardown never scans the store.
 pub(crate) fn record_traecli_session(task_id: &str, session_id: Option<String>) -> Option<String> {
-    let mut sessions = lock_unpoisoned(&TRAECLI_SESSIONS);
-    let streamed_session = match sessions.remove(task_id) {
-        Some(TraeCliSessionState::Pending(slot)) => lock_unpoisoned(&slot).clone(),
-        Some(TraeCliSessionState::Terminal(session)) => Some(session),
-        None => None,
-    };
-    let session = session_id
-        .filter(|session| !session.trim().is_empty())
-        .or(streamed_session)?;
-    sessions.insert(
-        task_id.to_string(),
-        TraeCliSessionState::Terminal(session.clone()),
-    );
-    Some(session)
+    backend_session::record_session(BackendId::TRAECLI, task_id, session_id)
 }
 
 /// Remove a discarded task's session without making it resumable.
 pub(super) fn forget_traecli_session(task_id: &str) {
-    lock_unpoisoned(&TRAECLI_SESSIONS).remove(task_id);
+    backend_session::forget_session(BackendId::TRAECLI, task_id);
 }
+
+pub(super) const CONTINUE_TARGET_ERROR: &str = "backend_continue_from references '{value}', which is neither a terminal traecli \
+     task_id nor a traecli session id; pass the task_id of a terminal backend 'traecli' run";
 
 /// Resolve a `backend_continue_from` value: a recorded parent task id first,
 /// else a raw TraeCLI session id passed through when it has the expected UUID
 /// shape. Anything else fails closed with a chainable hint.
 pub(crate) fn resolve_continue_target(value: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-    match lock_unpoisoned(&TRAECLI_SESSIONS).get(trimmed) {
-        Some(TraeCliSessionState::Terminal(session)) => return Ok(session.clone()),
-        None if looks_like_session_id(trimmed) => return Ok(trimmed.to_string()),
-        _ => {}
-    }
-    Err(format!(
-        "backend_continue_from references '{trimmed}', which is neither a terminal traecli \
-         task_id nor a traecli session id; pass the task_id of a terminal backend 'traecli' run"
-    ))
+    backend_session::resolve_continue_target(
+        BackendId::TRAECLI,
+        value,
+        looks_like_session_id,
+        CONTINUE_TARGET_ERROR,
+    )
 }
 
 /// Resolve a continuation before reading its deferred notes. Both synchronous
@@ -1293,77 +1321,21 @@ pub(crate) fn prepare_traecli_continuation(
     parent_history: &Path,
     prompt: &str,
 ) -> Result<(Option<String>, String, Vec<PathBuf>), String> {
-    let Some(value) = continue_from
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok((None, prompt.to_string(), Vec::new()));
-    };
-    let session = resolve_continue_target(value)?;
-    let mut task_ids = {
-        let sessions = lock_unpoisoned(&TRAECLI_SESSIONS);
-        if matches!(sessions.get(value), Some(TraeCliSessionState::Terminal(_))) {
-            vec![value.to_string()]
-        } else {
-            sessions
-                .iter()
-                .filter_map(|(task_id, state)| match state {
-                    TraeCliSessionState::Terminal(recorded) if recorded == &session => {
-                        Some(task_id.clone())
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        }
-    };
-    task_ids.sort();
-    let mut notes = Vec::new();
-    let mut side_note_files = Vec::new();
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    for task_id in task_ids {
-        let file = crate::ai::driver::side_note::side_note_file(parent_history, Some(&task_id));
-        let Ok(content) = std::fs::read_to_string(&file) else {
-            continue;
-        };
-        for line in content
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-        {
-            notes.push(
-                serde_json::from_str::<crate::ai::driver::side_note::SideNote>(line)
-                    .unwrap_or_else(|_| crate::ai::driver::side_note::SideNote {
-                        from: "user".to_string(),
-                        content: line.to_string(),
-                        ts: timestamp,
-                        target: Some(task_id.clone()),
-                    }),
-            );
-        }
-        side_note_files.push(file);
-    }
-    if notes.is_empty() {
-        return Ok((Some(session), prompt.to_string(), side_note_files));
-    }
-    notes.sort_by_key(|note| note.ts);
-    let mut augmented = String::from("Main-agent follow-ups:\n");
-    for note in notes {
-        augmented.push_str("- ");
-        augmented.push_str(
-            &serde_json::to_string(&note.content).expect("side-note string serialization"),
-        );
-        augmented.push('\n');
-    }
-    augmented.push('\n');
-    augmented.push_str(prompt);
-    Ok((Some(session), augmented, side_note_files))
+    backend_session::prepare_continuation(
+        BackendId::TRAECLI,
+        &ContinueContext {
+            continue_from,
+            parent_history,
+            prompt,
+        },
+        looks_like_session_id,
+        CONTINUE_TARGET_ERROR,
+    )
+    .map(|continuation| continuation.into_parts())
 }
 
 /// TraeCLI reports `thread_id` as a lowercase UUID (8-4-4-4-12 hex).
-fn looks_like_session_id(value: &str) -> bool {
+pub(super) fn looks_like_session_id(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 36 {
         return false;

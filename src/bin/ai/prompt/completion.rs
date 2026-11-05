@@ -772,15 +772,21 @@ impl CommandCompleter {
         ]
     }
 
-    fn use_backends() -> &'static [&'static str] {
-        &["traecli", "kernel"]
+    fn use_backends() -> Vec<&'static str> {
+        crate::ai::tools::task_tools::backends::backend_registry().use_names()
     }
 
-    fn traecli_model_candidates(token: &str) -> Vec<CompletionCandidate> {
-        let mut matched: Vec<(u8, String)> = crate::ai::tools::task_tools::traecli_model_names()
-            .into_iter()
-            .filter_map(|name| Self::name_token_match_rank(token, &name).map(|rank| (rank, name)))
-            .collect();
+    fn backend_model_candidates(
+        backend: crate::ai::tools::task_tools::BackendId,
+        token: &str,
+    ) -> Vec<CompletionCandidate> {
+        let mut matched: Vec<(u8, String)> =
+            crate::ai::tools::task_tools::backend_model_names(backend)
+                .into_iter()
+                .filter_map(|name| {
+                    Self::name_token_match_rank(token, &name).map(|rank| (rank, name))
+                })
+                .collect();
         matched.sort_by_key(|(rank, _)| *rank);
         Self::plain_candidates(matched.into_iter().map(|(_, name)| name))
     }
@@ -1350,20 +1356,22 @@ impl CommandCompleter {
                     _ => Vec::new(),
                 }
             } else if matches!(first, "/use" | ":use") {
+                let registry = crate::ai::tools::task_tools::backends::backend_registry();
                 match words.next() {
-                    None if token == "traecli" => {
-                        let models = Self::traecli_model_candidates("");
+                    None if registry.worker_use_id(token).is_some() => {
+                        let backend = registry.worker_use_id(token).unwrap();
+                        let models = Self::backend_model_candidates(backend, "");
                         if models.is_empty() {
                             vec![CompletionCandidate {
-                                display: "traecli".to_string(),
-                                replacement: "traecli ".to_string(),
+                                display: token.to_string(),
+                                replacement: format!("{token} "),
                             }]
                         } else {
                             models
                                 .into_iter()
                                 .map(|candidate| CompletionCandidate {
                                     display: candidate.display,
-                                    replacement: format!("traecli {}", candidate.replacement),
+                                    replacement: format!("{token} {}", candidate.replacement),
                                 })
                                 .collect()
                         }
@@ -1374,9 +1382,10 @@ impl CommandCompleter {
                             .filter(|backend| backend.starts_with(token))
                             .map(|backend| (*backend).to_string()),
                     ),
-                    Some("traecli") if words.next().is_none() => {
-                        Self::traecli_model_candidates(token)
-                    }
+                    Some(name) if words.next().is_none() => registry
+                        .worker_use_id(name)
+                        .map(|backend| Self::backend_model_candidates(backend, token))
+                        .unwrap_or_default(),
                     _ => Vec::new(),
                 }
             } else if matches!(first, "/agent" | ":agent" | "/agents" | ":agents") {

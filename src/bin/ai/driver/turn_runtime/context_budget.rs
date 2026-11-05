@@ -570,8 +570,8 @@ fn apply_history_context_budget(
         *messages = original;
         report.after_chars = after_prepass_chars;
         // The spill pass already modified the projection before the lossy
-        // attempt; keep its flag through the rollback so decision logs and the
-        // context-budget progress line still report the change.
+        // attempt; keep its flag through the rollback so decision logs still
+        // record that the projection was modified.
         report.changed =
             tool_spilled > 0 || report.lossless_removed_messages > 0 || memory_projection.changed;
         report.rolled_back = after_chars < scan.total_chars;
@@ -2291,8 +2291,8 @@ mod tests {
     fn spill_keeps_changed_flag_under_lossy_pressure() {
         // The unconditional size-gated spill runs before any lossy work and must
         // keep `changed = true` even when the lossy path expands afterwards:
-        // decision logs and the context-budget progress line rely on it to
-        // reflect that the projection was actually modified. Regression for the
+        // decision logs rely on it to reflect that the projection was actually
+        // modified. Regression for the
         // rollback branch overwriting the spill flag with the lossless/memory
         // flags.
         let history_file =

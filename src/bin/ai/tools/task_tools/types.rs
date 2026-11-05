@@ -281,9 +281,9 @@ pub(crate) struct AsyncTaskEntry {
     /// dispatch at a manifest that does not exist.
     pub(crate) agent_name: String,
     /// Execution backend for this task. `None` is the in-process kernel
-    /// runner; external backends carry their enum value so the status line can
+    /// runner; external backends carry their registered ID so the status line can
     /// distinguish them without parsing the agent name or model.
-    pub(crate) backend: Option<SubagentBackend>,
+    pub(crate) backend: Option<BackendId>,
     pub(crate) model: String,
     pub(crate) is_model_auto_selected: bool,
     pub(crate) auto_model_fallback: Option<models::AutoModelFallbackSpec>,

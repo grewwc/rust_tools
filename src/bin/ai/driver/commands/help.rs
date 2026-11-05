@@ -14,7 +14,8 @@ fn print_commands_help() {
         "    /effort [level]           show or set reasoning effort (shortcut for /model effort)"
     );
     println!(
-        "    /use [traecli [model]|kernel] [\\n<task>]  set backend and sticky agent-team; optionally start <task>; bare /use shows state"
+        "    {} [\\n<task>]  set backend and sticky agent-team; optionally start <task>; bare /use shows state",
+        crate::ai::tools::task_tools::backends::backend_registry().use_usage()
     );
     println!(
         "    /reset                    return to kernel; clear worker model override and sticky agent-team (no arguments)"

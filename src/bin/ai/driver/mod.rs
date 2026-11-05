@@ -367,6 +367,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 pub(in crate::ai) async fn run_with_cli(
     cli: cli::ParsedCli,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    crate::ai::tools::task_tools::backends::backend_registry();
     aios_kernel::kernel::register_current_pid_provider(current_task_pid);
 
     // The cli has already been parsed by the caller (run() or the background entry),

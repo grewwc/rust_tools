@@ -3,6 +3,13 @@
 
 use super::*;
 
+/// Shared tail policy for request-level and persisted LLM summary projections.
+/// Keep the most recent real user turns verbatim before summarizing older spans.
+pub(in crate::ai) const MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS: usize = 2;
+/// Match the resident increment window so persisting request-level compression
+/// never reduces the summary's capacity to retain decisions and prerequisites.
+pub(in crate::ai) const MID_TURN_LLM_SUMMARY_MAX_CHARS: usize = 8_000;
+
 /// Last-resort rescue for the reactive overflow path, for the case where
 /// mid-turn compression can no longer make progress: its policies never
 /// truncate user messages, so an oversized current user message would
@@ -86,8 +93,7 @@ pub(in crate::ai) fn current_turn_precision_tool_call_ids(
             continue;
         };
         if !super::tool_overflow::is_non_compressible_tool(name)
-            || !crate::ai::tools::tool_history_policy(name)
-                .counts_toward_precision_inline_budget()
+            || !crate::ai::tools::tool_history_policy(name).counts_toward_precision_inline_budget()
         {
             continue;
         }

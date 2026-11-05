@@ -267,7 +267,8 @@ pub(crate) fn validate_side_note_target(task_id: &str) -> Result<(), String> {
         Err(_) => return Ok(()),
     };
     if let Some(status) = finished_status {
-        if entry.backend.is_some_and(SubagentBackend::is_traecli) {
+        if task_backend(entry.backend).descriptor().side_notes == SideNoteMode::DeferredContinuation
+        {
             return Err(format!(
                 "Task `{trimmed}` already finished (status={status}); put new guidance in a follow-up `task`/`task_spawn` with `backend_continue_from`. Previously queued side-notes are retained for that continuation."
             ));
@@ -287,7 +288,7 @@ pub(crate) fn validate_side_note_target(task_id: &str) -> Result<(), String> {
 /// drains the queue under its own history file; writing to the lead's file
 /// would leave the note unread while still reporting success.
 ///
-/// TraeCLI queues stay under the parent's history and are drained when
+/// Deferred queues stay under the parent's history and are drained when
 /// `backend_continue_from` dispatches a continuation, not during the active run.
 pub(crate) fn resolve_side_note_history_file(
     task_id: &str,
@@ -304,13 +305,18 @@ pub(crate) fn resolve_side_note_history_file(
                 "Unknown task_id `{trimmed}`: no active subagent with this id in the current session."
             )
         })?;
-    if backend.is_some_and(SubagentBackend::is_traecli) {
+    if task_backend(backend).descriptor().side_notes == SideNoteMode::DeferredContinuation {
         return Ok(Some(foreground_history.to_path_buf()));
     }
     Ok(Some(crate::ai::driver::process_history_path(
         foreground_history,
         pid,
     )))
+}
+
+pub(crate) fn task_backend_id(task_id: &str) -> BackendId {
+    with_task_entry(task_id, |entry| entry.backend.unwrap_or_default().id())
+        .unwrap_or(BackendId::KERNEL)
 }
 
 /// Remove a task entry from the registry. Called by the synchronous `task`

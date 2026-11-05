@@ -1,4 +1,4 @@
-//! Live TraeCLI worker-model discovery for command completion.
+//! Registry-routed command completion and cached TraeCLI model discovery.
 
 use std::{
     io::Read,
@@ -8,6 +8,13 @@ use std::{
 };
 
 use rust_tools::commonw::FastSet;
+
+use super::backend::BackendId;
+
+/// Query only the selected backend, and only when completion requests models.
+pub(crate) fn backend_model_names(backend: BackendId) -> Vec<String> {
+    backend.resolve().model_names()
+}
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
 /// Negative-cache TTL for failed/empty discoveries. A transient spawn failure

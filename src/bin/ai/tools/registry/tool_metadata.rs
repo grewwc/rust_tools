@@ -279,7 +279,11 @@ fn load_builtin_metadata() -> HashMap<String, ToolMetadata> {
     let mut metadata = HashMap::new();
     for (name, content) in BUILTIN_TOOL_DESCRIPTION_FILES {
         let source = format!("builtin:{name}");
-        if let Some((parsed_name, file)) = parse_metadata_file(content, &source) {
+        if let Some((parsed_name, mut file)) = parse_metadata_file(content, &source) {
+            if let Some(parameters) = file.parameters.as_mut() {
+                crate::ai::tools::task_tools::backends::backend_registry()
+                    .expand_tool_schema(parameters);
+            }
             if let Some(entry) = finalize_metadata(file, None, &source) {
                 metadata.insert(parsed_name, entry);
             }

@@ -527,11 +527,12 @@ pub(crate) fn discard_tasks_for_session(session_id: &str) {
                     entry.completion_futex_addr,
                     entry.abort_handle.clone(),
                     entry.cancel_stream.clone(),
+                    entry.backend.unwrap_or_default().id(),
                 )
             })
             .collect::<Vec<_>>()
     };
-    for (_, _, _, _, abort_handle, cancel_stream) in &candidates {
+    for (_, _, _, _, abort_handle, cancel_stream, _) in &candidates {
         cancel_stream.store(true, Ordering::Release);
         if let Some(handle) = abort_handle {
             handle.abort();
@@ -540,7 +541,7 @@ pub(crate) fn discard_tasks_for_session(session_id: &str) {
 
     if !candidates.is_empty() {
         let _ = with_os_kernel(|os| {
-            for (_, pid, result_channel_id, completion_futex_addr, _, _) in &candidates {
+            for (_, pid, result_channel_id, completion_futex_addr, _, _, _) in &candidates {
                 let _ = os.cleanup_process_resources(*pid);
                 let _ = os.kill_process(*pid, "parent session deleted".to_string());
                 let _ = os.drop_terminated(*pid);
@@ -557,12 +558,12 @@ pub(crate) fn discard_tasks_for_session(session_id: &str) {
 
     let task_ids = candidates
         .into_iter()
-        .map(|(task_id, _, _, _, _, _)| task_id)
+        .map(|(task_id, _, _, _, _, _, backend_id)| {
+            remove_task_entry(&task_id);
+            backend_session::forget_session(backend_id, &task_id);
+            task_id
+        })
         .collect::<Vec<_>>();
-    for task_id in &task_ids {
-        remove_task_entry(task_id);
-        super::traecli::forget_traecli_session(task_id);
-    }
     {
         let mut progress_registry = lock_unpoisoned(&TASK_PROGRESS_REGISTRY);
         for task_id in &task_ids {
