@@ -48,7 +48,7 @@ use super::{
     types::Message,
 };
 pub(in crate::ai) const MAX_CHECKPOINTS_PER_SESSION: usize = 50;
-pub(in crate::ai) const MAX_CHECKPOINT_STORAGE_BYTES: u64 = 512 * 1024 * 1024;
+pub(in crate::ai) const MAX_CHECKPOINT_STORAGE_BYTES: u64 = 1024 * 1024 * 1024;
 const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 const GENERATION_SQLITE_FILE: &str = "history.sqlite";
 const GENERATION_ASSETS_DIR: &str = "assets";
