@@ -670,7 +670,9 @@ fn context_projection_fingerprint(
     // v20: group folds preserve short results inline, archive assistant replay
     // and arguments, and require a net reduction including provenance. Window
     // selection accounts for capped evidence before reducing recent groups.
-    const PROJECTION_VERSION: u8 = 20;
+    // v21: persisted budget compaction reuses the LLM summary fallback when
+    // mechanical compression still cannot reclaim old replay-heavy tool pairs.
+    const PROJECTION_VERSION: u8 = 21;
     projection_cache_key(
         PROJECTION_VERSION,
         history_max_chars,
@@ -980,7 +982,7 @@ async fn compact_session_history_with_app_inner(
         // `build_context_history` call and write the result back into the
         // context snapshot. Raw messages exist only in the canonical layer
         // and are never overwritten by compression.
-        let outcome = compress::compress_messages_for_context_with_outcome(
+        let mut outcome = compress::compress_messages_for_context_with_outcome(
             messages.clone(),
             app.config.history_max_chars,
             app.config.history_keep_last,
@@ -988,7 +990,6 @@ async fn compact_session_history_with_app_inner(
             Some(overflow_dir),
             cwd,
         );
-        outcome.report();
         // A failed recovery write is the only reason to keep the previous
         // snapshot: the removed span has no archive to point at, so the next
         // boundary must read canonical history again and retry. An unmet budget is
@@ -1001,8 +1002,42 @@ async fn compact_session_history_with_app_inner(
             ContextCompressionStatus::MissingArchiveSink
                 | ContextCompressionStatus::ArchiveCommitFailed
         ) {
+            outcome.report();
             return Ok(());
         }
+        // Mechanical shrinking cannot trim exact/encrypted replay while its
+        // assistant/tool pair remains. Reuse the request-level summary policy
+        // to replace an eligible old span, then persist that projection so the
+        // next turn does not rebuild and summarize the same replay payload.
+        // Summarize the pre-pass projection: mechanical removal of old user
+        // boundaries must not narrow the LLM's retained-turn window or its source.
+        // Use the existing request summary capacity instead of reducing it when
+        // moving that summary across the turn boundary.
+        // Legacy blobs have no separate snapshot, so keep their existing path.
+        if sqlite_source.is_some()
+            && app.config.history_max_chars > 0
+            && app.config.history_summary_max_chars > 0
+            && !outcome.budget_met()
+        {
+            let (candidate, _, after_chars, _, _) = compress::mid_turn_llm_summarize(
+                app,
+                messages.clone(),
+                compress::MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
+                compress::MID_TURN_LLM_SUMMARY_MAX_CHARS,
+                app.config.history_max_chars,
+                cwd,
+            )
+            .await;
+            // The shared compressor commits recovery archives before adopting a
+            // candidate and falls back mechanically if the summary is unavailable.
+            // Retain this completed mechanical projection when it makes no progress.
+            if after_chars < outcome.after_chars {
+                outcome.messages = candidate;
+                outcome.after_chars = after_chars;
+                outcome.status = ContextCompressionStatus::Complete;
+            }
+        }
+        outcome.report();
         outcome.messages
     } else if at_boundary {
         compress::compact_persisted_history_at_boundary_with_app(app, messages.clone()).await
@@ -1082,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_cache_key_is_versioned_and_v20_never_reuses_older_snapshots() {
+    fn projection_cache_key_is_versioned_and_v21_never_reuses_older_snapshots() {
         let params = (
             8_000usize,
             2usize,
@@ -1092,6 +1127,7 @@ mod tests {
         let v17_key = projection_cache_key(17, params.0, params.1, params.2, params.3);
         let v18_key = projection_cache_key(18, params.0, params.1, params.2, params.3);
         let v19_key = projection_cache_key(19, params.0, params.1, params.2, params.3);
+        let v20_key = projection_cache_key(20, params.0, params.1, params.2, params.3);
         assert_ne!(
             v17_key, v18_key,
             "identical projection parameters must not collide across projection versions"
@@ -1099,18 +1135,19 @@ mod tests {
         assert!(v17_key.starts_with("v17|"));
         assert!(v18_key.starts_with("v18|"));
         assert!(v19_key.starts_with("v19|"));
-        // The live fingerprint must carry v20 so snapshots materialized under
-        // v19 and earlier are rebuilt with group-fold evidence and provenance
-        // semantics. Updating the v20 literal is a deliberate tripwire for the
+        // The live fingerprint must carry v21 so replay-heavy snapshots
+        // materialized under v20 and earlier can adopt the persisted LLM fallback.
+        // Updating the v21 literal is a deliberate tripwire for the
         // next projection-strategy change.
         let live = context_projection_fingerprint(params.0, params.1, params.2, params.3);
         assert_eq!(
             live,
-            projection_cache_key(20, params.0, params.1, params.2, params.3)
+            projection_cache_key(21, params.0, params.1, params.2, params.3)
         );
         assert_ne!(live, v17_key);
         assert_ne!(live, v18_key);
         assert_ne!(live, v19_key);
+        assert_ne!(live, v20_key);
     }
 
     #[test]

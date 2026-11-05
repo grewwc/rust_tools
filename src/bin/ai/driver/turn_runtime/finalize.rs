@@ -10,6 +10,7 @@ use crate::ai::{
 use rust_tools::commonw::FastSet;
 use serde_json::Value;
 use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
 use super::{TurnOutcome, persistence::persist_pending_turn_messages_for_model};
 
@@ -26,6 +27,10 @@ static SESSION_TITLE_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
 /// finalize may overlap with the next round's defensive compression in prepare).
 static SESSION_COMPACTION_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
     LazyLock::new(|| Mutex::new(FastSet::default()));
+static SESSION_COMPACTION_FINISHED: LazyLock<tokio::sync::Notify> =
+    LazyLock::new(tokio::sync::Notify::new);
+// Allow the summary request's deadline and its bounded snapshot write to finish.
+const SESSION_COMPACTION_WAIT_TIMEOUT: Duration = Duration::from_secs(75);
 
 tokio::task_local! {
     /// The spawning parent scopes its formatting policy around the child turn.
@@ -359,45 +364,74 @@ fn mark_session_title_generation_finished(session_id: &str) {
     in_flight.remove(session_id);
 }
 
-/// Returns true when the compression in-flight slot was acquired; false means a compression task is
-/// already running for this session and the caller should skip to avoid recompressing the same history.
-pub(in crate::ai::driver::turn_runtime) fn mark_session_compaction_started(
-    session_id: &str,
-) -> bool {
-    let mut in_flight = SESSION_COMPACTION_IN_FLIGHT
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
-    in_flight.insert(session_id.to_string())
+/// Own the in-flight slot until completion, cancellation, or task unwind.
+pub(in crate::ai::driver::turn_runtime) struct SessionCompactionGuard {
+    session_id: String,
 }
 
-pub(in crate::ai::driver::turn_runtime) fn mark_session_compaction_finished(session_id: &str) {
+impl Drop for SessionCompactionGuard {
+    fn drop(&mut self) {
+        let mut in_flight = SESSION_COMPACTION_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        in_flight.remove(&self.session_id);
+        drop(in_flight);
+        SESSION_COMPACTION_FINISHED.notify_waiters();
+    }
+}
+
+fn try_start_session_compaction(session_id: &str) -> Option<SessionCompactionGuard> {
     let mut in_flight = SESSION_COMPACTION_IN_FLIGHT
         .lock()
         .unwrap_or_else(|err| err.into_inner());
-    in_flight.remove(session_id);
+    in_flight
+        .insert(session_id.to_string())
+        .then(|| SessionCompactionGuard {
+            session_id: session_id.to_string(),
+        })
+}
+
+/// Preparation must observe the completed projection before rebuilding context.
+/// Register before checking the slot so completion cannot race the first wait.
+pub(in crate::ai::driver::turn_runtime) async fn wait_for_session_compaction(
+    session_id: &str,
+) -> Option<SessionCompactionGuard> {
+    tokio::time::timeout(SESSION_COMPACTION_WAIT_TIMEOUT, async {
+        loop {
+            let finished = SESSION_COMPACTION_FINISHED.notified();
+            tokio::pin!(finished);
+            finished.as_mut().enable();
+            if let Some(guard) = try_start_session_compaction(session_id) {
+                return guard;
+            }
+            finished.await;
+        }
+    })
+    .await
+    .ok()
 }
 
 /// Interactive finalization dispatches persisted compression to the background: the compression
-/// result is only a write-back cache for the context snapshot, and the next `build_context_history`
-/// always recompresses from the canonical layer, so deferred persistence does not affect correctness.
+/// result is a replaceable context snapshot, and the next preparation waits for this task before
+/// reading that snapshot plus the canonical tail after its watermark.
 /// The foreground turn therefore does not have to wait for a CPU compression + SQLite write transaction
 /// after the answer is delivered.
 ///
 /// `at_boundary` records whether tools were called again this round (no tool calls = "answer
 /// delivered", using the more aggressive threshold). After return, the spawned task owns clearing the
-/// in-flight slot.
+/// in-flight guard.
 fn spawn_background_compaction(app: &App, at_boundary: bool) {
-    if !mark_session_compaction_started(&app.session_id) {
+    let Some(compaction_guard) = try_start_session_compaction(&app.session_id) else {
         // A compression is already running (e.g. the previous round's background task has not finished);
         // skipping this round is fine — once it completes, the next prepare re-evaluates against the
         // latest canonical history.
         return;
-    }
+    };
     let task_app = app.snapshot_for_detached_helper();
-    let session_id = task_app.session_id.clone();
     // Background tasks do not own the foreground terminal: compression warnings/logs must not steal the foreground output cursor.
     tokio::spawn(
         crate::ai::driver::runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(true, async move {
+            let _compaction_guard = compaction_guard;
             let compact_result = if at_boundary {
                 compact_session_history_at_boundary_with_app(
                     &task_app,
@@ -425,7 +459,6 @@ fn spawn_background_compaction(app: &App, at_boundary: bool) {
             {
                 eprintln!("[Warning] Failed to compact persisted history: {}", err);
             }
-            mark_session_compaction_finished(&session_id);
         }),
     );
 }
@@ -1015,6 +1048,44 @@ async fn request_outside_turn_title(
 mod tests {
     use super::*;
     use crate::ai::types::{FunctionCall, ToolCall};
+
+    #[tokio::test]
+    async fn compact_session_history_waits_for_in_flight_projection() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let session_id = format!("compaction-wait-{}", uuid::Uuid::new_v4());
+        let guard = try_start_session_compaction(&session_id).unwrap();
+        let waiting = wait_for_session_compaction(&session_id);
+        tokio::pin!(waiting);
+        std::future::poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        drop(guard);
+        let next_guard = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("completion must wake preparation")
+            .unwrap();
+        assert!(try_start_session_compaction(&session_id).is_none());
+        drop(next_guard);
+        assert!(try_start_session_compaction(&session_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn compact_session_history_releases_cancelled_in_flight_projection() {
+        let session_id = format!("compaction-cancel-{}", uuid::Uuid::new_v4());
+        let guard = try_start_session_compaction(&session_id).unwrap();
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(try_start_session_compaction(&session_id).is_some());
+    }
 
     fn tool_call(id: &str, name: &str, arguments: Value) -> ToolCall {
         ToolCall {

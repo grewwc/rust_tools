@@ -219,14 +219,9 @@ pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_hard_threshold(
         .max(MID_TURN_COMPRESS_HARD_FLOOR)
         .min(llm_summary_char_threshold(model))
 }
-/// Number of user-started turns kept in the tail window for the LLM summary fallback. Earlier conversation beyond this window is compressed
-/// into a single internal_note summary inserted before the tail window.
-pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS: usize = 2;
-/// Maximum character count of the LLM summary text. Matches the resident
-/// increment window (`MAX_INCREMENTAL_SUMMARY_INLINE_CHARS`, 8_000) so the newest
-/// record can use the whole window: the summary replaces everything before the
-/// last two user turns, and 4_000 chars dropped most of that span's decisions.
-pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_MAX_CHARS: usize = 8_000;
+pub(in crate::ai::driver::turn_runtime) use crate::ai::history::compress::{
+    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS, MID_TURN_LLM_SUMMARY_MAX_CHARS,
+};
 /// Pre-request LLM summary threshold: before each LLM request is sent, if lossless + weak-loss compression still leaves
 /// content above this threshold, the LLM summary fallback runs (compressing earlier conversation into a single internal_note).
 /// Gated by the LLM summary character threshold — LLM summary only runs when the context approaches the model's actual context window,

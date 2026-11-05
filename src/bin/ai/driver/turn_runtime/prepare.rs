@@ -396,12 +396,12 @@ pub(super) async fn prepare_turn(
     crate::ai::driver::runtime_ctx::publish_subagent_phase("preparing context");
     // The finalize phase may not have run due to interruption, request errors, or
     // an older-version process; its dispatched background compression may also
-    // still be running. Before the next turn, do a lightweight check: skip if a
-    // compression is already running (snapshots are just write-back cache;
-    // build_context_history always recomputes from canonical), otherwise run one
-    // foreground compression to disk, avoiding re-requesting an epoch summary
-    // every turn.
-    if super::finalize::mark_session_compaction_started(&app.session_id) {
+    // still be running. Wait for that projection before reading the snapshot,
+    // then re-evaluate the latest canonical tail under the same in-flight guard.
+    // The wait is bounded; cancellation also releases the guard.
+    if let Some(_compaction_guard) =
+        super::finalize::wait_for_session_compaction(&app.session_id).await
+    {
         let compact_result = compact_session_history_with_app(
             app,
             crate::ai::driver::runtime_ctx::effective_cwd()
@@ -409,7 +409,6 @@ pub(super) async fn prepare_turn(
                 .as_deref(),
         )
         .await;
-        super::finalize::mark_session_compaction_finished(&app.session_id);
         if let Err(err) = compact_result
             && crate::ai::driver::runtime_ctx::terminal_output_enabled()
         {
@@ -417,6 +416,10 @@ pub(super) async fn prepare_turn(
                 "[Warning] Failed to compact persisted history before preparing context: {err}"
             );
         }
+    } else if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        eprintln!(
+            "[Warning] Persisted history compaction is still running; preparing the retained context projection"
+        );
     }
     // build_context_history does SQLite/file I/O and is a synchronous blocking
     // call. On a multi-threaded runtime, move it to spawn_blocking so tokio
