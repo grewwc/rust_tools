@@ -3423,9 +3423,13 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
     let model_label = crate::ai::models::model_display_label(&app.current_model);
     let reasoning_effort_label =
         crate::ai::request::reasoning_effort_display_label(app, &app.current_model);
-    let backend_label = match app.session_default_subagent_backend {
-        crate::ai::tools::task_tools::SubagentBackend::Kernel => String::new(),
-        backend => format!("sub:{}", backend.as_str()),
+    let backend = app.session_default_subagent_backend;
+    let backend_label = if backend.resolve().execution_mode()
+        == crate::ai::tools::task_tools::ExecutionMode::External
+    {
+        format!("sub:{}", backend.as_str())
+    } else {
+        String::new()
     };
     if let Some(editor) = app.prompt_editor.as_mut() {
         let checkpoint_store = crate::ai::history::CheckpointStore::new(

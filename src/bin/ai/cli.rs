@@ -1162,7 +1162,7 @@ fn agent_names() -> String {
 
 /// Run a live model listing with a watchdog; shell completion must also recover
 /// when the CLI is missing or hangs. The binary is passed as an argv value.
-const TRAECLI_MODELS_SHELL_QUERY: &str = r#""$1" models 2>/dev/null &
+const BACKEND_MODELS_SHELL_QUERY: &str = r#""$1" {arguments} 2>/dev/null &
 a_models_pid=$!
 (sleep 1; kill "$a_models_pid" 2>/dev/null) >/dev/null 2>&1 &
 a_models_watchdog=$!
@@ -1172,38 +1172,100 @@ kill "$a_models_watchdog" 2>/dev/null
 wait "$a_models_watchdog" 2>/dev/null
 exit "$a_models_status""#;
 
-fn print_traecli_model_completion_sh() {
-    print!(
-        "{}",
-        r#"_a_refresh_traecli_models() {
-  local _a_bin="${TRAECLI_BIN:-traecli}" _a_now="$SECONDS" _a_output _a_name
-  if [[ "${_a_models_loaded:-0}" == 1 && "${_a_models_binary:-}" == "$_a_bin" ]] && (( _a_now - ${_a_models_time:-0} < 60 )); then
+fn backend_model_completion_descriptors() -> Vec<&'static crate::ai::tools::task_tools::Descriptor>
+{
+    crate::ai::tools::task_tools::backends::backend_registry()
+        .use_descriptors()
+        .into_iter()
+        .filter(|descriptor| {
+            descriptor.supports_worker_model && descriptor.model_discovery.is_some()
+        })
+        .collect()
+}
+
+fn backend_completion_key(descriptor: &crate::ai::tools::task_tools::Descriptor) -> String {
+    descriptor
+        .id
+        .as_str()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
+}
+
+fn backend_model_completion_template(
+    descriptor: &crate::ai::tools::task_tools::Descriptor,
+    template: &str,
+) -> String {
+    let discovery = descriptor.model_discovery.unwrap();
+    template
+        .replace("{backend}", &backend_completion_key(descriptor))
+        .replace("{binary}", discovery.binary)
+        .replace("{binary_env}", discovery.binary_env)
+        .replace("{cache_key}", discovery.cache_key)
+}
+
+fn backend_models_shell_query(descriptor: &crate::ai::tools::task_tools::Descriptor) -> String {
+    let arguments = descriptor
+        .model_discovery
+        .unwrap()
+        .arguments
+        .iter()
+        .map(|argument| {
+            if !argument.is_empty()
+                && argument
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:/".contains(&byte))
+            {
+                (*argument).to_string()
+            } else {
+                shell_single_quote(argument)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    BACKEND_MODELS_SHELL_QUERY.replace("{arguments}", &arguments)
+}
+
+fn print_backend_model_completion_sh() {
+    for descriptor in backend_model_completion_descriptors() {
+        print!(
+            "{}",
+            backend_model_completion_template(
+                descriptor,
+                r#"_a_refresh_{backend}_models() {
+  local _a_bin="${{binary_env}:-{binary}}" _a_now="$SECONDS" _a_output _a_name
+  if [[ "${_a_{cache_key}_loaded:-0}" == 1 && "${_a_{cache_key}_binary:-}" == "$_a_bin" ]] && (( _a_now - ${_a_{cache_key}_time:-0} < 60 )); then
     return 0
   fi
-  _a_models_loaded=1
-  _a_models_binary="$_a_bin"
-  _a_models_time="$_a_now"
-  _a_traecli_models_cache=()
+  _a_{cache_key}_loaded=1
+  _a_{cache_key}_binary="$_a_bin"
+  _a_{cache_key}_time="$_a_now"
+  _a_{backend}_models_cache=()
 "#
-    );
-    println!(
-        "  if _a_output=$(sh -c {} sh \"$_a_bin\"); then",
-        shell_single_quote(TRAECLI_MODELS_SHELL_QUERY)
-    );
-    print!(
-        "{}",
-        r#"    while IFS= read -r _a_name; do
+            )
+        );
+        println!(
+            "  if _a_output=$(sh -c {} sh \"$_a_bin\"); then",
+            shell_single_quote(&backend_models_shell_query(descriptor))
+        );
+        print!(
+            "{}",
+            backend_model_completion_template(
+                descriptor,
+                r#"    while IFS= read -r _a_name; do
       _a_name="${_a_name%$'\r'}"
       case "$_a_name" in
         ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._:/-]*) continue ;;
       esac
-      _a_traecli_models_cache+=("$_a_name")
+      _a_{backend}_models_cache+=("$_a_name")
     done <<< "$_a_output"
   fi
   return 0
 }
 "#
-    );
+            )
+        );
+    }
 }
 
 fn generate_bash(
@@ -1213,7 +1275,7 @@ fn generate_bash(
 ) {
     let session_subcommands =
         crate::ai::driver::commands::session::CANONICAL_SESSION_SUBCOMMANDS.join(" ");
-    print_traecli_model_completion_sh();
+    print_backend_model_completion_sh();
     println!("_a_completions() {{");
     println!("  local cur prev words cword");
     println!("  _get_comp_words_by_ref -n = cur prev words cword 2>/dev/null || true");
@@ -1283,17 +1345,25 @@ fn generate_bash(
     println!("    case \"${{COMP_WORDS[1]}}\" in");
     println!("      /use|:use)");
     println!("        if [ \"$COMP_CWORD\" -eq 2 ]; then");
-    println!("          COMPREPLY=($(compgen -W 'traecli kernel' -- \"$cur\"))");
-    println!(
-        "        elif [ \"$COMP_CWORD\" -eq 3 ] && [ \"${{COMP_WORDS[2]}}\" = traecli ]; then"
-    );
-    println!("          _a_refresh_traecli_models");
-    println!("          COMPREPLY=()");
-    println!("          if (( ${{#_a_traecli_models_cache[@]}} )); then");
-    println!(
-        "            COMPREPLY=($(compgen -W \"${{_a_traecli_models_cache[*]}}\" -- \"$cur\"))"
-    );
-    println!("          fi");
+    let use_backends = crate::ai::tools::task_tools::backends::backend_registry()
+        .use_names()
+        .join(" ");
+    println!("          COMPREPLY=($(compgen -W '{use_backends}' -- \"$cur\"))");
+    for descriptor in backend_model_completion_descriptors() {
+        let backend = backend_completion_key(descriptor);
+        for name in descriptor.use_names {
+            println!(
+                "        elif [ \"$COMP_CWORD\" -eq 3 ] && [ \"${{COMP_WORDS[2]}}\" = {name} ]; then"
+            );
+            println!("          _a_refresh_{backend}_models");
+            println!("          COMPREPLY=()");
+            println!("          if (( ${{#_a_{backend}_models_cache[@]}} )); then");
+            println!(
+                "            COMPREPLY=($(compgen -W \"${{_a_{backend}_models_cache[*]}}\" -- \"$cur\"))"
+            );
+            println!("          fi");
+        }
+    }
     println!("        else");
     println!("          COMPREPLY=()");
     println!("        fi");
@@ -1430,7 +1500,7 @@ fn generate_zsh(
         crate::ai::driver::commands::session::CANONICAL_SESSION_SUBCOMMANDS.join(" ");
     println!("#compdef a");
     println!();
-    print_traecli_model_completion_sh();
+    print_backend_model_completion_sh();
     println!("_a() {{");
     println!("  local -a _a_args");
     println!();
@@ -1474,7 +1544,10 @@ fn generate_zsh(
         "  local -a _a_persona_subcmds=(help list ls current cur create new use select switch delete del rm)"
     );
     println!("  local -a _a_model_subcmds=(current list help effort)");
-    println!("  local -a _a_use_backends=(traecli kernel)");
+    let use_backends = crate::ai::tools::task_tools::backends::backend_registry()
+        .use_names()
+        .join(" ");
+    println!("  local -a _a_use_backends=({use_backends})");
     println!("  local -a _a_skill_subcmds=(help list current use)");
     println!("  local -a _a_model_meta=({})", model_meta_words());
     println!("  local -a _a_skill_meta=({})", skill_meta_words());
@@ -1582,9 +1655,14 @@ fn generate_zsh(
     println!("      /use|:use)");
     println!("        if (( CURRENT <= 3 )); then");
     println!("          compadd -S ' ' -- \"${{_a_use_backends[@]}}\"");
-    println!("        elif (( CURRENT == 4 )) && [[ \"$words[3]\" == traecli ]]; then");
-    println!("          _a_refresh_traecli_models");
-    println!("          _a_name_candidates _a_traecli_models_cache");
+    for descriptor in backend_model_completion_descriptors() {
+        let backend = backend_completion_key(descriptor);
+        for name in descriptor.use_names {
+            println!("        elif (( CURRENT == 4 )) && [[ \"$words[3]\" == {name} ]]; then");
+            println!("          _a_refresh_{backend}_models");
+            println!("          _a_name_candidates _a_{backend}_models_cache");
+        }
+    }
     println!("        fi");
     println!("        return ;;");
     println!("      /usage|:usage)");
@@ -1663,42 +1741,62 @@ fn generate_fish(
     is_bool: fn(&str) -> bool,
     _has_value: fn(&str) -> bool,
 ) {
-    print!(
-        "{}",
-        r#"function __a_traecli_models
+    for descriptor in backend_model_completion_descriptors() {
+        print!(
+            "{}",
+            backend_model_completion_template(
+                descriptor,
+                r#"function __a_{backend}_models
   set -l _a_now (date +%s)
-  set -l _a_bin traecli
-  if set -q TRAECLI_BIN; and test -n "$TRAECLI_BIN"
-    set _a_bin "$TRAECLI_BIN"
+  set -l _a_bin {binary}
+  if set -q {binary_env}; and test -n "${binary_env}"
+    set _a_bin "${binary_env}"
   end
-  if not set -q __a_models_time; or test "$__a_models_binary" != "$_a_bin"; or test (math "$_a_now - $__a_models_time") -ge 60
-    set -g __a_models_time $_a_now
-    set -g __a_models_binary "$_a_bin"
-    set -g __a_traecli_models_cache
+  if not set -q __a_{cache_key}_time; or test "$__a_{cache_key}_binary" != "$_a_bin"; or test (math "$_a_now - $__a_{cache_key}_time") -ge 60
+    set -g __a_{cache_key}_time $_a_now
+    set -g __a_{cache_key}_binary "$_a_bin"
+    set -g __a_{backend}_models_cache
 "#
-    );
-    println!(
-        "    set -l _a_output (sh -c {} sh \"$_a_bin\")",
-        shell_single_quote(TRAECLI_MODELS_SHELL_QUERY)
-    );
-    print!(
-        "{}",
-        r#"    if test $status -eq 0
-      set -g __a_traecli_models_cache (string match -r '^[A-Za-z0-9][A-Za-z0-9._:/-]*$' -- $_a_output)
+            )
+        );
+        println!(
+            "    set -l _a_output (sh -c {} sh \"$_a_bin\")",
+            shell_single_quote(&backend_models_shell_query(descriptor))
+        );
+        print!(
+            "{}",
+            backend_model_completion_template(
+                descriptor,
+                r#"    if test $status -eq 0
+      set -g __a_{backend}_models_cache (string match -r '^[A-Za-z0-9][A-Za-z0-9._:/-]*$' -- $_a_output)
     end
   end
-  if set -q __a_traecli_models_cache[1]
-    printf '%s\n' $__a_traecli_models_cache
+  if set -q __a_{backend}_models_cache[1]
+    printf '%s\n' $__a_{backend}_models_cache
   end
 end
 "#
-    );
+            )
+        );
+    }
+    let use_backends = crate::ai::tools::task_tools::backends::backend_registry()
+        .use_names()
+        .join(" ");
     println!(
-        "complete -c a -n '__fish_seen_subcommand_from /use :use; and test (count (commandline -opc)) -eq 2' -f -a 'traecli kernel' -d 'subagent backend'"
+        "complete -c a -n '__fish_seen_subcommand_from /use :use; and test (count (commandline -opc)) -eq 2' -f -a '{use_backends}' -d 'subagent backend'"
     );
-    println!(
-        "complete -c a -n '__fish_seen_subcommand_from /use :use; and __fish_seen_subcommand_from traecli; and test (count (commandline -opc)) -eq 3' -f -a '(__a_traecli_models)' -d 'TraeCLI worker model'"
-    );
+    for descriptor in backend_model_completion_descriptors() {
+        let backend = backend_completion_key(descriptor);
+        let names = descriptor.use_names.join(" ");
+        let label = descriptor
+            .text
+            .worker_model_label
+            .unwrap_or(descriptor.text.display_name)
+            .replace('\'', "'\\''");
+        println!(
+            "complete -c a -n '__fish_seen_subcommand_from /use :use; and __fish_seen_subcommand_from {names}; and test (count (commandline -opc)) -eq 3' -f -a '(__a_{backend}_models)' -d '{label}'"
+        );
+    }
     for (name, ty, usage, aliases) in info {
         let escaped = usage.replace('\'', "'\\''");
         if is_bool(ty) {

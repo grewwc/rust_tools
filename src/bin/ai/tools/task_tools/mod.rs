@@ -32,6 +32,8 @@ use uuid::Uuid;
 mod agent_team;
 
 mod backend;
+pub(crate) mod backend_session;
+pub(crate) mod backends;
 mod collect;
 mod dispatch;
 mod epoll;
@@ -58,12 +60,10 @@ pub(crate) use quiet::{is_agent_team_mode, is_agent_team_wait_deadline_message};
 pub(crate) use registry::*;
 pub(crate) use spawn::*;
 #[cfg(test)]
-pub(crate) use traecli::resolve_continue_target;
 pub(crate) use traecli::{
-    normalize_traecli_reasoning_effort, prepare_traecli_continuation, record_traecli_session,
-    traecli_binary, traecli_binary_available, traecli_model_for,
+    prepare_traecli_continuation, record_traecli_session, resolve_continue_target,
 };
-pub(crate) use traecli_models::traecli_model_names;
+pub(crate) use traecli_models::backend_model_names;
 #[cfg(test)]
 pub(crate) use traecli_models::with_traecli_model_names_for_test;
 pub(crate) use types::*;

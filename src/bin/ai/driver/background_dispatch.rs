@@ -14,7 +14,7 @@ use crate::ai::{
     agents::AgentManifest,
     mcp::SharedMcpClient,
     skills::SkillManifest,
-    tools::task_tools::{capped_subagent_manifest, with_task_entry_by_pid},
+    tools::task_tools::{self, capped_subagent_manifest, with_task_entry_by_pid},
     types::App,
 };
 
@@ -853,6 +853,63 @@ mod tests {
     use crate::ai::tools::task_tools::SubagentTerminalStatus;
 
     #[test]
+    fn background_decoded_kernel_goal_ignores_legacy_continuation() {
+        use crate::ai::tools::task_tools::{
+            BackendId, ContinueContext, OsTaskGoal, decode_os_task_goal, encode_os_task_goal,
+        };
+
+        let mut goal: OsTaskGoal = serde_json::from_value(serde_json::json!({
+            "task_id": "task_legacy_resume",
+            "result_channel_id": 1,
+            "completion_futex_addr": 2,
+            "description": "persisted kernel continuation",
+            "prompt": "Original kernel task prompt.",
+            "agent_name": "navigator",
+            "model": "kernel-model",
+            "selection_explanation": "persisted fixture",
+            "backend_continue_from": "nonempty-legacy-resume-reference",
+        }))
+        .unwrap();
+
+        for stored_backend in [
+            None,
+            Some("kernel"),
+            Some("unknown-backend"),
+            Some("trae-cli"),
+            Some("coco"),
+        ] {
+            goal.backend = stored_backend.map(str::to_string);
+            let encoded = encode_os_task_goal(&goal).unwrap();
+            let decoded = decode_os_task_goal(&encoded).expect("legacy combination must decode");
+            assert!(
+                super::decode_background_process_task_goal(&encoded)
+                    .unwrap()
+                    .is_some()
+            );
+            let backend_id = BackendId::from_stored(decoded.backend.as_deref());
+            assert_eq!(backend_id, BackendId::KERNEL);
+            let backend = backend_id.resolve();
+            let context = ContinueContext {
+                continue_from: decoded.backend_continue_from.as_deref(),
+                parent_history: std::path::Path::new("unused-parent.sqlite"),
+                prompt: &decoded.prompt,
+            };
+            // Normal kernel continuation remains rejected; decoded background goals ignore it.
+            assert_eq!(
+                backend.continuation(&context).unwrap_err(),
+                "'backend_continue_from' needs backend 'traecli'"
+            );
+            let continuation =
+                super::prepare_background_subagent_continuation(backend.as_ref(), &context)
+                    .expect("background kernel must ignore the legacy resume field");
+            let (resume_session, prompt, side_note_files) = continuation.into_parts();
+            assert!(resume_session.is_none());
+            assert_eq!(prompt, decoded.prompt);
+            assert!(side_note_files.is_empty());
+        }
+    }
+
+    #[test]
     fn subagent_status_field_is_safe_single_line_text() {
         assert_eq!(
             sanitize_status_field("review\ncode\r\x1b[31m now\tplease"),
@@ -1370,6 +1427,19 @@ mod tests {
     }
 }
 
+/// Persisted kernel goals ignore external resume fields, as the original dispatch did.
+fn prepare_background_subagent_continuation(
+    backend: &dyn task_tools::Backend,
+    context: &task_tools::ContinueContext<'_>,
+) -> Result<task_tools::Continuation, String> {
+    match backend.execution_mode() {
+        task_tools::ExecutionMode::KernelDriver => {
+            Ok(task_tools::Continuation::fresh(context.prompt))
+        }
+        task_tools::ExecutionMode::External => backend.continuation(context),
+    }
+}
+
 /// Dispatch a batch of background processes: select ready processes, decode
 /// task goals, build questions, clone app context, and spawn each as a
 /// tokio task with proper scope setup.
@@ -1410,7 +1480,7 @@ pub(super) fn dispatch_background_batch(
         bool,
         bool,
         bool,
-        bool,
+        task_tools::BackendId,
         Option<String>,
         Option<String>,
         Vec<String>,
@@ -1419,10 +1489,7 @@ pub(super) fn dispatch_background_batch(
     )> = Vec::new();
     let backend_reasoning_effort =
         crate::ai::request::resolve_reasoning_effort(app, &app.current_model)
-            .and_then(|effort| {
-                crate::ai::tools::task_tools::normalize_traecli_reasoning_effort(effort.as_str())
-            })
-            .map(str::to_string);
+            .map(|effort| effort.as_str().to_string());
     for proc in &background_procs {
         let pid = proc.pid;
         let task_goal = match decode_background_process_task_goal(&proc.goal) {
@@ -1501,10 +1568,9 @@ pub(super) fn dispatch_background_batch(
                 .is_some_and(|goal| goal.parent_agent_team_mode),
             is_resume_wakeup,
             initialize_history,
-            task_goal.as_ref().is_some_and(|goal| {
-                crate::ai::tools::task_tools::SubagentBackend::from_stored(goal.backend.as_deref())
-                    .is_traecli()
-            }),
+            task_tools::BackendId::from_stored(
+                task_goal.as_ref().and_then(|goal| goal.backend.as_deref()),
+            ),
             task_goal
                 .as_ref()
                 .and_then(|goal| goal.backend_model.clone()),
@@ -1538,7 +1604,7 @@ pub(super) fn dispatch_background_batch(
         parent_agent_team_mode,
         is_resume_wakeup,
         initialize_history,
-        is_traecli_backend,
+        backend_id,
         backend_model,
         backend_continue_from,
         active_skill_names,
@@ -1546,7 +1612,27 @@ pub(super) fn dispatch_background_batch(
         image_files,
     ) in task_specs
     {
-        if is_traecli_backend && let Some(task_id) = task_id.as_deref() {
+        let backend = backend_id.resolve();
+        let execution_mode = backend.execution_mode();
+        // Preparation froze the worker model; attribution maps only the live
+        // parent's effort here. Result wording stays in the task record.
+        let identity = backend.attribution(&task_tools::ModelContext {
+            kernel_model: model_override.as_deref().unwrap_or(&app.current_model),
+            backend_model: backend_model.as_deref(),
+            session_worker_model: None,
+            kernel_reasoning_effort: None,
+            backend_reasoning_effort: backend_reasoning_effort.as_deref(),
+            selection_explanation: "",
+        });
+        let backend_model = if backend.descriptor().supports_worker_model {
+            Some(identity.model)
+        } else {
+            backend_model
+        };
+        let backend_reasoning_effort = identity.reasoning_effort;
+        if execution_mode == task_tools::ExecutionMode::External
+            && let Some(task_id) = task_id.as_deref()
+        {
             crate::ai::tools::task_tools::set_task_reasoning_effort(
                 task_id,
                 backend_reasoning_effort.clone(),
@@ -1644,7 +1730,6 @@ pub(super) fn dispatch_background_batch(
         let scope_task_id = task_id.clone().unwrap_or_else(|| format!("pid-{pid}"));
         let phase_slot = crate::ai::tools::task_tools::task_progress_slot(&scope_task_id)
             .unwrap_or_else(runtime_ctx::new_subagent_progress_slot);
-        let phase_slot_for_payload = phase_slot.clone();
         let phase_slot_for_backend = phase_slot.clone();
         let parent_history_for_scopes = original_history_file.clone();
 
@@ -1696,9 +1781,8 @@ pub(super) fn dispatch_background_batch(
         );
         let result_slot_for_scope = result_slot_for_payload.clone();
 
-        // TraeCLI backend inputs, cloned before `inner_fut` moves the owners.
-        // Kernel path ignores these; the branch below selects the runner.
-        let traecli_cwd = if inherit.cwd {
+        // External inputs are frozen before the driver's callback owns the app.
+        let backend_cwd = if inherit.cwd {
             inherited_cwd_dir
                 .clone()
                 .or_else(|| runtime_ctx::effective_cwd().ok())
@@ -1706,147 +1790,158 @@ pub(super) fn dispatch_background_batch(
         } else {
             scoped_cwd_dir.clone().unwrap_or_else(std::env::temp_dir)
         };
-        let traecli_cancel = task_app.cancel_stream.clone();
-        let traecli_workspace_allowed = inherit.cwd;
-        let traecli_parent_history = original_history_file.clone();
+        let backend_cancel = task_app.cancel_stream.clone();
+        let backend_workspace_allowed = inherit.cwd;
+        let backend_parent_history = original_history_file.clone();
 
+        let backend_session_slot: task_tools::backend_session::SessionSlot =
+            Arc::new(std::sync::Mutex::new(None));
+        let default_progress = backend.descriptor().text.default_progress;
         let inner_fut = TASK_PID.scope(Some(pid), async move {
             crate::ai::tools::registry::common::clear_tool_cancel();
-            // Resolve continuity and read deferred notes only for TraeCLI.
-            // Unknown references fail closed before touching the queue.
-            let traecli_continuation = if is_traecli_backend {
-                crate::ai::tools::task_tools::prepare_traecli_continuation(
-                    backend_continue_from.as_deref(),
-                    &traecli_parent_history,
-                    &proc_question,
-                )
-            } else {
-                Ok((None, String::new(), Vec::new()))
+            // External resolution reads deferred notes without consuming them;
+            // the backend commits the queues only after a successful process spawn.
+            let continuation = prepare_background_subagent_continuation(
+                backend.as_ref(),
+                &task_tools::ContinueContext {
+                    continue_from: backend_continue_from.as_deref(),
+                    parent_history: &backend_parent_history,
+                    prompt: &proc_question,
+                },
+            );
+            let events = task_tools::Events {
+                phase_slot: Some(phase_slot_for_backend),
+                session_slot: Some(backend_session_slot.clone()),
             };
-            // Subagent backend branch: TraeCLI runs a headless subprocess while
-            // the kernel path below keeps the exact in-process `run_turn` flow.
-            // Both branches publish through the same channel/futex/validation
-            // logic after this block, so `task_wait` / `task_status` stay uniform.
-            let (
-                result,
-                captured_output,
-                response_for_validation,
-                progress,
-                memory_merge_error,
-                backend_session,
-            ): (
-                Result<(), String>,
-                String,
-                String,
-                String,
-                Option<String>,
-                Option<String>,
-            ) = if is_traecli_backend {
-                match traecli_continuation {
-                    Err(err) => (
-                        Err(err),
-                        String::new(),
-                        String::new(),
-                        "traecli".to_string(),
-                        None,
-                        None,
-                    ),
-                    Ok((resume_session, prompt, side_note_files)) => {
-                        let spec = crate::ai::tools::task_tools::ExternalSubagentSpec {
-                            prompt,
-                            cwd: traecli_cwd,
-                            workspace_allowed: traecli_workspace_allowed,
-                            model: backend_model,
-                            skills: crate::ai::skills::render_external_skill_context(
-                                task_skills.as_slice(),
-                                &active_skill_names,
-                            ),
-                            resume_session,
-                            side_note_files,
-                            reasoning_effort: backend_reasoning_effort,
-                            image_files: image_files.clone(),
-                            phase_slot: Some(phase_slot_for_backend),
-                        };
-                        match crate::ai::tools::task_tools::run_external_subagent(
-                            crate::ai::tools::task_tools::SubagentBackend::TraeCli,
-                            &spec,
-                            traecli_cancel,
-                        )
-                        .await
-                        {
-                            Ok(outcome) => (
-                                Ok(()),
-                                outcome.output.clone(),
-                                outcome.output,
-                                outcome.progress,
-                                None,
-                                outcome.session_id,
-                            ),
-                            Err(err) => (
-                                Err(err),
-                                String::new(),
-                                String::new(),
-                                "traecli".to_string(),
-                                None,
-                                None,
-                            ),
-                        }
+            let memory_merge_error_slot = Arc::new(std::sync::Mutex::new(None::<String>));
+            let memory_merge_error_for_run = memory_merge_error_slot.clone();
+            let outcome = match continuation {
+                Err(error) => task_tools::Outcome {
+                    execution_error: Some(error),
+                    progress: default_progress.to_string(),
+                    ..task_tools::Outcome::default()
+                },
+                Ok(continuation) => {
+                    if backend.descriptor().supports_resume
+                        && let Some(task_id) = task_id.as_deref()
+                    {
+                        task_tools::backend_session::track_session_slot(
+                            backend_id,
+                            task_id,
+                            backend_session_slot.clone(),
+                        );
                     }
+                    let (resume_session, prompt, side_note_files) = continuation.into_parts();
+                    let context = match execution_mode {
+                        task_tools::ExecutionMode::External => {
+                            task_tools::RunContext::External(task_tools::ExternalSubagentSpec {
+                                prompt,
+                                cwd: backend_cwd,
+                                workspace_allowed: backend_workspace_allowed,
+                                model: backend_model,
+                                skills: crate::ai::skills::render_external_skill_context(
+                                    task_skills.as_slice(),
+                                    &active_skill_names,
+                                ),
+                                resume_session,
+                                side_note_files,
+                                reasoning_effort: backend_reasoning_effort,
+                                image_files: image_files.clone(),
+                                phase_slot: events.phase_slot.clone(),
+                            })
+                        }
+                        task_tools::ExecutionMode::KernelDriver => {
+                            task_tools::RunContext::kernel(move |events, _cancel| {
+                                Box::pin(async move {
+                                    let run = runtime_ctx::IS_RESUME_TURN.scope(
+                                        is_resume_wakeup,
+                                        turn_runtime::run_turn(
+                                            &mut task_app,
+                                            &task_mcp,
+                                            &task_skills,
+                                            usize::MAX,
+                                            prompt,
+                                            String::new(),
+                                            next_model,
+                                            None,
+                                            None,
+                                            false,
+                                            false,
+                                        ),
+                                    );
+                                    let run = turn_runtime::SUBAGENT_PARENT_AGENT_TEAM_MODE
+                                        .scope(parent_agent_team_mode, run);
+                                    let result = if let Some(spec) = auto_model_fallback {
+                                        runtime_ctx::AUTO_MODEL_FALLBACK.scope(spec, run).await
+                                    } else {
+                                        run.await
+                                    }
+                                    .map(|_| ())
+                                    .map_err(|error| format!("{error}"));
+                                    let captured = if result_channel_id.is_some() {
+                                        result_slot_for_payload.lock().await.clone()
+                                    } else {
+                                        runtime_ctx::SubagentResult::default()
+                                    };
+                                    let progress = events
+                                        .phase_slot
+                                        .as_ref()
+                                        .and_then(runtime_ctx::subagent_progress_snapshot)
+                                        .unwrap_or_else(|| default_progress.to_string());
+                                    let progress_snapshot = events.phase_slot.as_ref().and_then(
+                                        runtime_ctx::subagent_progress_state_snapshot,
+                                    );
+                                    let memory_merge_error = private_memory_for_merge.and_then(
+                                        |private_memory| {
+                                            crate::ai::tools::service::memory::merge_subagent_whitelist(
+                                                &private_memory,
+                                                &main_memory_for_merge,
+                                            )
+                                            .err()
+                                        },
+                                    );
+                                    if memory_merge_error.is_some() {
+                                        memory_merge_failed_for_inner.store(true, Ordering::Release);
+                                    }
+                                    *memory_merge_error_for_run
+                                        .lock()
+                                        .unwrap_or_else(|poison| poison.into_inner()) = memory_merge_error;
+                                    task_tools::Outcome {
+                                        execution_error: result.err(),
+                                        parent_payload: captured.parent_payload,
+                                        validation_body: captured.final_assistant_text,
+                                        progress,
+                                        progress_snapshot,
+                                        ..task_tools::Outcome::default()
+                                    }
+                                })
+                            })
+                        }
+                    };
+                    backend.run(context, events, backend_cancel).await
                 }
-            } else {
-                let run = runtime_ctx::IS_RESUME_TURN.scope(
-                    is_resume_wakeup,
-                    turn_runtime::run_turn(
-                        &mut task_app,
-                        &task_mcp,
-                        &task_skills,
-                        usize::MAX,
-                        proc_question,
-                        String::new(),
-                        next_model,
-                        None,
-                        None,
-                        false,
-                        false,
-                    ),
-                );
-                let run = turn_runtime::SUBAGENT_PARENT_AGENT_TEAM_MODE
-                    .scope(parent_agent_team_mode, run);
-                let result = if let Some(spec) = auto_model_fallback {
-                    runtime_ctx::AUTO_MODEL_FALLBACK.scope(spec, run).await
-                } else {
-                    run.await
-                }
-                .map(|_| ())
-                .map_err(|e| format!("{}", e));
-                let captured_result = if result_channel_id.is_some() {
-                    result_slot_for_payload.lock().await.clone()
-                } else {
-                    runtime_ctx::SubagentResult::default()
-                };
-                let captured_output = captured_result.parent_payload;
-                let response_for_validation = captured_result.final_assistant_text;
-                let progress = runtime_ctx::subagent_progress_snapshot(&phase_slot_for_payload)
-                    .unwrap_or_else(|| "working".to_string());
-                let memory_merge_error = private_memory_for_merge.and_then(|private_memory| {
-                    crate::ai::tools::service::memory::merge_subagent_whitelist(
-                        &private_memory,
-                        &main_memory_for_merge,
-                    )
-                    .err()
-                });
-                if memory_merge_error.is_some() {
-                    memory_merge_failed_for_inner.store(true, Ordering::Release);
-                }
-                (
-                    result,
-                    captured_output,
-                    response_for_validation,
-                    progress,
-                    memory_merge_error,
-                    None,
-                )
             };
+            // Keep the existing external failure payload and default progress;
+            // sessions are independently promoted from the captured slot.
+            let (captured_output, response_for_validation, progress) =
+                if outcome.execution_error.is_some()
+                    && execution_mode == task_tools::ExecutionMode::External
+                {
+                    (String::new(), String::new(), default_progress.to_string())
+                } else {
+                    (outcome.parent_payload, outcome.validation_body, outcome.progress)
+                };
+            let result = outcome.execution_error.map_or(Ok(()), Err);
+            let backend_session = outcome.backend_session;
+            if let Some(session) = &backend_session {
+                *backend_session_slot
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(session.clone());
+            }
+            let memory_merge_error = memory_merge_error_slot
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take();
             let (handoff, handoff_parse_error) = if result.is_ok() && memory_merge_error.is_none() {
                 match crate::ai::tools::task_tools::parse_subagent_handoff(&response_for_validation)
                 {
@@ -1885,12 +1980,13 @@ pub(super) fn dispatch_background_batch(
                 os.get_process(pid).map(|proc| &proc.state),
             );
             if publish_task_result && let Some(result_channel_id) = result_channel_id {
-                let backend_session = match (is_traecli_backend, task_id.as_deref()) {
-                    (true, Some(task_id)) => crate::ai::tools::task_tools::record_traecli_session(
+                let backend_session = match task_id.as_deref() {
+                    Some(task_id) => task_tools::backend_session::record_session(
+                        backend_id,
                         task_id,
                         backend_session,
                     ),
-                    _ => backend_session,
+                    None => backend_session,
                 };
                 let handoff_error = handoff
                     .as_ref()

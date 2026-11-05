@@ -1,4 +1,7 @@
-use crate::ai::{tools::task_tools::SubagentBackend, types::App};
+use crate::ai::{
+    tools::task_tools::{BackendId, ModelContext, backends::backend_registry},
+    types::App,
+};
 
 fn ensure_agent_team_sticky(app: &mut App) {
     // Keep the first stored spelling and drop later case variants so the sticky
@@ -21,12 +24,20 @@ fn ensure_agent_team_sticky(app: &mut App) {
 fn print_use_state(app: &App) {
     let backend = app.session_default_subagent_backend;
     println!("Session default subagent backend: {}", backend.as_str());
-    println!(
-        "TraeCLI worker model: {}",
-        crate::ai::tools::task_tools::traecli_model_for(
-            app.session_default_subagent_model.as_deref()
-        )
-    );
+    if let Some(worker_backend) = backend_registry().worker_backend_for(backend) {
+        let implementation = worker_backend.resolve();
+        if let Some(label) = implementation.descriptor().text.worker_model_label {
+            let identity = implementation.attribution(&ModelContext {
+                kernel_model: &app.current_model,
+                backend_model: app.session_default_subagent_model.as_deref(),
+                session_worker_model: None,
+                kernel_reasoning_effort: None,
+                backend_reasoning_effort: None,
+                selection_explanation: "",
+            });
+            println!("{label}: {}", identity.model);
+        }
+    }
     println!(
         "Sticky agent-team: {}",
         if app
@@ -75,38 +86,37 @@ pub(crate) fn try_handle_use_command(
     };
     let model = parts.next();
     if parts.next().is_some() {
-        println!("Too many arguments. Usage: /use [traecli [model]|kernel]");
+        println!(
+            "Too many arguments. Usage: {}",
+            backend_registry().use_usage()
+        );
         return Ok(true);
     }
 
-    let valid = match arg {
-        "traecli" => {
-            app.session_default_subagent_backend = SubagentBackend::TraeCli;
-            if let Some(model) = model {
-                app.session_default_subagent_model = Some(model.to_string());
-            }
-            ensure_agent_team_sticky(app);
-            super::session::persist_session_runtime_state(app);
-            print_use_state(app);
-            true
-        }
-        "kernel" if model.is_none() => {
-            app.session_default_subagent_backend = SubagentBackend::Kernel;
-            ensure_agent_team_sticky(app);
-            super::session::persist_session_runtime_state(app);
-            print_use_state(app);
-            true
-        }
-        "kernel" => {
-            println!("Kernel does not take a worker model. Usage: /use kernel");
-            false
-        }
-        _ => {
-            println!("Unknown backend '{arg}'. Usage: /use [traecli [model]|kernel]");
-            false
-        }
+    let Some(backend) = backend_registry().use_id(arg) else {
+        println!(
+            "Unknown backend '{arg}'. Usage: {}",
+            backend_registry().use_usage()
+        );
+        return Ok(true);
     };
-    if valid && prompt.is_some_and(|prompt| !prompt.is_empty()) {
+    let implementation = backend.resolve();
+    let descriptor = implementation.descriptor();
+    if model.is_some() && !descriptor.supports_worker_model {
+        println!(
+            "{} does not take a worker model. Usage: /use {}",
+            descriptor.text.display_name, descriptor.use_names[0]
+        );
+        return Ok(true);
+    }
+    app.session_default_subagent_backend = backend;
+    if let Some(model) = model {
+        app.session_default_subagent_model = Some(model.to_string());
+    }
+    ensure_agent_team_sticky(app);
+    super::session::persist_session_runtime_state(app);
+    print_use_state(app);
+    if prompt.is_some_and(|prompt| !prompt.is_empty()) {
         app.forced_question = prompt.map(str::to_string);
     }
     Ok(true)
@@ -140,7 +150,7 @@ pub(crate) fn try_handle_reset_command(
         return Ok(true);
     }
 
-    app.session_default_subagent_backend = SubagentBackend::Kernel;
+    app.session_default_subagent_backend = BackendId::default();
     app.session_default_subagent_model = None;
     app.session_default_skills
         .retain(|name| !name.eq_ignore_ascii_case("agent-team"));
@@ -190,7 +200,7 @@ mod tests {
             client: reqwest::Client::new(),
             current_model: String::new(),
             current_agent: "build".to_string(),
-            session_default_subagent_backend: SubagentBackend::Kernel,
+            session_default_subagent_backend: BackendId::KERNEL,
             session_default_subagent_model: None,
             session_default_skills: Vec::new(),
             current_agent_manifest: None,
@@ -231,10 +241,7 @@ mod tests {
         let mut app = test_app();
         app.current_model = "parent-model".to_string();
         assert!(try_handle_use_command(&mut app, " /use traecli GPT-5.5 ").unwrap());
-        assert_eq!(
-            app.session_default_subagent_backend,
-            SubagentBackend::TraeCli
-        );
+        assert_eq!(app.session_default_subagent_backend, BackendId::TRAECLI);
         assert_eq!(
             app.session_default_subagent_model.as_deref(),
             Some("GPT-5.5")
@@ -251,10 +258,7 @@ mod tests {
             skill_names: vec!["agent-team".to_string()],
         });
         assert!(try_handle_use_command(&mut app, ":use kernel").unwrap());
-        assert_eq!(
-            app.session_default_subagent_backend,
-            SubagentBackend::Kernel
-        );
+        assert_eq!(app.session_default_subagent_backend, BackendId::KERNEL);
         assert_eq!(app.session_default_skills, ["agent-team"]);
         assert_eq!(
             app.pending_skill_continuation.as_ref().unwrap().skill_names,
@@ -271,10 +275,7 @@ mod tests {
     fn use_kernel_adds_agent_team_to_empty_sticky_skills() {
         let mut app = test_app();
         assert!(try_handle_use_command(&mut app, "/use kernel").unwrap());
-        assert_eq!(
-            app.session_default_subagent_backend,
-            SubagentBackend::Kernel
-        );
+        assert_eq!(app.session_default_subagent_backend, BackendId::KERNEL);
         assert_eq!(app.session_default_skills, ["agent-team"]);
         assert!(app.session_default_subagent_model.is_none());
         assert!(app.pending_skill_continuation.is_none());
@@ -320,7 +321,7 @@ mod tests {
         app.session_id = "reset-command".to_string();
         app.session_history_file =
             SessionStore::new(&history_file).session_history_file(&app.session_id);
-        app.session_default_subagent_backend = SubagentBackend::TraeCli;
+        app.session_default_subagent_backend = BackendId::TRAECLI;
         app.session_default_subagent_model = Some("saved-worker-model".to_string());
         app.session_default_skills = vec![
             "first-skill".to_string(),
@@ -353,10 +354,7 @@ mod tests {
 
         assert!(super::super::try_handle_local_command(&mut app, "/reset").unwrap());
 
-        assert_eq!(
-            app.session_default_subagent_backend,
-            SubagentBackend::Kernel
-        );
+        assert_eq!(app.session_default_subagent_backend, BackendId::KERNEL);
         assert!(app.session_default_subagent_model.is_none());
         assert_eq!(app.session_default_skills, ["first-skill", "last-skill"]);
         assert_eq!(
@@ -404,7 +402,7 @@ mod tests {
         app.session_id = "reset-task-tools".to_string();
         app.session_history_file =
             SessionStore::new(&history_file).session_history_file(&app.session_id);
-        app.session_default_subagent_backend = SubagentBackend::TraeCli;
+        app.session_default_subagent_backend = BackendId::TRAECLI;
         app.session_default_skills = vec!["agent-team".to_string()];
         // The reset clears every Builtin-tagged member of the `task` and
         // `agent_team` groups, so derive the `agent_team` members from the same
@@ -466,17 +464,14 @@ mod tests {
     fn reset_command_clears_agent_team_only_continuation_and_accepts_both_prefixes() {
         for command in ["/reset", " \r\n :reset \t\r\n "] {
             let mut app = test_app();
-            app.session_default_subagent_backend = SubagentBackend::TraeCli;
+            app.session_default_subagent_backend = BackendId::TRAECLI;
             app.session_default_subagent_model = Some("saved-worker-model".to_string());
             app.session_default_skills = vec!["AGENT-TEAM".to_string()];
             app.pending_skill_continuation = Some(crate::ai::types::PendingSkillContinuation {
                 skill_names: vec!["Agent-Team".to_string()],
             });
             assert!(try_handle_reset_command(&mut app, command).unwrap());
-            assert_eq!(
-                app.session_default_subagent_backend,
-                SubagentBackend::Kernel
-            );
+            assert_eq!(app.session_default_subagent_backend, BackendId::KERNEL);
             assert!(app.session_default_subagent_model.is_none());
             assert!(app.session_default_skills.is_empty());
             assert!(app.pending_skill_continuation.is_none());
@@ -486,7 +481,7 @@ mod tests {
     #[test]
     fn reset_command_rejects_arguments_and_trailing_prompt_without_changing_state() {
         let mut app = test_app();
-        app.session_default_subagent_backend = SubagentBackend::TraeCli;
+        app.session_default_subagent_backend = BackendId::TRAECLI;
         app.session_default_subagent_model = Some("saved-worker-model".to_string());
         app.session_default_skills = vec!["AGENT-TEAM".to_string(), "other-skill".to_string()];
         app.pending_skill_continuation = Some(crate::ai::types::PendingSkillContinuation {
@@ -508,10 +503,7 @@ mod tests {
                 Some(Err("Usage: /reset (no arguments or trailing prompt)"))
             );
             assert!(try_handle_reset_command(&mut app, input).unwrap());
-            assert_eq!(
-                app.session_default_subagent_backend,
-                SubagentBackend::TraeCli
-            );
+            assert_eq!(app.session_default_subagent_backend, BackendId::TRAECLI);
             assert_eq!(
                 app.session_default_subagent_model.as_deref(),
                 Some("saved-worker-model")
@@ -569,10 +561,7 @@ mod tests {
             "/use traecli M extra\n任务",
         ] {
             assert!(try_handle_use_command(&mut app, input).unwrap());
-            assert_eq!(
-                app.session_default_subagent_backend,
-                SubagentBackend::Kernel
-            );
+            assert_eq!(app.session_default_subagent_backend, BackendId::KERNEL);
             assert!(app.session_default_subagent_model.is_none());
             assert!(app.session_default_skills.is_empty());
             assert!(app.forced_question.is_none());
@@ -589,10 +578,7 @@ mod tests {
         assert!(app.session_default_subagent_model.is_none());
         assert_eq!(app.session_default_skills, ["agent-team"]);
         assert!(try_handle_use_command(&mut app, ":use").unwrap());
-        assert_eq!(
-            app.session_default_subagent_backend,
-            SubagentBackend::TraeCli
-        );
+        assert_eq!(app.session_default_subagent_backend, BackendId::TRAECLI);
         assert_eq!(app.session_default_skills, ["agent-team"]);
     }
 
@@ -609,10 +595,7 @@ mod tests {
             try_handle_use_command(&mut app, "/use traecli GPT-6.1-Sol\n帮我做一个xxx任务")
                 .unwrap()
         );
-        assert_eq!(
-            app.session_default_subagent_backend,
-            SubagentBackend::TraeCli
-        );
+        assert_eq!(app.session_default_subagent_backend, BackendId::TRAECLI);
         assert_eq!(
             app.session_default_subagent_model.as_deref(),
             Some("GPT-6.1-Sol")
@@ -639,15 +622,12 @@ mod tests {
     #[test]
     fn use_command_bare_and_kernel_forms_start_trailing_prompt() {
         let mut app = test_app();
-        app.session_default_subagent_backend = SubagentBackend::TraeCli;
+        app.session_default_subagent_backend = BackendId::TRAECLI;
         app.session_default_subagent_model = Some("saved-model".to_string());
         app.session_default_skills = vec!["agent-team".to_string()];
 
         assert!(try_handle_use_command(&mut app, "/use\n任务").unwrap());
-        assert_eq!(
-            app.session_default_subagent_backend,
-            SubagentBackend::TraeCli
-        );
+        assert_eq!(app.session_default_subagent_backend, BackendId::TRAECLI);
         assert_eq!(
             app.session_default_subagent_model.as_deref(),
             Some("saved-model")
@@ -660,10 +640,7 @@ mod tests {
             skill_names: vec!["agent-team".to_string()],
         });
         assert!(try_handle_use_command(&mut app, "/use kernel\n任务").unwrap());
-        assert_eq!(
-            app.session_default_subagent_backend,
-            SubagentBackend::Kernel
-        );
+        assert_eq!(app.session_default_subagent_backend, BackendId::KERNEL);
         assert_eq!(
             app.session_default_subagent_model.as_deref(),
             Some("saved-model")
@@ -692,7 +669,7 @@ mod tests {
     #[test]
     fn use_command_runtime_snapshots_preserve_settings_and_children_skip_team() {
         let mut app = test_app();
-        app.session_default_subagent_backend = SubagentBackend::TraeCli;
+        app.session_default_subagent_backend = BackendId::TRAECLI;
         app.session_default_subagent_model = Some("GPT-6.1-Sol".to_string());
         app.session_default_skills = vec!["agent-team".to_string(), "other-skill".to_string()];
         for snapshot in [
@@ -701,7 +678,7 @@ mod tests {
         ] {
             assert_eq!(
                 snapshot.session_default_subagent_backend,
-                SubagentBackend::TraeCli
+                BackendId::TRAECLI
             );
             assert_eq!(
                 snapshot.session_default_subagent_model,
@@ -710,10 +687,7 @@ mod tests {
             assert_eq!(snapshot.session_default_skills, app.session_default_skills);
         }
         let child = app.fork_for_subagent();
-        assert_eq!(
-            child.session_default_subagent_backend,
-            SubagentBackend::TraeCli
-        );
+        assert_eq!(child.session_default_subagent_backend, BackendId::TRAECLI);
         assert_eq!(
             child.session_default_subagent_model,
             app.session_default_subagent_model

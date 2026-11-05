@@ -742,7 +742,7 @@ pub(super) fn write_terminal_subagent_result(
     // state alone does not stop the Future inside the hosting process. Only then terminate the
     // kernel process and publish the terminal result.
     let _ = os.kill_process(pid, format!("{}: {}", status, error));
-    let backend_session = record_traecli_session(task_id, None);
+    let backend_session = backend_session::record_session(task_backend_id(task_id), task_id, None);
     // Then write the terminal result as the subagent and release the producer side (the result
     // channel's producer ownership check requires current == pid). Although the process is already
     // terminated, the channel/futex resources are not reclaimed yet (that happens in
@@ -844,15 +844,16 @@ pub(super) fn format_task_result(
         result.status.to_uppercase(),
         duration_secs
     )];
-    let selection_explanation = if entry.backend.is_some_and(SubagentBackend::is_traecli) {
+    let backend = task_backend(entry.backend);
+    let selection_explanation = if let Some(template) = backend.descriptor().text.model_reason {
         let agent_reason = entry
             .selection_explanation
             .split_once('\n')
             .map(|(agent_reason, _)| agent_reason)
             .unwrap_or(&entry.selection_explanation);
         format!(
-            "{agent_reason}\nmodel_reason=backend model '{}'",
-            entry.model
+            "{agent_reason}\n{}",
+            template.replace("{model}", &entry.model)
         )
     } else {
         entry.selection_explanation.clone()
@@ -880,7 +881,7 @@ pub(super) fn format_task_result(
     if let Some(session) = result.backend_session
         && !session.trim().is_empty()
     {
-        parts.push(backend_session_footer(&session));
+        parts.push(backend_session_footer_for(backend.as_ref(), &session));
     }
     if task_blocked {
         parts.push(SUBAGENT_BLOCKED_PARENT_GUIDANCE.to_string());

@@ -4380,8 +4380,9 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
     };
 
     println!("Connected to {base}, session {session_id}.");
+    let use_usage = crate::ai::tools::task_tools::backends::backend_registry().use_usage();
     println!(
-        "Enter inserts a newline, Esc or Alt+Enter submits; Ctrl+C interrupts the running remote turn (a second Ctrl+C exits); /quit exits, /bg backgrounds the current session and exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions (/sessions current|id shows the current one), /fork branches the current session, /close deletes it and exits. /cd switches the remote working directory (Tab completes remote paths; /pwd prints it). /model, /effort, /agent switch the remote turn like the local REPL. /use [traecli [model]|kernel] shows or switches the remote session's default subagent backend; /reset restores kernel subagent defaults and clears sticky agent-team. /task and /discuss run multi-worker rooms on the server (/task help, /discuss help)."
+        "Enter inserts a newline, Esc or Alt+Enter submits; Ctrl+C interrupts the running remote turn (a second Ctrl+C exits); /quit exits, /bg backgrounds the current session and exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions (/sessions current|id shows the current one), /fork branches the current session, /close deletes it and exits. /cd switches the remote working directory (Tab completes remote paths; /pwd prints it). /model, /effort, /agent switch the remote turn like the local REPL. {use_usage} shows or switches the remote session's default subagent backend; /reset restores kernel subagent defaults and clears sticky agent-team. /task and /discuss run multi-worker rooms on the server (/task help, /discuss help)."
     );
     let mut editor = PromptEditor::new(&session_id, &app_config.history_file);
     // Command words the shared completion table does not carry: serve-chat-only
@@ -4484,7 +4485,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
             "/quit" | "/exit" | ":q" => break,
             "/help" | "/h" => {
                 println!(
-                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first, archived hidden); /sessions all - include archived; /sessions archive - list archived; /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|u<N>|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/export [path] - export the latest server-side assistant conclusion to a markdown file on the server (relative to the remote cwd; default: _summary.md)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/use [traecli [model]|kernel] - show or switch the remote session's default subagent backend (also :use); a task on a new line runs immediately\n/reset - restore kernel subagent defaults and clear sticky agent-team\n/audit [-f|--fast] [instruction] - run the audit subagent on the server, then verify and fix findings\n/task [N] <goal> - run a multi-worker task room on the server (/task status [room] shows progress; /task help for details)\n/discuss [N] <topic> - run a multi-member discussion on the server (/discuss status [room] shows progress; /discuss help for details)\n/distill-session [session-id|archive.zip] [--dry-run] [--limit N] - distill a session into knowledge on the server (paths resolve on the server)\n/title [text] - set or show the current server-side session title (bare /title shows it)\n/mark [<id>|current|last] [message] - mark a server-side session as important (default: current; leading `--` makes the rest a literal message for current)\n/unmark [<id>|current|last|--] - remove a server-side important mark (default: current; `--` forces current)\n/archive [<id>|current|last] - toggle the server-side formal archive flag (default: current)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
+                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first, archived hidden); /sessions all - include archived; /sessions archive - list archived; /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|u<N>|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/export [path] - export the latest server-side assistant conclusion to a markdown file on the server (relative to the remote cwd; default: _summary.md)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n{use_usage} - show or switch the remote session's default subagent backend (also :use); a task on a new line runs immediately\n/reset - restore kernel subagent defaults and clear sticky agent-team\n/audit [-f|--fast] [instruction] - run the audit subagent on the server, then verify and fix findings\n/task [N] <goal> - run a multi-worker task room on the server (/task status [room] shows progress; /task help for details)\n/discuss [N] <topic> - run a multi-member discussion on the server (/discuss status [room] shows progress; /discuss help for details)\n/distill-session [session-id|archive.zip] [--dry-run] [--limit N] - distill a session into knowledge on the server (paths resolve on the server)\n/title [text] - set or show the current server-side session title (bare /title shows it)\n/mark [<id>|current|last] [message] - mark a server-side session as important (default: current; leading `--` makes the rest a literal message for current)\n/unmark [<id>|current|last|--] - remove a server-side important mark (default: current; `--` forces current)\n/archive [<id>|current|last] - toggle the server-side formal archive flag (default: current)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
                 );
                 continue;
             }
@@ -4544,10 +4545,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                             if let Some(item) = items.iter().find(|s| s.id == session_id) {
                                 println!("title: {}", remote_session_title(item));
                                 println!("marked: {}", if item.marked { "yes" } else { "no" });
-                                println!(
-                                    "archived: {}",
-                                    if item.archived { "yes" } else { "no" }
-                                );
+                                println!("archived: {}", if item.archived { "yes" } else { "no" });
                             }
                         }
                         Err(err) => eprintln!("[serve-chat] {err}"),
@@ -5029,8 +5027,16 @@ mod tests {
             !out.contains("final answer was revised"),
             "retry header caused a spurious rewrite: {out}"
         );
-        assert_eq!(out.matches("part1").count(), 1, "duplicated first half: {out}");
-        assert_eq!(out.matches("part2").count(), 1, "duplicated second half: {out}");
+        assert_eq!(
+            out.matches("part1").count(),
+            1,
+            "duplicated first half: {out}"
+        );
+        assert_eq!(
+            out.matches("part2").count(),
+            1,
+            "duplicated second half: {out}"
+        );
     }
 
     #[test]

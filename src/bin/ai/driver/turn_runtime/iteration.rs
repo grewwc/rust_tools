@@ -1226,19 +1226,6 @@ async fn send_llm_request(
     }
 }
 
-fn format_context_budget_change(before_chars: usize, after_chars: usize) -> String {
-    if after_chars < before_chars {
-        return format!("compressed {before_chars} -> {after_chars} chars");
-    }
-    if after_chars > before_chars {
-        return format!(
-            "projection refreshed: {before_chars} -> {after_chars} chars (+{} chars)",
-            after_chars - before_chars
-        );
-    }
-    format!("projection refreshed: {before_chars} chars")
-}
-
 /// Measure only after runtime notes, tool visibility and fixed plan overhead are
 /// present. Character targets guide mechanical work; they never establish fit.
 async fn apply_request_budget(
@@ -1282,11 +1269,6 @@ async fn apply_request_budget(
     );
     if let Some(reason) = report.rollback_reason {
         crate::ai::driver::print::print_tool_note_line("context-budget", reason.note());
-    } else if report.changed {
-        crate::ai::driver::print::print_tool_note_line(
-            "context-budget",
-            &format_context_budget_change(report.before_chars, report.after_chars),
-        );
     }
 
     // The summary gate opens only when the measured prompt nears the input
@@ -2406,22 +2388,6 @@ mod tests {
         assert!(note.contains("remaining work, blockers, and suggested next steps"));
         assert!(note.contains("Do not dress up an unfinished task as completed"));
         assert!(note.contains("does not authorize fabrication"));
-    }
-
-    #[test]
-    fn context_budget_change_note_distinguishes_growth_from_compression() {
-        assert_eq!(
-            super::format_context_budget_change(76_505, 70_000),
-            "compressed 76505 -> 70000 chars"
-        );
-        assert_eq!(
-            super::format_context_budget_change(76_505, 78_288),
-            "projection refreshed: 76505 -> 78288 chars (+1783 chars)"
-        );
-        assert_eq!(
-            super::format_context_budget_change(76_505, 76_505),
-            "projection refreshed: 76505 chars"
-        );
     }
 
     #[test]

@@ -28,7 +28,7 @@ pub(super) fn current_task_progress(task_id: &str) -> Option<String> {
 
 pub(super) fn pending_task_side_note_progress(task_id: &str) -> Option<String> {
     let deferred = with_task_entry(task_id, |entry| {
-        entry.backend.is_some_and(SubagentBackend::is_traecli)
+        task_backend(entry.backend).descriptor().side_notes == SideNoteMode::DeferredContinuation
     })?;
     if !deferred {
         return None;

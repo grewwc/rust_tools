@@ -50,31 +50,34 @@ pub(crate) fn execute_send_side_note(args: &Value) -> Result<String, String> {
         .unwrap_or(foreground_history),
         None => foreground_history,
     };
-    let queued_for_continuation = target.as_deref().is_some_and(|target_id| {
+    let queued_backend = target.as_deref().and_then(|target_id| {
         crate::ai::tools::task_tools::with_task_entry(target_id, |entry| {
-            entry
-                .backend
-                .is_some_and(crate::ai::tools::task_tools::SubagentBackend::is_traecli)
+            let backend = crate::ai::tools::task_tools::task_backend(entry.backend);
+            let descriptor = backend.descriptor();
+            (descriptor.side_notes
+                == crate::ai::tools::task_tools::SideNoteMode::DeferredContinuation)
+                .then_some(descriptor.id)
         })
-        .unwrap_or(false)
+        .flatten()
     });
 
     side_note::push_side_note(&history_file, &note, "lead", target.as_deref())
         .map_err(|e| e.to_string())?;
 
     let chars = note.chars().count();
-    Ok(match target.as_deref() {
-        Some(target_id) if queued_for_continuation => format!(
-            "Queued side-note for traecli task `{target_id}` ({chars} chars); it will be prepended \
+    Ok(match (target.as_deref(), queued_backend) {
+        (Some(target_id), Some(backend)) => format!(
+            "Queued side-note for {} task `{target_id}` ({chars} chars); it will be prepended \
              to the next `task`/`task_spawn` prompt that resumes this session via \
              `backend_continue_from`. It does not interrupt the current run; queued notes are \
-             retained after completion or cancellation until continuation."
+             retained after completion or cancellation until continuation.",
+            backend.as_str()
         ),
-        Some(target_id) => format!(
+        (Some(target_id), None) => format!(
             "Queued side-note for task `{target_id}` ({chars} chars); it is injected into that \
              subagent's next model iteration, and is dropped if the task finishes first."
         ),
-        None => format!(
+        (None, _) => format!(
             "Injected side-note into foreground ({chars} chars), visible in the next model iteration."
         ),
     })

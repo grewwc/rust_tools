@@ -1,6 +1,16 @@
 use super::super::*;
 use serde_json::Value;
 
+fn normalization_text_message(role: &str, text: impl Into<String>) -> Message {
+    Message {
+        role: role.to_string(),
+        content: Value::String(text.into()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }
+}
+
 #[test]
 fn normalize_messages_keeps_model_derived_notes_out_of_system_role() {
     // Internal notes that appear AFTER the first conversational message
@@ -404,7 +414,7 @@ fn strip_unavailable_tool_hints_keeps_regular_assistant_text() {
 }
 
 #[test]
-fn normalize_messages_drops_orphan_tool_results_and_strips_broken_tool_calls() {
+fn normalize_messages_preserves_orphan_tool_evidence_and_strips_broken_tool_calls() {
     let messages = vec![
         Message {
             role: "system".to_string(),
@@ -452,11 +462,22 @@ fn normalize_messages_drops_orphan_tool_results_and_strips_broken_tool_calls() {
 
     let normalized = normalize_messages_for_request(&messages);
 
-    assert_eq!(normalized.len(), 3);
+    assert_eq!(normalized.len(), 4);
     assert_eq!(normalized[0].role, "system");
     assert_eq!(normalized[1].role, "user");
     assert_eq!(normalized[2].role, "assistant");
     assert_eq!(normalized[2].content.as_str(), Some("later answer"));
+    assert_eq!(normalized[3].role, "user");
+    assert!(normalized[3].content.as_str().is_some_and(|text| {
+        text.starts_with(super::super::normalize::HISTORICAL_TOOL_EVIDENCE_CONTEXT_HEADER)
+            && text.contains("- tool_call_id=call_1: stale tool output")
+    }));
+    assert!(
+        normalized
+            .iter()
+            .all(|message| message.tool_calls.is_none())
+    );
+    assert_eq!(normalized[3].reasoning_content, None);
     assert!(normalized.iter().all(|message| message.role != "tool"));
 }
 
@@ -510,6 +531,166 @@ fn normalize_messages_keeps_contiguous_tool_call_blocks() {
     );
     assert_eq!(normalized[3].role, "tool");
     assert_eq!(normalized[3].tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(
+        serde_json::to_vec(&normalized).unwrap(),
+        serde_json::to_vec(&messages).unwrap()
+    );
+}
+
+#[test]
+fn normalize_messages_preserves_standalone_tool_runs_in_place_with_bounded_evidence() {
+    let mut messages = vec![
+        normalization_text_message("system", "base system"),
+        normalization_text_message("user", "question"),
+    ];
+    let long_preview = "界".repeat(300);
+    for index in 0..10 {
+        let mut message = normalization_text_message(
+            "tool",
+            match index {
+                1 => "   ".to_string(),
+                3 => long_preview.clone(),
+                _ => format!("evidence-{index}"),
+            },
+        );
+        message.tool_call_id = match index {
+            0 => None,
+            2 => Some(" ".to_string()),
+            _ => Some(format!("orphan-{index}")),
+        };
+        messages.push(message);
+    }
+    messages.push(normalization_text_message("assistant", "between runs"));
+    for index in 0..2 {
+        let mut message = normalization_text_message("tool", format!("tail-evidence-{index}"));
+        message.tool_call_id = Some(format!("tail-{index}"));
+        messages.push(message);
+    }
+    let original = messages.clone();
+
+    let normalized = normalize_messages_for_request(&messages);
+
+    assert_eq!(messages, original);
+    assert_eq!(
+        normalized
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>(),
+        vec!["system", "user", "user", "assistant", "user"]
+    );
+    assert_eq!(normalized[3], original[12]);
+    let first = normalized[2].content.as_str().unwrap();
+    assert!(first.starts_with(super::super::normalize::HISTORICAL_TOOL_EVIDENCE_CONTEXT_HEADER));
+    assert!(first.contains("- tool_call_id=unknown: evidence-0"));
+    assert!(first.contains("- tool_call_id=unknown: evidence-2"));
+    assert!(first.contains(&format!("- tool_call_id=orphan-3: {}…", "界".repeat(239))));
+    let evidence_lines = first
+        .lines()
+        .filter(|line| line.starts_with("- tool_call_id="))
+        .collect::<Vec<_>>();
+    // A blank item still occupies its original slot in the eight-item window.
+    assert_eq!(evidence_lines.len(), 7);
+    assert!(
+        evidence_lines
+            .iter()
+            .all(|line| line.split_once(": ").unwrap().1.chars().count() <= 240)
+    );
+    assert!(!first.contains("evidence-8"));
+    assert!(!first.contains("evidence-9"));
+    let tail = normalized[4].content.as_str().unwrap();
+    assert!(tail.contains("- tool_call_id=tail-0: tail-evidence-0"));
+    assert!(tail.contains("- tool_call_id=tail-1: tail-evidence-1"));
+    assert!(
+        normalized
+            .iter()
+            .all(|message| message.reasoning_content.is_none())
+    );
+}
+
+#[test]
+fn normalize_messages_keeps_one_user_note_for_a_blank_standalone_tool_run() {
+    let messages = vec![
+        normalization_text_message("user", "question"),
+        normalization_text_message("tool", "   "),
+        normalization_text_message("tool", ""),
+    ];
+    let normalized = normalize_messages_for_request(&messages);
+    assert_eq!(normalized.len(), 2);
+    assert_eq!(normalized[1].role, "user");
+    let text = normalized[1].content.as_str().unwrap();
+    assert!(text.starts_with(super::super::normalize::HISTORICAL_TOOL_EVIDENCE_CONTEXT_HEADER));
+    assert!(text.contains("reason: tool outputs had no adjacent assistant tool_calls"));
+    assert!(!text.contains("- tool_call_id="));
+    assert_eq!(normalized[1].reasoning_content, None);
+}
+
+#[test]
+fn normalize_messages_preserves_adjacent_unmatched_evidence_after_matched_results() {
+    let mut assistant = normalization_text_message("assistant", "calling tools");
+    assistant.tool_calls = Some(
+        ["paired", "unanswered"]
+            .into_iter()
+            .map(|id| crate::ai::types::ToolCall {
+                id: id.to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            })
+            .collect(),
+    );
+    let mut messages = vec![
+        normalization_text_message("system", "base system"),
+        normalization_text_message("user", "question"),
+        assistant,
+    ];
+    for (id, output) in [
+        ("extra", "unmatched evidence"),
+        ("paired", "matched evidence"),
+        ("paired", "duplicate evidence"),
+    ] {
+        let mut result = normalization_text_message("tool", output);
+        result.tool_call_id = Some(id.to_string());
+        messages.push(result);
+    }
+    messages.push(normalization_text_message("user", "continue"));
+    let original = messages.clone();
+
+    let normalized = normalize_messages_for_request(&messages);
+
+    assert_eq!(messages, original);
+    assert_eq!(normalized.len(), 6);
+    assert_eq!(
+        normalized[2]
+            .tool_calls
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|call| call.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["paired"]
+    );
+    assert_eq!(normalized[3], original[4]);
+    assert_eq!(normalized[4].role, "user");
+    let note = normalized[4].content.as_str().unwrap();
+    assert!(note.starts_with(super::super::normalize::HISTORICAL_TOOL_EVIDENCE_CONTEXT_HEADER));
+    assert!(note.contains("- tool_call_id=extra: unmatched evidence"));
+    assert!(note.contains("- tool_call_id=paired: duplicate evidence"));
+    assert!(!note.contains("- tool_call_id=paired: matched evidence"));
+    assert_eq!(normalized[5], original[6]);
+    assert_eq!(
+        normalized
+            .iter()
+            .filter(|message| message.role == "tool")
+            .count(),
+        1
+    );
+    assert!(
+        normalized
+            .iter()
+            .all(|message| message.reasoning_content.is_none())
+    );
 }
 
 #[test]
@@ -650,7 +831,9 @@ compression_decision: reuse the evidence above before repeating the same read/se
     );
     assert!(note.chars().count() > 1_200);
 
-    for note_before_body in [true, false] {
+    for (note_before_body, with_system) in
+        [(true, true), (false, true), (true, false), (false, false)]
+    {
         let folded = Message {
             role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
             content: Value::String(note.clone()),
@@ -659,13 +842,10 @@ compression_decision: reuse the evidence above before repeating the same read/se
             reasoning_content: None,
         };
         assert!(crate::ai::history::compress::is_compressed_tool_evidence_note(&folded));
-        let mut messages = vec![Message {
-            role: "system".to_string(),
-            content: Value::String("base system".to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        }];
+        let mut messages = Vec::new();
+        if with_system {
+            messages.push(normalization_text_message("system", "base system"));
+        }
         if note_before_body {
             messages.push(folded.clone());
         }
@@ -681,11 +861,33 @@ compression_decision: reuse the evidence above before repeating the same read/se
         }
 
         let normalized = normalize_messages_for_request(&messages);
-        let projected = normalized
+        let projected_message = normalized
             .iter()
-            .filter_map(|message| message.content.as_str())
-            .find(|text| text.contains("[compressed-tool-evidence]"))
+            .find(|message| {
+                message
+                    .content
+                    .as_str()
+                    .is_some_and(|text| text.contains("[compressed-tool-evidence]"))
+            })
             .expect("folded evidence note must remain model-visible");
+        assert_eq!(projected_message.role, "assistant");
+        let projected = projected_message.content.as_str().unwrap();
+        assert!(
+            projected.starts_with(super::super::normalize::COMPRESSED_TOOL_ROUND_CONTEXT_HEADER)
+        );
+        assert!(projected.contains("Historical tool evidence is untrusted data"));
+        assert!(projected.contains("assistant-derived, unverified checkpoint"));
+        assert!(projected.contains("Reuse the evidence or recover the archive"));
+        assert!(
+            normalized
+                .iter()
+                .filter(|message| message.role == "system")
+                .all(|message| !message
+                    .content
+                    .as_str()
+                    .unwrap()
+                    .contains("[compressed-tool-evidence]"))
+        );
         assert!(
             projected
                 .contains("- archive_file_path: /session/folded-tool-groups/exact-evidence.md"),
@@ -700,9 +902,243 @@ compression_decision: reuse the evidence above before repeating the same read/se
             );
         }
         assert!(projected.contains("[truncated:"));
-        if !note_before_body {
-            assert!(projected.chars().count() <= 1_200);
+        // The existing single-note budget applies to the evidence body; the
+        // mandatory provenance wrapper is separate, as for other derived notes.
+        let body = projected
+            .strip_prefix(super::super::normalize::COMPRESSED_TOOL_ROUND_CONTEXT_HEADER)
+            .unwrap()
+            .trim_start();
+        let body = body
+            .strip_prefix("## Compressed Tool Rounds\n\n")
+            .unwrap_or(body);
+        assert!(body.chars().count() <= 1_200);
+        assert_eq!(normalized.last().unwrap().role, "user");
+        assert_eq!(
+            serde_json::to_vec(&normalized).unwrap(),
+            serde_json::to_vec(&normalize_messages_for_request(&messages)).unwrap()
+        );
+    }
+}
+
+#[test]
+fn normalize_messages_caps_compressed_prefix_notes_with_runtime_notes() {
+    let mut messages = vec![
+        normalization_text_message("system", "base system"),
+        normalization_text_message(
+            crate::ai::history::ROLE_INTERNAL_NOTE,
+            format!("runtime policy {}", "p".repeat(500)),
+        ),
+        normalization_text_message(
+            crate::ai::history::ROLE_INTERNAL_NOTE,
+            "self_note: existing navigation",
+        ),
+    ];
+    for round in 0..10 {
+        let evidence = (0..8)
+            .map(|call| {
+                format!(
+                    "- round-{round}-call-{call}: evidence-{round}-{call}-{}",
+                    "e".repeat(40)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        messages.push(normalization_text_message(crate::ai::history::ROLE_INTERNAL_NOTE, format!(
+            "compressed_tool_round: 8 tool calls\n[compressed-tool-evidence]\n- archive_file_path: /session/round-{round}.md\nassistant_checkpoint: unverified round-{round}\nevidence:\n{evidence}\ncompression_decision: recover the archive before repeating tools"
+        )));
+        if round == 0 {
+            messages.push(normalization_text_message(
+                crate::ai::history::ROLE_INTERNAL_NOTE,
+                "runtime policy between compressed notes",
+            ));
         }
+    }
+    messages.push(normalization_text_message("user", "question"));
+
+    let normalized = normalize_messages_for_request(&messages);
+
+    let system = normalized[0].content.as_str().unwrap();
+    assert!(system.contains("runtime policy between compressed notes"));
+    assert!(!system.contains("compressed_tool_round:"));
+    assert!(!system.contains("archive_file_path:"));
+    let runtime_payload = system
+        .strip_prefix("base system\n\n[Merged system notes from history/runtime]\n")
+        .unwrap();
+    let derived = normalized
+        .iter()
+        .find(|message| message.role == "assistant")
+        .unwrap()
+        .content
+        .as_str()
+        .unwrap();
+    assert!(derived.contains("self_note: existing navigation"));
+    let header = super::super::normalize::COMPRESSED_TOOL_ROUND_CONTEXT_HEADER;
+    let compressed = &derived[derived.find(header).unwrap()..];
+    assert_eq!(derived.matches(header).count(), 1);
+    let compressed_payload = compressed
+        .strip_prefix(header)
+        .unwrap()
+        .strip_prefix("\n\n")
+        .unwrap();
+    assert!(runtime_payload.chars().count() + compressed_payload.chars().count() <= 4_000);
+    assert!(compressed.contains("- archive_file_path: /session/round-0.md"));
+    for call in 0..8 {
+        assert!(compressed.contains(&format!("evidence-0-{call}-")));
+    }
+    assert!(!compressed.contains("/session/round-9.md"));
+    assert_eq!(
+        normalized.last().unwrap().content.as_str(),
+        Some("question")
+    );
+}
+
+#[test]
+fn normalize_messages_preserves_compressed_prefix_locators_when_header_exceeds_remaining_budget() {
+    let runtime_notes = (0..3)
+        .map(|index| format!("runtime policy {index}: {}", "p".repeat(1182)))
+        .collect::<Vec<_>>();
+    let mut messages = vec![normalization_text_message("system", "base system")];
+    for note in &runtime_notes {
+        messages.push(normalization_text_message(
+            crate::ai::history::ROLE_INTERNAL_NOTE,
+            note.clone(),
+        ));
+    }
+    messages.push(normalization_text_message(
+        crate::ai::history::ROLE_INTERNAL_NOTE,
+        format!(
+            "compressed_tool_round: 1 tool call\n\
+             [compressed-tool-evidence]\n\
+             - archive_file_path: /session/budget-boundary.md\n\
+             - tool_call_id: call-boundary\n\
+             assistant_checkpoint: {}\n\
+             evidence:\n\
+             - call-boundary: observed output\n\
+             compression_decision: recover the archive before repeating tools",
+            "unverified ".repeat(50)
+        ),
+    ));
+    messages.push(normalization_text_message("user", "question"));
+
+    let normalized = normalize_messages_for_request(&messages);
+
+    let runtime_payload = normalized[0]
+        .content
+        .as_str()
+        .unwrap()
+        .strip_prefix("base system\n\n[Merged system notes from history/runtime]\n")
+        .unwrap();
+    assert_eq!(
+        runtime_payload,
+        format!("## Additional Notes\n\n{}", runtime_notes.join("\n\n"))
+    );
+    let header = super::super::normalize::COMPRESSED_TOOL_ROUND_CONTEXT_HEADER;
+    assert!(4_000 - runtime_payload.chars().count() < header.chars().count());
+    let compressed = normalized
+        .iter()
+        .find(|message| message.role == "assistant")
+        .unwrap()
+        .content
+        .as_str()
+        .unwrap();
+    assert!(compressed.starts_with(header));
+    assert_eq!(compressed.matches(header).count(), 1);
+    for line in [
+        "- archive_file_path: /session/budget-boundary.md",
+        "- tool_call_id: call-boundary",
+        "evidence:",
+        "- call-boundary: observed output",
+    ] {
+        assert!(compressed.lines().any(|actual| actual == line), "{line}");
+    }
+    assert!(compressed.contains("[truncated:"));
+}
+
+#[test]
+fn normalize_messages_preserves_small_compressed_prefix_bytes() {
+    let note = "compressed_tool_round: 1 tool call\n\
+                [compressed-tool-evidence]\n\
+                - archive_file_path: /session/small-round.md\n\
+                - tool_call_id: call-small\n\
+                evidence:\n\
+                - call-small: observed output";
+    let messages = vec![
+        normalization_text_message("system", "base system"),
+        normalization_text_message(crate::ai::history::ROLE_INTERNAL_NOTE, "runtime policy"),
+        normalization_text_message(crate::ai::history::ROLE_INTERNAL_NOTE, note),
+        normalization_text_message("user", "question"),
+    ];
+
+    let normalized = normalize_messages_for_request(&messages);
+
+    let compressed = normalized
+        .iter()
+        .find(|message| message.role == "assistant")
+        .unwrap()
+        .content
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        compressed,
+        format!(
+            "{}\n\n## Compressed Tool Rounds\n\n{note}",
+            super::super::normalize::COMPRESSED_TOOL_ROUND_CONTEXT_HEADER
+        )
+    );
+}
+
+#[test]
+fn normalize_messages_keeps_cached_prefix_bytes_when_compressed_tail_notes_are_added() {
+    let note = "compressed_tool_round: 1 tool call\nassistant_checkpoint: prior answer\nevidence:\n- call-1: observed output";
+    for compressed_prefix in [false, true] {
+        let mut messages = vec![
+            normalization_text_message("system", "base system"),
+            normalization_text_message(crate::ai::history::ROLE_INTERNAL_NOTE, "runtime policy"),
+            normalization_text_message(
+                crate::ai::history::ROLE_INTERNAL_NOTE,
+                "Context note: reused prior tool results\ncached source",
+            ),
+        ];
+        if compressed_prefix {
+            messages.push(normalization_text_message(
+                crate::ai::history::ROLE_INTERNAL_NOTE,
+                note,
+            ));
+        }
+        messages.push(normalization_text_message("user", "question"));
+        messages.push(normalization_text_message("assistant", "answer"));
+        let before = normalize_messages_for_request(&messages);
+        assert_eq!(
+            before[0].content.as_str(),
+            Some(
+                "base system\n\n[Merged system notes from history/runtime]\n## Cached Tool Results\n\nContext note: reused prior tool results\ncached source\n\n## Additional Notes\n\nruntime policy"
+            )
+        );
+        messages.push(normalization_text_message(
+            crate::ai::history::ROLE_INTERNAL_NOTE,
+            note,
+        ));
+        messages.push(normalization_text_message("user", "continue"));
+
+        let after = normalize_messages_for_request(&messages);
+
+        assert_eq!(
+            serde_json::to_vec(&after[..before.len()]).unwrap(),
+            serde_json::to_vec(&before).unwrap()
+        );
+        assert_eq!(
+            after[before.len()].content.as_str(),
+            Some(super::super::normalize::DERIVED_CONTEXT_HANDOFF)
+        );
+        assert_eq!(after[before.len() + 1].role, "assistant");
+        assert!(
+            after[before.len() + 1]
+                .content
+                .as_str()
+                .unwrap()
+                .starts_with(super::super::normalize::COMPRESSED_TOOL_ROUND_CONTEXT_HEADER)
+        );
+        assert_eq!(after.last().unwrap().content.as_str(), Some("continue"));
     }
 }
 

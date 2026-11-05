@@ -106,10 +106,10 @@ pub(in crate::ai::driver::turn_runtime) const PROVIDER_CONTROL_LEAK_RETRY_NOTE_P
 pub(in crate::ai::driver::turn_runtime) const DEGENERATE_REPETITION_FINISH_REASON: &str =
     "degenerate_repetition";
 
-/// After detecting that this round's response was truncated, keep the visible text
-/// produced so far (if any) as partial progress and append a shrink-and-rewrite hint
-/// telling the model to reduce its per-output size next round before resending the
-/// truncated operation.
+/// After detecting that this round's response was truncated or could not be fully
+/// validated, keep the visible text produced so far (if any) as partial progress and
+/// append a shrink-and-rewrite hint telling the model to reduce its per-output size
+/// next round before resending all still-required operations from the discarded response.
 ///
 /// Idempotent: the same hint is never injected twice, so consecutive truncations do not
 /// stack duplicate notes.
@@ -207,13 +207,14 @@ pub(in crate::ai::driver::turn_runtime) fn append_truncation_retry_note(
             consecutive_truncations
         ));
     }
-    note.push_str("The previous response was truncated mid-generation (likely hitting the output length limit) and was not completed.\n");
+    note.push_str("The previous response was cut off or could not be fully validated (for example, due to incomplete tool-call arguments) and was not completed.\n");
+    note.push_str("Any tool calls from that response were discarded, so none of them executed.\n");
     note.push_str("This is not the final answer. Continue the current task and significantly reduce the size of a single response:\n");
     note.push_str(
         "- If writing files: split large files into multiple calls (create the skeleton first, then append/edit in chunks); keep each write under a few hundred lines;\n",
     );
     note.push_str("- Prefer small, incremental tool calls over emitting one oversized response;\n");
-    note.push_str("- Re-send only the operation that got truncated; do not repeat steps that already completed successfully.");
+    note.push_str("- Re-send all still-required operations from that response, not only the last one; do not repeat steps that already completed successfully.");
     // Process-level corrective hint: only sent to the LLM within this turn, never written
     // to the persisted turn_messages track. This hint only makes sense in the round right
     // after a truncation; if persisted it would replay on every later turn, keeping the

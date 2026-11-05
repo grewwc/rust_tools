@@ -131,7 +131,11 @@ pub(super) fn drain_task_result(
                 entry.pid
             )),
             progress: current_task_progress(task_id),
-            backend_session: record_traecli_session(task_id, None),
+            backend_session: backend_session::record_session(
+                task_backend(entry.backend).descriptor().id,
+                task_id,
+                None,
+            ),
         };
         let rendered = format_task_result_with_id(task_id, entry, result.clone());
         persist_rendered_task_evidence(task_id, entry, &result.status, &rendered)?;

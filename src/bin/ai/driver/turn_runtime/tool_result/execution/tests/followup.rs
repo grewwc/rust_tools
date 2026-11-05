@@ -711,7 +711,12 @@ fn truncated_response_retries_and_injects_shrink_note() {
         m.role == ROLE_INTERNAL_NOTE
             && m.content
                 .as_str()
-                .is_some_and(|c| c.starts_with(TRUNCATION_RETRY_NOTE_PREFIX))
+                .is_some_and(|c| {
+                    c.starts_with(TRUNCATION_RETRY_NOTE_PREFIX)
+                        && c.contains("The previous response was cut off or could not be fully validated (for example, due to incomplete tool-call arguments) and was not completed.")
+                        && c.contains("Any tool calls from that response were discarded, so none of them executed.")
+                        && c.contains("Re-send all still-required operations from that response, not only the last one; do not repeat steps that already completed successfully.")
+                })
     }));
 }
 

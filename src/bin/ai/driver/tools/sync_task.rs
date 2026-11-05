@@ -397,33 +397,26 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     let task_agent_manifests = ctx.agent_manifests.clone();
     let log_description = prepared.description.clone();
     let log_agent_name = prepared.agent_name.clone();
-    let log_model = if prepared.backend.is_traecli() {
-        crate::ai::tools::task_tools::traecli_model_for(prepared.backend_model.as_deref())
-    } else {
-        prepared.model.clone()
-    };
-    let log_reasoning_effort = if prepared.backend.is_traecli() {
+    let backend_id = prepared.backend.id();
+    let backend = backend_id.resolve();
+    let execution_mode = backend.execution_mode();
+    let default_progress = backend.descriptor().text.default_progress;
+    let kernel_reasoning_effort =
+        crate::ai::request::reasoning_effort_display_label(&task_app, &prepared.model);
+    let backend_reasoning_effort =
         crate::ai::request::resolve_reasoning_effort(&task_app, &task_app.current_model)
-            .and_then(|effort| task_tools::normalize_traecli_reasoning_effort(effort.as_str()))
-            .map(str::to_string)
-    } else {
-        Some(
-            crate::ai::request::reasoning_effort_display_label(&task_app, &prepared.model)
-                .to_string(),
-        )
-    };
-    let log_selection_explanation = if prepared.backend.is_traecli() {
-        // The kernel agent/model selection does not drive an external backend;
-        // report the model that backend will actually use.
-        let agent_reason = prepared
-            .selection_explanation
-            .split_once('\n')
-            .map(|(agent_reason, _)| agent_reason)
-            .unwrap_or(&prepared.selection_explanation);
-        format!("{agent_reason}\nmodel_reason=backend model '{log_model}'")
-    } else {
-        prepared.selection_explanation.clone()
-    };
+            .map(|effort| effort.as_str().to_string());
+    let identity = backend.attribution(&task_tools::ModelContext {
+        kernel_model: &prepared.model,
+        backend_model: prepared.backend_model.as_deref(),
+        session_worker_model: ctx.app_proto.session_default_subagent_model.as_deref(),
+        kernel_reasoning_effort: Some(kernel_reasoning_effort),
+        backend_reasoning_effort: backend_reasoning_effort.as_deref(),
+        selection_explanation: &prepared.selection_explanation,
+    });
+    let log_model = identity.model;
+    let log_reasoning_effort = identity.reasoning_effort;
+    let log_selection_explanation = identity.selection_explanation;
 
     println!(
         "\n[Task] Launching subagent '{}' with model {} inherit={} for: {}{}",
@@ -485,10 +478,8 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     let wrap_up_signal = wrap_up_lead_time.map(|_| Arc::new(AtomicBool::new(false)));
     let wrap_up_signal_for_scope = wrap_up_signal.clone();
 
-    // TraeCLI backend inputs, cloned before `inner_fut` moves the owners.
-    // Kernel path ignores these; the branch inside selects the runner.
-    let is_traecli_backend = prepared.backend.is_traecli();
-    let traecli_cwd = if prepared.inherit.cwd {
+    // External inputs are frozen before the driver's callback owns the app.
+    let backend_cwd = if prepared.inherit.cwd {
         inherited_cwd_dir
             .clone()
             .or_else(|| crate::ai::driver::runtime_ctx::effective_cwd().ok())
@@ -496,96 +487,123 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     } else {
         private_cwd_dir.clone().unwrap_or_else(std::env::temp_dir)
     };
-    let traecli_cancel = subagent_cancel.clone();
-    let traecli_workspace_allowed = prepared.inherit.cwd;
+    let backend_cancel = subagent_cancel.clone();
+    let backend_workspace_allowed = prepared.inherit.cwd;
     let backend_model = prepared.backend_model.clone();
-    let traecli_reasoning_effort = log_reasoning_effort.clone();
+    let backend_reasoning_effort = log_reasoning_effort.clone();
     let subagent_image_files = prepared.image_files.clone();
-    let traecli_continuation = if is_traecli_backend {
-        crate::ai::tools::task_tools::prepare_traecli_continuation(
-            prepared.backend_continue_from.as_deref(),
-            &parent_history_path,
-            &prompt,
-        )
-    } else {
-        Ok((None, String::new(), Vec::new()))
-    };
-    let traecli_result_slot = result_slot.clone();
-    let traecli_session_slot: Arc<std::sync::Mutex<Option<String>>> =
+    let continuation = backend.continuation(&task_tools::ContinueContext {
+        continue_from: prepared.backend_continue_from.as_deref(),
+        parent_history: &parent_history_path,
+        prompt: &prompt,
+    });
+    let backend_result_slot = result_slot.clone();
+    let kernel_result_slot = result_slot.clone();
+    let backend_session_slot: task_tools::backend_session::SessionSlot =
         Arc::new(std::sync::Mutex::new(None));
-    let traecli_session_slot_for_scope = traecli_session_slot.clone();
+    let backend_session_slot_for_run = backend_session_slot.clone();
+    let task_id_for_run = task_id.clone();
 
     let inner_fut = async move {
         let mut subagent_app = subagent_app;
         crate::ai::tools::registry::common::clear_tool_cancel();
-        // Subagent backend branch: TraeCLI runs a headless subprocess while
-        // the kernel path keeps the exact in-process `run_turn` flow. Both
-        // publish through the same result-slot/validation logic below.
-        let result: Result<(), String> = if is_traecli_backend {
-            match traecli_continuation {
-                Err(err) => Err(err),
-                Ok((resume_session, prompt, side_note_files)) => {
-                    let spec = crate::ai::tools::task_tools::ExternalSubagentSpec {
-                        prompt,
-                        cwd: traecli_cwd,
-                        workspace_allowed: traecli_workspace_allowed,
-                        model: backend_model,
-                        skills: crate::ai::skills::render_external_skill_context(
-                            task_skill_manifests_for_spawn.as_slice(),
-                            &crate::ai::driver::runtime_ctx::active_skill_names(),
-                        ),
-                        resume_session,
-                        side_note_files,
-                        reasoning_effort: traecli_reasoning_effort,
-                        image_files: subagent_image_files,
-                        phase_slot: Some(phase_slot_for_backend),
-                    };
-                    match crate::ai::tools::task_tools::run_external_subagent(
-                        crate::ai::tools::task_tools::SubagentBackend::TraeCli,
-                        &spec,
-                        traecli_cancel,
-                    )
-                    .await
-                    {
-                        Ok(outcome) => {
-                            // `finalize_turn` never runs for TraeCLI, so publish the
-                            // final text directly for the result-slot reader below.
-                            let mut guard = traecli_result_slot.lock().await;
-                            guard.parent_payload = outcome.output.clone();
-                            guard.final_assistant_text = outcome.output;
-                            if let Some(session) = outcome.session_id {
-                                *traecli_session_slot_for_scope
-                                    .lock()
-                                    .unwrap_or_else(|poison| poison.into_inner()) = Some(session);
-                            }
-                            Ok(())
-                        }
-                        Err(err) => Err(err),
-                    }
-                }
-            }
-        } else {
-            let run = turn_runtime::run_turn(
-                &mut subagent_app,
-                &task_mcp_for_spawn,
-                task_skill_manifests_for_spawn.as_slice(),
-                usize::MAX,
-                prompt,
-                String::new(),
-                model,
-                None,
-                None,
-                false,
-                false,
-            );
-            if let Some(spec) = auto_model_fallback {
-                runtime_ctx::AUTO_MODEL_FALLBACK.scope(spec, run).await
-            } else {
-                run.await
-            }
-            .map(|_outcome| ())
-            .map_err(|e| format!("{}", e))
+        let events = task_tools::Events {
+            phase_slot: Some(phase_slot_for_backend),
+            session_slot: Some(backend_session_slot_for_run.clone()),
         };
+        let outcome = match continuation {
+            Err(error) => task_tools::Outcome::failed(
+                error,
+                &events,
+                backend.descriptor().text.default_progress,
+            ),
+            Ok(continuation) => {
+                if backend.descriptor().supports_resume {
+                    task_tools::backend_session::track_session_slot(
+                        backend_id,
+                        &task_id_for_run,
+                        backend_session_slot_for_run.clone(),
+                    );
+                }
+                let (resume_session, prompt, side_note_files) = continuation.into_parts();
+                let context = match execution_mode {
+                    task_tools::ExecutionMode::External => {
+                        task_tools::RunContext::External(task_tools::ExternalSubagentSpec {
+                            prompt,
+                            cwd: backend_cwd,
+                            workspace_allowed: backend_workspace_allowed,
+                            model: backend_model,
+                            skills: crate::ai::skills::render_external_skill_context(
+                                task_skill_manifests_for_spawn.as_slice(),
+                                &runtime_ctx::active_skill_names(),
+                            ),
+                            resume_session,
+                            side_note_files,
+                            reasoning_effort: backend_reasoning_effort,
+                            image_files: subagent_image_files,
+                            phase_slot: events.phase_slot.clone(),
+                        })
+                    }
+                    task_tools::ExecutionMode::KernelDriver => {
+                        task_tools::RunContext::kernel(move |events, _cancel| {
+                            Box::pin(async move {
+                                let run = turn_runtime::run_turn(
+                                    &mut subagent_app,
+                                    &task_mcp_for_spawn,
+                                    task_skill_manifests_for_spawn.as_slice(),
+                                    usize::MAX,
+                                    prompt,
+                                    String::new(),
+                                    model,
+                                    None,
+                                    None,
+                                    false,
+                                    false,
+                                );
+                                let result = if let Some(spec) = auto_model_fallback {
+                                    runtime_ctx::AUTO_MODEL_FALLBACK.scope(spec, run).await
+                                } else {
+                                    run.await
+                                }
+                                .map_err(|error| format!("{error}"));
+                                let captured = kernel_result_slot.lock().await.clone();
+                                let progress_snapshot = events
+                                    .phase_slot
+                                    .as_ref()
+                                    .and_then(runtime_ctx::subagent_progress_state_snapshot);
+                                task_tools::Outcome {
+                                    execution_error: result.err(),
+                                    parent_payload: captured.parent_payload,
+                                    validation_body: captured.final_assistant_text,
+                                    progress: progress_snapshot
+                                        .as_ref()
+                                        .map(|snapshot| snapshot.display_status_line())
+                                        .unwrap_or_else(|| default_progress.to_string()),
+                                    progress_snapshot,
+                                    ..task_tools::Outcome::default()
+                                }
+                            })
+                        })
+                    }
+                };
+                backend.run(context, events, backend_cancel).await
+            }
+        };
+        // External failures retain the existing empty-body contract; kernel
+        // evidence remains in the driver's result slot for recovery below.
+        if outcome.execution_error.is_none()
+            || execution_mode == task_tools::ExecutionMode::KernelDriver
+        {
+            let mut guard = backend_result_slot.lock().await;
+            guard.parent_payload = outcome.parent_payload;
+            guard.final_assistant_text = outcome.validation_body;
+        }
+        if let Some(session) = outcome.backend_session {
+            *backend_session_slot_for_run
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(session);
+        }
+        let result = outcome.execution_error.map_or(Ok(()), Err);
         let _ = tx.send(result.clone());
         result
     };
@@ -607,7 +625,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     // block_in_place calls only wait for this task; they do not execute the child turn.
     wrapped = scope_sync_subagent_parent_policy(parent_agent_team_mode, wrapped);
     wrapped = Box::pin(runtime_ctx::SUBAGENT_DEPTH.scope(child_depth, wrapped));
-    if is_traecli_backend {
+    if execution_mode == task_tools::ExecutionMode::External {
         wrapped = Box::pin(runtime_ctx::SUBAGENT_TASK_ID.scope(task_id.clone(), wrapped));
     }
 
@@ -735,10 +753,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
         .unwrap_or_default();
     let mut captured_output = captured_result.parent_payload;
     let response_for_validation = captured_result.final_assistant_text;
-    let backend_session = traecli_session_slot
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .take();
+    let backend_session = task_tools::backend_session::captured_session(&backend_session_slot);
     let memory_merge_error = memory_merge_error
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
@@ -773,11 +788,8 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
         status = "FAILED";
         error = Some(validation_error);
     }
-    let backend_session = if is_traecli_backend {
-        task_tools::record_traecli_session(&task_id, backend_session)
-    } else {
-        backend_session
-    };
+    let backend_session =
+        task_tools::backend_session::record_session(backend_id, &task_id, backend_session);
     let rendered = format_subagent_output(
         status,
         &log_description,

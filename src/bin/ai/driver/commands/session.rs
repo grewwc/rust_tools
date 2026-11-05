@@ -140,10 +140,7 @@ pub(in crate::ai) fn persist_session_runtime_state(app: &App) {
             Some(None) => Some("off".to_string()),
             Some(Some(level)) => Some(level.as_str().to_string()),
         },
-        subagent_backend: match app.session_default_subagent_backend {
-            crate::ai::tools::task_tools::SubagentBackend::Kernel => None,
-            crate::ai::tools::task_tools::SubagentBackend::TraeCli => Some("traecli".to_string()),
-        },
+        subagent_backend: app.session_default_subagent_backend.stored_value(),
         subagent_model: app.session_default_subagent_model.clone(),
         default_skills: app.session_default_skills.clone(),
     };
@@ -179,9 +176,7 @@ fn restore_session_model_agent_effort(app: &mut App, store: &SessionStore) {
         }
     }
     app.session_default_subagent_backend =
-        crate::ai::tools::task_tools::SubagentBackend::from_stored(
-            stored.subagent_backend.as_deref(),
-        );
+        crate::ai::tools::task_tools::BackendId::from_stored(stored.subagent_backend.as_deref());
     app.session_default_subagent_model = stored.subagent_model;
     app.session_default_skills = stored.default_skills;
 }

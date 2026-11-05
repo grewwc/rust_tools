@@ -180,7 +180,7 @@ pub(super) struct App {
     pub(super) client: Client,
     pub(super) current_model: String,
     pub(super) current_agent: String,
-    pub(super) session_default_subagent_backend: crate::ai::tools::task_tools::SubagentBackend,
+    pub(super) session_default_subagent_backend: crate::ai::tools::task_tools::BackendId,
     /// TraeCLI worker model selected for this session; independent of `current_model`.
     pub(super) session_default_subagent_model: Option<String>,
     /// Skills activated on ordinary turns unless the user explicitly selects skills.

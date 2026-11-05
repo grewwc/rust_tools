@@ -24,6 +24,7 @@ use super::error::{
     DEFAULT_AUTO_THINKING_THRESHOLD, config_bool_is_true, control_model_for_aux_tasks,
     endpoint_for_request_model,
 };
+use super::normalize::HISTORICAL_TOOL_EVIDENCE_CONTEXT_HEADER;
 use super::reasoning::model_thinking_off_capability;
 use super::routing::{extract_router_content, strip_json_fence};
 
@@ -152,14 +153,21 @@ pub(super) fn resolve_thinking_static(
 }
 
 pub(crate) fn latest_user_message_text(messages: &[Message]) -> Option<String> {
-    // Skip synthetic user messages (task-evidence handoff, image followup, etc.):
-    // they are injected after the real user message, and picking one up here
-    // would take the handoff text instead of the user's actual question,
-    // polluting both the thinking short-circuit and the model-gate decision.
+    // Skip synthetic user messages (task-evidence handoff, image followup, etc.)
+    // and projected tool evidence whose runtime metadata has been cleared:
+    // picking one up here would take the handoff text instead of the user's
+    // actual question, polluting the thinking short-circuit and model gate.
     messages
         .iter()
         .rev()
-        .find(|message| message.role == "user" && !is_runtime_synthetic_user_message(message))
+        .find(|message| {
+            message.role == "user"
+                && !is_runtime_synthetic_user_message(message)
+                && !message
+                    .content
+                    .as_str()
+                    .is_some_and(|text| text.starts_with(HISTORICAL_TOOL_EVIDENCE_CONTEXT_HEADER))
+        })
         .and_then(extract_message_text)
 }
 

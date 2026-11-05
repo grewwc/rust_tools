@@ -61,19 +61,27 @@ fn build_multiline_completion_context(textarea: &TextArea<'_>) -> Option<Pending
 
 fn should_open_popup_on_first_tab(ctx: &PendingTabCompletion) -> bool {
     let trimmed = ctx.line[..ctx.col].trim();
-    // `/model` (including its `effort` subcommand), `/effort`, `/use traecli`,
+    // `/model` (including its `effort` subcommand), `/effort`, worker backends,
     // and serve-chat `/resume` all pick one value from a fixed candidate list,
     // so the first Tab opens the panel directly instead of the
     // silent-first-then-popup flow used for ambiguous completions.
+    // Match literal ASCII spaces here; candidate generation accepts broader whitespace.
+    let worker_models = trimmed
+        .strip_prefix("/use ")
+        .or_else(|| trimmed.strip_prefix(":use "))
+        .is_some_and(|rest| {
+            let name = rest.split_once(' ').map_or(rest, |(name, _)| name);
+            crate::ai::tools::task_tools::backends::backend_registry()
+                .worker_use_id(name)
+                .is_some()
+        });
     (matches!(trimmed, "/model" | ":model")
         || trimmed.starts_with("/model ")
         || trimmed.starts_with(":model ")
         || matches!(trimmed, "/effort" | ":effort")
         || trimmed.starts_with("/effort ")
         || trimmed.starts_with(":effort ")
-        || matches!(trimmed, "/use traecli" | ":use traecli")
-        || trimmed.starts_with("/use traecli ")
-        || trimmed.starts_with(":use traecli ")
+        || worker_models
         || matches!(trimmed, "/resume")
         || trimmed.starts_with("/resume "))
         || is_skill_reference_trigger(trimmed)
@@ -286,6 +294,44 @@ mod tests {
                     .map(|candidate| candidate.replacement.as_str())
                     .collect();
                 assert_eq!(replacements, ["traecli GPT-6.1-Sol", "traecli GPT-6-Astra"]);
+            },
+        );
+    }
+
+    #[test]
+    fn worker_model_completion_preserves_head_whitespace_and_tab_flow() {
+        crate::ai::tools::task_tools::with_traecli_model_names_for_test(
+            vec!["Worker-A".to_string(), "Worker-B".to_string()],
+            || {
+                for (line, popup_on_first_tab) in [
+                    ("/use traecli", true),
+                    (":use traecli", true),
+                    ("/use traecli Worker", true),
+                    ("/use traecli  Worker", true),
+                    (" \t/use traecli \t", true),
+                    ("/use  traecli", false),
+                    ("/use\ttraecli", false),
+                    (":use  traecli", false),
+                    (":use\ttraecli", false),
+                    ("/use traecli\tWorker", false),
+                ] {
+                    let mut textarea = TextArea::new(vec![line.to_string()]);
+                    textarea.move_cursor(CursorMove::End);
+                    let mut pending = None;
+                    let mut panel = None;
+
+                    let first = apply_multiline_completion(&mut textarea, &mut pending, &mut panel);
+                    assert_eq!(first.is_some(), popup_on_first_tab, "{line:?}");
+                    assert_eq!(panel.is_some(), popup_on_first_tab, "{line:?}");
+                    assert!(pending.is_some(), "{line:?}");
+                    assert_eq!(textarea.lines(), &[line.to_string()]);
+
+                    let second =
+                        apply_multiline_completion(&mut textarea, &mut pending, &mut panel);
+                    assert_eq!(second.as_deref(), Some("发现 2 个候选"), "{line:?}");
+                    assert_eq!(panel.as_ref().unwrap().items.len(), 2, "{line:?}");
+                    assert_eq!(textarea.lines(), &[line.to_string()]);
+                }
             },
         );
     }

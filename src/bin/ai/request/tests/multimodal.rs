@@ -1,5 +1,5 @@
-use super::common::{first_openai_vl_model_name, first_alibaba_vl_model_name};
 use super::super::*;
+use super::common::{first_alibaba_vl_model_name, first_openai_vl_model_name};
 use serde_json::Value;
 
 #[test]
@@ -314,10 +314,16 @@ fn normalize_messages_drops_path_like_historical_tool_call_names() {
     }));
     assert!(normalized.iter().all(|message| message.role != "tool"));
     assert!(normalized.iter().any(|message| {
-        message.role == "system"
-            && message
-                .content
-                .as_str()
-                .is_some_and(|content| content.contains("source contents"))
+        message.role == "user"
+            && message.content.as_str().is_some_and(|content| {
+                content
+                    .starts_with(super::super::normalize::HISTORICAL_TOOL_EVIDENCE_CONTEXT_HEADER)
+                    && content.contains("source contents")
+            })
     }));
+    assert!(
+        normalized
+            .iter()
+            .all(|message| message.reasoning_content.is_none())
+    );
 }
