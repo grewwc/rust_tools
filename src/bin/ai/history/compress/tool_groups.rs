@@ -20,8 +20,9 @@ use super::tool_overflow::{
 use super::{
     COMPRESSED_TOOL_EVIDENCE_MARKER, PlannedArchiveWrite, content_sha256_hex,
     is_archive_note_message, is_compressed_tool_evidence_note, is_context_checkpoint_marker,
-    is_persisted_reasoning_replay, is_summary_message, keep_recent_user_turns_when_trimming,
-    message_billable_chars, normalize_whitespace, value_to_string,
+    is_persisted_reasoning_replay, is_side_note_message, is_summary_message,
+    keep_recent_user_turns_when_trimming, message_billable_chars, normalize_whitespace,
+    value_to_string,
 };
 
 pub(super) const FOLDED_TOOL_GROUP_ARCHIVE_DIR: &str = "folded-tool-groups";
@@ -188,7 +189,7 @@ pub(super) fn first_trim_candidate(messages: &[Message], budget: usize) -> Optio
         // The checkpoint body is already on disk; the short marker is the only
         // way back to it. It must not be trimmed by the fallback merely for
         // appearing early in the conversation.
-        if is_context_checkpoint_marker(message) {
+        if is_context_checkpoint_marker(message) || is_side_note_message(message) {
             index += 1;
             continue;
         }

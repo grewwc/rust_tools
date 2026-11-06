@@ -62,8 +62,9 @@ function harness() {
   vm.runInContext(between('  $("oskill").onfocus', '  $("prompt").addEventListener("compositionstart"'), context);
   vm.runInContext(between("async function send()", "  const rewindFloor =") + "\n}", context);
   const body = between("  const body = { prompt, confirm: true };", '  setPromptValue("", true);');
-  const accept = between('    const res = await fetch(store.base + "/sessions/"', "    turnStarted = true;");
-  vm.runInContext(`async function submit() { if (!validateSkillInput()) return; const prompt = "hello", images = []; ${body}\n${accept}\nreturn body; }`, context);
+  const accept = between("// BEGIN turn HTTP acceptance", "// END turn HTTP acceptance")
+    .replace("// BEGIN turn HTTP acceptance", "").replace(/^\s*try \{\s*/, "");
+  vm.runInContext(`async function submit() { if (!validateSkillInput()) return; const prompt = "hello", images = [], sendBase = store.base, sid = sessionId; ${body}\n${accept}\nreturn body; }`, context);
   return {
     context, elements, requests,
     choose(name) { context.chooseSkill(name); },
@@ -338,14 +339,17 @@ test("pending choices survive session switching and move into the first created 
   h.choose("review"); h.switchTo("beta"); h.choose("build"); h.switchTo("alpha");
   assert.equal(h.elements.oskill.value, "review");
   h.switchTo(""); h.choose("build");
-  h.context.sessionId = "new";
-  h.context.carrySkillPick("", "new");
+  h.context.localStorage = { setItem() {} };
+  h.context.pendingNew = null;
+  h.context.carryTeamPick = () => {};
+  vm.runInContext(between("// BEGIN composer session adoption", "// END composer session adoption"), h.context);
+  assert.equal(h.context.adoptComposerSession("new", "", h.context.store.base), true);
+  assert.equal(h.context.pendingNew, "new");
   assert.equal(h.elements.oskill.value, "build");
   await h.context.submit();
   assert.deepEqual(h.requests[0].body.skills, ["build"]);
   h.switchTo("");
   assert.equal(h.elements.oskill.value, "");
-  assert.match(script, /carrySkillPick\(draftSession, sessionId\)/);
 });
 
 test("catalog removes obsolete choices and empty or failed catalogs preserve normal send", async () => {

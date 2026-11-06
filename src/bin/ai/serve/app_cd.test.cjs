@@ -16,6 +16,10 @@ function harness({ sessionId = "s1", images = [], respond } = {}) {
   const cards = [];
   const context = vm.createContext({
     sessionId,
+    pendingNew: null,
+    store: { base: "https://a.test" },
+    carrySkillPick: () => {},
+    carryTeamPick: () => {},
     pendingImages: images,
     api: async (url, opts) => {
       calls.push({ url, opts });

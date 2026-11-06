@@ -300,6 +300,10 @@ use progress::*;
 mod tests;
 
 #[cfg(test)]
+#[path = "side_note_injection_tests.rs"]
+mod side_note_injection_tests;
+
+#[cfg(test)]
 #[path = "session_e2e_tests.rs"]
 mod session_e2e_tests;
 
@@ -1412,25 +1416,36 @@ fn run_audit_subagent(app: &App, instruction: &str, fast: bool) -> Option<String
 /// A `/bg`-family draft never reaches the queue: the side-note listener recognizes
 /// it and detaches the terminal client itself, so only plain guidance is injected.
 fn drain_side_notes_and_inject(
-    history_file: &std::path::Path,
+    app: &crate::ai::types::App,
     messages: &mut Vec<crate::ai::history::Message>,
     turn_messages: &mut Vec<crate::ai::history::Message>,
-) {
+    persisted_turn_messages: &mut usize,
+) -> Result<(), String> {
     let target = crate::ai::driver::side_note::current_target_id();
-    let notes = crate::ai::driver::side_note::drain_side_notes(history_file, target.as_deref());
-    if notes.is_empty() {
-        return;
-    }
-    {
-        let injected = crate::ai::driver::side_note::side_notes_to_messages(notes);
-        let n = injected.len();
-        messages.extend(injected.clone());
-        turn_messages.extend(injected);
+    let n = crate::ai::driver::side_note::consume_side_notes(
+        &app.session_history_file,
+        target.as_deref(),
+        |notes| {
+            let injected = crate::ai::driver::side_note::side_notes_to_messages(notes.to_vec());
+            let previous_len = turn_messages.len();
+            turn_messages.extend(injected.iter().cloned());
+            // Even an ephemeral turn must commit queued input before clearing it.
+            // The usual lifecycle cleanup still owns ephemeral-session removal.
+            if !persist_pending_turn_messages(app, false, turn_messages, persisted_turn_messages) {
+                turn_messages.truncate(previous_len);
+                return Err("side-note canonical append failed; input remains queued".to_string());
+            }
+            messages.extend(injected);
+            Ok(())
+        },
+    )?;
+    if n > 0 {
         crate::ai::driver::print::print_tool_note_line(
             "side-note",
             &format!("injected {n} note(s)"),
         );
     }
+    Ok(())
 }
 
 /// Drain pending cross-session talk mail for this history file and inject it
@@ -1725,7 +1740,14 @@ async fn run_turn_body(
         // SUBAGENT_TASK_ID (falling back to the AIOS_SUBAGENT_TASK_ID / SUBAGENT_TASK_ID env vars).
         // A `/bg`-family draft never lands in the queue — the side-note listener handles it
         // directly — so every drained note is plain guidance.
-        drain_side_notes_and_inject(&app.session_history_file, &mut messages, &mut turn_messages);
+        if let Err(error) = drain_side_notes_and_inject(
+            app,
+            &mut messages,
+            &mut turn_messages,
+            &mut persisted_turn_messages,
+        ) {
+            break 'turn Err(error.into());
+        }
         drain_talk_and_inject(&app.session_history_file, &mut messages, &mut turn_messages);
         supervisor
             .progress

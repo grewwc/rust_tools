@@ -7,8 +7,13 @@
 //! instead, with older records archived verbatim before they leave the projection
 //! (`overflow_sink::trim_incremental_summary_notes_to_inline_budget`).
 
+use super::summary_input::{
+    SUMMARY_MESSAGE_MAX_CHARS, SUMMARY_MESSAGE_SEPARATOR, SUMMARY_TRANSCRIPT_MAX_CHARS,
+    render_summary_message,
+};
 use super::tool_overflow::stub_archive_display_path;
 use super::*;
+use crate::ai::history::HistoryMessageSummarizer;
 
 pub(super) const INCREMENTAL_SUMMARY_PREFIX: &str = "[incremental-memory-v1]";
 /// Session-asset directory holding the raw records behind summary increments.
@@ -28,14 +33,140 @@ pub(in crate::ai) fn is_incremental_summary(message: &Message) -> bool {
 pub(super) fn summary_delta_messages(messages: &[Message]) -> Vec<Message> {
     messages
         .iter()
-        .filter(|message| {
-            !is_summary_message(message)
-                && (!is_system_like_role(&message.role)
-                    || is_compressed_tool_evidence_note(message))
-                && !is_context_checkpoint_marker(message)
-        })
+        .filter(|message| is_summary_delta_message(message))
         .cloned()
         .collect()
+}
+
+fn is_summary_delta_message(message: &Message) -> bool {
+    !is_summary_message(message)
+        && (!is_system_like_role(&message.role) || is_compressed_tool_evidence_note(message))
+        && !is_context_checkpoint_marker(message)
+}
+
+struct SummaryInputSegment {
+    messages: Vec<Message>,
+    start_line: usize,
+    end_line: usize,
+    reserved_chars: usize,
+    partial_guidance: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SummaryInputCoverage {
+    segments: usize,
+    partial_guidance: bool,
+}
+
+/// Every body character is included in a continuation. Repeat the identity and
+/// ending so each partial side-note retains its author and final context.
+/// Only these speculative copies change; the archive binds the intact message.
+fn split_side_note_for_summary(message: &Message, source_line: usize) -> Option<Vec<Message>> {
+    let text = message.content.as_str()?;
+    let (header, body) = text.split_once("\n\n")?;
+    // Reserve at most a quarter of the transcript for repeated ending context,
+    // leaving the majority available for new, chronologically ordered text.
+    let ending: String = body
+        .chars()
+        .rev()
+        .take(SUMMARY_TRANSCRIPT_MAX_CHARS / 4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let suffix = format!("\n\n[Side-note ending repeated for context]\n{ending}");
+    let continuation = |start, end| {
+        format!(
+            "[Summary continuation: source line {source_line}, body chars {start}-{end}. Recover the complete side-note from the bound source before using partial guidance.]\n"
+        )
+    };
+    let mut shell = message.clone();
+    shell.content = Value::String(format!(
+        "{header}\n\n{}{suffix}",
+        continuation(usize::MAX, usize::MAX)
+    ));
+    let rendered_shell = render_summary_message(&shell, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    if rendered_shell.is_empty() {
+        return None;
+    }
+    let body_budget = SUMMARY_TRANSCRIPT_MAX_CHARS
+        .checked_sub(rendered_shell.chars().count())
+        .filter(|budget| *budget > 0)?;
+    let mut body_chars = body.chars();
+    let mut start = 1usize;
+    let mut fragments = Vec::new();
+    loop {
+        let piece: String = body_chars.by_ref().take(body_budget).collect();
+        if piece.is_empty() {
+            break;
+        }
+        let end = start + piece.chars().count() - 1;
+        let mut fragment = message.clone();
+        fragment.content = Value::String(format!(
+            "{header}\n\n{}{piece}{suffix}",
+            continuation(start, end)
+        ));
+        if !is_side_note_message(&fragment) {
+            return None;
+        }
+        fragments.push(fragment);
+        start = end + 1;
+    }
+    (!fragments.is_empty()).then_some(fragments)
+}
+
+/// Reserve the same rendered characters and worst-case separator as the request
+/// sampler. Its entire candidate set then fits, regardless of priority order.
+fn segment_summary_input(
+    messages: Vec<Message>,
+    source_lines: Vec<usize>,
+) -> Option<Vec<SummaryInputSegment>> {
+    if messages.len() != source_lines.len() {
+        return None;
+    }
+    let mut segments: Vec<SummaryInputSegment> = Vec::new();
+    let separator_chars = SUMMARY_MESSAGE_SEPARATOR.chars().count();
+    for (message, source_line) in messages.into_iter().zip(source_lines) {
+        let side_note = is_side_note_message(&message);
+        let render_limit = if side_note {
+            SUMMARY_TRANSCRIPT_MAX_CHARS
+        } else {
+            SUMMARY_MESSAGE_MAX_CHARS
+        };
+        let rendered = render_summary_message(&message, render_limit);
+        let partial_guidance = side_note && rendered.is_empty();
+        let fragments = if partial_guidance {
+            split_side_note_for_summary(&message, source_line)?
+        } else {
+            vec![message]
+        };
+        for fragment in fragments {
+            let chars = render_summary_message(&fragment, render_limit)
+                .chars()
+                .count();
+            if chars == 0 || chars > SUMMARY_TRANSCRIPT_MAX_CHARS {
+                return None;
+            }
+            if segments.last().is_none_or(|segment| {
+                segment.reserved_chars + separator_chars + chars > SUMMARY_TRANSCRIPT_MAX_CHARS
+            }) {
+                segments.push(SummaryInputSegment {
+                    messages: Vec::new(),
+                    start_line: source_line,
+                    end_line: source_line,
+                    reserved_chars: 0,
+                    partial_guidance: false,
+                });
+            }
+            let segment = segments.last_mut()?;
+            segment.reserved_chars +=
+                chars + usize::from(!segment.messages.is_empty()) * separator_chars;
+            segment.messages.push(fragment);
+            segment.end_line = source_line;
+            segment.partial_guidance |= partial_guidance;
+        }
+    }
+    (!segments.is_empty()).then_some(segments)
 }
 
 /// A pure candidate: considering a summary does not create a source archive.
@@ -43,7 +174,6 @@ pub(super) struct IncrementalSummaryPlan {
     message: Message,
     archive: PlannedArchiveWrite,
     archive_path: PathBuf,
-    archive_bytes: String,
 }
 
 impl IncrementalSummaryPlan {
@@ -56,7 +186,7 @@ impl IncrementalSummaryPlan {
     pub(super) fn commit(&self) -> bool {
         self.archive.commit()
             && std::fs::read_to_string(&self.archive_path)
-                .is_ok_and(|actual| actual == self.archive_bytes)
+                .is_ok_and(|actual| actual == self.archive.content())
     }
 }
 
@@ -123,15 +253,29 @@ pub(super) fn plan_incremental_summary(
     max_chars: usize,
     overflow_dir: Option<&Path>,
 ) -> Option<IncrementalSummaryPlan> {
+    let entries = memory_entries(draft);
+    plan_incremental_summary_entries(messages, &entries, max_chars, overflow_dir, None)
+}
+
+fn plan_incremental_summary_entries(
+    messages: &[Message],
+    entries: &[Value],
+    max_chars: usize,
+    overflow_dir: Option<&Path>,
+    input_coverage: Option<SummaryInputCoverage>,
+) -> Option<IncrementalSummaryPlan> {
     let root = overflow_dir?;
-    if messages.is_empty() || draft.trim().is_empty() || max_chars == 0 {
+    if messages.is_empty() || entries.is_empty() || max_chars == 0 {
         return None;
     }
-    let mut archive_bytes = String::new();
+    let mut archive_bytes = Vec::new();
     for message in messages {
-        archive_bytes.push_str(&serde_json::to_string(message).ok()?);
-        archive_bytes.push('\n');
+        serde_json::to_writer(&mut archive_bytes, message).ok()?;
+        archive_bytes.push(b'\n');
     }
+    // Compact JSON is UTF-8. Move the buffer into the writer without copying
+    // either each serialized message or the complete source span.
+    let archive_bytes = String::from_utf8(archive_bytes).ok()?;
     let digest = content_sha256_hex(archive_bytes.as_bytes());
     // The file name carries only the leading 24 hex chars (96 bits); the
     // record below keeps the full digest in `sha256` for verification, and no
@@ -149,19 +293,20 @@ pub(super) fn plan_incremental_summary(
         "end_line": messages.len(),
         "encoding": "one_raw_message_json_per_line",
     });
-    let entries = memory_entries(draft);
     let render = |selected: &[Value]| {
         let omitted_entries = selected.len() < entries.len();
         // Section boundaries do not establish semantic independence. An omitted
         // entry may contain a retained judgment's prerequisite or correction, so
         // partial records are recovery leads until their source is rechecked.
         // Even an intact draft does not prove that the model retained all premises.
-        let reuse_guard = if omitted_entries {
+        let reuse_guard = if omitted_entries
+            || input_coverage.is_some_and(|coverage| coverage.partial_guidance)
+        {
             "partial_draft_recover_source_before_using_judgments"
         } else {
             "check_prerequisites_before_using_judgments"
         };
-        let record = serde_json::json!({
+        let mut record = serde_json::json!({
             "schema": 1,
             "provenance": "assistant_derived_unverified",
             "source_scope": "compression_input_projection_not_claim_verification",
@@ -170,6 +315,13 @@ pub(super) fn plan_incremental_summary(
             "reuse_guard": reuse_guard,
             "interpretation": "Chronological increments, not a consolidated fact set. Recheck sources and prerequisites. Conflicting newer entries do not verify or silently erase old claims; superseded_conclusions are candidates, not authoritative invalidations.",
         });
+        if let Some(coverage) = input_coverage {
+            record["summary_input"] = serde_json::json!({
+                "max_segment_chars": SUMMARY_TRANSCRIPT_MAX_CHARS,
+                "segments": coverage.segments,
+                "partial_side_note": coverage.partial_guidance,
+            });
+        }
         // Put the locator first, on its own line, so later display truncation of
         // the body does not preferentially remove the provenance back-reference.
         let body = serde_json::to_string(&record).ok()?;
@@ -184,9 +336,24 @@ pub(super) fn plan_incremental_summary(
         return None;
     }
     let mut selected = Vec::new();
-    for entry in entries.iter().rev() {
+    // Keep the opening complete entry before filling the remaining window from
+    // recent segments. A long rebuild must not preferentially evict its start.
+    let preserve_start =
+        input_coverage.is_some() && render(&entries[..1])?.chars().count() <= max_chars;
+    if input_coverage.is_some() && !preserve_start {
+        return None;
+    }
+    if preserve_start {
+        selected.push(entries[0].clone());
+    }
+    let remaining = if input_coverage.is_some() {
+        &entries[1..]
+    } else {
+        entries
+    };
+    for entry in remaining.iter().rev() {
         let mut candidate = selected.clone();
-        candidate.insert(0, entry.clone());
+        candidate.insert(usize::from(preserve_start), entry.clone());
         if render(&candidate)?.chars().count() <= max_chars {
             selected = candidate;
         }
@@ -203,9 +370,8 @@ pub(super) fn plan_incremental_summary(
             tool_call_id: None,
             reasoning_content: None,
         },
-        archive: PlannedArchiveWrite::new(archive_path.clone(), archive_bytes.clone()),
+        archive: PlannedArchiveWrite::new(archive_path.clone(), archive_bytes),
         archive_path,
-        archive_bytes,
     })
 }
 
@@ -215,12 +381,51 @@ pub(super) async fn plan_incremental_summary_with_app(
     max_chars: usize,
     overflow_dir: Option<&Path>,
 ) -> Option<IncrementalSummaryPlan> {
-    let fresh = summary_delta_messages(messages);
-    if fresh.is_empty() || max_chars == 0 || overflow_dir.is_none() {
+    plan_incremental_summary_with_summarizer(app, messages, max_chars, overflow_dir).await
+}
+
+async fn plan_incremental_summary_with_summarizer(
+    summarizer: &(impl HistoryMessageSummarizer + ?Sized),
+    messages: &[Message],
+    max_chars: usize,
+    overflow_dir: Option<&Path>,
+) -> Option<IncrementalSummaryPlan> {
+    if max_chars == 0 || overflow_dir.is_none() {
         return None;
     }
-    let draft = build_persisted_summary_text_with_app(app, &fresh, max_chars).await;
-    plan_incremental_summary(messages, &draft, max_chars, overflow_dir)
+    let (source_lines, mut fresh): (Vec<_>, Vec<_>) = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| is_summary_delta_message(message))
+        .map(|(index, message)| (index + 1, message.clone()))
+        .unzip();
+    if fresh.is_empty() {
+        return None;
+    }
+    prepare_persisted_summary_messages(&mut fresh);
+    let segments = segment_summary_input(fresh, source_lines)?;
+    let coverage = SummaryInputCoverage {
+        segments: segments.len(),
+        partial_guidance: segments.iter().any(|segment| segment.partial_guidance),
+    };
+    let mut entries = Vec::new();
+    for (index, segment) in segments.into_iter().enumerate() {
+        let draft =
+            build_persisted_summary_text_with_app(summarizer, &segment.messages, max_chars).await?;
+        let mut segment_entries = memory_entries(&draft);
+        if segment_entries.is_empty() {
+            return None;
+        }
+        for entry in &mut segment_entries {
+            entry["segment"] = Value::from(index + 1);
+            entry["source_range"] = serde_json::json!({
+                "start_line": segment.start_line,
+                "end_line": segment.end_line,
+            });
+        }
+        entries.extend(segment_entries);
+    }
+    plan_incremental_summary_entries(messages, &entries, max_chars, overflow_dir, Some(coverage))
 }
 
 /// The synchronous projection uses the same transaction without a model call.
@@ -237,6 +442,14 @@ pub(super) fn plan_incremental_summary_without_app(
     let draft = build_persisted_summary_text(&fresh, max_chars.saturating_sub(1_200));
     plan_incremental_summary(messages, &draft, max_chars, overflow_dir)
 }
+
+#[cfg(test)]
+#[path = "incremental_archive_buffer_tests.rs"]
+mod archive_buffer_tests;
+
+#[cfg(test)]
+#[path = "incremental_segmentation_tests.rs"]
+mod segmentation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -346,7 +559,7 @@ mod tests {
         );
         assert_eq!(
             record["source"]["sha256"],
-            content_sha256_hex(plan.archive_bytes.as_bytes())
+            content_sha256_hex(plan.archive.content().as_bytes())
         );
         assert_eq!(record["source"].get("source_model"), Some(&Value::Null));
         assert_eq!(record["entries"][0]["status"], "derived_unverified");
@@ -360,8 +573,12 @@ mod tests {
 
     fn record(plan: &IncrementalSummaryPlan) -> Value {
         let text = value_to_string(&plan.message().content);
-        serde_json::from_str(text.strip_prefix(INCREMENTAL_SUMMARY_PREFIX).unwrap().trim())
-            .unwrap()
+        serde_json::from_str(
+            text.strip_prefix(INCREMENTAL_SUMMARY_PREFIX)
+                .unwrap()
+                .trim(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -372,7 +589,8 @@ mod tests {
         let input = vec![msg("assistant", claim)];
         let full = plan_incremental_summary(&input, &draft, 4_000, Some(dir.path())).unwrap();
         let exact_budget = value_to_string(&full.message().content).chars().count();
-        let exact = plan_incremental_summary(&input, &draft, exact_budget, Some(dir.path())).unwrap();
+        let exact =
+            plan_incremental_summary(&input, &draft, exact_budget, Some(dir.path())).unwrap();
         let json = record(&exact);
         assert_eq!(json["entries"][0]["text"], claim);
         assert_eq!(json["entries"][0]["status"], "derived_unverified");
@@ -381,7 +599,9 @@ mod tests {
             json["reuse_guard"],
             "check_prerequisites_before_using_judgments"
         );
-        assert!(plan_incremental_summary(&input, &draft, exact_budget - 1, Some(dir.path())).is_none());
+        assert!(
+            plan_incremental_summary(&input, &draft, exact_budget - 1, Some(dir.path())).is_none()
+        );
     }
 
     #[test]
@@ -391,7 +611,8 @@ mod tests {
             "- C_SENTINEL follows through B; scope: {}; requires A_SENTINEL, which remains unknown.",
             "configuration detail ".repeat(200)
         );
-        let draft = format!("Main request:\n- Investigate\nUnverified assistant judgments:\n{claim}");
+        let draft =
+            format!("Main request:\n- Investigate\nUnverified assistant judgments:\n{claim}");
         let input = vec![msg("assistant", &claim)];
         let full = plan_incremental_summary(&input, &draft, 10_000, Some(dir.path())).unwrap();
         assert_eq!(record(&full)["entries"][1]["text"], claim);
@@ -439,7 +660,10 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(restored, input, "the omitted premise must remain recoverable");
+        assert_eq!(
+            restored, input,
+            "the omitted premise must remain recoverable"
+        );
         let projected = crate::ai::request::normalize_messages_for_request_for_test(&[
             plan.message().clone(),
             msg("user", "Does C hold?"),
@@ -447,9 +671,11 @@ mod tests {
         // Request normalization adds a derived-context header around the intact
         // record; the guard and source must survive inside that assistant block.
         let content = value_to_string(&plan.message().content);
-        assert!(projected.iter().any(|m| {
-            m.role == "assistant" && value_to_string(&m.content).contains(&content)
-        }));
+        assert!(
+            projected.iter().any(|m| {
+                m.role == "assistant" && value_to_string(&m.content).contains(&content)
+            })
+        );
         assert!(!projected.iter().any(|m| {
             m.role == "system" && value_to_string(&m.content).contains(INCREMENTAL_SUMMARY_PREFIX)
         }));
@@ -485,7 +711,7 @@ mod tests {
         )
         .unwrap();
         assert!(plan.commit());
-        std::fs::write(&plan.archive_path, "x".repeat(plan.archive_bytes.len())).unwrap();
+        std::fs::write(&plan.archive_path, "x".repeat(plan.archive.content().len())).unwrap();
         assert!(!plan.commit());
     }
 

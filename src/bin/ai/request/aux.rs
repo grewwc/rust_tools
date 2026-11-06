@@ -13,6 +13,11 @@ use super::{
     apply_request_auth, control_model_for_aux_tasks, control_model_for_aux_tasks_from,
     endpoint_for_request_model, extract_router_content,
 };
+#[cfg(test)]
+use crate::ai::history::compress::summary_input::render_summary_message;
+use crate::ai::history::compress::summary_input::{
+    SUMMARY_TRANSCRIPT_MAX_CHARS, build_summary_history_input,
+};
 use crate::ai::{
     history::{
         HistoryMessageSummarizer, Message, compress::is_preserved_user_or_image_stub,
@@ -222,225 +227,9 @@ fn extract_middle_keypoints(
     keypoints
 }
 
-fn truncate_summary_fragment(fragment: &str, max_chars: usize) -> String {
-    let total = fragment.chars().count();
-    if total <= max_chars {
-        return fragment.to_string();
-    }
-    if max_chars < 80 {
-        return fragment.chars().take(max_chars).collect();
-    }
-
-    let marker = "\n...[message excerpt truncated]...\n";
-    let marker_chars = marker.chars().count();
-    let payload = max_chars.saturating_sub(marker_chars);
-    let head = payload * 2 / 3;
-    let tail = payload.saturating_sub(head);
-    let prefix: String = fragment.chars().take(head).collect();
-    let suffix: String = fragment
-        .chars()
-        .rev()
-        .take(tail)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{prefix}{marker}{suffix}")
-}
-
-fn push_summary_text(out: &mut String, text: &str, max_chars: usize) -> bool {
-    let used = out.chars().count();
-    let remaining = max_chars.saturating_sub(used);
-    let text_chars = text.chars().count();
-    out.extend(text.chars().take(remaining));
-    text_chars <= remaining
-}
-
-fn render_summary_message(message: &Message, max_chars: usize) -> String {
-    let mut out = String::with_capacity(max_chars.min(6_000));
-    push_summary_text(
-        &mut out,
-        &format!("### {}\n\n", message.role.to_uppercase()),
-        max_chars,
-    );
-    let content_budget = max_chars.saturating_mul(2) / 5;
-    let mut content = String::with_capacity(content_budget);
-    match &message.content {
-        Value::String(text) => {
-            push_summary_text(
-                &mut content,
-                &truncate_summary_fragment(text, content_budget),
-                content_budget,
-            );
-        }
-        Value::Array(parts) => {
-            for part in parts {
-                let text = part
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .or_else(|| part.get("content").and_then(Value::as_str));
-                if let Some(text) = text {
-                    if !push_summary_text(&mut content, text, content_budget)
-                        || !push_summary_text(&mut content, "\n", content_budget)
-                    {
-                        break;
-                    }
-                } else if !push_summary_text(
-                    &mut content,
-                    "[non-text content omitted from summary input]\n",
-                    content_budget,
-                ) {
-                    break;
-                }
-            }
-        }
-        other => {
-            push_summary_text(
-                &mut content,
-                &truncate_summary_fragment(&other.to_string(), content_budget),
-                content_budget,
-            );
-        }
-    }
-    push_summary_text(&mut out, &content, max_chars);
-
-    if let Some(tool_calls) = &message.tool_calls {
-        // 先输出所有调用的身份信息，再分配参数预算，避免超大 arguments 把后续
-        // call id/name 从摘要器视野中挤掉。
-        for call in tool_calls {
-            let metadata = format!(
-                "\nTool call: id={} type={} name={}\n",
-                truncate_summary_fragment(&call.id, 256),
-                truncate_summary_fragment(&call.tool_type, 128),
-                truncate_summary_fragment(&call.function.name, 256),
-            );
-            if !push_summary_text(&mut out, &metadata, max_chars) {
-                return out;
-            }
-        }
-        let argument_budget = (max_chars / 5).max(128) / tool_calls.len().max(1);
-        for call in tool_calls {
-            let arguments = format!(
-                "Tool arguments for {}: {}\n",
-                truncate_summary_fragment(&call.id, 128),
-                truncate_summary_fragment(&call.function.arguments, argument_budget),
-            );
-            if !push_summary_text(&mut out, &arguments, max_chars) {
-                return out;
-            }
-        }
-    }
-    if let Some(tool_call_id) = &message.tool_call_id {
-        push_summary_text(
-            &mut out,
-            &format!(
-                "\nTool result for call id: {}\n",
-                truncate_summary_fragment(tool_call_id, 256)
-            ),
-            max_chars,
-        );
-    }
-    if let Some(reasoning) = &message.reasoning_content
-        && !crate::ai::history::has_runtime_message_metadata(message)
-    {
-        let remaining = max_chars.saturating_sub(out.chars().count());
-        push_summary_text(
-            &mut out,
-            &format!(
-                "\nReasoning: {}",
-                truncate_summary_fragment(reasoning, remaining.saturating_sub(12))
-            ),
-            max_chars,
-        );
-    }
-    out
-}
-
-/// 按消息选样构造摘要器输入，避免单个超大消息吞掉全部预算。
-fn build_summary_history_input(messages: &[Message], max_chars: usize) -> String {
-    if messages.is_empty() || max_chars == 0 {
-        return String::new();
-    }
-
-    let last_index = messages.len().saturating_sub(1);
-    let mut candidates: Vec<(usize, usize, String)> = messages
-        .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            let raw = render_summary_message(message, 6_000);
-            let lower = raw.to_ascii_lowercase();
-            let is_recent = last_index.saturating_sub(index) < 8;
-            let is_priority_role =
-                matches!(message.role.as_str(), "system" | "user" | "internal_note");
-            let has_keypoint = [
-                "error",
-                "failed",
-                "failure",
-                "panic",
-                "fix",
-                "fixed",
-                "decision",
-                "root cause",
-                "warning",
-                "错误",
-                "失败",
-                "修复",
-                "决定",
-                "根因",
-                "警告",
-            ]
-            .iter()
-            .any(|needle| lower.contains(needle));
-            let score = usize::from(is_recent) * 1_000
-                + usize::from(is_priority_role) * 700
-                + usize::from(has_keypoint) * 500
-                + usize::from(index < 2) * 300
-                + index.min(200);
-            let per_message_cap = if is_priority_role { 6_000 } else { 3_000 };
-            (
-                index,
-                score,
-                truncate_summary_fragment(&raw, per_message_cap),
-            )
-        })
-        .collect();
-
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
-    let separator = "\n\n[...chronological messages omitted...]\n\n";
-    let separator_chars = separator.chars().count();
-    let mut selected = vec![false; messages.len()];
-    let mut used = 0usize;
-    for (index, _, fragment) in &candidates {
-        let fragment_chars = fragment.chars().count();
-        let extra = fragment_chars + usize::from(used > 0) * separator_chars;
-        if used + extra <= max_chars {
-            selected[*index] = true;
-            used += extra;
-        }
-    }
-
-    let mut ordered: Vec<(usize, &String)> = candidates
-        .iter()
-        .filter(|(index, _, _)| selected[*index])
-        .map(|(index, _, fragment)| (*index, fragment))
-        .collect();
-    ordered.sort_by_key(|(index, _)| *index);
-
-    let mut out = String::with_capacity(used.min(max_chars));
-    let mut previous_index = None;
-    for (index, fragment) in ordered {
-        if let Some(previous) = previous_index
-            && index != previous + 1
-        {
-            out.push_str(separator);
-        } else if previous_index.is_some() {
-            out.push('\n');
-        }
-        out.push_str(fragment);
-        previous_index = Some(index);
-    }
-    out
-}
+#[cfg(test)]
+#[path = "tests/side_note_summary.rs"]
+mod side_note_summary_tests;
 
 #[cfg(test)]
 mod summary_prompt_tests {
@@ -454,7 +243,10 @@ mod summary_prompt_tests {
         let configured = history_summary_prompt(4_000, "Keep {file:line} citations.");
         assert!(configured.starts_with(&default));
         assert!(configured.ends_with("Keep {file:line} citations."));
-        assert!(configured.contains("subject to the provenance, uncertainty, and output-limit rules above"));
+        assert!(
+            configured
+                .contains("subject to the provenance, uncertainty, and output-limit rules above")
+        );
     }
 
     #[test]
@@ -493,9 +285,15 @@ pub(crate) async fn summarize_history_via_model(
     }
 
     // Present priority-selected messages in their original chronological order.
-    let transcript = build_summary_history_input(messages, 22_000);
+    let transcript = build_summary_history_input(messages, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    if transcript.is_empty() {
+        return None;
+    }
     let cfg = crate::commonw::configw::get_all_config();
-    let additional = cfg.get(crate::ai::config_schema::AiConfig::HISTORY_SUMMARY_PROMPT, "");
+    let additional = cfg.get(
+        crate::ai::config_schema::AiConfig::HISTORY_SUMMARY_PROMPT,
+        "",
+    );
 
     let messages = vec![
         Message {
@@ -900,7 +698,9 @@ mod session_title_tests {
 
         assert_eq!(
             dialog,
-            vec!["user: 修复一个 \"/bg\" 相关的问题。为什么一个terminal，只挂了一个session，还要确认？"]
+            vec![
+                "user: 修复一个 \"/bg\" 相关的问题。为什么一个terminal，只挂了一个session，还要确认？"
+            ]
         );
     }
 

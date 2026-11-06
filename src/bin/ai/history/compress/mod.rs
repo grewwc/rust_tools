@@ -6,14 +6,15 @@ use crate::ai::types::App;
 
 use super::types::{
     MAX_HISTORY_TURNS, Message, ROLE_INTERNAL_NOTE, is_internal_note_role,
-    is_runtime_synthetic_user_message, is_system_like_role, last_real_user_index,
-    retained_turn_start,
+    is_runtime_synthetic_user_message, is_side_note_message, is_system_like_role,
+    last_real_user_index, retained_turn_start, user_input_turn_count,
 };
 
 mod dedup;
 mod incremental;
 #[cfg(test)]
 mod incremental_normalize_tests;
+pub(in crate::ai) mod summary_input;
 pub(in crate::ai) use incremental::SOURCE_DIR;
 pub(in crate::ai) use incremental::is_incremental_summary;
 use incremental::{
@@ -28,6 +29,7 @@ mod text_utils;
 mod tool_groups;
 mod tool_overflow;
 
+pub(in crate::ai) use prune_authorization::PruneAuthorization;
 use text_utils::{keep_ends_by_chars, truncate_to_chars};
 #[cfg(test)]
 use tool_groups::{FOLDED_TOOL_GROUP_ARCHIVE_DIR, fold_early_tool_groups};
@@ -46,18 +48,16 @@ use tool_overflow::{
 };
 use tool_overflow::{
     age_out_overflow_stub_previews, build_persisted_summary_text,
-    build_persisted_summary_text_with_app,
-    enforce_protected_precision_group_budget,
+    build_persisted_summary_text_with_app, enforce_protected_precision_group_budget,
     is_preserved_tool_overflow_content, merge_old_user_overflow_stubs,
-    minimize_overflow_stubs_for_hard_budget,
-    normalize_preserved_message_stubs_for_model, prepare_tool_messages_structured,
+    minimize_overflow_stubs_for_hard_budget, normalize_preserved_message_stubs_for_model,
+    prepare_persisted_summary_messages, prepare_tool_messages_structured,
     spill_oversized_preserved_messages, spill_protected_precision_to_fit,
     try_spill_preserved_message_to_stub,
 };
 pub(in crate::ai) use tool_overflow::{
     cap_oversized_tool_results_for_context, is_preserved_user_or_image_stub,
 };
-pub(in crate::ai) use prune_authorization::PruneAuthorization;
 
 pub(in crate::ai) fn has_valid_folded_tool_provenance(message: &Message) -> bool {
     folded_prune::provenance(message).is_some()
@@ -494,14 +494,15 @@ fn message_contains_image(content: &Value) -> bool {
 #[cfg(test)]
 use dedup::dedup_overlapping_read_file_results;
 use dedup::{dedup_adjacent, dedup_repeated_tool_results, keep_only_recent_reasoning_content};
+pub(in crate::ai) use overflow_sink::archive_messages_to_overflow;
 pub(in crate::ai) use overflow_sink::compressed_tool_evidence_exceeds_inline_budget;
 use overflow_sink::{
     OverflowSink, PlannedArchiveWrite, TruncatedFieldArchiveBatch,
-    archive_internal_notes_deduplicated, archive_messages_to_overflow,
-    archive_truncated_field_to_overflow, build_overflow_placeholder, content_sha256_hex,
-    insert_internal_note_archive_note_if_needed, insert_overflow_archive_note_if_exists,
-    trim_compressed_tool_evidence_to_inline_budget, trim_compressed_tool_evidence_with_status,
-    trim_incremental_summary_notes_to_inline_budget, trim_incremental_summary_notes_with_status,
+    archive_internal_notes_deduplicated, archive_truncated_field_to_overflow,
+    build_overflow_placeholder, content_sha256_hex, insert_internal_note_archive_note_if_needed,
+    insert_overflow_archive_note_if_exists, trim_compressed_tool_evidence_to_inline_budget,
+    trim_compressed_tool_evidence_with_status, trim_incremental_summary_notes_to_inline_budget,
+    trim_incremental_summary_notes_with_status,
 };
 
 #[cfg(test)]
@@ -518,6 +519,8 @@ mod overflow_sink_dedup_tests;
 mod overflow_stub_merge_tests;
 #[cfg(test)]
 mod shrink_successful_write_arguments_tests;
+#[cfg(test)]
+mod side_note_input_tests;
 #[cfg(test)]
 mod tail_window_tests;
 #[cfg(test)]

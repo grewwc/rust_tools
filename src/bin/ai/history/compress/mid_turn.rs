@@ -432,13 +432,13 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                 // 1. Leading system / internal_notes (agent instructions etc.)
                 //    kept verbatim
                 out.extend_from_slice(&messages[..preserved_system_end]);
-                // 2. Previous summaries remain byte-for-byte navigation context.
+                // 2. Previous summaries and live guidance remain byte-identical.
                 // The registered increment prefix projects as assistant-derived,
                 // never as a system fact. Only fresh input reaches the summarizer.
                 out.extend(
                     earlier
                         .iter()
-                        .filter(|m| is_summary_or_archive_note(m))
+                        .filter(|m| is_summary_or_archive_note(m) || is_side_note_message(m))
                         .cloned(),
                 );
                 out.push(summary_plan.message().clone());

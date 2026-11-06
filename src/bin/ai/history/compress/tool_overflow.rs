@@ -21,7 +21,6 @@ use crate::ai::{
         storage::file_store::{FileStore, is_bare_file_name, session_asset_for_alias},
         tool_history_policy,
     },
-    types::App,
 };
 
 use super::super::types::{Message, ROLE_INTERNAL_NOTE, is_system_like_role, retained_turn_start};
@@ -37,10 +36,9 @@ use super::{
     KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX, PRESERVED_CONTENT_STUB_PREFIX,
     PRESERVED_IMAGE_OVERFLOW_DIR, PRESERVED_TOOL_OVERFLOW_DIR, PRESERVED_USER_OVERFLOW_DIR,
     PlannedArchiveWrite, SESSION_ASSET_ALIAS_DIRS, USER_OVERFLOW_SPILL_MIN_CHARS,
-    automatic_summary_body, content_sha256_hex, dedup_adjacent,
-    keep_recent_user_turns_when_trimming, message_contains_image, normalize_whitespace,
-    redact_images_except_last, strip_nested_prior_summary_prefixes, tool_message_indices,
-    value_to_string,
+    automatic_summary_body, content_sha256_hex, keep_recent_user_turns_when_trimming,
+    message_contains_image, normalize_whitespace, redact_images_except_last,
+    strip_nested_prior_summary_prefixes, tool_message_indices, value_to_string,
 };
 
 pub(super) const PRESERVED_TOOL_OVERFLOW_STUB_PREFIX: &str = "[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]";
@@ -233,17 +231,27 @@ pub(super) fn task_evidence_review_lines(content: &str) -> Vec<String> {
     lines
 }
 
+/// Only complete model success authorizes an asynchronous summary candidate.
+/// The caller prepares and segments fresh input before invoking this port.
 pub(super) async fn build_persisted_summary_text_with_app(
-    app: &App,
+    app: &(impl HistoryMessageSummarizer + ?Sized),
     messages: &[Message],
     max_chars: usize,
-) -> String {
-    let mut prepared = super::summary_delta_messages(messages);
-    if prepared.is_empty() || max_chars == 0 {
-        return String::new();
+) -> Option<String> {
+    if messages.is_empty() || max_chars == 0 {
+        return None;
     }
+    let summary = app.summarize_history_messages(messages, max_chars).await?;
+    // Keep section boundaries for the incremental-memory record builder.
+    let summary = summary.trim();
+    (!summary.is_empty()).then(|| summary.to_string())
+}
+
+/// Preserve the row count so segmentation can retain original archive lines.
+/// All lossy preparation stays speculative until the source-bound plan commits.
+pub(super) fn prepare_persisted_summary_messages(messages: &mut [Message]) {
     prepare_tool_messages_structured(
-        &mut prepared,
+        messages,
         360,
         // The shared size floor still applies without an overflow sink.
         0,
@@ -252,19 +260,7 @@ pub(super) async fn build_persisted_summary_text_with_app(
         None,
         &FxHashSet::default(),
     );
-    redact_images_except_last(&mut prepared, 0);
-    dedup_adjacent(&mut prepared);
-    normalize_internal_notes_for_summary_model(&mut prepared);
-
-    if let Some(summary) = app.summarize_history_messages(&prepared, max_chars).await {
-        // Keep section boundaries for the incremental-memory record builder.
-        let summary = summary.trim().to_string();
-        if !summary.is_empty() {
-            return summary;
-        }
-    }
-
-    build_persisted_summary_text(messages, max_chars)
+    redact_images_except_last(messages, 0);
 }
 
 pub(super) fn normalize_internal_notes_for_summary_model(messages: &mut Vec<Message>) {
@@ -297,8 +293,7 @@ pub(super) fn prepare_tool_messages_structured(
     // spilling them first replaces the content with an archive stub, and dedup
     // refuses to fold an already-archived stub, so the "reuse the canonical
     // full result" pointer the model needs would never be written.
-    let mut newest_identical: rustc_hash::FxHashMap<u64, usize> =
-        rustc_hash::FxHashMap::default();
+    let mut newest_identical: rustc_hash::FxHashMap<u64, usize> = rustc_hash::FxHashMap::default();
     // The canonical copy may itself be protected (and therefore absent from
     // `indices`), so index every tool result, not only the spill candidates.
     for (idx, message) in messages.iter().enumerate() {
@@ -2297,7 +2292,10 @@ fn first_preserved_content_spill_candidate(messages: &[Message], budget: usize) 
         if idx >= protected_tail_start {
             break;
         }
-        if is_system_like_role(&message.role) || message.role == "tool" {
+        if is_system_like_role(&message.role)
+            || message.role == "tool"
+            || super::is_side_note_message(message)
+        {
             continue;
         }
         if message.role == "assistant"

@@ -345,6 +345,64 @@ select, summary { touch-action:manipulation; }
 #modelpicklist .modelrowdefault { border-bottom:1px solid var(--line); border-radius:12px 12px 0 0; margin-bottom:4px; }
 @keyframes model-up { from { transform:translateY(24px); opacity:.7; } to { transform:translateY(0); opacity:1; } }
 @keyframes model-fade { from { opacity:0; } to { opacity:1; } }
+/* The team entry belongs to the phone composer; desktop keeps its controls. */
+#teamcontrols, #teampick { display:none; }
+#teamtrigger {
+  display:flex; align-items:center; gap:8px; min-height:44px; max-width:100%;
+  padding:7px 12px 7px 8px; border-radius:999px; background:var(--surface);
+  color:var(--fg); border:1px solid var(--line); text-align:left; touch-action:manipulation;
+}
+#teamtrigger[data-mode="team"] { border-color:var(--acc-line-soft); background:var(--tint-2); }
+#teamtrigger:focus-visible, #teampick button:focus-visible, #teamworker:focus-visible { outline:2px solid var(--acc-focus); outline-offset:2px; }
+.teamicon { display:grid; place-items:center; flex:0 0 auto; width:28px; height:28px; border-radius:50%; background:var(--surface-2); color:var(--acc-soft); }
+.teamicon svg { width:18px; height:18px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
+#teamlabel { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; font-weight:600; }
+#teamstatus { flex:0 0 auto; color:var(--dim); font-size:11px; }
+#teamtrigger[data-state="error"] #teamstatus { color:var(--err); }
+.teamchev { flex:0 0 auto; width:6px; height:6px; margin:0 2px 3px; border-right:1.5px solid var(--dim); border-bottom:1.5px solid var(--dim); transform:rotate(45deg); }
+#teampick { position:fixed; inset:0; z-index:15; }
+#teampickscrim { position:absolute; inset:0; background:rgba(0,0,0,.55); animation:model-fade .18s ease-out; touch-action:none; }
+#teampickpanel {
+  position:absolute; left:0; right:0; bottom:0; margin:0 auto; width:min(100%,560px);
+  display:flex; flex-direction:column; max-height:calc(var(--app-height, 100vh) * .88);
+  padding:0 12px calc(10px + env(safe-area-inset-bottom)); border:1px solid var(--line); border-bottom:0;
+  border-radius:22px 22px 0 0; background:var(--panel); box-shadow:0 -12px 40px rgba(0,0,0,.5);
+  animation:model-up .24s cubic-bezier(.2,.8,.2,1);
+}
+#teamhandle { flex:0 0 auto; width:38px; height:4px; margin:8px auto 4px; border-radius:2px; background:var(--line-2); }
+#teamhead { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:4px 4px 12px; }
+#teamtitle { font-size:18px; font-weight:600; }
+#teamnote, #teamworkerhint { color:var(--dim); font-size:12px; line-height:1.5; }
+#teamnote { margin:3px 0 0; }
+#teamclose { flex:0 0 auto; width:44px; height:44px; padding:0; border-radius:50%; background:var(--surface); color:var(--dim); font-size:24px; }
+#teambody { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; touch-action:pan-y; padding:2px 2px 8px; }
+#teammodes { display:flex; flex-direction:column; gap:8px; }
+.teamchoice {
+  display:flex; align-items:center; gap:12px; min-height:56px; padding:12px;
+  border:1px solid var(--line); border-radius:14px; background:var(--surface); color:var(--fg); text-align:left;
+}
+.teamchoice:active { background:var(--surface-hover); }
+.teamchoice[aria-checked="true"] { background:var(--tint-3); border-color:var(--acc-line-soft); }
+.teamchoice[aria-checked="true"] .modelrowcheck { background:var(--acc); border-color:var(--acc); }
+.teamchoice[aria-checked="true"] .modelrowcheck::after { content:""; position:absolute; left:7px; top:3px; width:6px; height:11px; border:solid var(--on-acc); border-width:0 2px 2px 0; transform:rotate(45deg); }
+.teamchoicetext { flex:1; min-width:0; }
+.teamchoicetext strong { display:block; font-size:15px; }
+.teamchoicetext small { display:block; margin-top:3px; color:var(--dim); font-size:12px; line-height:1.5; }
+#teamadvanced { margin-top:18px; }
+#teambackendlabel, #teamworkerlabel { display:block; margin:0 0 8px; font-size:13px; font-weight:600; }
+#teambackends { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+#teambackends .teamchoice { min-height:76px; gap:8px; padding:10px; }
+#teambackends .modelrowcheck { width:18px; height:18px; }
+#teambackends .teamchoice[aria-checked="true"] .modelrowcheck::after { left:5px; top:2px; width:5px; height:9px; }
+#teamworkerwrap { margin-top:16px; padding:12px; border:1px solid var(--line); border-radius:14px; background:var(--surface); }
+#teamworkerfield { display:flex; align-items:center; gap:8px; }
+#teamworker { width:100%; min-width:0; min-height:44px; font-size:16px; background:var(--panel); border-radius:10px; }
+#teamworkerclear { flex:0 0 auto; min-width:44px; min-height:44px; padding:6px; border-radius:10px; background:var(--surface-2); font-size:12px; }
+#teamworkerhint { margin:8px 0 0; overflow-wrap:anywhere; }
+#teamerror { margin:10px 2px 2px; color:var(--err); font-size:13px; line-height:1.5; overflow-wrap:anywhere; }
+#teamactions { display:flex; flex:0 0 auto; gap:10px; padding:10px 2px 0; border-top:1px solid var(--line); }
+#teamactions button { flex:1; min-height:46px; border-radius:12px; font-size:14px; font-weight:600; }
+#teampick button:disabled, #teamworker:disabled { opacity:.55; }
 #skillpicker { position:relative; flex:1; min-width:0; }
 #skillfield { position:relative; }
 #oskill { width:100%; padding:6px 36px 6px 8px; font-size:16px; background-color:var(--surface); border-radius:10px; }
@@ -484,6 +542,8 @@ select, summary { touch-action:manipulation; }
   #modelpickfield { flex:0 0 auto; width:100%; }
   #omodelbtn { height:46px; padding:0 14px; font-size:15px; }
   #modelpickpanel { max-height:calc(var(--app-height, 100vh) * .88); }
+  #teamcontrols { display:flex; flex:0 0 auto; padding:4px 10px 0; }
+  #teampick:not([hidden]) { display:block; }
   .modelrow { min-height:56px; }
   #oskill { min-height:46px; padding:10px 44px 10px 12px; }
   #skillclear { width:42px; }
@@ -545,6 +605,7 @@ select, summary { touch-action:manipulation; }
 }
 @media (prefers-reduced-motion:reduce) { #jumpbottom, #prompt { transition:none; } body, header, #sessbar, #composer, #msgs, .msg, button, select, input, textarea, #sessions, #conn, #connstat, #questionpanel, #skillmenu, #turnstatus, .code-preview, .code-preview-toolbar, .code-block-toolbar, .mediaprev { transition:none; } }
 @media (prefers-reduced-motion:reduce) { #modelpickpanel, #modelpickscrim { animation:none; } }
+@media (prefers-reduced-motion:reduce) { #teampickpanel, #teampickscrim { animation:none; } }
 /* Server-side images in a reply: the path text stays, the fetched picture
    sits under it (see decorateMedia in the script below). */
 .mediaprev { display:block; margin:6px 0; }
@@ -633,6 +694,50 @@ select, summary { touch-action:manipulation; }
 </div>
 <div id="modelpicklist" role="listbox" aria-labelledby="modelpicktitle"></div>
 </section>
+</div>
+<div id="teampick" hidden>
+<div id="teampickscrim"></div>
+<section id="teampickpanel" role="dialog" aria-modal="true" aria-labelledby="teamtitle" aria-describedby="teamnote">
+<div id="teamhandle" aria-hidden="true"></div>
+<div id="teamhead">
+<div><div id="teamtitle">对话模式</div><p id="teamnote">应用于当前会话的后续消息</p></div>
+<button id="teamclose" type="button" aria-label="关闭对话模式选择器">×</button>
+</div>
+<div id="teambody">
+<div id="teammodes" role="radiogroup" aria-label="对话模式">
+<button id="teamnormal" class="teamchoice" type="button" role="radio" aria-checked="true" data-mode="normal">
+<span class="teamchoicetext"><strong>普通对话</strong><small>由主 Agent 处理你的问题</small></span><span class="modelrowcheck" aria-hidden="true"></span>
+</button>
+<button id="teamcollab" class="teamchoice" type="button" role="radio" aria-checked="false" data-mode="team" tabindex="-1">
+<span class="teamchoicetext"><strong>团队协作 <span class="modelfamily">agent-team</span></strong><small>主 Agent 拆解任务，子 Agent 协作完成</small></span><span class="modelrowcheck" aria-hidden="true"></span>
+</button>
+</div>
+<div id="teamadvanced" hidden>
+<div id="teambackendlabel">子 Agent 执行方式</div>
+<div id="teambackends" role="radiogroup" aria-labelledby="teambackendlabel">
+<button id="teamkernel" class="teamchoice" type="button" role="radio" aria-checked="true" data-backend="kernel">
+<span class="teamchoicetext"><strong>Kernel</strong><small>a 内置子 Agent</small></span><span class="modelrowcheck" aria-hidden="true"></span>
+</button>
+<button id="teamtraecli" class="teamchoice" type="button" role="radio" aria-checked="false" data-backend="traecli" tabindex="-1">
+<span class="teamchoicetext"><strong>TraeCLI</strong><small>通过 TraeCLI 协作</small></span><span class="modelrowcheck" aria-hidden="true"></span>
+</button>
+</div>
+<div id="teamworkerwrap" hidden>
+<label id="teamworkerlabel" for="teamworker">子 Agent 模型 <span class="modelfamily">可选</span></label>
+<div id="teamworkerfield"><input id="teamworker" type="text" aria-describedby="teamworkerhint" placeholder="输入 TraeCLI 支持的模型名" autocomplete="off" autocapitalize="none" spellcheck="false"><button id="teamworkerclear" type="button" aria-label="留空沿用会话中的子 Agent 模型">留空</button></div>
+<p id="teamworkerhint">仅用于 TraeCLI 子 Agent；主模型仍在 model 中设置。留空沿用会话已保存的值，未设置时使用 TraeCLI 默认模型。</p>
+</div>
+</div>
+<div id="teamerror" role="alert" hidden></div>
+</div>
+<div id="teamactions"><button id="teamcancel" type="button">取消</button><button id="teamapply" type="button" class="primary">应用模式</button></div>
+</section>
+</div>
+<div id="teamcontrols">
+<button id="teamtrigger" type="button" aria-haspopup="dialog" aria-controls="teampickpanel" aria-expanded="false">
+<span class="teamicon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3 20v-2a6 6 0 0 1 12 0v2M16 5a3 3 0 0 1 0 6M18 14a5 5 0 0 1 3 4v2"/></svg></span>
+<span id="teamlabel">普通对话</span><span id="teamstatus" role="status" aria-live="polite"></span><span class="teamchev" aria-hidden="true"></span>
+</button>
 </div>
 <div id="composer">
 <button id="img" aria-label="attach image">🖼</button>
@@ -2061,6 +2166,7 @@ function resetQuestionNavigator() {
   closeQuestionPanel();
   updateQuestionButton(0);
 }
+// BEGIN session switch
 function switchSession(nextId, saveCurrent = true) {
   nextId = nextId || "";
   if (nextId === sessionId) return;
@@ -2071,7 +2177,9 @@ function switchSession(nextId, saveCurrent = true) {
   restoreDraft();
   resetQuestionNavigator();
   restoreSkillPick();
+  restoreTeamPick();
 }
+// END session switch
 function questionRowsOf(messages, histTotal) {
   const base = Math.max(0, (histTotal || messages.length) - messages.length);
   const rows = [];
@@ -2430,35 +2538,292 @@ function createLiveActivity(parent, before) {
 // session — even after the browser was closed — restores its picks from the
 // server. The empty value always means "server default".
 const PICK_KEYS = { omodel: "model", oagent: "agent", oeffort: "reasoning_effort" };
+// BEGIN mobile team mode
+// Committed intent is scoped to a server/session. A sheet edits a separate
+// draft, and only a successful config response can acknowledge that intent.
+const teamPicks = new Map();
+const TEAM_FIELDS = { mode: { normal: "teamnormal", team: "teamcollab" }, backend: { kernel: "teamkernel", traecli: "teamtraecli" } };
+let teamDraft = null;
+let teamSheetHistoryPushed = false;
+let teamSheetBackPending = false;
+function teamPickKey(sid = sessionId, base = store.base) { return JSON.stringify([base, sid || ""]); }
+function teamPickState(sid = sessionId, base = store.base) {
+  const key = teamPickKey(sid, base);
+  if (!teamPicks.has(key)) teamPicks.set(key, {
+    choice: { mode: "normal", backend: "kernel", model: "" }, confirmed: null,
+    pending: false, saving: null, error: "", revision: 0,
+    loadEpoch: 0, fullLoadEpoch: 0, appliedTeamLoadEpoch: 0,
+  });
+  return teamPicks.get(key);
+}
+function teamChoiceFromConfig(cfg) {
+  const enabled = Array.isArray(cfg.default_skills) && cfg.default_skills.some((name) => typeof name === "string" && name.toLowerCase() === "agent-team");
+  return { mode: enabled ? "team" : "normal", backend: cfg.subagent_backend === "traecli" ? "traecli" : "kernel", model: typeof cfg.subagent_model === "string" ? cfg.subagent_model : "" };
+}
+function teamConfigPayload(choice) {
+  if (choice.mode === "normal") return { subagents: { action: "reset" } };
+  if (choice.mode !== "team" || !Object.hasOwn(TEAM_FIELDS.backend, choice.backend)) throw new Error("请选择有效的对话模式");
+  const subagents = { action: "use", backend: choice.backend };
+  if (choice.backend === "traecli" && choice.model.trim()) subagents.model = choice.model.trim();
+  return { subagents };
+}
+function teamChoiceConfirmed(choice, actual) {
+  return actual.mode === choice.mode && (choice.mode === "normal" || (actual.backend === choice.backend
+    && (choice.backend !== "traecli" || !choice.model.trim() || actual.model === choice.model.trim())));
+}
+function teamChoiceLabel(choice) {
+  return choice.mode === "team" ? "团队协作 · " + (choice.backend === "traecli" ? "TraeCLI" : "Kernel") : "普通对话";
+}
+function syncTeamTrigger() {
+  // Keep the capsule's label on one line and defer updates around the IME.
+  holdLayout("teamMode", () => {
+    const state = teamPickState(), unknown = sessionId && !state.confirmed && !state.pending;
+    const label = unknown ? "对话模式" : teamChoiceLabel(state.choice);
+    const status = state.saving ? "保存中" : state.error ? "重试" : state.pending ? "待保存" : unknown ? "未同步" : "";
+    const button = $("teamtrigger");
+    $("teamlabel").textContent = label;
+    $("teamstatus").textContent = status;
+    button.dataset.mode = unknown ? "unknown" : state.choice.mode;
+    button.dataset.state = state.saving ? "saving" : state.error ? "error" : state.pending ? "pending" : "ready";
+    button.setAttribute("aria-busy", String(!!state.saving));
+    button.setAttribute("aria-label", label + (status ? "，" + status : "") + "，选择对话模式");
+    button.title = state.error || label + (state.choice.mode === "team" && state.choice.backend === "traecli" && state.choice.model ? " · 子 Agent 模型：" + state.choice.model : "");
+  });
+}
+function restoreTeamPick() {
+  if (teamDraft && teamDraft.key !== teamPickKey()) closeTeamSheet(false, false);
+  syncTeamTrigger();
+}
+function carryTeamPick(from, to, base = store.base) {
+  const oldKey = teamPickKey(from, base), state = teamPicks.get(oldKey);
+  if (state) { teamPicks.set(teamPickKey(to, base), state); teamPicks.delete(oldKey); }
+  restoreTeamPick();
+}
+function hydrateTeamConfig(cfg, revision, loadEpoch) {
+  const state = teamPickState();
+  if (state.pending || state.saving || (revision !== undefined && revision !== state.revision)
+      || (loadEpoch !== undefined && loadEpoch < state.appliedTeamLoadEpoch)) return;
+  state.choice = teamChoiceFromConfig(cfg);
+  state.confirmed = { ...state.choice };
+  if (loadEpoch !== undefined) state.appliedTeamLoadEpoch = loadEpoch;
+  state.error = "";
+  syncTeamTrigger();
+  if (teamDraft && teamDraft.key === teamPickKey() && !teamDraft.edited && !teamDraft.saving) {
+    teamDraft.choice = { ...state.choice };
+    renderTeamSheet();
+  }
+}
+async function ensureTeamConfig(sid, base = store.base) {
+  const state = teamPickState(sid, base), key = teamPickKey(sid, base);
+  if (state.saving) return state.saving;
+  if (!state.pending) return true;
+  if (!sid || base !== store.base) return false;
+  const choice = { ...state.choice }, revision = state.revision;
+  state.error = "";
+  state.saving = (async () => {
+    try {
+      const cfg = await (await api("/sessions/" + sid + "/config", { method: "POST", body: JSON.stringify(teamConfigPayload(choice)) })).json();
+      const actual = teamChoiceFromConfig(cfg);
+      if (!teamChoiceConfirmed(choice, actual)) throw new Error("服务器尚未确认所选模式，请重试");
+      state.confirmed = actual;
+      if (state.revision !== revision) return false;
+      state.choice = { ...actual };
+      state.pending = false;
+      state.revision++;
+      return true;
+    } catch (e) {
+      state.error = "模式保存失败，选择与输入已保留：" + e.message;
+      if (key === teamPickKey()) note(state.error);
+      return false;
+    } finally {
+      state.saving = null;
+      syncTeamTrigger();
+      if (teamDraft && teamDraft.key === key && teamDraft.saving) {
+        teamDraft.saving = false;
+        teamDraft.error = state.error;
+        if (!state.pending) teamDraft.choice = { ...state.choice };
+        renderTeamSheet();
+      }
+    }
+  })();
+  syncTeamTrigger();
+  return state.saving;
+}
+function renderTeamSheet() {
+  if (!teamDraft) return;
+  const draft = teamDraft, state = teamPickState(draft.sid, draft.base);
+  for (const [field, controls] of Object.entries(TEAM_FIELDS)) for (const [value, id] of Object.entries(controls)) {
+    const selected = draft.choice[field] === value, button = $(id);
+    button.setAttribute("aria-checked", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+    button.disabled = draft.saving;
+  }
+  $("teamadvanced").hidden = draft.choice.mode !== "team";
+  $("teamworkerwrap").hidden = draft.choice.mode !== "team" || draft.choice.backend !== "traecli";
+  if ($("teamworker").value !== draft.choice.model) $("teamworker").value = draft.choice.model;
+  $("teamworker").disabled = draft.saving;
+  $("teamworkerclear").disabled = draft.saving;
+  const savedModel = state.confirmed && state.confirmed.model;
+  $("teamworkerhint").textContent = "仅用于 TraeCLI 子 Agent；主模型仍在 model 中设置。" + (savedModel ? "留空沿用会话已保存的模型：" + savedModel : "留空使用 TraeCLI 默认模型。");
+  $("teamnote").textContent = draft.saving ? "正在保存，收起后仍会继续" : !draft.sid ? "选择会先保留，发送首条消息前保存" : "应用于当前会话的后续消息";
+  $("teampickpanel").setAttribute("aria-busy", String(draft.saving));
+  $("teamcancel").textContent = draft.saving ? "收起" : "取消";
+  $("teamapply").textContent = draft.saving ? "正在保存…" : "应用模式";
+  $("teamapply").disabled = draft.saving || (!!draft.sid && !state.confirmed && !state.pending && !draft.edited);
+  const error = draft.error || state.error;
+  $("teamerror").textContent = error;
+  $("teamerror").hidden = !error;
+}
+function changeTeamDraft(field, value) {
+  if (!teamDraft || teamDraft.saving || !TEAM_FIELDS[field] || !Object.hasOwn(TEAM_FIELDS[field], value)) return;
+  teamDraft.choice[field] = value;
+  teamDraft.edited = true;
+  teamDraft.error = "";
+  renderTeamSheet();
+}
+function teamWorkerChanged() {
+  if (!teamDraft || teamDraft.saving) return;
+  teamDraft.choice.model = $("teamworker").value;
+  teamDraft.edited = true;
+  teamDraft.error = "";
+  $("teamapply").disabled = false;
+  $("teamerror").hidden = true;
+}
+function openTeamSheet() {
+  if (!isPhoneLayout() || !$("teampick").hidden) return;
+  const state = teamPickState();
+  teamDraft = { key: teamPickKey(), sid: sessionId, base: store.base, choice: { ...state.choice }, edited: false, saving: !!state.saving, error: "", composing: false };
+  $("teampick").hidden = false;
+  $("teamtrigger").setAttribute("aria-expanded", "true");
+  renderTeamSheet();
+  const target = state.saving ? $("teamclose") : $(TEAM_FIELDS.mode[teamDraft.choice.mode]);
+  try { target.focus({ preventScroll: true }); } catch (e) { target.focus(); }
+  if (typeof history !== "undefined" && history.pushState) {
+    try { history.pushState({ teamSheet: true }, ""); teamSheetHistoryPushed = true; }
+    catch (e) { teamSheetHistoryPushed = false; }
+  }
+  if (sessionId && !state.confirmed && !state.pending && !state.saving) void loadSessionConfig({ teamOnly: true });
+}
+function closeTeamSheet(fromHistory = false, restoreFocus = true) {
+  if ($("teampick").hidden) return;
+  $("teampick").hidden = true;
+  teamDraft = null;
+  $("teamtrigger").setAttribute("aria-expanded", "false");
+  if (restoreFocus && isPhoneLayout()) {
+    try { $("teamtrigger").focus({ preventScroll: true }); } catch (e) { $("teamtrigger").focus(); }
+  }
+  if (!fromHistory && teamSheetHistoryPushed) {
+    teamSheetBackPending = true;
+    try { history.back(); } catch (e) { teamSheetBackPending = false; }
+  }
+  teamSheetHistoryPushed = false;
+}
+async function applyTeamDraft() {
+  const draft = teamDraft;
+  if (!draft || draft.saving || draft.composing || draft.key !== teamPickKey()) return false;
+  const state = teamPickState(draft.sid, draft.base);
+  state.choice = { ...draft.choice, model: draft.choice.model.trim() };
+  state.pending = true;
+  state.error = "";
+  state.revision++;
+  draft.edited = true;
+  if (!draft.sid) { syncTeamTrigger(); closeTeamSheet(); return true; }
+  draft.saving = true;
+  draft.error = "";
+  renderTeamSheet();
+  const saved = await ensureTeamConfig(draft.sid, draft.base);
+  if (teamDraft === draft) {
+    if (saved) closeTeamSheet();
+    else { draft.saving = false; draft.error = state.error; renderTeamSheet(); }
+  }
+  return saved;
+}
+function teamSheetKeydown(e) {
+  if (!teamDraft || teamDraft.composing || e.isComposing || e.keyCode === 229) return;
+  if (e.key === "Escape") { e.preventDefault(); closeTeamSheet(); return; }
+  if (e.key === "Tab") {
+    const order = [...$("teampickpanel").querySelectorAll("button, input")].filter((el) => !el.disabled && el.tabIndex >= 0 && !el.closest("[hidden]"));
+    if (!order.length) return;
+    const index = order.indexOf(document.activeElement);
+    e.preventDefault();
+    order[(index + (e.shiftKey ? -1 : 1) + order.length) % order.length].focus();
+    return;
+  }
+  if (!["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key) || teamDraft.saving) return;
+  const group = document.activeElement && document.activeElement.closest('[role="radiogroup"]');
+  if (!group) return;
+  const radios = [...group.querySelectorAll('[role="radio"]')], current = radios.indexOf(document.activeElement);
+  const index = e.key === "Home" ? 0 : e.key === "End" ? radios.length - 1
+    : (current + (["ArrowDown", "ArrowRight"].includes(e.key) ? 1 : -1) + radios.length) % radios.length;
+  const next = radios[index];
+  if (!next) return;
+  e.preventDefault();
+  next.click();
+  next.focus();
+}
+function wireTeamMode() {
+  $("teamtrigger").onclick = openTeamSheet;
+  for (const id of ["teamclose", "teamcancel", "teampickscrim"]) $(id).onclick = () => closeTeamSheet();
+  $("teamapply").onclick = () => { void applyTeamDraft(); };
+  for (const [field, controls] of Object.entries(TEAM_FIELDS)) for (const [value, id] of Object.entries(controls)) $(id).onclick = () => changeTeamDraft(field, value);
+  $("teamworker").oninput = teamWorkerChanged;
+  $("teamworker").oncompositionstart = () => { if (teamDraft) teamDraft.composing = true; };
+  $("teamworker").oncompositionend = () => { if (teamDraft) { teamDraft.composing = false; teamWorkerChanged(); } };
+  $("teamworkerclear").onclick = () => { if (!teamDraft || teamDraft.saving) return; $("teamworker").value = ""; teamWorkerChanged(); $("teamworker").focus(); };
+  $("teampickpanel").onkeydown = teamSheetKeydown;
+  window.addEventListener("popstate", () => {
+    if (teamSheetBackPending) { teamSheetBackPending = false; return; }
+    closeTeamSheet(true);
+  });
+  const media = window.matchMedia && window.matchMedia(PHONE_LAYOUT_QUERY);
+  if (media && media.addEventListener) media.addEventListener("change", () => { if (!isPhoneLayout()) closeTeamSheet(); });
+  syncTeamTrigger();
+}
+// END mobile team mode
 // Mirror the current session's stored picks into the three selects. Runs after
 // the dropdown options exist (loadInfo) and whenever the current session
 // changes; a fetch that lost the session switch is dropped instead of painting
 // another session's picks onto this one.
-async function loadSessionConfig() {
-  const sid = sessionId;
-  if (!sid) { resetPicks(); return; }
+// BEGIN session config hydration
+async function loadSessionConfig({ teamOnly = false } = {}) {
+  const sid = sessionId, base = store.base;
+  if (!sid) { if (teamOnly) syncTeamTrigger(); else resetPicks(); return; }
+  const team = teamPickState(sid, base), teamRevision = team.revision, epoch = ++team.loadEpoch;
+  // Team-only reads cannot supersede a full restore of the three overrides.
+  // Team fields independently retain the newest successfully applied read.
+  const fullEpoch = teamOnly ? 0 : ++team.fullLoadEpoch;
   try {
     const cfg = await (await api("/sessions/" + sid + "/config")).json();
-    if (sid !== sessionId) return; // the user switched sessions meanwhile
-    applySessionConfig(cfg);
+    if (sid !== sessionId || base !== store.base) return;
+    if (!teamOnly && fullEpoch === team.fullLoadEpoch) applySessionConfig(cfg, { teamRevision, teamLoadEpoch: epoch });
+    else hydrateTeamConfig(cfg, teamRevision, epoch);
   } catch (e) {
-    if (sid !== sessionId) return;
+    if (sid !== sessionId || base !== store.base) return;
+    if (epoch !== team.loadEpoch && (teamOnly || fullEpoch !== team.fullLoadEpoch)) return;
+    if (epoch === team.loadEpoch && !team.pending && !team.saving && team.revision === teamRevision) {
+      team.error = "读取对话模式失败，请重试：" + e.message;
+      syncTeamTrigger();
+      if (teamDraft && teamDraft.key === teamPickKey()) renderTeamSheet();
+    }
     note("loading session config failed: " + e.message);
   }
 }
 // Assigning a value no option carries reads back as "" (the default); a pick
 // the server no longer offers is dropped rather than forced.
-function applySessionConfig(cfg) {
+function applySessionConfig(cfg, options = {}) {
   const set = (sel, v) => { sel.value = (v && [...sel.options].some((o) => o.value === v)) ? v : ""; };
   set($("omodel"), cfg.model || "");
   set($("oagent"), cfg.agent || "");
   set($("oeffort"), cfg.reasoning_effort || "");
   syncModelTrigger();
   syncOvrSummary();
+  if (options.team !== false) hydrateTeamConfig(cfg, options.teamRevision, options.teamLoadEpoch);
 }
 function resetPicks() {
-  applySessionConfig({ model: "", agent: "", reasoning_effort: "" });
+  applySessionConfig({ model: "", agent: "", reasoning_effort: "" }, { team: false });
+  syncTeamTrigger();
 }
+// END session config hydration
 // Persist the current picks as the session's config. With no session yet the
 // picks stay in-page: they travel with the first turn and are stored right
 // after the session is created.
@@ -3505,6 +3870,7 @@ async function resumeSync() {
       if (!bootComplete) startStaleFollow();
       return;
     }
+    if (isPhoneLayout()) void loadSessionConfig({ teamOnly: true });
     const sid = sessionId, epoch = runEpoch;
     const hadEvents = eventActive;
     const running = await pollConfirm();
@@ -4049,19 +4415,35 @@ function parseBlock(raw) {
 // child's: a child that ran it exits and takes the change with it, so the next
 // turn is back in the old directory. Mobile answers the command locally
 // through the session endpoint instead of starting a turn.
+// BEGIN composer cd command
 const CD_LINE_RE = /^[:/]cd(?:\s|$)/;
 function cdCommandLine(text) {
   const t = text.trim();
   return t && !t.includes("\n") && CD_LINE_RE.test(t) ? t : "";
 }
 
+// BEGIN composer session adoption
+// Both a first turn and /cd may create a lazy session. Carry committed picks
+// to that id without restoring an empty draft over the user's current input.
+function adoptComposerSession(newId, previousId, base) {
+  if (sessionId !== previousId || store.base !== base) return false;
+  sessionId = newId;
+  pendingNew = newId;
+  localStorage.setItem("serve.session", newId);
+  carrySkillPick(previousId, newId);
+  carryTeamPick(previousId, newId, base);
+  return true;
+}
+// END composer session adoption
 async function runCdCommand(text) {
   const command = cdCommandLine(text);
   if (!command || pendingImages.length) return false;
   if (!sessionId) {
-    try { sessionId = (await (await api("/sessions", { method: "POST" })).json()).id; }
+    const previousId = sessionId, base = store.base;
+    let newId;
+    try { newId = (await (await api("/sessions", { method: "POST" })).json()).id; }
     catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); return true; }
-    localStorage.setItem("serve.session", sessionId);
+    if (!adoptComposerSession(newId, previousId, base)) return true;
   }
   const sid = sessionId;
   setPromptValue("", true);
@@ -4087,7 +4469,32 @@ async function runCdCommand(text) {
   scrollToLatest(false);
   return true;
 }
+// END composer cd command
 
+// BEGIN turn session preparation
+async function prepareTurnSession(previousId, base) {
+  if (sessionId !== previousId || store.base !== base) return "";
+  let sid = previousId;
+  if (!sid) {
+    let newId;
+    try { newId = (await (await api("/sessions", { method: "POST" })).json()).id; }
+    catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); return ""; }
+    if (!adoptComposerSession(newId, previousId, base)) return "";
+    sid = newId;
+    persistPicks();
+  }
+  if (turns.has(sid)) { note("this session is already running a turn — stop it, or send from another session"); return ""; }
+  if (turns.size >= MAX_LIVE_TURNS) { note("already streaming " + turns.size + " turns — wait for one to finish"); return ""; }
+  // Finish an earlier UI config write before forwarding the original input.
+  // The child owns /use and /reset, so their later persisted result wins.
+  if (!await ensureTeamConfig(sid, base)) return "";
+  // A config request can wait for a running turn's snapshot. Navigation while
+  // it waits must never send the old input with the newly shown session's picks.
+  if (sid !== sessionId || base !== store.base) return "";
+  return sid;
+}
+// END turn session preparation
+// BEGIN composer send
 async function send() {
   if (sendBusy) return; // one send's own setup at a time
   if (typeof abortEvents === "function") abortEvents();
@@ -4098,27 +4505,16 @@ async function send() {
   if (!text.trim() && !pendingImages.length) return;
   if (!validateSkillInput()) return;
 
-  // A cd line belongs to the session, not to this turn (see runCdCommand).
-  if (await runCdCommand(text)) return;
-  const draftSession = sessionId;
+  const draftSession = sessionId, sendBase = store.base;
   sendBusy = true;
   let sid;
   try {
-    if (!sessionId) {
-      try { sessionId = (await (await api("/sessions", { method: "POST" })).json()).id; }
-      catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); return; }
-      localStorage.setItem("serve.session", sessionId);
-      carrySkillPick(draftSession, sessionId);
-      persistPicks(); // picks made before any session existed belong to this one now
-    }
-    sid = sessionId;
-    // One turn per session, but no longer one turn per page: a second session
-    // can start while the first is still streaming (that is what the registry
-    // is for). This session's own turn, or too many live ones, is what makes a
-    // send wait.
-    if (turns.has(sid)) { note("this session is already running a turn — stop it, or send from another session"); return; }
-    if (turns.size >= MAX_LIVE_TURNS) { note("already streaming " + turns.size + " turns — wait for one to finish"); return; }
+    // A cd line belongs to the session, not to this turn (see runCdCommand).
+    if (await runCdCommand(text)) return;
+    sid = await prepareTurnSession(draftSession, sendBase);
+    if (!sid) return;
   } finally { sendBusy = false; } // the stream below owns itself: other sessions may send now
+  if ($("prompt").value !== text || promptComposing) { note("输入已更新，请再次发送。"); return; }
   if (!validateSkillInput()) return;
   const rewindFloor = historySession === sid ? canonicalHistoryTotal : 0;
   let prompt = text;
@@ -4372,8 +4768,9 @@ async function send() {
   };
   // The request itself may take time; show Connecting before awaiting headers.
   flushPaint();
+  // BEGIN turn HTTP acceptance
   try {
-    const res = await fetch(store.base + "/sessions/" + sessionId + "/turns/stream", {
+    const res = await fetch(sendBase + "/sessions/" + sid + "/turns/stream", {
       method: "POST", headers: headers(true), body: JSON.stringify(body),
     });
     if (!res.ok) {
@@ -4382,6 +4779,7 @@ async function send() {
       throw new Error(res.status + " " + detail);
     }
     consumeSkillPick(skillSelection); // Accepted by the server, not model completion.
+    // END turn HTTP acceptance
     turnStarted = true;
     reader = res.body.getReader();
     const dec = new TextDecoder();
@@ -4605,7 +5003,11 @@ async function send() {
   else followOutput(finishFollow);
   loadInfo();
   loadSessions();
+  // Commands such as /use and /reset persist defaults in the child. Restore
+  // them from config instead of deriving mode from the echoed command/output.
+  if (sid === sessionId && sendBase === store.base && isPhoneLayout()) void loadSessionConfig({ teamOnly: true });
 }
+// END composer send
 
 // Length only, never the secret: separates "nothing stored" (0 chars, save
 // never landed) from "stored but wrong" without leaking the token on screen.
@@ -4765,6 +5167,7 @@ function wire() {
   $("modelpickscrim").onclick = () => closeModelSheet();
   $("modelpickpanel").onkeydown = modelSheetKeydown;
   window.addEventListener("popstate", () => { if (!$("modelpick").hidden) closeModelSheet(true); });
+  wireTeamMode();
   $("oskill").onfocus = renderSkillMenu;
   $("oskill").onclick = renderSkillMenu;
   $("oskill").onblur = closeSkillMenu;
@@ -4919,7 +5322,7 @@ function wire() {
       loadSessionConfig(); // a fresh session owns no config; clear the picks
     } catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); }
   };
-  $("refresh").onclick = async () => { await loadSessions(); await loadHistory(); };
+  $("refresh").onclick = async () => { await loadSessions(); await loadHistory(); if (isPhoneLayout()) await loadSessionConfig({ teamOnly: true }); };
   $("fork").onclick = async () => {
     if (!sessionId) return;
     try {
@@ -4948,6 +5351,7 @@ function registerAppServiceWorker() {
 async function boot() {
   registerAppServiceWorker();
   wire();
+  restoreTeamPick();
   try { await api("/healthz"); } catch (e) {
     $("info").textContent = "offline — retrying…";
     $("info").title = "cannot reach server: " + e.message;

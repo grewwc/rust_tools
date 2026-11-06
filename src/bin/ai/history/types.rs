@@ -46,8 +46,9 @@ pub(in crate::ai) struct SkillActivationEvent {
     pub(in crate::ai) outcome: String,
 }
 
-/// Internal origin marker for runtime-synthesized user messages (not real user
-/// input, so it does not form a user turn boundary).
+/// Internal origin marker for runtime-synthesized user messages, which retain
+/// their origin and do not form real user turn boundaries. Side-notes receive
+/// the same retention protection as user input during compression.
 ///
 /// `Message` has no separate metadata field yet, so the runtime-only origin side
 /// channel is stored in `reasoning_content`, which user messages never use. This
@@ -131,6 +132,34 @@ pub(in crate::ai) fn runtime_synthetic_user_message(content: Value) -> Message {
 pub(in crate::ai) fn is_runtime_synthetic_user_message(message: &Message) -> bool {
     message.role == "user"
         && message.reasoning_content.as_deref() == Some(RUNTIME_SYNTHETIC_USER_ORIGIN)
+}
+
+/// Recognizes side-notes by their runtime origin and envelope. Compression gives
+/// them the same retention protection as user input while preserving their
+/// author identity and existing turn boundaries.
+pub(in crate::ai) fn is_side_note_message(message: &Message) -> bool {
+    is_runtime_synthetic_user_message(message)
+        && message.content.as_str().is_some_and(|text| {
+            text.strip_prefix("[side-note from=")
+                .and_then(|rest| rest.split_once("] Live guidance (side-note) from "))
+                .is_some_and(|(metadata, _)| {
+                    metadata
+                        .rsplit_once(" ts=")
+                        .is_some_and(|(from, ts)| !from.is_empty() && ts.parse::<u64>().is_ok())
+                })
+        })
+}
+
+pub(in crate::ai) fn is_user_input_message(message: &Message) -> bool {
+    message.role == "user" && !is_runtime_synthetic_user_message(message)
+}
+
+/// Counts real user turns for compression thresholds and retention windows.
+pub(in crate::ai) fn user_input_turn_count(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .filter(|message| is_user_input_message(message))
+        .count()
 }
 
 /// Clears the runtime-only message origin side channel, preventing internal markers
@@ -376,13 +405,19 @@ mod tests {
             assert_eq!(persisted.content, content);
             assert_eq!(request_reminder(&persisted), Some(reminder));
             assert!(has_runtime_message_metadata(&persisted));
-            assert_eq!(last_real_user_index(std::slice::from_ref(&persisted)), Some(0));
+            assert_eq!(
+                last_real_user_index(std::slice::from_ref(&persisted)),
+                Some(0)
+            );
 
             let restored: Message =
                 serde_json::from_str(&serde_json::to_string(&persisted).unwrap()).unwrap();
             let mut projected = restored;
             clear_runtime_message_metadata(&mut projected);
-            assert_eq!(projected.content, prepend_request_reminder(content, reminder));
+            assert_eq!(
+                projected.content,
+                prepend_request_reminder(content, reminder)
+            );
             assert_eq!(projected.reasoning_content, None);
         }
 

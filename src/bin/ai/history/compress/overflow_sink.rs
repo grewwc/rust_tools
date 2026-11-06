@@ -24,6 +24,10 @@ impl PlannedArchiveWrite {
         Self { path, content }
     }
 
+    pub(super) fn content(&self) -> &str {
+        &self.content
+    }
+
     /// Atomically persist the planning-phase archive to disk. The path contains a
     /// content fingerprint, so an already-existing file can be reused directly;
     /// even if concurrent writers write temp files at the same time, only one
@@ -401,7 +405,7 @@ impl TruncatedFieldArchiveBatch {
     }
 }
 
-pub(super) fn archive_messages_to_overflow(
+pub(in crate::ai) fn archive_messages_to_overflow(
     messages: &[Message],
     overflow_dir: Option<&Path>,
 ) -> Option<String> {

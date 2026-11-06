@@ -103,6 +103,7 @@ test("drafts persist independently for each session and restore on switch", () =
     growPrompt() {},
     setPromptValue(value) { prompt.value = value; return true; },
     restoreSkillPick() {},
+    restoreTeamPick() {},
     isPhoneLayout: () => true,
   });
   vm.runInContext(layoutHoldSrc, context);

@@ -334,11 +334,13 @@ pub(in crate::ai) use types::{
     CODE_INSPECTION_MEMORY_PREFIX, COLON, MAX_HISTORY_TURNS, Message, NEWLINE,
     SkillActivationEvent, ToolExecutionOutcome, attach_request_reminder,
     clear_runtime_message_metadata, has_runtime_message_metadata, is_code_inspection_memory_text,
-    is_runtime_synthetic_user_message, last_real_user_index, prepend_request_reminder,
-    redact_inline_image_data, request_reminder, runtime_synthetic_user_message,
+    is_runtime_synthetic_user_message, is_side_note_message, is_user_input_message,
+    last_real_user_index, prepend_request_reminder, redact_inline_image_data, request_reminder,
+    runtime_synthetic_user_message, user_input_turn_count,
 };
 
 pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;
+pub(in crate::ai) use compress::archive_messages_to_overflow;
 pub(in crate::ai) const ROLE_INTERNAL_NOTE: &str = types::ROLE_INTERNAL_NOTE;
 
 const CONTEXT_SNAPSHOT_WRITE_DEADLINE: Duration = Duration::from_secs(1);
@@ -678,7 +680,12 @@ fn context_projection_fingerprint(
     // selection accounts for capped evidence before reducing recent groups.
     // v21: persisted budget compaction reuses the LLM summary fallback when
     // mechanical compression still cannot reclaim old replay-heavy tool pairs.
-    const PROJECTION_VERSION: u8 = 21;
+    // v22: side-notes receive the same compression protection as user input and
+    // remain verbatim across summaries and mechanical trimming, preserving
+    // their author identity and existing turn boundaries.
+    // v23: incremental model summaries consume bounded chronological segments,
+    // retain original source ranges, and abort when any segment fails.
+    const PROJECTION_VERSION: u8 = 23;
     projection_cache_key(
         PROJECTION_VERSION,
         history_max_chars,
@@ -965,10 +972,7 @@ async fn compact_session_history_with_app_inner(
     }
 
     let original_chars = messages_total_chars_pub(&messages);
-    let user_turns = messages
-        .iter()
-        .filter(|message| message.role == "user" && !is_runtime_synthetic_user_message(message))
-        .count();
+    let user_turns = user_input_turn_count(&messages);
     let exceeds_context_budget =
         app.config.history_max_chars > 0 && original_chars > app.config.history_max_chars;
     let exceeds_tool_evidence_budget =
@@ -1123,7 +1127,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_cache_key_is_versioned_and_v21_never_reuses_older_snapshots() {
+    fn projection_cache_key_is_versioned_and_v23_never_reuses_older_snapshots() {
         let params = (
             8_000usize,
             2usize,
@@ -1134,6 +1138,8 @@ mod tests {
         let v18_key = projection_cache_key(18, params.0, params.1, params.2, params.3);
         let v19_key = projection_cache_key(19, params.0, params.1, params.2, params.3);
         let v20_key = projection_cache_key(20, params.0, params.1, params.2, params.3);
+        let v21_key = projection_cache_key(21, params.0, params.1, params.2, params.3);
+        let v22_key = projection_cache_key(22, params.0, params.1, params.2, params.3);
         assert_ne!(
             v17_key, v18_key,
             "identical projection parameters must not collide across projection versions"
@@ -1141,19 +1147,21 @@ mod tests {
         assert!(v17_key.starts_with("v17|"));
         assert!(v18_key.starts_with("v18|"));
         assert!(v19_key.starts_with("v19|"));
-        // The live fingerprint must carry v21 so replay-heavy snapshots
-        // materialized under v20 and earlier can adopt the persisted LLM fallback.
-        // Updating the v21 literal is a deliberate tripwire for the
+        // The live fingerprint must carry v23 so older sampling-based
+        // summaries are rebuilt from canonical history.
+        // Updating the v23 literal is a deliberate tripwire for the
         // next projection-strategy change.
         let live = context_projection_fingerprint(params.0, params.1, params.2, params.3);
         assert_eq!(
             live,
-            projection_cache_key(21, params.0, params.1, params.2, params.3)
+            projection_cache_key(23, params.0, params.1, params.2, params.3)
         );
         assert_ne!(live, v17_key);
         assert_ne!(live, v18_key);
         assert_ne!(live, v19_key);
         assert_ne!(live, v20_key);
+        assert_ne!(live, v21_key);
+        assert_ne!(live, v22_key);
     }
 
     #[test]

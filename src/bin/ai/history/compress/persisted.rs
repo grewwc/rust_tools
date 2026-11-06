@@ -320,7 +320,13 @@ impl ContextCompressionOutcome {
         status: ContextCompressionStatus,
     ) -> Self {
         let after_chars = messages_total_chars(&messages);
-        Self { messages, status, before_chars, after_chars, max_chars }
+        Self {
+            messages,
+            status,
+            before_chars,
+            after_chars,
+            max_chars,
+        }
     }
 
     pub(in crate::ai) fn budget_met(&self) -> bool {
@@ -329,10 +335,18 @@ impl ContextCompressionOutcome {
 
     pub(in crate::ai) fn diagnostic(&self) -> Option<String> {
         let reason = match self.status {
-            ContextCompressionStatus::MissingArchiveSink => Some("no archive sink; unarchived context retained"),
-            ContextCompressionStatus::ArchiveCommitFailed => Some("archive commit failed; unarchived context retained"),
-            ContextCompressionStatus::NoEligibleDialogue => Some("no eligible fresh dialogue for a summary"),
-            ContextCompressionStatus::SummaryUnavailable => Some("no source-bound summary fits the configured summary budget"),
+            ContextCompressionStatus::MissingArchiveSink => {
+                Some("no archive sink; unarchived context retained")
+            }
+            ContextCompressionStatus::ArchiveCommitFailed => {
+                Some("archive commit failed; unarchived context retained")
+            }
+            ContextCompressionStatus::NoEligibleDialogue => {
+                Some("no eligible fresh dialogue for a summary")
+            }
+            ContextCompressionStatus::SummaryUnavailable => {
+                Some("no source-bound summary fits the configured summary budget")
+            }
             ContextCompressionStatus::Complete | ContextCompressionStatus::Disabled => None,
         };
         if reason.is_none() && self.budget_met() {
@@ -342,7 +356,10 @@ impl ContextCompressionOutcome {
             "context compression {:?}: {}; {} -> {} chars, max={}, budget_met={}",
             self.status,
             reason.unwrap_or("protected content or disabled compression leaves the budget unmet"),
-            self.before_chars, self.after_chars, self.max_chars, self.budget_met(),
+            self.before_chars,
+            self.after_chars,
+            self.max_chars,
+            self.budget_met(),
         ))
     }
 
@@ -370,8 +387,14 @@ pub(in crate::ai) fn compress_messages_for_context(
     cwd: Option<&Path>,
 ) -> Vec<Message> {
     compress_messages_for_context_with_outcome(
-        messages, max_chars, keep_last, summary_max_chars, overflow_dir, cwd,
-    ).into_messages()
+        messages,
+        max_chars,
+        keep_last,
+        summary_max_chars,
+        overflow_dir,
+        cwd,
+    )
+    .into_messages()
 }
 
 pub(in crate::ai) fn compress_messages_for_context_with_outcome(
@@ -419,7 +442,10 @@ pub(in crate::ai) fn compress_messages_for_context_with_outcome(
     let archive_failure = tool_window_failure.or(increment_window_failure);
     let finish = |messages, status| {
         ContextCompressionOutcome::new(
-            messages, before_chars, max_chars, archive_failure.unwrap_or(status),
+            messages,
+            before_chars,
+            max_chars,
+            archive_failure.unwrap_or(status),
         )
     };
 
@@ -462,11 +488,11 @@ pub(in crate::ai) fn compress_messages_for_context_with_outcome(
         return finish(outcome.messages, outcome.status);
     }
 
-    // Keep policies, checkpoints, and previous increments in their original
-    // order. A new increment describes only fresh dialogue, never old summaries.
+    // Keep policies, checkpoints, previous increments, and live user guidance in
+    // their original order. A new increment describes fresh dialogue only.
     let mut out: Vec<Message> = older
         .iter()
-        .filter(|message| is_system_like_role(&message.role))
+        .filter(|message| is_system_like_role(&message.role) || is_side_note_message(message))
         .cloned()
         .collect();
     if summary_max_chars > 0 {
@@ -911,10 +937,7 @@ async fn compact_persisted_history_with_app_inner(
     threshold_turns: usize,
 ) -> Vec<Message> {
     let messages = sanitize_persisted_history_messages(messages);
-    let user_turns = messages
-        .iter()
-        .filter(|message| message.role == "user" && !is_runtime_synthetic_user_message(message))
-        .count();
+    let user_turns = user_input_turn_count(&messages);
     if user_turns <= threshold_turns {
         return messages;
     }
@@ -942,7 +965,7 @@ async fn compact_persisted_history_with_app_inner(
     }
     let mut out: Vec<Message> = messages[..split_at]
         .iter()
-        .filter(|message| is_system_like_role(&message.role))
+        .filter(|message| is_system_like_role(&message.role) || is_side_note_message(message))
         .cloned()
         .collect();
     out.push(plan.message().clone());

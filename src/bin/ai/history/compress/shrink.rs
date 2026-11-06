@@ -536,7 +536,7 @@ pub(in crate::ai) fn drop_trim_candidates_batch(
         }
         let message = &messages[idx];
         // Predicate chain copied from `first_trim_candidate`.
-        if is_context_checkpoint_marker(message) {
+        if is_context_checkpoint_marker(message) || is_side_note_message(message) {
             idx += 1;
             continue;
         }

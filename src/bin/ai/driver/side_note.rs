@@ -8,6 +8,7 @@
 // input instead of waiting for the user's next typed message.
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -20,6 +21,133 @@ use rust_tools::commonw::FastSet;
 
 const SIDE_NOTE_DIR: &str = "side_notes";
 const FOREGROUND_FILE: &str = "foreground.jsonl";
+
+/// Existing JSONL queue bytes awaiting their durable commit. Taking a snapshot
+/// never removes durable input; acknowledgement removes only this exact prefix.
+pub(super) struct PendingSideNotes {
+    file: PathBuf,
+    content: String,
+    notes: Vec<SideNote>,
+}
+
+impl PendingSideNotes {
+    pub(super) fn notes(&self) -> &[SideNote] {
+        &self.notes
+    }
+
+    fn acknowledge_locked(&self) -> Result<(), String> {
+        let current = fs::read_to_string(&self.file)
+            .map_err(|error| format!("read side-note acknowledgement: {error}"))?;
+        let remaining = current
+            .strip_prefix(&self.content)
+            .ok_or_else(|| "side-note queue prefix changed; retained pending input".to_string())?;
+        // A suffix may contain guidance appended since the input snapshot. Sync
+        // its replacement before rename so a crash cannot lose that new input.
+        let tmp = self.file.with_extension(format!(
+            "drain.{}.{}.tmp",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let result = (|| {
+            let mut output = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp)
+                .map_err(|error| format!("open side-note acknowledgement: {error}"))?;
+            output
+                .write_all(remaining.as_bytes())
+                .map_err(|error| format!("write side-note acknowledgement: {error}"))?;
+            output
+                .sync_all()
+                .map_err(|error| format!("sync side-note acknowledgement: {error}"))?;
+            fs::rename(&tmp, &self.file)
+                .map_err(|error| format!("replace side-note queue: {error}"))?;
+            if let Some(parent) = self.file.parent() {
+                fs::File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|error| format!("sync side-note directory: {error}"))?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(tmp);
+        }
+        result
+    }
+
+    #[cfg(test)]
+    fn acknowledge(&self) -> Result<(), String> {
+        let mut woken = WOKEN_FOREGROUND_QUEUES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _lock = lock_side_note_queue(&self.file)?;
+        self.acknowledge_locked()?;
+        woken.remove(&self.file);
+        if fs::metadata(&self.file).is_ok_and(|metadata| metadata.len() > 0) {
+            super::notify_scheduler();
+        }
+        Ok(())
+    }
+}
+
+/// The empty lock file coordinates processes across queue replacement. It stores
+/// no session data; the queue retains the existing SideNote JSONL encoding.
+fn lock_side_note_queue(file: &Path) -> Result<fs::File, String> {
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(file.with_extension("lock"))
+        .map_err(|error| format!("open side-note queue lock: {error}"))?;
+    lock.lock()
+        .map_err(|error| format!("lock side-note queue: {error}"))?;
+    Ok(lock)
+}
+
+fn read_pending_side_notes_locked(
+    file: PathBuf,
+    target: Option<&str>,
+) -> Result<Option<PendingSideNotes>, String> {
+    let content = match fs::read_to_string(&file) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read side-note queue: {error}")),
+    };
+    let notes: Vec<SideNote> = content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            Some(serde_json::from_str(trimmed).unwrap_or_else(|_| SideNote {
+                from: "user".to_string(),
+                content: trimmed.to_string(),
+                ts: now_ts(),
+                target: target.map(str::to_string),
+            }))
+        })
+        .collect();
+    Ok((!notes.is_empty()).then_some(PendingSideNotes {
+        file,
+        content,
+        notes,
+    }))
+}
+
+#[cfg(test)]
+pub(super) fn read_pending_side_notes(
+    history_file: &Path,
+    target: Option<&str>,
+) -> Result<Option<PendingSideNotes>, String> {
+    let file = side_note_file(history_file, target);
+    if !file.exists() {
+        return Ok(None);
+    }
+    let _lock = lock_side_note_queue(&file)?;
+    read_pending_side_notes_locked(file, target)
+}
 
 // The same lock serializes foreground appends, drains, and wake decisions so a
 // drain cannot reset coalescing while an append or scheduler wake is in progress.
@@ -170,7 +298,7 @@ pub fn push_side_note(
             .unwrap_or_else(|err| err.into_inner())
     });
     // Persist the append before publishing any foreground scheduling notification.
-    use std::io::Write;
+    let _queue_lock = lock_side_note_queue(&file)?;
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -192,81 +320,68 @@ pub fn push_side_note(
     Ok(file)
 }
 
-/// Drain and clear all pending notes for the target queue. Called by the caller at iteration
-/// boundaries; new notes are injected immediately.
-/// Drain uses an atomic rename: push appends, while the drain side renames the old file to a temp
-/// file and reads it, avoiding notes pushed during the "read-then-truncate" window being dropped.
-pub fn drain_side_notes(history_file: &Path, target: Option<&str>) -> Vec<SideNote> {
+/// Durably commit input before acknowledging its queue prefix. Append failures
+/// and process exits leave the original JSONL available for the next delivery.
+pub(super) fn consume_side_notes(
+    history_file: &Path,
+    target: Option<&str>,
+    commit: impl FnOnce(&[SideNote]) -> Result<(), String>,
+) -> Result<usize, String> {
     let file = side_note_file(history_file, target);
+    if !file.exists() {
+        return Ok(0);
+    }
     let mut wake_state = is_foreground_target(target).then(|| {
         WOKEN_FOREGROUND_QUEUES
             .lock()
             .unwrap_or_else(|err| err.into_inner())
     });
-    // Atomic drain: try renaming the queue file to a temp file; failure means nothing is pending.
-    let tmp = file.with_extension(format!("drain.{}.tmp", std::process::id()));
-    let renamed = fs::rename(&file, &tmp).is_ok();
-    let content = if renamed {
-        if let Some(woken) = wake_state.as_mut() {
-            woken.remove(&file);
-        }
-        match fs::read_to_string(&tmp) {
-            Ok(c) => {
-                let _ = fs::remove_file(&tmp);
-                c
-            }
-            Err(_) => {
-                let _ = fs::remove_file(&tmp);
-                return Vec::new();
-            }
-        }
-    } else {
-        if !file.exists() {
-            if let Some(woken) = wake_state.as_mut() {
-                woken.remove(&file);
-            }
-            return Vec::new();
-        }
-        // Fallback path: rename can fail on cross-device moves etc.; degrade to atomic truncation
-        // (a tiny race remains, but only triggered on cross-device).
-        match fs::read_to_string(&file) {
-            Ok(c) => {
-                // Best-effort atomic truncation: write an empty temp file first, then rename over it.
-                let empty_tmp = file.with_extension(format!("empty.{}.tmp", std::process::id()));
-                let _ = fs::write(&empty_tmp, "");
-                if fs::rename(&empty_tmp, &file).is_ok()
-                    && let Some(woken) = wake_state.as_mut()
-                {
-                    woken.remove(&file);
-                }
-                c
-            }
-            Err(_) => return Vec::new(),
-        }
+    let _queue_lock = lock_side_note_queue(&file)?;
+    let Some(batch) = read_pending_side_notes_locked(file.clone(), target)? else {
+        return Ok(0);
     };
-    let mut out = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(note) = serde_json::from_str::<SideNote>(trimmed) {
-            out.push(note);
-        } else {
-            // Backward compatibility: a plain-text line is a single note.
-            out.push(SideNote {
-                from: "user".to_string(),
-                content: trimmed.to_string(),
-                ts: now_ts(),
-                target: target.map(|s| s.to_string()),
-            });
-        }
+    commit(batch.notes())?;
+    batch.acknowledge_locked()?;
+    if let Some(woken) = wake_state.as_mut() {
+        woken.remove(&file);
     }
-    out
+    Ok(batch.notes.len())
 }
 
-/// Convert SideNote into user messages that can be pushed straight into LLM `messages`.
-/// Uses `runtime_synthetic_user_message` to avoid being misjudged as a real user turn boundary.
+/// The next-input path can handle a local command without appending canonical
+/// dialogue. Archive its exact guidance using the existing overflow format
+/// before dequeue, then let the ordinary input path retain its original framing.
+pub(super) fn drain_side_notes_to_archive(
+    history_file: &Path,
+    target: Option<&str>,
+) -> Result<Vec<SideNote>, String> {
+    let mut notes = Vec::new();
+    consume_side_notes(history_file, target, |pending| {
+        let archived = side_notes_to_messages(pending.to_vec());
+        let root = assets_dir_for_history(history_file);
+        crate::ai::history::archive_messages_to_overflow(&archived, Some(&root))
+            .ok_or_else(|| "side-note archive commit failed; input remains queued".to_string())?;
+        notes = pending.to_vec();
+        Ok(())
+    })?;
+    Ok(notes)
+}
+
+/// Queue-only fixture helper; production consumers require a durable commit.
+#[cfg(test)]
+pub fn drain_side_notes(history_file: &Path, target: Option<&str>) -> Vec<SideNote> {
+    let mut notes = Vec::new();
+    consume_side_notes(history_file, target, |pending| {
+        notes = pending.to_vec();
+        Ok(())
+    })
+    .expect("drain side-note fixture");
+    notes
+}
+
+/// Convert side-notes to runtime-synthetic messages for the LLM request.
+/// Compression gives their complete contents the same retention protection as
+/// user input while preserving their author identity and turn boundaries.
 pub fn side_notes_to_messages(notes: Vec<SideNote>) -> Vec<Message> {
     notes
         .into_iter()
@@ -305,6 +420,10 @@ pub fn current_target_id() -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+#[path = "side_note_delivery_tests.rs"]
+mod delivery_tests;
 
 #[cfg(test)]
 mod tests {

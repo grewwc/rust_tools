@@ -1255,7 +1255,10 @@ async fn run_loop(
             ) {
                 Vec::new()
             } else {
-                crate::ai::driver::side_note::drain_side_notes(&app.session_history_file, None)
+                crate::ai::driver::side_note::drain_side_notes_to_archive(
+                    &app.session_history_file,
+                    None,
+                )?
             };
             let pending_side_note_count = pending_side_notes.len();
             let pending_side_note_input = pending_side_notes
