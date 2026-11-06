@@ -405,57 +405,74 @@ pub(super) async fn prepare_turn(
     let history_summary_max_chars = app.config.history_summary_max_chars;
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok();
     let reference_assets_dir = attachment_assets_dir.clone();
-    let (history, compression_diagnostic, pending_image_digests) =
-        tokio::task::spawn_blocking(move || {
-            let outcome = build_context_history_with_outcome(
-                history_count,
-                &history_file,
-                history_max_chars,
-                history_keep_last,
-                history_summary_max_chars,
-                overflow_dir,
-                cwd.as_deref(),
-            )
-            .map_err(|e| e.to_string())?;
-            // Capture compaction feedback before image substitution changes the
-            // projection size. The driver reports safe degradation without aborting
-            // turn preparation or discarding the retained source messages.
-            let compression_diagnostic = outcome.diagnostic();
-            let mut history = outcome.messages;
-            // Cross-turn image digests: replace prior turns' raw images with the
-            // digest persisted in history metadata, so a new turn does not re-send
-            // last turn's images to the model (consistent for all VL models). Images
-            // whose digest never reached metadata are reported back so the turn can
-            // retry persisting them instead of re-sending those images forever.
-            let digest_outcome = crate::ai::request::replace_old_images_with_persisted_digests(
-                &history_file,
-                &mut history,
+    let history_task = tokio::task::spawn_blocking(move || {
+        let outcome = build_context_history_with_outcome(
+            history_count,
+            &history_file,
+            history_max_chars,
+            history_keep_last,
+            history_summary_max_chars,
+            overflow_dir,
+            cwd.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
+        // Capture compaction feedback before image substitution changes the
+        // projection size. The driver reports safe degradation without aborting
+        // turn preparation or discarding the retained source messages.
+        let compression_diagnostic = outcome.diagnostic();
+        let mut history = outcome.messages;
+        // Cross-turn image digests: replace prior turns' raw images with the
+        // digest persisted in history metadata, so a new turn does not re-send
+        // last turn's images to the model (consistent for all VL models). Images
+        // whose digest never reached metadata are reported back so the turn can
+        // retry persisting them instead of re-sending those images forever.
+        let digest_outcome = crate::ai::request::replace_old_images_with_persisted_digests(
+            &history_file,
+            &mut history,
+            Some(reference_assets_dir.as_path()),
+        )
+        .map_err(|e| e.to_string())?;
+        // Materialize immutable reference snapshots after digest substitution so
+        // digest-bearing turns stay text-only while other image references turn
+        // into inline images for the request projection.
+        for m in &mut history {
+            crate::ai::request::materialize_references(
+                &mut m.content,
                 Some(reference_assets_dir.as_path()),
-            )
-            .map_err(|e| e.to_string())?;
-            // Materialize immutable reference snapshots after digest substitution so
-            // digest-bearing turns stay text-only while other image references turn
-            // into inline images for the request projection.
-            for m in &mut history {
-                crate::ai::request::materialize_references(
-                    &mut m.content,
-                    Some(reference_assets_dir.as_path()),
-                );
+            );
+        }
+        Ok::<_, String>((history, compression_diagnostic, digest_outcome.pending))
+    });
+    // Skill routing reads runtime manifests and MCP metadata, while the history
+    // task reads the session projection and attachment assets. Their inputs are
+    // independent, so overlap them without changing either resulting prompt.
+    // Keep the `Result` until history finishes to preserve the original error
+    // precedence and to avoid detaching a history task on skill-prepare failure.
+    let skill_turn_result = {
+        let mc = mcp_client.lock().unwrap();
+        skill_runtime::prepare_skill_for_turn(app, &mc, skill_manifests, question)
+    }
+    .map_err(|error| error.to_string());
+    let history_result: Result<_, String> = match history_task.await {
+        Ok(result) => result,
+        Err(error) => Err(format!("context history task failed: {error}")),
+    };
+    let (history, compression_diagnostic, pending_image_digests) = match history_result {
+        Ok(history) => history,
+        Err(error) => {
+            if let Ok(skill_turn) = skill_turn_result {
+                skill_turn.restore_agent_context(app);
             }
-            Ok::<_, String>((history, compression_diagnostic, digest_outcome.pending))
-        })
-        .await
-        .map_err(|e| format!("context history task failed: {e}"))?
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            return Err(error.into());
+        }
+    };
     if let Some(diagnostic) = compression_diagnostic
         && crate::ai::driver::runtime_ctx::terminal_output_enabled()
     {
         eprintln!("[history] {diagnostic}");
     }
-    let mut skill_turn = {
-        let mc = mcp_client.lock().unwrap();
-        skill_runtime::prepare_skill_for_turn(app, &mc, skill_manifests, question)?
-    };
+    let mut skill_turn =
+        skill_turn_result.map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
 
     {
         let now = chrono::Local::now();
