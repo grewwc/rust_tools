@@ -36,8 +36,8 @@ use crate::ai::types::App;
 #[allow(unused_imports)]
 pub(in crate::ai) use blob::{
     append_history, append_history_messages, append_history_messages_for_model, build_message_arr,
-    coalesce_repeated_wait_wake_notes, delete_history_artifacts, parse_history_blob,
-    replace_history_messages, truncate_history_messages,
+    coalesce_repeated_wait_wake_notes, delete_history_artifacts, is_sqlite_path,
+    parse_history_blob, replace_history_messages, truncate_history_messages,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use checkpoint::{
@@ -73,6 +73,9 @@ pub(in crate::ai) use sqlite::MarkMessageUpdate;
 pub(in crate::ai) use sqlite::fork_history_for_subagent;
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::{read_all_messages_sqlite, read_all_messages_sqlite_read_only};
+pub(in crate::ai) use sqlite::{
+    read_rewind_ledger_messages_sqlite, with_rewind_user_messages_sqlite,
+};
 
 /// Prepare an independent history file for a sub-agent. First dispatch forks
 /// the parent history on demand; resume only reuses the existing child file

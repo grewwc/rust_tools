@@ -7,7 +7,7 @@ use super::connection::sqlite_error_kind;
 /// `PRAGMA user_version` value written after every table and column this module
 /// creates exists. Bump it whenever a change here adds or alters schema; an
 /// existing database then runs the migration once more.
-pub(super) const HISTORY_SCHEMA_VERSION: i32 = 2;
+pub(super) const HISTORY_SCHEMA_VERSION: i32 = 3;
 
 pub(super) fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
     // Several operations run per turn and each one opens (or reuses) a
@@ -36,6 +36,7 @@ pub(super) fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
         CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
+        CREATE INDEX IF NOT EXISTS idx_messages_rewind_users ON messages(id) WHERE role = 'user';
         CREATE TABLE IF NOT EXISTS context_messages (
             position INTEGER PRIMARY KEY,
             role TEXT NOT NULL,
