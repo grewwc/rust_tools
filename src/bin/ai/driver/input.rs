@@ -1126,7 +1126,8 @@ fn collect_history_messages(
 #[derive(Debug, Clone)]
 struct HistoryRewindPlan {
     user_ordinal: usize,
-    keep_messages: Vec<history::Message>,
+    keep_messages: usize,
+    legacy_keep_messages: Option<Vec<history::Message>>,
     removed_messages: usize,
     preview: String,
 }
@@ -1136,38 +1137,51 @@ fn plan_history_rewind(
     target: HistoryRewindTarget,
 ) -> Result<HistoryRewindPlan, Box<dyn Error>> {
     let history_file = active_history_path(app);
-    let messages = history::build_message_arr(usize::MAX, &history_file)?;
-    let target_ordinal = resolve_rewind_target(&messages, target)?;
-    let Some((target_index, preview)) = find_user_message_by_ordinal(&messages, target_ordinal)
-    else {
-        return Err(format!("user input u{target_ordinal} not found").into());
+    let resolve = |messages: &[history::Message]| {
+        let ordinal = resolve_rewind_target(messages, target)?;
+        let (index, preview) = find_user_message_by_ordinal(messages, ordinal)
+            .ok_or_else(|| format!("user input u{ordinal} not found"))?;
+        Ok((index, (ordinal, preview)))
     };
-    let keep_messages = messages[..target_index].to_vec();
+    let (keep_messages, total_messages, (user_ordinal, preview), legacy_keep_messages) =
+        if history::is_sqlite_path(&history_file) {
+            let (keep, total, resolved) =
+                history::with_rewind_user_messages_sqlite(&history_file, resolve)?;
+            (keep, total, resolved, None)
+        } else {
+            let mut messages = history::build_message_arr(usize::MAX, &history_file)?;
+            let (index, resolved) = resolve(&messages)?;
+            let total = messages.len();
+            messages.truncate(index);
+            (index, total, resolved, Some(messages))
+        };
     Ok(HistoryRewindPlan {
-        user_ordinal: target_ordinal,
-        removed_messages: messages.len().saturating_sub(target_index),
+        user_ordinal,
+        removed_messages: total_messages.saturating_sub(keep_messages),
         keep_messages,
+        legacy_keep_messages,
         preview,
     })
 }
 
 fn apply_history_rewind(app: &mut App, plan: HistoryRewindPlan) -> Result<String, Box<dyn Error>> {
     let history_file = active_history_path(app);
-    history::truncate_history_messages(&history_file, plan.keep_messages.len())?;
+    let ledger_messages = match plan.legacy_keep_messages {
+        Some(messages) => messages,
+        None => history::read_rewind_ledger_messages_sqlite(&history_file, plan.keep_messages)?,
+    };
+    history::truncate_history_messages(&history_file, plan.keep_messages)?;
     history::invalidate_context_history_cache_for(&history_file);
     crate::ai::driver::commands::session::clear_session_local_runtime_state(app);
     crate::ai::driver::commands::session::reset_stale_patch_targets_from_messages(
         app,
-        &plan.keep_messages,
+        &ledger_messages,
     )?;
-    // 回滚历史时清除显式工具启用列表，避免上一轮 enable_tools 的状态泄漏。
+    // Clear explicit tool activation so the removed turn cannot leak enable_tools state.
     crate::ai::tools::enable_tools::clear_explicitly_enabled_tools(&app.session_id);
     Ok(format!(
         "[history] Rewound from u{}: {} · removed {} message(s); kept {} message(s).",
-        plan.user_ordinal,
-        plan.preview,
-        plan.removed_messages,
-        plan.keep_messages.len()
+        plan.user_ordinal, plan.preview, plan.removed_messages, plan.keep_messages
     ))
 }
 
@@ -2913,7 +2927,7 @@ mod tests {
         let rewind = plan_history_rewind(&app, HistoryRewindTarget::UserOrdinal(2))
             .expect("second real user should resolve");
         assert_eq!(rewind.user_ordinal, 2);
-        assert_eq!(rewind.keep_messages.len(), 3);
+        assert_eq!(rewind.keep_messages, 3);
         assert_eq!(rewind.removed_messages, 2);
 
         let _ = std::fs::remove_file(history_path);
@@ -3149,6 +3163,428 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn history_rewind_sqlite_plan_and_apply_match_full_load_reference() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = std::env::temp_dir().join(format!("ai-rewind-parity-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let call = |id: &str, name: &str, path: &str| crate::ai::types::ToolCall {
+            id: id.into(),
+            tool_type: "function".into(),
+            function: crate::ai::types::FunctionCall {
+                name: name.into(),
+                arguments: serde_json::json!({"path": path, "patch": "@@\n-old\n+new"}).to_string(),
+            },
+        };
+        let calls = |role, tool_call| Message {
+            tool_calls: Some(vec![tool_call]),
+            ..test_message(role, "unused body")
+        };
+        let result = |id: &str, body| Message {
+            tool_call_id: Some(id.into()),
+            ..test_message("tool", body)
+        };
+        let failed =
+            "Error: apply_patch failed: ambiguous patch: hunk context matches 2 locations.";
+        let mut first = test_message(
+            "user",
+            &format!(
+                "[runtime-synthetic-user] Case \"quoted\" \\path\n中文 É {}",
+                "x".repeat(130)
+            ),
+        );
+        first.tool_calls = Some(vec![call("user-call", "apply_patch", "/tmp/rewind-c.rs")]);
+        let mut reminder = test_message("user", "second shared needle");
+        history::attach_request_reminder(&mut reminder, "runtime reminder");
+        let multimodal = Message {
+            content: serde_json::json!([
+                {"type": "text", "text": "parts \"quote\" \\slash\nshared needle"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,hiddenPayload"}}
+            ]),
+            ..test_message("user", "")
+        };
+        let mut messages = vec![
+            test_message("system", "seed"),
+            first,
+            calls(
+                "assistant",
+                call("patch-a", "apply_patch", "/tmp/rewind-a.rs"),
+            ),
+            result("patch-a", failed),
+            result("user-call", failed),
+            history::runtime_synthetic_user_message(serde_json::json!(
+                "synthetic-only shared needle"
+            )),
+            reminder,
+            calls("assistant", call("read-a", "read_file", "/tmp/rewind-a.rs")),
+            result("read-a", "Error: unreadable"),
+            multimodal,
+            calls("system", call("patch-b", "apply_patch", "/tmp/rewind-b.rs")),
+            Message {
+                content: serde_json::json!(["not a string result"]),
+                ..result("patch-b", "")
+            },
+            test_message("user", "fourth"),
+            result("patch-b", failed),
+            result("patch-a", "Successfully patched /tmp/rewind-a.rs"),
+            calls(
+                "assistant",
+                call("write-c", "write_file", "/tmp/rewind-c.rs"),
+            ),
+            result("write-c", "Successfully wrote to /tmp/rewind-c.rs"),
+        ];
+        // Pin the multi-match error's count and its first-eight preview limit.
+        messages.extend((0..9).map(|_| test_message("user", "many matches")));
+        messages.push(history::runtime_synthetic_user_message(serde_json::json!(
+            "tail"
+        )));
+
+        fn state(path: &std::path::Path) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            [
+                "SELECT id,role,content,tool_calls,tool_call_id,reasoning_content,source_model FROM messages ORDER BY id",
+                "SELECT * FROM context_messages ORDER BY position",
+                "SELECT * FROM context_snapshot ORDER BY singleton",
+                "SELECT snapshot_id,source_message_id,projection_fingerprint,payload FROM context_snapshot_history ORDER BY snapshot_id",
+                "SELECT tool_call_id,execution_signature,succeeded FROM tool_execution_outcomes ORDER BY tool_call_id",
+                "SELECT id,assistant_text,reasoning_text,source_model FROM interrupted_stream_diagnostics ORDER BY id",
+                "SELECT * FROM skill_activation_events ORDER BY id",
+                "SELECT key,value FROM meta WHERE key != 'last_activity_unix_ms' ORDER BY key",
+            ]
+            .into_iter()
+            .map(|sql| {
+                let mut stmt = conn.prepare(sql).unwrap();
+                let columns = stmt.column_count();
+                stmt.query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            })
+            .collect()
+        }
+
+        let targets: &[&[&str]] = &[
+            &["u1"],
+            &["u2"],
+            &["U3"],
+            &["4"],
+            &["last"],
+            &["latest"],
+            &["grep", "CASE"],
+            &["grep", "\"quoted\""],
+            &["grep", "\\path"],
+            &["grep", "\n中文"],
+            &["grep", "É"],
+            &["grep", "é"],
+            &["grep", "\\\"quote\\\""],
+            &["grep", "\\\\slash\\n"],
+            &["grep", "shared", "needle"],
+            &["grep", "many", "matches"],
+            &["grep", "hiddenPayload"],
+            &["grep", "synthetic-only"],
+            &["u99"],
+        ];
+        for extension in ["sqlite", "sqlite.timeout-preserved", "blob"] {
+            for covered in [true, false] {
+                for args in targets {
+                    let path = dir.join(format!("actual.{extension}"));
+                    let reference_path = dir.join(format!("reference.{extension}"));
+                    for fixture in [&path, &reference_path] {
+                        history::replace_history_messages(fixture, &messages).unwrap();
+                        if history::is_sqlite_path(fixture) {
+                            let conn = rusqlite::Connection::open(fixture).unwrap();
+                            // Gaps prove that keep points count rows rather than subtract IDs.
+                            conn.execute_batch(
+                                "UPDATE messages SET id = -id; UPDATE messages SET id = -id * 2;",
+                            )
+                            .unwrap();
+                            conn.execute_batch(
+                                "DELETE FROM meta WHERE key = 'stale_patch_targets_v1';
+                                 INSERT OR REPLACE INTO meta(key,value) VALUES
+                                 ('prompt_residency_v1','{}'),('llm_prune_marks_v1','{}');
+                                 INSERT OR REPLACE INTO context_messages(position,role,content)
+                                 VALUES (0,'internal_note','\"summary\"');",
+                            )
+                            .unwrap();
+                            let watermark: i64 = conn
+                                .query_row(
+                                    if covered {
+                                        "SELECT MIN(id) FROM messages"
+                                    } else {
+                                        "SELECT MAX(id) FROM messages"
+                                    },
+                                    [],
+                                    |row| row.get(0),
+                                )
+                                .unwrap();
+                            conn.execute(
+                                "INSERT OR REPLACE INTO context_snapshot(singleton,source_message_id,source_generation,projection_fingerprint)
+                                 VALUES (1,?1,COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='history_generation'),0),'parity')",
+                                [watermark]
+                            ).unwrap();
+                        }
+                    }
+                    let mut app = test_app();
+                    // Also exercise active_history_path's config fallback.
+                    app.config.history_file = path.clone();
+                    app.session_history_file = if covered {
+                        path.clone()
+                    } else {
+                        PathBuf::new()
+                    };
+                    let target = super::parse_history_rewind_target(args).unwrap();
+                    let full = history::build_message_arr(usize::MAX, &path).unwrap();
+                    let reference =
+                        super::resolve_rewind_target(&full, target.clone()).and_then(|ordinal| {
+                            let (keep, preview) =
+                                super::find_user_message_by_ordinal(&full, ordinal)
+                                    .ok_or_else(|| format!("user input u{ordinal} not found"))?;
+                            Ok((ordinal, keep, preview))
+                        });
+                    let before = if history::is_sqlite_path(&path) {
+                        if extension == "sqlite" && covered && args.first() == Some(&"u1") {
+                            // Exercise the one-time index migration from the previous schema.
+                            rusqlite::Connection::open(&path).unwrap().execute_batch(
+                                "DROP INDEX idx_messages_rewind_users; PRAGMA user_version = 2;"
+                            ).unwrap();
+                        }
+                        Some(state(&path))
+                    } else {
+                        None
+                    };
+                    let plan = plan_history_rewind(&app, target);
+                    if let Some(before) = before {
+                        assert_eq!(state(&path), before, "planning mutated history: {args:?}");
+                        let conn = rusqlite::Connection::open(&path).unwrap();
+                        let query_plan: String = conn.query_row(
+                            "EXPLAIN QUERY PLAN SELECT id,content,reasoning_content FROM messages
+                             WHERE role = 'user' ORDER BY id ASC", [], |row| row.get(3)
+                        ).unwrap();
+                        assert!(
+                            query_plan.contains("idx_messages_rewind_users"),
+                            "{query_plan}"
+                        );
+                    }
+                    match (plan, reference) {
+                        (Err(actual), Err(expected)) => {
+                            assert_eq!(actual.to_string(), expected.to_string(), "{args:?}")
+                        }
+                        (Ok(plan), Ok((ordinal, keep, preview))) => {
+                            assert_eq!(
+                                plan.legacy_keep_messages.as_deref(),
+                                (!history::is_sqlite_path(&path)).then_some(&full[..keep])
+                            );
+                            assert_eq!(
+                                (
+                                    plan.user_ordinal,
+                                    plan.keep_messages,
+                                    plan.removed_messages,
+                                    &plan.preview
+                                ),
+                                (ordinal, keep, full.len() - keep, &preview),
+                                "{args:?}"
+                            );
+                            let expected_targets =
+                                crate::ai::driver::turn_runtime::stale_patch_targets_from_messages(
+                                    &full[..keep],
+                                );
+                            let output = apply_history_rewind(&mut app, plan).unwrap();
+                            assert_eq!(
+                                output,
+                                format!(
+                                    "[history] Rewound from u{ordinal}: {preview} · removed {} message(s); kept {keep} message(s).",
+                                    full.len() - keep
+                                )
+                            );
+                            assert_eq!(app.stale_patch_targets, expected_targets, "{args:?}");
+                            history::truncate_history_messages(&reference_path, keep).unwrap();
+                            if covered {
+                                history::write_stale_patch_targets_sqlite(
+                                    &reference_path,
+                                    &expected_targets,
+                                )
+                                .unwrap();
+                            }
+                            assert_eq!(
+                                history::build_message_arr(usize::MAX, &path).unwrap(),
+                                full[..keep]
+                            );
+                            if history::is_sqlite_path(&path) {
+                                assert_eq!(
+                                    history::read_stale_patch_targets_sqlite(&path).unwrap(),
+                                    covered.then_some(expected_targets)
+                                );
+                                assert_eq!(state(&path), state(&reference_path), "{args:?}");
+                            } else {
+                                assert_eq!(
+                                    std::fs::read(&path).unwrap(),
+                                    std::fs::read(&reference_path).unwrap()
+                                );
+                            }
+                        }
+                        (actual, expected) => {
+                            panic!("parity mismatch for {args:?}: {actual:?} vs {expected:?}")
+                        }
+                    }
+                }
+            }
+        }
+        // Empty histories retain the old target-specific errors.
+        let mut app = test_app();
+        app.session_history_file = dir.join("empty.sqlite");
+        for target in [
+            HistoryRewindTarget::LatestUser,
+            HistoryRewindTarget::UserOrdinal(1),
+            HistoryRewindTarget::Grep("none".into()),
+        ] {
+            let expected = super::resolve_rewind_target(&[], target.clone()).and_then(|ordinal| {
+                Err::<usize, Box<dyn std::error::Error>>(
+                    format!("user input u{ordinal} not found").into(),
+                )
+            });
+            assert_eq!(
+                plan_history_rewind(&app, target).unwrap_err().to_string(),
+                expected.unwrap_err().to_string()
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn history_rewind_sqlite_shrunk_history_retains_ledger() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let history_path =
+            std::env::temp_dir().join(format!("ai-rewind-shrunk-{}.sqlite", Uuid::new_v4()));
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+        let mut messages = rewind_failed_patch_messages("/tmp/rewind-shrunk.rs");
+        messages.extend([
+            test_message("assistant", "retained padding one"),
+            test_message("assistant", "retained padding two"),
+            test_message("user", "remove"),
+        ]);
+        append_history_messages(&history_path, &messages).unwrap();
+        let plan = plan_history_rewind(&app, HistoryRewindTarget::UserOrdinal(2)).unwrap();
+        assert_eq!(plan.keep_messages, 5);
+        assert!(plan.legacy_keep_messages.is_none());
+
+        // Another history mutation leaves fewer rows than the planned keep count.
+        history::truncate_history_messages(&history_path, 3).unwrap();
+        let survivors = history::build_message_arr(usize::MAX, &history_path).unwrap();
+        assert!(survivors.len() < plan.keep_messages);
+        let expected =
+            crate::ai::driver::turn_runtime::stale_patch_targets_from_messages(&survivors);
+        assert!(!expected.is_empty());
+        let output = apply_history_rewind(&mut app, plan).unwrap();
+        assert_eq!(
+            output,
+            "[history] Rewound from u2: remove · removed 1 message(s); kept 5 message(s)."
+        );
+        assert_eq!(
+            history::build_message_arr(usize::MAX, &history_path).unwrap(),
+            survivors
+        );
+        assert_eq!(app.stale_patch_targets, expected);
+        assert_eq!(
+            history::read_stale_patch_targets_sqlite(&history_path).unwrap(),
+            Some(expected)
+        );
+
+        // Keeping zero still removes every message and persists an empty ledger.
+        let plan = plan_history_rewind(&app, HistoryRewindTarget::UserOrdinal(1)).unwrap();
+        assert_eq!(plan.keep_messages, 0);
+        apply_history_rewind(&mut app, plan).unwrap();
+        assert!(
+            history::build_message_arr(usize::MAX, &history_path)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(app.stale_patch_targets.is_empty());
+        assert_eq!(
+            history::read_stale_patch_targets_sqlite(&history_path).unwrap(),
+            Some(Default::default())
+        );
+        history::delete_history_artifacts(&history_path).unwrap();
+    }
+
+    fn rewind_failed_patch_messages(path: &str) -> Vec<Message> {
+        vec![
+            test_message("user", "keep"),
+            Message {
+                tool_calls: Some(vec![crate::ai::types::ToolCall {
+                    id: "rewind-patch".into(),
+                    tool_type: "function".into(),
+                    function: crate::ai::types::FunctionCall {
+                        name: "apply_patch".into(),
+                        arguments: serde_json::json!({"path": path, "patch": "@@\n-old\n+new"})
+                            .to_string(),
+                    },
+                }]),
+                ..test_message("assistant", "")
+            },
+            Message {
+                tool_call_id: Some("rewind-patch".into()),
+                ..test_message(
+                    "tool",
+                    "Error: apply_patch failed: ambiguous patch: hunk context matches 2 locations.",
+                )
+            },
+        ]
+    }
+
+    #[test]
+    fn history_rewind_legacy_uses_plan_time_ledger() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let history_path =
+            std::env::temp_dir().join(format!("ai-rewind-legacy-snapshot-{}.blob", Uuid::new_v4()));
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+        let mut messages = rewind_failed_patch_messages("/tmp/rewind-legacy.rs");
+        messages.extend([
+            test_message("user", "remove"),
+            test_message("assistant", "removed answer"),
+        ]);
+        append_history_messages(&history_path, &messages).unwrap();
+        let plan = plan_history_rewind(&app, HistoryRewindTarget::UserOrdinal(2)).unwrap();
+        let keep = plan.keep_messages;
+        assert_eq!(keep, 3);
+        assert_eq!(
+            plan.legacy_keep_messages.as_deref(),
+            Some(&messages[..keep])
+        );
+        let expected =
+            crate::ai::driver::turn_runtime::stale_patch_targets_from_messages(&messages[..keep]);
+        assert!(!expected.is_empty());
+
+        // Change the retained result between planning and apply: a reload would
+        // incorrectly discard the plan-time stale target.
+        messages[0].content = serde_json::json!("changed retained user");
+        messages[2].content = serde_json::json!("Successfully patched /tmp/rewind-legacy.rs");
+        history::replace_history_messages(&history_path, &messages).unwrap();
+        assert!(
+            crate::ai::driver::turn_runtime::stale_patch_targets_from_messages(&messages[..keep])
+                .is_empty()
+        );
+        let output = apply_history_rewind(&mut app, plan).unwrap();
+        assert_eq!(
+            output,
+            "[history] Rewound from u2: remove · removed 2 message(s); kept 3 message(s)."
+        );
+        assert_eq!(app.stale_patch_targets, expected);
+        // Truncation still keeps the current file's prefix, as before the fix.
+        assert_eq!(
+            history::build_message_arr(usize::MAX, &history_path).unwrap(),
+            messages[..keep]
+        );
+        history::delete_history_artifacts(&history_path).unwrap();
     }
 
     #[test]

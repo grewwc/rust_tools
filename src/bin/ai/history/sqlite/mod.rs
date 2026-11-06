@@ -18,6 +18,7 @@ mod metadata;
 mod migrations;
 mod outcomes;
 mod revision;
+mod rewind;
 mod rollback;
 mod store;
 mod trim;
@@ -73,6 +74,9 @@ pub(in crate::ai) use outcomes::{
 #[cfg(test)]
 pub(in crate::ai) use revision::history_revision_cache_contains;
 pub(in crate::ai) use revision::{read_history_revision, remove_history_revision_cache_entry};
+pub(in crate::ai) use rewind::{
+    read_rewind_ledger_messages_sqlite, with_rewind_user_messages_sqlite,
+};
 #[cfg(test)]
 pub(in crate::ai) use rollback::restore_sqlite_after_rollback_with_transaction;
 pub(in crate::ai) use rollback::{
