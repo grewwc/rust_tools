@@ -1,8 +1,11 @@
+use crate::ai::tools::common::ToolCallPolicy;
+use crate::ai::tools::common::ToolCallPolicyRegistration;
 use crate::ai::tools::common::ToolDisplayConfig;
 use crate::ai::tools::common::ToolDisplayRegistration;
 use crate::ai::tools::common::ToolHistoryPolicy;
 use crate::ai::tools::common::ToolHistoryPolicyRegistration;
 use crate::ai::tools::common::ToolLossyCompressPolicy;
+use crate::ai::tools::common::ToolPersistentCachePolicy;
 use crate::ai::tools::common::ToolPrunePolicy;
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
@@ -36,6 +39,14 @@ inventory::submit!(ToolRegistration {
 
         execute: execute_apply_patch,
     }
+});
+
+inventory::submit!(ToolCallPolicyRegistration {
+    name: "apply_patch",
+    policy: ToolCallPolicy {
+        argument_aliases: &[("path", "file_path")],
+        persistent_cache: ToolPersistentCachePolicy::Disabled,
+    },
 });
 
 inventory::submit!(ToolStreamingRegistration {

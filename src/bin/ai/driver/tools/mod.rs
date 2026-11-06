@@ -13,10 +13,9 @@ use std::time::{Duration as StdDuration, UNIX_EPOCH};
 
 use crate::ai::{
     driver::print::{
-        echo_tool_args, echo_tool_output, format_tool_status_cached, format_tool_status_target,
-        format_tool_status_completed, format_tool_status_deferred, format_tool_status_failed,
-        format_tool_status_running, format_tool_status_skipped,
-        format_tool_status_with_file_target,
+        echo_tool_args, echo_tool_output, format_tool_status_cached, format_tool_status_completed,
+        format_tool_status_deferred, format_tool_status_failed, format_tool_status_running,
+        format_tool_status_skipped, format_tool_status_target, format_tool_status_with_file_target,
     },
     history::ToolExecutionOutcome,
     mcp::{McpClient, SharedMcpClient},
@@ -24,7 +23,8 @@ use crate::ai::{
     tools as builtin_tools,
     tools::os_tools::GLOBAL_OS,
     tools::registry::common::{
-        ToolParallelPolicy, ToolRetryPolicy, tool_parallel_policy, tool_retry_policy,
+        ToolParallelPolicy, ToolPersistentCachePolicy, ToolRetryPolicy, tool_call_policy,
+        tool_parallel_policy, tool_retry_policy,
     },
     tools::storage::memory_store::{AgentMemoryEntry, MemoryStore},
     types::{ToolCall, ToolResult},
@@ -153,7 +153,6 @@ struct CachedFileFingerprint {
 
 const TOOL_CACHE_RECENT_LIMIT: usize = 400;
 const TOOL_CACHE_TTL_MINUTES: i64 = 30;
-const TOOL_CACHE_READ_FILE_TOOL: &str = "read_file";
 
 fn route_tool_call(mcp_client: &McpClient, tool_name: &str) -> ToolRoute {
     if let Some((server_name, tool_name)) = mcp_client.parse_tool_name_for_known_server(tool_name) {
@@ -282,23 +281,6 @@ fn mcp_arg_validator(name: &str, schema: &Value) -> Option<Arc<jsonschema::Valid
     compiled
 }
 
-/// Per-tool compatibility aliases: (tool name, alias key, canonical key).
-///
-/// Services accept these historical spellings alongside the canonical key
-/// (`resolve_file_path_arg` / `optional_file_path_arg` take `path`;
-/// `execute_send_side_note` takes `content` / `target_task_id` / `target`),
-/// but published schemas only declare the canonical key. The table is
-/// per-tool on purpose: a global alias would collide with declared fields
-/// (`content` is a real parameter of `write_file`, not an alias for `note`).
-const BUILTIN_ARG_ALIASES: &[(&str, &str, &str)] = &[
-    ("read_file", "path", "file_path"),
-    ("write_file", "path", "file_path"),
-    ("apply_patch", "path", "file_path"),
-    ("send_side_note", "content", "note"),
-    ("send_side_note", "target_task_id", "task_id"),
-    ("send_side_note", "target", "task_id"),
-];
-
 /// Normalize a validation-only copy of builtin tool arguments.
 ///
 /// Two provider/service realities force this (the service still receives the
@@ -307,7 +289,7 @@ const BUILTIN_ARG_ALIASES: &[(&str, &str, &str)] = &[
 ///   apply_patch `patch`/`patch_file`). Services treat null as "not
 ///   provided", while published schemas don't list null types, so drop
 ///   null-valued keys that the schema doesn't require before validating.
-/// - Tools listed in `BUILTIN_ARG_ALIASES` accept a historical alias, but
+/// - Tools with registered argument aliases accept a historical alias, but
 ///   published schemas only declare the canonical key. Copy the alias value
 ///   to the canonical key (canonical wins when both are present) and remove
 ///   the alias key, so a compatible call isn't rejected at the gate — and the
@@ -325,14 +307,11 @@ fn normalize_for_validation(tool_name: &str, args: &Value, schema: &Value) -> Va
         .unwrap_or_default();
     let mut normalized = obj.clone();
     normalized.retain(|key, value| !value.is_null() || required.contains(&key.as_str()));
-    for (tool, alias, canonical) in BUILTIN_ARG_ALIASES {
-        if *tool != tool_name {
-            continue;
-        }
-        let Some(alias_value) = normalized.remove(*alias) else {
+    for &(alias, canonical) in tool_call_policy(tool_name).argument_aliases {
+        let Some(alias_value) = normalized.remove(alias) else {
             continue;
         };
-        if !normalized.contains_key(*canonical)
+        if !normalized.contains_key(canonical)
             && schema
                 .pointer(&format!("/properties/{canonical}"))
                 .is_some()
@@ -378,7 +357,7 @@ fn unknown_builtin_arg_keys(args: &Value, schema: &Value) -> Vec<String> {
 /// fails open (logged, call allowed) so broken metadata can never brick tool
 /// use; an invalid instance fails closed with a retryable error. Builtin
 /// validation runs on a normalized copy of the args
-/// (provider-materialized `null` optionals dropped, `BUILTIN_ARG_ALIASES`
+/// (provider-materialized `null` optionals dropped, registered argument aliases
 /// resolved); the service still receives the original args. Builtin
 /// validators are compiled once per tool name; MCP validators are compiled once
 /// per distinct schema text (server schemas can change on reconnect, so a name
@@ -395,11 +374,9 @@ fn validate_tool_call_args(
             .iter()
             .find(|tool| tool.function.name == tool_call.function.name)
             .map(|tool| tool.function.parameters.clone()),
-        ToolRoute::Builtin => Some(
-            crate::ai::tools::registry::tool_metadata::tool_parameters(
-                &tool_call.function.name,
-            ),
-        ),
+        ToolRoute::Builtin => Some(crate::ai::tools::registry::tool_metadata::tool_parameters(
+            &tool_call.function.name,
+        )),
     };
     let Some(schema) = schema else {
         return Ok(());
@@ -410,16 +387,14 @@ fn validate_tool_call_args(
     }
     match route {
         ToolRoute::Builtin => {
-            let normalized =
-                normalize_for_validation(&tool_call.function.name, args, &schema);
+            let normalized = normalize_for_validation(&tool_call.function.name, args, &schema);
             let unknown = unknown_builtin_arg_keys(&normalized, &schema);
             if !unknown.is_empty() {
                 let declared = schema
                     .get("properties")
                     .and_then(Value::as_object)
                     .map(|properties| {
-                        let mut names: Vec<&str> =
-                            properties.keys().map(String::as_str).collect();
+                        let mut names: Vec<&str> = properties.keys().map(String::as_str).collect();
                         names.sort_unstable();
                         names.join(", ")
                     })
@@ -1012,9 +987,14 @@ pub(super) async fn run_session_distill(
 ) -> RunOneResult {
     let prepared = match prepare_tool_call(mcp_client, tool_call, Some(allowed_tool_names)) {
         Ok(prepared) => prepared,
-        Err(tool_result) => return RunOneResult {
-            tool_result, ok: false, executed: false, cached: false,
-        },
+        Err(tool_result) => {
+            return RunOneResult {
+                tool_result,
+                ok: false,
+                executed: false,
+                cached: false,
+            };
+        }
     };
     if let Err(result) = confirm_tool_execution(tool_call, &prepared.args) {
         return result;
@@ -1027,8 +1007,19 @@ pub(super) async fn run_session_distill(
     }
     let result = crate::ai::tools::session_distill_tools::execute_with_app(app, &prepared.args)
         .await
-        .map(|content| ToolResult { tool_call_id: tool_call.id.clone(), content });
-    finalize_execution_result(session_id, tool_call, &prepared, result, Some(allowed_tool_names), true, false)
+        .map(|content| ToolResult {
+            tool_call_id: tool_call.id.clone(),
+            content,
+        });
+    finalize_execution_result(
+        session_id,
+        tool_call,
+        &prepared,
+        result,
+        Some(allowed_tool_names),
+        true,
+        false,
+    )
 }
 
 fn process_tool_denial(tool_call: &ToolCall) -> Option<RunOneResult> {
@@ -1041,9 +1032,14 @@ fn process_tool_denial(tool_call: &ToolCall) -> Option<RunOneResult> {
     Some(RunOneResult {
         tool_result: ToolResult {
             tool_call_id: tool_call.id.clone(),
-            content: format!("Error: tool '{}' is not in the allowed whitelist for this process.", tool_call.function.name),
+            content: format!(
+                "Error: tool '{}' is not in the allowed whitelist for this process.",
+                tool_call.function.name
+            ),
         },
-        ok: false, executed: false, cached: false,
+        ok: false,
+        executed: false,
+        cached: false,
     })
 }
 
@@ -1630,52 +1626,22 @@ fn store_tool_cache_result(
     store.maintain_after_append();
 }
 
-/// Name-based eligibility for the `read_file` result cache only.
-///
-/// Do not reuse this for retry or parallel policy: side effects are not
-/// encoded in tool names. Those decisions live in explicit registry metadata.
+/// Whether the tool registers a persistent result-cache policy.
+/// Retry, parallel execution, and same-turn replay have separate policies.
 fn is_cacheable_tool_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    let mutating = [
-        "create",
-        "delete",
-        "remove",
-        "update",
-        "write",
-        "save",
-        "append",
-        "insert",
-        "rename",
-        "move",
-        "install",
-        "run",
-        "execute",
-        "oauth",
-        "open_browser",
-        "report_event",
-        "memory",
-        "kill_terminal",
-        "edit",
-        "apply_patch",
-    ];
-    if mutating.iter().any(|needle| lower.contains(needle)) {
-        return false;
-    }
-    let reusable = [
-        "search", "find", "read", "get", "list", "view", "fetch", "export",
-    ];
-    reusable.iter().any(|needle| lower.contains(needle))
+    matches!(
+        tool_call_policy(name).persistent_cache,
+        ToolPersistentCachePolicy::FileFingerprint { .. }
+    )
 }
 
 fn should_store_or_load_tool_cache(tool_name: &str, args: &Value) -> bool {
     if !is_cacheable_tool_name(tool_name) {
         return false;
     }
-    // 目前只有 read_file 缓存具备可校验的环境指纹。搜索/目录/MCP 读取类工具虽然是
-    // 只读，但其结果会随外部状态变化；没有对应 fingerprint 时不落盘/不命中缓存，
-    // 避免把陈旧检索结果直接回放给模型。
-    tool_name == TOOL_CACHE_READ_FILE_TOOL
-        && !collect_tool_cache_file_fingerprints(tool_name, args).is_empty()
+    // A registered policy still needs a current fingerprint before storing or
+    // loading results. Read-only status alone cannot validate external state.
+    !collect_tool_cache_file_fingerprints(tool_name, args).is_empty()
 }
 
 fn build_tool_cache_key(name: &str, args: &Value) -> String {
@@ -1698,12 +1664,12 @@ fn collect_tool_cache_file_fingerprints(
     tool_name: &str,
     args: &Value,
 ) -> Vec<CachedFileFingerprint> {
-    let path = match tool_name {
-        TOOL_CACHE_READ_FILE_TOOL => args
-            .get("file_path")
-            .or_else(|| args.get("path"))
+    let path = match tool_call_policy(tool_name).persistent_cache {
+        ToolPersistentCachePolicy::FileFingerprint { path_arguments } => path_arguments
+            .iter()
+            .find_map(|key| args.get(*key))
             .and_then(Value::as_str),
-        _ => None,
+        ToolPersistentCachePolicy::Disabled => None,
     };
     path.and_then(cached_file_fingerprint_for_path)
         .into_iter()
@@ -1729,6 +1695,9 @@ fn cached_file_fingerprint_for_path(path: &str) -> Option<CachedFileFingerprint>
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod descriptor_tests;
 
 pub(super) fn penalty_for_skill_tools(skill: &crate::ai::skills::SkillManifest) -> f64 {
     if skill.tools.is_empty() {

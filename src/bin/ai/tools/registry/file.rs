@@ -1,11 +1,11 @@
 use serde_json::Value;
 
 use crate::ai::tools::common::{
-    ToolDisplayConfig, ToolDisplayRegistration, ToolHistoryPolicy, ToolHistoryPolicyRegistration,
-    ToolLossyCompressPolicy, ToolPrunePolicy,
-    ToolParallelPolicy, ToolParallelPolicyRegistration, ToolRegistration, ToolReplayRegistration,
-    ToolRetryPolicy, ToolRetryPolicyRegistration, ToolSpec, ToolStreamingRegistration,
-    short_path,
+    ToolCallPolicy, ToolCallPolicyRegistration, ToolDisplayConfig, ToolDisplayRegistration,
+    ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolParallelPolicy,
+    ToolParallelPolicyRegistration, ToolPersistentCachePolicy, ToolPrunePolicy, ToolRegistration,
+    ToolReplayRegistration, ToolRetryPolicy, ToolRetryPolicyRegistration, ToolSpec,
+    ToolStreamingRegistration, short_path,
 };
 use crate::ai::tools::service::file::{
     execute_read_file, execute_write_file, execute_write_file_streaming,
@@ -18,6 +18,16 @@ inventory::submit!(ToolRegistration {
 
         execute: execute_read_file,
     }
+});
+
+inventory::submit!(ToolCallPolicyRegistration {
+    name: "read_file",
+    policy: ToolCallPolicy {
+        argument_aliases: &[("path", "file_path")],
+        persistent_cache: ToolPersistentCachePolicy::FileFingerprint {
+            path_arguments: &["file_path", "path"],
+        },
+    },
 });
 
 // High-precision grounding results must stay serial even though reading is
@@ -60,6 +70,14 @@ inventory::submit!(ToolRegistration {
 
         execute: execute_write_file,
     }
+});
+
+inventory::submit!(ToolCallPolicyRegistration {
+    name: "write_file",
+    policy: ToolCallPolicy {
+        argument_aliases: &[("path", "file_path")],
+        persistent_cache: ToolPersistentCachePolicy::Disabled,
+    },
 });
 
 inventory::submit!(ToolStreamingRegistration {

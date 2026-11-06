@@ -1,6 +1,9 @@
 use std::sync::LazyLock;
 
-use rust_tools::{commonw::FastSet, cw::SkipMap};
+use rust_tools::{
+    commonw::{FastMap, FastSet},
+    cw::SkipMap,
+};
 use serde_json::Value;
 
 use crate::ai::tools::os_tools::GLOBAL_OS;
@@ -26,6 +29,53 @@ pub(crate) struct ToolRegistration {
 }
 
 inventory::collect!(ToolRegistration);
+
+/// Persistent result-cache qualification, independent of same-turn replay.
+/// Unregistered tools never persist or load results.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ToolPersistentCachePolicy {
+    #[default]
+    Disabled,
+    /// Require a current fingerprint for one file. Select the first present
+    /// raw argument before checking its type, so an invalid canonical value
+    /// never falls back to an alias. Fingerprint construction stays in the driver.
+    FileFingerprint {
+        path_arguments: &'static [&'static str],
+    },
+}
+
+/// Driver-only call policy; model-visible metadata and ToolSpec stay separate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ToolCallPolicy {
+    /// Ordered (alias, canonical) mappings applied only to the validation copy.
+    pub(crate) argument_aliases: &'static [(&'static str, &'static str)],
+    pub(crate) persistent_cache: ToolPersistentCachePolicy,
+}
+
+/// Optional call-policy registration beside the tool's execution registration.
+/// The default has no argument aliases and no persistent result cache.
+pub(crate) struct ToolCallPolicyRegistration {
+    pub(crate) name: &'static str,
+    pub(crate) policy: ToolCallPolicy,
+}
+
+inventory::collect!(ToolCallPolicyRegistration);
+
+static TOOL_CALL_POLICY_INDEX: LazyLock<FastMap<&'static str, ToolCallPolicy>> =
+    LazyLock::new(|| {
+        let mut index = FastMap::default();
+        for reg in inventory::iter::<ToolCallPolicyRegistration> {
+            index.entry(reg.name).or_insert(reg.policy);
+        }
+        index
+    });
+
+pub(crate) fn tool_call_policy(name: &str) -> ToolCallPolicy {
+    TOOL_CALL_POLICY_INDEX
+        .get(name)
+        .copied()
+        .unwrap_or_default()
+}
 
 pub(crate) type ToolStreamWriter<'a> = dyn FnMut(&[u8]) + 'a;
 pub(crate) type ToolStreamExecutor =
@@ -1029,10 +1079,7 @@ mod history_policy_tests {
 
     #[test]
     fn parallel_policy_defaults_to_serial_for_unregistered_tools() {
-        assert_eq!(
-            tool_parallel_policy("tree"),
-            ToolParallelPolicy::Serial
-        );
+        assert_eq!(tool_parallel_policy("tree"), ToolParallelPolicy::Serial);
         assert_eq!(
             tool_parallel_policy("not_a_registered_tool"),
             ToolParallelPolicy::Serial
@@ -1056,7 +1103,10 @@ mod history_policy_tests {
     fn retry_policy_defaults_to_no_retry() {
         // Side effects are not encoded in names. In particular, "forget" and
         // "mailbox" must not inherit retry safety from "get"/"read" substrings.
-        assert_eq!(tool_retry_policy("knowledge_forget"), ToolRetryPolicy::NoRetry);
+        assert_eq!(
+            tool_retry_policy("knowledge_forget"),
+            ToolRetryPolicy::NoRetry
+        );
         assert_eq!(tool_retry_policy("read_mailbox"), ToolRetryPolicy::NoRetry);
         assert_eq!(
             tool_retry_policy("task_evidence_read"),
