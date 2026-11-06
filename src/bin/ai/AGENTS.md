@@ -63,10 +63,10 @@ filesystem or sqlite. A top-level turn naming a session id auto-loads the
 9. **Compression purity.** Speculative fold/summary candidates stay pure until
    selected; persist evidence only for accepted candidates. Summary increments
    bind removed projection bytes in `summary-sources/`; prior summaries never
-   become fresh summarizer input, and
-   older records archive verbatim behind one back-reference before removal —
-   never merged, never dropped without an archive write. Binding is a recovery
-   locator, not claim verification. Bump the projection fingerprint when
+   become fresh summarizer input. Older records may fold into one versioned
+   early/recent preview only after their intact messages pass an exact-byte
+   source archive commit; the opening remains inline and period coverage has
+   no gaps. Binding is a recovery locator, not claim verification. Bump the projection fingerprint when
    persisted projection semantics change.
 10. **Model-visible wording is English.** Base prompt / gate notes / injected notes use one English system; keep Chinese only in keyword-match lists and terminal text.
 11. **Output post-processing is display-only.** `ai.output.postprocess_command`
