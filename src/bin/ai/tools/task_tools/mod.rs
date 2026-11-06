@@ -48,12 +48,13 @@ mod traecli_models;
 mod types;
 mod wait;
 
-// `collect` items are `pub(super)` (task_tools-tree visible), so the re-export
-// visibility must match exactly: broader would not re-export (warning), and it
-// would leak `AgentManifest` (private to the tree) into a public interface.
+// Collection helpers stay visible within the task-tools tree; only the publication stages
+// and guard are shared with the driver.
 pub(crate) use backend::*;
+#[cfg(test)]
 pub(crate) use collect::publish_task_result;
 pub(in crate::ai::tools::task_tools) use collect::*;
+pub(crate) use collect::{PreparedTaskPublication, TaskPublicationGuard, task_id_for_result};
 pub(crate) use dispatch::*;
 pub(crate) use epoll::*;
 pub(crate) use outstanding::*;

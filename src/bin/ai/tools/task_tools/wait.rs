@@ -432,17 +432,35 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     // needing removal from the registry); the suspended and budget-elapsed early-return paths also
     // use it for cleanup.
     let mut finished: Vec<String> = Vec::new();
-    // `write_terminal_subagent_result` only terminates the kernel process; it does not stop the
-    // hosting Tokio Future. So first abort every worker that exceeded its total lifetime, then
-    // enter the kernel critical section to publish the terminal state.
-    for tid in &task_ids {
-        let entry = entries.get(tid).expect("validated");
-        if entry.started_at.elapsed() > SUBAGENT_WALL_CLOCK_TIMEOUT {
-            entry.cancel_stream.store(true, Ordering::Release);
-            if let Some(handle) = &entry.abort_handle {
-                handle.abort();
-            }
+    // Snapshot expired tasks once, then abort all workers before publishing any terminal result.
+    let expired = task_ids
+        .iter()
+        .filter(|tid| {
+            entries.get(*tid).expect("validated").started_at.elapsed() > SUBAGENT_WALL_CLOCK_TIMEOUT
+        })
+        .collect::<Vec<_>>();
+    for tid in &expired {
+        let entry = entries.get(*tid).expect("validated");
+        entry.cancel_stream.store(true, Ordering::Release);
+        if let Some(handle) = &entry.abort_handle {
+            handle.abort();
         }
+    }
+    let shared = current_os_kernel()?;
+    for tid in expired {
+        let entry = entries.get(tid).expect("validated");
+        write_terminal_task_result(
+            &shared,
+            tid,
+            entry.pid,
+            entry.result_channel_id,
+            entry.completion_futex_addr,
+            TaskTerminalStatus::Timeout.as_str(),
+            &format!(
+                "Subagent exceeded wall-clock lifetime of {}s (likely stuck in a non-returning tool execution)",
+                SUBAGENT_WALL_CLOCK_TIMEOUT.as_secs()
+            ),
+        )?;
     }
     // The closure borrows wait_policy / registry / pending / ready / finished by reference by
     // default; no `move` is added, so code after the closure (e.g. `if !pending.is_empty()`) can
@@ -463,28 +481,6 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             // owner process when it expires, and only the next task_wait returns BUDGET ELAPSED.
             // Budget exhaustion also **never destroys the channel/futex**, so the main agent can
             // keep calling task_wait to wait longer.
-            // Wall-clock total-lifetime check: if a subagent still has no result past
-            // SUBAGENT_WALL_CLOCK_TIMEOUT (typically stuck in a single tool execution that never
-            // returns), terminate it proactively and write a timeout terminal result, so the
-            // immediately following read_task_result reads a result and the main agent does not
-            // spin in a "timeout -> wait again -> timeout" loop. Unlike the historical bug that
-            // compared started_at against the per-call timeout_secs, this uses an independent
-            // total-lifetime cap far larger than a single wait budget, and writes a failure result
-            // instead of destroying the channel, so no result is lost.
-            if entry.started_at.elapsed() > SUBAGENT_WALL_CLOCK_TIMEOUT {
-                write_terminal_subagent_result(
-                    os,
-                    tid,
-                    entry.pid,
-                    entry.result_channel_id,
-                    entry.completion_futex_addr,
-                    TaskTerminalStatus::Timeout.as_str(),
-                    &format!(
-                        "Subagent exceeded wall-clock lifetime of {}s (likely stuck in a non-returning tool execution)",
-                        SUBAGENT_WALL_CLOCK_TIMEOUT.as_secs()
-                    ),
-                );
-            }
             match drain_task_result(os, tid, entry, "subagent result collected")? {
                 Some(collected) => {
                     ready.push(collected.rendered);
@@ -737,6 +733,7 @@ fn append_pending_task_side_note_summaries(output: &mut String, task_ids: &[Stri
 /// producer-side named ownership and stores the futex to wake the waiter; destroying the
 /// channel/futex is left to the collector (task_wait's ready path or task_cancel itself) to avoid
 /// double release.
+#[cfg(test)]
 pub(super) fn write_terminal_subagent_result(
     os: &mut dyn aios_kernel::kernel::Kernel,
     task_id: &str,
@@ -746,6 +743,9 @@ pub(super) fn write_terminal_subagent_result(
     status: &str,
     error: &str,
 ) {
+    if task_publication_in_progress(os, pid) {
+        return;
+    }
     // The caller must first abort the Tokio task actually running the subagent; the kernel process
     // state alone does not stop the Future inside the hosting process. Only then terminate the
     // kernel process and publish the terminal result.
@@ -771,6 +771,98 @@ pub(super) fn write_terminal_subagent_result(
     let _ = os.futex_store(completion_futex_addr, 1);
     os.set_current_pid(original);
 }
+
+pub(super) fn write_terminal_task_result(
+    shared: &SharedKernel,
+    task_id: &str,
+    pid: u64,
+    result_channel_id: u64,
+    completion_futex_addr: FutexAddr,
+    status: &str,
+    error: &str,
+) -> Result<bool, String> {
+    write_terminal_task_result_with_io(
+        shared,
+        task_id,
+        pid,
+        result_channel_id,
+        completion_futex_addr,
+        status,
+        error,
+        || {},
+        || {},
+    )
+}
+
+/// Callers admit the task by session and owner and abort its worker before this transition.
+/// Reservation and IPC are short kernel sections; JSON, ledger, and warnings stay outside them.
+pub(crate) fn write_terminal_task_result_with_io(
+    shared: &SharedKernel,
+    task_id: &str,
+    pid: u64,
+    result_channel_id: u64,
+    completion_futex_addr: FutexAddr,
+    status: &str,
+    error: &str,
+    before_publication: impl FnOnce(),
+    before_warnings: impl FnOnce(),
+) -> Result<bool, String> {
+    let Some(entry) = with_task_entry(task_id, Clone::clone)
+        .filter(|entry| entry.pid == pid && entry.result_channel_id == result_channel_id)
+    else {
+        return Ok(false);
+    };
+    if entry.owner_pid == pid {
+        return Ok(false);
+    }
+    let publication_guard = {
+        let mut os = shared
+            .lock()
+            .map_err(|error| format!("Failed to lock AIOS kernel: {error}"))?;
+        if !is_task_pending(os.as_mut(), pid)?
+            || os
+                .get_process(pid)
+                .is_some_and(|process| process.is_foreground)
+        {
+            return Ok(false);
+        }
+        let Some(guard) = TaskPublicationGuard::reserve(os.as_ref(), pid) else {
+            return Ok(false);
+        };
+        if !os.terminate_process_tree(pid, format!("{status}: {error}")) {
+            return Ok(false);
+        }
+        guard
+    };
+    before_publication();
+    let backend_session = backend_session::record_session(task_backend_id(task_id), task_id, None);
+    let payload = serde_json::json!({
+        "status": status,
+        "output": "",
+        "error": error,
+        "progress": current_task_progress(task_id),
+        "backend_session": backend_session,
+    })
+    .to_string();
+    let mut prepared =
+        PreparedTaskPublication::prepare(Some(task_id), pid, result_channel_id, payload);
+    {
+        let mut os = shared
+            .lock()
+            .map_err(|error| format!("Failed to lock AIOS kernel: {error}"))?;
+        if let Ok(prepared) = &mut prepared {
+            prepared.commit_ipc(os.as_mut());
+        }
+        let _ = os.futex_store(completion_futex_addr, 1);
+    }
+    before_warnings();
+    if let Err(error) = prepared.and_then(PreparedTaskPublication::finish) {
+        eprintln!("[Task result delivery] {error}");
+    }
+    drop(publication_guard);
+    Ok(true)
+}
+
 pub(super) fn task_wait_sources(
     os: &mut dyn Kernel,
     task_ids: &[String],

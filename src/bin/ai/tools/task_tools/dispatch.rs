@@ -118,7 +118,7 @@ pub(super) fn ensure_top_level_task_orchestration(tool_name: &str) -> Result<(),
 /// Lock ordering: three steps to avoid forming a lock cycle with task_wait (registry -> kernel) —
 /// 1. Lock only TASK_REGISTRY to collect the candidates, then release immediately;
 /// 2. Holding no lock, abort the Tokio task actually running the subagent;
-/// 3. Lock only the kernel (via with_os_kernel) to kill + write the result.
+/// 3. Reserve the terminal transition, persist without the kernel guard, then commit IPC.
 /// The registry and the kernel are never held simultaneously (GLOBAL_OS and App.os are the same
 /// lock; see the reentrant-deadlock warning in os_tools.rs).
 pub(crate) fn reap_timed_out_subagents() {
@@ -153,18 +153,14 @@ pub(crate) fn reap_timed_out_subagents() {
             handle.abort();
         }
     }
-    // Step 3: hold only the kernel lock and check each process; if still running, kill it + write
-    // the timeout terminal state.
-    let _ = with_os_kernel(|os| {
-        for (task_id, session_id, pid, result_channel_id, completion_futex_addr, _, _) in candidates
-        {
-            if !is_task_pending(os, pid)? {
-                // The process already ended (completed normally / failed / killed by someone
-                // else); skip it — result and resource cleanup are handled by the collector.
-                continue;
-            }
-            write_terminal_subagent_result(
-                os,
+    // Reserve under the kernel lock, then persist outside it and commit IPC briefly.
+    let Ok(shared) = current_os_kernel() else {
+        return;
+    };
+    for (task_id, session_id, pid, result_channel_id, completion_futex_addr, _, _) in candidates {
+        if matches!(
+            write_terminal_task_result(
+                &shared,
                 &task_id,
                 pid,
                 result_channel_id,
@@ -174,15 +170,16 @@ pub(crate) fn reap_timed_out_subagents() {
                     "Subagent exceeded wall-clock lifetime of {}s (reaped by scheduler; likely stuck in a non-returning tool execution)",
                     SUBAGENT_WALL_CLOCK_TIMEOUT.as_secs()
                 ),
-            );
+            ),
+            Ok(true)
+        ) {
             record_uncollected_terminal_status(
                 &session_id,
                 &task_id,
                 TaskTerminalStatus::Timeout.as_str(),
             );
         }
-        Ok(())
-    });
+    }
 }
 
 inventory::submit!(ToolRegistration {
@@ -668,21 +665,16 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
         // read a bogus cancelled state. Cleanup of channel/futex/registry for already-ended tasks
         // is left to the collector (task_wait's ready / failure path, or a task_wait after
         // task_status).
-        let was_pending = with_os_kernel(|os| {
-            if !is_task_pending(os, pid)? {
-                return Ok(false);
-            }
-            write_terminal_subagent_result(
-                os,
-                &tid,
-                pid,
-                result_channel_id,
-                completion_futex_addr,
-                TaskTerminalStatus::Cancelled.as_str(),
-                &reason,
-            );
-            Ok(true)
-        })?;
+        let shared = current_os_kernel()?;
+        let was_pending = write_terminal_task_result(
+            &shared,
+            &tid,
+            pid,
+            result_channel_id,
+            completion_futex_addr,
+            TaskTerminalStatus::Cancelled.as_str(),
+            &reason,
+        )?;
         if was_pending {
             record_uncollected_terminal_status(
                 &session_id,

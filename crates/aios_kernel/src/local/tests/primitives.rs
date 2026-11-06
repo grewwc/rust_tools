@@ -222,6 +222,247 @@ fn rlimit_check_is_pure() {
 }
 
 #[test]
+fn rlimit_policy_preserves_precedence_and_commits_usage() {
+    use crate::primitives::{
+        ResourceLimit, ResourceUsage, ResourceUsageDelta, RlimitDim, RlimitOps, RlimitVerdict,
+    };
+
+    let mut limits = ResourceLimit {
+        max_turns: 18,
+        max_tool_calls: 22,
+        max_tokens_in: 30,
+        max_tokens_out: 36,
+        max_cost_micros: 40,
+        max_tool_call_bytes: 42,
+        max_fs_bytes: 46,
+        max_wallclock_ticks: 28,
+    };
+    // Every remaining dimension violates its limit; relax earlier dimensions to equality.
+    for (dimension, used, limit) in [
+        (RlimitDim::Turns, 19, 18),
+        (RlimitDim::ToolCalls, 23, 22),
+        (RlimitDim::TokensIn, 31, 30),
+        (RlimitDim::TokensOut, 37, 36),
+        (RlimitDim::CostMicros, 41, 40),
+        (RlimitDim::ToolCallBytes, 43, 42),
+        (RlimitDim::FsBytes, 47, 46),
+        (RlimitDim::WallclockTicks, 29, 28),
+    ] {
+        let mut os = LocalOS::new();
+        os.tick = 100;
+        let pid = os.begin_foreground("p".into(), "g".into(), 10, 0, None);
+        assert_eq!(
+            os.rusage_charge(
+                pid,
+                ResourceUsageDelta {
+                    turns: 2,
+                    tool_calls: 3,
+                    tokens_in: 5,
+                    tokens_out: 7,
+                    cost_micros: 11,
+                    last_tool_call_bytes: Some(17),
+                    fs_bytes: 13,
+                },
+            ),
+            RlimitVerdict::Ok
+        );
+        os.rlimit_set(pid, limits.clone()).unwrap();
+        os.tick = 129;
+        let before = os.rusage_get(pid).unwrap();
+        let delta = ResourceUsageDelta {
+            turns: 17,
+            tool_calls: 20,
+            tokens_in: 26,
+            tokens_out: 30,
+            cost_micros: 30,
+            last_tool_call_bytes: Some(43),
+            fs_bytes: 34,
+        };
+        let expected = RlimitVerdict::Exceeded {
+            dimension,
+            used,
+            limit,
+        };
+        assert_eq!(os.rlimit_check(pid, &delta), expected);
+        assert_eq!(os.rusage_get(pid).unwrap(), before);
+        let proc = os.get_process(pid).unwrap();
+        assert_eq!((proc.turns_used, proc.tool_calls_used), (2, 3));
+        assert_eq!(os.rlimit_get(pid).unwrap(), limits);
+
+        assert_eq!(os.rusage_charge(pid, delta), expected);
+        assert_eq!(
+            os.rusage_get(pid).unwrap(),
+            ResourceUsage {
+                turns: 19,
+                tool_calls: 23,
+                tokens_in: 31,
+                tokens_out: 37,
+                cost_micros: 41,
+                last_tool_call_bytes: 43,
+                fs_bytes: 47,
+            }
+        );
+        let proc = os.get_process(pid).unwrap();
+        assert_eq!((proc.turns_used, proc.tool_calls_used), (19, 23));
+
+        match dimension {
+            RlimitDim::Turns => limits.max_turns = used,
+            RlimitDim::ToolCalls => limits.max_tool_calls = used,
+            RlimitDim::TokensIn => limits.max_tokens_in = used,
+            RlimitDim::TokensOut => limits.max_tokens_out = used,
+            RlimitDim::CostMicros => limits.max_cost_micros = used,
+            RlimitDim::ToolCallBytes => limits.max_tool_call_bytes = used,
+            RlimitDim::FsBytes => limits.max_fs_bytes = used,
+            RlimitDim::WallclockTicks => limits.max_wallclock_ticks = used,
+        }
+    }
+}
+
+#[test]
+fn rlimit_policy_saturates_and_preserves_omitted_tool_bytes() {
+    use crate::primitives::{
+        ResourceLimit, ResourceUsage, ResourceUsageDelta, RlimitDim, RlimitOps, RlimitVerdict,
+    };
+
+    let mut os = LocalOS::new();
+    os.tick = 10;
+    let pid = os.begin_foreground("p".into(), "g".into(), 10, 0, None);
+    assert_eq!(
+        os.rusage_charge(
+            pid,
+            ResourceUsageDelta {
+                turns: u64::MAX - 1,
+                tool_calls: u64::MAX - 1,
+                tokens_in: u64::MAX - 1,
+                tokens_out: u64::MAX - 1,
+                cost_micros: u64::MAX - 1,
+                last_tool_call_bytes: Some(99),
+                fs_bytes: u64::MAX - 1,
+            },
+        ),
+        RlimitVerdict::Ok
+    );
+    let mut limits = ResourceLimit::unlimited();
+    limits.max_tool_call_bytes = 4;
+    limits.max_wallclock_ticks = 0;
+    os.rlimit_set(pid, limits).unwrap();
+    // A tick before creation must saturate elapsed time to zero.
+    os.tick = 9;
+    let delta = ResourceUsageDelta {
+        turns: 10,
+        tool_calls: 10,
+        tokens_in: 10,
+        tokens_out: 10,
+        cost_micros: 10,
+        last_tool_call_bytes: None,
+        fs_bytes: 10,
+    };
+    let before = os.rusage_get(pid).unwrap();
+    assert_eq!(os.rlimit_check(pid, &delta), RlimitVerdict::Ok);
+    assert_eq!(os.rusage_get(pid).unwrap(), before);
+    assert_eq!(os.rusage_charge(pid, delta), RlimitVerdict::Ok);
+    let mut expected_usage = ResourceUsage {
+        turns: u64::MAX,
+        tool_calls: u64::MAX,
+        tokens_in: u64::MAX,
+        tokens_out: u64::MAX,
+        cost_micros: u64::MAX,
+        last_tool_call_bytes: 99,
+        fs_bytes: u64::MAX,
+    };
+    assert_eq!(os.rusage_get(pid).unwrap(), expected_usage);
+    let proc = os.get_process(pid).unwrap();
+    assert_eq!(proc.turns_used, u64::MAX as usize);
+    assert_eq!(proc.tool_calls_used, u64::MAX as usize);
+
+    let supplied = ResourceUsageDelta {
+        last_tool_call_bytes: Some(7),
+        ..Default::default()
+    };
+    let exceeded = RlimitVerdict::Exceeded {
+        dimension: RlimitDim::ToolCallBytes,
+        used: 7,
+        limit: 4,
+    };
+    assert_eq!(os.rlimit_check(pid, &supplied), exceeded);
+    assert_eq!(os.rusage_get(pid).unwrap(), expected_usage);
+    assert_eq!(os.rusage_charge(pid, supplied), exceeded);
+    expected_usage.last_tool_call_bytes = 7;
+    assert_eq!(os.rusage_get(pid).unwrap(), expected_usage);
+    assert_eq!(os.rlimit_check(pid, &Default::default()), RlimitVerdict::Ok);
+    assert_eq!(os.rusage_charge(pid, Default::default()), RlimitVerdict::Ok);
+    assert_eq!(os.rusage_get(pid).unwrap(), expected_usage);
+
+    let supplied_zero = ResourceUsageDelta {
+        last_tool_call_bytes: Some(0),
+        ..Default::default()
+    };
+    assert_eq!(os.rlimit_check(pid, &supplied_zero), RlimitVerdict::Ok);
+    assert_eq!(os.rusage_get(pid).unwrap(), expected_usage);
+    assert_eq!(os.rusage_charge(pid, supplied_zero), RlimitVerdict::Ok);
+    expected_usage.last_tool_call_bytes = 0;
+    assert_eq!(os.rusage_get(pid).unwrap(), expected_usage);
+}
+
+#[test]
+fn rlimit_policy_accepts_exact_limits() {
+    use crate::primitives::{ResourceLimit, ResourceUsageDelta, RlimitOps, RlimitVerdict};
+
+    let mut os = LocalOS::new();
+    os.tick = 20;
+    let pid = os.begin_foreground("p".into(), "g".into(), 10, 0, None);
+    os.rlimit_set(
+        pid,
+        ResourceLimit {
+            max_turns: 2,
+            max_tool_calls: 3,
+            max_tokens_in: 5,
+            max_tokens_out: 7,
+            max_cost_micros: 11,
+            max_tool_call_bytes: 13,
+            max_fs_bytes: 17,
+            max_wallclock_ticks: 20,
+        },
+    )
+    .unwrap();
+    os.tick = 40;
+    let delta = ResourceUsageDelta {
+        turns: 2,
+        tool_calls: 3,
+        tokens_in: 5,
+        tokens_out: 7,
+        cost_micros: 11,
+        last_tool_call_bytes: Some(13),
+        fs_bytes: 17,
+    };
+    let before = os.rusage_get(pid).unwrap();
+    assert_eq!(os.rlimit_check(pid, &delta), RlimitVerdict::Ok);
+    assert_eq!(os.rusage_get(pid).unwrap(), before);
+    assert_eq!(os.rusage_charge(pid, delta), RlimitVerdict::Ok);
+}
+
+#[test]
+fn rlimit_policy_preserves_missing_process_results() {
+    use crate::primitives::{ResourceLimit, ResourceUsageDelta, RlimitOps, RlimitVerdict};
+
+    let mut os = LocalOS::new();
+    let delta = ResourceUsageDelta {
+        turns: 1,
+        last_tool_call_bytes: Some(1),
+        ..Default::default()
+    };
+    assert_eq!(os.rlimit_check(42, &delta), RlimitVerdict::NoSuchProcess);
+    assert_eq!(os.rusage_charge(42, delta), RlimitVerdict::NoSuchProcess);
+    assert_eq!(
+        os.rlimit_set(42, ResourceLimit::unlimited()),
+        Err("rlimit_set: no such pid 42".to_string())
+    );
+    assert_eq!(os.rlimit_get(42), None);
+    assert_eq!(os.rusage_get(42), None);
+    assert!(os.processes.is_empty());
+}
+
+#[test]
 fn increment_helpers_route_through_rusage_charge() {
     use crate::primitives::RlimitOps;
     let mut os = LocalOS::new();

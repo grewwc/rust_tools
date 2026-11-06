@@ -1,6 +1,121 @@
 use super::*;
 
 #[test]
+fn yield_requests_are_isolated_between_processes() {
+    let mut os = LocalOS::new();
+    let first = os.begin_foreground("first".to_string(), "goal".to_string(), 10, 8, None);
+    let second = os.begin_foreground("second".to_string(), "goal".to_string(), 10, 8, None);
+
+    os.set_current_pid(Some(first));
+    os.request_yield();
+    os.set_current_pid(Some(second));
+    assert!(
+        !os.consume_yield_requested(),
+        "another PID must not consume the request"
+    );
+    os.request_yield();
+
+    os.set_current_pid(Some(first));
+    assert!(os.consume_yield_requested());
+    assert!(!os.consume_yield_requested());
+    os.set_current_pid(Some(second));
+    assert!(os.consume_yield_requested());
+    assert!(!os.consume_yield_requested());
+
+    os.sleep_current(1).unwrap();
+    assert!(os.current_process_id().is_none());
+    assert!(
+        os.consume_yield_requested(),
+        "single-PID suspension keeps its yield intent"
+    );
+    os.request_yield();
+    assert!(
+        os.consume_yield_requested(),
+        "a synchronous wrapper can re-arm the yield"
+    );
+}
+
+#[test]
+fn yield_requests_survive_dispatch_of_another_process() {
+    for batch in [false, true] {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("root".to_string(), "goal".to_string(), 10, 8, None);
+        let child = os
+            .spawn(
+                Some(root),
+                "child".to_string(),
+                "goal".to_string(),
+                20,
+                8,
+                None,
+                None,
+            )
+            .unwrap();
+        os.request_yield();
+        let dispatched = if batch {
+            os.pop_all_ready(1).pop().unwrap()
+        } else {
+            os.pop_ready().unwrap()
+        };
+        assert_eq!(dispatched.pid, child);
+        assert!(!os.consume_yield_requested());
+        os.set_current_pid(Some(root));
+        assert!(
+            os.consume_yield_requested(),
+            "dispatch clears only the selected PID's request"
+        );
+
+        os.request_yield();
+        os.set_current_pid(Some(child));
+        os.request_yield();
+        assert!(os.requeue_current());
+        assert_eq!(os.pop_ready().unwrap().pid, child);
+        assert!(
+            !os.consume_yield_requested(),
+            "a new dispatch clears that PID's stale request"
+        );
+        os.terminate_current("child complete".to_string());
+        os.set_current_pid(Some(child));
+        assert!(!os.consume_yield_requested());
+        os.set_current_pid(Some(root));
+        assert!(os.consume_yield_requested());
+    }
+}
+
+#[test]
+fn yield_requests_ignore_exited_processes() {
+    let mut os = LocalOS::new();
+    let root = os.begin_foreground("root".to_string(), "goal".to_string(), 10, 8, None);
+    let child = os
+        .spawn(
+            Some(root),
+            "child".to_string(),
+            "goal".to_string(),
+            20,
+            8,
+            None,
+            None,
+        )
+        .unwrap();
+    os.request_yield();
+    os.set_current_pid(Some(child));
+    os.request_yield();
+    os.terminate_current("child complete".to_string());
+    os.set_current_pid(Some(child));
+    os.request_yield();
+    assert!(
+        !os.consume_yield_requested(),
+        "an exited PID cannot create a stale request"
+    );
+    assert!(os.drop_terminated(child));
+    os.set_current_pid(Some(child));
+    os.request_yield();
+    assert!(!os.consume_yield_requested());
+    os.set_current_pid(Some(root));
+    assert!(os.consume_yield_requested());
+}
+
+#[test]
 fn foreground_process_can_wait_and_resume_on_child_exit() {
     let mut os = LocalOS::new();
     let root = os.begin_foreground(
@@ -98,6 +213,8 @@ fn blocking_syscall_resolves_caller_from_task_local_when_current_pid_cleared() {
         None,
     );
 
+    let other = os.begin_foreground("other".to_string(), "other goal".to_string(), 10, 8, None);
+
     // Simulate a concurrent task clearing the shared current_pid during its wrap-up.
     os.set_current_pid(None);
     assert!(os.current_pid.is_none());
@@ -110,6 +227,17 @@ fn blocking_syscall_resolves_caller_from_task_local_when_current_pid_cleared() {
         .wait_on_events(vec![EventId::new(7)], WaitPolicy::Any, Some(5))
         .expect("wait_on_events must resolve caller from task-local");
     assert_eq!(timeout_tick, Some(5));
+    TEST_TASK_PID.with(|c| c.set(Some(other)));
+    assert!(
+        !os.consume_yield_requested(),
+        "task-local identity must isolate yield consumption"
+    );
+    TEST_TASK_PID.with(|c| c.set(Some(root)));
+    assert!(os.consume_yield_requested());
+    os.request_yield();
+    TEST_TASK_PID.with(|c| c.set(Some(other)));
+    assert!(!os.consume_yield_requested());
+    TEST_TASK_PID.with(|c| c.set(Some(root)));
     assert!(os.consume_yield_requested());
     assert!(matches!(
         os.get_process(root).map(|p| &p.state),

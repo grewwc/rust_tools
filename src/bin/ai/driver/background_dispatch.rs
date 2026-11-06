@@ -20,24 +20,473 @@ use crate::ai::{
 
 use super::agent_routing::{activate_primary_agent, ensure_runtime_manifests_loaded};
 use super::process_context::{
-    build_background_process_question, finalize_turn_quota, process_history_path,
+    build_background_process_question, finalize_turn_quota_outcome, process_history_path,
     resolve_background_subagent_context,
 };
 use super::runtime_ctx;
 use super::scheduler::{
-    DispatchOutcomeTag, classify_process_outcome, decode_background_process_task_goal,
-    maybe_emit_scheduler_eval, publish_background_task_failure, record_scheduler_outcome,
+    DispatchOutcomeTag, SchedulerDecision, classify_process_outcome,
+    decode_background_process_task_goal, maybe_emit_scheduler_eval,
+    publish_background_task_failure, record_scheduler_outcome,
     resolve_background_subagent_override, select_background_batch,
     should_publish_subagent_task_result,
 };
+use super::subagent_launch::{ExternalSubagentLaunch, resolve_external_subagent_cwd};
 use super::turn_runtime;
 use super::{BgSubagentGuard, TASK_PID, terminate_and_cleanup};
 
-/// Background subagent history is kept only while the process can still be
-/// scheduled. Normal termination, failure, panic, or a `task_cancel` that aborts
-/// the future are all cleaned up via Drop. Private memory files and the exclusive
-/// cwd scratch directory share history's lifetime and are reclaimed here too,
-/// preventing buildup over long runs.
+struct BackgroundTurnTarget {
+    pid: u64,
+    task_id: Option<String>,
+    result_channel_id: Option<u64>,
+    completion_futex_addr: Option<aios_kernel::primitives::FutexAddr>,
+    backend_id: task_tools::BackendId,
+}
+
+enum BackgroundTaskState {
+    Completed,
+    Failed(String),
+    Blocked(String),
+    /// Empty output can be a cooperative suspension rather than a final response.
+    Incomplete(Option<String>),
+}
+
+struct BackgroundTaskOutcome {
+    state: BackgroundTaskState,
+    output: String,
+    progress: String,
+    backend_session: Option<String>,
+    retain_recovery: bool,
+}
+
+impl BackgroundTaskOutcome {
+    fn status(&self) -> &'static str {
+        match self.state {
+            BackgroundTaskState::Completed => "completed",
+            BackgroundTaskState::Failed(_) => "failed",
+            BackgroundTaskState::Blocked(_) => "blocked",
+            BackgroundTaskState::Incomplete(_) => "running",
+        }
+    }
+
+    fn error(&self) -> Option<&str> {
+        match &self.state {
+            BackgroundTaskState::Failed(error) | BackgroundTaskState::Blocked(error) => Some(error),
+            BackgroundTaskState::Completed | BackgroundTaskState::Incomplete(_) => None,
+        }
+    }
+}
+
+fn resolve_background_task_outcome(
+    outcome: task_tools::Outcome,
+    memory_merge_error: Option<String>,
+    response_schema: Option<&serde_json::Value>,
+) -> BackgroundTaskOutcome {
+    let retain_recovery = memory_merge_error.is_some();
+    let mut output = outcome.parent_payload;
+    let state = if let Some(error) = outcome.execution_error.or(memory_merge_error) {
+        BackgroundTaskState::Failed(error)
+    } else {
+        match task_tools::parse_subagent_handoff(&outcome.validation_body) {
+            Err(error) => BackgroundTaskState::Failed(error),
+            Ok(Some(handoff)) => {
+                if let Some(action) = handoff.suggested_action {
+                    output = action;
+                }
+                BackgroundTaskState::Blocked(format!(
+                    "{}: {}",
+                    handoff.kind.as_str(),
+                    handoff.reason,
+                ))
+            }
+            Ok(None) => {
+                let validation_error = task_tools::validate_subagent_response(
+                    response_schema,
+                    &outcome.validation_body,
+                )
+                .err();
+                if output.trim().is_empty() && outcome.validation_body.trim().is_empty() {
+                    BackgroundTaskState::Incomplete(validation_error)
+                } else if let Some(error) = validation_error {
+                    BackgroundTaskState::Failed(error)
+                } else {
+                    BackgroundTaskState::Completed
+                }
+            }
+        }
+    };
+    BackgroundTaskOutcome {
+        state,
+        output,
+        progress: outcome.progress,
+        backend_session: outcome.backend_session,
+        retain_recovery,
+    }
+}
+
+struct BackgroundTurnRetention {
+    preserve_history: bool,
+    delivery_failed: bool,
+}
+
+async fn supervise_background_worker(
+    worker: impl std::future::Future<Output = task_tools::Outcome>,
+    events: &task_tools::Events,
+    default_progress: &str,
+) -> (task_tools::Outcome, bool) {
+    use futures_util::FutureExt;
+
+    match std::panic::AssertUnwindSafe(worker).catch_unwind().await {
+        Ok(outcome) => (outcome, false),
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic payload");
+            (
+                task_tools::Outcome::failed(
+                    format!("Background worker panicked: {detail}"),
+                    events,
+                    default_progress,
+                ),
+                true,
+            )
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackgroundFinalizationOrigin {
+    Turn,
+    Preparation,
+}
+
+struct BackgroundTerminalPlan {
+    outcome: BackgroundTaskOutcome,
+    origin: BackgroundFinalizationOrigin,
+    cleanup_history: Option<PathBuf>,
+    publication_guard: task_tools::TaskPublicationGuard,
+}
+
+enum BackgroundFinalization {
+    AlreadyTerminal,
+    Suspended,
+    Terminal(BackgroundTerminalPlan),
+}
+
+/// Reserve terminal ownership and account usage using only in-memory kernel operations.
+/// A publication guard keeps collectors pending until lock-free persistence and IPC complete.
+fn reserve_background_finalization(
+    os: &mut (dyn aios_kernel::kernel::Kernel + Send),
+    target: &BackgroundTurnTarget,
+    mut outcome: BackgroundTaskOutcome,
+    origin: BackgroundFinalizationOrigin,
+) -> BackgroundFinalization {
+    let pid = target.pid;
+    let Some(process) = os.get_process(pid) else {
+        return BackgroundFinalization::AlreadyTerminal;
+    };
+    if process.state == aios_kernel::kernel::ProcessState::Terminated {
+        return BackgroundFinalization::AlreadyTerminal;
+    }
+    let suspended = !should_publish_subagent_task_result(true, "", Some(&process.state));
+    if !suspended && let BackgroundTaskState::Incomplete(validation_error) = &mut outcome.state {
+        outcome.state = validation_error
+            .take()
+            .map(BackgroundTaskState::Failed)
+            .unwrap_or(BackgroundTaskState::Completed);
+    }
+    let publication_guard = if matches!(outcome.state, BackgroundTaskState::Incomplete(_)) {
+        None
+    } else if let Some(guard) = task_tools::TaskPublicationGuard::reserve(os, pid) {
+        Some(guard)
+    } else {
+        return BackgroundFinalization::AlreadyTerminal;
+    };
+    os.set_current_pid(Some(pid));
+    let quota = (origin == BackgroundFinalizationOrigin::Turn)
+        .then(|| finalize_turn_quota_outcome(os, pid));
+    if matches!(outcome.state, BackgroundTaskState::Completed)
+        && let Some(quota) = &quota
+        && matches!(
+            quota.verdict,
+            aios_kernel::primitives::RlimitVerdict::Exceeded { .. }
+        )
+        && (quota.should_terminate || target.result_channel_id.is_some())
+    {
+        outcome.state = BackgroundTaskState::Failed(super::format_rlimit_termination_result(
+            quota.verdict.clone(),
+        ));
+    }
+    let (dispatch_outcome, termination_result) = match &outcome.state {
+        BackgroundTaskState::Failed(error) => {
+            (DispatchOutcomeTag::Failed, Some(format!("Failed: {error}")))
+        }
+        BackgroundTaskState::Blocked(error) => (
+            DispatchOutcomeTag::Blocked,
+            Some(format!("Blocked: {error}")),
+        ),
+        BackgroundTaskState::Completed => (
+            DispatchOutcomeTag::Advanced,
+            quota.as_ref().and_then(|quota| {
+                (quota.should_terminate || target.result_channel_id.is_some())
+                    .then(|| quota.termination_result.clone())
+            }),
+        ),
+        BackgroundTaskState::Incomplete(_) => (classify_process_outcome(os, pid), None),
+    };
+    record_scheduler_outcome(os, pid, dispatch_outcome);
+    let Some(termination_result) = termination_result else {
+        if os.is_round_robin() {
+            os.set_current_pid(Some(pid));
+            os.requeue_current();
+        }
+        return BackgroundFinalization::Suspended;
+    };
+    let history = os
+        .get_process_mut(pid)
+        .and_then(|process| process.history_file.take());
+    let cleanup_history = (origin == BackgroundFinalizationOrigin::Preparation)
+        .then_some(history)
+        .flatten();
+    // Detachment guarantees the legacy kernel cleanup has no external file to delete.
+    // Converting the process first also lets cancellation recognize that this result already owns it.
+    terminate_and_cleanup(os, pid, termination_result, true);
+    BackgroundFinalization::Terminal(BackgroundTerminalPlan {
+        outcome,
+        origin,
+        cleanup_history,
+        publication_guard: publication_guard.expect("a terminal outcome reserves publication"),
+    })
+}
+
+/// Serialize and durably persist before taking the kernel lock for IPC.
+fn prepare_background_publication(
+    target: &BackgroundTurnTarget,
+    plan: &BackgroundTerminalPlan,
+) -> Option<Result<task_tools::PreparedTaskPublication, String>> {
+    let channel = target.result_channel_id?;
+    let outcome = &plan.outcome;
+    let payload = match plan.origin {
+        BackgroundFinalizationOrigin::Preparation => serde_json::json!({
+            "status": outcome.status(),
+            "output": outcome.output,
+            "error": outcome.error(),
+        }),
+        BackgroundFinalizationOrigin::Turn => {
+            let backend_session = match target.task_id.as_deref() {
+                Some(task_id) => task_tools::backend_session::record_session(
+                    target.backend_id,
+                    task_id,
+                    outcome.backend_session.clone(),
+                ),
+                None => outcome.backend_session.clone(),
+            };
+            serde_json::json!({
+                "status": outcome.status(),
+                "output": outcome.output,
+                "error": outcome.error(),
+                "progress": outcome.progress,
+                "backend_session": backend_session,
+            })
+        }
+    }
+    .to_string();
+    Some(task_tools::PreparedTaskPublication::prepare(
+        target.task_id.as_deref(),
+        target.pid,
+        channel,
+        payload,
+    ))
+}
+
+fn commit_background_publication(
+    os: &mut dyn aios_kernel::kernel::Kernel,
+    target: &BackgroundTurnTarget,
+    publication: &mut Option<Result<task_tools::PreparedTaskPublication, String>>,
+) {
+    if let Some(Ok(publication)) = publication {
+        publication.commit_ipc(os);
+    }
+    if let Some(addr) = target.completion_futex_addr {
+        let _ = os.futex_store(addr, 1);
+        super::notify_scheduler();
+    }
+}
+
+/// Warning persistence and external history deletion both run without the kernel guard.
+fn finish_background_publication(
+    plan: BackgroundTerminalPlan,
+    publication: Option<Result<task_tools::PreparedTaskPublication, String>>,
+    before_cleanup: impl FnOnce(),
+) -> BackgroundTurnRetention {
+    let delivery =
+        publication.map(|publication| publication.and_then(|publication| publication.finish()));
+    let delivery_failed = matches!(delivery, Some(Err(_)));
+    if let Some(Err(error)) = delivery {
+        runtime_ctx::publish_subagent_phase("result delivery failed; recovery retained");
+        eprintln!("[Task result delivery] {error}");
+    }
+    let preserve_history = plan.outcome.retain_recovery || delivery_failed;
+    if !preserve_history && let Some(history_path) = &plan.cleanup_history {
+        before_cleanup();
+        let _ = std::fs::remove_file(history_path);
+    }
+    drop(plan.publication_guard);
+    BackgroundTurnRetention {
+        preserve_history,
+        delivery_failed,
+    }
+}
+
+fn finalize_background_turn_shared(
+    shared_os: &aios_kernel::SharedKernel,
+    target: &BackgroundTurnTarget,
+    outcome: BackgroundTaskOutcome,
+) -> BackgroundTurnRetention {
+    finalize_background_turn_with_io(shared_os, target, outcome, || {}, || {})
+}
+
+fn finalize_background_turn_with_io(
+    shared_os: &aios_kernel::SharedKernel,
+    target: &BackgroundTurnTarget,
+    outcome: BackgroundTaskOutcome,
+    before_publication: impl FnOnce(),
+    before_cleanup: impl FnOnce(),
+) -> BackgroundTurnRetention {
+    finalize_background_outcome_with_io(
+        shared_os,
+        target,
+        outcome,
+        BackgroundFinalizationOrigin::Turn,
+        before_publication,
+        before_cleanup,
+    )
+}
+
+fn finalize_background_outcome_with_io(
+    shared_os: &aios_kernel::SharedKernel,
+    target: &BackgroundTurnTarget,
+    outcome: BackgroundTaskOutcome,
+    origin: BackgroundFinalizationOrigin,
+    before_publication: impl FnOnce(),
+    before_cleanup: impl FnOnce(),
+) -> BackgroundTurnRetention {
+    let finalization = {
+        let mut os = shared_os.lock().unwrap();
+        reserve_background_finalization(os.as_mut(), target, outcome, origin)
+    };
+    let plan = match finalization {
+        BackgroundFinalization::AlreadyTerminal => {
+            return BackgroundTurnRetention {
+                preserve_history: false,
+                delivery_failed: false,
+            };
+        }
+        BackgroundFinalization::Suspended => {
+            return BackgroundTurnRetention {
+                preserve_history: true,
+                delivery_failed: false,
+            };
+        }
+        BackgroundFinalization::Terminal(plan) => plan,
+    };
+    before_publication();
+    let mut publication = prepare_background_publication(target, &plan);
+    {
+        let mut os = shared_os.lock().unwrap();
+        commit_background_publication(os.as_mut(), target, &mut publication);
+    }
+    finish_background_publication(plan, publication, before_cleanup)
+}
+
+pub(super) fn publish_background_preparation_failure_with_io(
+    shared_os: &aios_kernel::SharedKernel,
+    pid: u64,
+    result_channel_id: Option<u64>,
+    completion_futex_addr: Option<aios_kernel::primitives::FutexAddr>,
+    error: &str,
+    before_publication: impl FnOnce(),
+    before_cleanup: impl FnOnce(),
+) {
+    let goal = shared_os
+        .lock()
+        .unwrap()
+        .get_process(pid)
+        .map(|process| process.goal.clone());
+    let task_id = goal
+        .as_deref()
+        .and_then(task_tools::decode_os_task_goal)
+        .map(|goal| goal.task_id)
+        .or_else(|| {
+            result_channel_id.and_then(|channel| task_tools::task_id_for_result(pid, channel))
+        });
+    let backend_id = task_id
+        .as_deref()
+        .and_then(|task_id| task_tools::with_task_entry(task_id, |entry| entry.backend))
+        .flatten()
+        .unwrap_or_default();
+    let target = BackgroundTurnTarget {
+        pid,
+        task_id,
+        result_channel_id,
+        completion_futex_addr,
+        backend_id,
+    };
+    let outcome = BackgroundTaskOutcome {
+        state: BackgroundTaskState::Failed(error.to_string()),
+        output: String::new(),
+        progress: String::new(),
+        backend_session: None,
+        retain_recovery: false,
+    };
+    finalize_background_outcome_with_io(
+        shared_os,
+        &target,
+        outcome,
+        BackgroundFinalizationOrigin::Preparation,
+        before_publication,
+        before_cleanup,
+    );
+}
+
+/// The existing behavior tests use a caller-owned LocalOS without a shared mutex.
+/// Run the same production stages, retaining their narrow IPC/quota assertions.
+#[cfg(test)]
+fn finalize_background_turn(
+    os: &mut (dyn aios_kernel::kernel::Kernel + Send),
+    target: &BackgroundTurnTarget,
+    outcome: BackgroundTaskOutcome,
+) -> BackgroundTurnRetention {
+    let plan = match reserve_background_finalization(
+        os,
+        target,
+        outcome,
+        BackgroundFinalizationOrigin::Turn,
+    ) {
+        BackgroundFinalization::AlreadyTerminal => {
+            return BackgroundTurnRetention {
+                preserve_history: false,
+                delivery_failed: false,
+            };
+        }
+        BackgroundFinalization::Suspended => {
+            return BackgroundTurnRetention {
+                preserve_history: true,
+                delivery_failed: false,
+            };
+        }
+        BackgroundFinalization::Terminal(plan) => plan,
+    };
+    let mut publication = prepare_background_publication(target, &plan);
+    commit_background_publication(os, target, &mut publication);
+    finish_background_publication(plan, publication, || {})
+}
+
+/// Reclaim child history and private artifacts when no resumable process or recovery
+/// source remains. Suspensions, memory-merge failures, publication warnings, and caught
+/// worker panics explicitly retain them; normal terminal cleanup runs through Drop.
 struct BackgroundSubagentHistoryGuard {
     path: Option<PathBuf>,
     memory_path: Option<PathBuf>,
@@ -795,11 +1244,12 @@ impl Drop for SubagentStatusLine {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackgroundSubagentHistoryGuard, SubagentStatusLine,
-        agent_team_subagent_status_semantic_key, clamp_status_block, format_subagent_elapsed,
-        redraw_status_block, render_agent_team_subagent_status_block_at_width,
-        render_subagent_status_line_at_width, sanitize_status_field,
-        sorted_active_subagent_statuses, status_line_redraw_deferred,
+        BackgroundDispatchSpec, BackgroundSubagentHistoryGuard, BackgroundTurnTarget,
+        SubagentStatusLine, agent_team_subagent_status_semantic_key, clamp_status_block,
+        finalize_background_turn, format_subagent_elapsed, redraw_status_block,
+        render_agent_team_subagent_status_block_at_width, render_subagent_status_line_at_width,
+        resolve_background_task_outcome, sanitize_status_field, select_background_batch_with_log,
+        sorted_active_subagent_statuses, status_line_redraw_deferred, supervise_background_worker,
     };
     use crate::ai::driver::runtime_ctx::{
         SubagentProgressSnapshot, new_subagent_progress_slot, publish_subagent_activity_to_slot,
@@ -807,6 +1257,956 @@ mod tests {
         subagent_progress_state_snapshot,
     };
     use crate::ai::tools::task_tools::SubagentTerminalStatus;
+    use aios_kernel::kernel::{KernelInternal, ProcessState, Syscall};
+    use aios_kernel::local::LocalOS;
+    use aios_kernel::primitives::{
+        ChannelId, FutexOps, IpcOps, IpcRecvResult, ResourceLimit, ResourceUsageDelta, RlimitOps,
+    };
+
+    fn background_turn_fixture() -> (LocalOS, BackgroundTurnTarget) {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("root".to_string(), "goal".to_string(), 10, 8, None);
+        let pid = os
+            .spawn(
+                Some(root),
+                "child".to_string(),
+                "goal".to_string(),
+                20,
+                8,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(os.pop_ready().unwrap().pid, pid);
+        let channel = os.channel_create(Some(root), 1, "turn result".to_string());
+        let futex = os.futex_create(0, "turn completion".to_string());
+        (
+            os,
+            BackgroundTurnTarget {
+                pid,
+                task_id: None,
+                result_channel_id: Some(channel.0),
+                completion_futex_addr: Some(futex),
+                backend_id: crate::ai::tools::task_tools::BackendId::KERNEL,
+            },
+        )
+    }
+
+    fn background_turn_output(body: &str) -> crate::ai::tools::task_tools::Outcome {
+        crate::ai::tools::task_tools::Outcome {
+            parent_payload: format!("Evidence retained for the parent\n{body}"),
+            validation_body: body.to_string(),
+            progress: "finished test turn".to_string(),
+            backend_session: Some("test-backend-session".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn background_turn_payload(
+        os: &mut LocalOS,
+        target: &BackgroundTurnTarget,
+    ) -> serde_json::Value {
+        let IpcRecvResult::Message(payload) = os
+            .channel_try_recv(None, ChannelId(target.result_channel_id.unwrap()))
+            .unwrap()
+        else {
+            panic!("the background turn must publish its terminal result");
+        };
+        serde_json::from_str(&payload).unwrap()
+    }
+
+    struct PublicationFixture {
+        root: std::path::PathBuf,
+        history_file: std::path::PathBuf,
+        child_history: std::path::PathBuf,
+        shared: aios_kernel::SharedKernel,
+        target: BackgroundTurnTarget,
+        context: std::sync::Arc<crate::ai::driver::runtime_ctx::DriverContext>,
+        owner_pid: u64,
+        session_id: String,
+    }
+
+    impl PublicationFixture {
+        fn new() -> Self {
+            use crate::ai::tools::task_tools::{AsyncTaskEntry, InheritOptions};
+            use aios_kernel::primitives::ChannelOwnerTag;
+
+            aios_kernel::kernel::register_current_pid_provider(super::super::current_task_pid);
+            let root = std::env::temp_dir().join(format!(
+                "runtime-lock-publication-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let history_file = root.join("history.sqlite");
+            let child_history = root.join("child.sqlite");
+            std::fs::write(&child_history, "child recovery fixture").unwrap();
+            let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+            let session_id = format!("lock-session-{}", uuid::Uuid::new_v4().simple());
+            let mut app = super::super::tests::test_app("build");
+            app.session_id = session_id.clone();
+            app.config.history_file = history_file.clone();
+            app.session_history_file = history_file.clone();
+            let shared = app.os.clone();
+            let (owner_pid, pid, channel, futex) = {
+                let mut os = shared.lock().unwrap();
+                let owner =
+                    os.begin_foreground("parent".to_string(), "goal".to_string(), 10, 8, None);
+                let pid = os
+                    .spawn(
+                        Some(owner),
+                        "child".to_string(),
+                        "goal".to_string(),
+                        20,
+                        8,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                assert_eq!(os.pop_ready().unwrap().pid, pid);
+                os.get_process_mut(pid).unwrap().history_file = Some(child_history.clone());
+                let channel = os.channel_create_tagged_with_holders(
+                    Some(owner),
+                    1,
+                    "task result".to_string(),
+                    ChannelOwnerTag::TaskResult,
+                    vec![
+                        "task_result.producer".to_string(),
+                        "task_result.consumer".to_string(),
+                    ],
+                );
+                let futex = os.futex_create(0, "task completion".to_string());
+                os.set_current_pid(Some(owner));
+                (owner, pid, channel, futex)
+            };
+            crate::ai::tools::task_tools::insert_task_entry_for_test(
+                task_id.clone(),
+                AsyncTaskEntry {
+                    session_id: session_id.clone(),
+                    evidence_history_file: Some(history_file.clone()),
+                    owner_pid,
+                    pid,
+                    result_channel_id: channel.0,
+                    completion_futex_addr: futex,
+                    description: "real task publication".to_string(),
+                    agent_name: "build".to_string(),
+                    backend: None,
+                    model: "test-model".to_string(),
+                    is_model_auto_selected: false,
+                    auto_model_fallback: None,
+                    selection_explanation: "fixture".to_string(),
+                    inherit: InheritOptions::default(),
+                    abort_handle: None,
+                    cancel_stream: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    started_at: std::time::Instant::now(),
+                    last_progress_notification_at: None,
+                    last_progress_persisted_at: None,
+                },
+            );
+            let context = crate::ai::driver::runtime_ctx::DriverContext::from_app_snapshot(
+                &app,
+                std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+                std::sync::Arc::new(Vec::new()),
+                std::sync::Arc::new(Vec::new()),
+            );
+            Self {
+                root,
+                history_file,
+                child_history,
+                shared,
+                target: BackgroundTurnTarget {
+                    pid,
+                    task_id: Some(task_id),
+                    result_channel_id: Some(channel.0),
+                    completion_futex_addr: Some(futex),
+                    backend_id: crate::ai::tools::task_tools::BackendId::KERNEL,
+                },
+                context,
+                owner_pid,
+                session_id,
+            }
+        }
+
+        fn scope<T>(&self, run: impl FnOnce() -> T) -> T {
+            super::super::TASK_PID.sync_scope(Some(self.owner_pid), || {
+                crate::ai::driver::runtime_ctx::DRIVER_CTX.sync_scope(self.context.clone(), || {
+                    crate::ai::driver::runtime_ctx::TURN_IDENTITY
+                        .sync_scope((self.session_id.clone(), 0usize), run)
+                })
+            })
+        }
+
+        fn published(&self) -> Option<(String, String, bool)> {
+            crate::ai::history::read_available_task_evidence_status_payload(
+                &self.history_file,
+                &self.session_id,
+                self.target.task_id.as_deref().unwrap(),
+            )
+            .unwrap()
+        }
+
+        fn payload(&self) -> serde_json::Value {
+            let os = self.shared.lock().unwrap();
+            let IpcRecvResult::Message(payload) = os
+                .channel_peek(None, ChannelId(self.target.result_channel_id.unwrap()))
+                .unwrap()
+            else {
+                panic!("terminal IPC payload missing")
+            };
+            serde_json::from_str(&payload).unwrap()
+        }
+    }
+
+    impl Drop for PublicationFixture {
+        fn drop(&mut self) {
+            crate::ai::tools::task_tools::remove_task_entry(
+                self.target.task_id.as_deref().unwrap(),
+            );
+            for backend in [
+                crate::ai::tools::task_tools::BackendId::KERNEL,
+                crate::ai::tools::task_tools::BackendId::TRAECLI,
+            ] {
+                crate::ai::tools::task_tools::backend_session::forget_session(
+                    backend,
+                    self.target.task_id.as_deref().unwrap(),
+                );
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn runtime_lock_publication_real_task_persists_outside_kernel() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let fixture = PublicationFixture::new();
+        let outcome = resolve_background_task_outcome(
+            background_turn_output("validated final body"),
+            None,
+            None,
+        );
+        let mut called = false;
+        let retention = super::finalize_background_turn_with_io(
+            &fixture.shared,
+            &fixture.target,
+            outcome,
+            || {
+                assert!(
+                    fixture.shared.try_lock().is_ok(),
+                    "JSON and ledger publication must run without the kernel guard"
+                );
+                called = true;
+            },
+            || {},
+        );
+        assert!(called);
+        assert!(!retention.delivery_failed);
+        assert_eq!(fixture.payload()["status"], "completed");
+        let (status, body, delivered) = fixture.published().unwrap();
+        assert_eq!(status, "completed");
+        assert!(body.contains("validated final body"));
+        assert!(!delivered);
+        let os = fixture.shared.lock().unwrap();
+        assert_eq!(os.rusage_get(fixture.target.pid).unwrap().turns, 1);
+        assert_eq!(
+            os.get_process(fixture.target.pid)
+                .unwrap()
+                .result
+                .as_deref(),
+            Some("Completed")
+        );
+    }
+
+    #[test]
+    fn runtime_lock_publication_prepare_failure_cleans_after_persistence() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let fixture = PublicationFixture::new();
+        fixture
+            .shared
+            .lock()
+            .unwrap()
+            .get_process_mut(fixture.target.pid)
+            .unwrap()
+            .goal = "AIOS_SUBAGENT_TASK:{corrupt".to_string();
+        let mut cleaned = false;
+        super::super::scheduler::publish_background_task_failure_with_io(
+            &fixture.shared,
+            fixture.target.pid,
+            fixture.target.result_channel_id,
+            fixture.target.completion_futex_addr,
+            "preparation failed",
+            || {
+                assert!(
+                    fixture.shared.try_lock().is_ok(),
+                    "prepare-failure publication must run outside the kernel lock"
+                );
+            },
+            || {
+                assert!(
+                    fixture.shared.try_lock().is_ok(),
+                    "history deletion must run outside the kernel lock"
+                );
+                assert!(
+                    fixture.child_history.exists(),
+                    "cleanup must happen after terminal persistence"
+                );
+                assert_eq!(fixture.published().unwrap().0, "failed");
+                assert_eq!(fixture.payload()["error"], "preparation failed");
+                assert!(
+                    fixture
+                        .shared
+                        .lock()
+                        .unwrap()
+                        .get_process(fixture.target.pid)
+                        .unwrap()
+                        .history_file
+                        .is_none()
+                );
+                cleaned = true;
+            },
+        );
+        assert!(cleaned);
+        assert!(!fixture.child_history.exists());
+        assert_eq!(
+            fixture
+                .shared
+                .lock()
+                .unwrap()
+                .rusage_get(fixture.target.pid)
+                .unwrap()
+                .turns,
+            0
+        );
+    }
+
+    #[test]
+    fn runtime_lock_publication_completion_claim_survives_cancel_and_collection() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let fixture = PublicationFixture::new();
+        let outcome = resolve_background_task_outcome(
+            background_turn_output("winning completion"),
+            None,
+            None,
+        );
+        super::finalize_background_turn_with_io(
+            &fixture.shared,
+            &fixture.target,
+            outcome,
+            || {
+                assert!(fixture.shared.try_lock().is_ok());
+                let context = fixture.context.clone();
+                let task_id = fixture.target.task_id.clone().unwrap();
+                let session_id = fixture.session_id.clone();
+                let owner = fixture.owner_pid;
+                let cancelled = std::thread::spawn(move || {
+                    super::super::TASK_PID.sync_scope(Some(owner), || {
+                        crate::ai::driver::runtime_ctx::DRIVER_CTX.sync_scope(context, || {
+                            crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+                                (session_id, 0usize),
+                                || {
+                                    crate::ai::tools::task_tools::execute_task_cancel(
+                                        &serde_json::json!({"task_ids":[task_id]}),
+                                    )
+                                    .unwrap()
+                                },
+                            )
+                        })
+                    })
+                })
+                .join()
+                .unwrap();
+                assert!(cancelled.contains("already finished"), "{cancelled}");
+                let pending = fixture.scope(|| {
+                    crate::ai::tools::task_tools::execute_task_status(
+                        &serde_json::json!({"task_ids":[fixture.target.task_id.clone().unwrap()]}),
+                    )
+                    .unwrap()
+                });
+                assert!(
+                    !pending.contains("terminated without publishing"),
+                    "{pending}"
+                );
+                assert!(
+                    crate::ai::tools::task_tools::with_task_entry(
+                        fixture.target.task_id.as_deref().unwrap(),
+                        |_| ()
+                    )
+                    .is_some()
+                );
+            },
+            || {},
+        );
+        assert_eq!(fixture.payload()["status"], "completed");
+        assert_eq!(fixture.published().unwrap().0, "completed");
+        let collected = fixture.scope(|| crate::ai::tools::task_tools::execute_task_wait(&serde_json::json!({"task_ids":[fixture.target.task_id.clone().unwrap()], "timeout_secs":1})).unwrap());
+        assert!(collected.contains("winning completion"), "{collected}");
+    }
+
+    #[test]
+    fn runtime_lock_publication_cancel_wins_before_late_completion() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let fixture = PublicationFixture::new();
+        fixture.scope(|| crate::ai::tools::task_tools::execute_task_cancel(&serde_json::json!({"task_ids":[fixture.target.task_id.clone().unwrap()], "reason":"cancel wins"})).unwrap());
+        assert!(
+            fixture.child_history.exists(),
+            "uncollected cancellation retains its history"
+        );
+        let original = fixture
+            .shared
+            .lock()
+            .unwrap()
+            .get_process(fixture.target.pid)
+            .unwrap()
+            .result
+            .clone();
+        let outcome =
+            resolve_background_task_outcome(background_turn_output("late completion"), None, None);
+        super::finalize_background_turn_with_io(
+            &fixture.shared,
+            &fixture.target,
+            outcome,
+            || panic!("late completion must not publish"),
+            || panic!("late completion must not delete artifacts"),
+        );
+        assert_eq!(fixture.payload()["status"], "cancelled");
+        assert_eq!(fixture.published().unwrap().0, "cancelled");
+        let os = fixture.shared.lock().unwrap();
+        assert_eq!(os.get_process(fixture.target.pid).unwrap().result, original);
+        assert_eq!(os.rusage_get(fixture.target.pid).unwrap().turns, 0);
+        drop(os);
+        let collected = fixture.scope(|| crate::ai::tools::task_tools::execute_task_wait(&serde_json::json!({"task_ids":[fixture.target.task_id.clone().unwrap()], "timeout_secs":1})).unwrap());
+        assert!(collected.contains("cancel wins"));
+        assert!(
+            !fixture.child_history.exists(),
+            "collection drains its external cleanup"
+        );
+    }
+
+    #[test]
+    fn runtime_lock_publication_cancel_and_timeout_persist_warnings_outside_kernel() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for status in ["cancelled", "timeout"] {
+            let fixture = PublicationFixture::new();
+            let task_id = fixture.target.task_id.as_deref().unwrap();
+            let mut entry =
+                crate::ai::tools::task_tools::with_task_entry(task_id, Clone::clone).unwrap();
+            entry.backend = Some(crate::ai::tools::task_tools::BackendId::TRAECLI);
+            crate::ai::tools::task_tools::insert_task_entry_for_test(task_id.to_string(), entry);
+            let session = "cccccccc-1111-2222-3333-444444444444";
+            let slot = crate::ai::tools::task_tools::backend_session::track_session(
+                crate::ai::tools::task_tools::BackendId::TRAECLI,
+                task_id,
+            );
+            *slot.lock().unwrap() = Some(session.to_string());
+            fixture
+                .shared
+                .lock()
+                .unwrap()
+                .channel_close(None, ChannelId(fixture.target.result_channel_id.unwrap()))
+                .unwrap();
+            fixture.scope(|| {
+                crate::ai::tools::task_tools::write_terminal_task_result_with_io(
+                    &fixture.shared,
+                    fixture.target.task_id.as_deref().unwrap(),
+                    fixture.target.pid,
+                    fixture.target.result_channel_id.unwrap(),
+                    fixture.target.completion_futex_addr.unwrap(),
+                    status,
+                    "terminal fixture reason",
+                    || {
+                        assert!(
+                            fixture.shared.try_lock().is_ok(),
+                            "cancellation/timeout persistence must run outside kernel lock"
+                        )
+                    },
+                    || {
+                        assert!(
+                            fixture.shared.try_lock().is_ok(),
+                            "delivery warning persistence must run outside kernel lock"
+                        );
+                        assert_eq!(fixture.published().unwrap().0, status);
+                    },
+                )
+                .unwrap()
+            });
+            let (stored_status, body, delivered) = fixture.published().unwrap();
+            assert_eq!(stored_status, status);
+            assert!(body.contains("terminal fixture reason"));
+            assert!(body.contains("IPC publication failed"));
+            assert!(body.contains(session));
+            assert!(!delivered);
+            {
+                let os = fixture.shared.lock().unwrap();
+                assert_eq!(
+                    os.get_process(fixture.target.pid).unwrap().state,
+                    ProcessState::Terminated
+                );
+                assert_eq!(
+                    os.futex_load(fixture.target.completion_futex_addr.unwrap()),
+                    Some(1)
+                );
+            }
+            let collected = fixture.scope(|| {
+                crate::ai::tools::task_tools::execute_task_wait(
+                    &serde_json::json!({"task_ids":[task_id], "timeout_secs":1}),
+                )
+                .unwrap()
+            });
+            assert!(collected.contains("terminal fixture reason"));
+            assert!(collected.contains(session));
+            assert!(fixture.published().unwrap().2);
+        }
+    }
+
+    #[test]
+    fn background_turn_success_charges_once_and_preserves_payload() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let (mut os, target) = background_turn_fixture();
+        os.rlimit_set(target.pid, ResourceLimit::from_legacy(1))
+            .unwrap();
+        let body = r#"{"count":1}"#;
+        let schema = serde_json::json!({"type":"object", "required":["count"], "properties":{"count":{"type":"integer"}}});
+        let outcome =
+            resolve_background_task_outcome(background_turn_output(body), None, Some(&schema));
+        let retention = finalize_background_turn(&mut os, &target, outcome);
+        let payload = background_turn_payload(&mut os, &target);
+        assert_eq!(payload["status"], "completed");
+        assert!(payload["error"].is_null());
+        assert_eq!(
+            payload["output"],
+            format!("Evidence retained for the parent\n{body}")
+        );
+        assert_eq!(payload["backend_session"], "test-backend-session");
+        assert_eq!(os.rusage_get(target.pid).unwrap().turns, 1);
+        assert_eq!(os.get_process(target.pid).unwrap().turns_used, 1);
+        assert_eq!(
+            os.get_process(target.pid).unwrap().result.as_deref(),
+            Some("Completed")
+        );
+        assert_eq!(
+            os.get_process(target.pid).unwrap().state,
+            ProcessState::Terminated
+        );
+        assert_eq!(
+            os.futex_load(target.completion_futex_addr.unwrap()),
+            Some(1)
+        );
+        assert!(!retention.preserve_history && !retention.delivery_failed);
+    }
+
+    #[test]
+    fn background_turn_execution_failure_charges_once() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let (mut os, target) = background_turn_fixture();
+        let mut outcome = background_turn_output("partial work");
+        outcome.execution_error = Some("worker execution failed".to_string());
+        let outcome = resolve_background_task_outcome(
+            outcome,
+            Some("secondary memory error".to_string()),
+            None,
+        );
+        finalize_background_turn(&mut os, &target, outcome);
+        let payload = background_turn_payload(&mut os, &target);
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"], "worker execution failed");
+        assert!(payload["output"].as_str().unwrap().contains("partial work"));
+        assert_eq!(
+            os.get_process(target.pid).unwrap().result.as_deref(),
+            Some("Failed: worker execution failed")
+        );
+        assert_eq!(os.rusage_get(target.pid).unwrap().turns, 1);
+    }
+
+    #[test]
+    fn background_turn_malformed_handoff_is_failed_everywhere() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        for body in [
+            "<subagent_handoff>{}",
+            "<subagent_handoff>invalid JSON</subagent_handoff>",
+            r#"<subagent_handoff>{"kind":"permission_required","reason":" "}</subagent_handoff>"#,
+        ] {
+            let (mut os, target) = background_turn_fixture();
+            let outcome = resolve_background_task_outcome(background_turn_output(body), None, None);
+            finalize_background_turn(&mut os, &target, outcome);
+            let payload = background_turn_payload(&mut os, &target);
+            assert_eq!(payload["status"], "failed", "{payload}");
+            let error = payload["error"].as_str().unwrap();
+            assert_eq!(
+                os.get_process(target.pid).unwrap().result.as_deref(),
+                Some(format!("Failed: {error}").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn background_turn_schema_failure_is_failed_everywhere() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        for body in ["not JSON", r#"{"count":"wrong"}"#] {
+            let (mut os, target) = background_turn_fixture();
+            let schema = serde_json::json!({"type":"object", "required":["count"], "properties":{"count":{"type":"integer"}}});
+            let outcome =
+                resolve_background_task_outcome(background_turn_output(body), None, Some(&schema));
+            finalize_background_turn(&mut os, &target, outcome);
+            let payload = background_turn_payload(&mut os, &target);
+            assert_eq!(payload["status"], "failed");
+            let error = payload["error"].as_str().unwrap();
+            assert_eq!(
+                os.get_process(target.pid).unwrap().result.as_deref(),
+                Some(format!("Failed: {error}").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn background_turn_memory_failure_is_failed_and_retains_recovery() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let (mut os, target) = background_turn_fixture();
+        let outcome = resolve_background_task_outcome(
+            background_turn_output("valid final response"),
+            Some("private memory merge failed".to_string()),
+            None,
+        );
+        let retention = finalize_background_turn(&mut os, &target, outcome);
+        let payload = background_turn_payload(&mut os, &target);
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"], "private memory merge failed");
+        assert_eq!(
+            os.get_process(target.pid).unwrap().result.as_deref(),
+            Some("Failed: private memory merge failed")
+        );
+        assert!(
+            retention.preserve_history,
+            "memory merge failure retains child recovery artifacts"
+        );
+    }
+
+    #[test]
+    fn background_turn_valid_handoff_bypasses_schema_and_is_blocked_everywhere() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        for kind in [
+            "authorization_required",
+            "permission_required",
+            "user_input_required",
+        ] {
+            let (mut os, target) = background_turn_fixture();
+            let body = format!(
+                "<subagent_handoff>{{\"kind\":\"{kind}\",\"reason\":\"approval needed\",\"suggested_action\":\"approve this operation\"}}</subagent_handoff>"
+            );
+            let schema = serde_json::json!({"type":"object", "required":["count"]});
+            let outcome =
+                resolve_background_task_outcome(background_turn_output(&body), None, Some(&schema));
+            finalize_background_turn(&mut os, &target, outcome);
+            let payload = background_turn_payload(&mut os, &target);
+            assert_eq!(payload["status"], "blocked");
+            assert_eq!(payload["output"], "approve this operation");
+            assert_eq!(payload["error"], format!("{kind}: approval needed"));
+            assert_eq!(
+                os.get_process(target.pid).unwrap().result.as_deref(),
+                Some(format!("Blocked: {kind}: approval needed").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn background_turn_quota_failure_is_decided_before_publication() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let (mut os, target) = background_turn_fixture();
+        os.rlimit_set(target.pid, ResourceLimit::from_legacy(1))
+            .unwrap();
+        os.rusage_charge(
+            target.pid,
+            ResourceUsageDelta {
+                turns: 1,
+                ..Default::default()
+            },
+        );
+        let outcome =
+            resolve_background_task_outcome(background_turn_output("final answer"), None, None);
+        finalize_background_turn(&mut os, &target, outcome);
+        let payload = background_turn_payload(&mut os, &target);
+        assert_eq!(payload["status"], "failed");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap()
+                .contains("Resource limit exceeded")
+        );
+        assert_eq!(os.rusage_get(target.pid).unwrap().turns, 2);
+        assert!(
+            os.get_process(target.pid)
+                .unwrap()
+                .result
+                .as_ref()
+                .unwrap()
+                .contains("Resource limit exceeded")
+        );
+    }
+
+    #[test]
+    fn background_turn_suspension_keeps_result_open_and_charges_once() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        for state in [
+            ProcessState::Stopped,
+            ProcessState::Sleeping { until_tick: 10 },
+            ProcessState::Waiting {
+                reason: aios_kernel::kernel::WaitReason::ProcessExit { on_pid: 99 },
+            },
+        ] {
+            for schema in [None, Some(serde_json::json!({"type":"object"}))] {
+                let (mut os, target) = background_turn_fixture();
+                os.get_process_mut(target.pid).unwrap().state = state.clone();
+                let outcome = resolve_background_task_outcome(
+                    crate::ai::tools::task_tools::Outcome::default(),
+                    None,
+                    schema.as_ref(),
+                );
+                let retention = finalize_background_turn(&mut os, &target, outcome);
+                assert_eq!(
+                    os.channel_peek(None, ChannelId(target.result_channel_id.unwrap()))
+                        .unwrap(),
+                    IpcRecvResult::Empty
+                );
+                assert_eq!(
+                    os.futex_load(target.completion_futex_addr.unwrap()),
+                    Some(0)
+                );
+                assert_eq!(os.get_process(target.pid).unwrap().state, state);
+                assert_eq!(os.rusage_get(target.pid).unwrap().turns, 1);
+                assert!(retention.preserve_history);
+            }
+        }
+    }
+
+    #[test]
+    fn background_turn_preserves_existing_terminal_result() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let (mut os, target) = background_turn_fixture();
+        let channel = ChannelId(target.result_channel_id.unwrap());
+        os.channel_send(
+            Some(target.pid),
+            channel,
+            serde_json::json!({"status":"cancelled", "error":"user cancelled"}).to_string(),
+        )
+        .unwrap();
+        os.channel_close(None, channel).unwrap();
+        os.terminate_current("cancelled: user cancelled".to_string());
+        let outcome = resolve_background_task_outcome(
+            background_turn_output("late successful response"),
+            None,
+            None,
+        );
+        finalize_background_turn(&mut os, &target, outcome);
+        assert_eq!(
+            background_turn_payload(&mut os, &target)["status"],
+            "cancelled"
+        );
+        assert_eq!(
+            os.get_process(target.pid).unwrap().result.as_deref(),
+            Some("cancelled: user cancelled")
+        );
+        assert_eq!(os.rusage_get(target.pid).unwrap().turns, 0);
+    }
+
+    #[tokio::test]
+    async fn background_turn_worker_panic_publishes_one_failure_with_recovery() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let (mut os, target) = background_turn_fixture();
+        let phase = new_subagent_progress_slot();
+        publish_subagent_checkpoint_to_slot(
+            &phase,
+            "saved checkpoint",
+            "verified work before panic",
+        );
+        let events = crate::ai::tools::task_tools::Events {
+            phase_slot: Some(phase),
+            session_slot: Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+                "worker-session".to_string(),
+            )))),
+        };
+        let (outcome, panicked) = supervise_background_worker(
+            async { panic!("injected worker panic") },
+            &events,
+            "working",
+        )
+        .await;
+        assert!(panicked);
+        let mut outcome = resolve_background_task_outcome(outcome, None, None);
+        outcome.retain_recovery |= panicked;
+        let retention = finalize_background_turn(&mut os, &target, outcome);
+        let payload = background_turn_payload(&mut os, &target);
+        assert_eq!(payload["status"], "failed");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap()
+                .contains("injected worker panic")
+        );
+        assert!(
+            payload["output"]
+                .as_str()
+                .unwrap()
+                .contains("verified work before panic")
+        );
+        assert_eq!(payload["backend_session"], "worker-session");
+        assert_eq!(os.rusage_get(target.pid).unwrap().turns, 1);
+        assert_eq!(
+            os.get_process(target.pid).unwrap().state,
+            ProcessState::Terminated
+        );
+        assert!(retention.preserve_history);
+        let late =
+            resolve_background_task_outcome(background_turn_output("late response"), None, None);
+        finalize_background_turn(&mut os, &target, late);
+        assert_eq!(os.rusage_get(target.pid).unwrap().turns, 1);
+        assert_eq!(
+            os.channel_peek(None, ChannelId(target.result_channel_id.unwrap()))
+                .unwrap(),
+            IpcRecvResult::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn background_turn_worker_supervision_keeps_abort_semantics() {
+        let events = crate::ai::tools::task_tools::Events::default();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            supervise_background_worker(
+                async move {
+                    started.send(()).unwrap();
+                    std::future::pending().await
+                },
+                &events,
+                "working",
+            )
+            .await
+        });
+        ready.await.unwrap();
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
+
+    #[test]
+    fn background_turn_suspended_over_quota_warns_and_stays_pending() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let (mut os, target) = background_turn_fixture();
+        os.rlimit_set(target.pid, ResourceLimit::from_legacy(1))
+            .unwrap();
+        os.rusage_charge(
+            target.pid,
+            ResourceUsageDelta {
+                turns: 1,
+                ..Default::default()
+            },
+        );
+        os.get_process_mut(target.pid).unwrap().state = ProcessState::Stopped;
+        let schema = serde_json::json!({"type":"object"});
+        let outcome = resolve_background_task_outcome(
+            crate::ai::tools::task_tools::Outcome::default(),
+            None,
+            Some(&schema),
+        );
+        finalize_background_turn(&mut os, &target, outcome);
+        assert_eq!(os.rusage_get(target.pid).unwrap().turns, 2);
+        let process = os.get_process(target.pid).unwrap();
+        assert_eq!(process.state, ProcessState::Stopped);
+        assert!(
+            process
+                .mailbox
+                .iter()
+                .any(|message| message.contains("[rlimit-warning]")
+                    && message.contains("used=2, limit=1"))
+        );
+        assert_eq!(
+            os.channel_peek(None, ChannelId(target.result_channel_id.unwrap()))
+                .unwrap(),
+            IpcRecvResult::Empty
+        );
+        assert_eq!(
+            os.futex_load(target.completion_futex_addr.unwrap()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn background_turn_empty_final_response_still_validates_schema() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let (mut os, target) = background_turn_fixture();
+        let schema = serde_json::json!({"type":"object"});
+        let outcome = resolve_background_task_outcome(
+            crate::ai::tools::task_tools::Outcome::default(),
+            None,
+            Some(&schema),
+        );
+        finalize_background_turn(&mut os, &target, outcome);
+        let payload = background_turn_payload(&mut os, &target);
+        assert_eq!(payload["status"], "failed");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap()
+                .contains("not valid JSON")
+        );
+        assert_eq!(
+            os.get_process(target.pid).unwrap().state,
+            ProcessState::Terminated
+        );
+    }
+
+    #[test]
+    fn background_turn_final_response_terminates_a_suspended_task() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let (mut os, target) = background_turn_fixture();
+        os.get_process_mut(target.pid).unwrap().state = ProcessState::Stopped;
+        let outcome =
+            resolve_background_task_outcome(background_turn_output("final response"), None, None);
+        finalize_background_turn(&mut os, &target, outcome);
+        assert_eq!(
+            background_turn_payload(&mut os, &target)["status"],
+            "completed"
+        );
+        assert_eq!(
+            os.get_process(target.pid).unwrap().state,
+            ProcessState::Terminated
+        );
+        assert_eq!(
+            os.get_process(target.pid).unwrap().result.as_deref(),
+            Some("Completed")
+        );
+    }
 
     fn activity_snapshot(phase: &str, latest: &str, sequence: u64) -> SubagentProgressSnapshot {
         let slot = new_subagent_progress_slot();
@@ -816,6 +2216,196 @@ mod tests {
         snapshot.elapsed = std::time::Duration::from_secs(8);
         snapshot.stale_for = std::time::Duration::from_secs(2);
         snapshot
+    }
+
+    #[test]
+    fn scheduler_dispatch_log_sink_runs_after_kernel_unlock() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        crate::ai::driver::scheduler::reset_scheduler_test_state();
+        let os = crate::ai::driver::new_local_kernel();
+        let expected_pids = {
+            let mut kernel = os.lock().unwrap();
+            (0..2)
+                .map(|index| {
+                    kernel
+                        .spawn(
+                            None,
+                            format!("fixture-{index}"),
+                            "goal".to_string(),
+                            10,
+                            10,
+                            None,
+                            None,
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let session_id = "scheduler-dispatch-unlocked-sink";
+        let mut sink_calls = 0;
+        let selected = select_background_batch_with_log(&os, 1, |decision| {
+            assert!(
+                os.try_lock().is_ok(),
+                "the log sink must run after the kernel guard is dropped"
+            );
+            sink_calls += 1;
+            decision.emit(session_id);
+        });
+        assert_eq!(sink_calls, 1);
+        assert_eq!(
+            selected.iter().map(|proc| proc.pid).collect::<Vec<_>>(),
+            expected_pids
+        );
+        let logs = crate::ai::driver::decision_log::get_decision_log_store()
+            .recent_by_session(session_id, 2);
+        assert_eq!(logs.len(), 1);
+        let decision = &logs[0];
+        assert_eq!(decision.session_id, session_id);
+        assert_eq!(decision.turn_id, 1);
+        assert_eq!(
+            decision.decision_type,
+            crate::ai::driver::decision_log::DecisionType::SchedulerDispatch
+        );
+        assert_eq!(decision.context, "scheduler_epoch=1");
+        assert_eq!(
+            decision.chosen_option,
+            format!("selected={expected_pids:?}")
+        );
+        assert_eq!(decision.reasoning, "eligible=2 deferred=0");
+        assert_eq!(
+            decision.alternatives_considered,
+            expected_pids
+                .iter()
+                .map(|pid| format!("pid={pid} score=1015 cooldown_until=0 fail_streak=0"))
+                .collect::<Vec<_>>()
+        );
+        assert!(decision.confidence.is_none());
+        assert!(decision.execution_time_ms.is_none());
+        let outcome = decision.outcome.as_ref().unwrap();
+        assert!(outcome.success);
+        assert_eq!(outcome.message, "scheduler decision accepted");
+        assert!(outcome.user_feedback.is_none());
+        crate::ai::driver::scheduler::reset_scheduler_test_state();
+    }
+
+    #[test]
+    fn dispatch_launch_background_spec_preserves_task_goal_inputs() {
+        use crate::ai::tools::task_tools::{BackendId, OsTaskGoal};
+
+        let goal: OsTaskGoal = serde_json::from_value(serde_json::json!({
+            "task_id": "task-launch",
+            "result_channel_id": 71,
+            "completion_futex_addr": 83,
+            "description": "stored task description",
+            "prompt": "stored task prompt",
+            "agent_name": "launch-agent",
+            "model": "kernel-launch-model",
+            "selection_explanation": "stored selection",
+            "auto_model_fallback": {"require_thinking": true, "target_tier": "Heavy"},
+            "spawn_depth": 2,
+            "parent_agent_team_mode": true,
+            "response_schema": {"type": "string"},
+            "backend": "traecli",
+            "backend_model": "external-launch-model",
+            "backend_continue_from": "previous-task",
+            "active_skill_names": ["second-skill", "first-skill"],
+            "image_files": ["/task/second.png", "/task/first.png"],
+        }))
+        .unwrap();
+        let history_path = std::path::PathBuf::from("child-history.sqlite");
+        let reasoning_effort = Some("high".to_string());
+        let spec = BackgroundDispatchSpec::from_task_goal(
+            97,
+            "prepared wakeup question".to_string(),
+            history_path.clone(),
+            Some(&goal),
+            true,
+            false,
+            &reasoning_effort,
+        );
+
+        assert_eq!(spec.pid, 97);
+        assert_eq!(spec.proc_question, "prepared wakeup question");
+        assert_eq!(spec.history_path, history_path);
+        assert_eq!(
+            spec.agent_override.as_deref(),
+            Some(goal.agent_name.as_str())
+        );
+        assert_eq!(spec.model_override.as_deref(), Some(goal.model.as_str()));
+        assert_eq!(spec.result_channel_id, Some(goal.result_channel_id));
+        assert_eq!(
+            spec.completion_futex_addr.map(|addr| addr.0),
+            Some(goal.completion_futex_addr)
+        );
+        assert_eq!(spec.task_id.as_deref(), Some(goal.task_id.as_str()));
+        assert_eq!(spec.response_schema, goal.response_schema);
+        let fallback = spec.auto_model_fallback.unwrap();
+        assert_eq!(
+            fallback.require_thinking,
+            goal.auto_model_fallback.unwrap().require_thinking
+        );
+        assert_eq!(
+            fallback.target_tier,
+            goal.auto_model_fallback.unwrap().target_tier
+        );
+        assert_eq!(spec.spawn_depth, goal.spawn_depth);
+        assert_eq!(spec.parent_agent_team_mode, goal.parent_agent_team_mode);
+        assert!(spec.is_resume_wakeup);
+        assert!(!spec.initialize_history);
+        assert_eq!(spec.backend_id, BackendId::TRAECLI);
+        assert_eq!(spec.backend_model, goal.backend_model);
+        assert_eq!(spec.backend_continue_from, goal.backend_continue_from);
+        assert_eq!(spec.active_skill_names, goal.active_skill_names);
+        assert_eq!(spec.backend_reasoning_effort, reasoning_effort);
+        assert_eq!(spec.image_files, goal.image_files);
+    }
+
+    #[test]
+    fn dispatch_launch_background_spec_preserves_non_task_defaults() {
+        for reasoning_effort in [None, Some("medium".to_string())] {
+            for (is_resume_wakeup, initialize_history) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let spec = BackgroundDispatchSpec::from_task_goal(
+                    19,
+                    "non-task question".to_string(),
+                    std::path::PathBuf::from("non-task-history.sqlite"),
+                    None,
+                    is_resume_wakeup,
+                    initialize_history,
+                    &reasoning_effort,
+                );
+
+                assert_eq!(spec.pid, 19);
+                assert_eq!(spec.proc_question, "non-task question");
+                assert_eq!(
+                    spec.history_path,
+                    std::path::Path::new("non-task-history.sqlite")
+                );
+                assert!(spec.agent_override.is_none());
+                assert!(spec.model_override.is_none());
+                assert!(spec.result_channel_id.is_none());
+                assert!(spec.completion_futex_addr.is_none());
+                assert!(spec.task_id.is_none());
+                assert!(spec.response_schema.is_none());
+                assert!(spec.auto_model_fallback.is_none());
+                assert_eq!(spec.spawn_depth, 0);
+                assert!(!spec.parent_agent_team_mode);
+                assert_eq!(spec.is_resume_wakeup, is_resume_wakeup);
+                assert_eq!(spec.initialize_history, initialize_history);
+                assert_eq!(
+                    spec.backend_id,
+                    crate::ai::tools::task_tools::BackendId::KERNEL
+                );
+                assert!(spec.backend_model.is_none());
+                assert!(spec.backend_continue_from.is_none());
+                assert!(spec.active_skill_names.is_empty());
+                assert_eq!(spec.backend_reasoning_effort, reasoning_effort);
+                assert!(spec.image_files.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -1772,6 +3362,87 @@ fn prepare_background_subagent_continuation(
     }
 }
 
+/// Inputs prepared for one background process before any task in the batch is spawned.
+struct BackgroundDispatchSpec {
+    pid: u64,
+    proc_question: String,
+    history_path: PathBuf,
+    agent_override: Option<String>,
+    model_override: Option<String>,
+    result_channel_id: Option<u64>,
+    completion_futex_addr: Option<aios_kernel::primitives::FutexAddr>,
+    task_id: Option<String>,
+    response_schema: Option<serde_json::Value>,
+    auto_model_fallback: Option<crate::ai::models::AutoModelFallbackSpec>,
+    spawn_depth: usize,
+    parent_agent_team_mode: bool,
+    is_resume_wakeup: bool,
+    initialize_history: bool,
+    backend_id: task_tools::BackendId,
+    backend_model: Option<String>,
+    backend_continue_from: Option<String>,
+    active_skill_names: Vec<String>,
+    backend_reasoning_effort: Option<String>,
+    image_files: Vec<String>,
+}
+
+impl BackgroundDispatchSpec {
+    fn from_task_goal(
+        pid: u64,
+        proc_question: String,
+        history_path: PathBuf,
+        task_goal: Option<&task_tools::OsTaskGoal>,
+        is_resume_wakeup: bool,
+        initialize_history: bool,
+        backend_reasoning_effort: &Option<String>,
+    ) -> Self {
+        Self {
+            pid,
+            proc_question,
+            history_path,
+            agent_override: task_goal.map(|goal| goal.agent_name.clone()),
+            model_override: task_goal.map(|goal| goal.model.clone()),
+            result_channel_id: task_goal.map(|goal| goal.result_channel_id),
+            completion_futex_addr: task_goal
+                .map(|goal| aios_kernel::primitives::FutexAddr(goal.completion_futex_addr)),
+            task_id: task_goal.map(|goal| goal.task_id.clone()),
+            response_schema: task_goal.and_then(|goal| goal.response_schema.clone()),
+            auto_model_fallback: task_goal.and_then(|goal| goal.auto_model_fallback),
+            spawn_depth: task_goal.map(|goal| goal.spawn_depth).unwrap_or(0),
+            parent_agent_team_mode: task_goal.is_some_and(|goal| goal.parent_agent_team_mode),
+            is_resume_wakeup,
+            initialize_history,
+            backend_id: task_tools::BackendId::from_stored(
+                task_goal.and_then(|goal| goal.backend.as_deref()),
+            ),
+            backend_model: task_goal.and_then(|goal| goal.backend_model.clone()),
+            backend_continue_from: task_goal.and_then(|goal| goal.backend_continue_from.clone()),
+            active_skill_names: task_goal
+                .map(|goal| goal.active_skill_names.clone())
+                .unwrap_or_default(),
+            backend_reasoning_effort: backend_reasoning_effort.clone(),
+            image_files: task_goal
+                .map(|goal| goal.image_files.clone())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+fn select_background_batch_with_log(
+    shared_os: &aios_kernel::kernel::SharedKernel,
+    epoch: u64,
+    emit_decision: impl FnOnce(SchedulerDecision),
+) -> Vec<aios_kernel::kernel::Process> {
+    let (background_procs, decision) = {
+        let mut os = shared_os.lock().unwrap();
+        select_background_batch(os.as_mut(), epoch)
+    };
+    if let Some(decision) = decision {
+        emit_decision(decision);
+    }
+    background_procs
+}
+
 /// Dispatch a batch of background processes: select ready processes, decode
 /// task goals, build questions, clone app context, and spawn each as a
 /// tokio task with proper scope setup.
@@ -1783,10 +3454,9 @@ pub(super) fn dispatch_background_batch(
     manifests_loaded: &mut bool,
     epoch: u64,
 ) {
-    let background_procs: Vec<aios_kernel::kernel::Process> = {
-        let mut os = app.os.lock().unwrap();
-        select_background_batch(os.as_mut(), epoch, app.session_id.as_str())
-    };
+    let background_procs = select_background_batch_with_log(&app.os, epoch, |decision| {
+        decision.emit(app.session_id.as_str());
+    });
     maybe_emit_scheduler_eval(epoch, app.session_id.as_str());
 
     if background_procs.is_empty() {
@@ -1797,28 +3467,7 @@ pub(super) fn dispatch_background_batch(
 
     let original_history_file = app.session_history_file.clone();
 
-    let mut task_specs: Vec<(
-        u64,
-        String,
-        PathBuf,
-        Option<String>,
-        Option<String>,
-        Option<u64>,
-        Option<aios_kernel::primitives::FutexAddr>,
-        Option<String>,
-        Option<serde_json::Value>,
-        Option<crate::ai::models::AutoModelFallbackSpec>,
-        usize,
-        bool,
-        bool,
-        bool,
-        task_tools::BackendId,
-        Option<String>,
-        Option<String>,
-        Vec<String>,
-        Option<String>,
-        Vec<String>,
-    )> = Vec::new();
+    let mut task_specs: Vec<BackgroundDispatchSpec> = Vec::new();
     let backend_reasoning_effort =
         crate::ai::request::resolve_reasoning_effort(app, &app.current_model)
             .map(|effort| effort.as_str().to_string());
@@ -1835,9 +3484,8 @@ pub(super) fn dispatch_background_batch(
                         )
                     })
                     .unwrap_or((None, None));
-                let mut os = app.os.lock().unwrap();
                 publish_background_task_failure(
-                    os.as_mut(),
+                    &app.os,
                     pid,
                     result_channel_id,
                     completion_futex_addr,
@@ -1879,49 +3527,18 @@ pub(super) fn dispatch_background_batch(
         };
 
         let history_path = process_history_path(&original_history_file, pid);
-        task_specs.push((
+        task_specs.push(BackgroundDispatchSpec::from_task_goal(
             pid,
             proc_question,
             history_path,
-            task_goal.as_ref().map(|goal| goal.agent_name.clone()),
-            task_goal.as_ref().map(|goal| goal.model.clone()),
-            task_goal.as_ref().map(|goal| goal.result_channel_id),
-            task_goal
-                .as_ref()
-                .map(|goal| aios_kernel::primitives::FutexAddr(goal.completion_futex_addr)),
-            task_goal.as_ref().map(|goal| goal.task_id.clone()),
-            task_goal
-                .as_ref()
-                .and_then(|goal| goal.response_schema.clone()),
-            task_goal.as_ref().and_then(|goal| goal.auto_model_fallback),
-            task_goal.as_ref().map(|goal| goal.spawn_depth).unwrap_or(0),
-            task_goal
-                .as_ref()
-                .is_some_and(|goal| goal.parent_agent_team_mode),
+            task_goal.as_ref(),
             is_resume_wakeup,
             initialize_history,
-            task_tools::BackendId::from_stored(
-                task_goal.as_ref().and_then(|goal| goal.backend.as_deref()),
-            ),
-            task_goal
-                .as_ref()
-                .and_then(|goal| goal.backend_model.clone()),
-            task_goal
-                .as_ref()
-                .and_then(|goal| goal.backend_continue_from.clone()),
-            task_goal
-                .as_ref()
-                .map(|goal| goal.active_skill_names.clone())
-                .unwrap_or_default(),
-            backend_reasoning_effort.clone(),
-            task_goal
-                .as_ref()
-                .map(|goal| goal.image_files.clone())
-                .unwrap_or_default(),
+            &backend_reasoning_effort,
         ));
     }
 
-    for (
+    for BackgroundDispatchSpec {
         pid,
         proc_question,
         history_path,
@@ -1942,7 +3559,7 @@ pub(super) fn dispatch_background_batch(
         active_skill_names,
         backend_reasoning_effort,
         image_files,
-    ) in task_specs
+    } in task_specs
     {
         let backend = backend_id.resolve();
         let execution_mode = backend.execution_mode();
@@ -2008,9 +3625,8 @@ pub(super) fn dispatch_background_batch(
         ) {
             Ok(agent) => agent,
             Err(err) => {
-                let mut os = app.os.lock().unwrap();
                 publish_background_task_failure(
-                    os.as_mut(),
+                    &app.os,
                     pid,
                     result_channel_id,
                     completion_futex_addr,
@@ -2039,9 +3655,8 @@ pub(super) fn dispatch_background_batch(
         ) {
             Ok(context) => context,
             Err(err) => {
-                let mut os = app.os.lock().unwrap();
                 publish_background_task_failure(
-                    os.as_mut(),
+                    &app.os,
                     pid,
                     result_channel_id,
                     completion_futex_addr,
@@ -2114,14 +3729,11 @@ pub(super) fn dispatch_background_batch(
         let result_slot_for_scope = result_slot_for_payload.clone();
 
         // External inputs are frozen before the driver's callback owns the app.
-        let backend_cwd = if inherit.cwd {
-            inherited_cwd_dir
-                .clone()
-                .or_else(|| runtime_ctx::effective_cwd().ok())
-                .unwrap_or_else(|| PathBuf::from("."))
-        } else {
-            scoped_cwd_dir.clone().unwrap_or_else(std::env::temp_dir)
-        };
+        let backend_cwd = resolve_external_subagent_cwd(
+            inherit.cwd,
+            inherited_cwd_dir.as_ref(),
+            scoped_cwd_dir.as_ref(),
+        );
         let backend_cancel = task_app.cancel_stream.clone();
         let backend_workspace_allowed = inherit.cwd;
         let backend_parent_history = original_history_file.clone();
@@ -2147,7 +3759,10 @@ pub(super) fn dispatch_background_batch(
             };
             let memory_merge_error_slot = Arc::new(std::sync::Mutex::new(None::<String>));
             let memory_merge_error_for_run = memory_merge_error_slot.clone();
-            let outcome = match continuation {
+            let events_for_supervision = events.clone();
+            let (outcome, worker_panicked) = supervise_background_worker(
+                async {
+                    match continuation {
                 Err(error) => task_tools::Outcome {
                     execution_error: Some(error),
                     progress: default_progress.to_string(),
@@ -2166,21 +3781,22 @@ pub(super) fn dispatch_background_batch(
                     let (resume_session, prompt, side_note_files) = continuation.into_parts();
                     let context = match execution_mode {
                         task_tools::ExecutionMode::External => {
-                            task_tools::RunContext::External(task_tools::ExternalSubagentSpec {
-                                prompt,
-                                cwd: backend_cwd,
-                                workspace_allowed: backend_workspace_allowed,
-                                model: backend_model,
-                                skills: crate::ai::skills::render_external_skill_context(
-                                    task_skills.as_slice(),
-                                    &active_skill_names,
-                                ),
-                                resume_session,
-                                side_note_files,
-                                reasoning_effort: backend_reasoning_effort,
-                                image_files: image_files.clone(),
-                                phase_slot: events.phase_slot.clone(),
-                            })
+                            task_tools::RunContext::External(
+                                ExternalSubagentLaunch {
+                                    prompt,
+                                    cwd: backend_cwd,
+                                    workspace_allowed: backend_workspace_allowed,
+                                    model: backend_model,
+                                    skill_manifests: task_skills.as_slice(),
+                                    active_skill_names: &active_skill_names,
+                                    resume_session,
+                                    side_note_files,
+                                    reasoning_effort: backend_reasoning_effort,
+                                    image_files: image_files.clone(),
+                                    phase_slot: events.phase_slot.clone(),
+                                }
+                                .into_spec(),
+                            )
                         }
                         task_tools::ExecutionMode::KernelDriver => {
                             task_tools::RunContext::kernel(move |events, _cancel| {
@@ -2252,20 +3868,23 @@ pub(super) fn dispatch_background_batch(
                     };
                     backend.run(context, events, backend_cancel).await
                 }
-            };
+            }
+                },
+                &events_for_supervision,
+                default_progress,
+            )
+            .await;
             // Keep the existing external failure payload and default progress;
             // sessions are independently promoted from the captured slot.
-            let (captured_output, response_for_validation, progress) =
-                if outcome.execution_error.is_some()
-                    && execution_mode == task_tools::ExecutionMode::External
-                {
-                    (String::new(), String::new(), default_progress.to_string())
-                } else {
-                    (outcome.parent_payload, outcome.validation_body, outcome.progress)
-                };
-            let result = outcome.execution_error.map_or(Ok(()), Err);
-            let backend_session = outcome.backend_session;
-            if let Some(session) = &backend_session {
+            let mut outcome = outcome;
+            if outcome.execution_error.is_some()
+                && execution_mode == task_tools::ExecutionMode::External
+            {
+                outcome.parent_payload.clear();
+                outcome.validation_body.clear();
+                outcome.progress = default_progress.to_string();
+            }
+            if let Some(session) = &outcome.backend_session {
                 *backend_session_slot
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner()) = Some(session.clone());
@@ -2274,125 +3893,23 @@ pub(super) fn dispatch_background_batch(
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .take();
-            let (handoff, handoff_parse_error) = if result.is_ok() && memory_merge_error.is_none() {
-                match crate::ai::tools::task_tools::parse_subagent_handoff(&response_for_validation)
-                {
-                    Ok(handoff) => (handoff, None),
-                    Err(error) => (None, Some(error)),
-                }
-            } else {
-                (None, None)
-            };
-            let response_validation_error = if result.is_ok()
-                && memory_merge_error.is_none()
-                && handoff.is_none()
-                && handoff_parse_error.is_none()
-            {
-                crate::ai::tools::task_tools::validate_subagent_response(
-                    response_schema.as_ref(),
-                    &response_for_validation,
-                )
-                .err()
-            } else {
-                None
-            };
-            let mut os = task_os.lock().unwrap();
-            os.set_current_pid(Some(pid));
-            let task_blocked = result.is_ok()
-                && memory_merge_error.is_none()
-                && handoff_parse_error.is_none()
-                && handoff.is_some();
-            let task_succeeded = result.is_ok()
-                && memory_merge_error.is_none()
-                && response_validation_error.is_none()
-                && !task_blocked;
-            let publish_task_result = should_publish_subagent_task_result(
-                task_succeeded,
-                &captured_output,
-                os.get_process(pid).map(|proc| &proc.state),
+            let mut outcome = resolve_background_task_outcome(
+                outcome,
+                memory_merge_error,
+                response_schema.as_ref(),
             );
-            let mut result_delivery_failed = false;
-            if publish_task_result && let Some(result_channel_id) = result_channel_id {
-                let backend_session = match task_id.as_deref() {
-                    Some(task_id) => task_tools::backend_session::record_session(
-                        backend_id,
-                        task_id,
-                        backend_session,
-                    ),
-                    None => backend_session,
-                };
-                let handoff_error = handoff
-                    .as_ref()
-                    .map(|handoff| format!("{}: {}", handoff.kind.as_str(), handoff.reason));
-                let published_output = handoff
-                    .as_ref()
-                    .and_then(|handoff| handoff.suggested_action.as_deref())
-                    .unwrap_or(&captured_output);
-                let payload = serde_json::json!({
-                    "status": if task_blocked {
-                        "blocked"
-                    } else if task_succeeded {
-                        "completed"
-                    } else {
-                        "failed"
-                    },
-                    "output": published_output,
-                    "error": result
-                        .as_ref()
-                        .err()
-                        .cloned()
-                        .or(memory_merge_error)
-                        .or(handoff_parse_error)
-                        .or(response_validation_error)
-                        .or(handoff_error),
-                    "progress": progress,
-                    "backend_session": backend_session,
-                })
-                .to_string();
-                if let Err(error) = task_tools::publish_task_result(
-                    os.as_mut(), task_id.as_deref(), pid, result_channel_id, payload,
-                ) {
-                    result_delivery_failed = true;
-                    runtime_ctx::publish_subagent_phase("result delivery failed; recovery retained");
-                    eprintln!("[Task result delivery] {error}");
-                }
-            }
-            if publish_task_result && let Some(addr) = completion_futex_addr {
-                let _ = os.futex_store(addr, 1);
-                super::notify_scheduler();
-            }
-            if result_delivery_failed && let Some(process) = os.get_process_mut(pid) {
-                // The outer history guard retains this path. Kernel teardown must not delete
-                // the remaining recovery source before that guard can preserve it.
-                process.history_file = None;
-            }
-            let preserve_history = match result {
-                Ok(_outcome) => {
-                    let outcome = classify_process_outcome(&**os, pid);
-                    record_scheduler_outcome(os.as_mut(), pid, outcome);
-                    os.increment_turns_used_for(pid);
-                    let (should_terminate, termination_result) =
-                        finalize_turn_quota(os.as_mut(), pid);
-                    if should_terminate {
-                        terminate_and_cleanup(os.as_mut(), pid, termination_result, true);
-                        false
-                    } else if os.is_round_robin() {
-                        os.set_current_pid(Some(pid));
-                        os.requeue_current();
-                        true
-                    } else {
-                        true
-                    }
-                }
-                Err(err) => {
-                    record_scheduler_outcome(os.as_mut(), pid, DispatchOutcomeTag::Failed);
-                    terminate_and_cleanup(os.as_mut(), pid, format!("Failed: {}", err), true);
-                    false
-                }
+            outcome.retain_recovery |= worker_panicked;
+            let target = BackgroundTurnTarget {
+                pid,
+                task_id,
+                result_channel_id,
+                completion_futex_addr,
+                backend_id,
             };
-            drop(os);
+            let retention = finalize_background_turn_shared(&task_os, &target, outcome);
             preserve_scoped_artifacts_for_inner.store(
-                preserve_history || result_delivery_failed, Ordering::Release,
+                retention.preserve_history || retention.delivery_failed,
+                Ordering::Release,
             );
         });
 

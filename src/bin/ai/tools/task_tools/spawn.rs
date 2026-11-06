@@ -32,7 +32,24 @@ pub(crate) fn decode_os_task_goal(goal: &str) -> Option<OsTaskGoal> {
 pub(super) fn with_os_kernel<T>(
     f: impl FnOnce(&mut dyn Kernel) -> Result<T, String>,
 ) -> Result<T, String> {
-    let shared: SharedKernel = match crate::ai::driver::runtime_ctx::try_current() {
+    let shared = current_os_kernel()?;
+    let (result, cleanup) = {
+        let mut kernel = shared
+            .lock()
+            .map_err(|e| format!("Failed to lock AIOS kernel: {e}"))?;
+        let result = f(kernel.as_mut());
+        let cleanup = kernel.drain_external_cleanup();
+        (result, cleanup)
+    };
+    for path in cleanup {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+/// Snapshot the owning kernel handle before any caller enters a critical section.
+pub(super) fn current_os_kernel() -> Result<SharedKernel, String> {
+    Ok(match crate::ai::driver::runtime_ctx::try_current() {
         Some(ctx) => ctx.app_proto.os.clone(),
         None => {
             let guard = GLOBAL_OS
@@ -43,11 +60,7 @@ pub(super) fn with_os_kernel<T>(
                 .cloned()
                 .ok_or("AIOS kernel is not initialized.".to_string())?
         }
-    };
-    let mut kernel = shared
-        .lock()
-        .map_err(|e| format!("Failed to lock AIOS kernel: {e}"))?;
-    f(kernel.as_mut())
+    })
 }
 
 pub(super) fn current_task_owner_pid() -> Result<u64, String> {

@@ -152,17 +152,28 @@ pub(super) fn wakeup_task_guidance(has_tool: impl Fn(&str) -> bool) -> Option<St
     Some(lines.join("\n"))
 }
 
-/// 一轮 turn 执行成功后对目标进程的 quota 收尾逻辑。
-/// 行为与改造前完全一致：扣减 `quota_turns` 一次，如果归零则准备 "Max LLM quota reached"
-/// 终止理由；如果进程已经处于 Waiting/Sleeping/Stopped 则保持其挂起状态、不触发终止。
-///
-/// 返回 `(should_terminate, termination_result)`，由调用方决定是否真的调用
-/// `terminate_and_cleanup`，从而保留 foreground / background 各自后续的特殊处理
-/// （如 round-robin requeue 等）。
+/// Charge one turn and return the caller's existing termination decision.
+/// Suspended processes keep their state and receive a warning when over quota.
 pub(super) fn finalize_turn_quota(
     os: &mut dyn aios_kernel::kernel::Kernel,
     pid: u64,
 ) -> (bool, String) {
+    let outcome = finalize_turn_quota_outcome(os, pid);
+    (outcome.should_terminate, outcome.termination_result)
+}
+
+pub(super) struct TurnQuotaOutcome {
+    pub(super) should_terminate: bool,
+    pub(super) termination_result: String,
+    pub(super) verdict: RlimitVerdict,
+}
+
+/// Finalize usage once for either a successful or a failed background execution.
+/// Keep the verdict typed so publication can use the same outcome as kernel teardown.
+pub(super) fn finalize_turn_quota_outcome(
+    os: &mut dyn aios_kernel::kernel::Kernel,
+    pid: u64,
+) -> TurnQuotaOutcome {
     let verdict = os.rusage_charge(
         pid,
         ResourceUsageDelta {
@@ -184,12 +195,16 @@ pub(super) fn finalize_turn_quota(
         if matches!(verdict, RlimitVerdict::Exceeded { .. }) {
             p.mailbox.push_back(format!(
                 "[rlimit-warning] {}",
-                super::format_rlimit_termination_result(verdict)
+                super::format_rlimit_termination_result(verdict.clone())
             ));
         }
         termination_result = "Completed".to_string();
     }
-    (should_terminate, termination_result)
+    TurnQuotaOutcome {
+        should_terminate,
+        termination_result,
+        verdict,
+    }
 }
 
 #[cfg(test)]
