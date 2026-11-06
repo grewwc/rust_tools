@@ -1550,7 +1550,30 @@ fn required_delegation_advisory_fires_on_third_read_only_round() {
                 .find(|message| message.role == crate::ai::history::ROLE_INTERNAL_NOTE)
                 .and_then(|message| message.content.as_str())
                 .expect("the scheduling advisory should be injected");
-            assert!(note.contains("Delegate a bounded discovery task now"));
+            assert!(
+                note.contains(
+                    "Acceptance-only review under the active acceptance rules does not require a fresh discovery spawn, including across turns"
+                ),
+                "{note}"
+            );
+            assert!(
+                note.contains(
+                    "the parent may only read a worker's already-returned exact final artifact/version and matching evidence"
+                ),
+                "{note}"
+            );
+            assert!(
+                note.contains(
+                    "This exception does not cover new searches, additional fact-finding, edits, command execution, or verification of artifacts the worker has not returned"
+                ),
+                "{note}"
+            );
+            assert!(
+                note.contains(
+                    "For new discovery or implementation work: Delegate a bounded discovery task now"
+                ),
+                "{note}"
+            );
             assert!(note.contains("does not require the parent to finish discovery first"));
             assert!(note.contains("Tools remain available"));
             supervisor.progress.reset_after_truncation();

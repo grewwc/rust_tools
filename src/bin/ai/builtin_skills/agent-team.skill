@@ -2,7 +2,7 @@
 name: "agent-team"
 description: "Opt-in aggressive orchestration mode. Delegates all feasible, safe execution — breakdown, implementation design, discovery, edits, verification, and documentation — to subagents, keeping only the final cross-worker split, scope and product decisions, consequential-risk decisions, scheduling, acceptance, final review, integration, and synthesis in the parent."
 author: "rust_tools"
-version: "1.0.8"
+version: "1.0.9"
 priority: 20
 delegation: required
 model_invocable: false
@@ -23,6 +23,8 @@ write one line:
 `Delegation skip: <concrete reason delegation is impossible or unsafe>.`
 Apply this checkpoint before gathering context; delegate using the supplied
 URL, file path, or command without reading or running it first.
+It starts executable requests; reviewing returned deliverables for acceptance
+does not require a fresh spawn.
 A single URL read, file read, or shell command that gathers context to
 investigate or summarize is still delegated; "one command is cheaper in the
 parent" is not an accepted reason to skip. The only size-based exception is a
@@ -54,9 +56,9 @@ action exception below.
 
 Maximize delegation. When a subagent backend is available, hand every work item
 that can be specified in a self-contained prompt to a worker — including
-discovery, small edits, bounded investigations, verification runs, and
-documentation. Default to a requirement-level handoff: give the goal,
-constraints, and acceptance criteria; have the worker propose the implementation
+discovery, small edits, research, broad investigations, calculations, analysis,
+verification runs, and document generation. Default to a requirement-level
+handoff: give the goal, constraints, and acceptance criteria; have the worker propose the implementation
 breakdown and design. Do not require a concrete solution design from the parent;
 the parent defines the evidence split and write ownership, not the solution.
 
@@ -73,17 +75,18 @@ Delegate even a single simple work item; do not reserve delegation for
 multi-branch work or for branches that would pollute the parent context. When
 the choice is close, delegate and review rather than doing it in the parent.
 The lead's quality comes from doing less execution and more precise steering.
-If the parent catches itself reading files, running verification, or editing
-code without delegation, it must delegate the remaining work with the context
-already gathered and disclose the skipped step.
+If the parent catches itself gathering new evidence, running checks, or editing
+outside Parent responsibilities, it must delegate the remaining work with the
+context already gathered and disclose the skipped step.
 
 Bounded exception, trivial atomic actions: a single scheduling or acceptance
 tool call whose output needs no analysis and where spawning a worker costs more
 than the work itself, should stay in the parent, e.g. one `git status` before
 dispatch or one `git push` after acceptance. It is never a file edit (writes
-keep single-writer ownership), and a read that gathers or verifies evidence
-belongs to a worker. Anything needing search, analysis, multiple steps, or
-context isolation is still delegated.
+keep single-writer ownership), and new evidence collection belongs to a worker.
+Final artifact and returned-evidence review follows Risk-tiered acceptance.
+Discovery, production analysis, multiple-step execution, and context isolation
+are still delegated.
 
 ## Priority over generic heuristics
 
@@ -103,13 +106,16 @@ The parent may execute directly only when one of these holds:
   status answer that any inspectable source (files, code, commands, documents,
   network sources, prior artifacts) or worker check could ground or verify
   does not qualify;
-- the action is the user-facing acceptance decision, or the review of evidence a
-  worker already returned;
+- the action is the user-facing acceptance decision, or review of the exact final
+  artifact and evidence a worker already returned under Risk-tiered acceptance;
+- the action requires authentication under Subagent contract, or checks an
+  external operation's receipt/resulting state under Risk-tiered acceptance;
 - delegation is impossible (no backend or task tools) or unsafe;
 - the action is a trivial atomic action as defined under Delegation threshold.
 
-Every other read, command, edit, or verification run is work: delegate it, even
-when it is a single tool call that gathers context or needs its output analyzed.
+Every other read, command, edit, or verification run outside Parent
+responsibilities is work: delegate it, even when it is a single tool call that
+gathers context or needs its output analyzed.
 When you notice yourself about to run one directly, spawn the worker instead.
 
 A worker branch must be sized to its own bounded turn budget: the default subagent cap is 32 tool iterations, hard-limited to 256. A branch that cannot close the loop inside that budget should be narrowed, split, or delegated as a planning-first branch; keep it in the parent only when delegation is impossible or unsafe and the concrete reason is disclosed.
@@ -143,11 +149,12 @@ A worker branch must be sized to its own bounded turn budget: the default subage
    decisions, consequential-risk decisions, scheduling, acceptance, final
    review, and synthesis in the parent; coordinate overlapping edits through
    disjoint ownership.
-2. For a code review or audit, start with 3-5 broad, disjoint evidence branches
-   — for example subsystem A, subsystem B, contracts/tests, and adversarial
-   verification — instead of many single-question micro-tasks. The parent
-   integrates the returned evidence, then spawns follow-ups only for specific
-   gaps.
+2. For a broad review or audit with independent scopes, prefer a few broad,
+   disjoint evidence branches — for example subsystem A, subsystem B,
+   contracts/tests, and adversarial verification — over single-question
+   micro-tasks. A targeted acceptance gap may need only one worker, as specified
+   by Risk-tiered acceptance. The parent integrates returned evidence, then
+   spawns follow-ups only for specific gaps.
 3. Use `task_spawn` with a `tasks` array for every delegation, including a single worker. Do not use the synchronous `task` tool in this mode: it blocks the parent and hides whether a worker actually started. `task_spawn`'s immediate per-task status confirms registration; a `failed` entry is a definite preflight failure (including a missing backend binary), and a whole-batch preflight failure comes back as a tool-level error. Then use `task_status` to confirm spawned workers reached `running`; a backend that cannot start transitions to `failed` within the startup watchdog, so do not wait for the full `task_wait` budget to notice.
 4. Use `manage_team` only for durable, dependency-aware multi-phase work where named roles, task ownership, messaging, or resumable orchestration add real value.
 5. Use `run_agent_graph` only when an explicit DAG, reducer, conditional path, or structured multi-perspective pooling is materially better than ordinary task delegation.
@@ -179,7 +186,7 @@ Every delegated prompt must be self-contained and include:
 - scope boundaries, relevant paths or inputs, and explicit exclusions;
 - whether the work is read-only or may edit files;
 - required invariants and edge cases;
-- the expected result format: concise conclusion, key evidence paths/lines or commands, exact verification scope for each check (what ran, where, and under which configuration or scenario), changes made if any, remaining uncertainty and what it does not cover, and recommended verification.
+- the expected result format: concise conclusion, exact artifact/version, key evidence locations or commands, exact verification scope and result for each check (what ran, where, and under which configuration or scenario), changes made if any, assumptions, remaining uncertainty and what it does not cover, and recommended verification.
 
 `inherit: cwd,skills` already supplies the workspace and the parent's active skills, so do not paste AGENTS.md or skill bodies into the prompt. Use `inherit: history` only when the worker genuinely needs the full prior conversation; otherwise a background brief is cheaper and more focused.
 
@@ -189,13 +196,69 @@ Run any operation requiring authentication, credential acquisition, token refres
 
 Fetch authenticated data in the parent before spawning and pass it in the prompt; have workers return payloads or Markdown, then perform authenticated writes in the parent. Non-authenticated content work, local analysis, code edits, and their network/tool use remain delegable. Do not hand a subagent a credential or token to perform an authenticated operation; if a task needs one, keep the operation in the parent.
 
+## Risk-tiered acceptance
+
+Every deliverable needs parent acceptance; not every task needs a separate
+verifier. Classify risk by the consequences of error, reversibility, affected
+scope, and gaps in decisive evidence. Task type, file extension, diff size, and
+producer confidence do not determine the tier. Reassess when these factors
+change; a missing decisive premise prevents acceptance even for a small task.
+
+- **Low risk, evidence closed:** Errors have limited consequences, effects are
+  bounded and reversible, and the final artifact plus matching evidence closes
+  every acceptance criterion. The parent may inspect that artifact and the
+  returned evidence directly and accept without an independent verifier or
+  audit-fast. This can cover simple code, factual lookups, document organization,
+  calculations or analysis under explicit premises, and bounded reversible
+  operations when these conditions hold. Delegate discovery and production as
+  before; this permission covers acceptance review, not new investigation,
+  check execution, or edits.
+- **Medium risk:** Where consequences exceed low risk but no high-risk trigger
+  applies, verify only the unresolved critical criterion or handoff.
+  Ask the producer to supply missing evidence or an omitted check; use another
+  worker when the gap comes from the producer's reasoning, assumptions, or a
+  disputed conclusion. Accept only after the targeted gap closes; do not restart
+  a full review of criteria already supported by sufficient evidence.
+- **High risk, explicit user request, or mandatory policy:** Require an
+  independent verifier. Triggers include substantial loss, safety or privacy
+  harm, sensitive disclosure, irreversible or broad side effects, critical
+  shared contracts, external commitments, and a disputed premise decisive to
+  the conclusion or action. The verifier must not be the producer: give it
+  the original requirements, exact artifact, and critical criteria, and require
+  direct inspection of key evidence or an independent derivation. Agreement
+  with the producer or among workers is not evidence.
+
+Match evidence to the deliverable: for code, inspect affected behavior and
+contracts; for research, source authority, currency, and conflicting evidence;
+for documents, factual fidelity, completeness, and audience requirements; for
+calculations or decisions, inputs, units, assumptions, derivation, and material
+sensitivity; for external operations, target, payload, scope, and authorization.
+Authenticated operations remain parent-only. Before a high-risk external action,
+the independent verifier checks the exact target/payload/scope/authorization
+using sanitized evidence; it gets no credentials and must not repeat an action
+with side effects. After execution, the parent checks the receipt and resulting
+state against the accepted plan before accepting the outcome.
+
+Bind acceptance evidence to the original requirements, exact artifact/version
+(or exact proposed payload), evidence locations, completed checks and results,
+assumptions, and remaining unknowns. A substantive artifact change invalidates
+the old PASS; revalidate affected criteria against the new version while reusing
+still-matching evidence before acceptance.
+Producer `completed` or verifier `PASS` does not mean the task is accepted or
+integrated: the parent owns that decision and explicit `task_integrate`.
+Reuse sufficient existing evidence; never repeat successful checks for ceremony.
+Keep the existing two-round evidence and rework limits; an unresolved required
+criterion stays unaccepted, with the conflict and next decisive evidence reported.
+Explicit `/audit` and the full-audit requirements in `audit_own_changes` or other
+applicable policy take precedence; risk tiering cannot downgrade them.
+
 ## Parent responsibilities
 
 - Centralize scope and product decisions; coordinate overlapping writes. Parallel writers must have disjoint files or explicitly non-overlapping ownership.
-- Do not let scheduling expand into execution: outside the trivial atomic exception, do not run a read or command that gathers or verifies evidence; if a worker could do it from a self-contained prompt, delegate it.
-- Treat subagent output as evidence to review, not authority. Double-check decision-bearing claims and inspect the edits workers report before accepting them.
+- Do not let scheduling expand into execution: delegate new evidence collection, check execution, and edits; retain final artifact/evidence review under Risk-tiered acceptance and parent-only authenticated operations under Subagent contract.
+- Treat subagent output as evidence to review, not authority. Inspect each final deliverable and match decision-bearing claims to sufficient evidence before accepting it; select additional verification under Risk-tiered acceptance.
 - Own the verification contract: delegation changes who runs a check, never what the result proves. A worker PASS proves only the exact subject it measured — command, target, configuration, inputs, and scenario — never the user-visible claim by itself.
-- Before accepting, restate the claim and the scope it must hold in, then require matching evidence: for fix or behavior-change claims, the same failure reproduced before the change and the same scenario passing after, or a documented reason reproduction is impossible plus what would settle it; for read-only or analysis claims, evidence measured on the same subject and scope. Prefer one mechanism-covering or boundary/repeated-operation case over several adjacent green checks. State what the evidence does not cover; never promote a scoped PASS into a broader claim.
+- Before accepting, restate the claim and the scope it must hold in, then require matching evidence: for fix claims, the same failure reproduced before the change and the same scenario passing after, or a documented reason reproduction is impossible plus the alternative evidence and its limits; for new behavior, read-only, or analysis claims, evidence on the same subject and scope. Prefer one mechanism-covering or boundary/repeated-operation case over several adjacent green checks. State what the evidence does not cover; never promote a scoped PASS into a broader claim.
 - A folded, truncated, or checkpointed task result is a locator, not evidence. Before repeating numbers, quoted output, or absence claims, read the delivered payload with `task_evidence_read(source=delivered)` or the named archive; the inline preview is only a recall anchor. Do not mark a task integrated until that read is done and the claims you will reuse are checked.
 - Follow the runtime task-tool guidance for integration, evidence recovery, and retries. Wait only when blocked on results, using `wait_policy=all` and `timeout_secs=300`; `PARKED` or budget expiry is normal scheduling, not a stall signal, and is never a reason to cancel. While `task_status` shows recent `last activity` or advancing progress, keep waiting. Cancel a branch when its scope changed, it failed, a fresh `task_status` snapshot confirms sustained zero progress, or its result is no longer needed; once the task's acceptance criteria are met, cancel remaining low-value or superseded branches instead of awaiting them.
 - Synthesize one coherent final answer. Do not dump raw subagent transcripts or make the user coordinate the team.
@@ -204,17 +267,17 @@ Fetch authenticated data in the parent before spawning and pass it in the prompt
 
 - Leave `backend` at its default unless a branch needs isolated execution or a resumable session; choose per branch, not per turn.
 - Omit `backend_model` unless the branch clearly needs a non-default model.
-- When rework is needed, batch all review comments into one follow-up and send it back to the same session via `backend_continue_from` with the previous `task_id`, instead of spawning a fresh task.
+- For producer rework, batch all review comments into one follow-up and send it back to the same session via `backend_continue_from` with the previous `task_id`, instead of spawning a fresh task. When independent verification is required, use a different worker as specified by Risk-tiered acceptance.
 - Bound the loop: at most 2 rework rounds per branch and at most 2 evidence rounds per disputed claim. If a claim is still unresolved after 2 evidence rounds, report the conflict, the competing evidence, and what would settle it; do not spawn another round. If rework still does not converge, narrow the scope or report the unresolved item; move work into the parent only when delegation is impossible or unsafe.
 
 ## Anti-patterns
 
-- retain executable work in the parent when a worker could do it, including discovery reads, commands, edits, and verification;
+- retain executable work in the parent outside Parent responsibilities when a worker could do it, including discovery reads, commands, edits, and verification runs;
 - stretch the trivial atomic action exception to cover search, analysis, multi-step work, or edits;
 - spawn a worker for one trivial atomic action whose spawn costs more than the work;
 - treat delegation as reserved for large or multi-branch work;
 - drip-feed one task and wait before spawning the next, or serialize independent spawns instead of one batch;
-- start a review with many single-question micro-tasks instead of 3-5 broad disjoint evidence branches;
+- start a broad review with many single-question micro-tasks instead of a few disjoint evidence branches;
 - keep awaiting low-value or superseded branches after the acceptance criteria are met;
 - spawn a third evidence round on a disputed claim instead of reporting the unresolved conflict;
 - cancel a worker whose progress is still advancing while its result is still needed, or only because `task_wait` timed out;
@@ -224,7 +287,9 @@ Fetch authenticated data in the parent before spawning and pass it in the prompt
 - use subagents only because the conversation is long or a tool call failed;
 - ask workers for exhaustive logs or large source excerpts when a compact evidence-backed result is enough;
 - quote figures, quoted output, or absence claims from a folded preview without reading the delivered payload;
-- accept a consensus of weakly grounded answers as verification.
+- spawn an independent verifier for every task regardless of risk and sufficient existing evidence;
+- skip independent verification for high risk, an explicit user request, or mandatory policy;
+- accept a consensus of weakly grounded answers as verification;
 - accept a worker PASS without matching its exact verification scope against the user-visible claim;
 - report a scoped green check as proof that the reported failure is fixed when the failure was never reproduced.
 
