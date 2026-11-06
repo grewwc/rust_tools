@@ -90,7 +90,7 @@ impl SubagentProgressEventKind {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub(crate) struct SubagentProgressEvent {
     pub(crate) sequence: u64,
     pub(crate) kind: SubagentProgressEventKind,
@@ -104,7 +104,7 @@ pub(crate) struct SubagentProgressEvent {
 
 /// Structured snapshot shared by all parent-observable paths. Display, wakeup, persistence, and hard-timeout recovery
 /// all project from here, preventing each path from assembling a semantically inconsistent state of its own.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub(crate) struct SubagentProgressSnapshot {
     pub(crate) phase: String,
     pub(crate) checkpoint_summary: Option<String>,

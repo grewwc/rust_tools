@@ -765,9 +765,9 @@ pub(super) fn write_terminal_subagent_result(
         "backend_session": backend_session,
     })
     .to_string();
-    let _ = os.channel_send(Some(pid), ChannelId(result_channel_id), payload);
-    let _ = os.channel_close(Some(pid), ChannelId(result_channel_id));
-    let _ = os.channel_release_named(ChannelId(result_channel_id), "task_result.producer");
+    if let Err(error) = publish_task_result(os, Some(task_id), pid, result_channel_id, payload) {
+        eprintln!("[Task result delivery] {error}");
+    }
     let _ = os.futex_store(completion_futex_addr, 1);
     os.set_current_pid(original);
 }
@@ -971,6 +971,7 @@ mod tests {
         insert_task_entry_for_test(
             task_id.clone(),
             AsyncTaskEntry {
+                evidence_history_file: None,
                 session_id: app.session_id.clone(),
                 owner_pid,
                 pid,
@@ -1156,6 +1157,7 @@ mod tests {
                 );
                 let completion_futex = os.futex_create(0, "task-complete".to_string());
                 let entry = AsyncTaskEntry {
+                    evidence_history_file: None,
                     session_id: String::new(),
                     owner_pid,
                     pid,

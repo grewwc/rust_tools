@@ -1,5 +1,5 @@
 //! Process-local session indices and deferred continuation-note transactions.
-//! Pending sessions stay unresumable until the task publishes a terminal result.
+//! Continuations wait for terminal publication and for the actual backend run to end.
 
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -20,6 +20,68 @@ pub(super) type SessionIndex = Arc<Mutex<FastMap<String, SessionState>>>;
 
 static SESSIONS: LazyLock<Mutex<FastMap<BackendId, SessionIndex>>> =
     LazyLock::new(|| Mutex::new(FastMap::default()));
+static ACTIVE_RUNS: LazyLock<Mutex<FastMap<(BackendId, String), SessionSlot>>> =
+    LazyLock::new(|| Mutex::new(FastMap::default()));
+
+/// Owned by the actual blocking runner, including time spent queued on the blocking pool.
+/// Aborting its async waiter does not make a still-running CLI resumable.
+pub(crate) struct BackendRunGuard {
+    backend: BackendId,
+    task_id: String,
+    session_slot: SessionSlot,
+}
+
+impl BackendRunGuard {
+    pub(crate) fn start(
+        backend: BackendId,
+        task_id: &str,
+        session_slot: SessionSlot,
+        resume_session: Option<&str>,
+    ) -> Result<Self, String> {
+        if let Some(session) = resume_session {
+            *lock_unpoisoned(&session_slot) = Some(session.to_string());
+        }
+        let key = (backend, task_id.to_string());
+        let mut active = lock_unpoisoned(&ACTIVE_RUNS);
+        if active.contains_key(&key)
+            || resume_session.is_some_and(|session| {
+                active.iter().any(|((running_backend, _), slot)| {
+                    *running_backend == backend
+                        && captured_session(slot).as_deref() == Some(session)
+                })
+            })
+        {
+            return Err(format!(
+                "Backend run for task {task_id} or its session is still active; wait for it to stop before retrying or continuing."
+            ));
+        }
+        active.insert(key, session_slot.clone());
+        Ok(Self {
+            backend,
+            task_id: task_id.to_string(),
+            session_slot,
+        })
+    }
+}
+
+impl Drop for BackendRunGuard {
+    fn drop(&mut self) {
+        let key = (self.backend, self.task_id.clone());
+        let mut active = lock_unpoisoned(&ACTIVE_RUNS);
+        if active
+            .get(&key)
+            .is_some_and(|slot| Arc::ptr_eq(slot, &self.session_slot))
+        {
+            active.remove(&key);
+        }
+        drop(active);
+        crate::ai::driver::notify_scheduler();
+    }
+}
+
+pub(crate) fn task_backend_run_is_active(backend: BackendId, task_id: &str) -> bool {
+    lock_unpoisoned(&ACTIVE_RUNS).contains_key(&(backend, task_id.to_string()))
+}
 
 /// A separate index per backend prevents task IDs and raw sessions from crossing
 /// backend boundaries. Creating an index performs no I/O or discovery.
@@ -77,12 +139,29 @@ pub(crate) fn resolve_continue_target(
     error_template: &str,
 ) -> Result<String, String> {
     let trimmed = value.trim();
-    match lock_unpoisoned(&session_index(backend)).get(trimmed) {
-        Some(SessionState::Terminal(session)) => return Ok(session.clone()),
-        None if accepts_raw_session(trimmed) => return Ok(trimmed.to_string()),
-        _ => {}
+    let index = session_index(backend);
+    let sessions = lock_unpoisoned(&index);
+    let session = match sessions.get(trimmed) {
+        Some(SessionState::Terminal(session)) => session.clone(),
+        None if accepts_raw_session(trimmed) => trimmed.to_string(),
+        _ => return Err(error_template.replace("{value}", trimmed)),
+    };
+    let pending = sessions.values().any(|state| match state {
+        SessionState::Pending(slot) => captured_session(slot).as_deref() == Some(session.as_str()),
+        SessionState::Terminal(_) => false,
+    });
+    let active = lock_unpoisoned(&ACTIVE_RUNS)
+        .iter()
+        .any(|((running_backend, _), slot)| {
+            *running_backend == backend
+                && captured_session(slot).as_deref() == Some(session.as_str())
+        });
+    if pending || active {
+        return Err(format!(
+            "Backend session {session} still has an active run. Wait for it to stop and collect its result before backend_continue_from."
+        ));
     }
-    Err(error_template.replace("{value}", trimmed))
+    Ok(session)
 }
 
 /// Reading notes does not consume them. The runner commits only after a process
@@ -192,6 +271,67 @@ pub(crate) fn prepare_continuation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_continuation_waits_for_actual_run_after_terminal_publication() {
+        let backend = BackendId::new("active-session-test");
+        let slot = track_session(backend, "task-a");
+        let guard =
+            BackendRunGuard::start(backend, "task-a", slot.clone(), Some("session-a")).unwrap();
+        assert!(
+            resolve_continue_target(backend, "session-a", |_| true, "invalid {value}").is_err()
+        );
+        record_session(backend, "task-a", None);
+        assert!(task_backend_run_is_active(backend, "task-a"));
+        for target in ["task-a", "session-a"] {
+            assert!(
+                resolve_continue_target(backend, target, |_| true, "invalid {value}")
+                    .unwrap_err()
+                    .contains("active run")
+            );
+        }
+        assert!(
+            BackendRunGuard::start(
+                backend,
+                "task-b",
+                Arc::new(Mutex::new(None)),
+                Some("session-a")
+            )
+            .is_err()
+        );
+        drop(guard);
+        assert!(!task_backend_run_is_active(backend, "task-a"));
+        assert_eq!(
+            resolve_continue_target(backend, "task-a", |_| true, "invalid {value}").unwrap(),
+            "session-a"
+        );
+        assert_eq!(
+            resolve_continue_target(backend, "session-a", |_| true, "invalid {value}").unwrap(),
+            "session-a"
+        );
+        forget_session(backend, "task-a");
+    }
+
+    #[test]
+    fn backend_continuation_rejects_raw_pending_session_without_run_guard() {
+        let backend = BackendId::new("pending-session-test");
+        let other = BackendId::new("pending-session-other");
+        let slot = track_session(backend, "task-a");
+        *lock_unpoisoned(&slot) = Some("session-a".to_string());
+        assert!(
+            resolve_continue_target(backend, "session-a", |_| true, "invalid {value}").is_err()
+        );
+        assert_eq!(
+            resolve_continue_target(other, "session-a", |_| true, "invalid {value}").unwrap(),
+            "session-a"
+        );
+        record_session(backend, "task-a", None);
+        assert_eq!(
+            resolve_continue_target(backend, "session-a", |_| true, "invalid {value}").unwrap(),
+            "session-a"
+        );
+        forget_session(backend, "task-a");
+    }
 
     #[test]
     fn backend_sessions_isolate_pending_and_terminal_states() {

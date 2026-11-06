@@ -315,11 +315,14 @@ pub(in crate::ai) use suspended::{
     format_suspended_timestamp_label, physical_terminal_key,
 };
 #[cfg(test)]
+pub(in crate::ai) use task_evidence::read_published_task_evidence_status_payload;
+#[cfg(test)]
 pub(in crate::ai) use task_evidence::render_unintegrated_task_evidence;
 pub(in crate::ai) use task_evidence::{
     DeliveredTaskEvidence, integrate_task_evidence, integrate_task_evidence_batch,
-    read_integrated_task_ids, read_task_evidence_status_payload, read_task_spawn_audit,
-    record_delivered_task_evidence, record_task_spawn_audit,
+    read_available_task_evidence_status_payload, read_integrated_task_ids,
+    read_task_evidence_status_payload, read_task_spawn_audit, record_delivered_task_evidence,
+    record_published_task_evidence, record_task_publication_warning, record_task_spawn_audit,
     record_uncollected_task_terminal_status, render_unintegrated_task_evidence_resilient,
     task_evidence_exists,
 };

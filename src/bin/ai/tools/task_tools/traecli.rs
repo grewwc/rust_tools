@@ -454,8 +454,18 @@ async fn run_traecli_subagent_with_session(
         let worker_evidence_slot = evidence_slot.clone();
         let worker_task_id = crate::ai::driver::runtime_ctx::try_subagent_task_id();
         let worker_context = crate::ai::driver::runtime_ctx::try_current();
+        let run_id = worker_task_id
+            .clone()
+            .unwrap_or_else(|| format!("run-{}", uuid::Uuid::new_v4().simple()));
+        let run_guard = backend_session::BackendRunGuard::start(
+            BackendId::TRAECLI,
+            &run_id,
+            worker_slot.clone(),
+            owned.resume_session.as_deref(),
+        )?;
         let binary = binary.to_string();
         let result = tokio::task::spawn_blocking(move || {
+            let _run_guard = run_guard;
             // Blocking workers do not inherit Tokio task locals. Carry the task and session
             // scopes so checkpoint events use the same persistence/notification path.
             let run = || {
@@ -607,6 +617,31 @@ pub(super) fn run_traecli_blocking_with(
     run_traecli_blocking_with_evidence(spec, cancel, binary, startup_timeout, session_slots, None)
 }
 
+/// Ensure early errors or panics cannot leave the owned CLI running after its run guard ends.
+struct TraeCliChildGuard(std::process::Child);
+
+impl std::ops::Deref for TraeCliChildGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for TraeCliChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for TraeCliChildGuard {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
 fn run_traecli_blocking_with_evidence(
     spec: &ExternalSubagentSpec,
     cancel: Arc<AtomicBool>,
@@ -623,14 +658,16 @@ fn run_traecli_blocking_with_evidence(
     };
     let cwd = normalize_cwd(&spec.cwd);
     publish_traecli_activity(spec, "starting traecli", "launching traecli");
-    let mut child = std::process::Command::new(binary)
-        .args(build_traecli_args(spec))
-        .current_dir(&cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to spawn traecli: {err}"))?;
+    let mut child = TraeCliChildGuard(
+        std::process::Command::new(binary)
+            .args(build_traecli_args(spec))
+            .current_dir(&cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| format!("failed to spawn traecli: {err}"))?,
+    );
 
     backend_session::DeferredNotes::consume_after_spawn(&spec.side_note_files);
 
@@ -1396,6 +1433,7 @@ mod tests {
         );
         let completion_futex = os.futex_create(0, "task-complete".to_string());
         AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: session_id.to_string(),
             owner_pid,
             pid,

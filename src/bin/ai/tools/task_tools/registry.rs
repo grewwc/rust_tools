@@ -134,8 +134,8 @@ pub(crate) struct SubagentTerminalStatus {
     pub(crate) description: String,
     pub(crate) agent_name: String,
     pub(crate) backend: Option<String>,
-    /// Model actually serving an external backend. `None` for the kernel
-    /// runner so its status line keeps the established format.
+    /// Model actually serving an external backend. The kernel runner does not
+    /// disclose a model in the status block.
     pub(crate) model: Option<String>,
     /// Effective effort display label. `None` preserves an external backend's
     /// unknown/default behavior.
@@ -143,6 +143,8 @@ pub(crate) struct SubagentTerminalStatus {
     pub(crate) state: String,
     pub(crate) elapsed_secs: u64,
     pub(crate) progress: Option<String>,
+    /// Sampled once with the text above so the shared tree can use typed activity.
+    pub(crate) progress_snapshot: Option<crate::ai::driver::runtime_ctx::SubagentProgressSnapshot>,
 }
 
 /// Registry-only half of the status-line snapshot. Kept separate from the kernel query so a caller
@@ -159,6 +161,7 @@ pub(crate) struct SubagentStatusSnapshot {
     reasoning_effort: Option<String>,
     started_at: Instant,
     progress: Option<String>,
+    progress_snapshot: Option<crate::ai::driver::runtime_ctx::SubagentProgressSnapshot>,
 }
 
 /// Snapshot the registry under its own lock, then resolve progress after releasing it.
@@ -176,12 +179,12 @@ pub(crate) fn subagent_status_snapshots(session_id: &str) -> Vec<SubagentStatusS
                 description: entry.description.clone(),
                 agent_name: entry.agent_name.clone(),
                 backend: entry.backend.map(|backend| backend.as_str().to_string()),
-                // Only external backends disclose their model in the status
-                // line; the kernel format stays unchanged.
+                // Only external backends disclose their model in the status block.
                 display_model: entry.backend.map(|_| entry.model.clone()),
                 reasoning_effort: None,
                 started_at: entry.started_at,
                 progress: None,
+                progress_snapshot: None,
             })
             .collect::<Vec<_>>()
     };
@@ -192,7 +195,18 @@ pub(crate) fn subagent_status_snapshots(session_id: &str) -> Vec<SubagentStatusS
         }
     }
     for snapshot in &mut snapshots {
-        snapshot.progress = current_task_progress(&snapshot.task_id);
+        snapshot.progress_snapshot = task_progress_slot(&snapshot.task_id).and_then(|slot| {
+            crate::ai::driver::runtime_ctx::subagent_progress_state_snapshot(&slot)
+        });
+        let progress = snapshot
+            .progress_snapshot
+            .as_ref()
+            .map(crate::ai::driver::runtime_ctx::SubagentProgressSnapshot::display_status_line)
+            .filter(|value| !value.is_empty());
+        snapshot.progress = match (progress, pending_task_side_note_progress(&snapshot.task_id)) {
+            (Some(progress), Some(pending)) => Some(format!("{progress} · {pending}")),
+            (progress, pending) => progress.or(pending),
+        };
     }
     snapshots
 }
@@ -219,6 +233,7 @@ pub(crate) fn subagent_terminal_statuses(
                 .unwrap_or_else(|_| "unknown".to_string()),
             elapsed_secs: snapshot.started_at.elapsed().as_secs(),
             progress: snapshot.progress,
+            progress_snapshot: snapshot.progress_snapshot,
         })
         .collect::<Vec<_>>();
     statuses.sort_by(|a, b| a.description.cmp(&b.description));
@@ -235,6 +250,7 @@ pub(crate) fn validate_side_note_target(task_id: &str) -> Result<(), String> {
         return Ok(());
     }
     let session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
+    recover_current_foreground_tasks(&session_id)?;
     let owner_pid_opt = current_task_owner_pid_opt();
     let entry = with_task_entry(trimmed, |entry| entry.clone()).ok_or_else(|| {
         format!(

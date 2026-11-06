@@ -33,11 +33,6 @@ use super::scheduler::{
 use super::turn_runtime;
 use super::{BgSubagentGuard, TASK_PID, terminate_and_cleanup};
 
-const MAX_SUBAGENT_STATUS_DETAILS: usize = 3;
-const MAX_SUBAGENT_DESCRIPTION_CHARS: usize = 32;
-const MAX_SUBAGENT_PROGRESS_CHARS: usize = 140;
-const MIN_STATUS_FIELD_WIDTH: usize = 4;
-
 /// Background subagent history is kept only while the process can still be
 /// scheduled. Normal termination, failure, panic, or a `task_cancel` that aborts
 /// the future are all cleaned up via Drop. Private memory files and the exclusive
@@ -117,7 +112,6 @@ pub(super) struct SubagentStatusLine {
     last_columns: Option<usize>,
     cursor_queries_disabled: bool,
     last_serve_key: Option<Vec<serde_json::Value>>,
-    agent_team_mode: bool,
     is_tty: bool,
 }
 
@@ -149,7 +143,6 @@ impl SubagentStatusLine {
             last_columns: None,
             cursor_queries_disabled: false,
             last_serve_key: None,
-            agent_team_mode: false,
             is_tty,
         }
     }
@@ -220,23 +213,11 @@ impl SubagentStatusLine {
             }
         }
 
-        self.agent_team_mode = app
-            .session_default_skills
-            .iter()
-            .chain(&app.forced_skills)
-            .any(|name| name.eq_ignore_ascii_case("agent-team"));
         if statuses.is_empty() {
             return;
         }
 
-        let status_line = if self.agent_team_mode {
-            render_agent_team_subagent_status_block_at_width(
-                &statuses,
-                crate::ai::stream::raw_terminal_cols(),
-            )
-        } else {
-            render_subagent_status_line(&statuses)
-        };
+        let status_line = render_subagent_status_line(&statuses);
         if crate::ai::background::serve_live_streaming() {
             self.publish_status_if_changed(&statuses, &status_line, |status_line| {
                 crate::ai::background::publish_serve_frame(
@@ -265,11 +246,7 @@ impl SubagentStatusLine {
         status_line: &str,
         publish: impl FnOnce(&str),
     ) {
-        let key = if self.agent_team_mode {
-            agent_team_subagent_status_semantic_key(statuses)
-        } else {
-            subagent_status_semantic_key(statuses)
-        };
+        let key = agent_team_subagent_status_semantic_key(statuses);
         if self.last_serve_key.as_ref() == Some(&key) {
             return;
         }
@@ -374,14 +351,25 @@ fn subagent_status_semantic_key(
         .iter()
         .map(|status| {
             let progress = status.progress.as_deref().unwrap_or_default();
-            let plan = progress.split_once(" · plan: ").map(|(_, plan)| {
-                let summary = plan
-                    .rsplit_once(" · elapsed ")
-                    .map_or(plan, |(summary, _)| summary);
-                sanitize_status_field(summary)
-            });
-            let (phase, latest) = match parse_activity_progress(status) {
-                Some(activity) => (activity.phase, Some(activity.latest)),
+            let snapshot = status.progress_snapshot.as_ref();
+            let plan = match snapshot {
+                Some(snapshot) => snapshot
+                    .checkpoint_summary
+                    .as_deref()
+                    .map(sanitize_status_field)
+                    .filter(|summary| !summary.is_empty()),
+                None => progress.split_once(" · plan: ").map(|(_, plan)| {
+                    let summary = plan
+                        .rsplit_once(" · elapsed ")
+                        .map_or(plan, |(summary, _)| summary);
+                    sanitize_status_field(summary)
+                }),
+            };
+            let (phase, latest) = match snapshot {
+                Some(snapshot) => (
+                    sanitize_status_field(&snapshot.phase),
+                    subagent_activity_progress(status).map(|activity| activity.latest),
+                ),
                 None => (
                     sanitize_status_field(
                         &progress
@@ -405,7 +393,13 @@ fn subagent_status_semantic_key(
                 "phase": phase,
                 "latest": latest,
                 "plan": plan,
-                "checkpoint_due": progress.ends_with(" · checkpoint due"),
+                "pending_side_notes": progress.split(" · ")
+                    .find(|field| field.starts_with("pending side-notes: "))
+                    .map(sanitize_status_field),
+                "checkpoint_due": snapshot.map_or_else(
+                    || progress.ends_with(" · checkpoint due"),
+                    |snapshot| snapshot.checkpoint_due,
+                ),
             })
         })
         .collect()
@@ -423,7 +417,7 @@ fn agent_team_subagent_status_semantic_key(
         serde_json::json!({
             "task_id": status.task_id,
             "status": subagent_status_semantic_key(std::slice::from_ref(status)),
-            "updates": parse_activity_progress(status).and_then(|activity| activity.updates),
+            "updates": subagent_activity_progress(status).and_then(|activity| activity.updates),
         })
     }));
     key
@@ -500,10 +494,14 @@ fn render_agent_team_subagent_header(
         .saturating_sub(display_width(prefix))
         .saturating_sub(display_width(&state))
         .saturating_sub(display_width(task_prefix));
-    let task_budget = content_width / 2;
+    let task = sanitize_status_field(&status.description);
+    let task_budget = (content_width / 2).min(display_width(&task));
     let identity_budget = content_width.saturating_sub(task_budget);
     let identity = truncate_status_field_to_width(&identity, identity_budget);
-    let task = truncate_status_field_to_width(&status.description, task_budget);
+    let task = truncate_status_field_to_width(
+        &task,
+        content_width.saturating_sub(display_width(&identity)),
+    );
     truncate_status_field_to_width(
         &format!("{prefix}{identity}{state}{task_prefix}{task}"),
         width,
@@ -516,7 +514,7 @@ fn render_agent_team_subagent_detail(
     width: usize,
 ) -> Option<String> {
     let prefix = if is_last { "   ↳ " } else { "│  ↳ " };
-    if let Some(activity) = parse_activity_progress(status) {
+    if let Some(activity) = subagent_activity_progress(status) {
         let phase_prefix = "phase: ";
         let updates = activity
             .updates
@@ -545,7 +543,16 @@ fn render_agent_team_subagent_detail(
         ));
     }
 
-    let progress = status.progress.as_deref().map(status_progress_text)?;
+    let progress = status
+        .progress
+        .as_deref()
+        .map(status_progress_text)
+        .or_else(|| {
+            status
+                .progress_snapshot
+                .as_ref()
+                .map(|snapshot| status_progress_text(&snapshot.display_status_line()))
+        })?;
     if progress.trim().is_empty() {
         return None;
     }
@@ -588,303 +595,7 @@ fn render_subagent_status_line_at_width(
     statuses: &[crate::ai::tools::task_tools::SubagentTerminalStatus],
     width: usize,
 ) -> String {
-    if statuses
-        .iter()
-        .all(|status| status.backend.is_none() && parse_activity_progress(status).is_none())
-    {
-        return render_legacy_subagent_status_line(statuses);
-    }
-
-    let total = statuses.len();
-    let active = statuses
-        .iter()
-        .filter(|status| !is_terminal_subagent_state(&status.state))
-        .count();
-    let count = if active == total {
-        format!("subagents · {total} active")
-    } else {
-        format!("subagents · {active}/{total} active")
-    };
-    let Some((status, activity)) = statuses
-        .iter()
-        .find_map(|status| parse_activity_progress(status).map(|activity| (status, activity)))
-    else {
-        let line = render_compact_subagent_status_line(statuses);
-        if display_width(&line) <= width {
-            return line;
-        }
-        let status = statuses
-            .iter()
-            .find(|status| status.backend.is_some() && status.reasoning_effort.is_some())
-            .unwrap_or(&statuses[0]);
-        return render_narrow_subagent_status_header(status, &count, width);
-    };
-
-    let backend = status
-        .backend
-        .as_deref()
-        .map(sanitize_status_field)
-        .filter(|backend| !backend.is_empty());
-    let line_one_suffix = format!(
-        " · {} {}",
-        sanitize_status_field(&status.state),
-        format_subagent_elapsed(status.elapsed_secs)
-    );
-    let backend_prefix = format!("{count} · [backend=");
-    let backend_suffix = "] ";
-    // The model is what the user cannot otherwise see, so it gets a stable
-    // budget before the backend tag and agent name compete for the remainder.
-    let model_suffix = status
-        .model
-        .as_deref()
-        .map(sanitize_status_field)
-        .filter(|model| !model.is_empty())
-        .map(|model| {
-            let budget = (width / 5).clamp(MIN_STATUS_FIELD_WIDTH, 24);
-            format!(" ({})", truncate_status_field_to_width(&model, budget))
-        })
-        .unwrap_or_default();
-    let effort_suffix = status
-        .reasoning_effort
-        .as_deref()
-        .map(sanitize_status_field)
-        .filter(|effort| !effort.is_empty())
-        .map(|effort| format!(" (effort: {effort})"))
-        .unwrap_or_default();
-    let backend = backend.map(|backend| {
-        let budget = width
-            .saturating_sub(display_width(&backend_prefix))
-            .saturating_sub(display_width(backend_suffix))
-            .saturating_sub(display_width(&line_one_suffix))
-            .saturating_sub(display_width(&model_suffix))
-            .saturating_sub(display_width(&effort_suffix))
-            .saturating_sub(MIN_STATUS_FIELD_WIDTH)
-            .max(MIN_STATUS_FIELD_WIDTH);
-        truncate_status_field_to_width(&backend, budget)
-    });
-    let line_one_prefix = match backend {
-        Some(backend) => format!("{backend_prefix}{backend}{backend_suffix}"),
-        None => format!("{count} · "),
-    };
-    let line_one_suffix_with_model = format!("{model_suffix}{effort_suffix}{line_one_suffix}");
-    let agent_width = available_field_width(width, &line_one_prefix, &line_one_suffix_with_model);
-    let agent = truncate_status_field_to_width(&status.agent_name, agent_width);
-    let line_one = format!("{line_one_prefix}{agent}{line_one_suffix_with_model}");
-    let line_one = if display_width(&line_one) <= width {
-        line_one
-    } else {
-        render_narrow_subagent_status_header(status, &count, width)
-    };
-
-    let latest_prefix = "↳ latest: ";
-    // `age` already carries its unit phrase ("2s ago") from the progress slot.
-    let latest_suffix = if activity.age.ends_with("ago") {
-        format!(" · {}", activity.age)
-    } else {
-        format!(" · {} ago", activity.age)
-    };
-    let latest_width = available_field_width(width, latest_prefix, &latest_suffix);
-    let latest = truncate_status_field_to_width(&activity.latest, latest_width);
-    let line_two = format!("{latest_prefix}{latest}{latest_suffix}");
-
-    let phase_prefix = "↳ phase: ";
-    let updates = activity
-        .updates
-        .map(|updates| format!(" · updates {updates}"))
-        .unwrap_or_default();
-    let task_prefix = format!("{updates} · task: ");
-    let content_width = width.saturating_sub(display_width(phase_prefix));
-    let task_budget = content_width
-        .saturating_sub(display_width(&task_prefix))
-        .saturating_div(2);
-    let phase_budget = content_width
-        .saturating_sub(display_width(&task_prefix))
-        .saturating_sub(task_budget);
-    let phase = truncate_status_field_to_width(&activity.phase, phase_budget);
-    let task = truncate_status_field_to_width(&status.description, task_budget);
-    let line_three = format!("{phase_prefix}{phase}{task_prefix}{task}");
-
-    [line_one, line_two, line_three]
-        .map(|line| truncate_status_field_to_width(&line, width))
-        .join("\n")
-}
-
-fn render_narrow_subagent_status_header(
-    status: &crate::ai::tools::task_tools::SubagentTerminalStatus,
-    count: &str,
-    width: usize,
-) -> String {
-    let effort = status
-        .reasoning_effort
-        .as_deref()
-        .map(sanitize_status_field)
-        .filter(|effort| !effort.is_empty())
-        .map(|effort| {
-            // Compact `e=<tier>` keeps effort ahead of lower-priority fields.
-            // When even that prefix cannot fit, reserve space for the value alone.
-            let label = format!("e={effort}");
-            if display_width(&label) <= width {
-                label
-            } else {
-                effort
-            }
-        })
-        .unwrap_or_default();
-    let model = status
-        .model
-        .as_deref()
-        .map(sanitize_status_field)
-        .filter(|model| !model.is_empty())
-        .map(|model| truncate_status_field_to_width(&model, (width / 5).min(24)))
-        .unwrap_or_default();
-    let fields = [
-        (count.to_string(), "", ""),
-        (
-            status
-                .backend
-                .as_deref()
-                .map(sanitize_status_field)
-                .unwrap_or_default(),
-            "[backend=",
-            "]",
-        ),
-        (status.agent_name.clone(), "", ""),
-        (model, "(", ")"),
-        (effort, "", ""),
-        (
-            format!(
-                "{} {}",
-                sanitize_status_field(&status.state),
-                format_subagent_elapsed(status.elapsed_secs)
-            ),
-            "",
-            "",
-        ),
-    ];
-    let mut parts: [String; 6] = std::array::from_fn(|_| String::new());
-    let mut remaining = width;
-    let mut kept = 0;
-    // Allocate effort, model, activity, and count before agent/backend details,
-    // then restore the usual display order without imposing a minimum width.
-    for index in [4, 3, 5, 0, 2, 1] {
-        let (value, prefix, suffix) = &fields[index];
-        if value.is_empty() {
-            continue;
-        }
-        let separator_width = if kept == 0 { 0 } else { display_width(" · ") };
-        if remaining <= separator_width {
-            break;
-        }
-        let value_width = remaining
-            .saturating_sub(separator_width)
-            .saturating_sub(display_width(prefix) + display_width(suffix));
-        let value = truncate_status_field_to_width(value, value_width);
-        if !value.is_empty() {
-            let part = format!("{prefix}{value}{suffix}");
-            remaining -= display_width(&part) + separator_width;
-            parts[index] = part;
-            kept += 1;
-        }
-    }
-    let line = parts
-        .iter()
-        .filter(|part| !part.is_empty())
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(" · ");
-    truncate_status_field_to_width(&line, width)
-}
-
-fn render_legacy_subagent_status_line(
-    statuses: &[crate::ai::tools::task_tools::SubagentTerminalStatus],
-) -> String {
-    let total = statuses.len();
-    let active = statuses
-        .iter()
-        .filter(|status| !is_terminal_subagent_state(&status.state))
-        .count();
-    let mut parts = vec![if active == total {
-        format!("subagents · {total} active")
-    } else {
-        format!("subagents · {active}/{total} active")
-    }];
-    parts.extend(
-        statuses
-            .iter()
-            .take(MAX_SUBAGENT_STATUS_DETAILS)
-            .map(|status| {
-                let mut detail = format!(
-                    "{} {} {} ({})",
-                    sanitize_status_field(&status.description),
-                    format_subagent_elapsed(status.elapsed_secs),
-                    sanitize_status_field(&status.state),
-                    sanitize_status_field(&status.agent_name)
-                );
-                if let Some(progress) = status.progress.as_deref() {
-                    detail.push_str(": ");
-                    detail.push_str(&sanitize_status_field(progress));
-                }
-                detail
-            }),
-    );
-    if total > MAX_SUBAGENT_STATUS_DETAILS {
-        parts.push(format!("+{} more", total - MAX_SUBAGENT_STATUS_DETAILS));
-    }
-    parts.join(" · ")
-}
-
-fn render_compact_subagent_status_line(
-    statuses: &[crate::ai::tools::task_tools::SubagentTerminalStatus],
-) -> String {
-    let total = statuses.len();
-    let active = statuses
-        .iter()
-        .filter(|status| !is_terminal_subagent_state(&status.state))
-        .count();
-    let mut parts = vec![if active == total {
-        format!("subagents · {total} active")
-    } else {
-        format!("subagents · {active}/{total} active")
-    }];
-    parts.extend(
-        statuses
-            .iter()
-            .take(MAX_SUBAGENT_STATUS_DETAILS)
-            .map(|status| {
-                let mut detail = String::new();
-                if let Some(backend) = status.backend.as_deref() {
-                    detail.push_str(&format!("[backend={}] ", sanitize_status_field(backend)));
-                }
-                detail.push_str(&sanitize_status_field(&status.agent_name));
-                if let Some(model) = status.model.as_deref() {
-                    detail.push_str(&format!(" ({})", sanitize_status_field(model)));
-                }
-                if let Some(effort) = status.reasoning_effort.as_deref() {
-                    detail.push_str(&format!(" (effort: {})", sanitize_status_field(effort)));
-                }
-                detail.push(' ');
-                detail.push_str(&format_subagent_elapsed(status.elapsed_secs));
-                detail.push(' ');
-                detail.push_str(&sanitize_status_field(&status.state));
-                if let Some(progress) = status.progress.as_deref() {
-                    detail.push_str(" · ");
-                    detail.push_str(&compact_status_field(
-                        &status_progress_text(progress),
-                        MAX_SUBAGENT_PROGRESS_CHARS,
-                    ));
-                }
-                detail.push_str(" · ");
-                detail.push_str(&compact_status_field(
-                    &status.description,
-                    MAX_SUBAGENT_DESCRIPTION_CHARS,
-                ));
-                detail
-            }),
-    );
-    if total > MAX_SUBAGENT_STATUS_DETAILS {
-        parts.push(format!("+{} more", total - MAX_SUBAGENT_STATUS_DETAILS));
-    }
-    parts.join(" · ")
+    render_agent_team_subagent_status_block_at_width(statuses, width)
 }
 
 struct ActivityProgress {
@@ -894,45 +605,31 @@ struct ActivityProgress {
     updates: Option<u64>,
 }
 
-fn parse_activity_progress(
+/// Project activity from the shared snapshot, independent of progress text order.
+fn subagent_activity_progress(
     status: &crate::ai::tools::task_tools::SubagentTerminalStatus,
 ) -> Option<ActivityProgress> {
-    let progress = status.progress.as_deref()?;
-    let fields = progress.split(" · ").collect::<Vec<_>>();
-    let last_index = fields
+    let snapshot = status.progress_snapshot.as_ref()?;
+    let latest = snapshot
+        .timeline
         .iter()
-        .position(|field| field.starts_with("last activity "))?;
-    let elapsed_index = fields
-        .iter()
-        .position(|field| field.starts_with("elapsed "))?;
-    if last_index == 0 || last_index >= elapsed_index {
-        return None;
-    }
-    let phase = fields.get(last_index + 1)?.trim();
-    if phase.starts_with("updates ") || phase.starts_with("plan: ") || phase.starts_with("elapsed ")
-    {
+        .rev()
+        .find(|event| event.kind == runtime_ctx::SubagentProgressEventKind::Activity)?;
+    let latest = sanitize_status_field(&latest.summary);
+    let phase = sanitize_status_field(&snapshot.phase);
+    if latest.is_empty() || latest == phase {
         return None;
     }
     Some(ActivityProgress {
-        latest: fields[..last_index].join(" · "),
-        age: fields[last_index]
-            .trim_start_matches("last activity ")
-            .to_string(),
-        phase: phase.to_string(),
-        updates: fields[last_index + 2..elapsed_index]
-            .iter()
-            .find_map(|field| field.strip_prefix("updates ")?.parse().ok()),
+        latest,
+        age: runtime_ctx::format_progress_duration(snapshot.stale_for),
+        phase,
+        updates: (snapshot.sequence > 1).then_some(snapshot.sequence),
     })
 }
 
 fn display_width(value: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(value)
-}
-
-fn available_field_width(width: usize, prefix: &str, suffix: &str) -> usize {
-    width
-        .saturating_sub(display_width(prefix))
-        .saturating_sub(display_width(suffix))
 }
 
 fn truncate_status_field_to_width(value: &str, max_width: usize) -> String {
@@ -1045,22 +742,6 @@ fn is_terminal_subagent_state(state: &str) -> bool {
     )
 }
 
-/// Keep one status detail compact enough that several active subagents still
-/// fit on a terminal row. Truncation is char-boundary safe and only applies
-/// when the field exceeds the budget, so short kernel details are unchanged.
-fn compact_status_field(value: &str, max_chars: usize) -> String {
-    let value = sanitize_status_field(value);
-    if value.chars().count() <= max_chars {
-        return value;
-    }
-    let mut compact = value
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    compact.push('…');
-    compact
-}
-
 /// The outer status line already prints the task's elapsed time, so drop the
 /// duplicate `elapsed` segment from the progress snapshot while keeping the
 /// more useful last-activity age.
@@ -1117,10 +798,25 @@ mod tests {
         BackgroundSubagentHistoryGuard, SubagentStatusLine,
         agent_team_subagent_status_semantic_key, clamp_status_block, format_subagent_elapsed,
         redraw_status_block, render_agent_team_subagent_status_block_at_width,
-        render_subagent_status_line, render_subagent_status_line_at_width, sanitize_status_field,
+        render_subagent_status_line_at_width, sanitize_status_field,
         sorted_active_subagent_statuses, status_line_redraw_deferred,
     };
+    use crate::ai::driver::runtime_ctx::{
+        SubagentProgressSnapshot, new_subagent_progress_slot, publish_subagent_activity_to_slot,
+        publish_subagent_checkpoint_to_slot, publish_subagent_phase_to_slot,
+        subagent_progress_state_snapshot,
+    };
     use crate::ai::tools::task_tools::SubagentTerminalStatus;
+
+    fn activity_snapshot(phase: &str, latest: &str, sequence: u64) -> SubagentProgressSnapshot {
+        let slot = new_subagent_progress_slot();
+        publish_subagent_activity_to_slot(&slot, phase, latest);
+        let mut snapshot = subagent_progress_state_snapshot(&slot).unwrap();
+        snapshot.sequence = sequence;
+        snapshot.elapsed = std::time::Duration::from_secs(8);
+        snapshot.stale_for = std::time::Duration::from_secs(2);
+        snapshot
+    }
 
     #[test]
     fn background_decoded_kernel_goal_ignores_legacy_continuation() {
@@ -1189,24 +885,17 @@ mod tests {
 
     #[test]
     fn live_status_dedup_ignores_elapsed_and_activity_age() {
-        for (initial, later) in [
-            (
-                "command: rg -n foo src · last activity 1s ago · running command · updates 2 · elapsed 5s",
-                "command: rg -n foo src · last activity 4s ago · running command · updates 9 · elapsed 8s",
-            ),
-            (
-                "calling model · plan: inspect task path · elapsed 5s · last activity 1s ago",
-                "calling model · plan: inspect task path · elapsed 8s · last activity 4s ago",
-            ),
-            (
-                "command: rg -n foo src · last activity 1s ago · running command · updates 2 · plan: inspect task path · elapsed 5s",
-                "command: rg -n foo src · last activity 4s ago · running command · updates 9 · plan: inspect  task\tpath · elapsed 8s",
-            ),
-            (
-                "calling model · plan: inspect task path · elapsed 5s · last activity 1s ago",
-                "calling model · plan: inspect  task\tpath · elapsed 8s · last activity 4s ago",
-            ),
-        ] {
+        for activity in [None, Some("command: rg -n foo src")] {
+            let slot = new_subagent_progress_slot();
+            if let Some(activity) = activity {
+                publish_subagent_activity_to_slot(&slot, "running command", activity);
+            } else {
+                publish_subagent_phase_to_slot(&slot, "calling model");
+            }
+            publish_subagent_checkpoint_to_slot(&slot, "inspect task path", "Saved plan");
+            let mut snapshot = subagent_progress_state_snapshot(&slot).unwrap();
+            snapshot.elapsed = std::time::Duration::from_secs(5);
+            snapshot.stale_for = std::time::Duration::from_secs(1);
             let mut status = SubagentTerminalStatus {
                 task_id: "task-focus".to_string(),
                 started_at: std::time::Instant::now(),
@@ -1217,7 +906,8 @@ mod tests {
                 reasoning_effort: None,
                 state: "running".to_string(),
                 elapsed_secs: 5,
-                progress: Some(initial.to_string()),
+                progress: Some(snapshot.display_status_line()),
+                progress_snapshot: Some(snapshot.clone()),
             };
             let mut line = SubagentStatusLine::new();
             let mut published = Vec::new();
@@ -1231,7 +921,11 @@ mod tests {
             assert_eq!(published, vec![first.clone()]);
 
             status.elapsed_secs = 8;
-            status.progress = Some(later.to_string());
+            snapshot.elapsed = std::time::Duration::from_secs(8);
+            snapshot.stale_for = std::time::Duration::from_secs(4);
+            snapshot.checkpoint_summary = Some("inspect  task\tpath".to_string());
+            status.progress = Some(snapshot.display_status_line());
+            status.progress_snapshot = Some(snapshot);
             let later = render_subagent_status_line_at_width(&[status.clone()], 120);
             assert_ne!(first, later);
             line.publish_status_if_changed(&[status], &later, |payload| {
@@ -1254,40 +948,59 @@ mod tests {
             state: "running".to_string(),
             elapsed_secs: 5,
             progress: None,
+            progress_snapshot: None,
         };
+        let slot = new_subagent_progress_slot();
         let mut line = SubagentStatusLine::new();
         line.is_tty = false;
         let mut published = 0;
-        for progress in [
-            "command: rg -n foo src · last activity 1s ago · running command · elapsed 5s",
-            "command: rg -n foo src · last activity 1s ago · processing output · elapsed 5s",
-            "completed: rg -n foo src · exit 0 · last activity 1s ago · processing output · elapsed 5s",
-            "completed: rg -n foo src · exit 0 · last activity 1s ago · processing output · plan: inspect task path · elapsed 5s",
-            "completed: rg -n foo src · exit 0 · last activity 1s ago · processing output · plan: verify task path · elapsed 5s",
-            "completed: rg -n foo src · exit 0 · last activity 1s ago · processing output · plan: verify task path · elapsed 5s · checkpoint due",
-        ] {
-            status.progress = Some(progress.to_string());
+        for change in 0..7 {
+            match change {
+                0 => publish_subagent_activity_to_slot(
+                    &slot,
+                    "running command",
+                    "command: rg -n foo src",
+                ),
+                1 => publish_subagent_phase_to_slot(&slot, "processing output"),
+                2 => publish_subagent_activity_to_slot(
+                    &slot,
+                    "processing output",
+                    "completed: rg -n foo src · exit 0",
+                ),
+                3 => publish_subagent_checkpoint_to_slot(&slot, "inspect task path", "Saved plan"),
+                4 => publish_subagent_checkpoint_to_slot(&slot, "verify task path", "Updated plan"),
+                // A new event with the same checkpoint still advances visible updates.
+                5 => {
+                    publish_subagent_checkpoint_to_slot(&slot, "verify task path", "Verified plan")
+                }
+                _ => {}
+            }
+            let mut snapshot = subagent_progress_state_snapshot(&slot).unwrap();
+            snapshot.checkpoint_due = change == 6;
+            status.progress = Some(snapshot.display_status_line());
+            status.progress_snapshot = Some(snapshot);
             let rendered = render_subagent_status_line_at_width(&[status.clone()], 120);
             line.publish_status_if_changed(&[status.clone()], &rendered, |_| published += 1);
         }
-        assert_eq!(published, 6);
+        assert_eq!(published, 7);
 
         status.description = "inspect another task".to_string();
         let rendered = render_subagent_status_line_at_width(&[status.clone()], 120);
         line.publish_status_if_changed(&[status.clone()], &rendered, |_| published += 1);
-        assert_eq!(published, 7);
+        assert_eq!(published, 8);
         line.finish();
         assert!(line.last_serve_key.is_none());
         line.publish_status_if_changed(&[status], &rendered, |_| published += 1);
-        assert_eq!(published, 8);
+        assert_eq!(published, 9);
     }
 
     #[test]
     fn subagent_status_line_shows_counts_elapsed_and_truncates_details() {
-        let statuses = vec![
+        let started_at = std::time::Instant::now();
+        let statuses = [
             SubagentTerminalStatus {
                 task_id: "task-review-stream".to_string(),
-                started_at: std::time::Instant::now(),
+                started_at,
                 description: "review stream".to_string(),
                 agent_name: "explorer".to_string(),
                 backend: None,
@@ -1295,11 +1008,15 @@ mod tests {
                 reasoning_effort: None,
                 state: "running".to_string(),
                 elapsed_secs: 38,
-                progress: Some("using read_file · src/bin/ai/driver.rs".to_string()),
+                progress: Some(format!(
+                    "using read_file · plan: {}",
+                    "inspect task path ".repeat(80)
+                )),
+                progress_snapshot: None,
             },
             SubagentTerminalStatus {
                 task_id: "task-review-driver".to_string(),
-                started_at: std::time::Instant::now(),
+                started_at: started_at + std::time::Duration::from_secs(1),
                 description: "review driver".to_string(),
                 agent_name: "explorer".to_string(),
                 backend: None,
@@ -1307,11 +1024,12 @@ mod tests {
                 reasoning_effort: None,
                 state: "waiting".to_string(),
                 elapsed_secs: 61,
-                progress: None,
+                progress: Some("waiting for task_wait PARKED".to_string()),
+                progress_snapshot: None,
             },
             SubagentTerminalStatus {
                 task_id: "task-compile-check".to_string(),
-                started_at: std::time::Instant::now(),
+                started_at: started_at + std::time::Duration::from_secs(2),
                 description: "compile check".to_string(),
                 agent_name: "executor".to_string(),
                 backend: None,
@@ -1320,10 +1038,11 @@ mod tests {
                 state: "completed".to_string(),
                 elapsed_secs: 3661,
                 progress: None,
+                progress_snapshot: None,
             },
             SubagentTerminalStatus {
                 task_id: "task-extra".to_string(),
-                started_at: std::time::Instant::now(),
+                started_at: started_at + std::time::Duration::from_secs(3),
                 description: "extra task".to_string(),
                 agent_name: "executor".to_string(),
                 backend: None,
@@ -1332,15 +1051,53 @@ mod tests {
                 state: "running".to_string(),
                 elapsed_secs: 5,
                 progress: None,
+                progress_snapshot: None,
+            },
+            SubagentTerminalStatus {
+                task_id: "task-last".to_string(),
+                started_at: started_at + std::time::Duration::from_secs(4),
+                description: "last task".to_string(),
+                agent_name: "executor".to_string(),
+                backend: None,
+                model: None,
+                reasoning_effort: None,
+                state: "running".to_string(),
+                elapsed_secs: 2,
+                progress: None,
+                progress_snapshot: None,
             },
         ];
 
-        assert_eq!(
-            render_subagent_status_line(&statuses),
-            "subagents · 3/4 active · review stream 38s running (explorer): using read_file · src/bin/ai/driver.rs · review driver 1m1s waiting (explorer) · compile check 1h1m completed (executor) · +1 more"
-        );
+        for width in [80, 120] {
+            let block = render_subagent_status_line_at_width(&statuses, width);
+            assert_eq!(block.lines().next(), Some("subagents · 4/5 active"));
+            assert_eq!(block.lines().count(), 7, "{block}");
+            for task in ["review stream", "review driver", "extra task", "last task"] {
+                assert!(block.contains(&format!("task: {task}")), "{block}");
+            }
+            assert!(block.contains("running 38s"), "{block}");
+            assert!(block.contains("waiting 1m1s"), "{block}");
+            assert!(
+                block.contains("progress: using read_file · plan:"),
+                "{block}"
+            );
+            assert!(
+                block.contains("progress: waiting for task_wait PARKED"),
+                "{block}"
+            );
+            assert!(block.contains('…'), "{block}");
+            assert!(block.lines().last().unwrap().starts_with("└─ "), "{block}");
+            assert!(!block.contains("compile check"), "{block}");
+            assert!(!block.contains(" more"), "{block}");
+            assert!(
+                block
+                    .lines()
+                    .all(|line| super::display_width(line) <= width)
+            );
+        }
         assert_eq!(format_subagent_elapsed(59), "59s");
         assert_eq!(format_subagent_elapsed(60), "1m0s");
+        assert_eq!(format_subagent_elapsed(3661), "1h1m");
     }
 
     #[test]
@@ -1355,11 +1112,12 @@ mod tests {
             reasoning_effort: None,
             state: "running".to_string(),
             elapsed_secs: 5,
+            progress_snapshot: None,
             progress: None,
         };
         assert_eq!(
-            render_subagent_status_line(&[kernel]),
-            "subagents · 1 active · inspect 5s running (explorer)"
+            render_subagent_status_line_at_width(&[kernel], 120),
+            "subagents · 1 active\n└─ explorer · running 5s · task: inspect"
         );
 
         let mut external = SubagentTerminalStatus {
@@ -1372,17 +1130,18 @@ mod tests {
             reasoning_effort: None,
             state: "running".to_string(),
             elapsed_secs: 5,
+            progress_snapshot: None,
             progress: Some("thinking".to_string()),
         };
-        // Full external details retain their exact format when the row can fit.
+        // Short task labels leave room for the optional backend metadata.
         assert_eq!(
             render_subagent_status_line_at_width(&[external.clone()], 120),
-            "subagents · 1 active · [backend=traecli] explorer (gpt-5.5) 5s running · thinking · inspect"
+            "subagents · 1 active\n└─ [backend=traecli] explorer (gpt-5.5) · running 5s · task: inspect\n   ↳ progress: thinking"
         );
         external.reasoning_effort = Some("xhigh".to_string());
         assert_eq!(
             render_subagent_status_line_at_width(&[external], 120),
-            "subagents · 1 active · [backend=traecli] explorer (gpt-5.5) (effort: xhigh) 5s running · thinking · inspect"
+            "subagents · 1 active\n└─ [backend=traecli] explorer (gpt-5.5) (effort: xhigh) · running 5s · task: inspect\n   ↳ progress: thinking"
         );
     }
 
@@ -1399,6 +1158,11 @@ mod tests {
             reasoning_effort: Some("xhigh".to_string()),
             state: "running".to_string(),
             elapsed_secs: 598,
+            progress_snapshot: Some(activity_snapshot(
+                "processing output",
+                "completed: rg -n \"backend\" src/bin/ai/driver/background_dispatch.rs",
+                60,
+            )),
             progress: Some(
                 "completed: rg -n \"backend\" src/bin/ai/driver/background_dispatch.rs · last activity 2s ago · processing output · updates 60 · plan: preserve compatibility · elapsed 9m58s"
                     .to_string(),
@@ -1408,21 +1172,17 @@ mod tests {
         let lines = block.lines().collect::<Vec<_>>();
 
         assert_eq!(lines.len(), 3, "{block}");
+        assert_eq!(lines[0], "subagents · 1 active", "{block}");
+        assert!(lines[1].starts_with("└─ [backend="), "{block}");
+        assert!(lines[1].contains("running 9m58s"), "{block}");
+        assert!(lines[1].contains("task: "), "{block}");
         assert!(
-            lines[0].starts_with("subagents · 1 active · [backend="),
-            "{block}"
-        );
-        assert!(lines[0].contains("running 9m58s"), "{block}");
-        assert!(lines[0].contains("(gpt-5.5)"), "{block}");
-        assert!(lines[0].contains("(effort: xhigh)"), "{block}");
-        assert!(lines[1].starts_with("↳ latest: completed:"), "{block}");
-        assert!(lines[1].ends_with(" · 2s ago"), "{block}");
-        assert!(
-            lines[2].starts_with("↳ phase: processing output"),
+            lines[2].starts_with("   ↳ phase: processing output"),
             "{block}"
         );
         assert!(lines[2].contains("updates 60"), "{block}");
-        assert!(lines[2].contains("task: "), "{block}");
+        assert!(lines[2].contains("latest: completed:"), "{block}");
+        assert!(lines[2].ends_with(" · 2s ago"), "{block}");
         assert!(block.contains('…'), "{block}");
         for line in lines {
             assert!(
@@ -1431,20 +1191,33 @@ mod tests {
             );
         }
 
-        let narrow = render_subagent_status_line_at_width(&[status.clone()], 72);
-        assert_eq!(narrow.lines().count(), 3, "{narrow}");
-        assert!(
-            narrow.lines().next().unwrap().contains("e=xhigh"),
-            "{narrow}"
-        );
-        assert!(
-            narrow.lines().next().unwrap().contains("(gpt-5.5)"),
-            "{narrow}"
-        );
-        for line in narrow.lines() {
+        for width in [72, 80] {
+            let narrow = render_subagent_status_line_at_width(&[status.clone()], width);
+            assert_eq!(narrow.lines().count(), 3, "{narrow}");
+            assert!(narrow.contains("running 9m58s"), "{narrow}");
+            assert!(narrow.contains("updates 60"), "{narrow}");
+            assert!(narrow.contains("latest: completed:"), "{narrow}");
             assert!(
-                unicode_width::UnicodeWidthStr::width(line) <= 72,
-                "line exceeds width: {line:?}"
+                narrow
+                    .lines()
+                    .all(|line| super::display_width(line) <= width)
+            );
+        }
+
+        // Text can be absent, reordered, or stale without changing structured activity.
+        for progress in [
+            None,
+            Some("elapsed 9m58s · invalid text · last activity 99s ago".to_string()),
+        ] {
+            let mut changed = status.clone();
+            changed.progress = progress;
+            assert_eq!(
+                render_subagent_status_line_at_width(&[changed.clone()], 120),
+                block
+            );
+            assert_eq!(
+                agent_team_subagent_status_semantic_key(&[changed]),
+                agent_team_subagent_status_semantic_key(&[status.clone()])
             );
         }
 
@@ -1455,18 +1228,18 @@ mod tests {
         long_fields.agent_name = "worker❤\u{fe0f}".repeat(24);
         long_fields.state = "running❤\u{fe0f}".repeat(24);
         long_fields.description = "任务❤\u{fe0f}".repeat(24);
-        long_fields.progress = Some(format!(
-            "{} · last activity {} ago · {} · updates {} · elapsed 9m58s",
-            "activity❤\u{fe0f}".repeat(24),
-            "age❤\u{fe0f}".repeat(24),
-            "phase❤\u{fe0f}".repeat(24),
+        long_fields.progress_snapshot = Some(activity_snapshot(
+            &"phase❤\u{fe0f}".repeat(24),
+            &"activity❤\u{fe0f}".repeat(24),
             u64::MAX,
         ));
         let mut no_activity = long_fields.clone();
         no_activity.progress = None;
+        no_activity.progress_snapshot = None;
         let mut kernel_activity = status.clone();
         kernel_activity.backend = None;
         kernel_activity.model = None;
+        kernel_activity.reasoning_effort = None;
         for sample in [status, long_fields, no_activity, kernel_activity] {
             for width in 0..=128 {
                 let block = render_subagent_status_line_at_width(&[sample.clone()], width);
@@ -1493,9 +1266,12 @@ mod tests {
             reasoning_effort: Some("max".to_string()),
             state: "running".to_string(),
             elapsed_secs: 8,
-            progress: Some(format!(
-                "completed: {label} command · exit 0 · last activity 2s ago · processing {label} · updates 7 · elapsed 8s"
+            progress_snapshot: Some(activity_snapshot(
+                &format!("processing {label}"),
+                &format!("completed: {label} command · exit 0"),
+                7,
             )),
+            progress: None,
         };
         let statuses = vec![
             status("task-m", "gamma", 2),
@@ -1546,6 +1322,14 @@ mod tests {
         let expected_order = ["task-z", "task-a", "task-m"].map(str::to_string);
         assert_eq!(ordered_ids(&statuses), expected_order);
         assert_eq!(ordered_ids(&reordered), expected_order);
+        let mut tied = reordered.clone();
+        for status in &mut tied {
+            status.started_at = spawned;
+        }
+        assert_eq!(
+            ordered_ids(&tied),
+            ["task-a", "task-m", "task-z"].map(str::to_string)
+        );
         let semantic_key = agent_team_subagent_status_semantic_key(&statuses);
         assert_eq!(
             semantic_key,
@@ -1557,10 +1341,10 @@ mod tests {
                 .iter_mut()
                 .find(|status| status.task_id == task_id)
                 .unwrap()
-                .progress
+                .progress_snapshot
                 .as_mut()
                 .unwrap();
-            *progress = progress.replace("updates 7", "updates 8");
+            progress.sequence = 8;
             assert_ne!(
                 semantic_key,
                 agent_team_subagent_status_semantic_key(&updated),
@@ -1577,7 +1361,7 @@ mod tests {
             ordered_ids(&changed),
             ["task-z", "task-m", "task-d"].map(str::to_string)
         );
-        let narrow = render_agent_team_subagent_status_block_at_width(&changed, 72);
+        let narrow = render_subagent_status_line_at_width(&changed, 72);
         assert_eq!(narrow.lines().count(), 7, "{narrow}");
         for line in narrow.lines() {
             assert!(
@@ -1588,27 +1372,46 @@ mod tests {
     }
 
     #[test]
-    fn kernel_status_without_activity_is_byte_identical_to_legacy_format() {
-        let status = SubagentTerminalStatus {
-            task_id: "task-kernel".to_string(),
-            started_at: std::time::Instant::now(),
-            description: "inspect scheduler".to_string(),
-            agent_name: "explorer".to_string(),
-            backend: None,
-            model: None,
-            reasoning_effort: None,
-            state: "running".to_string(),
-            elapsed_secs: 65,
-            progress: Some(
-                "calling model · plan: inspect task path · elapsed 1m5s · last activity 3s ago"
-                    .to_string(),
-            ),
-        };
-
-        assert_eq!(
-            render_subagent_status_line_at_width(&[status], 20),
-            "subagents · 1 active · inspect scheduler 1m5s running (explorer): calling model · plan: inspect task path · elapsed 1m5s · last activity 3s ago"
-        );
+    fn kernel_status_without_activity_keeps_phase_and_saved_plan() {
+        let slot = new_subagent_progress_slot();
+        publish_subagent_checkpoint_to_slot(&slot, "inspect task path", "Saved task plan");
+        for phase in [
+            "streaming response",
+            "using read_file",
+            "using exec_command",
+            "calling model",
+        ] {
+            publish_subagent_phase_to_slot(&slot, phase);
+            let mut snapshot = subagent_progress_state_snapshot(&slot).unwrap();
+            snapshot.elapsed = std::time::Duration::from_secs(65);
+            snapshot.stale_for = std::time::Duration::from_secs(3);
+            let status = SubagentTerminalStatus {
+                task_id: "task-kernel".to_string(),
+                started_at: std::time::Instant::now(),
+                description: "inspect scheduler".to_string(),
+                agent_name: "explorer".to_string(),
+                backend: None,
+                model: None,
+                reasoning_effort: None,
+                state: "running".to_string(),
+                elapsed_secs: 65,
+                progress: None,
+                progress_snapshot: Some(snapshot),
+            };
+            let block = render_subagent_status_line_at_width(&[status.clone()], 120);
+            assert_eq!(
+                block,
+                format!(
+                    "subagents · 1 active\n└─ explorer · running 1m5s · task: inspect scheduler\n   ↳ progress: {phase} · plan: inspect task path · last 3s ago"
+                )
+            );
+            assert!(!block.contains("latest:"), "{block}");
+            assert!(!block.contains("[backend="), "{block}");
+            let narrow = render_subagent_status_line_at_width(&[status], 80);
+            assert!(narrow.contains(&format!("progress: {phase}")), "{narrow}");
+            assert!(narrow.contains("plan: inspect task path"), "{narrow}");
+            assert!(narrow.lines().all(|line| super::display_width(line) <= 80));
+        }
     }
 
     /// Real production status output for an external PTY/emulator driver.
@@ -1654,6 +1457,11 @@ mod tests {
             reasoning_effort: Some("max".to_string()),
             state: "running".to_string(),
             elapsed_secs: 123,
+            progress_snapshot: Some(activity_snapshot(
+                "processing output",
+                "completed: git diff --check and verify the terminal rendering path",
+                91,
+            )),
             progress: Some("completed: git diff --check and verify the terminal rendering path · last activity 2s ago · processing output · updates 91 · elapsed 2m3s".to_string()),
         };
         let mut display = SubagentStatusLine::new();
@@ -1661,7 +1469,7 @@ mod tests {
         loop {
             sequence += 1;
             let cols = crate::ai::stream::raw_terminal_cols();
-            let block = render_agent_team_subagent_status_block_at_width(&[status.clone()], cols);
+            let block = render_subagent_status_line_at_width(&[status.clone()], cols);
             display.redraw_status_line(&block, false);
             let metadata = serde_json::json!({
                 "sequence": sequence,
@@ -1769,25 +1577,47 @@ mod tests {
 
     #[test]
     fn status_line_redraw_and_finish_skip_writes_while_composer_is_open() {
+        let status = SubagentTerminalStatus {
+            task_id: "task-parked".to_string(),
+            started_at: std::time::Instant::now(),
+            description: "wait for a task".to_string(),
+            agent_name: "explorer".to_string(),
+            backend: None,
+            model: None,
+            reasoning_effort: None,
+            state: "waiting".to_string(),
+            elapsed_secs: 5,
+            progress: Some("task_wait PARKED".to_string()),
+            progress_snapshot: None,
+        };
+        let cols = crate::ai::stream::raw_terminal_cols();
+        let block = render_subagent_status_line_at_width(&[status.clone()], cols);
+        let expected = clamp_status_block(&block);
         let mut line = SubagentStatusLine::new();
         line.is_tty = true; // Simulate a live TTY; cargo test captures stdout.
 
         // Refresh ticks while the composer is open: no record, no write.
-        line.redraw_status_line("subagents · 1 active", true);
+        line.redraw_status_line(&block, true);
         assert_eq!(line.last_line, None);
-        line.redraw_status_line("subagents · 2 active", true);
+        let two_tasks = render_subagent_status_line_at_width(&[status.clone(), status], cols);
+        line.redraw_status_line(&two_tasks, true);
         assert_eq!(line.last_line, None);
 
-        // A normal tick records the drawn line.
-        line.redraw_status_line("subagents · 1 active", false);
-        assert_eq!(line.last_line.as_deref(), Some("subagents · 1 active"));
+        line.redraw_status_line(&block, false);
+        assert_eq!(line.last_line.as_deref(), Some(expected.as_str()));
+        assert_eq!(line.last_columns, Some(cols));
 
-        // finish while the composer is open defers finalizing the line...
+        // A changed width invalidates dedup even when the visible text is unchanged.
+        line.last_columns = Some(cols + 1);
+        line.redraw_status_line(&block, false);
+        assert_eq!(line.last_columns, Some(cols));
+
+        // Foreground resumption defers finishing until the composer closes.
         line.finish_status_line(true);
-        assert_eq!(line.last_line.as_deref(), Some("subagents · 1 active"));
-        // ...and finalizes it once the composer closes.
+        assert_eq!(line.last_line.as_deref(), Some(expected.as_str()));
         line.finish_status_line(false);
         assert_eq!(line.last_line, None);
+        assert_eq!(line.last_columns, None);
     }
 
     #[test]
@@ -2481,6 +2311,7 @@ pub(super) fn dispatch_background_batch(
                 &captured_output,
                 os.get_process(pid).map(|proc| &proc.state),
             );
+            let mut result_delivery_failed = false;
             if publish_task_result && let Some(result_channel_id) = result_channel_id {
                 let backend_session = match task_id.as_deref() {
                     Some(task_id) => task_tools::backend_session::record_session(
@@ -2518,23 +2349,22 @@ pub(super) fn dispatch_background_batch(
                     "backend_session": backend_session,
                 })
                 .to_string();
-                let _ = os.channel_send(
-                    Some(pid),
-                    aios_kernel::primitives::ChannelId(result_channel_id),
-                    payload,
-                );
-                let _ = os.channel_close(
-                    Some(pid),
-                    aios_kernel::primitives::ChannelId(result_channel_id),
-                );
-                let _ = os.channel_release_named(
-                    aios_kernel::primitives::ChannelId(result_channel_id),
-                    "task_result.producer",
-                );
+                if let Err(error) = task_tools::publish_task_result(
+                    os.as_mut(), task_id.as_deref(), pid, result_channel_id, payload,
+                ) {
+                    result_delivery_failed = true;
+                    runtime_ctx::publish_subagent_phase("result delivery failed; recovery retained");
+                    eprintln!("[Task result delivery] {error}");
+                }
             }
             if publish_task_result && let Some(addr) = completion_futex_addr {
                 let _ = os.futex_store(addr, 1);
                 super::notify_scheduler();
+            }
+            if result_delivery_failed && let Some(process) = os.get_process_mut(pid) {
+                // The outer history guard retains this path. Kernel teardown must not delete
+                // the remaining recovery source before that guard can preserve it.
+                process.history_file = None;
             }
             let preserve_history = match result {
                 Ok(_outcome) => {
@@ -2561,7 +2391,9 @@ pub(super) fn dispatch_background_batch(
                 }
             };
             drop(os);
-            preserve_scoped_artifacts_for_inner.store(preserve_history, Ordering::Release);
+            preserve_scoped_artifacts_for_inner.store(
+                preserve_history || result_delivery_failed, Ordering::Release,
+            );
         });
 
         type BoxedTaskFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;

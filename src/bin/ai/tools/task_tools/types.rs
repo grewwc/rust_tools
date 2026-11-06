@@ -264,9 +264,12 @@ pub(crate) struct SubagentHandoff {
 #[derive(Clone)]
 pub(crate) struct AsyncTaskEntry {
     pub(crate) session_id: String,
+    /// Stable parent ledger location, retained when the foreground context disappears.
+    pub(crate) evidence_history_file: Option<PathBuf>,
     /// pid of the parent process that directly owns this task. task_wait/status/cancel only allow
     /// the owner process to observe its own spawned subtasks, preventing parent/sibling tasks
-    /// within the same session from interfering with each other.
+    /// within the same session from interfering with each other. A replacement foreground
+    /// may adopt this task only after the old owner exits, together with its kernel resources.
     pub(crate) owner_pid: u64,
     /// Matches the kernel `Process.pid`; the agent side additionally stores it so the pid can be
     /// looked up from a task_id.

@@ -196,6 +196,7 @@ fn final_response_under_no_tool_wrap_up_finishes_despite_outstanding_task() {
     crate::ai::tools::task_tools::insert_task_entry_for_test(
         task_id.clone(),
         crate::ai::tools::task_tools::AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: app.session_id.clone(),
             last_progress_notification_at: None,
             last_progress_persisted_at: None,
@@ -326,6 +327,7 @@ fn final_response_with_outstanding_task_reopens_when_tools_available() {
     crate::ai::tools::task_tools::insert_task_entry_for_test(
         task_id.clone(),
         crate::ai::tools::task_tools::AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: app.session_id.clone(),
             last_progress_notification_at: None,
             last_progress_persisted_at: None,
@@ -451,6 +453,7 @@ fn final_response_at_iteration_ceiling_finishes_despite_outstanding_task() {
     crate::ai::tools::task_tools::insert_task_entry_for_test(
         task_id.clone(),
         crate::ai::tools::task_tools::AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: app.session_id.clone(),
             last_progress_notification_at: None,
             last_progress_persisted_at: None,

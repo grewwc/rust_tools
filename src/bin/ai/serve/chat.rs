@@ -2821,10 +2821,9 @@ fn render_turn_stream_to_with_width(
     let mut thinking_region = ThinkingLiveRegion::new(configured_thinking_lines, None);
     let mut answer_pending = false;
     let mut answer_pending_drawn = false;
-    // How many terminal rows the subagent progress block currently occupies.
-    // Like the thinking/answer-pending lines it is transient live output,
-    // never scrollback: each frame redraws the block in place.
-    let mut subagent_status_rows = 0usize;
+    // Retain the plain rows so a resize can recompute the block's physical
+    // height before erasure. Each frame replaces this transient live output.
+    let mut subagent_status_rows = Vec::new();
     // Whether the cursor sits mid-line (answer delta without a trailing
     // newline, or a live thinking status). Footer/message lines must start
     // on a fresh row instead of gluing onto the answer's last line.
@@ -3251,8 +3250,8 @@ fn render_turn_stream_to_with_width(
                 // (several subagents, plans, elapsed counters). Painting each
                 // frame as an observer row leaves one wrapped copy per
                 // scheduler tick in the scrollback, so render it as a single
-                // in-place live row instead, exactly like the local TTY
-                // status line.
+                // in-place live block instead, exactly like the local TTY
+                // status block.
                 show_subagent_status(
                     payload,
                     &mut subagent_status_rows,
@@ -3836,47 +3835,34 @@ fn hide_answer_pending_status(
 
 /// Paint the parent-observed subagent status block as transient terminal rows.
 ///
-/// The payload is the whole scheduler status line: a header, the latest
-/// activity, and the phase/updates/task row. The server sends all three lines
-/// in one SSE event; treating each `data:` line as a separate event used to
-/// leave only the last one visible. Clamp every line to one physical row and
-/// redraw the block in place, matching the local TTY status line. Piped output
-/// stays clean: the progress block is terminal-only and is never part of the
-/// captured transcript.
+/// The server sends the complete team tree in one SSE event. Clamp every line
+/// to one physical row and redraw the block in place, matching the local TTY
+/// status block. If the tree exceeds the viewport, keep its prefix and mark
+/// the omitted bottom rows. Piped output stays clean: the progress block is
+/// terminal-only and is never part of the captured transcript.
 ///
 /// The block must not overwrite real output or another live status:
 /// - `thinking_active` / `answer_pending_drawn` own the active row;
 /// - `line_open` without our own rows means a body delta is mid-line.
 fn show_subagent_status(
     text: &str,
-    drawn_rows: &mut usize,
+    drawn_rows: &mut Vec<String>,
     answer_pending_drawn: bool,
     thinking_active: bool,
     line_open: &mut bool,
     tty: bool,
     out: &mut dyn std::io::Write,
 ) {
-    if !tty || thinking_active || answer_pending_drawn || (*line_open && *drawn_rows == 0) {
+    if !tty || thinking_active || answer_pending_drawn || (*line_open && drawn_rows.is_empty()) {
         return;
     }
-    let rows: Vec<String> = text
-        .lines()
-        .take(3)
-        .enumerate()
-        .map(|(index, line)| {
-            let line = if index == 0 {
-                format!("◌ {line}")
-            } else {
-                line.to_string()
-            };
-            crate::ai::stream::clamp_line_to_terminal_row_with_reserve(&line, 0)
-        })
-        .collect();
+    let (cols, viewport_rows) = subagent_terminal_size();
+    let rows = subagent_status_rows_at_height(text, viewport_rows);
     if rows.is_empty() {
         hide_subagent_status(drawn_rows, line_open, tty, out);
         return;
     }
-    erase_status_rows(*drawn_rows, out);
+    erase_subagent_status_rows_at_size(drawn_rows, cols, viewport_rows, out);
     for (index, row) in rows.iter().enumerate() {
         if index > 0 {
             let _ = write!(out, "\r\n");
@@ -3884,26 +3870,83 @@ fn show_subagent_status(
         let _ = write!(out, "{}", dim(row, true));
     }
     let _ = out.flush();
-    *drawn_rows = rows.len();
+    *drawn_rows = rows;
     *line_open = true;
+}
+
+fn subagent_terminal_size() -> (usize, usize) {
+    let rows = crossterm::terminal::size()
+        .map(|(_, rows)| usize::from(rows).max(1))
+        .unwrap_or(24);
+    (crate::ai::stream::raw_terminal_cols(), rows)
+}
+
+fn subagent_status_rows_at_height(text: &str, viewport_rows: usize) -> Vec<String> {
+    // Keep one row outside the status region so cursor-up can still reach
+    // its beginning after drawing a tall tree at the bottom of the screen.
+    let budget = viewport_rows.saturating_sub(1).max(1);
+    let total_rows = text.lines().count();
+    let kept_rows = if total_rows > budget {
+        budget - 1
+    } else {
+        total_rows
+    };
+    let mut rows: Vec<String> = text
+        .lines()
+        .take(kept_rows)
+        .enumerate()
+        .map(|(index, line)| {
+            let line = if index == 0 {
+                format!("◌ {line}")
+            } else {
+                line.to_string()
+            };
+            crate::ai::stream::clamp_line_to_terminal_row_with_reserve(&line, 1)
+        })
+        .collect();
+    if kept_rows < total_rows {
+        let marker = format!("… {} more rows below", total_rows - kept_rows);
+        rows.push(crate::ai::stream::clamp_line_to_terminal_row_with_reserve(
+            &marker, 1,
+        ));
+    }
+    rows
+}
+
+fn erase_subagent_status_rows_at_size(
+    drawn_rows: &mut Vec<String>,
+    cols: usize,
+    viewport_rows: usize,
+    out: &mut dyn std::io::Write,
+) {
+    // Narrowing can wrap previously clamped rows. A height reduction can
+    // move their prefix out of the viewport; erase only the visible suffix.
+    let physical_rows = drawn_rows
+        .iter()
+        .map(|row| thinking_physical_rows(row, cols))
+        .sum::<usize>()
+        .min(viewport_rows.max(1));
+    erase_status_rows(physical_rows, out);
+    drawn_rows.clear();
 }
 
 /// Clear the in-place subagent status block before other output claims the
 /// active line. No-op when the block was never painted.
 fn hide_subagent_status(
-    drawn_rows: &mut usize,
+    drawn_rows: &mut Vec<String>,
     line_open: &mut bool,
     tty: bool,
     out: &mut dyn std::io::Write,
 ) {
-    if *drawn_rows == 0 {
+    if drawn_rows.is_empty() {
         return;
     }
     if tty {
-        erase_status_rows(*drawn_rows, out);
+        let (cols, viewport_rows) = subagent_terminal_size();
+        erase_subagent_status_rows_at_size(drawn_rows, cols, viewport_rows, out);
         let _ = out.flush();
     }
-    *drawn_rows = 0;
+    drawn_rows.clear();
     *line_open = false;
 }
 
@@ -5804,7 +5847,7 @@ mod tests {
         // counters change, so appending frames as footer rows stacks one
         // wrapped copy per tick in the scrollback. The client must redraw a
         // single live row instead, and piped captures must stay clean.
-        let body = "event: subagent_progress\ndata: subagents · 1 active · worker 5s running (sharp)\n\nevent: subagent_progress\ndata: subagents · 1 active · worker 6s running (sharp)\n\nevent: delta\ndata: {\"delta\": \"answer\"}\n\nevent: done\ndata: \n\n";
+        let body = "event: subagent_progress\ndata: subagents · 1 active\n\nevent: subagent_progress\ndata: subagents · 1 active\n\nevent: delta\ndata: {\"delta\": \"answer\"}\n\nevent: done\ndata: \n\n";
 
         let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
         let mut piped = Vec::new();
@@ -5825,7 +5868,7 @@ mod tests {
             "each frame redraws the live row: {tty:?}"
         );
         assert!(
-            !tty.contains("(sharp)\n"),
+            !tty.contains("subagents · 1 active\x1b[0m\n"),
             "status must never become a scrollback row: {tty:?}"
         );
         assert!(tty.contains("answer"), "missing body: {tty:?}");
@@ -5834,9 +5877,9 @@ mod tests {
     #[test]
     fn sse_multiline_subagent_progress_keeps_the_whole_block() {
         // axum splits embedded newlines into one `data:` line per status row.
-        // The client must join them back into one event and paint all three
-        // rows in place; dispatching each line separately left only the last.
-        let body = "event: subagent_progress\ndata: subagents · 1 active · [backend=traecli] worker 5s running\ndata: ↳ latest: editing file · 2s ago\ndata: ↳ phase: processing output · updates 115 · task: audit\n\nevent: subagent_progress\ndata: subagents · 1 active · [backend=traecli] worker 6s running\ndata: ↳ latest: editing file · 3s ago\ndata: ↳ phase: processing output · updates 116 · task: audit\n\nevent: done\ndata: \n\n";
+        // A one-task team has three rows; they must be joined into one event
+        // and painted together, preserving the identity and detail prefixes.
+        let body = "event: subagent_progress\ndata: subagents · 1 active\ndata: └─ [backend=traecli] worker · running 5s · task: audit\ndata:    ↳ progress: editing file\n\nevent: subagent_progress\ndata: subagents · 1 active\ndata: └─ [backend=traecli] worker · running 6s · task: audit\ndata:    ↳ progress: reviewing output\n\nevent: done\ndata: \n\n";
 
         let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
         let mut piped = Vec::new();
@@ -5852,23 +5895,199 @@ mod tests {
         render_turn_stream_to(resp, &mut tty, true).expect("render tty");
         let tty = String::from_utf8(tty).expect("utf8");
         assert_eq!(
-            tty.matches("\x1b[2m◌ subagents · 1 active · [backend=traecli]")
-                .count(),
+            tty.matches("\x1b[2m◌ subagents · 1 active").count(),
             2,
             "each complete event paints one header row: {tty:?}"
         );
         assert!(
             tty.contains(
-                "\r\n\x1b[2m↳ latest: editing file · 2s ago\x1b[0m\r\n\x1b[2m↳ phase: processing output · updates 115 · task: audit\x1b[0m"
+                "\r\n\x1b[2m└─ [backend=traecli] worker · running 5s · task: audit\x1b[0m\r\n\x1b[2m   ↳ progress: editing file\x1b[0m"
             ),
             "all status rows must be painted: {tty:?}"
         );
         assert!(
-            tty.contains(
-                "\x1b[1A\r\x1b[K\x1b[1A\r\x1b[K\x1b[2m◌ subagents · 1 active · [backend=traecli] worker 6s running"
-            ),
+            tty.contains("\x1b[1A\r\x1b[K\x1b[1A\r\x1b[K\x1b[2m◌ subagents · 1 active"),
             "the previous three-row block must be erased before the next frame: {tty:?}"
         );
+    }
+
+    const SUBAGENT_TEAM_BLOCK: &str = concat!(
+        "subagents · 3 active\n",
+        "├─ [backend=traecli] alpha · running 5s · task: audit\n",
+        "│  ↳ progress: reading files\n",
+        "├─ [backend=traecli] beta · running 4s · task: implement\n",
+        "│  ↳ progress: editing file\n",
+        "└─ [backend=traecli] gamma · running 3s · task: validate\n",
+        "   ↳ progress: checking tests",
+    );
+
+    #[test]
+    fn sse_multiline_subagent_progress_draws_all_team_nodes_and_erases_old_rows() {
+        let body: &'static str = Box::leak(
+            format!(
+                "event: subagent_progress\ndata: {}\n\nevent: subagent_progress\ndata: subagents · 1 active\ndata: └─ alpha · running 6s · task: audit\ndata:    ↳ progress: reviewing output\n\nevent: done\ndata: \n\n",
+                SUBAGENT_TEAM_BLOCK.replace('\n', "\ndata: ")
+            )
+            .into_boxed_str(),
+        );
+        let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+        let mut piped = Vec::new();
+        render_turn_stream_to(resp, &mut piped, false).expect("render piped");
+        assert!(piped.is_empty(), "live progress must stay out of captures");
+
+        let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+        let mut tty = Vec::new();
+        render_turn_stream_to(resp, &mut tty, true).expect("render tty");
+        let tty = String::from_utf8(tty).expect("utf8");
+        let first_frame = tty.split("\x1b[2m◌ subagents · 1 active").next().unwrap();
+        assert_eq!(first_frame.matches("\r\n").count(), 6, "{tty:?}");
+        let mut previous_end = 0;
+        for row in SUBAGENT_TEAM_BLOCK.lines().skip(1) {
+            let painted = dim(row, true);
+            let start = first_frame.find(&painted).expect("missing team row");
+            assert!(start >= previous_end, "team rows must keep their order");
+            previous_end = start + painted.len();
+        }
+        let erase_seven = format!("\r\x1b[K{}", "\x1b[1A\r\x1b[K".repeat(6));
+        assert!(
+            tty.contains(&format!("{erase_seven}\x1b[2m◌ subagents · 1 active")),
+            "all seven old rows must be erased before the smaller frame: {tty:?}"
+        );
+        let erase_three = format!("\r\x1b[K{}", "\x1b[1A\r\x1b[K".repeat(2));
+        assert!(
+            tty.ends_with(&erase_three),
+            "done must clear the final block: {tty:?}"
+        );
+    }
+
+    #[test]
+    fn subagent_status_height_limit_marks_only_the_omitted_bottom_rows() {
+        let full = subagent_status_rows_at_height(SUBAGENT_TEAM_BLOCK, 8);
+        assert_eq!(full.len(), 7);
+        for (height, kept) in [(6usize, 4usize), (3, 1), (2, 0), (1, 0)] {
+            let rows = subagent_status_rows_at_height(SUBAGENT_TEAM_BLOCK, height);
+            assert_eq!(&rows[..kept], &full[..kept], "height={height}");
+            assert_eq!(rows.len(), kept + 1, "height={height}");
+            assert_eq!(rows[kept], format!("… {} more rows below", 7 - kept));
+            assert!(rows.len() <= height.saturating_sub(1).max(1));
+        }
+        assert!(subagent_status_rows_at_height("", 1).is_empty());
+    }
+
+    #[test]
+    fn subagent_status_rows_bound_unicode_to_one_terminal_row() {
+        let cols = crate::ai::stream::raw_terminal_cols();
+        let long = "界⚠️😀é".repeat(cols + 1);
+        let block = format!(
+            "subagents · 3 active\n├─ {long}\n│  ↳ {long}\n├─ {long}\n│  ↳ {long}\n└─ {long}\n   ↳ {long}"
+        );
+        let rows = subagent_status_rows_at_height(&block, 8);
+        assert_eq!(rows.len(), 7);
+        assert!(rows.iter().all(|row| {
+            row.chars().map(thinking_cell_width).sum::<usize>() <= cols.saturating_sub(1).max(1)
+        }));
+        assert!(rows[1..].iter().all(|row| row.ends_with('…')));
+    }
+
+    #[test]
+    fn subagent_status_erases_reflowed_rows_within_the_resized_viewport() {
+        // At width 20 these seven rows fit. At width 10 the eleven ASCII
+        // cells, six CJK glyphs, and six emoji each occupy two rows: ten total.
+        let previous = [
+            "12345678901",
+            "界界界界界界",
+            "⚠️⚠️⚠️⚠️⚠️⚠️",
+            "b",
+            "c",
+            "d",
+            "e",
+        ];
+        for (cols, height, expected) in [(20, 24, 7), (10, 24, 10), (10, 4, 4)] {
+            let mut drawn = previous.iter().map(|row| row.to_string()).collect();
+            let mut out = Vec::new();
+            erase_subagent_status_rows_at_size(&mut drawn, cols, height, &mut out);
+            let out = String::from_utf8(out).expect("utf8");
+            assert_eq!(out.matches("\x1b[K").count(), expected, "{out:?}");
+            assert_eq!(out.matches("\x1b[1A").count(), expected - 1, "{out:?}");
+            assert!(drawn.is_empty());
+        }
+    }
+
+    #[test]
+    fn subagent_status_gates_and_empty_updates_preserve_line_ownership() {
+        for (tty, thinking, pending, open) in [
+            (false, false, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, false, false, true),
+        ] {
+            let mut drawn = Vec::new();
+            let mut line_open = open;
+            let mut out = Vec::new();
+            show_subagent_status(
+                SUBAGENT_TEAM_BLOCK,
+                &mut drawn,
+                pending,
+                thinking,
+                &mut line_open,
+                tty,
+                &mut out,
+            );
+            assert!(out.is_empty());
+            assert!(drawn.is_empty());
+            assert_eq!(line_open, open);
+        }
+
+        let mut drawn = Vec::new();
+        let mut line_open = false;
+        let mut out = Vec::new();
+        show_subagent_status(
+            SUBAGENT_TEAM_BLOCK,
+            &mut drawn,
+            false,
+            false,
+            &mut line_open,
+            true,
+            &mut out,
+        );
+        assert_eq!(drawn.len(), 7);
+        assert!(line_open);
+        let start = out.len();
+        show_subagent_status(
+            "blocked",
+            &mut drawn,
+            true,
+            false,
+            &mut line_open,
+            true,
+            &mut out,
+        );
+        assert_eq!(out.len(), start);
+        assert_eq!(drawn.len(), 7);
+        assert!(line_open);
+
+        // Our own open line permits replacement, and shrinking must erase
+        // every old row before storing the new frame's row count.
+        show_subagent_status(
+            "subagents · 1 active",
+            &mut drawn,
+            false,
+            false,
+            &mut line_open,
+            true,
+            &mut out,
+        );
+        let replacement = std::str::from_utf8(&out[start..]).expect("utf8");
+        assert_eq!(replacement.matches("\x1b[K").count(), 7);
+        assert_eq!(replacement.matches("\x1b[1A").count(), 6);
+        assert_eq!(drawn.len(), 1);
+        assert!(line_open);
+
+        let start = out.len();
+        show_subagent_status("", &mut drawn, false, false, &mut line_open, true, &mut out);
+        assert_eq!(&out[start..], b"\r\x1b[K");
+        assert!(drawn.is_empty());
+        assert!(!line_open);
     }
 
     #[test]

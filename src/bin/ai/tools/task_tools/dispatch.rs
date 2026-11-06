@@ -27,6 +27,7 @@ pub(super) fn execute_task_retry(args: &Value) -> Result<String, String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "task_retry requires non-empty 'task_id'".to_string())?;
+    let current_owner_pid = current_task_owner_pid()?;
     let record = lock_unpoisoned(&TASK_RETRY_REGISTRY)
         .get_ref(&task_id.to_string())
         .cloned()
@@ -37,7 +38,6 @@ pub(super) fn execute_task_retry(args: &Value) -> Result<String, String> {
         ));
     }
 
-    let current_owner_pid = current_task_owner_pid()?;
     if record.owner_pid != current_owner_pid {
         return Err(format!(
             "task_retry: task_id '{task_id}' belongs to a different parent process"
@@ -55,6 +55,11 @@ pub(super) fn execute_task_retry(args: &Value) -> Result<String, String> {
                 "task_retry: task_id '{task_id}' has no collected terminal failure yet; collect it with task_wait or task_status first"
             ));
         }
+    }
+    if backend_session::task_backend_run_is_active(record.prepared.backend, task_id) {
+        return Err(format!(
+            "task_retry: task_id '{task_id}' has been collected but its backend run is still stopping; wait for it to end before retrying"
+        ));
     }
     let spawned = spawn_subagent_kernel_task_attempt(&record.prepared, Some(&record.retry_root))?;
     Ok(format!(

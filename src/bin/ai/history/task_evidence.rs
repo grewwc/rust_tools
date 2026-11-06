@@ -244,6 +244,93 @@ pub(in crate::ai) fn record_delivered_task_evidence(
     })
 }
 
+/// Commit a full terminal result before IPC publication, retaining delivered_at=0 until
+/// collection. A nonempty payload distinguishes it from a spawn placeholder. The first
+/// terminal publication wins, so cancellation cannot overwrite a completed result.
+pub(in crate::ai) fn record_published_task_evidence(
+    history_file: &Path,
+    session_id: &str,
+    evidence: DeliveredTaskEvidence<'_>,
+) -> io::Result<bool> {
+    with_store_lock(history_file, session_id, || {
+        let connection = open_store(history_file, session_id)?;
+        let updated = connection
+            .execute(
+                "INSERT INTO task_evidence (
+                task_id, description, agent_name, model, status, payload, summary,
+                delivered_at_unix_ms, integrated_at_unix_ms, disposition, integration_summary
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, NULL, NULL)
+             ON CONFLICT(task_id) DO UPDATE SET
+                description = excluded.description, agent_name = excluded.agent_name,
+                model = excluded.model, status = excluded.status,
+                payload = excluded.payload, summary = excluded.summary
+             WHERE task_evidence.delivered_at_unix_ms = 0 AND task_evidence.payload = ''",
+                params![
+                    evidence.task_id,
+                    evidence.description,
+                    evidence.agent_name,
+                    evidence.model,
+                    evidence.status,
+                    evidence.payload,
+                    task_result_summary(evidence.payload)
+                ],
+            )
+            .map_err(|error| sqlite_error("record published task evidence", error))?;
+        Ok(updated > 0)
+    })
+}
+
+pub(in crate::ai) fn record_task_publication_warning(
+    history_file: &Path,
+    session_id: &str,
+    task_id: &str,
+    warning: &str,
+) -> io::Result<()> {
+    with_store_lock(history_file, session_id, || {
+        let connection = open_store(history_file, session_id)?;
+        connection
+            .execute(
+                "UPDATE task_evidence SET payload = payload || char(10) || ?2
+             WHERE task_id = ?1 AND delivered_at_unix_ms = 0 AND payload <> ''",
+                params![task_id, warning],
+            )
+            .map_err(|error| sqlite_error("record task publication warning", error))?;
+        Ok(())
+    })
+}
+
+/// Read a complete result for a validated collector, including delivery interrupted before
+/// IPC cleanup. Empty, undelivered spawn placeholders are never collectable results.
+pub(in crate::ai) fn read_available_task_evidence_status_payload(
+    history_file: &Path,
+    session_id: &str,
+    task_id: &str,
+) -> io::Result<Option<(String, String, bool)>> {
+    let Some(connection) = open_read_store(history_file, session_id)? else {
+        return Ok(None);
+    };
+    connection
+        .query_row(
+            "SELECT status, payload, delivered_at_unix_ms > 0 FROM task_evidence
+         WHERE task_id = ?1 AND (delivered_at_unix_ms > 0 OR payload <> '')",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| sqlite_error("read available task evidence", error))
+}
+
+#[cfg(test)]
+pub(in crate::ai) fn read_published_task_evidence_status_payload(
+    history_file: &Path,
+    session_id: &str,
+    task_id: &str,
+) -> io::Result<Option<(String, String)>> {
+    read_available_task_evidence_status_payload(history_file, session_id, task_id).map(|record| {
+        record.and_then(|(status, payload, delivered)| (!delivered).then_some((status, payload)))
+    })
+}
+
 /// Records a durable audit placeholder for a subagent invocation (spawn).
 ///
 /// Shares the `task_evidence` table with `record_delivered_task_evidence`: spawn writes
@@ -292,7 +379,7 @@ pub(in crate::ai) fn record_uncollected_task_terminal_status(
         let updated = connection
             .execute(
                 "UPDATE task_evidence SET status = ?2
-                 WHERE task_id = ?1 AND delivered_at_unix_ms = 0",
+                 WHERE task_id = ?1 AND delivered_at_unix_ms = 0 AND payload = ''",
                 params![task_id, status],
             )
             .map_err(|error| sqlite_error("record uncollected task terminal status", error))?;
@@ -507,7 +594,7 @@ pub(in crate::ai) fn task_evidence_exists(
         let connection = open_store(history_file, session_id)?;
         connection
             .query_row(
-                "SELECT 1 FROM task_evidence WHERE task_id = ?1",
+                "SELECT 1 FROM task_evidence WHERE task_id = ?1 AND delivered_at_unix_ms > 0",
                 [task_id],
                 |_| Ok(()),
             )
@@ -1488,6 +1575,10 @@ mod tests {
         )
         .unwrap();
         assert!(
+            !task_evidence_exists(&history_file, session_id, "task-a").unwrap(),
+            "an undelivered spawn must not be classified as delivered"
+        );
+        assert!(
             read_unintegrated_task_evidence(&history_file, session_id)
                 .unwrap()
                 .is_empty(),
@@ -1519,6 +1610,7 @@ mod tests {
         assert_eq!(audit[0].status, "completed");
         assert!(audit[0].delivered_at_unix_ms > 0);
         assert_eq!(audit[0].summary, "edge case is fine");
+        assert!(task_evidence_exists(&history_file, session_id, "task-a").unwrap());
 
         // Integration retains the ledger entry and marker but removes it from the unintegrated projection.
         assert!(
@@ -1534,6 +1626,100 @@ mod tests {
                 .is_empty()
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn published_task_evidence_survives_until_collection_without_delivery() {
+        let root = std::env::temp_dir().join(format!(
+            "published-task-evidence-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let history_file = root.join("history.sqlite");
+        let session_id = "published-evidence";
+        let evidence = DeliveredTaskEvidence {
+            task_id: "task-a",
+            description: "check recovery",
+            agent_name: "build",
+            model: "fixture-model",
+            status: "completed",
+            payload: "full terminal result",
+        };
+        assert!(record_published_task_evidence(&history_file, session_id, evidence).unwrap());
+        assert!(!task_evidence_exists(&history_file, session_id, "task-a").unwrap());
+        assert!(
+            read_task_evidence_status_payload(&history_file, session_id, "task-a")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !integrate_task_evidence(&history_file, session_id, "task-a", "accepted", "used")
+                .unwrap()
+        );
+        assert!(
+            !record_published_task_evidence(
+                &history_file,
+                session_id,
+                DeliveredTaskEvidence {
+                    task_id: "task-a",
+                    description: "check recovery",
+                    agent_name: "build",
+                    model: "fixture-model",
+                    status: "cancelled",
+                    payload: "late cancellation",
+                }
+            )
+            .unwrap()
+        );
+        record_uncollected_task_terminal_status(&history_file, session_id, "task-a", "cancelled")
+            .unwrap();
+        assert_eq!(
+            read_published_task_evidence_status_payload(&history_file, session_id, "task-a")
+                .unwrap(),
+            Some(("completed".to_string(), "full terminal result".to_string()))
+        );
+        record_task_publication_warning(
+            &history_file,
+            session_id,
+            "task-a",
+            "IPC delivery failed; recovery saved",
+        )
+        .unwrap();
+        let (status, payload) =
+            read_published_task_evidence_status_payload(&history_file, session_id, "task-a")
+                .unwrap()
+                .unwrap();
+        assert_eq!(status, "completed");
+        assert!(payload.contains("full terminal result"));
+        assert!(payload.contains("IPC delivery failed"));
+        assert!(
+            read_published_task_evidence_status_payload(&history_file, "another-session", "task-a")
+                .unwrap()
+                .is_none()
+        );
+        record_delivered_task_evidence(
+            &history_file,
+            session_id,
+            DeliveredTaskEvidence {
+                task_id: "task-a",
+                description: "check recovery",
+                agent_name: "build",
+                model: "fixture-model",
+                status: &status,
+                payload: &payload,
+            },
+        )
+        .unwrap();
+        assert!(task_evidence_exists(&history_file, session_id, "task-a").unwrap());
+        assert!(
+            read_published_task_evidence_status_payload(&history_file, session_id, "task-a")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            integrate_task_evidence(&history_file, session_id, "task-a", "accepted", "used")
+                .unwrap()
+        );
         let _ = fs::remove_dir_all(root);
     }
 

@@ -60,6 +60,8 @@ mod mcp_lifecycle;
 pub mod model;
 pub mod note_search;
 pub mod observer;
+#[cfg(test)]
+mod orphaned_task_tests;
 pub mod print;
 mod process_context;
 pub mod reflection;
@@ -1710,10 +1712,9 @@ async fn run_loop(
             }
             Err(err) => {
                 let mut os = app.os.lock().unwrap();
-                let current_pid = os.current_process_id();
-                if let Some(pid) = current_pid {
+                if let Some(pid) = fg_pid {
                     record_scheduler_outcome(os.as_mut(), pid, DispatchOutcomeTag::Failed);
-                    terminate_and_cleanup(os.as_mut(), pid, format!("Failed: {}", err), false);
+                    terminate_and_cleanup(os.as_mut(), pid, format!("Failed: {}", err), true);
                 } else {
                     os.terminate_current(format!("Failed: {}", err));
                 }

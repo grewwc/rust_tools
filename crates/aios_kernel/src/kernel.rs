@@ -321,6 +321,16 @@ pub trait KernelInternal {
     fn terminate_current(&mut self, result: String);
     /// Get a mutable reference to the process with the given PID.
     fn get_process_mut(&mut self, pid: u64) -> Option<&mut Process>;
+    /// Reparent a task and transfer its listed channels from an exited owner to the current
+    /// live foreground. All resources are validated before mutation; an absent task process
+    /// is allowed because its completed result can outlive it. The caller owns session scoping.
+    fn adopt_process_resources(
+        &mut self,
+        target_pid: u64,
+        previous_owner_pid: u64,
+        new_owner_pid: u64,
+        channels: &[crate::primitives::ChannelId],
+    ) -> Result<(), String>;
     /// Consume and clear the yield request flag, returning its previous value.
     /// Processes can request to yield the CPU via the yield_current tool.
     fn consume_yield_requested(&mut self) -> bool;

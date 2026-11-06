@@ -562,6 +562,7 @@ mod tests {
             insert_task_entry_for_test(
                 task_id.clone(),
                 AsyncTaskEntry {
+                    evidence_history_file: None,
                     session_id: self.context.app_proto.session_id.clone(),
                     owner_pid: self.owner_pid,
                     pid,

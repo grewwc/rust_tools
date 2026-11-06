@@ -44,9 +44,11 @@ Crate targets: `cargo check -p aios_kernel`,
 5. **`LocalOS` state is guarded by the caller** via
    `SharedKernel = Arc<Mutex<Box<dyn Kernel + Send>>>` - kernel methods must
    not block or await.
-6. **Process-table lifecycle.** Removing a process reattaches its surviving
-   children to a live foreground owner instead of orphaning them, so child-scoped
-   ops (`kill_process` / `signal_process` / `reap_process` / `wait_on`) always have
-   a manageable owner. A target pid absent from the process table reports
+6. **Process-table lifecycle.** Removing a process reattaches surviving children
+   to an existing live foreground when available. A replacement foreground uses
+   `KernelInternal::adopt_process_resources` to validate the exited owner and
+   atomically adopt the child and its channels; the caller owns session scoping.
+   Child-scoped ops (`kill_process` / `signal_process` / `reap_process` / `wait_on`)
+   retain their owner checks. A target pid absent from the process table reports
    `"Process {pid} does not exist."` rather than a misleading "outside its scope"
    error.

@@ -102,6 +102,88 @@ impl KernelInternal for LocalOS {
         self.processes.get_mut(&pid)
     }
 
+    fn adopt_process_resources(
+        &mut self,
+        target_pid: u64,
+        previous_owner_pid: u64,
+        new_owner_pid: u64,
+        channels: &[ChannelId],
+    ) -> Result<(), String> {
+        if self.current_process_id() != Some(new_owner_pid)
+            || !self.processes.get(&new_owner_pid).is_some_and(|process| {
+                process.is_foreground && process.state != ProcessState::Terminated
+            })
+        {
+            return Err("Only the current live foreground can adopt process resources.".into());
+        }
+        if self
+            .processes
+            .get(&previous_owner_pid)
+            .is_some_and(|process| process.state != ProcessState::Terminated)
+        {
+            return Err(format!(
+                "Previous owner process {previous_owner_pid} is still alive."
+            ));
+        }
+        let previous_parent = self
+            .processes
+            .get(&target_pid)
+            .and_then(|process| process.parent_pid);
+        if let Some(process) = self.processes.get(&target_pid) {
+            if process.is_foreground {
+                return Err(format!(
+                    "Foreground process {target_pid} cannot be adopted."
+                ));
+            }
+            if let Some(parent) = previous_parent
+                && parent != new_owner_pid
+                && self
+                    .processes
+                    .get(&parent)
+                    .is_some_and(|process| process.state != ProcessState::Terminated)
+            {
+                return Err(format!(
+                    "Process {target_pid} still belongs to live parent {parent}."
+                ));
+            }
+        }
+        for channel in channels {
+            let entry = self
+                .channels
+                .get(&channel.raw())
+                .ok_or_else(|| format!("Channel {channel} does not exist."))?;
+            if entry.owner_pid != Some(previous_owner_pid) && entry.owner_pid != Some(new_owner_pid)
+            {
+                return Err(format!(
+                    "Channel {channel} does not belong to previous owner {previous_owner_pid}."
+                ));
+            }
+        }
+
+        if self.processes.contains_key(&target_pid) && previous_parent != Some(new_owner_pid) {
+            if let Some(parent) = previous_parent {
+                self.unregister_child(parent, target_pid);
+            }
+            self.processes
+                .get_mut(&target_pid)
+                .expect("validated process")
+                .parent_pid = Some(new_owner_pid);
+            self.register_child(new_owner_pid, target_pid);
+            self.bump_topology_version();
+        }
+        for channel in channels {
+            let entry = self
+                .channels
+                .get_mut(&channel.raw())
+                .expect("validated channel");
+            entry.owner_pid = Some(new_owner_pid);
+            let label = entry.label.clone();
+            let depth = entry.queue.len();
+            self.channel_emit_trace("adopt", *channel, Some(new_owner_pid), &label, depth);
+        }
+        Ok(())
+    }
+
     fn consume_yield_requested(&mut self) -> bool {
         let yielded = self.yield_requested;
         self.yield_requested = false;

@@ -51,10 +51,15 @@ pub(super) fn with_os_kernel<T>(
 }
 
 pub(super) fn current_task_owner_pid() -> Result<u64, String> {
-    with_os_kernel(|os| {
+    let owner_pid = with_os_kernel(|os| {
         os.current_process_id()
             .ok_or("task orchestration requires an active AIOS process context.".to_string())
-    })
+    })?;
+    recover_orphaned_task_owners(
+        &crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
+        owner_pid,
+    )?;
+    Ok(owner_pid)
 }
 
 pub(super) fn current_task_owner_pid_opt() -> Option<u64> {
@@ -692,6 +697,8 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
             task_id.clone(),
             AsyncTaskEntry {
                 session_id: crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
+                evidence_history_file: crate::ai::driver::runtime_ctx::try_current()
+                    .map(|context| context.app_proto.config.history_file.clone()),
                 owner_pid,
                 pid,
                 result_channel_id,

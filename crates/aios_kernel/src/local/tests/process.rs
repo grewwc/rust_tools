@@ -160,6 +160,148 @@ fn removing_parent_reparents_live_children_and_collects_unreapable_zombies() {
 }
 
 #[test]
+fn adopt_orphaned_process_transfers_channels_and_child_scope_atomically() {
+    use crate::primitives::{ChannelOwnerTag, IpcOps, IpcRecvResult};
+    let mut os = LocalOS::new();
+    let owner = os.begin_foreground("old".into(), "goal".into(), 10, 8, None);
+    let child = os
+        .spawn(
+            Some(owner),
+            "child".into(),
+            "goal".into(),
+            20,
+            4,
+            None,
+            None,
+        )
+        .unwrap();
+    let grandchild = os
+        .spawn(
+            Some(child),
+            "grandchild".into(),
+            "goal".into(),
+            20,
+            4,
+            None,
+            None,
+        )
+        .unwrap();
+    let channel = os.channel_create_tagged(
+        Some(owner),
+        2,
+        "result".into(),
+        ChannelOwnerTag::TaskResult,
+        2,
+    );
+    os.channel_send(Some(child), channel, "buffered before failure".into())
+        .unwrap();
+    os.terminate_pid(owner, "failed".into());
+    assert!(os.drop_terminated(owner));
+    let replacement = os.begin_foreground("replacement".into(), "goal".into(), 10, 8, None);
+    let outsider = os.begin_foreground("outsider".into(), "goal".into(), 10, 8, None);
+    let foreign_channel = os.channel_create(Some(outsider), 1, "foreign".into());
+    os.set_current_pid(Some(replacement));
+    assert!(
+        os.channel_send(Some(child), channel, "after failure".into())
+            .is_err()
+    );
+    assert!(
+        os.adopt_process_resources(child, owner, replacement, &[channel, foreign_channel])
+            .is_err()
+    );
+    assert_eq!(os.get_process(child).unwrap().parent_pid, None);
+    assert_eq!(os.channel_meta(channel).unwrap().owner_pid, Some(owner));
+    assert_eq!(os.channel_meta(channel).unwrap().queued_len, 1);
+
+    os.adopt_process_resources(child, owner, replacement, &[channel])
+        .unwrap();
+    assert_eq!(os.get_process(child).unwrap().parent_pid, Some(replacement));
+    assert_eq!(
+        os.channel_meta(channel).unwrap().owner_pid,
+        Some(replacement)
+    );
+    os.channel_send(Some(child), channel, "after failure".into())
+        .unwrap();
+    assert!(os.channel_try_recv(Some(outsider), channel).is_err());
+    assert_eq!(
+        os.channel_try_recv(Some(replacement), channel).unwrap(),
+        IpcRecvResult::Message("buffered before failure".into())
+    );
+    assert_eq!(
+        os.channel_try_recv(Some(replacement), channel).unwrap(),
+        IpcRecvResult::Message("after failure".into())
+    );
+    os.kill_process(child, "cancel adopted subtree".into())
+        .unwrap();
+    assert_eq!(
+        os.get_process(grandchild).unwrap().state,
+        ProcessState::Terminated
+    );
+}
+
+#[test]
+fn adopt_orphaned_completed_process_transfers_buffered_result() {
+    use crate::primitives::{IpcOps, IpcRecvResult};
+    let mut os = LocalOS::new();
+    let owner = os.begin_foreground("old".into(), "goal".into(), 10, 8, None);
+    let child = os
+        .spawn(
+            Some(owner),
+            "child".into(),
+            "goal".into(),
+            20,
+            4,
+            None,
+            None,
+        )
+        .unwrap();
+    let channel = os.channel_create(Some(owner), 1, "result".into());
+    os.channel_send(Some(child), channel, "completed result".into())
+        .unwrap();
+    os.terminate_pid(child, "completed".into());
+    os.terminate_pid(owner, "failed".into());
+    assert!(os.drop_terminated(owner));
+    assert!(os.get_process(child).is_none());
+    let replacement = os.begin_foreground("replacement".into(), "goal".into(), 10, 8, None);
+    os.adopt_process_resources(child, owner, replacement, &[channel])
+        .unwrap();
+    assert_eq!(
+        os.channel_try_recv(Some(replacement), channel).unwrap(),
+        IpcRecvResult::Message("completed result".into())
+    );
+}
+
+#[test]
+fn adopt_orphaned_process_rejects_live_owner_and_non_foreground_caller() {
+    let mut os = LocalOS::new();
+    let owner = os.begin_foreground("old".into(), "goal".into(), 10, 8, None);
+    let child = os
+        .spawn(
+            Some(owner),
+            "child".into(),
+            "goal".into(),
+            20,
+            4,
+            None,
+            None,
+        )
+        .unwrap();
+    let replacement = os.begin_foreground("replacement".into(), "goal".into(), 10, 8, None);
+    assert!(
+        os.adopt_process_resources(child, owner, replacement, &[])
+            .unwrap_err()
+            .contains("still alive")
+    );
+    os.set_current_pid(Some(child));
+    assert!(
+        os.adopt_process_resources(child, owner, replacement, &[])
+            .unwrap_err()
+            .contains("current live foreground")
+    );
+    assert_eq!(os.get_process(child).unwrap().parent_pid, Some(owner));
+}
+
+#[test]
 fn kill_cascades_to_grandchildren() {
     let mut os = LocalOS::new();
     let root = os.begin_foreground(

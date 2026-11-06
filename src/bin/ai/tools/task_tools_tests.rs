@@ -1556,6 +1556,7 @@ fn task_wait_formats_empty_subagent_result_explicitly() {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let entry = AsyncTaskEntry {
+        evidence_history_file: None,
         session_id: String::new(),
         owner_pid: 0,
         pid: 42,
@@ -1701,6 +1702,7 @@ fn task_wait_rejects_foreign_session_task_ids() {
     insert_task_entry_for_test(
         own_task_id.clone(),
         AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: "session-a".to_string(),
             owner_pid,
             pid: 1,
@@ -1724,6 +1726,7 @@ fn task_wait_rejects_foreign_session_task_ids() {
     insert_task_entry_for_test(
         foreign_task_id.clone(),
         AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: "session-b".to_string(),
             owner_pid,
             pid: 2,
@@ -2005,6 +2008,7 @@ fn task_status_and_outstanding_anchor_filter_same_session_sibling_owner_tasks() 
         insert_task_entry_for_test(
             task_id,
             AsyncTaskEntry {
+                evidence_history_file: None,
                 session_id: app.session_id.clone(),
                 owner_pid,
                 pid,
@@ -2093,6 +2097,7 @@ fn task_cancel_refuses_same_session_foreign_owner_task() {
     insert_task_entry_for_test(
         task_id.clone(),
         AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: app.session_id.clone(),
             owner_pid: sibling_owner_pid,
             pid: child_pid,
@@ -2132,6 +2137,144 @@ fn task_cancel_refuses_same_session_foreign_owner_task() {
 }
 
 #[test]
+fn orphaned_task_recovery_retains_session_scope_and_retry_collection_gate() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let root = std::env::temp_dir().join(format!(
+        "orphaned-task-control-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut app = test_app_with_model(String::new());
+    app.session_id = format!("owner-session-{}", uuid::Uuid::new_v4().simple());
+    app.config.history_file = root.join("history.sqlite");
+    let other_session = format!("other-session-{}", uuid::Uuid::new_v4().simple());
+    let _os_guard = init_os_tools_guard(app.os.clone());
+    let context = DriverContext::from_app_snapshot(
+        &app,
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+    );
+    let mut prepared = prepared_retry_task();
+    prepared.model.clear();
+    let owner = app
+        .os
+        .lock()
+        .unwrap()
+        .begin_foreground("old".into(), "goal".into(), 10, 8, None);
+    let spawn = |session_id: &str| {
+        DRIVER_CTX.sync_scope(context.clone(), || {
+            crate::ai::driver::runtime_ctx::TURN_IDENTITY
+                .sync_scope((session_id.to_string(), 0), || {
+                    super::spawn_subagent_kernel_task(&prepared).unwrap()
+                })
+        })
+    };
+    let task = spawn(&app.session_id);
+    let foreign = spawn(&other_session);
+    {
+        let mut os = app.os.lock().unwrap();
+        crate::ai::driver::terminate_and_cleanup(
+            os.as_mut(),
+            owner,
+            "Failed: fixture".into(),
+            true,
+        );
+    }
+    let replacement =
+        app.os
+            .lock()
+            .unwrap()
+            .begin_foreground("replacement".into(), "goal".into(), 10, 8, None);
+    let run = |owner_pid, action: &dyn Fn() -> Result<String, String>| {
+        app.os.lock().unwrap().set_current_pid(Some(owner_pid));
+        DRIVER_CTX.sync_scope(context.clone(), || {
+            crate::ai::driver::runtime_ctx::TURN_IDENTITY
+                .sync_scope((app.session_id.clone(), 1), || action())
+        })
+    };
+    let foreign_wait = run(replacement, &|| {
+        execute_task_wait(&serde_json::json!({"task_ids": [&foreign.task_id]}))
+    })
+    .unwrap_err();
+    assert!(foreign_wait.contains("another session"), "{foreign_wait}");
+    super::with_task_entry(&foreign.task_id, |entry| assert_eq!(entry.owner_pid, owner)).unwrap();
+    assert_eq!(
+        app.os
+            .lock()
+            .unwrap()
+            .get_process(foreign.pid)
+            .unwrap()
+            .parent_pid,
+        None
+    );
+    let before_collection = run(replacement, &|| {
+        execute_task_retry(&serde_json::json!({"task_id": &task.task_id}))
+    })
+    .unwrap_err();
+    assert!(
+        before_collection.contains("no collected terminal failure"),
+        "{before_collection}"
+    );
+    let cancelled = run(replacement, &|| {
+        execute_task_cancel(&serde_json::json!({"task_ids": [&task.task_id]}))
+    })
+    .unwrap();
+    assert!(cancelled.contains("Cancelled 1 task"), "{cancelled}");
+    let still_uncollected = run(replacement, &|| {
+        execute_task_retry(&serde_json::json!({"task_id": &task.task_id}))
+    })
+    .unwrap_err();
+    assert!(
+        still_uncollected.contains("no collected terminal failure"),
+        "{still_uncollected}"
+    );
+    let result = run(replacement, &|| {
+        execute_task_wait(&serde_json::json!({"task_ids": [&task.task_id]}))
+    })
+    .unwrap();
+    assert!(result.contains("CANCELLED"), "{result}");
+    assert!(super::with_task_entry(&task.task_id, |_| ()).is_none());
+    {
+        let mut os = app.os.lock().unwrap();
+        crate::ai::driver::terminate_and_cleanup(
+            os.as_mut(),
+            replacement,
+            "Failed: fixture again".into(),
+            true,
+        );
+    }
+    let next_owner =
+        app.os
+            .lock()
+            .unwrap()
+            .begin_foreground("next".into(), "goal".into(), 10, 8, None);
+    let retried = run(next_owner, &|| {
+        execute_task_retry(&serde_json::json!({"task_id": &task.task_id}))
+    })
+    .unwrap();
+    assert!(
+        retried.contains(&format!("retry_of={}", task.task_id)),
+        "{retried}"
+    );
+    assert_eq!(
+        TASK_RETRY_REGISTRY
+            .lock()
+            .unwrap()
+            .get_ref(&task.task_id)
+            .unwrap()
+            .owner_pid,
+        next_owner
+    );
+    DRIVER_CTX.sync_scope(context, || {
+        discard_tasks_for_session(&app.session_id);
+        discard_tasks_for_session(&other_session);
+    });
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout() {
     let _env_guard = crate::ai::test_support::ENV_LOCK
         .lock()
@@ -2162,6 +2305,7 @@ fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout
     insert_task_entry_for_test(
         task_id.clone(),
         AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: app.session_id.clone(),
             owner_pid,
             pid: child_pid,
@@ -2271,6 +2415,7 @@ fn task_status_collects_completed_results_and_cleans_up_resources() {
     insert_task_entry_for_test(
         task_id.clone(),
         AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: app.session_id.clone(),
             owner_pid: pid,
             pid,
@@ -2457,6 +2602,7 @@ fn task_wait_any_returns_ready_result_without_waiting_for_pending_task() {
         insert_task_entry_for_test(
             task_id,
             AsyncTaskEntry {
+                evidence_history_file: None,
                 session_id: app.session_id.clone(),
                 owner_pid: root_pid,
                 pid,
@@ -2540,6 +2686,7 @@ fn task_status_cleans_up_terminated_task_without_result() {
     insert_task_entry_for_test(
         task_id.clone(),
         AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: app.session_id.clone(),
             owner_pid: root_pid,
             pid,
@@ -2604,85 +2751,89 @@ fn task_status_reuses_persisted_terminal_evidence_after_channel_loss() {
     )
     .unwrap();
 
-    let mut app = test_app_with_model("qwen3.7-max".to_string());
-    app.config.history_file = history_file.clone();
-    app.session_id = session_id.clone();
-    let os_handle = app.os.clone();
-    let _os_guard = init_os_tools_guard(os_handle.clone());
+    for terminated in [true, false] {
+        let mut app = test_app_with_model("qwen3.7-max".to_string());
+        app.config.history_file = history_file.clone();
+        app.session_id = session_id.clone();
+        let os_handle = app.os.clone();
+        let _os_guard = init_os_tools_guard(os_handle.clone());
 
-    let (root_pid, pid, result_channel_id, completion_futex_addr) = {
-        let mut os = os_handle.lock().unwrap();
-        let root_pid = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
-        let pid = os
-            .spawn(
-                Some(root_pid),
-                "terminated".to_string(),
-                "terminated goal".to_string(),
-                20,
-                4,
-                None,
-                None,
-            )
-            .unwrap();
-        let channel = os.channel_create(Some(pid), 1, "task-result".to_string());
-        let completion_futex = os.futex_create(0, "task-complete".to_string());
-        os.set_current_pid(Some(root_pid));
-        os.kill_process(pid, "subagent crashed".to_string())
-            .unwrap();
-        (root_pid, pid, channel.raw(), completion_futex)
-    };
+        let (root_pid, pid, result_channel_id, completion_futex_addr) = {
+            let mut os = os_handle.lock().unwrap();
+            let root_pid = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
+            let pid = os
+                .spawn(
+                    Some(root_pid),
+                    "terminated".to_string(),
+                    "terminated goal".to_string(),
+                    20,
+                    4,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let channel = os.channel_create(Some(pid), 1, "task-result".to_string());
+            let completion_futex = os.futex_create(0, "task-complete".to_string());
+            os.set_current_pid(Some(root_pid));
+            if terminated {
+                os.kill_process(pid, "subagent crashed".to_string())
+                    .unwrap();
+            }
+            (root_pid, pid, channel.raw(), completion_futex)
+        };
 
-    insert_task_entry_for_test(
-        task_id.clone(),
-        AsyncTaskEntry {
-            session_id: app.session_id.clone(),
-            owner_pid: root_pid,
-            pid,
-            result_channel_id,
-            completion_futex_addr,
-            description: "terminated task".to_string(),
-            agent_name: "build".to_string(),
-            backend: None,
-            model: "qwen3.7-max".to_string(),
-            is_model_auto_selected: false,
-            auto_model_fallback: None,
-            selection_explanation: "explicit override".to_string(),
-            inherit: InheritOptions::default(),
-            abort_handle: None,
-            last_progress_notification_at: None,
-            last_progress_persisted_at: None,
-            cancel_stream: Arc::new(AtomicBool::new(false)),
-            started_at: Instant::now(),
-        },
-    );
+        insert_task_entry_for_test(
+            task_id.clone(),
+            AsyncTaskEntry {
+                evidence_history_file: None,
+                session_id: app.session_id.clone(),
+                owner_pid: root_pid,
+                pid,
+                result_channel_id,
+                completion_futex_addr,
+                description: "terminated task".to_string(),
+                agent_name: "build".to_string(),
+                backend: None,
+                model: "qwen3.7-max".to_string(),
+                is_model_auto_selected: false,
+                auto_model_fallback: None,
+                selection_explanation: "explicit override".to_string(),
+                inherit: InheritOptions::default(),
+                abort_handle: None,
+                last_progress_notification_at: None,
+                last_progress_persisted_at: None,
+                cancel_stream: Arc::new(AtomicBool::new(false)),
+                started_at: Instant::now(),
+            },
+        );
 
-    let context = DriverContext::new(
-        app,
-        Arc::new(std::sync::Mutex::new(McpClient::new())),
-        Arc::new(Vec::new()),
-        Arc::new(Vec::new()),
-    );
-    let output = DRIVER_CTX
-        .sync_scope(context, || {
-            crate::ai::driver::runtime_ctx::TURN_IDENTITY
-                .sync_scope((session_id.clone(), 0usize), || {
-                    execute_task_status(&serde_json::json!({}))
-                })
-        })
-        .expect("task_status should reuse persisted evidence");
+        let context = DriverContext::new(
+            app,
+            Arc::new(std::sync::Mutex::new(McpClient::new())),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+        );
+        let output = DRIVER_CTX
+            .sync_scope(context, || {
+                crate::ai::driver::runtime_ctx::TURN_IDENTITY
+                    .sync_scope((session_id.clone(), 0usize), || {
+                        execute_task_status(&serde_json::json!({}))
+                    })
+            })
+            .expect("task_status should reuse persisted evidence");
 
-    assert!(output.contains("durable output"), "{output}");
-    assert!(
-        !output.contains("terminated without publishing any output"),
-        "{output}"
-    );
-    assert!(remove_task_entry(&task_id).is_none());
+        assert!(output.contains("durable output"), "{output}");
+        assert!(
+            !output.contains("terminated without publishing any output"),
+            "{output}"
+        );
+        assert!(remove_task_entry(&task_id).is_none());
 
-    let os = os_handle.lock().unwrap();
-    assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
-    assert!(os.futex_event_id(completion_futex_addr).is_none());
-    drop(os);
-
+        let os = os_handle.lock().unwrap();
+        assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
+        assert!(os.futex_event_id(completion_futex_addr).is_none());
+        drop(os);
+    }
     let sessions_root = crate::ai::history::SessionStore::new(&history_file)
         .sessions_root()
         .to_path_buf();
@@ -2812,6 +2963,7 @@ async fn task_cancel_aborts_worker_and_leaves_result_collectable_via_task_wait()
     insert_task_entry_for_test(
         task_id.clone(),
         AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: app.session_id.clone(),
             owner_pid: root,
             pid,
@@ -2909,6 +3061,7 @@ async fn discarding_session_tasks_aborts_workers_and_releases_results() {
     insert_task_entry_for_test(
         task_id.clone(),
         AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: app.session_id.clone(),
             owner_pid: root,
             pid,
@@ -2989,6 +3142,7 @@ async fn wall_clock_reaper_aborts_worker_and_leaves_timeout_result_collectable()
     insert_task_entry_for_test(
         task_id.clone(),
         AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: app.session_id.clone(),
             owner_pid: root,
             pid,
@@ -3076,6 +3230,7 @@ async fn task_wait_wall_clock_timeout_aborts_worker_before_publishing_result() {
     insert_task_entry_for_test(
         task_id.clone(),
         AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: app.session_id.clone(),
             owner_pid: root,
             pid,
@@ -3242,6 +3397,7 @@ fn task_entry_can_be_looked_up_by_pid() {
         registry.insert(
             task_id.clone(),
             AsyncTaskEntry {
+                evidence_history_file: None,
                 session_id: String::new(),
                 owner_pid: 0,
                 pid: 4242,
@@ -3353,6 +3509,7 @@ fn subagent_progress_update_never_wakes_parked_parent() {
     insert_task_entry_for_test(
         task_id.clone(),
         AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: app.session_id.clone(),
             owner_pid,
             pid: child_pid,
@@ -3462,6 +3619,7 @@ fn wake_expired_task_waits_reaps_orphaned_state_when_owner_gone() {
     insert_task_entry_for_test(
         task_id.clone(),
         AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: app.session_id.clone(),
             owner_pid,
             pid: child_pid,
@@ -3554,6 +3712,7 @@ fn side_note_target_validation_accepts_stopped_subagent() {
     insert_task_entry_for_test(
         task_id.clone(),
         AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: app.session_id.clone(),
             owner_pid,
             pid: child_pid,
@@ -3653,6 +3812,7 @@ fn side_note_target_resolves_child_history_file() {
     insert_task_entry_for_test(
         task_id.clone(),
         AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: app.session_id.clone(),
             owner_pid,
             pid: child_pid,
@@ -3729,6 +3889,7 @@ fn side_note_target_queues_external_backend_for_continuation() {
     insert_task_entry_for_test(
         task_id.clone(),
         AsyncTaskEntry {
+            evidence_history_file: None,
             session_id: app.session_id.clone(),
             owner_pid,
             pid: child_pid,
@@ -3943,6 +4104,7 @@ fn task_wait_any_after_budget_reports_ready_and_pending() {
             insert_task_entry_for_test(
                 task_id,
                 AsyncTaskEntry {
+                    evidence_history_file: None,
                     session_id: app.session_id.clone(),
                     owner_pid,
                     pid,
@@ -4069,6 +4231,7 @@ impl ParentCheckpointTask {
         insert_task_entry_for_test(
             task_id.clone(),
             AsyncTaskEntry {
+                evidence_history_file: None,
                 session_id: session_id.clone(),
                 owner_pid,
                 pid: child_pid,

@@ -387,6 +387,8 @@ pub(super) async fn prepare_turn(
     next_model: &str,
     precomputed_ocr: Option<crate::ai::driver::model::OcrExtraction>,
 ) -> Result<TurnPreparation, Box<dyn std::error::Error>> {
+    let task_recovery_warning =
+        crate::ai::tools::task_tools::recover_current_foreground_tasks(&app.session_id).err();
     let attachment_assets_dir = {
         use crate::ai::history::SessionStore;
         let store = SessionStore::new(app.config.history_file.as_path());
@@ -624,6 +626,9 @@ pub(super) async fn prepare_turn(
     // describing" rule in the Autonomous Execution section. `detect_complex_task`
     // remains only for tests to observe shape signals.
 
+    if let Some(warning) = task_recovery_warning {
+        skill_turn.push_section(skill_runtime::ContextKind::Behavior, &warning);
+    }
     let (task_evidence_ledger, task_evidence_warning) =
         crate::ai::history::render_unintegrated_task_evidence_resilient(
             app.config.history_file.as_path(),

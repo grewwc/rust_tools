@@ -224,11 +224,7 @@ pub(crate) fn build_uncollected_tasks_notice(
     }
     for snapshot in &snapshots {
         if TaskTerminalStatus::parse(&snapshot.status).is_some() {
-            record_uncollected_terminal_status(
-                session_id,
-                &snapshot.task_id,
-                &snapshot.status,
-            );
+            record_uncollected_terminal_status(session_id, &snapshot.task_id, &snapshot.status);
         }
     }
     let mut lines = vec![format!(
@@ -282,6 +278,9 @@ pub(super) fn read_task_result(
     result_channel_id: u64,
     consume: bool,
 ) -> Result<Option<StoredTaskResult>, String> {
+    if os.channel_meta(ChannelId(result_channel_id)).is_none() {
+        return Ok(None);
+    }
     let payload = match if consume {
         os.channel_try_recv(None, ChannelId(result_channel_id))
     } else {

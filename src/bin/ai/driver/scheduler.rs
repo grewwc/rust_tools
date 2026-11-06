@@ -340,19 +340,19 @@ pub(super) fn publish_background_task_failure(
             "error": error,
         })
         .to_string();
-        let _ = os.channel_send(
-            Some(pid),
-            aios_kernel::primitives::ChannelId(result_channel_id),
+        let task_id = os
+            .get_process(pid)
+            .and_then(|process| crate::ai::tools::task_tools::decode_os_task_goal(&process.goal))
+            .map(|goal| goal.task_id);
+        if let Err(error) = crate::ai::tools::task_tools::publish_task_result(
+            os,
+            task_id.as_deref(),
+            pid,
+            result_channel_id,
             payload,
-        );
-        let _ = os.channel_close(
-            Some(pid),
-            aios_kernel::primitives::ChannelId(result_channel_id),
-        );
-        let _ = os.channel_release_named(
-            aios_kernel::primitives::ChannelId(result_channel_id),
-            "task_result.producer",
-        );
+        ) {
+            eprintln!("[Task result delivery] {error}");
+        }
     }
     if let Some(addr) = completion_futex_addr {
         let _ = os.futex_store(addr, 1);

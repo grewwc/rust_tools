@@ -45,11 +45,11 @@ pub(super) fn persist_rendered_task_evidence(
     status: &str,
     rendered: &str,
 ) -> Result<(), String> {
-    let Some(context) = crate::ai::driver::runtime_ctx::try_current() else {
+    let Some(history_file) = task_evidence_history_file(entry) else {
         return Ok(());
     };
     crate::ai::history::record_delivered_task_evidence(
-        context.app_proto.config.history_file.as_path(),
+        &history_file,
         &entry.session_id,
         crate::ai::history::DeliveredTaskEvidence {
             task_id,
@@ -61,6 +61,121 @@ pub(super) fn persist_rendered_task_evidence(
         },
     )
     .map_err(|error| format!("failed to persist task evidence for {task_id}: {error}"))
+}
+
+fn task_evidence_history_file(entry: &AsyncTaskEntry) -> Option<PathBuf> {
+    entry
+        .evidence_history_file
+        .clone()
+        .or_else(|| {
+            crate::ai::driver::runtime_ctx::try_current()
+                .map(|context| context.app_proto.config.history_file.clone())
+        })
+        .filter(|path| !path.as_os_str().is_empty() && !entry.session_id.is_empty())
+}
+
+/// Every terminal producer commits the full result before attempting IPC. Publication failures
+/// retain a recovery payload in the parent ledger and return a visible error to the driver.
+pub(crate) fn publish_task_result(
+    os: &mut dyn Kernel,
+    task_id: Option<&str>,
+    pid: u64,
+    result_channel_id: u64,
+    payload: String,
+) -> Result<(), String> {
+    let task = task_id.and_then(|task_id| {
+        with_task_entry(task_id, |entry| entry.clone())
+            .filter(|entry| entry.pid == pid && entry.result_channel_id == result_channel_id)
+            .map(|entry| (task_id.to_string(), entry))
+    });
+    let Some((task_id, entry)) = task else {
+        let channel = ChannelId(result_channel_id);
+        os.channel_send(Some(pid), channel, payload)?;
+        os.channel_close(None, channel)?;
+        if os.channel_meta(channel).is_some_and(|metadata| {
+            metadata
+                .ref_holders
+                .iter()
+                .any(|holder| holder == "task_result.producer")
+        }) {
+            os.channel_release_named(channel, "task_result.producer")?;
+        }
+        return Ok(());
+    };
+    let result: StoredTaskResult = serde_json::from_str(&payload).map_err(|error| {
+        format!("cannot publish task {task_id}: invalid terminal result: {error}")
+    })?;
+    let history_file = task_evidence_history_file(&entry)
+        .filter(|path| !path.as_os_str().is_empty() && !entry.session_id.is_empty());
+    let persistence = history_file.as_ref().map(|history_file| {
+        let rendered = format_task_result_with_id(&task_id, &entry, result.clone());
+        crate::ai::history::record_published_task_evidence(
+            history_file,
+            &entry.session_id,
+            crate::ai::history::DeliveredTaskEvidence {
+                task_id: &task_id,
+                description: &entry.description,
+                agent_name: &entry.agent_name,
+                model: &entry.model,
+                status: &result.status,
+                payload: &rendered,
+            },
+        )
+    });
+    if matches!(&persistence, Some(Ok(false))) {
+        // A terminal publication already owns this slot, including one collected earlier.
+        return Ok(());
+    }
+    let mut errors = Vec::new();
+    if let Some(Err(error)) = &persistence {
+        errors.push(format!("durable publication failed: {error}"));
+    }
+    let sent = match os.channel_send(Some(pid), ChannelId(result_channel_id), payload) {
+        Ok(()) => true,
+        Err(error) => {
+            let error = error.trim_end_matches('.');
+            let saved = matches!(&persistence, Some(Ok(true)));
+            let recovery = if saved {
+                "The full result is saved in the parent ledger; task_wait/task_status can collect it."
+            } else {
+                "The result could not be saved in the parent ledger; retain the child history for recovery."
+            };
+            let warning = format!(
+                "[Task result delivery warning] IPC publication failed: {error}. {recovery}"
+            );
+            if saved
+                && let Some(history_file) = &history_file
+                && let Err(error) = crate::ai::history::record_task_publication_warning(
+                    history_file,
+                    &entry.session_id,
+                    &task_id,
+                    &warning,
+                )
+            {
+                errors.push(format!("failed to save IPC delivery warning: {error}"));
+            }
+            errors.push(warning);
+            false
+        }
+    };
+    if (sent || matches!(&persistence, Some(Ok(true))))
+        && os.channel_meta(ChannelId(result_channel_id)).is_some()
+    {
+        // Closing is a host lifecycle operation; the producer is not the consumer owner.
+        if let Err(error) = os.channel_close(None, ChannelId(result_channel_id)) {
+            errors.push(format!("failed to close result channel: {error}"));
+        }
+        if let Err(error) =
+            os.channel_release_named(ChannelId(result_channel_id), "task_result.producer")
+        {
+            errors.push(format!("failed to release result producer: {error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("task_id={task_id}: {}", errors.join("; ")))
+    }
 }
 
 /// Reads the persisted evidence state (status + payload) for the given task_id in the current
@@ -100,28 +215,38 @@ pub(super) fn drain_task_result(
     cleanup_reason: &str,
 ) -> Result<Option<DrainedTaskResult>, String> {
     let Some(result) = read_task_result(os, entry.result_channel_id, false)? else {
-        if is_task_pending(os, entry.pid)? {
-            return Ok(None);
-        }
-        // An earlier collection may have persisted a terminal result before consuming the
-        // channel failed. The ledger is the source of truth for delivered evidence; never
-        // replace it with a synthesized failure.
-        if let Some((status, payload)) =
-            read_persisted_task_evidence_status(&entry.session_id, task_id)?
+        if let Some(history_file) = task_evidence_history_file(entry)
+            && let Some((status, rendered, delivered)) =
+                crate::ai::history::read_available_task_evidence_status_payload(
+                    &history_file,
+                    &entry.session_id,
+                    task_id,
+                )
+                .map_err(|error| {
+                    format!("failed to read available task evidence for {task_id}: {error}")
+                })?
         {
+            // Durable terminal truth takes precedence over an AIOS process that has not been
+            // torn down yet, including a collection interrupted after its ledger commit.
+            if !delivered {
+                persist_rendered_task_evidence(task_id, entry, &status, &rendered)?;
+            }
             mark_task_retry_status(task_id, &status);
             lock_unpoisoned(&TASK_PROGRESS_REGISTRY).take(&task_id.to_string());
             cleanup_collected_task(os, entry, cleanup_reason);
             return Ok(Some(DrainedTaskResult {
                 result: StoredTaskResult {
                     status,
-                    output: payload.clone(),
+                    output: rendered.clone(),
                     error: None,
                     progress: None,
                     backend_session: None,
                 },
-                rendered: payload,
+                rendered,
             }));
+        }
+        if is_task_pending(os, entry.pid)? {
+            return Ok(None);
         }
         let result = StoredTaskResult {
             status: TaskTerminalStatus::Failed.as_str().to_string(),

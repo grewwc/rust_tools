@@ -259,6 +259,7 @@ mod tests {
         insert_task_entry_for_test(
             task_id.clone(),
             AsyncTaskEntry {
+                evidence_history_file: None,
                 session_id: String::new(),
                 owner_pid: pid,
                 pid,
