@@ -115,7 +115,9 @@ test("override controls and summary keep model, agent, effort, skill order", asy
   const controls = ["omodel", "oagent", "oeffort", "oskill"];
   const positions = controls.map((id) => html.indexOf(`id="${id}"`));
   assert.ok(positions.every((pos, i) => pos >= 0 && (!i || pos > positions[i - 1])));
-  assert.match(html, /<summary id="ovrsummary">model · agent · effort · skill<\/summary>/);
+  // The summary hosts the team trigger beside the text, so the text lives in
+  // its own span inside the summary element.
+  assert.match(html, /<summary id="ovrsummaryline">\s*<span id="ovrsummary">model · agent · effort · skill<\/span>/);
   const h = harness();
   await h.context.loadSkills();
   for (const [id, value] of [["omodel", "test-model"], ["oagent", "build"], ["oeffort", "high"]]) {

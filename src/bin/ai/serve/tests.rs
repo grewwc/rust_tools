@@ -2224,6 +2224,39 @@ async fn server_info_reports_runtime_labels() {
     assert!(!info["version"].as_str().unwrap_or_default().is_empty());
 }
 
+#[test]
+fn subagent_model_names_come_from_the_traecli_backend() {
+    let names = crate::ai::tools::task_tools::with_traecli_model_names_for_test(
+        vec!["alpha-model".to_string(), "beta-model".to_string()],
+        super::subagent_model_names,
+    );
+    assert_eq!(names, ["alpha-model", "beta-model"]);
+}
+
+#[tokio::test]
+async fn subagent_models_endpoint_serializes_the_backend_model_list() {
+    use axum::{
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+    };
+    let resp = super::subagent_models(State(lifecycle_test_state()), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert!(
+        payload
+            .get("models")
+            .and_then(|value| value.as_array())
+            .is_some(),
+        "missing models array: {payload}"
+    );
+}
+
 fn turn_req(model: Option<&str>, agent: Option<&str>, reasoning_effort: Option<&str>) -> TurnReq {
     TurnReq {
         prompt: "hi".to_string(),

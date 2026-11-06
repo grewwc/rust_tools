@@ -31,24 +31,44 @@ pub(crate) fn android_apk_filename() -> String {
 /// bytes and `__ASERVE_APK_FILENAME__` stamped to the current download name.
 /// The page displays the id, so a screenshot identifies which page build a
 /// phone actually runs.
-static APP_PAGE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    let raw = include_str!("app.html");
+fn stamp_page(raw: &str) -> String {
     let digest = Sha256::digest(raw.as_bytes());
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     raw.replace("__ASERVE_PAGE_ID__", &hex[..8])
         .replace("__ASERVE_APK_FILENAME__", &android_apk_filename())
-});
+}
+
+/// Page source to serve: the checkout's own `app.html` when it exists, so a
+/// front-end edit shows up on the next page load without rebuilding the
+/// binary, and the embedded copy otherwise (an installed binary next to no
+/// sources). `A_SERVE_APP_HTML` points the lookup at another file. Read on
+/// every request, which is why the stamped page id tracks the served bytes.
+fn page_source() -> std::borrow::Cow<'static, str> {
+    let path = std::env::var_os("A_SERVE_APP_HTML")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/bin/ai/serve/app.html"
+            ))
+            .to_path_buf()
+        });
+    match std::fs::read_to_string(path) {
+        Ok(raw) => std::borrow::Cow::Owned(raw),
+        Err(_) => std::borrow::Cow::Borrowed(include_str!("app.html")),
+    }
+}
 
 // `no-store` keeps phones from running a stale cached copy of this page
 // after an upgrade (a stale page hides new diagnostics like the stored
 // token length below the save row).
 pub(crate) async fn serve_app() -> (
     [(axum::http::header::HeaderName, &'static str); 1],
-    Html<&'static str>,
+    Html<String>,
 ) {
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
-        Html(APP_PAGE.as_str()),
+        Html(stamp_page(&page_source())),
     )
 }
 
@@ -313,4 +333,34 @@ pub(crate) async fn server_info(
         }),
     )
         .into_response()
+}
+
+/// `GET /subagent-models`: selectable model names for the team sheet's
+/// TraeCLI subagent picker. Discovery shells out to `traecli models`, so it
+/// stays off the boot-critical `/info` request and runs on the blocking pool;
+/// the shared discovery cache makes repeat opens cheap.
+#[derive(Debug, Serialize)]
+pub(crate) struct SubagentModels {
+    models: Vec<String>,
+}
+
+/// TraeCLI's own model identifiers. The two model registries use different
+/// naming, so this never mirrors the parent model list.
+pub(crate) fn subagent_model_names() -> Vec<String> {
+    crate::ai::tools::task_tools::backend_model_names(
+        crate::ai::tools::task_tools::BackendId::TRAECLI,
+    )
+}
+
+pub(crate) async fn subagent_models(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let models = tokio::task::spawn_blocking(subagent_model_names)
+        .await
+        .unwrap_or_default();
+    (StatusCode::OK, Json(SubagentModels { models })).into_response()
 }

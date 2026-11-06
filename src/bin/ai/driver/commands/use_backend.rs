@@ -55,7 +55,10 @@ pub(crate) fn apply_subagent_use(
             descriptor.text.display_name, descriptor.use_names[0]
         ));
     }
-    config.subagent_backend = backend.stored_value();
+    // Store the canonical id instead of "unset" for the kernel default: the
+    // serve picker treats an absent value as its own default (TraeCLI), so a
+    // kernel choice has to survive the round trip as an explicit value.
+    config.subagent_backend = Some(backend.as_str().to_string());
     if let Some(model) = model {
         config.subagent_model = Some(model.to_string());
     }

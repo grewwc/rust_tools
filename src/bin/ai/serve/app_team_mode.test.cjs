@@ -27,13 +27,15 @@ function deferred() {
   return { promise, resolve, reject };
 }
 const NORMAL = { model: "", agent: "", reasoning_effort: "", default_skills: ["other-skill"], subagent_backend: "", subagent_model: "", output: "Sticky agent-team: active" };
-const KERNEL = { ...NORMAL, default_skills: ["other-skill", "AGENT-TEAM"], output: "Sticky agent-team: off" };
+// A kernel session stores the backend explicitly; an empty value means "never
+// chosen", which the page reads as its TraeCLI default.
+const KERNEL = { ...NORMAL, default_skills: ["other-skill", "AGENT-TEAM"], subagent_backend: "kernel", output: "Sticky agent-team: off" };
 const TRAECLI = { ...KERNEL, subagent_backend: "traecli", subagent_model: "worker-model" };
 const response = (cfg) => ({ ok: true, json: async () => plain(cfg) });
 const turnResponse = (read = async () => ({ done: false, value: Buffer.from("event: done\n\n") })) => ({ ok: true, body: { getReader: () => ({ read }) } });
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, configGet, createSession, skills = [], turnPost } = {}) {
+function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, configGet, createSession, skills = [], subagentModels, turnPost } = {}) {
   const document = { activeElement: null, querySelectorAll: () => [] };
   function node(tag = "div") {
     let text = "";
@@ -84,7 +86,8 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
   attach("teammodes", "teamnormal", "teamcollab");
   attach("teamadvanced", "teambackends", "teamworkerwrap");
   attach("teambackends", "teamkernel", "teamtraecli");
-  attach("teamworkerwrap", "teamworker", "teamworkerclear");
+  attach("teamworkerwrap", "teamworkerlabel", "teamworkerbtn", "teamworkerlist", "teamworkerhint");
+  attach("teamworkerlist", "teamworkersearch", "teamworkeroptions", "teamworkerstatus", "teamworkerretry");
   attach("teamactions", "teamcancel", "teamapply");
   attach("teamcontrols", "teamtrigger");
   attach("teamtrigger", "teamlabel", "teamstatus");
@@ -135,6 +138,7 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
       requests.push(request);
       const pathname = new URL(url).pathname;
       if (pathname === "/sessions") return createSession ? createSession(request) : response({ id: "fresh" });
+      if (pathname === "/subagent-models") return subagentModels ? subagentModels(request) : response({ models: ["worker-model", "other-model"] });
       if (pathname.endsWith("/config")) {
         const id = pathname.split("/")[2], current = configs.get(id) || plain(NORMAL);
         if (request.method === "GET") return configGet ? configGet(request) : response(current);
@@ -142,8 +146,10 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
         let next = { ...current, ...request.body };
         if (request.body.subagents) {
           const sub = request.body.subagents;
-          next = sub.action === "reset" ? { ...current, default_skills: NORMAL.default_skills, subagent_backend: "", subagent_model: "" }
-            : { ...current, default_skills: KERNEL.default_skills, subagent_backend: sub.backend === "kernel" ? "" : "traecli", subagent_model: sub.model || current.subagent_model };
+          // The server stores the chosen backend explicitly (kernel included)
+          // and reports TraeCLI for a session that never chose one.
+          next = sub.action === "reset" ? { ...current, default_skills: NORMAL.default_skills, subagent_backend: "traecli", subagent_model: "" }
+            : { ...current, default_skills: KERNEL.default_skills, subagent_backend: sub.backend, subagent_model: sub.model || current.subagent_model };
         }
         configs.set(id, next);
         return response(next);
@@ -170,8 +176,7 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
       context.openTeamSheet();
       context.changeTeamDraft("mode", mode);
       context.changeTeamDraft("backend", backend);
-      elements.teamworker.value = model;
-      context.teamWorkerChanged();
+      context.setTeamWorkerModel(model);
       return context.applyTeamDraft();
     },
   };
@@ -184,7 +189,9 @@ test("normal, Kernel and TraeCLI apply only the supported subagent payloads", as
     ["team", "traecli", " worker-model ", { subagents: { action: "use", backend: "traecli", model: "worker-model" } }],
     ["team", "traecli", "  ", { subagents: { action: "use", backend: "traecli" } }],
   ]) {
-    const h = harness();
+    // Start from the state the case actually changes: a no-op draft would not
+    // post anything, and the new default already selects TraeCLI.
+    const h = harness({ cfg: mode === "normal" ? KERNEL : NORMAL });
     await h.context.loadSessionConfig();
     assert.equal(await h.choose(mode, backend, model), true);
     assert.deepEqual(h.teamPosts().map((r) => r.body), [expected]);
@@ -193,7 +200,7 @@ test("normal, Kernel and TraeCLI apply only the supported subagent payloads", as
 });
 
 test("GET config restores sticky team state independently of backend and output text", async () => {
-  for (const [cfg, mode, backend] of [[NORMAL, "normal", "kernel"], [KERNEL, "team", "kernel"], [{ ...KERNEL, subagent_backend: "kernel" }, "team", "kernel"], [TRAECLI, "team", "traecli"], [{ ...TRAECLI, default_skills: [] }, "normal", "traecli"]]) {
+  for (const [cfg, mode, backend] of [[NORMAL, "normal", "traecli"], [KERNEL, "team", "kernel"], [{ ...KERNEL, subagent_backend: "kernel" }, "team", "kernel"], [TRAECLI, "team", "traecli"], [{ ...TRAECLI, default_skills: [] }, "normal", "traecli"]]) {
     const h = harness({ cfg: { ...cfg, model: "main-model", agent: "build", reasoning_effort: "high" } });
     await h.context.loadSessionConfig();
     assert.equal(h.state().choice.mode, mode);
@@ -408,7 +415,7 @@ test("failed config blocks the first turn, retains selection, text, images and s
   assert.equal(h.elements.teamtrigger.dataset.state, "error");
   assert.ok(h.notes.some((text) => /503 temporarily offline/.test(text)));
   h.context.openTeamSheet();
-  assert.equal(h.elements.teamkernel.attrs["aria-checked"], "true");
+  assert.equal(h.elements["team" + h.state().choice.backend].attrs["aria-checked"], "true");
   h.context.closeTeamSheet();
   fail = false;
   h.configs.set("fresh", KERNEL);
@@ -425,14 +432,13 @@ test("cancel, Escape and browser back discard sheet edits without persisting", a
     h.context.openTeamSheet();
     h.context.changeTeamDraft("mode", "team");
     h.context.changeTeamDraft("backend", "traecli");
-    h.elements.teamworker.value = "draft-worker";
-    h.context.teamWorkerChanged();
+    h.context.setTeamWorkerModel("draft-worker");
     if (action === "cancel") h.elements.teamcancel.click();
     if (action === "escape") h.context.teamSheetKeydown({ key: "Escape", preventDefault() {} });
     if (action === "back") h.listeners.get("popstate")();
     await settle();
     assert.equal(h.teamPosts().length, 0);
-    assert.deepEqual(plain(h.state().choice), { mode: "normal", backend: "kernel", model: "" });
+    assert.deepEqual(plain(h.state().choice), { mode: "normal", backend: "traecli", model: "" });
     assert.equal(h.elements.teampick.hidden, true);
     assert.equal(h.elements.teamtrigger.attrs["aria-expanded"], "false");
     assert.equal(h.context.document.activeElement, h.elements.teamtrigger);
@@ -478,7 +484,7 @@ test("an open sheet preserves edits and displays a failed save without acknowled
   await h.context.loadSessionConfig();
   assert.equal(await h.choose("team", "traecli", "worker-model"), false);
   assert.equal(h.elements.teampick.hidden, false);
-  assert.equal(h.elements.teamworker.value, "worker-model");
+  assert.equal(h.elements.teamworkervalue.textContent, "worker-model");
   assert.equal(h.elements.teamerror.hidden, false);
   assert.match(h.elements.teamerror.textContent, /network disconnected/);
   assert.equal(h.elements.teamapply.disabled, false);
@@ -504,7 +510,8 @@ test("late GETs cannot overwrite pending intent or an acknowledged team save", a
   assert.equal(h.state().choice.mode, "team");
   assert.equal(h.state().choice.backend, "traecli");
   assert.equal(h.state().pending, false);
-  assert.equal(h.elements.teamlabel.textContent, "团队协作 · TraeCLI");
+  assert.equal(h.elements.teamlabel.textContent, "subagent");
+  assert.equal(h.elements.teamtrigger.attrs["aria-label"], "subagent · TraeCLI，选择对话模式");
 });
 
 test("session switches restore each selection and never inherit it into a new session", async () => {
@@ -518,7 +525,7 @@ test("session switches restore each selection and never inherit it into a new se
   assert.equal(h.state().choice.mode, "normal");
   h.context.switchSession("alpha");
   assert.equal(h.state().choice.backend, "traecli");
-  assert.equal(h.elements.teamlabel.textContent, "团队协作 · TraeCLI");
+  assert.equal(h.elements.teamlabel.textContent, "subagent");
   assert.equal(h.teamPosts().length, 0);
 });
 
@@ -553,7 +560,7 @@ test("session or server changes during save prevent the old input from becoming 
     assert.equal(h.turns().length, 0);
     assert.equal(h.state("alpha", "https://a.test").confirmed.backend, "traecli");
     assert.equal(h.state().choice.mode, "normal");
-    assert.notEqual(h.elements.teamlabel.textContent, "团队协作 · TraeCLI");
+    assert.notEqual(h.elements.teamlabel.textContent, "subagent");
   }
 });
 
@@ -572,7 +579,7 @@ test("input edits and active composition during config saving preserve the new d
   }
 });
 
-test("keyboard navigation uses real backend radios, traps focus and respects model IME composition", async () => {
+test("keyboard navigation uses real backend radios, traps focus and respects search IME composition", async () => {
   const h = harness();
   await h.context.loadSessionConfig();
   h.context.openTeamSheet();
@@ -585,10 +592,10 @@ test("keyboard navigation uses real backend radios, traps focus and respects mod
   h.elements.teamapply.focus();
   h.context.teamSheetKeydown({ key: "Tab", preventDefault() {} });
   assert.equal(h.context.document.activeElement, h.elements.teamclose);
-  h.elements.teamworker.oncompositionstart();
+  h.elements.teamworkersearch.oncompositionstart();
   h.context.teamSheetKeydown({ key: "Escape", preventDefault() { assert.fail("IME key must not dismiss the sheet"); } });
   assert.equal(h.elements.teampick.hidden, false);
-  h.elements.teamworker.oncompositionend();
+  h.elements.teamworkersearch.oncompositionend();
 });
 
 test("worker model stays separate from the main model and blank preserves the saved worker", async () => {
@@ -596,11 +603,106 @@ test("worker model stays separate from the main model and blank preserves the sa
   await h.context.loadSessionConfig();
   h.context.openTeamSheet();
   assert.match(h.elements.teamworkerhint.textContent, /主模型.*model.*worker-model/);
-  h.elements.teamworkerclear.click();
+  h.elements.teamworkerbtn.click();
+  await settle();
+  const rows = h.elements.teamworkeroptions.children;
+  const fallback = rows.find((row) => row.dataset.model === "");
+  assert.ok(fallback, "picker needs the session-default row");
+  fallback.click();
   assert.equal(h.elements.omodel.value, "main-model");
   assert.equal(await h.context.applyTeamDraft(), true);
   assert.deepEqual(h.teamPosts()[0].body, { subagents: { action: "use", backend: "traecli" } });
   assert.equal(h.state().choice.model, "worker-model");
+});
+
+test("the subagent model is a list picker fed by /subagent-models and filtered by its search field", async () => {
+  const h = harness({ subagentModels: () => response({ models: ["alpha-model", "beta-model"] }) });
+  await h.context.loadSessionConfig();
+  h.context.openTeamSheet();
+  h.elements.teamcollab.click();
+  h.elements.teamtraecli.click();
+  await settle();
+  assert.ok(h.requests.some((request) => request.url.endsWith("/subagent-models") && request.method === "GET"), "the picker must ask the server for the model list");
+  assert.equal(h.elements.teamworkervalue.textContent, "会话默认");
+  h.elements.teamworkerbtn.click();
+  assert.equal(h.elements.teamworkerlist.hidden, false);
+  assert.deepEqual(h.elements.teamworkeroptions.children.map((row) => row.dataset.model), ["", "alpha-model", "beta-model"]);
+  h.elements.teamworkersearch.value = "beta";
+  h.elements.teamworkersearch.oninput();
+  assert.deepEqual(h.elements.teamworkeroptions.children.map((row) => row.dataset.model), ["beta-model"]);
+  h.elements.teamworkeroptions.children[0].click();
+  assert.equal(h.elements.teamworkervalue.textContent, "beta-model");
+  assert.equal(h.elements.teamworkerlist.hidden, true);
+  assert.equal(await h.context.applyTeamDraft(), true);
+  assert.deepEqual(h.teamPosts()[0].body, { subagents: { action: "use", backend: "traecli", model: "beta-model" } });
+  assert.equal(h.state().choice.model, "beta-model");
+});
+
+test("the open list floats over the sheet and closes without changing the draft", async () => {
+  const h = harness({ subagentModels: () => response({ models: ["alpha-model", "beta-model"] }) });
+  await h.context.loadSessionConfig();
+  h.context.openTeamSheet();
+  h.elements.teamcollab.click();
+  h.elements.teamtraecli.click();
+  await settle();
+  // Layout boxes are stub data: the trigger sits in the lower half, so the list
+  // may grow past the sheet panel top and is bounded by the viewport only.
+  let triggerTop = 420;
+  h.context.window.innerHeight = 800;
+  h.elements.teamworkerbtn.getBoundingClientRect = () => ({ top: triggerTop, bottom: triggerTop + 44, left: 12, width: 340, height: 44 });
+  h.elements.teamworkerwrap.getBoundingClientRect = () => ({ top: triggerTop - 34, bottom: triggerTop + 78, left: 12, width: 340, height: 112 });
+  h.elements.teampickpanel.getBoundingClientRect = () => ({ top: 60, bottom: 900, left: 0, width: 393, height: 840 });
+  h.elements.teamworkerbtn.click();
+  assert.equal(h.elements.teamworkerlist.hidden, false);
+  assert.equal(h.elements.teamworkerlist.style.maxHeight, "422px", "the list reaches from the sheet's top edge down to the card bottom");
+  assert.equal(h.elements.teamworkeroptions.style.maxHeight, "358px", "model rows scroll below the search field");
+  assert.equal(h.elements.teamworkerlist.style.bottom, "412px", "the list bottom lands on the card's bottom edge");
+  for (const [top, expected] of [[660, 662], [296, 298], [190, 240]]) {
+    triggerTop = top;
+    h.context.placeWorkerList();
+    assert.equal(h.elements.teamworkerlist.style.maxHeight, expected + "px", "the viewport cap and preferred floor must fit the measured space");
+    assert.equal(h.elements.teamworkeroptions.style.maxHeight, Math.max(0, expected - 64) + "px");
+  }
+  h.context.teamSheetKeydown({ key: "Escape", preventDefault() {} });
+  assert.equal(h.elements.teamworkerlist.hidden, true);
+  assert.equal(h.elements.teampick.hidden, false, "Escape must close the list before the sheet");
+  h.elements.teamworkerbtn.click();
+  h.elements.teampickpanel.onclick({ target: { closest: () => null } });
+  assert.equal(h.elements.teamworkerlist.hidden, true);
+  assert.equal(h.elements.teamworkervalue.textContent, "会话默认", "dismissing the list must not pick a model");
+  assert.equal(h.elements.teamcollab.attrs["aria-checked"], "true");
+  assert.equal(h.teamPosts().length, 0);
+});
+
+test("the trigger sits in the metadata line without toggling it", () => {
+  const h = harness();
+  let prevented = false;
+  h.elements.teamtrigger.onclick({ preventDefault() { prevented = true; } });
+  assert.equal(prevented, true, "the summary must not also collapse the override panel");
+  assert.equal(h.elements.teampick.hidden, false);
+});
+
+test("a failed model-list fetch keeps the session-default row and offers a retry", async () => {
+  let fail = true;
+  const h = harness({ subagentModels: () => {
+    if (fail) throw new Error("503 temporarily offline");
+    return response({ models: ["alpha-model"] });
+  } });
+  await h.context.loadSessionConfig();
+  h.context.openTeamSheet();
+  h.elements.teamcollab.click();
+  h.elements.teamtraecli.click();
+  await settle();
+  h.elements.teamworkerbtn.click();
+  await settle();
+  assert.match(h.elements.teamworkerstatus.textContent, /503 temporarily offline/);
+  assert.equal(h.elements.teamworkerretry.hidden, false);
+  assert.deepEqual(h.elements.teamworkeroptions.children.map((row) => row.dataset.model), [""]);
+  fail = false;
+  h.elements.teamworkerretry.click();
+  await settle();
+  assert.equal(h.elements.teamworkerretry.hidden, true);
+  assert.deepEqual(h.elements.teamworkeroptions.children.map((row) => row.dataset.model), ["", "alpha-model"]);
 });
 
 // The Rust driver owns command parsing. The turn fixtures below supply its
@@ -853,16 +955,43 @@ test("desktop keeps its send behavior and cannot open the phone team sheet", asy
   assert.equal(h.teamPosts().length, 0);
 });
 
-test("the entry is phone-only, at least 44px, and the accessible sheet uses the existing theme and viewport", () => {
+test("the entry is a phone-only 26px metadata chip and the accessible sheet uses the existing theme and viewport", () => {
   const phoneStart = css.indexOf("@media (max-width:700px)"), desktop = css.slice(0, phoneStart), phoneCss = css.slice(phoneStart);
   assert.match(desktop, /#teamcontrols, #teampick \{ display:none; \}/);
-  assert.match(phoneCss, /#teamcontrols \{ display:flex;/);
+  assert.match(phoneCss, /#ovrsummaryline #teamcontrols \{ display:flex;/);
+  assert.match(phoneCss, /#ovrwrap > summary \{ display:flex; align-items:center;/);
+  assert.match(phoneCss, /#ovrsummary \{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;/);
+  assert.match(desktop, /#ovrsummaryline #teamcontrols \{ flex:0 0 auto; padding:0; margin-left:auto; \}/);
+  assert.doesNotMatch(css, /#teamcontrols \{[^}]*(?:width:100%|display:block)/);
   assert.match(phoneCss, /#teampick:not\(\[hidden\]\) \{ display:block; \}/);
-  assert.match(desktop, /#teamtrigger \{[^}]*min-height:44px;[^}]*border-radius:999px;/);
+  assert.match(desktop, /#teamtrigger \{[^}]*gap:5px; min-height:26px;[^}]*padding:0 9px; border-radius:999px;[^}]*font-size:12px;/);
+  assert.match(desktop, /\.teamicon \{[^}]*width:13px; height:13px;/);
+  assert.match(desktop, /\.teamicon svg \{ width:13px; height:13px;/);
+  assert.match(desktop, /\.teamchev \{[^}]*width:14px; height:14px;/);
+  assert.match(desktop, /#teambackends \.teamchoice \{[^}]*min-height:60px;/);
   assert.match(desktop, /#teampickpanel \{[^}]*max-height:calc\(var\(--app-height, 100vh\) \* \.88\);[^}]*env\(safe-area-inset-bottom\)[^}]*background:var\(--panel\)/);
   assert.match(desktop, /#teambody \{[^}]*min-height:0; overflow-y:auto; overscroll-behavior:contain; touch-action:pan-y;/);
   assert.match(html, /id="teampickpanel" role="dialog" aria-modal="true" aria-labelledby="teamtitle" aria-describedby="teamnote"/);
-  assert.match(html, /id="teamworker"[^>]*aria-describedby="teamworkerhint"/);
+  assert.match(html, /id="teamworkerbtn"[^>]*aria-describedby="teamworkerhint"/);
+  assert.match(html, /id="teamworkeroptions" role="radiogroup"/);
+  assert.match(desktop, /#teamworkeroptions \.teamchoice \{[^}]*min-height:44px;/);
+  assert.match(desktop, /\.teamchoice \{[^}]*width:100%;/);
+  assert.match(desktop, /#teammodes \{[^}]*grid-template-columns:repeat\(2,minmax\(0,1fr\)\);/);
+  assert.match(desktop, /#teammodes \.teamchoicetext small \{ display:none; \}/);
+  assert.match(desktop, /#teamworkerlist \{[^}]*position:absolute;[^}]*left:12px; right:12px;/);
+  assert.match(desktop, /#teamworkerlist \{[^}]*max-height:calc\(var\(--app-height, 100vh\) \* \.96\);/);
+  assert.match(desktop, /#teamworkerlist \{[^}]*box-shadow:/);
+  assert.match(desktop, /#teamworkerlist\[hidden\] \{ display:none; \}/);
+  const workerOptionsCss = /#teamworkeroptions \{([^}]*)\}/.exec(desktop)[1];
+  assert.match(workerOptionsCss, /min-height:0;/);
+  assert.match(workerOptionsCss, /overflow-y:auto; overscroll-behavior:contain; touch-action:pan-y;/);
+  assert.doesNotMatch(workerOptionsCss, /max-height:/);
   assert.match(css, /prefers-reduced-motion:reduce\) \{ #teampickpanel, #teampickscrim \{ animation:none; \}/);
-  assert.ok(html.indexOf('<div id="teamcontrols">') < html.indexOf('<div id="composer">'));
+  const metadata = /<summary id="ovrsummaryline">([\s\S]*?)<\/summary>/.exec(html)[1];
+  assert.match(metadata, /<span id="ovrsummary">[^<]*<\/span>/);
+  assert.match(metadata, /<span id="teamcontrols">\s*<button id="teamtrigger" type="button" aria-haspopup="dialog" aria-controls="teampickpanel" aria-expanded="false">/);
+  assert.match(metadata, /<span id="teamlabel">/);
+  assert.match(metadata, /<span id="teamstatus" role="status" aria-live="polite">/);
+  assert.equal((html.match(/id="teamcontrols"/g) || []).length, 1);
+  assert.ok(html.indexOf('<summary id="ovrsummaryline">') < html.indexOf('<div id="composer">'));
 });

@@ -1504,6 +1504,7 @@ pub(in crate::ai) async fn run_serve(
         .route("/a-serve-v1.15.1.apk", get(serve_android_apk))
         .route(&apk_download_route, get(serve_android_apk))
         .route("/info", get(server_info))
+        .route("/subagent-models", get(subagent_models))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/fork", post(fork_session))
         .route("/sessions/{id}/title", post(set_session_title))

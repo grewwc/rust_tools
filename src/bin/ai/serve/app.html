@@ -324,6 +324,23 @@ select, summary { touch-action:manipulation; }
   border-radius:50%; background:var(--surface); color:var(--dim); font-size:22px; line-height:1;
 }
 @media (hover:hover) { #modelpickclose:hover { border-color:var(--line-2); color:var(--fg); } }
+#modelpicksearchwrap { position:relative; flex:0 0 auto; padding:0 4px 8px; }
+#modelpicksearch {
+  width:100%; height:40px; padding:0 40px 0 12px; box-sizing:border-box;
+  background:var(--surface); color:var(--fg); border:1px solid var(--line); border-radius:10px;
+  font-size:14px; -webkit-appearance:none; appearance:none;
+}
+#modelpicksearch:focus { border-color:var(--acc-focus); box-shadow:0 0 0 2px var(--focus-ring); outline:none; }
+#modelpicksearch::-webkit-search-cancel-button { display:none; }
+#modelpicksearchclear {
+  position:absolute; right:8px; top:calc(50% - 4px); transform:translateY(-50%);
+  display:grid; place-items:center; width:30px; height:30px; padding:0;
+  border:0; border-radius:50%; background:var(--surface-2); color:var(--dim);
+  font-size:18px; line-height:1;
+}
+#modelpicksearchclear[hidden] { display:none; }
+#modelpickempty { flex:0 0 auto; padding:22px 12px; color:var(--dim); font-size:13px; text-align:center; }
+#modelpickempty[hidden] { display:none; }
 #modelpicklist { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; touch-action:pan-y; padding:2px 0 4px; }
 .modelrow {
   display:flex; align-items:center; gap:12px; width:100%; min-height:54px;
@@ -345,21 +362,23 @@ select, summary { touch-action:manipulation; }
 #modelpicklist .modelrowdefault { border-bottom:1px solid var(--line); border-radius:12px 12px 0 0; margin-bottom:4px; }
 @keyframes model-up { from { transform:translateY(24px); opacity:.7; } to { transform:translateY(0); opacity:1; } }
 @keyframes model-fade { from { opacity:0; } to { opacity:1; } }
-/* The team entry belongs to the phone composer; desktop keeps its controls. */
+/* The team entry shares the phone metadata summary; desktop keeps its controls. */
 #teamcontrols, #teampick { display:none; }
+#ovrsummaryline #teamcontrols { flex:0 0 auto; padding:0; margin-left:auto; }
 #teamtrigger {
-  display:flex; align-items:center; gap:8px; min-height:44px; max-width:100%;
-  padding:7px 12px 7px 8px; border-radius:999px; background:var(--surface);
+  display:flex; align-items:center; gap:5px; min-height:26px; max-width:100%;
+  padding:0 9px; border-radius:999px; background:var(--surface); font-size:12px;
   color:var(--fg); border:1px solid var(--line); text-align:left; touch-action:manipulation;
 }
 #teamtrigger[data-mode="team"] { border-color:var(--acc-line-soft); background:var(--tint-2); }
-#teamtrigger:focus-visible, #teampick button:focus-visible, #teamworker:focus-visible { outline:2px solid var(--acc-focus); outline-offset:2px; }
-.teamicon { display:grid; place-items:center; flex:0 0 auto; width:28px; height:28px; border-radius:50%; background:var(--surface-2); color:var(--acc-soft); }
-.teamicon svg { width:18px; height:18px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
-#teamlabel { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; font-weight:600; }
+#teamtrigger:focus-visible, #teampick button:focus-visible, #teamworkerbtn:focus-visible { outline:2px solid var(--acc-focus); outline-offset:2px; }
+.teamicon { display:grid; place-items:center; flex:0 0 auto; width:13px; height:13px; border-radius:50%; background:var(--surface-2); color:var(--acc-soft); }
+.teamicon svg { width:13px; height:13px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
+#teamlabel { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; font-weight:600; }
 #teamstatus { flex:0 0 auto; color:var(--dim); font-size:11px; }
 #teamtrigger[data-state="error"] #teamstatus { color:var(--err); }
-.teamchev { flex:0 0 auto; width:6px; height:6px; margin:0 2px 3px; border-right:1.5px solid var(--dim); border-bottom:1.5px solid var(--dim); transform:rotate(45deg); }
+.teamchev { display:grid; place-items:center; flex:0 0 auto; width:14px; height:14px; }
+.teamchev::after { content:""; width:5px; height:5px; margin-top:-3px; border-right:1.5px solid var(--dim); border-bottom:1.5px solid var(--dim); transform:rotate(45deg); }
 #teampick { position:fixed; inset:0; z-index:15; }
 #teampickscrim { position:absolute; inset:0; background:rgba(0,0,0,.55); animation:model-fade .18s ease-out; touch-action:none; }
 #teampickpanel {
@@ -370,15 +389,20 @@ select, summary { touch-action:manipulation; }
   animation:model-up .24s cubic-bezier(.2,.8,.2,1);
 }
 #teamhandle { flex:0 0 auto; width:38px; height:4px; margin:8px auto 4px; border-radius:2px; background:var(--line-2); }
-#teamhead { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:4px 4px 12px; }
+#teamhead { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:4px 4px 8px; }
 #teamtitle { font-size:18px; font-weight:600; }
 #teamnote, #teamworkerhint { color:var(--dim); font-size:12px; line-height:1.5; }
 #teamnote { margin:3px 0 0; }
 #teamclose { flex:0 0 auto; width:44px; height:44px; padding:0; border-radius:50%; background:var(--surface); color:var(--dim); font-size:24px; }
 #teambody { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; touch-action:pan-y; padding:2px 2px 8px; }
-#teammodes { display:flex; flex-direction:column; gap:8px; }
+/* Both modes sit on one row: a full-width card per mode wasted a lot of the
+   sheet, and the names alone are enough to tell them apart. */
+#teammodes { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+#teammodes .teamchoice { min-height:44px; padding:6px 10px; gap:8px; }
+#teammodes .teamchoicetext strong { font-size:13px; }
+#teammodes .teamchoicetext small { display:none; }
 .teamchoice {
-  display:flex; align-items:center; gap:12px; min-height:56px; padding:12px;
+  display:flex; align-items:center; gap:12px; width:100%; min-height:52px; padding:10px 12px;
   border:1px solid var(--line); border-radius:14px; background:var(--surface); color:var(--fg); text-align:left;
 }
 .teamchoice:active { background:var(--surface-hover); }
@@ -387,22 +411,59 @@ select, summary { touch-action:manipulation; }
 .teamchoice[aria-checked="true"] .modelrowcheck::after { content:""; position:absolute; left:7px; top:3px; width:6px; height:11px; border:solid var(--on-acc); border-width:0 2px 2px 0; transform:rotate(45deg); }
 .teamchoicetext { flex:1; min-width:0; }
 .teamchoicetext strong { display:block; font-size:15px; }
-.teamchoicetext small { display:block; margin-top:3px; color:var(--dim); font-size:12px; line-height:1.5; }
-#teamadvanced { margin-top:18px; }
+.teamchoicetext small { display:block; margin-top:2px; color:var(--dim); font-size:12px; line-height:1.4; }
+#teamadvanced { margin-top:14px; }
 #teambackendlabel, #teamworkerlabel { display:block; margin:0 0 8px; font-size:13px; font-weight:600; }
 #teambackends { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
-#teambackends .teamchoice { min-height:76px; gap:8px; padding:10px; }
+#teambackends .teamchoice { min-height:60px; gap:8px; padding:8px 10px; }
 #teambackends .modelrowcheck { width:18px; height:18px; }
 #teambackends .teamchoice[aria-checked="true"] .modelrowcheck::after { left:5px; top:2px; width:5px; height:9px; }
-#teamworkerwrap { margin-top:16px; padding:12px; border:1px solid var(--line); border-radius:14px; background:var(--surface); }
-#teamworkerfield { display:flex; align-items:center; gap:8px; }
-#teamworker { width:100%; min-width:0; min-height:44px; font-size:16px; background:var(--panel); border-radius:10px; }
-#teamworkerclear { flex:0 0 auto; min-width:44px; min-height:44px; padding:6px; border-radius:10px; background:var(--surface-2); font-size:12px; }
+#teamworkerwrap { margin-top:10px; padding:8px; border:1px solid var(--line); border-radius:14px; background:var(--surface); }
+#teamworkerbtn {
+  display:flex; align-items:center; justify-content:space-between; gap:8px; width:100%;
+  min-height:44px; padding:6px 10px; border:1px solid var(--line); border-radius:10px;
+  background:var(--panel); color:var(--fg); font-size:13px; text-align:left;
+}
+#teamworkerbtn[aria-expanded="true"] { border-color:var(--acc-focus); }
+#teamworkervalue { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; }
+/* The picker floats over the section above instead of growing the sheet: the
+   trigger sits at the bottom of the sheet, so an in-flow list would be pushed
+   below the fold. The card is not positioned, so this list's containing block
+   is the sheet panel itself: the scrolling body cannot clip it, which lets it
+   rise past the body's top edge. The script sets `bottom` from the card's
+   bottom edge, so the list covers the trigger and its hint, and may rise to
+   just inside the sheet's top edge. */
+#teamworkerlist {
+  position:absolute; left:12px; right:12px; bottom:120px; z-index:8;
+  display:flex; flex-direction:column; gap:6px;
+  max-height:96vh; max-height:calc(var(--app-height, 100vh) * .96);
+  padding:8px; border:1px solid var(--line-2); border-radius:14px;
+  background:var(--panel); box-shadow:0 18px 42px rgba(0,0,0,.38);
+  animation:workerpop .14s ease-out;
+}
+@keyframes workerpop { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+@media (prefers-reduced-motion:reduce) { #teamworkerlist { animation:none; } }
+#teamworkerlist[hidden] { display:none; }
+#teamworkersearch { flex:0 0 auto; width:100%; min-height:38px; margin:0; padding:0 10px; font-size:13px; background:var(--surface); border-radius:10px; }
+#teamworkeroptions {
+  flex:1 1 auto; min-height:0;
+  display:flex; flex-direction:column; gap:6px; padding:2px;
+  overflow-y:auto; overscroll-behavior:contain; touch-action:pan-y;
+}
+#teamworkeroptions .teamchoice { min-height:44px; gap:10px; padding:6px 10px; border-radius:10px; }
+#teamworkeroptions .modelrowcheck { width:17px; height:17px; }
+#teamworkeroptions .teamchoice[aria-checked="true"] .modelrowcheck::after { left:5px; top:2px; width:5px; height:9px; }
+#teamworkeroptions .teamchoicetext strong { font-size:13px; }
+#teamworkeroptions .teamchoicetext small { margin-top:1px; font-size:11px; }
+#teamworkerstatus { margin:6px 2px 0; color:var(--dim); font-size:12px; overflow-wrap:anywhere; }
+#teamworkerstatus:empty { display:none; }
+#teamworkerstatus[data-state="error"] { color:var(--err); }
+#teamworkerretry { width:100%; min-height:44px; margin-top:6px; border-radius:10px; background:var(--surface-2); font-size:13px; }
 #teamworkerhint { margin:8px 0 0; overflow-wrap:anywhere; }
 #teamerror { margin:10px 2px 2px; color:var(--err); font-size:13px; line-height:1.5; overflow-wrap:anywhere; }
-#teamactions { display:flex; flex:0 0 auto; gap:10px; padding:10px 2px 0; border-top:1px solid var(--line); }
+#teamactions { display:flex; flex:0 0 auto; gap:10px; padding:8px 2px 0; border-top:1px solid var(--line); }
 #teamactions button { flex:1; min-height:46px; border-radius:12px; font-size:14px; font-weight:600; }
-#teampick button:disabled, #teamworker:disabled { opacity:.55; }
+#teampick button:disabled { opacity:.55; }
 #skillpicker { position:relative; flex:1; min-width:0; }
 #skillfield { position:relative; }
 #oskill { width:100%; padding:6px 36px 6px 8px; font-size:16px; background-color:var(--surface); border-radius:10px; }
@@ -536,13 +597,15 @@ select, summary { touch-action:manipulation; }
   #sessfilter { padding:10px 8px; }
   /* Override picks collapse into one summary row showing the current picks. */
   #ovrwrap { display:block; border-top:1px solid var(--line); }
-  #ovrwrap > summary { display:block; padding:8px 12px; font-size:12px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #ovrwrap > summary { display:flex; align-items:center; gap:8px; padding:8px 12px; font-size:12px; color:var(--dim); white-space:nowrap; }
+  #ovrsummary { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
   #ovr { flex-direction:column; gap:8px; padding:10px 12px 10px; }
   #ovr select { flex:0 0 auto; width:100%; height:46px; padding:0 40px 0 12px; font-size:15px; }
   #modelpickfield { flex:0 0 auto; width:100%; }
   #omodelbtn { height:46px; padding:0 14px; font-size:15px; }
+  #modelpicksearch { height:46px; font-size:16px; }
   #modelpickpanel { max-height:calc(var(--app-height, 100vh) * .88); }
-  #teamcontrols { display:flex; flex:0 0 auto; padding:4px 10px 0; }
+  #ovrsummaryline #teamcontrols { display:flex; }
   #teampick:not([hidden]) { display:block; }
   .modelrow { min-height:56px; }
   #oskill { min-height:46px; padding:10px 44px 10px 12px; }
@@ -663,7 +726,15 @@ select, summary { touch-action:manipulation; }
 </div>
 <div id="turnstatus" role="status" aria-live="polite" hidden></div>
 <details id="ovrwrap" open>
-<summary id="ovrsummary">model · agent · effort · skill</summary>
+<summary id="ovrsummaryline">
+<span id="ovrsummary">model · agent · effort · skill</span>
+<span id="teamcontrols">
+<button id="teamtrigger" type="button" aria-haspopup="dialog" aria-controls="teampickpanel" aria-expanded="false">
+<span class="teamicon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3 20v-2a6 6 0 0 1 12 0v2M16 5a3 3 0 0 1 0 6M18 14a5 5 0 0 1 3 4v2"/></svg></span>
+<span id="teamlabel">普通对话</span><span id="teamstatus" role="status" aria-live="polite"></span><span class="teamchev" aria-hidden="true"></span>
+</button>
+</span>
+</summary>
 <div id="ovr">
 <div id="modelpickfield">
 <button id="omodelbtn" type="button" aria-haspopup="listbox" aria-controls="modelpicklist" aria-expanded="false" aria-label="model override" disabled>
@@ -692,6 +763,11 @@ select, summary { touch-action:manipulation; }
 <div><div id="modelpicktitle">model</div><div id="modelpicknote">applies to this session</div></div>
 <button id="modelpickclose" type="button" aria-label="close model picker">×</button>
 </div>
+<div id="modelpicksearchwrap">
+<input id="modelpicksearch" type="text" role="combobox" aria-autocomplete="list" aria-haspopup="listbox" aria-controls="modelpicklist" aria-expanded="true" aria-label="搜索模型" placeholder="搜索模型…" autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="search">
+<button id="modelpicksearchclear" type="button" aria-label="清除模型搜索" tabindex="-1" hidden>×</button>
+</div>
+<div id="modelpickempty" role="status" hidden>没有匹配的模型</div>
 <div id="modelpicklist" role="listbox" aria-labelledby="modelpicktitle"></div>
 </section>
 </div>
@@ -706,10 +782,10 @@ select, summary { touch-action:manipulation; }
 <div id="teambody">
 <div id="teammodes" role="radiogroup" aria-label="对话模式">
 <button id="teamnormal" class="teamchoice" type="button" role="radio" aria-checked="true" data-mode="normal">
-<span class="teamchoicetext"><strong>普通对话</strong><small>由主 Agent 处理你的问题</small></span><span class="modelrowcheck" aria-hidden="true"></span>
+<span class="teamchoicetext"><strong>普通对话</strong><small>主 Agent 直接处理</small></span><span class="modelrowcheck" aria-hidden="true"></span>
 </button>
 <button id="teamcollab" class="teamchoice" type="button" role="radio" aria-checked="false" data-mode="team" tabindex="-1">
-<span class="teamchoicetext"><strong>团队协作 <span class="modelfamily">agent-team</span></strong><small>主 Agent 拆解任务，子 Agent 协作完成</small></span><span class="modelrowcheck" aria-hidden="true"></span>
+<span class="teamchoicetext"><strong>subagent <span class="modelfamily">agent-team</span></strong><small>主 Agent 拆解，子 Agent 协作</small></span><span class="modelrowcheck" aria-hidden="true"></span>
 </button>
 </div>
 <div id="teamadvanced" hidden>
@@ -723,21 +799,23 @@ select, summary { touch-action:manipulation; }
 </button>
 </div>
 <div id="teamworkerwrap" hidden>
-<label id="teamworkerlabel" for="teamworker">子 Agent 模型 <span class="modelfamily">可选</span></label>
-<div id="teamworkerfield"><input id="teamworker" type="text" aria-describedby="teamworkerhint" placeholder="输入 TraeCLI 支持的模型名" autocomplete="off" autocapitalize="none" spellcheck="false"><button id="teamworkerclear" type="button" aria-label="留空沿用会话中的子 Agent 模型">留空</button></div>
-<p id="teamworkerhint">仅用于 TraeCLI 子 Agent；主模型仍在 model 中设置。留空沿用会话已保存的值，未设置时使用 TraeCLI 默认模型。</p>
+<div id="teamworkerlabel">子 Agent 模型 <span class="modelfamily">可选</span></div>
+<button id="teamworkerbtn" type="button" aria-controls="teamworkerlist" aria-describedby="teamworkerhint" aria-expanded="false">
+<span id="teamworkervalue">会话默认</span><span class="teamchev" aria-hidden="true"></span>
+</button>
+<div id="teamworkerlist" hidden>
+<input id="teamworkersearch" type="search" placeholder="筛选 TraeCLI 模型" aria-label="筛选子 Agent 模型" autocomplete="off" autocapitalize="none" spellcheck="false">
+<div id="teamworkeroptions" role="radiogroup" aria-label="子 Agent 模型"></div>
+<p id="teamworkerstatus" role="status"></p>
+<button id="teamworkerretry" type="button" hidden>重新读取模型列表</button>
+</div>
+<p id="teamworkerhint">仅用于 TraeCLI 子 Agent；主模型仍在 model 中设置。会话默认表示沿用已保存的值，未设置时使用 TraeCLI 默认模型。</p>
 </div>
 </div>
 <div id="teamerror" role="alert" hidden></div>
 </div>
 <div id="teamactions"><button id="teamcancel" type="button">取消</button><button id="teamapply" type="button" class="primary">应用模式</button></div>
 </section>
-</div>
-<div id="teamcontrols">
-<button id="teamtrigger" type="button" aria-haspopup="dialog" aria-controls="teampickpanel" aria-expanded="false">
-<span class="teamicon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3 20v-2a6 6 0 0 1 12 0v2M16 5a3 3 0 0 1 0 6M18 14a5 5 0 0 1 3 4v2"/></svg></span>
-<span id="teamlabel">普通对话</span><span id="teamstatus" role="status" aria-live="polite"></span><span class="teamchev" aria-hidden="true"></span>
-</button>
 </div>
 <div id="composer">
 <button id="img" aria-label="attach image">🖼</button>
@@ -2174,6 +2252,11 @@ function switchSession(nextId, saveCurrent = true) {
   sessionId = nextId;
   if (sessionId) localStorage.setItem("serve.session", sessionId);
   else localStorage.removeItem("serve.session");
+  // The server running sample belongs to the session that was on screen.
+  // Carrying it here would paint that session's stop button on the session
+  // being opened; the next poll or live stream re-derives it for this one.
+  turnRunning = false;
+  syncStopButton();
   restoreDraft();
   resetQuestionNavigator();
   restoreSkillPick();
@@ -2546,11 +2629,14 @@ const TEAM_FIELDS = { mode: { normal: "teamnormal", team: "teamcollab" }, backen
 let teamDraft = null;
 let teamSheetHistoryPushed = false;
 let teamSheetBackPending = false;
+// TraeCLI model discovery is shared by every opening of the team sheet, so a
+// page load only asks the server once; the retry path forces a refetch.
+let workerModels = null, workerModelsState = "idle", workerModelsError = "", workerModelsEpoch = 0;
 function teamPickKey(sid = sessionId, base = store.base) { return JSON.stringify([base, sid || ""]); }
 function teamPickState(sid = sessionId, base = store.base) {
   const key = teamPickKey(sid, base);
   if (!teamPicks.has(key)) teamPicks.set(key, {
-    choice: { mode: "normal", backend: "kernel", model: "" }, confirmed: null,
+    choice: { mode: "normal", backend: "traecli", model: "" }, confirmed: null,
     pending: false, saving: null, error: "", revision: 0,
     loadEpoch: 0, fullLoadEpoch: 0, appliedTeamLoadEpoch: 0,
   });
@@ -2558,7 +2644,8 @@ function teamPickState(sid = sessionId, base = store.base) {
 }
 function teamChoiceFromConfig(cfg) {
   const enabled = Array.isArray(cfg.default_skills) && cfg.default_skills.some((name) => typeof name === "string" && name.toLowerCase() === "agent-team");
-  return { mode: enabled ? "team" : "normal", backend: cfg.subagent_backend === "traecli" ? "traecli" : "kernel", model: typeof cfg.subagent_model === "string" ? cfg.subagent_model : "" };
+  // TraeCLI is the default worker backend; only an explicit kernel keeps it.
+  return { mode: enabled ? "team" : "normal", backend: cfg.subagent_backend === "kernel" ? "kernel" : "traecli", model: typeof cfg.subagent_model === "string" ? cfg.subagent_model : "" };
 }
 function teamConfigPayload(choice) {
   if (choice.mode === "normal") return { subagents: { action: "reset" } };
@@ -2572,13 +2659,17 @@ function teamChoiceConfirmed(choice, actual) {
     && (choice.backend !== "traecli" || !choice.model.trim() || actual.model === choice.model.trim())));
 }
 function teamChoiceLabel(choice) {
-  return choice.mode === "team" ? "团队协作 · " + (choice.backend === "traecli" ? "TraeCLI" : "Kernel") : "普通对话";
+  return choice.mode === "team" ? "subagent" : "普通对话";
+}
+function teamBackendLabel(choice) {
+  return choice.backend === "traecli" ? "TraeCLI" : "Kernel";
 }
 function syncTeamTrigger() {
   // Keep the capsule's label on one line and defer updates around the IME.
   holdLayout("teamMode", () => {
     const state = teamPickState(), unknown = sessionId && !state.confirmed && !state.pending;
     const label = unknown ? "对话模式" : teamChoiceLabel(state.choice);
+    const detail = state.choice.mode === "team" ? " · " + teamBackendLabel(state.choice) : "";
     const status = state.saving ? "保存中" : state.error ? "重试" : state.pending ? "待保存" : unknown ? "未同步" : "";
     const button = $("teamtrigger");
     $("teamlabel").textContent = label;
@@ -2586,8 +2677,8 @@ function syncTeamTrigger() {
     button.dataset.mode = unknown ? "unknown" : state.choice.mode;
     button.dataset.state = state.saving ? "saving" : state.error ? "error" : state.pending ? "pending" : "ready";
     button.setAttribute("aria-busy", String(!!state.saving));
-    button.setAttribute("aria-label", label + (status ? "，" + status : "") + "，选择对话模式");
-    button.title = state.error || label + (state.choice.mode === "team" && state.choice.backend === "traecli" && state.choice.model ? " · 子 Agent 模型：" + state.choice.model : "");
+    button.setAttribute("aria-label", label + detail + (status ? "，" + status : "") + "，选择对话模式");
+    button.title = state.error || label + detail + (state.choice.mode === "team" && state.choice.backend === "traecli" && state.choice.model ? " · 子 Agent 模型：" + state.choice.model : "");
   });
 }
 function restoreTeamPick() {
@@ -2659,12 +2750,14 @@ function renderTeamSheet() {
     button.disabled = draft.saving;
   }
   $("teamadvanced").hidden = draft.choice.mode !== "team";
-  $("teamworkerwrap").hidden = draft.choice.mode !== "team" || draft.choice.backend !== "traecli";
-  if ($("teamworker").value !== draft.choice.model) $("teamworker").value = draft.choice.model;
-  $("teamworker").disabled = draft.saving;
-  $("teamworkerclear").disabled = draft.saving;
+  const workerVisible = draft.choice.mode === "team" && draft.choice.backend === "traecli";
+  $("teamworkerwrap").hidden = !workerVisible;
+  // Warm the picker as soon as TraeCLI becomes the backend so tapping the
+  // trigger usually shows the list without a loading pause.
+  if (workerVisible && workerModelsState === "idle") void loadWorkerModels();
   const savedModel = state.confirmed && state.confirmed.model;
-  $("teamworkerhint").textContent = "仅用于 TraeCLI 子 Agent；主模型仍在 model 中设置。" + (savedModel ? "留空沿用会话已保存的模型：" + savedModel : "留空使用 TraeCLI 默认模型。");
+  $("teamworkerhint").textContent = "仅用于 TraeCLI 子 Agent；主模型仍在 model 中设置。" + (savedModel ? "会话默认沿用已保存的模型：" + savedModel : "会话默认使用 TraeCLI 默认模型。");
+  renderTeamWorker();
   $("teamnote").textContent = draft.saving ? "正在保存，收起后仍会继续" : !draft.sid ? "选择会先保留，发送首条消息前保存" : "应用于当前会话的后续消息";
   $("teampickpanel").setAttribute("aria-busy", String(draft.saving));
   $("teamcancel").textContent = draft.saving ? "收起" : "取消";
@@ -2681,18 +2774,167 @@ function changeTeamDraft(field, value) {
   teamDraft.error = "";
   renderTeamSheet();
 }
-function teamWorkerChanged() {
-  if (!teamDraft || teamDraft.saving) return;
-  teamDraft.choice.model = $("teamworker").value;
-  teamDraft.edited = true;
-  teamDraft.error = "";
-  $("teamapply").disabled = false;
-  $("teamerror").hidden = true;
+function workerModelSaved() {
+  const draft = teamDraft;
+  if (!draft) return "";
+  const state = teamPickState(draft.sid, draft.base);
+  return (state.confirmed && state.confirmed.model) || "";
+}
+function renderTeamWorker() {
+  const draft = teamDraft;
+  if (!draft) return;
+  $("teamworkervalue").textContent = draft.choice.model || "会话默认";
+  $("teamworkerbtn").disabled = draft.saving;
+  $("teamworkerbtn").setAttribute("aria-expanded", String(!!draft.workerOpen));
+  $("teamworkerlist").hidden = !draft.workerOpen;
+  $("teamworkerretry").hidden = workerModelsState !== "error";
+  $("teamworkerretry").disabled = draft.saving;
+  $("teamworkersearch").hidden = !(workerModels || []).length;
+  $("teamworkersearch").disabled = draft.saving;
+  const saved = workerModelSaved();
+  $("teamworkerbtn").title = draft.choice.model || (saved ? "会话默认：沿用 " + saved : "会话默认：使用 TraeCLI 默认模型");
+  renderTeamWorkerOptions();
+}
+function renderTeamWorkerOptions() {
+  const draft = teamDraft;
+  if (!draft) return;
+  const box = $("teamworkeroptions"), query = (draft.workerQuery || "").trim().toLowerCase();
+  const current = draft.choice.model.trim(), saved = workerModelSaved();
+  box.textContent = "";
+  const rows = [{ value: "", name: "会话默认", note: saved ? "沿用会话已保存的模型：" + saved : "使用 TraeCLI 默认模型" }];
+  const seen = new Set([""]);
+  for (const raw of workerModels || []) {
+    const value = String(raw || "").trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    rows.push({ value, name: value, note: "" });
+  }
+  if (current && !seen.has(current)) rows.push({ value: current, name: current, note: "当前值（不在 TraeCLI 列表中）" });
+  let visible = 0;
+  for (const row of rows) {
+    if (query && !(row.name + " " + row.note).toLowerCase().includes(query)) continue;
+    visible++;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "teamchoice";
+    button.dataset.model = row.value;
+    button.setAttribute("role", "radio");
+    button.setAttribute("aria-checked", String(current === row.value));
+    button.tabIndex = current === row.value ? 0 : -1;
+    button.disabled = draft.saving;
+    const text = document.createElement("span");
+    text.className = "teamchoicetext";
+    const name = document.createElement("strong");
+    name.textContent = row.name;
+    text.appendChild(name);
+    if (row.note) {
+      const note = document.createElement("small");
+      note.textContent = row.note;
+      text.appendChild(note);
+    }
+    const check = document.createElement("span");
+    check.className = "modelrowcheck";
+    check.setAttribute("aria-hidden", "true");
+    button.appendChild(text);
+    button.appendChild(check);
+    button.onclick = () => setTeamWorkerModel(row.value);
+    box.appendChild(button);
+  }
+  let status = "", statusState = workerModelsState;
+  if (workerModelsState === "loading") status = "正在读取 TraeCLI 模型…";
+  else if (workerModelsState === "error") status = workerModelsError || "读取模型列表失败";
+  else if (!visible && query) { status = "没有匹配的模型"; statusState = "empty"; }
+  else if (workerModelsState === "ready" && !(workerModels || []).length) status = "TraeCLI 未返回模型列表；会话默认仍可用。";
+  $("teamworkerstatus").textContent = status;
+  $("teamworkerstatus").dataset.state = statusState;
+}
+async function loadWorkerModels(force = false) {
+  if (!teamDraft) return;
+  if (!force && (workerModelsState === "loading" || workerModelsState === "ready")) return;
+  const epoch = ++workerModelsEpoch;
+  workerModelsState = "loading";
+  workerModelsError = "";
+  renderTeamWorker();
+  try {
+    const data = await (await api("/subagent-models")).json();
+    if (epoch !== workerModelsEpoch) return;
+    workerModels = Array.isArray(data.models) ? data.models.map((name) => String(name)).filter(Boolean) : [];
+    workerModelsState = "ready";
+  } catch (e) {
+    if (epoch !== workerModelsEpoch) return;
+    workerModelsState = "error";
+    workerModelsError = "读取模型列表失败：" + e.message;
+  }
+  if (teamDraft) renderTeamWorker();
+}
+// Anchor the list to the trigger and let it grow up to the panel top. Its
+// containing block is the panel, so the scrolling body does not clip it.
+function placeWorkerList() {
+  const draft = teamDraft;
+  if (!draft || !draft.workerOpen) return;
+  const list = $("teamworkerlist"), wrap = $("teamworkerwrap"), panel = $("teampickpanel");
+  const rectOf = (el) => (el && el.getBoundingClientRect ? el.getBoundingClientRect() : null);
+  const wrapRect = rectOf(wrap), panelRect = rectOf(panel);
+  // A missing or zero-size layout box (detached, or the test stub) keeps the
+  // CSS fallback instead of writing nonsense pixels.
+  if (!wrapRect || !wrapRect.height || !panelRect) return;
+  const view = Number(window.innerHeight) > 0 ? Number(window.innerHeight) : 640;
+  // The open list covers the trigger and its hint: the picked model already
+  // shows as the checked row inside the list, so the collapsed label is not
+  // needed while choosing. Its bottom edge lands on the card's bottom edge.
+  list.style.bottom = Math.round(Math.max(6, panelRect.bottom - wrapRect.bottom + 10)) + "px";
+  // The panel does not clip the absolute list, so it may rise past the panel's
+  // top edge while open; it stops just inside the panel's top edge so the list
+  // gets the full sheet height without leaving the sheet.
+  const space = Math.max(0, Math.floor(wrapRect.bottom - panelRect.top - 16));
+  const cap = Math.round(view * .96);
+  const height = Math.max(240, Math.min(space, cap));
+  list.style.maxHeight = height + "px";
+  $("teamworkeroptions").style.maxHeight = Math.max(0, height - 64) + "px";
+}
+function setWorkerListOpen(open) {
+  const draft = teamDraft;
+  if (!draft || draft.saving) return;
+  draft.workerOpen = !!open && !$("teamworkerwrap").hidden;
+  if (draft.workerOpen) {
+    draft.workerQuery = "";
+    $("teamworkersearch").value = "";
+    if (workerModelsState !== "ready") void loadWorkerModels(workerModelsState === "error");
+  }
+  renderTeamWorker();
+  if (!draft.workerOpen) { $("teamworkerbtn").focus(); return; }
+  placeWorkerList();
+  const options = $("teamworkeroptions");
+  options.scrollTop = 0;
+  const rows = options.querySelectorAll('[role="radio"]');
+  const target = rows.find((row) => row.getAttribute("aria-checked") === "true") || rows[0];
+  // Reveal a saved model that sits below the fold without scrolling ancestors.
+  if (target && Number.isFinite(target.offsetTop) && Number.isFinite(target.offsetHeight)) {
+    const offset = target.offsetTop - options.offsetTop;
+    if (offset + target.offsetHeight > options.clientHeight) options.scrollTop = Math.max(0, offset - 6);
+  }
+  // Focusing a row must not scroll the body: that would move the trigger out
+  // from under the floating list and the sheet closes it on scroll.
+  if (target) { try { target.focus({ preventScroll: true }); } catch (e) { target.focus(); } }
+}
+function toggleWorkerList() {
+  if (!teamDraft) return;
+  setWorkerListOpen(!teamDraft.workerOpen);
+}
+function setTeamWorkerModel(value) {
+  const draft = teamDraft;
+  if (!draft || draft.saving) return;
+  draft.choice.model = String(value || "").trim();
+  draft.edited = true;
+  draft.error = "";
+  draft.workerOpen = false;
+  renderTeamSheet();
+  $("teamworkerbtn").focus();
 }
 function openTeamSheet() {
   if (!isPhoneLayout() || !$("teampick").hidden) return;
   const state = teamPickState();
-  teamDraft = { key: teamPickKey(), sid: sessionId, base: store.base, choice: { ...state.choice }, edited: false, saving: !!state.saving, error: "", composing: false };
+  teamDraft = { key: teamPickKey(), sid: sessionId, base: store.base, choice: { ...state.choice }, edited: false, saving: !!state.saving, error: "", composing: false, workerOpen: false, workerQuery: "" };
   $("teampick").hidden = false;
   $("teamtrigger").setAttribute("aria-expanded", "true");
   renderTeamSheet();
@@ -2740,7 +2982,12 @@ async function applyTeamDraft() {
 }
 function teamSheetKeydown(e) {
   if (!teamDraft || teamDraft.composing || e.isComposing || e.keyCode === 229) return;
-  if (e.key === "Escape") { e.preventDefault(); closeTeamSheet(); return; }
+  if (e.key === "Escape") {
+    e.preventDefault();
+    if (teamDraft.workerOpen) { setWorkerListOpen(false); return; }
+    closeTeamSheet();
+    return;
+  }
   if (e.key === "Tab") {
     const order = [...$("teampickpanel").querySelectorAll("button, input")].filter((el) => !el.disabled && el.tabIndex >= 0 && !el.closest("[hidden]"));
     if (!order.length) return;
@@ -2762,15 +3009,27 @@ function teamSheetKeydown(e) {
   next.focus();
 }
 function wireTeamMode() {
-  $("teamtrigger").onclick = openTeamSheet;
+  // The trigger now lives inside the metadata summary, whose activation
+  // behavior would collapse the override panel at the same time.
+  $("teamtrigger").onclick = (event) => { if (event) event.preventDefault(); openTeamSheet(); };
   for (const id of ["teamclose", "teamcancel", "teampickscrim"]) $(id).onclick = () => closeTeamSheet();
   $("teamapply").onclick = () => { void applyTeamDraft(); };
   for (const [field, controls] of Object.entries(TEAM_FIELDS)) for (const [value, id] of Object.entries(controls)) $(id).onclick = () => changeTeamDraft(field, value);
-  $("teamworker").oninput = teamWorkerChanged;
-  $("teamworker").oncompositionstart = () => { if (teamDraft) teamDraft.composing = true; };
-  $("teamworker").oncompositionend = () => { if (teamDraft) { teamDraft.composing = false; teamWorkerChanged(); } };
-  $("teamworkerclear").onclick = () => { if (!teamDraft || teamDraft.saving) return; $("teamworker").value = ""; teamWorkerChanged(); $("teamworker").focus(); };
+  $("teamworkerbtn").onclick = toggleWorkerList;
+  $("teamworkerretry").onclick = () => { void loadWorkerModels(true); };
+  $("teamworkersearch").oninput = () => { if (!teamDraft) return; teamDraft.workerQuery = $("teamworkersearch").value; renderTeamWorkerOptions(); };
+  $("teamworkersearch").oncompositionstart = () => { if (teamDraft) teamDraft.composing = true; };
+  $("teamworkersearch").oncompositionend = () => { if (teamDraft) teamDraft.composing = false; };
   $("teampickpanel").onkeydown = teamSheetKeydown;
+  // The list floats over the section above; tapping outside it dismisses it
+  // without touching the draft selection. Scrolling keeps it attached because
+  // it is positioned against the trigger card, not the viewport.
+  $("teampickpanel").onclick = (event) => {
+    if (!teamDraft || !teamDraft.workerOpen || !event || !event.target) return;
+    const target = event.target;
+    if (target === $("teamworkerbtn") || (target.closest && target.closest("#teamworkerlist"))) return;
+    setWorkerListOpen(false);
+  };
   window.addEventListener("popstate", () => {
     if (teamSheetBackPending) { teamSheetBackPending = false; return; }
     closeTeamSheet(true);
@@ -2883,10 +3142,19 @@ function syncModelTrigger() {
     : "model override: loading");
   btn.title = option ? (option.title || text) : "";
 }
-function renderModelSheet() {
+function modelQueryMatches(option, query) {
+  if (!query) return true;
+  const haystack = ((option.value || "") + " " + (option.textContent || "")).toLowerCase();
+  return query.split(/\s+/).filter(Boolean).every((part) => haystack.includes(part));
+}
+function renderModelSheet(query = "") {
   const sel = $("omodel"), list = $("modelpicklist");
+  const q = String(query || "").trim().toLowerCase();
   list.textContent = "";
+  let visible = 0;
   for (const option of [...sel.options]) {
+    if (!modelQueryMatches(option, q)) continue;
+    visible++;
     const row = document.createElement("button");
     row.type = "button";
     row.tabIndex = -1;
@@ -2928,10 +3196,14 @@ function renderModelSheet() {
     row.onclick = () => chooseModelOption(option.value);
     list.appendChild(row);
   }
+  $("modelpickempty").hidden = !q || visible > 0;
+  $("modelpicksearchclear").hidden = !q;
+  $("modelpicksearch").setAttribute("aria-expanded", String(visible > 0));
 }
 function openModelSheet() {
   const sel = $("omodel");
   if (!sel.options.length) return;
+  $("modelpicksearch").value = "";
   renderModelSheet();
   $("modelpick").hidden = false;
   $("omodelbtn").setAttribute("aria-expanded", "true");
@@ -2981,26 +3253,38 @@ function modelSheetKeydown(e) {
     closeModelSheet();
     return;
   }
+  const search = $("modelpicksearch");
+  const rows = () => [...$("modelpicklist").querySelectorAll('[role="option"]')];
   if (e.key === "Tab") {
-    const rows = [...$("modelpicklist").querySelectorAll('[role="option"]')];
-    const order = [$("modelpickclose"), ...rows];
+    const order = [$("modelpickclose"), search, ...rows()];
     const current = order.indexOf(document.activeElement);
     if (current < 0) return;
     e.preventDefault();
     order[(current + (e.shiftKey ? -1 : 1) + order.length) % order.length].focus();
     return;
   }
+  if (e.key === "Enter" && document.activeElement === search) {
+    const first = rows()[0];
+    if (first) { e.preventDefault(); first.click(); }
+    return;
+  }
   if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
-  const rows = [...$("modelpicklist").querySelectorAll('[role="option"]')];
-  if (!rows.length) return;
-  const current = rows.indexOf(document.activeElement);
+  const visible = rows();
+  if (!visible.length) return;
+  if (document.activeElement === search) {
+    if (!["ArrowDown", "Home", "End"].includes(e.key)) return;
+    e.preventDefault();
+    visible[e.key === "End" ? visible.length - 1 : 0].focus();
+    return;
+  }
+  const current = visible.indexOf(document.activeElement);
   let next = current;
   if (e.key === "Home") next = 0;
-  else if (e.key === "End") next = rows.length - 1;
-  else if (e.key === "ArrowDown") next = (current + 1) % rows.length;
-  else next = (current - 1 + rows.length) % rows.length;
+  else if (e.key === "End") next = visible.length - 1;
+  else if (e.key === "ArrowDown") next = (current + 1) % visible.length;
+  else next = (current - 1 + visible.length) % visible.length;
   e.preventDefault();
-  rows[next].focus();
+  visible[next].focus();
 }
 // Skills are pending next-turn choices, not persistent session configuration.
 // Keep drafts per server/session while the page is open; object identity keeps
@@ -4267,7 +4551,10 @@ async function pollConfirm() {
 // lost, page reloaded, another device).
 function isTurnRunning() {
   const freshServerTurn = turnRunning && (Date.now() - turnRunningAt) < RUNNING_SAMPLE_TTL_MS;
-  return turns.has(sessionId) || (staleSession === sessionId && !staleDone) || freshServerTurn;
+  // `""` is the no-session sentinel for both ids, so a stale follow must not
+  // match an empty selection: that painting is a stop button with nothing to
+  // stop, and its click is swallowed instead of starting the first turn.
+  return turns.has(sessionId) || (sessionId !== "" && staleSession === sessionId && !staleDone) || freshServerTurn;
 }
 // The one send/stop button reflects that predicate: stop glyph plus the stop
 // class while a turn runs, the plain send look otherwise.
@@ -5166,6 +5453,13 @@ function wire() {
   $("modelpickclose").onclick = () => closeModelSheet();
   $("modelpickscrim").onclick = () => closeModelSheet();
   $("modelpickpanel").onkeydown = modelSheetKeydown;
+  $("modelpicksearch").oninput = (e) => renderModelSheet(e.target.value);
+  $("modelpicksearchclear").onclick = () => {
+    const input = $("modelpicksearch");
+    input.value = "";
+    renderModelSheet();
+    input.focus();
+  };
   window.addEventListener("popstate", () => { if (!$("modelpick").hidden) closeModelSheet(true); });
   wireTeamMode();
   $("oskill").onfocus = renderSkillMenu;

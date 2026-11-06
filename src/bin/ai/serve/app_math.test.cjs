@@ -102,6 +102,8 @@ test("drafts persist independently for each session and restore on switch", () =
     $: (id) => elements[id],
     growPrompt() {},
     setPromptValue(value) { prompt.value = value; return true; },
+    turnRunning: false,
+    syncStopButton() {},
     restoreSkillPick() {},
     restoreTeamPick() {},
     isPhoneLayout: () => true,

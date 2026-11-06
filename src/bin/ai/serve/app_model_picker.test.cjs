@@ -27,6 +27,7 @@ function node(tag = "div", doc) {
     getAttribute(k) { return n.attrs[k] ?? null; },
     removeAttribute(k) { delete n.attrs[k]; },
     focus() { doc.activeElement = n; },
+    click() { if (n.onclick) n.onclick(); },
     scrollIntoView() {},
     querySelectorAll(selector) {
       const out = [];
@@ -67,6 +68,9 @@ function harness() {
     modelpickscrim: node("div", doc),
     modelpickpanel: node("section", doc),
     modelpickclose: node("button", doc),
+    modelpicksearch: node("input", doc),
+    modelpicksearchclear: node("button", doc),
+    modelpickempty: node("div", doc),
     modelpicklist: node("div", doc),
   };
   elements.modelpick.hidden = true;
@@ -111,6 +115,9 @@ test("opening renders a themed row for every option and marks the current one", 
   assert.equal(h.elements.omodelbtn.attrs["aria-expanded"], "true");
   const rows = h.rows();
   assert.equal(rows.length, 3);
+  assert.equal(h.elements.modelpicksearch.value, "");
+  assert.equal(h.elements.modelpicksearchclear.hidden, true);
+  assert.equal(h.elements.modelpickempty.hidden, true);
   assert.equal(rows[0].attrs["aria-selected"], "true");
   assert.match(rows[0].textContent, /server default/);
   assert.match(rows[0].textContent, /deepseek-v4-flash/);
@@ -129,6 +136,32 @@ test("choosing a model writes the hidden select, saves, and closes", () => {
   assert.equal(h.elements.omodelbtn.attrs["aria-expanded"], "false");
   assert.equal(h.elements.omodelbtnlabel.textContent, "model: deepseek-v4-flash");
   assert.equal(h.doc.activeElement, h.elements.omodelbtn);
+});
+
+test("typing filters the rows, shows an empty state, and Enter accepts the first match", () => {
+  const h = harness();
+  h.context.openModelSheet();
+  h.elements.modelpicksearch.value = "deepseek";
+  h.context.renderModelSheet(h.elements.modelpicksearch.value);
+  let rows = h.rows();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].dataset.value, "deepseek-v4-flash");
+  assert.match(rows[0].textContent, /deepseek/);
+  assert.equal(h.elements.modelpicksearchclear.hidden, false);
+  assert.equal(h.elements.modelpickempty.hidden, true);
+
+  h.elements.modelpicksearch.value = "no-such-model";
+  h.context.renderModelSheet(h.elements.modelpicksearch.value);
+  assert.equal(h.rows().length, 0);
+  assert.equal(h.elements.modelpickempty.hidden, false);
+
+  h.elements.modelpicksearch.value = "gpt";
+  h.context.renderModelSheet(h.elements.modelpicksearch.value);
+  h.elements.modelpicksearch.focus();
+  h.context.modelSheetKeydown({ key: "Enter", preventDefault() {} });
+  assert.equal(h.elements.omodel.value, "gpt-5.6-sol");
+  assert.equal(h.picks(), 1);
+  assert.equal(h.elements.modelpick.hidden, true);
 });
 
 test("the default row clears the override", () => {
@@ -170,9 +203,26 @@ test("arrow keys move the sheet focus and Escape closes it", () => {
   assert.equal(h.doc.activeElement, h.elements.omodelbtn);
 });
 
+test("the search field hands focus to the first filtered row", () => {
+  const h = harness();
+  h.context.openModelSheet();
+  h.elements.modelpicksearch.value = "gpt";
+  h.context.renderModelSheet(h.elements.modelpicksearch.value);
+  const rows = h.rows();
+  h.elements.modelpicksearch.focus();
+  h.context.modelSheetKeydown({ key: "ArrowDown", preventDefault() {} });
+  assert.equal(h.doc.activeElement, rows[0]);
+  h.elements.modelpicksearch.focus();
+  h.context.modelSheetKeydown({ key: "Tab", preventDefault() {} });
+  assert.equal(h.doc.activeElement, rows[0]);
+});
+
 test("markup keeps the native select as the value store", () => {
   assert.match(html, /<select id="omodel" aria-label="model override" hidden><\/select>/);
   assert.match(html, /id="omodelbtn"[\s\S]*?aria-haspopup="listbox"[\s\S]*?aria-controls="modelpicklist"/);
   assert.match(html, /id="modelpickpanel" role="dialog" aria-modal="true"/);
+  assert.match(html, /id="modelpicksearch"[^>]*role="combobox"[^>]*aria-controls="modelpicklist"/);
+  assert.match(html, /id="modelpicksearchclear"[^>]*aria-label="清除模型搜索"/);
+  assert.match(html, /id="modelpickempty"[^>]*role="status"[^>]*hidden/);
   assert.match(html, /id="modelpicklist" role="listbox"/);
 });

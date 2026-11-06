@@ -382,7 +382,9 @@ impl ServeTurnSelection {
                 }
                 _ => None,
             },
-            subagent_backend: String::new(),
+            // Serve sessions default their subagents to TraeCLI; a stored
+            // config overrides it.
+            subagent_backend: "traecli".to_string(),
             skills: Vec::new(),
         }
     }
@@ -531,7 +533,10 @@ fn merge_restored_session_config(
         selection.reasoning_effort = Some(cfg.reasoning_effort.clone());
         changed = true;
     }
-    if cfg.subagent_backend != selection.subagent_backend {
+    // An empty stored value keeps the session default instead of clearing it.
+    if !cfg.subagent_backend.is_empty()
+        && cfg.subagent_backend != selection.subagent_backend
+    {
         selection.subagent_backend = cfg.subagent_backend.clone();
         changed = true;
     }

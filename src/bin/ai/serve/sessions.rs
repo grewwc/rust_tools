@@ -7,11 +7,19 @@ use crate::ai::driver::commands::use_backend::{
 
 fn session_config_response(config: &SessionServeConfig) -> serde_json::Value {
     let kernel_model = config.model.clone().unwrap_or_else(default_turn_model);
+    // An absent stored backend means "never chosen": the serve session default
+    // is TraeCLI, so report that instead of an empty string the picker would
+    // have to guess about.
+    let subagent_backend = config
+        .subagent_backend
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("traecli");
     serde_json::json!({
         "model": config.model.as_deref().unwrap_or_default(),
         "agent": config.agent.as_deref().unwrap_or_default(),
         "reasoning_effort": config.reasoning_effort.as_deref().unwrap_or_default(),
-        "subagent_backend": config.subagent_backend.as_deref().unwrap_or_default(),
+        "subagent_backend": subagent_backend,
         "subagent_model": config.subagent_model.as_deref().unwrap_or_default(),
         "default_skills": config.default_skills,
         "output": format_use_state(config, &kernel_model),
