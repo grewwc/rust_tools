@@ -43,9 +43,6 @@ fn background_dispatch_limits_scale_with_backlog() {
 
 #[test]
 fn scheduler_meta_opens_circuit_after_consecutive_failures() {
-    let _guard = crate::ai::test_support::ENV_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
     reset_scheduler_test_state();
     let mut meta = ProcessDispatchMeta::default();
     meta = update_dispatch_meta(meta, DispatchOutcomeTag::Failed, 10);
@@ -92,65 +89,6 @@ fn subagent_task_result_stays_open_while_process_is_parked() {
         Some(&waiting)
     ));
     assert!(should_publish_subagent_task_result(true, "", None));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn background_turn_yield_requests_are_task_local() {
-    let _guard = crate::ai::test_support::ENV_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
-    aios_kernel::kernel::register_current_pid_provider(super::current_task_pid);
-    let os = super::new_local_kernel();
-    let (first, second) = {
-        let mut os = os.lock().unwrap();
-        let first = os.begin_foreground("first".to_string(), "goal".to_string(), 10, 8, None);
-        let second = os.begin_foreground("second".to_string(), "goal".to_string(), 10, 8, None);
-        (first, second)
-    };
-    let (first_requested, first_ready) = tokio::sync::oneshot::channel();
-    let (second_requested, second_ready) = tokio::sync::oneshot::channel();
-    let (first_consumed, last_ready) = tokio::sync::oneshot::channel();
-    let first_os = os.clone();
-    let first_worker = tokio::spawn(super::TASK_PID.scope(Some(first), async move {
-        {
-            let mut os = first_os.lock().unwrap();
-            os.set_current_pid(Some(second));
-            assert_eq!(os.current_process_id(), Some(first));
-            os.request_yield();
-        }
-        first_requested.send(()).unwrap();
-        second_ready.await.unwrap();
-        {
-            let mut os = first_os.lock().unwrap();
-            assert!(os.consume_yield_requested());
-            assert!(
-                !os.consume_yield_requested(),
-                "another task's yield remains pending"
-            );
-        }
-        first_consumed.send(()).unwrap();
-    }));
-    let second_worker = tokio::spawn(super::TASK_PID.scope(Some(second), async move {
-        first_ready.await.unwrap();
-        {
-            let mut os = os.lock().unwrap();
-            os.set_current_pid(Some(first));
-            assert_eq!(os.current_process_id(), Some(second));
-            assert!(
-                !os.consume_yield_requested(),
-                "a concurrent task cannot consume another PID's yield"
-            );
-            os.request_yield();
-        }
-        second_requested.send(()).unwrap();
-        last_ready.await.unwrap();
-        let mut os = os.lock().unwrap();
-        assert!(os.consume_yield_requested());
-        assert!(!os.consume_yield_requested());
-    }));
-    let (first_result, second_result) = tokio::join!(first_worker, second_worker);
-    first_result.unwrap();
-    second_result.unwrap();
 }
 
 #[test]
@@ -286,9 +224,6 @@ fn finalize_turn_quota_charges_turn_usage_once() {
 
 #[test]
 fn terminate_and_cleanup_removes_scheduler_meta_entry() {
-    let _guard = crate::ai::test_support::ENV_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
     reset_scheduler_test_state();
     let app = test_app("build");
     let pid = {

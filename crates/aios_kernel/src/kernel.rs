@@ -319,10 +319,6 @@ pub trait KernelInternal {
     /// Terminate the currently executing process (set state to Terminated with
     /// the given result string).
     fn terminate_current(&mut self, result: String);
-    /// Host-side terminal transition for an admitted task and its descendants.
-    /// The runtime owns admission and cancellation authority; syscall owner checks are unchanged.
-    /// Returns false when the target is absent or already terminated.
-    fn terminate_process_tree(&mut self, pid: u64, reason: String) -> bool;
     /// Get a mutable reference to the process with the given PID.
     fn get_process_mut(&mut self, pid: u64) -> Option<&mut Process>;
     /// Reparent a task and transfer its listed channels from an exited owner to the current
@@ -399,10 +395,9 @@ pub trait KernelInternal {
     /// Check whether any daemon process needs a restart (stop restarting once
     /// max_restarts is exceeded). Returns the list of PIDs that need a restart.
     fn check_daemon_restart(&mut self) -> Vec<u64>;
-    /// Detach process-owned external resources for runtime cleanup. Repeated calls are safe.
+    /// Clean up all resources of the given process (IPC, shared memory,
+    /// environment variables, signals, etc.).
     fn cleanup_process_resources(&mut self, pid: u64);
-    /// Take pending external cleanup paths. The caller must delete them after releasing its kernel guard.
-    fn drain_external_cleanup(&mut self) -> Vec<PathBuf>;
 }
 
 /// Kernel trait - combines Syscall + KernelInternal + Futex + Trace.

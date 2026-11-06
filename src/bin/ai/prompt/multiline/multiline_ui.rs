@@ -32,9 +32,7 @@ use super::render::{preserve_prompt_cursor_group, render_multiline_popup};
 use super::{
     MultilineHistoryState, SingleRowFrame,
     completion_panel::{CompletionPanel, PendingTabCompletion},
-    events::{
-        EventLoopAction, RecentTextInput, handle_multiline_input_batch, is_batchable_text_event,
-    },
+    events::{EventLoopAction, RecentTextInput, handle_multiline_event},
     render::render_multiline_popup_with_checkpoint,
 };
 use crate::ai::prompt::{PromptEditor, interrupted_error};
@@ -223,6 +221,17 @@ fn read_prompt_event(
     Ok(Some(first))
 }
 
+fn is_ssh_text_input_event(event: &Event) -> bool {
+    // Enter and Tab can submit or change completion state, so they are boundaries.
+    matches!(
+        event,
+        Event::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                && matches!(key.code, KeyCode::Char(_))
+    )
+}
+
 fn read_ssh_input_batch(
     first: Event,
     is_ssh: bool,
@@ -231,7 +240,7 @@ fn read_ssh_input_batch(
     mut read: impl FnMut(Duration) -> io::Result<Option<Event>>,
 ) -> io::Result<Vec<Event>> {
     let mut batch = vec![first];
-    if !is_ssh || !is_batchable_text_event(&batch[0]) {
+    if !is_ssh || !is_ssh_text_input_event(&batch[0]) {
         return Ok(batch);
     }
     prune_expired_cpr_replies(pending_cpr_replies, Instant::now());
@@ -255,7 +264,7 @@ fn read_ssh_input_batch(
         let Some(event) = event else {
             break;
         };
-        if !is_batchable_text_event(&event) {
+        if !is_ssh_text_input_event(&event) {
             pending.push_front(event);
             break;
         }
@@ -334,9 +343,6 @@ struct PromptScreen {
     /// Geometry of the last cleared or painted viewport. Stored tops may only
     /// clear the main screen while this geometry still matches the terminal.
     viewport_geometry: Option<(Rect, Size)>,
-    /// The emulator's measured edge belongs to one PTY geometry. Reuse it for
-    /// ordinary redraws; resize/reflow also invalidate it when winsize lags.
-    paint_width: Option<(Size, u16)>,
 }
 
 impl PromptScreen {
@@ -354,45 +360,6 @@ impl PromptScreen {
         self.pending_cpr_replies
             .back()
             .is_none_or(|query| now.duration_since(*query) >= CPR_PROBE_QUIET_PERIOD)
-    }
-
-    fn paint_columns(
-        &mut self,
-        terminal_size: Size,
-        measure: impl FnOnce() -> io::Result<u16>,
-    ) -> io::Result<u16> {
-        if let Some((sampled_size, width)) = self.paint_width
-            && sampled_size == terminal_size
-        {
-            return Ok(width);
-        }
-        self.paint_width = None;
-        if self.queries_disabled || !self.replies_settled(Instant::now()) {
-            return Ok(terminal_size.width.max(1));
-        }
-        match tracked_cursor_query(&mut self.pending_cpr_replies, measure) {
-            Ok(width) => {
-                self.paint_width = Some((terminal_size, width));
-                Ok(width)
-            }
-            Err(err) if PromptEditor::is_cursor_position_timeout(&err) => {
-                self.queries_disabled = true;
-                Ok(terminal_size.width.max(1))
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    /// A notification can catch up with an emulator edge sampled before the PTY
-    /// resized. Repaint that case even if the anchor already has the same size.
-    fn notify_paint_resize(&mut self, notified_size: Size) -> bool {
-        let changed = self.paint_width.is_some_and(|(size, width)| {
-            size != notified_size || width != notified_size.width.max(1)
-        });
-        if changed {
-            self.paint_width = None;
-        }
-        changed
     }
 
     fn prepare_viewport(
@@ -1279,8 +1246,6 @@ fn rebuild_after_terminal_reflow(
     last_drawn_area: Option<Rect>,
     verify_anchor: bool,
 ) -> io::Result<(Rect, Size)> {
-    // The settling pass must recheck the emulator even if PTY size is unchanged.
-    screen.paint_width = None;
     let terminal_size = terminal.backend().size()?;
     let requested_height = viewport_height_with_completion(
         terminal_size.height,
@@ -3599,11 +3564,26 @@ impl PromptEditor {
                                 Ok(size)
                             },
                         )?;
-                        let live_paint_width = screen.paint_columns(prepared_paint_size, || {
-                            SingleRowFrame::measure_columns(terminal.backend_mut(), || {
-                                cursor::position().map(|(column, _)| column)
-                            })
-                        })?;
+                        let live_paint_width = if !screen.queries_disabled
+                            && screen.replies_settled(Instant::now())
+                        {
+                            let measured =
+                                tracked_cursor_query(&mut screen.pending_cpr_replies, || {
+                                    SingleRowFrame::measure_columns(terminal.backend_mut(), || {
+                                        cursor::position().map(|(column, _)| column)
+                                    })
+                                });
+                            match measured {
+                                Ok(width) => width,
+                                Err(err) if PromptEditor::is_cursor_position_timeout(&err) => {
+                                    screen.queries_disabled = true;
+                                    prepared_paint_size.width.max(1)
+                                }
+                                Err(err) => return Err(err),
+                            }
+                        } else {
+                            prepared_paint_size.width.max(1)
+                        };
                         let paint_width_changed = last_painted_terminal_width
                             .is_some_and(|width| width != live_paint_width);
                         let force_repaint = force_repaint_next_frame || paint_width_changed;
@@ -3688,9 +3668,7 @@ impl PromptEditor {
                                 "sequence": fixture_frame_sequence,
                                 "size": [last_applied_terminal_size.width, last_applied_terminal_size.height],
                                 "frame": {"x": area.x, "y": area.y, "width": area.width, "height": area.height},
-                                "paint_width": live_paint_width,
                                 "alternate": screen.alternate,
-                                "resize_pending": resize_state.pending(),
                                 "cursor": textarea.cursor(),
                                 "content": textarea.lines().join("\n"),
                             });
@@ -3757,7 +3735,6 @@ impl PromptEditor {
                     // ellipses. Keep one later pass to reconcile cursor movement.
                     redraw_requested |=
                         resize_state.notify_resize(&event, last_applied_terminal_size);
-                    redraw_requested |= screen.notify_paint_resize(Size::new(width, height));
                     drift_log(&format!(
                         "resize notified: {width}x{height} applied={last_applied_terminal_size:?}"
                     ));
@@ -3817,23 +3794,25 @@ impl PromptEditor {
                         }
                     },
                 )?;
-                let previous_input_len = textarea_logical_char_count(&textarea);
-                match handle_multiline_input_batch(
-                    input_batch,
-                    &mut textarea,
-                    &mut history,
-                    &mut status_msg,
-                    &mut pending_tab_completion,
-                    &mut completion_panel,
-                    &mut recent_text_input,
-                    &self.session_image_dir,
-                )? {
-                    EventLoopAction::Continue => {
-                        force_repaint_next_frame |=
-                            textarea_logical_char_count(&textarea) < previous_input_len;
-                        redraw_requested = true;
+                for event in input_batch {
+                    let previous_input_len = textarea_logical_char_count(&textarea);
+                    match handle_multiline_event(
+                        event,
+                        &mut textarea,
+                        &mut history,
+                        &mut status_msg,
+                        &mut pending_tab_completion,
+                        &mut completion_panel,
+                        &mut recent_text_input,
+                        &self.session_image_dir,
+                    )? {
+                        EventLoopAction::Continue => {
+                            force_repaint_next_frame |=
+                                textarea_logical_char_count(&textarea) < previous_input_len;
+                            redraw_requested = true;
+                        }
+                        EventLoopAction::Submit(result) => break 'input Ok(result),
                     }
-                    EventLoopAction::Submit(result) => break 'input Ok(result),
                 }
             }
         })();
@@ -3925,123 +3904,6 @@ mod tests {
     }
 
     #[test]
-    fn paste_latency_stable_geometry_reuses_measured_columns() {
-        let mut screen = super::PromptScreen::default();
-        let size = Size::new(120, 40);
-        let mut queries = 0;
-        for _ in 0..32 {
-            assert_eq!(
-                screen
-                    .paint_columns(size, || {
-                        queries += 1;
-                        Ok(80)
-                    })
-                    .unwrap(),
-                80,
-                "the measured emulator edge must win over a lagging PTY width"
-            );
-        }
-        assert_eq!(queries, 1, "stable redraws must not repeat synchronous CPR");
-        assert!(screen.pending_cpr_replies.is_empty());
-    }
-
-    #[test]
-    fn paste_latency_resize_rechecks_geometry_and_lagging_emulator_width() {
-        let mut screen = super::PromptScreen::default();
-        let original = Size::new(120, 40);
-        assert_eq!(screen.paint_columns(original, || Ok(80)).unwrap(), 80);
-
-        // Winsize can already equal the notification while the sampled emulator
-        // edge still describes a previous resize. The notification owes a paint.
-        assert!(screen.notify_paint_resize(original));
-        assert_eq!(screen.paint_columns(original, || Ok(120)).unwrap(), 120);
-        assert!(!screen.notify_paint_resize(original));
-        assert_eq!(
-            screen
-                .paint_columns(original, || panic!(
-                    "a duplicate resize must reuse its width"
-                ))
-                .unwrap(),
-            120
-        );
-
-        // Even a one-column change tolerated by the anchor guard must sample the
-        // new edge. A height change also invalidates the geometry association.
-        for size in [Size::new(119, 40), Size::new(119, 30), Size::new(80, 30)] {
-            let mut queries = 0;
-            assert_eq!(
-                screen
-                    .paint_columns(size, || {
-                        queries += 1;
-                        Ok(size.width)
-                    })
-                    .unwrap(),
-                size.width
-            );
-            assert_eq!(queries, 1);
-        }
-    }
-
-    #[test]
-    fn paste_latency_width_timeout_preserves_the_orphan_reply_guard() {
-        let mut screen = super::PromptScreen::default();
-        let size = Size::new(120, 40);
-        assert_eq!(
-            screen
-                .paint_columns(size, || {
-                    Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "cursor position timeout",
-                    ))
-                })
-                .unwrap(),
-            120
-        );
-        assert!(screen.queries_disabled);
-        assert_eq!(screen.pending_cpr_replies.len(), 1);
-        assert!(screen.paint_width.is_none());
-        assert_eq!(
-            screen
-                .paint_columns(size, || panic!("a failed CPR must disable further queries"))
-                .unwrap(),
-            120
-        );
-        assert_eq!(screen.pending_cpr_replies.len(), 1);
-    }
-
-    #[test]
-    fn paste_latency_ctrl_v_is_delivered_as_a_standalone_clipboard_key() {
-        let first = key(KeyCode::Char('a'));
-        let second = key(KeyCode::Char('b'));
-        let clipboard = Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
-        let tail = key(KeyCode::Char('c'));
-        let mut input = VecDeque::from([second.clone(), clipboard.clone(), tail.clone()]);
-        let mut pending = VecDeque::new();
-        let mut replies = VecDeque::new();
-        let batch =
-            super::read_ssh_input_batch(first.clone(), true, &mut pending, &mut replies, |_| {
-                Ok(input.pop_front())
-            })
-            .unwrap();
-        assert_eq!(batch, vec![first, second]);
-        let delivered = super::read_prompt_event(&mut pending, &mut replies, |_| {
-            panic!("the queued clipboard key must be delivered before reading more text")
-        })
-        .unwrap()
-        .unwrap();
-        assert_eq!(delivered, clipboard);
-        let batch =
-            super::read_ssh_input_batch(delivered, true, &mut pending, &mut replies, |_| {
-                panic!("Ctrl+V must reach its clipboard handler without batching or lookahead")
-            })
-            .unwrap();
-        assert_eq!(batch, vec![clipboard]);
-        assert_eq!(input, VecDeque::from([tail]));
-        assert!(pending.is_empty());
-        assert!(replies.is_empty());
-    }
-
-    #[test]
     fn ssh_text_input_batch_collects_text_and_preserves_resize_boundary() {
         let first = key(KeyCode::Char('a'));
         let second = key(KeyCode::Char('b'));
@@ -4110,9 +3972,6 @@ mod tests {
     fn ssh_text_input_batch_preserves_paste_and_control_boundaries() {
         for boundary in [
             Event::Paste("clipboard text".into()),
-            key(KeyCode::Char('\r')),
-            key(KeyCode::Char('\n')),
-            key(KeyCode::Char('\t')),
             key(KeyCode::Esc),
             key(KeyCode::F(2)),
             key(KeyCode::Left),

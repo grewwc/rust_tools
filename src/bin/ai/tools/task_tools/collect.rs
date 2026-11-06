@@ -74,244 +74,10 @@ fn task_evidence_history_file(entry: &AsyncTaskEntry) -> Option<PathBuf> {
         .filter(|path| !path.as_os_str().is_empty() && !entry.session_id.is_empty())
 }
 
-type PublicationKey = (usize, u64);
-
-static PENDING_PUBLICATIONS: LazyLock<Mutex<rust_tools::commonw::FastSet<PublicationKey>>> =
-    LazyLock::new(|| Mutex::new(Default::default()));
-
-fn publication_key(os: &dyn Kernel, pid: u64) -> PublicationKey {
-    (os as *const dyn Kernel as *const () as usize, pid)
-}
-
-/// Owned by one terminal producer from kernel reservation through durable publication and IPC.
-/// The kernel identity disambiguates equal PIDs in independent runtime instances.
-pub(crate) struct TaskPublicationGuard {
-    key: PublicationKey,
-}
-
-impl TaskPublicationGuard {
-    pub(crate) fn reserve(os: &dyn Kernel, pid: u64) -> Option<Self> {
-        let key = publication_key(os, pid);
-        lock_unpoisoned(&PENDING_PUBLICATIONS)
-            .insert(key)
-            .then(|| Self { key })
-    }
-}
-
-impl Drop for TaskPublicationGuard {
-    fn drop(&mut self) {
-        lock_unpoisoned(&PENDING_PUBLICATIONS).remove(&self.key);
-        crate::ai::driver::notify_scheduler();
-    }
-}
-
-pub(super) fn task_publication_in_progress(os: &dyn Kernel, pid: u64) -> bool {
-    lock_unpoisoned(&PENDING_PUBLICATIONS).contains(&publication_key(os, pid))
-}
-
-#[cfg(test)]
-mod publication_guard_tests {
-    use super::*;
-    use aios_kernel::{KernelInternal, local::LocalOS};
-
-    #[test]
-    fn runtime_lock_publication_duplicate_claim_preserves_owner_and_kernel_scope() {
-        let mut first = LocalOS::new();
-        let mut second = LocalOS::new();
-        let pid = first.begin_foreground("first".to_string(), "goal".to_string(), 10, 8, None);
-        assert_eq!(
-            second.begin_foreground("second".to_string(), "goal".to_string(), 10, 8, None),
-            pid
-        );
-        let first_claim = TaskPublicationGuard::reserve(&first, pid).unwrap();
-        assert!(TaskPublicationGuard::reserve(&first, pid).is_none());
-        assert!(task_publication_in_progress(&first, pid));
-        let second_claim = TaskPublicationGuard::reserve(&second, pid).unwrap();
-        drop(first_claim);
-        assert!(!task_publication_in_progress(&first, pid));
-        assert!(task_publication_in_progress(&second, pid));
-        drop(second_claim);
-        assert!(!task_publication_in_progress(&second, pid));
-    }
-}
-
-pub(crate) fn task_id_for_result(pid: u64, result_channel_id: u64) -> Option<String> {
-    lock_task_registry().iter().find_map(|(task_id, entry)| {
-        (entry.pid == pid && entry.result_channel_id == result_channel_id).then(|| task_id.clone())
-    })
-}
-
-/// JSON parsing, rendering, and SQLite commits happen before this object enters the kernel.
-/// `commit_ipc` performs only nonblocking kernel operations; warning persistence happens in `finish`.
-pub(crate) struct PreparedTaskPublication {
-    task: Option<(String, AsyncTaskEntry)>,
-    history_file: Option<PathBuf>,
-    pid: u64,
-    channel: ChannelId,
-    payload: String,
-    saved: bool,
-    already_published: bool,
-    errors: Vec<String>,
-    warning: Option<(usize, String)>,
-}
-
-impl PreparedTaskPublication {
-    pub(crate) fn prepare(
-        task_id: Option<&str>,
-        pid: u64,
-        result_channel_id: u64,
-        payload: String,
-    ) -> Result<Self, String> {
-        let task = task_id.and_then(|task_id| {
-            with_task_entry(task_id, |entry| entry.clone())
-                .filter(|entry| entry.pid == pid && entry.result_channel_id == result_channel_id)
-                .map(|entry| (task_id.to_string(), entry))
-        });
-        let mut prepared = Self {
-            task,
-            history_file: None,
-            pid,
-            channel: ChannelId(result_channel_id),
-            payload,
-            saved: false,
-            already_published: false,
-            errors: Vec::new(),
-            warning: None,
-        };
-        if let Some((task_id, entry)) = &prepared.task {
-            let result: StoredTaskResult =
-                serde_json::from_str(&prepared.payload).map_err(|error| {
-                    format!("cannot publish task {task_id}: invalid terminal result: {error}")
-                })?;
-            prepared.history_file = task_evidence_history_file(entry);
-            if let Some(history_file) = &prepared.history_file {
-                let rendered = format_task_result_with_id(task_id, entry, result.clone());
-                match crate::ai::history::record_published_task_evidence(
-                    history_file,
-                    &entry.session_id,
-                    crate::ai::history::DeliveredTaskEvidence {
-                        task_id,
-                        description: &entry.description,
-                        agent_name: &entry.agent_name,
-                        model: &entry.model,
-                        status: &result.status,
-                        payload: &rendered,
-                    },
-                ) {
-                    Ok(saved) => {
-                        prepared.saved = saved;
-                        prepared.already_published = !saved;
-                    }
-                    Err(error) => prepared
-                        .errors
-                        .push(format!("durable publication failed: {error}")),
-                }
-            }
-        }
-        Ok(prepared)
-    }
-
-    pub(crate) fn commit_ipc(&mut self, os: &mut dyn Kernel) {
-        if self.already_published {
-            return;
-        }
-        if self.task.is_none() {
-            if let Err(error) = os.channel_send(
-                Some(self.pid),
-                self.channel,
-                std::mem::take(&mut self.payload),
-            ) {
-                self.errors.push(error);
-                return;
-            }
-            if let Err(error) = os.channel_close(None, self.channel) {
-                self.errors.push(error);
-                return;
-            }
-            if os.channel_meta(self.channel).is_some_and(|metadata| {
-                metadata
-                    .ref_holders
-                    .iter()
-                    .any(|holder| holder == "task_result.producer")
-            }) && let Err(error) = os.channel_release_named(self.channel, "task_result.producer")
-            {
-                self.errors.push(error);
-            }
-            return;
-        }
-        let owner_has_exited = os
-            .channel_meta(self.channel)
-            .and_then(|metadata| metadata.owner_pid)
-            .is_some_and(|owner_pid| {
-                !os.get_process(owner_pid)
-                    .is_some_and(|process| process.state != ProcessState::Terminated)
-            });
-        let sent = if self.saved && owner_has_exited {
-            false
-        } else {
-            match os.channel_send(
-                Some(self.pid),
-                self.channel,
-                std::mem::take(&mut self.payload),
-            ) {
-                Ok(()) => true,
-                Err(error) => {
-                    let error = error.trim_end_matches('.');
-                    let recovery = if self.saved {
-                        "The full result is saved in the parent ledger; task_wait/task_status can collect it."
-                    } else {
-                        "The result could not be saved in the parent ledger; retain the child history for recovery."
-                    };
-                    let warning = format!(
-                        "[Task result delivery warning] IPC publication failed: {error}. {recovery}"
-                    );
-                    self.warning = Some((self.errors.len(), warning.clone()));
-                    self.errors.push(warning);
-                    false
-                }
-            }
-        };
-        if (sent || self.saved) && os.channel_meta(self.channel).is_some() {
-            if let Err(error) = os.channel_close(None, self.channel) {
-                self.errors
-                    .push(format!("failed to close result channel: {error}"));
-            }
-            if let Err(error) = os.channel_release_named(self.channel, "task_result.producer") {
-                self.errors
-                    .push(format!("failed to release result producer: {error}"));
-            }
-        }
-    }
-
-    pub(crate) fn finish(mut self) -> Result<(), String> {
-        if self.saved
-            && let Some((task_id, entry)) = &self.task
-            && let Some(history_file) = &self.history_file
-            && let Some((index, warning)) = &self.warning
-            && let Err(error) = crate::ai::history::record_task_publication_warning(
-                history_file,
-                &entry.session_id,
-                task_id,
-                warning,
-            )
-        {
-            self.errors.insert(
-                *index,
-                format!("failed to save IPC delivery warning: {error}"),
-            );
-        }
-        if self.errors.is_empty() {
-            Ok(())
-        } else if let Some((task_id, _)) = self.task {
-            Err(format!("task_id={task_id}: {}", self.errors.join("; ")))
-        } else {
-            Err(self.errors.join("; "))
-        }
-    }
-}
-
-/// Caller-owned LocalOS fixtures run the same publication stages without a shared mutex.
-#[cfg(test)]
+/// Every terminal producer commits the full result before attempting IPC. Publication failures
+/// retain a recovery payload in the parent ledger and return a visible error to the driver. If
+/// the channel's owner has already exited, the durable payload is the delivery path until a later
+/// foreground collects it, so no send to that stale channel is attempted.
 pub(crate) fn publish_task_result(
     os: &mut dyn Kernel,
     task_id: Option<&str>,
@@ -319,9 +85,107 @@ pub(crate) fn publish_task_result(
     result_channel_id: u64,
     payload: String,
 ) -> Result<(), String> {
-    let mut prepared = PreparedTaskPublication::prepare(task_id, pid, result_channel_id, payload)?;
-    prepared.commit_ipc(os);
-    prepared.finish()
+    let task = task_id.and_then(|task_id| {
+        with_task_entry(task_id, |entry| entry.clone())
+            .filter(|entry| entry.pid == pid && entry.result_channel_id == result_channel_id)
+            .map(|entry| (task_id.to_string(), entry))
+    });
+    let Some((task_id, entry)) = task else {
+        let channel = ChannelId(result_channel_id);
+        os.channel_send(Some(pid), channel, payload)?;
+        os.channel_close(None, channel)?;
+        if os.channel_meta(channel).is_some_and(|metadata| {
+            metadata
+                .ref_holders
+                .iter()
+                .any(|holder| holder == "task_result.producer")
+        }) {
+            os.channel_release_named(channel, "task_result.producer")?;
+        }
+        return Ok(());
+    };
+    let result: StoredTaskResult = serde_json::from_str(&payload).map_err(|error| {
+        format!("cannot publish task {task_id}: invalid terminal result: {error}")
+    })?;
+    let history_file = task_evidence_history_file(&entry)
+        .filter(|path| !path.as_os_str().is_empty() && !entry.session_id.is_empty());
+    let persistence = history_file.as_ref().map(|history_file| {
+        let rendered = format_task_result_with_id(&task_id, &entry, result.clone());
+        crate::ai::history::record_published_task_evidence(
+            history_file,
+            &entry.session_id,
+            crate::ai::history::DeliveredTaskEvidence {
+                task_id: &task_id,
+                description: &entry.description,
+                agent_name: &entry.agent_name,
+                model: &entry.model,
+                status: &result.status,
+                payload: &rendered,
+            },
+        )
+    });
+    if matches!(&persistence, Some(Ok(false))) {
+        // A terminal publication already owns this slot, including one collected earlier.
+        return Ok(());
+    }
+    let mut errors = Vec::new();
+    if let Some(Err(error)) = &persistence {
+        errors.push(format!("durable publication failed: {error}"));
+    }
+    let channel = ChannelId(result_channel_id);
+    let owner_has_exited = os
+        .channel_meta(channel)
+        .and_then(|metadata| metadata.owner_pid)
+        .is_some_and(|owner_pid| {
+            !os.get_process(owner_pid)
+                .is_some_and(|process| process.state != ProcessState::Terminated)
+        });
+    let sent = if matches!(&persistence, Some(Ok(true))) && owner_has_exited {
+        false
+    } else {
+        match os.channel_send(Some(pid), channel, payload) {
+            Ok(()) => true,
+            Err(error) => {
+                let error = error.trim_end_matches('.');
+                let saved = matches!(&persistence, Some(Ok(true)));
+                let recovery = if saved {
+                    "The full result is saved in the parent ledger; task_wait/task_status can collect it."
+                } else {
+                    "The result could not be saved in the parent ledger; retain the child history for recovery."
+                };
+                let warning = format!(
+                    "[Task result delivery warning] IPC publication failed: {error}. {recovery}"
+                );
+                if saved
+                    && let Some(history_file) = &history_file
+                    && let Err(error) = crate::ai::history::record_task_publication_warning(
+                        history_file,
+                        &entry.session_id,
+                        &task_id,
+                        &warning,
+                    )
+                {
+                    errors.push(format!("failed to save IPC delivery warning: {error}"));
+                }
+                errors.push(warning);
+                false
+            }
+        }
+    };
+    if (sent || matches!(&persistence, Some(Ok(true)))) && os.channel_meta(channel).is_some() {
+        // Closing is a host lifecycle operation; the producer is not the consumer owner.
+        if let Err(error) = os.channel_close(None, channel) {
+            errors.push(format!("failed to close result channel: {error}"));
+        }
+        if let Err(error) = os.channel_release_named(channel, "task_result.producer") {
+            errors.push(format!("failed to release result producer: {error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("task_id={task_id}: {}", errors.join("; ")))
+    }
 }
 
 /// Reads the persisted evidence state (status + payload) for the given task_id in the current
@@ -360,9 +224,6 @@ pub(super) fn drain_task_result(
     entry: &AsyncTaskEntry,
     cleanup_reason: &str,
 ) -> Result<Option<DrainedTaskResult>, String> {
-    if task_publication_in_progress(os, entry.pid) {
-        return Ok(None);
-    }
     let Some(result) = read_task_result(os, entry.result_channel_id, false)? else {
         if let Some(history_file) = task_evidence_history_file(entry)
             && let Some((status, rendered, delivered)) =

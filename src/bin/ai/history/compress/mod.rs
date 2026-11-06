@@ -497,7 +497,7 @@ use dedup::{dedup_adjacent, dedup_repeated_tool_results, keep_only_recent_reason
 pub(in crate::ai) use overflow_sink::archive_messages_to_overflow;
 pub(in crate::ai) use overflow_sink::compressed_tool_evidence_exceeds_inline_budget;
 use overflow_sink::{
-    OverflowSink, PlannedArchiveWrite, TruncatedFieldArchiveBatch,
+    OverflowSink, PlannedArchiveWrite,
     archive_internal_notes_deduplicated, archive_truncated_field_to_overflow,
     build_overflow_placeholder, content_sha256_hex, insert_internal_note_archive_note_if_needed,
     insert_overflow_archive_note_if_exists, trim_compressed_tool_evidence_to_inline_budget,

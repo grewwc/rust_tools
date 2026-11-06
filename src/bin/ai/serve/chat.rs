@@ -217,7 +217,6 @@ fn fetch_remote_checkpoint_names(
         client.get(format!("{base}/sessions/{session_id}/checkpoints")),
         token,
     )
-    .timeout(Duration::from_secs(2))
     .send()
     .map_err(|err| format!("cannot reach serve at {base} ({err})"))?;
     let status = resp.status();

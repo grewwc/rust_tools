@@ -23,7 +23,7 @@ use crate::ai::{
     },
     model_names::ReasoningEffortWire,
     models,
-    provider::{ApiProvider, request_wire_shapes},
+    provider::{ApiProvider, adapter_for, compatible_wire_shapes},
     request_protocol::RequestProtocolDialect,
     types::{ReasoningItemMap, ToolDefinition},
 };
@@ -343,10 +343,7 @@ pub(super) fn measure_request_prompt_from_definitions(
         reasoning_item_counts(messages, reasoning_items);
     PromptCounts {
         messages: message_prompt_counts(messages),
-        tools: defs.map_or(
-            BillableCounts::default(),
-            tools_definitions_compact_json_counts,
-        ),
+        tools: defs.map_or(BillableCounts::default(), tools_definitions_compact_json_counts),
         reasoning,
         reasoning_encrypted_lower,
         reasoning_encrypted_upper,
@@ -424,10 +421,7 @@ fn compact_json_counts(value: &Value) -> BillableCounts {
             .unwrap_or_default(),
         Value::String(text) => BillableCounts::json_string(text),
         Value::Array(items) => {
-            items
-                .iter()
-                .map(compact_json_counts)
-                .sum::<BillableCounts>()
+            items.iter().map(compact_json_counts).sum::<BillableCounts>()
                 + BillableCounts::ascii(2 + items.len().saturating_sub(1))
         }
         Value::Object(map) => {
@@ -499,9 +493,7 @@ fn tools_definitions_compact_json_counts(defs: &[ToolDefinition]) -> BillableCou
 /// `agent_tools_for_request` which yields `None` for empty tool sets), `None`
 /// contributes 0 — mirroring `estimate_tools_tokens`' `None`-vs-`Some` split.
 pub(super) fn estimate_tools_tokens_from_definitions(defs: Option<&[ToolDefinition]>) -> usize {
-    defs.map_or(0, |defs| {
-        tools_definitions_compact_json_counts(defs).tokens()
-    })
+    defs.map_or(0, |defs| tools_definitions_compact_json_counts(defs).tokens())
 }
 
 /// Preview-path lower-bound estimate: messages, tool schemas, and reasoning
@@ -571,11 +563,7 @@ pub(crate) fn clamp_max_tokens_for_prompt(
 
 /// Reuse a current-request estimate without walking the history again.
 pub(super) fn clamp_with_estimated_prompt(model: &str, est_prompt: usize, model_max: u32) -> u32 {
-    clamp_with_estimated_prompt_from_parts(
-        models::context_window_tokens(model),
-        est_prompt,
-        model_max,
-    )
+    clamp_with_estimated_prompt_from_parts(models::context_window_tokens(model), est_prompt, model_max)
 }
 
 /// Registry-free core of [`clamp_with_estimated_prompt`] over the resolved
@@ -632,9 +620,10 @@ impl RequestModelInputs {
 }
 
 /// Resolve the wire `enable_search` field shared by body assembly and the
-/// tool-schema-free preview estimate. Responses keeps the caller flag; other
-/// protocols use the provider facade's endpoint policy and adapter defaults.
-/// This shared resolver keeps search-gated fingerprints in sync.
+/// tool-schema-free preview estimate. Responses keeps the caller flag, plain
+/// OpenAI-compatible endpoints split by endpoint shape, every other adapter
+/// decides via its own `enable_search_field`. Extracted so both paths cannot
+/// diverge on search-gated fingerprints.
 pub(super) fn resolve_wire_enable_search(
     model: &str,
     endpoint: &str,
@@ -660,7 +649,11 @@ pub(super) fn resolve_wire_enable_search_from_parts(
     if dialect == RequestProtocolDialect::Responses {
         return enable_search;
     }
-    request_wire_shapes(adapter_kind, endpoint, enable_search, None).0
+    if adapter_kind == ApiProvider::Compatible {
+        let (enable_search, _, _) = compatible_wire_shapes(endpoint, enable_search, None);
+        return enable_search;
+    }
+    adapter_for(adapter_kind, endpoint).enable_search_field(enable_search)
 }
 
 /// Assembles the HTTP request body (`RequestBody`), adding thinking / reasoning /
@@ -713,14 +706,15 @@ pub(super) fn build_request_body_from_parts<'a>(
 ) -> RequestBody<'a> {
     let endpoint = &inputs.endpoint;
     let request_model = inputs.request_model.clone();
-    let (thinking, reasoning_effort, reasoning) = resolve_reasoning_wire_controls_from_parts(
-        inputs.adapter,
-        &request_model,
-        endpoint,
-        inputs.effort_wire,
-        enable_thinking,
-        reasoning_effort,
-    );
+    let (thinking, reasoning_effort, reasoning) =
+        resolve_reasoning_wire_controls_from_parts(
+            inputs.adapter,
+            &request_model,
+            endpoint,
+            inputs.effort_wire,
+            enable_thinking,
+            reasoning_effort,
+        );
     // Responses maps search to the built-in web_search tool; for Chat Completions,
     // the provider dialect still decides whether to retain `enable_search`.
     let enable_search = resolve_wire_enable_search_from_parts(

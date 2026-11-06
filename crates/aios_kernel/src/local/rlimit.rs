@@ -1,78 +1,5 @@
 use super::*;
 
-fn candidate_usage(usage: &ResourceUsage, delta: &ResourceUsageDelta) -> ResourceUsage {
-    ResourceUsage {
-        turns: usage.turns.saturating_add(delta.turns),
-        tool_calls: usage.tool_calls.saturating_add(delta.tool_calls),
-        tokens_in: usage.tokens_in.saturating_add(delta.tokens_in),
-        tokens_out: usage.tokens_out.saturating_add(delta.tokens_out),
-        cost_micros: usage.cost_micros.saturating_add(delta.cost_micros),
-        last_tool_call_bytes: delta
-            .last_tool_call_bytes
-            .unwrap_or(usage.last_tool_call_bytes),
-        fs_bytes: usage.fs_bytes.saturating_add(delta.fs_bytes),
-    }
-}
-
-fn usage_verdict(
-    usage: &ResourceUsage,
-    limits: &ResourceLimit,
-    supplied_tool_bytes: Option<u64>,
-    elapsed: u64,
-) -> RlimitVerdict {
-    // Callers act on the first exceeded dimension, so this order is part of the contract.
-    for (dimension, used, limit) in [
-        (RlimitDim::Turns, Some(usage.turns), limits.max_turns),
-        (
-            RlimitDim::ToolCalls,
-            Some(usage.tool_calls),
-            limits.max_tool_calls,
-        ),
-        (
-            RlimitDim::TokensIn,
-            Some(usage.tokens_in),
-            limits.max_tokens_in,
-        ),
-        (
-            RlimitDim::TokensOut,
-            Some(usage.tokens_out),
-            limits.max_tokens_out,
-        ),
-        (
-            RlimitDim::CostMicros,
-            Some(usage.cost_micros),
-            limits.max_cost_micros,
-        ),
-        // Stored tool bytes are observational; only a supplied size is checked.
-        (
-            RlimitDim::ToolCallBytes,
-            supplied_tool_bytes,
-            limits.max_tool_call_bytes,
-        ),
-        (
-            RlimitDim::FsBytes,
-            Some(usage.fs_bytes),
-            limits.max_fs_bytes,
-        ),
-        (
-            RlimitDim::WallclockTicks,
-            Some(elapsed),
-            limits.max_wallclock_ticks,
-        ),
-    ] {
-        if let Some(used) = used
-            && used > limit
-        {
-            return RlimitVerdict::Exceeded {
-                dimension,
-                used,
-                limit,
-            };
-        }
-    }
-    RlimitVerdict::Ok
-}
-
 impl RlimitOps for LocalOS {
     fn rlimit_set(&mut self, pid: u64, limits: ResourceLimit) -> Result<(), String> {
         let proc = self
@@ -100,29 +27,153 @@ impl RlimitOps for LocalOS {
         let Some(proc) = self.processes.get_mut(&pid) else {
             return RlimitVerdict::NoSuchProcess;
         };
-        proc.usage = candidate_usage(&proc.usage, &delta);
-        // Keep legacy per-process counters in sync even when the verdict is exceeded.
+        proc.usage.turns = proc.usage.turns.saturating_add(delta.turns);
+        proc.usage.tool_calls = proc.usage.tool_calls.saturating_add(delta.tool_calls);
+        proc.usage.tokens_in = proc.usage.tokens_in.saturating_add(delta.tokens_in);
+        proc.usage.tokens_out = proc.usage.tokens_out.saturating_add(delta.tokens_out);
+        proc.usage.cost_micros = proc.usage.cost_micros.saturating_add(delta.cost_micros);
+        proc.usage.fs_bytes = proc.usage.fs_bytes.saturating_add(delta.fs_bytes);
+        if let Some(b) = delta.last_tool_call_bytes {
+            proc.usage.last_tool_call_bytes = b;
+        }
+        // keep legacy per-process counters in sync
         proc.turns_used = proc.usage.turns as usize;
         proc.tool_calls_used = proc.usage.tool_calls as usize;
 
-        usage_verdict(
-            &proc.usage,
-            &proc.limits,
-            delta.last_tool_call_bytes,
-            self.tick.saturating_sub(proc.created_at_tick),
-        )
+        let lim = &proc.limits;
+        if proc.usage.turns > lim.max_turns {
+            return RlimitVerdict::Exceeded {
+                dimension: RlimitDim::Turns,
+                used: proc.usage.turns,
+                limit: lim.max_turns,
+            };
+        }
+        if proc.usage.tool_calls > lim.max_tool_calls {
+            return RlimitVerdict::Exceeded {
+                dimension: RlimitDim::ToolCalls,
+                used: proc.usage.tool_calls,
+                limit: lim.max_tool_calls,
+            };
+        }
+        if proc.usage.tokens_in > lim.max_tokens_in {
+            return RlimitVerdict::Exceeded {
+                dimension: RlimitDim::TokensIn,
+                used: proc.usage.tokens_in,
+                limit: lim.max_tokens_in,
+            };
+        }
+        if proc.usage.tokens_out > lim.max_tokens_out {
+            return RlimitVerdict::Exceeded {
+                dimension: RlimitDim::TokensOut,
+                used: proc.usage.tokens_out,
+                limit: lim.max_tokens_out,
+            };
+        }
+        if proc.usage.cost_micros > lim.max_cost_micros {
+            return RlimitVerdict::Exceeded {
+                dimension: RlimitDim::CostMicros,
+                used: proc.usage.cost_micros,
+                limit: lim.max_cost_micros,
+            };
+        }
+        if let Some(b) = delta.last_tool_call_bytes {
+            if b > lim.max_tool_call_bytes {
+                return RlimitVerdict::Exceeded {
+                    dimension: RlimitDim::ToolCallBytes,
+                    used: b,
+                    limit: lim.max_tool_call_bytes,
+                };
+            }
+        }
+        if proc.usage.fs_bytes > lim.max_fs_bytes {
+            return RlimitVerdict::Exceeded {
+                dimension: RlimitDim::FsBytes,
+                used: proc.usage.fs_bytes,
+                limit: lim.max_fs_bytes,
+            };
+        }
+        // wallclock: elapsed = self.tick - created_at_tick
+        let elapsed = self.tick.saturating_sub(proc.created_at_tick);
+        if elapsed > lim.max_wallclock_ticks {
+            return RlimitVerdict::Exceeded {
+                dimension: RlimitDim::WallclockTicks,
+                used: elapsed,
+                limit: lim.max_wallclock_ticks,
+            };
+        }
+        RlimitVerdict::Ok
     }
 
     fn rlimit_check(&self, pid: u64, delta: &ResourceUsageDelta) -> RlimitVerdict {
         let Some(proc) = self.processes.get(&pid) else {
             return RlimitVerdict::NoSuchProcess;
         };
-        let usage = candidate_usage(&proc.usage, delta);
-        usage_verdict(
-            &usage,
-            &proc.limits,
-            delta.last_tool_call_bytes,
-            self.tick.saturating_sub(proc.created_at_tick),
-        )
+        let lim = &proc.limits;
+        let new_turns = proc.usage.turns.saturating_add(delta.turns);
+        if new_turns > lim.max_turns {
+            return RlimitVerdict::Exceeded {
+                dimension: RlimitDim::Turns,
+                used: new_turns,
+                limit: lim.max_turns,
+            };
+        }
+        let new_calls = proc.usage.tool_calls.saturating_add(delta.tool_calls);
+        if new_calls > lim.max_tool_calls {
+            return RlimitVerdict::Exceeded {
+                dimension: RlimitDim::ToolCalls,
+                used: new_calls,
+                limit: lim.max_tool_calls,
+            };
+        }
+        let new_in = proc.usage.tokens_in.saturating_add(delta.tokens_in);
+        if new_in > lim.max_tokens_in {
+            return RlimitVerdict::Exceeded {
+                dimension: RlimitDim::TokensIn,
+                used: new_in,
+                limit: lim.max_tokens_in,
+            };
+        }
+        let new_out = proc.usage.tokens_out.saturating_add(delta.tokens_out);
+        if new_out > lim.max_tokens_out {
+            return RlimitVerdict::Exceeded {
+                dimension: RlimitDim::TokensOut,
+                used: new_out,
+                limit: lim.max_tokens_out,
+            };
+        }
+        let new_cost = proc.usage.cost_micros.saturating_add(delta.cost_micros);
+        if new_cost > lim.max_cost_micros {
+            return RlimitVerdict::Exceeded {
+                dimension: RlimitDim::CostMicros,
+                used: new_cost,
+                limit: lim.max_cost_micros,
+            };
+        }
+        if let Some(b) = delta.last_tool_call_bytes {
+            if b > lim.max_tool_call_bytes {
+                return RlimitVerdict::Exceeded {
+                    dimension: RlimitDim::ToolCallBytes,
+                    used: b,
+                    limit: lim.max_tool_call_bytes,
+                };
+            }
+        }
+        let new_fs = proc.usage.fs_bytes.saturating_add(delta.fs_bytes);
+        if new_fs > lim.max_fs_bytes {
+            return RlimitVerdict::Exceeded {
+                dimension: RlimitDim::FsBytes,
+                used: new_fs,
+                limit: lim.max_fs_bytes,
+            };
+        }
+        let elapsed = self.tick.saturating_sub(proc.created_at_tick);
+        if elapsed > lim.max_wallclock_ticks {
+            return RlimitVerdict::Exceeded {
+                dimension: RlimitDim::WallclockTicks,
+                used: elapsed,
+                limit: lim.max_wallclock_ticks,
+            };
+        }
+        RlimitVerdict::Ok
     }
 }

@@ -22,10 +22,6 @@ use super::store::{
     read_messages_since_id, read_messages_with_sql,
 };
 
-#[cfg(test)]
-#[path = "context_snapshot_prepare_tests.rs"]
-mod prepare_tests;
-
 fn read_projected_canonical_messages_after_id(
     conn: &Connection,
     after_id: i64,
@@ -248,47 +244,18 @@ pub(in crate::ai) fn write_context_snapshot_sqlite_with_busy_timeout(
             .max(Duration::from_millis(1));
         let mut conn = open_history_db_with_busy_timeout(path, remaining)?;
         init_history_schema(&conn)?;
-        // Preparation is speculative: only the original transaction may decide
-        // which errors escape or which projection is archived. Keep the state
-        // lock and connection so a file replacement cannot invalidate the read.
-        #[cfg(test)]
-        let use_prepared = !prepare_tests::force_legacy();
-        #[cfg(not(test))]
-        let use_prepared = true;
-        let prepared = if use_prepared {
-            prepare_context_snapshot(&conn, path, messages, canonical_generation).unwrap_or(None)
-        } else {
-            None
-        };
-        #[cfg(test)]
-        let prepared = prepare_tests::before_begin(&conn, prepared);
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| sqlite_error(path, "begin context snapshot transaction", error))?;
-        #[cfg(test)]
-        prepare_tests::record_begin(&tx);
         if history_generation(&tx)? != canonical_generation {
             return Ok(false);
         }
-        let prepared = prepared.as_ref().filter(|prepared| {
-            read_context_snapshot_identity(&tx, path)
-                .is_ok_and(|identity| identity == prepared.identity)
-        });
 
-        archive_context_snapshot(
-            &tx,
-            path,
-            prepared.and_then(|prepared| prepared.archive_payload.as_deref()),
-        )?;
+        archive_context_snapshot(&tx, path)?;
         prune_context_snapshot_history(&tx, path)?;
         tx.execute("DELETE FROM context_messages", [])
             .map_err(|error| sqlite_error(path, "clear context_messages", error))?;
-        insert_context_messages(
-            &tx,
-            path,
-            messages,
-            prepared.map(|prepared| prepared.messages.as_slice()),
-        )?;
+        insert_context_messages(&tx, path, messages)?;
         tx.execute(
             "INSERT INTO context_snapshot
                 (singleton, source_message_id, source_generation, projection_fingerprint)
@@ -307,8 +274,6 @@ pub(in crate::ai) fn write_context_snapshot_sqlite_with_busy_timeout(
         bump_history_revision(&tx)?;
         tx.commit()
             .map_err(|error| sqlite_error(path, "commit context snapshot transaction", error))?;
-        #[cfg(test)]
-        prepare_tests::record_commit(&conn);
         Ok(true)
     })
 }
@@ -321,140 +286,13 @@ pub(in crate::ai) fn write_context_snapshot_sqlite_with_busy_timeout(
 /// therefore bounded in entries rather than bytes.
 const CONTEXT_SNAPSHOT_HISTORY_KEEP: usize = 8;
 
-#[derive(PartialEq, Eq)]
-struct ContextSnapshotIdentity {
-    data_version: i64,
-    generation: i64,
-    history_revision: Option<String>,
-    snapshot: Option<(i64, i64, String)>,
-}
-
-struct PreparedContextSnapshot<'a> {
-    identity: ContextSnapshotIdentity,
-    archive_payload: Option<Vec<u8>>,
-    messages: Vec<PreparedContextMessage<'a>>,
-}
-
-struct PreparedContextMessage<'a> {
-    message: &'a Message,
-    content: String,
-    tool_calls: Option<String>,
-}
-
-fn read_context_snapshot_identity(
-    conn: &Connection,
-    path: &Path,
-) -> io::Result<ContextSnapshotIdentity> {
-    // Read this first: a commit during any later preparation read must also
-    // invalidate the candidate, including external SQL that omits revision bumps.
-    // Both comparisons use this same connection; data_version is connection-local.
-    let data_version = conn
-        .pragma_query_value(None, "data_version", |row| row.get(0))
-        .map_err(|error| sqlite_error(path, "read context snapshot data_version", error))?;
-    let generation = history_generation(conn)?;
-    let history_revision = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'history_revision'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| sqlite_error(path, "read context snapshot history_revision", error))?;
-    let snapshot = conn
-        .query_row(
-            "SELECT source_message_id, source_generation, projection_fingerprint
-             FROM context_snapshot WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()
-        .map_err(|error| sqlite_error(path, "read context_snapshot", error))?;
-    Ok(ContextSnapshotIdentity {
-        data_version,
-        generation,
-        history_revision,
-        snapshot,
-    })
-}
-
-fn prepare_context_snapshot<'a>(
-    conn: &Connection,
-    path: &Path,
-    messages: &'a [Message],
-    canonical_generation: i64,
-) -> io::Result<Option<PreparedContextSnapshot<'a>>> {
-    let identity = read_context_snapshot_identity(conn, path)?;
-    if identity.generation != canonical_generation {
-        return Ok(None);
-    }
-    // The archive's DELETE precedes its projection read in the original path.
-    // A custom ring trigger can modify that projection inside the transaction.
-    let has_archive_trigger: bool = conn
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM sqlite_schema
-                 WHERE type = 'trigger' AND tbl_name = 'context_snapshot_history' COLLATE NOCASE
-                 UNION ALL
-                 SELECT 1 FROM sqlite_temp_schema
-                 WHERE type = 'trigger' AND tbl_name = 'context_snapshot_history' COLLATE NOCASE
-             )",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| sqlite_error(path, "read context archive triggers", error))?;
-    if has_archive_trigger {
-        return Ok(None);
-    }
-    let archive_payload = match identity.snapshot.as_ref() {
-        Some((source_message_id, source_generation, _))
-            if *source_generation == identity.generation =>
-        {
-            // This is the same newest watermark the original path reads after
-            // deleting payload-less entries, without performing that write yet.
-            let newest = conn
-                .query_row(
-                    "SELECT source_message_id FROM context_snapshot_history
-                     WHERE payload IS NOT NULL
-                     ORDER BY source_message_id DESC LIMIT 1",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(|error| sqlite_error(path, "read context_snapshot_history", error))?;
-            if newest.is_some_and(|watermark| watermark >= *source_message_id) {
-                None
-            } else {
-                Some(encode_context_history_payload(
-                    &read_archived_context_messages(conn, path)?,
-                )?)
-            }
-        }
-        _ => None,
-    };
-    let mut guidance = ToolGuidanceFilter::new(messages);
-    let messages = messages
-        .iter()
-        .filter(|message| guidance.keep(message))
-        .map(prepare_context_message)
-        .collect::<io::Result<Vec<_>>>()?;
-    Ok(Some(PreparedContextSnapshot {
-        identity,
-        archive_payload,
-        messages,
-    }))
-}
-
 /// Move the snapshot being replaced into the bounded rewind ring.
 ///
 /// A rewind that cuts before the newest snapshot's watermark cannot reuse it,
 /// but an older projection whose watermark still survives can serve as the
 /// prefix. Keeping several turn boundaries lets consecutive rewinds stay fast
 /// instead of recompressing the whole canonical history.
-fn archive_context_snapshot(
-    conn: &Connection,
-    path: &Path,
-    prepared_payload: Option<&[u8]>,
-) -> io::Result<()> {
+fn archive_context_snapshot(conn: &Connection, path: &Path) -> io::Result<()> {
     let current: Option<(i64, i64, String)> = conn
         .query_row(
             "SELECT source_message_id, source_generation, projection_fingerprint
@@ -496,15 +334,7 @@ fn archive_context_snapshot(
     if newest.is_some_and(|watermark| watermark >= source_message_id) {
         return Ok(());
     }
-    let encoded_payload;
-    let payload = match prepared_payload {
-        Some(payload) => payload,
-        None => {
-            encoded_payload =
-                encode_context_history_payload(&read_archived_context_messages(conn, path)?)?;
-            &encoded_payload
-        }
-    };
+    let payload = encode_context_history_payload(&read_archived_context_messages(conn, path)?)?;
     conn.execute(
         "INSERT INTO context_snapshot_history
             (source_message_id, projection_fingerprint, payload)
@@ -576,8 +406,6 @@ fn read_archived_context_messages(
 /// the same rows again. The ring is only read as a whole during a rewind, which
 /// makes a single payload a good fit.
 fn encode_context_history_payload(messages: &[ArchivedContextMessage]) -> io::Result<Vec<u8>> {
-    #[cfg(test)]
-    prepare_tests::record_cpu_work("archive gzip");
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     // Stream serialization straight into the gzip encoder instead of
     // materializing the full uncompressed JSON first; `to_writer` emits
@@ -660,30 +488,7 @@ pub(super) fn promote_context_snapshot_from_history(
     Ok(true)
 }
 
-fn prepare_context_message(message: &Message) -> io::Result<PreparedContextMessage<'_>> {
-    #[cfg(test)]
-    prepare_tests::record_cpu_work("message JSON");
-    let content = serde_json::to_string(&message.content)
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    let tool_calls = message
-        .tool_calls
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(PreparedContextMessage {
-        message,
-        content,
-        tool_calls,
-    })
-}
-
-fn insert_context_messages(
-    conn: &Connection,
-    path: &Path,
-    messages: &[Message],
-    prepared: Option<&[PreparedContextMessage<'_>]>,
-) -> io::Result<()> {
+fn insert_context_messages(conn: &Connection, path: &Path, messages: &[Message]) -> io::Result<()> {
     let mut stmt = conn
         .prepare(
             "INSERT INTO context_messages
@@ -691,13 +496,25 @@ fn insert_context_messages(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .map_err(|error| sqlite_error(path, "prepare context_messages insert", error))?;
-    let mut insert = |position: usize, row: &PreparedContextMessage<'_>| {
-        let message = row.message;
+    let mut guidance = ToolGuidanceFilter::new(messages);
+    for (position, message) in messages
+        .iter()
+        .filter(|message| guidance.keep(message))
+        .enumerate()
+    {
+        let content = serde_json::to_string(&message.content)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let tool_calls = message
+            .tool_calls
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| io::Error::other(error.to_string()))?;
         stmt.execute(params![
             position as i64,
             message.role,
-            row.content,
-            row.tool_calls,
+            content,
+            tool_calls,
             message.tool_call_id,
             message.reasoning_content,
         ])
@@ -707,22 +524,7 @@ fn insert_context_messages(
                 &format!("insert context_messages row {position}"),
                 error,
             )
-        })
-        .map(|_| ())
-    };
-    if let Some(rows) = prepared {
-        for (position, row) in rows.iter().enumerate() {
-            insert(position, row)?;
-        }
-    } else {
-        let mut guidance = ToolGuidanceFilter::new(messages);
-        for (position, message) in messages
-            .iter()
-            .filter(|message| guidance.keep(message))
-            .enumerate()
-        {
-            insert(position, &prepare_context_message(message)?)?;
-        }
+        })?;
     }
     Ok(())
 }
