@@ -356,19 +356,18 @@ fn apply_remote_header(editor: &mut PromptEditor, info: &ServerInfo, topic: Opti
     editor.set_session_topic(topic);
 }
 
-/// Client-side per-turn selection for serve-chat `/model`/`/effort`/`/agent`
-/// switching. The server stays stateless: the selected values travel with
-/// every turn request (`TurnReq` overrides) and the child CLI resolves them
-/// through the same registry path as the local REPL. `reasoning_effort` is
-/// `None` when cleared (server default), `Some("off")` when disabled, else
-/// the explicit tier. `skills` holds the pending forced skills from
-/// `/skills use` (next turn only, like the local REPL): they ride along as
-/// the `skills` turn field and are cleared once the server accepts the turn.
+/// Client-side state for serve-chat's input header and turn overrides. The
+/// model, effort, agent, and pending skills travel with turn requests; the
+/// subagent backend instead mirrors the server-owned session config so `/use`
+/// is displayed without changing the turn wire shape. `reasoning_effort` is
+/// `None` when cleared (server default), `Some("off")` when disabled, else the
+/// explicit tier. Pending skills are cleared once the server accepts the turn.
 #[derive(Debug, Clone)]
 struct ServeTurnSelection {
     model: String,
     agent: String,
     reasoning_effort: Option<String>,
+    subagent_backend: String,
     skills: Vec<String>,
 }
 
@@ -383,6 +382,7 @@ impl ServeTurnSelection {
                 }
                 _ => None,
             },
+            subagent_backend: String::new(),
             skills: Vec::new(),
         }
     }
@@ -396,6 +396,19 @@ impl ServeTurnSelection {
         models::default_reasoning_effort(&self.model)
             .map(|e| e.as_str().to_string())
             .unwrap_or_else(|| "server default".to_string())
+    }
+
+    fn effective_backend_label(&self) -> String {
+        let backend = crate::ai::tools::task_tools::SubagentBackend::from_stored(Some(
+            self.subagent_backend.as_str(),
+        ));
+        if backend.resolve().execution_mode()
+            == crate::ai::tools::task_tools::ExecutionMode::External
+        {
+            format!("sub:{}", backend.as_str())
+        } else {
+            String::new()
+        }
     }
 
     /// Refresh the input-box header after a local switch, mirroring
@@ -414,6 +427,7 @@ impl ServeTurnSelection {
             editor.set_current_agent_label(&self.agent);
         }
         editor.set_current_reasoning_effort_label(self.effective_effort_label());
+        editor.set_current_backend_label(self.effective_backend_label());
     }
 }
 
@@ -448,6 +462,15 @@ struct ServeSessionConfig {
     agent: String,
     #[serde(default)]
     reasoning_effort: String,
+    #[serde(default)]
+    subagent_backend: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServeSessionConfigResponse {
+    #[serde(flatten)]
+    config: ServeSessionConfig,
+    output: String,
 }
 
 /// Best-effort persist of a selection change to the server's session config,
@@ -485,9 +508,10 @@ fn persist_serve_config_patch(
 }
 
 /// Fold a server-stored session config into the client selection. Stored
-/// non-empty picks override the `/info` defaults so a reconnect resumes the
-/// last `/model`/`/effort`/`/agent` state. Returns true when something
-/// changed (callers refresh the input-box header in that case).
+/// non-empty turn picks override the `/info` defaults so a reconnect resumes
+/// the last `/model`/`/effort`/`/agent` state. The subagent backend is exact:
+/// an empty stored value means the kernel default and must clear a previous
+/// session's external-backend label. Returns true when something changed.
 fn merge_restored_session_config(
     cfg: &ServeSessionConfig,
     selection: &mut ServeTurnSelection,
@@ -505,6 +529,10 @@ fn merge_restored_session_config(
         && selection.reasoning_effort.as_deref() != Some(cfg.reasoning_effort.as_str())
     {
         selection.reasoning_effort = Some(cfg.reasoning_effort.clone());
+        changed = true;
+    }
+    if cfg.subagent_backend != selection.subagent_backend {
+        selection.subagent_backend = cfg.subagent_backend.clone();
         changed = true;
     }
     changed
@@ -1936,7 +1964,7 @@ fn run_serve_cd_command(
 
 fn run_serve_subagent_config_request(
     request: reqwest::blocking::RequestBuilder,
-) -> Result<(), String> {
+) -> Result<ServeSessionConfig, String> {
     let response = request
         .send()
         .map_err(|err| format!("subagent config request failed: {err}"))?;
@@ -1945,14 +1973,10 @@ fn run_serve_subagent_config_request(
     if !status.is_success() {
         return Err(server_error_message(status, &text));
     }
-    let body: serde_json::Value = serde_json::from_str(&text)
+    let body: ServeSessionConfigResponse = serde_json::from_str(&text)
         .map_err(|err| format!("serve returned an unexpected config body: {err}"))?;
-    let output = body
-        .get("output")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "serve config response is missing output".to_string())?;
-    print!("{output}");
-    Ok(())
+    print!("{}", body.output);
+    Ok(body.config)
 }
 
 fn run_serve_use_command(
@@ -1961,7 +1985,7 @@ fn run_serve_use_command(
     token: &str,
     session_id: &str,
     arg: &str,
-) -> Result<(), String> {
+) -> Result<ServeSessionConfig, String> {
     let command_line = arg.split_once('\n').map_or(arg, |(head, _)| head);
     let (backend, model) = parse_use_arguments(command_line)?;
     let url = format!("{base}/sessions/{session_id}/config");
@@ -1980,7 +2004,7 @@ fn run_serve_reset_command(
     token: &str,
     session_id: &str,
     arg: &str,
-) -> Result<(), String> {
+) -> Result<ServeSessionConfig, String> {
     validate_reset_arguments(arg).map_err(str::to_string)?;
     let request = client
         .post(format!("{base}/sessions/{session_id}/config"))
@@ -5006,6 +5030,10 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                     }
                     CommandCompleter::clear_checkpoint_candidates();
                     editor.set_session_id(session_id.as_str());
+                    if merge_restored_session_config(&ServeSessionConfig::default(), &mut selection)
+                    {
+                        selection.apply_header(&mut editor);
+                    }
                     println!("New session {session_id}.");
                 }
                 Err(err) => eprintln!("[serve-chat] {err}"),
@@ -5222,7 +5250,9 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                 // argument view trims it away and would treat the tail as a backend.
                 let arg = &trimmed[cmd.len()..];
                 match run_serve_use_command(&client, &base, &token, &session_id, arg) {
-                    Ok(()) => {
+                    Ok(config) => {
+                        merge_restored_session_config(&config, &mut selection);
+                        selection.apply_header(&mut editor);
                         if let Some((tail, title_seed)) = serve_use_turn_input(&trimmed) {
                             if let Err(err) = post_turn_stream(
                                 &client,
@@ -5242,9 +5272,12 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                 }
             }
             "/reset" | ":reset" => {
-                if let Err(err) = run_serve_reset_command(&client, &base, &token, &session_id, arg)
-                {
-                    eprintln!("[serve-chat] {err}");
+                match run_serve_reset_command(&client, &base, &token, &session_id, arg) {
+                    Ok(config) => {
+                        merge_restored_session_config(&config, &mut selection);
+                        selection.apply_header(&mut editor);
+                    }
+                    Err(err) => eprintln!("[serve-chat] {err}"),
                 }
             }
             _ => {
@@ -5800,6 +5833,7 @@ mod tests {
             model: "m".to_string(),
             agent: "build".to_string(),
             reasoning_effort: None,
+            subagent_backend: String::new(),
             skills: Vec::new(),
         };
         let mut editor = PromptEditor::new(
@@ -7474,25 +7508,38 @@ mod tests {
     }
 
     #[test]
-    fn merge_restored_session_config_fills_only_nonempty_picks() {
+    fn merge_restored_session_config_fills_turn_picks_and_tracks_backend_exactly() {
         let mut selection = ServeTurnSelection {
             model: "default-m".to_string(),
             agent: "build".to_string(),
             reasoning_effort: None,
+            subagent_backend: String::new(),
             skills: Vec::new(),
         };
         let cfg = ServeSessionConfig {
             model: "stored-m".to_string(),
             agent: String::new(), // empty -> keep the selection's agent
             reasoning_effort: "high".to_string(),
+            subagent_backend: "traecli".to_string(),
         };
         assert!(merge_restored_session_config(&cfg, &mut selection));
         assert_eq!(selection.model, "stored-m");
         assert_eq!(selection.agent, "build");
         assert_eq!(selection.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(selection.subagent_backend, "traecli");
+        assert_eq!(selection.effective_backend_label(), "sub:traecli");
 
         // Restoring the same picks again changes nothing.
         assert!(!merge_restored_session_config(&cfg, &mut selection));
+
+        // Unlike empty turn picks, an empty backend is meaningful: the resumed
+        // or newly-created session uses kernel and must clear a stale label.
+        assert!(merge_restored_session_config(
+            &ServeSessionConfig::default(),
+            &mut selection
+        ));
+        assert!(selection.subagent_backend.is_empty());
+        assert!(selection.effective_backend_label().is_empty());
     }
 
     #[test]
@@ -7708,15 +7755,22 @@ mod tests {
     #[test]
     fn serve_chat_subagent_commands_use_config_route() {
         let client = reqwest::blocking::Client::new();
-        for (arg, method) in [
-            ("", "GET"),
-            ("\nfix login", "GET"),
-            (" \nfix login", "GET"),
-            ("traecli GPT-5.5\nfix login", "POST"),
-            ("kernel", "POST"),
+        for (arg, method, response_backend) in [
+            ("", "GET", "traecli"),
+            ("\nfix login", "GET", "traecli"),
+            (" \nfix login", "GET", "traecli"),
+            ("traecli GPT-5.5\nfix login", "POST", "traecli"),
+            ("kernel", "POST", ""),
         ] {
-            let (base, captured) = serve_capture_once(r#"{"output":"server state\n"}"#);
-            run_serve_use_command(&client, &base, "tk", "s1", arg).expect("use config");
+            let response = if response_backend.is_empty() {
+                r#"{"subagent_backend":"","output":"server state\n"}"#
+            } else {
+                r#"{"subagent_backend":"traecli","output":"server state\n"}"#
+            };
+            let (base, captured) = serve_capture_once(response);
+            let config =
+                run_serve_use_command(&client, &base, "tk", "s1", arg).expect("use config");
+            assert_eq!(config.subagent_backend, response_backend);
             let request = captured.lock().unwrap().clone();
             assert!(
                 request.starts_with(&format!("{method} /sessions/s1/config HTTP/1.1")),
@@ -7745,8 +7799,10 @@ mod tests {
                 assert!(body.is_empty());
             }
         }
-        let (base, captured) = serve_capture_once(r#"{"output":"reset state\n"}"#);
-        run_serve_reset_command(&client, &base, "tk", "s1", "").expect("reset config");
+        let (base, captured) =
+            serve_capture_once(r#"{"subagent_backend":"","output":"reset state\n"}"#);
+        let config = run_serve_reset_command(&client, &base, "tk", "s1", "").expect("reset config");
+        assert!(config.subagent_backend.is_empty());
         let request = captured.lock().unwrap().clone();
         assert!(request.starts_with("POST /sessions/s1/config HTTP/1.1"));
         let body: serde_json::Value =
@@ -7821,6 +7877,7 @@ mod tests {
                 model: String::new(),
                 agent: String::new(),
                 reasoning_effort: None,
+                subagent_backend: String::new(),
                 skills: vec!["code-review".to_string()],
             };
             let route = classify_serve_input(prompt);

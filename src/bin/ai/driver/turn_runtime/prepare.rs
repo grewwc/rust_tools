@@ -7,7 +7,7 @@ use crate::ai::{
     driver::skill_runtime,
     history::{
         Message, ROLE_INTERNAL_NOTE, build_context_history_with_outcome,
-        compact_session_history_with_app, runtime_synthetic_user_message,
+        compact_session_history_without_summary_model, runtime_synthetic_user_message,
     },
     request,
     types::App,
@@ -396,15 +396,14 @@ pub(super) async fn prepare_turn(
     };
     let overflow_dir = Some(attachment_assets_dir.clone());
     crate::ai::driver::runtime_ctx::publish_subagent_phase("preparing context");
-    // The finalize phase may not have run due to interruption, request errors, or
-    // an older-version process; its dispatched background compression may also
-    // still be running. Wait for that projection before reading the snapshot,
-    // then re-evaluate the latest canonical tail under the same in-flight guard.
-    // The wait is bounded; cancellation also releases the guard.
-    if let Some(_compaction_guard) =
-        super::finalize::wait_for_session_compaction(&app.session_id).await
+    // Refresh an idle projection defensively after interrupted/error turns, but
+    // never wait for a previous post-turn compactor and never issue an auxiliary
+    // model request on the request-critical preparation path. If post-turn work
+    // is still active, the generation-bound snapshot plus canonical tail remain
+    // a safe input for `build_context_history_with_outcome` below.
+    if let Some(_compaction_guard) = super::finalize::try_start_session_compaction(&app.session_id)
     {
-        let compact_result = compact_session_history_with_app(
+        let compact_result = compact_session_history_without_summary_model(
             app,
             crate::ai::driver::runtime_ctx::effective_cwd()
                 .ok()
@@ -418,10 +417,6 @@ pub(super) async fn prepare_turn(
                 "[Warning] Failed to compact persisted history before preparing context: {err}"
             );
         }
-    } else if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
-        eprintln!(
-            "[Warning] Persisted history compaction is still running; preparing the retained context projection"
-        );
     }
     // build_context_history does SQLite/file I/O and is a synchronous blocking
     // call. On a multi-threaded runtime, move it to spawn_blocking so tokio

@@ -2,7 +2,6 @@ use super::super::*;
 use super::common::test_app;
 use serde_json::Value;
 
-
 #[test]
 fn session_title_generation_timeouts_are_relaxed_for_background_work() {
     assert_eq!(SESSION_TITLE_REQUEST_TIMEOUT_SECS, 90);
@@ -23,7 +22,11 @@ fn request_diagnostics_follow_terminal_suppression_scope() {
 
 #[test]
 fn model_fallback_and_disable_statuses_are_separate() {
-    let network = RequestError::cancelled("network timeout");
+    let network = RequestError {
+        kind: RequestErrorKind::Network,
+        message: "network timeout".to_string(),
+        retry_after: None,
+    };
     assert!(should_try_model_fallback(&network));
     assert!(!should_temporarily_disable_model(&network));
     assert!(should_temporarily_disable_auto_selected_model(&network));
@@ -46,6 +49,31 @@ fn model_fallback_and_disable_statuses_are_separate() {
     assert!(should_try_model_fallback(&billing));
     assert!(should_temporarily_disable_model(&billing));
     assert!(should_temporarily_disable_auto_selected_model(&billing));
+}
+
+#[test]
+fn cancellation_is_not_retryable_or_fallback_eligible() {
+    let cancelled = RequestError::cancelled("request cancelled by user");
+    assert!(!is_transient_error(&cancelled));
+    assert!(!should_try_model_fallback(&cancelled));
+    assert!(!should_temporarily_disable_model(&cancelled));
+    assert!(!should_temporarily_disable_auto_selected_model(&cancelled));
+    assert!(!should_rotate_key(&cancelled));
+}
+
+#[test]
+fn response_header_timeout_is_not_a_same_request_retry() {
+    let timeout = RequestError::response_header_timeout(90);
+
+    assert_eq!(
+        timeout.message,
+        "request timed out waiting for response headers after 90 seconds"
+    );
+    assert!(!is_transient_error(&timeout));
+    assert!(!should_temporarily_disable_model(&timeout));
+    assert!(should_temporarily_disable_auto_selected_model(&timeout));
+    assert!(should_try_model_fallback(&timeout));
+    assert!(!should_rotate_key(&timeout));
 }
 
 #[test]
@@ -420,7 +448,10 @@ fn prompt_cache_breakpoints_mark_first_system_and_last_user_or_tool() {
     // The rolling breakpoint lands on the last user/tool message, so the whole
     // conversation prefix is written for the next request to read back.
     assert_eq!(messages[3]["content"][0]["text"], "tool output");
-    assert_eq!(messages[3]["content"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(
+        messages[3]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
     // Earlier and assistant messages stay untouched.
     assert_eq!(messages[1]["content"], "first question");
     assert_eq!(messages[2]["content"], "answer");
@@ -531,14 +562,22 @@ fn prompt_cache_breakpoints_stay_off_request_messages_and_default_bodies() {
     assert!(!String::from_utf8(plain).unwrap().contains("cache_control"));
 
     request.explicit_cache_breakpoints = true;
-    let body: Value = serde_json::from_slice(
-        &RequestProtocolDialect::ChatCompletions.build_http_body(&request),
-    )
-    .unwrap();
-    assert_eq!(body["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
-    assert_eq!(body["messages"][1]["content"][0]["cache_control"]["type"], "ephemeral");
+    let body: Value =
+        serde_json::from_slice(&RequestProtocolDialect::ChatCompletions.build_http_body(&request))
+            .unwrap();
+    assert_eq!(
+        body["messages"][0]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert_eq!(
+        body["messages"][1]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
     // Fingerprints hash these request messages; the wire patch never reaches them.
-    assert_eq!(messages[0].content, Value::String("you are helpful".to_string()));
+    assert_eq!(
+        messages[0].content,
+        Value::String("you are helpful".to_string())
+    );
     assert_eq!(messages[1].content, Value::String("hi".to_string()));
 }
 

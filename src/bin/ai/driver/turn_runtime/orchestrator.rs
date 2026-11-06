@@ -14,7 +14,7 @@
 // =============================================================================
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rust_tools::commonw::FastSet;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -145,10 +145,15 @@ const VOLATILE_ARG_KEYS: &[&str] = &["offset", "limit", "page", "cursor", "max_r
 /// accumulated round count is not reset by mutation.
 const TOOL_ROUND_CHECKPOINT: usize = 16;
 const TOOL_ROUND_CHECKPOINT_MULTIPLIERS: [usize; 3] = [1, 2, 4];
-/// Retry cap for consecutive "stream-read interrupted" truncations (stream_error). Past this we
-/// give up on the turn to avoid retrying forever while the server keeps dropping the stream
-/// (especially for background tasks whose max_iterations = usize::MAX).
-const MAX_STREAM_ERROR_RETRIES: usize = 16;
+/// Retry only prompt stream failures. Replaying a request that already spent minutes in hidden
+/// reasoning makes the turn appear dead and can multiply the provider's full silence allowance.
+const MAX_STREAM_ERROR_RETRIES: usize = 2;
+const MAX_RETRYABLE_STREAM_ATTEMPT_SECS: u64 = 60;
+
+fn should_retry_stream_error(consecutive_failures: usize, attempt_elapsed: Duration) -> bool {
+    consecutive_failures <= MAX_STREAM_ERROR_RETRIES
+        && attempt_elapsed <= Duration::from_secs(MAX_RETRYABLE_STREAM_ATTEMPT_SECS)
+}
 /// Retry cap for consecutive "model output too long / truncated tool-call JSON" truncations.
 /// stream_error uses its own separate cap and does not count toward this one.
 const MAX_MODEL_TRUNCATION_RETRIES: usize = 3;
@@ -1756,6 +1761,7 @@ async fn run_turn_body(
         let active_skill_name = skill_turn.primary_skill_name().map(str::to_string);
         let compression_report = CompressionReport::default();
         let mut response_model = None;
+        let iteration_started_at = Instant::now();
         let execution = match execute_turn_iteration(
             app,
             &next_model,
@@ -2129,26 +2135,31 @@ async fn run_turn_body(
                     // not retry forever.
                     retry.consecutive_truncations = 0;
                     retry.consecutive_stream_errors += 1;
-                    if retry.consecutive_stream_errors > MAX_STREAM_ERROR_RETRIES {
+                    let stream_attempt_elapsed = iteration_started_at.elapsed();
+                    if !should_retry_stream_error(
+                        retry.consecutive_stream_errors,
+                        stream_attempt_elapsed,
+                    ) {
                         // stderr is not forwarded in serve mode (only tailed for
                         // error detail), so print through the note line: the daemon
                         // forwards child stdout as progress events to the frontend.
                         crate::ai::driver::print::print_tool_note_line(
                             "stream",
                             &format!(
-                                "{} consecutive response-stream read interruptions; giving up retry",
-                                retry.consecutive_stream_errors
+                                "response-stream read interrupted after {:.1}s (consecutive #{}); giving up automatic retry",
+                                stream_attempt_elapsed.as_secs_f32(),
+                                retry.consecutive_stream_errors,
                             ),
                         );
                         output.assistant_text =
-                            "[Response stream interrupted repeatedly; the server may be unstable. Please retry later or switch models]"
+                            "[Response stream stalled too long or was interrupted repeatedly. Please retry later or switch models]"
                                 .to_string();
                         break 'turn Ok(None);
                     }
                     crate::ai::driver::print::print_tool_note_line(
                         "stream",
                         &format!(
-                            "response-stream read interrupted (consecutive #{}); auto-retrying, stopping after {MAX_STREAM_ERROR_RETRIES} consecutive failures…",
+                            "response-stream read interrupted promptly (consecutive #{}); auto-retrying, stopping after {MAX_STREAM_ERROR_RETRIES} retries…",
                             retry.consecutive_stream_errors
                         ),
                     );

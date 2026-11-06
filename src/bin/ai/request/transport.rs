@@ -322,35 +322,9 @@ async fn request_messages_with_key(
         {
             Ok(result) => result,
             Err(_) => {
-                if attempt < retry_policy.max_attempts {
-                    let delay = retry_delay(attempt);
-                    crate::ai::driver::runtime_ctx::publish_subagent_phase(&format!(
-                        "retrying request ({attempt}/{})",
-                        retry_policy.max_attempts
-                    ));
-                    super::emit_request_diagnostic(format_args!(
-                        "[Warning] {}等待响应头超时 ({}s) - sleep {} 秒后重试 (attempt {}/{})",
-                        retry_scope_tag(),
-                        retry_policy.header_timeout_secs,
-                        delay.as_secs_f32(),
-                        attempt,
-                        retry_policy.max_attempts
-                    ));
-                    if sleep_with_cancel(app, delay).await {
-                        return Err(RequestError::cancelled(
-                            "request canceled by user during retry wait",
-                        ));
-                    }
-                    continue;
-                }
-                return Err(RequestError {
-                    kind: RequestErrorKind::Network,
-                    message: format!(
-                        "request timed out waiting for response headers after {} attempts",
-                        retry_policy.max_attempts
-                    ),
-                    retry_after: None,
-                });
+                return Err(RequestError::response_header_timeout(
+                    retry_policy.header_timeout_secs,
+                ));
             }
         };
 
@@ -532,8 +506,12 @@ pub(crate) async fn preview_request_budget(
     // registry endpoint (`endpoint_for_model(model, "")`), while calibration
     // identity uses the request endpoint: mirror each call site exactly.
     let wire_endpoint = models::endpoint_for_model(model, "");
-    let (thinking, wire_effort, reasoning) =
-        resolve_reasoning_wire_controls(model, &wire_endpoint, core.enable_thinking, reasoning_effort);
+    let (thinking, wire_effort, reasoning) = resolve_reasoning_wire_controls(
+        model,
+        &wire_endpoint,
+        core.enable_thinking,
+        reasoning_effort,
+    );
     let enable_search = resolve_wire_enable_search(
         model,
         &wire_endpoint,
@@ -798,8 +776,7 @@ impl RequestProjection {
         body.prompt_cache_key =
             main_request_prompt_cache_key(model, &app.session_id, &self.endpoint);
         body.explicit_cache_breakpoints = prompt_cache_enabled_for_model(model);
-        let feedback =
-            PromptTokenFeedback::capture(&app.session_id, model, &self.endpoint, &body);
+        let feedback = PromptTokenFeedback::capture(&app.session_id, model, &self.endpoint, &body);
         let budget =
             CurrentRequestBudget::measure(model, app.cli.max_tokens_override, &feedback, previous);
         // Auxiliary builders lack request-scoped usage. Only this shared main
@@ -807,7 +784,9 @@ impl RequestProjection {
         // An adaptive output override may lower, never defeat, the context cap.
         body.max_tokens = models::max_output_tokens(model).map(|model_max| {
             let cap = clamp_with_estimated_prompt(model, budget.prompt_tokens, model_max);
-            app.cli.max_tokens_override.map_or(cap, |value| cap.min(value))
+            app.cli
+                .max_tokens_override
+                .map_or(cap, |value| cap.min(value))
         });
         (body, feedback, budget)
     }
@@ -1125,8 +1104,8 @@ mod thinking_tests {
 
 #[cfg(test)]
 mod budget_tests {
-    use super::*;
     use super::super::current_budget::PromptCountSource;
+    use super::*;
     use futures_util::FutureExt;
     use serde_json::json;
 
@@ -1158,14 +1137,17 @@ mod budget_tests {
         let mut app = super::super::tests::test_app();
         app.cli.thinking_disabled_override = true;
         app.agent_context = Some(crate::ai::types::AgentContext {
-            tools: vec![serde_json::from_value(json!({
-                "type": "function",
-                "function": {
-                    "name": "budget_fixture",
-                    "description": "large schema content ".repeat(100),
-                    "parameters": {"type": "object", "properties": {}}
-                }
-            })).unwrap()],
+            tools: vec![
+                serde_json::from_value(json!({
+                    "type": "function",
+                    "function": {
+                        "name": "budget_fixture",
+                        "description": "large schema content ".repeat(100),
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }))
+                .unwrap(),
+            ],
             ..Default::default()
         });
         app
@@ -1173,7 +1155,9 @@ mod budget_tests {
 
     #[test]
     fn current_budget_shared_projection_counts_tools_once_and_preserves_inputs() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut app = app();
         let model = model();
         app.cli.max_tokens_override = Some(512);
@@ -1181,7 +1165,8 @@ mod budget_tests {
         let original = serde_json::to_value(&messages).unwrap();
         for tools_enabled in [true, false] {
             let mut projection = prepare_request_projection(&app, &model, &messages, tools_enabled)
-                .now_or_never().expect("preparation must not invoke an auxiliary LLM");
+                .now_or_never()
+                .expect("preparation must not invoke an auxiliary LLM");
             let message_tokens = super::super::builder::estimate_request_prompt_tokens(
                 &projection.messages,
                 None,
@@ -1196,9 +1181,13 @@ mod budget_tests {
             assert_eq!(body.estimated_prompt_tokens, measured.prompt_tokens);
             assert_eq!(body.max_tokens, Some(512));
             assert_eq!(measured.limits.output_reserve_tokens, 512);
-            assert_eq!(measured.limits.physical_context_tokens, models::context_window_tokens(&model));
+            assert_eq!(
+                measured.limits.physical_context_tokens,
+                models::context_window_tokens(&model)
+            );
             let preview = preview_request_budget(&app, &model, &messages, true, tools_enabled)
-                .now_or_never().expect("preview must finish without network I/O");
+                .now_or_never()
+                .expect("preview must finish without network I/O");
             assert_eq!(preview, measured);
         }
         assert_eq!(serde_json::to_value(&messages).unwrap(), original);
@@ -1236,7 +1225,10 @@ mod budget_tests {
             measured.source,
             PromptCountSource::CompatibleActualPlusEstimatedGrowth
         );
-        assert_eq!(body.messages[0].content, Value::String("prefix".to_string()));
+        assert_eq!(
+            body.messages[0].content,
+            Value::String("prefix".to_string())
+        );
         assert_eq!(body.messages.len(), messages.len());
         assert_eq!(body.messages.last().unwrap().role, "assistant");
         let preview = preview_request_budget(&app, &model, &messages, true, true)
@@ -1273,49 +1265,76 @@ mod budget_tests {
 
     #[test]
     fn current_budget_preview_borrows_usage_charges_growth_and_ignores_cache_discount() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut app = app();
         let model = model();
         let mut messages = vec![message("user", "prefix")];
-        let mut previous = prepare_request_projection(&app, &model, &messages, true).now_or_never().unwrap();
+        let mut previous = prepare_request_projection(&app, &model, &messages, true)
+            .now_or_never()
+            .unwrap();
         let (_, feedback, baseline) = previous.measure(&app, &model, true, None);
         app.last_known_prompt_tokens = Some(feedback);
         app.last_known_cached_prompt_tokens = Some(u64::MAX);
-        let pending = preview_request_budget(&app, &model, &messages, true, true).now_or_never().unwrap();
+        let pending = preview_request_budget(&app, &model, &messages, true, true)
+            .now_or_never()
+            .unwrap();
         assert_eq!(pending.source, PromptCountSource::NormalizedEstimate);
         let actual = baseline.prompt_tokens * 2;
         assert!(app.last_known_prompt_tokens.as_mut().unwrap().record_usage(
-            &app.session_id, Some(&model), Some(actual as u64)
+            &app.session_id,
+            Some(&model),
+            Some(actual as u64)
         ));
         messages.push(message("assistant", &"new code payload ".repeat(1_000)));
-        let mut current = prepare_request_projection(&app, &model, &messages, true).now_or_never().unwrap();
-        let (body, _, measured) = current.measure(&app, &model, true, app.last_known_prompt_tokens.as_ref());
+        let mut current = prepare_request_projection(&app, &model, &messages, true)
+            .now_or_never()
+            .unwrap();
+        let (body, _, measured) =
+            current.measure(&app, &model, true, app.last_known_prompt_tokens.as_ref());
         let growth = body.estimated_prompt_tokens - baseline.prompt_tokens;
         assert!(growth > 0);
         assert_eq!(measured.prompt_tokens, actual + growth * 2);
-        assert_eq!(measured.source, PromptCountSource::CompatibleActualPlusEstimatedGrowth);
+        assert_eq!(
+            measured.source,
+            PromptCountSource::CompatibleActualPlusEstimatedGrowth
+        );
         for _ in 0..2 {
-            let preview = preview_request_budget(&app, &model, &messages, true, true).now_or_never().unwrap();
+            let preview = preview_request_budget(&app, &model, &messages, true, true)
+                .now_or_never()
+                .unwrap();
             assert_eq!(preview, measured);
             assert!(app.last_known_prompt_tokens.is_some());
             assert_eq!(app.last_known_cached_prompt_tokens, Some(u64::MAX));
         }
         let replacement = vec![message("user", "compressed replacement")];
-        let replaced = preview_request_budget(&app, &model, &replacement, true, true).now_or_never().unwrap();
+        let replaced = preview_request_budget(&app, &model, &replacement, true, true)
+            .now_or_never()
+            .unwrap();
         assert_eq!(replaced.source, PromptCountSource::NormalizedEstimate);
-        let no_tools = preview_request_budget(&app, &model, &messages, true, false).now_or_never().unwrap();
+        let no_tools = preview_request_budget(&app, &model, &messages, true, false)
+            .now_or_never()
+            .unwrap();
         assert_eq!(no_tools.source, PromptCountSource::NormalizedEstimate);
     }
 
     #[test]
     fn current_budget_preview_thinking_resolution_stays_local_for_registry_models() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let app = super::super::tests::test_app();
         for entry in crate::ai::model_names::all() {
             for text in ["", "hello", "Diagnose this failure:\nmodule::call -> error"] {
                 let messages = vec![message("user", text)];
-                assert!(preview_request_budget(&app, &entry.key, &messages, true, true).now_or_never().is_some(),
-                    "preview must not await an auxiliary LLM for {}", entry.key);
+                assert!(
+                    preview_request_budget(&app, &entry.key, &messages, true, true)
+                        .now_or_never()
+                        .is_some(),
+                    "preview must not await an auxiliary LLM for {}",
+                    entry.key
+                );
             }
         }
     }
@@ -1377,7 +1396,14 @@ pub(crate) fn print_info(app: &App, model: &str) {
         });
     let session_part = summary
         .filter(|s| !s.is_empty())
-        .map(|s| format!("{} · {}{}{RESET}", theme::current().accent_muted, theme::current().accent_warn, s))
+        .map(|s| {
+            format!(
+                "{} · {}{}{RESET}",
+                theme::current().accent_muted,
+                theme::current().accent_warn,
+                s
+            )
+        })
         .unwrap_or_default();
 
     // The side-note composer may own the bottom row; write through the locked,
@@ -1454,12 +1480,16 @@ pub async fn do_request_json(
         .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
         // Non-streaming auxiliary request: 60s timeout per attempt
         let send_future = async {
-            let resp =
-                apply_request_auth(app.client.post(&endpoint), &endpoint, api_key, &app.session_id)
-                .header("Content-Type", "application/json")
-                .body(request_body.clone())
-                .send()
-                .await?;
+            let resp = apply_request_auth(
+                app.client.post(&endpoint),
+                &endpoint,
+                api_key,
+                &app.session_id,
+            )
+            .header("Content-Type", "application/json")
+            .body(request_body.clone())
+            .send()
+            .await?;
             Ok::<_, reqwest::Error>(resp)
         };
         enum AuxSendWait<T> {
@@ -1518,8 +1548,7 @@ pub async fn do_request_json(
                         .map(StreamUsage::normalized);
                     match usage {
                         Some(usage) => {
-                            let latency_ms =
-                                t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                            let latency_ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
                             let _ = charge_llm_usage_to_kernel(app, model, &usage, latency_ms);
                         }
                         None => {
@@ -1796,7 +1825,7 @@ pub async fn do_request_text_streaming(
                         key_idx = next_key_idx;
                         continue;
                     }
-                    if should_retry_status(status) && attempt < REQUEST_MAX_ATTEMPTS {
+                    if should_retry_status(status) && attempt < retry_policy.max_attempts {
                         let delay = retry_delay(attempt);
                         if sleep_with_cancel(app, delay).await {
                             return Err(Box::new(RequestError::cancelled(
@@ -1814,7 +1843,7 @@ pub async fn do_request_text_streaming(
             }
             Ok(Err(err)) => {
                 let retryable = matches!(&err.kind, RequestErrorKind::Network);
-                if retryable && attempt < REQUEST_MAX_ATTEMPTS {
+                if retryable && attempt < retry_policy.max_attempts {
                     let delay = retry_delay(attempt);
                     if sleep_with_cancel(app, delay).await {
                         return Err(Box::new(RequestError::cancelled(
@@ -1827,18 +1856,9 @@ pub async fn do_request_text_streaming(
                 return Err(Box::new(err));
             }
             Err(_) => {
-                if attempt < REQUEST_MAX_ATTEMPTS {
-                    super::emit_request_diagnostic(format_args!(
-                        "[Warning] {}do_request_text_streaming 等待响应头超时 ({}s), retrying (attempt {}/{})",
-                        retry_scope_tag(),
-                        retry_policy.header_timeout_secs,
-                        attempt,
-                        REQUEST_MAX_ATTEMPTS
-                    ));
-                    attempt += 1;
-                    continue;
-                }
-                return Err("do_request_text_streaming: all attempts timed out".into());
+                return Err(Box::new(RequestError::response_header_timeout(
+                    retry_policy.header_timeout_secs,
+                )));
             }
         };
 

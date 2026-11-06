@@ -103,6 +103,15 @@ impl SummaryFixture {
         assert_eq!(request["messages"][1]["role"], "user");
         request
     }
+
+    async fn assert_no_request(&mut self) {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut self.server,)
+                .await
+                .is_err(),
+            "pre-turn compaction must not contact the summary model"
+        );
+    }
 }
 
 impl Drop for SummaryFixture {
@@ -148,6 +157,64 @@ fn assert_summary_source(messages: &[Message], expected: &[Message], app: &types
     assert_eq!(record["source"]["start_line"], 1);
     assert_eq!(record["source"]["end_line"], expected.len());
     record
+}
+
+#[tokio::test]
+async fn pre_turn_persisted_compaction_does_not_call_summary_model() {
+    use crate::ai::history::{
+        append_history_messages, build_context_history_with_outcome,
+        compact_session_history_without_summary_model,
+    };
+
+    let mut fixture = SummaryFixture::new("200 OK", "must not be requested").await;
+    {
+        let app = &mut fixture.app;
+        let store = SessionStore::new(&app.config.history_file);
+        app.session_history_file = store.session_history_file(&app.session_id);
+        app.config.history_max_chars = 4_000;
+        app.config.history_keep_last = 8;
+        let mut canonical = Vec::new();
+        for index in 0..=200 {
+            canonical.push(Message {
+                role: "user".to_string(),
+                content: Value::String(format!("request {index}")),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+            canonical.push(Message {
+                role: "assistant".to_string(),
+                content: Value::String(format!("response {index}")),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+        }
+        canonical.push(Message {
+            role: "user".to_string(),
+            content: Value::String("protected current request ".repeat(2_000)),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+        append_history_messages(&app.session_history_file, &canonical).unwrap();
+        let projection = build_context_history_with_outcome(
+            0,
+            &app.session_history_file,
+            app.config.history_max_chars,
+            app.config.history_keep_last,
+            app.config.history_summary_max_chars,
+            Some(store.session_assets_dir(&app.session_id)),
+            None,
+        )
+        .unwrap();
+        assert!(!projection.budget_met());
+
+        compact_session_history_without_summary_model(app, None)
+            .await
+            .unwrap();
+    }
+    fixture.assert_no_request().await;
 }
 
 /// Persisted budget compaction must carry a replay-heavy summary into the next

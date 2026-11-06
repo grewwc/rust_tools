@@ -19,6 +19,8 @@ use crate::commonw::configw;
 
 #[derive(Debug)]
 pub(crate) enum RequestErrorKind {
+    Cancelled,
+    ResponseHeaderTimeout,
     Network,
     Status(StatusCode),
 }
@@ -44,8 +46,18 @@ impl RequestError {
 
     pub(crate) fn cancelled(message: impl Into<String>) -> Self {
         Self {
-            kind: RequestErrorKind::Network,
+            kind: RequestErrorKind::Cancelled,
             message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    pub(crate) fn response_header_timeout(timeout_secs: u64) -> Self {
+        Self {
+            kind: RequestErrorKind::ResponseHeaderTimeout,
+            message: format!(
+                "request timed out waiting for response headers after {timeout_secs} seconds"
+            ),
             retry_after: None,
         }
     }
@@ -358,6 +370,7 @@ pub(crate) fn control_model_for_aux_tasks_from(config: &AppConfig, current_model
 
 pub(crate) fn is_transient_error(err: &RequestError) -> bool {
     match err.kind {
+        RequestErrorKind::Cancelled | RequestErrorKind::ResponseHeaderTimeout => false,
         RequestErrorKind::Network => true,
         RequestErrorKind::Status(status) => is_retryable_status_with_body(status, &err.message),
     }
@@ -365,7 +378,9 @@ pub(crate) fn is_transient_error(err: &RequestError) -> bool {
 
 pub(crate) fn should_temporarily_disable_model(err: &RequestError) -> bool {
     match err.kind {
-        RequestErrorKind::Network => false,
+        RequestErrorKind::Cancelled
+        | RequestErrorKind::ResponseHeaderTimeout
+        | RequestErrorKind::Network => false,
         RequestErrorKind::Status(status) => {
             matches!(status.as_u16(), 402 | 404 | 429) || status.is_server_error()
         }
@@ -376,16 +391,20 @@ pub(crate) fn should_temporarily_disable_auto_selected_model(err: &RequestError)
     if should_temporarily_disable_model(err) {
         return true;
     }
-    if !matches!(err.kind, RequestErrorKind::Network) {
-        return false;
+    match err.kind {
+        RequestErrorKind::ResponseHeaderTimeout => true,
+        RequestErrorKind::Network => {
+            let message = err.message.to_ascii_lowercase();
+            message.contains("timed out") || message.contains("timeout")
+        }
+        RequestErrorKind::Cancelled | RequestErrorKind::Status(_) => false,
     }
-    let message = err.message.to_ascii_lowercase();
-    message.contains("timed out") || message.contains("timeout")
 }
 
 pub(crate) fn should_try_model_fallback(err: &RequestError) -> bool {
     match err.kind {
-        RequestErrorKind::Network => true,
+        RequestErrorKind::Cancelled => false,
+        RequestErrorKind::ResponseHeaderTimeout | RequestErrorKind::Network => true,
         RequestErrorKind::Status(status) => {
             matches!(status.as_u16(), 401 | 402 | 403 | 404 | 429) || status.is_server_error()
         }
@@ -510,7 +529,9 @@ pub(crate) fn should_rotate_key(err: &RequestError) -> bool {
             // Non-standard HTTP status codes also check the body for account-level error signals
             is_account_error_body(&err.message)
         }
-        RequestErrorKind::Network => false,
+        RequestErrorKind::Cancelled
+        | RequestErrorKind::ResponseHeaderTimeout
+        | RequestErrorKind::Network => false,
     }
 }
 
@@ -626,7 +647,10 @@ mod tests {
             Some("s2".to_string())
         );
         assert_eq!(
-            header("https://opencode.ai:443/inference/go/v1/chat/completions", "s3"),
+            header(
+                "https://opencode.ai:443/inference/go/v1/chat/completions",
+                "s3"
+            ),
             Some("s3".to_string())
         );
         assert_eq!(
@@ -640,10 +664,7 @@ mod tests {
             header("https://proxy.example.com/opencode.ai/v1", "s5"),
             None
         );
-        assert_eq!(
-            header("https://opencode.ai.evil.example/v1", "s6"),
-            None
-        );
+        assert_eq!(header("https://opencode.ai.evil.example/v1", "s6"), None);
         assert_eq!(header("https://notopencode.ai/v1", "s7"), None);
 
         // Empty session id never attaches the header, even on the real gateway.
@@ -655,7 +676,9 @@ mod tests {
         assert!(!is_opencode_gateway_endpoint(""));
         assert!(!is_opencode_gateway_endpoint("opencode.ai/zen/v1"));
         assert!(!is_opencode_gateway_endpoint("https:///zen/v1"));
-        assert!(!is_opencode_gateway_endpoint("https://opencode.ai.evil.example/v1"));
+        assert!(!is_opencode_gateway_endpoint(
+            "https://opencode.ai.evil.example/v1"
+        ));
         assert!(!is_opencode_gateway_endpoint("https://notopencode.ai/v1"));
         assert!(is_opencode_gateway_endpoint("https://opencode.ai./zen/v1"));
         assert!(is_opencode_gateway_endpoint("https://zen.opencode.ai/v1"));

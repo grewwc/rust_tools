@@ -1753,6 +1753,7 @@ async fn run_loop(
         // A serve child stays alive for another model iteration when either the
         // side-note queue or the talk inbox still holds foreground mail.
         let serve_follow_up_for_pending_queues = one_shot_mode
+            && !crate::ai::background::serve_output_complete()
             && can_flush_foreground_side_notes(
                 one_shot_mode,
                 crate::ai::background::is_serve_child(),

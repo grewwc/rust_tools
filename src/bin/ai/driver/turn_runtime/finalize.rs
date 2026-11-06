@@ -10,7 +10,6 @@ use crate::ai::{
 use rust_tools::commonw::FastSet;
 use serde_json::Value;
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
 
 use super::{TurnOutcome, persistence::persist_pending_turn_messages_for_model};
 
@@ -72,10 +71,6 @@ static SESSION_TITLE_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
 /// finalize may overlap with the next round's defensive compression in prepare).
 static SESSION_COMPACTION_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
     LazyLock::new(|| Mutex::new(FastSet::default()));
-static SESSION_COMPACTION_FINISHED: LazyLock<tokio::sync::Notify> =
-    LazyLock::new(tokio::sync::Notify::new);
-// Allow the summary request's deadline and its bounded snapshot write to finish.
-const SESSION_COMPACTION_WAIT_TIMEOUT: Duration = Duration::from_secs(75);
 
 tokio::task_local! {
     /// The spawning parent scopes its formatting policy around the child turn.
@@ -420,12 +415,12 @@ impl Drop for SessionCompactionGuard {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         in_flight.remove(&self.session_id);
-        drop(in_flight);
-        SESSION_COMPACTION_FINISHED.notify_waiters();
     }
 }
 
-fn try_start_session_compaction(session_id: &str) -> Option<SessionCompactionGuard> {
+pub(in crate::ai::driver::turn_runtime) fn try_start_session_compaction(
+    session_id: &str,
+) -> Option<SessionCompactionGuard> {
     let mut in_flight = SESSION_COMPACTION_IN_FLIGHT
         .lock()
         .unwrap_or_else(|err| err.into_inner());
@@ -436,29 +431,9 @@ fn try_start_session_compaction(session_id: &str) -> Option<SessionCompactionGua
         })
 }
 
-/// Preparation must observe the completed projection before rebuilding context.
-/// Register before checking the slot so completion cannot race the first wait.
-pub(in crate::ai::driver::turn_runtime) async fn wait_for_session_compaction(
-    session_id: &str,
-) -> Option<SessionCompactionGuard> {
-    tokio::time::timeout(SESSION_COMPACTION_WAIT_TIMEOUT, async {
-        loop {
-            let finished = SESSION_COMPACTION_FINISHED.notified();
-            tokio::pin!(finished);
-            finished.as_mut().enable();
-            if let Some(guard) = try_start_session_compaction(session_id) {
-                return guard;
-            }
-            finished.await;
-        }
-    })
-    .await
-    .ok()
-}
-
 /// Interactive finalization dispatches persisted compression to the background: the compression
-/// result is a replaceable context snapshot, and the next preparation waits for this task before
-/// reading that snapshot plus the canonical tail after its watermark.
+/// result is a replaceable context snapshot. The next preparation never waits for this task: it
+/// can safely read the generation-bound snapshot plus the canonical tail after its watermark.
 /// The foreground turn therefore does not have to wait for a CPU compression + SQLite write transaction
 /// after the answer is delivered.
 ///
@@ -731,6 +706,21 @@ pub(super) async fn finalize_turn(
                     .map(|text| crate::ai::request::strip_digest_blocks(&text))
                     .unwrap_or_default();
             crate::ai::background::publish_committed_serve_output(&visible_text);
+            // The accepted body is final; end the user-visible turn here rather
+            // than at child exit. Compression and title generation below are
+            // silent bookkeeping and can take minutes, during which the client
+            // would otherwise keep its next input blocked behind this turn.
+            // A side note or talk item already queued keeps the stream open so
+            // the run loop still delivers that follow-up in place.
+            if one_shot_mode
+                && !crate::ai::driver::side_note::has_pending_side_notes(
+                    &app.session_history_file,
+                    None,
+                )
+                && !crate::ai::driver::talk::has_pending_talk(&app.session_history_file)
+            {
+                crate::ai::background::mark_serve_output_complete();
+            }
         }
         // Task boundary detection: no tool calls in this turn means the agent has delivered its answer —
         // a natural "task complete" cut point. Trigger the summary with the more aggressive threshold
@@ -1145,26 +1135,14 @@ mod tests {
     use super::*;
     use crate::ai::types::{FunctionCall, ToolCall};
 
-    #[tokio::test]
-    async fn compact_session_history_waits_for_in_flight_projection() {
-        use std::future::Future;
-        use std::task::Poll;
-
+    #[test]
+    fn compact_session_history_skips_in_flight_projection_without_waiting() {
         let session_id = format!("compaction-wait-{}", uuid::Uuid::new_v4());
         let guard = try_start_session_compaction(&session_id).unwrap();
-        let waiting = wait_for_session_compaction(&session_id);
-        tokio::pin!(waiting);
-        std::future::poll_fn(|cx| {
-            assert!(waiting.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
+        assert!(try_start_session_compaction(&session_id).is_none());
 
         drop(guard);
-        let next_guard = tokio::time::timeout(Duration::from_secs(1), waiting)
-            .await
-            .expect("completion must wake preparation")
-            .unwrap();
+        let next_guard = try_start_session_compaction(&session_id).unwrap();
         assert!(try_start_session_compaction(&session_id).is_none());
         drop(next_guard);
         assert!(try_start_session_compaction(&session_id).is_some());

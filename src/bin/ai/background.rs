@@ -505,10 +505,32 @@ pub(crate) fn serve_confirm_channel() -> bool {
 /// quiet: the same text already streamed through the pipe chunk by chunk, and
 /// printing it again would show the answer twice.
 static SERVE_LIVE_STREAMING: AtomicBool = AtomicBool::new(false);
+/// Set once this serve child has told its client that the user-visible turn is
+/// complete. Later side-note/talk arrivals must then wait for the next turn
+/// instead of being consumed by a child whose SSE stream already ended.
+static SERVE_OUTPUT_COMPLETE: AtomicBool = AtomicBool::new(false);
 
 /// Whether this process streams its turn through a serve-owned live FIFO.
 pub(crate) fn serve_live_streaming() -> bool {
     SERVE_LIVE_STREAMING.load(Ordering::Relaxed)
+}
+
+/// Publish the early `done` marker exactly once per serve child.
+///
+/// The remaining finalize work (history compaction, title) is silent
+/// bookkeeping; the client must not keep its next input blocked behind it.
+pub(crate) fn mark_serve_output_complete() {
+    if !serve_live_streaming() {
+        return;
+    }
+    if SERVE_OUTPUT_COMPLETE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    publish_serve_frame(ServeLiveKind::OutputComplete, "");
+}
+
+pub(crate) fn serve_output_complete() -> bool {
+    SERVE_OUTPUT_COMPLETE.load(Ordering::Relaxed)
 }
 
 /// Install the serve-owned live FIFO passed via [`SERVE_LIVE_FIFO_ENV`].

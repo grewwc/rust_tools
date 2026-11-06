@@ -5,6 +5,23 @@
 use super::*;
 
 #[test]
+fn stream_error_retry_policy_rejects_slow_or_repeated_failures() {
+    assert!(should_retry_stream_error(1, Duration::from_secs(10)));
+    assert!(should_retry_stream_error(
+        MAX_STREAM_ERROR_RETRIES,
+        Duration::from_secs(MAX_RETRYABLE_STREAM_ATTEMPT_SECS),
+    ));
+    assert!(!should_retry_stream_error(
+        MAX_STREAM_ERROR_RETRIES + 1,
+        Duration::from_secs(10),
+    ));
+    assert!(!should_retry_stream_error(
+        1,
+        Duration::from_secs(MAX_RETRYABLE_STREAM_ATTEMPT_SECS + 1),
+    ));
+}
+
+#[test]
 fn record_turn_tool_uses_only_reads_the_current_turn() {
     let user = crate::ai::history::Message {
         role: "user".to_string(),

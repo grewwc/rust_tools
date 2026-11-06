@@ -91,13 +91,15 @@ pub(in crate::ai) fn append_request_error(
 
 /// Append the final structured error returned to the turn runtime. Unlike
 /// `request_error`, which records a raw non-2xx provider response, this also
-/// covers network errors and errors produced by request middleware.
+/// covers cancellation, network errors, and errors produced by request middleware.
 pub(in crate::ai) fn append_request_failure(session_id: &str, model: &str, error: &RequestError) {
     append_line(&request_failure_record_json(session_id, model, error));
 }
 
 fn request_failure_record_json(session_id: &str, model: &str, error: &RequestError) -> Value {
     let (error_kind, status) = match error.kind {
+        RequestErrorKind::Cancelled => ("cancelled", None),
+        RequestErrorKind::ResponseHeaderTimeout => ("response_header_timeout", None),
         RequestErrorKind::Network => ("network", None),
         RequestErrorKind::Status(status) => ("status", Some(status.as_u16())),
     };
@@ -216,7 +218,9 @@ fn append_line(record: &Value) {
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join(OUTCOME_LOG_FILE);
     rotate_if_large(&path);
-    let _guard = APPEND_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _guard = APPEND_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = file.write_all(line.as_bytes());
     }
@@ -276,7 +280,11 @@ mod tests {
         // String chars + the serialized JSON length of the parts array.
         assert_eq!(
             chars,
-            secret_chars + json!([{"type": "text", "text": "hi"}]).to_string().chars().count()
+            secret_chars
+                + json!([{"type": "text", "text": "hi"}])
+                    .to_string()
+                    .chars()
+                    .count()
         );
     }
 
@@ -309,11 +317,27 @@ mod tests {
                 .is_some_and(|message| message.ends_with("…[truncated]"))
         );
 
-        let network = RequestError::cancelled("request canceled");
+        let network = RequestError {
+            kind: RequestErrorKind::Network,
+            message: "network timeout".to_string(),
+            retry_after: None,
+        };
         let network_record = request_failure_record_json("sess", "model", &network);
         assert_eq!(network_record["error"]["kind"], "network");
         assert!(network_record["error"]["status"].is_null());
         assert!(network_record["error"]["retry_after_ms"].is_null());
+
+        let cancelled = RequestError::cancelled("request canceled");
+        let cancelled_record = request_failure_record_json("sess", "model", &cancelled);
+        assert_eq!(cancelled_record["error"]["kind"], "cancelled");
+        assert!(cancelled_record["error"]["status"].is_null());
+        assert!(cancelled_record["error"]["retry_after_ms"].is_null());
+
+        let timeout = RequestError::response_header_timeout(90);
+        let timeout_record = request_failure_record_json("sess", "model", &timeout);
+        assert_eq!(timeout_record["error"]["kind"], "response_header_timeout");
+        assert!(timeout_record["error"]["status"].is_null());
+        assert!(timeout_record["error"]["retry_after_ms"].is_null());
     }
 
     #[test]
@@ -343,7 +367,14 @@ mod tests {
             prompt_cache_key: None,
             explicit_cache_breakpoints: false,
         };
-        let record = request_record_json("sess", "beam-free", "https://example.test/v1", false, None, &request);
+        let record = request_record_json(
+            "sess",
+            "beam-free",
+            "https://example.test/v1",
+            false,
+            None,
+            &request,
+        );
         assert_eq!(record["kind"], "request");
         assert_eq!(record["controls"]["reasoning_effort"], "max");
         assert_eq!(record["controls"]["thinking"]["enable_thinking"], true);
@@ -357,7 +388,13 @@ mod tests {
     #[test]
     fn appenders_are_noop_without_a_session_dir() {
         // Unit tests run without a driver context: nothing is written, nothing panics.
-        append_request_error("sess", "model", "https://example.test/v1", 400, r#"{"error":{}}"#);
+        append_request_error(
+            "sess",
+            "model",
+            "https://example.test/v1",
+            400,
+            r#"{"error":{}}"#,
+        );
         assert!(current_session_assets_dir().is_none());
     }
 }
