@@ -6,7 +6,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rust_tools::commonw::FastSet;
 use serde_json::{Value, json};
 
 use crate::ai::types::{McpPrompt, McpResource, McpServerConfig, McpTool, McpTransportKind};
@@ -33,7 +32,6 @@ pub(in crate::ai) struct McpServerConnection {
     transport: McpTransport,
     pub(in crate::ai) request_timeout_ms: u64,
     pub(in crate::ai) tools: Vec<McpTool>,
-    pub(super) retry_safe_tools: FastSet<String>,
     pub(in crate::ai) resources: Vec<McpResource>,
     pub(in crate::ai) prompts: Vec<McpPrompt>,
 }
@@ -48,13 +46,6 @@ struct StdioTransport {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     stderr_tail: Arc<Mutex<String>>,
-}
-
-/// A failed write can be partial, so only failures before attempting transport
-/// IO prove that a tool call was not dispatched.
-pub(super) struct McpRequestFailure {
-    pub(super) error: String,
-    pub(super) may_have_been_sent: bool,
 }
 
 pub(in crate::ai) fn spawn_stderr_drain(stderr: ChildStderr) -> Arc<Mutex<String>> {
@@ -80,7 +71,6 @@ impl McpServerConnection {
             transport,
             request_timeout_ms: config.request_timeout_ms.max(100),
             tools: Vec::new(),
-            retry_safe_tools: FastSet::default(),
             resources: Vec::new(),
             prompts: Vec::new(),
         })
@@ -99,56 +89,21 @@ impl McpServerConnection {
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, String> {
-        self.request_with_delivery(id, method, params)
-            .map_err(|failure| failure.error)
-    }
-
-    pub(super) fn request_with_delivery(
-        &mut self,
-        id: u64,
-        method: &str,
-        params: Option<Value>,
-    ) -> Result<Value, McpRequestFailure> {
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id,
             method: method.to_string(),
             params,
         };
-        let request_str = serde_json::to_string(&request).map_err(|e| McpRequestFailure {
-            error: format!("Failed to serialize request: {}", e),
-            may_have_been_sent: false,
-        })?;
+        let request_str = serde_json::to_string(&request)
+            .map_err(|e| format!("Failed to serialize request: {}", e))?;
         let timeout_ms = self.request_timeout_ms;
 
-        if super::io::tool_cancel_requested() {
-            return Err(McpRequestFailure {
-                error: super::io::tool_cancel_error(),
-                may_have_been_sent: false,
-            });
-        }
-
         let result = match &mut self.transport {
-            McpTransport::Stdio(stdio) => {
-                if let Ok(Some(status)) = stdio.process.try_wait() {
-                    return Err(McpRequestFailure {
-                        error: stdio.decorate_transport_error(format!(
-                            "MCP server process exited with status {} before sending request",
-                            status
-                        )),
-                        may_have_been_sent: false,
-                    });
-                }
-                request_stdio(stdio, id, &request_str, timeout_ms)
-            }
-            // HTTP/SSE hides dispatch progress behind its transport API. Treat
-            // every failure after entering it as potentially dispatched.
+            McpTransport::Stdio(stdio) => request_stdio(stdio, id, &request_str, timeout_ms),
             McpTransport::Http(http) => http.request(id, &request_str, timeout_ms),
         };
-        result.map_err(|e| McpRequestFailure {
-            error: self.decorate_transport_error(e),
-            may_have_been_sent: true,
-        })
+        result.map_err(|e| self.decorate_transport_error(e))
     }
 
     pub(in crate::ai) fn notify(
@@ -181,7 +136,6 @@ impl McpServerConnection {
         self.transport = build_transport(&self.name, &self.config)?;
         self.request_timeout_ms = self.config.request_timeout_ms.max(100);
         self.tools.clear();
-        self.retry_safe_tools.clear();
         self.resources.clear();
         self.prompts.clear();
         Ok(())
@@ -448,7 +402,6 @@ mod tests {
             }),
             request_timeout_ms: 100,
             tools: Vec::new(),
-            retry_safe_tools: FastSet::default(),
             resources: Vec::new(),
             prompts: Vec::new(),
         };

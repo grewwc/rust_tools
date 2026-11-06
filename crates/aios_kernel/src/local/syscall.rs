@@ -134,7 +134,7 @@ impl Syscall for LocalOS {
 
         self.wait_queue.entry(target_pid).or_default().push(current);
         self.current_pid = None;
-        self.request_yield_for(current);
+        self.yield_requested = true;
 
         Ok(())
     }
@@ -196,7 +196,7 @@ impl Syscall for LocalOS {
             self.register_event_waiter(*event_id, current);
         }
         self.current_pid = None;
-        self.request_yield_for(current);
+        self.yield_requested = true;
         Ok(timeout_tick)
     }
 
@@ -328,7 +328,7 @@ impl Syscall for LocalOS {
         }
         self.wakeup_heap.push(Reverse((until_tick, current)));
         self.current_pid = None;
-        self.request_yield_for(current);
+        self.yield_requested = true;
         Ok(until_tick)
     }
 

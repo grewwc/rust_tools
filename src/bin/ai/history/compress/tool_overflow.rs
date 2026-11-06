@@ -708,9 +708,6 @@ pub(super) fn spill_protected_precision_to_fit(
     };
     let id_to_tool_name = build_tool_call_name_index(messages);
     let id_to_tool_args = build_tool_call_arguments_index(messages);
-    // This collection finishes before the spill loop writes or removes assets.
-    // Keep the directory snapshot local to that read-only phase.
-    let mut command_archives = CommandArchiveCandidates::new(overflow_dir);
     let mut candidates = messages
         .iter()
         .enumerate()
@@ -729,13 +726,12 @@ pub(super) fn spill_protected_precision_to_fit(
             // pointer both preserves the hard target and avoids the "spill →
             // read-back → spill again" cycle.
             let existing_asset_path = id_to_tool_args.get(id).and_then(|args| {
-                preserved_tool_overflow_path_in_arguments_with_cache(
+                preserved_tool_overflow_path_in_arguments(
                     &tool_name,
                     args,
                     overflow_dir,
                     cwd,
                     &text,
-                    Some(&mut command_archives),
                 )
             });
             (!text.trim().is_empty()
@@ -751,7 +747,6 @@ pub(super) fn spill_protected_precision_to_fit(
             })
         })
         .collect::<Vec<_>>();
-    drop(command_archives);
     candidates.sort_unstable_by_key(|(_, _, _, chars)| std::cmp::Reverse(*chars));
 
     // Running total maintained incrementally instead of re-scanning the whole
@@ -910,34 +905,12 @@ fn preserved_tool_overflow_path_in_arguments(
     cwd: Option<&Path>,
     result_text: &str,
 ) -> Option<PathBuf> {
-    preserved_tool_overflow_path_in_arguments_with_cache(
-        tool_name,
-        arguments,
-        overflow_dir,
-        cwd,
-        result_text,
-        None,
-    )
-}
-
-fn preserved_tool_overflow_path_in_arguments_with_cache(
-    tool_name: &str,
-    arguments: &str,
-    overflow_dir: &Path,
-    cwd: Option<&Path>,
-    result_text: &str,
-    command_archives: Option<&mut CommandArchiveCandidates<'_>>,
-) -> Option<PathBuf> {
     let args = serde_json::from_str::<Value>(arguments).ok()?;
     match tool_name {
         "read_file" => preserved_tool_overflow_read_file_path(arguments, overflow_dir),
         "execute_command" => {
             let command = value_string_from_keys(&args, &["command"])?;
-            if let Some(command_archives) = command_archives {
-                command_archives.path_in_command(&command, cwd, result_text)
-            } else {
-                archived_asset_path_in_command(&command, overflow_dir, cwd, result_text)
-            }
+            archived_asset_path_in_command(&command, overflow_dir, cwd, result_text)
         }
         _ => None,
     }
@@ -1043,12 +1016,8 @@ fn archived_asset_path_in_command(
         .join(PRESERVED_TOOL_OVERFLOW_DIR)
         .canonicalize()
         .ok()?;
-    #[cfg(test)]
-    command_archive_tests::record_directory_enumeration();
     for entry in std::fs::read_dir(&preserved_dir).ok()?.flatten() {
         let path = entry.path();
-        #[cfg(test)]
-        command_archive_tests::record_candidate_check();
         if !path.is_file() {
             continue;
         }
@@ -1084,112 +1053,6 @@ fn archived_asset_path_in_command(
     }
     None
 }
-
-/// Cache only candidate discovery during Path C's read-only collection phase.
-/// Keep candidates in read_dir order and reread matching content on every query.
-struct CommandArchiveCandidates<'a> {
-    overflow_dir: &'a Path,
-    candidates: Option<Vec<PathBuf>>,
-}
-
-impl<'a> CommandArchiveCandidates<'a> {
-    fn new(overflow_dir: &'a Path) -> Self {
-        Self {
-            overflow_dir,
-            candidates: None,
-        }
-    }
-
-    fn path_in_command(
-        &mut self,
-        command: &str,
-        cwd: Option<&Path>,
-        expected_output: &str,
-    ) -> Option<PathBuf> {
-        if let Some(candidates) = &self.candidates {
-            return Self::find_in_candidates(candidates, command, cwd, expected_output);
-        }
-
-        let preserved_dir = self
-            .overflow_dir
-            .join(PRESERVED_TOOL_OVERFLOW_DIR)
-            .canonicalize()
-            .ok()?;
-        #[cfg(test)]
-        command_archive_tests::record_directory_enumeration();
-        let entries = std::fs::read_dir(&preserved_dir).ok()?;
-        let mut candidates = Vec::new();
-        let mut cacheable = true;
-        for entry in entries {
-            let path = match entry {
-                Ok(entry) => entry.path(),
-                Err(_) => {
-                    cacheable = false;
-                    continue;
-                }
-            };
-            #[cfg(test)]
-            command_archive_tests::record_candidate_check();
-            let candidate = (|| -> std::io::Result<Option<PathBuf>> {
-                // Path::is_file() uses this same metadata call, but keeping the
-                // error lets a later query retry a failed candidate check.
-                if !std::fs::metadata(&path)?.is_file() {
-                    return Ok(None);
-                }
-                let canonical = path.canonicalize()?;
-                if !std::fs::metadata(&canonical)?.is_file()
-                    || canonical.parent() != Some(preserved_dir.as_path())
-                {
-                    return Ok(None);
-                }
-                Ok(Some(canonical))
-            })();
-            match candidate {
-                Ok(Some(canonical)) => candidates.push(canonical),
-                Ok(None) => {}
-                Err(_) => cacheable = false,
-            }
-        }
-        let reused = Self::find_in_candidates(&candidates, command, cwd, expected_output);
-        // Do not make directory or metadata failures sticky across queries.
-        if cacheable {
-            self.candidates = Some(candidates);
-        }
-        reused
-    }
-
-    fn find_in_candidates(
-        candidates: &[PathBuf],
-        command: &str,
-        cwd: Option<&Path>,
-        expected_output: &str,
-    ) -> Option<PathBuf> {
-        for canonical in candidates {
-            let abs = canonical.to_string_lossy();
-            let mentioned = command.contains(abs.as_ref())
-                || cwd
-                    .as_ref()
-                    .and_then(|cwd| canonical.strip_prefix(cwd).ok())
-                    .and_then(|rel| rel.to_str())
-                    .is_some_and(|rel_str| command.contains(rel_str))
-                || canonical
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|name| command.contains(name));
-            if mentioned
-                && std::fs::read_to_string(canonical)
-                    .is_ok_and(|archived| archived.trim() == expected_output.trim())
-            {
-                return Some(canonical.clone());
-            }
-        }
-        None
-    }
-}
-
-#[cfg(test)]
-#[path = "tool_overflow_command_archive_tests.rs"]
-mod command_archive_tests;
 
 /// Output of "read/retrieval" tools is zero-compressed (no trimming, no dedup
 /// folding, no whole-group deletion); over the threshold it only gets

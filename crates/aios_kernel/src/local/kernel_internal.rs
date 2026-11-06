@@ -55,9 +55,8 @@ impl KernelInternal for LocalOS {
             if let Some(proc) = self.processes.get_mut(&pid) {
                 proc.state = ProcessState::Running;
                 self.current_pid = Some(pid);
-                let process = proc.clone();
-                self.clear_yield_for(pid);
-                return Some(process);
+                self.yield_requested = false;
+                return Some(proc.clone());
             }
         }
         None
@@ -80,11 +79,11 @@ impl KernelInternal for LocalOS {
                 }
                 proc.state = ProcessState::Running;
                 result.push(proc.clone());
-                self.clear_yield_for(pid);
             }
         }
         if let Some(first) = result.first() {
             self.current_pid = Some(first.pid);
+            self.yield_requested = false;
         }
         result
     }
@@ -97,34 +96,6 @@ impl KernelInternal for LocalOS {
         if let Some(pid) = self.current_pid.take() {
             self.terminate_pid(pid, result);
         }
-    }
-
-    fn terminate_process_tree(&mut self, pid: u64, reason: String) -> bool {
-        if !self
-            .processes
-            .get(&pid)
-            .is_some_and(|process| process.state != ProcessState::Terminated)
-        {
-            return false;
-        }
-        for descendant in self.collect_descendants(pid).into_iter().rev() {
-            if self
-                .processes
-                .get(&descendant)
-                .is_some_and(|process| process.state != ProcessState::Terminated)
-            {
-                self.terminate_pid(descendant, format!("Killed (cascade from {pid}): {reason}"));
-            }
-        }
-        self.terminate_pid(pid, format!("Killed: {reason}"));
-        if self.current_pid.is_some_and(|current| {
-            self.processes
-                .get(&current)
-                .is_some_and(|process| process.state == ProcessState::Terminated)
-        }) {
-            self.current_pid = None;
-        }
-        true
     }
 
     fn get_process_mut(&mut self, pid: u64) -> Option<&mut Process> {
@@ -214,15 +185,13 @@ impl KernelInternal for LocalOS {
     }
 
     fn consume_yield_requested(&mut self) -> bool {
-        self.effective_current_pid()
-            .or(self.last_yield_pid)
-            .is_some_and(|pid| self.yield_requested.remove(&pid))
+        let yielded = self.yield_requested;
+        self.yield_requested = false;
+        yielded
     }
 
     fn request_yield(&mut self) {
-        if let Some(pid) = self.effective_current_pid().or(self.last_yield_pid) {
-            self.request_yield_for(pid);
-        }
+        self.yield_requested = true;
     }
 
     fn event_is_completed(&self, event_id: EventId) -> bool {
@@ -343,9 +312,8 @@ impl KernelInternal for LocalOS {
         if let Some(proc) = self.processes.get_mut(&fg_pid) {
             proc.state = ProcessState::Running;
             self.current_pid = Some(fg_pid);
-            let process = proc.clone();
-            self.clear_yield_for(fg_pid);
-            Some(process)
+            self.yield_requested = false;
+            Some(proc.clone())
         } else {
             None
         }
@@ -432,7 +400,7 @@ impl KernelInternal for LocalOS {
                 proc.state = ProcessState::Stopped;
             }
             self.current_pid = None;
-            self.request_yield_for(current);
+            self.yield_requested = true;
             return true;
         }
 
@@ -617,16 +585,10 @@ impl KernelInternal for LocalOS {
     }
 
     fn cleanup_process_resources(&mut self, pid: u64) {
-        if let Some(history_path) = self
-            .processes
-            .get_mut(&pid)
-            .and_then(|process| process.history_file.take())
-        {
-            self.external_cleanup.push(history_path);
+        if let Some(proc) = self.processes.get(&pid) {
+            if let Some(ref history_path) = proc.history_file {
+                let _ = std::fs::remove_file(history_path);
+            }
         }
-    }
-
-    fn drain_external_cleanup(&mut self) -> Vec<PathBuf> {
-        std::mem::take(&mut self.external_cleanup)
     }
 }

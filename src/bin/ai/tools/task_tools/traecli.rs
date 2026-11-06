@@ -5,9 +5,7 @@
 //! `backend: "traecli"` argument on a `task` / `task_spawn` item. All task control block
 //! semantics (task registry, result channel, futex, evidence ledger,
 //! cancellation) stay owned by the existing `task_spawn` / `task_wait` layer.
-//! Before execution signals, this runner retries recoverable backend failures
-//! and resumes any captured session. Unknown tool effects are never replayed
-//! automatically.
+//! This runner retries backend failures and resumes any captured session.
 //!
 //! CLI surface tracked: traecli 0.213.x. The non-interactive entry is the
 //! `exec` subcommand with `--json` (JSONL events on stdout); the pre-0.2xx
@@ -36,11 +34,7 @@
 //!   the parent task queue after completion/cancellation and prepended when
 //!   a continuation is dispatched. This does not use the TUI's Tab queue.
 
-mod codec;
-mod command;
-mod diagnostics;
-
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,15 +55,6 @@ use super::backend_session::SessionState as TraeCliSessionState;
 use super::backend_session::{self, SessionSlot as TraeCliSessionSlot};
 use super::registry::lock_unpoisoned;
 
-use self::codec::{
-    stdout_hint, traecli_item_activity, traecli_item_completion, traecli_item_id,
-    traecli_item_phase, traecli_message_text, truncate_head,
-};
-#[cfg(test)]
-use self::command::{binary_available, full_prompt};
-use self::command::{normalize_cwd, prompt_payload};
-use self::diagnostics::StderrTail;
-
 /// Parsed outcome of a TraeCLI `exec --json` run.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TraeCliOutcome {
@@ -86,14 +71,34 @@ pub(crate) struct TraeCliOutcome {
 pub(super) type TraeCliEvidenceSlot = Arc<Mutex<Option<TraeCliOutcome>>>;
 
 pub(crate) fn traecli_binary() -> String {
-    command::traecli_binary()
+    let raw = std::env::var("TRAECLI_BIN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "traecli".to_string());
+    let path = Path::new(&raw);
+    if path.components().count() > 1 && path.is_relative() {
+        if let Ok(cwd) = std::env::current_dir() {
+            return cwd.join(path).to_string_lossy().into_owned();
+        }
+    }
+    raw
 }
 
 /// Cheap preflight used when a task is admitted: an absent binary is a
 /// definite startup failure, so `task_spawn` can report it in its immediate
 /// per-task status instead of waiting for the runner's startup watchdog.
 pub(crate) fn traecli_binary_available() -> bool {
-    command::traecli_binary_available()
+    binary_available(&traecli_binary())
+}
+
+fn binary_available(binary: &str) -> bool {
+    let path = Path::new(&binary);
+    if path.components().count() > 1 {
+        return path.is_file();
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(&binary).is_file()))
+        .unwrap_or(false)
 }
 
 /// Built-in default TraeCLI model, used when neither the call, the
@@ -105,14 +110,17 @@ pub(crate) const TRAECLI_BUILTIN_DEFAULT_MODEL: &str = "gpt-5.5";
 /// default. Never fed from the parent model name: the two model registries
 /// use different naming.
 pub(crate) fn traecli_model(spec: &ExternalSubagentSpec) -> String {
-    command::traecli_model(spec)
+    traecli_model_for(spec.model.as_deref())
 }
 
 /// Resolve the effective TraeCLI model from a per-call or session pick without
 /// requiring a full spec. Task preparation prefers the per-call pick over the
 /// session pick before passing it here; environment/config defaults follow.
 pub(crate) fn traecli_model_for(explicit: Option<&str>) -> String {
-    command::traecli_model_for(explicit)
+    let env = std::env::var("TRAECLI_MODEL").ok();
+    let config = crate::commonw::configw::get_all_config()
+        .get_opt(crate::ai::config_schema::AiConfig::TRAECLI_DEFAULT_MODEL);
+    resolve_traecli_model(explicit, env.as_deref(), config.as_deref())
 }
 
 /// Pure precedence chain behind [`traecli_model`], kept separate so tests do
@@ -122,7 +130,12 @@ pub(crate) fn resolve_traecli_model(
     env: Option<&str>,
     config: Option<&str>,
 ) -> String {
-    command::resolve_traecli_model(explicit, env, config)
+    for candidate in [explicit, env, config] {
+        if let Some(name) = candidate.map(str::trim).filter(|s| !s.is_empty()) {
+            return name.to_string();
+        }
+    }
+    TRAECLI_BUILTIN_DEFAULT_MODEL.to_string()
 }
 
 /// Build the headless TraeCLI command for a subagent run.
@@ -136,21 +149,233 @@ pub(crate) fn resolve_traecli_model(
 /// re-prepended (the session already has them). `--permission-mode` stays
 /// omitted (see module docs). Never YOLO.
 pub(crate) fn build_traecli_args(spec: &ExternalSubagentSpec) -> Vec<String> {
-    command::build_traecli_args(spec)
+    if let Some(session) = spec
+        .resume_session
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let mut args = vec![
+            "exec".to_string(),
+            "resume".to_string(),
+            "--json".to_string(),
+            "--skip-git-repo-check".to_string(),
+            "--all".to_string(),
+            session.to_string(),
+            "-m".to_string(),
+            traecli_model(spec),
+        ];
+        push_effort_arg(&mut args, spec);
+        return args;
+    }
+    let cwd = normalize_cwd(&spec.cwd);
+    let mut args = vec![
+        "exec".to_string(),
+        "--json".to_string(),
+        "--skip-git-repo-check".to_string(),
+        "-C".to_string(),
+        cwd.to_string_lossy().into_owned(),
+        "-s".to_string(),
+        if spec.workspace_allowed {
+            "workspace-write"
+        } else {
+            "read-only"
+        }
+        .to_string(),
+    ];
+    args.push("-m".to_string());
+    args.push(traecli_model(spec));
+    push_effort_arg(&mut args, spec);
+    push_image_args(&mut args, spec);
+    args
+}
+
+/// Prompt bytes written to the child's stdin. Fresh runs prepend the inherited
+/// skill overlay; resume runs send only the follow-up because the persisted
+/// session already holds the original prompt and skills.
+fn prompt_payload(spec: &ExternalSubagentSpec) -> String {
+    let resuming = spec
+        .resume_session
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let mut payload = if resuming {
+        append_original_image_paths(spec.prompt.clone(), &spec.image_files)
+    } else {
+        full_prompt(spec)
+    };
+    if spec.phase_slot.is_some() {
+        payload.push_str(
+            "\n\nDuring long-running work, publish saved findings in a separate progress message \
+             using this format:\n<context_checkpoint>\nsummary: Short finding summary\n\
+             Checkpoint body with the evidence gathered so far.\n</context_checkpoint>\n\
+             Keep each checkpoint concise. Send the final answer separately after finishing.",
+        );
+    }
+    payload
 }
 
 /// Normalize effort for both TraeCLI argv and display. TraeCLI has no "off"
 /// tier, so `none`/`minimal` clamp to `low`; other supported tiers pass through.
 /// Unknown values are omitted so the backend default wins.
 pub(crate) fn normalize_traecli_reasoning_effort(effort: &str) -> Option<&str> {
-    command::normalize_traecli_reasoning_effort(effort)
+    match effort.trim() {
+        "none" | "minimal" => Some("low"),
+        effort @ ("low" | "medium" | "high" | "xhigh" | "max") => Some(effort),
+        _ => None,
+    }
 }
 
-/// Keep the last non-empty body, session, and completed-turn usage independently
-/// of terminal errors. The blocking runner also applies the process exit status.
+fn push_effort_arg(args: &mut Vec<String>, spec: &ExternalSubagentSpec) {
+    let Some(mapped) = spec
+        .reasoning_effort
+        .as_deref()
+        .and_then(normalize_traecli_reasoning_effort)
+    else {
+        return;
+    };
+    args.push("-c".to_string());
+    args.push(format!("model_reasoning_effort={mapped}"));
+}
+
+/// Attach the parent turn's original images to the child's first request.
+/// Codex's `exec` accepts one `-i/--image <FILE>` per image; resume runs
+/// already carry them in the persisted session, so only the path hint is
+/// re-sent there.
+fn push_image_args(args: &mut Vec<String>, spec: &ExternalSubagentSpec) {
+    for path in &spec.image_files {
+        args.push("-i".to_string());
+        args.push(path.clone());
+    }
+}
+
+/// Later turns can compact the original request down to a summary. Keep the
+/// absolute paths in the follow-up prompt so the model can reopen the original
+/// whenever the task still depends on its visual detail.
+fn append_original_image_paths(mut prompt: String, image_files: &[String]) -> String {
+    if image_files.is_empty() {
+        return prompt;
+    }
+    prompt.push_str("\n\n## Original images\n");
+    for path in image_files {
+        prompt.push_str("- ");
+        prompt.push_str(path);
+        prompt.push('\n');
+    }
+    prompt.push_str("Use your image viewer on these paths when you need the original again.");
+    prompt
+}
+
+/// Final prompt text: parent skill context first (mirroring the kernel path,
+/// where skills are system-prompt overlays above the task), then the task.
+fn full_prompt(spec: &ExternalSubagentSpec) -> String {
+    match spec
+        .skills
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(skills) => format!("{skills}\n\n{}", spec.prompt),
+        None => spec.prompt.clone(),
+    }
+}
+
+/// Scan full `exec --json` stdout: the last non-empty `agent_message` wins,
+/// `thread_id` comes from `thread.started`, turns/usage accumulate from
+/// `turn.completed`. `reasoning` and `command_execution` items are ignored.
 /// Returns `None` when no turn, message, or error event exists.
 pub(crate) fn parse_stream_json_output(output: &str) -> Option<TraeCliOutcome> {
-    codec::parse_stream_json_output(output)
+    let mut outcome = TraeCliOutcome::default();
+    let mut turns: u64 = 0;
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+    let mut saw_usage = false;
+    let mut message: Option<String> = None;
+    let mut error_text: Option<String> = None;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.starts_with('{') {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        match event_type {
+            "thread.started" => {
+                if outcome.session_id.is_none() {
+                    outcome.session_id = value
+                        .get("thread_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+            }
+            "item.completed" => {
+                let item = value.get("item");
+                let item_type = item.and_then(|i| i.get("type")).and_then(Value::as_str);
+                if item_type == Some("agent_message") {
+                    if let Some(text) = item.and_then(|i| i.get("text")).and_then(Value::as_str) {
+                        if !text.trim().is_empty() {
+                            let text = traecli_message_text(text, |_, _| {});
+                            if !text.trim().is_empty() {
+                                message = Some(text);
+                            }
+                        }
+                    }
+                }
+            }
+            "turn.completed" => {
+                turns += 1;
+                if let Some(usage) = value.get("usage") {
+                    if let Some(n) = usage.get("input_tokens").and_then(Value::as_u64) {
+                        input_tokens += n;
+                        saw_usage = true;
+                    }
+                    if let Some(n) = usage.get("output_tokens").and_then(Value::as_u64) {
+                        output_tokens += n;
+                        saw_usage = true;
+                    }
+                }
+            }
+            "error" => {
+                if error_text.is_none() {
+                    error_text = value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            value
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .or_else(|| Some(trimmed.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if turns == 0 && message.is_none() && error_text.is_none() {
+        return None;
+    }
+    if turns > 0 {
+        outcome.num_turns = Some(turns);
+    }
+    if saw_usage {
+        outcome.input_tokens = Some(input_tokens);
+        outcome.output_tokens = Some(output_tokens);
+    }
+    match message {
+        Some(text) => outcome.result = text,
+        None => {
+            outcome.result = error_text.unwrap_or_default();
+            outcome.is_error = true;
+        }
+    }
+    Some(outcome)
 }
 
 pub(crate) async fn run_traecli_subagent(
@@ -196,39 +421,6 @@ async fn run_traecli_subagent_with_session(
     supplied_session_slot: Option<TraeCliSessionSlot>,
     evidence_slot: Option<TraeCliEvidenceSlot>,
 ) -> Result<TraeCliOutcome, String> {
-    let mut guard = TraeCliCancelOnDrop(Some(cancel.clone()));
-    let result = run_traecli_attempts(
-        spec,
-        cancel,
-        binary,
-        startup_timeout,
-        supplied_session_slot,
-        evidence_slot,
-    )
-    .await;
-    guard.0 = None;
-    result
-}
-
-/// Dropping an async waiter must also stop its non-abortable blocking worker.
-struct TraeCliCancelOnDrop(Option<Arc<AtomicBool>>);
-
-impl Drop for TraeCliCancelOnDrop {
-    fn drop(&mut self) {
-        if let Some(cancel) = &self.0 {
-            cancel.store(true, Ordering::Release);
-        }
-    }
-}
-
-async fn run_traecli_attempts(
-    spec: &ExternalSubagentSpec,
-    cancel: Arc<AtomicBool>,
-    binary: &str,
-    startup_timeout: Duration,
-    supplied_session_slot: Option<TraeCliSessionSlot>,
-    evidence_slot: Option<TraeCliEvidenceSlot>,
-) -> Result<TraeCliOutcome, String> {
     if spec.prompt.trim().is_empty() {
         return Err("traecli subagent prompt is empty".to_string());
     }
@@ -255,13 +447,11 @@ async fn run_traecli_attempts(
         // captured by any attempt for the task, and finally the caller's
         // original session.
         let attempt_session_slot = Arc::new(Mutex::new(None));
-        let attempt_effects = Arc::new(AtomicBool::new(false));
         let owned = attempt_spec.clone();
         let worker_cancel = cancel.clone();
         let worker_slot = session_slot.clone();
         let worker_attempt_slot = attempt_session_slot.clone();
         let worker_evidence_slot = evidence_slot.clone();
-        let worker_effects = attempt_effects.clone();
         let worker_task_id = crate::ai::driver::runtime_ctx::try_subagent_task_id();
         let worker_context = crate::ai::driver::runtime_ctx::try_current();
         let run_id = worker_task_id
@@ -279,14 +469,13 @@ async fn run_traecli_attempts(
             // Blocking workers do not inherit Tokio task locals. Carry the task and session
             // scopes so checkpoint events use the same persistence/notification path.
             let run = || {
-                run_traecli_blocking_with_tracking(
+                run_traecli_blocking_with_evidence(
                     &owned,
                     worker_cancel,
                     &binary,
                     startup_timeout,
                     vec![worker_slot, worker_attempt_slot],
                     worker_evidence_slot,
-                    worker_effects,
                 )
             };
             let run = || match worker_context {
@@ -319,11 +508,6 @@ async fn run_traecli_attempts(
             return Err(error);
         }
         if is_permanent_traecli_error(&error) {
-            return Err(error);
-        }
-        // A captured session is a continuation target, not an idempotency
-        // guarantee. A disconnected tool may already have committed its effect.
-        if attempt_effects.load(Ordering::Acquire) {
             return Err(error);
         }
         if attempt == total_attempts {
@@ -375,13 +559,12 @@ const TRAECLI_RETRY_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// permissions, or working directory is wrong on the first attempt, and the
 /// auth/config/argument markers below are CLI-level diagnostics that would
 /// repeat identically. Startup timeouts, provider disconnects, rate limits,
-/// and unclassified non-zero exits are retryable only before an execution
-/// signal. The per-attempt effect tracker owns that separate replay boundary.
+/// and unclassified non-zero exits remain retryable; unknown errors are also
+/// retried because a transient cause is more likely than a deterministic one.
 fn is_permanent_traecli_error(error: &str) -> bool {
-    error.starts_with("failed to spawn traecli:") || permanent_traecli_error_marker(error).is_some()
-}
-
-fn permanent_traecli_error_marker(error: &str) -> Option<&'static str> {
+    if error.starts_with("failed to spawn traecli:") {
+        return true;
+    }
     let lower = error.to_ascii_lowercase();
     const PERMANENT_MARKERS: &[&str] = &[
         "unauthorized",
@@ -402,8 +585,7 @@ fn permanent_traecli_error_marker(error: &str) -> Option<&'static str> {
     ];
     PERMANENT_MARKERS
         .iter()
-        .copied()
-        .find(|marker| lower.contains(marker))
+        .any(|marker| lower.contains(marker))
 }
 
 /// The two retries wait 1s then 2s; retry numbers are one-based.
@@ -435,71 +617,27 @@ pub(super) fn run_traecli_blocking_with(
     run_traecli_blocking_with_evidence(spec, cancel, binary, startup_timeout, session_slots, None)
 }
 
-/// Every owned CLI has its own Unix process group. Waits go through this guard:
-/// once a child is reaped, its ID can be reused and must never be signalled.
-struct TraeCliChildGuard {
-    child: std::process::Child,
-    reaped: bool,
-}
-
-impl TraeCliChildGuard {
-    fn spawn(command: &mut std::process::Command) -> std::io::Result<Self> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-        let child = crate::fork_guard::spawn(command)?;
-        Ok(Self {
-            child,
-            reaped: false,
-        })
-    }
-
-    fn kill(&mut self) -> std::io::Result<()> {
-        if self.reaped {
-            return Ok(());
-        }
-        #[cfg(unix)]
-        unsafe {
-            // An unreaped child reserves its PID even if it has just exited.
-            // Signal the owned group before any wait can release that identity.
-            libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL);
-        }
-        self.child.kill()
-    }
-
-    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        let status = self.child.try_wait()?;
-        self.reaped |= status.is_some();
-        Ok(status)
-    }
-
-    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        let status = self.child.wait()?;
-        self.reaped = true;
-        Ok(status)
-    }
-}
+/// Ensure early errors or panics cannot leave the owned CLI running after its run guard ends.
+struct TraeCliChildGuard(std::process::Child);
 
 impl std::ops::Deref for TraeCliChildGuard {
     type Target = std::process::Child;
     fn deref(&self) -> &Self::Target {
-        &self.child
+        &self.0
     }
 }
 
 impl std::ops::DerefMut for TraeCliChildGuard {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.child
+        &mut self.0
     }
 }
 
 impl Drop for TraeCliChildGuard {
     fn drop(&mut self) {
-        if !self.reaped {
-            let _ = self.kill();
-            let _ = self.wait();
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
         }
     }
 }
@@ -512,29 +650,6 @@ fn run_traecli_blocking_with_evidence(
     session_slots: Vec<TraeCliSessionSlot>,
     evidence_slot: Option<TraeCliEvidenceSlot>,
 ) -> Result<TraeCliOutcome, String> {
-    run_traecli_blocking_with_tracking(
-        spec,
-        cancel,
-        binary,
-        startup_timeout,
-        session_slots,
-        evidence_slot,
-        Arc::new(AtomicBool::new(false)),
-    )
-}
-
-fn run_traecli_blocking_with_tracking(
-    spec: &ExternalSubagentSpec,
-    cancel: Arc<AtomicBool>,
-    binary: &str,
-    startup_timeout: Duration,
-    session_slots: Vec<TraeCliSessionSlot>,
-    evidence_slot: Option<TraeCliEvidenceSlot>,
-    execution_effects: Arc<AtomicBool>,
-) -> Result<TraeCliOutcome, String> {
-    if cancel.load(Ordering::Acquire) {
-        return Err("traecli subagent cancelled".to_string());
-    }
     let with_sandbox_hint = |mut error: String, stderr: &str| {
         if let Some(hint) = read_only_sandbox_hint(spec, true, &[error.as_str(), stderr]) {
             error.push_str(hint);
@@ -543,15 +658,16 @@ fn run_traecli_blocking_with_tracking(
     };
     let cwd = normalize_cwd(&spec.cwd);
     publish_traecli_activity(spec, "starting traecli", "launching traecli");
-    let mut command = std::process::Command::new(binary);
-    command
-        .args(build_traecli_args(spec))
-        .current_dir(&cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = TraeCliChildGuard::spawn(&mut command)
-        .map_err(|err| format!("failed to spawn traecli: {err}"))?;
+    let mut child = TraeCliChildGuard(
+        std::process::Command::new(binary)
+            .args(build_traecli_args(spec))
+            .current_dir(&cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| format!("failed to spawn traecli: {err}"))?,
+    );
 
     backend_session::DeferredNotes::consume_after_spawn(&spec.side_note_files);
 
@@ -569,11 +685,6 @@ fn run_traecli_blocking_with_tracking(
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
-                if let Ok(value) = serde_json::from_str::<Value>(&line)
-                    && codec::event_may_have_effect(&value)
-                {
-                    execution_effects.store(true, Ordering::Release);
-                }
                 // Capture before forwarding: the async waiter can be aborted
                 // while the blocking runner is between cancellation polls.
                 for slot in &session_slots {
@@ -585,12 +696,17 @@ fn run_traecli_blocking_with_tracking(
             }
         })
     });
-    let stderr_shared = Arc::new(Mutex::new(StderrTail::default()));
+    let stderr_shared = Arc::new(Mutex::new(String::new()));
     let stderr_sink = stderr_shared.clone();
-    let stderr_handle = child
-        .stderr
-        .take()
-        .map(|stderr| std::thread::spawn(move || diagnostics::read_stderr(stderr, &stderr_sink)));
+    let stderr_handle = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            if let Ok(mut sink) = stderr_sink.lock() {
+                *sink = text;
+            }
+        })
+    });
 
     // The prompt travels over stdin: scoped instructions can exceed the OS
     // argv limit (E2BIG). Write it on its own thread: a child that is slow to
@@ -633,8 +749,8 @@ fn run_traecli_blocking_with_tracking(
                         let _ = handle.join();
                     }
                 }
-                let stderr_text = take_stderr_snapshot(stderr_handle, &stderr_shared, 1_000);
-                let detail = stderr_text.trim();
+                let stderr_text = take_stderr_snapshot(stderr_handle, &stderr_shared);
+                let detail = truncate_head(stderr_text.trim(), 1_000);
                 let error = if detail.is_empty() {
                     format!(
                         "traecli did not emit a startup event within {}s",
@@ -663,10 +779,8 @@ fn run_traecli_blocking_with_tracking(
     // the direct child exits. Joining a reader/writer thread blocked on that
     // pipe would hang the task, so detached threads are dropped instead.
     drop(stdin_handle);
-    let stderr_text = take_stderr_snapshot(stderr_handle, &stderr_shared, 2_000);
-    let reduction = codec::reduce_stream_json_output(&stdout_text);
-    if let Some(mut outcome) = reduction.outcome {
-        outcome.is_error |= !status.success();
+    let stderr_text = take_stderr_snapshot(stderr_handle, &stderr_shared);
+    if let Some(outcome) = parse_stream_json_output(&stdout_text) {
         if let Some(slot) = evidence_slot {
             *lock_unpoisoned(&slot) = Some(outcome.clone());
         }
@@ -676,21 +790,19 @@ fn run_traecli_blocking_with_tracking(
                 &stderr_text,
             ));
         }
-        if let Some(error) = reduction.error {
+        if outcome.is_error {
             return Err(with_sandbox_hint(
-                format!("traecli subagent failed: {}", error.trim()),
+                format!("traecli subagent failed: {}", outcome.result.trim()),
                 &stderr_text,
             ));
         }
-        if status.success() {
-            return Ok(outcome);
-        }
+        return Ok(outcome);
     }
 
-    // Surface a process failure even when a body was parsed, or missing output
-    // when no result exists. Keep stderr and the first non-JSON stdout line as
-    // diagnostics without replacing the captured body in the evidence slot.
-    let stderr_tail = stderr_text.trim();
+    // No parseable events: surface whatever the CLI printed. Errors normally
+    // land on stderr (`Error: ...`, non-zero exit), but keep the first
+    // non-JSON stdout line as a hint in case the shape changes.
+    let stderr_tail = truncate_head(stderr_text.trim(), 2000);
     let hint = stdout_hint(&stdout_text);
     let result = if status.success() {
         match hint {
@@ -861,6 +973,14 @@ impl TraeCliActiveItems {
     }
 }
 
+fn traecli_item_id(value: &Value) -> Option<&str> {
+    value
+        .get("item")
+        .and_then(|item| item.get("id"))
+        .or_else(|| value.get("item_id"))
+        .and_then(Value::as_str)
+}
+
 /// Append one streamed event and refresh both the live phase and the
 /// human-readable activity line from it.
 fn record_traecli_event(
@@ -891,6 +1011,39 @@ fn record_traecli_event(
         stdout.push('\n');
     }
     stdout.push_str(line);
+}
+
+/// Only complete explicit checkpoint blocks become parent progress; ordinary messages,
+/// reasoning, and tool output stay out of the checkpoint carrier.
+fn traecli_message_text(text: &str, mut checkpoint: impl FnMut(&str, &str)) -> String {
+    const OPEN: &str = "<context_checkpoint>";
+    const CLOSE: &str = "</context_checkpoint>";
+    let mut remaining = String::new();
+    let mut cursor = text;
+    while let Some(start) = cursor.find(OPEN) {
+        remaining.push_str(&cursor[..start]);
+        let after_open = &cursor[start + OPEN.len()..];
+        let Some(end) = after_open.find(CLOSE) else {
+            remaining.push_str(&cursor[start..]);
+            return remaining;
+        };
+        let raw = after_open[..end].trim();
+        let (summary, body) = raw.split_once('\n').unwrap_or((raw, ""));
+        let summary = summary
+            .trim()
+            .strip_prefix("summary:")
+            .unwrap_or(summary)
+            .trim();
+        let body = body.trim();
+        if !summary.is_empty() && !body.is_empty() {
+            checkpoint(summary, body);
+        } else {
+            remaining.push_str(&cursor[start..start + OPEN.len() + end + CLOSE.len()]);
+        }
+        cursor = &after_open[end + CLOSE.len()..];
+    }
+    remaining.push_str(cursor);
+    remaining
 }
 
 /// Map a traecli stream event to a coarse phase and a live activity line.
@@ -936,9 +1089,11 @@ fn traecli_event_progress(
             active_items.clear();
             ("finishing", "turn complete".to_string())
         }
-        "error" | "turn.failed" => (
+        "error" => (
             "backend error",
-            codec::protocol_error_text(value)
+            value
+                .get("message")
+                .and_then(Value::as_str)
                 .map(|message| format!("error: {}", truncate_head(message, 80)))
                 .unwrap_or_else(|| "error event".to_string()),
         ),
@@ -949,13 +1104,125 @@ fn traecli_event_progress(
     }
 }
 
+fn traecli_item_phase(value: &Value) -> &'static str {
+    match value
+        .get("item")
+        .and_then(|item| item.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("reasoning") => "thinking",
+        Some("agent_message") => "writing response",
+        Some("command_execution") => "running command",
+        Some("tool_call" | "tool_use") => "running tool",
+        _ => "working",
+    }
+}
+
+/// Summarize a streamed item for the status line without echoing full tool
+/// output. Commands keep the command; tool calls keep the tool name and a
+/// compact argument preview.
+fn traecli_item_activity(item: &Value) -> String {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+    match item_type {
+        "command_execution" => item
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|command| format!("command: {}", truncate_head(command, 80)))
+            .unwrap_or_else(|| "command started".to_string()),
+        "tool_call" | "tool_use" => {
+            let name = item
+                .get("name")
+                .or_else(|| item.get("tool_name"))
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            match traecli_item_input(item) {
+                Some(input) if !input.is_empty() => {
+                    format!("tool {name}: {}", truncate_head(&input, 70))
+                }
+                _ => format!("tool {name}"),
+            }
+        }
+        "reasoning" => "reasoning".to_string(),
+        "agent_message" => "drafting response".to_string(),
+        _ if item_type.is_empty() => "item started".to_string(),
+        _ => format!("item: {item_type}"),
+    }
+}
+
+fn traecli_item_completion(item: &Value) -> String {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+    match item_type {
+        "command_execution" => {
+            let command = item
+                .get("command")
+                .and_then(Value::as_str)
+                .map(|command| truncate_head(command, 70))
+                .unwrap_or_else(|| "command".to_string());
+            match item.get("exit_code").and_then(Value::as_i64) {
+                Some(code) => format!("completed: {command} · exit {code}"),
+                None => format!("completed: {command}"),
+            }
+        }
+        "tool_call" | "tool_use" => {
+            let name = item
+                .get("name")
+                .or_else(|| item.get("tool_name"))
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            format!("completed tool {name}")
+        }
+        "agent_message" => "response ready".to_string(),
+        "reasoning" => "reasoning complete".to_string(),
+        _ => "processing output".to_string(),
+    }
+}
+
+fn traecli_item_input(item: &Value) -> Option<String> {
+    let value = item
+        .get("input")
+        .or_else(|| item.get("arguments"))
+        .or_else(|| item.get("parameters"))?;
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Null => None,
+        other => serde_json::to_string(other).ok(),
+    }
+}
+
+fn normalize_cwd(cwd: &Path) -> PathBuf {
+    if cwd.as_os_str().is_empty() {
+        std::env::temp_dir()
+    } else {
+        cwd.to_path_buf()
+    }
+}
+
+/// First non-empty, non-JSON line of stdout, if any.
+fn stdout_hint(output: &str) -> Option<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('{'))
+        .map(|line| truncate_head(line, 500))
+}
+
+/// Char-boundary-safe head truncation with an ellipsis marker.
+fn truncate_head(text: &str, max_chars: usize) -> String {
+    if text.chars().count() > max_chars {
+        let mut out: String = text.chars().take(max_chars).collect();
+        out.push_str("...");
+        out
+    } else {
+        text.to_string()
+    }
+}
+
 /// Read the stderr snapshot without waiting forever for a pipe held open by a
 /// descendant process. Normal children close stderr on exit, so the thread
 /// finishes within one poll; otherwise the partial snapshot is used.
 fn take_stderr_snapshot(
     mut handle: Option<std::thread::JoinHandle<()>>,
-    shared: &Arc<Mutex<StderrTail>>,
-    max_chars: usize,
+    shared: &Arc<Mutex<String>>,
 ) -> String {
     let deadline = Instant::now() + Duration::from_millis(250);
     loop {
@@ -968,7 +1235,7 @@ fn take_stderr_snapshot(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    lock_unpoisoned(shared).snapshot(max_chars)
+    shared.lock().map(|text| text.clone()).unwrap_or_default()
 }
 
 /// Drain streamed lines after the child exits. The reader thread normally
@@ -1124,8 +1391,6 @@ pub(super) fn looks_like_session_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    mod reliability;
-
     use super::*;
     use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext, TURN_IDENTITY};
     use crate::ai::mcp::McpClient;

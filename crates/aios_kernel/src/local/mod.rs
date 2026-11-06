@@ -95,12 +95,7 @@ pub struct LocalOS {
     pub(super) children_by_parent: FastMap<u64, FastSet<u64>>,
     pub next_pid: u64,
     pub current_pid: Option<u64>,
-    pub(super) yield_requested: FastSet<u64>,
-    /// Caller retained for synchronous suspension wrappers after `current_pid` is cleared.
-    /// A runtime-provided PID always takes precedence when consuming or re-arming a request.
-    pub(super) last_yield_pid: Option<u64>,
-    /// Detached external resources, drained by the runtime before it releases the kernel guard.
-    pub(super) external_cleanup: Vec<PathBuf>,
+    pub(super) yield_requested: bool,
     pub tick: u64,
     pub(super) round_robin: bool,
     pub(super) shared_memory: FastMap<String, ShmEntry>,
@@ -217,9 +212,7 @@ impl LocalOS {
             children_by_parent: FastMap::default(),
             next_pid: 1,
             current_pid: None,
-            yield_requested: FastSet::default(),
-            last_yield_pid: None,
-            external_cleanup: Vec::new(),
+            yield_requested: false,
             tick: 0,
             round_robin: true,
             shared_memory: FastMap::default(),
@@ -259,7 +252,6 @@ impl LocalOS {
         // O(1) lazy removal: drop the membership marker; any tombstone left
         // in `ready_queue` is filtered out by `pop_ready`.
         self.ready_set.remove(&pid);
-        self.clear_yield_for(pid);
         self.wait_queue.remove(&pid);
 
         let orphaned_children: Vec<u64> = self
@@ -386,25 +378,6 @@ impl LocalOS {
         crate::kernel::current_task_pid().or(self.current_pid)
     }
 
-    fn request_yield_for(&mut self, pid: u64) {
-        if !self
-            .processes
-            .get(&pid)
-            .is_some_and(|process| process.state != ProcessState::Terminated)
-        {
-            return;
-        }
-        self.yield_requested.insert(pid);
-        self.last_yield_pid = Some(pid);
-    }
-
-    fn clear_yield_for(&mut self, pid: u64) {
-        self.yield_requested.remove(&pid);
-        if self.last_yield_pid == Some(pid) {
-            self.last_yield_pid = None;
-        }
-    }
-
     fn enqueue_ready(&mut self, pid: u64) {
         // Return directly for a nonexistent pid or one already queued. The `ready_set.insert` return
         // value doubles as the dedup check, saving an extra table lookup.
@@ -429,7 +402,6 @@ impl LocalOS {
     fn terminate_pid(&mut self, pid: u64, result: String) {
         // O(1) tombstone: only removes set membership; `pop_ready` does the cleanup.
         self.ready_set.remove(&pid);
-        self.clear_yield_for(pid);
         if let Some(proc) = self.processes.get_mut(&pid) {
             proc.state = ProcessState::Terminated;
             proc.result = Some(result.clone());
@@ -699,7 +671,7 @@ impl LocalOS {
                     proc.state = ProcessState::Stopped;
                     if self.current_pid == Some(target_pid) {
                         self.current_pid = None;
-                        self.request_yield_for(target_pid);
+                        self.yield_requested = true;
                     }
                 }
             }
@@ -717,7 +689,67 @@ impl LocalOS {
     }
 
     pub fn process_pending_signals(&mut self) -> bool {
-        <Self as KernelInternal>::process_pending_signals(self)
+        let current = match self.current_pid {
+            Some(pid) => pid,
+            None => return false,
+        };
+
+        let signals: Vec<Signal> = {
+            if let Some(proc) = self.processes.get(&current) {
+                proc.pending_signals.iter().copied().collect()
+            } else {
+                return false;
+            }
+        };
+
+        let mut should_cancel = false;
+        let mut should_terminate = false;
+        let mut should_stop = false;
+
+        for signal in signals {
+            match signal {
+                Signal::SigCancel => {
+                    should_cancel = true;
+                }
+                Signal::SigKill => {
+                    should_terminate = true;
+                    break;
+                }
+                Signal::SigTerm => {
+                    should_terminate = true;
+                    break;
+                }
+                Signal::SigStop => {
+                    should_stop = true;
+                    break;
+                }
+                Signal::SigCont => {}
+            }
+        }
+
+        if let Some(proc) = self.processes.get_mut(&current) {
+            proc.pending_signals.clear();
+        }
+
+        if should_cancel {
+            return true;
+        }
+
+        if should_terminate {
+            self.terminate_current("Terminated by signal".to_string());
+            return true;
+        }
+
+        if should_stop {
+            if let Some(proc) = self.processes.get_mut(&current) {
+                proc.state = ProcessState::Stopped;
+            }
+            self.current_pid = None;
+            self.yield_requested = true;
+            return true;
+        }
+
+        false
     }
 
     fn event_wait_is_satisfied(

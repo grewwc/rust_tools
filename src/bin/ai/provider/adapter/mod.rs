@@ -11,16 +11,16 @@
 //! is byte-identical across providers.
 //!
 //! This module only carries the cross-provider public contract: the
-//! [`ProviderAdapter`] trait, the [`adapter_for`] dispatch, and the endpoint-aware
-//! [`request_wire_shapes`] facade. Each concrete provider implementation lives in
-//! its own file (`alibaba` / `compatible` / `openai` / `openrouter` / `opencode`).
+//! [`ProviderAdapter`] trait and the [`adapter_for`] dispatch. Each concrete
+//! provider implementation lives in its own file (`alibaba` / `compatible` /
+//! `openai` / `openrouter` / `opencode`).
 //!
 //! The wire encoding of the thinking switch is an axis orthogonal to the
 //! provider, moved into the [`thinking`] submodule ([`thinking_dialect_for`]);
 //! provider adapters no longer participate in thinking-field encoding.
 
 mod alibaba;
-mod compatible;
+pub(in crate::ai) mod compatible;
 mod openai;
 mod opencode;
 mod openrouter;
@@ -32,6 +32,7 @@ use crate::ai::request::{ParsedStreamPayload, try_parse_stream_chunk_loose};
 
 use super::ApiProvider;
 
+pub(in crate::ai) use compatible::compatible_wire_shapes;
 pub(in crate::ai) use thinking::{
     ThinkingOffCapability, reasoning_effort_reduces_thinking_for, thinking_dialect_for,
     thinking_off_capability_for,
@@ -188,28 +189,4 @@ pub(in crate::ai) fn adapter_for(
         ApiProvider::OpenAi => openai_adapter(),
         ApiProvider::OpenCode => opencode_adapter(),
     }
-}
-
-/// Resolve endpoint-aware search and effort fields after any declared effort
-/// placement has been handled by the caller. Thinking remains a separate dialect.
-///
-/// Compatible's endpoint policy precedes the generic adapter defaults. This is
-/// intentionally independent of `adapter_for`: an endpoint matching both
-/// DashScope and OpenRouter keeps Compatible's request fields even though
-/// OpenRouter owns general adapter dispatch.
-pub(in crate::ai) fn request_wire_shapes<'a>(
-    provider: ApiProvider,
-    endpoint: &str,
-    requested_enable_search: Option<bool>,
-    effort: Option<&'a str>,
-) -> (Option<bool>, Option<&'a str>, Option<Value>) {
-    if provider == ApiProvider::Compatible {
-        return compatible::compatible_wire_shapes(endpoint, requested_enable_search, effort);
-    }
-    let adapter = adapter_for(provider, endpoint);
-    (
-        adapter.enable_search_field(requested_enable_search),
-        adapter.reasoning_top_level(effort),
-        adapter.reasoning_nested(effort),
-    )
 }

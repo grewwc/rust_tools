@@ -18,26 +18,15 @@ const ROOT_ENV: &str = "RUST_TOOLS_PROMPT_PTY_TEST_ROOT";
 /// Device status report the child writes to ask where its cursor is.
 const CURSOR_QUERY: &str = "\x1b[6n";
 
-/// Commanded cursor row after CUP, relative moves, and save/restore. This tracks
-/// the inline anchor's probe commands without pretending to emulate text reflow.
+/// The row of the last `ESC[<row>;<col>H` in `text`.
+///
+/// The value is what a CPR reply must carry, i.e. the same 1-based row the
+/// child wrote, so the harness can echo a commanded position back verbatim.
 fn last_move_to_row(text: &str) -> Option<u16> {
     let bytes = text.as_bytes();
     let mut best = None;
-    let mut saved = None;
     let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == 0x1b && bytes[i + 1] == b'7' {
-            saved = best;
-            i += 2;
-            continue;
-        }
-        if bytes[i] == 0x1b && bytes[i + 1] == b'8' {
-            if saved.is_some() {
-                best = saved;
-            }
-            i += 2;
-            continue;
-        }
+    while i + 2 < bytes.len() {
         if bytes[i] != 0x1b || bytes[i + 1] != b'[' {
             i += 1;
             continue;
@@ -49,18 +38,6 @@ fn last_move_to_row(text: &str) -> Option<u16> {
             row = row * 10 + u32::from(bytes[j] - b'0');
             digits = true;
             j += 1;
-        }
-        if j < bytes.len() && matches!(bytes[j], b'A' | b'B') {
-            let count = u16::try_from(row).unwrap().max(1);
-            best = best.map(|current: u16| {
-                if bytes[j] == b'A' {
-                    current.saturating_sub(count).max(1)
-                } else {
-                    current.saturating_add(count)
-                }
-            });
-            i = j + 1;
-            continue;
         }
         // CUP is `ESC[<row>;<col>H`: the row is followed by `;`, the column
         // and only then the terminator, so `H` sits two parameters along rather
@@ -94,14 +71,6 @@ struct PtyEditor {
 
 impl PtyEditor {
     fn start(rounds: usize) -> Self {
-        Self::start_with_ssh(rounds, false)
-    }
-
-    fn start_with_ssh(rounds: usize, is_ssh: bool) -> Self {
-        Self::start_configured(rounds, is_ssh, false)
-    }
-
-    fn start_configured(rounds: usize, is_ssh: bool, report_frames: bool) -> Self {
         let root = std::env::temp_dir().join(format!("prompt-cpr-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let mut master = -1;
@@ -134,10 +103,6 @@ impl PtyEditor {
             .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"])
             .env(ROOT_ENV, &root)
             .env("RUST_TOOLS_PROMPT_PTY_TEST_ROUNDS", rounds.to_string())
-            .env(
-                "RUST_TOOLS_EDITOR_FIXTURE",
-                if report_frames { "1" } else { "0" },
-            )
             .env("TERM", "xterm-256color")
             .env_remove("SSH_CONNECTION")
             .env_remove("SSH_CLIENT")
@@ -145,9 +110,6 @@ impl PtyEditor {
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave));
-        if is_ssh {
-            command.env("SSH_TTY", "/dev/tty");
-        }
         // Only async-signal-safe syscalls run between fork and exec.
         unsafe {
             command.pre_exec(|| {
@@ -218,43 +180,6 @@ impl PtyEditor {
 
     fn send(&mut self, bytes: &[u8]) {
         self.master.write_all(bytes).unwrap();
-    }
-
-    fn resize_columns(&mut self, columns: u16) {
-        let size = libc::winsize {
-            ws_row: 24,
-            ws_col: columns,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        assert_eq!(
-            unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
-            0,
-            "resize: {}",
-            io::Error::last_os_error()
-        );
-        self.columns = columns;
-    }
-
-    fn frame_responsive(&mut self, sequence: u64) -> serde_json::Value {
-        let deadline = Instant::now() + Duration::from_secs(8);
-        loop {
-            self.answer_queries_from(0);
-            let text = String::from_utf8_lossy(&self.output);
-            for tail in text.split("\x1b]777;editor;frame;").skip(1) {
-                if let Some((json, _)) = tail.split_once('\x07') {
-                    let frame: serde_json::Value = serde_json::from_str(json).unwrap();
-                    if frame["sequence"] == sequence {
-                        return frame;
-                    }
-                }
-            }
-            assert!(
-                Instant::now() < deadline,
-                "missing frame {sequence}: {text}"
-            );
-            self.pump(Duration::from_millis(20));
-        }
     }
 
     fn submit(&mut self) {
@@ -553,95 +478,11 @@ fn responsive_cursor_query_keeps_inline_editor() {
     // Answer every probe with the row it commanded: a terminal that replies
     // promptly must leave the editor inline instead of degrading it.
     pty.ready_responsive(0, 0);
-    pty.send(b"\x1b[F typed");
-    pty.pump(Duration::from_millis(80));
-    pty.send("\x1b[200~\r\npaste\t中文\x1b[201~".as_bytes());
-    pty.pump(Duration::from_millis(80));
     pty.submit();
-    pty.result(0, "draft typed\npaste\t中文");
+    pty.result(0, "draft");
     pty.finish(false);
     // The fresh anchor needs low/high/final probes, followed by one width
     // measurement at the emulator's right edge before the initial paint.
-    pty.assert_query_columns(&[1, 1, 1, pty.columns]);
-}
-
-#[test]
-fn paste_latency_cpr_harness_tracks_relative_probe_rows() {
-    let bottom = "\x1b[10;1H\x1b7";
-    assert_eq!(last_move_to_row(&format!("{bottom}\x1b[3A")), Some(7));
-    assert_eq!(
-        last_move_to_row(&format!("{bottom}\x1b[3A\x1b[1B")),
-        Some(8)
-    );
-    assert_eq!(last_move_to_row(&format!("{bottom}\x1b[3A\x1b8")), Some(10));
-}
-
-#[test]
-fn paste_latency_pty_resize_and_settling_requery_and_adopt_measured_width() {
-    const WIDTH_QUERY: &str = "\x1b[65535G\x1b[6n";
-    let mut pty = PtyEditor::start_configured(1, false, true);
-    let first = pty.frame_responsive(1);
-    pty.ready(0);
-    assert_eq!(first["size"], serde_json::json!([80, 24]));
-    assert_eq!(first["paint_width"], 80);
-    assert_eq!(pty.count(WIDTH_QUERY), 1);
-
-    // Change the real PTY winsize, but return a narrower emulator edge. The
-    // completed draw must use the CPR result rather than the new PTY width.
-    pty.resize_columns(60);
-    pty.columns = 53;
-    let immediate = pty.frame_responsive(2);
-    assert_eq!(immediate["size"], serde_json::json!([60, 24]));
-    assert_eq!(immediate["frame"]["width"], 60);
-    assert_eq!(immediate["paint_width"], 53);
-    assert_eq!(immediate["resize_pending"], true);
-    assert_eq!(immediate["alternate"], false);
-    assert_eq!(pty.count(WIDTH_QUERY), 2);
-
-    // No second resize notification: the settling pass invalidates the same
-    // geometry's cached edge and adopts the emulator's now-current width.
-    pty.columns = 60;
-    let settled = pty.frame_responsive(3);
-    assert_eq!(settled["size"], serde_json::json!([60, 24]));
-    assert_eq!(settled["paint_width"], 60);
-    assert_eq!(settled["resize_pending"], false);
-    assert_eq!(settled["alternate"], false);
-    assert_eq!(pty.count(WIDTH_QUERY), 3);
-
-    pty.send(b"x");
-    let edited = pty.frame_responsive(4);
-    assert_eq!(edited["content"], "xdraft");
-    assert_eq!(edited["paint_width"], 60);
-    assert_eq!(
-        pty.count(WIDTH_QUERY),
-        3,
-        "ordinary input reuses the settled cache"
-    );
-    pty.submit();
-    pty.result(0, "xdraft");
-    pty.finish(false);
-}
-
-#[test]
-fn paste_latency_ssh_text_and_enter_need_no_extra_cursor_queries() {
-    let mut pty = PtyEditor::start_with_ssh(1, true);
-    pty.ready_responsive(0, 0);
-    assert!(pty.contains("\x1b[?2004l"));
-    assert!(
-        !pty.contains("\x1b[?2004h"),
-        "SSH image paste keeps its existing mode"
-    );
-    pty.send(b"\x1b[F");
-    pty.pump(Duration::from_millis(40));
-    // Exceed the event cap so the text crosses multiple redraw batches.
-    let pasted = "abcdefgh中🙂".repeat(160);
-    pty.send(pasted.as_bytes());
-    pty.pump(Duration::from_millis(120));
-    pty.send(b"\rsecond");
-    pty.pump(Duration::from_millis(80));
-    pty.submit();
-    pty.result(0, &format!("draft{pasted}\nsecond"));
-    pty.finish(false);
     pty.assert_query_columns(&[1, 1, 1, pty.columns]);
 }
 

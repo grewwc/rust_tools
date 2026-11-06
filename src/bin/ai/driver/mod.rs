@@ -73,7 +73,6 @@ pub mod side_note;
 pub mod signal;
 pub mod skill_runtime;
 mod skill_watcher;
-mod subagent_launch;
 pub mod talk;
 pub(crate) mod task;
 pub mod thinking;

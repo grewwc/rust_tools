@@ -1,5 +1,4 @@
 mod common;
-mod compatible_wire;
 mod deepseek;
 mod file_references;
 mod interrupt;

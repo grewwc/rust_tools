@@ -42,7 +42,6 @@ use crate::ai::{
 };
 
 use super::super::runtime_ctx::DriverContext;
-use super::super::subagent_launch::{ExternalSubagentLaunch, resolve_external_subagent_cwd};
 
 /// Hard upper bound on how long a synchronous `task` tool call may block
 /// the parent agent. Keeps a runaway sub-agent from wedging the foreground
@@ -480,11 +479,14 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     let wrap_up_signal_for_scope = wrap_up_signal.clone();
 
     // External inputs are frozen before the driver's callback owns the app.
-    let backend_cwd = resolve_external_subagent_cwd(
-        prepared.inherit.cwd,
-        inherited_cwd_dir.as_ref(),
-        private_cwd_dir.as_ref(),
-    );
+    let backend_cwd = if prepared.inherit.cwd {
+        inherited_cwd_dir
+            .clone()
+            .or_else(|| crate::ai::driver::runtime_ctx::effective_cwd().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        private_cwd_dir.clone().unwrap_or_else(std::env::temp_dir)
+    };
     let backend_cancel = subagent_cancel.clone();
     let backend_workspace_allowed = prepared.inherit.cwd;
     let backend_model = prepared.backend_model.clone();
@@ -525,22 +527,23 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
                 }
                 let (resume_session, prompt, side_note_files) = continuation.into_parts();
                 let context = match execution_mode {
-                    task_tools::ExecutionMode::External => task_tools::RunContext::External(
-                        ExternalSubagentLaunch {
+                    task_tools::ExecutionMode::External => {
+                        task_tools::RunContext::External(task_tools::ExternalSubagentSpec {
                             prompt,
                             cwd: backend_cwd,
                             workspace_allowed: backend_workspace_allowed,
                             model: backend_model,
-                            skill_manifests: task_skill_manifests_for_spawn.as_slice(),
-                            active_skill_names: &runtime_ctx::active_skill_names(),
+                            skills: crate::ai::skills::render_external_skill_context(
+                                task_skill_manifests_for_spawn.as_slice(),
+                                &runtime_ctx::active_skill_names(),
+                            ),
                             resume_session,
                             side_note_files,
                             reasoning_effort: backend_reasoning_effort,
                             image_files: subagent_image_files,
                             phase_slot: events.phase_slot.clone(),
-                        }
-                        .into_spec(),
-                    ),
+                        })
+                    }
                     task_tools::ExecutionMode::KernelDriver => {
                         task_tools::RunContext::kernel(move |events, _cancel| {
                             Box::pin(async move {
