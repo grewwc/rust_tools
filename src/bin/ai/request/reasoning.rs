@@ -18,8 +18,8 @@ use super::super::{
     history::{Message, is_code_inspection_memory_text, is_system_like_role},
     models,
     provider::{
-        ApiProvider, ReasoningEffort, ThinkingOffCapability, adapter_for, compatible_wire_shapes,
-        reasoning_effort_reduces_thinking_for, thinking_dialect_for, thinking_off_capability_for,
+        ApiProvider, ReasoningEffort, ThinkingOffCapability, reasoning_effort_reduces_thinking_for,
+        request_wire_shapes, thinking_dialect_for, thinking_off_capability_for,
     },
     types::{App, ReasoningItemMap},
 };
@@ -72,7 +72,6 @@ pub(super) fn resolve_reasoning_wire_controls_from_parts<'a>(
     enable_thinking: bool,
     reasoning_effort: Option<&'a str>,
 ) -> (Map<String, Value>, Option<&'a str>, Option<Value>) {
-    let adapter = adapter_for(adapter_kind, endpoint);
     let thinking_dialect = thinking_dialect_for(adapter_kind, request_model, endpoint);
     // Per-vendor effort **value** adaptation: the dialect owns the mapping and
     // this layer never invents a wire value. A registry-declared
@@ -97,18 +96,8 @@ pub(super) fn resolve_reasoning_wire_controls_from_parts<'a>(
                 reasoning_effort.map(|effort| json!({ "effort": effort })),
             ),
         }
-    } else if adapter_kind == ApiProvider::Compatible {
-        // Compatible providers split by endpoint: DashScope uses the DashScope
-        // shape, other plain OpenAI-compatible endpoints (e.g. the internal
-        // modelhub) use the OpenAI shape. The adapter.reasoning_*() defaults
-        // cannot be used here because the trait singleton cannot see the endpoint.
-        compatible_wire_shapes(endpoint, None, reasoning_effort)
     } else {
-        (
-            None,
-            adapter.reasoning_top_level(reasoning_effort),
-            adapter.reasoning_nested(reasoning_effort),
-        )
+        request_wire_shapes(adapter_kind, endpoint, None, reasoning_effort)
     };
     let thinking = thinking_dialect.fields(enable_thinking, top_level_reasoning_effort);
     (thinking, top_level_reasoning_effort, nested_reasoning)

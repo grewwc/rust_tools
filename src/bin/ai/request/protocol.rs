@@ -3,20 +3,30 @@
 //! The provider adapter owns "who sends and what fields look like"; endpoint-level wire
 //! differences such as `/v1/chat/completions` vs `/v1/responses` are centralized in this
 //! module, so protocol decisions do not scatter across `transport.rs` / `builder.rs`.
+//! Messages and Responses encoders live in private child modules; public builders
+//! and the adapter-before-encoding boundary remain here.
+
+mod messages;
+mod responses;
 
 use serde_json::{Value, json};
 
+use super::RequestBody;
 use super::builder::RequestModelInputs;
 use super::reasoning::{
-    apply_prompt_cache_breakpoints, is_code_inspection_memory_message, is_nonempty_text_block,
-    mark_content_cache_breakpoint, resolve_reasoning_wire_controls_from_parts,
+    apply_prompt_cache_breakpoints, resolve_reasoning_wire_controls_from_parts,
 };
-use super::{RequestBody, types::extract_displayable_text};
 use crate::ai::history::Message;
 use crate::ai::models;
 use crate::ai::provider::ApiProvider;
 use crate::ai::request_protocol::RequestProtocolDialect;
-use crate::ai::types::{ReasoningItemMap, ToolCall};
+use crate::ai::types::ToolCall;
+
+use messages::build_messages_request_body;
+#[cfg(test)]
+use messages::mark_messages_cache_breakpoint;
+pub(super) use responses::build_responses_request_body;
+pub(in crate::ai::request) use responses::responses_reasoning_replay_stats;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(in crate::ai::request) struct ResponsesReasoningReplayStats {
@@ -51,261 +61,6 @@ impl RequestProtocolDialect {
                 .expect("messages body should serialize"),
         }
     }
-}
-
-/// Anthropic Messages API body: a top-level `system` string, a `messages` array
-/// of content-block messages, `tools` as `{name, description, input_schema}` and
-/// a required `max_tokens`. History roles map onto Anthropic user/assistant
-/// blocks; OpenAI-shaped tool calls become `tool_use` blocks and tool results
-/// become `tool_result` blocks inside a user message. Extended thinking is
-/// merged in from `request.thinking` (produced by the thinking dialect) and the
-/// assistant thinking chain is replayed as `thinking` blocks, so vision and
-/// thinking stay available on this dialect instead of being silently dropped.
-fn build_messages_request_body(request: &RequestBody<'_>) -> Value {
-    let max_tokens = request.max_tokens.unwrap_or(4096);
-    let mut body = serde_json::Map::new();
-    body.insert("model".to_string(), Value::String(request.model.clone()));
-    body.insert("stream".to_string(), Value::Bool(request.stream));
-    body.insert("max_tokens".to_string(), json!(max_tokens));
-
-    let mut system_parts: Vec<String> = Vec::new();
-    let mut messages: Vec<Value> = Vec::new();
-    for message in request.messages {
-        match message.role.as_str() {
-            "system" => {
-                let text = extract_displayable_text(&message.content);
-                if !text.is_empty() {
-                    system_parts.push(text);
-                }
-            }
-            "user" => messages.push(json!({
-                "role": "user",
-                "content": messages_user_content(message),
-            })),
-            "assistant" => messages.push(messages_assistant_message(message)),
-            "tool" => {
-                let mut tool_result = serde_json::Map::new();
-                tool_result.insert("type".to_string(), json!("tool_result"));
-                tool_result.insert(
-                    "tool_use_id".to_string(),
-                    json!(message.tool_call_id.clone().unwrap_or_default()),
-                );
-                tool_result.insert(
-                    "content".to_string(),
-                    messages_content_blocks(&message.content),
-                );
-                // Signal failed tool executions so the model treats them as
-                // errors to correct, not as ordinary text output. The flag is a
-                // turn-scoped side channel (see `RequestBody.tool_errors`),
-                // keyed by tool_call_id.
-                let tool_use_id = message.tool_call_id.clone().unwrap_or_default();
-                let failed = request
-                    .tool_errors
-                    .and_then(|errors| errors.get(&tool_use_id))
-                    .copied()
-                    .unwrap_or(false);
-                if failed {
-                    tool_result.insert("is_error".to_string(), json!(true));
-                }
-                messages.push(json!({
-                    "role": "user",
-                    "content": [Value::Object(tool_result)],
-                }));
-            }
-            // Runtime-only roles (internal_note, ...) never reach the wire.
-            _ => {}
-        }
-    }
-    if !system_parts.is_empty() {
-        let system = system_parts.join("\n\n");
-        // Anthropic caches in tools → system → messages order, so this
-        // breakpoint covers the tool schemas as well.
-        let system = if request.explicit_cache_breakpoints {
-            json!([{ "type": "text", "text": system, "cache_control": { "type": "ephemeral" } }])
-        } else {
-            Value::String(system)
-        };
-        body.insert("system".to_string(), system);
-    }
-    if request.explicit_cache_breakpoints {
-        mark_messages_cache_breakpoint(&mut messages);
-    }
-    body.insert("messages".to_string(), Value::Array(messages));
-
-    if let Some(tools) = messages_tools(request.tools.as_ref()) {
-        body.insert("tools".to_string(), tools);
-    }
-
-    // Merge the resolved thinking controls (Anthropic extended thinking, set
-    // by the thinking dialect) into the body.
-    for (key, value) in &request.thinking {
-        body.insert(key.clone(), value.clone());
-    }
-
-    Value::Object(body)
-}
-
-/// Rolling Anthropic cache breakpoint on the last user message (tool results
-/// are user messages on this dialect), so each request writes the conversation
-/// prefix the next one reads back. Any block type except empty text accepts
-/// `cache_control` here (`tool_result` and `image` included).
-fn mark_messages_cache_breakpoint(messages: &mut [Value]) {
-    if let Some(content) = messages
-        .iter_mut()
-        .rev()
-        .find(|message| {
-            message.get("role").and_then(Value::as_str) == Some("user")
-                && !is_code_inspection_memory_message(message)
-        })
-        .and_then(|message| message.get_mut("content"))
-    {
-        mark_content_cache_breakpoint(content, |block| {
-            block.get("type").and_then(Value::as_str) != Some("text")
-                || is_nonempty_text_block(block)
-        });
-    }
-}
-
-/// User message content: plain strings pass through; structured blocks are
-/// converted to Anthropic content blocks (text → `text`, images → `image`),
-/// so vision-capable models receive the actual pixels instead of a degraded
-/// text extraction.
-fn messages_user_content(message: &Message) -> Value {
-    messages_content_blocks(&message.content)
-}
-
-/// Convert a message content value to Anthropic Messages content blocks.
-/// Strings pass through verbatim; block arrays are mapped part-by-part via
-/// [`messages_content_block`]; anything else is reduced to its displayable text.
-fn messages_content_blocks(content: &Value) -> Value {
-    match content {
-        Value::String(text) => Value::String(text.clone()),
-        Value::Array(items) => {
-            let blocks: Vec<Value> = items.iter().filter_map(messages_content_block).collect();
-            if blocks.is_empty() {
-                Value::String(String::new())
-            } else {
-                Value::Array(blocks)
-            }
-        }
-        other => Value::String(extract_displayable_text(other)),
-    }
-}
-
-/// One content part → Anthropic block, or `None` when nothing sendable remains
-/// (e.g. an image without a usable URL). Empty text parts are dropped because
-/// Anthropic rejects empty `text` blocks with a 400.
-fn messages_content_block(item: &Value) -> Option<Value> {
-    let is_image = matches!(item.get("type").and_then(Value::as_str), Some("image_url"))
-        || item.get("image_url").is_some()
-        || matches!(item.get("kind").and_then(Value::as_str), Some("image"));
-    if is_image {
-        return messages_image_block(item);
-    }
-    let text = extract_displayable_text(item);
-    if text.is_empty() {
-        return None;
-    }
-    Some(json!({ "type": "text", "text": text }))
-}
-
-/// OpenAI image part (`{"type": "image_url", "image_url": {"url": ...}}` or a
-/// bare `{"kind": "image", "url": ...}`) → Anthropic `image` block. Base64
-/// `data:` URIs become `source.type = base64`; http(s) URLs become
-/// `source.type = url`; anything else is dropped.
-fn messages_image_block(item: &Value) -> Option<Value> {
-    let url = item
-        .get("image_url")
-        .and_then(|v| v.get("url").or(Some(v)))
-        .and_then(Value::as_str)
-        .or_else(|| item.get("url").and_then(Value::as_str))?;
-    if let Some(rest) = url.strip_prefix("data:") {
-        let (media_type, payload) = rest.split_once(',')?;
-        let media_type = media_type.strip_suffix(";base64").unwrap_or(media_type);
-        return Some(json!({
-            "type": "image",
-            "source": { "type": "base64", "media_type": media_type, "data": payload },
-        }));
-    }
-    if url.starts_with("http://") || url.starts_with("https://") {
-        return Some(json!({
-            "type": "image",
-            "source": { "type": "url", "url": url },
-        }));
-    }
-    None
-}
-
-/// Assistant message → content blocks: text plus `tool_use` blocks for each tool
-/// call (the JSON-encoded arguments become the `input` object; unparseable
-/// arguments are wrapped so the wire stays valid JSON).
-fn messages_assistant_message(message: &Message) -> Value {
-    let mut blocks: Vec<Value> = Vec::new();
-    // Replay the previous thinking chain before the visible text / tool_use
-    // blocks. Anthropic requires thinking blocks to be echoed back when a tool
-    // round continues the same assistant turn, so replay only on tool-call
-    // rounds (the only case where a `tool_result` follows); stale reasoning on
-    // plain-answer turns is not resent. The zen gateway's adaptive-thinking
-    // dialect accepts plain `thinking` blocks; the `signature` field is not
-    // persisted and is not required by that gateway.
-    if let Some(thinking) = message
-        .reasoning_content
-        .as_deref()
-        .filter(|text| !text.trim().is_empty())
-    {
-        let has_tool_calls = message
-            .tool_calls
-            .as_ref()
-            .is_some_and(|tool_calls| !tool_calls.is_empty());
-        if has_tool_calls {
-            blocks.push(json!({ "type": "thinking", "thinking": thinking }));
-        }
-    }
-    let text = extract_displayable_text(&message.content);
-    if !text.is_empty() {
-        blocks.push(json!({"type": "text", "text": text}));
-    }
-    if let Some(tool_calls) = message.tool_calls.as_ref() {
-        for call in tool_calls {
-            let input = serde_json::from_str(&call.function.arguments)
-                .unwrap_or_else(|_| json!({"arguments": call.function.arguments}));
-            blocks.push(json!({
-                "type": "tool_use",
-                "id": call.id,
-                "name": call.function.name,
-                "input": input,
-            }));
-        }
-    }
-    if blocks.is_empty() {
-        blocks.push(json!({"type": "text", "text": ""}));
-    }
-    json!({"role": "assistant", "content": blocks})
-}
-
-/// OpenAI-compatible `tools` array (function shape) → Anthropic
-/// `{name, description, input_schema}`. Non-function tools (e.g. web_search) are
-/// dropped; the Messages dialect keeps search off for now.
-fn messages_tools(tools: Option<&Value>) -> Option<Value> {
-    let converted = tools
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|tool| {
-            let function = tool.get("function").unwrap_or(tool);
-            let name = function.get("name").and_then(Value::as_str)?;
-            let mut converted = serde_json::Map::new();
-            converted.insert("name".to_string(), Value::String(name.to_string()));
-            if let Some(description) = function.get("description").and_then(Value::as_str) {
-                converted.insert("description".to_string(), Value::String(description.to_string()));
-            }
-            if let Some(parameters) = function.get("parameters") {
-                converted.insert("input_schema".to_string(), parameters.clone());
-            }
-            Some(Value::Object(converted))
-        })
-        .collect::<Vec<_>>();
-    (!converted.is_empty()).then_some(Value::Array(converted))
 }
 
 pub(crate) fn build_http_body_for_request(
@@ -399,15 +154,14 @@ pub(crate) fn build_http_body_for_json_messages_from_parts(
     let model = inputs.request_model.as_str();
     let endpoint = inputs.endpoint.as_str();
     let request_messages = json_messages_to_request_messages(messages);
-    let (thinking, reasoning_effort, reasoning) =
-        resolve_reasoning_wire_controls_from_parts(
-            inputs.adapter,
-            model,
-            endpoint,
-            inputs.effort_wire,
-            false,
-            reasoning_effort,
-        );
+    let (thinking, reasoning_effort, reasoning) = resolve_reasoning_wire_controls_from_parts(
+        inputs.adapter,
+        model,
+        endpoint,
+        inputs.effort_wire,
+        false,
+        reasoning_effort,
+    );
     let stream_options = (stream && include_stream_usage).then(|| json!({ "include_usage": true }));
     let mut request = RequestBody {
         model: inputs.request_model.clone(),
@@ -504,269 +258,6 @@ fn append_content_part_text(out: &mut String, part: &Value) {
     {
         out.push_str(text);
     }
-}
-
-fn responses_content_type_for_role(role: &str) -> &'static str {
-    if role.eq_ignore_ascii_case("assistant") {
-        "output_text"
-    } else {
-        "input_text"
-    }
-}
-
-fn responses_content_item(role: &str, item: &Value) -> Value {
-    let item_type = item
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if matches!(
-        item_type,
-        "input_text"
-            | "input_image"
-            | "output_text"
-            | "refusal"
-            | "input_file"
-            | "computer_screenshot"
-            | "summary_text"
-            | "tether_browsing_display"
-    ) {
-        return item.clone();
-    }
-
-    if let Some(url) = item
-        .get("image_url")
-        .and_then(|v| v.get("url").or(Some(v)))
-        .and_then(|v| v.as_str())
-    {
-        return json!({
-            "type": "input_image",
-            "image_url": url,
-        });
-    }
-
-    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-        return json!({
-            "type": responses_content_type_for_role(role),
-            "text": text,
-        });
-    }
-
-    let fallback = extract_displayable_text(item);
-    if !fallback.is_empty() {
-        return json!({
-            "type": responses_content_type_for_role(role),
-            "text": fallback,
-        });
-    }
-
-    item.clone()
-}
-
-fn responses_content_items(role: &str, content: &Value) -> Vec<Value> {
-    match content {
-        Value::Array(items) => items
-            .iter()
-            .map(|item| responses_content_item(role, item))
-            .collect(),
-        Value::String(text) => vec![json!({
-            "type": responses_content_type_for_role(role),
-            "text": text,
-        })],
-        Value::Null => Vec::new(),
-        other => {
-            let fallback = extract_displayable_text(other);
-            if fallback.is_empty() {
-                vec![other.clone()]
-            } else {
-                vec![json!({
-                    "type": responses_content_type_for_role(role),
-                    "text": fallback,
-                })]
-            }
-        }
-    }
-}
-
-/// Filters out content items with empty text: the Responses API rejects `output_text` /
-/// `input_text` whose `text` is an empty string (returns 400 invalid_value).
-fn responses_item_is_empty_text(item: &Value) -> bool {
-    matches!(
-        item.get("type").and_then(Value::as_str),
-        Some("input_text" | "output_text")
-    ) && item
-        .get("text")
-        .and_then(Value::as_str)
-        .is_none_or(|text| text.is_empty())
-}
-
-fn responses_message_content(message: &Message) -> Vec<Value> {
-    // Note: do not replay `reasoning_content` as `summary_text` in message content.
-    // The Responses API message content only accepts `output_text` / `refusal`; putting
-    // `summary_text` in causes a 400. Reasoning summaries are a separate `reasoning` output item,
-    // and replay would need the server-side original item id / encrypted_content, which we do not
-    // persist -- so faithful replay is impossible; do not send them back and let this round's
-    // `reasoning` request parameter fetch them anew.
-    responses_content_items(&message.role, &message.content)
-        .into_iter()
-        .filter(|item| !responses_item_is_empty_text(item))
-        .collect()
-}
-
-fn responses_message_input(message: &Message) -> Value {
-    json!({
-        "role": message.role,
-        "content": responses_message_content(message),
-    })
-}
-
-pub(in crate::ai::request) fn responses_reasoning_replay_stats(
-    messages: &[Message],
-    reasoning_items: Option<&ReasoningItemMap>,
-) -> ResponsesReasoningReplayStats {
-    let mut stats = ResponsesReasoningReplayStats::default();
-    for message in messages {
-        let Some(first_tool_call) = message
-            .tool_calls
-            .as_ref()
-            .filter(|calls| !calls.is_empty())
-            .and_then(|calls| calls.first())
-        else {
-            continue;
-        };
-        stats.tool_call_groups += 1;
-        let replayed = reasoning_items
-            .and_then(|items| items.get(&first_tool_call.id))
-            .is_some_and(|items| !items.is_empty());
-        if replayed {
-            stats.replayed_groups += 1;
-        } else {
-            stats.missing_groups += 1;
-        }
-    }
-    stats
-}
-
-fn responses_input(
-    messages: &[Message],
-    reasoning_items: Option<&ReasoningItemMap>,
-) -> Vec<Value> {
-    let mut input = Vec::new();
-    for message in messages {
-        if let Some(tool_calls) = message
-            .tool_calls
-            .as_ref()
-            .filter(|calls| !calls.is_empty())
-        {
-            // A Responses API tool round is a flat sequence of output items. Replay it in the
-            // order the provider streamed it: reasoning items (if this turn's side channel
-            // captured them, keyed by the first tool_call id — spliced verbatim so the model keeps
-            // the previous hop's reasoning context), then the narration message item the model
-            // produced before dispatching the tool, then the function_call items. The narration is
-            // preserved on the chat-completions wire (driver/turn_runtime/tool_result/messaging.rs
-            // persists it, truncated to 800 chars), so dropping it here would make Responses lose
-            // the model's intermediate conclusions across tool hops.
-            if let Some(items) = reasoning_items
-                .zip(tool_calls.first())
-                .and_then(|(map, first)| map.get(&first.id))
-            {
-                input.extend(items.iter().cloned());
-            }
-            let narration_items = responses_message_content(message);
-            if !narration_items.is_empty() {
-                // The Responses API rejects empty output_text, so only emit the message item when
-                // the model actually produced narration.
-                input.push(json!({
-                    "role": "assistant",
-                    "content": narration_items,
-                }));
-            }
-            for tool_call in tool_calls {
-                input.push(json!({
-                    "type": "function_call",
-                    "call_id": tool_call.id,
-                    "name": tool_call.function.name,
-                    "arguments": tool_call.function.arguments,
-                }));
-            }
-        } else if message.role == "tool" {
-            if let Some(call_id) = &message.tool_call_id {
-                input.push(json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": message.content,
-                }));
-            }
-        } else {
-            input.push(responses_message_input(message));
-        }
-    }
-    input
-}
-
-fn responses_tools(tools: Option<&Value>, enable_search: bool) -> Option<Value> {
-    let mut converted = tools
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|tool| {
-            let function = tool.get("function").unwrap_or(tool);
-            json!({
-                "type": "function",
-                "name": function.get("name").cloned().unwrap_or(Value::Null),
-                "description": function.get("description").cloned().unwrap_or(Value::Null),
-                "parameters": function.get("parameters").cloned().unwrap_or(Value::Null),
-            })
-        })
-        .collect::<Vec<_>>();
-    if enable_search {
-        converted.push(json!({"type": "web_search"}));
-    }
-    (!converted.is_empty()).then_some(Value::Array(converted))
-}
-
-pub(super) fn build_responses_request_body(request: &RequestBody<'_>) -> Value {
-    let mut body = json!({
-        "model": request.model,
-        "input": responses_input(request.messages, request.reasoning_items),
-        "stream": request.stream,
-    });
-    let object = body.as_object_mut().expect("responses body is an object");
-    // Encrypted reasoning replay: only when explicitly requesting `reasoning.encrypted_content`
-    // does the server deliver a reasoning item carrying encrypted_content in
-    // `response.output_item.done`, for replay within the same turn's tool chain (see
-    // responses_input). Enabled only for models that advertise this capability bit.
-    if request.reasoning_encrypted_replay {
-        object.insert(
-            "include".to_string(),
-            json!(["reasoning.encrypted_content"]),
-        );
-    }
-    if let Some(tools) =
-        responses_tools(request.tools.as_ref(), request.enable_search == Some(true))
-    {
-        object.insert("tools".to_string(), tools);
-    }
-    if let Some(tool_choice) = &request.tool_choice {
-        object.insert("tool_choice".to_string(), tool_choice.clone());
-    }
-    if let Some(effort) = request.reasoning_effort {
-        // The Responses API does not return reasoning text by default; only when explicitly
-        // requesting a reasoning summary does the provider send response.reasoning_summary_text.*
-        // events.
-        object.insert(
-            "reasoning".to_string(),
-            json!({ "effort": effort, "summary": "auto" }),
-        );
-    } else if let Some(reasoning) = &request.reasoning {
-        object.insert("reasoning".to_string(), reasoning.clone());
-    }
-    if let Some(max_tokens) = request.max_tokens {
-        object.insert("max_output_tokens".to_string(), max_tokens.into());
-    }
-    if let Some(key) = &request.prompt_cache_key {
-        object.insert("prompt_cache_key".to_string(), key.clone().into());
-    }
-    body
 }
 
 #[cfg(test)]
@@ -1118,8 +609,9 @@ mod messages_body_tests {
         // Registry coverage: the Messages-dialect class the synthetic inputs
         // stand for must keep existing, or the pin tests a dead path.
         assert!(
-            crate::ai::model_names::all().iter().any(|m| m.request_protocol
-                == Some(RequestProtocolDialect::Messages)),
+            crate::ai::model_names::all()
+                .iter()
+                .any(|m| m.request_protocol == Some(RequestProtocolDialect::Messages)),
             "registry must keep at least one Messages-protocol entry"
         );
         let request = RequestBody {
@@ -1221,5 +713,154 @@ mod messages_body_tests {
         assert_eq!(blocks[0]["text"], "thinking out loud");
         assert_eq!(blocks[1]["type"], "tool_use");
         assert_eq!(blocks[1]["input"]["arguments"], "not json");
+    }
+}
+
+#[cfg(test)]
+mod wire_body_tests {
+    use super::*;
+    use crate::ai::types::ReasoningItemMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn http_body_builder_preserves_messages_and_responses_wire_bytes() {
+        let messages = json_messages_to_request_messages(&[
+            json!({"role": "system", "content": "Stable instruction."}),
+            json!({"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                {"type": "text", "text": "Inspect this."},
+            ]}),
+            json!({
+                "role": "assistant",
+                "content": "Checking.",
+                "reasoning_content": "First inspect the image.",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "inspect", "arguments": "{\"path\":\"a.png\"}"},
+                }],
+            }),
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "failed"}),
+        ]);
+        let reasoning_item = json!({
+            "type": "reasoning", "id": "rs_1", "encrypted_content": "ENC", "summary": [],
+        });
+        let mut reasoning_items = ReasoningItemMap::default();
+        reasoning_items.insert("call_1".to_string(), Arc::new(vec![reasoning_item.clone()]));
+        let tool_errors = [("call_1".to_string(), true)].into_iter().collect();
+        let mut request = RequestBody {
+            model: "synthetic-wire-model".to_string(),
+            messages: &messages,
+            stream: true,
+            thinking: serde_json::Map::from_iter([(
+                "thinking".to_string(),
+                json!({"type": "adaptive"}),
+            )]),
+            enable_search: Some(true),
+            tools: Some(json!([{"type": "function", "function": {
+                "name": "inspect", "description": "Inspect an image",
+                "parameters": {"type": "object"},
+            }}])),
+            tool_choice: Some(json!("auto")),
+            reasoning_effort: Some("high"),
+            reasoning: None,
+            stream_options: Some(json!({"include_usage": true})),
+            max_tokens: Some(1024),
+            reasoning_items: Some(&reasoning_items),
+            reasoning_encrypted_replay: true,
+            estimated_prompt_tokens: 0,
+            estimated_prompt_tokens_upper: 0,
+            message_counts: Default::default(),
+            prompt_cache_key: Some("session-key".to_string()),
+            explicit_cache_breakpoints: true,
+            tool_errors: Some(&tool_errors),
+        };
+
+        // Pin the pre-extraction bodies independently of the dialect helpers,
+        // including object insertion order and tool-round content order.
+        let messages_body = json!({
+            "model": "synthetic-wire-model",
+            "stream": true,
+            "max_tokens": 1024,
+            "system": [{"type": "text", "text": "Stable instruction.",
+                "cache_control": {"type": "ephemeral"}}],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "AAAA",
+                    }},
+                    {"type": "text", "text": "Inspect this."},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "First inspect the image."},
+                    {"type": "text", "text": "Checking."},
+                    {"type": "tool_use", "id": "call_1", "name": "inspect",
+                        "input": {"path": "a.png"}},
+                ]},
+                {"role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "call_1", "content": "failed",
+                    "is_error": true, "cache_control": {"type": "ephemeral"},
+                }]},
+            ],
+            "tools": [{"name": "inspect", "description": "Inspect an image",
+                "input_schema": {"type": "object"}}],
+            "thinking": {"type": "adaptive"},
+        });
+        let responses_body = json!({
+            "model": "synthetic-wire-model",
+            "input": [
+                {"role": "system", "content": [{"type": "input_text", "text": "Stable instruction."}]},
+                {"role": "user", "content": [
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                    {"type": "input_text", "text": "Inspect this."},
+                ]},
+                reasoning_item,
+                {"role": "assistant", "content": [{"type": "output_text", "text": "Checking."}]},
+                {"type": "function_call", "call_id": "call_1", "name": "inspect",
+                    "arguments": "{\"path\":\"a.png\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "failed"},
+            ],
+            "stream": true,
+            "include": ["reasoning.encrypted_content"],
+            "tools": [
+                {"type": "function", "name": "inspect", "description": "Inspect an image",
+                    "parameters": {"type": "object"}},
+                {"type": "web_search"},
+            ],
+            "tool_choice": "auto",
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "max_output_tokens": 1024,
+            "prompt_cache_key": "session-key",
+        });
+
+        for (dialect, endpoint, expected) in [
+            (
+                RequestProtocolDialect::Messages,
+                "https://example.com/v1/messages",
+                messages_body,
+            ),
+            (
+                RequestProtocolDialect::Responses,
+                "https://example.com/v1/responses",
+                responses_body,
+            ),
+        ] {
+            let actual = build_http_body_for_request_from_parts(
+                ApiProvider::Compatible,
+                dialect,
+                endpoint,
+                &mut request,
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&actual).expect("wire body should be valid JSON"),
+                expected,
+                "{dialect:?}",
+            );
+            assert_eq!(
+                actual,
+                serde_json::to_vec(&expected).unwrap(),
+                "{dialect:?}"
+            );
+        }
     }
 }
