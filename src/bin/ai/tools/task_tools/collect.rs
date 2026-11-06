@@ -75,7 +75,9 @@ fn task_evidence_history_file(entry: &AsyncTaskEntry) -> Option<PathBuf> {
 }
 
 /// Every terminal producer commits the full result before attempting IPC. Publication failures
-/// retain a recovery payload in the parent ledger and return a visible error to the driver.
+/// retain a recovery payload in the parent ledger and return a visible error to the driver. If
+/// the channel's owner has already exited, the durable payload is the delivery path until a later
+/// foreground collects it, so no send to that stale channel is attempted.
 pub(crate) fn publish_task_result(
     os: &mut dyn Kernel,
     task_id: Option<&str>,
@@ -130,44 +132,52 @@ pub(crate) fn publish_task_result(
     if let Some(Err(error)) = &persistence {
         errors.push(format!("durable publication failed: {error}"));
     }
-    let sent = match os.channel_send(Some(pid), ChannelId(result_channel_id), payload) {
-        Ok(()) => true,
-        Err(error) => {
-            let error = error.trim_end_matches('.');
-            let saved = matches!(&persistence, Some(Ok(true)));
-            let recovery = if saved {
-                "The full result is saved in the parent ledger; task_wait/task_status can collect it."
-            } else {
-                "The result could not be saved in the parent ledger; retain the child history for recovery."
-            };
-            let warning = format!(
-                "[Task result delivery warning] IPC publication failed: {error}. {recovery}"
-            );
-            if saved
-                && let Some(history_file) = &history_file
-                && let Err(error) = crate::ai::history::record_task_publication_warning(
-                    history_file,
-                    &entry.session_id,
-                    &task_id,
-                    &warning,
-                )
-            {
-                errors.push(format!("failed to save IPC delivery warning: {error}"));
+    let channel = ChannelId(result_channel_id);
+    let owner_has_exited = os
+        .channel_meta(channel)
+        .and_then(|metadata| metadata.owner_pid)
+        .is_some_and(|owner_pid| {
+            !os.get_process(owner_pid)
+                .is_some_and(|process| process.state != ProcessState::Terminated)
+        });
+    let sent = if matches!(&persistence, Some(Ok(true))) && owner_has_exited {
+        false
+    } else {
+        match os.channel_send(Some(pid), channel, payload) {
+            Ok(()) => true,
+            Err(error) => {
+                let error = error.trim_end_matches('.');
+                let saved = matches!(&persistence, Some(Ok(true)));
+                let recovery = if saved {
+                    "The full result is saved in the parent ledger; task_wait/task_status can collect it."
+                } else {
+                    "The result could not be saved in the parent ledger; retain the child history for recovery."
+                };
+                let warning = format!(
+                    "[Task result delivery warning] IPC publication failed: {error}. {recovery}"
+                );
+                if saved
+                    && let Some(history_file) = &history_file
+                    && let Err(error) = crate::ai::history::record_task_publication_warning(
+                        history_file,
+                        &entry.session_id,
+                        &task_id,
+                        &warning,
+                    )
+                {
+                    errors.push(format!("failed to save IPC delivery warning: {error}"));
+                }
+                errors.push(warning);
+                false
             }
-            errors.push(warning);
-            false
         }
     };
-    if (sent || matches!(&persistence, Some(Ok(true))))
-        && os.channel_meta(ChannelId(result_channel_id)).is_some()
-    {
+    if (sent || matches!(&persistence, Some(Ok(true)))) && os.channel_meta(channel).is_some() {
         // Closing is a host lifecycle operation; the producer is not the consumer owner.
-        if let Err(error) = os.channel_close(None, ChannelId(result_channel_id)) {
+        if let Err(error) = os.channel_close(None, channel) {
             errors.push(format!("failed to close result channel: {error}"));
         }
-        if let Err(error) =
-            os.channel_release_named(ChannelId(result_channel_id), "task_result.producer")
-        {
+        if let Err(error) = os.channel_release_named(channel, "task_result.producer") {
             errors.push(format!("failed to release result producer: {error}"));
         }
     }

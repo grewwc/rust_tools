@@ -140,6 +140,12 @@ const CPR_REPLY_WINDOW: Duration = Duration::from_secs(10);
 /// Upper bound on unaccounted replies kept in the guard queue. Every timed-out
 /// query pushes one, so the queue only grows while the link stays down.
 const MAX_PENDING_CPR_REPLIES: usize = 8;
+/// Small idle window used to collect text bytes that an SSH terminal exposes as
+/// individual key events after bracketed paste is disabled.
+const SSH_INPUT_BATCH_IDLE: Duration = Duration::from_millis(2);
+/// Bound one batch so ordinary typing and control events stay responsive.
+const SSH_INPUT_BATCH_WINDOW: Duration = Duration::from_millis(12);
+const MAX_SSH_INPUT_BATCH_EVENTS: usize = 1024;
 
 /// A main-screen probe is only safe once no *recent* reply is outstanding: an
 /// older reply would already have been delivered, so an answer arriving now is
@@ -213,6 +219,58 @@ fn read_prompt_event(
     // queued: a reply that is merely slow must still be swallowed when it
     // arrives, otherwise its trailing `[row;colR` would be typed into the box.
     Ok(Some(first))
+}
+
+fn is_ssh_text_input_event(event: &Event) -> bool {
+    // Enter and Tab can submit or change completion state, so they are boundaries.
+    matches!(
+        event,
+        Event::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                && matches!(key.code, KeyCode::Char(_))
+    )
+}
+
+fn read_ssh_input_batch(
+    first: Event,
+    is_ssh: bool,
+    pending: &mut VecDeque<Event>,
+    pending_cpr_replies: &mut VecDeque<Instant>,
+    mut read: impl FnMut(Duration) -> io::Result<Option<Event>>,
+) -> io::Result<Vec<Event>> {
+    let mut batch = vec![first];
+    if !is_ssh || !is_ssh_text_input_event(&batch[0]) {
+        return Ok(batch);
+    }
+    prune_expired_cpr_replies(pending_cpr_replies, Instant::now());
+    // Leave ambiguous Escapes to the regular reader while CPRs are outstanding.
+    // Its fragmented-reply grace must never extend the batch deadline.
+    if !pending_cpr_replies.is_empty() {
+        return Ok(batch);
+    }
+
+    let deadline = Instant::now() + SSH_INPUT_BATCH_WINDOW;
+    while batch.len() < MAX_SSH_INPUT_BATCH_EVENTS {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        let timeout = remaining.min(SSH_INPUT_BATCH_IDLE);
+        // No cursor query is issued during batching, so no CPR lookahead is needed.
+        let event = match pending.pop_front() {
+            Some(event) => Some(event),
+            None => read(timeout)?,
+        };
+        let Some(event) = event else {
+            break;
+        };
+        if !is_ssh_text_input_event(&event) {
+            pending.push_front(event);
+            break;
+        }
+        batch.push(event);
+    }
+    Ok(batch)
 }
 
 /// Drops replies that can no longer arrive, oldest first.
@@ -3334,7 +3392,7 @@ impl PromptEditor {
             #[cfg(test)]
             let mut fixture_frame_sequence = 0_u64;
 
-            loop {
+            'input: loop {
                 // The background only publishes title updates; the terminal is
                 // still redrawn by the foreground input loop at this safe draw
                 // point.
@@ -3723,23 +3781,38 @@ impl PromptEditor {
                     }
                 }
 
-                let previous_input_len = textarea_logical_char_count(&textarea);
-                match handle_multiline_event(
+                let input_batch = read_ssh_input_batch(
                     event,
-                    &mut textarea,
-                    &mut history,
-                    &mut status_msg,
-                    &mut pending_tab_completion,
-                    &mut completion_panel,
-                    &mut recent_text_input,
-                    &self.session_image_dir,
-                )? {
-                    EventLoopAction::Continue => {
-                        force_repaint_next_frame =
-                            textarea_logical_char_count(&textarea) < previous_input_len;
-                        redraw_requested = true;
+                    is_ssh,
+                    &mut self.pending_terminal_events,
+                    &mut screen.pending_cpr_replies,
+                    |timeout| {
+                        if event::poll(timeout)? {
+                            event::read().map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                )?;
+                for event in input_batch {
+                    let previous_input_len = textarea_logical_char_count(&textarea);
+                    match handle_multiline_event(
+                        event,
+                        &mut textarea,
+                        &mut history,
+                        &mut status_msg,
+                        &mut pending_tab_completion,
+                        &mut completion_panel,
+                        &mut recent_text_input,
+                        &self.session_image_dir,
+                    )? {
+                        EventLoopAction::Continue => {
+                            force_repaint_next_frame |=
+                                textarea_logical_char_count(&textarea) < previous_input_len;
+                            redraw_requested = true;
+                        }
+                        EventLoopAction::Submit(result) => break 'input Ok(result),
                     }
-                    EventLoopAction::Submit(result) => break Ok(result),
                 }
             }
         })();
@@ -3828,6 +3901,200 @@ mod tests {
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn ssh_text_input_batch_collects_text_and_preserves_resize_boundary() {
+        let first = key(KeyCode::Char('a'));
+        let second = key(KeyCode::Char('b'));
+        let resize = Event::Resize(120, 40);
+        let mut input = VecDeque::from([second.clone(), resize.clone()]);
+        let mut pending = VecDeque::new();
+        let mut replies = VecDeque::new();
+
+        let batch =
+            super::read_ssh_input_batch(first.clone(), true, &mut pending, &mut replies, |_| {
+                Ok(input.pop_front())
+            })
+            .unwrap();
+
+        assert_eq!(batch, vec![first, second]);
+        assert_eq!(pending, VecDeque::from([resize]));
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn ssh_text_input_batch_preserves_enter_and_tab_boundaries() {
+        for code in [KeyCode::Enter, KeyCode::Tab] {
+            for buffered in [false, true] {
+                let first = key(KeyCode::Char('a'));
+                let second = key(KeyCode::Char('b'));
+                let boundary = key(code);
+                let tail = key(KeyCode::Char('x'));
+                let mut input = VecDeque::from([second.clone(), boundary.clone(), tail.clone()]);
+                let mut pending = if buffered {
+                    std::mem::take(&mut input)
+                } else {
+                    VecDeque::new()
+                };
+                let mut replies = VecDeque::new();
+
+                let batch = super::read_ssh_input_batch(
+                    first.clone(),
+                    true,
+                    &mut pending,
+                    &mut replies,
+                    |_| Ok(input.pop_front()),
+                )
+                .unwrap();
+
+                assert_eq!(batch, vec![first, second]);
+                assert_eq!(pending.pop_front(), Some(boundary.clone()));
+                let batch = super::read_ssh_input_batch(
+                    boundary.clone(),
+                    true,
+                    &mut pending,
+                    &mut replies,
+                    |_| panic!("Enter/Tab must not pre-read input after a possible submission"),
+                )
+                .unwrap();
+                assert_eq!(batch, vec![boundary]);
+                assert_eq!(
+                    pending.into_iter().chain(input).collect::<Vec<_>>(),
+                    vec![tail],
+                    "code={code:?}, buffered={buffered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ssh_text_input_batch_preserves_paste_and_control_boundaries() {
+        for boundary in [
+            Event::Paste("clipboard text".into()),
+            key(KeyCode::Esc),
+            key(KeyCode::F(2)),
+            key(KeyCode::Left),
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Release,
+            )),
+        ] {
+            let first = key(KeyCode::Char('a'));
+            let tail = key(KeyCode::Char('x'));
+            let mut input = VecDeque::from([boundary.clone(), tail.clone()]);
+            let mut pending = VecDeque::new();
+            let mut replies = VecDeque::new();
+            let batch = super::read_ssh_input_batch(
+                first.clone(),
+                true,
+                &mut pending,
+                &mut replies,
+                |_| Ok(input.pop_front()),
+            )
+            .unwrap();
+
+            assert_eq!(batch, vec![first]);
+            assert_eq!(pending, VecDeque::from([boundary]));
+            assert_eq!(input, VecDeque::from([tail]));
+        }
+    }
+
+    #[test]
+    fn ssh_text_input_batch_with_pending_cpr_never_reads_ahead_or_starts_grace() {
+        let first = key(KeyCode::Char('a'));
+        let second = key(KeyCode::Char('b'));
+        let resize = Event::Resize(90, 30);
+        let tail = key(KeyCode::Char('x'));
+        let mut input = VecDeque::from([key(KeyCode::Esc), resize.clone()]);
+        input.extend("[13;1R".chars().map(|ch| key(KeyCode::Char(ch))));
+        input.push_back(tail.clone());
+        let mut pending = VecDeque::from([second.clone()]);
+        let outstanding = std::time::Instant::now();
+        let mut replies = VecDeque::from([outstanding]);
+        let original_input = input.clone();
+
+        let batch =
+            super::read_ssh_input_batch(first.clone(), true, &mut pending, &mut replies, |_| {
+                panic!("pending CPR must disable batching before any read or Escape grace")
+            })
+            .unwrap();
+
+        assert_eq!(batch, vec![first]);
+        assert_eq!(pending, VecDeque::from([second.clone()]));
+        assert_eq!(replies, VecDeque::from([outstanding]));
+        assert_eq!(input, original_input);
+        let mut read = |_| Ok(input.pop_front());
+        assert_eq!(
+            super::read_prompt_event(&mut pending, &mut replies, &mut read).unwrap(),
+            Some(second)
+        );
+        assert_eq!(
+            super::read_prompt_event(&mut pending, &mut replies, &mut read).unwrap(),
+            None,
+            "the normal reader must still swallow the fragmented CPR"
+        );
+        assert!(replies.is_empty());
+        assert_eq!(
+            super::read_prompt_event(&mut pending, &mut replies, &mut read).unwrap(),
+            Some(resize)
+        );
+        assert_eq!(
+            super::read_prompt_event(&mut pending, &mut replies, &mut read).unwrap(),
+            Some(tail)
+        );
+        assert!(pending.is_empty());
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn ssh_text_input_batch_resumes_after_cpr_expires() {
+        let first = key(KeyCode::Char('a'));
+        let second = key(KeyCode::Char('b'));
+        let expired = std::time::Instant::now() - super::CPR_REPLY_WINDOW;
+        let mut input = VecDeque::from([second.clone()]);
+        let mut pending = VecDeque::new();
+        let mut replies = VecDeque::from([expired]);
+        let batch = super::read_ssh_input_batch(
+            first.clone(),
+            true,
+            &mut pending,
+            &mut replies,
+            |timeout| {
+                assert!(timeout <= super::SSH_INPUT_BATCH_IDLE);
+                assert!(timeout <= super::SSH_INPUT_BATCH_WINDOW);
+                Ok(input.pop_front())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(batch, vec![first, second]);
+        assert!(replies.is_empty());
+        assert!(pending.is_empty());
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn local_text_input_is_not_batched() {
+        let first = key(KeyCode::Char('a'));
+        let mut pending = VecDeque::new();
+        let mut replies = VecDeque::new();
+        let mut reads = 0;
+
+        let batch =
+            super::read_ssh_input_batch(first.clone(), false, &mut pending, &mut replies, |_| {
+                reads += 1;
+                Ok(Some(key(KeyCode::Char('b'))))
+            })
+            .unwrap();
+
+        assert_eq!(batch, vec![first]);
+        assert_eq!(reads, 0);
+        assert!(pending.is_empty());
     }
 
     /// Exercise the production input loop in an external PTY/emulator. Run this

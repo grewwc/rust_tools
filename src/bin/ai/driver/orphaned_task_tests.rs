@@ -283,7 +283,7 @@ async fn orphaned_traecli_completion_survives_foreground_failure() {
         result.contains("11111111-1111-4111-8111-111111111111"),
         "{result}"
     );
-    assert!(result.contains("IPC publication failed"), "{result}");
+    assert!(!result.contains("IPC publication failed"), "{result}");
     assert!(
         crate::ai::history::task_evidence_exists(
             &fixture.app.config.history_file,
