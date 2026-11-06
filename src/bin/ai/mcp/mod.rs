@@ -1,6 +1,7 @@
 mod client;
 mod config;
 pub(in crate::ai) mod connection;
+mod handshake;
 mod http;
 mod io;
 mod jsonrpc;
@@ -8,6 +9,9 @@ mod jsonrpc;
 pub(in crate::ai) use client::{McpClient, SharedMcpClient};
 pub(in crate::ai) use client::{send_notification_to_conn, send_request_to_conn};
 pub(super) use config::load_mcp_config_from_file;
+pub(in crate::ai) use handshake::initialize_and_discover;
+#[cfg(all(test, unix))]
+pub(in crate::ai) use handshake::test_support;
 
 /// MCP servers commonly return `-32601 Method not found` without echoing the
 /// method name. Discovery must therefore key off the JSON-RPC code alone; a

@@ -2,8 +2,8 @@ use std::error::Error;
 use std::fs;
 use std::io;
 
-use crate::ai::mcp::{McpClient, connection::McpServerConnection};
-use crate::ai::types::{App, McpPrompt, McpResource, McpServerConfig, McpTool};
+use crate::ai::mcp::{McpClient, connection::McpServerConnection, initialize_and_discover};
+use crate::ai::types::{App, McpServerConfig};
 use rust_tools::cw::SkipMap;
 
 #[derive(Debug, Clone)]
@@ -278,10 +278,78 @@ mod tests {
             *guard = None;
         }
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_handshake_startup_uses_a_fresh_counter_per_server() {
+        use crate::ai::mcp::test_support::*;
+
+        let _guard = serial_guard();
+        let first = ScriptedServer::new(complete_responses(1, "first"));
+        let second = ScriptedServer::new(complete_responses(1, "second"));
+
+        let first_conn = connect_single_server("first", &first.config).unwrap();
+        let second_conn = connect_single_server("second", &second.config).unwrap();
+
+        assert_eq!(first.transcript(), complete_transcript(1));
+        assert_eq!(second.transcript(), complete_transcript(1));
+        assert_eq!(observed_catalogs(&first_conn), catalogs("first"));
+        assert_eq!(observed_catalogs(&second_conn), catalogs("second"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_handshake_startup_keeps_successful_servers_after_discovery_failure() {
+        use crate::ai::mcp::test_support::*;
+        use serde_json::json;
+
+        let _guard = serial_guard();
+        let mut failed_responses = complete_responses(1, "failed");
+        failed_responses[3] = failure(3, -32000, "resource catalog failed");
+        let failed = ScriptedServer::new(failed_responses);
+        let working = ScriptedServer::new(complete_responses(1, "working"));
+        let config_path = std::env::temp_dir().join(format!(
+            "mcp-handshake-config-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&json!({
+                "mcpServers": {"failed": failed.config, "working": working.config}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let prepared =
+            prepare_mcp_initialization_from_path(config_path.to_string_lossy().to_string()).await;
+        fs::remove_file(&config_path).unwrap();
+
+        assert_eq!(failed.transcript(), complete_transcript(1)[..4]);
+        assert_eq!(working.transcript(), complete_transcript(1));
+        assert!(prepared.report.loaded);
+        assert_eq!(prepared.report.server_count, 2);
+        assert_eq!(prepared.report.tool_count, 1);
+        assert_eq!(prepared.report.resource_count, 1);
+        assert_eq!(prepared.report.prompt_count, 1);
+        assert_eq!(
+            prepared.report.failures,
+            ["failed: MCP error -32000: resource catalog failed"]
+        );
+        assert_eq!(prepared.client.servers.len(), 1);
+        assert!(prepared.client.servers.get_str_ref("failed").is_none());
+        let conn = prepared
+            .client
+            .servers
+            .get_str_ref("working")
+            .unwrap()
+            .lock()
+            .unwrap();
+        assert_eq!(observed_catalogs(&conn), catalogs("working"));
+    }
 }
 
-/// Synchronously connect a single MCP server (extracted from
-/// McpClient::connect_server).
+/// Synchronously connect one startup server with its own request-ID counter.
 fn connect_single_server(
     name: &str,
     config: &McpServerConfig,
@@ -294,121 +362,9 @@ fn connect_single_server(
     // Use a dedicated request-ID counter.
     let next_id = std::sync::atomic::AtomicU64::new(1);
 
-    initialize_server(&mut conn, &next_id)?;
-    conn.tools = list_tools(&mut conn, &next_id)?;
-    conn.resources = list_resources(&mut conn, &next_id)?;
-    conn.prompts = list_prompts(&mut conn, &next_id)?;
+    initialize_and_discover(&mut conn, &next_id)?;
 
     Ok(conn)
-}
-
-// The functions below are extracted from McpClient and use a dedicated
-// AtomicU64 counter.
-fn initialize_server(
-    conn: &mut McpServerConnection,
-    next_id: &std::sync::atomic::AtomicU64,
-) -> Result<(), String> {
-    use crate::ai::mcp::{send_notification_to_conn, send_request_to_conn};
-    use serde_json::json;
-
-    let params = json!({
-        "protocolVersion": conn.protocol_version(),
-        "capabilities": {
-            "tools": {},
-            "resources": {},
-            "prompts": {}
-        },
-        "clientInfo": {
-            "name": "rust-tools-ai",
-            "version": "1.0.0"
-        }
-    });
-
-    let id1 = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    send_request_to_conn(conn, id1, "initialize", Some(params))?;
-
-    // notifications/initialized is a notification (no id, no response
-    // expected) and cannot be sent as a request.
-    send_notification_to_conn(conn, "notifications/initialized", None)?;
-    Ok(())
-}
-
-fn list_tools(
-    conn: &mut McpServerConnection,
-    next_id: &std::sync::atomic::AtomicU64,
-) -> Result<Vec<McpTool>, String> {
-    use crate::ai::mcp::{is_method_not_found, send_request_to_conn};
-    let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let result = match send_request_to_conn(conn, id, "tools/list", None) {
-        Ok(v) => v,
-        Err(err) => {
-            if is_method_not_found(&err) {
-                return Ok(Vec::new());
-            }
-            return Err(err);
-        }
-    };
-    let tools = result["tools"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|t| serde_json::from_value(t.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(tools)
-}
-
-fn list_resources(
-    conn: &mut McpServerConnection,
-    next_id: &std::sync::atomic::AtomicU64,
-) -> Result<Vec<McpResource>, String> {
-    use crate::ai::mcp::{is_method_not_found, send_request_to_conn};
-    let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let result = match send_request_to_conn(conn, id, "resources/list", None) {
-        Ok(v) => v,
-        Err(err) => {
-            if is_method_not_found(&err) {
-                return Ok(Vec::new());
-            }
-            return Err(err);
-        }
-    };
-    let resources = result["resources"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|r| serde_json::from_value(r.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(resources)
-}
-
-fn list_prompts(
-    conn: &mut McpServerConnection,
-    next_id: &std::sync::atomic::AtomicU64,
-) -> Result<Vec<McpPrompt>, String> {
-    use crate::ai::mcp::{is_method_not_found, send_request_to_conn};
-    let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let result = match send_request_to_conn(conn, id, "prompts/list", None) {
-        Ok(v) => v,
-        Err(err) => {
-            if is_method_not_found(&err) {
-                return Ok(Vec::new());
-            }
-            return Err(err);
-        }
-    };
-    let prompts = result["prompts"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|p| serde_json::from_value(p.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(prompts)
 }
 
 pub async fn drain_response(response: &mut reqwest::Response) -> Result<(), Box<dyn Error>> {

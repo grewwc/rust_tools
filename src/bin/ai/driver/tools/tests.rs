@@ -3,7 +3,8 @@ use super::{
     build_tool_cache_key, classify_tool_error, collect_tool_cache_file_fingerprints,
     execute_tool_calls, execute_with_safe_retry, is_cacheable_tool_name,
     is_parallel_safe_tool_call, is_tool_cache_entry_fresh, parallel_safe_batch_len,
-    prepare_tool_call, should_retry_once, should_store_or_load_tool_cache, tool_cache_validation_matches,
+    prepare_tool_call, should_retry_once, should_store_or_load_tool_cache,
+    tool_cache_validation_matches,
 };
 use crate::ai::mcp::McpClient;
 use crate::ai::tools::registry::common::{ToolParallelPolicy, tool_parallel_policy};
@@ -14,8 +15,205 @@ use chrono::{Duration, Utc};
 use rust_tools::commonw::FastSet;
 use serde_json::json;
 use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+#[test]
+fn mcp_reliability_is_error_uses_driver_failure_and_observer_semantics() {
+    use crate::ai::mcp::test_support::{ScriptedServer, complete_responses, serial_guard, success};
+
+    struct Observer(Vec<(String, Option<bool>)>);
+    impl super::ToolExecutionObserver for Observer {
+        fn on_tool_dispatched(&mut self, _: &ToolCall) {
+            self.0.push(("dispatched".to_string(), None));
+        }
+        fn on_tool_started(&mut self, _: &ToolCall) {
+            self.0.push(("started".to_string(), None));
+        }
+        fn on_tool_finished(&mut self, _: &ToolCall, result: &super::RunOneResult) {
+            assert!(result.executed);
+            assert!(!result.cached);
+            self.0.push(("finished".to_string(), Some(result.ok)));
+        }
+    }
+
+    let _serial = serial_guard();
+    let (_kernel_guard, _kernel, _root) = setup_tool_kernel();
+    for (envelope, succeeded) in [
+        (
+            json!({"content": [{"type": "text", "text": "Error: ordinary successful text"}]}),
+            true,
+        ),
+        (
+            json!({
+                "content": [{"type": "text", "text": "failed"}, {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/png"}],
+                "structuredContent": {"detail": "fixture failure"}, "isError": true
+            }),
+            false,
+        ),
+    ] {
+        let mut scripted = complete_responses(1, "invoke");
+        scripted.push(success(5, envelope.clone()));
+        let server = ScriptedServer::new(scripted);
+        let mut client = McpClient::new();
+        client.connect_server("fixture", &server.config).unwrap();
+        let routing = client.routing_snapshot();
+        let shared = std::sync::Arc::new(Mutex::new(client));
+        let mut call = tool_call("mcp_fixture_invoke");
+        call.function.arguments = json!({"value": "run"}).to_string();
+        let mut observer = Observer(Vec::new());
+
+        let output = execute_tool_calls(
+            "mcp-reliability-fixture",
+            &routing,
+            &shared,
+            &[call.clone()],
+            None,
+            Some(&mut observer),
+        )
+        .unwrap()
+        .into_tool_exec_output();
+
+        assert_eq!(output.had_error, !succeeded);
+        assert_eq!(output.cached_hits, vec![false]);
+        assert_eq!(output.executed_tool_calls.len(), 1);
+        assert_eq!(output.tool_results[0].tool_call_id, call.id);
+        assert_eq!(
+            output.execution_outcomes[0].as_ref().unwrap().succeeded,
+            succeeded
+        );
+        assert_eq!(
+            observer.0,
+            vec![
+                ("dispatched".to_string(), None),
+                ("started".to_string(), None),
+                ("finished".to_string(), Some(succeeded)),
+            ]
+        );
+        if succeeded {
+            assert_eq!(
+                output.tool_results[0].content,
+                "Error: ordinary successful text"
+            );
+        } else {
+            assert!(
+                output.tool_results[0]
+                    .content
+                    .contains(&envelope.to_string())
+            );
+        }
+        assert_eq!(server.executions().len(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_reliability_cancellation_before_dispatch_keeps_the_connection_usable() {
+    use crate::ai::mcp::test_support::{
+        ScriptedServer, complete_responses, complete_transcript, serial_guard, success,
+    };
+    use crate::ai::tools::registry::common::{clear_tool_cancel, request_tool_cancel};
+
+    let _serial = serial_guard();
+    let (_kernel_guard, _kernel, _root) = setup_tool_kernel();
+    for shared_api in [false, true] {
+        let mut scripted = complete_responses(1, "invoke");
+        scripted.push(success(
+            6,
+            json!({"content": [{"type": "text", "text": "after cancellation"}]}),
+        ));
+        let first = ScriptedServer::new(scripted);
+        let restarted = ScriptedServer::new(complete_responses(6, "invoke"));
+        let mut client = McpClient::new();
+        client.connect_server("fixture", &first.config).unwrap();
+        client
+            .servers
+            .get_str_ref("fixture")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .config = restarted.config.clone();
+        let shared = std::sync::Arc::new(Mutex::new(client));
+        let invoke = || {
+            if shared_api {
+                McpClient::call_tool_on_shared(&shared, "fixture", "invoke", json!({}))
+            } else {
+                shared
+                    .lock()
+                    .unwrap()
+                    .call_tool("fixture", "invoke", json!({}))
+            }
+        };
+
+        request_tool_cancel();
+        let canceled = invoke();
+        clear_tool_cancel();
+
+        assert!(canceled.unwrap_err().contains("canceled by user"));
+        assert!(first.executions().is_empty());
+        assert_eq!(first.transcript(), complete_transcript(1));
+        assert!(restarted.transcript().is_empty());
+        assert_eq!(invoke().unwrap(), "after cancellation");
+        assert_eq!(first.executions().len(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_reliability_cancellation_after_dispatch_never_replays_even_safe_calls() {
+    use crate::ai::mcp::test_support::{ScriptedServer, complete_responses, serial_guard, success};
+    use crate::ai::tools::registry::common::{clear_tool_cancel, request_tool_cancel};
+
+    let _serial = serial_guard();
+    let (_kernel_guard, _kernel, _root) = setup_tool_kernel();
+    for shared_api in [false, true] {
+        let mut scripted = complete_responses(1, "invoke");
+        scripted[2].as_mut().unwrap()["result"]["tools"][0]["annotations"] =
+            json!({"readOnlyHint": true});
+        scripted.push(None);
+        let first = ScriptedServer::new(scripted);
+        let mut recovery = complete_responses(6, "invoke");
+        recovery.push(success(
+            10,
+            json!({"content": [{"text": "must not replay"}]}),
+        ));
+        let restarted = ScriptedServer::new(recovery);
+        let mut client = McpClient::new();
+        client.connect_server("fixture", &first.config).unwrap();
+        client
+            .servers
+            .get_str_ref("fixture")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .config = restarted.config.clone();
+        let shared = std::sync::Arc::new(Mutex::new(client));
+
+        let canceled = std::thread::scope(|scope| {
+            let canceler = scope.spawn(|| {
+                first.wait_for_execution();
+                request_tool_cancel();
+            });
+            let result = if shared_api {
+                McpClient::call_tool_on_shared(&shared, "fixture", "invoke", json!({}))
+            } else {
+                shared
+                    .lock()
+                    .unwrap()
+                    .call_tool("fixture", "invoke", json!({}))
+            };
+            canceler.join().unwrap();
+            result
+        });
+        clear_tool_cancel();
+
+        assert!(canceled.unwrap_err().contains("canceled by user"));
+        assert_eq!(first.executions().len(), 1);
+        assert!(restarted.executions().is_empty());
+    }
+}
 
 #[test]
 fn subagent_tool_phase_includes_file_target_without_rendering() {
@@ -116,7 +314,9 @@ impl Drop for ToolKernelTestGuard {
 }
 
 fn setup_tool_kernel() -> (ToolKernelTestGuard, aios_kernel::kernel::SharedKernel, u64) {
-    let lock = TOOL_KERNEL_TEST_LOCK.lock().unwrap();
+    let lock = TOOL_KERNEL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     if let Ok(mut g) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
         *g = None;
     }
@@ -497,13 +697,16 @@ fn tool_cache_requires_file_fingerprints() {
 }
 
 fn temp_file_path(name: &str) -> std::path::PathBuf {
+    static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+    let sequence = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
     let mut path = std::env::temp_dir();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     path.push(format!(
-        "rust_tools_{name}_{}_{}",
+        "rust_tools_{name}_{}_{}_{sequence}",
         std::process::id(),
         nanos
     ));
@@ -740,10 +943,7 @@ fn overflow_stub_argument_guard_catches_transcribed_stubs() {
         r#"{"patch": "*** Begin Patch\n*** End Patch\n"}"#,
     );
     assert!(super::prepare_tool_call(&mcp, &real, None).is_ok());
-    let recovery = tool_call_with_args(
-        "apply_patch",
-        r#"{"patch_file": "/tmp/x.patch"}"#,
-    );
+    let recovery = tool_call_with_args("apply_patch", r#"{"patch_file": "/tmp/x.patch"}"#);
     assert!(super::prepare_tool_call(&mcp, &recovery, None).is_ok());
     // A marker key that is not true-ish (e.g. a nested value named like the
     // marker with boolean false) must not trip the stub guard: it is rejected
@@ -755,7 +955,10 @@ fn overflow_stub_argument_guard_catches_transcribed_stubs() {
     let err = super::prepare_tool_call(&mcp, &benign, None)
         .expect_err("undeclared marker key must be rejected, but not as a stub");
     assert!(err.content.contains("unknown argument(s)"), "{err:?}");
-    assert!(!err.content.contains("context-overflow pointer stub"), "{err:?}");
+    assert!(
+        !err.content.contains("context-overflow pointer stub"),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -775,7 +978,10 @@ fn plan_update_not_found_gets_plan_specific_hint() {
 
     // Generic file-not-found errors keep the original, file-oriented hint.
     let generic = super::remediation_hint("read_file", "no such file: /x/y", None).unwrap();
-    assert!(generic.contains("verify the path or identifier"), "{generic}");
+    assert!(
+        generic.contains("verify the path or identifier"),
+        "{generic}"
+    );
     assert!(!generic.contains("plan-state.json"), "{generic}");
 }
 
@@ -788,14 +994,21 @@ fn user_cancellation_gets_stop_hint_not_generic_execute_hint() {
     let err = "Error: execute_command failed: git commit canceled by user";
     let hint = super::remediation_hint("execute_command", err, None).unwrap();
     assert!(hint.contains("Do not retry it"), "{hint}");
-    assert!(!hint.contains("break the command into smaller pieces"), "{hint}");
+    assert!(
+        !hint.contains("break the command into smaller pieces"),
+        "{hint}"
+    );
 
     // Non-canceled execute_command errors keep the generic hint, but only when
     // a fallback read tool is visible this turn (remediation_hint returns None
     // for an empty visibility set, so the unwrap here needs "read_file").
     let allowed: FastSet<String> = ["read_file".to_string()].into_iter().collect();
-    let generic = super::remediation_hint("execute_command", "exit code 1", Some(&allowed)).unwrap();
-    assert!(generic.contains("break the command into smaller pieces"), "{generic}");
+    let generic =
+        super::remediation_hint("execute_command", "exit code 1", Some(&allowed)).unwrap();
+    assert!(
+        generic.contains("break the command into smaller pieces"),
+        "{generic}"
+    );
 }
 
 #[test]
@@ -811,7 +1024,10 @@ fn schema_gate_rejects_wrong_typed_arguments_before_dispatch() {
     );
     let err = super::prepare_tool_call(&mcp, &mistyped, None)
         .expect_err("wrong-typed offset must be rejected centrally");
-    assert!(err.content.contains("invalid arguments for 'read_file'"), "{err:?}");
+    assert!(
+        err.content.contains("invalid arguments for 'read_file'"),
+        "{err:?}"
+    );
     // Correctly typed arguments still pass through.
     let typed = tool_call_with_args(
         "read_file",
@@ -856,10 +1072,8 @@ fn schema_gate_resolves_all_declared_compat_aliases() {
     let mcp = McpClient::new();
     // `write_file` shares the historical `path` alias via
     // `resolve_file_path_arg`.
-    let write_alias = tool_call_with_args(
-        "write_file",
-        r#"{"path": "src/main.rs", "content": "hi"}"#,
-    );
+    let write_alias =
+        tool_call_with_args("write_file", r#"{"path": "src/main.rs", "content": "hi"}"#);
     assert!(super::prepare_tool_call(&mcp, &write_alias, None).is_ok());
     // `apply_patch` accepts `path` via `optional_file_path_arg`.
     let patch_alias = tool_call_with_args(
@@ -914,8 +1128,7 @@ fn schema_gate_rejects_silent_divergence_beyond_read_file() {
         r#"{"command": "ls", "pty": false, "timeout": -1}"#,
     );
     assert!(super::prepare_tool_call(&mcp, &negative_timeout, None).is_err());
-    let negative_depth =
-        tool_call_with_args("tree", r#"{"max_depth": -1}"#);
+    let negative_depth = tool_call_with_args("tree", r#"{"max_depth": -1}"#);
     assert!(super::prepare_tool_call(&mcp, &negative_depth, None).is_err());
     // In-range values still pass.
     let sane_timeout = tool_call_with_args(
@@ -942,10 +1155,7 @@ fn execute_command_session_control_is_split_into_command_session() {
     assert!(err.content.contains("unknown argument(s)"), "{err:?}");
     assert!(err.content.contains("session_id"), "{err:?}");
 
-    let missing_action = tool_call_with_args(
-        "command_session",
-        r#"{"session_id": "cmd-1"}"#,
-    );
+    let missing_action = tool_call_with_args("command_session", r#"{"session_id": "cmd-1"}"#);
     assert!(
         super::prepare_tool_call(&mcp, &missing_action, None).is_err(),
         "command_session must require action"
@@ -1002,15 +1212,30 @@ fn schema_gate_rejects_out_of_range_integers_before_dispatch() {
         ("search_overflow", r#"{"query": "x", "max_results": 201}"#),
         ("knowledge_search", r#"{"query": "x", "limit": 0}"#),
         ("knowledge_list", r#"{"limit": 101}"#),
-        ("knowledge_semantic_search", r#"{"query": "x", "limit": 21}"#),
+        (
+            "knowledge_semantic_search",
+            r#"{"query": "x", "limit": 21}"#,
+        ),
         ("knowledge_save", r#"{"content": "x", "priority": 256}"#),
         ("knowledge_save", r#"{"content": "x", "priority": -1}"#),
         ("list_skills", r#"{"limit": 0}"#),
         ("sleep_process", r#"{"turns": 0}"#),
-        ("spawn_process", r#"{"name": "p", "goal": "g", "priority": 300}"#),
-        ("spawn_process", r#"{"name": "p", "goal": "g", "quota_turns": -1}"#),
-        ("spawn_daemon", r#"{"name": "d", "goal": "g", "max_restarts": -1}"#),
-        ("session_distill", r#"{"archive": "/tmp/a.zip", "limit": 101}"#),
+        (
+            "spawn_process",
+            r#"{"name": "p", "goal": "g", "priority": 300}"#,
+        ),
+        (
+            "spawn_process",
+            r#"{"name": "p", "goal": "g", "quota_turns": -1}"#,
+        ),
+        (
+            "spawn_daemon",
+            r#"{"name": "d", "goal": "g", "max_restarts": -1}"#,
+        ),
+        (
+            "session_distill",
+            r#"{"archive": "/tmp/a.zip", "limit": 101}"#,
+        ),
     ];
     for (tool, args) in cases {
         let call = tool_call_with_args(tool, args);
@@ -1025,8 +1250,14 @@ fn schema_gate_rejects_out_of_range_integers_before_dispatch() {
     let ok_cases = [
         ("task_wait", r#"{"task_ids": ["t"], "timeout_secs": 60}"#),
         ("search_overflow", r#"{"query": "x", "context_lines": 0}"#),
-        ("spawn_process", r#"{"name": "p", "goal": "g", "quota_turns": 0}"#),
-        ("spawn_daemon", r#"{"name": "d", "goal": "g", "max_restarts": 0}"#),
+        (
+            "spawn_process",
+            r#"{"name": "p", "goal": "g", "quota_turns": 0}"#,
+        ),
+        (
+            "spawn_daemon",
+            r#"{"name": "d", "goal": "g", "max_restarts": 0}"#,
+        ),
     ];
     for (tool, args) in ok_cases {
         let call = tool_call_with_args(tool, args);
@@ -1045,66 +1276,426 @@ fn schema_gate_rejects_out_of_range_integers_before_dispatch() {
 /// negatives are valid). The test below walks the whole registry, so a new
 /// integer parameter fails until its author registers it here.
 const INT_BOUND_REGISTRY: &[(&str, &str, Option<i64>, Option<i64>, &str)] = &[
-    ("execute_command", "timeout", Some(1), Some(300), "service clamps 1-300"),
-    ("execute_command", "yield_time_ms", Some(5000), Some(60000), "service clamps 5000-60000; each poll is a model round"),
-    ("command_session", "yield_time_ms", Some(5000), Some(60000), "service clamps 5000-60000; each poll is a model round"),
-    ("task_wait", "timeout_secs", Some(1), Some(60), "service clamps 1-60"),
-    ("search_overflow", "context_lines", Some(0), Some(5), "unwrap_or(2).min(5); 0 is valid"),
-    ("search_overflow", "max_results", Some(1), Some(200), "service clamps 1-200"),
-    ("knowledge_search", "limit", Some(1), None, "no upper clamp; 0 would return empty"),
-    ("knowledge_list", "limit", Some(1), Some(100), "unwrap_or(20).min(100)"),
-    ("knowledge_semantic_search", "limit", Some(1), Some(20), "service clamps 1-20"),
-    ("knowledge_save", "priority", Some(0), Some(255), "u8 range; service rejects >255"),
-    ("knowledge_consolidate", "save_entries[].priority", Some(0), Some(255), "same u8 parser"),
-    ("list_skills", "limit", Some(1), Some(100), "service clamps 1-100"),
-    ("list_skill_resources", "limit", Some(1), Some(200), "pre-existing bound, pinned"),
-    ("read_skill_resource", "limit", Some(1), Some(65536), "pre-existing bound, pinned"),
-    ("read_file", "offset", Some(1), None, "no upper clamp in service"),
-    ("read_file", "char_offset", Some(0), None, "0 is valid; no upper clamp"),
-    ("read_file", "limit", Some(1), None, "no upper clamp in service"),
-    ("run_agent_graph", "max_parallel", Some(1), Some(8), "pre-existing bound, pinned"),
-    ("run_agent_graph", "static_graph.nodes[].max_retries", Some(0), None, "pre-existing, pinned"),
-    ("run_agent_graph", "dynamic_graph.policy.min_selected", Some(2), None, "pre-existing, pinned"),
-    ("run_agent_graph", "dynamic_graph.policy.max_selected", Some(2), None, "pre-existing, pinned"),
-    ("show_changes", "limit_snippet", Some(0), Some(4000), "pre-existing bound, pinned"),
-    ("sleep_process", "turns", Some(1), None, "documented minimum 1; no upper clamp"),
-    ("spawn_process", "priority", Some(0), Some(255), "u8 range; larger values truncate via `as u8`"),
-    ("spawn_process", "quota_turns", Some(0), None, "0 means unlimited per ResourceLimit::from_legacy"),
-    ("spawn_daemon", "priority", Some(0), Some(255), "u8 range, as above"),
-    ("spawn_daemon", "quota_turns", Some(0), None, "0 means unlimited, as above"),
-    ("spawn_daemon", "max_restarts", Some(0), None, "0 disables restarts; no upper clamp"),
-    ("session_distill", "limit", Some(1), Some(100), "service clamps 1-100"),
-    ("session_list", "limit", Some(0), Some(100), "unwrap_or(20).min(100); 0 returns no rows"),
-    ("session_read", "limit", Some(0), Some(200), "unwrap_or(default).min(200); 0 returns no messages"),
-    ("session_read", "from", Some(0), None, "0 is the oldest canonical index; no upper clamp"),
-    ("session_search", "max_results", Some(0), Some(100), "unwrap_or(20).min(100); 0 stops immediately"),
-    ("tree", "max_depth", Some(0), Some(6), "pre-existing bound, pinned"),
-    ("manage_team", "budget.max_parallel", Some(1), Some(8), "validate_budget enforces 1-8"),
-    ("manage_team", "budget.max_tasks", Some(1), Some(512), "validate_budget enforces 1-512"),
-    ("manage_team", "budget.max_total_attempts", Some(1), Some(4096), "validate_budget enforces <=4096"),
-    ("manage_team", "budget.max_messages", Some(1), Some(2048), "validate_budget enforces 1-2048"),
-    ("manage_team", "lease_secs", Some(1), Some(86400), "service clamps 1-86400"),
-    ("phone_action", "days", Some(1), Some(30), "calendar_read rejects values outside 1-30"),
-    ("phone_action", "max", Some(1), Some(20), "calendar_read and note_list enforce 1-20"),
-    ("phone_action", "duration_min", Some(5), Some(600), "calendar_add rejects durations outside 5-600"),
-    ("phone_action", "hour", Some(0), Some(23), "alarm requires an integer hour in 0-23"),
-    ("phone_action", "minute", Some(0), Some(59), "alarm requires an integer minute in 0-59"),
-    ("phone_action", "weekdays[]", Some(1), Some(7), "alarm validates each unique ISO weekday in 1-7"),
-    ("phone_action", "seconds", Some(1), Some(86400), "timer requires an integer duration in 1-86400"),
-    ("phone_action", "offset", Some(0), Some(1048576), "file_read enforces MAX_FILE_CHARS; note_list enforces the narrower action-specific maximum 100000"),
-    ("phone_action", "limit", Some(1), Some(3000), "file_read enforces 1-3000 Unicode codepoints"),
-    ("kill_process", "pid", None, None, "service ok_or fails closed; no silent default"),
-    ("reap_process", "pid", None, None, "service ok_or fails closed; no silent default"),
-    ("wait_process", "pid", None, None, "service ok_or fails closed; no silent default"),
-    ("signal_process", "pid", None, None, "service ok_or fails closed; no silent default"),
-    ("send_ipc_message", "pid", None, None, "service ok_or fails closed; no silent default"),
-    ("set_process_group", "pid", None, None, "service ok_or fails closed; no silent default"),
-    ("set_process_group", "pgid", None, None, "service ok_or fails closed; no silent default"),
-    ("signal_process_group", "pgid", None, None, "service ok_or fails closed; no silent default"),
-    ("plan", "steps[].step", None, None, "parse_step_specs ok_or fails closed; labels only"),
-    ("plan_update", "step", None, None, "service ok_or fails closed; unknown steps report not-found"),
-    ("save_skill", "priority", None, None, "signed as_i64; negative precedence is valid"),
-    ("save_skill", "subskills[].priority", None, None, "signed as_i64; negative precedence is valid"),
+    (
+        "execute_command",
+        "timeout",
+        Some(1),
+        Some(300),
+        "service clamps 1-300",
+    ),
+    (
+        "execute_command",
+        "yield_time_ms",
+        Some(5000),
+        Some(60000),
+        "service clamps 5000-60000; each poll is a model round",
+    ),
+    (
+        "command_session",
+        "yield_time_ms",
+        Some(5000),
+        Some(60000),
+        "service clamps 5000-60000; each poll is a model round",
+    ),
+    (
+        "task_wait",
+        "timeout_secs",
+        Some(1),
+        Some(60),
+        "service clamps 1-60",
+    ),
+    (
+        "search_overflow",
+        "context_lines",
+        Some(0),
+        Some(5),
+        "unwrap_or(2).min(5); 0 is valid",
+    ),
+    (
+        "search_overflow",
+        "max_results",
+        Some(1),
+        Some(200),
+        "service clamps 1-200",
+    ),
+    (
+        "knowledge_search",
+        "limit",
+        Some(1),
+        None,
+        "no upper clamp; 0 would return empty",
+    ),
+    (
+        "knowledge_list",
+        "limit",
+        Some(1),
+        Some(100),
+        "unwrap_or(20).min(100)",
+    ),
+    (
+        "knowledge_semantic_search",
+        "limit",
+        Some(1),
+        Some(20),
+        "service clamps 1-20",
+    ),
+    (
+        "knowledge_save",
+        "priority",
+        Some(0),
+        Some(255),
+        "u8 range; service rejects >255",
+    ),
+    (
+        "knowledge_consolidate",
+        "save_entries[].priority",
+        Some(0),
+        Some(255),
+        "same u8 parser",
+    ),
+    (
+        "list_skills",
+        "limit",
+        Some(1),
+        Some(100),
+        "service clamps 1-100",
+    ),
+    (
+        "list_skill_resources",
+        "limit",
+        Some(1),
+        Some(200),
+        "pre-existing bound, pinned",
+    ),
+    (
+        "read_skill_resource",
+        "limit",
+        Some(1),
+        Some(65536),
+        "pre-existing bound, pinned",
+    ),
+    (
+        "read_file",
+        "offset",
+        Some(1),
+        None,
+        "no upper clamp in service",
+    ),
+    (
+        "read_file",
+        "char_offset",
+        Some(0),
+        None,
+        "0 is valid; no upper clamp",
+    ),
+    (
+        "read_file",
+        "limit",
+        Some(1),
+        None,
+        "no upper clamp in service",
+    ),
+    (
+        "run_agent_graph",
+        "max_parallel",
+        Some(1),
+        Some(8),
+        "pre-existing bound, pinned",
+    ),
+    (
+        "run_agent_graph",
+        "static_graph.nodes[].max_retries",
+        Some(0),
+        None,
+        "pre-existing, pinned",
+    ),
+    (
+        "run_agent_graph",
+        "dynamic_graph.policy.min_selected",
+        Some(2),
+        None,
+        "pre-existing, pinned",
+    ),
+    (
+        "run_agent_graph",
+        "dynamic_graph.policy.max_selected",
+        Some(2),
+        None,
+        "pre-existing, pinned",
+    ),
+    (
+        "show_changes",
+        "limit_snippet",
+        Some(0),
+        Some(4000),
+        "pre-existing bound, pinned",
+    ),
+    (
+        "sleep_process",
+        "turns",
+        Some(1),
+        None,
+        "documented minimum 1; no upper clamp",
+    ),
+    (
+        "spawn_process",
+        "priority",
+        Some(0),
+        Some(255),
+        "u8 range; larger values truncate via `as u8`",
+    ),
+    (
+        "spawn_process",
+        "quota_turns",
+        Some(0),
+        None,
+        "0 means unlimited per ResourceLimit::from_legacy",
+    ),
+    (
+        "spawn_daemon",
+        "priority",
+        Some(0),
+        Some(255),
+        "u8 range, as above",
+    ),
+    (
+        "spawn_daemon",
+        "quota_turns",
+        Some(0),
+        None,
+        "0 means unlimited, as above",
+    ),
+    (
+        "spawn_daemon",
+        "max_restarts",
+        Some(0),
+        None,
+        "0 disables restarts; no upper clamp",
+    ),
+    (
+        "session_distill",
+        "limit",
+        Some(1),
+        Some(100),
+        "service clamps 1-100",
+    ),
+    (
+        "session_list",
+        "limit",
+        Some(0),
+        Some(100),
+        "unwrap_or(20).min(100); 0 returns no rows",
+    ),
+    (
+        "session_read",
+        "limit",
+        Some(0),
+        Some(200),
+        "unwrap_or(default).min(200); 0 returns no messages",
+    ),
+    (
+        "session_read",
+        "from",
+        Some(0),
+        None,
+        "0 is the oldest canonical index; no upper clamp",
+    ),
+    (
+        "session_search",
+        "max_results",
+        Some(0),
+        Some(100),
+        "unwrap_or(20).min(100); 0 stops immediately",
+    ),
+    (
+        "tree",
+        "max_depth",
+        Some(0),
+        Some(6),
+        "pre-existing bound, pinned",
+    ),
+    (
+        "manage_team",
+        "budget.max_parallel",
+        Some(1),
+        Some(8),
+        "validate_budget enforces 1-8",
+    ),
+    (
+        "manage_team",
+        "budget.max_tasks",
+        Some(1),
+        Some(512),
+        "validate_budget enforces 1-512",
+    ),
+    (
+        "manage_team",
+        "budget.max_total_attempts",
+        Some(1),
+        Some(4096),
+        "validate_budget enforces <=4096",
+    ),
+    (
+        "manage_team",
+        "budget.max_messages",
+        Some(1),
+        Some(2048),
+        "validate_budget enforces 1-2048",
+    ),
+    (
+        "manage_team",
+        "lease_secs",
+        Some(1),
+        Some(86400),
+        "service clamps 1-86400",
+    ),
+    (
+        "phone_action",
+        "days",
+        Some(1),
+        Some(30),
+        "calendar_read rejects values outside 1-30",
+    ),
+    (
+        "phone_action",
+        "max",
+        Some(1),
+        Some(20),
+        "calendar_read and note_list enforce 1-20",
+    ),
+    (
+        "phone_action",
+        "duration_min",
+        Some(5),
+        Some(600),
+        "calendar_add rejects durations outside 5-600",
+    ),
+    (
+        "phone_action",
+        "hour",
+        Some(0),
+        Some(23),
+        "alarm requires an integer hour in 0-23",
+    ),
+    (
+        "phone_action",
+        "minute",
+        Some(0),
+        Some(59),
+        "alarm requires an integer minute in 0-59",
+    ),
+    (
+        "phone_action",
+        "weekdays[]",
+        Some(1),
+        Some(7),
+        "alarm validates each unique ISO weekday in 1-7",
+    ),
+    (
+        "phone_action",
+        "seconds",
+        Some(1),
+        Some(86400),
+        "timer requires an integer duration in 1-86400",
+    ),
+    (
+        "phone_action",
+        "offset",
+        Some(0),
+        Some(1048576),
+        "file_read enforces MAX_FILE_CHARS; note_list enforces the narrower action-specific maximum 100000",
+    ),
+    (
+        "phone_action",
+        "limit",
+        Some(1),
+        Some(3000),
+        "file_read enforces 1-3000 Unicode codepoints",
+    ),
+    (
+        "kill_process",
+        "pid",
+        None,
+        None,
+        "service ok_or fails closed; no silent default",
+    ),
+    (
+        "reap_process",
+        "pid",
+        None,
+        None,
+        "service ok_or fails closed; no silent default",
+    ),
+    (
+        "wait_process",
+        "pid",
+        None,
+        None,
+        "service ok_or fails closed; no silent default",
+    ),
+    (
+        "signal_process",
+        "pid",
+        None,
+        None,
+        "service ok_or fails closed; no silent default",
+    ),
+    (
+        "send_ipc_message",
+        "pid",
+        None,
+        None,
+        "service ok_or fails closed; no silent default",
+    ),
+    (
+        "set_process_group",
+        "pid",
+        None,
+        None,
+        "service ok_or fails closed; no silent default",
+    ),
+    (
+        "set_process_group",
+        "pgid",
+        None,
+        None,
+        "service ok_or fails closed; no silent default",
+    ),
+    (
+        "signal_process_group",
+        "pgid",
+        None,
+        None,
+        "service ok_or fails closed; no silent default",
+    ),
+    (
+        "plan",
+        "steps[].step",
+        None,
+        None,
+        "parse_step_specs ok_or fails closed; labels only",
+    ),
+    (
+        "plan_update",
+        "step",
+        None,
+        None,
+        "service ok_or fails closed; unknown steps report not-found",
+    ),
+    (
+        "save_skill",
+        "priority",
+        None,
+        None,
+        "signed as_i64; negative precedence is valid",
+    ),
+    (
+        "save_skill",
+        "subskills[].priority",
+        None,
+        None,
+        "signed as_i64; negative precedence is valid",
+    ),
 ];
 
 fn collect_int_bounds(
@@ -1310,7 +1901,12 @@ fn search_overflow_description_stays_in_sync_with_implementation() {
         .cloned()
         .collect();
     let expected: std::collections::BTreeSet<String> = [
-        "query", "scope", "file_pattern", "is_regex", "case_sensitive", "context_lines",
+        "query",
+        "scope",
+        "file_pattern",
+        "is_regex",
+        "case_sensitive",
+        "context_lines",
         "max_results",
     ]
     .into_iter()

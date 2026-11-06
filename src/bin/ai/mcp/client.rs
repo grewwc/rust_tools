@@ -7,10 +7,10 @@ use rust_tools::cw::SkipMap;
 use serde_json::{Value, json};
 
 use crate::ai::types::{
-    FunctionDefinition, McpPrompt, McpResource, McpServerConfig, McpTool, ToolDefinition,
+    FunctionDefinition, McpPrompt, McpResource, McpServerConfig, ToolDefinition,
 };
 
-use super::connection::McpServerConnection;
+use super::{connection::McpServerConnection, initialize_and_discover};
 
 /// Sends a JSON-RPC request to an MCP server connection. The transport owns
 /// request/response correlation, so stdio and HTTP share this entry point.
@@ -35,6 +35,46 @@ pub(in crate::ai) fn send_notification_to_conn(
 pub(in crate::ai) type SharedMcpClient = Arc<std::sync::Mutex<McpClient>>;
 
 type ServerId = String;
+
+/// Preserve the MCP result envelope until its text-only driver projection.
+/// A successful single text block without structured content keeps its legacy
+/// bytes; richer results project as the complete JSON envelope.
+struct McpToolResultEnvelope(Value);
+
+impl McpToolResultEnvelope {
+    fn into_text_result(self) -> Result<String, String> {
+        if self.0["isError"].as_bool() == Some(true) {
+            return Err(format!("MCP tool returned isError=true: {}", self.0));
+        }
+
+        if self.0.get("structuredContent").is_none()
+            && self
+                .0
+                .get("isError")
+                .is_none_or(|value| value.as_bool() == Some(false))
+            && let Some(content) = self.0["content"].as_array()
+        {
+            if let [block] = content.as_slice()
+                && block
+                    .get("type")
+                    .is_none_or(|value| value.as_str() == Some("text"))
+                && let Some(text) = block["text"].as_str()
+            {
+                return Ok(text.to_string());
+            }
+            if content.is_empty()
+                && self.0.as_object().is_some_and(|object| {
+                    object
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "content" | "isError"))
+                })
+            {
+                return Ok(String::new());
+            }
+        }
+        Ok(self.0.to_string())
+    }
+}
 
 pub(in crate::ai) struct McpClient {
     pub(in crate::ai) servers: SkipMap<ServerId, Arc<Mutex<McpServerConnection>>>,
@@ -106,10 +146,7 @@ impl McpClient {
 
         let mut conn = McpServerConnection::connect(name, config)?;
 
-        self.initialize_server(&mut conn)?;
-        conn.tools = self.list_tools(&mut conn)?;
-        conn.resources = self.list_resources(&mut conn)?;
-        conn.prompts = self.list_prompts(&mut conn)?;
+        initialize_and_discover(&mut conn, &self.next_id)?;
 
         self.servers
             .insert(name.to_string(), Arc::new(Mutex::new(conn)));
@@ -150,11 +187,7 @@ impl McpClient {
     fn restart_connection(&self, conn: &mut McpServerConnection) -> Result<(), String> {
         conn.restart()?;
 
-        self.initialize_server(conn)?;
-        conn.tools = self.list_tools(conn)?;
-        conn.resources = self.list_resources(conn)?;
-        conn.prompts = self.list_prompts(conn)?;
-        Ok(())
+        initialize_and_discover(conn, &self.next_id)
     }
 
     pub(in crate::ai) fn reset_server(&self, server_name: &str) -> Result<(), String> {
@@ -233,107 +266,6 @@ impl McpClient {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn send_request(
-        &self,
-        conn: &mut McpServerConnection,
-        method: &str,
-        params: Option<Value>,
-    ) -> Result<Value, String> {
-        let id = self.next_request_id();
-        send_request_to_conn(conn, id, method, params)
-    }
-
-    fn initialize_server(&self, conn: &mut McpServerConnection) -> Result<(), String> {
-        let params = json!({
-            "protocolVersion": conn.protocol_version(),
-            "capabilities": {
-                "tools": {},
-                "resources": {},
-                "prompts": {}
-            },
-            "clientInfo": {
-                "name": "rust-tools-ai",
-                "version": "1.0.0"
-            }
-        });
-
-        let id1 = self.next_request_id();
-        send_request_to_conn(conn, id1, "initialize", Some(params))?;
-        // notifications/initialized is a notification (no id, no response
-        // expected); it must not be sent as a request.
-        send_notification_to_conn(conn, "notifications/initialized", None)?;
-        Ok(())
-    }
-
-    fn list_tools(&self, conn: &mut McpServerConnection) -> Result<Vec<McpTool>, String> {
-        let result = match self.send_request(conn, "tools/list", None) {
-            Ok(v) => v,
-            Err(err) => {
-                if super::is_method_not_found(&err) {
-                    return Ok(Vec::new());
-                }
-                return Err(err);
-            }
-        };
-
-        let tools = result["tools"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| serde_json::from_value(t.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Ok(tools)
-    }
-
-    fn list_resources(&self, conn: &mut McpServerConnection) -> Result<Vec<McpResource>, String> {
-        let result = match self.send_request(conn, "resources/list", None) {
-            Ok(v) => v,
-            Err(err) => {
-                if super::is_method_not_found(&err) {
-                    return Ok(Vec::new());
-                }
-                return Err(err);
-            }
-        };
-
-        let resources = result["resources"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|r| serde_json::from_value(r.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Ok(resources)
-    }
-
-    fn list_prompts(&self, conn: &mut McpServerConnection) -> Result<Vec<McpPrompt>, String> {
-        let result = match self.send_request(conn, "prompts/list", None) {
-            Ok(v) => v,
-            Err(err) => {
-                if super::is_method_not_found(&err) {
-                    return Ok(Vec::new());
-                }
-                return Err(err);
-            }
-        };
-
-        let prompts = result["prompts"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|p| serde_json::from_value(p.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Ok(prompts)
-    }
-
     pub(in crate::ai) fn call_tool(
         &self,
         server_name: &str,
@@ -344,97 +276,29 @@ impl McpClient {
             .servers
             .get_str_ref(server_name)
             .ok_or_else(|| format!("Server not found: {}", server_name))?;
-
-        // First attempt
-        let mut conn = conn_cell
-            .lock()
-            .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
-        let id1 = self.next_request_id();
-        let params1 = json!({ "name": tool_name, "arguments": arguments.clone() });
-        let first = send_request_to_conn(&mut conn, id1, "tools/call", Some(params1));
-        match first {
-            Ok(result) => {
-                let content = result["content"]
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .and_then(|c| c["text"].as_str())
-                    .unwrap_or("")
-                    .to_string();
-                return Ok(content);
-            }
-            Err(err) if Self::is_user_interrupt_error(&err) => {
-                let restart_res = self.restart_connection(&mut conn);
+        Self::call_tool_with_recovery(
+            conn_cell,
+            server_name,
+            tool_name,
+            arguments,
+            || Ok(self.next_request_id()),
+            || {
+                let mut conn = conn_cell
+                    .lock()
+                    .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+                let result = self.restart_connection(&mut conn);
                 drop(conn);
-                if restart_res.is_ok() {
-                    // A restart re-runs tools/list; keep the routing/schema
-                    // cache in sync with the live tool set.
+                if result.is_ok() {
                     self.rebuild_metadata_cache();
                 }
-                return match restart_res {
-                    Ok(()) => Err(format!(
-                        "MCP tool call canceled by user (Ctrl+C): {}",
-                        tool_name
-                    )),
-                    Err(restart_err) => Err(format!(
-                        "MCP tool call canceled by user (Ctrl+C): {} | restart failed: {}",
-                        tool_name, restart_err
-                    )),
-                };
-            }
-            Err(err) if Self::is_transport_error(&err) || Self::is_protocol_desync_error(&err) => {
-                // Try restart once and retry
-                let restart_res = self.restart_connection(&mut conn);
-                drop(conn);
-                if restart_res.is_ok() {
-                    self.rebuild_metadata_cache();
-                }
-                match restart_res {
-                    Ok(()) => {
-                        let mut conn2 = conn_cell
-                            .lock()
-                            .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
-                        let id2 = self.next_request_id();
-                        let params2 = json!({ "name": tool_name, "arguments": arguments.clone() });
-                        let result =
-                            send_request_to_conn(&mut conn2, id2, "tools/call", Some(params2))?;
-                        let content = result["content"]
-                            .as_array()
-                            .and_then(|arr| arr.first())
-                            .and_then(|c| c["text"].as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        return Ok(content);
-                    }
-                    Err(restart_err) => {
-                        let kind = if Self::is_protocol_desync_error(&err) {
-                            "Protocol desync"
-                        } else {
-                            "Transport error"
-                        };
-                        return Err(format!(
-                            "{}: {} | restart failed: {}",
-                            kind, err, restart_err
-                        ));
-                    }
-                }
-            }
-            Err(err) => return Err(err),
-        }
-
-        // unreachable
+                result
+            },
+        )
     }
 
-    /// Shared-client tool-call entry point: never performs blocking IO while
-    /// holding the `SharedMcpClient` outer lock. The old
-    /// `McpClient::call_tool(&self, ...)` required the caller to already hold
-    /// the outer lock (`guard.call_tool`), which kept it held throughout
-    /// the blocking transport request/read and `restart_connection`,
-    /// blocking other servers' `tool_definitions` / `is_available`. This
-    /// method instead holds the outer lock only briefly for the `servers`
-    /// lookup and `next_id` allocation, then releases it and does IO while
-    /// holding only the per-server `Mutex<McpServerConnection>`; on `restart`
-    /// it follows the outer-lock -> inner-lock order (releasing the inner lock
-    /// before reacquiring it) to avoid an inner-lock -> outer-lock deadlock.
+    /// Request IO holds only the per-server lock. Shared ID allocation and
+    /// restart retain the owner's counter, and cache rebuilding follows the
+    /// outer-to-inner lock order after releasing the connection lock.
     pub(in crate::ai) fn call_tool_on_shared(
         shared: &SharedMcpClient,
         server_name: &str,
@@ -451,105 +315,125 @@ impl McpClient {
                 .cloned()
                 .ok_or_else(|| format!("Server not found: {}", server_name))?
         };
-        let fetch_next_id = |shared: &SharedMcpClient| -> Result<u64, String> {
-            let guard = shared
-                .lock()
-                .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
-            Ok(guard.next_id.fetch_add(1, Ordering::Relaxed))
-        };
-        let id1 = fetch_next_id(shared)?;
-        let params1 = json!({ "name": tool_name, "arguments": arguments.clone() });
-        let first = {
+        Self::call_tool_with_recovery(
+            &conn_arc,
+            server_name,
+            tool_name,
+            arguments,
+            || {
+                let guard = shared
+                    .lock()
+                    .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+                Ok(guard.next_request_id())
+            },
+            || {
+                let result = {
+                    let guard = shared
+                        .lock()
+                        .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+                    let mut conn = conn_arc
+                        .lock()
+                        .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+                    guard.restart_connection(&mut conn)
+                };
+                if result.is_ok() {
+                    let guard = shared
+                        .lock()
+                        .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+                    guard.rebuild_metadata_cache();
+                }
+                result
+            },
+        )
+    }
+
+    fn call_tool_with_recovery(
+        conn_arc: &Arc<Mutex<McpServerConnection>>,
+        server_name: &str,
+        tool_name: &str,
+        arguments: Value,
+        mut next_id: impl FnMut() -> Result<u64, String>,
+        mut restart: impl FnMut() -> Result<(), String>,
+    ) -> Result<String, String> {
+        let params = json!({ "name": tool_name, "arguments": arguments });
+        let id = next_id()?;
+        let (first, retry_safe_before) = {
             let mut conn = conn_arc
                 .lock()
                 .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
-            send_request_to_conn(&mut *conn, id1, "tools/call", Some(params1))
+            let retry_safe = conn.retry_safe_tools.contains(tool_name);
+            (
+                conn.request_with_delivery(id, "tools/call", Some(params.clone())),
+                retry_safe,
+            )
         };
-        match first {
-            Ok(result) => {
-                let content = result["content"]
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .and_then(|c| c["text"].as_str())
-                    .unwrap_or("")
-                    .to_string();
-                return Ok(content);
+        let failure = match first {
+            Ok(result) => return McpToolResultEnvelope(result).into_text_result(),
+            Err(failure) => failure,
+        };
+
+        if Self::is_user_interrupt_error(&failure.error) {
+            let canceled = format!("MCP tool call canceled by user (Ctrl+C): {}", tool_name);
+            // Nothing entered the transport, so the current connection remains
+            // usable after the caller clears cancellation.
+            if !failure.may_have_been_sent {
+                return Err(canceled);
             }
-            Err(err) if Self::is_user_interrupt_error(&err) => {
-                let restart_res = {
-                    let guard = shared
-                        .lock()
-                        .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
-                    let mut conn = conn_arc
-                        .lock()
-                        .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
-                    guard.restart_connection(&mut *conn)
-                };
-                if restart_res.is_ok() {
-                    let guard = shared
-                        .lock()
-                        .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
-                    guard.rebuild_metadata_cache();
-                }
-                return match restart_res {
-                    Ok(()) => Err(format!(
-                        "MCP tool call canceled by user (Ctrl+C): {}",
-                        tool_name
-                    )),
-                    Err(restart_err) => Err(format!(
-                        "MCP tool call canceled by user (Ctrl+C): {} | restart failed: {}",
-                        tool_name, restart_err
-                    )),
-                };
-            }
-            Err(err) if Self::is_transport_error(&err) || Self::is_protocol_desync_error(&err) => {
-                let restart_res = {
-                    let guard = shared
-                        .lock()
-                        .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
-                    let mut conn = conn_arc
-                        .lock()
-                        .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
-                    guard.restart_connection(&mut *conn)
-                };
-                if restart_res.is_ok() {
-                    let guard = shared
-                        .lock()
-                        .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
-                    guard.rebuild_metadata_cache();
-                }
-                match restart_res {
-                    Ok(()) => {
-                        let id2 = fetch_next_id(shared)?;
-                        let params2 = json!({ "name": tool_name, "arguments": arguments });
-                        let mut conn2 = conn_arc
-                            .lock()
-                            .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
-                        let result =
-                            send_request_to_conn(&mut *conn2, id2, "tools/call", Some(params2))?;
-                        let content = result["content"]
-                            .as_array()
-                            .and_then(|arr| arr.first())
-                            .and_then(|c| c["text"].as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        return Ok(content);
-                    }
-                    Err(restart_err) => {
-                        let kind = if Self::is_protocol_desync_error(&err) {
-                            "Protocol desync"
-                        } else {
-                            "Transport error"
-                        };
-                        return Err(format!(
-                            "{}: {} | restart failed: {}",
-                            kind, err, restart_err
-                        ));
-                    }
-                }
-            }
-            Err(err) => return Err(err),
+            return match restart() {
+                Ok(()) => Err(canceled),
+                Err(restart_err) => Err(format!("{} | restart failed: {}", canceled, restart_err)),
+            };
         }
+        if !Self::is_transport_error(&failure.error)
+            && !Self::is_protocol_desync_error(&failure.error)
+        {
+            return Err(failure.error);
+        }
+
+        let kind = if Self::is_protocol_desync_error(&failure.error) {
+            "Protocol desync"
+        } else {
+            "Transport error"
+        };
+        if let Err(restart_err) = restart() {
+            return Err(format!(
+                "{}: {} | restart failed: {}",
+                kind, failure.error, restart_err
+            ));
+        }
+
+        let not_replayed = || {
+            format!(
+                "{}: {} | MCP tool call was not replayed: {}. The server may have executed the call; replay requires explicit safety in both connection generations.",
+                kind, failure.error, tool_name
+            )
+        };
+        let can_replay = |conn: &McpServerConnection| {
+            !failure.may_have_been_sent
+                || (retry_safe_before && conn.retry_safe_tools.contains(tool_name))
+        };
+        {
+            let conn = conn_arc
+                .lock()
+                .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+            if !can_replay(&conn) {
+                return Err(not_replayed());
+            }
+        }
+
+        // Allocate outside the per-server lock: the shared allocator takes the
+        // outer lock. Recheck safety under the lock used for the actual retry.
+        let id = next_id()?;
+        let mut conn = conn_arc
+            .lock()
+            .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+        if !can_replay(&conn) {
+            return Err(not_replayed());
+        }
+        let result = conn
+            .request_with_delivery(id, "tools/call", Some(params))
+            .map_err(|failure| failure.error)?;
+        McpToolResultEnvelope(result).into_text_result()
     }
 
     pub(in crate::ai) fn get_all_tools(&self) -> Vec<ToolDefinition> {
@@ -639,5 +523,375 @@ impl McpClient {
 impl Drop for McpClient {
     fn drop(&mut self) {
         self.disconnect_all();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::ai::mcp::test_support::*;
+
+    #[derive(Clone, Copy, Debug)]
+    enum CallApi {
+        Direct,
+        Shared,
+    }
+
+    const CALL_APIS: [CallApi; 2] = [CallApi::Direct, CallApi::Shared];
+
+    fn call(api: CallApi, shared: &SharedMcpClient) -> Result<String, String> {
+        match api {
+            CallApi::Direct => shared.lock().unwrap().call_tool(
+                "fixture",
+                "read_with_effects",
+                json!({"value": "run"}),
+            ),
+            CallApi::Shared => McpClient::call_tool_on_shared(
+                shared,
+                "fixture",
+                "read_with_effects",
+                json!({"value": "run"}),
+            ),
+        }
+    }
+
+    fn responses(first_id: u64, annotations: Value) -> Vec<Option<Value>> {
+        let mut responses = complete_responses(first_id, "read_with_effects");
+        responses[2].as_mut().unwrap()["result"]["tools"][0]["annotations"] = annotations;
+        responses
+    }
+
+    fn client(first: &ScriptedServer, restarted: Option<&ScriptedServer>) -> SharedMcpClient {
+        let mut client = McpClient::new();
+        client.connect_server("fixture", &first.config).unwrap();
+        if let Some(restarted) = restarted {
+            client
+                .servers
+                .get_str_ref("fixture")
+                .unwrap()
+                .lock()
+                .unwrap()
+                .config = restarted.config.clone();
+        }
+        Arc::new(Mutex::new(client))
+    }
+
+    #[test]
+    fn mcp_reliability_lost_response_never_replays_unknown_or_unsafe_calls() {
+        let _guard = serial_guard();
+        for api in CALL_APIS {
+            for annotations in [
+                json!({}),
+                json!({"readOnlyHint": false, "idempotentHint": false}),
+                json!({"readOnlyHint": "true", "idempotentHint": 1}),
+            ] {
+                let mut first_responses = responses(1, annotations.clone());
+                first_responses.push(None);
+                let first = ScriptedServer::new_closing(first_responses);
+                let mut restarted_responses = responses(6, annotations.clone());
+                restarted_responses.push(success(
+                    10,
+                    json!({"content": [{"type": "text", "text": "replayed"}]}),
+                ));
+                let restarted = ScriptedServer::new(restarted_responses);
+                let shared = client(&first, Some(&restarted));
+                let old_cache = shared.lock().unwrap().cached_tool_definitions_arc();
+
+                let result = call(api, &shared);
+
+                assert!(result.is_err(), "{api:?}: {annotations}: {result:?}");
+                assert!(result.unwrap_err().contains("not replayed"));
+                assert_eq!(first.executions().len(), 1);
+                assert!(restarted.executions().is_empty());
+                assert_eq!(restarted.transcript(), complete_transcript(6));
+                let guard = shared.lock().unwrap();
+                assert!(!Arc::ptr_eq(
+                    &old_cache,
+                    &guard.cached_tool_definitions_arc()
+                ));
+                assert_eq!(guard.get_all_tools().len(), 1);
+                assert_eq!(guard.get_all_resources().len(), 1);
+                assert_eq!(guard.get_all_prompts().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_reliability_desync_does_not_replay_an_unknown_call() {
+        let _guard = serial_guard();
+        for api in CALL_APIS {
+            let mut first_responses = responses(1, json!({}));
+            first_responses.push(success(99, json!({"content": [{"text": "wrong id"}]})));
+            let first = ScriptedServer::new(first_responses);
+            let mut restarted_responses = responses(6, json!({}));
+            restarted_responses.push(success(10, json!({"content": [{"text": "replayed"}]})));
+            let restarted = ScriptedServer::new(restarted_responses);
+            let shared = client(&first, Some(&restarted));
+
+            let result = call(api, &shared);
+
+            assert!(result.is_err(), "{api:?}: {result:?}");
+            assert_eq!(first.executions().len(), 1);
+            assert!(restarted.executions().is_empty());
+        }
+    }
+
+    #[test]
+    fn mcp_reliability_dead_connection_retries_before_any_tool_dispatch() {
+        let _guard = serial_guard();
+        for api in CALL_APIS {
+            let first = ScriptedServer::new(responses(1, json!({})));
+            let mut restarted_responses = responses(6, json!({}));
+            restarted_responses.push(success(
+                10,
+                json!({"content": [{"type": "text", "text": "once"}]}),
+            ));
+            let restarted = ScriptedServer::new(restarted_responses);
+            let shared = client(&first, Some(&restarted));
+            shared
+                .lock()
+                .unwrap()
+                .servers
+                .get_str_ref("fixture")
+                .unwrap()
+                .lock()
+                .unwrap()
+                .shutdown_and_reap();
+
+            assert_eq!(call(api, &shared).unwrap(), "once");
+            assert!(first.executions().is_empty());
+            assert_eq!(first.transcript(), complete_transcript(1));
+            assert_eq!(restarted.executions().len(), 1);
+        }
+    }
+
+    #[test]
+    fn mcp_reliability_explicit_safe_retry_uses_the_same_result_projection() {
+        let _guard = serial_guard();
+        let envelope = json!({
+            "content": [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}],
+            "structuredContent": {"answer": 42}, "isError": false
+        });
+        for api in CALL_APIS {
+            for annotations in [
+                json!({"readOnlyHint": true}),
+                json!({"idempotentHint": true}),
+            ] {
+                let mut first_responses = responses(1, annotations.clone());
+                first_responses.push(None);
+                let first = ScriptedServer::new_closing(first_responses);
+                let mut restarted_responses = responses(6, annotations);
+                restarted_responses.push(success(10, envelope.clone()));
+                let restarted = ScriptedServer::new(restarted_responses);
+                let shared = client(&first, Some(&restarted));
+
+                assert_eq!(call(api, &shared).unwrap(), envelope.to_string());
+                assert_eq!(first.executions().len(), 1);
+                assert_eq!(restarted.executions().len(), 1);
+                assert_eq!(
+                    first.executions()[0]["params"],
+                    restarted.executions()[0]["params"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_reliability_retry_requires_safety_in_both_connection_generations() {
+        let _guard = serial_guard();
+        for api in CALL_APIS {
+            for (before, after) in [
+                (json!({"readOnlyHint": true}), json!({})),
+                (json!({}), json!({"idempotentHint": true})),
+            ] {
+                let mut first_responses = responses(1, before);
+                first_responses.push(None);
+                let first = ScriptedServer::new_closing(first_responses);
+                let mut restarted_responses = responses(6, after);
+                restarted_responses.push(success(10, json!({"content": [{"text": "replayed"}]})));
+                let restarted = ScriptedServer::new(restarted_responses);
+                let shared = client(&first, Some(&restarted));
+
+                assert!(call(api, &shared).is_err());
+                assert_eq!(first.executions().len(), 1);
+                assert!(restarted.executions().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_reliability_rich_result_projection_keeps_all_payloads() {
+        let _guard = serial_guard();
+        for api in CALL_APIS {
+            for envelope in [
+                json!({"content": [{"type": "text", "text": "one"}, {"type": "text", "text": "two"}]}),
+                json!({"content": [
+                    {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/png"},
+                    {"type": "audio", "data": "YXVkaW8=", "mimeType": "audio/wav"},
+                    {"type": "resource", "resource": {"uri": "test://file", "text": "resource text"}},
+                    {"type": "resource_link", "uri": "test://link", "name": "link"}
+                ]}),
+                json!({"content": [], "structuredContent": {"answer": 42}}),
+                json!({"structuredContent": {"answer": 42}}),
+                json!({"content": [{"type": "image", "text": "not a text block", "data": "aW1hZ2U="}]}),
+                json!({"content": [{"type": "text", "text": "one", "annotations": {"audience": ["user"]}}], "structuredContent": {"answer": 42}, "_meta": {"trace": "fixture"}}),
+            ] {
+                let mut scripted = responses(1, json!({}));
+                scripted.push(success(5, envelope.clone()));
+                let first = ScriptedServer::new(scripted);
+                let shared = client(&first, None);
+
+                assert_eq!(call(api, &shared).unwrap(), envelope.to_string(), "{api:?}");
+                assert_eq!(first.executions().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_reliability_single_text_and_jsonrpc_errors_keep_existing_outputs() {
+        let _guard = serial_guard();
+        for api in CALL_APIS {
+            for envelope in [
+                json!({"content": [{"type": "text", "text": "unchanged\\ntext"}]}),
+                json!({"content": [{"text": "unchanged\\ntext"}], "isError": false}),
+                json!({"content": [{"type": "text", "text": "unchanged\\ntext", "annotations": {"audience": ["user"]}}], "_meta": {"trace": "fixture"}}),
+            ] {
+                let mut scripted = responses(1, json!({}));
+                scripted.push(success(5, envelope));
+                let first = ScriptedServer::new(scripted);
+                assert_eq!(
+                    call(api, &client(&first, None)).unwrap(),
+                    "unchanged\\ntext"
+                );
+            }
+            let mut scripted = responses(1, json!({}));
+            scripted.push(Some(json!({
+                "jsonrpc": "2.0", "id": 5,
+                "error": {"code": -32602, "message": "invalid arguments", "data": {"field": "value"}}
+            })));
+            let first = ScriptedServer::new(scripted);
+            assert_eq!(
+                call(api, &client(&first, None)).unwrap_err(),
+                "MCP error -32602: invalid arguments ({\"field\":\"value\"})"
+            );
+            assert_eq!(first.executions().len(), 1);
+        }
+    }
+
+    #[test]
+    fn mcp_reliability_safe_retry_is_bounded_and_does_not_swallow_is_error() {
+        let _guard = serial_guard();
+        for api in CALL_APIS {
+            for lost_second_response in [false, true] {
+                let annotations = json!({"readOnlyHint": true});
+                let mut first_responses = responses(1, annotations.clone());
+                first_responses.push(None);
+                let first = ScriptedServer::new_closing(first_responses);
+                let mut restarted_responses = responses(6, annotations);
+                let envelope =
+                    json!({"content": [{"type": "text", "text": "tool failed"}], "isError": true});
+                restarted_responses.push(if lost_second_response {
+                    None
+                } else {
+                    success(10, envelope.clone())
+                });
+                let restarted = ScriptedServer::new_closing(restarted_responses);
+                let shared = client(&first, Some(&restarted));
+
+                let result = call(api, &shared);
+
+                assert!(result.is_err(), "{api:?}: {result:?}");
+                if !lost_second_response {
+                    let error = result.unwrap_err();
+                    assert!(error.contains("isError"));
+                    assert!(error.contains(&envelope.to_string()));
+                }
+                assert_eq!(first.executions().len(), 1);
+                assert_eq!(restarted.executions().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_handshake_client_connections_share_the_current_counter() {
+        let _guard = serial_guard();
+        let first = ScriptedServer::new(complete_responses(21, "first"));
+        let second = ScriptedServer::new(complete_responses(25, "second"));
+        let mut client = McpClient::new();
+        client.next_id.store(21, Ordering::Relaxed);
+
+        client.connect_server("first", &first.config).unwrap();
+        client.connect_server("second", &second.config).unwrap();
+
+        assert_eq!(first.transcript(), complete_transcript(21));
+        assert_eq!(second.transcript(), complete_transcript(25));
+        assert_eq!(client.next_id.load(Ordering::Relaxed), 29);
+        for name in ["first", "second"] {
+            let conn = client.servers.get_str_ref(name).unwrap().lock().unwrap();
+            assert_eq!(observed_catalogs(&conn), catalogs(name));
+        }
+        assert_eq!(client.get_all_tools().len(), 2);
+        assert_eq!(client.get_all_resources().len(), 2);
+        assert_eq!(client.get_all_prompts().len(), 2);
+    }
+
+    #[test]
+    fn mcp_handshake_failed_shared_reconnect_preserves_partial_state_and_cache() {
+        let _guard = serial_guard();
+        let mut first_responses = complete_responses(41, "old");
+        first_responses.push(failure(45, -32000, "broken pipe"));
+        let first = ScriptedServer::new(first_responses);
+        let mut restart_responses = complete_responses(46, "new");
+        restart_responses[3] = failure(48, -32000, "resource catalog failed");
+        let restarted = ScriptedServer::new(restart_responses);
+        let mut client = McpClient::new();
+        client.next_id.store(41, Ordering::Relaxed);
+        client.connect_server("restart", &first.config).unwrap();
+        let cached_tools = client.cached_tool_definitions_arc();
+        let cached_resources = Arc::clone(&client.cached_resources.read().unwrap());
+        let cached_prompts = Arc::clone(&client.cached_prompts.read().unwrap());
+        let conn_arc = client.servers.get_str_ref("restart").unwrap().clone();
+        // Supply the next scripted process to the caller-owned restart path.
+        conn_arc.lock().unwrap().config = restarted.config.clone();
+        let shared = Arc::new(Mutex::new(client));
+
+        let err =
+            McpClient::call_tool_on_shared(&shared, "restart", "old", json!({"value": "run"}))
+                .unwrap_err();
+
+        assert_eq!(
+            err,
+            "Transport error: MCP error -32000: broken pipe | restart failed: MCP error -32000: resource catalog failed"
+        );
+        let mut first_transcript = complete_transcript(41);
+        first_transcript.push(json!({
+            "jsonrpc": "2.0", "id": 45, "method": "tools/call",
+            "params": {"name": "old", "arguments": {"value": "run"}}
+        }));
+        assert_eq!(first.transcript(), first_transcript);
+        assert_eq!(restarted.transcript(), complete_transcript(46)[..4]);
+        let client = shared.lock().unwrap();
+        assert_eq!(client.next_id.load(Ordering::Relaxed), 49);
+        assert!(Arc::ptr_eq(
+            &cached_tools,
+            &client.cached_tool_definitions_arc()
+        ));
+        assert!(Arc::ptr_eq(
+            &cached_resources,
+            &client.cached_resources.read().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &cached_prompts,
+            &client.cached_prompts.read().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &conn_arc,
+            client.servers.get_str_ref("restart").unwrap()
+        ));
+        let conn = conn_arc.lock().unwrap();
+        assert_eq!(
+            observed_catalogs(&conn),
+            [catalogs("new")[0].clone(), json!([]), json!([])]
+        );
     }
 }
