@@ -462,16 +462,34 @@ fn apply_history_context_budget(
     // Size-gated tool-result offload is unconditional (independent of the
     // soft target / allow_lossy): single results beyond the model's inline
     // cap no longer occupy every request just because total context is under
-    // pressure. The protected tail window (most recent tool groups) stays raw.
+    // pressure. Under budget pressure, preserve only tool groups from the
+    // current user turn; older "recent" groups must not keep a multi-megabyte
+    // request alive after a new user message starts another turn.
     let overflow_dir = {
         let store = crate::ai::history::SessionStore::new(app.config.history_file.as_path());
         store.session_assets_dir(&app.session_id)
     };
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok();
+    let keep_recent_tool_groups = if scan.total_chars > target_chars {
+        let current_turn_start =
+            crate::ai::history::last_real_user_index(messages).unwrap_or(messages.len());
+        messages[current_turn_start..]
+            .iter()
+            .filter(|message| {
+                message.role == "assistant"
+                    && message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| !calls.is_empty())
+            })
+            .count()
+    } else {
+        crate::ai::history::compress::KEEP_RECENT_TOOL_GROUPS
+    };
     let tool_spilled = crate::ai::history::compress::cap_oversized_tool_results_for_context(
         messages,
         tool_inline_cap_chars,
-        crate::ai::history::compress::KEEP_RECENT_TOOL_GROUPS,
+        keep_recent_tool_groups,
         Some(overflow_dir.as_path()),
         cwd.as_deref(),
     );
@@ -2050,7 +2068,7 @@ mod tests {
         ));
         let app = test_app(history_file);
         let current_user = msg("user", "latest user input must stay exact");
-        let exact_output = (0..600usize)
+        let exact_output = (0..6000usize)
             .map(|idx| {
                 format!(
                     "src/main.rs:{}: precise match {}\n",
@@ -2059,19 +2077,13 @@ mod tests {
                 )
             })
             .collect::<String>();
-        // A large read_file result is only offloaded once it falls outside the "last 6 tool results"
-        // protection window; otherwise the near-end window keeps it verbatim (to prevent the model
-        // from re-searching content that was just retrieved).
+        // The next user message starts a new turn, so even the immediately preceding tool result
+        // is no longer protected when it would leave the outgoing request over budget.
         let mut messages = vec![
             msg("system", "system prompt must stay exact"),
             assistant_tool_call("call-1", "read_file"),
             tool_result("call-1", exact_output.clone()),
         ];
-        for i in 0..6usize {
-            let id = format!("recent-{i}");
-            messages.push(assistant_tool_call(&id, "execute_command"));
-            messages.push(tool_result(&id, format!("recent tool output {i}")));
-        }
         messages.push(current_user.clone());
 
         let report = apply_pre_request_context_budget(&app, &app.current_model, &mut messages);

@@ -13,8 +13,8 @@ pub(super) const FINISH_REASON_GRACE_MS: u64 = 750;
 ///
 /// This stays a *connection* bound: a stream that already delivered something is worth preserving through a quiet
 /// stretch, but not indefinitely — after this much silence it is treated as stalled and the attempt replays
-/// through the retry ladder. Healthy streams on this wire keep refreshing it (visible text, reasoning summaries,
-/// tool-argument deltas, item open/close events), so a provider that really stopped sending is discovered
+/// through the retry ladder. Healthy streams on this wire keep refreshing it through visible text, reasoning
+/// summaries, and tool-argument deltas, so a provider that really stopped sending is discovered
 /// quickly. Silences that are *expected* because the provider declared work are covered by
 /// `STREAM_DECLARED_ITEM_TIMEOUT_SECS` instead of by widening this bound.
 ///

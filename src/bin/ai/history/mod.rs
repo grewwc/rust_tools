@@ -923,16 +923,7 @@ pub(in crate::ai) async fn compact_session_history_with_app(
     app: &App,
     cwd: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    compact_session_history_with_app_inner(app, false, cwd, true).await
-}
-
-/// Refresh the persisted context projection without issuing a summary-model request.
-/// Turn preparation uses this path so rebuilding context never waits on an auxiliary LLM.
-pub(in crate::ai) async fn compact_session_history_without_summary_model(
-    app: &App,
-    cwd: Option<&Path>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    compact_session_history_with_app_inner(app, false, cwd, false).await
+    compact_session_history_with_app_inner(app, false, cwd).await
 }
 
 /// Compression triggered at task boundaries: a more aggressive threshold
@@ -942,14 +933,13 @@ pub(in crate::ai) async fn compact_session_history_at_boundary_with_app(
     app: &App,
     cwd: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    compact_session_history_with_app_inner(app, true, cwd, true).await
+    compact_session_history_with_app_inner(app, true, cwd).await
 }
 
 async fn compact_session_history_with_app_inner(
     app: &App,
     at_boundary: bool,
     cwd: Option<&Path>,
-    allow_summary_model: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let history_file = &app.session_history_file;
     let store = SessionStore::new(app.config.history_file.as_path());
@@ -995,10 +985,6 @@ async fn compact_session_history_with_app_inner(
     if user_turns <= threshold && !exceeds_context_budget && !exceeds_tool_evidence_budget {
         return Ok(());
     }
-    if !allow_summary_model && !exceeds_context_budget && !exceeds_tool_evidence_budget {
-        return Ok(());
-    }
-
     let _hooks = crate::ai::driver::hooks::CompressionHookGuard::new();
     let compacted = if exceeds_context_budget || exceeds_tool_evidence_budget {
         // Use exactly the same compression strategy as the next
@@ -1038,7 +1024,6 @@ async fn compact_session_history_with_app_inner(
         // moving that summary across the turn boundary.
         // Legacy blobs have no separate snapshot, so keep their existing path.
         if sqlite_source.is_some()
-            && allow_summary_model
             && app.config.history_max_chars > 0
             && app.config.history_summary_max_chars > 0
             && !outcome.budget_met()

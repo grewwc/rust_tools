@@ -32,17 +32,17 @@ use super::{
     },
     wire_log::WireOutcomeNote,
 };
-mod metrics;
-mod hints;
-mod tool_calls;
-mod fold_render;
 mod driver;
+mod fold_render;
+mod hints;
+mod metrics;
+mod tool_calls;
 
+pub(super) use driver::*;
+pub(super) use fold_render::*;
+pub(super) use hints::*;
 use metrics::*;
 use tool_calls::*;
-pub(super) use hints::*;
-pub(super) use fold_render::*;
-pub(super) use driver::*;
 
 // Slices under runtime/ still address their old sibling modules via `super::state` and
 // `super::side_note_input` (before the split those paths resolved through `runtime`
@@ -50,7 +50,6 @@ pub(super) use driver::*;
 // without per-file path edits.
 use crate::ai::stream::side_note_input;
 use crate::ai::stream::state;
-
 
 /// Maximum number of decode errors before giving up and returning partial content
 /// Delay in milliseconds between retry attempts on transient errors
@@ -143,6 +142,13 @@ impl StreamPayloadOutcome {
             meaningful_progress: true,
         }
     }
+
+    fn continue_without_progress() -> Self {
+        Self {
+            should_stop: false,
+            meaningful_progress: false,
+        }
+    }
 }
 
 /// Silence allowance for the current stream state.
@@ -171,6 +177,18 @@ fn stream_silence_timeout_secs(state: &StreamProcessingState) -> u64 {
     } else {
         STREAM_FIRST_CHUNK_TIMEOUT_SECS
     }
+}
+
+fn should_refresh_stream_progress(
+    meaningful_progress: bool,
+    assistant_chars_before: usize,
+    assistant_chars_after: usize,
+    has_tool_calls: bool,
+) -> bool {
+    meaningful_progress
+        && (assistant_chars_before == 0
+            || assistant_chars_after > assistant_chars_before
+            || has_tool_calls)
 }
 
 fn initial_stream_processing_state(app: &App) -> StreamProcessingState {
@@ -287,6 +305,7 @@ pub(super) async fn stream_response(
             }
         };
 
+        let assistant_chars_before = state.content.assistant_text.len();
         let step = match process_chunk_result(
             app,
             current_history,
@@ -312,7 +331,12 @@ pub(super) async fn stream_response(
             StreamChunkStep::Continue {
                 meaningful_progress,
             } => {
-                if meaningful_progress {
+                if should_refresh_stream_progress(
+                    meaningful_progress,
+                    assistant_chars_before,
+                    state.content.assistant_text.len(),
+                    !state.content.tool_calls_map.is_empty(),
+                ) {
                     last_meaningful_progress_at = Instant::now();
                 }
             }
@@ -345,8 +369,9 @@ pub(super) async fn stream_response(
     // everything it had, so silence after it is the socket closing rather than a stream failure, and
     // must not be reported as one. A stalled tool-argument stream is a runtime-side cut regardless
     // (`tool_args_stalled`), and stays an error so half-generated arguments are never executed.
-    let provider_declared_end =
-        (state.content.response_completed || state.content.response_incomplete) && !tool_args_stalled;
+    let provider_declared_end = (state.content.response_completed
+        || state.content.response_incomplete)
+        && !tool_args_stalled;
     let idle_timeout_secs =
         idle_timeout_secs.filter(|_| !state.content.finish_reason_seen && !provider_declared_end);
     if idle_timeout_secs.is_some() {
@@ -386,7 +411,6 @@ pub(super) async fn stream_response(
 /// immediately; once the first visible chunk arrives it is erased by moving the cursor back up over
 /// the rows the hint occupies (see `erase_waiting_hint`), leaving no extra lines behind.
 
-
 /// Write the hint as exactly one live-region row and remember its plain text: the hint owns its own line
 /// and is erased by moving the cursor back up over it, and a terminal that narrowed re-wraps the row that
 /// is already on screen, so the erase recomputes the physical row count from the text actually written.
@@ -397,15 +421,9 @@ pub(super) async fn stream_response(
 /// `show_deferred_body_buffering_hint`, `refresh_deferred_body_rate_hint`,
 /// `refresh_tool_call_rate_hint`) keep the hint active.
 
-
 /// Label for the tool-call receiving hint. `rate_text` is the optional live
 /// argument-throughput suffix: it stays `None` until a measurable argument window
 /// exists, so the row keeps its original wording in the first moments of a call.
-
-
-
-
-
 
 /// Show a compact "generating…" hint while the assistant body is being withheld
 /// (defer_assistant_body) and thinking is closed. The final answer is streamed but
@@ -440,7 +458,6 @@ pub(super) async fn stream_response(
 /// `None` until the first token of that window and until `MIN_RATE_WINDOW` has elapsed,
 /// mirroring `format_token_rate`'s "—" gate so the very first chunk is not reported as a
 /// misleading burst rate.
-
 
 fn immediate_cancel_result(app: &App, state: &mut StreamProcessingState) -> Option<StreamResult> {
     stream_interrupt_requested(app).then(|| cancelled_stream_result(state))
@@ -844,7 +861,9 @@ fn finalize_stream_response(
     };
     // Serve children keep provisional prose private: a failed attempt must not
     // escape through stdout after its live FIFO deliberately withheld it.
-    if render_terminal && state.render.defer_assistant_body && outcome != StreamOutcome::Completed
+    if render_terminal
+        && state.render.defer_assistant_body
+        && outcome != StreamOutcome::Completed
         && !crate::ai::background::serve_live_streaming()
     {
         // Failure-path echo of the whole body: apply the same runtime-owned region
@@ -926,11 +945,8 @@ fn finalize_stream_response(
 /// Minimum elapsed window before an instantaneous rate is reported; shorter windows
 /// (e.g. the first chunk right after output starts) would print misleadingly large rates.
 
-
-
 /// Pure function: build a readable cache-hit line from prompt_tokens / cached_tokens.
 /// Returns Some only when there really was a hit (cached > 0), to avoid pointless noise.
-
 
 async fn wait_for_interrupt(app: &App) {
     let _ = wait_for_interrupt_or_timeout(app, None).await;
@@ -1060,7 +1076,9 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         }
     }
 
-    state.wire_log.note_stream_cut(state.framing.decode_error_count);
+    state
+        .wire_log
+        .note_stream_cut(state.framing.decode_error_count);
 
     Some(StreamResult {
         outcome,
@@ -1083,12 +1101,8 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
     })
 }
 
-
-
-
 /// The terminal does not print tool-call arguments; the streaming receive phase only shows an erasable
 /// tool-name status line, while the actual execution lines are printed uniformly by the tool execution layer.
-
 
 /// Incrementally resolves cumulative keys for chat-completions tool calls whose
 /// `index` is missing. If everything fell onto the default key 0, parallel tool
@@ -1098,7 +1112,6 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
 /// digits, so no collision). Parameter-continuation deltas with neither id nor
 /// index attach to the most recent call without an index; if there is none, fall
 /// back to the old-behavior key 0.
-
 
 /// Consume internal tool-call stream events. The return value indicates whether this batch detected a hallucinated
 /// internal tool-protocol marker (`HallucinatedProtocolMarker`) — the caller then stops the stream and retries downgraded.
@@ -1382,7 +1395,6 @@ fn is_standalone_stream_marker(content: &str, marker: &str) -> bool {
     content.trim_matches('\n') == marker
 }
 
-
 // Scratch buffer reused across thinking-fold body renders so each redraw does not
 // rebuild a zero-capacity String. Purely an allocation-reuse optimization: the
 // renderer clears the buffer before every rebuild, so the bytes handed to the
@@ -1612,7 +1624,7 @@ fn closing_quote_on_line(rest: &str) -> Option<usize> {
         } else if ch == '\n' {
             return None;
         }
-}
+    }
     None
 }
 
@@ -1631,73 +1643,84 @@ fn process_stream_payload(
     state.wire_log.observe(event_type, payload);
     let parsed = normalize::parse_stream_payload(adapter, payload, event_type);
     note_function_call_item_lifecycle(event_type, &parsed, &mut state.content);
-    let (mut chunk, merge_mode, is_replayed) =
-        match parsed {
-            super::state::ParsedStreamPayload::Ignore => {
-                return Ok(StreamPayloadOutcome::default());
-            }
-            super::state::ParsedStreamPayload::Done => { state.content.done_seen = true; return Ok(StreamPayloadOutcome::stop()) },
-            super::state::ParsedStreamPayload::Error(msg) => {
-                return Err(format!("provider stream error: {msg}").into());
-            }
-            super::state::ParsedStreamPayload::ReasoningItem { item, open } => {
-                // Track the provider's open items: while one is open the model is thinking, and this
-                // wire streams nothing for that thinking, so the silence must not be read as a stalled
-                // stream (see `stream_silence_timeout_secs`).
-                if open {
-                    state.content.mark_reasoning_started();
-                    state.content.open_output_items =
-                        state.content.open_output_items.saturating_add(1);
-                } else {
-                    state.content.interleaved_generation |= state.content.output_started_at.is_some();
-                    state.content.generation_finished_at = Some(Instant::now());
-                    state.content.open_output_items =
-                        state.content.open_output_items.saturating_sub(1);
+    let (mut chunk, merge_mode, is_replayed) = match parsed {
+        super::state::ParsedStreamPayload::Ignore => {
+            return Ok(StreamPayloadOutcome::default());
+        }
+        super::state::ParsedStreamPayload::Done => {
+            state.content.done_seen = true;
+            return Ok(StreamPayloadOutcome::stop());
+        }
+        super::state::ParsedStreamPayload::Error(msg) => {
+            return Err(format!("provider stream error: {msg}").into());
+        }
+        super::state::ParsedStreamPayload::ReasoningItem { item, open } => {
+            // Track the provider's open items: while one is open the model is thinking, and this
+            // wire streams nothing for that thinking, so the silence must not be read as a stalled
+            // stream (see `stream_silence_timeout_secs`).
+            if open {
+                state.content.mark_reasoning_started();
+                state.content.open_output_items = state.content.open_output_items.saturating_add(1);
+                if !state.content.thinking_open {
+                    state.content.thinking_open = true;
+                    render_thinking_event(markers, state, &StreamTextEvent::OpenThinking)?;
                 }
-                if let Some(item) = item {
-                    // Capture the full reasoning item (incl. encrypted_content) for same-turn tool-chain replay.
-                    // Produces no visible output and never enters persisted history. Models like Spark may emit multiple
-                    // reasoning segments (different ids) before one tool_call; all must be kept. The gateway re-sends the same
-                    // reasoning resource in .added (partial payload) and .done (full payload) with identical ids but
-                    // different content, so whole-field equality dedup would judge them unequal; converge by id and keep the
-                    // later one (.done always comes after .added and is the protocol's authoritative final state), otherwise the same
-                    // resource id appears twice during replay and modelhub returns 400 (-4003).
-                    state.content.reasoning_items.push(item);
-                    crate::ai::history::compress::dedup_reasoning_items_by_id(
-                        &mut state.content.reasoning_items,
-                    );
+            } else {
+                state.content.interleaved_generation |= state.content.output_started_at.is_some();
+                state.content.generation_finished_at = Some(Instant::now());
+                state.content.open_output_items = state.content.open_output_items.saturating_sub(1);
+                if state.content.open_output_items == 0 && state.content.thinking_open {
+                    state.content.thinking_open = false;
+                    render_thinking_event(markers, state, &StreamTextEvent::CloseThinking)?;
                 }
-                return Ok(StreamPayloadOutcome::progress());
             }
-            super::state::ParsedStreamPayload::Chunk(chunk) => {
-                (chunk, StreamEventMergeMode::Append, false)
+            if let Some(item) = item {
+                // Capture the full reasoning item (incl. encrypted_content) for same-turn tool-chain replay.
+                // Produces no visible output and never enters persisted history. Models like Spark may emit multiple
+                // reasoning segments (different ids) before one tool_call; all must be kept. The gateway re-sends the same
+                // reasoning resource in .added (partial payload) and .done (full payload) with identical ids but
+                // different content, so whole-field equality dedup would judge them unequal; converge by id and keep the
+                // later one (.done always comes after .added and is the protocol's authoritative final state), otherwise the same
+                // resource id appears twice during replay and modelhub returns 400 (-4003).
+                state.content.reasoning_items.push(item);
+                crate::ai::history::compress::dedup_reasoning_items_by_id(
+                    &mut state.content.reasoning_items,
+                );
             }
-            super::state::ParsedStreamPayload::ResponseTerminal {
-                status,
-                chunk,
-                server_text,
-            } => {
-                // The provider declared how this response ended (Responses wire). Record it before
-                // the chunk is processed: a completed response ends at its own marker (`response.completed`),
-                // and an incomplete one must stay retryable even when partial visible text exists.
-                match status {
-                    crate::ai::request::ResponseTerminalStatus::Completed => {
-                        state.content.response_completed = true;
-                        state.content.response_server_text = server_text;
-                    }
-                    crate::ai::request::ResponseTerminalStatus::Incomplete => {
-                        state.content.response_incomplete = true;
-                    }
+            // The lifecycle projects only the active thinking boundary; hidden reasoning remains
+            // unpersisted. It must not refresh the meaningful-progress timer, or repeated hidden
+            // items could keep an apparently dead turn alive indefinitely.
+            return Ok(StreamPayloadOutcome::continue_without_progress());
+        }
+        super::state::ParsedStreamPayload::Chunk(chunk) => {
+            (chunk, StreamEventMergeMode::Append, false)
+        }
+        super::state::ParsedStreamPayload::ResponseTerminal {
+            status,
+            chunk,
+            server_text,
+        } => {
+            // The provider declared how this response ended (Responses wire). Record it before
+            // the chunk is processed: a completed response ends at its own marker (`response.completed`),
+            // and an incomplete one must stay retryable even when partial visible text exists.
+            match status {
+                crate::ai::request::ResponseTerminalStatus::Completed => {
+                    state.content.response_completed = true;
+                    state.content.response_server_text = server_text;
                 }
-                (chunk, StreamEventMergeMode::Append, false)
+                crate::ai::request::ResponseTerminalStatus::Incomplete => {
+                    state.content.response_incomplete = true;
+                }
             }
-            super::state::ParsedStreamPayload::ReplayedChunk(chunk) => {
-                (chunk, StreamEventMergeMode::Append, true)
-            }
-            super::state::ParsedStreamPayload::SnapshotChunk(chunk) => {
-                (chunk, StreamEventMergeMode::AppendMissingSuffix, false)
-            }
-        };
+            (chunk, StreamEventMergeMode::Append, false)
+        }
+        super::state::ParsedStreamPayload::ReplayedChunk(chunk) => {
+            (chunk, StreamEventMergeMode::Append, true)
+        }
+        super::state::ParsedStreamPayload::SnapshotChunk(chunk) => {
+            (chunk, StreamEventMergeMode::AppendMissingSuffix, false)
+        }
+    };
 
     // AIOS: capture usage block from whichever chunk carries it. OpenAI emits
     // the final `usage` on a chunk with `choices: []`, so we must pull it *before*

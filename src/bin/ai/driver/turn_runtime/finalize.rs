@@ -66,9 +66,8 @@ fn session_title_seed_for_process(
 
 static SESSION_TITLE_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
     LazyLock::new(|| Mutex::new(FastSet::default()));
-/// In-flight dedup mirroring the title task: prevents the same session from running persisted
-/// compression multiple times concurrently (the background compression dispatched at foreground
-/// finalize may overlap with the next round's defensive compression in prepare).
+/// In-flight dedup mirroring the title task: overlapping turns must not run persisted
+/// post-turn compression for the same session concurrently.
 static SESSION_COMPACTION_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
     LazyLock::new(|| Mutex::new(FastSet::default()));
 
@@ -390,6 +389,10 @@ fn should_compact_session_history_in_background(
     !is_subagent && !one_shot_mode && !should_quit
 }
 
+fn should_run_post_turn_maintenance(is_serve_child: bool) -> bool {
+    !is_serve_child
+}
+
 fn mark_session_title_generation_started(session_id: &str) -> bool {
     let mut in_flight = SESSION_TITLE_IN_FLIGHT
         .lock()
@@ -443,8 +446,8 @@ pub(in crate::ai::driver::turn_runtime) fn try_start_session_compaction(
 fn spawn_background_compaction(app: &App, at_boundary: bool) {
     let Some(compaction_guard) = try_start_session_compaction(&app.session_id) else {
         // A compression is already running (e.g. the previous round's background task has not finished);
-        // skipping this round is fine — once it completes, the next prepare re-evaluates against the
-        // latest canonical history.
+        // skipping this round is fine because a later post-turn dispatch re-evaluates the latest
+        // canonical history, while request projection independently merges the canonical tail.
         return;
     };
     let task_app = app.snapshot_for_detached_helper();
@@ -472,8 +475,8 @@ fn spawn_background_compaction(app: &App, at_boundary: bool) {
             // Runs inside the terminal-output-suppressed scope above: a background
             // failure must not write to the TTY while the textarea owns it (the raw
             // newline would shift the parked cursor and overwrite the help line).
-            // Compaction is a best-effort write-back cache; the next turn's prepare
-            // retries it in the foreground and reports there if still failing.
+            // Compaction is a best-effort write-back cache; a future post-turn
+            // dispatch retries it without delaying a model request.
             if let Err(err) = compact_result
                 && crate::ai::driver::runtime_ctx::terminal_output_enabled()
             {
@@ -775,22 +778,26 @@ pub(super) async fn finalize_turn(
             }
         }
         let _ = poisoned;
-        // Persisted compression is a write-back cache (the next round recomputes
-        // from canonical). A serve child may still consume a side-note queued
-        // during this final model request, so the SSE remains open until the
-        // child either starts that follow-up or exits.
-        // `at_boundary` = no tool calls this round (answer delivered), using
-        // the more aggressive threshold.
-        dispatch_finalize_compaction(
-            app,
-            !had_tool_calls,
-            should_compact_session_history_in_background(
-                one_shot_mode,
-                should_quit,
-                crate::ai::driver::runtime_ctx::has_subagent_result_slot(),
-            ),
-        )
-        .await;
+        // Serve owns the per-session turn lock until this child exits. Once the
+        // committed body and OutputComplete have been published, write-back
+        // maintenance must not keep that lock held and block the next request.
+        // The serve parent owns title recovery; persisted compression remains a
+        // best-effort cache and is never part of remote turn completion.
+        let serve_child = crate::ai::background::is_serve_child();
+        if should_run_post_turn_maintenance(serve_child) {
+            // `at_boundary` = no tool calls this round (answer delivered), using
+            // the more aggressive threshold.
+            dispatch_finalize_compaction(
+                app,
+                !had_tool_calls,
+                should_compact_session_history_in_background(
+                    one_shot_mode,
+                    should_quit,
+                    crate::ai::driver::runtime_ctx::has_subagent_result_slot(),
+                ),
+            )
+            .await;
+        }
         // Try to generate an LLM summary title for the current conversation (when none exists and there is enough context).
         // Interactive foreground turns must not wait here on a background quality task.
         // Runs after the user-visible output (and the serve early-done marker
@@ -798,11 +805,13 @@ pub(super) async fn finalize_turn(
         // it, so this order is unobservable to single-machine runs but keeps
         // the SSE turn from idling behind the title LLM call. Stays in this
         // arm so no-response turns keep skipping title generation, as before.
-        maybe_generate_session_title(
-            app,
-            should_generate_session_title_in_background(one_shot_mode, should_quit),
-        )
-        .await;
+        if should_run_post_turn_maintenance(serve_child) {
+            maybe_generate_session_title(
+                app,
+                should_generate_session_title_in_background(one_shot_mode, should_quit),
+            )
+            .await;
+        }
     } else {
         if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
             println!("{}", format_empty_state("no response"));
@@ -2002,6 +2011,12 @@ mod tests {
         assert!(!should_compact_session_history_in_background(
             false, true, false
         ));
+    }
+
+    #[test]
+    fn serve_child_releases_turn_without_post_turn_maintenance() {
+        assert!(!should_run_post_turn_maintenance(true));
+        assert!(should_run_post_turn_maintenance(false));
     }
 
     #[test]

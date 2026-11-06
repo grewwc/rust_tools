@@ -7,7 +7,7 @@ use crate::ai::{
     driver::skill_runtime,
     history::{
         Message, ROLE_INTERNAL_NOTE, build_context_history_with_outcome,
-        compact_session_history_without_summary_model, runtime_synthetic_user_message,
+        runtime_synthetic_user_message,
     },
     request,
     types::App,
@@ -396,31 +396,9 @@ pub(super) async fn prepare_turn(
     };
     let overflow_dir = Some(attachment_assets_dir.clone());
     crate::ai::driver::runtime_ctx::publish_subagent_phase("preparing context");
-    // Refresh an idle projection defensively after interrupted/error turns, but
-    // never wait for a previous post-turn compactor and never issue an auxiliary
-    // model request on the request-critical preparation path. If post-turn work
-    // is still active, the generation-bound snapshot plus canonical tail remain
-    // a safe input for `build_context_history_with_outcome` below.
-    if let Some(_compaction_guard) = super::finalize::try_start_session_compaction(&app.session_id)
-    {
-        let compact_result = compact_session_history_without_summary_model(
-            app,
-            crate::ai::driver::runtime_ctx::effective_cwd()
-                .ok()
-                .as_deref(),
-        )
-        .await;
-        if let Err(err) = compact_result
-            && crate::ai::driver::runtime_ctx::terminal_output_enabled()
-        {
-            eprintln!(
-                "[Warning] Failed to compact persisted history before preparing context: {err}"
-            );
-        }
-    }
-    // build_context_history does SQLite/file I/O and is a synchronous blocking
-    // call. On a multi-threaded runtime, move it to spawn_blocking so tokio
-    // worker threads are not blocked.
+    // Request preparation builds one bounded in-memory projection. Persisted
+    // compaction is post-turn best effort and must never add a second full-history
+    // pass before the main model request.
     let history_file = app.session_history_file.clone();
     let history_max_chars = app.config.history_max_chars;
     let history_keep_last = app.config.history_keep_last;

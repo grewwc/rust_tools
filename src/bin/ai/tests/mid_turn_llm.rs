@@ -160,11 +160,8 @@ fn assert_summary_source(messages: &[Message], expected: &[Message], app: &types
 }
 
 #[tokio::test]
-async fn pre_turn_persisted_compaction_does_not_call_summary_model() {
-    use crate::ai::history::{
-        append_history_messages, build_context_history_with_outcome,
-        compact_session_history_without_summary_model,
-    };
+async fn request_projection_does_not_call_summary_model() {
+    use crate::ai::history::{append_history_messages, build_context_history_with_outcome};
 
     let mut fixture = SummaryFixture::new("200 OK", "must not be requested").await;
     {
@@ -209,10 +206,6 @@ async fn pre_turn_persisted_compaction_does_not_call_summary_model() {
         )
         .unwrap();
         assert!(!projection.budget_met());
-
-        compact_session_history_without_summary_model(app, None)
-            .await
-            .unwrap();
     }
     fixture.assert_no_request().await;
 }

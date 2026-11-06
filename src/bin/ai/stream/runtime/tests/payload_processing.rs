@@ -1,6 +1,15 @@
 use super::*;
 
 #[test]
+fn hidden_progress_cannot_keep_a_finished_visible_body_open() {
+    assert!(should_refresh_stream_progress(true, 0, 0, false));
+    assert!(should_refresh_stream_progress(true, 0, 5, false));
+    assert!(!should_refresh_stream_progress(true, 5, 5, false));
+    assert!(should_refresh_stream_progress(true, 5, 5, true));
+    assert!(!should_refresh_stream_progress(false, 5, 6, false));
+}
+
+#[test]
 fn response_completed_event_does_not_block_late_snapshot_text() {
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
@@ -36,11 +45,11 @@ fn response_completed_event_does_not_block_late_snapshot_text() {
 }
 
 #[test]
-fn hidden_thinking_item_keeps_the_long_allowance_and_counts_as_liveness() {
+fn hidden_thinking_item_projects_active_state_without_extending_liveness() {
     // The Responses wire streams no content for hidden thinking: the provider opens a reasoning
     // item and then goes quiet for a long stretch (measured 111s on muse-spark xhigh). That silence
-    // is work in progress, not a stalled stream, so a provider-held open item already selects the
-    // long allowance, and both the opening and closing events count as liveness (restarting the timer).
+    // is expected work in progress, so a provider-held open item selects the long allowance. The
+    // lifecycle events themselves carry no visible content and therefore must not restart the timer.
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
     let mut app = test_app();
@@ -62,8 +71,9 @@ fn hidden_thinking_item_keeps_the_long_allowance_and_counts_as_liveness() {
     )
     .unwrap();
     assert!(!opened.should_stop);
-    assert!(opened.meaningful_progress);
+    assert!(!opened.meaningful_progress);
     assert_eq!(state.content.open_output_items, 1);
+    assert!(state.content.thinking_open);
     assert_eq!(
         stream_silence_timeout_secs(&state),
         STREAM_DECLARED_ITEM_TIMEOUT_SECS
@@ -83,8 +93,9 @@ fn hidden_thinking_item_keeps_the_long_allowance_and_counts_as_liveness() {
         r#"{"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","status":"completed","encrypted_content":"enc-xyz"}}"#,
     )
     .unwrap();
-    assert!(closed.meaningful_progress);
+    assert!(!closed.meaningful_progress);
     assert_eq!(state.content.open_output_items, 0);
+    assert!(!state.content.thinking_open);
     assert_eq!(state.content.reasoning_items.len(), 1);
     assert_eq!(
         stream_silence_timeout_secs(&state),
@@ -113,10 +124,16 @@ fn silence_window_selection_uses_the_connection_bound_once_output_arrived() {
         STREAM_FIRST_CHUNK_TIMEOUT_SECS
     );
     state.content.assistant_text.push_str("working");
-    assert_eq!(stream_silence_timeout_secs(&state), STREAM_IDLE_TIMEOUT_SECS);
+    assert_eq!(
+        stream_silence_timeout_secs(&state),
+        STREAM_IDLE_TIMEOUT_SECS
+    );
     state.content.assistant_text.clear();
     state.content.finish_reason_seen = true;
-    assert_eq!(stream_silence_timeout_secs(&state), STREAM_IDLE_TIMEOUT_SECS);
+    assert_eq!(
+        stream_silence_timeout_secs(&state),
+        STREAM_IDLE_TIMEOUT_SECS
+    );
 
     // A model that declares a longer allowance (`stream_silence_timeout_secs`) widens only the
     // no-declaration case; a provider-held open item keeps the declared-item allowance.
@@ -180,7 +197,10 @@ fn open_function_call_item_selects_the_declared_item_allowance() {
     )
     .unwrap();
     assert_eq!(state.content.open_output_items, 0);
-    assert_eq!(stream_silence_timeout_secs(&state), STREAM_IDLE_TIMEOUT_SECS);
+    assert_eq!(
+        stream_silence_timeout_secs(&state),
+        STREAM_IDLE_TIMEOUT_SECS
+    );
 }
 
 #[test]
@@ -977,7 +997,9 @@ fn provider_control_leak_chunked_delivery_matches_single_shot() {
     let cases = [
         leaked.to_string(),
         quoted_envelope.to_string(),
-        format!("First I quoted the constant: {quoted_mention}\nThen the provider emitted: {leaked}"),
+        format!(
+            "First I quoted the constant: {quoted_mention}\nThen the provider emitted: {leaked}"
+        ),
         format!("{leaked}\nLater I quoted the constant: {quoted_mention}"),
         format!("{leaked}\nA trailing bare token: <|end|>assistant to="),
     ];
@@ -996,7 +1018,10 @@ fn provider_control_leak_chunked_delivery_matches_single_shot() {
         // at the first report because the stream stops there.
         let mut scanner = ProviderControlLeakScanner::new();
         let mut verdict = false;
-        for end in (20..=text.len()).step_by(20).chain(std::iter::once(text.len())) {
+        for end in (20..=text.len())
+            .step_by(20)
+            .chain(std::iter::once(text.len()))
+        {
             verdict |= scanner.observe(&text[..end]);
         }
         assert_eq!(
