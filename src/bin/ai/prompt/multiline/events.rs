@@ -33,6 +33,68 @@ pub(in crate::ai::prompt::multiline) struct RecentTextInput {
     source: RecentTextInputSource,
 }
 
+pub(in crate::ai::prompt::multiline) fn is_batchable_text_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                && matches!(key.code, KeyCode::Char(ch) if !ch.is_control())
+    )
+}
+
+pub(in crate::ai::prompt::multiline) fn handle_multiline_input_batch(
+    events: Vec<Event>,
+    textarea: &mut TextArea<'_>,
+    history: &mut MultilineHistoryState,
+    status_msg: &mut Option<String>,
+    pending_tab_completion: &mut Option<PendingTabCompletion>,
+    completion_panel: &mut Option<CompletionPanel>,
+    recent_text_input: &mut Option<RecentTextInput>,
+    session_image_dir: &Path,
+) -> io::Result<EventLoopAction> {
+    // Keep single keys and control events on the existing path. A collected text
+    // run edits the draft once, without treating keyboard input as clipboard paste.
+    if events.len() > 1 && events.iter().all(is_batchable_text_event) {
+        let mut text = String::new();
+        for event in events {
+            let Event::Key(key) = event else {
+                unreachable!()
+            };
+            *status_msg = None;
+            if should_skip_non_ascii_repeat_or_duplicate_press(recent_text_input, key) {
+                continue;
+            }
+            dismiss_completion_panel(pending_tab_completion, completion_panel);
+            remember_trackable_key_press(recent_text_input, key);
+            if let KeyCode::Char(ch) = key.code {
+                text.push(ch);
+            }
+        }
+        if !text.is_empty() {
+            textarea.insert_str(text);
+        }
+        return Ok(EventLoopAction::Continue);
+    }
+
+    for event in events {
+        match handle_multiline_event(
+            event,
+            textarea,
+            history,
+            status_msg,
+            pending_tab_completion,
+            completion_panel,
+            recent_text_input,
+            session_image_dir,
+        )? {
+            EventLoopAction::Continue => {}
+            action => return Ok(action),
+        }
+    }
+    Ok(EventLoopAction::Continue)
+}
+
 pub(in crate::ai::prompt::multiline) fn handle_multiline_event(
     event: Event,
     textarea: &mut TextArea<'_>,
@@ -461,21 +523,7 @@ fn insert_text(textarea: &mut TextArea<'_>, text: &str) {
     }
 
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    if !normalized.contains('\n') {
-        textarea.insert_str(&normalized);
-        return;
-    }
-
-    let lines: Vec<&str> = normalized.split('\n').collect();
-    for (idx, line) in lines.iter().enumerate() {
-        if !line.is_empty() {
-            textarea.insert_str(line);
-        }
-        if idx + 1 < lines.len() {
-            let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-            textarea.input(Input::from(enter));
-        }
-    }
+    textarea.insert_str(normalized);
 }
 
 /// Generate a compact but clear placeholder for pasted images.
@@ -545,6 +593,187 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(action, EventLoopAction::Continue));
+    }
+
+    #[test]
+    fn paste_latency_text_batch_is_one_edit_and_preserves_ime_state() {
+        let mut batched = TextArea::default();
+        insert_text(&mut batched, "中");
+        let mut sequential = batched.clone();
+        let initial_recent = Some(RecentTextInput {
+            text: "中".into(),
+            source: RecentTextInputSource::Paste,
+        });
+        let mut batch_recent = initial_recent.clone();
+        let mut sequential_recent = initial_recent;
+        let events = vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('中'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('哈'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('哈'),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            )),
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            )),
+            Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            Event::Key(KeyEvent::new(KeyCode::Char('文'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('文'), KeyModifiers::NONE)),
+        ];
+        for event in events.iter().cloned() {
+            apply_event(&mut sequential, &mut sequential_recent, event);
+        }
+        let mut status = Some("previous status".into());
+        let mut panel = Some(CompletionPanel {
+            items: Vec::new(),
+            selected_index: 0,
+        });
+        let action = handle_multiline_input_batch(
+            events,
+            &mut batched,
+            &mut MultilineHistoryState::default(),
+            &mut status,
+            &mut None,
+            &mut panel,
+            &mut batch_recent,
+            Path::new("/unused-image-directory"),
+        )
+        .unwrap();
+        assert!(matches!(action, EventLoopAction::Continue));
+        assert_eq!(batched.lines(), &["中哈aaA文文"]);
+        assert_eq!(batched.lines(), sequential.lines());
+        assert_eq!(batched.cursor(), sequential.cursor());
+        assert_eq!(batch_recent, sequential_recent);
+        assert!(status.is_none());
+        assert!(panel.is_none());
+        assert!(batched.undo());
+        assert_eq!(batched.lines(), &["中"], "one undo removes the text run");
+    }
+
+    #[test]
+    fn paste_latency_multiline_paste_preserves_newlines_tabs_and_suffix() {
+        let mut textarea = TextArea::default();
+        insert_text(&mut textarea, "left右");
+        textarea.move_cursor(CursorMove::Jump(0, 4));
+        insert_text(&mut textarea, "中\r\n\r\n\t行\r末\n");
+        assert_eq!(textarea.lines(), &["left中", "", "\t行", "末", "右"]);
+        assert_eq!(textarea.cursor(), (4, 0));
+        assert!(textarea.undo());
+        assert_eq!(textarea.lines(), &["left右"]);
+        assert_eq!(textarea.cursor(), (0, 4));
+    }
+
+    #[test]
+    fn paste_latency_selection_replacement_matches_characters_and_keeps_chunk_undo() {
+        // Block image-directory creation before clipboard access, as in the PTY
+        // fixture. Text paste must still run through the actual event handler.
+        let disabled_images =
+            std::env::temp_dir().join(format!("prompt-selection-{}.disabled", Uuid::new_v4()));
+        fs::write(&disabled_images, b"").unwrap();
+        for (pasted, expected, cursor) in [
+            ("ab中", vec!["leftab中RIGHT"], (0, 7)),
+            (
+                "中\r\n\r\n\t尾\r",
+                vec!["left中", "", "\t尾", "RIGHT"],
+                (3, 0),
+            ),
+            ("\r\n中\r\r\n", vec!["left", "中", "", "RIGHT"], (3, 0)),
+        ] {
+            let original = vec!["leftOLD", "removed", "tailRIGHT"];
+            let mut batched = TextArea::from(original.clone());
+            batched.move_cursor(CursorMove::Jump(0, 4));
+            batched.start_selection();
+            batched.move_cursor(CursorMove::Jump(2, 4));
+            assert_eq!(batched.selection_range(), Some(((0, 4), (2, 4))));
+            let mut sequential = batched.clone();
+            let normalized = pasted.replace("\r\n", "\n").replace('\r', "\n");
+            let mut recent = None;
+            for ch in normalized.chars() {
+                apply_event(
+                    &mut sequential,
+                    &mut recent,
+                    Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
+                );
+            }
+            let events = if pasted == normalized && !pasted.chars().any(char::is_control) {
+                pasted
+                    .chars()
+                    .map(|ch| Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)))
+                    .collect()
+            } else {
+                vec![Event::Paste(pasted.into())]
+            };
+            let action = handle_multiline_input_batch(
+                events,
+                &mut batched,
+                &mut MultilineHistoryState::default(),
+                &mut None,
+                &mut None,
+                &mut None,
+                &mut None,
+                &disabled_images,
+            )
+            .unwrap();
+            assert!(matches!(action, EventLoopAction::Continue));
+            assert_eq!(batched.lines(), expected, "paste={pasted:?}");
+            assert_eq!(batched.cursor(), cursor);
+            assert_eq!(batched.lines(), sequential.lines());
+            assert_eq!(batched.cursor(), sequential.cursor());
+            assert!(batched.selection_range().is_none());
+            assert!(sequential.selection_range().is_none());
+
+            // Selection deletion remains a separate edit in tui-textarea. The
+            // inserted run/chunk must undo as a whole, then restore the deletion.
+            assert!(batched.undo());
+            assert_eq!(batched.lines(), &["leftRIGHT"]);
+            for _ in normalized.chars() {
+                assert!(sequential.undo());
+            }
+            assert_eq!(batched.lines(), sequential.lines());
+            assert_eq!(batched.cursor(), sequential.cursor());
+            assert!(batched.undo());
+            assert!(sequential.undo());
+            assert_eq!(batched.lines(), original);
+            assert_eq!(batched.lines(), sequential.lines());
+            assert!(
+                !batched.undo(),
+                "replacement must have exactly two undo edits"
+            );
+            assert!(batched.redo());
+            assert_eq!(batched.lines(), &["leftRIGHT"]);
+            assert!(batched.redo());
+            assert_eq!(batched.lines(), expected);
+            assert_eq!(batched.cursor(), cursor);
+            assert!(!batched.redo());
+        }
+        fs::remove_file(disabled_images).unwrap();
+    }
+
+    #[test]
+    fn paste_latency_control_event_keeps_its_order_and_stops_the_batch() {
+        let mut textarea = TextArea::default();
+        let error = handle_multiline_input_batch(
+            vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+            ],
+            &mut textarea,
+            &mut MultilineHistoryState::default(),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+            Path::new("/unused-image-directory"),
+        )
+        .err()
+        .expect("Ctrl+C must still interrupt");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(textarea.lines(), &["a"]);
     }
 
     #[test]
