@@ -122,6 +122,8 @@ pub(super) struct OverflowSink {
     /// degrades to one duplicate append rather than dropping evidence.
     seen_payloads: rustc_hash::FxHashSet<String>,
     seen_payloads_loaded: bool,
+    #[cfg(test)]
+    fingerprint_index_loads: usize,
 }
 
 impl OverflowSink {
@@ -133,6 +135,8 @@ impl OverflowSink {
             payload_offset: 0,
             seen_payloads: rustc_hash::FxHashSet::default(),
             seen_payloads_loaded: false,
+            #[cfg(test)]
+            fingerprint_index_loads: 0,
         }
     }
 
@@ -233,6 +237,10 @@ impl OverflowSink {
     }
 
     pub(super) fn flush(&mut self) -> bool {
+        self.flush_with_index_cache(false)
+    }
+
+    fn flush_with_index_cache(&mut self, reuse_index: bool) -> bool {
         if self.buffer.is_empty() {
             return false;
         }
@@ -256,15 +264,35 @@ impl OverflowSink {
         }
         if !self.seen_payloads_loaded {
             self.seen_payloads_loaded = true;
+            if reuse_index {
+                self.seen_payloads.clear();
+            }
+            #[cfg(test)]
+            {
+                self.fingerprint_index_loads += 1;
+            }
             let fingerprints = std::fs::read_to_string(self.fingerprint_index_path())
                 .map(|text| {
+                    // Appending to an unterminated line changes the previous
+                    // final entry. A fresh single-field sink would reload it.
+                    if reuse_index && !text.is_empty() && !text.ends_with('\n') {
+                        self.seen_payloads_loaded = false;
+                    }
                     text.lines()
                         .map(str::trim)
                         .filter(|line| !line.is_empty())
                         .map(str::to_string)
                         .collect::<Vec<_>>()
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|error| {
+                    // A missing index starts empty and becomes cacheable after
+                    // its first successful append. Other read failures must
+                    // retain the single-field path's plain-append fallback.
+                    if reuse_index && error.kind() != std::io::ErrorKind::NotFound {
+                        self.seen_payloads_loaded = false;
+                    }
+                    Vec::new()
+                });
             self.seen_payloads.extend(fingerprints);
         }
         let digest = content_sha256_hex(payload.as_bytes());
@@ -284,7 +312,12 @@ impl OverflowSink {
             // payloads readers can no longer find, so reset the in-memory set
             // and drop the sidecar; both repopulate from fresh appends below.
             self.seen_payloads.clear();
-            let _ = std::fs::remove_file(self.fingerprint_index_path());
+            let removed = std::fs::remove_file(self.fingerprint_index_path());
+            if reuse_index
+                && removed.is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound)
+            {
+                self.seen_payloads_loaded = false;
+            }
         }
         use std::io::Write;
         // Append mode: a later compress pass must never wipe what earlier
@@ -309,7 +342,7 @@ impl OverflowSink {
         // copy. Best effort: losing an index entry just costs one duplicate
         // append later.
         self.seen_payloads.insert(digest.clone());
-        let _ = std::fs::OpenOptions::new()
+        let indexed = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.fingerprint_index_path())
@@ -317,11 +350,54 @@ impl OverflowSink {
                 writeln!(f, "{digest}")?;
                 f.sync_data()
             });
+        if reuse_index && indexed.is_err() {
+            // The next legacy single-field sink would see only what actually
+            // reached the sidecar, even when this append partially succeeded.
+            self.seen_payloads_loaded = false;
+        }
         true
     }
 
     pub(super) fn file_path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// Share only successful fingerprint state across one field-truncation pass.
+/// Body and index appends keep their existing per-field durability boundaries.
+pub(super) struct TruncatedFieldArchiveBatch {
+    sink: Option<OverflowSink>,
+}
+
+impl TruncatedFieldArchiveBatch {
+    pub(super) fn new(overflow_dir: Option<&Path>) -> Self {
+        Self {
+            sink: overflow_dir.map(OverflowSink::new),
+        }
+    }
+
+    pub(super) fn archive_field(
+        &mut self,
+        message: &Message,
+        field: MutableMessageField,
+    ) -> Option<String> {
+        let sink = self.sink.as_mut()?;
+        // Each field is still its own payload, with exactly the same header or
+        // separator that a new sink would build at this point in the pass.
+        sink.buffer.clear();
+        sink.payload_offset = 0;
+        if !sink.push_truncated_field(message, field) {
+            return None;
+        }
+        sink.flush_with_index_cache(true)
+            .then(|| sink.file_path().to_string_lossy().into_owned())
+    }
+
+    #[cfg(test)]
+    pub(super) fn fingerprint_index_loads(&self) -> usize {
+        self.sink
+            .as_ref()
+            .map_or(0, |sink| sink.fingerprint_index_loads)
     }
 }
 

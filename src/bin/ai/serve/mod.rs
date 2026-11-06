@@ -609,6 +609,7 @@ fn stream_child_turn(
         }
     }
     let status = child.wait();
+    let child_exit_ms = t0.elapsed().as_millis();
     child_done.store(true, Ordering::SeqCst);
     if let Some(handle) = fifo_handle {
         let _ = handle.join();
@@ -639,9 +640,14 @@ fn stream_child_turn(
     }
     // `live_fifo` drops here, removing the per-turn inode whatever happened.
     eprintln!(
-        "[serve] turn session={} first_byte_ms={} done_ms={} total_ms={} early_done={}",
+        "[serve] turn session={} first_byte_ms={} body_ms={} child_exit_ms={} done_ms={} total_ms={} early_done={}",
         session_id,
         timing.first_ms.load(std::sync::atomic::Ordering::SeqCst),
+        timing
+            .body_ms
+            .get()
+            .map_or_else(|| "-1".to_string(), u128::to_string),
+        child_exit_ms,
         timing.done_ms.load(std::sync::atomic::Ordering::SeqCst),
         t0.elapsed().as_millis(),
         already_done,
@@ -762,6 +768,8 @@ struct ServeFrameDecoder {
     /// In-flight chunked committed body, present between `ReplaceStart` and
     /// `ReplaceEnd`.
     pending_replace: Option<String>,
+    /// First complete body frame received, before chunked body reassembly.
+    first_body_at: Option<std::time::Instant>,
 }
 
 #[cfg(feature = "serve")]
@@ -814,6 +822,12 @@ impl ServeFrameDecoder {
             }
             if self.buf.len() < 5 + len {
                 break;
+            }
+            if kind == background::ServeLiveKind::Replace as u8
+                || kind == background::ServeLiveKind::ReplaceStart as u8
+            {
+                self.first_body_at
+                    .get_or_insert_with(std::time::Instant::now);
             }
             let payload = String::from_utf8_lossy(&self.buf[5..5 + len]).into_owned();
             self.buf.drain(..5 + len);
@@ -1128,7 +1142,11 @@ fn pump_live_fifo(
             std::thread::sleep(std::time::Duration::from_millis(100));
             continue;
         }
-        for event in decoder.push(&buf[..n as usize]) {
+        let events = decoder.push(&buf[..n as usize]);
+        if let Some(body_at) = decoder.first_body_at {
+            timing.stamp_body(t0, body_at);
+        }
+        for event in events {
             forward_live_event(event, turn_done, tx, &timing, t0, confirm.as_deref());
         }
     }

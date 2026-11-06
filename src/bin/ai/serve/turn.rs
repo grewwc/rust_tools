@@ -516,13 +516,14 @@ pub(crate) async fn post_confirm(
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
-/// Send-side millisecond clock for the per-turn diagnostic line at the end
+/// Millisecond clock for the per-turn diagnostic line at the end
 /// of [`stream_child_turn`]. Shared by the stdout loop and the FIFO pump
 /// thread; every stamp is first-writer-wins so concurrent forwards cannot
 /// skew the spans.
 #[derive(Clone, Default)]
 pub(crate) struct TurnSendTiming {
     pub(crate) first_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) body_ms: std::sync::Arc<std::sync::OnceLock<u128>>,
     pub(crate) done_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -539,6 +540,11 @@ impl TurnSendTiming {
 
     pub(crate) fn stamp_first(&self, t0: std::time::Instant) {
         Self::stamp_ms(&self.first_ms, t0);
+    }
+
+    pub(crate) fn stamp_body(&self, t0: std::time::Instant, body_at: std::time::Instant) {
+        self.body_ms
+            .get_or_init(|| body_at.saturating_duration_since(t0).as_millis());
     }
 
     pub(crate) fn stamp_done(&self, t0: std::time::Instant) {

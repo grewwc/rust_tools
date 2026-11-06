@@ -179,6 +179,25 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
     allow_protected_fallback: bool,
 ) -> bool {
+    let mut archive_batch = TruncatedFieldArchiveBatch::new(overflow_dir);
+    truncate_mutable_messages_to_fit_with_archive(
+        messages,
+        max_chars,
+        overflow_dir,
+        protected_tool_call_ids,
+        allow_protected_fallback,
+        Some(&mut archive_batch),
+    )
+}
+
+fn truncate_mutable_messages_to_fit_with_archive(
+    messages: &mut Vec<Message>,
+    max_chars: usize,
+    overflow_dir: Option<&Path>,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
+    allow_protected_fallback: bool,
+    mut archive_batch: Option<&mut TruncatedFieldArchiveBatch>,
+) -> bool {
     if max_chars == 0 || messages_total_chars(messages) <= max_chars {
         return true;
     }
@@ -281,6 +300,7 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
                 overflow_dir,
                 FieldArchivePolicy::BestEffort,
                 allow_protected_fallback,
+                archive_batch.as_deref_mut(),
             );
             if outcome != FieldTruncateOutcome::Truncated {
                 // A fixed marker / archive path may already be the smallest
@@ -388,6 +408,7 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
 ) -> bool {
     minimize_overflow_stubs_for_hard_budget(messages);
     minimize_truncated_previews_for_hard_budget(messages);
+    let mut archive_batch = TruncatedFieldArchiveBatch::new(overflow_dir);
     let mut truncated_any = false;
     for message in messages.iter_mut() {
         if is_system_like_role(&message.role) || message.role == "user" {
@@ -413,6 +434,7 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
                 overflow_dir,
                 FieldArchivePolicy::BestEffort,
                 true,
+                Some(&mut archive_batch),
             )
             .truncated();
         }
@@ -423,13 +445,16 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
             .map(|reasoning| reasoning.chars().count())
             && reasoning_chars > per_field_cap
         {
-            truncated_any |= truncate_mutable_field(
+            truncated_any |= truncate_mutable_field_with_policy(
                 message,
                 MutableMessageField::Reasoning,
                 reasoning_chars - per_field_cap,
                 overflow_dir,
                 FieldArchivePolicy::BestEffort,
-            );
+                false,
+                Some(&mut archive_batch),
+            )
+            .truncated();
         }
         let tool_call_count = message.tool_calls.as_ref().map(Vec::len).unwrap_or(0);
         for call_index in 0..tool_call_count {
@@ -448,24 +473,29 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
             let arguments_protected =
                 call.is_some_and(|call| protected_tool_call_ids.contains(&call.id));
             if !arguments_protected && argument_chars > per_field_cap {
-                truncated_any |= truncate_mutable_field(
+                truncated_any |= truncate_mutable_field_with_policy(
                     message,
                     MutableMessageField::ToolArguments(call_index),
                     argument_chars - per_field_cap,
                     overflow_dir,
                     FieldArchivePolicy::BestEffort,
-                );
+                    false,
+                    Some(&mut archive_batch),
+                )
+                .truncated();
             }
         }
     }
     if truncated_any {
         insert_overflow_archive_note_if_exists(messages, overflow_dir);
     }
-    let inner = truncate_mutable_messages_to_fit(
+    let inner = truncate_mutable_messages_to_fit_with_archive(
         messages,
         max_chars,
         overflow_dir,
         protected_tool_call_ids,
+        true,
+        Some(&mut archive_batch),
     );
     truncated_any || inner
 }
@@ -664,6 +694,7 @@ pub(in crate::ai) fn truncate_mutable_field(
         overflow_dir,
         archive_policy,
         false,
+        None,
     )
     .truncated()
 }
@@ -722,7 +753,12 @@ fn truncate_mutable_field_with_policy(
     overflow_dir: Option<&Path>,
     archive_policy: FieldArchivePolicy,
     allow_small_tool_results: bool,
+    mut archive_batch: Option<&mut TruncatedFieldArchiveBatch>,
 ) -> FieldTruncateOutcome {
+    let mut archive_field = |message: &Message, field| match archive_batch.as_deref_mut() {
+        Some(batch) => batch.archive_field(message, field),
+        None => archive_truncated_field_to_overflow(message, field, overflow_dir),
+    };
     // The archive path can be derived directly from overflow_dir (same source
     // as OverflowSink::new), so size the stub against that path first and do
     // the real archive write last: if the stub would not be strictly shorter
@@ -767,7 +803,7 @@ fn truncate_mutable_field_with_policy(
                 if build_stub(archive_path_hint.as_deref()).chars().count() >= original_chars {
                     return FieldTruncateOutcome::NoProgress;
                 }
-                let archived = archive_truncated_field_to_overflow(message, field, overflow_dir);
+                let archived = archive_field(message, field);
                 if archived.is_none() && archive_policy == FieldArchivePolicy::Required {
                     return FieldTruncateOutcome::archive_dependent(overflow_dir);
                 }
@@ -797,9 +833,7 @@ fn truncate_mutable_field_with_policy(
                     if pointer_for_path(path_hint).is_none() {
                         return FieldTruncateOutcome::target_dependent(reduce_by);
                     }
-                    let Some(archive_file_path) =
-                        archive_truncated_field_to_overflow(message, field, overflow_dir)
-                    else {
+                    let Some(archive_file_path) = archive_field(message, field) else {
                         return FieldTruncateOutcome::archive_dependent(overflow_dir);
                     };
                     let Some(pointer) = pointer_for_path(&archive_file_path) else {
@@ -866,8 +900,7 @@ fn truncate_mutable_field_with_policy(
             // only after the archive write actually failed may we degrade to
             // the no-path inline stub, so a good archive is never downgraded
             // to an unreadable preview.
-            let archive_file_path =
-                archive_truncated_field_to_overflow(message, field, overflow_dir);
+            let archive_file_path = archive_field(message, field);
             // Required policy (current user instruction): without an archived
             // copy the preview-only stub would be the last surviving version of
             // the instruction and could never be read back. Refuse and keep
@@ -915,8 +948,7 @@ fn truncate_mutable_field_with_policy(
             else {
                 return FieldTruncateOutcome::target_dependent(reduce_by);
             };
-            let archive_file_path =
-                archive_truncated_field_to_overflow(message, field, overflow_dir);
+            let archive_file_path = archive_field(message, field);
             // Required policy: an unarchived stub must never replace the only
             // copy of the field; refuse so the caller keeps the original.
             if archive_file_path.is_none() && archive_policy == FieldArchivePolicy::Required {
@@ -988,8 +1020,7 @@ fn truncate_mutable_field_with_policy(
             let Some(truncated) = build_candidate(archive_path_hint.as_deref()) else {
                 return FieldTruncateOutcome::target_dependent(reduce_by);
             };
-            let archive_file_path =
-                archive_truncated_field_to_overflow(message, field, overflow_dir);
+            let archive_file_path = archive_field(message, field);
             // Required policy: an unarchived stub must never replace the only
             // copy of the field; refuse so the caller keeps the original.
             if archive_file_path.is_none() && archive_policy == FieldArchivePolicy::Required {
@@ -1057,6 +1088,7 @@ pub(in crate::ai) fn shrink_successful_write_arguments(
         })
         .collect();
 
+    let mut archive_batch = TruncatedFieldArchiveBatch::new(overflow_dir);
     let mut changed = false;
     for message in messages.iter_mut() {
         if message.role != "assistant" {
@@ -1095,13 +1127,17 @@ pub(in crate::ai) fn shrink_successful_write_arguments(
             candidates.push((call_index, original_chars));
         }
         for (call_index, original_chars) in candidates {
-            if truncate_mutable_field(
+            if truncate_mutable_field_with_policy(
                 message,
                 MutableMessageField::ToolArguments(call_index),
                 original_chars.saturating_sub(240),
                 overflow_dir,
                 FieldArchivePolicy::BestEffort,
-            ) {
+                false,
+                Some(&mut archive_batch),
+            )
+            .truncated()
+            {
                 changed = true;
             }
         }
@@ -1125,3 +1161,7 @@ pub(in crate::ai) fn is_successful_write_result(tool_name: &str, result_text: &s
         _ => false,
     }
 }
+
+#[cfg(test)]
+#[path = "truncate_archive_batch_tests.rs"]
+mod archive_batch_tests;

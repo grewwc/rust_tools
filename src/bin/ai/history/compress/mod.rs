@@ -496,12 +496,12 @@ use dedup::dedup_overlapping_read_file_results;
 use dedup::{dedup_adjacent, dedup_repeated_tool_results, keep_only_recent_reasoning_content};
 pub(in crate::ai) use overflow_sink::compressed_tool_evidence_exceeds_inline_budget;
 use overflow_sink::{
-    OverflowSink, PlannedArchiveWrite, archive_internal_notes_deduplicated,
-    archive_messages_to_overflow, archive_truncated_field_to_overflow, build_overflow_placeholder,
-    content_sha256_hex, insert_internal_note_archive_note_if_needed,
-    insert_overflow_archive_note_if_exists, trim_compressed_tool_evidence_to_inline_budget,
-    trim_compressed_tool_evidence_with_status, trim_incremental_summary_notes_to_inline_budget,
-    trim_incremental_summary_notes_with_status,
+    OverflowSink, PlannedArchiveWrite, TruncatedFieldArchiveBatch,
+    archive_internal_notes_deduplicated, archive_messages_to_overflow,
+    archive_truncated_field_to_overflow, build_overflow_placeholder, content_sha256_hex,
+    insert_internal_note_archive_note_if_needed, insert_overflow_archive_note_if_exists,
+    trim_compressed_tool_evidence_to_inline_budget, trim_compressed_tool_evidence_with_status,
+    trim_incremental_summary_notes_to_inline_budget, trim_incremental_summary_notes_with_status,
 };
 
 #[cfg(test)]
