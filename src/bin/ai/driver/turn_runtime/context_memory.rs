@@ -67,10 +67,8 @@ struct RecoveryIndex {
 pub(super) fn has_projectable_recoverable_memory(messages: &[Message]) -> bool {
     let recoverable_chars = messages
         .iter()
-        .filter_map(|message| {
-            recoverable_metadata(message)?;
-            Some(message_billable_chars(message))
-        })
+        .filter_map(recoverable_candidate)
+        .map(|candidate| candidate.chars)
         .sum::<usize>();
     recoverable_chars >= MIN_RECOVERABLE_MEMORY_CHARS
 }
@@ -261,17 +259,6 @@ fn project_memory_metadata(
 }
 
 fn recoverable_candidate(message: &Message) -> Option<Candidate> {
-    let (text, recovery_targets) = recoverable_metadata(message)?;
-    Some(Candidate {
-        index: 0,
-        chars: message_billable_chars(message),
-        tokens: tokenize(text.trim_start(), MAX_DOCUMENT_TOKENS),
-        recovery_targets,
-    })
-}
-
-/// Shares candidate validation with callers that do not need lexical tokens.
-fn recoverable_metadata(message: &Message) -> Option<(Cow<'_, str>, BTreeSet<RecoveryTarget>)> {
     if message.role != ROLE_INTERNAL_NOTE
         || message.tool_calls.is_some()
         || message.tool_call_id.is_some()
@@ -280,7 +267,7 @@ fn recoverable_metadata(message: &Message) -> Option<(Cow<'_, str>, BTreeSet<Rec
     {
         return None;
     }
-    let text = message_text_view(&message.content);
+    let text = value_to_string(&message.content);
     let trimmed = text.trim_start();
     if trimmed.starts_with(crate::ai::history::compress::QUERY_MEMORY_INDEX_PREFIX)
         || crate::ai::history::compress::is_context_compaction_state(message)
@@ -292,7 +279,12 @@ fn recoverable_metadata(message: &Message) -> Option<(Cow<'_, str>, BTreeSet<Rec
     if recovery_targets.is_empty() {
         return None;
     }
-    Some((text, recovery_targets))
+    Some(Candidate {
+        index: 0,
+        chars: message_billable_chars(message),
+        tokens: tokenize(trimmed, MAX_DOCUMENT_TOKENS),
+        recovery_targets,
+    })
 }
 
 fn is_recoverable_metadata(message: &Message, text: &str) -> bool {
@@ -750,8 +742,6 @@ fn insert_target(targets: &mut BTreeSet<RecoveryTarget>, value: &str, directory:
 }
 
 fn tokenize(text: &str, limit: usize) -> FxHashSet<String> {
-    #[cfg(test)]
-    tests::TOKENIZE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut tokens = FxHashSet::default();
     extend_tokens(&mut tokens, text, limit);
     tokens
@@ -864,7 +854,7 @@ pub(super) fn has_archive_recall_sources(messages: &[Message]) -> bool {
             return text
                 .trim_start()
                 .starts_with(crate::ai::history::compress::QUERY_MEMORY_INDEX_PREFIX)
-                || recoverable_metadata(message).is_some();
+                || recoverable_candidate(message).is_some();
         }
         message.role == "assistant"
             && message_text_view(&message.content).starts_with(RECALL_PREFIX)
@@ -937,11 +927,11 @@ fn refresh_archive_recall(
     extend_tokens(&mut query, active_context, MAX_QUERY_TOKENS);
     let mut targets = collect_stale_index_notes(messages, user).1;
     for message in messages.iter().take(user) {
-        if let Some((_, recovery_targets)) = recoverable_metadata(message) {
-            targets.extend(recovery_targets);
+        if let Some(candidate) = recoverable_candidate(message) {
+            targets.extend(candidate.recovery_targets);
         }
     }
-    let mut recalled = if budget >= RECALL_BUDGET_QUANTUM && !query.is_empty() {
+    let recalled = if budget >= RECALL_BUDGET_QUANTUM && !query.is_empty() {
         recall_archive_pair(assets_dir, &targets, &query, budget)
     } else {
         Vec::new()
@@ -953,12 +943,12 @@ fn refresh_archive_recall(
         return false;
     }
     let mut projected = Vec::with_capacity(messages.len() + recalled.len());
-    for (index, message) in std::mem::take(messages).into_iter().enumerate() {
+    for (index, message) in messages.iter().enumerate() {
         if index == user {
-            projected.append(&mut recalled);
+            projected.extend(recalled.iter().cloned());
         }
         if !obsolete.contains(&index) {
-            projected.push(message);
+            projected.push(message.clone());
         }
     }
     // Only runtime-owned recall pairs can be replaced. All source indexes and
@@ -1154,103 +1144,6 @@ mod tests {
     use super::*;
     use crate::ai::types::{FunctionCall, ToolCall};
 
-    thread_local! {
-        pub(super) static TOKENIZE_CALLS: std::cell::Cell<usize> = const {
-            std::cell::Cell::new(0)
-        };
-    }
-
-    #[test]
-    fn recoverable_memory_predicates_match_candidates_without_tokenizing() {
-        let valid = message(
-            ROLE_INTERNAL_NOTE,
-            "  [context-overflow-truncated]\nfile_path: /tmp/session.assets/migration.rs\nMixed CASE 支付路由 alpha-beta.rs",
-        );
-        let tokenized = recoverable_candidate(&valid).expect("recoverable pointer");
-        assert!(tokenized.tokens.contains("case"));
-        assert!(tokenized.tokens.contains("支付"));
-        assert_ne!(tokenized.tokens.len(), tokenized.chars);
-        assert!(matches!(
-            recoverable_metadata(&valid).expect("metadata").0,
-            Cow::Borrowed(_)
-        ));
-
-        let mut structured = valid.clone();
-        structured.content = json!([
-            {"type": "text", "text": valid.content.as_str().unwrap()},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-        ]);
-        let mut with_calls = valid.clone();
-        with_calls.tool_calls = Some(Vec::new());
-        let mut with_call_id = valid.clone();
-        with_call_id.tool_call_id = Some("call-1".to_string());
-        let mut with_reasoning = valid.clone();
-        with_reasoning.reasoning_content = Some("model reasoning".to_string());
-        let mut variants = vec![
-            valid.clone(),
-            structured,
-            with_calls,
-            with_call_id,
-            with_reasoning,
-            message(
-                ROLE_INTERNAL_NOTE,
-                "ordinary note\nfile_path: /tmp/source.md",
-            ),
-            message(
-                ROLE_INTERNAL_NOTE,
-                "[context-overflow-truncated]\nfile_path: relative.md",
-            ),
-            message(
-                ROLE_INTERNAL_NOTE,
-                "[query-memory-index-v1]\nfile_path: /tmp/source.md",
-            ),
-        ];
-        for role in ["system", "user", "assistant", "tool"] {
-            let mut rejected = valid.clone();
-            rejected.role = role.to_string();
-            variants.push(rejected);
-        }
-        for variant in variants {
-            let expected = recoverable_candidate(&variant).map(|candidate| candidate.chars);
-            let before_calls = TOKENIZE_CALLS.get();
-            let actual = recoverable_metadata(&variant).map(|_| message_billable_chars(&variant));
-            assert_eq!(actual, expected, "{variant:?}");
-            assert_eq!(TOKENIZE_CALLS.get(), before_calls);
-        }
-
-        let prefix = "[context-overflow-truncated]\nfile_path: /tmp/session.assets/migration.rs\n";
-        for chars in [
-            MIN_RECOVERABLE_MEMORY_CHARS - 1,
-            MIN_RECOVERABLE_MEMORY_CHARS,
-            MIN_RECOVERABLE_MEMORY_CHARS + 1,
-        ] {
-            let note = message(
-                ROLE_INTERNAL_NOTE,
-                format!("{prefix}{}", "x".repeat(chars - prefix.chars().count())),
-            );
-            let mut messages = vec![note, message("user", "continue migration")];
-            let expected = messages
-                .iter()
-                .filter_map(recoverable_candidate)
-                .map(|candidate| candidate.chars)
-                .sum::<usize>()
-                >= MIN_RECOVERABLE_MEMORY_CHARS;
-            let before_calls = TOKENIZE_CALLS.get();
-            assert_eq!(has_projectable_recoverable_memory(&messages), expected);
-            assert_eq!(expected, chars >= MIN_RECOVERABLE_MEMORY_CHARS);
-            assert!(has_archive_recall_sources(&messages));
-            assert_eq!(TOKENIZE_CALLS.get(), before_calls);
-            // Recall still tokenizes the live query, but target collection does not.
-            assert!(!refresh_archive_recall(
-                &mut messages,
-                0,
-                Path::new("/tmp"),
-                ""
-            ));
-            assert_eq!(TOKENIZE_CALLS.get(), before_calls + 1);
-        }
-    }
-
     #[test]
     fn recoverable_candidate_accepts_only_valid_folded_reasoning_sidecars() {
         let fixture = RecallFixture::new();
@@ -1266,8 +1159,7 @@ mod tests {
                     arguments: "{}".to_string(),
                 },
             }]);
-            // Exceed the individual fold floor so this fixture produces provenance.
-            let mut result = message("tool", &"evidence ".repeat(1_000));
+            let mut result = message("tool", &"evidence ".repeat(300));
             result.tool_call_id = Some(id);
             messages.extend([assistant, result]);
         }
@@ -1365,7 +1257,7 @@ mod tests {
                 100_000,
                 &fixture.0,
                 "",
-                true,
+                true
             );
             assert!(stats.changed);
             let recalled = recalled_text(&projected);
@@ -1390,7 +1282,7 @@ mod tests {
                 100_000,
                 &fixture.0,
                 "",
-                true,
+                true
             );
             assert!(!again.changed);
             assert_eq!(projected, once);
@@ -1425,7 +1317,7 @@ mod tests {
             100_000,
             &fixture.0,
             "rare_plan_dependency",
-            true,
+            true
         );
         assert!(recalled_text(&projected).contains("rare_plan_dependency fact"));
         assert_eq!(
@@ -1451,21 +1343,9 @@ mod tests {
         let mut projected = vec![index_note(&targets), message("user", "rare_keyword")];
         let original = projected.clone();
         let tight = total_chars(&projected);
-        apply_query_aware_memory_projection_with_context(
-            &mut projected,
-            tight,
-            &fixture.0,
-            "",
-            true,
-        );
+        apply_query_aware_memory_projection_with_context(&mut projected, tight, &fixture.0, "", true);
         assert_eq!(projected, original);
-        apply_query_aware_memory_projection_with_context(
-            &mut projected,
-            100_000,
-            &fixture.0,
-            "",
-            true,
-        );
+        apply_query_aware_memory_projection_with_context(&mut projected, 100_000, &fixture.0, "", true);
         assert!(recalled_text(&projected).contains("rare_keyword at the end"));
         assert!(recalled_text(&projected).contains("partial line"));
     }
@@ -1488,13 +1368,7 @@ mod tests {
         ]);
         let mut projected = vec![index_note(&targets), message("user", "secret_keyword")];
         let original = projected.clone();
-        apply_query_aware_memory_projection_with_context(
-            &mut projected,
-            100_000,
-            &fixture.0,
-            "",
-            true,
-        );
+        apply_query_aware_memory_projection_with_context(&mut projected, 100_000, &fixture.0, "", true);
         assert_eq!(projected, original);
         assert_eq!(parsed_targets(single_index_note(&projected)), targets);
     }
@@ -1520,13 +1394,7 @@ mod tests {
         ]);
         let mut projected = vec![index_note(&targets), message("user", "secret_keyword")];
         let original = projected.clone();
-        apply_query_aware_memory_projection_with_context(
-            &mut projected,
-            100_000,
-            &fixture.0,
-            "",
-            true,
-        );
+        apply_query_aware_memory_projection_with_context(&mut projected, 100_000, &fixture.0, "", true);
         assert_eq!(projected, original);
     }
 
@@ -1975,7 +1843,7 @@ mod tests {
             100_000,
             &fixture.0,
             "",
-            true,
+            true
         );
         assert!(stats.changed);
         let recalled = recalled_text(&projected);
