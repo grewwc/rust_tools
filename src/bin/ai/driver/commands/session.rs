@@ -140,7 +140,7 @@ pub(in crate::ai) fn persist_session_runtime_state(app: &App) {
             Some(None) => Some("off".to_string()),
             Some(Some(level)) => Some(level.as_str().to_string()),
         },
-        subagent_backend: app.session_default_subagent_backend.stored_value(),
+        subagent_backend: Some(app.session_default_subagent_backend.as_str().to_string()),
         subagent_model: app.session_default_subagent_model.clone(),
         default_skills: app.session_default_skills.clone(),
     };
@@ -176,7 +176,9 @@ fn restore_session_model_agent_effort(app: &mut App, store: &SessionStore) {
         }
     }
     app.session_default_subagent_backend =
-        crate::ai::tools::task_tools::BackendId::from_stored(stored.subagent_backend.as_deref());
+        crate::ai::tools::task_tools::BackendId::from_session_config(
+            stored.subagent_backend.as_deref(),
+        );
     app.session_default_subagent_model = stored.subagent_model;
     app.session_default_skills = stored.default_skills;
 }
@@ -2244,7 +2246,7 @@ mod tests {
 
         super::super::use_backend::try_handle_use_command(&mut reopened, "/use kernel").unwrap();
         let stored = store.read_session_serve_config(&session_id).unwrap();
-        assert!(stored.subagent_backend.is_none());
+        assert_eq!(stored.subagent_backend.as_deref(), Some("kernel"));
         assert_eq!(stored.default_skills, ["agent-team"]);
         assert_eq!(stored.subagent_model.as_deref(), Some("GPT-6.1-Sol"));
         restore_session_local_runtime_state(&mut reopened).unwrap();
@@ -2255,13 +2257,16 @@ mod tests {
         assert_eq!(reopened.session_default_skills, ["agent-team"]);
         super::super::use_backend::try_handle_reset_command(&mut reopened, "/reset").unwrap();
         let stored = store.read_session_serve_config(&session_id).unwrap();
-        assert!(stored.subagent_backend.is_none());
+        assert_eq!(
+            stored.subagent_backend.as_deref(),
+            Some(crate::ai::tools::task_tools::BackendId::from_session_config(None).as_str())
+        );
         assert!(stored.subagent_model.is_none());
         assert!(stored.default_skills.is_empty());
         restore_session_local_runtime_state(&mut reopened).unwrap();
         assert_eq!(
             reopened.session_default_subagent_backend,
-            crate::ai::tools::task_tools::SubagentBackend::Kernel
+            crate::ai::tools::task_tools::BackendId::from_session_config(None)
         );
         assert!(reopened.session_default_subagent_model.is_none());
         assert!(reopened.session_default_skills.is_empty());
@@ -2271,6 +2276,57 @@ mod tests {
             reopened.cli.reasoning_effort_override,
             Some(Some(ReasoningEffort::High))
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_config_subagent_backends_roundtrip_canonical_ids_and_legacy_defaults() {
+        use crate::ai::tools::task_tools::BackendId;
+
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+
+        for backend in [BackendId::KERNEL, BackendId::TRAECLI] {
+            let command = format!("/use {}", backend.as_str());
+            assert!(super::super::use_backend::try_handle_use_command(&mut app, &command).unwrap());
+            let stored = store.read_session_serve_config(&app.session_id).unwrap();
+            assert_eq!(stored.subagent_backend.as_deref(), Some(backend.as_str()));
+
+            let mut reopened = test_app(&root);
+            reopened.session_default_subagent_backend = if backend == BackendId::KERNEL {
+                BackendId::TRAECLI
+            } else {
+                BackendId::KERNEL
+            };
+            restore_session_local_runtime_state(&mut reopened).unwrap();
+            assert_eq!(reopened.session_default_subagent_backend, backend);
+        }
+
+        for legacy_backend in [None, Some("")] {
+            let config = SessionServeConfig {
+                subagent_backend: legacy_backend.map(str::to_string),
+                ..Default::default()
+            };
+            store
+                .write_session_serve_config(&app.session_id, &config)
+                .unwrap();
+            let persisted = store.read_session_serve_config(&app.session_id).unwrap();
+            assert_eq!(persisted.subagent_backend, None);
+            restore_session_local_runtime_state(&mut app).unwrap();
+            assert_eq!(
+                app.session_default_subagent_backend,
+                BackendId::from_session_config(legacy_backend)
+            );
+            assert_eq!(
+                store.read_session_serve_config(&app.session_id).unwrap(),
+                persisted
+            );
+        }
+
         let _ = fs::remove_dir_all(root);
     }
 

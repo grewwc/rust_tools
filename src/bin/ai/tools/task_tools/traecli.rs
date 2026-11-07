@@ -1,8 +1,8 @@
 //! TraeCLI subagent backend: headless execution via `traecli exec --json`.
 //!
-//! This module is additive and opt-in. The default subagent backend remains the
-//! in-process kernel runner; TraeCLI runs when selected by `/use traecli` or a
-//! `backend: "traecli"` argument on a `task` / `task_spawn` item. All task control block
+//! Session defaults prefer TraeCLI when its binary is available; explicit
+//! `/use` selections or a `backend` argument on a `task` / `task_spawn` item
+//! override that preference. All task control block
 //! semantics (task registry, result channel, futex, evidence ledger,
 //! cancellation) stay owned by the existing `task_spawn` / `task_wait` layer.
 //! This runner retries backend failures and resumes any captured session.

@@ -34,9 +34,18 @@ const TRAECLI = { ...KERNEL, subagent_backend: "traecli", subagent_model: "worke
 const response = (cfg) => ({ ok: true, json: async () => plain(cfg) });
 const turnResponse = (read = async () => ({ done: false, value: Buffer.from("event: done\n\n") })) => ({ ok: true, body: { getReader: () => ({ read }) } });
 const settle = () => new Promise((resolve) => setImmediate(resolve));
+function nodeList(nodes = []) {
+  const list = {
+    ...nodes, length: nodes.length,
+    item(index) { return this[index] ?? null; },
+    forEach(callback, thisArg) { nodes.forEach((node, index) => callback.call(thisArg, node, index, list)); },
+    [Symbol.iterator]() { return nodes[Symbol.iterator](); },
+  };
+  return list;
+}
 
 function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, configGet, createSession, skills = [], subagentModels, turnPost } = {}) {
-  const document = { activeElement: null, querySelectorAll: () => [] };
+  const document = { activeElement: null, querySelectorAll: () => nodeList() };
   function node(tag = "div") {
     let text = "";
     const classes = new Set();
@@ -50,10 +59,12 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
       getAttribute(key) { return el.attrs[key] ?? null; },
       appendChild(child) { child.parentNode = el; el.children.push(child); return child; },
       remove() { if (el.parentNode) el.parentNode.children = el.parentNode.children.filter((n) => n !== el); },
-      focus() { if (!el.disabled) document.activeElement = el; },
+      focus(options) { if (!el.disabled) { document.activeElement = el; el.focusOptions = options; } },
       click() { if (!el.disabled) return el.onclick?.(); },
+      contains(target) { for (let cur = target; cur; cur = cur.parentNode) if (cur === el) return true; return false; },
       closest(selector) {
         for (let cur = el; cur; cur = cur.parentNode) {
+          if (selector.startsWith("#") && cur.id === selector.slice(1)) return cur;
           if (selector === "[hidden]" && cur.hidden) return cur;
           if (selector === '[role="radiogroup"]' && cur.attrs.role === "radiogroup") return cur;
         }
@@ -66,7 +77,7 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
           walk(child);
         });
         walk(el);
-        return found;
+        return nodeList(found);
       },
     };
     return el;
@@ -75,6 +86,7 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
   const elements = {};
   for (const match of html.matchAll(/<(div|section|button|span|input|p|label)[^>]*id="(team[^"]*)"[^>]*>/g)) {
     const el = elements[match[2]] = node(match[1]);
+    el.id = match[2];
     el.hidden = /\shidden(?:\s|>)/.test(match[0]);
     const role = /role="([^"]+)"/.exec(match[0]);
     if (role) el.attrs.role = role[1];
@@ -87,6 +99,8 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
   attach("teamadvanced", "teambackends", "teamworkerwrap");
   attach("teambackends", "teamkernel", "teamtraecli");
   attach("teamworkerwrap", "teamworkerlabel", "teamworkerbtn", "teamworkerlist", "teamworkerhint");
+  attach("teamworkerbtn", "teamworkervalue");
+  elements.teamworkerbtn.appendChild(node("span"));
   attach("teamworkerlist", "teamworkersearch", "teamworkeroptions", "teamworkerstatus", "teamworkerretry");
   attach("teamactions", "teamcancel", "teamapply");
   attach("teamcontrols", "teamtrigger");
@@ -615,6 +629,28 @@ test("worker model stays separate from the main model and blank preserves the sa
   assert.equal(h.state().choice.model, "worker-model");
 });
 
+test("worker model opening and selection work with browser NodeList snapshots", async () => {
+  const h = harness({ cfg: TRAECLI });
+  await h.context.loadSessionConfig();
+  h.context.openTeamSheet();
+  await settle();
+  const snapshot = h.elements.teamworkeroptions.querySelectorAll('[role="radio"]');
+  assert.equal(Array.isArray(snapshot), false);
+  assert.equal(snapshot.find, undefined);
+  assert.equal(snapshot.map, undefined);
+  assert.equal(snapshot.item(0), snapshot[0]);
+  assert.doesNotThrow(() => h.elements.teamworkerbtn.click());
+  const rows = Array.from(h.elements.teamworkeroptions.querySelectorAll('[role="radio"]'));
+  assert.equal(h.context.document.activeElement, rows.find((row) => row.dataset.model === "worker-model"));
+  assert.equal(h.context.document.activeElement.focusOptions.preventScroll, true);
+  assert.equal(h.elements.teamworkerbtn.attrs["aria-expanded"], "true");
+  assert.doesNotThrow(() => rows.find((row) => row.dataset.model === "other-model").click());
+  assert.equal(h.elements.teamworkervalue.textContent, "other-model");
+  assert.equal(h.elements.teamworkerlist.hidden, true);
+  assert.doesNotThrow(() => h.elements.teamworkerbtn.click());
+  assert.equal(h.context.document.activeElement.dataset.model, "other-model");
+});
+
 test("the subagent model is a list picker fed by /subagent-models and filtered by its search field", async () => {
   const h = harness({ subagentModels: () => response({ models: ["alpha-model", "beta-model"] }) });
   await h.context.loadSessionConfig();
@@ -674,6 +710,28 @@ test("the open list floats over the sheet and closes without changing the draft"
   assert.equal(h.teamPosts().length, 0);
 });
 
+test("worker list ignores child taps throughout the trigger card", async () => {
+  const h = harness({ cfg: TRAECLI });
+  await h.context.loadSessionConfig();
+  h.context.openTeamSheet();
+  await settle();
+  h.elements.teamworkerbtn.click();
+  const choice = plain(h.state().choice);
+  for (const target of [
+    ...h.elements.teamworkerbtn.children,
+    h.elements.teamworkerlabel, h.elements.teamworkerhint, h.elements.teamworkerwrap,
+    h.elements.teamworkeroptions.children[0].children[0].children[0],
+  ]) {
+    h.elements.teampickpanel.onclick({ target });
+    assert.equal(h.elements.teamworkerlist.hidden, false, "an inside tap must leave the worker list open");
+  }
+  h.elements.teampickpanel.onclick({ target: h.elements.teamadvanced });
+  assert.equal(h.elements.teamworkerlist.hidden, true);
+  assert.equal(h.elements.teampick.hidden, false);
+  assert.deepEqual(plain(h.state().choice), choice);
+  assert.equal(h.teamPosts().length, 0);
+});
+
 test("the trigger sits in the metadata line without toggling it", () => {
   const h = harness();
   let prevented = false;
@@ -703,6 +761,75 @@ test("a failed model-list fetch keeps the session-default row and offers a retry
   await settle();
   assert.equal(h.elements.teamworkerretry.hidden, true);
   assert.deepEqual(h.elements.teamworkeroptions.children.map((row) => row.dataset.model), ["", "alpha-model"]);
+});
+
+test("empty worker discovery is retried when the model list opens again", async () => {
+  let calls = 0;
+  const h = harness({ cfg: TRAECLI, subagentModels: () => response({ models: ++calls === 1 ? [] : ["alpha-model"] }) });
+  await h.context.loadSessionConfig(); h.context.openTeamSheet();
+  await settle();
+  assert.equal(calls, 1);
+  assert.match(h.elements.teamworkerstatus.textContent, /未返回模型列表/);
+  h.elements.teamworkerbtn.click();
+  await settle();
+  assert.equal(calls, 2);
+  assert.ok(h.elements.teamworkeroptions.children.some((row) => row.dataset.model === "alpha-model"));
+  h.context.setWorkerListOpen(false); h.context.setWorkerListOpen(true);
+  await settle();
+  assert.equal(calls, 2, "nonempty worker discovery is cached");
+});
+
+test("cold worker openings and retries share one pending discovery", async () => {
+  const discovery = deferred();
+  let calls = 0;
+  const h = harness({ cfg: TRAECLI, subagentModels: () => { calls++; return discovery.promise; } });
+  await h.context.loadSessionConfig(); h.context.openTeamSheet();
+  const first = h.context.loadWorkerModels(), second = h.context.loadWorkerModels(true);
+  assert.equal(calls, 1);
+  assert.equal(first, second);
+  let completed = false;
+  first.then(() => { completed = true; });
+  await settle();
+  assert.equal(completed, false, "every caller waits for the same discovery");
+  discovery.resolve(response({ models: ["alpha-model"] }));
+  await Promise.all([first, second]);
+  assert.ok(h.elements.teamworkeroptions.children.some((row) => row.dataset.model === "alpha-model"));
+});
+
+test("worker discovery cannot publish an old server's result over a newer request", async () => {
+  const old = deferred();
+  const h = harness({ cfg: TRAECLI, subagentModels: (request) => request.url.startsWith("https://a.test")
+    ? old.promise : response({ models: ["new-model"] }) });
+  await h.context.loadSessionConfig(); h.context.openTeamSheet();
+  const first = h.context.loadWorkerModels();
+  h.context.store.base = "https://b.test";
+  await h.context.loadWorkerModels();
+  old.resolve(response({ models: ["old-model"] })); await first;
+  h.context.setWorkerListOpen(true);
+  assert.deepEqual(h.elements.teamworkeroptions.children.map((row) => row.dataset.model), ["", "new-model", "worker-model"]);
+  assert.equal(h.requests.filter((request) => request.url.endsWith("/subagent-models")).length, 2);
+});
+
+test("send captures a transcript anchor and links successive pending inputs despite a stale count", async () => {
+  const h = harness();
+  await h.context.loadSessionConfig();
+  const preceding = h.context.document.createElement("div");
+  preceding.dataset.canonicalIdentity = '["assistant","finished answer",false,"",null]';
+  preceding.dataset.canonicalIndex = "7";
+  h.elements.msgs.appendChild(preceding);
+  h.context.canonicalHistoryTotal = 1;
+  await h.context.send();
+  const first = h.context.pendingUserInputs.get("alpha")[0];
+  assert.equal(first.minIndex, 1);
+  assert.equal(first.afterHistoryKey, preceding.dataset.canonicalIdentity);
+  assert.equal(first.afterHistoryIndex, 7);
+  assert.equal(first.afterInput, null);
+  h.elements.prompt.value = "second prompt";
+  await h.context.send();
+  const second = h.context.pendingUserInputs.get("alpha")[1];
+  assert.equal(second.afterInput, first);
+  assert.equal(second.afterHistoryKey, preceding.dataset.canonicalIdentity);
+  assert.equal(h.turns().length, 2);
 });
 
 // The Rust driver owns command parsing. The turn fixtures below supply its
@@ -975,6 +1102,7 @@ test("the entry is a phone-only 26px metadata chip and the accessible sheet uses
   assert.match(html, /id="teamworkerbtn"[^>]*aria-describedby="teamworkerhint"/);
   assert.match(html, /id="teamworkeroptions" role="radiogroup"/);
   assert.match(desktop, /#teamworkeroptions \.teamchoice \{[^}]*min-height:44px;/);
+  assert.match(desktop, /#teamworkersearch \{[^}]*min-height:38px;/);
   assert.match(desktop, /\.teamchoice \{[^}]*width:100%;/);
   assert.match(desktop, /#teammodes \{[^}]*grid-template-columns:repeat\(2,minmax\(0,1fr\)\);/);
   assert.match(desktop, /#teammodes \.teamchoicetext small \{ display:none; \}/);

@@ -12,6 +12,15 @@ const between = (start, end) => {
   assert.ok(a >= 0 && b > a, `${start} .. ${end}`);
   return script.slice(a, b);
 };
+function nodeList(nodes = []) {
+  const list = {
+    ...nodes, length: nodes.length,
+    item(index) { return this[index] ?? null; },
+    forEach(callback, thisArg) { nodes.forEach((node, index) => callback.call(thisArg, node, index, list)); },
+    [Symbol.iterator]() { return nodes[Symbol.iterator](); },
+  };
+  return list;
+}
 function select() {
   let value = "";
   return {
@@ -286,6 +295,32 @@ test("actual turn request sends skills only when selected, clearing on HTTP succ
   assert.equal("skills" in h.requests[1].body, false);
 });
 
+test("request payload trims padded selected names without changing their order", async () => {
+  const h = harness();
+  await h.context.loadSkills();
+  h.context.setSkillPick(h.context.skillPickKey(), ["  review  ", "\tbuild\r\n"], "");
+  await h.context.submit();
+  assert.deepEqual(h.requests[0].body.skills, ["review", "build"]);
+  assert.deepEqual(h.selected(), []);
+});
+
+test("eight long chosen skill names remain inspectable in the constrained trigger", async () => {
+  const catalog = Array.from({ length: 8 }, (_, i) => ({ name: "long-mobile-skill-selection-" + i }));
+  const h = harness({ catalog });
+  await h.context.loadSkills();
+  for (const skill of catalog) h.choose(skill.name);
+  const chosen = catalog.map((skill) => skill.name).join(" + ");
+  assert.equal(h.elements.skillvalue.textContent, "skill: " + chosen);
+  assert.ok(h.elements.oskill.title.includes(chosen));
+  assert.ok(h.elements.oskill.attrs["aria-label"].includes(chosen));
+  h.open();
+  assert.deepEqual(h.names(), catalog.map((skill) => skill.name));
+  assert.ok(h.options().every((option) => option.attrs["aria-selected"] === "true"));
+  const css = html.match(/<style>([\s\S]*?)<\/style>/)[1];
+  assert.match(css, /#skillpicker \{[^}]*flex:1; min-width:0;/);
+  assert.match(css, /#skillvalue \{[^}]*flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;/);
+});
+
 test("HTTP rejection and transport failure retain the pending selection", async () => {
   const h = harness();
   await h.context.loadSkills();
@@ -420,6 +455,39 @@ test("catalog removes obsolete choices and empty or failed catalogs preserve nor
   assert.equal("skills" in h.requests[1].body, false);
 });
 
+test("an empty skill discovery is retried on opening overrides and a nonempty catalog is reused", async () => {
+  const h = harness();
+  let calls = 0;
+  h.context.api = async () => ({ json: async () => ++calls === 1 ? [] : [{ name: "review" }] });
+  await h.context.loadSkills();
+  assert.equal(h.elements.oskill.disabled, true);
+  h.elements.ovrwrap.open = true;
+  await h.elements.ovrwrap.ontoggle();
+  assert.equal(calls, 2);
+  assert.equal(h.elements.oskill.disabled, false);
+  h.open();
+  assert.deepEqual(h.names(), ["review"]);
+  h.elements.ovrwrap.open = false; await h.elements.ovrwrap.ontoggle();
+  h.elements.ovrwrap.open = true; await h.elements.ovrwrap.ontoggle();
+  assert.equal(calls, 2, "a nonempty discovery is reused by later openings");
+});
+
+test("concurrent cold skill loads share one request until discovery finishes", async () => {
+  const h = harness();
+  let calls = 0, resolve;
+  h.context.api = () => { calls++; return new Promise((finish) => { resolve = finish; }); };
+  const first = h.context.loadSkills(), second = h.context.loadSkills();
+  assert.equal(calls, 1);
+  assert.equal(first, second);
+  h.elements.ovrwrap.open = true;
+  const opening = h.elements.ovrwrap.ontoggle();
+  assert.equal(opening, first);
+  resolve({ json: async () => [{ name: "review" }] });
+  await Promise.all([first, second, opening]);
+  h.open();
+  assert.deepEqual(h.names(), ["review"]);
+});
+
 test("overlapping catalog fetches cannot restore options from an old server", async () => {
   const h = harness();
   let resolve;
@@ -458,6 +526,39 @@ test("completion matches case-insensitive substrings in catalog order", async ()
   assert.deepEqual(h.names(), ["build"]);
   h.type(" ");
   assert.deepEqual(h.names(), ["play_mahjong_discard", "review", "build"]);
+});
+
+test("skill search ignores composing Enter flags after composition has ended", async () => {
+  const h = harness();
+  await h.context.loadSkills(); h.type("rev");
+  for (const extra of [{ isComposing: true }, { keyCode: 229 }]) {
+    assert.equal(h.key("Enter", extra).prevented, undefined);
+    assert.deepEqual(h.selected(), []);
+    assert.equal(h.elements.skillsearch.value, "rev");
+    assert.equal(h.elements.skillmenu.hidden, false);
+  }
+  assert.equal(h.key("Enter").prevented, true);
+  assert.deepEqual(h.selected(), ["review"]);
+  assert.equal(h.requests.length, 0);
+});
+
+test("main model search cannot commit Enter during IME composition", () => {
+  const search = {}, option = { click() { picks++; } };
+  let picks = 0, closes = 0;
+  const context = vm.createContext({
+    document: { activeElement: search },
+    $: (id) => id === "modelpicksearch" ? search : { querySelectorAll: () => nodeList([option]) },
+    closeModelSheet() { closes++; },
+  });
+  vm.runInContext(between("function modelSheetKeydown(", "// Skills are pending next-turn choices"), context);
+  for (const extra of [{ isComposing: true }, { keyCode: 229 }]) {
+    context.modelSheetKeydown({ key: "Enter", ...extra, preventDefault() { assert.fail("composing Enter must not select a model"); } });
+    assert.equal(picks, 0);
+  }
+  context.modelSheetKeydown({ key: "Enter", preventDefault() {} });
+  assert.equal(picks, 1);
+  context.modelSheetKeydown({ key: "Escape", preventDefault() {} });
+  assert.equal(closes, 1);
 });
 
 test("search clear preserves the ordered set and reset returns to session default", async () => {
