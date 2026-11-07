@@ -363,7 +363,7 @@ mod tests {
             registry.resume_required_error(),
             "'backend_continue_from' needs backend 'traecli'"
         );
-        assert_eq!(BackendId::KERNEL.stored_value(), None);
+        assert_eq!(BackendId::KERNEL.stored_value().as_deref(), Some("kernel"));
         assert_eq!(
             BackendId::TRAECLI.stored_value().as_deref(),
             Some("traecli")

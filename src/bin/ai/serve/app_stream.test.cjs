@@ -7,6 +7,16 @@ const path = require("node:path");
 const vm = require("node:vm");
 const script = fs.readFileSync(path.join(__dirname, "app.html"), "utf8").match(/<script>([\s\S]*?)<\/script>/)[1];
 
+function nodeList(nodes = []) {
+  const list = {
+    ...nodes, length: nodes.length,
+    item(index) { return this[index] ?? null; },
+    forEach(callback, thisArg) { nodes.forEach((node, index) => callback.call(thisArg, node, index, list)); },
+    [Symbol.iterator]() { return nodes[Symbol.iterator](); },
+  };
+  return list;
+}
+
 function streamHarness({ activityOnly = false } = {}) {
   const timers = [];
   const box = {
@@ -16,7 +26,7 @@ function streamHarness({ activityOnly = false } = {}) {
       this.children = this.children.filter((child) => child !== node);
       this.children.splice(this.children.indexOf(before), 0, node);
     },
-    querySelectorAll() { return this.children.filter((child) => child.summary); },
+    querySelectorAll() { return nodeList(this.children.filter((child) => child.summary)); },
   };
   function node() {
     const classes = new Set();

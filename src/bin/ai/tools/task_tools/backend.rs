@@ -60,9 +60,18 @@ impl BackendId {
             .unwrap_or(Self::KERNEL)
     }
 
-    /// The session's kernel default is represented by an absent stored field.
+    /// Unset session preferences use TraeCLI when available. Persisted task
+    /// identities retain their legacy kernel interpretation in `from_stored`.
+    pub(crate) fn from_session_config(value: Option<&str>) -> Self {
+        match value {
+            None | Some("") if super::traecli::traecli_binary_available() => Self::TRAECLI,
+            _ => Self::from_stored(value),
+        }
+    }
+
+    /// Preserve explicit choices independently of the session default.
     pub(crate) fn stored_value(self) -> Option<String> {
-        (self != Self::default()).then(|| self.as_str().to_string())
+        Some(self.as_str().to_string())
     }
 
     #[cfg(test)]

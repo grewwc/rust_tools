@@ -4,26 +4,97 @@ use super::*;
 use crate::ai::driver::commands::use_backend::{
     apply_subagent_use, format_use_state, reset_subagent_config,
 };
+use crate::ai::tools::task_tools::BackendId;
 
 fn session_config_response(config: &SessionServeConfig) -> serde_json::Value {
     let kernel_model = config.model.clone().unwrap_or_else(default_turn_model);
-    // An absent stored backend means "never chosen": the serve session default
-    // is TraeCLI, so report that instead of an empty string the picker would
-    // have to guess about.
-    let subagent_backend = config
-        .subagent_backend
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .unwrap_or("traecli");
+    let subagent_backend = BackendId::from_session_config(config.subagent_backend.as_deref());
     serde_json::json!({
         "model": config.model.as_deref().unwrap_or_default(),
         "agent": config.agent.as_deref().unwrap_or_default(),
         "reasoning_effort": config.reasoning_effort.as_deref().unwrap_or_default(),
-        "subagent_backend": subagent_backend,
+        "subagent_backend": subagent_backend.as_str(),
         "subagent_model": config.subagent_model.as_deref().unwrap_or_default(),
         "default_skills": config.default_skills,
         "output": format_use_state(config, &kernel_model),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_config_subagent_backend_matches_runtime_for_available_backends() {
+        const CHILD_ENV: &str = "RUST_TOOLS_SESSION_BACKEND_DEFAULT_TEST_CHILD";
+        let Some(expected_default) = std::env::var_os(CHILD_ENV) else {
+            // Isolate availability overrides from concurrently running backend tests.
+            let exe = std::env::current_exe().unwrap();
+            let missing_binary = std::env::temp_dir()
+                .join(format!("missing-traecli-{}", uuid::Uuid::new_v4().simple()));
+            for (binary, expected) in [
+                (&exe, BackendId::TRAECLI),
+                (&missing_binary, BackendId::KERNEL),
+            ] {
+                let output = std::process::Command::new(&exe)
+                    .args([
+                        "--exact",
+                        "ai::serve::sessions::tests::session_config_subagent_backend_matches_runtime_for_available_backends",
+                    ])
+                    .env(CHILD_ENV, expected.as_str())
+                    .env("TRAECLI_BIN", binary)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{} default failed:\n{}\n{}",
+                    expected.as_str(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            }
+            return;
+        };
+        let expected_default = BackendId::from_stored(expected_default.to_str());
+        for (stored, expected) in [
+            (None, expected_default),
+            (Some(""), expected_default),
+            (Some("kernel"), BackendId::KERNEL),
+            (Some("traecli"), BackendId::TRAECLI),
+            (Some("unknown-backend"), BackendId::KERNEL),
+            (Some("trae-cli"), BackendId::KERNEL),
+        ] {
+            let config = SessionServeConfig {
+                subagent_backend: stored.map(str::to_string),
+                ..Default::default()
+            };
+            let runtime_backend = BackendId::from_session_config(stored);
+            assert_eq!(runtime_backend, expected);
+            let response = session_config_response(&config);
+            assert_eq!(response["subagent_backend"], runtime_backend.as_str());
+            assert!(response["output"].as_str().unwrap().starts_with(&format!(
+                "Session default subagent backend: {}\n",
+                runtime_backend.as_str()
+            )));
+        }
+
+        // Exercise the driver's actual restore path with each availability override.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ai::driver::commands::session::tests::session_config_subagent_backends_roundtrip_canonical_ids_and_legacy_defaults",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "driver backend roundtrip failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    }
 }
 
 pub(crate) async fn list_sessions(

@@ -467,7 +467,7 @@ select, summary { touch-action:manipulation; }
 #skillpicker { position:relative; flex:1; min-width:0; }
 #skillfield { position:relative; }
 #oskill { display:flex; align-items:center; justify-content:space-between; gap:8px; width:100%; min-height:44px; padding:6px 12px; text-align:left; font-size:16px; font-weight:600; background:var(--surface); border:1px solid var(--line); border-radius:10px; }
-#skillvalue { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#skillvalue { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #skillchev { flex:0 0 auto; width:7px; height:7px; margin-top:-3px; border-right:1.5px solid var(--dim); border-bottom:1.5px solid var(--dim); transform:rotate(45deg); }
 #oskill:focus-visible, #oskill[aria-expanded="true"] { border-color:var(--acc-focus); box-shadow:0 0 0 2px var(--focus-ring); outline:none; }
 #oskill:disabled { opacity:.5; }
@@ -2767,9 +2767,10 @@ const TEAM_FIELDS = { mode: { normal: "teamnormal", team: "teamcollab" }, backen
 let teamDraft = null;
 let teamSheetHistoryPushed = false;
 let teamSheetBackPending = false;
-// TraeCLI model discovery is shared by every opening of the team sheet, so a
-// page load only asks the server once; the retry path forces a refetch.
+// Nonempty TraeCLI discovery is reused across sheet openings for each server.
+// Empty or failed discovery can retry; concurrent callers share one request.
 let workerModels = null, workerModelsState = "idle", workerModelsError = "", workerModelsEpoch = 0;
+let workerModelsBase = "", workerModelsRequest = null;
 function teamPickKey(sid = sessionId, base = store.base) { return JSON.stringify([base, sid || ""]); }
 function teamPickState(sid = sessionId, base = store.base) {
   const key = teamPickKey(sid, base);
@@ -2892,7 +2893,8 @@ function renderTeamSheet() {
   $("teamworkerwrap").hidden = !workerVisible;
   // Warm the picker as soon as TraeCLI becomes the backend so tapping the
   // trigger usually shows the list without a loading pause.
-  if (workerVisible && workerModelsState === "idle") void loadWorkerModels();
+  if (workerVisible && (workerModelsBase !== store.base || workerModelsState === "idle"
+      || (workerModelsState === "ready" && !workerModels?.length))) void loadWorkerModels();
   const savedModel = state.confirmed && state.confirmed.model;
   $("teamworkerhint").textContent = "仅用于 TraeCLI 子 Agent；主模型仍在 model 中设置。" + (savedModel ? "会话默认沿用已保存的模型：" + savedModel : "会话默认使用 TraeCLI 默认模型。");
   renderTeamWorker();
@@ -2986,24 +2988,33 @@ function renderTeamWorkerOptions() {
   $("teamworkerstatus").textContent = status;
   $("teamworkerstatus").dataset.state = statusState;
 }
-async function loadWorkerModels(force = false) {
+function loadWorkerModels(force = false) {
   if (!teamDraft) return;
-  if (!force && (workerModelsState === "loading" || workerModelsState === "ready")) return;
+  const base = store.base;
+  if (workerModelsRequest?.base === base) return workerModelsRequest.promise;
+  if (!force && workerModelsBase === base && workerModelsState === "ready" && workerModels?.length) return Promise.resolve();
   const epoch = ++workerModelsEpoch;
+  if (workerModelsBase !== base) workerModels = null;
+  workerModelsBase = base;
   workerModelsState = "loading";
   workerModelsError = "";
   renderTeamWorker();
-  try {
-    const data = await (await api("/subagent-models")).json();
-    if (epoch !== workerModelsEpoch) return;
-    workerModels = Array.isArray(data.models) ? data.models.map((name) => String(name)).filter(Boolean) : [];
-    workerModelsState = "ready";
-  } catch (e) {
-    if (epoch !== workerModelsEpoch) return;
-    workerModelsState = "error";
-    workerModelsError = "读取模型列表失败：" + e.message;
-  }
-  if (teamDraft) renderTeamWorker();
+  const request = { base, promise: null };
+  request.promise = (async () => {
+    try {
+      const data = await (await api("/subagent-models")).json();
+      if (epoch !== workerModelsEpoch || base !== store.base) return;
+      workerModels = Array.isArray(data.models) ? data.models.map((name) => String(name).trim()).filter(Boolean) : [];
+      workerModelsState = "ready";
+    } catch (e) {
+      if (epoch !== workerModelsEpoch || base !== store.base) return;
+      workerModelsState = "error";
+      workerModelsError = "读取模型列表失败：" + e.message;
+    }
+    if (teamDraft) renderTeamWorker();
+  })().finally(() => { if (workerModelsRequest === request) workerModelsRequest = null; });
+  workerModelsRequest = request;
+  return request.promise;
 }
 // Anchor the list to the trigger and let it grow up to the panel top. Its
 // containing block is the panel, so the scrolling body does not clip it.
@@ -3037,14 +3048,14 @@ function setWorkerListOpen(open) {
   if (draft.workerOpen) {
     draft.workerQuery = "";
     $("teamworkersearch").value = "";
-    if (workerModelsState !== "ready") void loadWorkerModels(workerModelsState === "error");
+    if (workerModelsState !== "ready" || !workerModels?.length) void loadWorkerModels(workerModelsState === "error");
   }
   renderTeamWorker();
   if (!draft.workerOpen) { $("teamworkerbtn").focus(); return; }
   placeWorkerList();
   const options = $("teamworkeroptions");
   options.scrollTop = 0;
-  const rows = options.querySelectorAll('[role="radio"]');
+  const rows = [...options.querySelectorAll('[role="radio"]')];
   const target = rows.find((row) => row.getAttribute("aria-checked") === "true") || rows[0];
   // Reveal a saved model that sits below the fold without scrolling ancestors.
   if (target && Number.isFinite(target.offsetTop) && Number.isFinite(target.offsetHeight)) {
@@ -3165,7 +3176,7 @@ function wireTeamMode() {
   $("teampickpanel").onclick = (event) => {
     if (!teamDraft || !teamDraft.workerOpen || !event || !event.target) return;
     const target = event.target;
-    if (target === $("teamworkerbtn") || (target.closest && target.closest("#teamworkerlist"))) return;
+    if ($("teamworkerwrap").contains(target)) return;
     setWorkerListOpen(false);
   };
   window.addEventListener("popstate", () => {
@@ -3386,6 +3397,7 @@ function chooseModelOption(value) {
   closeModelSheet();
 }
 function modelSheetKeydown(e) {
+  if (e.key === "Enter" && (e.isComposing || e.keyCode === 229)) return;
   if (e.key === "Escape") {
     e.preventDefault();
     closeModelSheet();
@@ -3432,6 +3444,7 @@ const skillPicks = new Map();
 const skillDraftsLoaded = new Set();
 const MAX_PICKED_SKILLS = 8; // Matches the turn request's MAX_TURN_SKILLS cap.
 let skillLoadEpoch = 0;
+let skillLoadRequest = null;
 let skillCatalog = [], skillMatches = [], skillActive = -1, skillComposing = false;
 function skillPickKey(sid = sessionId) { return JSON.stringify([store.base, sid || ""]); }
 function readSkillPick(key = skillPickKey()) {
@@ -3631,37 +3644,44 @@ function carrySkillPick(from, to) {
 function captureSkillPick() {
   const key = skillPickKey(), pick = readSkillPick();
   const names = !$("oskill").disabled && pick ? pick.names : [];
-  return { key, pick, skills: names.slice() };
+  return { key, pick, skills: names.map((name) => name.trim()).filter(Boolean) };
 }
 function consumeSkillPick(sent) {
   if (sent.skills.length && skillPicks.get(sent.key) === sent.pick) setSkillPick(sent.key, [], sent.pick.query);
   restoreSkillPick();
 }
-async function loadSkills() {
-  const epoch = ++skillLoadEpoch, base = store.base, sel = $("oskill");
+function loadSkills() {
+  const base = store.base;
+  if (skillLoadRequest?.base === base) return skillLoadRequest.promise;
+  const epoch = ++skillLoadEpoch, sel = $("oskill");
   sel.disabled = true;
   skillCatalog = [];
   $("skillvalue").textContent = "skill: loading…";
   restoreSkillPick();
-  try {
-    const skills = await (await api("/skills")).json();
-    if (epoch !== skillLoadEpoch || base !== store.base) return;
-    const seen = new Set();
-    skillCatalog = skills.filter((s) => {
-      if (typeof s.name !== "string" || !s.name.trim() || seen.has(s.name.trim().toLowerCase())) return false;
-      seen.add(s.name.trim().toLowerCase());
-      return true;
-    }).map((s) => ({ ...s, name: s.name.trim() }));
-    $("skillvalue").textContent = skillCatalog.length ? "skill: session default" : "skill: none available";
-    sel.title = "Toggle skills for the next message; session defaults still apply.";
-    sel.disabled = !skillCatalog.length;
-    if (!skillCatalog.length) setSkillPick(skillPickKey(), [], "");
-  } catch (_) {
-    if (epoch !== skillLoadEpoch || base !== store.base) return;
-    $("skillvalue").textContent = "skill: unavailable";
-    sel.title = "Could not load skills; reconnect to retry. Normal messages still work.";
-  }
-  restoreSkillPick();
+  const request = { base, promise: null };
+  request.promise = (async () => {
+    try {
+      const skills = await (await api("/skills")).json();
+      if (epoch !== skillLoadEpoch || base !== store.base) return;
+      const seen = new Set();
+      skillCatalog = skills.filter((s) => {
+        if (typeof s.name !== "string" || !s.name.trim() || seen.has(s.name.trim().toLowerCase())) return false;
+        seen.add(s.name.trim().toLowerCase());
+        return true;
+      }).map((s) => ({ ...s, name: s.name.trim() }));
+      $("skillvalue").textContent = skillCatalog.length ? "skill: session default" : "skill: none available";
+      sel.title = "Toggle skills for the next message; session defaults still apply.";
+      sel.disabled = !skillCatalog.length;
+      if (!skillCatalog.length) setSkillPick(skillPickKey(), [], "");
+    } catch (_) {
+      if (epoch !== skillLoadEpoch || base !== store.base) return;
+      $("skillvalue").textContent = "skill: unavailable";
+      sel.title = "Could not load skills; reconnect to retry. Normal messages still work.";
+    }
+    restoreSkillPick();
+  })().finally(() => { if (skillLoadRequest === request) skillLoadRequest = null; });
+  skillLoadRequest = request;
+  return request.promise;
 }
 async function loadInfo() {
   try {
@@ -3926,16 +3946,18 @@ function historyRowsOf(msgs, histTotal, showAll) {
     if (isRuntimeSyntheticUser(message)) continue;
     const text = textOf(message.content, message.role === "user").trim();
     if (!text) continue;
+    const identity = [
+      message.role || "", text, !!message.reasoning_content,
+      message.tool_call_id || "",
+      message.tool_call_id ? calls.get(message.tool_call_id) : null,
+    ];
     rows.push({
       message,
       text,
       historyIndex: histBase + i,
       call: message.tool_call_id ? calls.get(message.tool_call_id) : null,
-      key: JSON.stringify([
-        histBase + i, message.role || "", text, !!message.reasoning_content,
-        message.tool_call_id || "",
-        message.tool_call_id ? calls.get(message.tool_call_id) : null,
-      ]),
+      key: JSON.stringify([histBase + i, ...identity]),
+      identity: JSON.stringify(identity),
     });
   }
   return { rows, shownCount: shown.length };
@@ -3945,7 +3967,12 @@ function renderHistoryRow(row, parent) {
   if (m.role === "user") addUserBubble(row.text, row.historyIndex, parent);
   else if (m.role === "assistant") addMsgMd(row.text, parent);
   else addFold(row.call ? callLabel(row.call) : FOLD_ROLE_LABELS[m.role] || m.role, row.text.slice(0, 2000), parent);
-  if (parent?.lastElementChild) parent.lastElementChild.dataset.canonicalIndex = String(row.historyIndex);
+  if (parent?.lastElementChild) {
+    const data = parent.lastElementChild.dataset;
+    data.canonicalIndex = String(row.historyIndex);
+    data.canonicalKey = row.key;
+    data.canonicalIdentity = row.identity;
+  }
 }
 // A session the server reports as running while this page holds no stream for
 // it — reloaded mid-turn, the feed of a turn in another session died, or the
@@ -3981,12 +4008,24 @@ function attachLiveBox() {
 function attachPendingInputs(root) {
   const pending = pendingUserInputs.get(sessionId) || [];
   if (!pending.length) return;
-  // Canonical indices keep each prompt after earlier turns and before its own reply.
-  const rows = Array.from(root.children).filter((node) => node.dataset?.canonicalIndex !== undefined);
+  // Each refresh resolves the owning turn before the DOM rows are reconciled.
+  const rows = new Map(Array.from(root.children).map((node) => [node.dataset?.canonicalKey, node]));
   for (const input of pending) {
-    const anchor = rows.find((node) => Number(node.dataset.canonicalIndex) >= input.minIndex);
+    const anchor = input.beforeKey ? rows.get(input.beforeKey) : null;
     root.insertBefore(input.row, anchor || null);
   }
+}
+function pendingHistoryFloor(input, history, msgs, baseIndex, total) {
+  const identity = input.afterInput?.historyIdentity || input.afterHistoryKey;
+  if (!identity) return input.afterInput ? input.afterInput.minIndex : input.minIndex;
+  const previousIndex = input.afterInput?.historyIndex ?? input.afterHistoryIndex;
+  const previous = history.rows.find((row) => row.identity === identity && row.historyIndex === previousIndex)
+    || history.rows.findLast((row) => row.identity === identity);
+  if (!previous) return total;
+  // The preceding turn may have gained tool rows or its final answer since send.
+  const next = msgs.findIndex((message, index) => baseIndex + index > previous.historyIndex
+    && message.role === "user" && !isRuntimeSyntheticUser(message));
+  return next < 0 ? total : baseIndex + next;
 }
 // A turn the user has left whose feed is gone: its box is retired here, and
 // that session picks the turn up from history when it is opened again.
@@ -4055,7 +4094,7 @@ async function loadHistory(prefetched) {
   const baseIndex = Math.max(0, (histTotal || msgs.length) - msgs.length);
   let acknowledgedThrough = 0;
   for (const input of pendingUserInputs.get(forSession) || []) {
-    const floor = Math.max(input.minIndex, acknowledgedThrough);
+    const floor = Math.max(pendingHistoryFloor(input, history, msgs, baseIndex, canonicalHistoryTotal), acknowledgedThrough);
     // Image tokens become reference parts, or OCR is appended for non-vision models.
     const expected = input.prompt.replace(/\[\[image:[\s\S]*?\]\]/g, "").trim();
     const hadImages = expected !== input.prompt.trim();
@@ -4075,11 +4114,14 @@ async function loadHistory(prefetched) {
       for (let i = msgs.length - 1; i >= 0; i--) if (matches(msgs[i])) { found = i; break; }
     }
     if (found >= 0) {
+      input.historyIndex = baseIndex + found;
+      input.historyIdentity = history.rows.find((row) => row.historyIndex === input.historyIndex)?.identity;
       acknowledgedThrough = Math.max(acknowledgedThrough, baseIndex + found + 1);
       input.row.remove();
       revokePreviews(input.row);
     } else {
       input.minIndex = floor;
+      input.beforeKey = history.rows.find((row) => row.historyIndex >= floor)?.key || null;
       pending.push(input);
     }
   }
@@ -4925,6 +4967,10 @@ async function prepareTurnSession(previousId, base) {
 }
 // END turn session preparation
 // BEGIN composer send
+function pendingInputAnchor(root) {
+  const previous = Array.from(root.children).findLast((node) => node.dataset?.canonicalIdentity);
+  return { afterHistoryKey: previous?.dataset.canonicalIdentity || "", afterHistoryIndex: Number(previous?.dataset.canonicalIndex) };
+}
 async function send() {
   if (sendBusy) return; // one send's own setup at a time
   if (typeof abortEvents === "function") abortEvents();
@@ -4974,7 +5020,10 @@ async function send() {
   // `settled` flips once the turn's POST is accepted: from then on this input
   // is in canonical history, so an exact text match anywhere in the transcript
   // belongs to it. Before that, a match may still be an older identical input.
-  const userInput = { row: userBubble.parentNode, prompt, minIndex: rewindFloor, settled: false };
+  const userInput = {
+    row: userBubble.parentNode, prompt, minIndex: rewindFloor, settled: false,
+    ...pendingInputAnchor($("msgs")), afterInput: pendingInputs.at(-1) || null,
+  };
   pendingInputs.push(userInput);
   pendingUserInputs.set(sid, pendingInputs);
   scrollToLatest(false);
@@ -5606,6 +5655,7 @@ function wire() {
   window.addEventListener("popstate", () => { if (!$("modelpick").hidden) closeModelSheet(true); });
   wireTeamMode();
   // BEGIN skill picker events
+  $("ovrwrap").ontoggle = () => { if ($("ovrwrap").open && !skillCatalog.length) return loadSkills(); };
   $("oskill").onclick = () => { if ($("skillmenu").hidden) openSkillMenu(); else closeSkillMenu(true); };
   $("skillsearch").oninput = (e) => {
     if (e.isComposing) skillComposing = true;
