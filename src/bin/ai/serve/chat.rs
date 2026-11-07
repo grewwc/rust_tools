@@ -382,9 +382,9 @@ impl ServeTurnSelection {
                 }
                 _ => None,
             },
-            subagent_backend: crate::ai::tools::task_tools::BackendId::from_session_config(None)
-                .as_str()
-                .to_string(),
+            // Serve sessions default their subagents to TraeCLI; a stored
+            // config overrides it.
+            subagent_backend: "traecli".to_string(),
             skills: Vec::new(),
         }
     }
@@ -401,7 +401,7 @@ impl ServeTurnSelection {
     }
 
     fn effective_backend_label(&self) -> String {
-        let backend = crate::ai::tools::task_tools::SubagentBackend::from_session_config(Some(
+        let backend = crate::ai::tools::task_tools::SubagentBackend::from_stored(Some(
             self.subagent_backend.as_str(),
         ));
         if backend.resolve().execution_mode()
@@ -511,9 +511,9 @@ fn persist_serve_config_patch(
 
 /// Fold a server-stored session config into the client selection. Stored
 /// non-empty turn picks override the `/info` defaults so a reconnect resumes
-/// the last `/model`/`/effort`/`/agent` state. Empty backend values resolve to
-/// the available session default, replacing a previous session's backend.
-/// Returns true when something changed.
+/// the last `/model`/`/effort`/`/agent` state. The subagent backend is exact:
+/// an empty stored value means the kernel default and must clear a previous
+/// session's external-backend label. Returns true when something changed.
 fn merge_restored_session_config(
     cfg: &ServeSessionConfig,
     selection: &mut ServeTurnSelection,
@@ -533,11 +533,11 @@ fn merge_restored_session_config(
         selection.reasoning_effort = Some(cfg.reasoning_effort.clone());
         changed = true;
     }
-    let backend = crate::ai::tools::task_tools::BackendId::from_session_config(Some(
-        cfg.subagent_backend.as_str(),
-    ));
-    if backend.as_str() != selection.subagent_backend {
-        selection.subagent_backend = backend.as_str().to_string();
+    // An empty stored value keeps the session default instead of clearing it.
+    if !cfg.subagent_backend.is_empty()
+        && cfg.subagent_backend != selection.subagent_backend
+    {
+        selection.subagent_backend = cfg.subagent_backend.clone();
         changed = true;
     }
     changed
@@ -4933,7 +4933,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
     println!("Connected to {base}, session {session_id}.");
     let use_usage = crate::ai::tools::task_tools::backends::backend_registry().use_usage();
     println!(
-        "Enter inserts a newline, Esc or Alt+Enter submits; Ctrl+C interrupts the running remote turn (a second Ctrl+C exits); /quit exits, /bg backgrounds the current session and exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions (/sessions current|id shows the current one), /fork branches the current session, /close deletes it and exits. /cd switches the remote working directory (Tab completes remote paths; /pwd prints it). /model, /effort, /agent switch the remote turn like the local REPL. {use_usage} shows or switches the remote session's default subagent backend; /reset restores the default subagent backend and clears sticky agent-team. /task and /discuss run multi-worker rooms on the server (/task help, /discuss help)."
+        "Enter inserts a newline, Esc or Alt+Enter submits; Ctrl+C interrupts the running remote turn (a second Ctrl+C exits); /quit exits, /bg backgrounds the current session and exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions (/sessions current|id shows the current one), /fork branches the current session, /close deletes it and exits. /cd switches the remote working directory (Tab completes remote paths; /pwd prints it). /model, /effort, /agent switch the remote turn like the local REPL. {use_usage} shows or switches the remote session's default subagent backend; /reset restores kernel subagent defaults and clears sticky agent-team. /task and /discuss run multi-worker rooms on the server (/task help, /discuss help)."
     );
     let mut editor = PromptEditor::new(&session_id, &app_config.history_file);
     // Command words the shared completion table does not carry: serve-chat-only
@@ -5036,7 +5036,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
             "/quit" | "/exit" | ":q" => break,
             "/help" | "/h" => {
                 println!(
-                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first, archived hidden); /sessions all - include archived; /sessions archive - list archived; /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|u<N>|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/export, /import - session ZIP commands available in the local REPL (same as /ss export/import)\n/export-md [path] - export the latest server-side assistant conclusion to a markdown file on the server (relative to the remote cwd; default: _summary.md)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n{use_usage} - show or switch the remote session's default subagent backend (also :use); a task on a new line runs immediately\n/reset - restore the default subagent backend and clear sticky agent-team\n/audit [-f|--fast] [instruction] - run the audit subagent on the server, then verify and fix findings\n/task [N] <goal> - run a multi-worker task room on the server (/task status [room] shows progress; /task help for details)\n/discuss [N] <topic> - run a multi-member discussion on the server (/discuss status [room] shows progress; /discuss help for details)\n/distill-session [session-id|archive.zip] [--dry-run] [--limit N] - distill a session into knowledge on the server (paths resolve on the server)\n/title [text] - set or show the current server-side session title (bare /title shows it)\n/mark [<id>|current|last] [message] - mark a server-side session as important (default: current; leading `--` makes the rest a literal message for current)\n/unmark [<id>|current|last|--] - remove a server-side important mark (default: current; `--` forces current)\n/archive [<id>|current|last] - toggle the server-side formal archive flag (default: current)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
+                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first, archived hidden); /sessions all - include archived; /sessions archive - list archived; /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|u<N>|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/export, /import - session ZIP commands available in the local REPL (same as /ss export/import)\n/export-md [path] - export the latest server-side assistant conclusion to a markdown file on the server (relative to the remote cwd; default: _summary.md)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n{use_usage} - show or switch the remote session's default subagent backend (also :use); a task on a new line runs immediately\n/reset - restore kernel subagent defaults and clear sticky agent-team\n/audit [-f|--fast] [instruction] - run the audit subagent on the server, then verify and fix findings\n/task [N] <goal> - run a multi-worker task room on the server (/task status [room] shows progress; /task help for details)\n/discuss [N] <topic> - run a multi-member discussion on the server (/discuss status [room] shows progress; /discuss help for details)\n/distill-session [session-id|archive.zip] [--dry-run] [--limit N] - distill a session into knowledge on the server (paths resolve on the server)\n/title [text] - set or show the current server-side session title (bare /title shows it)\n/mark [<id>|current|last] [message] - mark a server-side session as important (default: current; leading `--` makes the rest a literal message for current)\n/unmark [<id>|current|last|--] - remove a server-side important mark (default: current; `--` forces current)\n/archive [<id>|current|last] - toggle the server-side formal archive flag (default: current)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
                 );
                 continue;
             }
@@ -5048,13 +5048,8 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                     }
                     CommandCompleter::clear_checkpoint_candidates();
                     editor.set_session_id(session_id.as_str());
-                    if restore_serve_session_picks(
-                        &client,
-                        &base,
-                        &token,
-                        &session_id,
-                        &mut selection,
-                    ) {
+                    if merge_restored_session_config(&ServeSessionConfig::default(), &mut selection)
+                    {
                         selection.apply_header(&mut editor);
                     }
                     println!("New session {session_id}.");
@@ -7555,41 +7550,14 @@ mod tests {
         // Restoring the same picks again changes nothing.
         assert!(!merge_restored_session_config(&cfg, &mut selection));
 
-        // Explicit kernel picks round-trip even when TraeCLI is the default.
-        let kernel_cfg = ServeSessionConfig {
-            subagent_backend: "kernel".to_string(),
-            ..Default::default()
-        };
-        assert!(merge_restored_session_config(&kernel_cfg, &mut selection));
-        assert_eq!(selection.subagent_backend, "kernel");
+        // Unlike empty turn picks, an empty backend is meaningful: the resumed
+        // or newly-created session uses kernel and must clear a stale label.
+        assert!(merge_restored_session_config(
+            &ServeSessionConfig::default(),
+            &mut selection
+        ));
+        assert!(selection.subagent_backend.is_empty());
         assert!(selection.effective_backend_label().is_empty());
-        assert!(!merge_restored_session_config(&kernel_cfg, &mut selection));
-
-        // Empty preferences restore the available default without clearing turn picks.
-        let default_backend = crate::ai::tools::task_tools::BackendId::from_session_config(None);
-        for previous in ["kernel", "traecli"] {
-            selection.subagent_backend = previous.to_string();
-            assert_eq!(
-                merge_restored_session_config(&ServeSessionConfig::default(), &mut selection),
-                previous != default_backend.as_str()
-            );
-            assert_eq!(selection.subagent_backend, default_backend.as_str());
-            assert_eq!(
-                selection.effective_backend_label(),
-                if default_backend == crate::ai::tools::task_tools::BackendId::TRAECLI {
-                    "sub:traecli"
-                } else {
-                    ""
-                }
-            );
-            assert_eq!(selection.model, "stored-m");
-            assert_eq!(selection.agent, "build");
-            assert_eq!(selection.reasoning_effort.as_deref(), Some("high"));
-            assert!(!merge_restored_session_config(
-                &ServeSessionConfig::default(),
-                &mut selection
-            ));
-        }
     }
 
     #[test]

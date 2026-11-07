@@ -17,15 +17,6 @@ const layoutHoldSrc = script.slice(
 );
 const renderer = script.slice(script.indexOf("const esc ="), script.indexOf("function sessionTitle("));
 const decode = (s) => s.replace(/&(amp|lt|gt|quot);/g, (_, key) => ({ amp: "&", lt: "<", gt: ">", quot: '"' })[key]);
-function nodeList(nodes = []) {
-  const list = {
-    ...nodes, length: nodes.length,
-    item(index) { return this[index] ?? null; },
-    forEach(callback, thisArg) { nodes.forEach((node, index) => callback.call(thisArg, node, index, list)); },
-    [Symbol.iterator]() { return nodes[Symbol.iterator](); },
-  };
-  return list;
-}
 function nodesOf(markup) {
   return [...markup.matchAll(/<span class="math (display|inline)" data-tex="([^"]*)">([\s\S]*?)<\/span>/g)].map((m) => ({
     dataset: { tex: decode(m[2]) }, textContent: decode(m[3]),
@@ -36,7 +27,7 @@ function harness() {
   const assets = [], calls = [];
   const msgs = {
     nodes: [], scrollTop: 0, scrollHeight: 200, clientHeight: 100,
-    querySelectorAll() { return nodeList(this.nodes.filter((node) => "tex" in node.dataset)); },
+    querySelectorAll() { return this.nodes.filter((node) => "tex" in node.dataset); },
     querySelector() { return this.querySelectorAll()[0] || null; },
   };
   const document = { createElement: (tag) => ({ tag }), head: { appendChild: (el) => assets.push(el) } };
@@ -100,7 +91,7 @@ test("drafts persist independently for each session and restore on switch", () =
       setAttribute() {},
     },
     questioncount: { textContent: "" },
-    msgs: { querySelectorAll: () => nodeList() },
+    msgs: { querySelectorAll: () => [] },
   };
   const context = vm.createContext({
     localStorage: {
@@ -639,7 +630,7 @@ test("preview controls switch between isolated rendering and escaped source", ()
   const preview = {
     classList: { toggle(name, on) { if (on) classes.add(name); else classes.delete(name); } },
     querySelector(selector) { return selector === "iframe" ? frame : source; },
-    querySelectorAll() { return nodeList(buttons); },
+    querySelectorAll() { return buttons; },
   };
   for (const button of buttons) {
     button.closest = (selector) => (selector === ".code-preview" ? preview : null);
@@ -916,7 +907,7 @@ test("stream paint batches answer, thinking and progress into one follow pass", 
     classList: { remove() {} },
     set innerHTML(markup) { answerWrites++; h.msgs.nodes = nodesOf(markup); },
     querySelector: () => null,
-    querySelectorAll: () => nodeList(),
+    querySelectorAll: () => [],
   };
   Object.assign(h.context, {
     answerDirty: true, progressDirty: true, thinkingDirty: true, thinkingDoneDirty: true,
@@ -1039,7 +1030,7 @@ function previewHarness(paths, api) {
     replaceWith(node) { this.replacement = node; },
   }));
   const subtree = (nodes) => ({
-    querySelectorAll(selector) { return nodeList(nodes.filter((n) => !selector.includes(":not") || !n.dataset.held)); },
+    querySelectorAll(selector) { return nodes.filter((n) => !selector.includes(":not") || !n.dataset.held); },
     contains: (node) => nodes.includes(node),
   });
   const root = subtree(slots);
@@ -1156,7 +1147,7 @@ function historyHarness({
     revokePreviews(node) { retired.push(node); },
     renderHistoryRow(row, parent) {
       const node = {
-        key: row.key, parent, dataset: { canonicalIndex: String(row.historyIndex ?? rows.indexOf(row)), canonicalKey: row.key },
+        key: row.key, parent, dataset: { canonicalIndex: String(row.historyIndex ?? rows.indexOf(row)) },
         classList: { contains: (name) => row.role === "user" && name === "user-msg-row" },
       };
       node.remove = function remove() {
@@ -1492,7 +1483,7 @@ test("unmatched pending user rows precede trailing canonical answers", () => {
   };
   const row = (key, user = false, index) => ({
     key,
-    dataset: index === undefined ? {} : { canonicalIndex: String(index), canonicalKey: key },
+    dataset: index === undefined ? {} : { canonicalIndex: String(index) },
     classList: { contains: (name) => user && name === "user-msg-row" },
     get previousElementSibling() { return root.children[root.children.indexOf(this) - 1] || null; },
   });
@@ -1503,7 +1494,7 @@ test("unmatched pending user rows precede trailing canonical answers", () => {
     sessionId: "s", staleBox: null, turns: new Map([["s", { box }]]),
     eventSession: "", recoveredView: null,
     $: () => root, armHistoryFollow() {},
-    pendingUserInputs: new Map([["s", [{ row: pendingUser, prompt: "unmatched prompt", minIndex: 1, beforeKey: answer.key }]]]),
+    pendingUserInputs: new Map([["s", [{ row: pendingUser, prompt: "unmatched prompt", minIndex: 1 }]]]),
     shouldFollowOutput: () => true, followOutput() {},
   });
   const start = script.indexOf("function attachLiveBox(");
@@ -1523,10 +1514,7 @@ test("unmatched pending user rows precede trailing canonical answers", () => {
 
   const secondPending = row("second pending user", true);
   root.children = [canonicalUser, answer];
-  context.pendingUserInputs.set("s", [
-    { row: pendingUser, minIndex: 1, beforeKey: answer.key },
-    { row: secondPending, minIndex: 1, beforeKey: answer.key },
-  ]);
+  context.pendingUserInputs.set("s", [{ row: pendingUser, minIndex: 1 }, { row: secondPending, minIndex: 1 }]);
   context.turns.set("s", { box });
   context.attachLiveBox();
   assert.deepEqual(root.children, [canonicalUser, pendingUser, secondPending, answer, box], "pending prompts keep their input order");
@@ -1594,72 +1582,6 @@ test("a later pending input follows the previous turn's finished answer", async 
   assert.deepEqual(h.root.children.map((node) => node.key), ["old prompt", "finished answer", "pending user", "live box"]);
   assert.equal(h.root.children[2], user);
   assert.equal(h.root.lastElementChild, live);
-});
-
-for (const drift of ["grew", "shrank"]) test(`pending placement follows its history anchor when the count ${drift}`, async () => {
-  const user = { key: "pending user" }, live = { key: "live box" };
-  const oldPrompt = { role: "user", content: "old prompt" };
-  const h = indexedHistoryHarness({ existingNodes: [user, live] });
-  await h.context.loadHistory({ messages: [oldPrompt], histTotal: drift === "shrank" ? 9 : 1 });
-  const afterHistoryKey = h.root.lastElementChild.dataset.canonicalIdentity;
-  h.context.pendingUserInputs.set("s", [{
-    row: user, prompt: "next prompt", minIndex: drift === "shrank" ? 9 : 1, afterHistoryKey,
-  }]);
-  h.context.turns.set("s", { box: live });
-  const messages = drift === "shrank"
-    ? [oldPrompt, { role: "user", content: "" }, { role: "assistant", content: "owned answer" }]
-    : [oldPrompt, { role: "assistant", content: "finished answer" }];
-  await h.context.loadHistory({ messages, histTotal: messages.length });
-  const expected = drift === "shrank"
-    ? ["old prompt", "pending user", "owned answer", "live box"]
-    : ["old prompt", "finished answer", "pending user", "live box"];
-  assert.deepEqual(h.root.children.map((node) => node.key), expected);
-  const first = h.root.children.slice();
-  await h.context.loadHistory({ messages, histTotal: messages.length });
-  assert.deepEqual(h.root.children, first, "reattachment keeps the same prompt and answer nodes in order");
-});
-
-for (const acknowledged of [false, true]) test(`two pending prompts keep their history anchors (first acknowledged=${acknowledged})`, async () => {
-  const oldPrompt = { role: "user", content: "old prompt" };
-  const firstRow = { key: "first pending" }, secondRow = { key: "second pending" }, live = { key: "live box" };
-  const h = indexedHistoryHarness({ existingNodes: [firstRow, secondRow, live] });
-  await h.context.loadHistory({ messages: [oldPrompt], histTotal: 1 });
-  const first = {
-    row: firstRow, prompt: "first prompt", minIndex: 1,
-    afterHistoryKey: h.root.lastElementChild.dataset.canonicalIdentity,
-  };
-  const second = { row: secondRow, prompt: "second prompt", minIndex: 1, afterInput: first };
-  h.context.pendingUserInputs.set("s", [first, second]);
-  h.context.turns.set("s", { box: live });
-  const messages = [oldPrompt, { role: "assistant", content: "finished answer" }];
-  if (acknowledged) messages.push({ role: "user", content: "first prompt" }, { role: "assistant", content: "first answer" });
-  await h.context.loadHistory({ messages, histTotal: messages.length });
-  assert.deepEqual(h.root.children.map((node) => node.key), acknowledged
-    ? ["old prompt", "finished answer", "first prompt", "first answer", "second pending", "live box"]
-    : ["old prompt", "finished answer", "first pending", "second pending", "live box"]);
-  assert.equal(h.context.pendingUserInputs.get("s").length, acknowledged ? 1 : 2);
-  const before = h.root.children.slice();
-  await h.context.loadHistory({ messages, histTotal: messages.length });
-  assert.deepEqual(h.root.children, before);
-});
-
-test("an identical earlier prompt cannot move the anchor past the first pending input", async () => {
-  const firstRow = { key: "first pending" }, secondRow = { key: "second pending" }, live = { key: "live box" };
-  const h = indexedHistoryHarness({ existingNodes: [firstRow, secondRow, live] });
-  const oldPrompt = { role: "user", content: "repeat" };
-  await h.context.loadHistory({ messages: [oldPrompt], histTotal: 1 });
-  const previous = h.root.lastElementChild.dataset;
-  const first = {
-    row: firstRow, prompt: "repeat", minIndex: 1,
-    afterHistoryKey: previous.canonicalIdentity, afterHistoryIndex: Number(previous.canonicalIndex),
-  };
-  const second = { row: secondRow, prompt: "next prompt", minIndex: 1, afterInput: first };
-  h.context.pendingUserInputs.set("s", [first, second]);
-  h.context.turns.set("s", { box: live });
-  const messages = [oldPrompt, { role: "assistant", content: "old answer" }, oldPrompt, { role: "assistant", content: "new answer" }];
-  await h.context.loadHistory({ messages, histTotal: 4 });
-  assert.deepEqual(h.root.children.map((node) => node.key), ["repeat", "old answer", "repeat", "new answer", "second pending", "live box"]);
-  assert.equal(h.context.pendingUserInputs.get("s")[0], second);
 });
 
 function scrollHarness({ phone = true, scrollTop = 0 } = {}) {

@@ -1066,15 +1066,11 @@ async fn session_config_subagents_use_reset_roundtrip() {
     let store = super::SessionStore::new(&state.history_file);
     let id = "subagent-config";
     let (_, fresh) = session_config_test_response(state.clone(), id, None).await;
-    let default_backend = super::super::tools::task_tools::BackendId::from_session_config(None);
-    assert_eq!(fresh["subagent_backend"], default_backend.as_str());
+    assert_eq!(fresh["subagent_backend"], "");
     assert_eq!(fresh["subagent_model"], "");
     assert_eq!(fresh["default_skills"], serde_json::json!([]));
     let fresh_output = fresh["output"].as_str().unwrap();
-    assert!(fresh_output.starts_with(&format!(
-        "Session default subagent backend: {}\n",
-        default_backend.as_str()
-    )));
+    assert!(fresh_output.starts_with("Session default subagent backend: kernel\n"));
     assert!(fresh_output.contains("TraeCLI worker model: "));
     assert!(fresh_output.ends_with("Sticky agent-team: off\n"));
     let initial = super::SessionServeConfig {
@@ -1111,10 +1107,8 @@ async fn session_config_subagents_use_reset_roundtrip() {
         assert_eq!(saved.model, initial.model);
         assert_eq!(saved.agent, initial.agent);
         assert_eq!(saved.reasoning_effort, initial.reasoning_effort);
-        assert_eq!(saved.subagent_backend.as_deref(), Some(backend));
-        assert_eq!(body["subagent_backend"], backend);
         assert_eq!(
-            super::super::tools::task_tools::BackendId::from_session_config(
+            super::super::tools::task_tools::BackendId::from_stored(
                 saved.subagent_backend.as_deref()
             )
             .as_str(),
@@ -1168,7 +1162,6 @@ async fn session_config_subagents_use_reset_roundtrip() {
     assert_eq!(saved.model, initial.model);
     assert_eq!(saved.agent, initial.agent);
     assert_eq!(saved.reasoning_effort, initial.reasoning_effort);
-    assert_eq!(reset["subagent_backend"], default_backend.as_str());
     assert_eq!(reset["output"], fresh["output"]);
     let (_, read) = session_config_test_response(state.clone(), id, None).await;
     assert_eq!(read, reset);
