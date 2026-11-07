@@ -930,7 +930,7 @@ let lastItems = []; // latest /sessions payload (newest-first), backing the sess
 let lastMsgCount = null; // message count from the last history load
 let canonicalHistoryTotal = 0; // full canonical count, including rows outside the 200-row window
 let historySession = ""; // session whose canonical rows back historyKeys
-let historyKeys = []; // visible canonical rows currently mounted before any live turn UI
+let historyKeys = []; // visible canonical rows currently mounted, excluding live turn UI
 let historyLoadSeq = 0;
 const pendingUserInputs = new Map(); // local rows survive until canonical history acknowledges them
 // Live turns, one entry per session that is streaming right now: the page can
@@ -2548,13 +2548,125 @@ function createThinkingFold(parent, before) {
   return next;
 }
 
+// Detached cards are kept weakly so reattachment can resume without retaining
+// removed turns. Only connected running cards share the interval.
+const subagentClocks = new WeakMap();
+const tickingSubagents = new Set();
+const SUBAGENT_ACTIVE_PHASES = new Set(["running", "active"]);
+let subagentTicker = null, subagentTickerWired = false, subagentPageHidden = false;
+function syncSubagentTicker() {
+  for (const clock of tickingSubagents) if (!clock.box.isConnected) tickingSubagents.delete(clock);
+  if (!tickingSubagents.size || document.hidden || subagentPageHidden) {
+    if (subagentTicker !== null) clearInterval(subagentTicker);
+    subagentTicker = null;
+    return;
+  }
+  if (subagentTicker !== null) return;
+  subagentTicker = setInterval(() => {
+    syncSubagentTicker();
+    if (subagentTicker === null) return;
+    const now = Date.now();
+    for (const clock of tickingSubagents) clock.paint(now);
+  }, 1000);
+}
+function wireSubagentTicker() {
+  if (subagentTickerWired) return;
+  subagentTickerWired = true;
+  const resume = () => {
+    syncSubagentTicker();
+    if (document.hidden || subagentPageHidden) return;
+    const now = Date.now();
+    for (const clock of tickingSubagents) clock.paint(now);
+  };
+  document.addEventListener("visibilitychange", resume);
+  window.addEventListener("pagehide", () => { subagentPageHidden = true; syncSubagentTicker(); });
+  window.addEventListener("pageshow", () => { subagentPageHidden = false; resume(); });
+  new MutationObserver((records) => {
+    for (const record of records) for (const node of record.addedNodes) {
+      const boxes = [node, ...(node.querySelectorAll ? node.querySelectorAll(".msg.asst") : [])];
+      for (const box of boxes) {
+        const clock = subagentClocks.get(box);
+        if (!clock || !box.isConnected) continue;
+        tickingSubagents.add(clock);
+        if (!document.hidden && !subagentPageHidden) clock.paint(Date.now());
+      }
+    }
+    syncSubagentTicker();
+  }).observe(document.body, { childList: true, subtree: true });
+}
+function formatSubagentElapsed(seconds) {
+  const hours = Math.floor(seconds / 3600), minutes = Math.floor(seconds / 60) % 60;
+  return (hours ? hours + "h" : "") + (hours || minutes ? minutes + "m" : "") + seconds % 60 + "s";
+}
+function createSubagentClock(fold) {
+  let rows = new Map(), lines = [], rendered = "";
+  const clock = {
+    box: fold.box,
+    paint(now) {
+      const text = lines.map((line) => {
+        if (typeof line === "string") return line;
+        const seconds = line.seconds + Math.max(0, Math.floor((now - line.at) / 1000));
+        return line.prefix + line.separator + formatSubagentElapsed(seconds) + line.tail;
+      }).join("\n");
+      if (text === rendered) return;
+      rendered = text;
+      fold.set("subagents · " + shortLine(text || "idle", 100), text);
+    },
+    set(text) {
+      const now = Date.now(), next = new Map(), counts = new Map();
+      let running = false;
+      rendered = String(text || "");
+      lines = rendered.split("\n").map((line) => {
+        if (/^[\s│]*↳/.test(line)) return line;
+        const match = line.match(/^((?:[├└]─ )?(.+?)(?: · |: )([a-z][a-z_-]*))(?=$|[\s·])(.*)$/i);
+        if (!match) return line;
+        // Branch prefixes and progress details change independently of identity.
+        const identity = JSON.stringify([match[2], match[4].match(/ · task: (.*)$/)?.[1] || ""]);
+        const count = counts.get(identity) || 0;
+        counts.set(identity, count + 1);
+        const key = identity + "\n" + count, previous = rows.get(key);
+        const elapsed = match[4].match(/^(\s+(?:·\s+)?)(\d+h(?:\d+m)?(?:\d+s)?|\d+m(?:\d+s)?|\d+s)(?=$|\s*·)/);
+        const row = { at: previous ? previous.at : now, seconds: previous ? previous.seconds : 0 };
+        if (elapsed) {
+          row.at = now;
+          row.seconds = [...elapsed[2].matchAll(/(\d+)([hms])/g)].reduce((total, part) =>
+            total + Number(part[1]) * ({ h: 3600, m: 60, s: 1 }[part[2]]), 0);
+        }
+        next.set(key, row);
+        if (!SUBAGENT_ACTIVE_PHASES.has(match[3].toLowerCase())) return line;
+        running = true;
+        return { ...row, prefix: match[1], separator: elapsed ? elapsed[1] : " ",
+          tail: elapsed ? match[4].slice(elapsed[0].length) : match[4] };
+      });
+      rows = next;
+      fold.set("subagents · " + shortLine(text || "idle", 100), text);
+      if (running) {
+        subagentClocks.set(fold.box, clock);
+        wireSubagentTicker();
+        if (fold.box.isConnected) tickingSubagents.add(clock);
+      } else {
+        subagentClocks.delete(fold.box);
+        tickingSubagents.delete(clock);
+      }
+      syncSubagentTicker();
+    },
+    stop() {
+      subagentClocks.delete(fold.box);
+      tickingSubagents.delete(clock);
+      rows.clear();
+      syncSubagentTicker();
+    },
+  };
+  return clock;
+}
+
 // Live tools use the same call labels as history, keyed by call id rather than
 // inferred from stderr. Completion updates its own card, even for parallel tools.
 function createLiveActivity(parent, before) {
   const tools = new Map();
   let phase = "Connecting…";
   let waiting = false;
-  let subagents = null;
+  let subagents = null, subagentClock = null;
   // Tool/thinking cards insert before the *current* answer bubble. A turn can
   // hold several answer bubbles (prose, then tools, then more prose), so the
   // answer-segment owner moves this anchor whenever it seals a bubble.
@@ -2599,10 +2711,14 @@ function createLiveActivity(parent, before) {
     },
     subagents(text) {
       if (!subagents && !text) return;
-      if (!subagents) subagents = insert("subagents");
-      subagents.set("subagents · " + shortLine(text || "idle", 100), text);
+      if (!subagents) {
+        subagents = insert("subagents");
+        subagentClock = createSubagentClock(subagents);
+      }
+      subagentClock.set(text);
     },
     finish(reason) {
+      if (subagentClock) subagentClock.stop();
       for (const tool of tools.values()) if (tool.running) {
         tool.running = false;
         tool.fold.box.dataset.running = "false";
@@ -3814,6 +3930,7 @@ function renderHistoryRow(row, parent) {
   if (m.role === "user") addUserBubble(row.text, row.historyIndex, parent);
   else if (m.role === "assistant") addMsgMd(row.text, parent);
   else addFold(row.call ? callLabel(row.call) : FOLD_ROLE_LABELS[m.role] || m.role, row.text.slice(0, 2000), parent);
+  if (parent?.lastElementChild) parent.lastElementChild.dataset.canonicalIndex = String(row.historyIndex);
 }
 // A session the server reports as running while this page holds no stream for
 // it — reloaded mid-turn, the feed of a turn in another session died, or the
@@ -3836,7 +3953,7 @@ function armHistoryFollow() {
 function attachLiveBox() {
   const root = $("msgs");
   const follow = shouldFollowOutput(root);
-  for (const input of pendingUserInputs.get(sessionId) || []) root.appendChild(input.row);
+  attachPendingInputs(root);
   const box = turns.get(sessionId)?.box || (eventSession === sessionId ? recoveredView?.box : null);
   if (!box) { followOutput(follow, root); armHistoryFollow(); return; }
   // A failed feed is now represented by canonical history. reloadStale can
@@ -3845,6 +3962,16 @@ function attachLiveBox() {
   if (box === staleBox) return;
   root.appendChild(box);
   followOutput(follow, root);
+}
+function attachPendingInputs(root) {
+  const pending = pendingUserInputs.get(sessionId) || [];
+  if (!pending.length) return;
+  // Canonical indices keep each prompt after earlier turns and before its own reply.
+  const rows = Array.from(root.children).filter((node) => node.dataset?.canonicalIndex !== undefined);
+  for (const input of pending) {
+    const anchor = rows.find((node) => Number(node.dataset.canonicalIndex) >= input.minIndex);
+    root.insertBefore(input.row, anchor || null);
+  }
 }
 // A turn the user has left whose feed is gone: its box is retired here, and
 // that session picks the turn up from history when it is opened again.
@@ -3909,9 +4036,6 @@ async function loadHistory(prefetched) {
   // 200-message window can slide forward without re-decoding every image.
   const start = sameSession && nextKeys.length ? historyKeys.indexOf(nextKeys[0]) : -1;
   const retained = start < 0 ? 0 : Math.min(historyKeys.length - start, nextKeys.length);
-  const appendOnly = retained > 0
-    && nextKeys.slice(0, retained).every((key, i) => key === historyKeys[start + i])
-    && root.children.length >= historyKeys.length;
   const pending = [];
   const baseIndex = Math.max(0, (histTotal || msgs.length) - msgs.length);
   let acknowledgedThrough = 0;
@@ -3949,6 +4073,11 @@ async function loadHistory(prefetched) {
   const protectedRows = new Set(pending.map((input) => input.row));
   const liveBox = turns.get(forSession)?.box || (eventSession === forSession ? recoveredView?.box : null);
   if (liveBox) protectedRows.add(liveBox);
+  // Reconcile only the canonical prefix; pending rows may be interleaved with it.
+  for (const row of protectedRows) row.remove();
+  const appendOnly = retained > 0
+    && nextKeys.slice(0, retained).every((key, i) => key === historyKeys[start + i])
+    && root.children.length >= historyKeys.length;
   const removeRow = (node) => {
     if (!protectedRows.has(node)) revokePreviews(node);
     node.remove();
@@ -3961,7 +4090,6 @@ async function loadHistory(prefetched) {
     // Fetching has completed, so this synchronous clear-and-render is painted
     // as one frame instead of exposing an empty transcript during network I/O.
     // A still-running box is reattached below; its previews remain owned by it.
-    for (const row of protectedRows) row.remove();
     revokePreviews(root);
     root.textContent = "";
     for (const row of history.rows) renderHistoryRow(row, root);

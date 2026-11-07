@@ -1105,7 +1105,19 @@ function historyHarness({
   const pending = delayed ? new Promise((resolve) => { resolveResponse = () => resolve(response); }) : Promise.resolve(response);
   const root = {
     children: [], scrollTop: 0, scrollHeight: 100,
-    appendChild(node) { if (node.remove) node.remove(); this.children.push(node); node.parent = this; return node; },
+    insertBefore(node, anchor) {
+      if (node.remove) node.remove();
+      const index = anchor === null ? this.children.length : this.children.indexOf(anchor);
+      assert.ok(index >= 0, "the insertion anchor must be a child");
+      this.children.splice(index, 0, node);
+      node.parent = this;
+      Object.defineProperty(node, "previousElementSibling", {
+        configurable: true,
+        get() { return root.children[root.children.indexOf(this) - 1] || null; },
+      });
+      return node;
+    },
+    appendChild(node) { return this.insertBefore(node, null); },
     get lastElementChild() { return this.children[this.children.length - 1]; },
     set textContent(value) { assert.equal(value, ""); clears += 1; this.children = []; },
   };
@@ -1115,8 +1127,8 @@ function historyHarness({
     if (i >= 0) root.children.splice(i, 1);
   };
   const rows = [
-    { key: "old", text: "prompt" },
-    { key: "new", text: "reply" },
+    { key: "old", text: "prompt", role: "user", historyIndex: 0 },
+    { key: "new", text: "reply", role: "assistant", historyIndex: 1 },
   ];
   const context = vm.createContext({
     sessionId: "s", historySession: existingKeys.length ? "s" : "", historyKeys: existingKeys.slice(),
@@ -1134,7 +1146,10 @@ function historyHarness({
     followOutput(wasFollowing) { if (wasFollowing) root.scrollTop = root.scrollHeight; },
     revokePreviews(node) { retired.push(node); },
     renderHistoryRow(row, parent) {
-      const node = { key: row.key, parent };
+      const node = {
+        key: row.key, parent, dataset: { canonicalIndex: String(row.historyIndex ?? rows.indexOf(row)) },
+        classList: { contains: (name) => row.role === "user" && name === "user-msg-row" },
+      };
       node.remove = function remove() {
         const i = root.children.indexOf(this);
         if (i >= 0) root.children.splice(i, 1);
@@ -1261,13 +1276,16 @@ test("a changed canonical row rebuilds safely without retiring a running box", a
 });
 
 for (const prefix of ["old", "different"]) test(`unacknowledged user input survives history refresh (${prefix})`, async () => {
-  const old = { key: "old" }, user = { key: "pending-user" }, live = { key: "running" };
+  const old = { key: "old", classList: { contains: (name) => name === "user-msg-row" } };
+  const user = { key: "pending-user" }, live = { key: "running" };
   const h = historyHarness({ existingKeys: [prefix], existingNodes: [old, user, live] });
   h.context.pendingUserInputs.set("s", [{ row: user, prompt: "prompt", minIndex: 2 }]);
   h.context.turns.set("s", { box: live });
   const older = [{ role: "user", content: "prompt" }, { role: "assistant", content: "reply" }];
   await h.context.loadHistory({ messages: older, histTotal: 2 });
-  assert.deepEqual(h.root.children.slice(-2), [user, live]);
+  assert.deepEqual(h.root.children.map((node) => node.key), ["old", "new", "pending-user", "running"]);
+  assert.equal(h.root.children[2], user);
+  assert.equal(h.root.lastElementChild, live);
   assert.equal(h.retired.includes(user), false, "pending input previews must stay owned by the input");
   h.rows.push({ key: "canonical-user", text: "prompt" });
   await h.context.loadHistory({ messages: [...older, { role: "user", content: "prompt" }], histTotal: 3 });
@@ -1447,6 +1465,123 @@ test("a stale live box is not reattached beside canonical history", () => {
   vm.runInContext(script.slice(start, end), context);
   context.attachLiveBox();
   assert.deepEqual(root.appended, []);
+});
+
+test("unmatched pending user rows precede trailing canonical answers", () => {
+  const root = {
+    children: [], scrollTop: 0, scrollHeight: 10,
+    get lastElementChild() { return this.children[this.children.length - 1] || null; },
+    insertBefore(node, anchor) {
+      const oldIndex = this.children.indexOf(node);
+      if (oldIndex >= 0) this.children.splice(oldIndex, 1);
+      const index = anchor === null ? this.children.length : this.children.indexOf(anchor);
+      assert.ok(index >= 0, "the insertion anchor must be a child");
+      this.children.splice(index, 0, node);
+      return node;
+    },
+    appendChild(node) { return this.insertBefore(node, null); },
+  };
+  const row = (key, user = false, index) => ({
+    key,
+    dataset: index === undefined ? {} : { canonicalIndex: String(index) },
+    classList: { contains: (name) => user && name === "user-msg-row" },
+    get previousElementSibling() { return root.children[root.children.indexOf(this) - 1] || null; },
+  });
+  const canonicalUser = row("canonical user", true, 0), answer = row("assistant answer", false, 2);
+  const pendingUser = row("pending user", true), box = row("live box");
+  root.children = [canonicalUser, answer];
+  const context = vm.createContext({
+    sessionId: "s", staleBox: null, turns: new Map([["s", { box }]]),
+    eventSession: "", recoveredView: null,
+    $: () => root, armHistoryFollow() {},
+    pendingUserInputs: new Map([["s", [{ row: pendingUser, prompt: "unmatched prompt", minIndex: 1 }]]]),
+    shouldFollowOutput: () => true, followOutput() {},
+  });
+  const start = script.indexOf("function attachLiveBox(");
+  const end = script.indexOf("// A turn the user has left", start);
+  vm.runInContext(script.slice(start, end), context);
+  context.attachLiveBox();
+  assert.deepEqual(root.children, [canonicalUser, pendingUser, answer, box]);
+
+  root.children = [canonicalUser];
+  context.turns.clear();
+  context.attachLiveBox();
+  assert.deepEqual(root.children, [canonicalUser, pendingUser], "without an answer the pending prompt appends");
+
+  root.children = [answer];
+  context.attachLiveBox();
+  assert.deepEqual(root.children, [pendingUser, answer], "a window with no user rows still puts the prompt first");
+
+  const secondPending = row("second pending user", true);
+  root.children = [canonicalUser, answer];
+  context.pendingUserInputs.set("s", [{ row: pendingUser, minIndex: 1 }, { row: secondPending, minIndex: 1 }]);
+  context.turns.set("s", { box });
+  context.attachLiveBox();
+  assert.deepEqual(root.children, [canonicalUser, pendingUser, secondPending, answer, box], "pending prompts keep their input order");
+});
+
+function indexedHistoryHarness(options = {}) {
+  const h = historyHarness(options);
+  const append = (role, text, parent = h.root) => {
+    const node = {
+      key: text, dataset: {},
+      classList: { contains: (name) => role === "user" && name === "user-msg-row" },
+      remove() {
+        const index = h.root.children.indexOf(this);
+        if (index >= 0) h.root.children.splice(index, 1);
+      },
+    };
+    parent.appendChild(node);
+    return node;
+  };
+  Object.assign(h.context, {
+    addUserBubble: (text, index, parent) => append("user", text, parent),
+    addMsgMd: (text, parent) => append("assistant", text, parent),
+    addFold: (label, text, parent) => append("tool", text, parent),
+    FOLD_ROLE_LABELS: {},
+  });
+  const start = script.indexOf("function historyRowsOf(");
+  const end = script.indexOf("// A session the server reports", start);
+  vm.runInContext(script.slice(start, end), h.context);
+  return h;
+}
+
+test("identical history refresh preserves canonical nodes around a pending input", async () => {
+  const user = { key: "pending user", classList: { contains: (name) => name === "user-msg-row" } };
+  const live = { key: "live box" };
+  const messages = [
+    { role: "user", content: "old prompt" },
+    { role: "user", content: "" },
+    { role: "assistant", content: "owned answer" },
+  ];
+  const h = indexedHistoryHarness({ messages, total: "3", existingNodes: [user, live] });
+  h.context.pendingUserInputs.set("s", [{ row: user, prompt: "unmatched prompt", minIndex: 1 }]);
+  h.context.turns.set("s", { box: live });
+  const snapshot = { messages, histTotal: 3 };
+  await h.context.loadHistory(snapshot);
+  assert.deepEqual(h.root.children.map((node) => node.key), ["old prompt", "pending user", "owned answer", "live box"]);
+  const first = h.root.children.slice(), answer = first[2];
+  const clears = h.clears();
+  await h.context.loadHistory(snapshot);
+  assert.deepEqual(h.root.children.map((node) => node.key), first.map((node) => node.key));
+  assert.deepEqual(h.root.children, first);
+  h.root.children.forEach((node, index) => assert.equal(node, first[index], "unchanged canonical rows keep their nodes"));
+  assert.equal(h.root.children.filter((node) => node === answer).length, 1, "the canonical answer is retained exactly once");
+  assert.equal(h.retired.includes(answer), false, "a retained answer keeps its previews");
+  assert.equal(h.clears(), clears, "unchanged history is not rebuilt");
+});
+
+test("a later pending input follows the previous turn's finished answer", async () => {
+  const user = { key: "pending user", classList: { contains: (name) => name === "user-msg-row" } };
+  const live = { key: "live box" };
+  const messages = [{ role: "user", content: "old prompt" }, { role: "assistant", content: "finished answer" }];
+  const h = indexedHistoryHarness({ messages, existingNodes: [user, live] });
+  h.context.pendingUserInputs.set("s", [{ row: user, prompt: "next prompt", minIndex: 2 }]);
+  h.context.turns.set("s", { box: live });
+  await h.context.loadHistory({ messages, histTotal: 2 });
+  assert.deepEqual(h.root.children.map((node) => node.key), ["old prompt", "finished answer", "pending user", "live box"]);
+  assert.equal(h.root.children[2], user);
+  assert.equal(h.root.lastElementChild, live);
 });
 
 function scrollHarness({ phone = true, scrollTop = 0 } = {}) {

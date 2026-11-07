@@ -7,23 +7,29 @@ const path = require("node:path");
 const vm = require("node:vm");
 const script = fs.readFileSync(path.join(__dirname, "app.html"), "utf8").match(/<script>([\s\S]*?)<\/script>/)[1];
 
-function streamHarness() {
+function streamHarness({ activityOnly = false } = {}) {
   const timers = [];
   const box = {
-    children: [],
+    children: [], isConnected: true,
     appendChild(node) { if (!this.children.includes(node)) this.children.push(node); },
     insertBefore(node, before) {
       this.children = this.children.filter((child) => child !== node);
       this.children.splice(this.children.indexOf(before), 0, node);
     },
+    querySelectorAll() { return this.children.filter((child) => child.summary); },
   };
   function node() {
     const classes = new Set();
     const item = { dataset: {}, textContent: "", innerHTML: "", classList: {
       add: (name) => classes.add(name), remove: (name) => classes.delete(name),
-    }, remove() { box.children = box.children.filter((child) => child !== item); } };
+    }, get isConnected() { return box.isConnected && box.children.includes(item); },
+    remove() { box.children = box.children.filter((child) => child !== item); } };
     return item;
   }
+  const clock = { now: 1000 }, intervals = new Map(), listeners = new Map(), observers = [];
+  let intervalId = 0;
+  const listen = (type, fn) => listeners.set(type, (listeners.get(type) || []).concat(fn));
+  const document = { hidden: false, body: box, addEventListener: listen };
   const context = vm.createContext({
     box, sid: "s", sessionId: "s", finished: false, turnError: false,
     runEpoch: 0, eventFailures: 0, confirmPollSeq: 0,
@@ -35,14 +41,39 @@ function streamHarness() {
     addFold(title, text) {
       const item = node(), summary = { textContent: title }, details = { open: false };
       const body = { textContent: text };
+      item.className = "msg asst";
       item.summary = summary; item.body = body;
       item.querySelector = (selector) => selector === "summary" ? summary : details;
       box.children.push(item);
       return { box: item, body, set(label, value) { summary.textContent = label; body.textContent = value; } };
     },
+    ...(activityOnly ? {
+      Date: { now: () => clock.now }, document, window: { addEventListener: listen },
+      MutationObserver: class { constructor(fn) { observers.push(fn); } observe() {} },
+      setInterval(fn, delay) { const id = ++intervalId; intervals.set(id, { fn, delay }); return id; },
+      clearInterval(id) { intervals.delete(id); },
+    } : {}),
   });
   vm.runInContext(script.slice(script.indexOf("function toolArgsOf("), script.indexOf("const FOLD_ROLE_LABELS")), context);
   vm.runInContext(script.slice(script.indexOf("function createThinkingFold("), script.indexOf("// The three override picks")), context);
+  // Activity tests reuse the fold DOM without executing the transport slices.
+  if (activityOnly) {
+    const activity = context.createLiveActivity(box, null);
+    const mutate = (addedNodes = []) => observers.forEach((fn) => fn([{ addedNodes }]));
+    return {
+      box, intervals,
+      progress: (text) => activity.subagents(text), finish: (reason) => activity.finish(reason),
+      newActivity: () => context.createLiveActivity(box, null),
+      step(ms = 1000) { clock.now += ms; for (const { fn } of [...intervals.values()]) fn(); },
+      visible(value) { document.hidden = !value; this.fire("visibilitychange"); },
+      fire(type) { for (const fn of listeners.get(type) || []) fn(); },
+      detach() { box.isConnected = false; mutate(); },
+      attach() { box.isConnected = true; mutate([box]); },
+      remove(item) { item.remove(); mutate(); },
+      titles: () => box.children.filter((item) => item.summary).map((item) => item.summary.textContent),
+      bodies: () => box.children.filter((item) => item.body).map((item) => item.body.textContent),
+    };
+  }
   vm.runInContext(script.slice(script.indexOf("function replyPaintDelay("), script.indexOf("function sessionTitle(")), context);
   const start = script.indexOf('  let bubble = addMsgMd("", box);');
   assert.ok(start > 0);
@@ -406,6 +437,100 @@ test("subagent snapshots stay distinct from logs and empty thinking markers", ()
   assert.equal(h.titles().length, 1);
   assert.match(h.titles()[0], /subagents/);
   assert.equal(h.bodies()[0], "worker: finished");
+});
+
+test("subagent elapsed ticker advances task rows and reanchors to server snapshots", () => {
+  const h = streamHarness({ activityOnly: true });
+  const snapshot = "subagents · 2 active\n├─ [backend=traecli] alpha · running 59s · task: audit\n│  ↳ progress: running 3s · last activity 2s ago\n├─ beta · active · 1m59s · task: implement\n└─ gamma · completed 7m3s · task: running 5s";
+  h.progress(snapshot);
+  const card = h.box.children[0];
+  h.step();
+  assert.equal(h.bodies()[0], snapshot.replace("running 59s", "running 1m0s").replace("active · 1m59s", "active · 2m0s"));
+  assert.equal(h.intervals.size, 1);
+  assert.equal([...h.intervals.values()][0].delay, 1000);
+  assert.equal(h.box.children[0], card);
+  assert.equal(card.className, "msg asst");
+  assert.deepEqual(card.dataset, {});
+  h.step(5000);
+  assert.match(h.bodies()[0], /alpha · running 1m5s/);
+  h.progress("subagents · 1 active\n└─ [backend=traecli] alpha · running 8s · task: audit");
+  assert.match(h.bodies()[0], /running 8s/);
+  h.step(2000);
+  assert.match(h.bodies()[0], /running 10s/);
+  h.newActivity().subagents("other: running 42s");
+  h.step();
+  assert.equal(h.intervals.size, 1, "all activity cards share one interval");
+  assert.ok(h.bodies().some((text) => text.includes("alpha · running 11s")));
+  assert.ok(h.bodies().includes("other: running 43s"));
+});
+
+test("subagent elapsed ticker preserves first-seen fallback across row and progress changes", () => {
+  const h = streamHarness({ activityOnly: true });
+  h.progress("subagents · 2 active\n├─ worker · ready · task: audit\n└─ peer · running 3s · task: other");
+  h.step(4000);
+  h.progress("subagents · 1 active\n└─ worker · running · task: audit\n   ↳ progress: reading files");
+  h.step(2000);
+  assert.match(h.bodies()[0], /worker · running 6s · task: audit/);
+  h.progress("subagents · 1 active\n└─ worker · running · task: audit\n   ↳ progress: editing files");
+  h.step(2000);
+  assert.match(h.bodies()[0], /worker · running 8s · task: audit/);
+  assert.match(h.bodies()[0], /progress: editing files/);
+  h.progress("subagents · 0 active");
+  assert.equal(h.intervals.size, 0);
+  h.progress("worker: running");
+  h.step();
+  assert.equal(h.bodies()[0], "worker: running 1s");
+});
+
+test("subagent elapsed ticker preserves terminal text and stops when activity finishes", () => {
+  const h = streamHarness({ activityOnly: true });
+  h.progress("worker: running 1h1m");
+  h.step();
+  assert.equal(h.bodies()[0], "worker: running 1h1m1s");
+  const terminal = "worker: completed · 1h1m7s\n   ↳ final: running 42s\n";
+  h.progress(terminal);
+  const title = h.titles()[0];
+  assert.equal(h.intervals.size, 0);
+  h.step(30000);
+  assert.equal(h.bodies()[0], terminal);
+  assert.equal(h.titles()[0], title);
+  h.progress("worker: running 9s");
+  h.step();
+  h.finish("ended");
+  const frozen = h.bodies()[0];
+  assert.equal(h.intervals.size, 0);
+  h.step(3000);
+  assert.equal(h.bodies()[0], frozen);
+});
+
+test("subagent elapsed ticker pauses while hidden or detached and resumes one interval", () => {
+  const h = streamHarness({ activityOnly: true });
+  h.progress("worker: running 42s");
+  h.step();
+  h.visible(false);
+  assert.equal(h.intervals.size, 0);
+  h.step(5000);
+  assert.equal(h.bodies()[0], "worker: running 43s");
+  h.visible(true);
+  assert.equal(h.bodies()[0], "worker: running 48s");
+  h.visible(true);
+  assert.equal(h.intervals.size, 1);
+  h.fire("pagehide");
+  assert.equal(h.intervals.size, 0);
+  h.step(3000);
+  assert.equal(h.bodies()[0], "worker: running 48s");
+  h.fire("pageshow");
+  assert.equal(h.bodies()[0], "worker: running 51s");
+  h.detach();
+  assert.equal(h.intervals.size, 0);
+  h.step(4000);
+  assert.equal(h.bodies()[0], "worker: running 51s");
+  h.attach();
+  assert.equal(h.bodies()[0], "worker: running 55s");
+  assert.equal(h.intervals.size, 1);
+  h.remove(h.box.children[0]);
+  assert.equal(h.intervals.size, 0);
+  assert.deepEqual(h.bodies(), []);
 });
 
 test("a final replace supersedes provisional streaming text", () => {
