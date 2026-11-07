@@ -23,92 +23,124 @@ function select() {
     get selectedIndex() { return this.options.findIndex((o) => o.value === value); },
   };
 }
-function harness() {
-  const document = { activeElement: null, createElement: () => node() };
-  function node() {
+function harness({ storage = new Map(), base = "https://a.test", sid = "alpha", catalog = [
+  { name: "review", description: "Review changes" },
+  { name: "build", description: "Build software" },
+] } = {}) {
+  const document = {
+    activeElement: null, listeners: {}, createElement: (tag) => node(tag),
+    addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); },
+  };
+  function focusOut(from, to) {
+    for (let parent = from; parent; parent = parent.parentElement) parent.onfocusout?.({ relatedTarget: to });
+  }
+  function node(tag = "div") {
     return {
-      value: "", hidden: true, disabled: false, children: [], attrs: {},
-      set textContent(value) { this.text = value; this.children = []; },
+      tagName: tag, value: "", hidden: true, disabled: false, children: [], attrs: {},
+      set textContent(value) { this.text = String(value); this.children = []; },
       get textContent() { return (this.text || "") + this.children.map((c) => c.textContent).join(""); },
-      appendChild(child) { this.children.push(child); },
-      setAttribute(key, value) { this.attrs[key] = value; },
+      appendChild(child) { child.parentElement = this; this.children.push(child); },
+      setAttribute(key, value) { this.attrs[key] = String(value); },
+      getAttribute(key) { return this.attrs[key] ?? null; },
       removeAttribute(key) { delete this.attrs[key]; },
-      focus() { if (document.activeElement === this) return; document.activeElement = this; this.onfocus?.(); },
-      blur() { document.activeElement = null; this.onblur?.(); },
+      contains(target) { return target === this || this.children.some((child) => child.contains?.(target)); },
+      focus(options) {
+        if (document.activeElement === this) return;
+        const previous = document.activeElement;
+        document.activeElement = this; this.focusOptions = options;
+        focusOut(previous, this); this.onfocus?.();
+      },
+      blur() { document.activeElement = null; focusOut(this, null); this.onblur?.(); },
+      click() { if (!this.disabled) this.onclick?.(); },
       scrollIntoView() {},
     };
   }
   const elements = {
-    oskill: node(), skillmenu: node(), skillclear: node(), skillhint: node(), ovrwrap: {}, prompt: node(),
+    skillpicker: node(), skillfield: node(), oskill: node("button"), skillvalue: node(),
+    skillmenu: node(), skillsearchwrap: node(), skillsearch: node("input"), skillsearchclear: node("button"),
+    skilloptions: node(), skillempty: node(), skillclear: node("button"), skillhint: node(), ovrwrap: {}, prompt: node(),
     omodel: select(), oagent: select(), oeffort: select(), ovrsummary: {},
   };
+  for (const [parent, children] of [
+    ["skillpicker", ["skillfield", "skillmenu", "skillhint"]],
+    ["skillfield", ["oskill"]], ["oskill", ["skillvalue"]],
+    ["skillmenu", ["skillsearchwrap", "skilloptions", "skillempty", "skillclear"]],
+    ["skillsearchwrap", ["skillsearch", "skillsearchclear"]],
+  ]) for (const child of children) elements[parent].appendChild(elements[child]);
   const requests = [];
   const context = vm.createContext({
     $: (id) => elements[id], document,
-    store: { base: "https://a.test" }, sessionId: "alpha",
+    store: { base }, sessionId: sid,
+    sessionStorage: {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, String(value)), removeItem: (key) => storage.delete(key),
+    },
     sendBusy: false, pendingImages: [],
     headers: () => ({ Authorization: "Bearer test" }),
     api: async (url) => {
       assert.equal(url, "/skills");
-      return { json: async () => [
-        { name: "review", description: "Review changes" },
-        { name: "build", description: "Build software" },
-      ] };
+      return { json: async () => catalog };
     },
     fetch: async (url, opts) => { requests.push({ url, ...opts, body: JSON.parse(opts.body) }); return { ok: true }; },
   });
   vm.runInContext(between("function syncOvrSummary()", "// The composer grows"), context);
   vm.runInContext(between("function fillSelect(", "async function loadInfo()"), context);
-  vm.runInContext(between('  $("oskill").onfocus', '  $("prompt").addEventListener("compositionstart"'), context);
+  vm.runInContext(between("// BEGIN skill picker events", "// END skill picker events"), context);
   vm.runInContext(between("async function send()", "  const rewindFloor =") + "\n}", context);
   const body = between("  const body = { prompt, confirm: true };", '  setPromptValue("", true);');
   const accept = between("// BEGIN turn HTTP acceptance", "// END turn HTTP acceptance")
     .replace("// BEGIN turn HTTP acceptance", "").replace(/^\s*try \{\s*/, "");
   vm.runInContext(`async function submit() { if (!validateSkillInput()) return; const prompt = "hello", images = [], sendBase = store.base, sid = sessionId; ${body}\n${accept}\nreturn body; }`, context);
   return {
-    context, elements, requests,
+    context, elements, requests, storage,
+    open() { if (elements.skillmenu.hidden) elements.oskill.click(); },
     choose(name) { context.chooseSkill(name); },
-    type(text, composing = false) { elements.oskill.focus(); elements.oskill.value = text; elements.oskill.oninput({ isComposing: composing }); },
-    options() { return elements.skillmenu.children.filter((n) => n.attrs.role === "option"); },
-    key(key, extra = {}) { const event = { key, preventDefault() { this.prevented = true; }, ...extra }; elements.oskill.onkeydown(event); return event; },
+    type(text, composing = false) {
+      this.open(); elements.skillsearch.focus(); elements.skillsearch.value = text;
+      elements.skillsearch.oninput({ isComposing: composing });
+    },
+    options() { return elements.skilloptions.children.filter((n) => n.attrs.role === "option"); },
+    names() { return this.options().map((option) => option.children[0].children[0].textContent); },
+    selected() { return Array.from(context.captureSkillPick().skills); },
+    key(key, extra = {}) { const event = { key, preventDefault() { this.prevented = true; }, ...extra }; elements.skillmenu.onkeydown(event); return event; },
+    outside(target = elements.prompt) { for (const listener of document.listeners.pointerdown || []) listener({ target }); },
     switchTo(sid) { context.sessionId = sid; context.restoreSkillPick(); },
   };
 }
 
-test("skill combobox loads server names and describes next-message scope", async () => {
+test("skill picker loads server names and describes next-message scope", async () => {
   const h = harness();
   await h.context.loadSkills();
-  assert.match(html, /<input id="oskill" type="text" role="combobox"/);
-  h.elements.oskill.focus();
-  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["review", "build", "Default"]);
-  assert.match(h.elements.oskill.placeholder, /next message/);
-  assert.equal(h.options()[0].children[1].textContent, "Review changes");
+  assert.match(html, /<button id="oskill" type="button"[^>]*aria-haspopup="listbox"/);
+  assert.match(html, /<input id="skillsearch" type="text" role="combobox"/);
+  assert.match(html, /id="skilloptions" role="listbox"[^>]*aria-multiselectable="true"/);
+  h.open();
+  assert.deepEqual(h.names(), ["review", "build"]);
+  assert.match(h.elements.skillhint.textContent, /Next message only.*Session defaults still apply/);
+  assert.equal(h.options()[0].children[0].children[1].textContent, "Review changes");
   assert.equal(h.elements.ovrsummary.textContent, "model default · agent default · effort default · skill default");
   h.choose("review");
+  assert.equal(h.elements.skillvalue.textContent, "skill: review");
   assert.equal(h.elements.ovrsummary.textContent, "model default · agent default · effort default · skill review (next)");
 });
 
-test("comma-separated skill names send every selected skill", async () => {
+test("tapping skills toggles an ordered set and sends every selected name", async () => {
   const h = harness();
   await h.context.loadSkills();
-  h.choose("review");
-  h.choose("build");
-  assert.equal(h.elements.oskill.value, "review, build");
-  assert.equal(h.elements.ovrsummary.textContent, "model default · agent default · effort default · skill review, build (next)");
-  // Already picked names drop out of the suggestion list; the last segment
-  // still drives the query.
-  h.elements.oskill.focus();
-  h.type("review, bui");
-  assert.equal(h.elements.oskill.attrs["aria-invalid"], "true");
-  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["build", "Default"]);
-  // Picking from the menu replaces only the partial tail, not the whole field.
-  h.choose("build");
-  assert.equal(h.elements.oskill.value, "review, build");
-  h.type("review, build");
-  assert.equal(h.elements.oskill.attrs["aria-invalid"], "false");
+  h.open(); h.options()[0].click(); h.options()[1].click();
+  assert.deepEqual(h.selected(), ["review", "build"]);
+  assert.equal(h.elements.skillvalue.textContent, "skill: review + build");
+  assert.equal(h.elements.ovrsummary.textContent, "model default · agent default · effort default · skill review + build (next)");
+  assert.deepEqual(h.options().map((o) => o.attrs["aria-selected"]), ["true", "true"]);
+  assert.equal(h.elements.skillmenu.hidden, false);
+  h.options()[0].click();
+  assert.deepEqual(h.selected(), ["build"]);
+  assert.equal(h.options()[0].attrs["aria-selected"], "false");
+  h.options()[0].click();
+  assert.deepEqual(h.selected(), ["build", "review"], "a reselected skill goes to the end");
   await h.context.submit();
-  assert.deepEqual(h.requests[0].body.skills, ["review", "build"]);
-  assert.equal(h.elements.oskill.value, "");
+  assert.deepEqual(h.requests[0].body.skills, ["build", "review"]);
+  assert.deepEqual(h.selected(), []);
 });
 
 test("override controls and summary keep model, agent, effort, skill order", async () => {
@@ -124,121 +156,120 @@ test("override controls and summary keep model, agent, effort, skill order", asy
     h.elements[id].appendChild({ value, textContent: value });
     h.elements[id].value = value;
   }
+  h.context.syncOvrSummary(); // Select change events refresh the summary independently of the search.
   h.type("unknown");
-  assert.equal(h.elements.ovrsummary.textContent, "model test-model · agent build · effort high · skill choose a match");
+  assert.equal(h.elements.ovrsummary.textContent, "model test-model · agent build · effort high · skill default");
   h.choose("review");
   assert.equal(h.elements.ovrsummary.textContent, "model test-model · agent build · effort high · skill review (next)");
 });
 
-test("typing filters names and descriptions, touch selection and clear keep next-turn semantics", async () => {
+test("typing filters names and descriptions, and touch selection keeps the picker open", async () => {
   const h = harness();
   await h.context.loadSkills();
   h.type("SOFTware");
-  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["build", "Default"]);
+  assert.deepEqual(h.names(), ["build"]);
   assert.equal(h.elements.oskill.attrs["aria-expanded"], "true");
   const touch = { preventDefault() { this.prevented = true; } };
   h.options()[0].onpointerdown(touch);
   assert.equal(touch.prevented, true);
   h.options()[0].onclick();
-  assert.equal(h.elements.oskill.value, "build");
-  assert.equal(h.elements.skillmenu.hidden, true);
-  await h.context.submit();
-  assert.deepEqual(h.requests[0].body.skills, ["build"]);
+  assert.equal(h.elements.skillsearch.value, "SOFTware");
+  assert.equal(h.elements.skillmenu.hidden, false);
+  assert.equal(h.options()[0].attrs["aria-selected"], "true");
   h.type(" ReVieW ");
-  assert.equal(h.elements.oskill.attrs["aria-invalid"], "false");
+  assert.deepEqual(h.names(), ["review"]);
+  h.options()[0].click();
   await h.context.submit();
-  assert.deepEqual(h.requests[1].body.skills, ["review"]);
-  h.type("build"); h.elements.skillclear.onclick();
-  assert.equal(h.elements.oskill.value, "");
-  await h.context.submit();
-  assert.equal("skills" in h.requests[2].body, false);
+  assert.deepEqual(h.requests[0].body.skills, ["build", "review"]);
 });
 
-test("deleting skill text to empty closes suggestions and clears the pending choice", async () => {
+test("clearing the filter retains selections and shows the complete catalog", async () => {
   for (const empty of ["", " \t "]) {
     const h = harness();
     await h.context.loadSkills();
-    h.type("review");
+    h.choose("review"); h.type("bui");
     h.key("ArrowDown");
     assert.equal(h.elements.skillmenu.hidden, false);
-    assert.ok(h.elements.oskill.attrs["aria-activedescendant"]);
+    assert.ok(h.elements.skillsearch.attrs["aria-activedescendant"]);
     h.type(empty);
-    assert.equal(h.context.document.activeElement, h.elements.oskill);
-    assert.equal(h.elements.skillmenu.hidden, true);
-    assert.equal(h.elements.oskill.attrs["aria-expanded"], "false");
-    assert.equal(h.elements.oskill.attrs["aria-activedescendant"], undefined);
-    assert.equal(h.elements.oskill.attrs["aria-invalid"], "false");
-    assert.equal(h.elements.skillhint.hidden, true);
-    assert.match(h.elements.ovrsummary.textContent, / · skill default$/);
-    await h.context.submit();
-    assert.equal("skills" in h.requests[0].body, false);
-    h.switchTo("beta"); h.switchTo("alpha");
-    assert.equal(h.elements.oskill.value, "");
-    h.type("bui");
+    assert.equal(h.context.document.activeElement, h.elements.skillsearch);
     assert.equal(h.elements.skillmenu.hidden, false);
-    assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["build", "Default"]);
-    h.key("ArrowDown"); h.key("Enter");
-    assert.equal(h.elements.oskill.value, "build");
+    assert.equal(h.elements.oskill.attrs["aria-expanded"], "true");
+    assert.equal(h.elements.skillsearch.attrs["aria-activedescendant"], undefined);
+    assert.deepEqual(h.names(), ["review", "build"]);
+    assert.deepEqual(h.selected(), ["review"]);
+    await h.context.submit();
+    assert.deepEqual(h.requests[0].body.skills, ["review"]);
   }
 });
 
-test("composition ending with empty skill text does not reopen suggestions", async () => {
+test("an empty committed composition keeps the filter usable and preserves picks", async () => {
   const h = harness();
   await h.context.loadSkills();
-  h.type("review");
-  h.elements.oskill.oncompositionstart();
+  h.choose("review"); h.type("rev");
+  h.elements.skillsearch.oncompositionstart();
   h.type("", true);
-  assert.equal(h.elements.skillmenu.hidden, true);
-  h.elements.oskill.oncompositionend();
-  assert.equal(h.elements.skillmenu.hidden, true);
+  assert.equal(h.elements.skillmenu.hidden, false, "the IME field must remain visible");
+  h.elements.skillsearch.oncompositionend();
   h.type(""); // WebView may emit a final input event after compositionend.
-  assert.equal(h.elements.skillmenu.hidden, true);
-  assert.equal(h.elements.oskill.attrs["aria-expanded"], "false");
-  await h.context.submit();
-  assert.equal("skills" in h.requests[0].body, false);
-  h.elements.oskill.onclick(); // Explicitly browsing the catalog still works.
   assert.equal(h.elements.skillmenu.hidden, false);
-  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["review", "build", "Default"]);
+  assert.deepEqual(h.names(), ["review", "build"]);
+  assert.deepEqual(h.selected(), ["review"]);
+  await h.context.submit();
+  assert.deepEqual(h.requests[0].body.skills, ["review"]);
 });
 
-test("keyboard navigation selects a suggestion without sending and Escape/blur close the menu", async () => {
+test("keyboard navigation toggles choices without sending and Escape or focus outside closes", async () => {
   const h = harness();
   await h.context.loadSkills();
-  h.type("rev");
+  h.open();
   assert.equal(h.key("ArrowDown").prevented, true);
-  assert.equal(h.elements.oskill.attrs["aria-activedescendant"], h.options()[0].id);
-  assert.equal(h.options()[0].attrs["aria-selected"], "true");
+  assert.equal(h.elements.skillsearch.attrs["aria-activedescendant"], h.options()[0].id);
+  assert.equal(h.options()[0].attrs["data-active"], "true");
+  assert.equal(h.options()[0].attrs["aria-selected"], "false", "navigation is separate from selection");
   assert.equal(h.key("Enter").prevented, true);
-  assert.equal(h.elements.oskill.value, "review");
+  assert.deepEqual(h.selected(), ["review"]);
+  h.key("ArrowDown"); h.key("Enter");
+  assert.deepEqual(h.selected(), ["review", "build"]);
+  h.key("Home"); h.key("Enter");
+  assert.deepEqual(h.selected(), ["build"]);
+  h.key("End"); h.key("Enter");
+  assert.deepEqual(h.selected(), []);
   assert.equal(h.requests.length, 0);
-  h.elements.oskill.onclick();
   h.key("Escape");
   assert.equal(h.elements.skillmenu.hidden, true);
-  assert.equal(h.elements.oskill.value, "review");
+  assert.equal(h.context.document.activeElement, h.elements.oskill);
+  assert.equal(h.elements.oskill.focusOptions.preventScroll, true);
+  h.open();
   h.key("ArrowUp");
-  assert.equal(h.options().at(-1).attrs["aria-selected"], "true");
+  assert.equal(h.options().at(-1).attrs["data-active"], "true");
   h.key("Enter");
-  assert.equal(h.elements.oskill.value, "");
-  h.elements.oskill.onclick(); h.elements.oskill.blur();
+  assert.deepEqual(h.selected(), ["build"]);
+  h.elements.prompt.focus();
   assert.equal(h.elements.skillmenu.hidden, true);
+  h.open();
+  h.outside(h.options()[0].children[0]);
+  assert.equal(h.elements.skillmenu.hidden, false, "tapping inside the list keeps it open");
+  h.outside();
+  assert.equal(h.elements.skillmenu.hidden, true);
+  assert.deepEqual(h.selected(), ["build"]);
+  assert.equal(h.elements.skillsearch.attrs["aria-activedescendant"], undefined);
 });
 
-test("unmatched input is a session draft and cannot silently send the default or lose images", async () => {
+test("an unmatched filter has an empty state and never becomes a forced skill", async () => {
   const h = harness();
   await h.context.loadSkills();
   h.type("not-a-skill");
-  assert.match(h.elements.skillmenu.textContent, /No matching skills/);
-  assert.equal(h.elements.oskill.attrs["aria-invalid"], "true");
+  assert.equal(h.elements.skillempty.hidden, false);
+  assert.deepEqual(h.names(), []);
+  assert.equal(h.context.validateSkillInput(), true);
   h.switchTo("beta"); h.type("bui"); h.switchTo("alpha");
-  assert.equal(h.elements.oskill.value, "not-a-skill");
-  h.elements.prompt.value = "hello";
-  h.context.pendingImages = [{ filename: "photo.png" }];
-  await h.context.send();
-  assert.equal(h.elements.ovrwrap.open, true);
-  assert.equal(h.elements.prompt.value, "hello");
-  assert.equal(h.context.pendingImages.length, 1);
-  assert.equal(h.requests.length, 0);
-  assert.equal(h.context.sendBusy, false);
+  assert.equal(h.elements.skillsearch.value, "not-a-skill");
+  await h.context.submit();
+  assert.equal("skills" in h.requests[0].body, false);
+  h.choose("build"); h.type("not-a-skill");
+  await h.context.submit();
+  assert.deepEqual(h.requests[1].body.skills, ["build"]);
 });
 
 test("actual turn request sends skills only when selected, clearing on HTTP success", async () => {
@@ -248,7 +279,8 @@ test("actual turn request sends skills only when selected, clearing on HTTP succ
   await h.context.submit();
   assert.deepEqual(h.requests[0].body, { prompt: "hello", confirm: true, skills: ["review"] });
   assert.equal(h.requests[0].url, "https://a.test/sessions/alpha/turns/stream");
-  assert.equal(h.elements.oskill.value, "");
+  assert.deepEqual(h.selected(), []);
+  assert.equal(h.elements.skillvalue.textContent, "skill: session default");
   await h.context.submit();
   assert.match(h.elements.ovrsummary.textContent, /^model default · agent default · effort default · skill default$/);
   assert.equal("skills" in h.requests[1].body, false);
@@ -257,13 +289,16 @@ test("actual turn request sends skills only when selected, clearing on HTTP succ
 test("HTTP rejection and transport failure retain the pending selection", async () => {
   const h = harness();
   await h.context.loadSkills();
-  h.choose("build");
+  h.choose("build"); h.choose("review");
   h.context.fetch = async () => ({ ok: false, status: 409, json: async () => ({ error: "running" }) });
   await assert.rejects(h.context.submit(), /409 running/);
-  assert.equal(h.elements.oskill.value, "build");
+  assert.deepEqual(h.selected(), ["build", "review"]);
   h.context.fetch = async () => { throw new Error("offline"); };
   await assert.rejects(h.context.submit(), /offline/);
-  assert.equal(h.elements.oskill.value, "build");
+  assert.deepEqual(h.selected(), ["build", "review"]);
+  const reloaded = harness({ storage: h.storage });
+  await reloaded.context.loadSkills();
+  assert.deepEqual(reloaded.selected(), ["build", "review"]);
 });
 
 test("late acceptance cannot clear another session or a reselected skill", async () => {
@@ -274,22 +309,22 @@ test("late acceptance cannot clear another session or a reselected skill", async
   h.choose("review");
   const pending = h.context.submit();
   h.switchTo("beta");
-  assert.equal(h.elements.oskill.value, "");
+  assert.deepEqual(h.selected(), []);
   h.choose("build");
   resolve({ ok: true });
   await pending;
-  assert.equal(h.elements.oskill.value, "build");
+  assert.deepEqual(h.selected(), ["build"]);
   h.switchTo("alpha");
-  assert.equal(h.elements.oskill.value, "");
+  assert.deepEqual(h.selected(), []);
   h.choose("review");
   const again = h.context.submit();
   h.choose(""); h.choose("review");
   resolve({ ok: true });
   await again;
-  assert.equal(h.elements.oskill.value, "review");
+  assert.deepEqual(h.selected(), ["review"]);
 });
 
-test("late HTTP acceptance preserves a newer unselected search draft", async () => {
+test("late HTTP acceptance consumes selected skills and preserves a newer independent filter", async () => {
   const h = harness();
   await h.context.loadSkills(); h.choose("review");
   let resolve;
@@ -297,27 +332,38 @@ test("late HTTP acceptance preserves a newer unselected search draft", async () 
   const pending = h.context.submit();
   h.type("bui");
   resolve({ ok: true }); await pending;
-  assert.equal(h.elements.oskill.value, "bui");
-  assert.equal(h.context.validateSkillInput(), false);
+  assert.equal(h.elements.skillsearch.value, "bui");
+  assert.deepEqual(h.selected(), []);
+  assert.equal(h.context.validateSkillInput(), true);
 });
 
 test("Chinese composition cannot pick, clear, or submit until committed", async () => {
   const h = harness();
   h.context.api = async () => ({ json: async () => [{ name: "mahjong", description: "麻将分析" }] });
   await h.context.loadSkills();
-  h.elements.oskill.focus(); h.elements.oskill.oncompositionstart();
+  h.open(); h.elements.skillsearch.oncompositionstart();
   h.type("ma", true);
-  assert.equal(h.elements.skillmenu.hidden, true);
+  assert.equal(h.elements.skillmenu.hidden, false);
   for (const extra of [{}, { isComposing: true }, { keyCode: 229 }]) {
     assert.equal(h.key("Enter", extra).prevented, undefined);
   }
   h.elements.skillclear.onclick();
-  assert.equal(h.elements.oskill.value, "ma");
+  h.choose("mahjong");
+  assert.equal(h.elements.skillsearch.value, "ma");
+  assert.deepEqual(h.selected(), []);
   assert.equal(h.context.validateSkillInput(), false);
-  h.elements.oskill.value = "麻将";
-  h.elements.oskill.oncompositionend();
-  assert.equal(h.elements.oskill.value, "麻将");
-  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["mahjong", "Default"]);
+  h.elements.prompt.value = "hello";
+  h.context.pendingImages = [{ filename: "photo.png" }];
+  await h.context.send();
+  assert.equal(h.elements.ovrwrap.open, true);
+  assert.equal(h.elements.prompt.value, "hello");
+  assert.equal(h.context.pendingImages.length, 1);
+  assert.equal(h.requests.length, 0);
+  assert.equal(h.context.sendBusy, false);
+  h.elements.skillsearch.value = "麻将";
+  h.elements.skillsearch.oncompositionend();
+  assert.equal(h.elements.skillsearch.value, "麻将");
+  assert.deepEqual(h.names(), ["mahjong"]);
   assert.equal(h.key("Enter", { keyCode: 229 }).prevented, undefined);
   h.options()[0].onclick(); await h.context.submit();
   assert.deepEqual(h.requests[0].body.skills, ["mahjong"]);
@@ -327,48 +373,49 @@ test("skill names and descriptions render as text, never catalog-supplied markup
   const h = harness();
   const name = '<img src=x onerror="alert(1)">';
   h.context.api = async () => ({ json: async () => [{ name, description: "<script>alert(2)</script>" }] });
-  await h.context.loadSkills(); h.elements.oskill.focus();
+  await h.context.loadSkills(); h.open();
   const option = h.options()[0];
-  assert.equal(option.children[0].textContent, name);
-  assert.equal(option.children[1].textContent, "<script>alert(2)</script>");
-  assert.equal(option.children[0].children.length, 0);
+  assert.equal(option.children[0].children[0].textContent, name);
+  assert.equal(option.children[0].children[1].textContent, "<script>alert(2)</script>");
+  assert.equal(option.children[0].children[0].children.length, 0);
   assert.doesNotMatch(between("function renderSkillMenu()", "function skillKeydown("), /innerHTML/);
 });
 
 test("pending choices survive session switching and move into the first created session", async () => {
   const h = harness();
   await h.context.loadSkills();
-  h.choose("review"); h.switchTo("beta"); h.choose("build"); h.switchTo("alpha");
-  assert.equal(h.elements.oskill.value, "review");
-  h.switchTo(""); h.choose("build");
+  h.choose("review"); h.choose("build"); h.switchTo("beta"); h.choose("build"); h.switchTo("alpha");
+  assert.deepEqual(h.selected(), ["review", "build"]);
+  h.switchTo(""); h.choose("build"); h.choose("review");
   h.context.localStorage = { setItem() {} };
   h.context.pendingNew = null;
   h.context.carryTeamPick = () => {};
   vm.runInContext(between("// BEGIN composer session adoption", "// END composer session adoption"), h.context);
   assert.equal(h.context.adoptComposerSession("new", "", h.context.store.base), true);
   assert.equal(h.context.pendingNew, "new");
-  assert.equal(h.elements.oskill.value, "build");
+  assert.deepEqual(h.selected(), ["build", "review"]);
   await h.context.submit();
-  assert.deepEqual(h.requests[0].body.skills, ["build"]);
+  assert.deepEqual(h.requests[0].body.skills, ["build", "review"]);
   h.switchTo("");
-  assert.equal(h.elements.oskill.value, "");
+  assert.deepEqual(h.selected(), []);
+  assert.equal(h.storage.has('serve.skill-draft:["https://a.test",""]'), false);
 });
 
 test("catalog removes obsolete choices and empty or failed catalogs preserve normal send", async () => {
   const h = harness();
-  await h.context.loadSkills(); h.choose("review");
+  await h.context.loadSkills(); h.choose("review"); h.choose("build");
   h.context.api = async () => ({ json: async () => [{ name: "build" }] });
   await h.context.loadSkills();
-  assert.equal(h.elements.oskill.value, "");
+  assert.deepEqual(h.selected(), ["build"]);
   await h.context.submit();
-  assert.equal("skills" in h.requests[0].body, false);
+  assert.deepEqual(h.requests[0].body.skills, ["build"]);
   h.context.api = async () => ({ json: async () => [] });
   await h.context.loadSkills();
   assert.equal(h.elements.oskill.disabled, true);
-  assert.match(h.elements.oskill.placeholder, /none available/);
+  assert.match(h.elements.skillvalue.textContent, /none available/);
   h.context.api = async () => { throw new Error("offline"); };
   await h.context.loadSkills();
-  assert.match(h.elements.oskill.placeholder, /unavailable/);
+  assert.match(h.elements.skillvalue.textContent, /unavailable/);
   await h.context.submit();
   assert.equal("skills" in h.requests[1].body, false);
 });
@@ -383,11 +430,11 @@ test("overlapping catalog fetches cannot restore options from an old server", as
   await h.context.loadSkills();
   resolve({ json: async () => [{ name: "old-skill" }] });
   await old;
-  h.elements.oskill.focus();
-  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["new-skill", "Default"]);
+  h.open();
+  assert.deepEqual(h.names(), ["new-skill"]);
 });
 
-test("fuzzy search matches multi-token, reordered, and subsequence queries", async () => {
+test("completion matches case-insensitive substrings in catalog order", async () => {
   const h = harness();
   h.context.api = async () => ({ json: async () => [
     { name: "play_mahjong_discard", description: "Analyze mahjong discards" },
@@ -395,25 +442,177 @@ test("fuzzy search matches multi-token, reordered, and subsequence queries", asy
     { name: "build", description: "Build software" },
   ] });
   await h.context.loadSkills();
-  // Multi-token query spans name and description, order-independent.
-  h.type("mahjong discard");
-  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["play_mahjong_discard", "Default"]);
-  h.type("discard mahjong");
-  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["play_mahjong_discard", "Default"]);
-  // Subsequence tolerance: "mhd" appears in order inside "mahjong_discard".
+  h.type("MAHJONG_DISCARD");
+  assert.deepEqual(h.names(), ["play_mahjong_discard"]);
+  h.type("Analyze mahjong");
+  assert.deepEqual(h.names(), ["play_mahjong_discard"]);
   h.type("mhd");
-  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["play_mahjong_discard", "Default"]);
-  // Name substring outranks description substring for the same query.
+  assert.deepEqual(h.names(), []);
   h.type("build");
-  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["build", "Default"]);
-  h.type("softwar");
-  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["build", "Default"]);
-  // Every token must match somewhere: one bad token kills the candidate.
-  h.type("review mahjong");
-  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["Default"]);
-  h.type("zzz");
-  assert.match(h.elements.skillmenu.textContent, /No matching skills/);
-  // A query that only fuzzy-matches still shows the intended skill.
-  h.type("pl_mj_dscrd");
-  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["play_mahjong_discard", "Default"]);
+  assert.deepEqual(h.names(), ["build"]);
+  assert.deepEqual(h.selected(), [], "an exact search still needs an explicit choice");
+  assert.equal(h.key("Enter").prevented, true);
+  assert.deepEqual(h.selected(), ["build"], "Enter completes the first matching skill");
+  assert.equal(h.requests.length, 0);
+  h.type("SOFTwar");
+  assert.deepEqual(h.names(), ["build"]);
+  h.type(" ");
+  assert.deepEqual(h.names(), ["play_mahjong_discard", "review", "build"]);
+});
+
+test("search clear preserves the ordered set and reset returns to session default", async () => {
+  const h = harness();
+  await h.context.loadSkills(); h.choose("build"); h.choose("review"); h.type("bui");
+  const touch = { preventDefault() { this.prevented = true; } };
+  h.elements.skillsearchclear.onpointerdown(touch);
+  assert.equal(touch.prevented, true);
+  h.elements.skillsearchclear.click();
+  assert.equal(h.elements.skillsearch.value, "");
+  assert.equal(h.elements.skillsearchclear.hidden, true);
+  assert.deepEqual(h.names(), ["review", "build"]);
+  assert.deepEqual(h.selected(), ["build", "review"]);
+  assert.equal(h.elements.skillclear.attrs["aria-pressed"], "false");
+  h.elements.skillclear.click();
+  assert.deepEqual(h.selected(), []);
+  assert.equal(h.elements.skillclear.attrs["aria-pressed"], "true");
+  assert.equal(h.elements.skillvalue.textContent, "skill: session default");
+  assert.equal(h.elements.skillmenu.hidden, true);
+  assert.equal(h.context.document.activeElement, h.elements.oskill);
+  assert.equal(h.storage.size, 0);
+  await h.context.submit();
+  assert.equal("skills" in h.requests[0].body, false);
+});
+
+test("reload restores the same ordered pending choices and independent search", async () => {
+  const h = harness();
+  await h.context.loadSkills(); h.choose("build"); h.choose("review"); h.type("bui");
+  const reloaded = harness({ storage: h.storage });
+  await reloaded.context.loadSkills();
+  assert.deepEqual(reloaded.selected(), ["build", "review"]);
+  assert.equal(reloaded.elements.skillsearch.value, "bui");
+  assert.equal(reloaded.elements.skillvalue.textContent, "skill: build + review");
+  assert.match(reloaded.elements.oskill.attrs["aria-label"], /build \+ review.*next message/);
+  await reloaded.context.submit();
+  assert.deepEqual(reloaded.requests[0].body.skills, ["build", "review"]);
+  const acceptedReload = harness({ storage: h.storage });
+  await acceptedReload.context.loadSkills();
+  assert.deepEqual(acceptedReload.selected(), [], "accepted selections stay consumed after reload");
+  assert.equal(acceptedReload.elements.skillsearch.value, "bui");
+});
+
+test("stored skill drafts are isolated by server and session", async () => {
+  const h = harness();
+  await h.context.loadSkills(); h.choose("review"); h.choose("build");
+  h.switchTo("beta"); h.choose("build");
+  h.context.store.base = "https://b.test"; h.switchTo("alpha");
+  await h.context.loadSkills(); h.choose("review");
+  for (const [base, sid, names] of [
+    ["https://a.test", "alpha", ["review", "build"]],
+    ["https://a.test", "beta", ["build"]], ["https://b.test", "alpha", ["review"]],
+  ]) {
+    const reloaded = harness({ storage: h.storage, base, sid });
+    await reloaded.context.loadSkills();
+    assert.deepEqual(reloaded.selected(), names);
+  }
+});
+
+test("unavailable tab storage preserves normal in-memory picking and sending", async () => {
+  const h = harness();
+  const denied = () => { throw new Error("storage unavailable"); };
+  h.context.sessionStorage = { getItem: denied, setItem: denied, removeItem: denied };
+  await h.context.loadSkills(); h.choose("review"); h.choose("build");
+  h.switchTo("beta"); h.switchTo("alpha");
+  assert.deepEqual(h.selected(), ["review", "build"]);
+  await h.context.submit();
+  assert.deepEqual(h.requests[0].body.skills, ["review", "build"]);
+  assert.deepEqual(h.selected(), []);
+  const cleanupFailure = harness();
+  await cleanupFailure.context.loadSkills(); cleanupFailure.choose("review");
+  cleanupFailure.context.sessionStorage.removeItem = denied;
+  await cleanupFailure.context.submit();
+  assert.deepEqual(cleanupFailure.selected(), [], "a failed storage cleanup must not restore a consumed pick");
+  cleanupFailure.switchTo("beta"); cleanupFailure.switchTo("alpha");
+  assert.deepEqual(cleanupFailure.selected(), []);
+});
+
+test("the eight-skill wire limit disables extra picks without truncating selection", async () => {
+  const catalog = Array.from({ length: 9 }, (_, i) => ({ name: "skill-" + (i + 1) }));
+  const h = harness({ catalog });
+  await h.context.loadSkills();
+  for (const skill of catalog.slice(0, 8)) h.choose(skill.name);
+  h.open();
+  assert.equal(h.options()[8].disabled, true);
+  assert.equal(h.options()[8].attrs["aria-disabled"], "true");
+  assert.equal(h.options()[0].disabled, false, "selected skills can still be removed at the limit");
+  h.choose("skill-9");
+  assert.deepEqual(h.selected(), catalog.slice(0, 8).map((s) => s.name));
+  assert.match(h.elements.skillhint.textContent, /Selection limit reached/);
+  h.options()[0].click();
+  assert.equal(h.options()[8].disabled, false);
+  h.options()[8].click();
+  await h.context.submit();
+  assert.deepEqual(h.requests[0].body.skills, catalog.slice(1).map((s) => s.name));
+});
+
+test("catalog and restored names use canonical case and deduplicate in order", async () => {
+  const storage = new Map([['serve.skill-draft:["https://a.test","alpha"]', JSON.stringify({
+    names: ["review", "BUILD", "Review", null, "missing"], query: "",
+  })]]);
+  const h = harness({ storage, catalog: [{ name: " Review " }, { name: "review" }, { name: "BUILD" }] });
+  await h.context.loadSkills(); h.open();
+  assert.deepEqual(h.names(), ["Review", "BUILD"]);
+  assert.deepEqual(h.selected(), ["Review", "BUILD"]);
+  assert.deepEqual(h.options().map((o) => o.attrs["aria-selected"]), ["true", "true"]);
+  h.choose("missing");
+  assert.deepEqual(h.selected(), ["Review", "BUILD"]);
+  await h.context.submit();
+  assert.deepEqual(h.requests[0].body.skills, ["Review", "BUILD"]);
+});
+
+test("late acceptance from a previous server clears only that server's sent picks", async () => {
+  const h = harness();
+  await h.context.loadSkills(); h.choose("review");
+  let resolve;
+  h.context.fetch = () => new Promise((r) => { resolve = r; });
+  const pending = h.context.submit();
+  h.context.store.base = "https://b.test";
+  await h.context.loadSkills(); h.choose("build");
+  resolve({ ok: true }); await pending;
+  assert.deepEqual(h.selected(), ["build"]);
+  assert.equal(h.elements.skillvalue.textContent, "skill: build");
+  const oldServer = harness({ storage: h.storage });
+  await oldServer.context.loadSkills();
+  assert.deepEqual(oldServer.selected(), []);
+  const newServer = harness({ storage: h.storage, base: "https://b.test" });
+  await newServer.context.loadSkills();
+  assert.deepEqual(newServer.selected(), ["build"]);
+});
+
+test("config hydration leaves pending picks ordered and defaults owned by the session", async () => {
+  const h = harness();
+  await h.context.loadSkills(); h.choose("build"); h.choose("review");
+  h.context.syncModelTrigger = () => {};
+  vm.runInContext(between("function applySessionConfig(", "function resetPicks()"), h.context);
+  h.context.applySessionConfig({ model: "", agent: "", reasoning_effort: "", default_skills: ["agent-team", "review"] }, { team: false });
+  assert.deepEqual(h.selected(), ["build", "review"]);
+  assert.match(h.elements.skillhint.textContent, /Session defaults still apply/);
+  await h.context.submit();
+  assert.deepEqual(h.requests[0].body, { prompt: "hello", confirm: true, skills: ["build", "review"] });
+});
+
+test("skill picker uses themed floating rows, 44px targets, and reduced motion", () => {
+  const css = html.match(/<style>([\s\S]*?)<\/style>/)[1];
+  const picker = html.slice(html.indexOf('<div id="skillpicker">'), html.indexOf('<div id="modelpick"'));
+  assert.doesNotMatch(picker, /<datalist|\blist=/);
+  for (const id of ["oskill", "skillsearch", "skillclear"]) {
+    assert.match(css, new RegExp("#" + id + " \\{[^}]*min-height:44px;"));
+  }
+  assert.match(css, /#skillsearchclear \{[^}]*width:44px; height:44px;/);
+  assert.match(css, /#skilloptions \.modelrow \{[^}]*min-height:44px;/);
+  assert.match(css, /#skillvalue \{[^}]*text-overflow:ellipsis; white-space:nowrap;/);
+  assert.match(css, /#skillmenu \{[^}]*position:absolute;[^}]*background:var\(--panel\);/);
+  assert.match(css, /#skilloptions \{[^}]*min-height:0; overflow-y:auto; overscroll-behavior:contain; touch-action:pan-y;/);
+  assert.match(css, /prefers-reduced-motion:reduce\) \{ #skillmenu \{ animation:none; \}/);
+  assert.match(picker, /aria-label="reset skills to session default"/);
+  assert.doesNotThrow(() => new vm.Script(script));
 });

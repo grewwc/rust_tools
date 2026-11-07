@@ -466,13 +466,27 @@ select, summary { touch-action:manipulation; }
 #teampick button:disabled { opacity:.55; }
 #skillpicker { position:relative; flex:1; min-width:0; }
 #skillfield { position:relative; }
-#oskill { width:100%; padding:6px 36px 6px 8px; font-size:16px; background-color:var(--surface); border-radius:10px; }
-#oskill:focus { border-color:var(--acc-focus); box-shadow:0 0 0 2px var(--focus-ring); outline:none; }
-#skillclear { position:absolute; right:1px; top:1px; bottom:1px; width:34px; padding:0; background:transparent; border:0; color:var(--dim); }
-#skillmenu { position:absolute; bottom:calc(100% + 8px); left:0; right:0; z-index:12; max-height:min(240px,35vh); max-height:min(240px,calc(var(--app-height, 100vh) * .35)); overflow-y:auto; overscroll-behavior:contain; touch-action:pan-y; padding:5px; background:var(--panel); border:1px solid var(--acc-line); border-radius:12px; box-shadow:0 8px 24px #0008; }
-#skillmenu [role="option"] { padding:10px; min-height:44px; border-radius:8px; cursor:pointer; overflow-wrap:anywhere; }
-#skillmenu [aria-selected="true"], #skillmenu [role="option"]:hover { background:var(--tint-3); }
+#oskill { display:flex; align-items:center; justify-content:space-between; gap:8px; width:100%; min-height:44px; padding:6px 12px; text-align:left; font-size:16px; font-weight:600; background:var(--surface); border:1px solid var(--line); border-radius:10px; }
+#skillvalue { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#skillchev { flex:0 0 auto; width:7px; height:7px; margin-top:-3px; border-right:1.5px solid var(--dim); border-bottom:1.5px solid var(--dim); transform:rotate(45deg); }
+#oskill:focus-visible, #oskill[aria-expanded="true"] { border-color:var(--acc-focus); box-shadow:0 0 0 2px var(--focus-ring); outline:none; }
+#oskill:disabled { opacity:.5; }
+#skillmenu { position:absolute; bottom:calc(100% + 8px); left:0; right:0; z-index:12; display:flex; flex-direction:column; gap:6px; max-height:min(360px,60vh); max-height:min(360px,calc(var(--app-height, 100vh) * .60)); padding:8px; background:var(--panel); border:1px solid var(--line-2); border-radius:14px; box-shadow:0 18px 42px rgba(0,0,0,.38); animation:workerpop .14s ease-out; }
+#skillmenu[hidden] { display:none; }
+#skillsearchwrap { position:relative; flex:0 0 auto; }
+#skillsearch { width:100%; min-height:44px; padding:8px 52px 8px 10px; font-size:16px; background:var(--surface); border-radius:10px; }
+#skillsearch:focus { border-color:var(--acc-focus); box-shadow:0 0 0 2px var(--focus-ring); outline:none; }
+#skillsearchclear { position:absolute; right:0; top:0; width:44px; height:44px; padding:0; background:transparent; border:0; color:var(--dim); }
+#skillsearchclear[hidden] { display:none; }
+#skilloptions { flex:1 1 auto; min-height:0; overflow-y:auto; overscroll-behavior:contain; touch-action:pan-y; padding:2px; }
+#skilloptions .modelrow { min-height:44px; padding:8px 10px; }
+#skilloptions .modelrowcheck { border-radius:5px; }
+#skilloptions [data-active="true"], #skilloptions .modelrow:focus-visible { outline:2px solid var(--acc-focus); outline-offset:-2px; }
+#skilloptions .modelrow:disabled { opacity:.5; }
 #skillmenu small { display:block; color:var(--dim); font-size:12px; }
+#skillempty { padding:10px; color:var(--dim); font-size:13px; text-align:center; }
+#skillempty[hidden] { display:none; }
+#skillclear { flex:0 0 auto; width:100%; min-height:44px; padding:8px 10px; background:var(--surface-2); border-radius:10px; }
 #skillhint { padding:5px 8px; color:var(--dim); font-size:12px; }
 #composer { display:flex; gap:8px; padding:10px 12px calc(10px + env(safe-area-inset-bottom)); background:var(--panel); border-top:1px solid var(--line); }
 #prompt {
@@ -608,8 +622,7 @@ select, summary { touch-action:manipulation; }
   #ovrsummaryline #teamcontrols { display:flex; }
   #teampick:not([hidden]) { display:block; }
   .modelrow { min-height:56px; }
-  #oskill { min-height:46px; padding:10px 44px 10px 12px; }
-  #skillclear { width:42px; }
+  #oskill { min-height:46px; padding:10px 12px; font-size:15px; }
   #msgs { padding:10px; }
   #jumpbottom { display:grid; }
   #jumpbottom.show { opacity:1; transform:translateY(0) scale(1); pointer-events:auto; }
@@ -668,6 +681,7 @@ select, summary { touch-action:manipulation; }
 }
 @media (prefers-reduced-motion:reduce) { #jumpbottom, #prompt { transition:none; } body, header, #sessbar, #composer, #msgs, .msg, button, select, input, textarea, #sessions, #conn, #connstat, #questionpanel, #skillmenu, #turnstatus, .code-preview, .code-preview-toolbar, .code-block-toolbar, .mediaprev { transition:none; } }
 @media (prefers-reduced-motion:reduce) { #modelpickpanel, #modelpickscrim { animation:none; } }
+@media (prefers-reduced-motion:reduce) { #skillmenu { animation:none; } }
 @media (prefers-reduced-motion:reduce) { #teampickpanel, #teampickscrim { animation:none; } }
 /* Server-side images in a reply: the path text stays, the fetched picture
    sits under it (see decorateMedia in the script below). */
@@ -747,10 +761,18 @@ select, summary { touch-action:manipulation; }
 <select id="oeffort" aria-label="reasoning effort override"></select>
 <div id="skillpicker">
 <div id="skillfield">
-<input id="oskill" type="text" role="combobox" aria-label="skill for next message" aria-autocomplete="list" aria-controls="skillmenu" aria-expanded="false" aria-describedby="skillhint" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="skill: loading…" disabled>
-<button id="skillclear" type="button" aria-label="clear skill selection" title="Use default skill" hidden>×</button>
+<button id="oskill" type="button" aria-label="skills for next message" aria-haspopup="listbox" aria-controls="skilloptions" aria-expanded="false" aria-describedby="skillhint" disabled>
+<span id="skillvalue">skill: loading…</span><span id="skillchev" aria-hidden="true"></span>
 </div>
-<div id="skillmenu" role="listbox" aria-label="skill suggestions" hidden></div>
+<div id="skillmenu" hidden>
+<div id="skillsearchwrap">
+<input id="skillsearch" type="text" role="combobox" aria-label="filter skills for next message" aria-autocomplete="list" aria-haspopup="listbox" aria-controls="skilloptions" aria-expanded="false" aria-describedby="skillhint" autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="search" placeholder="Filter skills…">
+<button id="skillsearchclear" type="button" aria-label="clear skill search" hidden>×</button>
+</div>
+<div id="skilloptions" role="listbox" aria-label="skills for next message" aria-multiselectable="true"></div>
+<div id="skillempty" role="status" hidden>No matching skills</div>
+<button id="skillclear" type="button" aria-label="reset skills to session default" aria-pressed="true">Session default</button>
+</div>
 <div id="skillhint" role="status" hidden></div>
 </div>
 </div>
@@ -1708,7 +1730,7 @@ function syncOvrSummary() {
   const t = (s) => { const o = s.options[s.selectedIndex]; return (o && s.value) ? o.textContent : "default"; };
   $("ovrsummary").textContent = "model " + t($("omodel")) + " · agent " + t($("oagent")) + " · effort " + t($("oeffort"));
   const pick = skillPicks.get(skillPickKey());
-  const skill = !$("oskill").disabled && pick ? (pick.names.length ? pick.names.join(", ") + " (next)" : "choose a match") : "default";
+  const skill = !$("oskill").disabled && pick && pick.names.length ? pick.names.join(" + ") + " (next)" : "default";
   $("ovrsummary").textContent += " · skill " + skill;
 }
 // The composer grows with its content (up to the CSS cap) instead of
@@ -3403,247 +3425,240 @@ function modelSheetKeydown(e) {
   visible[next].focus();
 }
 // Skills are pending next-turn choices, not persistent session configuration.
-// Keep drafts per server/session while the page is open; object identity keeps
-// an older HTTP acknowledgement from clearing a newer selection.
+// Tab storage restores drafts after reload, scoped to the server and session.
+// Selection identity keeps an older HTTP acknowledgement from clearing a
+// newer ordered set; editing the independent filter does not reselect skills.
 const skillPicks = new Map();
+const skillDraftsLoaded = new Set();
+const MAX_PICKED_SKILLS = 8; // Matches the turn request's MAX_TURN_SKILLS cap.
 let skillLoadEpoch = 0;
 let skillCatalog = [], skillMatches = [], skillActive = -1, skillComposing = false;
 function skillPickKey(sid = sessionId) { return JSON.stringify([store.base, sid || ""]); }
-function saveSkillPick() {
-  const key = skillPickKey(), text = $("oskill").value;
-  const names = skillComposing ? [] : skillNamesFromText(text);
-  if (text.trim()) skillPicks.set(key, { text, names: names || [] });
+function readSkillPick(key = skillPickKey()) {
+  if (!skillDraftsLoaded.has(key)) {
+    skillDraftsLoaded.add(key);
+    try {
+      const saved = JSON.parse(sessionStorage.getItem("serve.skill-draft:" + key));
+      if (saved && Array.isArray(saved.names)) {
+        const names = [], seen = new Set();
+        for (const raw of saved.names) {
+          if (typeof raw !== "string" || !raw.trim()) continue;
+          const name = raw.trim(), lower = name.toLowerCase();
+          if (!seen.has(lower)) { names.push(name); seen.add(lower); }
+          if (names.length === MAX_PICKED_SKILLS) break;
+        }
+        const query = typeof saved.query === "string" ? saved.query : "";
+        if (names.length || query) skillPicks.set(key, { names, query });
+      }
+    } catch (_) {}
+  }
+  return skillPicks.get(key);
+}
+function persistSkillPick(key) {
+  try {
+    const pick = skillPicks.get(key), storageKey = "serve.skill-draft:" + key;
+    if (pick) sessionStorage.setItem(storageKey, JSON.stringify(pick));
+    else sessionStorage.removeItem(storageKey);
+  } catch (_) {}
+}
+function setSkillPick(key, names, query) {
+  skillDraftsLoaded.add(key);
+  if (names.length || query) skillPicks.set(key, { names, query });
   else skillPicks.delete(key);
-  syncSkillInput();
-  syncOvrSummary();
-}
-// Parse a comma-separated selection ("review, build") into canonical catalog
-// names. Returns null when any segment does not name a skill, so a partially
-// typed segment keeps the field invalid until it resolves.
-function skillNamesFromText(text) {
-  const names = [];
-  for (const segment of text.split(",")) {
-    const trimmed = segment.trim();
-    if (!trimmed) continue;
-    const match = skillCatalog.find((s) => s.name.toLowerCase() === trimmed.toLowerCase());
-    if (!match) return null;
-    if (!names.includes(match.name)) names.push(match.name);
-  }
-  return names;
-}
-// Completed picks in the comma-separated field: every segment that exactly
-// names a catalog skill. A partial segment still being typed is ignored, so
-// choosing from the suggestion list replaces only that tail instead of
-// discarding the picks before it.
-function completedSkillNames(text) {
-  const names = [];
-  for (const segment of text.split(",")) {
-    const trimmed = segment.trim();
-    if (!trimmed) continue;
-    const match = skillCatalog.find((s) => s.name.toLowerCase() === trimmed.toLowerCase());
-    if (match && !names.includes(match.name)) names.push(match.name);
-  }
-  return names;
+  persistSkillPick(key);
 }
 function skillInputChanged() {
-  saveSkillPick();
-  // Clearing a search dismisses suggestions; explicit focus/click can still browse all skills.
-  if (skillComposing || !$('oskill').value.trim()) closeSkillMenu();
-  else renderSkillMenu();
+  const key = skillPickKey(), pick = readSkillPick() || { names: [], query: "" };
+  pick.query = $("skillsearch").value;
+  if (pick.names.length || pick.query) skillPicks.set(key, pick);
+  else skillPicks.delete(key);
+  persistSkillPick(key);
+  skillActive = -1;
+  syncSkillInput();
+  if (!skillComposing) renderSkillMenu();
 }
 function syncSkillInput() {
-  const input = $("oskill"), pick = skillPicks.get(skillPickKey());
-  const invalid = !input.disabled && !!input.value.trim() && !(pick && pick.names.length);
-  input.setAttribute("aria-invalid", String(invalid && !skillComposing));
-  $("skillclear").hidden = input.disabled || !input.value;
-  $("skillhint").hidden = !invalid || skillComposing;
-  $("skillhint").textContent = invalid ? "Choose a matching skill, or clear to use default." : "";
+  const button = $("oskill"), pick = skillPicks.get(skillPickKey());
+  const names = !button.disabled && pick ? pick.names : [];
+  if (!button.disabled) {
+    $("skillvalue").textContent = "skill: " + (names.length ? names.join(" + ") : "session default");
+    button.title = "Skills for the next message: " + (names.length ? names.join(" + ") : "session default") + ". Session defaults still apply.";
+  }
+  button.setAttribute("aria-label", $("skillvalue").textContent + " (next message)");
+  $("skillsearch").disabled = button.disabled;
+  $("skillsearchclear").hidden = !$("skillsearch").value;
+  $("skillclear").disabled = button.disabled || skillComposing;
+  $("skillclear").setAttribute("aria-pressed", String(!names.length));
+  $("skillhint").hidden = button.disabled;
+  $("skillhint").textContent = (names.length === MAX_PICKED_SKILLS ? "Selection limit reached. " : "") + "Next message only; up to " + MAX_PICKED_SKILLS + " skills. Session defaults still apply.";
 }
 function restoreSkillPick() {
-  const sel = $("oskill"), key = skillPickKey();
-  let pick = skillPicks.get(key);
-  if (pick && pick.names.length && !sel.disabled) {
-    const live = pick.names.filter((name) => skillCatalog.some((s) => s.name === name));
-    if (live.length !== pick.names.length) {
-      if (live.length) {
-        pick = { text: live.join(", "), names: live };
-        skillPicks.set(key, pick);
-      } else {
-        skillPicks.delete(key); pick = null;
-      }
+  const key = skillPickKey();
+  let pick = readSkillPick();
+  if (pick && !$("oskill").disabled) {
+    const live = pick.names.map((name) => skillCatalog.find((s) => s.name.toLowerCase() === name.toLowerCase()))
+      .filter(Boolean).map((s) => s.name);
+    if (live.length !== pick.names.length || live.some((name, i) => name !== pick.names[i])) {
+      setSkillPick(key, live, pick.query);
+      pick = skillPicks.get(key);
     }
   }
-  const value = !sel.disabled && pick ? pick.text : "";
-  if (sel.value !== value) sel.value = value;
+  $("skillsearch").value = pick ? pick.query : "";
   closeSkillMenu();
   syncSkillInput();
   syncOvrSummary();
 }
-function closeSkillMenu() {
+function closeSkillMenu(returnFocus = false) {
+  const wasOpen = !$("skillmenu").hidden;
   $("skillmenu").hidden = true;
   $("oskill").setAttribute("aria-expanded", "false");
-  $("oskill").removeAttribute("aria-activedescendant");
+  $("skillsearch").setAttribute("aria-expanded", "false");
+  $("skillsearch").removeAttribute("aria-activedescendant");
   skillActive = -1;
+  if (returnFocus && wasOpen) {
+    try { $("oskill").focus({ preventScroll: true }); } catch (_) { $("oskill").focus(); }
+  }
+}
+function openSkillMenu() {
+  if ($("oskill").disabled || skillComposing) return;
+  $("skillmenu").hidden = false;
+  $("oskill").setAttribute("aria-expanded", "true");
+  $("skillsearch").setAttribute("aria-expanded", "true");
+  renderSkillMenu();
+  try { $("skillsearch").focus({ preventScroll: true }); } catch (_) { $("skillsearch").focus(); }
 }
 function chooseSkill(name) {
   if (skillComposing || $("oskill").disabled) return;
   if (name && !skillCatalog.some((s) => s.name === name)) return;
+  const names = (readSkillPick()?.names || []).slice();
   if (!name) {
-    $("oskill").value = "";
+    names.length = 0;
+    $("skillsearch").value = "";
   } else {
-    // Append to the current selection instead of replacing it; the field
-    // holds a comma-separated list so one message can force several skills.
-    // The tail is the query being replaced by this choice, so a partial tail
-    // must not drop the completed picks before it.
-    const names = completedSkillNames($("oskill").value);
-    if (!names.includes(name)) names.push(name);
-    $("oskill").value = names.join(", ");
+    const index = names.indexOf(name);
+    if (index >= 0) names.splice(index, 1);
+    else if (names.length < MAX_PICKED_SKILLS) names.push(name);
+    else return;
   }
-  saveSkillPick();
-  $("oskill").focus();
-  closeSkillMenu();
+  setSkillPick(skillPickKey(), names, $("skillsearch").value);
+  syncSkillInput();
+  syncOvrSummary();
+  if (!name) closeSkillMenu(true);
+  else renderSkillMenu();
 }
 function renderSkillMenu() {
-  const input = $("oskill"), menu = $("skillmenu");
-  closeSkillMenu();
-  if (input.disabled || skillComposing || document.activeElement !== input) return;
-  // Only the segment being typed feeds the suggestion query; earlier
-  // comma-separated segments are already chosen.
-  const segments = input.value.split(",");
-  const query = segments.pop().trim().toLowerCase();
-  const tokens = query.split(/\s+/).filter(Boolean);
-  // Fuzzy matching: every token must match the name or description, as a
-  // substring or as an ordered subsequence (gaps allowed). Scores rank
-  // name/substring hits above description/subsequence hits; the best
-  // candidates come first so a short typo-tolerant query still lands on
-  // the intended skill.
-  const picked = new Set();
-  for (const segment of segments) {
-    const match = skillCatalog.find((s) => s.name.toLowerCase() === segment.trim().toLowerCase());
-    if (match) picked.add(match.name);
-  }
-  const scored = skillCatalog.filter((skill) => !picked.has(skill.name))
-    .map((skill) => ({ skill, score: skillMatchScore(skill, tokens) }))
-    .filter((entry) => entry.score >= 0);
-  // With a query, rank by relevance; with no query, keep catalog order.
-  if (tokens.length) scored.sort((a, b) => b.score - a.score || a.skill.name.localeCompare(b.skill.name));
-  const matches = scored.map((entry) => entry.skill);
+  if ($("oskill").disabled || skillComposing || $("skillmenu").hidden) return;
+  const box = $("skilloptions"), query = $("skillsearch").value.trim().toLowerCase();
+  const names = readSkillPick()?.names || [], activeName = skillMatches[skillActive]?.name;
+  skillMatches = skillCatalog.filter((s) => (s.name + " " + (s.description || "")).toLowerCase().includes(query));
+  skillActive = activeName ? skillMatches.findIndex((s) => s.name === activeName) : -1;
   // Use DOM text nodes: catalog descriptions are untrusted plain text.
-  skillMatches = [...matches, { name: "", description: "No forced skill for the next message" }];
-  menu.textContent = "";
+  box.textContent = "";
   skillMatches.forEach((skill, index) => {
-    const option = document.createElement("div");
+    const option = document.createElement("button");
+    option.type = "button";
+    option.className = "modelrow";
+    option.tabIndex = -1;
     option.id = "skill-option-" + index;
     option.setAttribute("role", "option");
-    option.setAttribute("aria-selected", "false");
-    const name = document.createElement("div"), description = document.createElement("small");
-    name.textContent = skill.name || "Default";
+    const selected = names.includes(skill.name);
+    option.setAttribute("aria-selected", String(selected));
+    option.disabled = !selected && names.length === MAX_PICKED_SKILLS;
+    option.setAttribute("aria-disabled", String(option.disabled));
+    const text = document.createElement("div"), name = document.createElement("strong"), description = document.createElement("small");
+    text.className = "modelrowtext";
+    name.className = "modelrowname";
+    description.className = "modelrowmeta";
+    name.textContent = skill.name;
     description.textContent = skill.description || "";
-    option.appendChild(name); option.appendChild(description);
+    text.appendChild(name); text.appendChild(description);
+    const check = document.createElement("span");
+    check.className = "modelrowcheck";
+    check.setAttribute("aria-hidden", "true");
+    option.appendChild(text); option.appendChild(check);
     // Keep focus in the input until the click, including when using touch.
     option.onpointerdown = (e) => e.preventDefault();
     option.onclick = () => chooseSkill(skill.name);
-    menu.appendChild(option);
+    box.appendChild(option);
   });
-  if (!matches.length) {
-    const empty = document.createElement("small");
-    empty.textContent = "No matching skills";
-    menu.appendChild(empty);
-  }
-  menu.hidden = false;
-  input.setAttribute("aria-expanded", "true");
+  $("skillempty").hidden = !!skillMatches.length;
+  setSkillActive(skillActive);
 }
-function skillMatchScore(skill, tokens) {
-  const name = (skill.name || "").toLowerCase();
-  const desc = (skill.description || "").toLowerCase();
-  let score = 0;
-  for (const token of tokens) {
-    const nIdx = name.indexOf(token);
-    if (nIdx >= 0) { score += 100; continue; }
-    const dIdx = desc.indexOf(token);
-    if (dIdx >= 0) { score += 50; continue; }
-    const nGap = subseqGaps(token, name);
-    if (nGap >= 0) { score += 30 - nGap; continue; }
-    const dGap = subseqGaps(token, desc);
-    if (dGap >= 0) { score += 15 - dGap; continue; }
-    return -1; // A token matched nothing: not a candidate.
+function setSkillActive(index) {
+  skillActive = index;
+  const options = [...$("skilloptions").children], input = $("skillsearch");
+  options.forEach((option, i) => option.setAttribute("data-active", String(i === index)));
+  const active = options[index];
+  if (active) {
+    input.setAttribute("aria-activedescendant", active.id);
+    active.scrollIntoView({ block: "nearest" });
+  } else {
+    input.removeAttribute("aria-activedescendant");
   }
-  return score;
-}
-function subseqGaps(needle, hay) {
-  let ni = 0, gaps = 0, prev = -1;
-  for (let hi = 0; ni < needle.length && hi < hay.length; hi++) {
-    if (hay[hi] === needle[ni]) {
-      if (prev >= 0) gaps += hi - prev - 1;
-      prev = hi;
-      ni++;
-    }
-  }
-  return ni === needle.length ? gaps : -1;
 }
 function skillKeydown(e) {
   if (skillComposing || e.isComposing || e.keyCode === 229) return;
-  const menu = $("skillmenu");
-  if (e.key === "Escape") { e.preventDefault(); closeSkillMenu(); return; }
-  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+  if (e.key === "Escape") { e.preventDefault(); closeSkillMenu(true); return; }
+  if (document.activeElement !== $("skillsearch") || $("skillmenu").hidden) return;
+  if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
     e.preventDefault();
-    if (menu.hidden) renderSkillMenu();
-    if (menu.hidden) return;
-    skillActive = skillActive < 0 ? (e.key === "ArrowDown" ? 0 : skillMatches.length - 1)
+    if (!skillMatches.length) return;
+    const next = e.key === "Home" ? 0 : e.key === "End" ? skillMatches.length - 1
+      : skillActive < 0 ? (e.key === "ArrowDown" ? 0 : skillMatches.length - 1)
       : (skillActive + (e.key === "ArrowDown" ? 1 : -1) + skillMatches.length) % skillMatches.length;
-    [...menu.children].forEach((option, index) => option.setAttribute("aria-selected", String(index === skillActive)));
-    const active = menu.children[skillActive];
-    $("oskill").setAttribute("aria-activedescendant", active.id);
-    active.scrollIntoView({ block: "nearest" });
+    setSkillActive(next);
   } else if (e.key === "Enter") {
     e.preventDefault(); // Select only; never submit a chat message from this field.
-    if (!menu.hidden && skillActive >= 0) chooseSkill(skillMatches[skillActive].name);
-    else {
-      const pick = skillPicks.get(skillPickKey());
-      if (pick && pick.names.length) closeSkillMenu();
-      else renderSkillMenu();
-    }
+    const match = skillMatches[skillActive < 0 ? 0 : skillActive];
+    if (match) chooseSkill(match.name);
   }
 }
 function validateSkillInput() {
-  const input = $("oskill"), pick = skillPicks.get(skillPickKey());
-  if (input.disabled || (!skillComposing && (!input.value.trim() || (pick && pick.names.length)))) return true;
+  if ($("oskill").disabled || !skillComposing) return true;
   $("ovrwrap").open = true;
-  input.focus();
-  renderSkillMenu();
+  $("skillsearch").focus();
   return false;
 }
 function carrySkillPick(from, to) {
-  const key = skillPickKey(from), pick = skillPicks.get(key);
-  if (pick) { skillPicks.set(skillPickKey(to), pick); skillPicks.delete(key); }
+  const key = skillPickKey(from), nextKey = skillPickKey(to), pick = readSkillPick(key);
+  if (pick) {
+    skillDraftsLoaded.add(nextKey);
+    skillPicks.set(nextKey, pick); skillPicks.delete(key);
+    persistSkillPick(nextKey); persistSkillPick(key);
+  }
   restoreSkillPick();
 }
 function captureSkillPick() {
-  const key = skillPickKey(), pick = skillPicks.get(key);
+  const key = skillPickKey(), pick = readSkillPick();
   const names = !$("oskill").disabled && pick ? pick.names : [];
   return { key, pick, skills: names.slice() };
 }
 function consumeSkillPick(sent) {
-  if (sent.skills.length && skillPicks.get(sent.key) === sent.pick) skillPicks.delete(sent.key);
+  if (sent.skills.length && skillPicks.get(sent.key) === sent.pick) setSkillPick(sent.key, [], sent.pick.query);
   restoreSkillPick();
 }
 async function loadSkills() {
   const epoch = ++skillLoadEpoch, base = store.base, sel = $("oskill");
   sel.disabled = true;
   skillCatalog = [];
-  sel.placeholder = "skill: loading…";
+  $("skillvalue").textContent = "skill: loading…";
   restoreSkillPick();
   try {
     const skills = await (await api("/skills")).json();
     if (epoch !== skillLoadEpoch || base !== store.base) return;
-    skillCatalog = skills.filter((s) => typeof s.name === "string" && s.name.trim());
-    sel.placeholder = skillCatalog.length ? "skill: type to search (next message; comma separates)" : "skill: none available";
-    sel.title = "Skills for the next message only, comma-separated; default does not force a skill";
+    const seen = new Set();
+    skillCatalog = skills.filter((s) => {
+      if (typeof s.name !== "string" || !s.name.trim() || seen.has(s.name.trim().toLowerCase())) return false;
+      seen.add(s.name.trim().toLowerCase());
+      return true;
+    }).map((s) => ({ ...s, name: s.name.trim() }));
+    $("skillvalue").textContent = skillCatalog.length ? "skill: session default" : "skill: none available";
+    sel.title = "Toggle skills for the next message; session defaults still apply.";
     sel.disabled = !skillCatalog.length;
-    if (!skillCatalog.length) skillPicks.delete(skillPickKey());
+    if (!skillCatalog.length) setSkillPick(skillPickKey(), [], "");
   } catch (_) {
     if (epoch !== skillLoadEpoch || base !== store.base) return;
-    sel.placeholder = "skill: unavailable";
+    $("skillvalue").textContent = "skill: unavailable";
     sel.title = "Could not load skills; reconnect to retry. Normal messages still work.";
   }
   restoreSkillPick();
@@ -5590,18 +5605,27 @@ function wire() {
   };
   window.addEventListener("popstate", () => { if (!$("modelpick").hidden) closeModelSheet(true); });
   wireTeamMode();
-  $("oskill").onfocus = renderSkillMenu;
-  $("oskill").onclick = renderSkillMenu;
-  $("oskill").onblur = closeSkillMenu;
-  $("oskill").oninput = (e) => {
+  // BEGIN skill picker events
+  $("oskill").onclick = () => { if ($("skillmenu").hidden) openSkillMenu(); else closeSkillMenu(true); };
+  $("skillsearch").oninput = (e) => {
     if (e.isComposing) skillComposing = true;
     skillInputChanged();
   };
-  $("oskill").oncompositionstart = () => { skillComposing = true; closeSkillMenu(); };
-  $("oskill").oncompositionend = () => { skillComposing = false; skillInputChanged(); };
-  $("oskill").onkeydown = skillKeydown;
+  $("skillsearch").oncompositionstart = () => { skillComposing = true; syncSkillInput(); };
+  $("skillsearch").oncompositionend = () => { skillComposing = false; skillInputChanged(); };
+  $("skillmenu").onkeydown = skillKeydown;
+  $("skillsearchclear").onpointerdown = (e) => e.preventDefault();
+  $("skillsearchclear").onclick = () => {
+    if (skillComposing) return;
+    $("skillsearch").value = "";
+    skillInputChanged();
+    $("skillsearch").focus();
+  };
   $("skillclear").onpointerdown = (e) => e.preventDefault();
   $("skillclear").onclick = () => chooseSkill("");
+  $("skillpicker").onfocusout = (e) => { if (!$("skillpicker").contains(e.relatedTarget)) closeSkillMenu(); };
+  document.addEventListener("pointerdown", (e) => { if (!$("skillpicker").contains(e.target)) closeSkillMenu(); });
+  // END skill picker events
   $("prompt").addEventListener("compositionstart", () => {
     promptComposing = true;
     composingText = "";
