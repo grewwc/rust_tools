@@ -33,7 +33,8 @@ use super::text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
 use super::tool_groups::{recent_tool_group_message_indices, recent_tool_result_groups};
 use super::{
     IMAGE_OVERFLOW_SPILL_MIN_CHARS, KEEP_RECENT_TOOL_GROUPS,
-    KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX, PRESERVED_CONTENT_STUB_PREFIX,
+    KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX, KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MIN,
+    KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS, PRESERVED_CONTENT_STUB_PREFIX,
     PRESERVED_IMAGE_OVERFLOW_DIR, PRESERVED_TOOL_OVERFLOW_DIR, PRESERVED_USER_OVERFLOW_DIR,
     PlannedArchiveWrite, SESSION_ASSET_ALIAS_DIRS, USER_OVERFLOW_SPILL_MIN_CHARS,
     automatic_summary_body, content_sha256_hex, keep_recent_user_turns_when_trimming,
@@ -2151,50 +2152,130 @@ pub(in crate::ai) fn normalize_preserved_message_stubs_for_model(messages: &mut 
 fn first_preserved_content_spill_candidate(messages: &[Message], budget: usize) -> Option<usize> {
     let keep_recent_user_turns = keep_recent_user_turns_when_trimming(messages, budget);
     let protected_tail_start = retained_turn_start(messages, keep_recent_user_turns);
-    for (idx, message) in messages.iter().enumerate() {
-        if idx >= protected_tail_start {
-            break;
-        }
-        if is_system_like_role(&message.role)
-            || message.role == "tool"
-            || super::is_side_note_message(message)
-        {
-            continue;
-        }
-        if message.role == "assistant"
+    messages[..protected_tail_start]
+        .iter()
+        .position(preserved_content_requires_spill)
+}
+
+fn preserved_content_requires_spill(message: &Message) -> bool {
+    if is_system_like_role(&message.role)
+        || message.role == "tool"
+        || super::is_side_note_message(message)
+        || (message.role == "assistant"
             && message
                 .tool_calls
                 .as_ref()
-                .map(|calls| !calls.is_empty())
-                .unwrap_or(false)
-        {
-            continue;
-        }
+                .is_some_and(|calls| !calls.is_empty()))
+    {
+        return false;
+    }
 
-        let text = value_to_string(&message.content);
-        if is_preserved_user_or_image_stub(&text) {
-            continue;
-        }
+    let text = value_to_string(&message.content);
+    if is_preserved_user_or_image_stub(&text) {
+        return false;
+    }
 
-        // value_to_string folds an image's base64 into "[图片]" and cannot
-        // reflect the real size. For image messages, the serialized length of
-        // the raw content decides whether to spill, matching the intent of
-        // "moving large images into session temp files"; ordinary text messages
-        // are still billed by value_to_string.
-        let char_count = if message_contains_image(&message.content) {
-            message.content.to_string().chars().count()
-        } else {
-            text.chars().count()
-        };
-        if message_contains_image(&message.content) && char_count >= IMAGE_OVERFLOW_SPILL_MIN_CHARS
-        {
-            return Some(idx);
+    // value_to_string replaces image data with a display marker. Spill images
+    // by their raw serialized size and ordinary user text by its display size.
+    let contains_image = message_contains_image(&message.content);
+    let char_count = if contains_image {
+        message.content.to_string().chars().count()
+    } else {
+        text.chars().count()
+    };
+    (contains_image && char_count >= IMAGE_OVERFLOW_SPILL_MIN_CHARS)
+        || (message.role == "user" && char_count >= USER_OVERFLOW_SPILL_MIN_CHARS)
+}
+
+#[derive(Clone, Copy, Default)]
+struct PreservedTailWindow {
+    start: usize,
+    chars: usize,
+}
+
+/// State for one in-place spill pass. A spill retains the role and synthetic-user
+/// origin, so all user-turn boundaries stay fixed. Only billable sizes change.
+/// Rebuild this state when the caller supplies a different message sequence.
+struct PreservedContentSpillCursor {
+    next: usize,
+    total_chars: usize,
+    windows: [PreservedTailWindow; KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX],
+}
+
+impl PreservedContentSpillCursor {
+    fn new(messages: &[Message]) -> Self {
+        let mut windows =
+            [PreservedTailWindow::default(); KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX];
+        let mut total_chars = 0;
+        let mut user_turns = 0;
+        // One reverse walk collects both the full total and each possible tail
+        // total, counting the same fields as messages_total_chars exactly once.
+        for (idx, message) in messages.iter().enumerate().rev() {
+            total_chars += super::message_billable_chars(message);
+            if message.role == "user" && !super::is_runtime_synthetic_user_message(message) {
+                user_turns += 1;
+                if let Some(window) = windows.get_mut(user_turns - 1) {
+                    *window = PreservedTailWindow {
+                        start: idx,
+                        chars: total_chars,
+                    };
+                }
+            }
         }
-        if message.role == "user" && char_count >= USER_OVERFLOW_SPILL_MIN_CHARS {
-            return Some(idx);
+        for (index, window) in windows.iter_mut().enumerate() {
+            // retained_turn_start protects the entire sequence when there are
+            // no more real user turns than the requested retention count.
+            if user_turns <= index + 1 {
+                *window = PreservedTailWindow {
+                    start: 0,
+                    chars: total_chars,
+                };
+            }
+        }
+        Self {
+            next: 0,
+            total_chars,
+            windows,
         }
     }
-    None
+
+    fn protected_tail_start(&self, budget: usize) -> usize {
+        let mut keep = if self.total_chars <= KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS {
+            KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX
+        } else {
+            KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MIN
+        };
+        if budget > 0 {
+            while keep > 1 && self.windows[keep - 1].chars > budget {
+                keep -= 1;
+            }
+        }
+        self.windows[keep - 1].start
+    }
+
+    fn next_candidate(&mut self, messages: &[Message], budget: usize) -> Option<usize> {
+        // The boundary can move when a replacement crosses the total-size
+        // threshold or makes a larger tail fit. Re-evaluate the original rule
+        // from the cached totals rather than rescanning messages.
+        let protected_tail_start = self.protected_tail_start(budget);
+        while self.next < protected_tail_start {
+            let idx = self.next;
+            self.next += 1;
+            if preserved_content_requires_spill(&messages[idx]) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    fn record_replacement(&mut self, idx: usize, before_chars: usize, after_chars: usize) {
+        self.total_chars = self.total_chars - before_chars + after_chars;
+        for window in &mut self.windows {
+            if idx >= window.start {
+                window.chars = window.chars - before_chars + after_chars;
+            }
+        }
+    }
 }
 
 fn write_preserved_message_overflow_file(
@@ -2261,6 +2342,14 @@ pub(super) fn try_spill_preserved_message_to_stub(
     let Some(idx) = first_preserved_content_spill_candidate(messages, budget) else {
         return false;
     };
+    spill_preserved_message_to_stub_at(messages, overflow_dir, idx)
+}
+
+fn spill_preserved_message_to_stub_at(
+    messages: &mut [Message],
+    overflow_dir: &Path,
+    idx: usize,
+) -> bool {
     let kind = if message_contains_image(&messages[idx].content) {
         "image"
     } else {
@@ -2301,8 +2390,25 @@ pub(super) fn spill_oversized_preserved_messages(
     overflow_dir: &Path,
     budget: usize,
 ) {
-    while try_spill_preserved_message_to_stub(messages, overflow_dir, budget) {}
+    let mut cursor = PreservedContentSpillCursor::new(messages);
+    while let Some(idx) = cursor.next_candidate(messages, budget) {
+        let before_chars = super::message_billable_chars(&messages[idx]);
+        if !spill_preserved_message_to_stub_at(messages, overflow_dir, idx) {
+            break;
+        }
+        cursor.record_replacement(
+            idx,
+            before_chars,
+            super::message_billable_chars(&messages[idx]),
+        );
+        // Every examined prefix message is now either an unchanged ineligible
+        // message or a recognized stub. Restarting at zero cannot select it.
+    }
 }
+
+#[cfg(test)]
+#[path = "preserved_spill_tests.rs"]
+mod preserved_spill_tests;
 
 fn structured_tool_output_summary(text: &str, max_chars: usize) -> String {
     let lines = text
