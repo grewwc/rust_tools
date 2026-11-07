@@ -475,10 +475,10 @@ pub(in crate::ai) fn compress_messages_for_context_with_outcome(
     }
 
     let split_at = retained_turn_start(&messages, keep_last);
-    let (older, recent) = messages.split_at(split_at);
+    let older = &messages[..split_at];
     if older.is_empty() {
         let outcome = shrink_messages_to_fit_with_summary_outcome(
-            recent.to_vec(),
+            messages,
             max_chars,
             summary_max_chars,
             overflow_dir.as_deref(),
@@ -526,7 +526,7 @@ pub(in crate::ai) fn compress_messages_for_context_with_outcome(
         };
         insert_archive_note_if_missing(&mut out, build_overflow_placeholder(&path));
     }
-    out.extend_from_slice(recent);
+    out.extend(messages.into_iter().skip(split_at));
     let outcome = shrink_messages_to_fit_with_summary_outcome(
         out,
         max_chars,
@@ -703,7 +703,13 @@ pub(in crate::ai) fn sanitize_message_for_persisted_history_inner(
     message: &Message,
     replay_source_model: Option<&str>,
 ) -> Message {
-    let mut sanitized = message.clone();
+    sanitize_owned_message_for_persisted_history(message.clone(), replay_source_model)
+}
+
+fn sanitize_owned_message_for_persisted_history(
+    mut sanitized: Message,
+    replay_source_model: Option<&str>,
+) -> Message {
     if sanitized.role != "assistant" {
         return sanitized;
     }
@@ -725,15 +731,16 @@ pub(in crate::ai) fn sanitize_message_for_persisted_history_inner(
         .as_ref()
         .is_some_and(|tool_calls| !tool_calls.is_empty())
     {
-        let narration = match &sanitized.content {
+        let capped = match &sanitized.content {
             Value::Null => String::new(),
-            Value::String(text) => text.clone(),
-            other => value_to_string(other),
+            Value::String(text) => {
+                truncate_to_chars(text, PERSISTED_TOOL_CALL_ASSISTANT_NARRATION_MAX_CHARS)
+            }
+            other => truncate_to_chars(
+                &value_to_string(other),
+                PERSISTED_TOOL_CALL_ASSISTANT_NARRATION_MAX_CHARS,
+            ),
         };
-        let capped = truncate_to_chars(
-            &narration,
-            PERSISTED_TOOL_CALL_ASSISTANT_NARRATION_MAX_CHARS,
-        );
         sanitized.content = Value::String(capped);
     }
     let has_tool_calls = sanitized
@@ -787,8 +794,8 @@ pub(in crate::ai) fn sanitize_persisted_history_messages(messages: Vec<Message>)
                 .reasoning_content
                 .as_deref()
                 .is_some_and(|reasoning| is_persisted_reasoning_replay(reasoning));
-            sanitize_message_for_persisted_history_inner(
-                &message,
+            sanitize_owned_message_for_persisted_history(
+                message,
                 preserve.then_some("already-tagged"),
             )
         })
@@ -858,7 +865,7 @@ pub(in crate::ai) fn coalesce_accumulated_summary_notes(messages: Vec<Message>) 
         }
     }
 
-    let merged_summary = if merged_bodies.is_empty() {
+    let mut merged_summary = if merged_bodies.is_empty() {
         None
     } else {
         Some(Message {
@@ -881,10 +888,10 @@ pub(in crate::ai) fn coalesce_accumulated_summary_notes(messages: Vec<Message>) 
     for m in messages {
         if legacy_summary(&m) || is_archive_note_message(&m) {
             if !inserted {
-                if let Some(summary) = merged_summary.clone() {
+                if let Some(summary) = merged_summary.take() {
                     out.push(summary);
                 }
-                out.extend(archive_notes.iter().cloned());
+                out.append(&mut archive_notes);
                 inserted = true;
             }
             // Remaining summaries and already-collected archive notes are dropped.
@@ -963,12 +970,137 @@ async fn compact_persisted_history_with_app_inner(
     if !plan.commit() {
         return messages;
     }
-    let mut out: Vec<Message> = messages[..split_at]
-        .iter()
+    let mut messages = messages;
+    let recent = messages.split_off(split_at);
+    let mut out: Vec<Message> = messages
+        .into_iter()
         .filter(|message| is_system_like_role(&message.role) || is_side_note_message(message))
-        .cloned()
         .collect();
     out.push(plan.message().clone());
-    out.extend_from_slice(&messages[split_at..]);
+    out.extend(recent);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::types::{FunctionCall, ToolCall};
+
+    fn message(role: &str, content: &str) -> Message {
+        Message {
+            role: role.to_string(),
+            content: Value::String(content.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn consuming_history_paths_reuse_existing_payload_allocations() {
+        let messages = vec![
+            message("system", "stable rules"),
+            message("user", "latest request"),
+        ];
+        let expected = messages.clone();
+        let pointers = messages
+            .iter()
+            .map(|message| message.content.as_str().unwrap().as_ptr())
+            .collect::<Vec<_>>();
+        let outcome = compress_messages_for_context_with_outcome(
+            messages,
+            100_000,
+            usize::MAX,
+            400,
+            None,
+            None,
+        );
+        assert_eq!(outcome.status, ContextCompressionStatus::Complete);
+        assert_eq!(outcome.messages, expected);
+        for (message, pointer) in outcome.messages.iter().zip(&pointers) {
+            assert_eq!(message.content.as_str().unwrap().as_ptr(), *pointer);
+        }
+        let sanitized = sanitize_persisted_history_messages(outcome.messages);
+        assert_eq!(sanitized, expected);
+        for (message, pointer) in sanitized.iter().zip(&pointers) {
+            assert_eq!(message.content.as_str().unwrap().as_ptr(), *pointer);
+        }
+
+        let mut assistant = message("assistant", &"narration 支付 ".repeat(100));
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "call-1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "apply_patch".to_string(),
+                arguments: "patch evidence ".repeat(1_000),
+            },
+        }]);
+        assistant.reasoning_content = Some(encode_reasoning_replay_state("model", "replay state"));
+        let arguments_pointer = assistant.tool_calls.as_ref().unwrap()[0]
+            .function
+            .arguments
+            .as_ptr();
+        let replay_pointer = assistant.reasoning_content.as_ref().unwrap().as_ptr();
+        let expected =
+            sanitize_message_for_persisted_history_inner(&assistant, Some("already-tagged"));
+        let sanitized = sanitize_persisted_history_messages(vec![assistant]);
+        assert_eq!(sanitized, vec![expected]);
+        assert_eq!(
+            sanitized[0].content.as_str().unwrap().chars().count(),
+            PERSISTED_TOOL_CALL_ASSISTANT_NARRATION_MAX_CHARS + 1
+        );
+        assert!(sanitized[0].content.as_str().unwrap().ends_with('\u{2026}'));
+        assert_eq!(
+            sanitized[0].tool_calls.as_ref().unwrap()[0]
+                .function
+                .arguments
+                .as_ptr(),
+            arguments_pointer
+        );
+        assert_eq!(
+            sanitized[0].reasoning_content.as_ref().unwrap().as_ptr(),
+            replay_pointer
+        );
+    }
+
+    #[test]
+    fn context_compression_moves_recent_tail_after_archive_commit() {
+        let dir = std::env::temp_dir().join(format!("ai-owned-context-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let messages = vec![
+            message("system", "stable rules"),
+            message("user", "older request"),
+            message("assistant", "older response"),
+            message("user", "latest request"),
+        ];
+        let recent = messages.last().unwrap().clone();
+        let pointer = messages.last().unwrap().content.as_str().unwrap().as_ptr();
+        let outcome = compress_messages_for_context_with_outcome(
+            messages,
+            100_000,
+            1,
+            0,
+            Some(dir.clone()),
+            None,
+        );
+        assert_eq!(outcome.status, ContextCompressionStatus::Complete);
+        assert_eq!(
+            outcome.messages.first(),
+            Some(&message("system", "stable rules"))
+        );
+        assert_eq!(outcome.messages.last(), Some(&recent));
+        assert_eq!(
+            outcome
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .as_str()
+                .unwrap()
+                .as_ptr(),
+            pointer
+        );
+        assert!(outcome.messages.iter().any(is_archive_note_message));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
