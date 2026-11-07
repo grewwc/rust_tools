@@ -2,6 +2,28 @@ use std::fs;
 use std::path::PathBuf;
 
 #[test]
+fn top_level_archive_commands_are_recognized_by_cli_and_shell_completion() {
+    for (command, arguments) in [
+        ("/export", ""),
+        (":export", "current out.zip"),
+        ("/import", "archive.zip as=restored"),
+        (":import", "archive.zip"),
+        ("/export-md", ""),
+        (":export-md", "out.md"),
+    ] {
+        assert!(super::INTERNAL_COMMANDS.contains(&command), "{command}");
+        assert!(crate::ai::driver::commands::is_local_command_start(command));
+        let mut argv = vec!["a".to_string(), command.to_string()];
+        argv.extend(arguments.split_whitespace().map(str::to_string));
+        let cli = super::parse_cli_args(argv.into_iter());
+        assert_eq!(
+            cli.args,
+            [format!("{command} {arguments}").trim().to_string()]
+        );
+    }
+}
+
+#[test]
 fn use_command_cli_keeps_worker_model_separate_and_recognizes_command() {
     for command in ["/use", ":use"] {
         let cli = super::parse_cli_args(

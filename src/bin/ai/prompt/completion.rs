@@ -15,7 +15,10 @@ use rustyline::{
     validate::Validator,
 };
 
-use crate::{commonw::utils::expanduser, cw::Trie};
+use crate::{
+    ai::driver::commands::session::is_top_level_export_output_path, commonw::utils::expanduser,
+    cw::Trie,
+};
 
 pub(super) type LineEditor = Editor<CommandCompleter, DefaultHistory>;
 
@@ -91,6 +94,10 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":memo",
         "/export",
         ":export",
+        "/import",
+        ":import",
+        "/export-md",
+        ":export-md",
         ":model",
         "/effort",
         ":effort",
@@ -353,6 +360,10 @@ impl CommandCompleter {
             ":memo",
             "/export",
             ":export",
+            "/import",
+            ":import",
+            "/export-md",
+            ":export-md",
             ":model",
             "/effort",
             ":effort",
@@ -854,7 +865,11 @@ impl CommandCompleter {
     /// Output-path candidates of `/sessions export|markdown [output]`: the same
     /// listing as file references, without the `@` prefix those carry.
     fn output_path_candidates(token: &str) -> Vec<CompletionCandidate> {
-        Self::plain_candidates(complete_path_fragment(token, None))
+        Self::plain_candidates(
+            complete_path_fragment(token, None)
+                .into_iter()
+                .map(|path| path.strip_prefix('@').unwrap_or(&path).to_string()),
+        )
     }
 
     fn persona_subcommands() -> &'static [&'static str] {
@@ -1613,6 +1628,31 @@ impl CommandCompleter {
                         let arg_index = words.count();
                         Self::session_argument_candidates(sub, arg_index, token)
                     }
+                }
+            } else if matches!(first, "/export" | ":export") {
+                match (words.next(), words.next()) {
+                    (None, _) => {
+                        let mut candidates = Self::session_argument_candidates("export", 0, token);
+                        candidates.extend(distill_zip_candidates(token).into_iter().filter(
+                            |candidate| {
+                                candidate.display.ends_with('/')
+                                    || is_top_level_export_output_path(&candidate.display)
+                            },
+                        ));
+                        candidates
+                    }
+                    (Some(selector), None) if !is_top_level_export_output_path(selector) => {
+                        Self::session_argument_candidates("export", 1, token)
+                    }
+                    _ => Vec::new(),
+                }
+            } else if matches!(first, "/import" | ":import") {
+                Self::session_argument_candidates("import", words.count(), token)
+            } else if matches!(first, "/export-md" | ":export-md") {
+                if words.next().is_none() {
+                    Self::output_path_candidates(token)
+                } else {
+                    Vec::new()
                 }
             } else if matches!(first, "/archive" | ":archive") {
                 // Top-level toggle: the first argument is a session selector
@@ -3464,6 +3504,105 @@ mod tests {
             .unwrap();
         assert!(!pairs.iter().any(|pair| pair.replacement == "clear-all"));
         assert!(!pairs.iter().any(|pair| pair.replacement == "verbose"));
+    }
+
+    #[test]
+    fn top_level_archive_command_completion_covers_zip_and_markdown() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for prefix in ["/", ":"] {
+            let (_, candidates) = CommandCompleter::complete_for_line(prefix, prefix.len());
+            for command in ["export", "import", "export-md"] {
+                let command = format!("{prefix}{command}");
+                assert!(CommandCompleter::top_level_commands().contains(&command.as_str()));
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|candidate| candidate.replacement == command)
+                );
+            }
+        }
+        for command in ["/export", ":export"] {
+            let line = format!("{command} ");
+            let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.replacement == "current")
+            );
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.replacement == "last")
+            );
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "top-level-archive-completion-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("archive.zip"), "").unwrap();
+        fs::write(root.join("archive.ZIP"), "").unwrap();
+        fs::write(root.join("summary.md"), "").unwrap();
+        fs::create_dir(root.join("exports")).unwrap();
+        let path_prefix = format!("{}/", root.display());
+        for (command, include_markdown, include_uppercase_zip) in [
+            ("/export", false, false),
+            (":export", false, false),
+            ("/import", false, true),
+            (":import", false, true),
+            ("/export current", true, true),
+            (":export last", true, true),
+            ("/export-md", true, true),
+            (":export-md", true, true),
+            ("/ss export current", true, true),
+            ("/sessions markdown last", true, true),
+        ] {
+            let line = format!("{command} {path_prefix}");
+            let (start, candidates) = CommandCompleter::complete_for_line(&line, line.len());
+            assert_eq!(&line[start..], path_prefix);
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.replacement == format!("{path_prefix}archive.zip")),
+                "{line}"
+            );
+            assert_eq!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.replacement == format!("{path_prefix}summary.md")),
+                include_markdown,
+                "{line}"
+            );
+            assert_eq!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.replacement == format!("{path_prefix}archive.ZIP")),
+                include_uppercase_zip,
+                "{line}"
+            );
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.replacement == format!("{path_prefix}exports/")),
+                "{line}"
+            );
+        }
+        for line in [
+            "/export archive.zip ",
+            ":export archive.zip ",
+            "/export current archive.zip ",
+            "/import archive.zip ",
+            ":import archive.zip as=restored ",
+            "/export-md summary.md ",
+            ":export-md summary.md ",
+        ] {
+            let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
+            assert!(candidates.is_empty(), "{line}");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

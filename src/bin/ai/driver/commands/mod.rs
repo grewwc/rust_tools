@@ -40,7 +40,7 @@ pub(crate) use checkpoint::{
 };
 pub use cwd::try_handle_cwd_command;
 pub use discuss::try_handle_discuss_command;
-pub use export::try_handle_export_command;
+pub use export::try_handle_export_markdown_command;
 pub use goal::try_handle_goal_command;
 pub use help::try_handle_help_command;
 pub use model::try_handle_model_command;
@@ -100,12 +100,14 @@ pub fn is_local_command_start(token: &str) -> bool {
             | "diff"
             | "effort"
             | "export"
+            | "export-md"
             | "fork"
             | "git"
             | "goal"
             | "h"
             | "help"
             | "history"
+            | "import"
             | "mark"
             | "memo"
             | "model"
@@ -137,7 +139,7 @@ pub fn is_local_command_start(token: &str) -> bool {
 /// them. Serve-chat intercepts `/use` and `/reset` through the config endpoint;
 /// their classifier routes remain compatible. The turn child executes `/memo`
 /// after pre-turn dispatch, `/audit` and `/distill-session` in the turn
-/// dispatcher, and `/mark`, `/unmark`, `/archive`, `/title`, and `/export` in the
+/// dispatcher, and `/mark`, `/unmark`, `/archive`, `/title`, and `/export-md` in the
 /// pre-turn local-command path. `/task`, `/discuss`, and `/goal` inject a
 /// `forced_question` into the turn.
 fn is_serve_forwarded_command_start(token: &str) -> bool {
@@ -158,7 +160,7 @@ fn is_serve_forwarded_command_start(token: &str) -> bool {
             | "discuss"
             | "goal"
             | "distill-session"
-            | "export"
+            | "export-md"
             | "mark"
             | "unmark"
             | "archive"
@@ -213,7 +215,7 @@ pub(crate) fn serve_command_title_seed(input: &str) -> Option<String> {
     let trimmed = extraction_input.trim();
     let word = local_command_word(trimmed);
     match word {
-        "distill-session" | "export" | "mark" | "unmark" | "archive" | "title" | "reset"
+        "distill-session" | "export-md" | "mark" | "unmark" | "archive" | "title" | "reset"
         | "memo" => Some(String::new()),
         "use" => {
             let tail = trimmed
@@ -432,7 +434,7 @@ pub fn try_handle_local_command(
     if try_handle_share_command(app, input)? {
         return Ok(true);
     }
-    if try_handle_export_command(app, input)? {
+    if try_handle_export_markdown_command(app, input)? {
         return Ok(true);
     }
     Ok(false)
@@ -767,7 +769,7 @@ mod tests {
             ("/mark m", ""),
             (":unmark m", ""),
             ("/archive last", ""),
-            ("/export out.md", ""),
+            ("/export-md out.md", ""),
             ("/distill-session current", ""),
             ("/memo remember this", ""),
             ("/reset", ""),
@@ -801,6 +803,48 @@ mod tests {
         assert!(!looks_like_slash_command(":)"));
         assert!(!looks_like_slash_command("plain prompt"));
         assert!(!looks_like_slash_command(""));
+    }
+
+    #[test]
+    fn top_level_archive_commands_preserve_serve_routing_policy() {
+        use super::{
+            ServeInputRoute, classify_serve_input, is_local_command_start,
+            is_serve_local_command_start,
+        };
+
+        for input in [
+            "/export",
+            ":export current out.zip",
+            "/import archive.zip",
+            ":import archive.zip as=restored",
+            "/ss export current out.zip",
+            ":ss import archive.zip",
+        ] {
+            assert!(is_local_command_start(input), "{input}");
+            assert!(is_serve_local_command_start(input), "{input}");
+            assert_eq!(
+                classify_serve_input(input),
+                ServeInputRoute::Unsupported,
+                "{input}"
+            );
+        }
+        for input in ["/export-md", ":export-md notes/summary.md"] {
+            assert!(is_local_command_start(input), "{input}");
+            assert!(!is_serve_local_command_start(input), "{input}");
+            assert_eq!(
+                classify_serve_input(input),
+                ServeInputRoute::ServerCommand,
+                "{input}"
+            );
+        }
+        for input in ["/export-md-extra", ":imports"] {
+            assert!(!is_local_command_start(input), "{input}");
+            assert_eq!(
+                classify_serve_input(input),
+                ServeInputRoute::UnknownCommand,
+                "{input}"
+            );
+        }
     }
 
     #[test]

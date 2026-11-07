@@ -68,7 +68,7 @@ fn print_commands_help() {
         "    /memo [text]              save last assistant conclusion (or given text) as memo to knowledge base"
     );
     println!(
-        "    /export [file.md]         save last assistant conclusion to a markdown file (default: _summary.md)"
+        "    /export-md [file.md]      save last assistant conclusion to a markdown file (default: _summary.md)"
     );
     println!(
         "    /goal [target]            enter goal mode: agent persists until the goal is done"
@@ -118,8 +118,13 @@ fn print_commands_help() {
     println!(
         "    /sessions export <id|current|last> [output.zip]  export session to a portable zip"
     );
+    println!(
+        "    /export [<id>|current|last] [output.zip]  export session to zip (default: current, session_export.zip)"
+    );
+    println!("    /export <output.zip>        export current session to the given zip path");
     println!("    /sessions markdown <id|current|last> [output.md] export session to Markdown");
     println!("    /sessions import <file.zip> [as=<id>]           import a session export zip");
+    println!("    /import <file.zip> [as=<id>]  import a session zip and switch to it");
     println!("    /sessions fork [src=<id>] [as=<id>]      copy session to a new branch");
     println!("    /sessions branch <keep_turns> [src=<id>] [as=<id>] retain complete user turns");
     println!(

@@ -609,6 +609,24 @@ fn delete_one_session(store: &SessionStore, session_id: &str) -> std::io::Result
     Ok(deleted)
 }
 
+/// Recognize the explicit ZIP output-path shorthand for top-level export.
+pub(in crate::ai) fn is_top_level_export_output_path(arg: &str) -> bool {
+    arg.ends_with(".zip")
+}
+
+/// Top-level export defaults to the current session and accepts a `.zip` path
+/// in the selector position. Every other first argument remains a selector.
+fn top_level_export_args<'a>(
+    first: Option<&'a str>,
+    output: Option<&'a str>,
+) -> (&'a str, Option<&'a str>) {
+    match first {
+        None => ("current", None),
+        Some(path) if is_top_level_export_output_path(path) => ("current", Some(path)),
+        Some(selector) => (selector, output),
+    }
+}
+
 pub fn try_handle_session_command(
     app: &mut App,
     input: &str,
@@ -634,6 +652,7 @@ pub fn try_handle_session_command(
     let top_level_mark = cmd == "mark";
     let top_level_unmark = cmd == "unmark";
     let top_level_archive = cmd == "archive";
+    let top_level_archive_transfer = matches!(cmd, "export" | "import");
     if cmd != "sessions"
         && cmd != "session"
         && cmd != "ss"
@@ -643,6 +662,7 @@ pub fn try_handle_session_command(
         && !top_level_mark
         && !top_level_unmark
         && !top_level_archive
+        && !top_level_archive_transfer
     {
         return Ok(false);
     }
@@ -658,6 +678,8 @@ pub fn try_handle_session_command(
         "unmark"
     } else if top_level_archive {
         "archive"
+    } else if top_level_archive_transfer {
+        cmd
     } else if cmd == "session" {
         // Bare `/session` (no subcommand) shows the current session id — the
         // intuitive reading of the singular name. `/sessions` and `/ss` keep
@@ -733,11 +755,16 @@ pub fn try_handle_session_command(
                 "  /sessions export <id|current|last> [output.zip]  export session to a portable zip"
             );
             println!(
+                "  /export [<id>|current|last] [output.zip]  export session to zip (default: current, session_export.zip)"
+            );
+            println!("  /export <output.zip>        export current session to the given zip path");
+            println!(
                 "  /sessions markdown <id|current|last> [output.md] export session to Markdown"
             );
             println!(
                 "  /sessions import <file.zip> [as=<id>]           import a session export zip"
             );
+            println!("  /import <file.zip> [as=<id>]  import a session zip and switch to it");
             println!("  /sessions fork [<src>|src=<id>] [as=<id>]  copy session to a new branch");
             println!("  /sessions branch <keep_turns> [src=<id>] [as=<id>]");
             println!(
@@ -1312,6 +1339,9 @@ pub fn try_handle_session_command(
         }
         "export" | "export-current" | "export-cur" | "export-last" | "export-latest" => {
             let (selector, output) = match action {
+                "export" if top_level_archive_transfer => {
+                    top_level_export_args(parts.next(), parts.next())
+                }
                 "export" => {
                     let Some(selector) = parts.next() else {
                         println!(
@@ -2671,6 +2701,192 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn top_level_export_args_only_treat_zip_paths_as_output() {
+        assert_eq!(top_level_export_args(None, None), ("current", None));
+        assert_eq!(
+            top_level_export_args(Some("notes/session.zip"), None),
+            ("current", Some("notes/session.zip"))
+        );
+        for selector in [
+            "current",
+            "last",
+            "session-id",
+            "session.with.dots",
+            "session.ZIP",
+            "notes/session",
+        ] {
+            assert_eq!(
+                top_level_export_args(Some(selector), Some("out.zip")),
+                (selector, Some("out.zip"))
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_export_and_import_move_one_zip_while_export_md_stays_separate() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        struct CwdGuard(PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                std::env::set_current_dir(&self.0).unwrap();
+            }
+        }
+        let cwd_guard = CwdGuard(std::env::current_dir().unwrap());
+        std::env::set_current_dir(&root).unwrap();
+
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let src_id = app.session_id.clone();
+        let conclusion = "## Latest conclusion\n\nPreserve **Markdown** and the full body.\n";
+        let original = ["current-session question", "earlier conclusion", conclusion]
+            .into_iter()
+            .enumerate()
+            .map(|(index, content)| Message {
+                role: if index == 0 { "user" } else { "assistant" }.to_string(),
+                content: Value::String(content.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            })
+            .collect::<Vec<_>>();
+        append_history_messages(&app.session_history_file, &original).unwrap();
+        let other_id = "named-export-source";
+        append_history_messages(
+            &store.session_history_file(other_id),
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("named-session payload".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+
+        let default_zip = root.join("session_export.zip");
+        for command in ["/export", ":export"] {
+            assert!(super::super::try_handle_local_command(&mut app, command).unwrap());
+            assert!(fs::read(&default_zip).unwrap().starts_with(b"PK"));
+            assert!(!root.join("_summary.md").exists());
+            assert!(!super::super::try_handle_export_markdown_command(&mut app, command).unwrap());
+        }
+        for (command, filename) in [("/export", "slash.zip"), (":export", "colon.zip")] {
+            let path = root.join(filename);
+            assert!(
+                super::super::try_handle_local_command(
+                    &mut app,
+                    &format!("{command} {}", path.display())
+                )
+                .unwrap()
+            );
+            assert!(fs::read(path).unwrap().starts_with(b"PK"));
+        }
+        for (command, selector, filename) in [
+            ("/export", "current", "selected-current.zip"),
+            (":export", src_id.as_str(), "selected-id.zip"),
+            ("/export", other_id, "selected-other.zip"),
+            (":export", "last", "selected-last.zip"),
+        ] {
+            let path = root.join(filename);
+            assert!(
+                super::super::try_handle_local_command(
+                    &mut app,
+                    &format!("{command} {selector} {}", path.display())
+                )
+                .unwrap()
+            );
+            assert!(fs::read(path).unwrap().starts_with(b"PK"));
+        }
+
+        for (command, archive, destination) in [
+            ("/import", &default_zip, "imported-current-slash"),
+            (
+                ":import",
+                &root.join("selected-id.zip"),
+                "imported-current-colon",
+            ),
+        ] {
+            assert!(
+                super::super::try_handle_local_command(
+                    &mut app,
+                    &format!("{command} {} as={destination}", archive.display())
+                )
+                .unwrap()
+            );
+            assert_eq!(app.session_id, destination);
+            assert_eq!(
+                app.session_history_file,
+                store.session_history_file(destination)
+            );
+            let restored = store.read_all_messages(destination).unwrap();
+            assert_eq!(
+                restored
+                    .iter()
+                    .map(|message| &message.content)
+                    .collect::<Vec<_>>(),
+                original
+                    .iter()
+                    .map(|message| &message.content)
+                    .collect::<Vec<_>>()
+            );
+        }
+        let selected_other = root.join("selected-other.zip");
+        assert!(
+            super::super::try_handle_local_command(
+                &mut app,
+                &format!(":import {} as=imported-other", selected_other.display())
+            )
+            .unwrap()
+        );
+        assert_eq!(app.session_id, "imported-other");
+        assert_eq!(
+            store.read_all_messages("imported-other").unwrap()[0].content,
+            Value::String("named-session payload".to_string())
+        );
+        let shorthand_zip = root.join("slash.zip");
+        assert!(
+            super::super::try_handle_local_command(
+                &mut app,
+                &format!("/import {}", shorthand_zip.display())
+            )
+            .unwrap()
+        );
+        assert_ne!(app.session_id, "imported-other");
+        assert_eq!(
+            store.read_all_messages(&app.session_id).unwrap().len(),
+            original.len()
+        );
+        for command in ["/import", ":import"] {
+            let current_id = app.session_id.clone();
+            assert!(super::super::try_handle_local_command(&mut app, command).unwrap());
+            assert_eq!(app.session_id, current_id);
+        }
+
+        assert!(!try_handle_session_command(&mut app, "/export-md").unwrap());
+        assert!(super::super::try_handle_local_command(&mut app, "/export-md").unwrap());
+        assert_eq!(
+            fs::read_to_string(root.join("_summary.md")).unwrap(),
+            conclusion
+        );
+        let markdown_path = root.join("last-conclusion.md");
+        assert!(
+            super::super::try_handle_local_command(
+                &mut app,
+                &format!(":export-md {}", markdown_path.display())
+            )
+            .unwrap()
+        );
+        assert_eq!(fs::read_to_string(markdown_path).unwrap(), conclusion);
+        assert!(fs::read(default_zip).unwrap().starts_with(b"PK"));
+
+        drop(cwd_guard);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -2252,7 +2252,7 @@ fn check_serve_rewind_syntax(args: &[&str]) -> Result<(), String> {
 
 fn print_serve_history_help() {
     println!(
-        "/history usage (remote session):\n  /history [N]           Show last N messages (default: {})\n  /history full          Show full messages\n  /history user/assistant/tool/system\n                         Filter by role\n  /history u<N>          Replay the assistant reply to user message u<N>\n  /history grep <keyword>  Search messages\n  /history last [N]      Replay the Nth recent assistant conclusion (full text)\n  /history replay        Replay the last assistant conclusion (text only)\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history help          Show this help\n\n`/history copy`/`/history export` and other-session views are local-only: print the view here and save or copy it locally; `/export [path]` runs on the server. Assistant rows carry no model tag; the history route serves bare messages.",
+        "/history usage (remote session):\n  /history [N]           Show last N messages (default: {})\n  /history full          Show full messages\n  /history user/assistant/tool/system\n                         Filter by role\n  /history u<N>          Replay the assistant reply to user message u<N>\n  /history grep <keyword>  Search messages\n  /history last [N]      Replay the Nth recent assistant conclusion (full text)\n  /history replay        Replay the last assistant conclusion (text only)\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history help          Show this help\n\n`/history copy`/`/history export` and other-session views are local-only: print the view here and save or copy it locally; `/export-md [path]` runs on the server. Assistant rows carry no model tag; the history route serves bare messages.",
         SERVE_HISTORY_DEFAULT_COUNT
     );
 }
@@ -2679,7 +2679,7 @@ mod serve_history_tests {
         assert!(!is_serve_local_command_start("/goal refactor parser"));
         assert!(!is_serve_local_command_start("/task status"));
         // `/audit`, `/distill-session`, `/mark`, `/unmark`, `/archive`,
-        // `/title`, and `/export` execute in the server turn child, so
+        // `/title`, and `/export-md` execute in the server turn child, so
         // serve-chat forwards them like a prompt instead of blocking them.
         assert!(!is_serve_local_command_start("/audit"));
         assert!(!is_serve_local_command_start(":audit -f review this"));
@@ -2713,11 +2713,24 @@ mod serve_history_tests {
                 "{input}"
             );
         }
-        for input in ["/export", ":export", "/export notes/summary.md"] {
+        for input in ["/export-md", ":export-md", "/export-md notes/summary.md"] {
             assert!(!is_serve_local_command_start(input), "{input}");
             assert_eq!(
                 classify_serve_input(input),
                 ServeInputRoute::ServerCommand,
+                "{input}"
+            );
+        }
+        for input in [
+            "/export",
+            ":export current out.zip",
+            "/import archive.zip",
+            ":import archive.zip as=restored",
+        ] {
+            assert!(is_serve_local_command_start(input), "{input}");
+            assert_eq!(
+                classify_serve_input(input),
+                ServeInputRoute::Unsupported,
                 "{input}"
             );
         }
@@ -5023,7 +5036,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
             "/quit" | "/exit" | ":q" => break,
             "/help" | "/h" => {
                 println!(
-                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first, archived hidden); /sessions all - include archived; /sessions archive - list archived; /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|u<N>|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/export [path] - export the latest server-side assistant conclusion to a markdown file on the server (relative to the remote cwd; default: _summary.md)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n{use_usage} - show or switch the remote session's default subagent backend (also :use); a task on a new line runs immediately\n/reset - restore kernel subagent defaults and clear sticky agent-team\n/audit [-f|--fast] [instruction] - run the audit subagent on the server, then verify and fix findings\n/task [N] <goal> - run a multi-worker task room on the server (/task status [room] shows progress; /task help for details)\n/discuss [N] <topic> - run a multi-member discussion on the server (/discuss status [room] shows progress; /discuss help for details)\n/distill-session [session-id|archive.zip] [--dry-run] [--limit N] - distill a session into knowledge on the server (paths resolve on the server)\n/title [text] - set or show the current server-side session title (bare /title shows it)\n/mark [<id>|current|last] [message] - mark a server-side session as important (default: current; leading `--` makes the rest a literal message for current)\n/unmark [<id>|current|last|--] - remove a server-side important mark (default: current; `--` forces current)\n/archive [<id>|current|last] - toggle the server-side formal archive flag (default: current)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
+                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first, archived hidden); /sessions all - include archived; /sessions archive - list archived; /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|u<N>|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/export, /import - session ZIP commands available in the local REPL (same as /ss export/import)\n/export-md [path] - export the latest server-side assistant conclusion to a markdown file on the server (relative to the remote cwd; default: _summary.md)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n{use_usage} - show or switch the remote session's default subagent backend (also :use); a task on a new line runs immediately\n/reset - restore kernel subagent defaults and clear sticky agent-team\n/audit [-f|--fast] [instruction] - run the audit subagent on the server, then verify and fix findings\n/task [N] <goal> - run a multi-worker task room on the server (/task status [room] shows progress; /task help for details)\n/discuss [N] <topic> - run a multi-member discussion on the server (/discuss status [room] shows progress; /discuss help for details)\n/distill-session [session-id|archive.zip] [--dry-run] [--limit N] - distill a session into knowledge on the server (paths resolve on the server)\n/title [text] - set or show the current server-side session title (bare /title shows it)\n/mark [<id>|current|last] [message] - mark a server-side session as important (default: current; leading `--` makes the rest a literal message for current)\n/unmark [<id>|current|last|--] - remove a server-side important mark (default: current; `--` forces current)\n/archive [<id>|current|last] - toggle the server-side formal archive flag (default: current)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
                 );
                 continue;
             }
@@ -5297,7 +5310,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                     ServeInputRoute::Unsupported => {
                         let command = trimmed.split_whitespace().next().unwrap_or(&trimmed);
                         eprintln!(
-                            "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /cd, /pwd, /git, /history, /export, /model, /effort, /agent, /use, /reset, /skills, /sessions, /resume, /fork, /close, /bg, /new, /audit, /distill-session, /mark, /unmark, /archive, /title (see /help)."
+                            "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /cd, /pwd, /git, /history, /export-md, /model, /effort, /agent, /use, /reset, /skills, /sessions, /resume, /fork, /close, /bg, /new, /audit, /distill-session, /mark, /unmark, /archive, /title (see /help)."
                         );
                     }
                     // Unknown command shapes must not fall through to the
@@ -5311,7 +5324,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                     }
                     // `/memo`, `/task`, `/discuss`, `/goal`, `/audit`,
                     // `/distill-session`, `/mark`, `/unmark`, `/archive`,
-                    // `/title` execute in the server turn child; everything
+                    // `/title`, `/export-md` execute in the server turn child; everything
                     // else is ordinary prompt text. State commands have their
                     // own HTTP branches above.
                     ServeInputRoute::ServerCommand | ServeInputRoute::Prompt => {
