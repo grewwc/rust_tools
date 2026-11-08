@@ -59,58 +59,51 @@
    UI instead of leaving dark-only literals behind. */
 :root {
   color-scheme: dark;
-  --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --dim:#8b949e;
-  --acc:#2f81f7; --ok:#3fb950; --err:#f85149;
-  --surface:#21262d; --surface-hover:#30363d; --surface-2:#262d36; --line-2:#3a424d;
-  --field:#0d1117; --code-bg:#0d1117; --media-bg:#080b10; --code-toolbar:#161b22;
-  --acc-soft:#79c0ff; --acc-soft-2:#b6d8ff; --acc-line:#426b94; --acc-line-soft:rgba(88,166,255,.5);
-  --acc-solid:#1f6feb; --acc-focus:#388bfd; --on-acc:#fff;
-  --glass:rgba(22,27,34,.94); --glass-strong:rgba(22,27,34,.98);
-  --tint:rgba(31,111,235,.16); --tint-2:rgba(31,111,235,.13); --tint-3:rgba(31,111,235,.33); --tint-4:rgba(31,111,235,.55);
-  --composer-a:#1b2129; --composer-b:#151a21;
-  --focus-ring:rgba(56,139,253,.18); --acc-shadow:rgba(31,111,235,.34); --glow:rgba(88,166,255,.75);
-  --edge:rgba(255,255,255,.28);
-  /* Reading weight. 450 resolves to the Medium face of Roboto / SF Pro and of
-     Noto Sans CJK, and stays Regular where no Medium face exists, so body
-     text gains body without turning bold. */
+  --bg:#101719; --panel:#192225; --line:#303e42; --fg:#e4edef; --dim:#a0b1b5;
+  --acc:#8bd5ca; --ok:#8dd5a0; --err:#ffb4ab;
+  --surface:#243034; --surface-hover:#304045; --surface-2:#202c30; --line-2:#45595e;
+  --field:#202c30; --code-bg:#111b1e; --media-bg:#0d1517; --code-toolbar:#202c30;
+  --acc-soft:#8bd5ca; --acc-soft-2:#bcece5; --acc-line:#527f79; --acc-line-soft:rgba(139,213,202,.45);
+  --acc-solid:#285f59; --acc-focus:#8bd5ca; --on-acc:#102f2b; --on-user:#e1f6f1;
+  --glass:rgba(25,34,37,.95); --glass-strong:rgba(25,34,37,.98);
+  --tint:rgba(139,213,202,.12); --tint-2:rgba(139,213,202,.08); --tint-3:rgba(139,213,202,.18); --tint-4:rgba(139,213,202,.28);
+  --composer-a:#243034; --composer-b:#202c30;
+  --focus-ring:rgba(139,213,202,.18); --acc-shadow:rgba(0,0,0,.20); --glow:rgba(139,213,202,.55);
+  --edge:rgba(228,237,239,.20);
+  --shadow-sm:0 2px 8px rgba(0,0,0,.12); --shadow-panel:0 8px 28px rgba(0,0,0,.22);
+  --radius-card:18px; --radius-control:14px;
   --fw-text:450; --fw-meta:400;
 }
 :root[data-theme="light"] {
   color-scheme: light;
-  /* Soft paper instead of pure white: a large #ffffff surface is what makes
-     a light theme glare on a phone, so every area is a light grey and the
-     contrast against the text is carried by the text, not by the background.
-     The panel is the dominant surface (header, composer, assistant cards), so
-     it stays a couple of steps below white and the page never reaches the
-     luminance at which a phone screen turns into a lamp. */
-  --bg:#e4e8ed; --panel:#eef1f5; --line:#ccd3db; --fg:#22272d; --dim:#57606a;
-  --acc:#0a5cbe; --ok:#13702c; --err:#b8372a;
-  --surface:#dbe0e6; --surface-hover:#d1d8e0; --surface-2:#e7ebef; --line-2:#c1c9d3;
-  --field:#eef1f5; --code-bg:#e7ebf0; --media-bg:#dadee4; --code-toolbar:#e6eaef;
-  --acc-soft:#0a5cbe; --acc-soft-2:#093c78; --acc-line:#6cb2f0; --acc-line-soft:rgba(10,92,190,.38);
-  --acc-solid:#0a5cbe; --acc-focus:#0a5cbe; --on-acc:#ffffff;
-  --glass:rgba(238,241,245,.95); --glass-strong:rgba(238,241,245,.98);
-  --tint:rgba(10,92,190,.10); --tint-2:rgba(10,92,190,.08); --tint-3:rgba(10,92,190,.14); --tint-4:rgba(10,92,190,.22);
-  --composer-a:#eef1f5; --composer-b:#e6eaef;
-  --focus-ring:rgba(10,92,190,.16); --acc-shadow:rgba(10,92,190,.26); --glow:rgba(10,92,190,.30);
-  --edge:rgba(34,39,45,.20);
+  --bg:#eaf0ef; --panel:#f5f8f7; --line:#d3dfdc; --fg:#202d2b; --dim:#586b66;
+  --acc:#246b60; --ok:#286b3d; --err:#b53e36;
+  --surface:#e3ece9; --surface-hover:#d7e5e0; --surface-2:#edf3f0; --line-2:#b6cbc3;
+  --field:#edf3f0; --code-bg:#e6eeeb; --media-bg:#e0e9e5; --code-toolbar:#edf3f0;
+  --acc-soft:#246b60; --acc-soft-2:#174e45; --acc-line:#87b4a9; --acc-line-soft:rgba(36,107,96,.38);
+  --acc-solid:#246b60; --acc-focus:#246b60; --on-acc:#ffffff; --on-user:#ffffff;
+  --glass:rgba(245,248,247,.95); --glass-strong:rgba(245,248,247,.98);
+  --tint:rgba(36,107,96,.10); --tint-2:rgba(36,107,96,.06); --tint-3:rgba(36,107,96,.13); --tint-4:rgba(36,107,96,.22);
+  --composer-a:#f5f8f7; --composer-b:#edf3f0;
+  --focus-ring:rgba(36,107,96,.14); --acc-shadow:rgba(36,107,96,.16); --glow:rgba(36,107,96,.32);
+  --edge:rgba(32,45,43,.18);
+  --shadow-sm:0 2px 8px rgba(32,61,52,.05); --shadow-panel:0 8px 28px rgba(32,61,52,.10);
 }
-/* Warm paper palette, the eye-comfort one: the same low luminance as the
-   softened light palette, but the blue end of the spectrum is dropped, so the
-   page reads as paper instead of a lit screen. */
+/* Warm surfaces keep the same teal accent and hierarchy as the other themes. */
 :root[data-theme="warm"] {
   color-scheme: light;
-  --bg:#e6dfd0; --panel:#efe9dd; --line:#d0c6b1; --fg:#37312a; --dim:#665d4e;
-  --acc:#7d5220; --ok:#3f6b30; --err:#9c3222;
-  --surface:#dcd4c2; --surface-hover:#d2c9b5; --surface-2:#eae3d5; --line-2:#c4b9a2;
-  --field:#efe9dd; --code-bg:#e4dccb; --media-bg:#d9d1bf; --code-toolbar:#e2dac9;
-  --acc-soft:#7d5220; --acc-soft-2:#5f3d15; --acc-line:#c09a68; --acc-line-soft:rgba(125,82,32,.38);
-  --acc-solid:#7d5220; --acc-focus:#7d5220; --on-acc:#fbf7f0;
-  --glass:rgba(239,233,221,.95); --glass-strong:rgba(239,233,221,.98);
-  --tint:rgba(125,82,32,.10); --tint-2:rgba(125,82,32,.08); --tint-3:rgba(125,82,32,.14); --tint-4:rgba(125,82,32,.22);
-  --composer-a:#efe9dd; --composer-b:#e5dece;
-  --focus-ring:rgba(125,82,32,.18); --acc-shadow:rgba(125,82,32,.26); --glow:rgba(125,82,32,.30);
-  --edge:rgba(55,49,42,.22);
+  --bg:#eee7da; --panel:#f7f0e4; --line:#ddd1bc; --fg:#34362d; --dim:#68695a;
+  --acc:#35695d; --ok:#456b36; --err:#a83e2f;
+  --surface:#e9e2d2; --surface-hover:#ded7c5; --surface-2:#f1eadc; --line-2:#c6bca5;
+  --field:#f1eadc; --code-bg:#eae3d3; --media-bg:#e4dccb; --code-toolbar:#f1eadc;
+  --acc-soft:#35695d; --acc-soft-2:#244d42; --acc-line:#91afa0; --acc-line-soft:rgba(53,105,93,.38);
+  --acc-solid:#35695d; --acc-focus:#35695d; --on-acc:#fffaf1; --on-user:#fffaf1;
+  --glass:rgba(247,240,228,.95); --glass-strong:rgba(247,240,228,.98);
+  --tint:rgba(53,105,93,.10); --tint-2:rgba(53,105,93,.06); --tint-3:rgba(53,105,93,.13); --tint-4:rgba(53,105,93,.22);
+  --composer-a:#f7f0e4; --composer-b:#f1eadc;
+  --focus-ring:rgba(53,105,93,.15); --acc-shadow:rgba(53,105,93,.16); --glow:rgba(53,105,93,.32);
+  --edge:rgba(52,54,45,.18);
+  --shadow-sm:0 2px 8px rgba(64,57,36,.05); --shadow-panel:0 8px 28px rgba(64,57,36,.10);
 }
 /* Theme switch repaints smoothly instead of snapping. The list is explicit:
    elements that animate on their own (the jump button, the question
@@ -125,7 +118,7 @@ html { height:100%; overflow:hidden; }
 /* The document itself never scrolls: the message list is the only scroller and
    the header and composer stay put. Older engines use the 100vh fallback; the
    rest use the measured height when the dynamic viewport is unreliable. */
-body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; display:flex; flex-direction:column; overflow:hidden;
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display:flex; flex-direction:column; overflow:hidden;
   height:100vh; height:100dvh; height:var(--app-height, 100dvh); }
 /* The font shorthand resets font-weight, so the reading weight has to be
    declared after it. */
@@ -225,7 +218,7 @@ select, summary { touch-action:manipulation; }
 #questionbtn svg { width:20px; height:20px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; }
 #questionbtn .count {
   position:absolute; top:-6px; right:-6px; min-width:18px; padding:1px 4px; border-radius:999px;
-  background:var(--acc-solid); color:var(--on-acc); font-size:10px; line-height:16px;
+  background:var(--acc); color:var(--on-acc); font-size:10px; line-height:16px;
 }
 #questionpanel {
   display:none; position:absolute; inset:10px 10px 8px; z-index:4; flex-direction:column;
@@ -591,29 +584,82 @@ select, summary { touch-action:manipulation; }
 #confirmerr.show { display:block; }
 #confirmbtns { display:flex; gap:8px; }
 #confirmbtns button { flex:1; min-height:44px; }
-/* ---- phone layout (narrow viewports only; desktop is untouched) ---------- */
+/* Shared visual language; layout and state visibility stay with their owners. */
+header { gap:8px; padding-bottom:12px; border-bottom-color:transparent; }
+header b { font-size:20px; font-weight:700; letter-spacing:-.03em; }
+button, select, input, textarea { border-radius:var(--radius-control); }
+button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible {
+  outline:2px solid var(--acc-focus); outline-offset:2px;
+}
+button:active:not(:disabled) { filter:brightness(.96); }
+#menu, #connbtn, #newbtn, #themebtn { flex-shrink:0; border-radius:var(--radius-control); }
+#newbtn { font-size:20px; line-height:1; box-shadow:var(--shadow-sm); }
+#sessbar { align-items:center; padding:8px 16px; min-height:40px; }
+#sesstitle { font-size:14px; }
+#sessmeta { font-variant-numeric:tabular-nums; }
+#sessions ul { padding:10px; }
+#sessions li { border-radius:var(--radius-control); margin-bottom:4px; }
+#sessfilter { border-radius:var(--radius-control); background:var(--surface-2); }
+#msgs { padding:18px; gap:14px; }
+.turn { gap:12px; }
+.msg { padding:12px 16px; border-radius:var(--radius-card); line-height:1.6; }
+.msg.user { color:var(--on-user); border-bottom-right-radius:6px; }
+.msg.asst { box-shadow:var(--shadow-sm); border-top-left-radius:6px; }
+.msg details summary { border-radius:10px; }
+.msg.md .p { margin:6px 0; }
+.msg.md .h { margin:12px 0 6px; }
+.msg.md pre { padding:12px; border-radius:var(--radius-control); }
+.msg.md blockquote { padding:6px 12px; border-color:var(--acc-line); background:var(--tint-2); border-radius:0 10px 10px 0; }
+.msg.md .code-preview iframe, .msg.md .media-image img, .msg.md .media-video video,
+.msg.phone-frame img { border-radius:var(--radius-control); }
+.msg.md .code-block-toolbar, .msg.md .code-preview-toolbar { gap:8px; margin-bottom:8px; }
+#ovr { align-items:center; padding-top:12px; }
+#ovr select, #omodelbtn, #oskill { min-height:44px; border-radius:var(--radius-control); background-color:var(--surface-2); box-shadow:none; }
+#modelpickpanel, #teampickpanel { border-radius:24px 24px 0 0; box-shadow:var(--shadow-panel); }
+#modelpickhandle, #teamhandle { width:40px; margin:12px auto 10px; background:var(--line-2); }
+#modelpickhead, #teamhead { padding-bottom:14px; }
+#modelpicktitle, #teamtitle { font-size:20px; letter-spacing:-.02em; }
+#modelpicksearch, #skillsearch, #teamworkersearch { border-radius:var(--radius-control); background:var(--surface-2); }
+.modelrow, .teamchoice { border-radius:var(--radius-control); }
+#skillmenu, #teamworkerlist, #teamworkerwrap { border-radius:var(--radius-card); box-shadow:var(--shadow-panel); }
+#skillclear, #teamworkerbtn, #teamactions button { border-radius:var(--radius-control); }
+#questionpanel, #confirmbox { border-radius:20px; box-shadow:var(--shadow-panel); }
+#confirmbox { padding:20px; gap:14px; }
+.question-link { border-radius:var(--radius-control); padding:12px; }
+#composer { align-items:end; gap:10px; }
+#prompt { background:var(--surface-2); }
+#conn { gap:8px; padding:12px; }
+#themepick { gap:8px; }
+#themepick button { min-height:44px; border-radius:999px; }
+#jumpbottom { background:var(--acc); box-shadow:var(--shadow-panel); }
+@media (hover:hover) {
+  button:hover:not(:disabled):not(.primary):not(.stop), #sessions li:hover { background-color:var(--surface-hover); }
+}
+/* Phone geometry preserves the drawer, viewport, and composer state rules. */
 @media (max-width:700px) {
-  header button { min-width:44px; min-height:44px; }
+  header { padding-left:10px; padding-right:10px; gap:6px; }
+  header button { min-width:44px; min-height:44px; padding:0 10px; }
   #apkdownload {
     display:grid; flex:0 0 44px; width:44px; height:44px; place-items:center;
-    border:1px solid var(--line-2); border-radius:10px; background:var(--surface);
+    border:1px solid var(--line); border-radius:14px; background:var(--surface);
     color:var(--acc-soft); text-decoration:none; touch-action:manipulation;
   }
   #apkdownload:active { background:var(--surface-hover); transform:translateY(1px); }
   #themebtn { width:44px; min-width:44px; height:44px; border-radius:12px; }
   /* The drawer floats over the chat instead of squeezing it; tapping the
      dimmed remainder (the scrim) closes it. */
-  #sessions { position:absolute; top:0; bottom:0; left:0; z-index:10; width:min(86vw,320px); box-shadow:8px 0 24px rgba(0,0,0,.55); }
+  #sessions { position:absolute; top:0; bottom:0; left:0; z-index:10; width:min(86vw,320px); border-radius:0 20px 20px 0; box-shadow:var(--shadow-panel); }
   #scrim.on { display:block; position:absolute; inset:0; z-index:5; background:rgba(0,0,0,.45); }
   #sessions li { padding:12px 10px; font-size:15px; touch-action:pan-y; -webkit-user-select:none; user-select:none; }
   #sessions li .rnm { -webkit-user-select:text; user-select:text; }
   .rowbtns button { flex:1; min-height:42px; font-size:13px; }
   #sessfilter { padding:10px 8px; }
   /* Override picks collapse into one summary row showing the current picks. */
-  #ovrwrap { display:block; border-top:1px solid var(--line); }
-  #ovrwrap > summary { display:flex; align-items:center; gap:8px; padding:8px 12px; font-size:12px; color:var(--dim); white-space:nowrap; }
+  #ovrwrap { display:block; border-top:1px solid var(--line); background:var(--panel); }
+  #ovrwrap > summary { display:flex; align-items:center; gap:8px; min-height:48px; padding:6px 12px; font-size:12px; color:var(--dim); white-space:nowrap; }
+  #teamtrigger { min-height:44px; padding:0 12px; gap:6px; background:var(--surface-2); }
   #ovrsummary { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
-  #ovr { flex-direction:column; gap:8px; padding:10px 12px 10px; }
+  #ovr { flex-direction:column; align-items:stretch; gap:10px; padding:4px 12px 12px; }
   #ovr select { flex:0 0 auto; width:100%; height:46px; padding:0 40px 0 12px; font-size:15px; }
   #modelpickfield { flex:0 0 auto; width:100%; }
   #omodelbtn { height:46px; padding:0 14px; font-size:15px; }
@@ -623,7 +669,10 @@ select, summary { touch-action:manipulation; }
   #teampick:not([hidden]) { display:block; }
   .modelrow { min-height:56px; }
   #oskill { min-height:46px; padding:10px 12px; font-size:15px; }
-  #msgs { padding:10px; }
+  #msgs { padding:14px 12px; gap:14px; }
+  #modelpickclose, #questionclose { width:44px; height:44px; min-width:44px; min-height:44px; }
+  #modelpicksearchclear { width:44px; height:44px; right:5px; }
+  #modelpicksearch { padding-right:52px; }
   #jumpbottom { display:grid; }
   #jumpbottom.show { opacity:1; transform:translateY(0) scale(1); pointer-events:auto; }
   #questionbtn.show { display:grid; }
@@ -645,16 +694,16 @@ select, summary { touch-action:manipulation; }
   #composer {
     display:grid; grid-template-columns:42px minmax(0,1fr) 42px;
     grid-template-areas:"image prompt send";
-    align-items:end; gap:8px; margin:6px 8px; padding:8px 8px calc(8px + env(safe-area-inset-bottom));
-    border:1px solid var(--line); border-radius:18px;
+    align-items:end; gap:8px; margin:8px 10px; padding:10px 8px calc(10px + env(safe-area-inset-bottom));
+    border:1px solid var(--line); border-radius:20px;
     background:linear-gradient(180deg, var(--composer-a) 0%, var(--composer-b) 100%);
-    box-shadow:0 8px 24px rgba(0,0,0,.26);
+    box-shadow:var(--shadow-panel);
   }
   #composer.side-note-ready {
     grid-template-columns:42px minmax(0,1fr) 58px 42px;
     grid-template-areas:"image prompt sidenote send";
   }
-  #composer:focus-within { border-color:var(--acc-focus); box-shadow:0 0 0 2px var(--focus-ring), 0 8px 24px rgba(0,0,0,.26); }
+  #composer:focus-within { border-color:var(--acc-focus); box-shadow:0 0 0 2px var(--focus-ring), var(--shadow-panel); }
   #prompt {
     grid-area:prompt; width:100%; min-height:40px; max-height:38vh; max-height:calc(var(--app-height, 100vh) * .38);
     box-sizing:border-box; padding:7px 4px 5px; border:0; border-radius:12px;
@@ -686,8 +735,8 @@ select, summary { touch-action:manipulation; }
 /* Server-side images in a reply: the path text stays, the fetched picture
    sits under it (see decorateMedia in the script below). */
 .mediaprev { display:block; margin:6px 0; }
-.mediaprev.loaded { padding:6px; border:1px solid var(--line); border-radius:8px; }
-.mediaprev img { display:block; max-width:100%; max-height:52vh; border-radius:6px; }
+.mediaprev.loaded { padding:8px; border:1px solid var(--line); border-radius:var(--radius-card); background:var(--surface-2); }
+.mediaprev img { display:block; max-width:100%; max-height:52vh; border-radius:var(--radius-control); }
 .mediaprev audio { display:block; width:100%; }
 .mediaprev .mediacap { display:block; margin-top:4px; font-size:11px; color:var(--dim); word-break:break-all; }
 #viewer { display:none; position:fixed; inset:0; z-index:60; background:rgba(0,0,0,.92); align-items:center; justify-content:center; }
