@@ -514,6 +514,9 @@ select, summary { touch-action:manipulation; }
 /* Rendered markdown for assistant replies (.md): block layout instead of the
    pre-wrap source view the other bubbles keep. */
 .msg.md { white-space:normal; }
+.msg.md .answer-actions { display:flex; justify-content:flex-end; align-items:center; gap:8px; margin-top:8px; }
+.msg.md .answer-copy { flex:0 0 auto; min-width:44px; min-height:44px; padding:8px 12px; border:1px solid var(--line); border-radius:var(--radius-control); background:var(--code-toolbar); color:var(--fg); font-size:13px; touch-action:manipulation; }
+.msg.md .answer-copy-status { color:var(--dim); font-size:12px; }
 .msg.md .p { margin:3px 0; }
 .msg.md .h { font-weight:700; margin:6px 0 2px; }
 .msg.md .h.lv1 { font-size:19px; }
@@ -1208,23 +1211,82 @@ function codeBlock(source, lang) {
 function copyCodeText(text) {
   const value = String(text == null ? "" : text);
   if (!value) return Promise.resolve(false);
+  const fallback = () => {
+    let area;
+    const focused = document.activeElement;
+    try {
+      area = document.createElement("textarea");
+      area.value = value;
+      area.setAttribute("readonly", "");
+      area.setAttribute("aria-hidden", "true");
+      area.tabIndex = -1;
+      area.style.position = "fixed";
+      area.style.top = "0";
+      area.style.left = "0";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      area.setSelectionRange(0, value.length);
+      return !!document.execCommand("copy");
+    } catch (_) { return false; }
+    finally {
+      if (area && area.parentNode) area.parentNode.removeChild(area);
+      if (focused && document.activeElement !== focused && typeof focused.focus === "function") {
+        try { focused.focus({ preventScroll: true }); } catch (_) {}
+      }
+    }
+  };
   try {
     if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) {
-      return navigator.clipboard.writeText(value).then(() => true, () => false);
+      return Promise.resolve(navigator.clipboard.writeText(value)).then(() => true, fallback);
     }
   } catch (_) {}
-  try {
-    const area = document.createElement("textarea");
-    area.value = value;
-    area.setAttribute("readonly", "");
-    area.style.position = "fixed";
-    area.style.opacity = "0";
-    document.body.appendChild(area);
-    area.select();
-    const ok = document.execCommand("copy");
-    document.body.removeChild(area);
-    return Promise.resolve(!!ok);
-  } catch (_) { return Promise.resolve(false); }
+  return Promise.resolve(fallback());
+}
+const answerCopyTexts = new WeakMap();
+// Only completed answer bubbles get a footer. Moving their existing nodes keeps
+// rendered previews intact and leaves streaming paints on their current path.
+function addAnswerCopy(root, text) {
+  if (!root || root.dataset.role !== "assistant" || !root.classList.contains("md") || root.classList.contains("pending")) return;
+  if (text !== undefined) {
+    const value = String(text);
+    if (!value.trim()) return;
+    answerCopyTexts.set(root, value);
+  }
+  if (root.querySelector(".answer-actions")) return;
+  const body = document.createElement("div");
+  body.className = "answer-body";
+  while (root.firstChild) body.appendChild(root.firstChild);
+  const actions = document.createElement("div");
+  actions.className = "answer-actions";
+  const status = document.createElement("span");
+  status.className = "answer-copy-status";
+  status.setAttribute("role", "status");
+  status.setAttribute("aria-live", "polite");
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "answer-copy";
+  button.setAttribute("data-copy-answer", "");
+  button.setAttribute("aria-label", "复制");
+  button.textContent = "复制";
+  actions.appendChild(status);
+  actions.appendChild(button);
+  root.appendChild(body);
+  root.appendChild(actions);
+}
+function copyNearbyAnswer(button) {
+  const host = button.closest(".msg.md");
+  const body = host && host.querySelector(".answer-body");
+  if (!body || host.dataset.role !== "assistant" || host.classList.contains("pending") || button.disabled) return;
+  const text = answerCopyTexts.has(host) ? answerCopyTexts.get(host) : body.innerText ?? body.textContent;
+  const status = host.querySelector(".answer-copy-status");
+  button.disabled = true;
+  if (status) status.textContent = "";
+  return copyCodeText(text).then((ok) => {
+    button.disabled = false;
+    if (status) status.textContent = ok ? "已复制" : "复制失败";
+    return ok;
+  });
 }
 function copyNearbyCode(button) {
   const host = button.closest(".code-preview, .code-block");
@@ -1287,7 +1349,9 @@ function handlePreviewClick(event) {
   if (copyButton) { copyNearbyCode(copyButton); return; }
   const button = target.closest("[data-preview-view]");
   const preview = button && button.closest(".code-preview");
-  if (preview) setPreviewView(preview, button.dataset.previewView);
+  if (preview) { setPreviewView(preview, button.dataset.previewView); return; }
+  const answerButton = target.closest("[data-copy-answer]");
+  if (answerButton) return copyNearbyAnswer(answerButton);
 }
 // Folding an open card back from its own header means scrolling up to a summary
 // that has already left the viewport, so a double tap anywhere else on an open
@@ -2411,12 +2475,13 @@ function addMsg(role, text, cls, parent) {
 }
 // Assistant replies render as markdown; addMsg stays the plain (escaped,
 // pre-wrap) path for user text, progress traces, errors and notices.
-function addMsgMd(text, parent) {
+function addMsgMd(text, parent, copyText = text) {
   const follow = !parent && shouldFollowOutput();
   const d = addMsg("assistant", "", "asst md", parent);
   d.innerHTML = text ? renderMarkdown(text) : "";
   if (!parent) followOutput(follow);
   decorateAndLoad(d);
+  if (text) addAnswerCopy(d, copyText);
   return d;
 }
 // --- server-side media ----------------------------------------------------
@@ -4014,7 +4079,7 @@ function historyRowsOf(msgs, histTotal, showAll) {
 function renderHistoryRow(row, parent) {
   const m = row.message;
   if (m.role === "user") addUserBubble(row.text, row.historyIndex, parent);
-  else if (m.role === "assistant") addMsgMd(row.text, parent);
+  else if (m.role === "assistant") addMsgMd(row.text, parent, textOf(m.content));
   else addFold(row.call ? callLabel(row.call) : FOLD_ROLE_LABELS[m.role] || m.role, row.text.slice(0, 2000), parent);
   if (parent?.lastElementChild) {
     const data = parent.lastElementChild.dataset;
@@ -5211,6 +5276,7 @@ async function send() {
       bubble.classList.remove("pending");
       bubble.innerHTML = renderMarkdown(raw, false);
       decorateAndLoad(bubble);
+      addAnswerCopy(bubble, raw);
     } else {
       bubble.remove();
       answerBubbles.pop();
@@ -5460,6 +5526,7 @@ async function send() {
     finishFollow = sid === sessionId && shouldFollowOutput();
     if (bubble && raw.trim()) bubble.innerHTML = renderMarkdown(raw); // previews belong to the finished reply
     if (bubble) decorateAndLoad(bubble); // reply paths become previews only once it is final
+    if (finished && bubble && raw.trim()) addAnswerCopy(bubble, raw);
     if (!finished && !turnError) {
       // Only the session on screen can be followed from history here; a stalled
       // turn in a session the user has left is retired, and its reply is what
