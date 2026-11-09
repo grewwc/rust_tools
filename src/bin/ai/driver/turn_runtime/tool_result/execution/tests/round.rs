@@ -482,6 +482,6 @@ fn tool_round_releases_live_mcp_lock_before_dispatch() {
     );
     assert!(
         lock_was_available.load(std::sync::atomic::Ordering::SeqCst),
-        "tool dispatch must not retain the live MCP mutex; a synchronous task subagent needs it while preparing context"
+        "tool dispatch must not retain the live MCP mutex; a foreground subagent needs it while preparing context"
     );
 }

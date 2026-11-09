@@ -9,6 +9,7 @@ use crate::ai::{
         format_suspended_timestamp_label, generate_session_summary,
     },
     provider::ReasoningEffort,
+    tools::task_tools::BackendId,
     types::App,
 };
 
@@ -132,6 +133,14 @@ pub(in crate::ai) fn restore_session_local_runtime_state(app: &mut App) -> std::
 /// and never fails the command.
 pub(in crate::ai) fn persist_session_runtime_state(app: &App) {
     let store = SessionStore::new(app.config.history_file.as_path());
+    // An ordinary kernel session is the default state, so leave the backend
+    // unset; only an explicit pick (always paired with agent-team) needs to
+    // survive as a stored value.
+    let explicit_backend = app.session_default_subagent_backend != BackendId::KERNEL
+        || app
+            .session_default_skills
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("agent-team"));
     let config = SessionServeConfig {
         model: Some(app.current_model.clone()),
         agent: Some(app.current_agent.clone()),
@@ -140,7 +149,8 @@ pub(in crate::ai) fn persist_session_runtime_state(app: &App) {
             Some(None) => Some("off".to_string()),
             Some(Some(level)) => Some(level.as_str().to_string()),
         },
-        subagent_backend: Some(app.session_default_subagent_backend.as_str().to_string()),
+        subagent_backend: explicit_backend
+            .then(|| app.session_default_subagent_backend.as_str().to_string()),
         subagent_model: app.session_default_subagent_model.clone(),
         default_skills: app.session_default_skills.clone(),
     };
@@ -156,6 +166,7 @@ fn restore_session_model_agent_effort(app: &mut App, store: &SessionStore) {
     let Ok(stored) = store.read_session_serve_config(&app.session_id) else {
         return;
     };
+    let session_backend = super::use_backend::effective_subagent_backend(&stored);
     if app.cli.model.is_none() {
         if let Some(model) = stored.model {
             app.current_model = model;
@@ -175,10 +186,7 @@ fn restore_session_model_agent_effort(app: &mut App, store: &SessionStore) {
             };
         }
     }
-    app.session_default_subagent_backend =
-        crate::ai::tools::task_tools::BackendId::from_session_config(
-            stored.subagent_backend.as_deref(),
-        );
+    app.session_default_subagent_backend = session_backend;
     app.session_default_subagent_model = stored.subagent_model;
     app.session_default_skills = stored.default_skills;
 }
@@ -2257,16 +2265,13 @@ mod tests {
         assert_eq!(reopened.session_default_skills, ["agent-team"]);
         super::super::use_backend::try_handle_reset_command(&mut reopened, "/reset").unwrap();
         let stored = store.read_session_serve_config(&session_id).unwrap();
-        assert_eq!(
-            stored.subagent_backend.as_deref(),
-            Some(crate::ai::tools::task_tools::BackendId::from_session_config(None).as_str())
-        );
+        assert_eq!(stored.subagent_backend, None);
         assert!(stored.subagent_model.is_none());
         assert!(stored.default_skills.is_empty());
         restore_session_local_runtime_state(&mut reopened).unwrap();
         assert_eq!(
             reopened.session_default_subagent_backend,
-            crate::ai::tools::task_tools::BackendId::from_session_config(None)
+            crate::ai::tools::task_tools::BackendId::KERNEL
         );
         assert!(reopened.session_default_subagent_model.is_none());
         assert!(reopened.session_default_skills.is_empty());
@@ -2317,10 +2322,7 @@ mod tests {
             let persisted = store.read_session_serve_config(&app.session_id).unwrap();
             assert_eq!(persisted.subagent_backend, None);
             restore_session_local_runtime_state(&mut app).unwrap();
-            assert_eq!(
-                app.session_default_subagent_backend,
-                BackendId::from_session_config(legacy_backend)
-            );
+            assert_eq!(app.session_default_subagent_backend, BackendId::KERNEL);
             assert_eq!(
                 store.read_session_serve_config(&app.session_id).unwrap(),
                 persisted

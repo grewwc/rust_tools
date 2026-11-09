@@ -106,35 +106,6 @@ pub(super) fn task_wait_key(
 }
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
-        name: "task",
-        description: "",
-
-        execute: execute_task,
-    }
-});
-
-// `task` / `task_spawn` / `task_wait` / `task_status`
-// may all carry the only visible result of a subagent: the spawn-family arguments (subagent
-// prompt / response schema) and return values (the task_id list) are required inputs for the
-// later wait/status/integrate calls; once a result is lossy-compressed or LLM-pruned, the main
-// agent can lose its grounding on already-finished subtasks. Lossy compression and pruning are
-// uniformly banned here; oversized content goes to an overflow stub + file_path instead of being
-// reduced to an unrecoverable summary.
-inventory::submit!(ToolHistoryPolicyRegistration {
-    name: "task",
-    policy: ToolHistoryPolicy {
-        lossy_compress: ToolLossyCompressPolicy::Never,
-        prune: ToolPrunePolicy::AfterIntegration,
-        counts_toward_precision_inline_budget: false,
-    },
-});
-
-pub(crate) fn execute_task(_args: &Value) -> Result<String, String> {
-    Err("task is handled by the runtime".to_string())
-}
-
-inventory::submit!(ToolRegistration {
-    spec: ToolSpec {
         name: "task_spawn",
         description: "",
 
@@ -151,8 +122,20 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     },
 });
 
-/// Pre-flight subagent task spec produced from a `task` / `task_spawn` tool
-/// call before the kernel actually spawns the new process.
+// The synchronous `task` tool is no longer registered, but sessions persisted
+// before its removal still hold task results that must keep the same retention
+// policy when their history is compressed or pruned.
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "task",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::AfterIntegration,
+        counts_toward_precision_inline_budget: false,
+    },
+});
+
+/// Pre-flight subagent task spec produced from a `task_spawn` tool call before
+/// the kernel actually spawns the new process.
 #[derive(Clone)]
 pub(crate) struct PreparedSubagentTask {
     pub(crate) description: String,
@@ -325,9 +308,9 @@ pub(crate) fn validate_subagent_response(
         .map_err(|error| format!("Subagent response did not match response_schema: {error}"))
 }
 
-/// Parse and validate a `task` / `task_spawn` tool call payload, run subagent
-/// auto-selection, and resolve the model. Used both by the async `task_spawn`
-/// path and by the synchronous `task` interception in the driver.
+/// Parse and validate a `task_spawn` item payload, run subagent auto-selection,
+/// and resolve the model. Driver-internal foreground commands reuse the same
+/// preparation path.
 pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask, String> {
     let description = args["description"]
         .as_str()
@@ -563,8 +546,7 @@ pub(crate) struct SpawnedSubagentTask {
 
 /// Spawn a subagent kernel process and register it in `TASK_REGISTRY`. The
 /// returned handle exposes the IPC channel + futex that the caller can wait
-/// on. Used by both `task_spawn` (async) and the synchronous `task` runtime
-/// interception path.
+/// on. Used by `task_spawn` and by driver-internal foreground commands.
 pub(crate) fn spawn_subagent_kernel_task(
     prepared: &PreparedSubagentTask,
 ) -> Result<SpawnedSubagentTask, String> {
@@ -774,12 +756,10 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
 
     let mut spawned_count = 0usize;
     let mut entries = Vec::with_capacity(prepared.len());
-    let mut spawned_ids = Vec::with_capacity(prepared.len());
     for (index, task) in prepared.iter().enumerate() {
         match spawn_subagent_kernel_task(task) {
             Ok(spawned) => {
                 spawned_count += 1;
-                spawned_ids.push(spawned.task_id.clone());
                 record_subagent_spawn_audit(&spawned.task_id, task);
                 let mut entry = serde_json::json!({
                     "index": index,
@@ -819,9 +799,6 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
                 entries.push(entry);
             }
         }
-    }
-    if !spawned_ids.is_empty() {
-        record_last_spawn_batch(spawned_ids);
     }
     if spawned_count == 0 {
         let details = entries

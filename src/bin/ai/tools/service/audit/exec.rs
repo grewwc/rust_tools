@@ -197,8 +197,8 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
         ));
     }
 
-    // Direct TraeCLI execution is a task-tool concern: only the `task` /
-    // `task_spawn` tools own the task control block, cancellation, evidence
+    // Direct TraeCLI execution is a task-tool concern: only `task_spawn`
+    // owns the task control block, cancellation, evidence
     // ledger, and result validation. See `audit::traecli`.
     if let Some(reason) = blocked_direct_traecli(program) {
         return Err(reason.to_string());

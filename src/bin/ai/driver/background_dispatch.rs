@@ -2417,7 +2417,7 @@ pub(super) fn dispatch_background_batch(
         if let Some(dir) = inherited_cwd_dir {
             wrapped = Box::pin(runtime_ctx::SUBAGENT_CWD.scope(dir, wrapped));
         }
-        // Set the subagent nesting depth, used by `task_spawn` / `task` to
+        // Set the subagent nesting depth, used by `task_spawn` to
         // detect recursive fan-out inside subagents.
         wrapped = Box::pin(runtime_ctx::SUBAGENT_DEPTH.scope(spawn_depth, wrapped));
         // Background tasks only hand final results to task_wait/task_status

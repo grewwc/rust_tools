@@ -22,7 +22,7 @@ pub(crate) enum ToolGroup {
     /// turn whose client declared the native bridge, so web/CLI clients never
     /// see phone-only tools.
     Phone,
-    /// Subagent orchestration family (`task` / `task_spawn` / ...). Lazy for
+    /// Subagent orchestration family (`task_spawn` / `task_wait` / ...). Lazy for
     /// every top-level turn; loaded eagerly when a manifest declares the group.
     Task,
     /// Kernel process / IPC / shared-memory / environment primitives for agents

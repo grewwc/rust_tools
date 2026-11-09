@@ -1025,7 +1025,6 @@ fn build_hidden_task_tool_catalog(available_tools: &Box<SkipSet<String>>) -> Opt
         return None;
     }
     const TASK_FAMILY: &[&str] = &[
-        "task",
         "task_spawn",
         "task_wait",
         "task_status",
@@ -1665,7 +1664,7 @@ fn build_system_prompt(
                 // defers to it and keeps only the plan-schema field semantics. Per-shape
                 // orchestration mechanics come from the plan-time footer in
                 // `plan_state::render::delegation_guidance`.
-                lines.push("When planning, decide delegation per the async_subagent_orchestration guidance below. A delegated step runs in a subagent with a clean, focused context and the parent reviews its result; `parallelizable: true` means no dependency on earlier steps (run those concurrently via `task_spawn`); delegated steps without it run one at a time via the synchronous `task`.".to_string());
+                lines.push("When planning, decide delegation per the async_subagent_orchestration guidance below. A delegated step runs in a subagent with a clean, focused context and the parent reviews its result; `parallelizable: true` means no dependency on earlier steps (run those concurrently via `task_spawn`); delegated steps without it run one at a time via `task_spawn` followed by `task_wait`.".to_string());
             }
         }
         if has_tool(available_tools, "spawn_process") {
@@ -1700,19 +1699,15 @@ fn build_system_prompt(
     }
 
     if has_tool(available_tools, "task_spawn") || has_tool(available_tools, "task_status") {
-        // Cross-tool delegation decisions only. Tool-local semantics (task vs
-        // task_spawn routing, model/inherit defaults, wait timeout/wait_policy,
+        // Cross-tool delegation decisions only. Tool-local semantics
+        // (model/inherit defaults, wait timeout/wait_policy,
         // task_integrate disposition, task_cancel collect-later) live in the
         // always-visible tool schemas and runtime follow-ups, so repeating them
         // here would add resident tokens without adding constraints. Final-response
         // gates check outstanding tasks and unintegrated evidence with bounded retries.
         let mut lines = Vec::new();
         if has_tool(available_tools, "task_spawn") {
-            if has_tool(available_tools, "task") {
-                lines.push("Use `task_spawn` to fan out MULTIPLE focused, independent subtasks concurrently. For a single delegated subtask whose result you need back, prefer the synchronous `task` (one spawned task immediately joined by `task_wait` gains no concurrency and just adds overhead).".to_string());
-            } else {
-                lines.push("Use `task_spawn` to fan out MULTIPLE focused, independent subtasks concurrently. For a single delegated subtask, one spawned task immediately joined by `task_wait` gains no concurrency and just adds overhead.".to_string());
-            }
+            lines.push("Use `task_spawn` for every delegation, including a single focused subtask whose result you need back. Spawn first, continue any independent parent-side work, then collect with `task_wait`; never block before spawning.".to_string());
             lines.push("When no active skill requires delegation, qualify a subtask when it has a distinct, bounded goal and its expected latency or context-isolation benefit outweighs handoff overhead — a serial step qualifies too when it keeps substantial intermediate reads, searches, logs, or experiments out of the parent context while returning a concise result; parallel branches are not required.".to_string());
             lines.push("Keep pre-division shared discovery sequential; never run dependent steps concurrently, do not delegate merely to create parallelism, and keep work in the parent when net benefit is marginal or uncertain — unless an active skill requires delegation.".to_string());
             lines.push("Prefer delegating broad read-only discovery, cross-module caller or consumer mapping, noisy log or dependency research, and independent adversarial verification. Keep final decisions and end-to-end synthesis in the parent; when an active skill requires delegation, hand a tightly coupled edit to exactly one worker instead of doing it in the parent. Iteration limits, tool failures, and recovery steps are not delegation benefits.".to_string());

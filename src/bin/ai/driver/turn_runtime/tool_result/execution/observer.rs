@@ -537,7 +537,7 @@ impl ToolExecutor for RoundToolExecutorAdapter {
             let _streaming_guard = ToolExecutionStreamingGuard::new(&app.streaming);
             // Do not hold the lock across dispatch: take a non-locking routing_snapshot for
             // routing so a temporary MutexGuard does not outlive the whole let statement.
-            // Otherwise a synchronous `task` subagent running `run_turn` on another thread
+            // Otherwise a foreground subagent running `run_turn` on another thread
             // (`mcp_client.lock()` in prepare.rs) would never acquire this lock, while the
             // parent thread blocks waiting for the subagent to return → cross-thread
             // deadlock (symptom: subagent stuck in preparing context).

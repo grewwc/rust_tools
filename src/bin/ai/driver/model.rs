@@ -262,7 +262,7 @@ pub(in crate::ai) async fn parse_attached_images_via_subagent(
 
     let args = image_parse_dispatch_args(&vl_model, image_files);
 
-    // Same as /audit: dispatch a synchronous subagent to parse the images, wait for it to
+    // Same as /audit: dispatch a foreground subagent to parse the images, wait for it to
     // finish, then return to the main agent. On failure do not silently return None (otherwise
     // the main agent would have neither image content nor a failure hint and could only guess),
     // but build a placeholder OcrExtraction marked with error so the prepare stage injects a
@@ -340,7 +340,7 @@ fn failed_image_parse_extraction(image_files: &[String], reason: &str) -> OcrExt
 }
 
 /// Strips the [task_id=...] / [Task: ...] status headers and the trailing reminder from a
-/// synchronous subagent's rendered output, keeping only the subagent's final parsed text.
+/// foreground subagent's rendered output, keeping only the subagent's final parsed text.
 fn extract_subagent_output_text(content: &str) -> String {
     let reminder = crate::ai::tools::task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER;
     let mut text = content.to_string();

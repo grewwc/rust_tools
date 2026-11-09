@@ -617,7 +617,7 @@ mod tests {
             let err = validate(command).unwrap_err();
             assert!(
                 err.contains("task_spawn"),
-                "expected task/task_spawn hint for {command}, got: {err}"
+                "expected task_spawn hint for {command}, got: {err}"
             );
         }
     }

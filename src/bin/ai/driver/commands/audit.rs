@@ -1,18 +1,20 @@
 use std::path::Path;
 use std::time::Duration;
 
-/// `/audit` 是用户显式发起的深度审计；允许比普通同步 `task` 更长的前台等待时间。
+/// `/audit` is an explicitly requested deep audit; it allows a longer foreground wait than an
+/// ordinary delegated subagent.
 pub(crate) const AUDIT_SUBAGENT_HARD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-/// 给审计子代理预留收口时间，避免到硬超时时丢失已经收集到的结论。
-/// 之前 2 分钟太短：长模型请求来不及被收口信号打断就在硬超时处被 abort，导致 15 分钟
-/// 工作产物丢失。5 分钟让收口信号能在请求中途打断并强制产出最终结论。
+/// Reserve wrap-up time so the audit does not lose collected conclusions at the hard timeout.
+/// Two minutes was too short: a long model request could not be interrupted before the hard
+/// timeout aborted it, losing up to fifteen minutes of work. Five minutes lets the wrap-up signal
+/// interrupt a request mid-flight and force a final conclusion.
 pub(crate) const AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME: Duration = Duration::from_secs(5 * 60);
 
-/// `/audit --fast` 的硬超时：当前会话模型 + high 思考 + 步数受限，正常一轮快速
-/// 审计几分钟内应能完成；8 分钟硬超时兜底，避免长时间占用前台。
+/// Hard timeout for `/audit --fast`: the current session model with high reasoning and a bounded
+/// step count normally finishes a quick audit in a few minutes; eight minutes caps foreground use.
 pub(crate) const FAST_AUDIT_SUBAGENT_HARD_TIMEOUT: Duration = Duration::from_secs(8 * 60);
-/// 快速审计的收口预留：3 分钟足够在请求中途打断并产出最终结论，
-/// 同时保留同步 task 的收口保护语义。
+/// Wrap-up reserve for a fast audit: three minutes is enough to interrupt a request and produce a
+/// final conclusion while preserving the foreground runner's wrap-up guarantee.
 pub(crate) const FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME: Duration = Duration::from_secs(3 * 60);
 
 const SUBAGENT_FINAL_ANSWER_MARKER: &str = "[Subagent final answer]\n";
@@ -20,13 +22,13 @@ pub(crate) const AUDIT_PROGRESS_PROTOCOL: &str = include_str!("prompts/audit_pro
 /// Builtin skill whose procedure the self-generated `/audit` note quotes.
 const AUDIT_PROCEDURE_SKILL: &str = "audit_own_changes";
 
-/// `/audit` 需要在已有 DRIVER_CTX 的 turn 内启动同步子代理，因此这里只识别命令，
-/// 实际执行由 turn_runtime 在进入模型循环前完成。
+/// `/audit` needs to start its foreground subagent inside a turn that already has `DRIVER_CTX`,
+/// so this module only parses the command; turn_runtime executes it before entering the model loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AuditCommand {
     Run { instruction: String, fast: bool },
-    /// 缺省 `/audit` / `/audit -f`（没有指令）：不启动子代理，而是让当前 turn
-    /// 继续，由 lead agent 自行生成审查内容后再启动审计子代理。
+/// Bare `/audit` / `/audit -f` (no instruction): do not start a subagent yet. Let the current
+/// turn continue so the lead agent can build the audit scope before starting the audit subagent.
     SelfGenerated { fast: bool },
 }
 
@@ -80,7 +82,7 @@ fn strip_fast_flag(instruction: &str) -> Option<&str> {
 
 /// Guidance injected for `/audit` without an instruction: the audit scope is left to the lead
 /// agent (only it knows what changed in this session), which builds the self-contained audit
-/// prompt and starts the `audit` / `audit-fast` subagent through the `task` tool.
+/// prompt and starts the `audit` / `audit-fast` subagent through `task_spawn`.
 ///
 /// The procedure is not restated here: it is quoted verbatim from the builtin
 /// `audit_own_changes` skill, so the command path and the skill text cannot drift apart.
@@ -112,9 +114,9 @@ pub(crate) fn inject_self_generated_audit_note(
          decides that an audit runs now, and it starts agent=\"{agent}\" instead of letting the \
          skill pick the tier.\n\
          \n\
-         If you end this turn without having started the `{agent}` subagent through the task \
-         tool, the runtime forces a synchronous `/audit{fast_flag}` with this turn's output as \
-         the audit instruction, so the audit always runs in a subagent.\n\
+         If you end this turn without having started the `{agent}` subagent through `task_spawn`, \
+         the runtime forces a foreground `/audit{fast_flag}` with this turn's output as the audit \
+         instruction, so the audit always runs in a subagent.\n\
          \n\
          {procedure}"
     );
@@ -127,9 +129,9 @@ pub(crate) fn inject_self_generated_audit_note(
     });
 }
 
-/// Detects whether the lead agent already started an audit subagent during this turn via the
-/// model-facing `task` / `task_spawn` tools with agent `audit` / `audit-fast`. The
-/// self-generated `/audit` path falls back to a forced synchronous run when this returns
+/// Detects whether the lead agent already started an audit subagent during this turn via
+/// `task_spawn` with agent `audit` / `audit-fast`. The self-generated `/audit` path falls back to
+/// a forced foreground run when this returns
 /// false, so the "audit always runs in a subagent" contract holds even if the lead agent
 /// never spawns it itself. Turn messages are this turn's in-memory canonical history; the
 /// tool calls recorded there are exactly the calls the lead agent made.
@@ -147,7 +149,6 @@ pub(crate) fn turn_spawned_audit_subagent(turn_messages: &[crate::ai::history::M
                 serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
                     .ok()
                     .is_some_and(|args| match name.as_str() {
-                        "task" => is_audit(&args),
                         "task_spawn" => args
                             .get("tasks")
                             .and_then(|tasks| tasks.as_array())
@@ -159,10 +160,12 @@ pub(crate) fn turn_spawned_audit_subagent(turn_messages: &[crate::ai::history::M
     })
 }
 
-/// 同步 `/audit` 的完整 payload 会作为主 agent 的证据持久化；终端只显示子代理的
-/// 最终结论，避免把工具调用记录和给主 agent 的控制提示直接泄漏给用户。
+/// The full `/audit` payload is persisted as the main agent's evidence; the terminal shows only
+/// the subagent's final conclusion so tool-call records and parent-facing control notes never leak
+/// to the user.
 pub(crate) fn terminal_audit_result(payload: &str) -> String {
-    // 首选：子代理产出工具证据时，finalize 用 marker 分隔证据与最终答案。
+    // Preferred path: when the subagent produced tool evidence, finalize separates
+    // the evidence from the final answer with a marker.
     if let Some((_, answer)) = payload.split_once(SUBAGENT_FINAL_ANSWER_MARKER) {
         let answer = strip_parent_reminder(answer);
         if !answer.is_empty() {
@@ -170,9 +173,10 @@ pub(crate) fn terminal_audit_result(payload: &str) -> String {
         }
     }
 
-    // 超时/失败路径：中断前已收集的恢复证据块（sync_task 写入 result slot 的
-    // SUBAGENT_TIMEOUT_RECOVERY_V1）只随完整 payload 交给主 agent（lead agent）作为证据，
-    // 终端不展示节选内容——用户只需要知道审计未完成，原因由紧凑的 `Error:` 行给出。
+    // Timeout/failure path: the recovery evidence block collected before interruption
+    // (`SUBAGENT_TIMEOUT_RECOVERY_V1` from the foreground runner) goes to the lead agent only as
+    // part of the full payload. The terminal shows no excerpt — the user only needs to know the
+    // audit did not finish, with the reason in the compact `Error:` line.
     if let Some(error) = payload
         .lines()
         .find_map(|line| line.trim().strip_prefix("Error: "))
@@ -180,10 +184,11 @@ pub(crate) fn terminal_audit_result(payload: &str) -> String {
         return format!("[audit] {error}");
     }
 
-    // 回退：子代理零工具调用直接内联作答时 payload 里没有 marker（见 finalize.rs
-    // `format_subagent_result_for_parent`：工具证据为空则原样返回最终文本）。审计
-    // 提示已把 mutation-log / git diff 注入，内联作答很常见。此时剥离 sync 子代理
-    // payload 的固定头部与父提醒尾巴，展示真正的结论，而不是误报「无最终答案」。
+    // Fallback: a subagent that answers inline with zero tool calls produces no marker (see
+    // finalize.rs `format_subagent_result_for_parent`, which returns the final text unchanged when
+    // tool evidence is empty). Inline answers are common because the audit prompt already injects
+    // the mutation log / git diff. Strip the foreground-subagent payload header and parent reminder
+    // tail, then show the actual conclusion instead of reporting "no final answer".
     let stripped = strip_subagent_payload_header(payload);
     let body = strip_parent_reminder(&stripped);
     if !body.is_empty() && body != SUBAGENT_NO_FINAL_TEXT_SENTINEL {
@@ -194,8 +199,9 @@ pub(crate) fn terminal_audit_result(payload: &str) -> String {
         .to_string()
 }
 
-/// sync 子代理在无最终文本时写入的占位串（见 `sync_task::format_subagent_output`）。
-/// 命中它说明确实没有结论，回退到通用提示而非把占位串展示给用户。
+/// Placeholder written by a foreground subagent when it produced no final text
+/// (see `sync_task::format_subagent_output`). A match means there really is no
+/// conclusion, so fall back to the generic notice instead of showing the placeholder.
 const SUBAGENT_NO_FINAL_TEXT_SENTINEL: &str = "(subagent did not produce any final assistant text)";
 
 /// Full audit payload for the lead-agent fix loop: unlike the terminal view
@@ -205,7 +211,8 @@ pub(crate) fn audit_report_for_fix(payload: &str) -> String {
     strip_parent_reminder(payload).trim().to_string()
 }
 
-/// 剥离 payload 末尾的父提醒（finalize / sync 都会附加 `SUBAGENT_PARENT_SUMMARY_REMINDER`）。
+/// Strip the trailing parent reminder (`finalize` and the foreground runner both append
+/// `SUBAGENT_PARENT_SUMMARY_REMINDER`).
 fn strip_parent_reminder(text: &str) -> &str {
     text.trim()
         .strip_suffix(crate::ai::tools::task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER)
@@ -213,11 +220,13 @@ fn strip_parent_reminder(text: &str) -> &str {
         .trim()
 }
 
-/// 剥离 sync 子代理 payload 的固定头部：`[task_id=…]` 行、`[Task: …] STATUS after …s`
-/// 行，以及 selection_explanation 的 `agent_reason=` / `model_reason=` 行（见
-/// `sync_task::format_subagent_output` 与 `task_tools::build_selection_explanation`）。
-/// 只跳过开头**连续**的已知元数据行；审计结论（散文 / markdown）不会以这些前缀开头，
-/// 因此不会被误删。即便头部格式将来变动，最坏也只是多显示几行头部，绝不会吞掉结论。
+/// Strip the foreground-subagent payload header: the `[task_id=…]` line, the
+/// `[Task: …] STATUS after …s` line, and the selection explanation's
+/// `agent_reason=` / `model_reason=` lines (see `sync_task::format_subagent_output`
+/// and `task_tools::build_selection_explanation`). Only consecutive known metadata
+/// lines at the start are skipped; audit conclusions (prose / markdown) do not
+/// start with those prefixes, so they are never swallowed. If the header format
+/// changes later, the worst case is a few extra displayed header lines.
 fn strip_subagent_payload_header(payload: &str) -> String {
     const HEADER_PREFIXES: &[&str] = &["[task_id=", "[Task: ", "agent_reason=", "model_reason="];
     let mut lines = payload.lines().peekable();
@@ -434,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_spawned_audit_subagent_detects_task_calls() {
+    fn turn_spawned_audit_subagent_detects_task_spawn_calls() {
         let call = |name: &str, args: &str| ToolCall {
             id: "1".into(),
             tool_type: "function".into(),
@@ -450,11 +459,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
         };
-        // Both spawn tools with either audit agent are detected.
-        assert!(turn_spawned_audit_subagent(&[msg(vec![call(
-            "task",
-            r#"{"agent":"audit"}"#
-        )])]));
+        // Either audit agent spawned through task_spawn is detected.
         assert!(turn_spawned_audit_subagent(&[msg(vec![call(
             "task_spawn",
             r#"{"tasks":[{"agent":"audit-fast"},{"agent":"build"}]}"#
@@ -465,14 +470,13 @@ mod tests {
             r#"{"tasks":[{"agent":"build"}]}"#
         )])]));
         assert!(!turn_spawned_audit_subagent(&[msg(vec![call(
-            "task",
-            r#"{"agent":"build"}"#
-        )])]));
-        assert!(!turn_spawned_audit_subagent(&[msg(vec![call(
             "read_file",
             r#"{"agent":"audit"}"#
         )])]));
-        assert!(!turn_spawned_audit_subagent(&[msg(vec![call("task", "not json")])]));
+        assert!(!turn_spawned_audit_subagent(&[msg(vec![call(
+            "task_spawn",
+            "not json"
+        )])]));
         assert!(!turn_spawned_audit_subagent(&[]));
     }
 

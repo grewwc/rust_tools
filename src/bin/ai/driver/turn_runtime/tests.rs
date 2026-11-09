@@ -1660,7 +1660,6 @@ fn required_delegation_advisory_fires_on_unclassified_command_round() {
 fn required_delegation_advisory_skips_coordination_only_rounds() {
     for name in [
         "task_spawn",
-        "task",
         "task_wait",
         "task_status",
         "task_cancel",
@@ -1695,7 +1694,7 @@ fn required_delegation_advisory_skips_coordination_only_rounds() {
 
 #[test]
 fn required_delegation_tracks_work_rounds_until_delegation() {
-    for name in ["task", "task_spawn"] {
+    for name in ["task_spawn"] {
         let mut supervisor = TurnSupervisor::default();
         supervisor.progress.delegation_required = true;
         let mut messages = Vec::new();
@@ -2033,7 +2032,7 @@ fn required_delegation_advisory_state_survives_recursive_body() {
 
 #[test]
 fn required_delegation_advisory_stands_down_after_delegation() {
-    for name in ["task", "task_spawn"] {
+    for name in ["task_spawn"] {
         for read_first in [None, Some(false), Some(true)] {
             let mut supervisor = TurnSupervisor::default();
             supervisor.progress.delegation_required = true;

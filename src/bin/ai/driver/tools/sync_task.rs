@@ -1,12 +1,12 @@
 // =============================================================================
-// Synchronous `task` tool interception
+// Driver-internal foreground subagent runner
 // =============================================================================
-// The synchronous `task` tool is intercepted by the driver and executed
-// inside the active turn's runtime, instead of being routed through the
-// kernel scheduler like `task_spawn`. This lets the calling agent block
-// on a single sub-agent without forking a subprocess and without relying
-// on the outer driver loop to make progress (which it cannot, because the
-// outer driver loop is currently awaiting this tool call).
+// Explicit commands such as `/audit` and attached-image parsing run one
+// subagent inside the active turn's runtime, instead of routing it through the
+// kernel scheduler like `task_spawn`. This lets the command block on a single
+// subagent without forking a subprocess and without relying on the outer driver
+// loop to make progress (which it cannot, because the outer driver loop is
+// currently awaiting this call). No model-facing tool reaches this runner.
 //
 // Execution model:
 //   1. Read `DRIVER_CTX` to obtain a snapshot of the parent runtime
@@ -43,16 +43,6 @@ use crate::ai::{
 
 use super::super::runtime_ctx::DriverContext;
 
-/// Hard upper bound on how long a synchronous `task` tool call may block
-/// the parent agent. Keeps a runaway sub-agent from wedging the foreground
-/// turn forever. Subagents are leaf tasks with a separate iteration cap;
-/// ten minutes gives complex sub-tasks (multi-step research, cross-module
-/// refactors, audits) enough budget to return useful partial evidence without
-/// wedging the parent turn for an interactive session.
-const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-/// Reserve enough of the existing hard-timeout budget for one interrupted request to stop and one
-/// no-tool synthesis request to return a useful result to the parent.
-const SYNC_TASK_WRAP_UP_LEAD_TIME: Duration = Duration::from_secs(3 * 60);
 const TIMEOUT_RECOVERY_MAX_CHARS: usize = 24_000;
 const TIMEOUT_RECOVERY_TAIL_MESSAGES: usize = 40;
 
@@ -174,37 +164,6 @@ fn suppress_subagent_terminal_output(wrapped: BoxedSubagentFuture) -> BoxedSubag
     Box::pin(runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(true, wrapped))
 }
 
-/// Runs a synchronous sub-agent requested by the model through the `task` tool. The sub-agent gets
-/// a pre-timeout wrap-up request before the hard limit, so it can stop expanding the investigation
-/// and return useful partial conclusions instead of being killed mid-step. The default budget is
-/// 10 minutes; the `audit` agent gets an extended 15-minute budget (see
-/// `sync_task_timeouts_for_agent`).
-pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
-    let (hard_timeout, wrap_up_lead_time) = sync_task_timeouts_for_agent(args);
-    execute_sync_task_with_pre_timeout_wrap_up(tool_call_id, args, hard_timeout, wrap_up_lead_time)
-}
-
-/// Sync-task budget by requested agent. The audit agent carries the heaviest evidence contract
-/// (per-finding falsification checks and three evidence arrays sourced from in-turn `read_file`s),
-/// so a cold-starting subagent often cannot finish a complete report within the default 10-minute
-/// sync budget. Give `audit` the same extended budget as the explicit `/audit` command (shared
-/// constants in `driver/commands/audit.rs`); every other agent keeps the default. `audit-fast`
-/// also keeps the default: its 8-minute `/audit --fast` budget is calibrated for that command's
-/// pinned session-model + high-thinking configuration, which model-initiated `task` calls do not
-/// apply.
-fn sync_task_timeouts_for_agent(args: &Value) -> (Duration, Option<Duration>) {
-    // Mirror `prepare_subagent_task`'s trim and `select_subagent`'s ASCII
-    // case-insensitive lookup so `"Audit"` / `"audit "` cannot slip past the
-    // extended-budget match while still resolving to the audit agent.
-    match args.get("agent").and_then(|v| v.as_str()).map(str::trim) {
-        Some(agent) if agent.eq_ignore_ascii_case("audit") => (
-            crate::ai::driver::commands::audit::AUDIT_SUBAGENT_HARD_TIMEOUT,
-            Some(crate::ai::driver::commands::audit::AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME),
-        ),
-        _ => (SYNC_TASK_HARD_TIMEOUT, Some(SYNC_TASK_WRAP_UP_LEAD_TIME)),
-    }
-}
-
 /// Reasoning-effort tier requested by a subagent dispatch.
 ///
 /// The user-facing tier table ([`crate::ai::provider::ReasoningEffort::parse`]) deliberately
@@ -233,16 +192,16 @@ fn parse_subagent_reasoning_override(
     }
 }
 
-/// Internal synchronous-task entry point with caller-selected timeout and wrap-up policy. These
-/// controls are not exposed to model tool arguments, so the foreground wait remains bounded.
+/// Foreground subagent entry point with caller-selected timeout and wrap-up policy. Used by
+/// driver-internal commands (`/audit`) and attached-image parsing; no model tool can call it.
 pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     tool_call_id: &str,
     args: &Value,
     hard_timeout: Duration,
     wrap_up_lead_time: Option<Duration>,
 ) -> Result<ToolResult, String> {
-    // Recursion depth guard: prevents a mode:all heavy agent from delegating through synchronous
-    // `task` into unbounded nesting. Consistent with the check in `spawn_subagent_kernel_task`.
+    // Recursion depth guard: prevents a mode:all heavy agent from delegating through a
+    // foreground subagent into unbounded nesting. Consistent with `spawn_subagent_kernel_task`.
     let parent_depth = runtime_ctx::current_subagent_depth();
     let child_depth = parent_depth + 1;
     if child_depth > task_tools::MAX_SUBAGENT_SPAWN_DEPTH {
@@ -256,12 +215,13 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     }
     let prepared = task_tools::prepare_subagent_task(args)?;
     let ctx = runtime_ctx::try_current().ok_or_else(|| {
-        "task tool requires an active driver turn (DRIVER_CTX is not set)".to_string()
+        "foreground subagent dispatch requires an active driver turn (DRIVER_CTX is not set)"
+            .to_string()
     })?;
 
     let (mut task_app, parent_agent_team_mode) = fork_sync_subagent_with_parent_policy(&ctx);
-    // Driver-internal dispatch options (the task tool schema seen by model calls has neither
-    // field, so they never match):
+    // Driver-internal dispatch options (the retired `task` tool schema had neither field, and
+    // `task_spawn` does not forward them):
     // - `image_files`: attaches images directly to the sub-agent's first user message so a VL
     //   model sees them in the first round, avoiding the redundant read_file-then-re-attach
     //   base64 round trip;
@@ -378,8 +338,8 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
         super::super::activate_primary_agent(&mut task_app, &capped_agent);
     }
 
-    // `agent-team` is parent-only orchestration: a child has no `task` tool,
-    // so forwarding it would only duplicate instructions the child cannot use.
+    // `agent-team` is parent-only orchestration: a child has no task tools, so forwarding it
+    // would only duplicate instructions the child cannot use.
     task_app.forced_skills.retain(|name| name != "agent-team");
     let task_skill_manifests = if prepared.inherit.skills {
         std::sync::Arc::new(
@@ -815,7 +775,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
             payload: &content,
         },
     )
-    .map_err(|error| format!("failed to persist synchronous task evidence: {error}"))?;
+    .map_err(|error| format!("failed to persist foreground subagent evidence: {error}"))?;
     Ok(ToolResult {
         tool_call_id: tool_call_id.to_string(),
         content,
@@ -1539,9 +1499,10 @@ mod tests {
 
     #[test]
     fn sync_task_formats_timeout_as_parent_visible_output() {
+        let hard_timeout = Duration::from_secs(10 * 60);
         let timeout_error = format!(
             "subagent task exceeded hard timeout of {}s",
-            SYNC_TASK_HARD_TIMEOUT.as_secs()
+            hard_timeout.as_secs()
         );
         for effort in [None, Some("high")] {
             let output = format_subagent_output(
@@ -1550,7 +1511,7 @@ mod tests {
                 "build",
                 "qwen3.7-max",
                 effort,
-                SYNC_TASK_HARD_TIMEOUT.as_secs_f64(),
+                hard_timeout.as_secs_f64(),
                 "model_reason=auto-selected",
                 "",
                 Some(&timeout_error),
@@ -1568,50 +1529,6 @@ mod tests {
             assert!(output.contains("(subagent did not produce any final assistant text)"));
             assert!(output.contains(task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER));
         }
-    }
-
-    #[test]
-    fn ordinary_sync_task_reserves_wrap_up_inside_ten_minute_hard_timeout() {
-        assert_eq!(SYNC_TASK_HARD_TIMEOUT, Duration::from_secs(10 * 60));
-        assert_eq!(SYNC_TASK_WRAP_UP_LEAD_TIME, Duration::from_secs(3 * 60));
-        assert!(SYNC_TASK_WRAP_UP_LEAD_TIME < SYNC_TASK_HARD_TIMEOUT);
-        assert_eq!(
-            SYNC_TASK_HARD_TIMEOUT - SYNC_TASK_WRAP_UP_LEAD_TIME,
-            Duration::from_secs(7 * 60)
-        );
-    }
-
-    #[test]
-    fn audit_agent_gets_extended_sync_budget_others_keep_default() {
-        let default = (SYNC_TASK_HARD_TIMEOUT, Some(SYNC_TASK_WRAP_UP_LEAD_TIME));
-        assert_eq!(
-            sync_task_timeouts_for_agent(&serde_json::json!({})),
-            default
-        );
-        assert_eq!(
-            sync_task_timeouts_for_agent(&serde_json::json!({ "agent": "build" })),
-            default
-        );
-        // audit-fast's 8-minute budget is calibrated for `/audit --fast`'s pinned
-        // configuration; model-initiated calls keep the (larger) default budget.
-        assert_eq!(
-            sync_task_timeouts_for_agent(&serde_json::json!({ "agent": "audit-fast" })),
-            default
-        );
-        assert_eq!(
-            sync_task_timeouts_for_agent(&serde_json::json!({ "agent": "audit" })),
-            (
-                crate::ai::driver::commands::audit::AUDIT_SUBAGENT_HARD_TIMEOUT,
-                Some(crate::ai::driver::commands::audit::AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME)
-            )
-        );
-        assert_eq!(
-            sync_task_timeouts_for_agent(&serde_json::json!({ "agent": "Audit " })),
-            (
-                crate::ai::driver::commands::audit::AUDIT_SUBAGENT_HARD_TIMEOUT,
-                Some(crate::ai::driver::commands::audit::AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME)
-            )
-        );
     }
 
     #[test]

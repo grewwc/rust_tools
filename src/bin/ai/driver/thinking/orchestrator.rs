@@ -365,19 +365,11 @@ impl ThinkingOrchestrator {
         if turn_index < Self::CONTEXT_BUDGET_TURN_THRESHOLD {
             return None;
         }
-        let has_task = available_tool_names.iter().any(|n| n == "task");
         let has_task_spawn = available_tool_names.iter().any(|n| n == "task_spawn");
-        if !has_task && !has_task_spawn {
+        if !has_task_spawn {
             return None;
         }
-        let routing = match (has_task, has_task_spawn) {
-            (true, true) => {
-                "Use task for one focused investigation, or task_spawn for multiple independent branches"
-            }
-            (true, false) => "Use task for one focused investigation",
-            (false, true) => "Use task_spawn for multiple independent branches",
-            (false, false) => unreachable!(),
-        };
+        let routing = "Use task_spawn for one focused investigation or multiple independent branches";
         Some(format!(
             "[Context Budget] This conversation has been going for {}+ turns. \
              Your context is growing large, which can disperse attention and waste tokens. \
@@ -752,24 +744,16 @@ mod tests {
     #[test]
     fn context_budget_nudge_only_after_threshold() {
         let orch = ThinkingOrchestrator::new();
-        let tools = vec!["task".to_string(), "task_spawn".to_string()];
+        let tools = vec!["task_spawn".to_string()];
         // Below threshold -> not injected
         assert!(orch.build_context_budget_nudge(5, &tools).is_none());
         // Threshold reached and task_spawn available -> injected; serial/parallel sub-steps may
         // be delegated, but not the whole branch.
         let nudge = orch.build_context_budget_nudge(15, &tools).unwrap();
         assert!(nudge.contains("context isolation is a valid benefit"));
-        assert!(nudge.contains("Use task for one focused investigation"));
+        assert!(nudge.contains("Use task_spawn for one focused investigation"));
         assert!(nudge.contains("Delegate those sub-parts one at a time"));
         assert!(nudge.contains("do not hand off the current unresolved branch"));
-        // Remind even when only the sync task tool exists; inject nothing only when neither
-        // delegation tool is present.
-        let task_only = vec!["task".to_string()];
-        assert!(
-            orch.build_context_budget_nudge(15, &task_only)
-                .unwrap()
-                .contains("Use task for one focused investigation")
-        );
         assert!(orch.build_context_budget_nudge(15, &[]).is_none());
     }
 }

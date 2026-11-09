@@ -1,7 +1,7 @@
 //! TraeCLI subagent backend: headless execution via `traecli exec --json`.
 //!
 //! Session defaults prefer TraeCLI when its binary is available; explicit
-//! `/use` selections or a `backend` argument on a `task` / `task_spawn` item
+//! `/use` selections or a `backend` argument on a `task_spawn` item
 //! override that preference. All task control block
 //! semantics (task registry, result channel, futex, evidence ledger,
 //! cancellation) stay owned by the existing `task_spawn` / `task_wait` layer.

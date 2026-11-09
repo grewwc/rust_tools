@@ -650,7 +650,7 @@ pub(super) async fn finalize_turn(
     {
         // Publish to the parent agent early: even without final assistant prose this round, any reusable
         // subagent evidence (e.g. read_file results) must be visible to the parent.
-        // This keeps the synchronous `task` and the asynchronous `task_wait` on the same parent-side payload.
+        // This keeps the foreground runner and the asynchronous `task_wait` on the same parent-side payload.
         crate::ai::driver::runtime_ctx::publish_subagent_result(
             &subagent_output_for_parent,
             final_assistant_text,

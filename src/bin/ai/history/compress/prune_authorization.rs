@@ -11,8 +11,8 @@
 
 use rustc_hash::FxHashSet;
 
-/// Asynchronous task ids use this prefix (`next_task_id`); synchronous tasks
-/// use bare UUIDs (`handle_task_tool` in driver/tools/sync_task.rs).
+/// Asynchronous task ids use this prefix (`next_task_id`); legacy persisted
+/// synchronous task results use bare UUIDs.
 const TASK_ID_PREFIX: &str = "task_";
 
 /// Markers the runtime itself writes into subagent results: `[task_id=X]` for

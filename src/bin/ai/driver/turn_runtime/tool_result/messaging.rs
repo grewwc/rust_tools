@@ -1873,7 +1873,7 @@ mod tests {
         let history_file = session_root.join("history.sqlite");
         let parent_app = test_app(history_file);
 
-        // A synchronous subagent inherits config.history_file + session_id from the
+        // A foreground subagent inherits config.history_file + session_id from the
         // parent and only swaps session_history_file for its own forked history.
         let parent_history = parent_app.session_history_file.clone();
         let stem = parent_history

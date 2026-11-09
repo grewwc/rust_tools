@@ -74,8 +74,8 @@ pub(super) fn mark_task_retry_status(task_id: &str, status: &str) {
 pub(super) fn is_retryable_task_status(status: &str) -> bool {
     TaskTerminalStatus::parse(status).is_some_and(TaskTerminalStatus::is_retryable)
 }
-/// Look up a registered async task entry. Used by the driver-side sync `task`
-/// interception to retrieve the channel/futex/inherit info after spawning.
+/// Look up a registered async task entry. Used by collection paths to retrieve
+/// the channel/futex/inherit info after spawning.
 pub(crate) fn with_task_entry<R>(task_id: &str, f: impl FnOnce(&AsyncTaskEntry) -> R) -> Option<R> {
     let registry = lock_task_registry();
     registry.get_ref(&task_id.to_string()).map(f)
@@ -290,7 +290,7 @@ pub(crate) fn validate_side_note_target(task_id: &str) -> Result<(), String> {
         if task_backend(entry.backend).descriptor().side_notes == SideNoteMode::DeferredContinuation
         {
             return Err(format!(
-                "Task `{trimmed}` already finished (status={status}); put new guidance in a follow-up `task`/`task_spawn` with `backend_continue_from`. Previously queued side-notes are retained for that continuation."
+                "Task `{trimmed}` already finished (status={status}); put new guidance in a follow-up `task_spawn` with `backend_continue_from`. Previously queued side-notes are retained for that continuation."
             ));
         }
         return Err(format!(
@@ -339,8 +339,7 @@ pub(crate) fn task_backend_id(task_id: &str) -> BackendId {
         .unwrap_or(BackendId::KERNEL)
 }
 
-/// Remove a task entry from the registry. Called by the synchronous `task`
-/// interception once it has consumed the result.
+/// Remove a task entry from the registry once its result has been consumed.
 pub(crate) fn remove_task_entry(task_id: &str) -> Option<AsyncTaskEntry> {
     lock_unpoisoned(&TASK_REASONING_EFFORT_REGISTRY).remove(&task_id.to_string());
     let mut registry = lock_task_registry();
@@ -352,8 +351,7 @@ pub(crate) fn insert_task_entry_for_test(task_id: String, entry: AsyncTaskEntry)
     let mut registry = lock_task_registry();
     registry.insert(task_id, entry);
 }
-/// channel. Re-exported for the synchronous `task` interception so that both
-/// paths produce identical output.
+/// channel. Re-exported so every collection path produces identical output.
 pub(crate) fn format_finished_task(entry: &AsyncTaskEntry, result: StoredTaskResult) -> String {
     format_task_result(entry, result, None)
 }

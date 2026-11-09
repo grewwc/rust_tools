@@ -1574,7 +1574,7 @@ fn resolve_inline_image_path(raw: &str, assets_dir: &Path) -> String {
 /// current request and every later history replay. A source that already is one
 /// of these immutable snapshots (e.g. a digest's original image path opened again)
 /// is reused instead of copied a second time.
-/// `pub(crate)` because the synchronous `task` tool attaches caller-provided
+/// `pub(crate)` because the foreground subagent runner attaches caller-provided
 /// images to a sub-agent's first turn; the sub-agent path skips
 /// `finalize_question`, so it must capture the files itself before the turn
 /// is persisted. The `read_file` image followup captures its images here too.

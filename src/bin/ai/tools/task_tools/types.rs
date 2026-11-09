@@ -9,7 +9,7 @@ pub(super) const DEFAULT_TASK_QUOTA_TURNS: usize = 10;
 pub(crate) const MAX_SUBAGENT_SPAWN_DEPTH: usize = 1;
 /// A subagent is a leaf evidence-gathering/execution unit of its parent agent and must not inherit
 /// the main agent's full long-running loop budget. The main agent keeps its own max_steps; only
-/// the `task` / `task_spawn` launch path is clamped here.
+/// the `task_spawn` launch path is clamped here.
 pub(crate) const SUBAGENT_MAX_ITERATIONS: usize = 32;
 /// Agents that explicitly declare `max_steps` (such as the deep audit `/audit`) may exceed the
 /// default 32 rounds, but no subagent may go beyond this absolute hard cap, preventing a runaway

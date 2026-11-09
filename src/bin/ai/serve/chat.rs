@@ -382,7 +382,7 @@ impl ServeTurnSelection {
                 }
                 _ => None,
             },
-            subagent_backend: crate::ai::tools::task_tools::BackendId::from_session_config(None)
+            subagent_backend: crate::ai::tools::task_tools::BackendId::from_stored(None)
                 .as_str()
                 .to_string(),
             skills: Vec::new(),
@@ -401,7 +401,7 @@ impl ServeTurnSelection {
     }
 
     fn effective_backend_label(&self) -> String {
-        let backend = crate::ai::tools::task_tools::SubagentBackend::from_session_config(Some(
+        let backend = crate::ai::tools::task_tools::SubagentBackend::from_stored(Some(
             self.subagent_backend.as_str(),
         ));
         if backend.resolve().execution_mode()
@@ -511,8 +511,10 @@ fn persist_serve_config_patch(
 
 /// Fold a server-stored session config into the client selection. Stored
 /// non-empty turn picks override the `/info` defaults so a reconnect resumes
-/// the last `/model`/`/effort`/`/agent` state. Empty backend values resolve to
-/// the available session default, replacing a previous session's backend.
+/// the last `/model`/`/effort`/`/agent` state. An empty backend value means the
+/// session stores no choice, so it restores the kernel default (ordinary
+/// conversation) and replaces a previous session's backend. The mobile picker
+/// applies its own TraeCLI default to the same empty value.
 /// Returns true when something changed.
 fn merge_restored_session_config(
     cfg: &ServeSessionConfig,
@@ -533,9 +535,8 @@ fn merge_restored_session_config(
         selection.reasoning_effort = Some(cfg.reasoning_effort.clone());
         changed = true;
     }
-    let backend = crate::ai::tools::task_tools::BackendId::from_session_config(Some(
-        cfg.subagent_backend.as_str(),
-    ));
+    let backend =
+        crate::ai::tools::task_tools::BackendId::from_stored(Some(cfg.subagent_backend.as_str()));
     if backend.as_str() != selection.subagent_backend {
         selection.subagent_backend = backend.as_str().to_string();
         changed = true;
@@ -7555,7 +7556,7 @@ mod tests {
         // Restoring the same picks again changes nothing.
         assert!(!merge_restored_session_config(&cfg, &mut selection));
 
-        // Explicit kernel picks round-trip even when TraeCLI is the default.
+        // Explicit kernel picks round-trip.
         let kernel_cfg = ServeSessionConfig {
             subagent_backend: "kernel".to_string(),
             ..Default::default()
@@ -7565,8 +7566,8 @@ mod tests {
         assert!(selection.effective_backend_label().is_empty());
         assert!(!merge_restored_session_config(&kernel_cfg, &mut selection));
 
-        // Empty preferences restore the available default without clearing turn picks.
-        let default_backend = crate::ai::tools::task_tools::BackendId::from_session_config(None);
+        // Empty preferences restore the kernel default without clearing turn picks.
+        let default_backend = crate::ai::tools::task_tools::BackendId::from_stored(None);
         for previous in ["kernel", "traecli"] {
             selection.subagent_backend = previous.to_string();
             assert_eq!(
@@ -7574,14 +7575,7 @@ mod tests {
                 previous != default_backend.as_str()
             );
             assert_eq!(selection.subagent_backend, default_backend.as_str());
-            assert_eq!(
-                selection.effective_backend_label(),
-                if default_backend == crate::ai::tools::task_tools::BackendId::TRAECLI {
-                    "sub:traecli"
-                } else {
-                    ""
-                }
-            );
+            assert!(selection.effective_backend_label().is_empty());
             assert_eq!(selection.model, "stored-m");
             assert_eq!(selection.agent, "build");
             assert_eq!(selection.reasoning_effort.as_deref(), Some("high"));

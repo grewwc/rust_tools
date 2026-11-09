@@ -398,12 +398,12 @@ fn delegation_guidance(
     if parallel_delegated >= 2 {
         s.push_str(" Launch the parallel delegated steps concurrently via task_spawn, then collect with a single task_wait.");
     } else if parallel_delegated == 1 && serial_delegated == 0 {
-        s.push_str(" Run the single delegated step with the synchronous `task` tool (async spawn+wait adds overhead without concurrency for one task).");
+        s.push_str(" Spawn the single delegated step via task_spawn, then collect it with task_wait.");
     } else if parallel_delegated == 1 {
         s.push_str(" Spawn the single parallel delegated step via task_spawn while you run the serial ones, then collect it with task_wait.");
     }
     if serial_delegated > 0 {
-        s.push_str(" Run serial delegated steps one at a time with the synchronous `task`, passing the needed context from prior results in the prompt; never run dependent steps concurrently.");
+        s.push_str(" Run serial delegated steps one at a time via task_spawn followed by task_wait, passing the needed context from prior results in the prompt; never run dependent steps concurrently.");
     }
     s
 }

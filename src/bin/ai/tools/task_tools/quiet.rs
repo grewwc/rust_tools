@@ -784,7 +784,6 @@ mod tests {
         let args = serde_json::json!({
             "task_ids": [task_id.clone()], "timeout_secs": 300, "wait_policy": "all"
         });
-        record_last_spawn_batch(vec![task_id.clone()]);
         let before_wait = Instant::now();
         let parked = fixture.scope(|| execute_task_wait(&args)).unwrap();
         let after_wait = Instant::now();
@@ -840,7 +839,6 @@ mod tests {
         assert!(elapsed.contains("(idle="));
         assert_eq!(elapsed.lines().count(), 1);
         assert!(with_task_entry(&task_id, |_| ()).is_some());
-        reset_last_spawn_batch_for_test();
     }
 
     #[test]

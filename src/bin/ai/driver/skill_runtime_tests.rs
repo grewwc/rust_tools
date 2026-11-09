@@ -135,7 +135,6 @@ fn skill_declaring_task_group_eagerly_loads_only_the_task_family() {
         skill_groups.iter().any(|name| name == "task_spawn"),
         "skill with [core, task] must eagerly expose task_spawn"
     );
-    assert!(skill_groups.iter().any(|name| name == "task"));
     assert!(skill_groups.iter().any(|name| name == "task_integrate"));
     assert!(
         !skill_groups.iter().any(|name| name == "run_agent_graph"),
@@ -407,7 +406,6 @@ fn runtime_enabled_task_tools_drop_out_of_hidden_catalog_and_gate_guidance() {
     // section never renders.
     let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
     set_explicit_enabled_tool_names(vec![
-        "task".to_string(),
         "task_spawn".to_string(),
         "task_wait".to_string(),
         "task_status".to_string(),
@@ -491,7 +489,6 @@ async fn subagent_builtin_tools_hide_task_orchestration_family() {
                 .collect::<Box<SkipSet<_>>>();
 
             for hidden in [
-                "task",
                 "task_spawn",
                 "task_wait",
                 "task_status",
@@ -565,7 +562,7 @@ fn executor_group_defers_process_primitives_but_keeps_core_editing() {
 #[test]
 fn manifest_groups_union_explicit_tools_keeps_delegation_subset_resident() {
     // build.agent declares [core] plus a whitelist of the task family
-    // (task/task_spawn/task_wait/task_status/task_integrate/
+    // (task_spawn/task_wait/task_status/task_integrate/
     // task_cancel) to keep delegation tools visible without paying for the
     // whole 11-tool group in every turn. The loader must merge group
     // expansion with explicitly named tools (previously mutually exclusive
@@ -573,7 +570,6 @@ fn manifest_groups_union_explicit_tools_keeps_delegation_subset_resident() {
     let mut agent = agent("build", Vec::new());
     agent.tool_groups = vec!["core".to_string()];
     agent.tools = vec![
-        "task".to_string(),
         "task_spawn".to_string(),
         "task_wait".to_string(),
         "task_status".to_string(),
@@ -591,7 +587,6 @@ fn manifest_groups_union_explicit_tools_keeps_delegation_subset_resident() {
         "read_file",
         "apply_patch",
         "enable_tools",
-        "task",
         "task_spawn",
         "task_wait",
         "task_status",
@@ -686,8 +681,8 @@ fn hidden_task_tool_catalog_advertises_lazy_subagent_family() {
          When the task splits into multiple independent branches that would benefit from \
          subagent parallelism (broad discovery, cross-module mapping, independent verification, \
          or concurrent research), enable the needed tools via `enable_tools`.\n\
-         Available: `task`, `task_spawn`, `task_wait`, `task_status`, \
-         `task_retry`, `task_cancel`, `task_evidence_read`, `task_audit`, and 3 more."
+         Available: `task_spawn`, `task_wait`, `task_status`, \
+         `task_retry`, `task_cancel`, `task_evidence_read`, `task_audit`, `task_integrate`, and 2 more."
     );
 }
 
@@ -697,7 +692,6 @@ fn hidden_task_tool_catalog_suppressed_when_family_loaded() {
     // declaration), the catalog must not repeat the nudge.
     let mut available = SkipSet::new(16);
     for name in [
-        "task",
         "task_spawn",
         "task_wait",
         "task_status",
@@ -1407,9 +1401,9 @@ fn system_prompt_uses_criterion_based_parallel_delegation() {
     // section (the single decision source) and keeps only the plan-schema field semantics.
     assert!(prompt.contains("fan out MULTIPLE focused, independent subtasks concurrently"));
     assert!(prompt.contains("decide delegation per the async_subagent_orchestration guidance"));
-    assert!(
-        prompt.contains("delegated steps without it run one at a time via the synchronous `task`")
-    );
+    assert!(prompt.contains(
+        "delegated steps without it run one at a time via `task_spawn` followed by `task_wait`"
+    ));
     // No longer mandates delegation for every substantive step.
     assert!(!prompt.contains("on every substantive step"));
     assert!(prompt.contains("distinct, bounded goal"));
@@ -1479,14 +1473,12 @@ fn system_prompt_does_not_require_status_as_a_finishing_ritual() {
 }
 
 #[test]
-fn system_prompt_routes_single_delegation_to_sync_task_when_available() {
+fn system_prompt_routes_single_delegation_to_task_spawn() {
     // The Async Subagent Orchestration section is the single authority for
-    // task routing. When the synchronous `task` tool is also available, a
-    // SINGLE delegated subtask must be steered to `task` instead of a lone
-    // task_spawn+task_wait; the Planning section must not repeat that rule
-    // (dedup keeps token cost down without losing guidance).
+    // task routing. A SINGLE delegated subtask must use task_spawn followed by
+    // task_wait; the Planning section must not repeat that rule (dedup keeps
+    // token cost down without losing guidance).
     let mut available = SkipSet::new(16);
-    available.insert("task".to_string());
     available.insert("task_spawn".to_string());
     available.insert("task_wait".to_string());
     available.insert("task_status".to_string());
@@ -1496,12 +1488,9 @@ fn system_prompt_routes_single_delegation_to_sync_task_when_available() {
         .render_system_prompt();
 
     // Canonical home: Async Subagent Orchestration section (task branch).
-    assert!(prompt.contains(
-        "For a single delegated subtask whose result you need back, prefer the synchronous `task`"
-    ));
+    assert!(prompt.contains("Use `task_spawn` for every delegation"));
     // The Planning section no longer duplicates the routing rule...
-    assert!(!prompt.contains("for a SINGLE subtask use the synchronous `task`"));
-    assert!(!prompt.contains("is just a slower `task`"));
+    assert!(!prompt.contains("synchronous `task`"));
     // ...but still keeps its own unique plan/delegate guidance.
     assert!(prompt.contains(
         "Simple tasks: act directly (unless an active skill requires delegation). Complex ones: call `plan` first — before the first tool call"
@@ -1519,7 +1508,6 @@ fn system_prompt_task_only_tools_skip_empty_planning_section() {
     // guidance must come solely from the Async section, with no empty
     // Planning header left over.
     let mut available = SkipSet::new(16);
-    available.insert("task".to_string());
     available.insert("task_spawn".to_string());
     available.insert("task_wait".to_string());
     available.insert("task_status".to_string());
@@ -1532,9 +1520,7 @@ fn system_prompt_task_only_tools_skip_empty_planning_section() {
     // No empty Planning section header.
     assert!(!prompt.contains("<planning_subprocess_execution>"));
     // Routing guidance still present, from the Async section alone.
-    assert!(prompt.contains(
-        "For a single delegated subtask whose result you need back, prefer the synchronous `task`"
-    ));
+    assert!(prompt.contains("Use `task_spawn` for every delegation"));
     assert!(prompt.contains("<async_subagent_orchestration>"));
 }
 
@@ -3680,7 +3666,6 @@ fn explicit_tool_lists_keep_baseline_entries_available() {
     // Task orchestration / knowledge memory series have been moved out of the baseline: under narrow-whitelist skills they are no longer
     // auto-re-added, but the main Agent can still progressively discover and enable them via the resident enable_tools,
     // so delegation of subagents is never truly lost.
-    assert!(!names.contains(&"task".to_string()));
     assert!(!names.contains(&"task_spawn".to_string()));
     assert!(!names.contains(&"task_wait".to_string()));
     assert!(!names.contains(&"task_status".to_string()));

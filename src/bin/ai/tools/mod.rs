@@ -54,7 +54,6 @@ const BASELINE_TOOL_NAMES: &[&str] = &[
     "load_skill",
     "enable_tools",
     "read_file",
-    "task",
     "task_spawn",
     "task_retry",
     "task_wait",
@@ -83,7 +82,6 @@ pub(crate) fn eager_baseline_tool_names() -> &'static [&'static str] {
 pub(crate) const SEARCH_OVERFLOW_CASE_SENSITIVE_DEFAULT: bool = false;
 
 const SUBAGENT_ORCHESTRATION_TOOL_NAMES: &[&str] = &[
-    "task",
     "task_spawn",
     "task_retry",
     "task_wait",

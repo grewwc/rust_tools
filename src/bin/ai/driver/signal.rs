@@ -15,11 +15,11 @@ static REQUEST_INTERRUPT_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 // `/sessions close` must not be misdetected as a suspension.
 static SIGINT_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// Registry of sub-agents currently executing in the foreground synchronously
-/// (blocking the parent turn).
+/// Registry of sub-agents currently executing in the foreground (blocking the
+/// parent turn).
 ///
-/// The sync `task` tool blocks the parent turn inside `execute_sync_task` while
-/// waiting for the sub-agent to finish; during that window the parent agent
+/// Driver-internal commands such as `/audit` and attached-image parsing block the
+/// parent turn while waiting for the sub-agent to finish; during that window the parent agent
 /// itself neither streams nor sits in its iteration loop — it is "stuck" inside
 /// a tool call. Pressing Ctrl+C then, judging only by the global
 /// shutdown/streaming flags, would shut the whole main agent down (the
@@ -154,7 +154,7 @@ pub(in crate::ai) fn take_parked_foreground_interrupt() -> bool {
 }
 
 /// RAII guard: registers a foreground sub-agent's cancel flag when
-/// `execute_sync_task` dispatches it, and deregisters it automatically on drop
+/// foreground runner dispatches it, and deregisters it automatically on drop
 /// (including panic / early return) so the registry never leaks stale entries.
 pub(in crate::ai) struct ForegroundSubagentGuard {
     id: u64,
@@ -202,7 +202,7 @@ fn probe_foreground_subagent() -> ForegroundSubagentProbe {
         if top.cancel_requested {
             // Cancellation was requested but the sub-agent is still on the stack →
             // stuck. Soft cancellation has proven ineffective (if it worked, this
-            // guard would already have dropped when execute_sync_task returned), so
+            // guard would already have dropped when the foreground runner returned), so
             // escalation to a forced exit is required.
             return ForegroundSubagentProbe::Stuck;
         }
@@ -742,7 +742,7 @@ mod tests {
         // consumed; classified as stuck.
         assert_eq!(probe_foreground_subagent(), ForegroundSubagentProbe::Stuck);
 
-        // Returning from the synchronous task unregisters the target. Subsequent
+        // Returning from the foreground runner unregisters the target. Subsequent
         // tool calls in this same parent turn must still execute.
         drop(registration);
         let tool_calls: Vec<_> = (0..2)
@@ -801,7 +801,7 @@ mod tests {
         // Regression test: when a foreground sub-agent is stuck (cancel requested
         // but still on the stack), the second Ctrl+C must exit directly even though
         // the foreground turn activity flag is true (the parent turn is blocked in
-        // execute_sync_task without returning), instead of falling into
+        // the foreground runner without returning), instead of falling into
         // sigint_action's CancelStream (which only sets a soft flag while the
         // parked main thread polls nothing — "Ctrl+C can't close the app").
         let _guard = crate::ai::test_support::ENV_LOCK
@@ -819,7 +819,7 @@ mod tests {
         );
         assert!(cancel.load(Ordering::Relaxed));
 
-        // Simulate the parent turn still blocked in execute_sync_task: raise the
+        // Simulate the parent turn still blocked in the foreground runner: raise the
         // foreground turn activity flag — exactly the condition that used to latch
         // sigint_action on CancelStream forever.
         let _turn = ForegroundTurnGuard::enter();

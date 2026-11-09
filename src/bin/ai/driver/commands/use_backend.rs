@@ -22,6 +22,27 @@ fn ensure_agent_team_sticky(config: &mut SessionServeConfig) {
     }
 }
 
+/// True when the session's stored defaults keep the agent-team skill active.
+pub(crate) fn agent_team_sticky(config: &SessionServeConfig) -> bool {
+    config
+        .default_skills
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("agent-team"))
+}
+
+/// Resolve the backend a stored session config runs. An explicit pick wins; an
+/// agent-team session without one keeps the TraeCLI default the mobile picker
+/// shows; an ordinary session defaults to the kernel backend.
+pub(crate) fn effective_subagent_backend(config: &SessionServeConfig) -> BackendId {
+    BackendId::canonical_stored(config.subagent_backend.as_deref()).unwrap_or_else(|| {
+        if agent_team_sticky(config) {
+            BackendId::TRAECLI
+        } else {
+            BackendId::KERNEL
+        }
+    })
+}
+
 pub(crate) fn parse_use_arguments(args: &str) -> Result<(Option<&str>, Option<&str>), String> {
     let mut parts = args.split_whitespace();
     let backend = parts.next();
@@ -73,7 +94,7 @@ pub(crate) fn reset_subagent_config(config: &mut SessionServeConfig) {
 }
 
 pub(crate) fn format_use_state(config: &SessionServeConfig, kernel_model: &str) -> String {
-    let backend = BackendId::from_session_config(config.subagent_backend.as_deref());
+    let backend = effective_subagent_backend(config);
     let mut output = format!("Session default subagent backend: {}\n", backend.as_str());
     if let Some(worker_backend) = backend_registry().worker_backend_for(backend) {
         let implementation = worker_backend.resolve();
@@ -91,11 +112,7 @@ pub(crate) fn format_use_state(config: &SessionServeConfig, kernel_model: &str) 
     }
     output.push_str(&format!(
         "Sticky agent-team: {}\n",
-        if config
-            .default_skills
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case("agent-team"))
-        {
+        if agent_team_sticky(config) {
             "active"
         } else {
             "off"
@@ -114,8 +131,7 @@ fn app_subagent_config(app: &App) -> SessionServeConfig {
 }
 
 fn apply_app_subagent_config(app: &mut App, config: SessionServeConfig) {
-    app.session_default_subagent_backend =
-        BackendId::from_session_config(config.subagent_backend.as_deref());
+    app.session_default_subagent_backend = effective_subagent_backend(&config);
     app.session_default_subagent_model = config.subagent_model;
     app.session_default_skills = config.default_skills;
 }
@@ -300,6 +316,37 @@ mod tests {
     }
 
     #[test]
+    fn effective_backend_defaults_follow_session_mode() {
+        let normal = SessionServeConfig::default();
+        assert_eq!(effective_subagent_backend(&normal), BackendId::KERNEL);
+
+        let team = SessionServeConfig {
+            default_skills: vec!["AGENT-TEAM".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(effective_subagent_backend(&team), BackendId::TRAECLI);
+
+        let explicit_kernel = SessionServeConfig {
+            subagent_backend: Some("kernel".to_string()),
+            default_skills: vec!["agent-team".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_subagent_backend(&explicit_kernel),
+            BackendId::KERNEL
+        );
+
+        let explicit_traecli = SessionServeConfig {
+            subagent_backend: Some("traecli".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_subagent_backend(&explicit_traecli),
+            BackendId::TRAECLI
+        );
+    }
+
+    #[test]
     fn use_command_switches_backend_and_keeps_session_defaults() {
         let mut app = test_app();
         app.current_model = "parent-model".to_string();
@@ -417,10 +464,7 @@ mod tests {
 
         assert!(super::super::try_handle_local_command(&mut app, "/reset").unwrap());
 
-        assert_eq!(
-            app.session_default_subagent_backend,
-            BackendId::from_session_config(None)
-        );
+        assert_eq!(app.session_default_subagent_backend, BackendId::KERNEL);
         assert!(app.session_default_subagent_model.is_none());
         assert_eq!(app.session_default_skills, ["first-skill", "last-skill"]);
         assert_eq!(
@@ -444,10 +488,7 @@ mod tests {
         let stored = SessionStore::new(&history_file)
             .read_session_serve_config(&app.session_id)
             .unwrap();
-        assert_eq!(
-            stored.subagent_backend.as_deref(),
-            Some(app.session_default_subagent_backend.as_str())
-        );
+        assert_eq!(stored.subagent_backend, None);
         assert!(stored.subagent_model.is_none());
         assert_eq!(stored.default_skills, ["first-skill", "last-skill"]);
         assert_eq!(stored.model.as_deref(), Some("parent-model"));
@@ -540,10 +581,7 @@ mod tests {
                 skill_names: vec!["Agent-Team".to_string()],
             });
             assert!(try_handle_reset_command(&mut app, command).unwrap());
-            assert_eq!(
-                app.session_default_subagent_backend,
-                BackendId::from_session_config(None)
-            );
+            assert_eq!(app.session_default_subagent_backend, BackendId::KERNEL);
             assert!(app.session_default_subagent_model.is_none());
             assert!(app.session_default_skills.is_empty());
             assert!(app.pending_skill_continuation.is_none());

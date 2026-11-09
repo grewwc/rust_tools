@@ -68,7 +68,7 @@ pub(crate) fn execute_send_side_note(args: &Value) -> Result<String, String> {
     Ok(match (target.as_deref(), queued_backend) {
         (Some(target_id), Some(backend)) => format!(
             "Queued side-note for {} task `{target_id}` ({chars} chars); it will be prepended \
-             to the next `task`/`task_spawn` prompt that resumes this session via \
+             to the next `task_spawn` prompt that resumes this session via \
              `backend_continue_from`. It does not interrupt the current run; queued notes are \
              retained after completion or cancellation until continuation.",
             backend.as_str()

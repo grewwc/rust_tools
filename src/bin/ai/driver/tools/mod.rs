@@ -34,7 +34,9 @@ use crate::commonw::prompt::prompt_yes_or_no_interruptible;
 mod barrier;
 mod sync_task;
 
-/// 供 driver 内部的显式命令复用同步 `task` 路径，保持子代理隔离、取消和证据持久化语义。
+/// Driver-internal foreground subagent runner used by explicit commands such as
+/// `/audit`. It keeps the subagent's isolation, cancellation, and evidence
+/// persistence semantics without exposing a model-callable tool.
 pub(in crate::ai::driver) fn execute_direct_subagent_task(
     tool_call_id: &str,
     args: &Value,
@@ -720,15 +722,11 @@ fn execute_prepared_tool_call(
 ) -> Result<ToolResult, String> {
     match &prepared.route {
         ToolRoute::Builtin => {
-            if tool_call.function.name == "task" {
-                sync_task::execute_sync_task(&tool_call.id, &prepared.args).map(|tr| tr)
-            } else {
-                execute_prepared_builtin_tool_call(tool_call, prepared, |chunk| {
-                    if let Some(observer) = observer.as_deref_mut() {
-                        observer.on_tool_stream(tool_call, chunk);
-                    }
-                })
-            }
+            execute_prepared_builtin_tool_call(tool_call, prepared, |chunk| {
+                if let Some(observer) = observer.as_deref_mut() {
+                    observer.on_tool_stream(tool_call, chunk);
+                }
+            })
         }
         ToolRoute::Mcp {
             server_name,

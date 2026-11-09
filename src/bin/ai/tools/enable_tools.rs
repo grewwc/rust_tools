@@ -385,8 +385,8 @@ fn group_members(group: ToolGroup) -> Vec<String> {
 
 /// Whether a registered tool carries this exact name.
 ///
-/// A name can be both a tool and a group shortcut (`task`); callers use this to
-/// notice the collision instead of silently resolving only one meaning.
+/// A name can be both a tool and a group shortcut; callers use this to notice
+/// the collision instead of silently resolving only one meaning.
 fn tool_is_registered(name: &str) -> bool {
     inventory::iter::<ToolRegistration>
         .into_iter()
@@ -438,7 +438,7 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                     "Group shortcuts (a group name may be passed to 'enable'): {}",
                     parts.join(", ")
                 ));
-                // A shortcut name can also be a registered tool (`task`). Such a
+                // A shortcut name can also be a registered tool. Such a
                 // name never shows up in the enumeration above — either because
                 // it is active already or because 'enable' resolves it as the
                 // tool — so the model reads the reply as "this family is
@@ -481,7 +481,7 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
             // enable-ability flag rather than a loadable unit and never
             // expands, so a single entry can never dump the whole catalog;
             // per-name enables stay the fine-grained path. A name that is both
-            // a registered tool and a group (`task`) resolves both ways:
+            // a registered tool and a group resolves both ways:
             // answering a request for the family with "already active" for the
             // tool alone reads as "the family is unavailable", so the reply
             // names the collision and the expansion.
@@ -776,47 +776,25 @@ mod tests {
     }
 
     #[test]
-    fn tool_name_that_is_also_a_group_shortcut_resolves_both_ways() {
-        // `task` names both a registered tool and a group. Resolving the name as
-        // the tool alone answers a request for the family with "already active"
-        // while the rest of the family stays unloaded, which reads as "this
-        // family is unavailable"; the name must load the tool and expand the
-        // group, and the reply must state which of the two happened.
+    fn task_group_shortcut_loads_the_async_family() {
+        // `task` is only a group shortcut now: enabling it must expand to the
+        // async subagent family instead of resolving to a single tool.
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         reset_state_for_tests();
-        set_active_tool_names(vec!["enable_tools".to_string(), "task".to_string()]);
+        set_active_tool_names(vec!["enable_tools".to_string()]);
 
         let listed = execute_enable_tools(&json!({"operation": "list"})).unwrap();
-        assert!(
-            !listed.contains("  - task:"),
-            "a loaded tool is not part of the available enumeration: {listed}"
-        );
-        assert!(
-            listed.contains(
-                "Also registered tool names (enabling such a name loads the tool and expands the group): task"
-            ),
-            "the catalog must still disclose the collision: {listed}"
-        );
+        assert!(!listed.contains("  - task:"), "{listed}");
+        assert!(!listed.contains("Also registered tool names"), "{listed}");
 
         let enabled =
             execute_enable_tools(&json!({"operation": "enable", "tools": ["task"]})).unwrap();
         assert!(
-            enabled.contains("Name is both a tool and a group shortcut (resolved both ways): task"),
+            enabled.contains("Expanded group shortcut(s): task (9 tools)"),
             "{enabled}"
         );
-        assert!(
-            enabled.contains("Expanded group shortcut(s): task (10 tools)"),
-            "{enabled}"
-        );
-        assert!(
-            enabled.contains(
-                "Already active (already in this turn's tool set, call it directly): task"
-            ),
-            "{enabled}"
-        );
-        // 10 group members minus the already-loaded `task` itself, each once.
         assert!(enabled.contains("Enabled 9 tool(s)"), "{enabled}");
         for name in [
             "task_audit",
@@ -844,7 +822,6 @@ mod tests {
 
         let output = execute_enable_tools(&json!({"operation": "list"})).unwrap();
         for name in [
-            "task",
             "task_spawn",
             "task_retry",
             "task_wait",
@@ -1005,7 +982,6 @@ mod tests {
             let output = execute_enable_tools(&json!({"operation": "list"})).unwrap();
 
             for hidden in [
-                "task",
                 "task_spawn",
                 "task_wait",
                 "task_status",

@@ -159,8 +159,8 @@ mod tests {
     #[test]
     fn test_plan_delegate_without_parallelizable_stays_serial() {
         // delegate=true without explicit parallelizable: the step is SERIAL — it must not
-        // get the parallel prefix or parallel counting, and guidance routes it to the
-        // sequential synchronous `task`, not concurrent task_spawn.
+        // get the parallel prefix or parallel counting, and guidance routes it to a
+        // sequential task_spawn + task_wait, not concurrent task_spawn branches.
         let args = serde_json::json!({
             "summary": "Delegate a single independent module fix",
             "steps": [
@@ -177,10 +177,10 @@ mod tests {
         assert!(result.contains("[delegate]"));
         assert!(result.contains("1 step(s) marked for delegation."));
         assert!(!result.contains("can run in parallel."));
-        // Serial delegated steps use synchronous `task` calls one at a time.
-        assert!(result.contains("synchronous `task`"));
+        // Serial delegated steps use task_spawn + task_wait one at a time.
+        assert!(result.contains("task_spawn"));
+        assert!(result.contains("task_wait"));
         assert!(result.contains("one at a time"));
-        assert!(!result.contains("task_spawn"));
         assert!(!result.contains("Proceed to execute."));
     }
 
@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn test_plan_multiple_parallel_delegates_advise_concurrent_task_spawn() {
         // Two delegated steps with explicit parallelizable: guidance recommends concurrent
-        // task_spawn + a single task_wait, not the synchronous `task`.
+        // task_spawn + a single task_wait.
         let args = serde_json::json!({
             "summary": "Two independent module fixes",
             "steps": [
@@ -225,13 +225,12 @@ mod tests {
         assert!(result.contains("2 step(s) marked for delegation."));
         assert!(result.contains("concurrently via task_spawn"));
         assert!(result.contains("single task_wait"));
-        assert!(!result.contains("synchronous `task`"));
     }
 
     #[test]
     fn test_plan_multiple_serial_delegates_advise_sequential_task() {
         // Two delegated steps WITHOUT parallelizable are dependent/serial: they must run
-        // one at a time via the synchronous `task` — never concurrently via task_spawn.
+        // one at a time via task_spawn + task_wait — never concurrently.
         let args = serde_json::json!({
             "summary": "Two dependent module fixes",
             "steps": [
@@ -241,16 +240,15 @@ mod tests {
         });
         let result = execute_plan(&args).unwrap();
         assert!(result.contains("2 step(s) marked for delegation."));
-        assert!(result.contains("one at a time with the synchronous `task`"));
+        assert!(result.contains("one at a time via task_spawn followed by task_wait"));
         assert!(result.contains("never run dependent steps concurrently"));
         assert!(!result.contains("can run in parallel."));
-        assert!(!result.contains("task_spawn"));
     }
 
     #[test]
     fn test_plan_mixed_parallel_and_serial_delegates() {
-        // Mixed plans should recommend task_spawn for the parallel step and
-        // synchronous `task` for the serial step.
+        // Mixed plans should recommend task_spawn for the parallel step and a
+        // sequential task_spawn + task_wait for the serial step.
         let args = serde_json::json!({
             "summary": "One independent fix plus one dependent step",
             "steps": [
@@ -260,7 +258,7 @@ mod tests {
         });
         let result = execute_plan(&args).unwrap();
         assert!(result.contains("Spawn the single parallel delegated step via task_spawn"));
-        assert!(result.contains("one at a time with the synchronous `task`"));
+        assert!(result.contains("one at a time via task_spawn followed by task_wait"));
         assert!(result.contains("1 step(s) can run in parallel."));
         assert!(result.contains("2 step(s) marked for delegation."));
     }

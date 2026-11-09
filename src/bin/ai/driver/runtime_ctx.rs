@@ -7,7 +7,7 @@
 //
 // It is set up once per foreground/background turn in `driver::run_loop`
 // and inherited by every nested `tokio::spawn` that participates in
-// sub-agent dispatch (see `task_tools::execute_task`).
+// sub-agent dispatch (see `task_tools::spawn_subagent_kernel_task`).
 //
 // Holding `Arc<DriverContext>` keeps the structure cheap to clone while
 // still letting tools synthesise a fresh `task_app` for the spawned
@@ -16,7 +16,7 @@
 //
 // In addition to the parent-runtime snapshot, this module exposes several
 // finer-grained task-locals that drive persona isolation plus the
-// `inherit.memory` / `inherit.cwd` flags of the `task` / `task_spawn`
+// `inherit.memory` / `inherit.cwd` flags of the `task_spawn`
 // tools:
 //
 //   - `PERSONA_MEMORY_PATH` overrides `MemoryStore::from_env_or_config`
@@ -399,13 +399,13 @@ tokio::task_local! {
     /// to the parent agent. Absence means "no parent is interested".
     pub(crate) static SUBAGENT_RESULT_SLOT: SubagentResultSlot;
     /// When set, `runtime_ctx::publish_subagent_phase` writes the sub-agent's
-    /// current execution phase here so the spawning `task` tool's heartbeat
+    /// current execution phase here so the spawning tool's heartbeat
     /// line can surface it. Absence means "no parent is showing a heartbeat".
     pub(crate) static SUBAGENT_PHASE: SubagentPhaseSlot;
     /// Stable task id for background async tasks. The progress publisher uses it to persist the unified snapshot at low frequency and wake the
-    /// corresponding parent process; a synchronous `task` has no such scope but can still show heartbeats via the shared slot.
+    /// corresponding parent process; an in-process foreground runner can still show heartbeats via the shared slot.
     pub(crate) static SUBAGENT_TASK_ID: String;
-    /// Set when the parent's synchronous wait is about to hit its hard timeout; the subagent consumes it once to request immediate wrap-up.
+    /// Set when a foreground parent's wait is about to hit its hard timeout; the subagent consumes it once to request immediate wrap-up.
     pub(crate) static SUBAGENT_WRAP_UP_SIGNAL: SubagentWrapUpSignal;
     /// Background subagents do not own the terminal. Their full responses are still parsed, persisted, and returned to the parent through the
     /// result slot as usual, but streaming body, thinking, tool status, etc. must never write directly to stdout/stderr,
@@ -413,7 +413,7 @@ tokio::task_local! {
     pub(crate) static SUPPRESS_TERMINAL_OUTPUT: bool;
     /// Subagent nesting depth. Unset for the top-level agent (equivalent to 0); incremented each time
     /// a subagent is spawned. Guards against recursive fan-out of `mode: all` heavy agents
-    /// exhausting resources — `task_spawn` / `task` refuse to delegate further once `MAX_SUBAGENT_SPAWN_DEPTH`
+    /// exhausting resources — `task_spawn` refuses to delegate further once `MAX_SUBAGENT_SPAWN_DEPTH`
     /// is exceeded.
     pub(crate) static SUBAGENT_DEPTH: usize;
     /// The current turn's (session_id, turn_id) tuple. The driver run_loop enters it before each

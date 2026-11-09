@@ -598,7 +598,7 @@ impl ProgressLedger {
         let mut inject_advisory = false;
         for tool_call in tool_calls {
             match tool_call.function.name.as_str() {
-                "task" | "task_spawn" => {
+                "task_spawn" => {
                     self.delegation_calls_this_turn =
                         self.delegation_calls_this_turn.saturating_add(1);
                 }
@@ -1206,7 +1206,7 @@ pub(in crate::ai::driver) async fn run_turn(
     app.fire_turn_start_hooks(turn_index);
 
     let result = (async {
-        // `/audit` with an instruction runs the audit subagent synchronously, then
+        // `/audit` with an instruction runs the audit subagent in the foreground, then
         // auto-fixes by default: the same turn continues in the normal model loop
         // with the audit report as the fix prompt. `/audit` / `/audit -f` without
         // an instruction is NOT short-circuited: the audit scope is left to the
@@ -1346,7 +1346,7 @@ pub(in crate::ai::driver) async fn run_turn(
     result
 }
 
-/// Run the audit subagent synchronously and print its terminal report.
+/// Run the audit subagent in the foreground and print its terminal report.
 /// Returns the full report for the lead-agent fix loop, or `None` when the
 /// subagent could not start (nothing to fix). `/audit` auto-fixes by default:
 /// the caller feeds the returned report into the normal model loop instead of
@@ -1546,8 +1546,8 @@ async fn run_turn_body(
     };
 
     // `/audit` / `/audit -f` without an instruction: tell the lead agent to generate the audit
-    // content itself (only it knows the change details) and start the audit subagent via the
-    // `task` tool; the note is injected into the request projection only, not persisted history.
+    // content itself (only it knows the change details) and start the audit subagent via
+    // `task_spawn`; the note is injected into the request projection only, not persisted history.
     if let Some(fast) = self_generated_audit {
         crate::ai::driver::commands::audit::inject_self_generated_audit_note(&mut messages, fast);
         crate::ai::driver::print::print_tool_note_line(
@@ -2844,8 +2844,8 @@ async fn run_turn_body(
             )
             .await?;
             // Self-generated `/audit` enforcement: the injected note tells the lead agent
-            // to start the audit subagent itself through the task tool. If the turn ended
-            // without that (and was not interrupted), force a synchronous `/audit` with
+            // to start the audit subagent itself through task_spawn. If the turn ended
+            // without that (and was not interrupted), force a foreground `/audit` with
             // this turn's final text as the instruction, so the audit always runs in a
             // subagent instead of silently degrading to a lead-agent self-audit.
             if let Some(fast) = self_generated_audit

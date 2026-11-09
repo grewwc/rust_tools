@@ -236,7 +236,7 @@ pub fn print_agents_list(agent_manifests: &[AgentManifest]) {
     }
 
     if !subagents.is_empty() {
-        println!("\nSubagents (use @<name> in conversation or task tool):");
+        println!("\nSubagents (use @<name> in conversation or task_spawn):");
         for agent in &subagents {
             let color_info = agent.color.as_deref().unwrap_or("default");
             println!("  {} - {} ({})", agent.name, agent.description, color_info);

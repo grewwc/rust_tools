@@ -2,18 +2,33 @@
 
 use super::*;
 use crate::ai::driver::commands::use_backend::{
-    apply_subagent_use, format_use_state, reset_subagent_config,
+    agent_team_sticky, apply_subagent_use, effective_subagent_backend, format_use_state,
+    reset_subagent_config,
 };
 use crate::ai::tools::task_tools::BackendId;
 
+/// Render the config response. `subagent_backend` carries an explicitly stored
+/// canonical choice verbatim. Without one, an agent-team session reports the
+/// TraeCLI default its picker uses (and that the runtime applies), while an
+/// ordinary session reports empty so each client keeps its own initial picker
+/// selection (the mobile sheet defaults to TraeCLI) and the runtime stays on
+/// the kernel backend.
 fn session_config_response(config: &SessionServeConfig) -> serde_json::Value {
     let kernel_model = config.model.clone().unwrap_or_else(default_turn_model);
-    let subagent_backend = BackendId::from_session_config(config.subagent_backend.as_deref());
+    // A stored canonical choice is reported as-is. Without one, an agent-team
+    // session reports the TraeCLI default its mobile picker shows; an ordinary
+    // session reports empty so each client keeps its own initial picker
+    // selection while the runtime uses the kernel default.
+    let subagent_backend = match BackendId::canonical_stored(config.subagent_backend.as_deref()) {
+        Some(backend) => backend.as_str(),
+        None if agent_team_sticky(config) => effective_subagent_backend(config).as_str(),
+        None => "",
+    };
     serde_json::json!({
         "model": config.model.as_deref().unwrap_or_default(),
         "agent": config.agent.as_deref().unwrap_or_default(),
         "reasoning_effort": config.reasoning_effort.as_deref().unwrap_or_default(),
-        "subagent_backend": subagent_backend.as_str(),
+        "subagent_backend": subagent_backend,
         "subagent_model": config.subagent_model.as_deref().unwrap_or_default(),
         "default_skills": config.default_skills,
         "output": format_use_state(config, &kernel_model),
@@ -25,75 +40,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_config_subagent_backend_matches_runtime_for_available_backends() {
-        const CHILD_ENV: &str = "RUST_TOOLS_SESSION_BACKEND_DEFAULT_TEST_CHILD";
-        let Some(expected_default) = std::env::var_os(CHILD_ENV) else {
-            // Isolate availability overrides from concurrently running backend tests.
-            let exe = std::env::current_exe().unwrap();
-            let missing_binary = std::env::temp_dir()
-                .join(format!("missing-traecli-{}", uuid::Uuid::new_v4().simple()));
-            for (binary, expected) in [
-                (&exe, BackendId::TRAECLI),
-                (&missing_binary, BackendId::KERNEL),
-            ] {
-                let output = std::process::Command::new(&exe)
-                    .args([
-                        "--exact",
-                        "ai::serve::sessions::tests::session_config_subagent_backend_matches_runtime_for_available_backends",
-                    ])
-                    .env(CHILD_ENV, expected.as_str())
-                    .env("TRAECLI_BIN", binary)
-                    .output()
-                    .unwrap();
-                assert!(
-                    output.status.success(),
-                    "{} default failed:\n{}\n{}",
-                    expected.as_str(),
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
-            }
-            return;
-        };
-        let expected_default = BackendId::from_stored(expected_default.to_str());
-        for (stored, expected) in [
-            (None, expected_default),
-            (Some(""), expected_default),
-            (Some("kernel"), BackendId::KERNEL),
-            (Some("traecli"), BackendId::TRAECLI),
-            (Some("unknown-backend"), BackendId::KERNEL),
-            (Some("trae-cli"), BackendId::KERNEL),
+    fn session_config_reports_stored_choice_and_mode_aware_defaults() {
+        for (stored, expected_wire) in [
+            (None, ""),
+            (Some(""), ""),
+            (Some("kernel"), "kernel"),
+            (Some("traecli"), "traecli"),
+            (Some("unknown-backend"), ""),
+            (Some("trae-cli"), ""),
         ] {
             let config = SessionServeConfig {
                 subagent_backend: stored.map(str::to_string),
                 ..Default::default()
             };
-            let runtime_backend = BackendId::from_session_config(stored);
-            assert_eq!(runtime_backend, expected);
+            let runtime_backend = BackendId::from_stored(stored);
             let response = session_config_response(&config);
-            assert_eq!(response["subagent_backend"], runtime_backend.as_str());
+            // An ordinary session reports no stored choice, so the mobile
+            // picker keeps its own TraeCLI default while the runtime stays on
+            // the kernel backend.
+            assert_eq!(response["subagent_backend"], expected_wire);
             assert!(response["output"].as_str().unwrap().starts_with(&format!(
                 "Session default subagent backend: {}\n",
                 runtime_backend.as_str()
             )));
         }
 
-        // Exercise the driver's actual restore path with each availability override.
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "ai::driver::commands::session::tests::session_config_subagent_backends_roundtrip_canonical_ids_and_legacy_defaults",
-            ])
-            .output()
-            .unwrap();
+        // An agent-team session without an explicit pick keeps the TraeCLI
+        // default the mobile picker shows; resetting clears the team and the
+        // session returns to the kernel default.
+        let mut team = SessionServeConfig {
+            default_skills: vec!["AGENT-TEAM".to_string()],
+            ..Default::default()
+        };
+        let response = session_config_response(&team);
+        assert_eq!(response["subagent_backend"], "traecli");
         assert!(
-            output.status.success(),
-            "driver backend roundtrip failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            response["output"]
+                .as_str()
+                .unwrap()
+                .starts_with("Session default subagent backend: traecli\n")
         );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        reset_subagent_config(&mut team);
+        let response = session_config_response(&team);
+        assert_eq!(response["subagent_backend"], "");
+        assert!(
+            response["output"]
+                .as_str()
+                .unwrap()
+                .starts_with("Session default subagent backend: kernel\n")
+        );
     }
 }
 

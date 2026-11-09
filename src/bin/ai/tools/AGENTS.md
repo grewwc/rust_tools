@@ -28,7 +28,7 @@ Applies to `src/bin/ai/tools/**`. Layers: `registry/` (schema/metadata), `servic
 7. **Process groups.** Track each command pgid for teardown; never persist it. Kill commands target registered groups only (a shell redirection is not a kill target), and `rm` targets session temp only; external processes remain blocked and project deletes use `apply_patch`. A detaching launcher (`open -n`) is rejected: its app is re-parented to launchd and can never be registered, so launch the app binary with `&` instead.
 8. **Truncation.** Truncating tools must distinguish complete/failed/incomplete, include shown-vs-total counts and a narrow/page hint.
 9. **Patch/read/search.** Anchor patches on removed text, normalize confusables, and reject ambiguity; explicit envelopes own deletes and pure inserts use line numbers. `Replace in line` accepts exactly three single-line fields and requires a unique exact/trimmed match. Failures identify the hunk and echo reusable patch text. `patch` and `patch_file` are exclusive (8K/64K); patch files stay in session temp or `effective_cwd`.
-10. **Subagent tools are top-level only.** Hide `task` at depth and never re-enable
+10. **Subagent tools are top-level only.** Hide the task family at depth and never re-enable
     it. Scope by session+owner; persistence/integration follows the AI guide's
     **History is truth** contract. `task_evidence_read` defaults to progress; exact
     delivered reads neither collect nor mutate state. The bounded ledger points

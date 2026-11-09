@@ -30,60 +30,6 @@ pub(super) fn reset_task_wait_noop_count(key: &TaskWaitKey) {
 
 pub(super) const OUTSTANDING_SUBAGENT_TASKS_NOTE_PREFIX: &str = "[pending-subagent-tasks]";
 
-/// Task id list produced by the most recent successful `task_spawn`, used to
-/// detect the "lone spawn" anti-pattern: spawning a single task and immediately `task_wait`-ing to
-/// collect it. That scenario gains no concurrency and should use the synchronous `task` tool
-/// (spawn + wait is only slower). The hint is light normative guidance: it fires once, never
-/// rejects or blocks, and the model may ignore it (e.g. when it really did interleave parent-side
-/// work between spawn and wait).
-pub(super) struct LastSpawnBatch {
-    task_ids: Vec<String>,
-    hinted: bool,
-}
-pub(super) static LAST_SPAWN_BATCH: LazyLock<Mutex<Option<LastSpawnBatch>>> =
-    LazyLock::new(|| Mutex::new(None));
-
-pub(super) fn record_last_spawn_batch(task_ids: Vec<String>) {
-    *lock_unpoisoned(&LAST_SPAWN_BATCH) = Some(LastSpawnBatch {
-        task_ids,
-        hinted: false,
-    });
-}
-
-/// If this wait's task_ids match "the most recent spawn was a single task" and the hint has not
-/// been shown yet, return the normative hint text once (consuming the hinted flag so it fires at
-/// most once per whole session turn).
-pub(super) fn lone_spawn_hint_note(waited_task_ids: &[String]) -> Option<String> {
-    let mut guard = match LAST_SPAWN_BATCH.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let record = guard.as_mut()?;
-    if record.hinted || record.task_ids.len() != 1 {
-        return None;
-    }
-    let sole_id = &record.task_ids[0];
-    if !waited_task_ids.contains(sole_id) {
-        return None;
-    }
-    record.hinted = true;
-    Some(
-        "[tool_followup:lone_spawn]\n\
-         This task_wait collects the only task spawned by the most recent task_spawn call. \
-         Without parent-side work in between, task_spawn + task_wait adds no concurrency over the \
-         synchronous `task` tool. Keep the asynchronous form when an orchestration policy requires \
-         it or its immediate spawn status matters; otherwise prefer synchronous `task` for \
-         one-shot handoffs. \
-         (If you intentionally ran parent-side work between spawn and wait, ignore this hint.)"
-            .to_string(),
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn reset_last_spawn_batch_for_test() {
-    *lock_unpoisoned(&LAST_SPAWN_BATCH) = None;
-}
-
 pub(super) fn load_or_create_task_wait_state(
     key: &TaskWaitKey,
     timeout_secs: u64,
@@ -404,13 +350,6 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             already_delivered.len()
         ));
     }
-    // lone-spawn normative hint: computed only once (consuming the hinted flag), then uniformly
-    // appended at every later return point.
-    let lone_spawn_hint = if agent_team_mode {
-        None
-    } else {
-        lone_spawn_hint_note(&task_ids)
-    };
     let wait_key = task_wait_key(
         &current_session_id,
         current_owner_pid,
@@ -593,7 +532,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     }
     let wait_message = wait_result?;
     if let Some(message) = wait_message {
-        return Ok(append_lone_spawn_hint(message, lone_spawn_hint.as_deref()));
+        return Ok(message);
     }
     if agent_team_mode && !ready.is_empty() {
         // Deliver terminal evidence immediately, including partial `all` waits. The quiet
@@ -624,10 +563,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     // Fall through to the pending status branch, which reports ready output and pending ids.
     if wait_policy == WaitPolicy::Any && !ready.is_empty() && !wait_budget_elapsed {
         clear_task_wait_state(&wait_key);
-        return Ok(append_lone_spawn_hint(
-            ready.join("\n\n---\n\n"),
-            lone_spawn_hint.as_deref(),
-        ));
+        return Ok(ready.join("\n\n---\n\n"));
     }
     if !pending.is_empty() {
         // Surface partial progress instead of dropping it on the floor.
@@ -693,25 +629,11 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         };
         parts.push(pending_message);
         clear_task_wait_state(&wait_key);
-        return Ok(append_lone_spawn_hint(
-            parts.join("\n\n---\n\n"),
-            lone_spawn_hint.as_deref(),
-        ));
+        return Ok(parts.join("\n\n---\n\n"));
     }
 
     clear_task_wait_state(&wait_key);
-    Ok(append_lone_spawn_hint(
-        ready.join("\n\n---\n\n"),
-        lone_spawn_hint.as_deref(),
-    ))
-}
-
-pub(super) fn append_lone_spawn_hint(mut text: String, hint: Option<&str>) -> String {
-    if let Some(hint) = hint {
-        text.push_str("\n\n");
-        text.push_str(hint);
-    }
-    text
+    Ok(ready.join("\n\n---\n\n"))
 }
 
 // Queued backend notes remain visible after a checkpoint revision has been delivered.

@@ -1,4 +1,4 @@
-[subagent-pre-timeout-wrap-up] The foreground wait time for the current synchronous sub-task is about to run out.
+[subagent-pre-timeout-wrap-up] The foreground wait time for the current sub-task is about to run out.
 You are now in no-tool wrap-up mode: do not issue new tool calls or expand into new audit branches.
 Immediately produce a final answer based on the evidence gathered: first list the verified conclusions;
 separately mark risks that are not yet verified — never guess.

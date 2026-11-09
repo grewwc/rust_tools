@@ -321,69 +321,6 @@ fn task_spawn_requires_a_non_empty_tasks_array_and_preflights_every_item() {
     );
 }
 
-#[test]
-fn task_wait_hints_lone_spawn_and_consumes_hint_once() {
-    let _env_guard = crate::ai::test_support::ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    super::reset_last_spawn_batch_for_test();
-    super::record_last_spawn_batch(vec!["t-1".to_string()]);
-
-    let hint =
-        super::lone_spawn_hint_note(&["t-1".to_string()]).expect("lone spawn+wait should hint");
-    assert!(hint.contains("lone_spawn"));
-    assert!(hint.contains("synchronous `task`"));
-
-    // 只提示一次：hinted 置位后，同一会话内不再重复提示。
-    assert!(super::lone_spawn_hint_note(&["t-1".to_string()]).is_none());
-    super::reset_last_spawn_batch_for_test();
-}
-
-#[test]
-fn task_wait_no_hint_for_multi_task_spawn() {
-    let _env_guard = crate::ai::test_support::ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    super::reset_last_spawn_batch_for_test();
-    super::record_last_spawn_batch(vec!["t-1".to_string(), "t-2".to_string()]);
-    assert!(
-        super::lone_spawn_hint_note(&["t-1".to_string()]).is_none(),
-        "batch spawn 是真正的 fan-out，不应提示改用同步 task"
-    );
-    super::reset_last_spawn_batch_for_test();
-}
-
-#[test]
-fn task_wait_no_hint_when_waiting_unrelated_task() {
-    let _env_guard = crate::ai::test_support::ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    super::reset_last_spawn_batch_for_test();
-    super::record_last_spawn_batch(vec!["t-1".to_string()]);
-    assert!(
-        super::lone_spawn_hint_note(&["t-other".to_string()]).is_none(),
-        "wait 的不是最近 spawn 的任务，不提示"
-    );
-    // 未命中不消耗 hint：之后 wait 自己的任务仍可提示。
-    assert!(super::lone_spawn_hint_note(&["t-1".to_string()]).is_some());
-    super::reset_last_spawn_batch_for_test();
-}
-
-#[test]
-fn task_wait_no_hint_after_newer_spawn() {
-    let _env_guard = crate::ai::test_support::ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    super::reset_last_spawn_batch_for_test();
-    super::record_last_spawn_batch(vec!["t-1".to_string()]);
-    super::record_last_spawn_batch(vec!["t-2".to_string()]);
-    assert!(
-        super::lone_spawn_hint_note(&["t-1".to_string()]).is_none(),
-        "t-2 是更近的 spawn，wait 旧的 t-1 不提示"
-    );
-    super::reset_last_spawn_batch_for_test();
-}
-
 pub(super) fn test_app_with_model(current_model: String) -> App {
     App {
         cli: ParsedCli::default(),
@@ -851,7 +788,6 @@ fn traecli_model_attribution_agrees_across_spawn_status_and_delivery() {
                 assert_eq!(failed_batch["tasks"][0]["model"], parent_model);
                 assert_eq!(failed_batch["tasks"][1]["model"], backend_model);
                 discard_tasks_for_session(&app.session_id);
-                super::reset_last_spawn_batch_for_test();
             })
         },
     );
@@ -3281,7 +3217,6 @@ fn subagent_result_tools_are_never_lossy_and_gate_evidence_pruning_on_integratio
     // state. The integration call itself is a plain acknowledgement and stays
     // outside the pruning protocol entirely.
     let gated = [
-        "task",
         "task_wait",
         "task_status",
         "task_retry",

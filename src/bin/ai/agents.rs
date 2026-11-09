@@ -221,7 +221,7 @@ pub(super) struct AgentManifest {
     pub(super) disabled: bool,
     #[serde(default)]
     pub(super) hidden: bool,
-    /// Whether `task` may pick this agent when the caller omits `agent`.
+    /// Whether `task_spawn` may pick this agent when the caller omits `agent`.
     /// Agents whose system prompt fixes their output shape and forbids edits
     /// (audit reviewers) set this to `false`: a lexical score must never assign
     /// them work they are not allowed to do. They stay reachable by naming them

@@ -300,7 +300,7 @@ pub(super) fn inject_delegation_required_advisory(messages: &mut Vec<crate::ai::
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(
-            "[delegation-required-advisory] This turn requires delegation, but the parent just made a mutating tool call before using `task` or `task_spawn`. Hand the edit to a subagent now, or state the concrete reason delegation is unsafe."
+            "[delegation-required-advisory] This turn requires delegation, but the parent just made a mutating tool call before using `task_spawn`. Hand the edit to a subagent now, or state the concrete reason delegation is unsafe."
                 .to_string(),
         ),
         tool_calls: None,
@@ -315,7 +315,7 @@ pub(super) fn inject_delegation_exploration_advisory(
     messages.push(crate::ai::history::Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: serde_json::Value::String(
-            "[delegation-required-exploration-advisory] An active skill requires delegation, and the parent has continued tool work without using `task` or `task_spawn` in this turn. \
+            "[delegation-required-exploration-advisory] An active skill requires delegation, and the parent has continued tool work without using `task_spawn` in this turn. \
              Acceptance-only review under the active acceptance rules does not require a fresh discovery spawn, including across turns: the parent may only read a worker's already-returned exact final artifact/version and matching evidence. \
              This exception does not cover new searches, additional fact-finding, edits, command execution, or verification of artifacts the worker has not returned.\n\
              For new discovery or implementation work: Delegate a bounded discovery task now using the known objective, candidate paths, and missing evidence; the worker can do the remaining exploration. \

@@ -53,20 +53,16 @@ impl BackendId {
         Ok(Self::parse_optional(value)?.unwrap_or(Self::KERNEL))
     }
 
-    /// Stored values are canonical IDs. Legacy aliases still fall back to kernel.
+    /// Stored values are canonical IDs. Absent, empty, and unknown values fall
+    /// back to the kernel backend, an ordinary in-process conversation; the
+    /// TraeCLI preference belongs to the client picker, not to this resolver.
     pub(crate) fn from_stored(value: Option<&str>) -> Self {
-        value
-            .and_then(|name| super::backends::backend_registry().canonical_id(name))
-            .unwrap_or(Self::KERNEL)
+        Self::canonical_stored(value).unwrap_or(Self::KERNEL)
     }
 
-    /// Unset session preferences use TraeCLI when available. Persisted task
-    /// identities retain their legacy kernel interpretation in `from_stored`.
-    pub(crate) fn from_session_config(value: Option<&str>) -> Self {
-        match value {
-            None | Some("") if super::traecli::traecli_binary_available() => Self::TRAECLI,
-            _ => Self::from_stored(value),
-        }
+    /// Resolve a stored value only when it names a registered canonical ID.
+    pub(crate) fn canonical_stored(value: Option<&str>) -> Option<Self> {
+        value.and_then(|name| super::backends::backend_registry().canonical_id(name))
     }
 
     /// Preserve explicit choices independently of the session default.
