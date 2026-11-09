@@ -742,7 +742,8 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
         trim_compressed_tool_evidence_with_status(messages, overflow_dir);
     messages = trimmed_messages;
 
-    if messages_total_chars(&messages) <= max_chars {
+    let mut total = messages_total_chars(&messages);
+    if total <= max_chars {
         return finish(
             messages,
             evidence_window_failure.unwrap_or(ContextCompressionStatus::Complete),
@@ -760,7 +761,6 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
     // branches — semantically identical to calling
     // `messages_total_chars(&messages)` every round, but avoids repeatedly
     // O(n)-rescanning the whole message sequence across loop iterations.
-    let mut total = messages_total_chars(&messages);
     while total > max_chars {
         // Fold all unprotected tool groups over budget in one batch (both
         // compressible and non-compressible go through [`fold_early_tool_groups`])

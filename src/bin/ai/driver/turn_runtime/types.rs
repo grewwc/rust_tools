@@ -2,6 +2,12 @@ use crate::ai::history::Message;
 use rust_tools::commonw::FastSet;
 use std::path::PathBuf;
 
+pub(super) struct PersistableContextProjection {
+    pub(super) message_range: std::ops::Range<usize>,
+    pub(super) messages: Vec<Message>,
+    pub(super) basis: crate::ai::history::ContextSnapshotBasis,
+}
+
 pub(super) struct PreparedToolResult {
     pub(super) content_for_model: String,
     pub(super) content_for_terminal: String,
@@ -21,6 +27,7 @@ pub(super) struct LargeToolSummary {
 pub(super) struct TurnPreparation {
     pub(super) skill_turn: super::super::skill_runtime::SkillTurnGuard,
     pub(super) messages: Vec<Message>,
+    pub(super) persistable_context: Option<PersistableContextProjection>,
     pub(super) turn_messages: Vec<Message>,
     pub(super) persisted_turn_messages: usize,
     pub(super) max_iterations: usize,

@@ -210,19 +210,24 @@ async fn request_projection_does_not_call_summary_model() {
     fixture.assert_no_request().await;
 }
 
-/// Persisted budget compaction must carry a replay-heavy summary into the next
-/// turn instead of rebuilding the same oversized mechanical projection.
+/// Automatic persisted compaction remains mechanical even when protected replay
+/// leaves its soft character budget unmet.
 #[tokio::test]
-async fn compact_session_history_persists_replay_summary_across_turns() {
+async fn automatic_compaction_preserves_replay_without_model_summary() {
     use crate::ai::history::{
         append_history_messages, build_context_history_with_outcome, build_message_arr,
         compact_session_history_with_app,
         compress::{ContextCompressionStatus, encode_encrypted_reasoning_replay_state},
     };
 
-    let draft = "Goals:\n- Continue the requested fix.\nObservations to recheck:\n- Historical tool evidence is preserved in the source archive.";
-    let mut fixture = SummaryFixture::new("200 OK", draft).await;
-    let app = &mut fixture.app;
+    let mut app = test_app_with_cancel_stream(Arc::new(AtomicBool::new(false)));
+    let root = std::env::temp_dir().join(format!(
+        "automatic-mechanical-replay-{}",
+        uuid::Uuid::new_v4()
+    ));
+    app.config.history_file = root.join("history.sqlite");
+    app.session_id = "automatic-mechanical-replay".to_string();
+    let app = &mut app;
     let store = SessionStore::new(&app.config.history_file);
     app.session_history_file = store.session_history_file(&app.session_id);
     app.config.history_max_chars = 24_000;
@@ -306,68 +311,26 @@ async fn compact_session_history_persists_replay_summary_across_turns() {
     compact_session_history_with_app(app, None).await.unwrap();
 
     let persisted = build(app);
-    assert!(persisted.budget_met());
-    assert!(persisted.after_chars < mechanical.after_chars);
+    assert!(!persisted.budget_met());
     assert_eq!(persisted.messages.first(), canonical.first());
-    assert!(persisted.messages.ends_with(&tail));
-    // The accepted summary must bind the pre-pass span, including the original
-    // user intent that mechanical compression has already archived and removed.
-    let mut earlier = vec![canonical[1].clone()];
-    earlier.extend(old_pair.iter().cloned());
-    let record = assert_summary_source(&persisted.messages, &earlier, app);
-    assert_eq!(record["entries"][0]["text"], draft.lines().nth(1).unwrap());
-    assert_eq!(
-        build_message_arr(usize::MAX, &app.session_history_file).unwrap(),
-        canonical
-    );
-    let overflow_path = assets.join("overflow-history.md");
-    let archived = std::fs::read(&overflow_path).unwrap();
-
-    // An unchanged snapshot must not add a second increment or archive the same
-    // removed span again. The context cache must also contain the new projection.
-    compact_session_history_with_app(app, None).await.unwrap();
-    assert_eq!(build(app).messages, persisted.messages);
-    assert_eq!(std::fs::read(&overflow_path).unwrap(), archived);
-
-    let appended = text_message("user", &"New turn detail. ".repeat(200));
-    append_history_messages(&app.session_history_file, &[appended.clone()]).unwrap();
-    canonical.push(appended.clone());
-    let next = build(app);
+    assert!(persisted.messages.iter().any(|message| {
+        message.content.as_str() == Some("Check that the next turn reuses the projection.")
+    }));
     assert!(
-        next.budget_met(),
-        "the next turn must reuse the compact prefix"
-    );
-    assert_eq!(next.messages.last(), Some(&appended));
-    assert_eq!(
-        next.messages
+        persisted
+            .messages
             .iter()
-            .filter(|message| crate::ai::history::compress::is_incremental_summary(message))
-            .count(),
-        1
+            .any(|message| message.reasoning_content.as_deref() == Some(replay.as_str()))
     );
-    let (unchanged, before, after, effective, inserted) = mid_turn_llm_summarize(
-        app,
-        next.messages.clone(),
-        crate::ai::history::compress::MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
-        app.config.history_summary_max_chars,
-        app.config.history_max_chars,
-        None,
-    )
-    .await;
-    assert_eq!(unchanged, next.messages);
-    assert_eq!(before, after);
-    assert!(!effective && !inserted);
     assert_eq!(
         build_message_arr(usize::MAX, &app.session_history_file).unwrap(),
         canonical
     );
-    let request = fixture.request().await;
     assert!(
-        request["messages"][1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("Historical tool evidence")
+        !assets.join("summary-sources").exists(),
+        "automatic mechanical compaction must not invoke the model summarizer"
     );
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// Regression: when the older tool groups already saved more than 4K, we must not return early while still above hard_target.
@@ -649,7 +612,7 @@ async fn mid_turn_llm_summary_path_a_runs_when_old_user_turns_folded_away() {
     let earlier = messages[3..5].to_vec();
     let tail = messages[5..].to_vec();
     let (compressed, measured_before, after, effective, inserted) =
-        mid_turn_llm_summarize(app, messages, 2, 4_000, 20_000, None).await;
+        mid_turn_llm_summarize(app, messages, 2, 4_000, 8_000, None).await;
     assert!(
         after < before,
         "应发生压缩：after={} before={}",

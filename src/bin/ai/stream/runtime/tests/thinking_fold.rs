@@ -43,6 +43,58 @@ fn thinking_fold_keeps_reasoning_buffer_intact() {
 }
 
 #[test]
+fn serve_tool_call_start_keeps_thinking_fold_open() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    state.content.thinking_open = true;
+
+    let (_, frames) = crate::ai::background::capture_serve_frames(|| {
+        crate::ai::background::with_serve_live_streaming_for_test(true, || {
+            crate::ai::stream::inline_recovery::ensure_tool_calls_section_open(
+                &mut app, &markers, &mut state,
+            );
+        });
+    });
+
+    assert!(
+        state.content.thinking_open,
+        "a tool-call start must not close the serve thinking fold"
+    );
+    assert!(state.render.printed_tool_calls_header);
+    assert!(
+        frames.is_empty(),
+        "the serve close belongs at dispatch, but opening the section published {frames:?}"
+    );
+}
+
+#[test]
+fn serve_thinking_done_publishes_once_per_phase() {
+    use crate::ai::background::{ServeLiveKind, publish_serve_frame};
+
+    let (_, frames) = crate::ai::background::capture_serve_frames(|| {
+        crate::ai::background::with_serve_live_streaming_for_test(true, || {
+            publish_serve_frame(ServeLiveKind::ThinkingStart, "");
+            publish_serve_frame(ServeLiveKind::Thinking, "Wait again with a");
+            publish_serve_frame(ServeLiveKind::ThinkingDone, "");
+            // Stream-end finalize and tool dispatch also close the phase; a
+            // phase that is already closed must not emit another close.
+            publish_serve_frame(ServeLiveKind::ThinkingDone, "");
+            publish_serve_frame(ServeLiveKind::ThinkingDone, "");
+            // A later reasoning stretch is a new phase with its own close.
+            publish_serve_frame(ServeLiveKind::Thinking, "larger timeout.");
+            publish_serve_frame(ServeLiveKind::ThinkingDone, "");
+        });
+    });
+
+    let closes = frames
+        .iter()
+        .filter(|(kind, _)| *kind == ServeLiveKind::ThinkingDone)
+        .count();
+    assert_eq!(closes, 2, "one close per thinking phase: {frames:?}");
+}
+
+#[test]
 fn reasoning_summary_done_snapshot_does_not_duplicate_thinking() {
     // The Responses protocol first streams `.delta` increments, then re-sends the whole reasoning
     // summary via a `.done` event (SnapshotChunk). Without unseen-suffix dedup on the snapshot, thinking prints twice.

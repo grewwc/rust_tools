@@ -153,7 +153,10 @@ pub(super) fn rebase_metadata_after_rollback(
             .map_err(|e| io::Error::other(e.to_string()))?;
         // Each counter takes MAX(checkpoint value, live value) then +1 (generation/revision must strictly
         // increase; turn_seq can simply take the live value, since it is the “next number to allocate”).
-        let bump_gen = live_generation.saturating_add(1).max(0);
+        let bump_gen = live_generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("history generation overflow"))?
+            .max(0);
         let bump_rev = live_revision.saturating_add(1).max(0);
         let bump_turn = live_turn_seq.max(0);
         tx.execute(
@@ -171,7 +174,8 @@ pub(super) fn rebase_metadata_after_rollback(
                 "UPDATE context_snapshot
                  SET source_generation = (
                      SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'history_generation'
-                 )
+                 ),
+                     compression_state = NULL
                  WHERE singleton = 1",
                 [],
             )

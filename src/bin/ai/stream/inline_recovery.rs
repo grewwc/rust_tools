@@ -792,21 +792,9 @@ pub(super) fn ensure_tool_calls_section_open(
 
     let _ = clear_waiting_hint(state);
 
-    if state.content.thinking_open {
-        // If fold mode is active, render the fold ending first
-        if crate::ai::background::serve_live_streaming() {
-            // Serve children have no local fold: thinking arrives through
-            // frames, so the fold is never active here and the else branch
-            // below would print the raw close marker to child stdout, where
-            // the SSE line pump forwards it as a plain message (a stray
-            // `╰─ done thinking` row under the chat client's folded
-            // `✓ thinking` summary on every tool round). Close the remote
-            // fold instead; the chat-side close is idempotent.
-            crate::ai::background::publish_serve_frame(
-                crate::ai::background::ServeLiveKind::ThinkingDone,
-                "",
-            );
-        } else if state.render.thinking_fold.active {
+    if state.content.thinking_open && !crate::ai::background::serve_live_streaming() {
+        // If fold mode is active, render the fold ending first.
+        if state.render.thinking_fold.active {
             let _ = finalize_thinking_fold(state);
         } else {
             let _ = write_stream_content(
@@ -817,6 +805,16 @@ pub(super) fn ensure_tool_calls_section_open(
         }
         state.content.thinking_open = false;
     }
+    // Serve children keep the remote fold open here: starting the tool-call
+    // section only means argument bytes began streaming, and reasoning may
+    // continue afterwards. Closing now would split one reasoning block into
+    // two chat bubbles. `finalize_stream_response` closes the phase when the
+    // stream ends and `TerminalToolObserver::on_tool_dispatched` is the
+    // fallback before the tool card; the frame publisher emits one
+    // `ThinkingDone` per phase, so both paths cannot double-close it. No local
+    // fold exists on this path, so the marker branch above would otherwise
+    // leak the raw close line to child stdout, where the SSE line pump
+    // forwards it as a plain message.
     let _ = state.render.markdown.flush_pending();
     state.render.printed_tool_calls_header = true;
 }

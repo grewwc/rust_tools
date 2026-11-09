@@ -49,10 +49,14 @@ pub(super) use lock::{
 pub(in crate::ai) use connection::close_cached_write_conn;
 #[cfg(test)]
 pub(in crate::ai) use context::write_context_snapshot_sqlite;
+#[allow(unused_imports)]
+pub(in crate::ai) use context::write_context_snapshot_sqlite_if_stamp;
+#[cfg(test)]
+pub(in crate::ai) use context::write_context_snapshot_sqlite_with_busy_timeout;
 pub(in crate::ai) use context::{
     build_message_arr_sqlite, context_projection_within_compaction_limits_sqlite,
     read_context_history_sqlite, read_recent_messages_sqlite, read_recent_turn_window_sqlite,
-    write_context_snapshot_sqlite_with_busy_timeout,
+    write_context_snapshot_sqlite_if_revision,
 };
 pub(in crate::ai) use metadata::{
     MarkMessageUpdate, read_first_user_prompt_sqlite, read_session_archived_sqlite,
@@ -85,10 +89,11 @@ pub(in crate::ai) use rollback::{
     restore_staged_sqlite_after_rollback,
 };
 pub(in crate::ai) use store::{
-    ContextHistory, SessionListMetadata, append_history_sqlite, append_history_sqlite_for_model,
-    coalesce_repeated_wait_wake_notes_sqlite, count_user_turns_sqlite,
-    message_count_sqlite_read_only, read_all_messages_sqlite, read_all_messages_sqlite_read_only,
-    read_all_messages_with_models_sqlite, replace_all_messages_sqlite, reserve_turn_index_sqlite,
+    ContextHistory, SessionListMetadata, SnapshotReadMeta, SnapshotStamp, append_history_sqlite,
+    append_history_sqlite_for_model, coalesce_repeated_wait_wake_notes_sqlite,
+    count_user_turns_sqlite, message_count_sqlite_read_only, read_all_messages_sqlite,
+    read_all_messages_sqlite_read_only, read_all_messages_with_models_sqlite,
+    replace_all_messages_sqlite, reserve_turn_index_sqlite,
 };
 pub(in crate::ai) use trim::{
     clear_session_history_sqlite, remap_session_asset_paths_sqlite, truncate_messages_sqlite,

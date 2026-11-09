@@ -16,11 +16,14 @@ use super::connection::{
 };
 use super::lock::with_session_state_lock_until;
 use super::migrations::init_history_schema;
-use super::revision::{bump_history_revision, history_generation};
-use super::store::{
-    ContextHistory, RecentTurnWindow, decode_message_content, decode_tool_calls,
-    read_messages_since_id, read_messages_with_sql,
+use super::revision::{
+    bump_history_revision, clear_context_snapshot_compression_state, history_generation,
 };
+use super::store::{
+    RecentTurnWindow, decode_message_content, decode_tool_calls, read_messages_since_id,
+    read_messages_with_sql,
+};
+use super::{ContextHistory, SnapshotReadMeta, SnapshotStamp};
 
 fn read_projected_canonical_messages_after_id(
     conn: &Connection,
@@ -73,17 +76,20 @@ fn read_projected_canonical_messages_after_id(
 /// same persisted projection as a freshly written snapshot; guidance filtering
 /// still runs whenever the projection is served.
 pub(super) fn extend_context_snapshot_through_latest(conn: &Connection) -> io::Result<()> {
-    let watermark: Option<i64> = conn
+    let snapshot: Option<(i64, i64)> = conn
         .query_row(
-            "SELECT source_message_id FROM context_snapshot WHERE singleton = 1",
+            "SELECT source_message_id, snapshot_revision
+             FROM context_snapshot WHERE singleton = 1",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|error| io::Error::other(error.to_string()))?;
-    let Some(watermark) = watermark else {
+    let Some((watermark, snapshot_revision)) = snapshot else {
         return Ok(());
     };
+    // Rewinds invalidate reuse even when no canonical tail survives.
+    clear_context_snapshot_compression_state(conn)?;
     let latest: i64 = conn
         .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| {
             row.get(0)
@@ -92,6 +98,9 @@ pub(super) fn extend_context_snapshot_through_latest(conn: &Connection) -> io::R
     if latest <= watermark {
         return Ok(());
     }
+    let next_snapshot_revision = snapshot_revision
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("context snapshot revision overflow"))?;
     let tail = read_projected_canonical_messages_after_id(conn, watermark)
         .map_err(|error| io::Error::other(error.to_string()))?;
     let next_position: i64 = conn
@@ -129,8 +138,11 @@ pub(super) fn extend_context_snapshot_through_latest(conn: &Connection) -> io::R
     }
     drop(stmt);
     conn.execute(
-        "UPDATE context_snapshot SET source_message_id = ?1 WHERE singleton = 1",
-        params![latest],
+        "UPDATE context_snapshot
+         SET source_message_id = ?1,
+             snapshot_revision = ?2
+         WHERE singleton = 1",
+        params![latest, next_snapshot_revision],
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(())
@@ -325,7 +337,8 @@ fn read_context_history_on_conn(
         .map_err(|error| io::Error::other(error.to_string()))?;
     let snapshot = tx
         .query_row(
-            "SELECT source_message_id, source_generation, projection_fingerprint
+            "SELECT source_message_id, source_generation, projection_fingerprint,
+                    snapshot_revision, compression_state
              FROM context_snapshot WHERE singleton = 1",
             [],
             |row| {
@@ -333,26 +346,43 @@ fn read_context_history_on_conn(
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .optional()
-        .map_err(|error| io::Error::other(error.to_string()))?
-        .filter(|(_, generation, fingerprint)| {
-            *generation == canonical_generation && fingerprint == projection_fingerprint
-        });
-
-    let (mut messages, after_id, has_snapshot) = if let Some((source_message_id, _, _)) = snapshot {
-        let messages = read_messages_with_sql(
-            &tx,
-            "SELECT role, content, tool_calls, tool_call_id, reasoning_content
-                 FROM context_messages ORDER BY position ASC",
-        )
         .map_err(|error| io::Error::other(error.to_string()))?;
-        (messages, source_message_id, true)
-    } else {
-        (Vec::new(), 0, false)
+    // The epoch belongs to the physical singleton, including a snapshot that
+    // the read policy rejects. Generation always comes from canonical metadata.
+    let snapshot_revision = snapshot.as_ref().map_or(0, |snapshot| snapshot.3);
+    let snapshot_stamp = SnapshotStamp {
+        canonical_generation,
+        snapshot_revision,
     };
+    let snapshot = snapshot.filter(|(_, generation, fingerprint, _, _)| {
+        *generation == canonical_generation && fingerprint == projection_fingerprint
+    });
+
+    let (mut messages, after_id, mut snapshot_meta) =
+        if let Some((source_message_id, _, fingerprint, _, compression_state)) = snapshot {
+            let messages = read_messages_with_sql(
+                &tx,
+                "SELECT role, content, tool_calls, tool_call_id, reasoning_content
+                     FROM context_messages ORDER BY position ASC",
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+            let meta = SnapshotReadMeta {
+                source_message_id,
+                message_count: messages.len(),
+                projection_fingerprint: fingerprint,
+                compression_state,
+                guidance_unchanged: true,
+            };
+            (messages, source_message_id, Some(meta))
+        } else {
+            (Vec::new(), 0, None)
+        };
     messages.extend(
         read_projected_canonical_messages_after_id(&tx, after_id)
             .map_err(|error| io::Error::other(error.to_string()))?,
@@ -366,11 +396,19 @@ fn read_context_history_on_conn(
     let mut guidance = ToolGuidanceFilter::new(&messages);
     messages.retain(|message| guidance.keep(message));
     let guidance_unchanged = messages.len() == original_len;
+    if let Some(meta) = snapshot_meta.as_mut() {
+        meta.guidance_unchanged = guidance_unchanged;
+    }
+    let snapshot_is_current =
+        snapshot_meta.is_some() && after_id == latest_message_id && guidance_unchanged;
     Ok(ContextHistory {
         messages,
         source_message_id: latest_message_id,
         canonical_generation,
-        snapshot_is_current: has_snapshot && after_id == latest_message_id && guidance_unchanged,
+        snapshot_revision,
+        snapshot_stamp,
+        snapshot_meta,
+        snapshot_is_current,
     })
 }
 
@@ -402,6 +440,81 @@ pub(in crate::ai) fn write_context_snapshot_sqlite_with_busy_timeout(
     projection_fingerprint: &str,
     busy_timeout: Duration,
 ) -> io::Result<bool> {
+    write_context_snapshot_sqlite_with_revision(
+        path,
+        messages,
+        source_message_id,
+        canonical_generation,
+        projection_fingerprint,
+        None,
+        None,
+        busy_timeout,
+    )
+    .map(|stamp| stamp.is_some())
+}
+
+/// Replace a snapshot only when it is still the snapshot the caller read.
+/// Competing snapshot mutations advance this revision, so stale mechanical work
+/// cannot overwrite a newer LLM summary. A plain canonical tail remains
+/// mergeable; extending a current snapshot through that tail also advances the
+/// revision and conservatively rejects work based on the older snapshot.
+pub(in crate::ai) fn write_context_snapshot_sqlite_if_revision(
+    path: &Path,
+    messages: &[Message],
+    source_message_id: i64,
+    canonical_generation: i64,
+    projection_fingerprint: &str,
+    expected_snapshot_revision: i64,
+    busy_timeout: Duration,
+) -> io::Result<bool> {
+    write_context_snapshot_sqlite_if_stamp(
+        path,
+        messages,
+        source_message_id,
+        projection_fingerprint,
+        SnapshotStamp {
+            canonical_generation,
+            snapshot_revision: expected_snapshot_revision,
+        },
+        None,
+        busy_timeout,
+    )
+    .map(|stamp| stamp.is_some())
+}
+
+/// Atomically persist a projection and its compression certificate if both
+/// canonical lineage and physical snapshot epoch still match the read stamp.
+pub(in crate::ai) fn write_context_snapshot_sqlite_if_stamp(
+    path: &Path,
+    messages: &[Message],
+    source_message_id: i64,
+    projection_fingerprint: &str,
+    expected: SnapshotStamp,
+    compression_state: Option<&str>,
+    busy_timeout: Duration,
+) -> io::Result<Option<SnapshotStamp>> {
+    write_context_snapshot_sqlite_with_revision(
+        path,
+        messages,
+        source_message_id,
+        expected.canonical_generation,
+        projection_fingerprint,
+        Some(expected.snapshot_revision),
+        compression_state,
+        busy_timeout,
+    )
+}
+
+fn write_context_snapshot_sqlite_with_revision(
+    path: &Path,
+    messages: &[Message],
+    source_message_id: i64,
+    canonical_generation: i64,
+    projection_fingerprint: &str,
+    expected_snapshot_revision: Option<i64>,
+    compression_state: Option<&str>,
+    busy_timeout: Duration,
+) -> io::Result<Option<SnapshotStamp>> {
     let deadline = Instant::now() + busy_timeout;
     with_session_state_lock_until(path, deadline, || {
         let remaining = deadline
@@ -413,33 +526,58 @@ pub(in crate::ai) fn write_context_snapshot_sqlite_with_busy_timeout(
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| sqlite_error(path, "begin context snapshot transaction", error))?;
         if history_generation(&tx)? != canonical_generation {
-            return Ok(false);
+            return Ok(None);
         }
+        let current_snapshot_revision = tx
+            .query_row(
+                "SELECT snapshot_revision FROM context_snapshot WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| sqlite_error(path, "read context snapshot revision", error))?
+            .unwrap_or(0);
+        if expected_snapshot_revision.is_some_and(|expected| expected != current_snapshot_revision)
+        {
+            return Ok(None);
+        }
+        let stamp = SnapshotStamp {
+            canonical_generation,
+            snapshot_revision: current_snapshot_revision
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("context snapshot revision overflow"))?,
+        };
 
         archive_context_snapshot(&tx, path)?;
         prune_context_snapshot_history(&tx, path)?;
         tx.execute("DELETE FROM context_messages", [])
             .map_err(|error| sqlite_error(path, "clear context_messages", error))?;
-        insert_context_messages(&tx, path, messages)?;
+        let guidance_unchanged = insert_context_messages(&tx, path, messages)?;
+        let compression_state = compression_state.filter(|_| guidance_unchanged);
         tx.execute(
             "INSERT INTO context_snapshot
-                (singleton, source_message_id, source_generation, projection_fingerprint)
-             VALUES (1, ?1, ?2, ?3)
+                (singleton, source_message_id, source_generation, projection_fingerprint,
+                 snapshot_revision, compression_state)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(singleton) DO UPDATE SET
                 source_message_id = excluded.source_message_id,
                 source_generation = excluded.source_generation,
-                projection_fingerprint = excluded.projection_fingerprint",
+                projection_fingerprint = excluded.projection_fingerprint,
+                snapshot_revision = excluded.snapshot_revision,
+                compression_state = excluded.compression_state",
             params![
                 source_message_id,
                 canonical_generation,
-                projection_fingerprint
+                projection_fingerprint,
+                stamp.snapshot_revision,
+                compression_state,
             ],
         )
         .map_err(|error| sqlite_error(path, "upsert context_snapshot", error))?;
         bump_history_revision(&tx)?;
         tx.commit()
             .map_err(|error| sqlite_error(path, "commit context snapshot transaction", error))?;
-        Ok(true)
+        Ok(Some(stamp))
     })
 }
 
@@ -635,13 +773,14 @@ pub(super) fn promote_context_snapshot_from_history(
     }
     conn.execute(
         "INSERT INTO context_snapshot
-            (singleton, source_message_id, source_generation, projection_fingerprint)
-         SELECT 1, source_message_id, ?2, projection_fingerprint
+            (singleton, source_message_id, source_generation, projection_fingerprint, compression_state)
+         SELECT 1, source_message_id, ?2, projection_fingerprint, NULL
          FROM context_snapshot_history WHERE snapshot_id = ?1
          ON CONFLICT(singleton) DO UPDATE SET
             source_message_id = excluded.source_message_id,
             source_generation = excluded.source_generation,
-            projection_fingerprint = excluded.projection_fingerprint",
+            projection_fingerprint = excluded.projection_fingerprint,
+            compression_state = NULL",
         params![snapshot_id, generation],
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
@@ -653,7 +792,12 @@ pub(super) fn promote_context_snapshot_from_history(
     Ok(true)
 }
 
-fn insert_context_messages(conn: &Connection, path: &Path, messages: &[Message]) -> io::Result<()> {
+/// Returns whether guidance filtering preserved every input message.
+fn insert_context_messages(
+    conn: &Connection,
+    path: &Path,
+    messages: &[Message],
+) -> io::Result<bool> {
     let mut stmt = conn
         .prepare(
             "INSERT INTO context_messages
@@ -662,6 +806,7 @@ fn insert_context_messages(conn: &Connection, path: &Path, messages: &[Message])
         )
         .map_err(|error| sqlite_error(path, "prepare context_messages insert", error))?;
     let mut guidance = ToolGuidanceFilter::new(messages);
+    let mut inserted_count = 0;
     for (position, message) in messages
         .iter()
         .filter(|message| guidance.keep(message))
@@ -690,8 +835,9 @@ fn insert_context_messages(conn: &Connection, path: &Path, messages: &[Message])
                 error,
             )
         })?;
+        inserted_count += 1;
     }
-    Ok(())
+    Ok(inserted_count == messages.len())
 }
 pub(in crate::ai) fn build_message_arr_sqlite(
     history_count: usize,

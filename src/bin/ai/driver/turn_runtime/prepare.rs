@@ -6,14 +6,14 @@ use crate::ai::mcp::SharedMcpClient;
 use crate::ai::{
     driver::skill_runtime,
     history::{
-        Message, ROLE_INTERNAL_NOTE, build_context_history_with_outcome,
+        Message, ROLE_INTERNAL_NOTE, build_context_history_with_snapshot_basis,
         runtime_synthetic_user_message,
     },
     request,
     types::App,
 };
 
-use super::types::TurnPreparation;
+use super::types::{PersistableContextProjection, TurnPreparation};
 
 fn current_request_tool_names(app: &App) -> rust_tools::commonw::FastSet<String> {
     app.agent_context
@@ -406,7 +406,7 @@ pub(super) async fn prepare_turn(
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok();
     let reference_assets_dir = attachment_assets_dir.clone();
     let history_task = tokio::task::spawn_blocking(move || {
-        let outcome = build_context_history_with_outcome(
+        let (outcome, snapshot_basis) = build_context_history_with_snapshot_basis(
             history_count,
             &history_file,
             history_max_chars,
@@ -441,7 +441,12 @@ pub(super) async fn prepare_turn(
                 Some(reference_assets_dir.as_path()),
             );
         }
-        Ok::<_, String>((history, compression_diagnostic, digest_outcome.pending))
+        Ok::<_, String>((
+            history,
+            compression_diagnostic,
+            digest_outcome.pending,
+            snapshot_basis,
+        ))
     });
     // Skill routing reads runtime manifests and MCP metadata, while the history
     // task reads the session projection and attachment assets. Their inputs are
@@ -457,15 +462,16 @@ pub(super) async fn prepare_turn(
         Ok(result) => result,
         Err(error) => Err(format!("context history task failed: {error}")),
     };
-    let (history, compression_diagnostic, pending_image_digests) = match history_result {
-        Ok(history) => history,
-        Err(error) => {
-            if let Ok(skill_turn) = skill_turn_result {
-                skill_turn.restore_agent_context(app);
+    let (history, compression_diagnostic, pending_image_digests, snapshot_basis) =
+        match history_result {
+            Ok(history) => history,
+            Err(error) => {
+                if let Ok(skill_turn) = skill_turn_result {
+                    skill_turn.restore_agent_context(app);
+                }
+                return Err(error.into());
             }
-            return Err(error.into());
-        }
-    };
+        };
     if let Some(diagnostic) = compression_diagnostic
         && crate::ai::driver::runtime_ctx::terminal_output_enabled()
     {
@@ -667,7 +673,10 @@ pub(super) async fn prepare_turn(
             messages.push(reminder);
         }
     }
+    let persistable_history = snapshot_basis.as_ref().map(|_| history.clone());
+    let history_start = messages.len();
     messages.extend(history);
+    let history_end = messages.len();
     if let Some(ledger) = task_evidence_ledger {
         messages.extend(task_evidence_handoff_messages(&ledger));
     }
@@ -779,6 +788,11 @@ pub(super) async fn prepare_turn(
     Ok(TurnPreparation {
         skill_turn,
         messages,
+        persistable_context: snapshot_basis.map(|basis| PersistableContextProjection {
+            message_range: history_start..history_end,
+            messages: persistable_history.unwrap_or_default(),
+            basis,
+        }),
         turn_messages,
         persisted_turn_messages: 0,
         max_iterations,

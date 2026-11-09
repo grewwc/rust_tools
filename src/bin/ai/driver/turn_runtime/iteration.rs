@@ -22,7 +22,7 @@ use super::{
     TurnOutcome, context_budget,
     persistence::persist_pending_turn_messages,
     record_llm_summary_attempt_chars, should_try_llm_summary,
-    types::{IterationExecution, ToolCallExecution},
+    types::{IterationExecution, PersistableContextProjection, ToolCallExecution},
 };
 
 struct StreamingFlagGuard {
@@ -1228,10 +1228,28 @@ async fn send_llm_request(
 
 /// Measure only after runtime notes, tool visibility and fixed plan overhead are
 /// present. Character targets guide mechanical work; they never establish fit.
+fn locate_persistable_context(
+    messages: &[Message],
+    projection: &PersistableContextProjection,
+) -> Option<std::ops::Range<usize>> {
+    if projection.messages.is_empty() {
+        return None;
+    }
+    let preferred = projection.message_range.clone();
+    if preferred.end <= messages.len() && messages[preferred.clone()] == projection.messages[..] {
+        return Some(preferred);
+    }
+    messages
+        .windows(projection.messages.len())
+        .position(|window| window == projection.messages)
+        .map(|start| start..start + projection.messages.len())
+}
+
 async fn apply_request_budget(
     app: &App,
     model: &str,
     messages: &mut Vec<Message>,
+    persistable_context: &mut Option<PersistableContextProjection>,
     tools_enabled: bool,
     iteration: usize,
     compression_report: &mut CompressionReport,
@@ -1246,6 +1264,7 @@ async fn apply_request_budget(
         "projection_maintenance"
     };
     let attempt = CompactionAttempt::start(trigger, before, messages);
+    let request_before_mechanical = messages.clone();
     // Re-measure only after a real projection change. When normalized tokens
     // remain above the target, the shared helper uses that feedback for a
     // bounded follow-up pass instead of retrying the same raw-char target on
@@ -1279,7 +1298,118 @@ async fn apply_request_budget(
     // `post_chars` already describes the current projection unless the LLM
     // summary replaced it below; reuse it instead of scanning a third time.
     let mut chars = post_chars;
+    let mut llm_attempted = false;
     if budget.exceeds_input_allowance() && should_try_llm_summary(&app.session_id, chars, 0) {
+        let attempt = CompactionAttempt::start("llm_input_allowance", budget, messages);
+        if let Some(projection) = persistable_context.take()
+            && let Some(range) = locate_persistable_context(&request_before_mechanical, &projection)
+        {
+            let full_chars =
+                crate::ai::history::messages_total_chars_pub(&request_before_mechanical);
+            let history_chars = crate::ai::history::messages_total_chars_pub(&projection.messages);
+            let outside_chars = full_chars.saturating_sub(history_chars);
+            let history_target = budget
+                .compression_target_chars(chars)
+                .saturating_sub(outside_chars);
+            let (candidate_history, _, _, effective, inserted) =
+                crate::ai::history::mid_turn_llm_summarize(
+                    app,
+                    projection.messages.clone(),
+                    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
+                    MID_TURN_LLM_SUMMARY_MAX_CHARS,
+                    history_target,
+                    crate::ai::driver::runtime_ctx::effective_cwd()
+                        .ok()
+                        .as_deref(),
+                )
+                .await;
+            // A false/false outcome is the structural no-op path (for example,
+            // too few historical turns to split) and did not consume a model
+            // summary. Let the full-request fallback handle that case.
+            llm_attempted = inserted || effective;
+
+            if inserted {
+                let history_file = app.session_history_file.clone();
+                let basis = projection.basis;
+                let snapshot_messages = candidate_history.clone();
+                let snapshot_write = tokio::task::spawn_blocking(move || {
+                    crate::ai::history::persist_context_snapshot_from_basis(
+                        &history_file,
+                        &snapshot_messages,
+                        &basis,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .await;
+                match snapshot_write {
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => crate::ai::driver::print::print_tool_note_line(
+                        "context-budget",
+                        "LLM summary was used for this request, but its reusable snapshot was stale; the next turn will rebuild from canonical history.",
+                    ),
+                    Ok(Err(error)) => crate::ai::driver::print::print_tool_note_line(
+                        "context-budget",
+                        &format!("Could not persist reusable LLM summary: {error}"),
+                    ),
+                    Err(error) => crate::ai::driver::print::print_tool_note_line(
+                        "context-budget",
+                        &format!("Reusable LLM summary task failed: {error}"),
+                    ),
+                }
+
+                let mut candidate = Vec::with_capacity(
+                    request_before_mechanical.len() - projection.messages.len()
+                        + candidate_history.len(),
+                );
+                candidate.extend_from_slice(&request_before_mechanical[..range.start]);
+                candidate.extend(candidate_history);
+                candidate.extend_from_slice(&request_before_mechanical[range.end..]);
+                let candidate_before =
+                    request::preview_request_budget(app, model, &candidate, true, tools_enabled)
+                        .await;
+                let (candidate_budget, rerun_report) =
+                    context_budget::apply_measured_context_budget_until_soft_target(
+                        app,
+                        model,
+                        candidate_before,
+                        &mut candidate,
+                        tools_enabled,
+                    )
+                    .await;
+                if let Some(reason) = rerun_report.rollback_reason {
+                    crate::ai::driver::print::print_tool_note_line("context-budget", reason.note());
+                }
+                *messages = candidate;
+                budget = candidate_budget;
+            }
+
+            let after_chars = crate::ai::history::messages_total_chars_pub(messages);
+            attempt.finish(
+                &app.session_id,
+                iteration,
+                model,
+                budget,
+                messages,
+                inserted,
+            );
+            compression_report.record_llm_summary_attempt(
+                format!(
+                    "pre-request persistent LLM ({} tokens)",
+                    budget.limits.input_allowance_tokens
+                ),
+                chars,
+                after_chars,
+                effective,
+                inserted,
+            );
+            record_llm_summary_attempt_chars(&app.session_id, after_chars);
+            chars = after_chars;
+        }
+    }
+    if budget.exceeds_input_allowance()
+        && !llm_attempted
+        && should_try_llm_summary(&app.session_id, chars, 0)
+    {
         let attempt = CompactionAttempt::start("llm_input_allowance", budget, messages);
         // Work on a clone: dropping this future during cancellation must retain
         // the complete live projection, including its active-plan handoff.
@@ -1318,6 +1448,9 @@ async fn apply_request_budget(
         record_llm_summary_attempt_chars(&app.session_id, after_chars);
         chars = after_chars;
     }
+    if report.projection_committed() && !llm_attempted {
+        *persistable_context = None;
+    }
     let _ = chars;
     budget
 }
@@ -1343,6 +1476,7 @@ async fn request_model_response(
     app: &mut App,
     next_model: &str,
     messages: &mut Vec<Message>,
+    persistable_context: &mut Option<PersistableContextProjection>,
     force_final_response: bool,
     _iteration: usize,
     mut compression_report: CompressionReport,
@@ -1391,6 +1525,7 @@ async fn request_model_response(
         app,
         next_model,
         messages,
+        persistable_context,
         !force_final_response,
         _iteration,
         &mut compression_report,
@@ -1457,6 +1592,7 @@ async fn request_model_response(
                     app,
                     &fallback_model,
                     messages,
+                    persistable_context,
                     !force_final_response,
                     _iteration,
                     &mut fallback_report,
@@ -1747,6 +1883,7 @@ pub(super) async fn execute_turn_iteration(
     next_model: &str,
     response_model: &mut Option<String>,
     messages: &mut Vec<Message>,
+    persistable_context: &mut Option<PersistableContextProjection>,
     turn_messages: &[Message],
     one_shot_mode: bool,
     persisted_turn_messages: &mut usize,
@@ -1774,6 +1911,7 @@ pub(super) async fn execute_turn_iteration(
             app,
             next_model,
             messages,
+            persistable_context,
             force_final_response,
             iteration,
             compression_report,

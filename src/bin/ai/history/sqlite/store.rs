@@ -18,15 +18,38 @@ use super::{
     revision::{bump_history_revision, invalidate_context_snapshot, touch_session_activity},
 };
 
-/// The rebuildable context consumed by the model's actual request. `messages` is
-/// always the one canonical record of the session; the messages here are only a
-/// compression snapshot, and adding the raw messages after `source_message_id`
-/// rebuilds the current context. `canonical_generation` rejects stale snapshots
-/// produced by a concurrent rewind/clear.
+/// The canonical lineage and physical snapshot epoch used to fence writes.
+/// Ordinary canonical appends leave both counters unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::ai) struct SnapshotStamp {
+    pub(in crate::ai) canonical_generation: i64,
+    pub(in crate::ai) snapshot_revision: i64,
+}
+
+/// Metadata for the stored prefix accepted by the current projection policy.
+/// Its message count and watermark describe the snapshot before merging the
+/// canonical tail and applying turn-scoped guidance filtering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::ai) struct SnapshotReadMeta {
+    pub(in crate::ai) source_message_id: i64,
+    pub(in crate::ai) message_count: usize,
+    pub(in crate::ai) projection_fingerprint: String,
+    pub(in crate::ai) compression_state: Option<String>,
+    pub(in crate::ai) guidance_unchanged: bool,
+}
+
+/// The rebuildable context consumed by the model's actual request. Canonical
+/// `messages` rows are the durable truth; this projection combines a compatible
+/// snapshot with the canonical tail. `source_message_id` is the latest canonical
+/// watermark. The write stamp remains available even when policy filtering
+/// rejects the stored prefix.
 pub(in crate::ai) struct ContextHistory {
     pub(in crate::ai) messages: Vec<Message>,
     pub(in crate::ai) source_message_id: i64,
     pub(in crate::ai) canonical_generation: i64,
+    pub(in crate::ai) snapshot_revision: i64,
+    pub(in crate::ai) snapshot_stamp: SnapshotStamp,
+    pub(in crate::ai) snapshot_meta: Option<SnapshotReadMeta>,
     pub(in crate::ai) snapshot_is_current: bool,
 }
 

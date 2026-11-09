@@ -7,7 +7,7 @@ use super::connection::sqlite_error_kind;
 /// `PRAGMA user_version` value written after every table and column this module
 /// creates exists. Bump it whenever a change here adds or alters schema; an
 /// existing database then runs the migration once more.
-pub(super) const HISTORY_SCHEMA_VERSION: i32 = 3;
+pub(super) const HISTORY_SCHEMA_VERSION: i32 = 5;
 
 pub(super) fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
     // Several operations run per turn and each one opens (or reuses) a
@@ -49,7 +49,9 @@ pub(super) fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             source_message_id INTEGER NOT NULL,
             source_generation INTEGER NOT NULL,
-            projection_fingerprint TEXT NOT NULL
+            projection_fingerprint TEXT NOT NULL,
+            snapshot_revision INTEGER NOT NULL DEFAULT 1,
+            compression_state TEXT
         );
         CREATE TABLE IF NOT EXISTS context_snapshot_history (
             snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,6 +108,13 @@ pub(super) fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
         "projection_fingerprint",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    add_column_if_missing(
+        conn,
+        "context_snapshot",
+        "snapshot_revision",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    add_column_if_missing(conn, "context_snapshot", "compression_state", "TEXT")?;
     add_column_if_missing(conn, "context_snapshot_history", "payload", "BLOB")?;
     migrate_context_snapshot_ring_payloads(conn, version)?;
     drop_legacy_previous_snapshot_tables(conn)?;

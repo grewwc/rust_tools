@@ -57,3 +57,53 @@ fn partial_stream_with_structured_failure_never_renders_success() {
 
     assert!(streamed_tool_result_is_failure(&call, &result));
 }
+
+#[test]
+fn serve_tool_dispatch_closes_thinking_before_tool_frame() {
+    let app = test_app_with_tools(&[]);
+    let mut observer = TerminalToolObserver::new_for_test(&app);
+    let call = test_tool_call(
+        "call_wait",
+        "task_wait",
+        serde_json::json!({"task_ids": ["task_1"]}),
+    );
+
+    let (_, frames) = crate::ai::background::capture_serve_frames(|| {
+        crate::ai::background::with_serve_live_streaming_for_test(true, || {
+            // A reasoning phase is open when the call dispatches.
+            crate::ai::background::publish_serve_frame(
+                crate::ai::background::ServeLiveKind::Thinking,
+                "Wait again with a",
+            );
+            crate::ai::driver::tools::ToolExecutionObserver::on_tool_dispatched(
+                &mut observer,
+                &call,
+            );
+            // End-of-stream finalize may have closed the same phase first;
+            // the publisher must swallow that duplicate.
+            crate::ai::background::publish_serve_frame(
+                crate::ai::background::ServeLiveKind::ThinkingDone,
+                "",
+            );
+        });
+    });
+
+    let done: Vec<_> = frames
+        .iter()
+        .filter(|(kind, _)| *kind == crate::ai::background::ServeLiveKind::ThinkingDone)
+        .collect();
+    assert_eq!(done.len(), 1, "one close per thinking phase: {frames:?}");
+    let done_index = frames
+        .iter()
+        .position(|(kind, _)| *kind == crate::ai::background::ServeLiveKind::ThinkingDone)
+        .expect("dispatch closes the open phase");
+    let tool_index = frames
+        .iter()
+        .position(|(kind, _)| *kind == crate::ai::background::ServeLiveKind::Tool)
+        .expect("dispatch publishes the tool card");
+    assert!(
+        done_index < tool_index,
+        "the thinking fold must close before the tool card: {frames:?}"
+    );
+    assert!(frames[tool_index].1.contains("\"phase\":\"started\""));
+}

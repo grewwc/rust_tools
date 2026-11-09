@@ -383,13 +383,17 @@ fn should_compact_session_history_in_background(
     one_shot_mode: bool,
     should_quit: bool,
     is_subagent: bool,
+    is_serve_child: bool,
 ) -> bool {
     // Subagent history is managed by the caller's lifecycle guard; if compression escapes the current
     // future, the guard may delete the temp SQLite first and the background task then touches a missing file.
-    !is_subagent && !one_shot_mode && !should_quit
+    // Serve children must commit snapshots within their process lifetime, including resumed turns
+    // that are not one-shot. Detached work can be lost at exit, releasing the parent's turn lock
+    // before snapshot persistence finishes and leaving the persisted tail growing.
+    !is_subagent && !is_serve_child && !one_shot_mode && !should_quit
 }
 
-fn should_run_post_turn_maintenance(is_serve_child: bool) -> bool {
+fn should_run_post_turn_title(is_serve_child: bool) -> bool {
     !is_serve_child
 }
 
@@ -486,9 +490,10 @@ fn spawn_background_compaction(app: &App, at_boundary: bool) {
     );
 }
 
-/// Persisted-compression dispatch at finalize. Foreground interactive turns go through the background
-/// (so the prompt returns without blocking); one-shot runs, soon-to-exit processes, and subagents take
-/// the foreground `.await` path, ensuring the snapshot is persisted before the owning history's lifetime ends.
+/// Persisted-compression dispatch at finalize. Live interactive turns outside serve children go through
+/// the background (so the prompt returns without blocking); one-shot runs, soon-to-exit processes,
+/// subagents, and serve children take the foreground `.await` path, ensuring the snapshot is persisted
+/// before the owning history's lifetime ends.
 async fn dispatch_finalize_compaction(app: &App, at_boundary: bool, run_in_background: bool) {
     if run_in_background {
         spawn_background_compaction(app, at_boundary);
@@ -778,26 +783,23 @@ pub(super) async fn finalize_turn(
             }
         }
         let _ = poisoned;
-        // Serve owns the per-session turn lock until this child exits. Once the
-        // committed body and OutputComplete have been published, write-back
-        // maintenance must not keep that lock held and block the next request.
-        // The serve parent owns title recovery; persisted compression remains a
-        // best-effort cache and is never part of remote turn completion.
+        // Serve children must persist the history snapshot before exiting, including
+        // resumed turns. The parent accepts holding its per-session turn lock until
+        // this foreground compaction completes.
+        // `at_boundary` = no tool calls this round (answer delivered), using
+        // the more aggressive threshold.
         let serve_child = crate::ai::background::is_serve_child();
-        if should_run_post_turn_maintenance(serve_child) {
-            // `at_boundary` = no tool calls this round (answer delivered), using
-            // the more aggressive threshold.
-            dispatch_finalize_compaction(
-                app,
-                !had_tool_calls,
-                should_compact_session_history_in_background(
-                    one_shot_mode,
-                    should_quit,
-                    crate::ai::driver::runtime_ctx::has_subagent_result_slot(),
-                ),
-            )
-            .await;
-        }
+        dispatch_finalize_compaction(
+            app,
+            !had_tool_calls,
+            should_compact_session_history_in_background(
+                one_shot_mode,
+                should_quit,
+                crate::ai::driver::runtime_ctx::has_subagent_result_slot(),
+                serve_child,
+            ),
+        )
+        .await;
         // Try to generate an LLM summary title for the current conversation (when none exists and there is enough context).
         // Interactive foreground turns must not wait here on a background quality task.
         // Runs after the user-visible output (and the serve early-done marker
@@ -805,7 +807,8 @@ pub(super) async fn finalize_turn(
         // it, so this order is unobservable to single-machine runs but keeps
         // the SSE turn from idling behind the title LLM call. Stays in this
         // arm so no-response turns keep skipping title generation, as before.
-        if should_run_post_turn_maintenance(serve_child) {
+        // The serve parent remains responsible for title generation and recovery.
+        if should_run_post_turn_title(serve_child) {
             maybe_generate_session_title(
                 app,
                 should_generate_session_title_in_background(one_shot_mode, should_quit),
@@ -2000,23 +2003,36 @@ mod tests {
     #[test]
     fn persisted_history_compaction_stays_within_subagent_lifetime() {
         assert!(should_compact_session_history_in_background(
-            false, false, false
+            false, false, false, false
         ));
         assert!(!should_compact_session_history_in_background(
-            false, false, true
+            false, false, true, false
         ));
         assert!(!should_compact_session_history_in_background(
-            true, false, false
+            true, false, false, false
         ));
         assert!(!should_compact_session_history_in_background(
-            false, true, false
+            false, true, false, false
         ));
     }
 
     #[test]
-    fn serve_child_releases_turn_without_post_turn_maintenance() {
-        assert!(!should_run_post_turn_maintenance(true));
-        assert!(should_run_post_turn_maintenance(false));
+    fn serve_child_compaction_stays_within_child_lifetime() {
+        assert!(!should_compact_session_history_in_background(
+            false, false, false, true
+        ));
+        assert!(!should_compact_session_history_in_background(
+            true, false, false, true
+        ));
+        assert!(should_compact_session_history_in_background(
+            false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn serve_child_skips_post_turn_title_generation() {
+        assert!(!should_run_post_turn_title(true));
+        assert!(should_run_post_turn_title(false));
     }
 
     #[test]

@@ -4,6 +4,24 @@
 
 use super::*;
 
+#[path = "prefix_reuse.rs"]
+mod prefix_reuse;
+#[path = "prefix_cert.rs"]
+mod prefix_cert;
+pub(in crate::ai) use prefix_cert::{
+    PrefixCertificatePolicy, prefix_certificate_json_from_cache, try_reuse_certificate_json,
+};
+#[cfg(test)]
+pub(in crate::ai) use prefix_cert::{
+    PROOF_VERSION, PrefixCertificate, prefix_certificate_from_cache, validate_certificate_json,
+};
+#[cfg(test)]
+#[path = "prefix_cert_tests.rs"]
+mod prefix_cert_tests;
+#[cfg(test)]
+#[path = "prefix_reuse_tests.rs"]
+mod prefix_reuse_tests;
+
 /// Physical cap for a single raw tool result in the request context. Canonical
 /// history is unaffected.
 pub(in crate::ai) const TOOL_RESULT_RAW_HARD_CAP_CHARS: usize = 64_000;
@@ -398,6 +416,73 @@ pub(in crate::ai) fn compress_messages_for_context(
 }
 
 pub(in crate::ai) fn compress_messages_for_context_with_outcome(
+    messages: Vec<Message>,
+    max_chars: usize,
+    keep_last: usize,
+    summary_max_chars: usize,
+    overflow_dir: Option<PathBuf>,
+    cwd: Option<&Path>,
+) -> ContextCompressionOutcome {
+    compress_messages_with_prefix_cache(
+        messages,
+        max_chars,
+        keep_last,
+        summary_max_chars,
+        overflow_dir,
+        cwd,
+        &prefix_reuse::CACHE,
+    )
+}
+
+fn compress_messages_with_prefix_cache(
+    messages: Vec<Message>,
+    max_chars: usize,
+    keep_last: usize,
+    summary_max_chars: usize,
+    overflow_dir: Option<PathBuf>,
+    cwd: Option<&Path>,
+    cache: &std::sync::Mutex<prefix_reuse::PrefixReuseCache>,
+) -> ContextCompressionOutcome {
+    let key = prefix_reuse::PrefixReuseKey::new(
+        max_chars,
+        keep_last,
+        summary_max_chars,
+        overflow_dir.as_deref(),
+        cwd,
+    );
+    if let Some(chars) = cache
+        .lock()
+        .ok()
+        .and_then(|mut cache| cache.try_reuse(&messages, &key))
+    {
+        // The certificate proves the entire pipeline is an identity operation,
+        // including its pre-budget passes; both counts therefore equal the input.
+        return ContextCompressionOutcome {
+            messages,
+            status: ContextCompressionStatus::Complete,
+            before_chars: chars,
+            after_chars: chars,
+            max_chars,
+        };
+    }
+
+    let outcome = compress_messages_for_context_full(
+        messages,
+        max_chars,
+        keep_last,
+        summary_max_chars,
+        overflow_dir,
+        cwd,
+    );
+    // Admission uses pure probes only and runs outside the shared cache lock.
+    let next = prefix_reuse::PrefixReuseCache::from_outcome(key, &outcome);
+    if let Ok(mut cache) = cache.lock() {
+        *cache = next;
+    }
+    outcome
+}
+
+fn compress_messages_for_context_full(
     mut messages: Vec<Message>,
     max_chars: usize,
     keep_last: usize,
@@ -843,6 +928,7 @@ pub(in crate::ai) fn coalesce_accumulated_summary_notes(messages: Vec<Message>) 
     // Merge all summary bodies and dedupe archive pointers with identical
     // content; both keep their original order.
     let mut merged_bodies: Vec<String> = Vec::new();
+    let mut seen_summary_bodies = rustc_hash::FxHashSet::<String>::default();
     let mut first_summary_role: Option<String> = None;
     let mut archive_notes: Vec<Message> = Vec::new();
     let mut seen_archive_texts = rustc_hash::FxHashSet::default();
@@ -854,7 +940,8 @@ pub(in crate::ai) fn coalesce_accumulated_summary_notes(messages: Vec<Message>) 
             let text = value_to_string(&m.content);
             let body = automatic_summary_body(&text).unwrap_or_else(|| text.trim());
             let body = body.trim();
-            if !body.is_empty() && !merged_bodies.iter().any(|b| b == body) {
+            if !body.is_empty() && !seen_summary_bodies.contains(body) {
+                seen_summary_bodies.insert(body.to_string());
                 merged_bodies.push(body.to_string());
             }
         } else if is_archive_note_message(m) {

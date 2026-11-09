@@ -1312,8 +1312,9 @@ fn write_stream_split_segment(
                 // flush. Keep it off child stdout — the SSE line pump would
                 // forward it as a plain message and the chat client would
                 // print a second close line under its folded `✓ thinking`
-                // summary. The chat-side close is idempotent, so this also
-                // safely covers markers the CloseThinking event reported.
+                // summary. The frame publisher drops a close for an already
+                // closed phase, so this also safely covers markers the
+                // CloseThinking event reported.
                 crate::ai::background::publish_serve_frame(
                     crate::ai::background::ServeLiveKind::ThinkingDone,
                     "",

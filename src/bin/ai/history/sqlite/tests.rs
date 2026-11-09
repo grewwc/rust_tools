@@ -3,6 +3,9 @@ use rusqlite::Connection;
 use serde_json::Value;
 use std::io;
 
+#[path = "prefix_state_tests.rs"]
+mod prefix_state_tests;
+
 #[test]
 fn sqlite_error_classifies_transient_failures_as_retryable() {
     // BUSY/LOCKED and SQLITE_IOERR system I/O failures (e.g. FSTAT/SHMOPEN when
@@ -494,7 +497,8 @@ fn history_connection_caps_wal_size_after_checkpoint() {
     let wal_size = std::fs::metadata(&wal_path).unwrap().len();
     assert!(wal_size > super::connection::HISTORY_WAL_SIZE_LIMIT_BYTES as u64);
 
-    conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)")
+        .unwrap();
     assert_eq!(
         std::fs::metadata(&wal_path).unwrap().len(),
         wal_size,
@@ -567,7 +571,10 @@ fn prompt_residency_clears_when_truncation_removes_turns() {
     // Keeping every message removes nothing, so the residency still applies.
     write();
     truncate_messages_sqlite(&path, 4).unwrap();
-    assert_eq!(read_prompt_residency_sqlite(&path).unwrap(), Some(residency.clone()));
+    assert_eq!(
+        read_prompt_residency_sqlite(&path).unwrap(),
+        Some(residency.clone())
+    );
 
     truncate_messages_to_user_turns_sqlite(&path, 1).unwrap();
     assert_eq!(read_prompt_residency_sqlite(&path).unwrap(), None);
@@ -1406,7 +1413,10 @@ fn rewind_promotes_archived_projection_and_absorbs_tail() {
     truncate_messages_sqlite(&path, kept).unwrap();
 
     let projected = read_context_history_sqlite(&path, PROJECTION).unwrap();
-    assert_eq!(projected.messages, vec![first_summary, msg("user", "second")]);
+    assert_eq!(
+        projected.messages,
+        vec![first_summary, msg("user", "second")]
+    );
     assert!(projected.snapshot_is_current);
     assert_eq!(
         projected.source_message_id,
@@ -1832,7 +1842,11 @@ fn ring_entries_store_one_compressed_payload_and_promote_exactly() {
     }]);
     tool_turn.reasoning_content = Some("the file holds the answer".to_string());
     let tool_result = tool_msg("call-1", "file body");
-    let first_projection = vec![first_summary.clone(), tool_turn.clone(), tool_result.clone()];
+    let first_projection = vec![
+        first_summary.clone(),
+        tool_turn.clone(),
+        tool_result.clone(),
+    ];
     assert!(
         write_context_snapshot_sqlite(
             &path,
@@ -1859,12 +1873,7 @@ fn ring_entries_store_one_compressed_payload_and_promote_exactly() {
     assert!(
         write_context_snapshot_sqlite(
             &path,
-            &[
-                first_summary,
-                tool_turn,
-                tool_result,
-                msg("user", "second"),
-            ],
+            &[first_summary, tool_turn, tool_result, msg("user", "second"),],
             second_source.source_message_id,
             second_source.canonical_generation,
             PROJECTION,
@@ -1971,6 +1980,15 @@ fn v1_ring_rows_are_dropped_when_payloads_replace_the_row_table() {
         )
         .unwrap();
     assert_eq!(payload_column, 1);
+    let snapshot_revision_column: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('context_snapshot')
+             WHERE name = 'snapshot_revision'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(snapshot_revision_column, 1);
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();

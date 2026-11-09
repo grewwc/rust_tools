@@ -512,7 +512,41 @@ static SERVE_OUTPUT_COMPLETE: AtomicBool = AtomicBool::new(false);
 
 /// Whether this process streams its turn through a serve-owned live FIFO.
 pub(crate) fn serve_live_streaming() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(value) = TEST_SERVE_LIVE_STREAMING.with(|slot| slot.get()) {
+            return value;
+        }
+    }
     SERVE_LIVE_STREAMING.load(Ordering::Relaxed)
+}
+
+// Scoped test override for `serve_live_streaming`. The production flag is
+// installed once per process from the live FIFO environment, so unit tests
+// need a per-thread switch that cannot leak the serve branch into parallel
+// tests.
+#[cfg(test)]
+thread_local! {
+    static TEST_SERVE_LIVE_STREAMING: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Scoped test override for [`serve_live_streaming`]; see the thread-local
+/// above.
+#[cfg(test)]
+pub(crate) fn with_serve_live_streaming_for_test<T>(
+    value: bool,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_SERVE_LIVE_STREAMING.with(|slot| slot.set(self.0));
+        }
+    }
+    let previous = TEST_SERVE_LIVE_STREAMING.with(|slot| slot.replace(Some(value)));
+    let _restore = Restore(previous);
+    run()
 }
 
 /// Publish the early `done` marker exactly once per serve child.
@@ -672,6 +706,32 @@ pub(crate) fn publish_serve_frame(kind: ServeLiveKind, text: &str) {
     if !serve_live_streaming() {
         return;
     }
+    // Several paths can close one thinking phase (an explicit end marker in
+    // the stream, end-of-stream finalize, tool dispatch), and the chat client
+    // renders one bubble per phase. Keep the phase state here, at the only
+    // publisher, so a second close for an already-closed phase is dropped
+    // instead of reaching the client as a redundant event.
+    match kind {
+        ServeLiveKind::ThinkingStart => mark_serve_thinking_fold_open(),
+        ServeLiveKind::Thinking if !text.is_empty() => mark_serve_thinking_fold_open(),
+        ServeLiveKind::ThinkingDone => {
+            if !take_serve_thinking_fold_open() {
+                return;
+            }
+        }
+        _ => {}
+    }
+    #[cfg(test)]
+    {
+        if TEST_SERVE_FRAMES.with(|slot| slot.borrow().is_some()) {
+            TEST_SERVE_FRAMES.with(|slot| {
+                if let Some(frames) = slot.borrow_mut().as_mut() {
+                    frames.push((kind, text.to_string()));
+                }
+            });
+            return;
+        }
+    }
     if text.is_empty() {
         let frame = [kind as u8, 0, 0, 0, 0];
         publish_live_output_bytes(&frame);
@@ -684,6 +744,73 @@ pub(crate) fn publish_serve_frame(kind: ServeLiveKind, text: &str) {
         frame.extend_from_slice(payload.as_bytes());
         publish_live_output_bytes(&frame);
     }
+}
+
+/// Whether the chat client's live thinking fold is open, i.e. whether a
+/// `ThinkingDone` frame still has a phase to close. Production runs one
+/// foreground turn per serve child, so a process-wide flag matches the FIFO
+/// order; test builds keep it per thread because unit tests publish through
+/// the scoped serve setters in parallel.
+#[cfg(not(test))]
+static SERVE_THINKING_FOLD_OPEN: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    static SERVE_THINKING_FOLD_OPEN: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn mark_serve_thinking_fold_open() {
+    #[cfg(test)]
+    {
+        SERVE_THINKING_FOLD_OPEN.with(|slot| slot.set(true));
+    }
+    #[cfg(not(test))]
+    {
+        SERVE_THINKING_FOLD_OPEN.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Clear the open-phase flag, returning whether this call closed a phase and
+/// therefore should publish `ThinkingDone`.
+fn take_serve_thinking_fold_open() -> bool {
+    #[cfg(test)]
+    {
+        SERVE_THINKING_FOLD_OPEN.with(|slot| slot.replace(false))
+    }
+    #[cfg(not(test))]
+    {
+        SERVE_THINKING_FOLD_OPEN.swap(false, Ordering::Relaxed)
+    }
+}
+
+// Records frames published under `capture_serve_frames` instead of writing
+// them to the live FIFO. The slot is thread-local, so parallel tests never
+// observe each other's frames.
+#[cfg(test)]
+thread_local! {
+    static TEST_SERVE_FRAMES: std::cell::RefCell<Option<Vec<(ServeLiveKind, String)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Records frames published during `run` instead of writing them to the live
+/// FIFO. Used to pin the dispatch-time close/tool ordering.
+#[cfg(test)]
+pub(crate) fn capture_serve_frames<T>(
+    run: impl FnOnce() -> T,
+) -> (T, Vec<(ServeLiveKind, String)>) {
+    struct Restore(Option<Vec<(ServeLiveKind, String)>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            TEST_SERVE_FRAMES.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+    let previous = TEST_SERVE_FRAMES.with(|slot| slot.borrow_mut().replace(Vec::new()));
+    let _restore = Restore(previous);
+    let result = run();
+    let frames = TEST_SERVE_FRAMES.with(|slot| slot.borrow_mut().take().unwrap_or_default());
+    (result, frames)
 }
 
 /// PID recorded by a real-time `/bg` handoff, if that process is still alive.

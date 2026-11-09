@@ -84,6 +84,11 @@ impl<'a> TerminalToolObserver<'a> {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn new_for_test(app: &'a App) -> Self {
+        Self::new(app)
+    }
+
     fn reset_stream_state(&mut self) {
         self.active_stream_tool_call_id = None;
         self.pending_utf8.clear();
@@ -373,6 +378,16 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
             && crate::ai::driver::runtime_ctx::terminal_output_enabled()
         {
             if let Some(payload) = crate::ai::background::serve_tool_started_payload(tool_call) {
+                // The stream keeps the reasoning fold open across a tool-call
+                // start so trailing reasoning stays in one bubble; this card is
+                // where that fold ends if no earlier path closed it. Publish
+                // the close back-to-back with the card. The publisher drops a
+                // close whose phase is already closed, so end-of-stream
+                // finalize and parallel calls cannot emit a second one.
+                crate::ai::background::publish_serve_frame(
+                    crate::ai::background::ServeLiveKind::ThinkingDone,
+                    "",
+                );
                 crate::ai::background::publish_serve_frame(
                     crate::ai::background::ServeLiveKind::Tool,
                     &payload,

@@ -55,8 +55,9 @@ fn history_file_fingerprint(path: &Path) -> ((u64, Option<SystemTime>), (u64, Op
 /// changed by another connection since I opened", and a new connection's initial
 /// reading does not vary with external writes (a new connection consistently
 /// returns 2 in practice), so it cannot serve as a cross-connection cache
-/// invalidation signal. When the key is missing (an old DB that has never had a
-/// revision written), 0 is returned, consistent with "never modified".
+/// invalidation signal. When the meta table or key is missing (an old DB that
+/// has never had a revision written), 0 is returned, consistent with "never
+/// modified". Connection or query failures return None and are not cached.
 pub(in crate::ai) fn read_history_revision(path: &Path) -> Option<i64> {
     // In-process cache: if the fingerprint (main DB len/mtime, WAL sidecar
     // len/mtime) is unchanged, reuse the previous result instead of opening a
@@ -71,19 +72,20 @@ pub(in crate::ai) fn read_history_revision(path: &Path) -> Option<i64> {
         }
     }
     let conn = Connection::open(path).ok()?;
-    // The meta table may not exist yet (brand-new DB) or may never have had a
-    // revision written: both cases are treated as 0 ("never modified") so the
-    // return value stays stable and comparable. Only an unopenable connection
-    // yields None.
-    let value: Option<i64> = conn
-        .query_row(
+    // Check table absence explicitly so query failures remain unknown instead
+    // of being cached as the old-DB revision of 0.
+    let revision = if conn.table_exists(None, "meta").ok()? {
+        conn.query_row(
             "SELECT CAST(value AS INTEGER) FROM meta WHERE key='history_revision' LIMIT 1",
             [],
             |row| row.get(0),
         )
         .optional()
-        .unwrap_or(None);
-    let revision = value.unwrap_or(0);
+        .ok()?
+        .unwrap_or(0)
+    } else {
+        0
+    };
     if let Ok(mut cache) = HISTORY_REVISION_CACHE.lock() {
         cache.insert(path.to_path_buf(), (fingerprint, revision));
     }
@@ -156,6 +158,7 @@ pub(super) fn history_generation(conn: &Connection) -> io::Result<i64> {
 /// Any operation that rewrites the canonical messages must invalidate derived
 /// snapshots.
 pub(super) fn invalidate_context_snapshot(conn: &Connection) -> io::Result<()> {
+    clear_context_snapshot_compression_state(conn)?;
     conn.execute("DELETE FROM context_messages", [])
         .map_err(|error| io::Error::other(error.to_string()))?;
     conn.execute("DELETE FROM context_snapshot", [])
@@ -163,6 +166,17 @@ pub(super) fn invalidate_context_snapshot(conn: &Connection) -> io::Result<()> {
     conn.execute("DELETE FROM context_snapshot_history", [])
         .map_err(|error| io::Error::other(error.to_string()))?;
     bump_history_generation(conn)?;
+    Ok(())
+}
+
+/// A retained projection can survive a lineage change without retaining its
+/// certificate for reuse as the next compression prefix.
+pub(super) fn clear_context_snapshot_compression_state(conn: &Connection) -> io::Result<()> {
+    conn.execute(
+        "UPDATE context_snapshot SET compression_state = NULL WHERE singleton = 1",
+        [],
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(())
 }
 
@@ -206,14 +220,16 @@ fn snapshot_watermark(conn: &Connection) -> io::Result<Option<(i64, i64)>> {
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
-        .optional()
-        .map_err(|error| io::Error::other(error.to_string()))
+    .optional()
+    .map_err(|error| io::Error::other(error.to_string()))
 }
 
 fn restamp_context_snapshot(conn: &Connection) -> io::Result<()> {
     let generation = bump_history_generation(conn)?;
     conn.execute(
-        "UPDATE context_snapshot SET source_generation = ?1 WHERE singleton = 1",
+        "UPDATE context_snapshot
+         SET source_generation = ?1, compression_state = NULL
+         WHERE singleton = 1",
         params![generation],
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
@@ -221,13 +237,16 @@ fn restamp_context_snapshot(conn: &Connection) -> io::Result<()> {
 }
 
 fn bump_history_generation(conn: &Connection) -> io::Result<i64> {
+    let generation = history_generation(conn)?
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("history generation overflow"))?;
     conn.execute(
-        "INSERT INTO meta (key, value) VALUES ('history_generation', '1')
-         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
-        [],
+        "INSERT INTO meta (key, value) VALUES ('history_generation', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![generation.to_string()],
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
-    history_generation(conn)
+    Ok(generation)
 }
 pub(super) fn read_i64_meta_from_conn(conn: &Connection, key: &str) -> Option<i64> {
     conn.query_row(

@@ -1524,6 +1524,7 @@ async fn run_turn_body(
     let TurnPreparation {
         mut skill_turn,
         mut messages,
+        mut persistable_context,
         mut turn_messages,
         mut persisted_turn_messages,
         max_iterations,
@@ -1767,6 +1768,7 @@ async fn run_turn_body(
             &next_model,
             &mut response_model,
             &mut messages,
+            &mut persistable_context,
             &turn_messages,
             one_shot_mode,
             &mut persisted_turn_messages,
