@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 
 use crate::ai::{
     driver::{drain_response, input, skill_runtime},
-    history::{Message, ROLE_INTERNAL_NOTE, compress::llm_prune, last_real_user_index},
+    history::{
+        HistoryMessageSummarizer, Message, ROLE_INTERNAL_NOTE, compress::llm_prune,
+        last_real_user_index,
+    },
     mcp::McpClient,
     middleware::request::build_llm_client_chain,
     path_utils::normalize_lexical,
@@ -20,8 +23,8 @@ use crate::ai::{
 use super::{
     CompressionReport, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS, MID_TURN_LLM_SUMMARY_MAX_CHARS,
     TurnOutcome, context_budget,
+    llm_summary_budget::{LlmSummaryBudget, LlmSummaryGate},
     persistence::persist_pending_turn_messages,
-    record_llm_summary_attempt_chars, should_try_llm_summary,
     types::{IterationExecution, PersistableContextProjection, ToolCallExecution},
 };
 
@@ -1250,6 +1253,8 @@ async fn apply_request_budget(
     model: &str,
     messages: &mut Vec<Message>,
     persistable_context: &mut Option<PersistableContextProjection>,
+    llm_summary_budget: &mut LlmSummaryBudget,
+    summarizer: &(impl HistoryMessageSummarizer + Sync + ?Sized),
     tools_enabled: bool,
     iteration: usize,
     compression_report: &mut CompressionReport,
@@ -1290,144 +1295,155 @@ async fn apply_request_budget(
         crate::ai::driver::print::print_tool_note_line("context-budget", reason.note());
     }
 
-    // The summary gate opens only when the measured prompt nears the input
-    // allowance; mechanical compression already runs at the soft target, so a
-    // mid-range summary would add a full-context LLM call without new headroom.
-    // The shared growth cursor suppresses repeated attempts at the same
-    // incompressible projection.
+    // Both summary paths use the same turn allowance, after mechanical work.
+    // Only measured input overflow opens the first attempt. A completed
+    // no-call attempt can reopen on a materially changed later tool round;
+    // failed or ineffective model calls never reopen within this turn.
     // `post_chars` already describes the current projection unless the LLM
     // summary replaced it below; reuse it instead of scanning a third time.
     let mut chars = post_chars;
-    let mut llm_attempted = false;
-    if budget.exceeds_input_allowance() && should_try_llm_summary(&app.session_id, chars, 0) {
+    if let Some(projection) = persistable_context.as_ref()
+        && let Some(range) = locate_persistable_context(&request_before_mechanical, projection)
+        && let Some(summary_attempt) = llm_summary_budget.begin_attempt(LlmSummaryGate {
+            session_id: &app.session_id,
+            model,
+            trigger: "persistable_context",
+            round: iteration,
+            request_budget: budget,
+            chars_before: chars,
+        })
+    {
+        let projection = persistable_context.take().unwrap();
         let attempt = CompactionAttempt::start("llm_input_allowance", budget, messages);
-        if let Some(projection) = persistable_context.take()
-            && let Some(range) = locate_persistable_context(&request_before_mechanical, &projection)
-        {
-            let full_chars =
-                crate::ai::history::messages_total_chars_pub(&request_before_mechanical);
-            let history_chars = crate::ai::history::messages_total_chars_pub(&projection.messages);
-            let outside_chars = full_chars.saturating_sub(history_chars);
-            let history_target = budget
-                .compression_target_chars(chars)
-                .saturating_sub(outside_chars);
-            let (candidate_history, _, _, effective, inserted) =
-                crate::ai::history::mid_turn_llm_summarize(
-                    app,
-                    projection.messages.clone(),
-                    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
-                    MID_TURN_LLM_SUMMARY_MAX_CHARS,
-                    history_target,
-                    crate::ai::driver::runtime_ctx::effective_cwd()
-                        .ok()
-                        .as_deref(),
+        let full_chars = crate::ai::history::messages_total_chars_pub(&request_before_mechanical);
+        let history_chars = crate::ai::history::messages_total_chars_pub(&projection.messages);
+        let outside_chars = full_chars.saturating_sub(history_chars);
+        let history_target = budget
+            .compression_target_chars(chars)
+            .saturating_sub(outside_chars);
+        let summary = crate::ai::history::compress::mid_turn_llm_summarize_with_summarizer(
+            app,
+            summarizer,
+            projection.messages.clone(),
+            MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
+            MID_TURN_LLM_SUMMARY_MAX_CHARS,
+            history_target,
+            crate::ai::driver::runtime_ctx::effective_cwd()
+                .ok()
+                .as_deref(),
+        )
+        .await;
+        let effective = summary.effective;
+        let inserted = summary.summary_inserted;
+        let model_called = summary.model_called;
+        let candidate_history = summary.messages;
+
+        if inserted {
+            let history_file = app.session_history_file.clone();
+            let basis = projection.basis;
+            let snapshot_messages = candidate_history.clone();
+            let snapshot_write = tokio::task::spawn_blocking(move || {
+                crate::ai::history::persist_context_snapshot_from_basis(
+                    &history_file,
+                    &snapshot_messages,
+                    &basis,
                 )
-                .await;
-            // A false/false outcome is the structural no-op path (for example,
-            // too few historical turns to split) and did not consume a model
-            // summary. Let the full-request fallback handle that case.
-            llm_attempted = inserted || effective;
-
-            if inserted {
-                let history_file = app.session_history_file.clone();
-                let basis = projection.basis;
-                let snapshot_messages = candidate_history.clone();
-                let snapshot_write = tokio::task::spawn_blocking(move || {
-                    crate::ai::history::persist_context_snapshot_from_basis(
-                        &history_file,
-                        &snapshot_messages,
-                        &basis,
-                    )
-                    .map_err(|error| error.to_string())
-                })
-                .await;
-                match snapshot_write {
-                    Ok(Ok(true)) => {}
-                    Ok(Ok(false)) => crate::ai::driver::print::print_tool_note_line(
-                        "context-budget",
-                        "LLM summary was used for this request, but its reusable snapshot was stale; the next turn will rebuild from canonical history.",
-                    ),
-                    Ok(Err(error)) => crate::ai::driver::print::print_tool_note_line(
-                        "context-budget",
-                        &format!("Could not persist reusable LLM summary: {error}"),
-                    ),
-                    Err(error) => crate::ai::driver::print::print_tool_note_line(
-                        "context-budget",
-                        &format!("Reusable LLM summary task failed: {error}"),
-                    ),
-                }
-
-                let mut candidate = Vec::with_capacity(
-                    request_before_mechanical.len() - projection.messages.len()
-                        + candidate_history.len(),
-                );
-                candidate.extend_from_slice(&request_before_mechanical[..range.start]);
-                candidate.extend(candidate_history);
-                candidate.extend_from_slice(&request_before_mechanical[range.end..]);
-                let candidate_before =
-                    request::preview_request_budget(app, model, &candidate, true, tools_enabled)
-                        .await;
-                let (candidate_budget, rerun_report) =
-                    context_budget::apply_measured_context_budget_until_soft_target(
-                        app,
-                        model,
-                        candidate_before,
-                        &mut candidate,
-                        tools_enabled,
-                    )
-                    .await;
-                if let Some(reason) = rerun_report.rollback_reason {
-                    crate::ai::driver::print::print_tool_note_line("context-budget", reason.note());
-                }
-                *messages = candidate;
-                budget = candidate_budget;
+                .map_err(|error| error.to_string())
+            })
+            .await;
+            match snapshot_write {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => crate::ai::driver::print::print_tool_note_line(
+                    "context-budget",
+                    "LLM summary was used for this request, but its reusable snapshot was stale; the next turn will rebuild from canonical history.",
+                ),
+                Ok(Err(error)) => crate::ai::driver::print::print_tool_note_line(
+                    "context-budget",
+                    &format!("Could not persist reusable LLM summary: {error}"),
+                ),
+                Err(error) => crate::ai::driver::print::print_tool_note_line(
+                    "context-budget",
+                    &format!("Reusable LLM summary task failed: {error}"),
+                ),
             }
 
-            let after_chars = crate::ai::history::messages_total_chars_pub(messages);
-            attempt.finish(
-                &app.session_id,
-                iteration,
-                model,
-                budget,
-                messages,
-                inserted,
+            let mut candidate = Vec::with_capacity(
+                request_before_mechanical.len() - projection.messages.len()
+                    + candidate_history.len(),
             );
-            compression_report.record_llm_summary_attempt(
-                format!(
-                    "pre-request persistent LLM ({} tokens)",
-                    budget.limits.input_allowance_tokens
-                ),
-                chars,
-                after_chars,
-                effective,
-                inserted,
-            );
-            record_llm_summary_attempt_chars(&app.session_id, after_chars);
-            chars = after_chars;
+            candidate.extend_from_slice(&request_before_mechanical[..range.start]);
+            candidate.extend(candidate_history);
+            candidate.extend_from_slice(&request_before_mechanical[range.end..]);
+            let candidate_before =
+                request::preview_request_budget(app, model, &candidate, true, tools_enabled).await;
+            let (candidate_budget, rerun_report) =
+                context_budget::apply_measured_context_budget_until_soft_target(
+                    app,
+                    model,
+                    candidate_before,
+                    &mut candidate,
+                    tools_enabled,
+                )
+                .await;
+            if let Some(reason) = rerun_report.rollback_reason {
+                crate::ai::driver::print::print_tool_note_line("context-budget", reason.note());
+            }
+            *messages = candidate;
+            budget = candidate_budget;
         }
+
+        let after_chars = crate::ai::history::messages_total_chars_pub(messages);
+        attempt.finish(
+            &app.session_id,
+            iteration,
+            model,
+            budget,
+            messages,
+            inserted,
+        );
+        compression_report.record_llm_summary_attempt(
+            format!(
+                "pre-request persistent LLM ({} tokens)",
+                budget.limits.input_allowance_tokens
+            ),
+            chars,
+            after_chars,
+            effective,
+            inserted,
+        );
+        llm_summary_budget.finish_attempt(summary_attempt, after_chars, model_called);
+        chars = after_chars;
     }
-    if budget.exceeds_input_allowance()
-        && !llm_attempted
-        && should_try_llm_summary(&app.session_id, chars, 0)
-    {
+    if let Some(summary_attempt) = llm_summary_budget.begin_attempt(LlmSummaryGate {
+        session_id: &app.session_id,
+        model,
+        trigger: "pre_request_fallback",
+        round: iteration,
+        request_budget: budget,
+        chars_before: chars,
+    }) {
         let attempt = CompactionAttempt::start("llm_input_allowance", budget, messages);
         // Work on a clone: dropping this future during cancellation must retain
         // the complete live projection, including its active-plan handoff.
         let mut summary_messages = messages.clone();
         let active_plan = context_budget::ActivePlanProjection::take(&mut summary_messages);
         let target = budget.compression_target_chars(chars);
-        let (mut candidate, _, _, effective, inserted) =
-            crate::ai::history::mid_turn_llm_summarize(
-                app,
-                summary_messages,
-                MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
-                MID_TURN_LLM_SUMMARY_MAX_CHARS,
-                active_plan.remaining_target(target),
-                crate::ai::driver::runtime_ctx::effective_cwd()
-                    .ok()
-                    .as_deref(),
-            )
-            .await;
+        let summary = crate::ai::history::compress::mid_turn_llm_summarize_with_summarizer(
+            app,
+            summarizer,
+            summary_messages,
+            MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
+            MID_TURN_LLM_SUMMARY_MAX_CHARS,
+            active_plan.remaining_target(target),
+            crate::ai::driver::runtime_ctx::effective_cwd()
+                .ok()
+                .as_deref(),
+        )
+        .await;
+        let effective = summary.effective;
+        let inserted = summary.summary_inserted;
+        let model_called = summary.model_called;
+        let mut candidate = summary.messages;
         active_plan.restore(&mut candidate);
         // The history pipeline has already committed archive guards before
         // returning a replacement. Its effectiveness flag is not an identity test.
@@ -1445,13 +1461,11 @@ async fn apply_request_budget(
             effective,
             inserted,
         );
-        record_llm_summary_attempt_chars(&app.session_id, after_chars);
-        chars = after_chars;
+        llm_summary_budget.finish_attempt(summary_attempt, after_chars, model_called);
     }
-    if report.projection_committed() && !llm_attempted {
+    if report.projection_committed() {
         *persistable_context = None;
     }
-    let _ = chars;
     budget
 }
 
@@ -1477,6 +1491,7 @@ async fn request_model_response(
     next_model: &str,
     messages: &mut Vec<Message>,
     persistable_context: &mut Option<PersistableContextProjection>,
+    llm_summary_budget: &mut LlmSummaryBudget,
     force_final_response: bool,
     _iteration: usize,
     mut compression_report: CompressionReport,
@@ -1526,6 +1541,8 @@ async fn request_model_response(
         next_model,
         messages,
         persistable_context,
+        llm_summary_budget,
+        app,
         !force_final_response,
         _iteration,
         &mut compression_report,
@@ -1593,6 +1610,8 @@ async fn request_model_response(
                     &fallback_model,
                     messages,
                     persistable_context,
+                    llm_summary_budget,
+                    app,
                     !force_final_response,
                     _iteration,
                     &mut fallback_report,
@@ -1884,6 +1903,7 @@ pub(super) async fn execute_turn_iteration(
     response_model: &mut Option<String>,
     messages: &mut Vec<Message>,
     persistable_context: &mut Option<PersistableContextProjection>,
+    llm_summary_budget: &mut LlmSummaryBudget,
     turn_messages: &[Message],
     one_shot_mode: bool,
     persisted_turn_messages: &mut usize,
@@ -1912,6 +1932,7 @@ pub(super) async fn execute_turn_iteration(
             next_model,
             messages,
             persistable_context,
+            llm_summary_budget,
             force_final_response,
             iteration,
             compression_report,
@@ -2152,7 +2173,7 @@ pub(super) async fn execute_turn_iteration(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{record_llm_summary_attempt_chars, should_try_llm_summary};
+    use super::super::llm_summary_budget::{LlmSummaryBudget, LlmSummaryReason};
     use super::{
         App, LlmClient, LlmRequest, StreamingFlagGuard, build_llm_request_client,
         context_overflow_target_chars, no_tool_handoff_note, project_instruction_target_paths,
@@ -2902,31 +2923,273 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pre_request_llm_summary_cursor_backoff_after_attempt() {
-        let sid = "test-session-cursor-backoff";
-        record_llm_summary_attempt_chars(sid, 0);
-        let threshold = 240_000;
-        let after_chars = 240_457;
+    struct ScriptedHistorySummarizer {
+        calls: AtomicUsize,
+        response: Option<&'static str>,
+    }
 
-        assert!(should_try_llm_summary(sid, after_chars, threshold));
+    impl crate::ai::history::HistoryMessageSummarizer for ScriptedHistorySummarizer {
+        fn summarize_history_messages<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _max_chars: usize,
+        ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.response.map(str::to_string)
+            })
+        }
+    }
 
-        // The caller writes the cursor after every attempt (success or not). After simulating a failure/no-op,
-        // write the post-attempt size so the next same-sized request is blocked by the growth guard,
-        // preventing idle retries every turn when the context structurally cannot shrink.
-        record_llm_summary_attempt_chars(sid, after_chars);
-        assert!(!should_try_llm_summary(sid, after_chars, threshold));
-        // Re-trigger only after growth ≥ MIN_GROWTH(20K)
-        assert!(should_try_llm_summary(sid, after_chars + 20_000, threshold));
+    fn summary_message(role: &str, content: impl Into<String>) -> Message {
+        Message {
+            role: role.to_string(),
+            content: Value::String(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
 
-        record_llm_summary_attempt_chars(sid, 230_000);
-        assert!(!should_try_llm_summary(sid, after_chars, threshold));
-        assert!(should_try_llm_summary(sid, 251_000, threshold));
+    #[tokio::test]
+    async fn llm_summary_budget_caps_model_calls_across_tool_rounds() {
+        // Exercise both production trigger paths, including a failed response
+        // and a completed response that produces no usable summary candidate.
+        for persistent in [false, true] {
+            for response in [None, Some("   ")] {
+                let root =
+                    std::env::temp_dir().join(format!("summary-turn-{}", uuid::Uuid::new_v4()));
+                let mut app = crate::ai::middleware::test_util::test_app();
+                app.config.history_file = root.join("history.sqlite");
+                app.session_history_file = root.join("history.sqlite");
+                app.session_id = format!("summary-turn-{}", uuid::Uuid::new_v4());
+                app.current_model = "summary-turn-test-model".to_string();
+                let mut history = Vec::new();
+                for turn in 0..3 {
+                    history.push(summary_message(
+                        "user",
+                        format!("old request {turn}: {}", "u".repeat(2_000)),
+                    ));
+                    history.push(summary_message(
+                        "assistant",
+                        format!("old answer {turn}: {}", "a".repeat(2_000)),
+                    ));
+                }
+                assert!(super::persist_pending_turn_messages(
+                    &app, false, &history, &mut 0
+                ));
+                let (_, basis) = crate::ai::history::build_context_history_with_snapshot_basis(
+                    usize::MAX,
+                    &app.session_history_file,
+                    100_000,
+                    8,
+                    8_000,
+                    None,
+                    None,
+                )
+                .unwrap();
+                let mut projection = persistent.then(|| super::PersistableContextProjection {
+                    message_range: 1..1 + history.len(),
+                    messages: history.clone(),
+                    basis: basis.unwrap(),
+                });
+                // Fixed instructions cannot be mechanically trimmed. Their
+                // size keeps every simulated tool round above input allowance,
+                // with a valid old dialogue span available on the first round.
+                let mut messages = vec![summary_message(
+                    "system",
+                    "fixed instruction ".repeat(40_000),
+                )];
+                messages.extend(history);
+                messages.push(summary_message("user", "continue the current task"));
+                let initial_messages = messages.clone();
+                let summarizer = ScriptedHistorySummarizer {
+                    calls: AtomicUsize::new(0),
+                    response,
+                };
+                let mut turn_budget = LlmSummaryBudget::default();
+                for round in 1..=4 {
+                    if round > 1 {
+                        let id = format!("summary_tool_{round}");
+                        messages.push(Message {
+                            tool_calls: Some(vec![ToolCall {
+                                id: id.clone(),
+                                tool_type: "function".to_string(),
+                                function: FunctionCall {
+                                    name: "read_file".to_string(),
+                                    arguments: "{}".to_string(),
+                                },
+                            }]),
+                            ..summary_message("assistant", "")
+                        });
+                        messages.push(Message {
+                            tool_call_id: Some(id),
+                            ..summary_message("tool", format!("round {round} evidence"))
+                        });
+                    }
+                    let before = request::preview_request_budget(
+                        &app,
+                        &app.current_model,
+                        &messages,
+                        true,
+                        false,
+                    )
+                    .await;
+                    assert!(before.exceeds_input_allowance());
+                    let after = super::apply_request_budget(
+                        &app,
+                        &app.current_model,
+                        &mut messages,
+                        &mut projection,
+                        &mut turn_budget,
+                        &summarizer,
+                        false,
+                        round,
+                        &mut super::CompressionReport::default(),
+                        before,
+                    )
+                    .await;
+                    assert!(after.exceeds_input_allowance());
+                    assert_eq!(summarizer.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(
+                        turn_budget.decide(true, 2_000_000, round + 1).reason,
+                        LlmSummaryReason::AttemptLimit
+                    );
+                }
+                let logs = crate::ai::driver::decision_log::get_decision_log_store()
+                    .by_type(&crate::ai::driver::decision_log::DecisionType::ContextProjection);
+                let decisions: Vec<Value> = logs
+                    .iter()
+                    .filter(|log| log.session_id == app.session_id)
+                    .map(|log| serde_json::from_str(&log.context).unwrap())
+                    .filter(|body: &Value| body["schema"] == "llm-summary-budget-v1")
+                    .collect();
+                assert_eq!(
+                    decisions
+                        .iter()
+                        .filter(|body| body["model_called"] == true)
+                        .count(),
+                    1
+                );
+                assert!(
+                    decisions
+                        .iter()
+                        .any(|body| body["trigger"] == "pre_request_fallback"
+                            && body["reason"] == "attempt-limit")
+                );
+                if persistent {
+                    assert!(
+                        decisions
+                            .iter()
+                            .any(|body| body["trigger"] == "persistable_context"
+                                && body["reason"] == "model-called")
+                    );
+                }
+                assert!(decisions.iter().all(|body| body["chars_before"].is_u64()
+                    && body["chars_after"].is_u64()
+                    && body["attempt_index"].is_u64()));
+                assert!(
+                    !serde_json::to_string(&decisions)
+                        .unwrap()
+                        .contains("fixed instruction")
+                );
 
-        // No cross-session interference: another session's cursor stays 0 and should trigger independently.
-        let other = "test-session-cursor-isolation";
-        assert!(should_try_llm_summary(other, after_chars, threshold));
+                // A fresh turn in the same session receives its own allowance.
+                let mut next_messages = initial_messages;
+                let before = request::preview_request_budget(
+                    &app,
+                    &app.current_model,
+                    &next_messages,
+                    true,
+                    false,
+                )
+                .await;
+                super::apply_request_budget(
+                    &app,
+                    &app.current_model,
+                    &mut next_messages,
+                    &mut None,
+                    &mut LlmSummaryBudget::default(),
+                    &summarizer,
+                    false,
+                    1,
+                    &mut super::CompressionReport::default(),
+                    before,
+                )
+                .await;
+                assert_eq!(summarizer.calls.load(Ordering::SeqCst), 2);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
 
-        record_llm_summary_attempt_chars(sid, 0);
+    #[tokio::test]
+    async fn llm_summary_budget_below_allowance_keeps_request_bytes() {
+        let root = std::env::temp_dir().join(format!("summary-normal-{}", uuid::Uuid::new_v4()));
+        let mut app = crate::ai::middleware::test_util::test_app();
+        app.config.history_file = root.join("history.sqlite");
+        app.session_history_file = root.join("history.sqlite");
+        let mut messages = vec![
+            summary_message("system", "stable instructions"),
+            summary_message("user", "a normal question"),
+        ];
+        let original_bytes = serde_json::to_vec(&messages).unwrap();
+        let summarizer = ScriptedHistorySummarizer {
+            calls: AtomicUsize::new(0),
+            response: None,
+        };
+        let before =
+            request::preview_request_budget(&app, &app.current_model, &messages, true, false).await;
+        assert!(!before.exceeds_input_allowance());
+        let mut budget = LlmSummaryBudget::default();
+        super::apply_request_budget(
+            &app,
+            &app.current_model,
+            &mut messages,
+            &mut None,
+            &mut budget,
+            &summarizer,
+            false,
+            1,
+            &mut super::CompressionReport::default(),
+            before,
+        )
+        .await;
+        assert_eq!(serde_json::to_vec(&messages).unwrap(), original_bytes);
+        assert_eq!(summarizer.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.decide(true, 500_000, 2).attempt_index, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn llm_summary_budget_mechanical_only_outcome_does_not_spend_model_call() {
+        let root = std::env::temp_dir().join(format!("summary-no-op-{}", uuid::Uuid::new_v4()));
+        let mut app = crate::ai::middleware::test_util::test_app();
+        app.config.history_file = root.join("history.sqlite");
+        app.session_history_file = root.join("history.sqlite");
+        let messages = vec![
+            summary_message("system", "instructions"),
+            summary_message("user", "current task"),
+            summary_message("assistant", "replay ".repeat(4_000)),
+        ];
+        let summarizer = ScriptedHistorySummarizer {
+            calls: AtomicUsize::new(0),
+            response: None,
+        };
+        let outcome = crate::ai::history::compress::mid_turn_llm_summarize_with_summarizer(
+            &app,
+            &summarizer,
+            messages,
+            2,
+            8_000,
+            1_000,
+            None,
+        )
+        .await;
+        assert!(outcome.effective);
+        assert!(!outcome.summary_inserted);
+        assert!(!outcome.model_called);
+        assert_eq!(summarizer.calls.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

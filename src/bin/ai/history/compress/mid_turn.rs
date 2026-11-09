@@ -2,6 +2,8 @@
 //! protection and LLM-summary fallback.
 
 use super::*;
+use crate::ai::history::HistoryMessageSummarizer;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Shared tail policy for request-level and persisted LLM summary projections.
 /// Keep the most recent real user turns verbatim before summarizing older spans.
@@ -325,16 +327,55 @@ fn cap_mid_turn_llm_evidence(messages: Vec<Message>, overflow_dir: &Path) -> (Ve
     (messages, after)
 }
 
+/// Summary execution is independent of candidate insertion and net savings.
+/// A failed model response or rejected archive plan still consumes a call.
+pub(in crate::ai) struct MidTurnLlmSummaryOutcome {
+    pub(in crate::ai) messages: Vec<Message>,
+    pub(in crate::ai) before_chars: usize,
+    pub(in crate::ai) after_chars: usize,
+    pub(in crate::ai) effective: bool,
+    pub(in crate::ai) summary_inserted: bool,
+    pub(in crate::ai) model_called: bool,
+}
+
+struct ObservedSummarizer<'a, S: ?Sized> {
+    inner: &'a S,
+    model_called: AtomicBool,
+}
+
+impl<S: HistoryMessageSummarizer + ?Sized> HistoryMessageSummarizer for ObservedSummarizer<'_, S> {
+    fn summarize_history_messages<'a>(
+        &'a self,
+        messages: &'a [Message],
+        max_chars: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        // Incremental planning has already checked for fresh, nonempty input.
+        // Observe the port before awaiting it, regardless of its eventual result.
+        self.model_called.store(true, Ordering::Relaxed);
+        self.inner.summarize_history_messages(messages, max_chars)
+    }
+}
+
 fn finalize_mid_turn_llm_summary(
     messages: Vec<Message>,
     before: usize,
     llm_summary_inserted: bool,
-) -> (Vec<Message>, usize, usize, bool, bool) {
+    model_called: bool,
+) -> MidTurnLlmSummaryOutcome {
     let after = messages_total_chars(&messages);
     let was_effective = before.saturating_sub(after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS;
-    (messages, before, after, was_effective, llm_summary_inserted)
+    MidTurnLlmSummaryOutcome {
+        messages,
+        before_chars: before,
+        after_chars: after,
+        effective: was_effective,
+        summary_inserted: llm_summary_inserted,
+        model_called,
+    }
 }
 
+/// Retain the projection-only interface for persisted history callers. The
+/// turn driver uses the explicit execution outcome below to account for calls.
 pub(in crate::ai) async fn mid_turn_llm_summarize(
     app: &App,
     messages: Vec<Message>,
@@ -343,6 +384,38 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     hard_target: usize,
     cwd: Option<&Path>,
 ) -> (Vec<Message>, usize, usize, bool, bool) {
+    let outcome = mid_turn_llm_summarize_with_summarizer(
+        app,
+        app,
+        messages,
+        keep_recent_turns,
+        summary_max_chars,
+        hard_target,
+        cwd,
+    )
+    .await;
+    (
+        outcome.messages,
+        outcome.before_chars,
+        outcome.after_chars,
+        outcome.effective,
+        outcome.summary_inserted,
+    )
+}
+
+pub(in crate::ai) async fn mid_turn_llm_summarize_with_summarizer(
+    app: &App,
+    summarizer: &(impl HistoryMessageSummarizer + Sync + ?Sized),
+    messages: Vec<Message>,
+    keep_recent_turns: usize,
+    summary_max_chars: usize,
+    hard_target: usize,
+    cwd: Option<&Path>,
+) -> MidTurnLlmSummaryOutcome {
+    let observed = ObservedSummarizer {
+        inner: summarizer,
+        model_called: AtomicBool::new(false),
+    };
     let before = messages_total_chars(&messages);
     let overflow_dir = crate::ai::history::SessionStore::new(app.config.history_file.as_path())
         .session_assets_dir(&app.session_id);
@@ -360,7 +433,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     // doc).
     let mut llm_summary_inserted = false;
     if best_after <= hard_target {
-        return finalize_mid_turn_llm_summary(messages, before, llm_summary_inserted);
+        return finalize_mid_turn_llm_summary(messages, before, llm_summary_inserted, false);
     }
 
     // === Path A: cross-turn LLM summary ===
@@ -412,8 +485,8 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
             .any(|m| m.role == "user" || m.role == "assistant")
             || !checkpoint_markers.is_empty();
         if has_dialog {
-            if let Some(summary_plan) = plan_incremental_summary_with_app(
-                app,
+            if let Some(summary_plan) = incremental::plan_incremental_summary_with_summarizer(
+                &observed,
                 earlier,
                 summary_max_chars,
                 Some(overflow_dir.as_path()),
@@ -478,7 +551,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                 if before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS
                     && best_after <= hard_target
                 {
-                    return finalize_mid_turn_llm_summary(best.unwrap(), before, true);
+                    return finalize_mid_turn_llm_summary(best.unwrap(), before, true, true);
                 }
             }
         }
@@ -528,6 +601,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
             best.unwrap_or(messages),
             before,
             llm_summary_inserted,
+            observed.model_called.load(Ordering::Relaxed),
         );
     }
 
@@ -559,7 +633,12 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
         Some(overflow_dir.as_path()),
         &lossless_tool_call_ids,
     );
-    finalize_mid_turn_llm_summary(result, before, llm_summary_inserted)
+    finalize_mid_turn_llm_summary(
+        result,
+        before,
+        llm_summary_inserted,
+        observed.model_called.load(Ordering::Relaxed),
+    )
 }
 
 #[cfg(test)]

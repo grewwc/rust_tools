@@ -2223,22 +2223,31 @@ mod tests {
             &app.current_model,
             app.config.history_max_chars,
         );
-        let gate_open = crate::ai::driver::turn_runtime::should_try_llm_summary(
-            &app.session_id,
+        let measured = crate::ai::request::preview_request_budget(
+            &app,
+            &app.current_model,
+            &work,
+            true,
+            false,
+        )
+        .await;
+        let gate = super::super::llm_summary_budget::LlmSummaryBudget::default().decide(
+            measured.exceeds_input_allowance(),
             report.after_chars,
-            llm_threshold,
+            1,
         );
         assert!(
-            !gate_open,
+            gate.reason == super::super::llm_summary_budget::LlmSummaryReason::BelowAllowance,
             "常规压缩已达标后不应调用有损 LLM 摘要: after_chars={} threshold={}",
-            report.after_chars, llm_threshold
+            report.after_chars,
+            llm_threshold
         );
 
         // 5. Many small old user messages cannot be silently dropped by regular compression; when
         //    the context still exceeds the threshold after compression, the LLM summary fallback
         //    must actually run. Each segment stays below the user-original offload threshold to cover this path.
         let mut summary_work = vec![msg("system", "你是测试助手，请遵循项目规则。")];
-        for turn in 0..220 {
+        for turn in 0..440 {
             summary_work.push(msg(
                 "user",
                 format!("第 {turn} 轮问题：{}", "u".repeat(900)),
@@ -2254,12 +2263,23 @@ mod tests {
             dense_report.after_chars,
             llm_threshold
         );
+        let measured = crate::ai::request::preview_request_budget(
+            &app,
+            &app.current_model,
+            &summary_work,
+            true,
+            false,
+        )
+        .await;
         assert!(
-            crate::ai::driver::turn_runtime::should_try_llm_summary(
-                &app.session_id,
-                dense_report.after_chars,
-                llm_threshold,
-            ),
+            super::super::llm_summary_budget::LlmSummaryBudget::default()
+                .decide(
+                    measured.exceeds_input_allowance(),
+                    dense_report.after_chars,
+                    1,
+                )
+                .reason
+                == super::super::llm_summary_budget::LlmSummaryReason::Allowed,
             "压缩后仍超阈值时 LLM 摘要门控应打开"
         );
 

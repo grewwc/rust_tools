@@ -27,6 +27,7 @@ use super::{
     iteration::{
         execute_turn_iteration, finish_interrupted_turn, refresh_skill_turn_for_iteration,
     },
+    llm_summary_budget::LlmSummaryBudget,
     persistence::{persist_pending_turn_messages, persist_pending_turn_messages_for_model},
     prepare::prepare_turn,
     tool_result::{
@@ -1344,6 +1345,7 @@ pub(in crate::ai::driver) async fn run_turn(
                             self_generated_audit,
                             should_quit,
                             DelegationAdvisoryState::default(),
+                            LlmSummaryBudget::default(),
                         ),
                     )
                     .await
@@ -1521,6 +1523,7 @@ async fn run_turn_body(
     self_generated_audit: Option<bool>,
     should_quit: bool,
     delegation_advisory: DelegationAdvisoryState,
+    mut llm_summary_budget: LlmSummaryBudget,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
     // Clear the previous round's interrupt flag at the start of every round so it
     // reflects only whether THIS round was interrupted by Ctrl+C.
@@ -1782,6 +1785,7 @@ async fn run_turn_body(
             &mut response_model,
             &mut messages,
             &mut persistable_context,
+            &mut llm_summary_budget,
             &turn_messages,
             one_shot_mode,
             &mut persisted_turn_messages,
@@ -2899,6 +2903,7 @@ async fn run_turn_body(
                             None,
                             should_quit,
                             supervisor.progress.delegation_advisory,
+                            llm_summary_budget,
                         ))
                         .await;
                     }

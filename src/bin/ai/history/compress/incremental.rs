@@ -261,7 +261,7 @@ pub(super) async fn plan_incremental_summary_with_app(
     plan_incremental_summary_with_summarizer(app, messages, max_chars, overflow_dir).await
 }
 
-async fn plan_incremental_summary_with_summarizer(
+pub(super) async fn plan_incremental_summary_with_summarizer(
     summarizer: &(impl HistoryMessageSummarizer + ?Sized),
     messages: &[Message],
     max_chars: usize,

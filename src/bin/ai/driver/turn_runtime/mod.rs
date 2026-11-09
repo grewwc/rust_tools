@@ -26,6 +26,7 @@ mod context_metrics;
 mod debug;
 mod finalize;
 mod iteration;
+mod llm_summary_budget;
 mod orchestrator;
 mod output_postprocess;
 mod persistence;
@@ -268,66 +269,6 @@ pub(in crate::ai::driver::turn_runtime) fn token_window_char_ceiling(model: &str
         .saturating_div(5)
         .max(MID_TURN_COMPRESS_SOFT_FLOOR)
 }
-/// Pre-request LLM summary re-trigger minimum change: if messages have changed by less than this since the last LLM summary,
-/// skip it, avoiding a repeated LLM call every turn when summarization fails. The gate compares the absolute delta, so a
-/// projection that materially shrank (e.g. mechanical compression) is not mistaken for the same unchanged projection.
-pub(in crate::ai::driver::turn_runtime) const PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH: usize = 20_000;
-
-/// Records the total message character count after the last LLM summary attempt per independent execution context.
-///
-/// mid-turn and pre-request share this cursor: if the same context batch just attempted an LLM summary
-/// and no new compression headroom appeared, do not repeat the request at the other trigger point. Both success and no-op
-/// attempts record the post-attempt size; retry only after the projection changed by at least
-/// [`PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH`] in either direction (shrinkage below the cursor means a materially different,
-/// still-over-budget projection, which must not be suppressed).
-/// The key includes both the session and the current scheduler process pid so the parent agent and concurrent subagents do not suppress each other.
-static LAST_LLM_SUMMARY_ATTEMPT_CHARS: std::sync::LazyLock<
-    std::sync::Mutex<rust_tools::commonw::FastMap<String, usize>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(rust_tools::commonw::FastMap::default()));
-
-fn llm_summary_attempt_scope_key(session_id: &str, task_pid: Option<u64>) -> String {
-    match task_pid {
-        Some(pid) => format!("{session_id}:pid:{pid}"),
-        None => session_id.to_string(),
-    }
-}
-
-fn current_llm_summary_attempt_scope_key(session_id: &str) -> String {
-    llm_summary_attempt_scope_key(session_id, super::current_task_pid())
-}
-
-fn load_last_llm_summary_attempt_chars(session_id: &str) -> usize {
-    let scope_key = current_llm_summary_attempt_scope_key(session_id);
-    LAST_LLM_SUMMARY_ATTEMPT_CHARS
-        .lock()
-        .ok()
-        .and_then(|map| map.get(&scope_key).copied())
-        .unwrap_or(0)
-}
-
-pub(in crate::ai::driver::turn_runtime) fn record_llm_summary_attempt_chars(
-    session_id: &str,
-    chars_after_attempt: usize,
-) {
-    let scope_key = current_llm_summary_attempt_scope_key(session_id);
-    if let Ok(mut map) = LAST_LLM_SUMMARY_ATTEMPT_CHARS.lock() {
-        map.insert(scope_key, chars_after_attempt);
-    }
-}
-
-pub(in crate::ai::driver::turn_runtime) fn should_try_llm_summary(
-    session_id: &str,
-    total_chars: usize,
-    threshold: usize,
-) -> bool {
-    if total_chars <= threshold {
-        return false;
-    }
-    let last_attempt_chars = load_last_llm_summary_attempt_chars(session_id);
-    let delta = total_chars.abs_diff(last_attempt_chars);
-    last_attempt_chars == 0 || delta >= PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH
-}
-
 pub(in crate::ai) use debug::report_agent_hang_debug;
 
 #[cfg(test)]
@@ -399,74 +340,6 @@ mod tests {
                 "pre-request LLM (limit 180000) skipped (no LLM summary), \
                  mechanical-only: 581560 → 569677 chars"
             )
-        );
-    }
-
-    #[test]
-    fn llm_summary_attempt_gate_is_shared_across_mid_turn_and_pre_request() {
-        let sid = "test-shared-llm-summary-attempt-gate";
-        let mid_turn_hard = 315_000;
-        let pre_request_threshold = 180_000;
-        let attempted_chars = 426_331;
-
-        record_llm_summary_attempt_chars(sid, 0);
-        assert!(should_try_llm_summary(sid, attempted_chars, mid_turn_hard));
-
-        // After mid-turn already attempted an LLM summary on this context batch without effect,
-        // pre-request must not immediately repeat the same summary just because its threshold is lower.
-        record_llm_summary_attempt_chars(sid, attempted_chars);
-        assert!(!should_try_llm_summary(
-            sid,
-            attempted_chars,
-            pre_request_threshold
-        ));
-        assert!(!should_try_llm_summary(
-            sid,
-            attempted_chars + PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH - 1,
-            pre_request_threshold
-        ));
-        assert!(should_try_llm_summary(
-            sid,
-            attempted_chars + PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH,
-            pre_request_threshold
-        ));
-
-        record_llm_summary_attempt_chars(sid, 0);
-    }
-
-    #[test]
-    fn llm_summary_gate_reopens_after_material_shrink_below_cursor() {
-        let sid = "test-llm-summary-shrink-reopen";
-        record_llm_summary_attempt_chars(sid, 300_000);
-
-        // A later mechanical pass can shrink the projection far below the last
-        // post-attempt size while token pressure still exceeds the soft target
-        // (threshold 0 keeps the character gate open in the pre-request path).
-        // Saturated subtraction would report zero growth and suppress the only
-        // remaining relief (LLM summary); the absolute delta must reopen it.
-        assert!(should_try_llm_summary(sid, 250_000, 0));
-
-        // Small jitter around the cursor stays suppressed.
-        record_llm_summary_attempt_chars(sid, 250_000);
-        assert!(!should_try_llm_summary(sid, 251_000, 0));
-
-        record_llm_summary_attempt_chars(sid, 0);
-    }
-
-    #[test]
-    fn llm_summary_attempt_scope_isolated_by_task_pid() {
-        let sid = "test-llm-summary-attempt-scope";
-        assert_ne!(
-            llm_summary_attempt_scope_key(sid, None),
-            llm_summary_attempt_scope_key(sid, Some(41))
-        );
-        assert_ne!(
-            llm_summary_attempt_scope_key(sid, Some(41)),
-            llm_summary_attempt_scope_key(sid, Some(42))
-        );
-        assert_ne!(
-            llm_summary_attempt_scope_key("session-a", Some(41)),
-            llm_summary_attempt_scope_key("session-b", Some(41))
         );
     }
 
