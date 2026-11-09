@@ -44,6 +44,8 @@ function streamHarness({ activityOnly = false } = {}) {
     box, sid: "s", sessionId: "s", finished: false, turnError: false,
     runEpoch: 0, eventFailures: 0, confirmPollSeq: 0,
     setTimeout: (fn, delay) => { timers.push(delay); return timers.length; }, clearTimeout() {},
+    // Extracted slices may arm timers; the assertions drive them directly.
+    setInterval: () => 0, clearInterval() {},
     shouldFollowOutput: () => false, followOutput() {},
     renderMarkdown: (text) => text, decorateMath() {}, decorateAndLoad() {},
     showConfirm() {}, hideConfirm() {}, confirmShown: null,
