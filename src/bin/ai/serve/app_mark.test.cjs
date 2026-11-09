@@ -663,9 +663,9 @@ test("mark styles use theme gold and phone actions have 44px touch targets", () 
   assert.match(css, /#sessions li \.mk\[aria-pressed="true"\] \{ color:var\(--mark\); \}/);
   assert.equal((css.match(/--mark:#[a-f0-9]+/gi) || []).length, 3);
   const phoneCSS = css.slice(css.indexOf("@media (max-width:700px)"));
-  assert.match(phoneCSS, /#sessions li \.rn, #sessions li \.mk \{ min-width:44px; min-height:44px; \}/);
-  assert.match(phoneCSS, /#sessions li \.mk \{ display:inline-flex; align-items:center; justify-content:center; border-radius:12px; background:var\(--surface-2\); \}/);
-  assert.match(phoneCSS, /#sessions li \.mk\[aria-pressed="true"\] \{ background:var\(--tint-3\); color:var\(--mark\); \}/);
+  assert.match(phoneCSS, /#sessions li \.rn \{ min-width:44px; min-height:44px; \}/);
+  assert.match(phoneCSS, /#sessions li \.mk \{ display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; padding:0; font-size:15px; background:none; \}/);
+  assert.match(phoneCSS, /#sessions li \.mk\[aria-pressed="true"\] \{ color:var\(--mark\); \}/);
   assert.match(css, /#sessionactionspanel button \{ min-width:44px; min-height:44px;/);
   assert.match(html, /id="sessionactions" hidden/);
   assert.match(html, /id="sessionactionspanel" role="dialog" aria-modal="true" aria-labelledby="sessionactionstitle"/);

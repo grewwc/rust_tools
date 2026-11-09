@@ -799,11 +799,9 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #sessions { position:absolute; top:0; bottom:0; left:0; z-index:10; width:min(86vw,320px); border-radius:0 20px 20px 0; box-shadow:var(--shadow-panel); }
   #scrim.on { display:block; position:absolute; inset:0; z-index:5; background:rgba(0,0,0,.45); }
   #sessions li { padding:12px 10px; font-size:15px; touch-action:pan-y; -webkit-user-select:none; user-select:none; }
-  #sessions li .rn, #sessions li .mk { min-width:44px; min-height:44px; }
-  /* The star has to read as a control on the phone too: the desktop hover
-     reveal is unavailable, so the mark button carries its own surface. */
-  #sessions li .mk { display:inline-flex; align-items:center; justify-content:center; border-radius:12px; background:var(--surface-2); }
-  #sessions li .mk[aria-pressed="true"] { background:var(--tint-3); color:var(--mark); }
+  #sessions li .rn { min-width:44px; min-height:44px; }
+  #sessions li .mk { display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; padding:0; font-size:15px; background:none; }
+  #sessions li .mk[aria-pressed="true"] { color:var(--mark); }
   #sessions li .rnm { -webkit-user-select:text; user-select:text; }
   .rowbtns button { flex:1; min-height:42px; font-size:13px; }
   #sessfilter { padding:10px 8px; }
