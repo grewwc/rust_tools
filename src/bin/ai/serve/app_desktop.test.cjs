@@ -567,6 +567,27 @@ test("the sheet has desktop placement, modal attributes and unchanged theme-base
   assert.match(html, /id="sessionactionspanel" role="dialog" aria-modal="true" aria-labelledby="sessionactionstitle"/);
 });
 
+test("desktop user bubbles stay gray and selected sessions retain teal accents", () => {
+  const desktopBubble = responsiveRule(".msg.user");
+  assert.equal(desktopBubble.background, "var(--surface)");
+  assert.equal(desktopBubble.color, "var(--fg)");
+  for (const [selector, background] of [
+    [":root", "#2e2e2e"],
+    [':root[data-theme="light"]', "#dfdfdf"],
+    [':root[data-theme="warm"]', "#e0dede"],
+  ]) {
+    assert.equal(responsiveRule(selector)["--surface"], background, selector + " user bubble fill");
+  }
+  assert.equal(responsiveRule("#sessions li.cur")["box-shadow"], "inset 2px 0 0 var(--acc)");
+  assert.equal(responsiveRule("#sessions li.cur").background, "var(--tint-3)");
+  assert.equal(responsiveRule("button.primary").background, "var(--acc)");
+  assert.equal(responsiveRule("button.primary").color, "var(--on-acc)");
+  const phoneBubble = responsiveRule(".msg.user", true);
+  assert.equal(phoneBubble.background, "var(--acc-solid)");
+  assert.equal(phoneBubble.color, "var(--on-user)");
+  assert.equal(responsiveRule("#sessions li.cur", true)["box-shadow"], undefined);
+});
+
 function loadChat(h) {
   Object.assign(h.context, {
     esc: (text) => String(text), updateQuestionButton() {},

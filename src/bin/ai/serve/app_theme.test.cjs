@@ -7,6 +7,7 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const { createHash } = require("node:crypto");
 const vm = require("node:vm");
 const { test } = require("node:test");
 
@@ -19,12 +20,12 @@ function styleWithoutTokens() {
   return style.replace(/:root(?:\[[^\]]*\])?\s*\{[^}]*\}/g, "");
 }
 
-function tokenBlock(selector) {
-  const at = style.indexOf(selector);
+function tokenBlock(selector, source = style) {
+  const at = source.indexOf(selector);
   assert.ok(at >= 0, "missing token block: " + selector);
-  const open = style.indexOf("{", at);
-  const close = style.indexOf("}", open);
-  return style.slice(open + 1, close);
+  const open = source.indexOf("{", at);
+  const close = source.indexOf("}", open);
+  return source.slice(open + 1, close);
 }
 
 const PALETTES = {
@@ -115,6 +116,174 @@ test("no palette literal survives outside the token blocks", () => {
       assert.ok(!rest.includes(m[2]), "palette literal " + m[2] + " left in the stylesheet");
     }
   }
+});
+
+function desktopMediaQueries() {
+  const blocks = [];
+  for (const match of style.matchAll(/@media \(min-width:701px\)[^{]*\{/g)) {
+    const open = match.index + match[0].length;
+    let depth = 1, end = open;
+    while (end < style.length && depth) {
+      if (style[end] === "{") depth++;
+      if (style[end] === "}") depth--;
+      end++;
+    }
+    assert.equal(depth, 0, "unclosed desktop media query");
+    blocks.push({ css: style.slice(match.index, end), body: style.slice(open, end - 1) });
+  }
+  return blocks;
+}
+
+function tokenValues(block) {
+  return Object.fromEntries([...block.matchAll(/(--[a-z0-9-]+):([^;]+);/g)]
+    .map((match) => [match[1], match[2].trim()]));
+}
+
+test("desktop palette overrides use neutral surfaces and keep the shared accent", () => {
+  const expected = {
+    "dark": {
+      "--bg": "#1b1b1b",
+      "--code-bg": "#1f1f1f",
+      "--code-toolbar": "#292929",
+      "--dim": "#b4b4b4",
+      "--edge": "rgba(231,231,231,.20)",
+      "--fg": "#e7e7e7",
+      "--field": "#292929",
+      "--glass": "rgba(36,36,36,.95)",
+      "--glass-strong": "rgba(36,36,36,.98)",
+      "--line": "#3e3e3e",
+      "--line-2": "#5c5c5c",
+      "--media-bg": "#161616",
+      "--panel": "#242424",
+      "--surface": "#2e2e2e",
+      "--surface-2": "#292929",
+      "--surface-hover": "#383838",
+      "--tint": "rgba(231,231,231,.08)",
+      "--tint-2": "rgba(231,231,231,.05)",
+      "--tint-3": "rgba(231,231,231,.10)",
+      "--tint-4": "rgba(231,231,231,.16)"
+    },
+    "light": {
+      "--bg": "#e9e9e9",
+      "--code-bg": "#e2e2e2",
+      "--code-toolbar": "#ececec",
+      "--dim": "#575757",
+      "--edge": "rgba(46,46,46,.18)",
+      "--fg": "#2e2e2e",
+      "--field": "#ececec",
+      "--glass": "rgba(242,242,242,.95)",
+      "--glass-strong": "rgba(242,242,242,.98)",
+      "--line": "#d0d0d0",
+      "--line-2": "#b1b1b1",
+      "--media-bg": "#dadada",
+      "--panel": "#f2f2f2",
+      "--shadow-panel": "0 8px 28px rgba(46,46,46,.10)",
+      "--shadow-sm": "0 2px 8px rgba(46,46,46,.05)",
+      "--surface": "#dfdfdf",
+      "--surface-2": "#ececec",
+      "--surface-hover": "#d3d3d3",
+      "--tint": "rgba(46,46,46,.06)",
+      "--tint-2": "rgba(46,46,46,.04)",
+      "--tint-3": "rgba(46,46,46,.08)",
+      "--tint-4": "rgba(46,46,46,.13)"
+    },
+    "warm": {
+      "--bg": "#e9e7e7",
+      "--code-bg": "#e3e1e1",
+      "--code-toolbar": "#edebeb",
+      "--dim": "#585656",
+      "--edge": "rgba(48,46,46,.18)",
+      "--fg": "#302e2e",
+      "--field": "#edebeb",
+      "--glass": "rgba(242,240,240,.95)",
+      "--glass-strong": "rgba(242,240,240,.98)",
+      "--line": "#d1cfcf",
+      "--line-2": "#b4b2b2",
+      "--media-bg": "#dbd9d9",
+      "--panel": "#f2f0f0",
+      "--shadow-panel": "0 8px 28px rgba(48,46,46,.10)",
+      "--shadow-sm": "0 2px 8px rgba(48,46,46,.05)",
+      "--surface": "#e0dede",
+      "--surface-2": "#edebeb",
+      "--surface-hover": "#d4d2d2",
+      "--tint": "rgba(48,46,46,.06)",
+      "--tint-2": "rgba(48,46,46,.04)",
+      "--tint-3": "rgba(48,46,46,.08)",
+      "--tint-4": "rgba(48,46,46,.13)"
+    }
+  };
+  const desktop = desktopMediaQueries()[0].body;
+  for (const [name, selector] of Object.entries(PALETTES)) {
+    const shared = tokenValues(tokenBlock(selector));
+    const overrides = tokenValues(tokenBlock(selector, desktop));
+    assert.deepEqual(overrides, expected[name], name + " desktop palette changed");
+    const effective = { ...shared, ...overrides };
+    for (const token of ["--acc", "--acc-soft", "--acc-soft-2", "--acc-line", "--acc-line-soft",
+      "--acc-solid", "--acc-focus", "--on-acc", "--ok", "--err", "--mark", "--focus-ring", "--glow"]) {
+      assert.equal(effective[token], shared[token], name + " changed the accent token " + token);
+    }
+  }
+});
+
+test("desktop surfaces, text and shadows stay gray without yellow or teal drift", () => {
+  const desktop = desktopMediaQueries()[0].body;
+  const tokens = ["--bg", "--panel", "--surface", "--surface-hover", "--surface-2", "--field",
+    "--code-toolbar", "--code-bg", "--media-bg", "--glass", "--glass-strong", "--tint", "--tint-2",
+    "--tint-3", "--tint-4", "--edge", "--line", "--line-2", "--fg", "--dim", "--shadow-sm", "--shadow-panel"];
+  for (const [name, selector] of Object.entries(PALETTES)) {
+    const palette = { ...tokenValues(tokenBlock(selector)), ...tokenValues(tokenBlock(selector, desktop)) };
+    for (const token of tokens) {
+      const color = palette[token].match(/#([a-f0-9]{6})(?![a-f0-9])|rgba\((\d+),(\d+),(\d+),[.\d]+\)/i);
+      assert.ok(color, name + " " + token + " has no parsable color");
+      const [r, g, b] = color[1] ? color[1].match(/../g).map((channel) => parseInt(channel, 16)) : color.slice(2).map(Number);
+      const high = Math.max(r, g, b), low = Math.min(r, g, b), chroma = high - low;
+      assert.ok(chroma <= 6, name + " " + token + " channel spread " + chroma + " is not neutral");
+      if (chroma === 0) continue;
+      const sector = high === r ? ((g - b) / chroma + 6) % 6 : high === g ? (b - r) / chroma + 2 : (r - g) / chroma + 4;
+      const hue = sector * 60;
+      assert.ok(hue < 20 || hue > 80, name + " " + token + " has a yellow/orange hue " + hue);
+      assert.ok(hue < 140 || hue > 210, name + " " + token + " has a teal hue " + hue);
+    }
+  }
+});
+
+test("desktop text and selected rows stay readable on neutral surfaces", () => {
+  const desktop = desktopMediaQueries()[0].body;
+  for (const [name, selector] of Object.entries(PALETTES)) {
+    const palette = { ...tokenValues(tokenBlock(selector)), ...tokenValues(tokenBlock(selector, desktop)) };
+    const surfaces = ["--bg", "--panel", "--surface", "--surface-hover", "--surface-2", "--code-bg", "--media-bg"];
+    for (const token of surfaces) {
+      const background = palette[token];
+      assert.ok(contrast(palette["--fg"], background) >= 7, name + " body text contrast on " + token);
+      assert.ok(contrast(palette["--dim"], background) >= 4.5, name + " muted text contrast on " + token);
+    }
+    for (const token of ["--tint", "--tint-2", "--tint-3", "--tint-4"]) {
+      const rgba = palette[token].match(/^rgba\((\d+),(\d+),(\d+),([.\d]+)\)$/);
+      assert.ok(rgba, name + " " + token + " is not an rgba fill");
+      const base = palette["--panel"].slice(1).match(/../g).map((channel) => parseInt(channel, 16));
+      const alpha = Number(rgba[4]);
+      const background = "#" + base.map((channel, index) => Math.round(channel * (1 - alpha) + Number(rgba[index + 1]) * alpha)
+        .toString(16).padStart(2, "0")).join("");
+      assert.ok(contrast(palette["--fg"], background) >= 7, name + " selected text contrast on " + token);
+      assert.ok(contrast(palette["--dim"], background) >= 4.5, name + " selected muted text contrast on " + token);
+    }
+    if (name !== "dark") {
+      assert.ok(relativeLuminance(palette["--panel"]) <= 0.9, name + " desktop panel is too bright");
+    }
+    assert.ok(relativeLuminance(palette["--panel"]) > relativeLuminance(palette["--bg"]), name + " panel hierarchy");
+    assert.ok(contrast(palette["--acc"], palette["--panel"]) >= 4.5, name + " link contrast");
+    assert.ok(contrast(palette["--on-acc"], palette["--acc"]) >= 4.5, name + " primary button contrast");
+  }
+});
+
+test("desktop overrides leave all phone-applicable CSS byte-identical", () => {
+  const desktop = desktopMediaQueries();
+  assert.equal(desktop.length, 2, "expected the desktop and narrow desktop media queries");
+  let phoneApplicable = style;
+  for (const block of desktop) phoneApplicable = phoneApplicable.replace(block.css, "");
+  assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
+    "ac44e1349f15f6dc514b580c84878518d9aa9c588dd3c4a14862b10bcfae2535",
+    "shared or phone CSS changed outside the desktop queries");
 });
 
 test("the header carries a theme toggle with one icon per palette", () => {
