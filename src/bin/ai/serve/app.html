@@ -175,12 +175,9 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessions li { padding:8px; border-radius:8px; font-size:14px; transition:background-color .15s ease, box-shadow .15s ease; }
 #sessions li.cur { background:var(--tint-3); box-shadow:inset 3px 0 0 var(--acc); }
 #sessions li.cur span[role="button"] { font-weight:600; }
-#promptnav { margin-top:10px; padding-top:8px; border-top:1px solid var(--line); }
-#promptnav > summary { font-size:12px; color:var(--dim); cursor:pointer; list-style:none; }
-#promptnav > summary::-webkit-details-marker { display:none; }
-#promptlist { list-style:none; margin:6px 0 0; padding:0; display:flex; flex-direction:column; gap:2px; max-height:34vh; overflow:auto; }
-#promptlist button { width:100%; padding:5px 6px; border:0; border-radius:6px; background:none; color:var(--fg); font:inherit; font-size:12px; line-height:1.35; text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:pointer; }
-#promptlist button:hover { background:var(--surface-2); }
+/* The prompt index is a desktop aid for long transcripts; the phone drawer
+   keeps its single-column session list. */
+#promptnav { display:none; }
 #msgs .user-msg-row.flash .msg.user { box-shadow:0 0 0 2px var(--acc); }
 #sessions li.holding { background:var(--tint-4); }
 #sessions li small { color:var(--dim); display:block; font-size:12px; }
@@ -717,12 +714,58 @@ button:active:not(:disabled) { filter:brightness(.96); }
   }
   #sessfilter { min-height:32px; font-size:13px; }
   #sessions .rowbtns { flex-shrink:0; }
+  /* Session prompt index: a bordered card so it reads as a first-class
+     sidebar section instead of a footnote under the session list. */
+  #promptnav {
+    display:block; flex:0 0 auto; min-height:0; margin:6px 8px 10px;
+    padding:8px 8px 6px; border:1px solid var(--line); border-radius:var(--radius-card);
+    background:var(--surface); box-shadow:var(--shadow-sm);
+  }
+  #promptnav > summary {
+    display:flex; align-items:center; gap:8px; padding:2px 4px 7px;
+    font-size:12px; font-weight:600; letter-spacing:.02em; color:var(--fg);
+    cursor:pointer; list-style:none;
+  }
+  #promptnav > summary::-webkit-details-marker { display:none; }
+  #promptnav .pncount {
+    margin-left:auto; padding:1px 7px; border-radius:999px;
+    background:var(--tint-3); color:var(--dim); font-size:11px; font-weight:500;
+    font-variant-numeric:tabular-nums;
+  }
+  #promptlist {
+    display:flex; flex-direction:column; gap:1px; margin:0; padding:0 4px 2px;
+    list-style:none; max-height:min(38vh, 320px); overflow:auto; overscroll-behavior:contain;
+  }
+  #promptlist li { min-width:0; }
+  #promptlist button {
+    display:flex; gap:8px; align-items:baseline; width:100%; padding:5px 7px;
+    border:0; border-left:2px solid transparent; border-radius:6px;
+    background:none; color:var(--fg); font:inherit; font-size:12.5px; line-height:1.35;
+    text-align:left; cursor:pointer;
+  }
+  #promptlist button:hover { background:var(--surface-2); border-left-color:var(--acc); }
+  #promptlist button:focus-visible { outline:2px solid var(--acc); outline-offset:1px; }
+  #promptlist .pni {
+    flex:0 0 auto; min-width:18px; color:var(--dim);
+    font-size:11px; font-variant-numeric:tabular-nums;
+  }
+  #promptlist .pnt { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #promptlist li.cur button { background:var(--tint-3); border-left-color:var(--acc); font-weight:500; }
+  #promptlist .pempty { padding:6px 7px; color:var(--dim); font-size:12px; }
   /* Equal outer widths and gutters align transcript, status, and footer. */
   #msgwrap, #turnstatus, #ovrwrap, #composer { width:100%; max-width:1000px; align-self:center; }
   #msgs { padding:18px 24px; gap:10px; }
   .turn { gap:8px; }
   .msg { max-width:100%; padding:8px 12px; line-height:1.5; }
-  .msg.user { max-width:85%; background:var(--surface); color:var(--fg); }
+  /* A reader's own turn is the anchor when scrolling back through a long
+     tool-heavy transcript, so it gets a distinct surface, a border and the
+     accent rule instead of blending into the assistant cards. */
+  .msg.user {
+    max-width:85%; background:var(--surface-2); color:var(--fg);
+    border:1px solid var(--line); box-shadow:0 1px 2px rgba(15,23,42,.05);
+    font-weight:450;
+  }
+  .user-msg-row > .msg.user { border-left:3px solid var(--acc); }
   /* The wrapper is also the canonical history row, so give it a box instead
      of flattening its children into the transcript flex scroller. */
   .user-msg-row {
@@ -934,7 +977,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <nav id="sessions"><input id="sessfilter" placeholder="filter sessions…" autocomplete="off">
 <div id="sesscount"></div><ul id="sesslist"></ul>
 <details id="promptnav" open>
-<summary>我的输入 <span id="promptcount"></span></summary>
+<summary><span class="pnlabel">会话提问</span><span id="promptcount" class="pncount"></span></summary>
 <ol id="promptlist"></ol>
 </details>
 <div class="rowbtns"><button id="fork">fork</button><button id="del">delete</button><button id="refresh">refresh</button></div>
@@ -4382,25 +4425,42 @@ function syncPromptNav() {
   if (!list || !$("msgs")) return;
   const rows = [...$("msgs").querySelectorAll(".user-msg-row")];
   const count = $("promptcount");
-  if (count) count.textContent = rows.length ? String(rows.length) : "";
   list.textContent = "";
+  let shown = 0;
   for (const row of rows) {
     const bubble = row.querySelector(".msg.user");
     const text = (bubble ? bubble.textContent : "").trim().replace(/\s+/g, " ");
     if (!text) continue;
+    shown += 1;
     const item = document.createElement("li");
     const button = document.createElement("button");
     button.type = "button";
-    button.textContent = text.slice(0, 80);
-    button.title = text.slice(0, 400);
+    const index = document.createElement("span");
+    index.className = "pni";
+    index.textContent = String(shown).padStart(2, "0");
+    const label = document.createElement("span");
+    label.className = "pnt";
+    label.textContent = text.slice(0, 120);
+    button.title = text.slice(0, 600);
+    button.appendChild(index);
+    button.appendChild(label);
     button.onclick = () => {
       row.scrollIntoView({ block: "center", behavior: "smooth" });
       row.classList.add("flash");
       setTimeout(() => row.classList.remove("flash"), 1200);
+      for (const other of list.querySelectorAll("li.cur")) other.classList.remove("cur");
+      item.classList.add("cur");
     };
     item.appendChild(button);
     list.appendChild(item);
   }
+  if (!shown) {
+    const empty = document.createElement("li");
+    empty.className = "pempty";
+    empty.textContent = "当前会话还没有提问";
+    list.appendChild(empty);
+  }
+  if (count) count.textContent = shown ? String(shown) : "";
 }
 
 if (typeof MutationObserver === "function" && $("msgs")) {

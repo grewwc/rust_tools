@@ -567,10 +567,12 @@ test("the sheet has desktop placement, modal attributes and unchanged theme-base
   assert.match(html, /id="sessionactionspanel" role="dialog" aria-modal="true" aria-labelledby="sessionactionstitle"/);
 });
 
-test("desktop user bubbles stay gray and selected sessions retain teal accents", () => {
+test("desktop user bubbles stay neutral but carry a border and accent rule", () => {
   const desktopBubble = responsiveRule(".msg.user");
-  assert.equal(desktopBubble.background, "var(--surface)");
+  assert.equal(desktopBubble.background, "var(--surface-2)");
   assert.equal(desktopBubble.color, "var(--fg)");
+  assert.equal(desktopBubble.border, "1px solid var(--line)");
+  assert.equal(responsiveRule(".user-msg-row > .msg.user")["border-left"], "3px solid var(--acc)");
   for (const [selector, background] of [
     [":root", "#2e2e2e"],
     [':root[data-theme="light"]', "#dfdfdf"],
