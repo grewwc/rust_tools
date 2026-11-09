@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 
 use crate::commonw::utils::expanduser;
 use rust_tools::cw::SkipMap;
@@ -316,12 +317,107 @@ where
     }
 }
 
-static USER_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(load_user_models);
-static BUILTIN_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(load_builtin_models);
-static USER_BY_KEY: LazyLock<SkipMap<String, usize>> = LazyLock::new(build_user_key_index);
-static BUILTIN_BY_KEY: LazyLock<SkipMap<String, usize>> = LazyLock::new(build_builtin_key_index);
-static USER_BY_NAME: LazyLock<SkipMap<String, usize>> = LazyLock::new(build_user_name_index);
-static BUILTIN_BY_NAME: LazyLock<SkipMap<String, usize>> = LazyLock::new(build_builtin_name_index);
+/// Process-global snapshot of the model registry (built-in `models/` plus the
+/// user registry). The registry is re-read whenever either directory's
+/// modification time changed, so a model file edited after startup is picked
+/// up without a restart; while the directories are untouched the parsed result
+/// is reused. The snapshot is shared across threads, so every caller observes
+/// one stable set of `ModelDef` allocations.
+struct RegistryState {
+    user_models: Vec<ModelDef>,
+    builtin_models: Vec<ModelDef>,
+    user_by_key: SkipMap<String, usize>,
+    builtin_by_key: SkipMap<String, usize>,
+    user_by_name: SkipMap<String, usize>,
+    builtin_by_name: SkipMap<String, usize>,
+    /// On-disk stamp this snapshot was loaded from, used to detect reloads.
+    stamp: Option<(Option<SystemTime>, Option<SystemTime>)>,
+}
+
+fn empty_registry_state() -> &'static RegistryState {
+    Box::leak(Box::new(RegistryState {
+        user_models: Vec::new(),
+        builtin_models: Vec::new(),
+        user_by_key: SkipMap::default(),
+        builtin_by_key: SkipMap::default(),
+        user_by_name: SkipMap::default(),
+        builtin_by_name: SkipMap::default(),
+        stamp: None,
+    }))
+}
+
+static REGISTRY: LazyLock<Mutex<&'static RegistryState>> =
+    LazyLock::new(|| Mutex::new(empty_registry_state()));
+
+/// Identity of the on-disk registry inputs: the newest file mtime in each
+/// directory, or `None` when the directory cannot be listed. Re-reading only
+/// when this changes keeps steady-state lookups free of directory scans while
+/// still observing added, removed, and rewritten model files.
+
+fn registry_stamp() -> Option<(Option<SystemTime>, Option<SystemTime>)> {
+    let builtin_stamp = dir_stamp(&builtin_config_dir());
+    let user_stamp = user_registry_stamp();
+    Some((builtin_stamp, user_stamp))
+}
+
+fn dir_stamp(dir: &Path) -> Option<SystemTime> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut newest: Option<SystemTime> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file()
+            || !path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
+            continue;
+        }
+        let modified = entry.metadata().and_then(|meta| meta.modified()).ok();
+        if let Some(modified) = modified
+            && newest.is_none_or(|current| modified > current)
+        {
+            newest = Some(modified);
+        }
+    }
+    newest
+}
+
+/// The user registry is either the new-format directory (with its own stamp)
+/// or the legacy single file (whose mtime is the stamp).
+fn user_registry_stamp() -> Option<SystemTime> {
+    let dir = user_config_dir();
+    if dir.is_dir() {
+        return dir_stamp(&dir);
+    }
+    std::fs::metadata(legacy_user_config_path())
+        .and_then(|meta| meta.modified())
+        .ok()
+}
+
+/// Reload the registry when the on-disk stamp moved. A broken registry is kept
+/// out of the cache (the previous snapshot stays live) and the load error is
+/// returned to the caller, so a transient edit neither poisons the cache nor
+/// aborts the process.
+fn registry_state() -> Result<&'static RegistryState, String> {
+    let stamp = registry_stamp();
+    let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    if registry.stamp == stamp && stamp.is_some() {
+        return Ok(*registry);
+    }
+    let user_models = load_user_models()?;
+    let builtin_models = load_builtin_models()?;
+    let state = Box::leak(Box::new(RegistryState {
+        user_by_key: build_user_key_index(&user_models),
+        user_by_name: build_user_name_index(&user_models),
+        builtin_by_key: build_builtin_key_index(&builtin_models),
+        builtin_by_name: build_builtin_name_index(&builtin_models),
+        user_models,
+        builtin_models,
+        stamp,
+    }));
+    *registry = state;
+    Ok(state)
+}
 
 fn lookup_key(value: &str) -> String {
     let mut normalized = String::new();
@@ -436,7 +532,11 @@ fn load_models_from_file(path: &Path) -> Option<Vec<ModelDef>> {
     if let Ok(models) = serde_json::from_str::<Vec<ModelDef>>(&content) {
         for model in &models {
             if let Err(reason) = validate_model_def(model, path) {
-                eprintln!("[model_names] invalid model in {}: {}", path.display(), reason);
+                eprintln!(
+                    "[model_names] invalid model in {}: {}",
+                    path.display(),
+                    reason
+                );
                 return None;
             }
         }
@@ -445,7 +545,11 @@ fn load_models_from_file(path: &Path) -> Option<Vec<ModelDef>> {
     match serde_json::from_str::<ModelDef>(&content) {
         Ok(model) => {
             if let Err(reason) = validate_model_def(&model, path) {
-                eprintln!("[model_names] invalid model in {}: {}", path.display(), reason);
+                eprintln!(
+                    "[model_names] invalid model in {}: {}",
+                    path.display(),
+                    reason
+                );
                 return None;
             }
             Some(vec![model])
@@ -465,9 +569,7 @@ fn load_models_from_file(path: &Path) -> Option<Vec<ModelDef>> {
 /// here instead of truncating every long response.
 fn validate_model_def(model: &ModelDef, path: &Path) -> Result<(), String> {
     if model.key.trim().is_empty() {
-        return Err(
-            "model with empty `key` will never resolve; check for a typo".to_string(),
-        );
+        return Err("model with empty `key` will never resolve; check for a typo".to_string());
     }
     if model.name.trim().is_empty() {
         eprintln!(
@@ -576,69 +678,65 @@ fn load_models_from_dir(dir: &Path, strict: bool) -> Option<Vec<ModelDef>> {
     Some(models)
 }
 
-fn load_user_models() -> Vec<ModelDef> {
+fn load_user_models() -> Result<Vec<ModelDef>, String> {
     // New-format directory takes precedence; fall back to the legacy single-file override when absent.
     // Fail fast like the builtin registry: a broken user file exits with the
     // file-specific reason already printed, instead of silently skipping it.
     let dir = user_config_dir();
     if dir.is_dir() {
-        return load_models_from_dir(&dir, true).unwrap_or_else(|| {
-            eprintln!(
+        return load_models_from_dir(&dir, true).ok_or_else(|| {
+            format!(
                 "[model_names] failed to load user models from {}",
                 dir.display()
-            );
-            std::process::exit(1)
+            )
         });
     }
     let legacy = legacy_user_config_path();
     if legacy.exists() {
-        load_models_from_file(&legacy).unwrap_or_else(|| {
-            eprintln!(
+        load_models_from_file(&legacy).ok_or_else(|| {
+            format!(
                 "[model_names] failed to load user models from {}",
                 legacy.display()
-            );
-            std::process::exit(1)
+            )
         })
     } else {
-        Vec::new()
+        Ok(Vec::new())
     }
 }
 
-fn load_builtin_models() -> Vec<ModelDef> {
+fn load_builtin_models() -> Result<Vec<ModelDef>, String> {
     let dir = builtin_config_dir();
     if !dir.is_dir() {
-        eprintln!(
+        return Err(format!(
             "[model_names] builtin models dir not found at {}",
             dir.display()
-        );
-        std::process::exit(1);
+        ));
     }
-    load_models_from_dir(&dir, true).unwrap_or_else(|| {
-        eprintln!(
+    load_models_from_dir(&dir, true).ok_or_else(|| {
+        format!(
             "[model_names] failed to load builtin models from {}",
             dir.display()
-        );
-        std::process::exit(1)
+        )
     })
 }
 
-fn build_user_key_index() -> SkipMap<String, usize> {
+fn build_user_key_index(models: &[ModelDef]) -> SkipMap<String, usize> {
     let mut index = SkipMap::default();
     // Phase 1: unique identifiers (handles, keys, declared aliases).
-    for (i, m) in USER_MODELS.iter().enumerate() {
+    for (i, m) in models.iter().enumerate() {
         insert_model_key_aliases(&mut index, m, i);
     }
-    insert_legacy_aliases_after_keys(&mut index, &USER_MODELS);
+    insert_legacy_aliases_after_keys(&mut index, models);
     index
 }
 
-fn build_builtin_key_index() -> SkipMap<String, usize> {
+fn build_builtin_key_index(models: &[ModelDef]) -> SkipMap<String, usize> {
     let mut index = SkipMap::default();
     // Phase 1: unique identifiers (handles, keys, declared aliases).
-    for (i, m) in BUILTIN_MODELS.iter().enumerate() {
+    for (i, m) in models.iter().enumerate() {
         insert_model_key_aliases(&mut index, m, i);
     }
-    insert_legacy_aliases_after_keys(&mut index, &BUILTIN_MODELS);
+    insert_legacy_aliases_after_keys(&mut index, models);
     index
 }
 
@@ -674,9 +772,9 @@ fn insert_model_key_aliases(index: &mut SkipMap<String, usize>, model: &ModelDef
     }
 }
 
-fn build_user_name_index() -> SkipMap<String, usize> {
+fn build_user_name_index(models: &[ModelDef]) -> SkipMap<String, usize> {
     let mut index = SkipMap::default();
-    for (i, m) in USER_MODELS.iter().enumerate() {
+    for (i, m) in models.iter().enumerate() {
         let key = lookup_key(&m.name);
         if !key.is_empty() && !index.contains_key(&key) {
             index.insert(key, i);
@@ -685,9 +783,9 @@ fn build_user_name_index() -> SkipMap<String, usize> {
     index
 }
 
-fn build_builtin_name_index() -> SkipMap<String, usize> {
+fn build_builtin_name_index(models: &[ModelDef]) -> SkipMap<String, usize> {
     let mut index = SkipMap::default();
-    for (i, m) in BUILTIN_MODELS.iter().enumerate() {
+    for (i, m) in models.iter().enumerate() {
         let key = lookup_key(&m.name);
         if !key.is_empty() && !index.contains_key(&key) {
             index.insert(key, i);
@@ -697,17 +795,24 @@ fn build_builtin_name_index() -> SkipMap<String, usize> {
 }
 
 pub fn all() -> Vec<&'static ModelDef> {
+    let state = match registry_state() {
+        Ok(state) => state,
+        Err(e) => {
+            eprintln!("{e}");
+            return Vec::new();
+        }
+    };
     let mut seen = SkipSet::new(16);
     let mut result = Vec::new();
 
-    for m in USER_MODELS.iter() {
+    for m in state.user_models.iter() {
         let key = lookup_key(&model_handle(m));
         if seen.insert(key) {
             result.push(m);
         }
     }
 
-    for m in BUILTIN_MODELS.iter() {
+    for m in state.builtin_models.iter() {
         let key = lookup_key(&model_handle(m));
         if seen.insert(key) {
             result.push(m);
@@ -718,27 +823,31 @@ pub fn all() -> Vec<&'static ModelDef> {
 }
 
 pub fn find_by_name(name: &str) -> Option<&'static ModelDef> {
+    let state = registry_state().ok()?;
     let name_lower = lookup_key(name);
 
-    if let Some(&i) = USER_BY_NAME.get_ref(&name_lower) {
-        return Some(&USER_MODELS[i]);
+    if let Some(&i) = state.user_by_name.get_ref(&name_lower) {
+        return Some(&state.user_models[i]);
     }
 
-    BUILTIN_BY_NAME
+    state
+        .builtin_by_name
         .get_ref(&name_lower)
-        .map(|&i| &BUILTIN_MODELS[i])
+        .map(|&i| &state.builtin_models[i])
 }
 
 pub fn find_by_key(key: &str) -> Option<&'static ModelDef> {
+    let state = registry_state().ok()?;
     let key_lower = lookup_key(key);
 
-    if let Some(&i) = USER_BY_KEY.get_ref(&key_lower) {
-        return Some(&USER_MODELS[i]);
+    if let Some(&i) = state.user_by_key.get_ref(&key_lower) {
+        return Some(&state.user_models[i]);
     }
 
-    BUILTIN_BY_KEY
+    state
+        .builtin_by_key
         .get_ref(&key_lower)
-        .map(|&i| &BUILTIN_MODELS[i])
+        .map(|&i| &state.builtin_models[i])
 }
 
 pub fn find_by_identifier(identifier: &str) -> Option<&'static ModelDef> {
