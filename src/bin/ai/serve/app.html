@@ -4364,7 +4364,11 @@ function histEndsTurn(msgs) {
   return !!tail && tail.role === "assistant" && !!textOf(tail.content).trim();
 }
 function historyRowsOf(msgs, histTotal, showAll) {
-  const shown = showAll ? msgs : msgs.slice(-200);
+  // A broad window keeps the user's own prompts on screen: one turn writes dozens
+  // of tool rows, so 200 rows can cover only a handful of prompts. The phone stays
+  // narrower because every row costs memory there.
+  const rowWindow = typeof isPhoneLayout === "function" && isPhoneLayout() ? 200 : 800;
+  const shown = showAll ? msgs : msgs.slice(-rowWindow);
   const calls = new Map();
   for (const m of msgs) for (const c of m.tool_calls || []) if (c && c.id) calls.set(c.id, c);
   const histBase = Math.max(0, (histTotal || msgs.length) - shown.length);
@@ -4555,7 +4559,8 @@ async function loadHistory(prefetched) {
       histTotal = prefetched.histTotal;
     } else {
       try {
-        const res = await api("/sessions/" + forSession + "/history?limit=201");
+        const rowWindow = typeof isPhoneLayout === "function" && isPhoneLayout() ? 200 : 800;
+        const res = await api("/sessions/" + forSession + "/history?limit=" + (rowWindow + 1));
         histTotal = Number(res.headers.get("x-history-total")) || 0;
         msgs = await res.json();
       }
