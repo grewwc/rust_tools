@@ -2465,10 +2465,11 @@ function isPhoneLayout() {
 function isNearBottom(root = $("msgs")) {
   return root.scrollHeight - root.scrollTop - root.clientHeight <= FOLLOW_BOTTOM_GAP;
 }
-// Desktop preserves its existing always-follow behavior. On a phone, new
-// output follows only while the reader is already at the live edge.
+// New output follows only while the reader is already at the live edge, on both
+// layouts: dragging a desktop transcript down on every chunk makes reading
+// anything above impossible, and the jump button is the way back.
 function shouldFollowOutput(root = $("msgs")) {
-  return !isPhoneLayout() || isNearBottom(root);
+  return isNearBottom(root);
 }
 function updateJumpButton() {
   const button = $("jumpbottom");
