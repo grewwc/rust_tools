@@ -247,6 +247,11 @@ pub(crate) struct CreateSessionResp {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct SetSessionMarkReq {
+    pub(crate) marked: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct HistoryQuery {
     pub(crate) limit: Option<usize>,
     /// `?meta=roles` returns only the per-message roles (a bare array of

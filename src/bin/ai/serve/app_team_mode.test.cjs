@@ -227,8 +227,8 @@ test("GET config restores sticky team state independently of backend and output 
   }
 });
 
-test("phone-only config refresh updates team state without replacing main model, agent or effort picks", async () => {
-  const h = harness({ cfg: TRAECLI });
+for (const phone of [true, false]) test("team-only config refresh updates team state without replacing main model, agent or effort picks (" + (phone ? "phone" : "desktop") + ")", async () => {
+  const h = harness({ phone, cfg: TRAECLI });
   h.elements.omodel.value = "main-model";
   h.elements.oagent.value = "build";
   h.elements.oeffort.value = "high";
@@ -1072,25 +1072,36 @@ test("switching sessions during a mode save keeps the command draft and cannot s
   }
 });
 
-test("desktop keeps its send behavior and cannot open the phone team sheet", async () => {
+test("desktop opens the shared team sheet and can select agent-team", async () => {
   const h = harness({ phone: false });
   h.context.openTeamSheet();
+  assert.equal(h.elements.teampick.hidden, false);
+  assert.equal(h.history.pushes, 1);
+  assert.equal(await h.choose("team", "kernel"), true);
+  assert.deepEqual(h.teamPosts().map((r) => r.body), [{ subagents: { action: "use", backend: "kernel" } }]);
   assert.equal(h.elements.teampick.hidden, true);
-  assert.equal(h.history.pushes, 0);
   await h.context.send();
   assert.equal(h.turns().length, 1);
-  assert.equal(h.teamPosts().length, 0);
 });
 
-test("the entry is a phone-only 26px metadata chip and the accessible sheet uses the existing theme and viewport", () => {
+test("the layout hosts the team entry and the accessible sheet uses the existing theme and viewport", () => {
   const phoneStart = css.indexOf("@media (max-width:700px)"), desktop = css.slice(0, phoneStart), phoneCss = css.slice(phoneStart);
-  assert.match(desktop, /#teamcontrols, #teampick \{ display:none; \}/);
+  assert.match(desktop, /#teamcontrols \{ display:none; \}/);
+  assert.match(desktop, /#teampick\[hidden\] \{ display:none; \}/);
+  assert.match(desktop, /#teampick:not\(\[hidden\]\) \{ display:block; \}/);
   assert.match(phoneCss, /#ovrsummaryline #teamcontrols \{ display:flex;/);
   assert.match(phoneCss, /#ovrwrap > summary \{ display:flex; align-items:center;/);
   assert.match(phoneCss, /#ovrsummary \{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;/);
   assert.match(desktop, /#ovrsummaryline #teamcontrols \{ flex:0 0 auto; padding:0; margin-left:auto; \}/);
-  assert.doesNotMatch(css, /#teamcontrols \{[^}]*(?:width:100%|display:block)/);
-  assert.match(phoneCss, /#teampick:not\(\[hidden\]\) \{ display:block; \}/);
+  const desktopRow = /@media \(min-width:701px\) \{([\s\S]*?)\n\}/.exec(desktop);
+  assert.ok(desktopRow);
+  assert.match(desktopRow[1], /#ovrwrap \{[^}]*display:grid; grid-template-columns:minmax\(0,1fr\) auto;[^}]*gap:4px 8px; padding:10px 24px 4px;/);
+  assert.match(desktopRow[1], /#ovrwrap > summary \{ display:flex; align-items:center; grid-column:2; grid-row:1; padding:0; list-style:none; \}/);
+  assert.match(desktopRow[1], /#ovrsummary \{ display:none; \}/);
+  assert.match(desktopRow[1], /#ovr \{[^}]*display:grid;[^}]*grid-column:1; grid-row:1;[^}]*min-width:0;/);
+  assert.match(desktopRow[1], /#teamcontrols \{ display:flex; \}/);
+  assert.match(desktopRow[1], /#teamtrigger \{ min-height:36px;/);
+  assert.doesNotMatch(css, /#teamcontrols \{(?:[^}]*;)?\s*(?:width:100%|display:block)/);
   assert.match(desktop, /#teamtrigger \{[^}]*gap:5px; min-height:26px;[^}]*padding:0 9px; border-radius:999px;[^}]*font-size:12px;/);
   assert.match(desktop, /\.teamicon \{[^}]*width:13px; height:13px;/);
   assert.match(desktop, /\.teamicon svg \{ width:13px; height:13px;/);

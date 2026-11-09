@@ -858,6 +858,174 @@ async fn delete_unknown_session_still_succeeds() {
 }
 
 #[tokio::test]
+async fn session_mark_endpoint_roundtrips_and_updates_list() {
+    use crate::ai::history::MarkMessageUpdate;
+
+    let state = lifecycle_test_state();
+    let root = state
+        .history_file
+        .parent()
+        .expect("test root")
+        .to_path_buf();
+    let store = SessionStore::new(state.history_file.as_path());
+    store
+        .write_session_title_with_origin("mark-me", "Mark test", SessionTitleOrigin::User)
+        .expect("persist session");
+    assert!(!store.read_session_marked("mark-me").expect("initial mark"));
+
+    let app = Router::new()
+        .route("/sessions", get(list_sessions))
+        .route("/sessions/{id}/mark", post(set_session_mark))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listen");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let client = reqwest::Client::new();
+
+    for (index, marked) in [true, true, false].into_iter().enumerate() {
+        if index == 1 {
+            store
+                .write_session_mark("mark-me", true, MarkMessageUpdate::Set("keep this note"))
+                .expect("persist mark message");
+        }
+        let response = client
+            .post(format!("{base}/sessions/mark-me/mark"))
+            .json(&serde_json::json!({"marked": marked}))
+            .send()
+            .await
+            .expect("mark request");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response
+                .json::<serde_json::Value>()
+                .await
+                .expect("mark json"),
+            serde_json::json!({"marked": marked})
+        );
+        assert_eq!(
+            store.read_session_marked("mark-me").expect("stored mark"),
+            marked
+        );
+        let response = client
+            .get(format!("{base}/sessions"))
+            .send()
+            .await
+            .expect("list request");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let sessions = response
+            .json::<Vec<serde_json::Value>>()
+            .await
+            .expect("list json");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["id"], "mark-me");
+        assert_eq!(sessions[0]["marked"], marked);
+        assert_eq!(
+            store
+                .read_session_mark_message("mark-me")
+                .expect("mark message"),
+            if index == 1 { "keep this note" } else { "" }
+        );
+    }
+
+    for marked in [true, false] {
+        let response = client
+            .post(format!("{base}/sessions/missing/mark"))
+            .json(&serde_json::json!({"marked": marked}))
+            .send()
+            .await
+            .expect("missing mark request");
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(!store.session_exists("missing").expect("missing session"));
+        assert_eq!(store.list_sessions().expect("stored sessions").len(), 1);
+    }
+    server.abort();
+    let _ = server.await;
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[tokio::test]
+async fn session_mark_rejects_absent_session_without_creating_it() {
+    let state = lifecycle_test_state();
+    let root = state
+        .history_file
+        .parent()
+        .expect("test root")
+        .to_path_buf();
+    let store = SessionStore::new(state.history_file.as_path());
+    for marked in [true, false] {
+        let response = set_session_mark(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("missing".to_string()),
+            Json(SetSessionMarkReq { marked }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(!store.session_exists("missing").expect("session absent"));
+        assert!(store.list_sessions().expect("no session rows").is_empty());
+    }
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[tokio::test]
+async fn session_mark_guards_auth_and_session_id() {
+    let mut state = lifecycle_test_state();
+    state.token = "t".to_string();
+    let root = state
+        .history_file
+        .parent()
+        .expect("test root")
+        .to_path_buf();
+    let store = SessionStore::new(state.history_file.as_path());
+    store
+        .write_session_title_with_origin("guarded", "Guard test", SessionTitleOrigin::User)
+        .expect("persist session");
+    let mut headers = HeaderMap::new();
+    let response = set_session_mark(
+        State(state.clone()),
+        headers.clone(),
+        Path("guarded".to_string()),
+        Json(SetSessionMarkReq { marked: true }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(!store.read_session_marked("guarded").expect("stored mark"));
+
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer t"),
+    );
+    for id in ["", "../invalid", "invalid.id"] {
+        let response = set_session_mark(
+            State(state.clone()),
+            headers.clone(),
+            Path(id.to_string()),
+            Json(SetSessionMarkReq { marked: true }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "id={id:?}");
+    }
+    let response = set_session_mark(
+        State(state),
+        headers,
+        Path("guarded".to_string()),
+        Json(SetSessionMarkReq { marked: true }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(store.read_session_marked("guarded").expect("stored mark"));
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[tokio::test]
 async fn rename_session_persists_user_title() {
     use axum::{
         Json,

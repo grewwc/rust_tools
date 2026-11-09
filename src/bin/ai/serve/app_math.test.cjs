@@ -434,25 +434,44 @@ test("empty side notes are rejected locally without polling or disabling the con
 });
 
 test("phone session hold targets its own row and scrolling cancels it", () => {
-  const start = script.indexOf("const SESSION_HOLD_MS");
+  const start = script.indexOf("let sessionActionTarget = null;");
   const end = script.indexOf("async function deleteSession(", start);
   assert.ok(start >= 0 && end > start);
-  let scheduled = null;
+  let now = 1000, nextTimer = 1;
+  const timers = new Map();
   const cleared = [];
   const deleted = [];
+  const document = { activeElement: null };
+  const elements = Object.fromEntries([
+    "sessionactions", "sessionactionstitle", "sessionactionmark", "sessionactiondelete",
+    "sessionactioncancel", "sessionactionsscrim", "sessionactionspanel",
+  ].map((id) => [id, { hidden: true, textContent: "", focus() { document.activeElement = this; } }]));
+  const media = { matches: true };
   const context = vm.createContext({
-    window: { matchMedia: () => ({ matches: true }) },
-    Date: { now: () => 1000 },
-    setTimeout: (fn, ms) => { scheduled = { fn, ms, id: 9 }; return 9; },
-    clearTimeout: (id) => cleared.push(id),
+    document, $: (id) => elements[id],
+    window: { matchMedia: () => media },
+    Date: { now: () => now },
+    setTimeout: (fn, ms) => { const id = nextTimer++; timers.set(id, { fn, ms, at: now + ms }); return id; },
+    clearTimeout: (id) => { cleared.push(id); timers.delete(id); },
+    sessionTitle: (s) => s.summary,
+    toggleSessionMark: () => assert.fail("holding must not mark a session"),
     deleteSession: (id) => deleted.push(id),
   });
   vm.runInContext(script.slice(start, end), context);
+  context.wireSessionActions();
+  const advance = (ms) => {
+    now += ms;
+    for (const [id, timer] of [...timers]) {
+      if (timer.at <= now) { timers.delete(id); timer.fn(); }
+    }
+  };
   const row = () => {
     const classes = new Set();
+    const marker = { focus() { document.activeElement = this; } };
     return {
-      dataset: {},
+      dataset: {}, marker,
       classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name), contains: (name) => classes.has(name) },
+      querySelector: (selector) => { assert.equal(selector, ".mk"); return marker; },
     };
   };
   const touch = (x, y) => ({
@@ -461,22 +480,78 @@ test("phone session hold targets its own row and scrolling cancels it", () => {
   });
 
   const held = row();
-  context.bindSessionLongPress(held, { id: "hi-session" });
+  const heldSession = { id: "hi-session", summary: "Hi session" };
+  context.bindSessionLongPress(held, heldSession);
+  elements.sessionactiondelete.onclick();
+  assert.deepEqual(deleted, []);
   held.onpointerdown(touch(10, 20));
   assert.equal(held.classList.contains("holding"), true);
-  assert.equal(scheduled.ms, 650);
-  scheduled.fn();
-  assert.deepEqual(deleted, ["hi-session"]);
+  assert.equal(timers.size, 1);
+  assert.equal([...timers.values()][0].ms, 650);
+  advance(649);
+  assert.equal(elements.sessionactions.hidden, true);
+  assert.deepEqual(deleted, []);
+  advance(1);
+  assert.equal(elements.sessionactions.hidden, false);
+  assert.equal(elements.sessionactionstitle.textContent, "Hi session");
+  assert.equal(vm.runInContext("sessionActionTarget", context), heldSession);
+  assert.equal(vm.runInContext("sessionActionReturnFocus", context), held.marker);
+  assert.equal(document.activeElement, elements.sessionactionmark);
+  assert.deepEqual(deleted, []);
   assert.equal(context.sessionHoldConsumed(held), true);
   assert.equal(held.classList.contains("holding"), false);
+  held.onpointerup();
+  assert.equal(elements.sessionactions.hidden, false);
+  assert.deepEqual(deleted, []);
+  elements.sessionactiondelete.onclick();
+  assert.deepEqual(deleted, ["hi-session"]);
+  assert.equal(elements.sessionactions.hidden, true);
+  assert.equal(document.activeElement, held.marker);
 
   const scrolled = row();
-  context.bindSessionLongPress(scrolled, { id: "keep-session" });
+  const otherSession = { id: "keep-session", summary: "Keep session" };
+  context.bindSessionLongPress(scrolled, otherSession);
   scrolled.onpointerdown(touch(10, 20));
   scrolled.onpointermove(touch(10, 40));
-  assert.deepEqual(cleared, [9]);
+  assert.deepEqual(cleared, [2]);
+  advance(650);
+  assert.equal(timers.size, 0);
+  assert.equal(elements.sessionactions.hidden, true);
   assert.equal(scrolled.classList.contains("holding"), false);
+  assert.equal(context.sessionHoldConsumed(scrolled), false);
   assert.deepEqual(deleted, ["hi-session"]);
+
+  scrolled.onpointerdown(touch(10, 20));
+  scrolled.onpointercancel();
+  assert.deepEqual(cleared, [2, 3]);
+  advance(650);
+  assert.equal(timers.size, 0);
+  assert.equal(elements.sessionactions.hidden, true);
+  assert.equal(scrolled.classList.contains("holding"), false);
+  assert.equal(context.sessionHoldConsumed(scrolled), false);
+  assert.deepEqual(deleted, ["hi-session"]);
+
+  scrolled.onpointerdown({ ...touch(10, 20), pointerType: "mouse" });
+  scrolled.onpointerdown({ ...touch(10, 20), target: { closest: () => elements.sessionactiondelete } });
+  media.matches = false;
+  scrolled.onpointerdown(touch(10, 20));
+  advance(650);
+  assert.equal(timers.size, 0);
+  assert.equal(elements.sessionactions.hidden, true);
+  assert.deepEqual(deleted, ["hi-session"]);
+
+  media.matches = true;
+  scrolled.onpointerdown(touch(10, 20));
+  advance(650);
+  assert.equal(elements.sessionactions.hidden, false);
+  assert.equal(elements.sessionactionstitle.textContent, "Keep session");
+  assert.equal(vm.runInContext("sessionActionTarget", context), otherSession);
+  assert.equal(vm.runInContext("sessionActionReturnFocus", context), scrolled.marker);
+  assert.deepEqual(deleted, ["hi-session"]);
+  elements.sessionactiondelete.onclick();
+  assert.deepEqual(deleted, ["hi-session", "keep-session"]);
+  assert.equal(elements.sessionactions.hidden, true);
+  assert.equal(document.activeElement, scrolled.marker);
 });
 
 test("targeted session delete preserves the open session", async () => {

@@ -1521,6 +1521,7 @@ pub(in crate::ai) async fn run_serve(
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/fork", post(fork_session))
         .route("/sessions/{id}/title", post(set_session_title))
+        .route("/sessions/{id}/mark", post(set_session_mark))
         .route(
             "/sessions/{id}/config",
             get(get_session_config).post(set_session_config),

@@ -1,10 +1,11 @@
-//! Session lifecycle routes: list/create/fork/delete, title, config.
+//! Session lifecycle routes: list/create/fork/delete, title, mark, config.
 
 use super::*;
 use crate::ai::driver::commands::use_backend::{
     agent_team_sticky, apply_subagent_use, effective_subagent_backend, format_use_state,
     reset_subagent_config,
 };
+use crate::ai::history::{MarkMessageUpdate, with_sessions_lifecycle_lock};
 use crate::ai::tools::task_tools::BackendId;
 
 /// Render the config response. `subagent_backend` carries an explicitly stored
@@ -222,6 +223,52 @@ pub(crate) async fn delete_session(
             )
                 .into_response()
         }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// Set an existing session's important mark. Marking preserves its optional
+/// mark message; unmarking clears it, mirroring local `/mark` and `/unmark`.
+pub(crate) async fn set_session_mark(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SetSessionMarkReq>,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if SessionStore::validate_session_id(&id).is_err() {
+        return bad_request(format!("invalid session id: {id}")).into_response();
+    }
+    let store = SessionStore::new(state.history_file.as_path());
+    let result = with_sessions_lifecycle_lock(store.sessions_root(), || {
+        // The writer creates missing databases. Serialize this existence
+        // check with deletion so marking cannot recreate a deleted session.
+        if !store.session_exists(&id)? {
+            return Ok(None);
+        }
+        let message = if req.marked {
+            MarkMessageUpdate::Keep
+        } else {
+            MarkMessageUpdate::Clear
+        };
+        store.write_session_mark(&id, req.marked, message)?;
+        store.read_session_marked(&id).map(Some)
+    });
+    match result {
+        Ok(Some(marked)) => {
+            (StatusCode::OK, Json(serde_json::json!({"marked": marked}))).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("session not found: {id}")})),
+        )
+            .into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": err.to_string()})),
