@@ -2951,6 +2951,8 @@ fn render_turn_stream_to_with_width(
                 | "confirm_request"
                 | "replace"
                 | "subagent_progress"
+                | "compression_start"
+                | "compression_done"
         ) {
             // Header deduplication is only for adjacent retry copies. Once
             // the stream reports model activity, the next request header is
@@ -2980,6 +2982,15 @@ fn render_turn_stream_to_with_width(
             }
             "done" => {
                 break Ok(());
+            }
+            "compression_start" => {
+                hide_answer_pending_status(&mut answer_pending_drawn, &mut line_open, tty, out);
+                let _ = writeln!(out, "[Info] Compressing history with the language model…");
+                line_open = false;
+            }
+            "compression_done" => {
+                let _ = writeln!(out, "[Info] History compression complete.");
+                line_open = false;
             }
             "thinking_start" => {
                 // A second thinking block in one turn closes the previous
@@ -7141,6 +7152,20 @@ mod tests {
         // End-of-turn still terminates the answer's open row, even when no
         // footer follows it.
         assert_eq!(buf, b"answer\n");
+    }
+
+    #[test]
+    fn sse_history_compression_progress_is_visible() {
+        let url = serve_body_once(
+            "event: compression_start\ndata: \n\nevent: compression_done\ndata: \n\nevent: done\ndata: \n\n",
+        );
+        let resp = reqwest::blocking::get(url).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, false).expect("render");
+        assert_eq!(
+            String::from_utf8(buf).expect("utf8"),
+            "[Info] Compressing history with the language model…\n[Info] History compression complete.\n"
+        );
     }
 
     #[test]

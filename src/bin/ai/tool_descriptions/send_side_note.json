@@ -6,7 +6,7 @@
     "properties": {
       "task_id": {
         "type": "string",
-        "description": "Running subagent task id (from `task` / `task_spawn`), owned by the current process and session. Omit or use an empty string for foreground guidance."
+        "description": "Running subagent task id (from `task_spawn`), owned by the current process and session. Omit or use an empty string for foreground guidance."
       },
       "note": {
         "type": "string",

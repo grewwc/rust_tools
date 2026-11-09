@@ -950,7 +950,27 @@ async fn compact_session_history_with_app_inner(
         app.config.history_summary_max_chars,
         Some(&overflow_dir),
     );
+    let threshold = if at_boundary {
+        compress::persisted_history_keep_recent_turns()
+    } else {
+        MAX_HISTORY_TURNS
+    };
     let (messages, sqlite_source) = if blob::is_sqlite_path(history_file) {
+        // The exact path below decodes, sanitizes, and filters every projected
+        // message. A conservative SQL-only upper bound can prove that all three
+        // automatic compaction triggers are inactive without changing either
+        // canonical history or the derived projection.
+        if sqlite::context_projection_within_compaction_limits_sqlite(
+            history_file.as_path(),
+            &projection_fingerprint,
+            app.config.history_max_chars,
+            threshold,
+            compress::compressed_tool_evidence_inline_chars_limit(),
+        )
+        .unwrap_or(false)
+        {
+            return Ok(());
+        }
         let context =
             read_context_history_sqlite_with_retry(history_file.as_path(), &projection_fingerprint)
                 .await?;
@@ -977,11 +997,6 @@ async fn compact_session_history_with_app_inner(
         app.config.history_max_chars > 0 && original_chars > app.config.history_max_chars;
     let exceeds_tool_evidence_budget =
         compress::compressed_tool_evidence_exceeds_inline_budget(&messages);
-    let threshold = if at_boundary {
-        compress::persisted_history_keep_recent_turns()
-    } else {
-        MAX_HISTORY_TURNS
-    };
     if user_turns <= threshold && !exceeds_context_budget && !exceeds_tool_evidence_budget {
         return Ok(());
     }
@@ -991,7 +1006,7 @@ async fn compact_session_history_with_app_inner(
         // `build_context_history` call and write the result back into the
         // context snapshot. Raw messages exist only in the canonical layer
         // and are never overwritten by compression.
-        let mut outcome = compress::compress_messages_for_context_with_outcome(
+        let outcome = compress::compress_messages_for_context_with_outcome(
             messages.clone(),
             app.config.history_max_chars,
             app.config.history_keep_last,
@@ -1013,38 +1028,6 @@ async fn compact_session_history_with_app_inner(
         ) {
             outcome.report();
             return Ok(());
-        }
-        // Mechanical shrinking cannot trim exact/encrypted replay while its
-        // assistant/tool pair remains. Reuse the request-level summary policy
-        // to replace an eligible old span, then persist that projection so the
-        // next turn does not rebuild and summarize the same replay payload.
-        // Summarize the pre-pass projection: mechanical removal of old user
-        // boundaries must not narrow the LLM's retained-turn window or its source.
-        // Use the existing request summary capacity instead of reducing it when
-        // moving that summary across the turn boundary.
-        // Legacy blobs have no separate snapshot, so keep their existing path.
-        if sqlite_source.is_some()
-            && app.config.history_max_chars > 0
-            && app.config.history_summary_max_chars > 0
-            && !outcome.budget_met()
-        {
-            let (candidate, _, after_chars, _, _) = compress::mid_turn_llm_summarize(
-                app,
-                messages.clone(),
-                compress::MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
-                compress::MID_TURN_LLM_SUMMARY_MAX_CHARS,
-                app.config.history_max_chars,
-                cwd,
-            )
-            .await;
-            // The shared compressor commits recovery archives before adopting a
-            // candidate and falls back mechanically if the summary is unavailable.
-            // Retain this completed mechanical projection when it makes no progress.
-            if after_chars < outcome.after_chars {
-                outcome.messages = candidate;
-                outcome.after_chars = after_chars;
-                outcome.status = ContextCompressionStatus::Complete;
-            }
         }
         outcome.report();
         outcome.messages
@@ -1352,6 +1335,244 @@ mod tests {
         append_history_messages(&app.session_history_file, &messages).unwrap();
         let overflow_dir = store.session_assets_dir(&app.session_id);
         (app, messages, overflow_dir)
+    }
+
+    #[tokio::test]
+    async fn compact_session_history_sqlite_preflight_preserves_noop_projection() {
+        let (mut app, messages, overflow_dir) = boundary_compaction_fixture("context-preflight");
+        app.config.history_max_chars = 0;
+        let fingerprint = context_projection_fingerprint(
+            app.config.history_max_chars,
+            app.config.history_keep_last,
+            app.config.history_summary_max_chars,
+            Some(&overflow_dir),
+        );
+        let initial =
+            read_context_history_sqlite_with_retry(&app.session_history_file, &fingerprint)
+                .await
+                .unwrap();
+        assert!(
+            sqlite::write_context_snapshot_sqlite_with_busy_timeout(
+                &app.session_history_file,
+                &messages,
+                initial.source_message_id,
+                initial.canonical_generation,
+                &fingerprint,
+                Duration::from_secs(1),
+            )
+            .unwrap()
+        );
+        let folded_evidence = Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: serde_json::json!(format!(
+                "{}\nsmall retained evidence",
+                compress::COMPRESSED_TOOL_EVIDENCE_MARKER
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        append_history_messages(
+            &app.session_history_file,
+            std::slice::from_ref(&folded_evidence),
+        )
+        .unwrap();
+
+        assert!(
+            sqlite::context_projection_within_compaction_limits_sqlite(
+                &app.session_history_file,
+                &fingerprint,
+                0,
+                MAX_HISTORY_TURNS,
+                compress::compressed_tool_evidence_inline_chars_limit(),
+            )
+            .unwrap()
+        );
+        assert!(
+            !sqlite::context_projection_within_compaction_limits_sqlite(
+                &app.session_history_file,
+                &fingerprint,
+                1,
+                MAX_HISTORY_TURNS,
+                compress::compressed_tool_evidence_inline_chars_limit(),
+            )
+            .unwrap(),
+            "stored chars above the configured context budget require the exact path"
+        );
+        assert!(
+            !sqlite::context_projection_within_compaction_limits_sqlite(
+                &app.session_history_file,
+                &fingerprint,
+                0,
+                1,
+                compress::compressed_tool_evidence_inline_chars_limit(),
+            )
+            .unwrap(),
+            "SQL user rows are a conservative upper bound for the real-user threshold"
+        );
+        assert!(
+            !sqlite::context_projection_within_compaction_limits_sqlite(
+                &app.session_history_file,
+                &fingerprint,
+                0,
+                MAX_HISTORY_TURNS,
+                0,
+            )
+            .unwrap(),
+            "folded evidence above its inline budget requires the exact path"
+        );
+
+        let before =
+            read_context_history_sqlite_with_retry(&app.session_history_file, &fingerprint)
+                .await
+                .unwrap();
+        assert!(!before.snapshot_is_current);
+        compact_session_history_with_app(&app, None).await.unwrap();
+        let after = read_context_history_sqlite_with_retry(&app.session_history_file, &fingerprint)
+            .await
+            .unwrap();
+        assert!(!after.snapshot_is_current);
+        assert_eq!(after.messages, before.messages);
+        let mut canonical = messages;
+        canonical.push(folded_evidence);
+        assert_eq!(
+            build_message_arr(usize::MAX, &app.session_history_file).unwrap(),
+            canonical
+        );
+        let image_message = Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([{
+                "type": "image_url",
+                "image_url": { "url": "https://example.invalid/i.png" }
+            }]),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        append_history_messages(
+            &app.session_history_file,
+            std::slice::from_ref(&image_message),
+        )
+        .unwrap();
+        assert!(
+            !sqlite::context_projection_within_compaction_limits_sqlite(
+                &app.session_history_file,
+                &fingerprint,
+                0,
+                MAX_HISTORY_TURNS,
+                compress::compressed_tool_evidence_inline_chars_limit(),
+            )
+            .unwrap(),
+            "nominal image billing must fall back to the exact decoded path"
+        );
+        let _ = std::fs::remove_dir_all(app.config.history_file.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn sqlite_preflight_counts_reasoning_replay_wrapper_in_canonical_tail() {
+        let (mut app, messages, overflow_dir) = boundary_compaction_fixture("replay-preflight");
+        app.config.history_max_chars = 0;
+        let fingerprint = context_projection_fingerprint(
+            app.config.history_max_chars,
+            app.config.history_keep_last,
+            app.config.history_summary_max_chars,
+            Some(&overflow_dir),
+        );
+        let initial =
+            read_context_history_sqlite_with_retry(&app.session_history_file, &fingerprint)
+                .await
+                .unwrap();
+        assert!(
+            sqlite::write_context_snapshot_sqlite_with_busy_timeout(
+                &app.session_history_file,
+                &messages,
+                initial.source_message_id,
+                initial.canonical_generation,
+                &fingerprint,
+                Duration::from_secs(1),
+            )
+            .unwrap()
+        );
+
+        let replay_model = crate::ai::model_names::all()
+            .into_iter()
+            .find(|definition| crate::ai::models::reasoning_content_replay_enabled(&definition.key))
+            .expect("model registry must contain an exact-replay model")
+            .key
+            .clone();
+        let replay_message = Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!(""),
+            tool_calls: Some(vec![crate::ai::types::ToolCall {
+                id: "call-replay".to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: Some("inspect the file before editing".to_string()),
+        };
+        append_history_messages_for_model(
+            &app.session_history_file,
+            std::slice::from_ref(&replay_message),
+            &replay_model,
+        )
+        .unwrap();
+
+        let exact = read_context_history_sqlite_with_retry(&app.session_history_file, &fingerprint)
+            .await
+            .unwrap();
+        assert!(!exact.snapshot_is_current);
+        let stored_field_chars = |message: &Message| {
+            serde_json::to_string(&message.content)
+                .unwrap()
+                .chars()
+                .count()
+                + message
+                    .tool_calls
+                    .as_ref()
+                    .map(|calls| serde_json::to_string(calls).unwrap().chars().count())
+                    .unwrap_or_default()
+                + message
+                    .reasoning_content
+                    .as_deref()
+                    .map(|reasoning| reasoning.chars().count())
+                    .unwrap_or_default()
+        };
+        let raw_stored_chars = messages
+            .iter()
+            .chain(std::iter::once(&replay_message))
+            .map(stored_field_chars)
+            .sum::<usize>();
+        assert!(
+            messages_total_chars_pub(&exact.messages) > raw_stored_chars,
+            "the model-bound replay wrapper must be the difference that crosses this budget"
+        );
+        assert!(
+            !sqlite::context_projection_within_compaction_limits_sqlite(
+                &app.session_history_file,
+                &fingerprint,
+                raw_stored_chars,
+                MAX_HISTORY_TURNS,
+                compress::compressed_tool_evidence_inline_chars_limit(),
+            )
+            .unwrap(),
+            "the SQL preflight must not skip an exact path whose replay wrapper crosses the budget"
+        );
+        assert!(
+            sqlite::context_projection_within_compaction_limits_sqlite(
+                &app.session_history_file,
+                &fingerprint,
+                usize::MAX,
+                MAX_HISTORY_TURNS,
+                compress::compressed_tool_evidence_inline_chars_limit(),
+            )
+            .unwrap(),
+            "replay accounting must stay eligible for the no-op fast path when limits allow it"
+        );
+        let _ = std::fs::remove_dir_all(app.config.history_file.parent().unwrap());
     }
 
     #[tokio::test]

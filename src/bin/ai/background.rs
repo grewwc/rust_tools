@@ -559,7 +559,6 @@ pub(crate) fn open_serve_live_fifo_from_env() {
     SERVE_LIVE_STREAMING.store(true, Ordering::Relaxed);
 }
 
-
 /// Non-unix processes have no FIFO: scrub the handoff and keep CLI behavior.
 #[cfg(not(unix))]
 pub(crate) fn open_serve_live_fifo_from_env() {
@@ -594,6 +593,10 @@ pub(crate) enum ServeLiveKind {
     ReplaceEnd = 16,
     /// Server-computed live rate attached to subsequent thinking text frames.
     ThinkingRate = 17,
+    /// A model-backed history compression request has started.
+    CompressionStart = 18,
+    /// The current model-backed history compression request has ended.
+    CompressionDone = 19,
 }
 
 /// Max payload bytes per serve frame: header (5) + payload stays under the
@@ -1089,8 +1092,8 @@ pub(super) fn stop_background(session_id: &str) -> Result<(), Box<dyn std::error
         let _ = std::fs::remove_file(&pid_path);
         // The session is gone; drop any suspended binding so a terminal key
         // reuse cannot silently resume it.
-        let _ = crate::ai::history::SuspendedSessionStore::new()
-            .remove_for_session(session_id, None);
+        let _ =
+            crate::ai::history::SuspendedSessionStore::new().remove_for_session(session_id, None);
         return Err(format!(
             "进程 {pid}（session {session_id}）已经不在了（可能已完成），已清理 PID 文件"
         )
@@ -1115,8 +1118,8 @@ pub(super) fn stop_background(session_id: &str) -> Result<(), Box<dyn std::error
         let _ = std::fs::remove_file(&pid_path);
         // Confirmed stopped: the session is over, so no suspended binding should
         // remain either.
-        let _ = crate::ai::history::SuspendedSessionStore::new()
-            .remove_for_session(session_id, None);
+        let _ =
+            crate::ai::history::SuspendedSessionStore::new().remove_for_session(session_id, None);
         eprintln!("[stop] session {session_id} (PID {pid}) stopped.");
     }
     Ok(())
@@ -1335,7 +1338,8 @@ mod tests {
         for (ok, cached, executed) in [(false, false, true), (true, true, false)] {
             let finished: serde_json::Value = serde_json::from_str(
                 &serve_tool_finished_payload(&call, "result\n带来", ok, cached, executed).unwrap(),
-            ).unwrap();
+            )
+            .unwrap();
             assert_eq!(finished["id"], call.id);
             assert_eq!(finished["phase"], "finished");
             assert_eq!(finished["output"], "result\n带来");
@@ -1352,7 +1356,10 @@ mod tests {
             let call = lifecycle_call(&text);
             for (payload, field) in [
                 (serve_tool_started_payload(&call).unwrap(), "arguments"),
-                (serve_tool_finished_payload(&call, &text, true, false, true).unwrap(), "output"),
+                (
+                    serve_tool_finished_payload(&call, &text, true, false, true).unwrap(),
+                    "output",
+                ),
             ] {
                 assert!(payload.len() <= MAX_SERVE_FRAME_BYTES);
                 let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
@@ -1362,7 +1369,10 @@ mod tests {
                 assert_eq!(parsed[format!("{field}_truncated")], true);
                 assert_eq!(parsed["id"], call.id);
             }
-            assert_eq!(call.function.arguments, text, "canonical arguments remain intact");
+            assert_eq!(
+                call.function.arguments, text,
+                "canonical arguments remain intact"
+            );
         }
         let mut call = lifecycle_call("");
         call.id = "x".repeat(MAX_SERVE_FRAME_BYTES);

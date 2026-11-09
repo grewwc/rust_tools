@@ -715,7 +715,8 @@ fn setup_live_fifo(_session_id: &str) -> Option<LiveFifo> {
 /// 7 = confirmation resolved, 8 = subagent progress, 9 = input request,
 /// 10 = input resolved, 11 = assistant body pending, 12 = tool lifecycle,
 /// 13 = committed body, 14/15/16 = chunked committed body start/chunk/end,
-/// 17 = server-computed live thinking rate).
+/// 17 = server-computed live thinking rate, 18/19 = model-backed history
+/// compression start/done).
 #[derive(Debug, PartialEq, Eq)]
 #[cfg(feature = "serve")]
 enum ServeLiveEvent {
@@ -741,6 +742,8 @@ enum ServeLiveEvent {
     Replace(String),
     /// Bounded JSON describing an actual tool dispatch or its completed result.
     Tool(String),
+    CompressionStart,
+    CompressionDone,
 }
 
 /// Incremental parser for serve-live frames (`[kind: u8][len: u32 BE][payload]`):
@@ -807,7 +810,9 @@ impl ServeFrameDecoder {
                 || kind == background::ServeLiveKind::ReplaceStart as u8
                 || kind == background::ServeLiveKind::ReplaceChunk as u8
                 || kind == background::ServeLiveKind::ReplaceEnd as u8
-                || kind == background::ServeLiveKind::Tool as u8;
+                || kind == background::ServeLiveKind::Tool as u8
+                || kind == background::ServeLiveKind::CompressionStart as u8
+                || kind == background::ServeLiveKind::CompressionDone as u8;
             if !known || len > background::MAX_SERVE_FRAME_LEN as usize {
                 self.buf.clear();
                 break;
@@ -884,6 +889,12 @@ impl ServeFrameDecoder {
                 }
                 k if k == background::ServeLiveKind::Tool as u8 => {
                     Some(ServeLiveEvent::Tool(payload))
+                }
+                k if k == background::ServeLiveKind::CompressionStart as u8 => {
+                    Some(ServeLiveEvent::CompressionStart)
+                }
+                k if k == background::ServeLiveKind::CompressionDone as u8 => {
+                    Some(ServeLiveEvent::CompressionDone)
                 }
                 // Every kind accepted by the `known` gate above must have an
                 // arm here: falling through would end the turn for a frame
@@ -964,6 +975,8 @@ fn live_event(event: ServeLiveEvent) -> Option<ServeSse> {
         | ServeLiveEvent::InputDone(_) => None,
         ServeLiveEvent::SubagentProgress(line) => Some(ServeSse::new("subagent_progress", line)),
         ServeLiveEvent::Tool(payload) => Some(ServeSse::new("tool", payload)),
+        ServeLiveEvent::CompressionStart => Some(ServeSse::new("compression_start", "")),
+        ServeLiveEvent::CompressionDone => Some(ServeSse::new("compression_done", "")),
         ServeLiveEvent::OutputComplete => None,
     }
 }

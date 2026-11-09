@@ -50,8 +50,9 @@ pub(in crate::ai) use connection::close_cached_write_conn;
 #[cfg(test)]
 pub(in crate::ai) use context::write_context_snapshot_sqlite;
 pub(in crate::ai) use context::{
-    build_message_arr_sqlite, read_context_history_sqlite, read_recent_messages_sqlite,
-    read_recent_turn_window_sqlite, write_context_snapshot_sqlite_with_busy_timeout,
+    build_message_arr_sqlite, context_projection_within_compaction_limits_sqlite,
+    read_context_history_sqlite, read_recent_messages_sqlite, read_recent_turn_window_sqlite,
+    write_context_snapshot_sqlite_with_busy_timeout,
 };
 pub(in crate::ai) use metadata::{
     MarkMessageUpdate, read_first_user_prompt_sqlite, read_session_archived_sqlite,
@@ -61,15 +62,14 @@ pub(in crate::ai) use metadata::{
     write_session_mark_sqlite, write_session_serve_config_sqlite, write_session_title_sqlite,
 };
 pub(in crate::ai) use outcomes::{
-    ENCRYPTED_REASONING_REPLAY_REJECTIONS_MAX_ENTRIES,
-    append_interrupted_stream_diagnostic_sqlite, append_skill_activation_event_sqlite,
-    append_tool_execution_outcomes_sqlite, read_encrypted_reasoning_replay_rejections_sqlite,
-    read_image_digest_sqlite, read_llm_prune_marks_sqlite, read_prompt_residency_sqlite,
-    read_skill_activation_events_sqlite, read_stale_patch_targets_sqlite,
-    read_tool_execution_outcomes_cached, read_tool_execution_outcomes_sqlite,
-    read_tool_message_ids_sqlite, upsert_image_digest_sqlite, write_llm_prune_marks_sqlite,
+    ENCRYPTED_REASONING_REPLAY_REJECTIONS_MAX_ENTRIES, append_interrupted_stream_diagnostic_sqlite,
+    append_skill_activation_event_sqlite, append_tool_execution_outcomes_sqlite,
+    read_encrypted_reasoning_replay_rejections_sqlite, read_image_digest_sqlite,
+    read_llm_prune_marks_sqlite, read_prompt_residency_sqlite, read_skill_activation_events_sqlite,
+    read_stale_patch_targets_sqlite, read_tool_execution_outcomes_cached,
+    read_tool_execution_outcomes_sqlite, read_tool_message_ids_sqlite, upsert_image_digest_sqlite,
+    write_encrypted_reasoning_replay_rejections_sqlite, write_llm_prune_marks_sqlite,
     write_prompt_residency_sqlite, write_stale_patch_targets_sqlite,
-    write_encrypted_reasoning_replay_rejections_sqlite,
 };
 #[cfg(test)]
 pub(in crate::ai) use revision::history_revision_cache_contains;

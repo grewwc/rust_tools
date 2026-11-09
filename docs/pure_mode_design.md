@@ -6,7 +6,7 @@
 （外加每轮工具指导、隐藏能力目录、项目指令等动态 section）压缩到约 2 KB，只保留与具体工具、
 具体项目无关的通用行为底线：防幻觉、诚实、工具证据、安全红线、一句话响应风格。
 纯净模式实现为一个独立 agent 类型（`pure.agent`）：`--agent pure` / `--pure` /
-`/agent pure` / `task` 的 `agent` 字段均可选用，`ai.prompt.pure_mode = true` 把它设为启动默认。
+`/agent pure` / `task_spawn` 的 `agent` 字段均可选用，`ai.prompt.pure_mode = true` 把它设为启动默认。
 
 **非目标**：
 
@@ -105,7 +105,7 @@
   配置默认在 `entry()` 里应用（终端会话 attach 判定之后、App 构造之前），因此首屏、会话恢复、
   manifest 激活看到的是同一个选择；serve 常驻进程不应用启动默认，按会话的存储 agent 渲染。
 - 后台任务：`--agent pure` 随现有 `--agent` 转发透传；`--no-pure` 单独透传以便子进程同样跳过启动默认。
-- 子代理：`App::fork_baseline` 克隆 `current_agent_manifest`，因此自动继承；`task` 的 `agent`
+- 子代理：`App::fork_baseline` 克隆 `current_agent_manifest`，因此自动继承；`task_spawn` 的 `agent`
   字段也可显式点名 `pure`。`auto_select: false` 保证 router 永远不会自动选中它。
 - 用户自定义 agent：`pure` 与其他 front-matter 键一样通用解析，用户自有 `.agent` 文件声明
   `pure: true` 即可获得最小渲染（有意支持的用法，与 `hidden` / `disabled` 等键一致）。
@@ -238,7 +238,7 @@ fn build_pure_system_prompt(agent: &AgentManifest) -> SystemPromptBuilder {
 2. **scoped project instructions**：✅ 已彻底关闭（渲染文本 marker + `SkillTurnGuard.pure_mode`）。
 3. **observer / suggested tool calls**：是否仅在用户显式启用 observer 时保留
    （built-in critic 已在 pure 下跳过；建议 observer 也按显式启用保留）。
-4. 子代理/后台是否继承纯净模式：✅ 继承（fork 克隆 manifest；`task` 可显式点名 `pure`）。
+4. 子代理/后台是否继承纯净模式：✅ 继承（fork 克隆 manifest；`task_spawn` 可显式点名 `pure`）。
 5. ~~`--pure --agent` 时是否保留 agent 的 prompt 文本~~：agent 模型下已无意义——
    `--agent X` 即选择 agent X，`--pure` ≡ `--agent pure`，显式 `--agent` 优先。
 6. 是否保留 `runtime_environment`：✅ 保留（约 100 tokens）。

@@ -8,7 +8,7 @@ use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::super::compress;
-use super::super::compress::is_summary_note_text;
+use super::super::compress::{COMPRESSED_TOOL_EVIDENCE_MARKER, is_summary_note_text};
 use super::super::tool_guidance::ToolGuidanceFilter;
 use super::super::types::{Message, ROLE_INTERNAL_NOTE};
 use super::connection::{
@@ -141,6 +141,171 @@ pub(in crate::ai) fn read_context_history_sqlite(
 ) -> io::Result<ContextHistory> {
     with_cached_read_conn(path, Duration::from_secs(2), |conn| {
         read_context_history_on_conn(conn, projection_fingerprint)
+    })
+}
+
+/// Return `true` only when persisted-size upper bounds prove that rebuilding the
+/// context projection cannot trigger automatic compaction.
+///
+/// For image-free content, stored JSON is at least as large as the billable
+/// decoded fields, and counting every `user` row includes runtime-synthetic
+/// users. Images use a nominal in-memory charge that raw JSON cannot safely
+/// upper-bound, so any potential image marker forces the exact path. Guidance
+/// filtering and most persisted-message sanitization can only remove or shrink
+/// the remaining values. Exact-replay reasoning in the canonical tail is the
+/// exception: its model-bound persistence wrapper can grow the field, so that
+/// delta is measured explicitly below. The query is deliberately conservative:
+/// an uncertain or oversized projection falls back to the exact
+/// decode-and-filter path.
+pub(in crate::ai) fn context_projection_within_compaction_limits_sqlite(
+    path: &Path,
+    projection_fingerprint: &str,
+    history_max_chars: usize,
+    max_user_turns: usize,
+    max_compressed_tool_evidence_chars: usize,
+) -> io::Result<bool> {
+    with_cached_read_conn(path, Duration::from_secs(2), |conn| {
+        init_history_schema(conn)?;
+        let tx = conn
+            .transaction()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let canonical_generation = history_generation(&tx)?;
+        let snapshot_source = tx
+            .query_row(
+                "SELECT source_message_id, source_generation, projection_fingerprint
+                 FROM context_snapshot WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .filter(|(_, generation, fingerprint)| {
+                *generation == canonical_generation && fingerprint == projection_fingerprint
+            })
+            .map(|(source_message_id, _, _)| source_message_id);
+        let after_id = snapshot_source.unwrap_or(0);
+        let projection_sql = if snapshot_source.is_some() {
+            "SELECT role, content, tool_calls, reasoning_content FROM context_messages
+             UNION ALL
+             SELECT role, content, tool_calls, reasoning_content
+             FROM messages WHERE id > ?3"
+        } else {
+            "SELECT role, content, tool_calls, reasoning_content
+             FROM messages WHERE id > ?3"
+        };
+        let sql = format!(
+            "SELECT
+                 COALESCE(SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END), 0),
+                 COALESCE(SUM(
+                     length(content)
+                     + COALESCE(length(tool_calls), 0)
+                     + COALESCE(length(reasoning_content), 0)
+                 ), 0),
+                 COALESCE(SUM(CASE
+                     WHEN role = ?1 AND instr(content, ?2) > 0 THEN
+                         length(content)
+                         + COALESCE(length(tool_calls), 0)
+                         + COALESCE(length(reasoning_content), 0)
+                     ELSE 0
+                 END), 0),
+                 COALESCE(SUM(CASE
+                     WHEN instr(content, 'data:image/') > 0
+                         OR instr(content, '\"image_url\"') > 0
+                         OR (
+                             instr(content, '\"reference\"') > 0
+                             AND instr(content, '\"image\"') > 0
+                         )
+                     THEN 1
+                     ELSE 0
+                 END), 0)
+             FROM ({projection_sql})"
+        );
+        let (user_rows, stored_chars, compressed_tool_evidence_chars, potential_image_rows) = tx
+            .query_row(
+                &sql,
+                params![
+                    ROLE_INTERNAL_NOTE,
+                    COMPRESSED_TOOL_EVIDENCE_MARKER,
+                    after_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+
+        // Snapshot rows are already sanitized. Canonical-tail reasoning is raw,
+        // and exact-replay models wrap it with model provenance before it enters
+        // the projection. Measure only that small tail delta so the aggregate
+        // remains an upper bound without decoding every projected message.
+        let mut replay_stmt = tx
+            .prepare(
+                "SELECT tool_calls, reasoning_content, source_model
+                 FROM messages
+                 WHERE id > ?1
+                   AND role = 'assistant'
+                   AND tool_calls IS NOT NULL
+                   AND reasoning_content IS NOT NULL
+                   AND source_model IS NOT NULL",
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let replay_rows = replay_stmt
+            .query_map(params![after_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let mut replay_wrapper_extra_chars = 0usize;
+        for row in replay_rows {
+            let (tool_calls, reasoning, source_model) =
+                row.map_err(|error| io::Error::other(error.to_string()))?;
+            if !decode_tool_calls(Some(&tool_calls)).is_some_and(|calls| !calls.is_empty())
+                || compress::is_persisted_reasoning_replay(&reasoning)
+                || !crate::ai::models::reasoning_content_replay_enabled(&source_model)
+            {
+                continue;
+            }
+            let wrapped_chars = compress::encode_reasoning_replay_state(&source_model, &reasoning)
+                .chars()
+                .count();
+            replay_wrapper_extra_chars = replay_wrapper_extra_chars
+                .checked_add(wrapped_chars.saturating_sub(reasoning.chars().count()))
+                .ok_or_else(|| io::Error::other("reasoning replay size overflow"))?;
+        }
+        drop(replay_stmt);
+        tx.commit()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+
+        let stored_chars = stored_chars
+            .checked_add(
+                i64::try_from(replay_wrapper_extra_chars)
+                    .map_err(|_| io::Error::other("reasoning replay size overflow"))?,
+            )
+            .ok_or_else(|| io::Error::other("projected history size overflow"))?;
+
+        let within =
+            |value: i64, limit: usize| usize::try_from(value).is_ok_and(|value| value <= limit);
+        Ok(within(user_rows, max_user_turns)
+            && (history_max_chars == 0 || within(stored_chars, history_max_chars))
+            && within(
+                compressed_tool_evidence_chars,
+                max_compressed_tool_evidence_chars,
+            )
+            && potential_image_rows == 0)
     })
 }
 

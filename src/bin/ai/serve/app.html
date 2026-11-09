@@ -4659,6 +4659,10 @@ function handleReplayEvent(sid, kind, payload, view) {
     try { view.tool(JSON.parse(payload)); } catch (_) {}
   } else if (kind === "subagent_progress") {
     view.subagents(payload);
+  } else if (kind === "compression_start") {
+    view.phase("Compressing history…");
+  } else if (kind === "compression_done") {
+    view.phase("Processing…");
   } else if (kind === "delta") {
     try { view.delta(JSON.parse(payload).delta || ""); } catch (_) {}
   } else if (kind === "replace") {
@@ -5472,6 +5476,12 @@ async function send() {
           mutateTranscript(() => activity.subagents(payload));
           activityDirty = true;
           schedulePaint();
+        }
+        else if (kind === "compression_start") {
+          setPhase("Compressing history…");
+        }
+        else if (kind === "compression_done") {
+          setPhase("Processing…");
         }
         else if (kind === "confirm_request") {
           setPhase("Waiting for confirmation…", true);

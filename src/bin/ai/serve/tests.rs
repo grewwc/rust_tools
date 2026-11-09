@@ -2660,6 +2660,8 @@ fn transactional_serve_body_frame_decoder_reassembles_pending() {
         test_frame(ServeLiveKind::ThinkingStart, b""),
         test_frame(ServeLiveKind::Thinking, "带来".as_bytes()),
         test_frame(ServeLiveKind::ThinkingDone, b""),
+        test_frame(ServeLiveKind::CompressionStart, b""),
+        test_frame(ServeLiveKind::CompressionDone, b""),
         test_frame(ServeLiveKind::AssistantBodyPending, b""),
         test_frame(ServeLiveKind::Replace, "final".as_bytes()),
         test_frame(ServeLiveKind::OutputComplete, b""),
@@ -2679,6 +2681,8 @@ fn transactional_serve_body_frame_decoder_reassembles_pending() {
             ServeLiveEvent::ThinkingStart,
             ServeLiveEvent::Thinking("带来".to_string(), None),
             ServeLiveEvent::ThinkingDone,
+            ServeLiveEvent::CompressionStart,
+            ServeLiveEvent::CompressionDone,
             ServeLiveEvent::AssistantBodyPending,
             ServeLiveEvent::Replace("final".to_string()),
             ServeLiveEvent::OutputComplete,
@@ -2689,6 +2693,28 @@ fn transactional_serve_body_frame_decoder_reassembles_pending() {
     let mut cut = ServeFrameDecoder::default();
     assert_eq!(cut.push(&wire[..10]), vec![]);
     assert_eq!(cut.finish(), vec![]);
+}
+
+#[tokio::test]
+async fn history_compression_frames_map_to_sse_progress_events() {
+    use crate::ai::background::ServeLiveKind;
+    let wire = [
+        test_frame(ServeLiveKind::CompressionStart, b""),
+        test_frame(ServeLiveKind::CompressionDone, b""),
+    ]
+    .concat();
+    let mut decoder = ServeFrameDecoder::default();
+    let events = decoder.push(&wire);
+    let response = Sse::new(stream::iter(events.into_iter().map(|event| {
+        Ok::<_, std::convert::Infallible>(live_event(event).unwrap().into_event())
+    })))
+    .into_response();
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("event: compression_start\n"), "{text}");
+    assert!(text.contains("event: compression_done\n"), "{text}");
 }
 
 #[tokio::test]
@@ -3132,4 +3158,12 @@ fn chat_page_forwards_prompt_bytes_unchanged() {
         page.contains(r#"if (!text.trim() && !pendingImages.length) return;"#),
         "blank input is still detected on the trimmed view"
     );
+}
+
+#[test]
+fn chat_page_handles_history_compression_progress() {
+    let page = include_str!("app.html");
+    assert!(page.matches(r#"kind === "compression_start""#).count() >= 2);
+    assert!(page.matches(r#"kind === "compression_done""#).count() >= 2);
+    assert!(page.contains("Compressing history…"));
 }

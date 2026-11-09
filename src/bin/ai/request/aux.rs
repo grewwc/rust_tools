@@ -272,6 +272,42 @@ fn history_summary_prompt(max_chars: usize, additional: &str) -> String {
     prompt
 }
 
+struct HistoryCompressionProgress {
+    local: Option<super::TransientStatusLine>,
+    remote: bool,
+}
+
+impl HistoryCompressionProgress {
+    fn start() -> Self {
+        let remote = crate::ai::background::serve_live_streaming();
+        if remote {
+            crate::ai::background::publish_serve_frame(
+                crate::ai::background::ServeLiveKind::CompressionStart,
+                "",
+            );
+        }
+        let mut local = (!remote).then(super::TransientStatusLine::new).flatten();
+        if let Some(line) = local.as_mut() {
+            line.update("Compressing history with the language model…");
+        }
+        Self { local, remote }
+    }
+}
+
+impl Drop for HistoryCompressionProgress {
+    fn drop(&mut self) {
+        if let Some(line) = self.local.as_mut() {
+            line.clear();
+        }
+        if self.remote {
+            crate::ai::background::publish_serve_frame(
+                crate::ai::background::ServeLiveKind::CompressionDone,
+                "",
+            );
+        }
+    }
+}
+
 /// Summarize older dialogue for context compression. Priority sampling preserves
 /// recent requests, errors and decisions without letting one large message consume
 /// the entire input budget.
@@ -340,6 +376,7 @@ pub(crate) async fn summarize_history_via_model(
         client: &app.client,
         session_id: &app.session_id,
     };
+    let _progress = HistoryCompressionProgress::start();
     let text = match send_aux_chat_request_with_key_rotation(
         &ctx,
         &control_model,
