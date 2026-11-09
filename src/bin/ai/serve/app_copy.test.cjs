@@ -180,7 +180,8 @@ test("completed assistant answers have exactly one copy control and other rows h
   assert.equal(first.querySelector("[data-copy-answer]").type, "button");
   assert.equal(first.querySelector("[data-copy-answer]").getAttribute("aria-label"), "复制");
   assert.equal(first.querySelector(".answer-copy-status").getAttribute("role"), "status");
-  assert.match(html, /\.msg\.md \.answer-copy \{[^}]*min-width:44px;[^}]*min-height:44px;/);
+  assert.match(html, /\.msg\.md \.answer-copy \{[^}]*min-width:52px;[^}]*min-height:32px;/);
+  assert.match(html, /\.msg\.md \.answer-copy::after \{[^}]*inset:-6px;/);
   assert.doesNotMatch(html.match(/\.msg\.md \.answer-actions \{([^}]*)\}/)[1], /position:\s*absolute/);
 });
 

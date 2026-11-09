@@ -542,7 +542,9 @@ select, summary { touch-action:manipulation; }
    pre-wrap source view the other bubbles keep. */
 .msg.md { white-space:normal; }
 .msg.md .answer-actions { display:flex; justify-content:flex-end; align-items:center; gap:8px; margin-top:8px; }
-.msg.md .answer-copy { flex:0 0 auto; min-width:44px; min-height:44px; padding:8px 12px; border:1px solid var(--line); border-radius:var(--radius-control); background:var(--code-toolbar); color:var(--fg); font-size:13px; touch-action:manipulation; }
+.msg.md .answer-copy { position:relative; flex:0 0 auto; min-width:52px; min-height:32px; padding:4px 10px; border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--dim); font-size:12px; touch-action:manipulation; }
+/* The box stays small; the touch area still reaches the 44px target. */
+.msg.md .answer-copy::after { content:""; position:absolute; inset:-6px; }
 .msg.md .answer-copy-status { color:var(--dim); font-size:12px; }
 .msg.md .p { margin:3px 0; }
 .msg.md .h { font-weight:700; margin:6px 0 2px; }
@@ -714,6 +716,10 @@ button:active:not(:disabled) { filter:brightness(.96); }
   }
   #sessfilter { min-height:32px; font-size:13px; }
   #sessions .rowbtns { flex-shrink:0; }
+  /* A per-answer affordance must not outweigh the answer: keep the control a
+     quiet text button on desktop, where the pointer already targets precisely. */
+  .msg.md .answer-copy { min-width:0; min-height:0; padding:2px 8px; font-size:11px; letter-spacing:.02em; border-color:transparent; }
+  .msg.md .answer-copy:hover, .msg.md .answer-copy:focus-visible { border-color:var(--line); }
   /* Session prompt index: a bordered card so it reads as a first-class
      sidebar section instead of a footnote under the session list. */
   #promptnav {
