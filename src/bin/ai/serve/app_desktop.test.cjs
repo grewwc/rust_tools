@@ -223,7 +223,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
   const row = (id = "target-session") => elements.sesslist.children.find((li) => li.querySelector("small")?.textContent === id.slice(0, 8));
   const title = (id) => row(id).querySelector("span");
   const open = (id) => { const target = title(id); target.focus(); return dispatch(target, "keydown", { key: "F10", shiftKey: true }); };
-  const select = (id) => dispatch(title(id), "click").done;
+  const select = (id) => dispatch(phone ? title(id) : row(id), "click").done;
   const advance = (ms) => {
     now += ms;
     for (const [id, timer] of [...timers]) if (timer.at <= now) { timers.delete(id); timer.fn(); }
@@ -232,12 +232,12 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     dispatch, row, title, open, select, advance, historyLoads: () => historyLoads, configLoads: () => configLoads, grows: () => grows };
 }
 
-test("desktop double-click opens the shared mark/fork/delete sheet without a mark request", async () => {
+test("desktop double-click opens the shared mark/fork/delete sheet after one mark toggle", async () => {
   const h = harness(), title = h.title();
   const click = h.dispatch(title, "click", { detail: 1 });
-  assert.equal(h.context.sessionId, "target-session");
-  await click.done;
-  await h.dispatch(title, "click", { detail: 2 }).done;
+  assert.equal(h.context.sessionId, "open-session");
+  const second = h.dispatch(title, "click", { detail: 2 });
+  assert.equal(second.event.stopped, true);
   const double = h.dispatch(title, "dblclick", { detail: 2 });
   assert.equal(double.event.prevented, true);
   assert.equal(double.event.stopped, true);
@@ -248,16 +248,48 @@ test("desktop double-click opens the shared mark/fork/delete sheet without a mar
   assert.deepEqual(h.elements.sessionactionspanel.querySelectorAll("button").filter((button) => !button.hidden).map((button) => button.textContent),
     ["标记会话", "fork", "删除会话", "取消"]);
   assert.equal(h.document.activeElement, h.elements.sessionactionmark);
-  assert.equal(h.historyLoads(), 1, "the second pointer click must not repeat navigation");
+  assert.equal(h.historyLoads(), 0, "title clicks must not navigate");
   h.dispatch(h.document.activeElement, "keydown", { key: "Escape" });
   assert.equal(h.elements.sessionactions.hidden, true);
   assert.equal(h.document.activeElement, title);
-  assert.deepEqual(h.requests, []);
+  await Promise.all([click.done, second.done, double.done]);
+  assert.equal(h.context.sessionId, "open-session");
+  assert.equal(h.configLoads(), 0);
+  assert.deepEqual(h.requests, [
+    { path: "/sessions/target-session/mark", method: "POST", body: { marked: true } },
+    { path: "/sessions", method: "GET", body: null },
+  ]);
 });
 
-for (const titleClick of [true, false]) test("desktop single " + (titleClick ? "title" : "row body") + " click selects the session", async () => {
+test("desktop single title click toggles its mark without switching sessions", async () => {
+  for (const marked of [false, true]) {
+    const h = harness({ marked });
+    const click = h.dispatch(h.title(), "click");
+    await click.done;
+    assert.equal(click.event.stopped, true);
+    assert.equal(h.context.sessionId, "open-session");
+    assert.equal(h.row().classList.contains("cur"), false);
+    assert.equal(h.title().getAttribute("aria-current"), "false");
+    assert.equal(h.row("open-session").classList.contains("cur"), true);
+    assert.equal(h.elements.sesstitle.textContent, "Open session");
+    assert.equal(h.elements.prompt.value, "draft in A");
+    assert.equal(h.row().querySelector(".mk").getAttribute("aria-pressed"), String(!marked));
+    assert.equal(h.elements.sessionactions.hidden, true);
+    assert.equal(h.historyLoads(), 0);
+    assert.equal(h.configLoads(), 0);
+    assert.deepEqual(h.drawers, []);
+    assert.deepEqual(h.requests, [
+      { path: "/sessions/target-session/mark", method: "POST", body: { marked: !marked } },
+      { path: "/sessions", method: "GET", body: null },
+    ]);
+  }
+});
+
+test("desktop single row body click selects the session", async () => {
   const h = harness();
-  await h.dispatch(titleClick ? h.title() : h.row(), "click").done;
+  const click = h.dispatch(h.row(), "click");
+  await click.done;
+  assert.equal(click.event.stopped, false);
   assert.equal(h.context.sessionId, "target-session");
   assert.equal(h.row().classList.contains("cur"), true);
   assert.equal(h.title().getAttribute("aria-current"), "true");
@@ -268,19 +300,30 @@ for (const titleClick of [true, false]) test("desktop single " + (titleClick ? "
   assert.deepEqual(h.requests, []);
 });
 
-for (const key of ["Enter", " "]) test("desktop focused title " + JSON.stringify(key) + " selects without opening actions", async () => {
-  const h = harness(), title = h.title();
-  title.focus();
-  const press = h.dispatch(title, "keydown", { key });
-  await press.done;
-  assert.equal(press.event.prevented, true);
-  assert.equal(press.event.stopped, true);
-  assert.equal(title.getAttribute("role"), "button");
-  assert.equal(title.getAttribute("tabindex"), "0");
-  assert.equal(h.context.sessionId, "target-session");
-  assert.equal(h.elements.sessionactions.hidden, true);
-  h.dispatch(title, "dblclick", { detail: 0 });
-  assert.equal(h.elements.sessionactions.hidden, true, "a keyboard activation cannot become a double-click action");
+for (const key of ["Enter", " "]) test("desktop focused title " + JSON.stringify(key) + " toggles its mark without opening actions", async () => {
+  for (const marked of [false, true]) {
+    const h = harness({ marked }), title = h.title();
+    title.focus();
+    const press = h.dispatch(title, "keydown", { key });
+    await press.done;
+    assert.equal(press.event.prevented, true);
+    assert.equal(press.event.stopped, true);
+    assert.equal(title.getAttribute("role"), "button");
+    assert.equal(title.getAttribute("tabindex"), "0");
+    assert.equal(h.context.sessionId, "open-session");
+    assert.equal(h.title().getAttribute("aria-current"), "false");
+    assert.equal(h.row().querySelector(".mk").getAttribute("aria-pressed"), String(!marked));
+    assert.equal(h.elements.prompt.value, "draft in A");
+    assert.equal(h.historyLoads(), 0);
+    assert.equal(h.configLoads(), 0);
+    assert.deepEqual(h.requests, [
+      { path: "/sessions/target-session/mark", method: "POST", body: { marked: !marked } },
+      { path: "/sessions", method: "GET", body: null },
+    ]);
+    assert.equal(h.elements.sessionactions.hidden, true);
+    h.dispatch(title, "dblclick", { detail: 0 });
+    assert.equal(h.elements.sessionactions.hidden, true, "a keyboard activation cannot become a double-click action");
+  }
 });
 
 for (const extra of [{ key: "F10", shiftKey: true }, { key: "ContextMenu" }]) test("desktop title keyboard menu " + extra.key + " opens and Escape restores focus", () => {

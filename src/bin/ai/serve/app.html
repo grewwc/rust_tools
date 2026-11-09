@@ -4139,7 +4139,7 @@ function renderSessionList(items, errText, { preserveScroll = true } = {}) {
     t.onclick = (ev) => {
       ev.stopPropagation();
       if (!isPhoneLayout() && ev.detail > 1) return;
-      return li.onclick();
+      return isPhoneLayout() ? li.onclick() : toggleSessionMark(s);
     };
     t.ondblclick = (ev) => {
       if (isPhoneLayout() || ev.detail === 0) return;
