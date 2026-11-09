@@ -30,7 +30,7 @@ function streamHarness({ activityOnly = false } = {}) {
   };
   function node() {
     const classes = new Set();
-    const item = { dataset: {}, textContent: "", innerHTML: "", classList: {
+    const item = { dataset: {}, textContent: "", innerHTML: "", querySelector() { return null; }, classList: {
       add: (name) => classes.add(name), remove: (name) => classes.delete(name),
     }, get isConnected() { return box.isConnected && box.children.includes(item); },
     remove() { box.children = box.children.filter((child) => child !== item); } };
@@ -39,15 +39,18 @@ function streamHarness({ activityOnly = false } = {}) {
   const clock = { now: 1000 }, intervals = new Map(), listeners = new Map(), observers = [];
   let intervalId = 0;
   const listen = (type, fn) => listeners.set(type, (listeners.get(type) || []).concat(fn));
-  const document = { hidden: false, body: box, addEventListener: listen };
+  const document = { hidden: false, body: box, addEventListener: listen, createElement: () => node() };
   const context = vm.createContext({
-    box, sid: "s", sessionId: "s", finished: false, turnError: false,
+    box, sid: "s", sessionId: "s", finished: false, turnError: false, document,
     LIVE_STALL_MS: 300000,
     runEpoch: 0, eventFailures: 0, confirmPollSeq: 0,
     setTimeout: (fn, delay) => { timers.push(delay); return timers.length; }, clearTimeout() {},
     // Extracted slices may arm timers; the assertions drive them directly.
     setInterval: () => 0, clearInterval() {},
-    shouldFollowOutput: () => false, followOutput() {},
+    shouldFollowOutput: () => false, followOutput() {}, closeProgressPhase() {},
+    rememberRate() {}, storedRate: () => "",
+    estimateTextTokens: () => 1, measuredRateText: () => "",
+    mutateTranscript(mutation) { mutation(); },
     renderMarkdown: (text) => text, decorateMath() {}, decorateAndLoad() {},
     showConfirm() {}, hideConfirm() {}, confirmShown: null,
     addMsgMd() { const item = node(); box.children.push(item); return item; },
@@ -88,6 +91,7 @@ function streamHarness({ activityOnly = false } = {}) {
     };
   }
   vm.runInContext(script.slice(script.indexOf("function replyPaintDelay("), script.indexOf("function sessionTitle(")), context);
+  vm.runInContext(script.slice(script.indexOf("function setAnswerRate("), script.indexOf("// Only completed answer bubbles")), context);
   const start = script.indexOf('  let bubble = addMsgMd("", box);');
   assert.ok(start > 0);
   vm.runInContext(script.slice(start, script.indexOf("  let turnStarted = false;", start)), context);
@@ -131,9 +135,13 @@ function streamHarness({ activityOnly = false } = {}) {
     bodies: () => box.children.filter((item) => item.body).map((item) => item.body.textContent),
     pending: () => vm.runInContext("phaseBubble.textContent", context),
     pendingVisible: () => vm.runInContext("box.children.includes(phaseBubble)", context),
+    answerRate: () => vm.runInContext("(bubble || answerBubbles.at(-1)).dataset.tokenRate || ''", context),
+    ageOutput: (ms) => vm.runInContext(`outputStartedAt = Date.now() - ${ms}`, context),
     fail: () => vm.runInContext('fail("turn failed")', context),
     reply: () => vm.runInContext("(bubble || answerBubbles.at(-1)).innerHTML", context),
-    metrics: () => box.children.filter((item) => item.textContent.startsWith("↳ speed")).map((item) => item.textContent),
+    // Only message bubbles count as a leaked speed row; the turn footer that
+    // carries the final throughput is plain text, not a card.
+    metrics: () => box.children.filter((item) => String(item.className || "").includes("msg") && item.textContent.startsWith("↳ speed")).map((item) => item.textContent),
     answerCount: () => vm.runInContext("answerBubbles.filter((b) => b.innerHTML).length", context),
   };
 }
@@ -421,7 +429,9 @@ test("live tools separate real thinking phases, while logs cannot split tokens",
   h.emit("thinking", { text: "Next thought" });
   h.emit("progress", "another diagnostic");
   assert.deepEqual(h.titles().filter((title) => title.startsWith("thinking")), ["thinking", "thinking…"]);
-  assert.equal(h.titles().filter((title) => title.startsWith("activity log")).length, 1);
+  // Plain child stdout (diagnostics included) is not transcript content; tool
+  // work is rendered from structured `tool` events instead.
+  assert.equal(h.titles().filter((title) => title.startsWith("activity log")).length, 0);
   assert.ok(h.bodies().includes("The user asks"));
   assert.ok(h.bodies().some((text) => text.includes("search results")));
   assert.ok(h.titles().findIndex((title) => title.includes("web_search")) < h.titles().lastIndexOf("thinking…"));
@@ -431,15 +441,35 @@ test("live tools separate real thinking phases, while logs cannot split tokens",
   assert.equal(h.pendingVisible(), false, "a completed turn must not retain a running indicator");
 });
 
-test("token throughput remains visible instead of being hidden in the activity log", () => {
+test("token throughput stays in existing status and answer UI without a separate message", () => {
   const h = streamHarness();
   h.emit("progress", "request diagnostic");
+  h.emit("progress", "↳ speed · reasoning 18 tok @ — tok/s · output 122 tok @ — tok/s");
+  assert.deepEqual(h.metrics(), []);
+  assert.match(h.pending(), /reasoning 18 tok @ — tok\/s · output 122 tok @ — tok\/s/);
+  h.emit("thinking", { text: "brief thought", rate: "~10 tok @ — tok/s" });
+  assert.ok(h.titles().includes("thinking… · ~10 tok @ — tok/s"));
+  h.emit("delta", { delta: "Final answer" });
   h.emit("progress", "  \x1b[2m↳ speed · reasoning 800 tok @ 400 tok/s · output 400 tok @ 400 tok/s\x1b[0m");
-  assert.deepEqual(h.metrics(), ["↳ speed · reasoning 800 tok @ 400 tok/s · output 400 tok @ 400 tok/s"]);
-  assert.equal(h.titles().filter((title) => title.startsWith("activity log")).length, 1);
+  assert.deepEqual(h.metrics(), []);
+  assert.match(h.pending(), /reasoning 800 tok @ 400 tok\/s · output 400 tok @ 400 tok\/s/);
+  assert.equal(h.titles().filter((title) => title.startsWith("activity log")).length, 0);
   assert.doesNotMatch(h.bodies().join("\n"), /400 tok\/s/);
   h.emit("done");
-  assert.equal(h.metrics().length, 1, "the completed turn keeps its throughput line");
+  assert.equal(h.metrics().length, 0, "throughput never creates its own message");
+  assert.equal(h.answerRate(), "reasoning 800 tok @ 400 tok/s · output 400 tok @ 400 tok/s");
+  assert.ok(h.titles().includes("thinking · ~10 tok @ — tok/s"), "closing thinking keeps its last displayed rate");
+});
+
+test("ordinary streamed output shows a live rate and keeps a final estimate", () => {
+  const h = streamHarness();
+  h.emit("delta", { delta: "abcdefgh" });
+  h.ageOutput(1000);
+  h.emit("delta", { delta: "ijkl" });
+  assert.match(h.pending(), /Responding… · output ~3 tok @ [\d.]+ tok\/s ·/);
+  h.emit("done");
+  assert.equal(h.metrics().length, 0);
+  assert.match(h.answerRate(), /output ~3 tok @ [\d.]+ tok\/s/);
 });
 
 test("parallel tool completion and confirmation preserve the remaining active status", () => {

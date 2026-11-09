@@ -1103,7 +1103,8 @@ test("separate thinking phases create separate folds", () => {
   const fold = () => ({ box: { querySelector: () => summary }, body });
   let creations = 0;
   let insertions = 0;
-  const parent = { insertBefore(node, before) { insertions++; assert.ok(node); assert.equal(before, "reply"); } };
+  const parent = { insertBefore(node, before) { insertions++; assert.ok(node); assert.equal(before, reply); } };
+  const reply = { parentNode: parent };
   const context = vm.createContext({
     addFold(title, text, host) {
       creations++;
@@ -1115,8 +1116,8 @@ test("separate thinking phases create separate folds", () => {
     },
   });
   vm.runInContext(script.slice(start, end), context);
-  const first = context.createThinkingFold(parent, "reply");
-  const second = context.createThinkingFold(parent, "reply");
+  const first = context.createThinkingFold(parent, reply);
+  const second = context.createThinkingFold(parent, reply);
   assert.notEqual(second, first);
   assert.equal(creations, 2);
   assert.equal(insertions, 2);
@@ -1148,10 +1149,9 @@ test("progress cannot split an active thinking phase", () => {
   assert.ok(subagentBranch);
   assert.doesNotMatch(progressBranch[1], /closeThinkingPhase/);
   assert.doesNotMatch(subagentBranch[1], /closeThinkingPhase/);
-  assert.match(progressBranch[1], /ensureProgressPhase\(\)/);
+  assert.doesNotMatch(progressBranch[1], /ensureProgressPhase\(\)|progLines\.push/);
   assert.match(subagentBranch[1], /activity.subagents\(payload\)/);
   assert.doesNotMatch(blockDispatch, /closeProgressPhase/);
-  assert.match(script, /const ensureProgressPhase = \(\) => \{[\s\S]*?box\.insertBefore\(prog\.box, bubble\)/);
   assert.doesNotMatch(script, /finalizing response/);
 });
 
@@ -1568,7 +1568,10 @@ test("image reread followups stay internal without losing real prompts or canoni
   Object.assign(h.context, {
     addUserBubble: (text, index) => rendered.push({ role: "user", text, index }),
     addMsgMd: (text) => rendered.push({ role: "assistant", text }),
-    addFold: (label, text) => rendered.push({ role: "tool", label, text }),
+    addFold: (label, text) => {
+      rendered.push({ role: "tool", label, text });
+      return { box: { querySelector: () => null } };
+    },
     FOLD_ROLE_LABELS: {},
   });
   const content = [{ type: "reference", kind: "image", name: "hand.jpg", asset: "attachments/hand.jpg" }, { type: "text", text: "which tile?" }];
@@ -1920,20 +1923,28 @@ test("phone output follows only while the reader remains near the bottom", () =>
   assert.equal(away.classes.has("show"), true);
   assert.equal(away.attrs["aria-hidden"], "false");
 
-  const near = scrollHarness({ phone: true, scrollTop: 520 });
+  const near = scrollHarness({ phone: true, scrollTop: 596 });
   assert.equal(near.context.shouldFollowOutput(), true);
   near.context.followOutput(true);
   assert.equal(near.msgs.scrollTop, 1000);
   assert.equal(near.classes.has("show"), false);
 
-  const directed = scrollHarness({ phone: true, scrollTop: 590 });
+  const directed = scrollHarness({ phone: true, scrollTop: 597 });
+  directed.context.noteTranscriptIntent(-1);
+  assert.equal(directed.context.shouldFollowOutput(), false, "an upward wheel/touch intent locks before layout changes scrollTop");
+  directed.msgs.scrollTop = 600;
+  directed.context.followOutput(false);
+  assert.equal(directed.msgs.scrollTop, 600, "live DOM updates cannot clear an explicit upward-scroll lock");
+  directed.msgs.scrollTop = 597;
   directed.context.noteTranscriptScroll(600);
   assert.equal(directed.context.shouldFollowOutput(), false, "an upward gesture locks following even inside the bottom gap");
   directed.context.followOutput(false);
-  assert.equal(directed.msgs.scrollTop, 590);
+  assert.equal(directed.msgs.scrollTop, 597);
   directed.msgs.scrollTop = 600;
   directed.context.noteTranscriptScroll(590);
-  assert.equal(directed.context.shouldFollowOutput(), true, "scrolling back to the live edge restores following");
+  assert.equal(directed.context.shouldFollowOutput(), false, "content growth that moves scrollTop must not resume following");
+  directed.context.noteTranscriptIntent(1);
+  assert.equal(directed.context.shouldFollowOutput(), true, "a downward gesture back at the live edge restores following");
 });
 
 test("desktop output follows only while the reader is at the live edge", () => {
@@ -1955,7 +1966,7 @@ for (const phone of [false, true]) test((phone ? "phone" : "desktop") + " jump b
   assert.equal(h.classes.has("show"), true);
   assert.equal(h.attrs["aria-hidden"], "false");
   assert.equal(h.button.tabIndex, 0);
-  h.msgs.scrollTop = 520;
+  h.msgs.scrollTop = 596;
   h.context.updateJumpButton();
   assert.equal(h.classes.has("show"), false);
   assert.equal(h.attrs["aria-hidden"], "true");

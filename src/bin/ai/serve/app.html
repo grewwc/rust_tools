@@ -270,13 +270,11 @@ select, summary { touch-action:manipulation; }
   letter-spacing:.01em; }
 .msg.md pre, .msg.md code { letter-spacing:normal; }
 .msg.pending { color:var(--dim); font-style:italic; }
-.msg.turn-metric { align-self:flex-start; padding:0 4px; background:none; color:var(--dim); font-size:12px; }
 .msg.user { align-self:flex-end; background:var(--acc-solid); color:var(--on-acc); }
 /* Assistant cards span the row (capped by max-width) so a collapsed fold stays
    tappable across the whole card instead of only over its text. */
 .msg.asst { align-self:stretch; background:var(--panel); border:1px solid var(--line); }
-/* `touch-action:manipulation` keeps a double tap on a fold from zooming the page,
-   so the second tap still lands as a click (see collapseFoldForTap). */
+/* `touch-action:manipulation` keeps a double tap on a fold from zooming the page. */
 .msg details { font-size:13px; color:var(--dim); touch-action:manipulation; }
 /* Desktop keeps the compact whole-bubble shortcut; phones use the explicit
    action below so a normal transcript tap cannot destroy history. */
@@ -579,6 +577,10 @@ select, summary { touch-action:manipulation; }
    pre-wrap source view the other bubbles keep. */
 .msg.md { white-space:normal; }
 .msg.md .answer-actions { display:flex; justify-content:flex-end; align-items:center; gap:8px; margin-top:8px; }
+/* The final throughput belongs to the turn, not to one answer segment: a turn
+   that ends on tool calls still reports it, and it never becomes a card of its
+   own. */
+.turn-rate { align-self:flex-start; padding:0 4px; color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums; }
 .msg.md .answer-copy { position:relative; flex:0 0 auto; min-width:52px; min-height:32px; padding:4px 10px; border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--dim); font-size:12px; touch-action:manipulation; }
 /* The box stays small; the touch area still reaches the 44px target. */
 .msg.md .answer-copy::after { content:""; position:absolute; inset:-6px; }
@@ -1537,6 +1539,10 @@ function copyCodeText(text) {
   return Promise.resolve(fallback());
 }
 const answerCopyTexts = new WeakMap();
+function setAnswerRate(root, text) {
+  if (!root || !text) return;
+  root.dataset.tokenRate = text;
+}
 // Only completed answer bubbles get a footer. Moving their existing nodes keeps
 // rendered previews intact and leaves streaming paints on their current path.
 function addAnswerCopy(root, text) {
@@ -1646,10 +1652,8 @@ function handlePreviewClick(event) {
   const answerButton = target.closest("[data-copy-answer]");
   if (answerButton) return copyNearbyAnswer(answerButton);
 }
-// Folding an open card back from its own header means scrolling up to a summary
-// that has already left the viewport, so a double tap anywhere else on an open
-// fold closes it. Single taps keep their meaning: keyboard activation reports
-// detail 0, and taps on controls inside the fold are left to those controls.
+// Double-clicking inside an open fold closes it, which saves a scroll back to
+// its summary. Single clicks, controls, and the summary keep their own behavior.
 let lastFoldTap = { at: 0, x: 0, y: 0 };
 function collapseFoldForTap(event) {
   if (!event.detail) return;
@@ -2591,7 +2595,10 @@ function historyEndsUnanswered(messages) {
   return false;
 }
 const PHONE_LAYOUT_QUERY = "(max-width:700px)";
-const FOLLOW_BOTTOM_GAP = 80;
+// Following needs the reader at the live edge, not merely close to it: a
+// one-notch scroll up on a trackpad stays inside a wide tolerance, so the next
+// paint would pull the view back down before the reader ever reaches old rows.
+const FOLLOW_BOTTOM_GAP = 4;
 let jumpingToBottom = false;
 let outputFollowSuspended = false;
 function isPhoneLayout() {
@@ -2599,6 +2606,35 @@ function isPhoneLayout() {
 }
 function isNearBottom(root = $("msgs")) {
   return root.scrollHeight - root.scrollTop - root.clientHeight <= FOLLOW_BOTTOM_GAP;
+}
+// Scroll position survives a reload per session. `atBottom` is stored instead
+// of a raw offset when the reader is at the live edge, so new output still
+// follows after the transcript grows.
+const SCROLL_POSITION_PREFIX = "serve.scroll.";
+function savedTranscriptPosition(id) {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SCROLL_POSITION_PREFIX + id) || "null");
+    if (saved && typeof saved.top === "number") {
+      return { top: saved.top, atBottom: !!saved.atBottom };
+    }
+  } catch (_) {}
+  return null;
+}
+function rememberTranscriptPosition(root = $("msgs")) {
+  if (!sessionId) return;
+  const atBottom = isNearBottom(root);
+  try {
+    localStorage.setItem(SCROLL_POSITION_PREFIX + sessionId,
+      JSON.stringify({ top: atBottom ? 0 : root.scrollTop, atBottom }));
+  } catch (_) {}
+}
+let scrollPositionTimer = null;
+function scheduleRememberTranscriptPosition() {
+  if (scrollPositionTimer !== null) return;
+  scrollPositionTimer = setTimeout(() => {
+    scrollPositionTimer = null;
+    rememberTranscriptPosition();
+  }, 200);
 }
 // New output follows only while the reader is already at the live edge, on both
 // layouts: dragging a desktop transcript down on every chunk makes reading
@@ -2608,7 +2644,10 @@ function shouldFollowOutput(root = $("msgs")) {
 }
 function noteTranscriptScroll(previousTop, root = $("msgs")) {
   if (root.scrollTop < previousTop) outputFollowSuspended = true;
-  else if (root.scrollTop > previousTop && isNearBottom(root)) outputFollowSuspended = false;
+}
+function noteTranscriptIntent(deltaY) {
+  if (deltaY < 0) outputFollowSuspended = true;
+  else if (deltaY > 0 && isNearBottom()) outputFollowSuspended = false;
 }
 function updateJumpButton() {
   const button = $("jumpbottom");
@@ -2693,7 +2732,10 @@ function resetQuestionNavigator() {
 function switchSession(nextId, saveCurrent = true) {
   nextId = nextId || "";
   if (nextId === sessionId) return;
-  if (saveCurrent) persistDraft();
+  if (saveCurrent) {
+    persistDraft();
+    if (typeof rememberTranscriptPosition === "function") rememberTranscriptPosition();
+  }
   pauseHistoryRetry(sessionId);
   sessionId = nextId;
   if (sessionId) localStorage.setItem("serve.session", sessionId);
@@ -3035,10 +3077,95 @@ const FOLD_ROLE_LABELS = { tool: "tool", internal_note: "internal note" };
 // that carried it.
 const foldOpenState = new Map();
 
-function addFold(title, bodyText, parent) {
+// A reattached stream replays the running turn into a fresh progress view, so a
+// fold the reader opened would come back collapsed; remember the choice by key.
+const foldOpenByKey = new Map();
+const FOLD_OPEN_STORAGE = "serve.foldopen";
+function loadFoldOpenState() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(FOLD_OPEN_STORAGE) || "[]");
+    if (Array.isArray(saved)) {
+      for (const key of saved.slice(-300)) if (typeof key === "string") foldOpenState.set(key, true);
+    }
+  } catch (_) {}
+}
+function saveFoldOpenState() {
+  try {
+    localStorage.setItem(FOLD_OPEN_STORAGE, JSON.stringify([...foldOpenState.keys()].slice(-300)));
+  } catch (_) {}
+}
+// History rows are rebuilt from canonical messages, so their open state is
+// keyed by message identity and kept across reloads.
+function bindStoredFold(det, key) {
+  det.dataset.foldKey = key;
+  if (foldOpenState.has(key)) det.open = foldOpenState.get(key);
+  det.addEventListener("toggle", () => {
+    if (det.open) foldOpenState.set(key, true);
+    else foldOpenState.delete(key);
+    const oldest = foldOpenState.keys().next();
+    if (foldOpenState.size > 300 && !oldest.done) foldOpenState.delete(oldest.value);
+    saveFoldOpenState();
+  });
+}
+loadFoldOpenState();
+
+// Live rates are display-only and never persisted in canonical messages.
+// Keep the last value per reasoning/answer text so a reload can still show it.
+const RATE_STORAGE = "serve.rates";
+function rateTextKey(text) {
+  text = String(text).replace(/\s+/g, " ").trim();
+  const head = text.slice(0, 512);
+  const tail = text.slice(-512);
+  let hash = 5381;
+  for (let i = 0; i < head.length; i++) hash = ((hash * 33) ^ head.charCodeAt(i)) >>> 0;
+  for (let i = 0; i < tail.length; i++) hash = ((hash * 33) ^ tail.charCodeAt(i)) >>> 0;
+  return text.length + ":" + hash.toString(36);
+}
+function estimateTextTokens(text) {
+  let ascii = 0, nonAscii = 0;
+  for (const ch of text) {
+    if (ch.charCodeAt(0) < 128) ascii++;
+    else nonAscii++;
+  }
+  return nonAscii + Math.ceil(ascii / 4);
+}
+// Server rate frames are not replayed when a retained stream starts mid-phase.
+// Fall back to the same client-side estimate the live answer counter uses so a
+// reloaded phone still shows a rate beside its thinking fold.
+function measuredRateText(tokens, startedAt, now = Date.now()) {
+  if (!startedAt || !tokens) return "";
+  const elapsed = now - startedAt;
+  if (elapsed < 500) return "~" + tokens + " tok @ — tok/s";
+  const rate = tokens * 1000 / elapsed;
+  const shown = rate >= 100 ? Math.round(rate) : rate >= 10 ? rate.toFixed(1) : rate.toFixed(2);
+  return "~" + tokens + " tok @ " + shown + " tok/s";
+}
+function rememberRate(kind, sid, text, rate) {
+  if (!sid || !text || !rate) return;
+  text = String(text).trim();
+  let store = {};
+  try { store = JSON.parse(localStorage.getItem(RATE_STORAGE) || "{}") || {}; } catch (_) {}
+  store[kind + "|" + sid + "|" + rateTextKey(text)] = rate;
+  const keys = Object.keys(store);
+  for (const key of keys.slice(0, Math.max(0, keys.length - 1000))) delete store[key];
+  try { localStorage.setItem(RATE_STORAGE, JSON.stringify(store)); } catch (_) {}
+}
+function storedRate(kind, sid, text) {
+  if (!sid || !text) return "";
+  text = String(text).trim();
+  try {
+    const store = JSON.parse(localStorage.getItem(RATE_STORAGE) || "{}") || {};
+    return store[kind + "|" + sid + "|" + rateTextKey(text)] || "";
+  } catch (_) { return ""; }
+}
+function addFold(title, bodyText, parent, key) {
   const d = document.createElement("div");
   d.className = "msg asst";
   const det = document.createElement("details");
+  if (key) {
+    det.dataset.foldKey = key;
+    if (foldOpenByKey.has(key)) det.open = foldOpenByKey.get(key);
+  }
   const sum = document.createElement("summary");
   sum.textContent = title;
   det.appendChild(sum);
@@ -3046,6 +3173,10 @@ function addFold(title, bodyText, parent) {
   pre.className = "prog";
   pre.textContent = bodyText;
   det.appendChild(pre);
+  if (key) det.addEventListener("toggle", () => {
+    if (foldOpenByKey.size > 2000) foldOpenByKey.clear();
+    foldOpenByKey.set(key, det.open);
+  });
   d.appendChild(det);
   (parent || $("msgs")).appendChild(d);
   return { box: d, body: pre, set(title2, text2) { sum.textContent = title2; pre.textContent = text2; } };
@@ -3054,8 +3185,11 @@ function addFold(title, bodyText, parent) {
 // Create a fold only after real thinking text arrives. Explicit lifecycle
 // events close each phase; concurrent progress cannot split the reasoning text.
 function createThinkingFold(parent, before) {
-  const next = addFold("thinking…", "", parent);
-  parent.insertBefore(next.box, before);
+  const ordinal = (parent._thinkingOrdinal = (parent._thinkingOrdinal || 0) + 1);
+  const next = addFold("thinking…", "", parent, "thinking:" + ordinal);
+  // A recovered turn can hand over a node from an older box; inserting against
+  // a foreign parent throws, and the caller's guard would drop the whole phase.
+  parent.insertBefore(next.box, before && before.parentNode === parent ? before : null);
   return next;
 }
 
@@ -3182,9 +3316,9 @@ function createLiveActivity(parent, before) {
   // hold several answer bubbles (prose, then tools, then more prose), so the
   // answer-segment owner moves this anchor whenever it seals a bubble.
   let anchor = before;
-  const insert = (title) => {
-    const fold = addFold(title, "", parent);
-    parent.insertBefore(fold.box, anchor);
+  const insert = (title, key) => {
+    const fold = addFold(title, "", parent, key);
+    parent.insertBefore(fold.box, anchor && anchor.parentNode === parent ? anchor : null);
     return fold;
   };
   const renderTool = (tool) => {
@@ -3207,7 +3341,7 @@ function createLiveActivity(parent, before) {
       if (!event || !event.id || !event.name || !["started", "finished"].includes(event.phase)) return;
       let tool = tools.get(event.id);
       if (!tool) {
-        tool = { fold: insert(event.name), name: event.name };
+        tool = { fold: insert(event.name, "tool:" + (event.id || event.name + ":" + tools.size)), name: event.name };
         tool.fold.box.classList.add("tool-activity");
         tools.set(event.id, tool);
       }
@@ -3223,7 +3357,7 @@ function createLiveActivity(parent, before) {
     subagents(text) {
       if (!subagents && !text) return;
       if (!subagents) {
-        subagents = insert("subagents");
+        subagents = insert("subagents", "subagents");
         subagentClock = createSubagentClock(subagents);
       }
       subagentClock.set(text);
@@ -4817,15 +4951,20 @@ function historyRowsOf(msgs, histTotal, showAll) {
     // Filter only the display rows, keeping canonical offsets and counts intact.
     if (isRuntimeSyntheticUser(message)) continue;
     const text = textOf(message.content, message.role === "user").trim();
-    if (!text) continue;
+    // Persisted reasoning rides beside the message, and runtime origins reuse the
+    // same field for sidecar metadata; only model reasoning becomes a fold.
+    const persisted = typeof message.reasoning_content === "string" ? message.reasoning_content.trim() : "";
+    const reasoning = persisted && !persisted.startsWith("runtime-origin:") ? persisted : "";
+    if (!text && !reasoning) continue;
     const identity = [
-      message.role || "", text, !!message.reasoning_content,
+      message.role || "", text, reasoning,
       message.tool_call_id || "",
       message.tool_call_id ? calls.get(message.tool_call_id) : null,
     ];
     rows.push({
       message,
       text,
+      reasoning,
       historyIndex: histBase + i,
       call: message.tool_call_id ? calls.get(message.tool_call_id) : null,
       key: JSON.stringify([histBase + i, ...identity]),
@@ -4837,21 +4976,34 @@ function historyRowsOf(msgs, histTotal, showAll) {
 function renderHistoryRow(row, parent) {
   const m = row.message;
   if (m.role === "user") addUserBubble(row.text, row.historyIndex, parent);
-  else if (m.role === "assistant") addMsgMd(row.text, parent, textOf(m.content));
+  else if (m.role === "assistant") {
+    if (row.reasoning) {
+      const thinkRate = typeof storedRate === "function" ? storedRate("thinking", sessionId, row.reasoning) : "";
+      const fold = addFold(thinkRate ? "thinking · " + thinkRate : "thinking", row.reasoning, parent);
+      const det = fold.box.querySelector("details");
+      if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + row.identity + ":thinking");
+    }
+    if (row.text) {
+      addMsgMd(row.text, parent, textOf(m.content));
+      const turnRate = typeof storedRate === "function" ? storedRate("turn", sessionId, row.text) : "";
+      if (turnRate) {
+        const line = document.createElement("div");
+        line.className = "turn-rate";
+        line.textContent = "↳ speed · " + turnRate;
+        line.dataset.turnRate = "1";
+        parent.appendChild(line);
+      }
+    }
+  }
   else {
     const fold = addFold(row.call ? callLabel(row.call) : FOLD_ROLE_LABELS[m.role] || m.role, row.text.slice(0, 2000), parent);
     const det = fold.box.querySelector("details");
-    if (det) {
-      det.dataset.foldKey = row.identity;
-      if (foldOpenState.has(row.identity)) det.open = foldOpenState.get(row.identity);
-      det.addEventListener("toggle", () => {
-        if (foldOpenState.size > 2000) foldOpenState.clear();
-        foldOpenState.set(row.identity, det.open);
-      });
-    }
+    if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + row.identity);
   }
-  if (parent?.lastElementChild) {
-    const data = parent.lastElementChild.dataset;
+  const last = parent?.lastElementChild;
+  const node = last && last.dataset && last.dataset.turnRate ? last.previousElementSibling : last;
+  if (node?.dataset) {
+    const data = node.dataset;
     data.canonicalIndex = String(row.historyIndex);
     data.canonicalKey = row.key;
     data.canonicalIdentity = row.identity;
@@ -5055,8 +5207,12 @@ async function loadHistory(prefetched) {
       renderSessionBar();
       if (!lastHistoryEndsUnanswered) root.querySelectorAll(".turn-interrupted").forEach((node) => node.remove());
       const sameSession = historySession === forSession;
-      const follow = !sameSession || shouldFollowOutput(root);
-      const oldScrollTop = root.scrollTop;
+      const savedPosition = sameSession ? null
+        : (typeof savedTranscriptPosition === "function" ? savedTranscriptPosition(forSession) : null);
+      const follow = sameSession
+        ? shouldFollowOutput(root)
+        : (!savedPosition || savedPosition.atBottom);
+      const oldScrollTop = savedPosition && !savedPosition.atBottom ? savedPosition.top : root.scrollTop;
       const nextKeys = history.rows.map((row) => row.key);
       // Keep the overlapping canonical window, including loaded media. The
       // 200-message window can slide forward without re-decoding every image.
@@ -5187,6 +5343,21 @@ if ($("msgs") && typeof $("msgs").addEventListener === "function") {
   // live edge must not trigger a fetch, and a transcript shorter than its viewport
   // has no older rows to reveal.
   let previousTop = $("msgs").scrollTop;
+  let previousTouchY = null;
+  $("msgs").addEventListener("wheel", (event) => noteTranscriptIntent(event.deltaY), { passive: true });
+  $("msgs").addEventListener("touchstart", (event) => {
+    previousTouchY = event.touches?.[0]?.clientY ?? null;
+  }, { passive: true });
+  $("msgs").addEventListener("touchmove", (event) => {
+    const y = event.touches?.[0]?.clientY;
+    if (previousTouchY !== null && y !== undefined) noteTranscriptIntent(previousTouchY - y);
+    previousTouchY = y ?? previousTouchY;
+  }, { passive: true });
+  // Releasing a drag at the live edge is the reader's way back to following.
+  $("msgs").addEventListener("touchend", () => {
+    previousTouchY = null;
+    if (isNearBottom()) outputFollowSuspended = false;
+  }, { passive: true });
   $("msgs").addEventListener("scroll", () => {
     const root = $("msgs");
     const movedUp = root.scrollTop < previousTop;
@@ -5572,6 +5743,9 @@ function recoveredProgressView() {
   let think = null;
   let thinking = "";
   let answer = "";
+  let tokenRate = "";
+  let thinkStartedAt = 0;
+  let thinkTokens = 0;
   const sealAnswerSegment = () => {
     if (!bubble || bubble.dataset.segmentSealed) return;
     if (answer.trim()) {
@@ -5595,13 +5769,13 @@ function recoveredProgressView() {
     answerBubbles.push(bubble);
     activity.anchor(bubble);
   };
-  const paintPhase = () => { phaseBubble.textContent = activity.label(); };
+  const paintPhase = () => { phaseBubble.textContent = activity.label() + (tokenRate ? " · " + tokenRate : ""); };
   const paintAnswer = () => {
     if (bubble) { bubble.hidden = !answer; bubble.textContent = answer; }
     activity.setPhase(answer ? "Responding…" : "Processing…");
     paintPhase();
   };
-  const endThinking = () => { think = null; thinking = ""; };
+  const endThinking = () => { think = null; thinking = ""; thinkStartedAt = 0; thinkTokens = 0; };
   paintPhase();
   return {
     box,
@@ -5610,13 +5784,17 @@ function recoveredProgressView() {
     thinkingText(text, rate = "") {
       sealAnswerSegment();
       thinking += text;
+      if (!thinkStartedAt) thinkStartedAt = Date.now();
+      thinkTokens += estimateTextTokens(text);
+      const shownRate = rate || measuredRateText(thinkTokens, thinkStartedAt);
       if (!think) think = createThinkingFold(box, phaseBubble);
-      think.set(rate ? "thinking · " + rate : "thinking", thinking.length > 6000 ? "…" + thinking.slice(-6000) : thinking);
+      think.set(shownRate ? "thinking · " + shownRate : "thinking", thinking.length > 6000 ? "…" + thinking.slice(-6000) : thinking);
       activity.setPhase("Thinking…");
       paintPhase();
     },
     delta(text) { endThinking(); ensureAnswerBubble(); answer += text; paintAnswer(); },
     replace(text) { endThinking(); ensureAnswerBubble(); answer = text; paintAnswer(); },
+    rate(text) { tokenRate = text; paintPhase(); },
     tool(event) { endThinking(); sealAnswerSegment(); activity.setPhase("Processing…"); activity.tool(event); paintPhase(); },
     subagents(text) { activity.subagents(text); },
     phase(text, waiting) { activity.setPhase(text, waiting); paintPhase(); },
@@ -5670,6 +5848,9 @@ function handleReplayEvent(sid, kind, payload, view) {
     try { cid = JSON.parse(payload).id; } catch (_) {}
     if (cid === null || (confirmShown && confirmShown.id === cid)) hideConfirm();
     view.phase("Processing…");
+  } else if (!kind && payload) {
+    const plain = payload.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").trim();
+    if (/^↳\s+speed(?:\s*·|\s|$)/i.test(plain)) view.rate(plain.replace(/^↳\s+speed\s*·?\s*/i, ""));
   }
 }
 
@@ -6161,7 +6342,42 @@ async function send() {
   phaseBubble.classList.add("pending");
   const activity = createLiveActivity(box, bubble);
   const clockStart = Date.now();
-  const phaseLine = () => "◌ " + activity.label() + " · " + formatElapsed(Date.now() - clockStart);
+  let outputStartedAt = 0, liveOutputAscii = 0, liveOutputNonAscii = 0, tokenRate = "";
+  const observeLiveOutput = (text) => {
+    if (!text) return;
+    if (!outputStartedAt) outputStartedAt = Date.now();
+    for (const ch of text) {
+      if (/^[\x00-\x7f]$/.test(ch)) liveOutputAscii++;
+      else liveOutputNonAscii++;
+    }
+  };
+  const liveOutputRate = (includeUnmeasured = false) => {
+    if (!outputStartedAt) return "";
+    const elapsed = Date.now() - outputStartedAt;
+    const tokens = liveOutputNonAscii + Math.ceil(liveOutputAscii / 4);
+    if (!tokens) return "";
+    if (elapsed < 500) return includeUnmeasured ? "~" + tokens + " tok @ — tok/s" : "";
+    const rate = tokens * 1000 / elapsed;
+    const shown = rate >= 100 ? Math.round(rate) : rate >= 10 ? rate.toFixed(1) : rate.toFixed(2);
+    return "~" + tokens + " tok @ " + shown + " tok/s";
+  };
+  const phaseLine = () => {
+    const liveRate = liveOutputRate();
+    const rate = tokenRate || (liveRate ? "output " + liveRate : "");
+    return "◌ " + activity.label() + (rate ? " · " + rate : "") + " · " + formatElapsed(Date.now() - clockStart);
+  };
+  // The measured throughput stays on the turn after it ends, including a turn
+  // that stopped on a tool round and therefore has no final answer bubble.
+  let turnRateLine = null;
+  const showTurnRate = (text) => {
+    if (!text) return;
+    if (!turnRateLine) {
+      turnRateLine = document.createElement("div");
+      turnRateLine.className = "turn-rate";
+      box.appendChild(turnRateLine);
+    }
+    turnRateLine.textContent = "↳ speed · " + text;
+  };
   const phaseTimer = setInterval(() => {
     // The box is parked while the user reads another session; keep the clock
     // live through that detach so it is current when attachLiveBox restores it.
@@ -6177,15 +6393,24 @@ async function send() {
   let prog = null;
   let progDetails = null;
   let progLines = [];
-  let tokenRateLine = null;
   let subagentProgress = "";
   const progressFolds = [];
   const ensureProgressPhase = () => {
     if (prog) return;
     prog = addFold("activity log", "", box);
-    box.insertBefore(prog.box, bubble);
+    box.insertBefore(prog.box, phaseBubble.parentNode === box ? phaseBubble : null);
     progDetails = prog.box.querySelector("details");
     progressFolds.push(prog);
+  };
+  // Progress rows belong to the phase they arrived in: after a thinking or tool
+  // phase, the next rows open a fresh fold at the current end of the turn instead
+  // of growing the first fold at the top.
+  const closeProgressPhase = () => {
+    if (!prog) return;
+    prog = null;
+    progDetails = null;
+    progLines = [];
+    expandProgress = false;
   };
   const renderProgress = () => {
     const visible = progLines.slice(-50);
@@ -6194,6 +6419,9 @@ async function send() {
   let think = null;
   let thinkRaw = "";
   let thinkRate = "";
+  let thinkStartedAt = 0;
+  let thinkTokens = 0;
+  let thinkRateStoredAt = 0;
   const thinkingFolds = [];
   let answerDirty = false;
   let progressDirty = false;
@@ -6226,7 +6454,7 @@ async function send() {
       thinkingDirty = false;
     }
     if (thinkingDoneDirty && think) {
-      think.box.querySelector("summary").textContent = "thinking";
+      think.box.querySelector("summary").textContent = thinkRate ? "thinking · " + thinkRate : "thinking";
       thinkingDoneDirty = false;
     }
     if (answerDirty) {
@@ -6263,6 +6491,9 @@ async function send() {
     }
     bubble = null;
     raw = "";
+    outputStartedAt = 0;
+    liveOutputAscii = 0;
+    liveOutputNonAscii = 0;
     answerDirty = false;
     activity.anchor(phaseBubble);
   };
@@ -6274,13 +6505,26 @@ async function send() {
     answerBubbles.push(bubble);
     activity.anchor(bubble);
   };
+  const preserveAnswerRate = (text) => {
+    if (!text) return;
+    for (let i = answerBubbles.length - 1; i >= 0; i--) {
+      const candidate = answerBubbles[i];
+      if (candidate && (candidate.dataset.segmentSealed || (candidate === bubble && raw.trim()))) {
+        setAnswerRate(candidate, text);
+        return;
+      }
+    }
+  };
   const closeThinkingPhase = () => {
     if (!think) return;
+    if (typeof rememberRate === "function") rememberRate("thinking", sid, thinkRaw, thinkRate);
     thinkingDoneDirty = true;
     flushPaint();
     think = null;
     thinkRaw = "";
     thinkRate = "";
+    thinkStartedAt = 0;
+    thinkTokens = 0;
   };
   const mutateTranscript = (mutation) => {
     const follow = sid === sessionId && shouldFollowOutput();
@@ -6382,7 +6626,11 @@ async function send() {
           activity.finish("ended");
           activityDirty = false;
           if (sid === sessionId) confirmPollSeq++;
-          mutateTranscript(() => phaseBubble.remove());
+          const finalLiveRate = liveOutputRate(true);
+          const finalRate = tokenRate || (finalLiveRate ? "output " + finalLiveRate : "");
+          if (typeof rememberRate === "function") rememberRate("turn", sid, raw, finalRate);
+          preserveAnswerRate(finalRate);
+          mutateTranscript(() => { phaseBubble.remove(); showTurnRate(finalRate); });
           if (!answerDirty && bubble) mutateTranscript(() => {
             bubble.classList.remove("pending");
             if (!raw) bubble.textContent = "";
@@ -6394,8 +6642,11 @@ async function send() {
         else if (kind === "delta") {
           closeThinkingPhase();
           ensureAnswerBubble();
-          try { raw += JSON.parse(payload).delta || ""; }
-          catch (_) { raw += payload; }
+          let delta = "";
+          try { delta = JSON.parse(payload).delta || ""; }
+          catch (_) { delta = payload; }
+          raw += delta;
+          observeLiveOutput(delta);
           answerDirty = true;
           setPhase("Responding…");
         }
@@ -6404,6 +6655,10 @@ async function send() {
           ensureAnswerBubble();
           try { raw = JSON.parse(payload).text || ""; }
           catch (_) { raw = payload; }
+          outputStartedAt = 0;
+          liveOutputAscii = 0;
+          liveOutputNonAscii = 0;
+          observeLiveOutput(raw);
           answerDirty = true;
           setPhase(raw ? "Responding…" : "Processing…");
         }
@@ -6428,7 +6683,14 @@ async function send() {
                 thinkingFolds.push(think);
               });
               thinkRaw += text;
-              thinkRate = typeof event.rate === "string" ? event.rate : "";
+              if (!thinkStartedAt) thinkStartedAt = Date.now();
+              thinkTokens += estimateTextTokens(text);
+              thinkRate = (typeof event.rate === "string" && event.rate) ||
+                measuredRateText(thinkTokens, thinkStartedAt);
+              if (thinkRate && Date.now() - thinkRateStoredAt > 1000) {
+                thinkRateStoredAt = Date.now();
+                if (typeof rememberRate === "function") rememberRate("thinking", sid, thinkRaw, thinkRate);
+              }
               thinkingDirty = true;
               schedulePaint();
             }
@@ -6499,18 +6761,12 @@ async function send() {
         else if (payload) {
           const plainPayload = payload.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").trim();
           if (/^↳\s+speed(?:\s*·|\s|$)/i.test(plainPayload)) {
-            if (!tokenRateLine) {
-              tokenRateLine = addMsgMd("", box);
-              tokenRateLine.classList.add("turn-metric");
-              box.insertBefore(tokenRateLine, phaseBubble);
-            }
-            tokenRateLine.textContent = plainPayload;
-          } else {
-            ensureProgressPhase();
-            progLines.push(payload);
-            progressDirty = true;
+            tokenRate = plainPayload.replace(/^↳\s+speed\s*·?\s*/i, "");
+            activityDirty = true;
             schedulePaint();
           }
+          // Plain child stdout is tool chatter, not transcript content; tool
+          // work is already rendered from structured `tool` events.
         }
       }
       if (finished) break;
@@ -6728,7 +6984,11 @@ function wire() {
   $("cdeny").onclick = () => answerConfirm(false);
   $("msgs").addEventListener("click", handlePreviewClick);
   $("msgs").addEventListener("click", collapseFoldForTap);
-  $("msgs").addEventListener("scroll", scheduleJumpButtonUpdate, { passive: true });
+  $("msgs").addEventListener("scroll", () => {
+    scheduleJumpButtonUpdate();
+    scheduleRememberTranscriptPosition();
+  }, { passive: true });
+  window.addEventListener("pagehide", () => rememberTranscriptPosition());
   $("jumpbottom").onclick = () => scrollToLatest(true);
   $("questionbtn").onclick = (event) => { event.stopPropagation(); openQuestionPanel(); };
   $("questionclose").onclick = closeQuestionPanel;
