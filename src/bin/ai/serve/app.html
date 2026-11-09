@@ -5295,19 +5295,11 @@ function syncStopButton() {
 // composer, so all three go through holdLayout and an active IME composition
 // is never moved. The newest note replaces an older pending one.
 function note(msg) {
-  if (noteTimer !== null) {
-    clearTimeout(noteTimer);
-    noteTimer = null;
-  }
-  holdLayout("note", () => {
-    const el = $("connstat");
-    el.textContent = msg;
-    el.classList.add("show", "note");
-    noteTimer = setTimeout(() => {
-      noteTimer = null;
-      hideNote();
-    }, 3000);
-  });
+  // Status chatter goes to the console only: an inline banner would either
+  // push the transcript or reserve space for it, and the transcript must not
+  // move while it is being read.
+  noteTimer = null;
+  console.warn("status: " + msg);
 }
 function hideNote() {
   if (promptComposing) {

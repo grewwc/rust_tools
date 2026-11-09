@@ -341,7 +341,7 @@ test("a previous commit callback preserves work queued during the next compositi
   assert.equal(run(context, "pendingShare + pendingAppend"), "");
 });
 
-test("a transient note does not move the composer during a composition", () => {
+test("a transient note never reserves layout or schedules a timer", () => {
   const classes = new Set();
   const connstat = {
     textContent: "",
@@ -350,25 +350,21 @@ test("a transient note does not move the composer during a composition", () => {
       remove(...names) { names.forEach((name) => classes.delete(name)); },
     },
   };
+  const warnings = [];
   const context = makeContext({
     $: (id) => (id === "connstat" ? connstat : null),
+    console: { warn: (msg) => warnings.push(msg) },
   });
   run(context, "let noteTimer = null;");
   vm.runInContext(noteSrc, context);
   run(context, "promptComposing = true;");
   run(context, "note('working');");
-  assert.equal(connstat.textContent, "", "the note appeared while a word was being composed");
-  assert.equal(context.timers.length, 0, "the note timer started while a word was being composed");
   run(context, "promptComposing = false;");
   run(context, "flushLayout();");
-  assert.equal(connstat.textContent, "working");
-  assert.ok(classes.has("show") && classes.has("note"), "the held note was not shown");
-  run(context, "promptComposing = true;");
-  context.timers.shift()();
-  assert.ok(classes.has("show"), "the note hid while a word was being composed");
-  run(context, "promptComposing = false;");
-  run(context, "flushLayout();");
-  assert.ok(!classes.has("show"), "the note stayed after its timer");
+  assert.equal(connstat.textContent, "", "the note wrote to the status element");
+  assert.ok(!classes.has("show") && !classes.has("note"), "the note classed the status element");
+  assert.equal(context.timers.length, 0, "the note scheduled a timer");
+  assert.deepEqual(warnings, ["status: working"]);
 });
 
 test("the side note column does not resize the composer during a composition", () => {
