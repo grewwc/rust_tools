@@ -270,6 +270,7 @@ select, summary { touch-action:manipulation; }
   letter-spacing:.01em; }
 .msg.md pre, .msg.md code { letter-spacing:normal; }
 .msg.pending { color:var(--dim); font-style:italic; }
+.msg.turn-metric { align-self:flex-start; padding:0 4px; background:none; color:var(--dim); font-size:12px; }
 .msg.user { align-self:flex-end; background:var(--acc-solid); color:var(--on-acc); }
 /* Assistant cards span the row (capped by max-width) so a collapsed fold stays
    tappable across the whole card instead of only over its text. */
@@ -281,15 +282,23 @@ select, summary { touch-action:manipulation; }
    action below so a normal transcript tap cannot destroy history. */
 .msg.rewindable { cursor:pointer; }
 .user-msg-row { display:contents; }
-.rewind-action { display:none; }
+/* The rewind control is the only way to rewind: the bubble itself stays a
+   normal selectable block so text can be selected and copied. */
+.rewind-action {
+  display:inline-flex; flex:0 0 auto; align-items:center; justify-content:center;
+  width:30px; height:30px; padding:0; border:1px solid var(--line);
+  border-radius:999px; background:var(--glass); color:var(--dim);
+  font-size:17px; line-height:1; opacity:.62;
+  transition:opacity .12s, color .12s, border-color .12s;
+}
+.rewind-action:hover { opacity:1; color:var(--acc); border-color:var(--acc-line-soft); }
 #sidenote { display:none; }
 .msg .prog { font-size:13px; color:var(--dim); }
 .msg.err { border-color:var(--err); color:var(--err); }
 #ovr { display:flex; gap:8px; padding:10px 12px 0; }
-/* Agent and effort keep the platform picker (its dropdown is the right phone
-   interaction), but replace its default chrome with the app's field style: a
-   stable touch target, a themed surface, and a chevron drawn from the palette
-   so it follows every theme. */
+/* Agent and effort keep their value in a hidden select (session config, the
+   summary and request code read one source) and draw their own list, so the
+   popup follows the theme instead of the platform's system menu. */
 #ovr select {
   flex:1; min-width:0; height:38px; padding:0 34px 0 12px;
   font-size:13px; font-weight:600; color:var(--fg);
@@ -308,8 +317,8 @@ select, summary { touch-action:manipulation; }
 /* The platform draws a <select> popup itself and ignores option styling, so the
    model list uses a sheet instead. The select stays hidden as the value store:
    session config, the summary, and request code keep reading one source. */
-#modelpickfield { flex:1; min-width:0; }
-#omodelbtn {
+#modelpickfield, #agentpickfield, #effortpickfield { flex:1; min-width:0; }
+#omodelbtn, #oagentbtn, #oeffortbtn {
   display:flex; align-items:center; justify-content:space-between; gap:8px;
   width:100%; height:38px; padding:0 12px; text-align:left;
   font-size:16px; font-weight:600; color:var(--fg);
@@ -317,11 +326,35 @@ select, summary { touch-action:manipulation; }
   box-shadow:0 1px 2px rgba(0,0,0,.12);
   -webkit-appearance:none; appearance:none;
 }
-#omodelbtnlabel { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-#omodelchev { flex:0 0 auto; width:7px; height:7px; margin-top:-3px; border-right:1.5px solid var(--dim); border-bottom:1.5px solid var(--dim); transform:rotate(45deg); }
-@media (hover:hover) { #omodelbtn:hover { border-color:var(--line-2); } }
-#omodelbtn:focus-visible { border-color:var(--acc-focus); box-shadow:0 0 0 2px var(--focus-ring); outline:none; }
-#omodelbtn:disabled { opacity:.5; }
+#omodelbtnlabel, #oagentbtnlabel, #oeffortbtnlabel { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#omodelchev, #oagentchev, #oeffortchev { flex:0 0 auto; width:7px; height:7px; margin-top:-3px; border-right:1.5px solid var(--dim); border-bottom:1.5px solid var(--dim); transform:rotate(45deg); }
+@media (hover:hover) { #omodelbtn:hover, #oagentbtn:hover, #oeffortbtn:hover { border-color:var(--line-2); } }
+#omodelbtn:focus-visible, #oagentbtn:focus-visible, #oeffortbtn:focus-visible { border-color:var(--acc-focus); box-shadow:0 0 0 2px var(--focus-ring); outline:none; }
+#omodelbtn:disabled, #oagentbtn:disabled, #oeffortbtn:disabled { opacity:.5; }
+#pickpop[hidden] { display:none; }
+#pickpop { position:fixed; inset:0; z-index:70; }
+#pickpopscrim { position:absolute; inset:0; background:rgba(0,0,0,.28); }
+#pickpopmenu {
+  position:absolute; left:50%; bottom:104px; transform:translateX(-50%);
+  width:min(400px, calc(100vw - 32px)); max-height:min(56vh, 420px);
+  display:flex; flex-direction:column; overflow:hidden;
+  background:var(--panel); border:1px solid var(--line);
+  border-radius:14px; box-shadow:var(--shadow-panel);
+}
+#pickpophead { display:flex; align-items:center; justify-content:space-between; gap:8px;
+  padding:10px 12px; border-bottom:1px solid var(--line); }
+#pickpoptitle { font-size:12px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:var(--dim); }
+#pickpopclose { width:28px; height:28px; padding:0; border-radius:999px; border:0;
+  background:transparent; color:var(--dim); font-size:18px; line-height:1; }
+#pickpoplist { display:flex; flex-direction:column; gap:2px; padding:6px;
+  overflow-y:auto; overscroll-behavior:contain; -webkit-overflow-scrolling:touch; }
+.pickrow { display:flex; align-items:center; gap:8px; min-height:40px; padding:8px 10px;
+  border:0; border-radius:8px; background:transparent; text-align:left;
+  font-size:14px; color:var(--fg); }
+.pickrow:hover { background:var(--surface-2); }
+.pickrow[aria-selected="true"] { background:var(--tint-2); font-weight:600; }
+.pickcheck { flex:0 0 auto; width:14px; color:var(--acc); font-size:13px; }
+.picktext { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #modelpick[hidden] { display:none; }
 #modelpick { position:fixed; inset:0; z-index:15; }
 #modelpickscrim { position:absolute; inset:0; background:rgba(0,0,0,.55); animation:model-fade .18s ease-out; touch-action:none; }
@@ -513,7 +546,6 @@ select, summary { touch-action:manipulation; }
 #skillclear { flex:0 0 auto; width:100%; min-height:44px; padding:8px 10px; background:var(--surface-2); border-radius:10px; }
 #skillhint { padding:5px 8px; color:var(--dim); font-size:12px; }
 #composer { display:flex; gap:8px; padding:10px 12px calc(10px + env(safe-area-inset-bottom)); background:var(--panel); border-top:1px solid var(--line); }
-#img svg { width:19px; height:19px; display:block; }
 #prompt {
   flex:1; min-height:44px; max-height:30vh; max-height:calc(var(--app-height, 100vh) * .30); padding:9px 10px; resize:none;
   -webkit-user-select:text; user-select:text; -webkit-touch-callout:default;
@@ -651,7 +683,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 .msg.phone-frame img { border-radius:var(--radius-control); }
 .msg.md .code-block-toolbar, .msg.md .code-preview-toolbar { gap:8px; margin-bottom:8px; }
 #ovr { align-items:center; padding-top:12px; }
-#ovr select, #omodelbtn, #oskill { min-height:44px; border-radius:var(--radius-control); background-color:var(--surface-2); box-shadow:none; }
+#ovr select, #omodelbtn, #oagentbtn, #oeffortbtn, #oskill { min-height:44px; border-radius:var(--radius-control); background-color:var(--surface-2); box-shadow:none; }
 #modelpickpanel, #teampickpanel { border-radius:24px 24px 0 0; box-shadow:var(--shadow-panel); }
 #modelpickhandle, #teamhandle { width:40px; margin:12px auto 10px; background:var(--line-2); }
 #modelpickhead, #teamhead { padding-bottom:14px; }
@@ -674,6 +706,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 }
 /* Desktop owns its shell geometry; shared theme rules and phone states stay
    independent of the rail, reading column, and compact footer. */
+#img::before { content:"+"; font-size:20px; font-weight:300; line-height:1; }
 @media (min-width:701px) {
   /* Gray reading surfaces keep teal on actions and focus indicators. The
      shared palettes above continue to own every phone colour. */
@@ -803,7 +836,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
     display:grid; grid-template-columns:minmax(0,1.3fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1.2fr);
     grid-column:1; grid-row:1; position:relative; min-width:0; align-items:start; gap:4px 8px; padding:0;
   }
-  #ovr select, #omodelbtn, #oskill { width:100%; height:36px; min-height:36px; padding:0 10px; font-size:13px; }
+  #ovr select, #omodelbtn, #oagentbtn, #oeffortbtn, #oskill { width:100%; height:36px; min-height:36px; padding:0 10px; font-size:13px; }
   #ovr select { padding-right:30px; }
   /* The hint spans the row without changing the skill button's alignment. */
   #skillpicker { display:contents; }
@@ -847,6 +880,8 @@ button:active:not(:disabled) { filter:brightness(.96); }
 }
 /* Phone geometry preserves the drawer, viewport, and composer state rules. */
 @media (max-width:700px) {
+  #pickpopmenu { bottom:calc(84px + env(safe-area-inset-bottom)); width:calc(100vw - 20px); }
+  .pickrow { min-height:46px; }
   header { padding-left:10px; padding-right:10px; gap:6px; }
   header button { min-width:44px; min-height:44px; padding:0 10px; }
   #apkdownload {
@@ -875,7 +910,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #ovr { flex-direction:column; align-items:stretch; gap:10px; padding:4px 12px 12px; }
   #ovr select { flex:0 0 auto; width:100%; height:46px; padding:0 40px 0 12px; font-size:15px; }
   #modelpickfield { flex:0 0 auto; width:100%; }
-  #omodelbtn { height:46px; padding:0 14px; font-size:15px; }
+  #omodelbtn, #oagentbtn, #oeffortbtn { height:46px; padding:0 14px; font-size:15px; }
   #modelpicksearch { height:46px; font-size:16px; }
   #modelpickpanel { max-height:calc(var(--app-height, 100vh) * .88); }
   #ovrsummaryline #teamcontrols { display:flex; }
@@ -928,7 +963,6 @@ button:active:not(:disabled) { filter:brightness(.96); }
   }
   #img { grid-area:image; font-size:0; background:transparent; border-color:var(--line-2); color:var(--dim); }
   #img:hover { background:var(--tint-2); color:var(--fg); }
-  #img svg { width:19px; height:19px; display:block; }
   #sidenote.show {
     grid-area:sidenote; display:inline-flex; align-items:center; justify-content:center;
     align-self:end; height:42px; padding:0 8px; gap:4px; border-radius:999px;
@@ -955,6 +989,24 @@ button:active:not(:disabled) { filter:brightness(.96); }
 #viewer { display:none; position:fixed; inset:0; z-index:60; background:rgba(0,0,0,.92); align-items:center; justify-content:center; }
 #viewer.on { display:flex; }
 #viewer img { max-width:100vw; max-height:100vh; }
+/* Desktop asks before a rewind in place, right above the composer, instead of
+   freezing the page with a browser dialog. */
+@media (min-width:701px) {
+  .rewind-confirm { position:fixed; left:50%; bottom:104px; transform:translateX(-50%); z-index:60;
+    display:flex; align-items:center; gap:10px; max-width:min(680px, calc(100vw - 48px));
+    padding:9px 10px 9px 12px; border:1px solid var(--line); border-radius:12px;
+    background:var(--panel); box-shadow:0 14px 36px rgba(0,0,0,.22); font-size:13px; }
+  .rewind-confirm-label { flex:0 0 auto; color:var(--fg); }
+  .rewind-confirm-quote { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap; color:var(--dim); font-family:ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .rewind-confirm-cancel, .rewind-confirm-ok { flex:0 0 auto; height:30px; padding:0 14px;
+    border-radius:8px; border:1px solid var(--line); background:var(--surface-2); color:var(--fg);
+    font:inherit; cursor:pointer; }
+  .rewind-confirm-ok { border-color:var(--acc); background:var(--acc); color:#fff; }
+  .rewind-confirm-cancel:hover { background:var(--tint-2); }
+  .rewind-confirm-ok:hover { filter:brightness(.94); }
+  .rewind-confirm-cancel:focus-visible, .rewind-confirm-ok:focus-visible { outline:2px solid var(--acc); outline-offset:2px; }
+}
 </style>
 </head>
 <body id="serve-app">
@@ -1023,8 +1075,18 @@ button:active:not(:disabled) { filter:brightness(.96); }
 </button>
 <select id="omodel" aria-label="model override" hidden></select>
 </div>
-<select id="oagent" aria-label="agent override"></select>
-<select id="oeffort" aria-label="reasoning effort override"></select>
+<div id="agentpickfield">
+<button id="oagentbtn" type="button" aria-haspopup="listbox" aria-controls="pickpoplist" aria-expanded="false" aria-label="agent override" disabled>
+<span id="oagentbtnlabel">agent: loading…</span><span id="oagentchev" aria-hidden="true"></span>
+</button>
+<select id="oagent" aria-label="agent override" hidden></select>
+</div>
+<div id="effortpickfield">
+<button id="oeffortbtn" type="button" aria-haspopup="listbox" aria-controls="pickpoplist" aria-expanded="false" aria-label="reasoning effort override" disabled>
+<span id="oeffortbtnlabel">effort: loading…</span><span id="oeffortchev" aria-hidden="true"></span>
+</button>
+<select id="oeffort" aria-label="reasoning effort override" hidden></select>
+</div>
 <div id="skillpicker">
 <div id="skillfield">
 <button id="oskill" type="button" aria-label="skills for next message" aria-haspopup="listbox" aria-controls="skilloptions" aria-expanded="false" aria-describedby="skillhint" disabled>
@@ -1057,6 +1119,13 @@ button:active:not(:disabled) { filter:brightness(.96); }
 </div>
 <div id="modelpickempty" role="status" hidden>没有匹配的模型</div>
 <div id="modelpicklist" role="listbox" aria-labelledby="modelpicktitle"></div>
+</section>
+</div>
+<div id="pickpop" hidden>
+<div id="pickpopscrim"></div>
+<section id="pickpopmenu" role="dialog" aria-modal="true" aria-labelledby="pickpoptitle">
+<div id="pickpophead"><span id="pickpoptitle">agent</span><button id="pickpopclose" type="button" aria-label="close picker">×</button></div>
+<div id="pickpoplist" role="listbox" aria-labelledby="pickpoptitle"></div>
 </section>
 </div>
 <div id="teampick" hidden>
@@ -1106,7 +1175,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 </section>
 </div>
 <div id="composer">
-<button id="img" aria-label="上传文件" title="上传文件"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="5" width="17" height="14" rx="3.2"/><circle cx="9" cy="10" r="1.35"/><path d="M4.4 16.8 8.7 12.5a1.9 1.9 0 0 1 2.7 0l2.1 2.1"/><path d="M14.1 13.9l1.7-1.7a1.9 1.9 0 0 1 2.7 0l1.6 1.6"/></svg></button>
+<button id="img" aria-label="上传文件" title="上传文件"></button>
 <input id="file" type="file" accept="image/*" multiple hidden>
 <textarea id="prompt" placeholder="ask…" rows="1"></textarea>
 <button id="sidenote" type="button" aria-label="send as side note" aria-hidden="true" tabindex="-1" title="send as side note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v11H9l-4 3V5Z"/><path d="M9 9h6"/></svg><span>note</span></button>
@@ -2524,6 +2593,7 @@ function historyEndsUnanswered(messages) {
 const PHONE_LAYOUT_QUERY = "(max-width:700px)";
 const FOLLOW_BOTTOM_GAP = 80;
 let jumpingToBottom = false;
+let outputFollowSuspended = false;
 function isPhoneLayout() {
   return !!(window.matchMedia && window.matchMedia(PHONE_LAYOUT_QUERY).matches);
 }
@@ -2534,7 +2604,11 @@ function isNearBottom(root = $("msgs")) {
 // layouts: dragging a desktop transcript down on every chunk makes reading
 // anything above impossible, and the jump button is the way back.
 function shouldFollowOutput(root = $("msgs")) {
-  return isNearBottom(root);
+  return !outputFollowSuspended && isNearBottom(root);
+}
+function noteTranscriptScroll(previousTop, root = $("msgs")) {
+  if (root.scrollTop < previousTop) outputFollowSuspended = true;
+  else if (root.scrollTop > previousTop && isNearBottom(root)) outputFollowSuspended = false;
 }
 function updateJumpButton() {
   const button = $("jumpbottom");
@@ -2553,11 +2627,15 @@ function scheduleJumpButtonUpdate() {
   });
 }
 function followOutput(wasFollowing, root = $("msgs")) {
-  if (wasFollowing) root.scrollTop = root.scrollHeight;
+  if (wasFollowing) {
+    outputFollowSuspended = false;
+    root.scrollTop = root.scrollHeight;
+  }
   updateJumpButton();
 }
 function scrollToLatest(smooth = true) {
   const root = $("msgs");
+  outputFollowSuspended = false;
   jumpingToBottom = smooth;
   updateJumpButton();
   if (smooth && root.scrollTo) root.scrollTo({ top: root.scrollHeight, behavior: "smooth" });
@@ -2649,25 +2727,77 @@ async function openQuestionPanel() {
   $("questionbtn").setAttribute("aria-expanded", "true");
   const list = $("questionlist");
   list.innerHTML = '<div class="empty">loading…</div>';
+  panel._shown = 20;
+  await renderQuestionPage(panel, list, 20);
+  // Opening lands on the newest turn: that is the entry a reader wants first,
+  // and older turns arrive by scrolling up.
+  list.scrollTop = list.scrollHeight;
+  requestAnimationFrame(() => {
+    if (panel.classList.contains("open")) list.scrollTop = list.scrollHeight;
+  });
+  if (!list._olderScroll) {
+    list._olderScroll = true;
+    // Swiping up at the top of the list asks for the previous page, exactly
+    // like scrolling the transcript back; no separate button is involved.
+    list.addEventListener("scroll", () => {
+      if (!panel.classList.contains("open") || panel._loading) return;
+      if (list.dataset.hasOlder !== "1" || list.scrollTop > 6) return;
+      panel._shown = Math.max(1, panel._shown || 20) + 20;
+      renderQuestionPage(panel, list, panel._shown);
+    });
+  }
+}
+// The navigator never reads the whole transcript: it fetches a bounded tail of
+// the history and grows that tail only when the reader asks for older prompts,
+// so opening the panel on a long session stays cheap.
+// The prompt menu carries global ordinals, not transcript offsets, so a tapped
+// entry is located by its text among the rendered user bubbles (newest first);
+// a target outside the current tail widens the transcript once and retries.
+function userBubbleFor(text) {
+  const wanted = String(text || "").trim();
+  if (!wanted) return null;
+  const bubbles = [...$("msgs").querySelectorAll(".msg.user")];
+  for (let i = bubbles.length - 1; i >= 0; i -= 1) {
+    if (String(bubbles[i].dataset.question || "").trim() === wanted) return bubbles[i];
+  }
+  return null;
+}
+async function renderQuestionPage(panel, list, want) {
   const forSession = sessionId;
+  if (!forSession || panel._loading) return;
+  panel._loading = true;
+  const hadRows = !!list.childElementCount;
+  const prevHeight = list.scrollHeight;
+  const prevTop = list.scrollTop;
   try {
-    const res = await api("/sessions/" + forSession + "/history");
+    let cache = null;
+    const count = Math.max(40, want);
+    const res = await api("/sessions/" + forSession + "/history?role=user&count=" + count);
     const messages = await res.json();
-    const histTotal = Number(res.headers.get("x-history-total")) || messages.length;
     if (forSession !== sessionId || !panel.classList.contains("open")) return;
-    questionCache = { sessionId: forSession, messages, histTotal, rows: questionRowsOf(messages, histTotal) };
+    // Only real user prompts travel. The server counts them across the whole
+    // session and stamps every row with `user_ordinal`, so a partial fetch
+    // still carries exact turn numbers, and one page costs one page.
+    const rows = messages
+      .map((m) => ({ text: textOf(m.content).trim().replace(/\s+/g, " "), ordinal: Number(m.user_ordinal) || 0 }))
+      .filter((row) => row.text && row.ordinal > 0);
+    cache = { sessionId: forSession, rows, messages, histTotal: rows.length };
+    questionCache = cache;
     list.textContent = "";
-    const cache = questionCache;
-    const rows = cache.rows;
+    const full = !rows.length || rows[0].ordinal === 1;
     updateQuestionButton(rows.length);
     if (!rows.length) { list.innerHTML = '<div class="empty">no questions in this session</div>'; return; }
-    rows.forEach((row, i) => {
+    const shown = Math.min(rows.length, Math.max(1, want));
+    const start = rows.length - shown;
+    list.dataset.hasOlder = start > 0 || !full ? "1" : "";
+    rows.slice(start).forEach((row, offset) => {
+      const i = start + offset;
       const button = document.createElement("button");
       button.type = "button";
       button.className = "question-link";
       const num = document.createElement("span");
       num.className = "num";
-      num.textContent = String(i + 1);
+      num.textContent = String(row.ordinal);
       const text = document.createElement("span");
       text.className = "text";
       text.textContent = row.text;
@@ -2675,10 +2805,10 @@ async function openQuestionPanel() {
       button.onclick = async () => {
         if (cache.sessionId !== sessionId) return;
         closeQuestionPanel();
-        let target = $("msgs").querySelector('[data-history-index="' + row.historyIndex + '"]');
+        let target = userBubbleFor(row.text);
         if (!target) {
-          await loadHistory({ sessionId: cache.sessionId, messages: cache.messages, histTotal: cache.histTotal, showAll: true });
-          target = $("msgs").querySelector('[data-history-index="' + row.historyIndex + '"]');
+          await loadHistory({ sessionId: cache.sessionId, showAll: true });
+          target = userBubbleFor(row.text);
         }
         if (cache.sessionId !== sessionId) return;
         if (!target) return;
@@ -2689,8 +2819,11 @@ async function openQuestionPanel() {
       };
       list.appendChild(button);
     });
+    if (hadRows) list.scrollTop = prevTop + (list.scrollHeight - prevHeight);
   } catch (e) {
     if (forSession === sessionId) list.innerHTML = '<div class="empty">load failed: ' + esc(e.message) + '</div>';
+  } finally {
+    panel._loading = false;
   }
 }
 // `parent` mounts the node inside a live turn's own container instead of the
@@ -2896,6 +3029,11 @@ function callLabel(call) {
 }
 // Roles that reach the fold path and deserve a readable title.
 const FOLD_ROLE_LABELS = { tool: "tool", internal_note: "internal note" };
+// Which stored folds the reader left open, keyed by the identity the history
+// projection already uses to dedupe rows. The transcript is rebuilt from
+// canonical history on every refresh, so an expansion has to outlive the card
+// that carried it.
+const foldOpenState = new Map();
 
 function addFold(title, bodyText, parent) {
   const d = document.createElement("div");
@@ -3573,6 +3711,8 @@ function applySessionConfig(cfg, options = {}) {
   set($("oagent"), cfg.agent || "");
   set($("oeffort"), cfg.reasoning_effort || "");
   syncModelTrigger();
+  syncPickTrigger("agent");
+  syncPickTrigger("effort");
   syncOvrSummary();
   if (options.team !== false) hydrateTeamConfig(cfg, options.teamRevision, options.teamLoadEpoch);
 }
@@ -3594,6 +3734,8 @@ async function persistPicks() {
 // server instead of this browser's storage, and refresh the collapsed summary.
 function savePick() {
   syncModelTrigger();
+  syncPickTrigger("agent");
+  syncPickTrigger("effort");
   syncOvrSummary();
   persistPicks();
 }
@@ -3616,10 +3758,91 @@ function fillSelect(sel, entries, currentLabel, kind) {
     sel.appendChild(o);
   }
   sel.value = (prev && [...sel.options].some((o) => o.value === prev)) ? prev : "";
+  // The trigger text belongs to the callers that refill the list: they sync
+  // their own label right after this, which keeps this helper free of picker
+  // state and usable on its own.
 }
 // A platform <select> popup is drawn outside the page, so its rows cannot be
-// themed. Keep the hidden select as the value store and let a sheet render the
+// themed. Keep the hidden select as the value store and let a list render the
 // same options with the app's typography and touch targets.
+function pickSelect(kind) { return $(kind === "agent" ? "oagent" : "oeffort"); }
+function pickButton(kind) { return $(kind === "agent" ? "oagentbtn" : "oeffortbtn"); }
+function pickLabel(kind) { return $(kind === "agent" ? "oagentbtnlabel" : "oeffortbtnlabel"); }
+let pickPopKind = null;
+let pickPopReturn = null;
+function syncPickTrigger(kind) {
+  const sel = pickSelect(kind), btn = pickButton(kind), label = pickLabel(kind);
+  if (!sel || !btn || !label) return;
+  const option = sel.options[sel.selectedIndex];
+  const text = option ? option.textContent : "";
+  label.textContent = text || kind + ": default";
+  btn.title = text;
+  btn.disabled = sel.options.length === 0;
+}
+function renderPickPop() {
+  const sel = pickSelect(pickPopKind), list = $("pickpoplist");
+  if (!sel || !list) return;
+  $("pickpoptitle").textContent = pickPopKind;
+  list.textContent = "";
+  for (const option of [...sel.options]) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "pickrow";
+    row.setAttribute("role", "option");
+    const current = option.value === sel.value;
+    row.setAttribute("aria-selected", current ? "true" : "false");
+    const check = document.createElement("span");
+    check.className = "pickcheck";
+    check.textContent = current ? "✓" : "";
+    const text = document.createElement("span");
+    text.className = "picktext";
+    text.textContent = option.textContent;
+    row.append(check, text);
+    row.onclick = () => {
+      sel.value = option.value;
+      syncPickTrigger(pickPopKind);
+      closePickPop();
+      sel.dispatchEvent(new Event("change"));
+    };
+    list.appendChild(row);
+  }
+}
+function openPickPop(kind) {
+  const sel = pickSelect(kind);
+  if (!sel || !sel.options.length) return;
+  pickPopKind = kind;
+  pickPopReturn = pickButton(kind);
+  renderPickPop();
+  $("pickpop").hidden = false;
+  if (pickPopReturn) pickPopReturn.setAttribute("aria-expanded", "true");
+  const first = $("pickpoplist").querySelector('.pickrow[aria-selected="true"]') || $("pickpoplist").querySelector(".pickrow");
+  if (first && first.focus) first.focus();
+}
+function closePickPop() {
+  const pop = $("pickpop");
+  if (!pop || pop.hidden) return;
+  pop.hidden = true;
+  if (pickPopReturn) {
+    pickPopReturn.setAttribute("aria-expanded", "false");
+    if (pickPopReturn.focus) pickPopReturn.focus();
+  }
+  pickPopKind = null;
+  pickPopReturn = null;
+}
+function pickPopKeydown(ev) {
+  if (ev.key === "Escape") {
+    ev.stopPropagation();
+    closePickPop();
+    return;
+  }
+  if (ev.key !== "ArrowDown" && ev.key !== "ArrowUp") return;
+  const rows = [...$("pickpoplist").querySelectorAll(".pickrow")];
+  if (!rows.length) return;
+  ev.preventDefault();
+  const at = rows.indexOf(document.activeElement);
+  const next = ev.key === "ArrowDown" ? Math.min(rows.length - 1, at + 1) : Math.max(0, at - 1);
+  rows[next === -1 ? 0 : next].focus();
+}
 let modelSheetReturnFocus = null;
 let modelSheetHistoryPushed = false;
 function modelFamily(id) {
@@ -4041,6 +4264,8 @@ async function loadInfo() {
     syncModelTrigger();
     fillSelect($("oagent"), (info.agents || []).map((a) => [a, a]), info.agent, "agent");
     fillSelect($("oeffort"), (info.efforts || []).map((e) => [e, e]), info.reasoning_effort, "effort");
+    syncPickTrigger("agent");
+    syncPickTrigger("effort");
     // The three picks are per-session and live on the server; loadSessionConfig
     // mirrors them into these selects once the current session is known.
     syncOvrSummary();
@@ -4365,11 +4590,43 @@ function startRename(li, s) {
   inp.onblur = commit;
 }
 let sessionsLoadSeq = 0;
+// Session pages arrive one batch at a time: the drawer becomes usable on the
+// first page and the rest streams in behind it, so a long list neither delays
+// the first paint nor holds the whole payload in one response.
+async function loadSessionPages() {
+  const pageSize = 50;
+  const collected = [];
+  let firstIds = "";
+  let offset = 0;
+  while (true) {
+    const page = await (await api("/sessions?limit=" + pageSize + "&offset=" + offset)).json();
+    const items = Array.isArray(page) ? page : [];
+    if (!offset) {
+      collected.push(...items);
+      firstIds = items.map((item) => item.id).join("|");
+      if (items.length < pageSize) return collected;
+      renderSessionList(collected.slice().reverse());
+      offset = pageSize;
+      continue;
+    }
+    const ids = items.map((item) => item.id).join("|");
+    // A daemon that predates offsets answers with the same first page again;
+    // one plain request returns the whole list instead of paging forever.
+    if (ids && ids === firstIds && items.length === pageSize) {
+      const whole = await (await api("/sessions")).json();
+      return Array.isArray(whole) ? whole : collected;
+    }
+    if (!items.length) return collected;
+    collected.push(...items);
+    if (items.length < pageSize) return collected;
+    offset += pageSize;
+  }
+}
 async function loadSessions() {
   const loadId = ++sessionsLoadSeq, forSession = sessionId, base = store.base;
   let items;
   try {
-    items = await (await api("/sessions")).json();
+    items = await loadSessionPages();
   } catch (e) {
     if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base) return;
     // Keep the last good list so one failed refresh (e.g. a token hiccup)
@@ -4431,24 +4688,56 @@ function histEndsTurn(msgs) {
 }
 // The prompt list mirrors the user rows on screen so a reader can jump back to
 // any of their own turns without hunting through tool output.
+// The entries mirror the mounted transcript, so a row is always clickable and
+// the numbering matches what is on screen. Rows outside the fetched tail are
+// announced instead of invented, and the count is suffixed while more exist.
+function promptNavHasOlder() {
+  const total = typeof canonicalHistoryTotal === "number" ? canonicalHistoryTotal : 0;
+  const shown = typeof lastMsgCount === "number" ? lastMsgCount : null;
+  return total > 0 && shown !== null && shown < total;
+}
 function syncPromptNav() {
   const list = $("promptlist");
   if (!list || !$("msgs")) return;
   const rows = [...$("msgs").querySelectorAll(".user-msg-row")];
   const count = $("promptcount");
+  // Every streamed tool row mutates the transcript; rebuilding a list of up to
+  // 800 scanned rows on each of those frames is wasted work, so only a changed
+  // user row or a changed fetch window rebuilds.
+  const signature = rows.length
+    + "|" + (rows.length ? rows[0].textContent.length + "/" + rows[rows.length - 1].textContent.length : "")
+    + "|" + promptNavHasOlder();
+  if (signature === list._signature) return;
+  const oldItems = [...list.querySelectorAll("li[data-history-index]")];
+  const oldFirst = oldItems[0]?.dataset.historyIndex || "";
+  const oldSelected = list.querySelector("li.cur")?.dataset.historyIndex || "";
+  const oldTop = list.scrollTop;
+  const oldHeight = list.scrollHeight;
+  const followedNewest = !oldItems.length || oldTop + list.clientHeight >= oldHeight - 2;
+  list._signature = signature;
   list.textContent = "";
-  let shown = 0;
+  // The index follows the transcript: the first prompt sits at the top and each
+  // later one is appended below it, so reading the list top to bottom matches
+  // reading the conversation top to bottom and the ordinal stays the
+  // chronological turn number.
+  const entries = [];
   for (const row of rows) {
     const bubble = row.querySelector(".msg.user");
     const text = (bubble ? bubble.textContent : "").trim().replace(/\s+/g, " ");
-    if (!text) continue;
-    shown += 1;
+    if (text) entries.push({ row, text });
+  }
+  const shown = entries.length;
+  // Prompts that are still outside the rendered window belong above the first
+  // entry, where the older turns continue, not below the newest one.
+  for (let i = 0; i < shown; i += 1) {
+    const { row, text } = entries[i];
     const item = document.createElement("li");
+    item.dataset.historyIndex = row.querySelector(".msg.user")?.dataset.historyIndex || String(i);
     const button = document.createElement("button");
     button.type = "button";
     const index = document.createElement("span");
     index.className = "pni";
-    index.textContent = String(shown).padStart(2, "0");
+    index.textContent = String(i + 1).padStart(2, "0");
     const label = document.createElement("span");
     label.className = "pnt";
     label.textContent = text.slice(0, 120);
@@ -4465,13 +4754,42 @@ function syncPromptNav() {
     item.appendChild(button);
     list.appendChild(item);
   }
+  const items = [...list.querySelectorAll("li[data-history-index]")];
+  const selected = items.find((item) => item.dataset.historyIndex === oldSelected) || items[items.length - 1];
+  if (selected) selected.classList.add("cur");
+  if (!oldItems.length || followedNewest) {
+    list.scrollTop = list.scrollHeight;
+  } else if (oldFirst && items[0]?.dataset.historyIndex !== oldFirst) {
+    list.scrollTop = oldTop + Math.max(0, list.scrollHeight - oldHeight);
+  }
   if (!shown) {
     const empty = document.createElement("li");
     empty.className = "pempty";
     empty.textContent = "当前会话还没有提问";
     list.appendChild(empty);
   }
-  if (count) count.textContent = shown ? String(shown) : "";
+  if (count) count.textContent = shown ? String(shown) + (promptNavHasOlder() ? "+" : "") : "";
+}
+
+if ($("promptlist") && typeof $("promptlist").addEventListener === "function") {
+  const list = $("promptlist");
+  let loadingOlderPrompts = false;
+  const requestOlderPrompts = async () => {
+    if (loadingOlderPrompts || list.scrollTop > 0 || !promptNavHasOlder()) return;
+    loadingOlderPrompts = true;
+    try {
+      await loadOlderHistory();
+      syncPromptNav();
+    } finally {
+      loadingOlderPrompts = false;
+    }
+  };
+  list.addEventListener("scroll", requestOlderPrompts, { passive: true });
+  // A short list has no scroll range, so an upward trackpad/wheel gesture must
+  // still request the older batch instead of being swallowed by the sidebar.
+  list.addEventListener("wheel", (event) => {
+    if (event.deltaY < 0) requestOlderPrompts();
+  }, { passive: true });
 }
 
 if (typeof MutationObserver === "function" && $("msgs")) {
@@ -4520,7 +4838,18 @@ function renderHistoryRow(row, parent) {
   const m = row.message;
   if (m.role === "user") addUserBubble(row.text, row.historyIndex, parent);
   else if (m.role === "assistant") addMsgMd(row.text, parent, textOf(m.content));
-  else addFold(row.call ? callLabel(row.call) : FOLD_ROLE_LABELS[m.role] || m.role, row.text.slice(0, 2000), parent);
+  else {
+    const fold = addFold(row.call ? callLabel(row.call) : FOLD_ROLE_LABELS[m.role] || m.role, row.text.slice(0, 2000), parent);
+    const det = fold.box.querySelector("details");
+    if (det) {
+      det.dataset.foldKey = row.identity;
+      if (foldOpenState.has(row.identity)) det.open = foldOpenState.get(row.identity);
+      det.addEventListener("toggle", () => {
+        if (foldOpenState.size > 2000) foldOpenState.clear();
+        foldOpenState.set(row.identity, det.open);
+      });
+    }
+  }
   if (parent?.lastElementChild) {
     const data = parent.lastElementChild.dataset;
     data.canonicalIndex = String(row.historyIndex);
@@ -4658,6 +4987,8 @@ async function loadHistory(prefetched) {
     historySession = "";
     historyKeys = [];
     canonicalHistoryTotal = 0;
+    const nav = $("promptlist");
+    if (nav) nav._signature = "";
     addMsg("asst", "no session yet — tap ＋ to start one.", "asst");
     return;
   }
@@ -4665,7 +4996,13 @@ async function loadHistory(prefetched) {
   stopHistoryRetry(state);
   state.loading = loadId;
   try {
-    if (historySession && historySession !== forSession) abortEvents();
+    if (historySession && historySession !== forSession) {
+      abortEvents();
+      // The index lists the mounted rows of one session, so a switch always
+      // rebuilds it even when two sessions happen to hold same-sized prompts.
+      const nav = $("promptlist");
+      if (nav) nav._signature = "";
+    }
     let msgs = [];
     // One message beyond the rendered window: a tool result sitting at the edge
     // would otherwise be titled with a bare role name, because the call that
@@ -4675,13 +5012,20 @@ async function loadHistory(prefetched) {
     // maps to `histTotal - shown.length + bubble_index` for `POST /rewind`.
     // Older servers omit the header, so fall back to the fetched length.
     let histTotal = 0;
+    // The mounted window rides on the transcript element: a grown tail belongs
+    // to the session it was fetched for, and carrying it on the node keeps the
+    // history render free of extra module state.
+    const pager = $("msgs");
     if (prefetched) {
       msgs = prefetched.messages;
       histTotal = prefetched.histTotal;
     } else {
       try {
         const rowWindow = typeof isPhoneLayout === "function" && isPhoneLayout() ? 200 : 800;
-        const res = await api("/sessions/" + forSession + "/history?limit=" + (rowWindow + 1));
+        const want = pager._histWinSession === forSession && (pager._histWin || 0) > rowWindow + 1
+          ? pager._histWin
+          : rowWindow + 1;
+        const res = await api("/sessions/" + forSession + "/history?limit=" + want);
         histTotal = Number(res.headers.get("x-history-total")) || 0;
         msgs = await res.json();
       }
@@ -4692,10 +5036,16 @@ async function loadHistory(prefetched) {
         return;
       }
     }
+    // Both paths leave `msgs` as the tail this session has mounted, so scroll-up
+    // paging knows how much of the session is already on screen.
+    pager._histWin = msgs.length;
+    pager._histWinSession = forSession;
     if (forSession !== sessionId || loadId !== historyLoadSeq) return;
     const root = $("msgs");
     try {
-      const history = historyRowsOf(msgs, histTotal, !!(prefetched && prefetched.showAll));
+      const rowWindow = typeof isPhoneLayout === "function" && isPhoneLayout() ? 200 : 800;
+      const expandedWindow = pager._histWinSession === forSession && (pager._histWin || 0) > rowWindow + 1;
+      const history = historyRowsOf(msgs, histTotal, !!(prefetched && prefetched.showAll) || expandedWindow);
       canonicalHistoryTotal = histTotal || msgs.length;
       lastMsgCount = history.shownCount;
       staleKey = histKey(msgs);
@@ -4804,12 +5154,55 @@ async function loadHistory(prefetched) {
     }
   }
 }
+// Scrolling to the top of the transcript asks for older rows: the fetch is a
+// tail, so a bigger window is a superset of what is mounted. The scroll offset
+// is compensated by the height that was prepended, which keeps the row the
+// reader was looking at under the same cursor position.
+async function loadOlderHistory() {
+  if (!sessionId) return;
+  const root = $("msgs");
+  if (root._histOlder) return;
+  if (root._histWinSession !== sessionId || !lastMsgCount) return;
+  if (!canonicalHistoryTotal || lastMsgCount >= canonicalHistoryTotal) return;
+  const state = historyLoadState(sessionId);
+  if (state && state.loading) return;
+  root._histOlder = true;
+  const beforeTop = root.scrollTop;
+  const beforeHeight = root.scrollHeight;
+  root._histWin = Math.min(
+    canonicalHistoryTotal,
+    Math.max(lastMsgCount + 50, Math.ceil(lastMsgCount * 2.5)),
+  );
+  try {
+    await loadHistory();
+    root.scrollTop = beforeTop + (root.scrollHeight - beforeHeight);
+  } finally {
+    root._histOlder = false;
+  }
+}
+// Minimal DOM harnesses mount the transcript without event plumbing, so the
+// listener is registered only where the node really supports it.
+if ($("msgs") && typeof $("msgs").addEventListener === "function") {
+  // Only an upward gesture at the very top counts: a programmatic scroll to the
+  // live edge must not trigger a fetch, and a transcript shorter than its viewport
+  // has no older rows to reveal.
+  let previousTop = $("msgs").scrollTop;
+  $("msgs").addEventListener("scroll", () => {
+    const root = $("msgs");
+    const movedUp = root.scrollTop < previousTop;
+    noteTranscriptScroll(previousTop, root);
+    previousTop = root.scrollTop;
+    if (!movedUp || root.scrollTop > 0) return;
+    if (root.scrollHeight <= root.clientHeight + 8) return;
+    loadOlderHistory();
+  }, { passive: true });
+}
 // Historical user inputs offer a rewind to just before them, mirroring the
 // local `/history rewind u<N>`: that message and everything after it is
 // removed, titles and other metadata are untouched. The server holds the
 // session lock, so an action during an active turn waits for it to finish.
 function attachUserRewind(d, text, activate) {
-  d.title = "tap to rewind to just before this message";
+  d.title = "rewind to just before this message";
   const host = d.parentNode;
   const row = document.createElement("div");
   row.className = "user-msg-row";
@@ -4832,10 +5225,8 @@ function attachUserRewind(d, text, activate) {
   } else {
     d.appendChild(action);
   }
-  d.onclick = (ev) => {
-    if (ev.target && ev.target.closest && ev.target.closest(".rewind-action")) return;
-    if (!window.matchMedia || !window.matchMedia("(max-width: 700px)").matches) activate();
-  };
+  // Clicking the bubble never rewinds on either layout: the text stays
+  // selectable and copyable, and the button beside it is the sole trigger.
   return d;
 }
 function addUserBubble(text, index, parent) {
@@ -4868,9 +5259,62 @@ function addLiveUserBubble(text, prompt, targetSession, minIndex) {
     } catch (e) { note("rewind failed: " + e.message); }
   });
 }
+// A rewind deletes the quoted input and every message after it, so the click
+// asks once more. Desktop asks with a bar just above the composer, quoted input
+// and all, because a browser modal freezes the page and cannot be styled; the
+// phone keeps the native sheet, which is thumb-sized and already familiar.
+function askRewind(short) {
+  const phone = typeof isPhoneLayout === "function" && isPhoneLayout();
+  const question = "Rewind to just before:\n\n\"" + short + "\"\n\nThis message and everything after it will be removed. Continue?";
+  if (phone || typeof document === "undefined" || typeof document.body === "undefined") {
+    return Promise.resolve(confirm(question));
+  }
+  return new Promise((resolve) => {
+    const bar = document.createElement("div");
+    bar.className = "rewind-confirm";
+    bar.setAttribute("role", "group");
+    bar.setAttribute("aria-label", "rewind confirmation");
+    const label = document.createElement("span");
+    label.className = "rewind-confirm-label";
+    label.textContent = "撤回此输入及之后的内容？";
+    const quote = document.createElement("span");
+    quote.className = "rewind-confirm-quote";
+    quote.textContent = "「" + short + "」";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "rewind-confirm-cancel";
+    cancel.textContent = "取消";
+    const ok = document.createElement("button");
+    ok.type = "button";
+    ok.className = "rewind-confirm-ok";
+    ok.textContent = "撤回";
+    const close = (value) => {
+      bar.remove();
+      document.removeEventListener("keydown", onKey, true);
+      if (typeof document.focus === "function") document.focus();
+      resolve(value);
+    };
+    const onKey = (ev) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        close(false);
+      }
+    };
+    cancel.onclick = () => close(false);
+    ok.onclick = () => close(true);
+    bar.appendChild(label);
+    bar.appendChild(quote);
+    bar.appendChild(cancel);
+    bar.appendChild(ok);
+    document.addEventListener("keydown", onKey, true);
+    document.body.appendChild(bar);
+    if (typeof ok.focus === "function") ok.focus();
+  });
+}
 async function rewindTo(index, preview, targetSession = sessionId) {
   const short = preview.length > 80 ? preview.slice(0, 79) + "…" : preview;
-  if (!confirm("Rewind to just before:\n\n\"" + short + "\"\n\nThis message and everything after it will be removed. Continue?")) return;
+  if (!(await askRewind(short))) return;
   try {
     const res = await (await api("/sessions/" + targetSession + "/rewind", {
       method: "POST", body: JSON.stringify({ message_index: index }),
@@ -5424,10 +5868,6 @@ function syncStopButton() {
   const text = !detached ? "" : fresh
     ? "The server is still running the previous turn · Stop cancels it · the input unlocks when it finishes"
     : "Live connection lost · reconnecting and checking the server history…";
-  // The input looks ready but cannot send, so it says why while it waits.
-  const prompt = $("prompt");
-  const hint = detached ? "Waiting for the previous turn to finish…" : "ask…";
-  if (prompt && prompt.placeholder !== hint) prompt.placeholder = hint;
   const box = $("composer");
   if (box && typeof box.setAttribute === "function") { box.setAttribute("aria-busy", detached ? "true" : "false"); }
   // The status row sits directly above the composer: changing its text can
@@ -5737,6 +6177,7 @@ async function send() {
   let prog = null;
   let progDetails = null;
   let progLines = [];
+  let tokenRateLine = null;
   let subagentProgress = "";
   const progressFolds = [];
   const ensureProgressPhase = () => {
@@ -6056,10 +6497,20 @@ async function send() {
           if (sid === sessionId && (cid === null || (confirmShown && confirmShown.id === cid))) hideConfirm();
         }
         else if (payload) {
-          ensureProgressPhase();
-          progLines.push(payload);
-          progressDirty = true;
-          schedulePaint();
+          const plainPayload = payload.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").trim();
+          if (/^↳\s+speed(?:\s*·|\s|$)/i.test(plainPayload)) {
+            if (!tokenRateLine) {
+              tokenRateLine = addMsgMd("", box);
+              tokenRateLine.classList.add("turn-metric");
+              box.insertBefore(tokenRateLine, phaseBubble);
+            }
+            tokenRateLine.textContent = plainPayload;
+          } else {
+            ensureProgressPhase();
+            progLines.push(payload);
+            progressDirty = true;
+            schedulePaint();
+          }
         }
       }
       if (finished) break;
@@ -6302,8 +6753,13 @@ function wire() {
   if (window.matchMedia && matchMedia("(max-width: 700px)").matches) $("ovrwrap").open = false;
   $("scrim").onclick = () => setDrawer(false);
   $("omodel").onchange = () => savePick();
-  $("oagent").onchange = () => savePick();
-  $("oeffort").onchange = () => savePick();
+  $("oagent").onchange = () => { syncPickTrigger("agent"); savePick(); };
+  $("oeffort").onchange = () => { syncPickTrigger("effort"); savePick(); };
+  $("oagentbtn").onclick = () => openPickPop("agent");
+  $("oeffortbtn").onclick = () => openPickPop("effort");
+  $("pickpopscrim").onclick = () => closePickPop();
+  $("pickpopclose").onclick = () => closePickPop();
+  $("pickpop").onkeydown = pickPopKeydown;
   $("omodelbtn").onclick = openModelSheet;
   $("modelpickclose").onclick = () => closeModelSheet();
   $("modelpickscrim").onclick = () => closeModelSheet();

@@ -105,7 +105,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
   const elements = {};
   for (const [id, tag] of [
     ["sesslist", "ul"], ["sesscount", "div"], ["sesstitle", "div"], ["sessmeta", "div"],
-    ["prompt", "textarea"], ["msgs", "div"], ["newbtn", "button"], ["fork", "button"],
+    ["prompt", "textarea"], ["msgs", "div"], ["promptlist", "ol"], ["promptcount", "span"], ["newbtn", "button"], ["fork", "button"],
     ["refresh", "button"], ["del", "button"], ["omodel", "select"], ["oagent", "select"], ["oeffort", "select"],
     ["composer", "div"], ["img", "button"], ["sidenote", "button"], ["send", "button"], ["turnstatus", "div"],
   ]) elements[id] = node(tag);
@@ -591,6 +591,53 @@ test("desktop user bubbles stay neutral but carry a border and accent rule", () 
   assert.equal(responsiveRule("#sessions li.cur", true)["box-shadow"], "inset 3px 0 0 var(--acc)");
 });
 
+test("desktop prompt index starts at the newest question and upward wheel loads older prompts", async () => {
+  const h = harness(), list = h.elements.promptlist;
+  const originalQueryAll = list.querySelectorAll.bind(list);
+  list.querySelectorAll = (selector) => {
+    if (selector === "li[data-history-index]") return list.children.filter((item) => item.dataset.historyIndex !== undefined);
+    if (selector === "li.cur") return list.children.filter((item) => item.classList.contains("cur"));
+    return originalQueryAll(selector);
+  };
+  Object.defineProperty(list, "scrollHeight", { get: () => list.children.length * 30 });
+  list.clientHeight = 90;
+  const rows = [];
+  const makeRow = (index) => {
+    const row = h.document.createElement("div"), bubble = h.document.createElement("div");
+    row.className = "user-msg-row";
+    bubble.className = "msg user";
+    bubble.dataset.historyIndex = String(index);
+    bubble.textContent = "question " + index;
+    row.appendChild(bubble);
+    row.querySelector = (selector) => selector === ".msg.user" ? bubble : null;
+    return row;
+  };
+  rows.push(...[4, 5, 6, 7, 8, 9].map(makeRow));
+  h.elements.msgs.querySelectorAll = (selector) => selector === ".user-msg-row" ? rows : [];
+  Object.assign(h.context, { canonicalHistoryTotal: 10, lastMsgCount: 6 });
+  vm.runInContext(between("function promptNavHasOlder()", 'if ($("promptlist") && typeof $("promptlist").addEventListener'), h.context);
+  h.context.syncPromptNav();
+  assert.equal(list.children.at(-1).classList.contains("cur"), true, "the newest prompt is selected by default");
+  assert.equal(list.scrollTop, list.scrollHeight, "the initial prompt window opens at its newest end");
+
+  list.scrollTop = 0;
+  rows.unshift(...[0, 1, 2, 3].map(makeRow));
+  h.context.lastMsgCount = 10;
+  h.context.syncPromptNav();
+  assert.equal(list.scrollTop, 120, "prepending older prompts keeps the previous first prompt in place");
+  assert.equal(list.children.at(-1).classList.contains("cur"), true, "the newest prompt remains selected");
+
+  const listeners = {}, olderLoads = [];
+  list.addEventListener = (type, listener) => { listeners[type] = listener; };
+  h.context.lastMsgCount = 6;
+  h.context.loadOlderHistory = async () => { olderLoads.push(true); };
+  vm.runInContext(between('if ($("promptlist") && typeof $("promptlist").addEventListener', "if (typeof MutationObserver"), h.context);
+  list.scrollTop = 0;
+  listeners.wheel({ deltaY: -1 });
+  await Promise.resolve();
+  assert.equal(olderLoads.length, 1, "an upward gesture works even before the list has a scroll range");
+});
+
 function loadChat(h) {
   Object.assign(h.context, {
     esc: (text) => String(text), updateQuestionButton() {},
@@ -643,8 +690,8 @@ test("user rewind targets retain desktop bubble clicks and phone action clicks",
     h.context.rewindTo = (...args) => rewinds.push(args);
     const bubble = h.context.addUserBubble("rewind preview", 17);
     await h.dispatch(bubble, "click").done;
-    assert.deepEqual(rewinds, phone ? [] : [[17, "rewind preview"]]);
-    if (phone) {
+    assert.deepEqual(rewinds, [], "a bubble tap never rewinds on either layout");
+    {
       const action = bubble.parentNode.children[0];
       assert.equal(action.getAttribute("aria-label"), "rewind to before this message");
       const click = h.dispatch(action, "click");
@@ -653,7 +700,7 @@ test("user rewind targets retain desktop bubble clicks and phone action clicks",
       assert.deepEqual(rewinds, [[17, "rewind preview"]]);
     }
   }
-  assert.equal(responsiveRule(".rewind-action").display, "none");
+  assert.equal(responsiveRule(".rewind-action").display, "inline-flex");
 });
 
 test("desktop side-note visibility reserves a grid column only while the turn runs", () => {

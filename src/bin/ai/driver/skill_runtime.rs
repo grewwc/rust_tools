@@ -2454,6 +2454,31 @@ mod pure_prompt_tests {
     }
 
     #[test]
+    fn overflow_stub_guidance_is_unconditional_and_not_duplicated() {
+        let skill = skill_with_prompt("SKILL_SCOPE_MARKER");
+        for skills in [Vec::new(), vec![&skill]] {
+            for available in [tools(&[]), tools(&["search_overflow"])] {
+                let has_recovery = has_tool(&available, "search_overflow");
+                for goal_mode in [None, Some("test goal".to_string())] {
+                    let ctx = PromptContext {
+                        goal_mode,
+                        ..PromptContext::default()
+                    };
+                    let prompt = render_turn(None, &skills, &available, &ctx);
+                    assert!(prompt.contains(
+                        "`_context_overflow_truncated` inside tool arguments is a placeholder, not real arguments: never resend it as a tool call."
+                    ));
+                    assert_eq!(prompt.matches("_context_overflow_truncated").count(), 1);
+                    assert_eq!(
+                        prompt.contains("<compressed_context_recovery>"),
+                        has_recovery
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn pure_agent_renders_baseline_and_skips_skill_instructions() {
         let pure_agent = pure_agent_manifest();
         let skill = skill_with_prompt("SKILL_SCOPE_MARKER");
@@ -2592,7 +2617,8 @@ mod pure_prompt_tests {
 
     #[test]
     fn default_profile_prompt_bytes_are_unchanged() {
-        const DEFAULT_PROFILE_PROMPT_HASH: u64 = 5_520_967_184_060_508_820;
+        // Update this golden value only for deliberate prompt changes.
+        const DEFAULT_PROFILE_PROMPT_HASH: u64 = 15_379_186_106_504_725_919;
         let prompt = render_turn(None, &[], &tools(FULL_TOOL_SET), &PromptContext::default());
         assert_eq!(
             stable_hash(without_environment_block(&prompt).as_bytes()),

@@ -130,28 +130,44 @@ test("drafts persist independently for each session and restore on switch", () =
   assert.equal(values.has("serve.draft.beta"), false);
 });
 
-test("question navigator fetches the complete history and renders an older target on demand", async () => {
+test("question navigator fetches one bounded page and keeps global turn numbers", async () => {
   const start = script.indexOf("function questionRowsOf(");
   const end = script.indexOf("// `parent` mounts", start);
   assert.ok(start >= 0 && end > start);
-  const messages = Array.from({ length: 205 }, (_, i) => ({
-    role: i % 2 ? "assistant" : "user",
-    content: "message " + i,
+  const userOrdinals = Array.from({ length: 103 }, (_, i) => ({
+    role: "user",
+    content: "prompt " + (i + 1),
+    user_ordinal: i + 1,
   }));
   const links = [];
+  const created = [];
+  const paths = [];
   let panelOpen = false;
   let loaded = null;
-  let target = null;
-  let scrolled = false;
-  const panel = { classList: {
+  let scrolledTo = null;
+  let widened = 0;
+  const panel = { _shown: 20, classList: {
     contains: (name) => name === "open" && panelOpen,
     add: (name) => { if (name === "open") panelOpen = true; },
   } };
   const list = {
     innerHTML: "",
     textContent: "",
+    scrollTop: 0,
+    scrollHeight: 40 * 20,
+    childElementCount: 0,
+    dataset: {},
     appendChild: (node) => links.push(node),
+    addEventListener: (name, fn) => { if (name === "scroll") list.onScroll = fn; },
   };
+  // The transcript on screen holds only its own bounded tail, exactly like the
+  // rendered history window.
+  const bubbles = userOrdinals.slice(-20).map((row) => ({
+    dataset: { question: row.content },
+    offsetWidth: 1,
+    scrollIntoView: () => { scrolledTo = row.content; },
+    classList: { remove() {}, add() {} },
+  }));
   const context = vm.createContext({
     sessionId: "session-a",
     questionCache: null,
@@ -159,42 +175,95 @@ test("question navigator fetches the complete history and renders an older targe
       questionpanel: panel,
       questionbtn: { setAttribute() {} },
       questionlist: list,
-      msgs: { querySelector: () => target },
+      msgs: { querySelectorAll: (sel) => (sel === ".msg.user" ? bubbles : []) },
     })[id],
     api: async (path) => {
-      assert.equal(path, "/sessions/session-a/history");
-      return { json: async () => messages, headers: { get: () => String(messages.length) } };
+      const match = path.match(/^\/sessions\/session-a\/history\?role=user&count=(\d+)$/);
+      assert.ok(match, "the navigator asks only for real user prompts, one bounded page: " + path);
+      const count = Number(match[1]);
+      assert.ok(count <= 320, "the fetched page stays bounded: " + count);
+      paths.push(path);
+      return {
+        json: async () => userOrdinals.slice(userOrdinals.length - count),
+        headers: { get: () => String(userOrdinals.length) },
+      };
     },
     textOf: (content) => String(content || ""),
     updateQuestionButton: (count) => { context.count = count; },
     closeQuestionPanel: () => { panelOpen = false; },
     loadHistory: async (prefetched) => {
       loaded = prefetched;
-      target = {
-        offsetWidth: 1,
-        scrollIntoView: () => { scrolled = true; },
-        classList: { remove() {}, add() {} },
-      };
+      widened += 1;
+      for (const row of userOrdinals) {
+        if (bubbles.some((bubble) => bubble.dataset.question === row.content)) continue;
+        bubbles.push({
+          dataset: { question: row.content },
+          offsetWidth: 1,
+          scrollIntoView: () => { scrolledTo = row.content; },
+          classList: { remove() {}, add() {} },
+        });
+      }
     },
     esc: (value) => value,
-    document: { createElement: () => ({ append() {} }) },
+    requestAnimationFrame: (fn) => fn(),
+    document: { createElement: () => {
+      const node = {
+        children: [],
+        append(...kids) { this.children = kids; },
+        appendChild(kid) { kid.parentNode = this; this.children.push(kid); return kid; },
+      };
+      created.push(node);
+      return node;
+    } },
   });
   vm.runInContext(script.slice(start, end), context);
   vm.runInContext(userOriginHelpers, context);
   await context.openQuestionPanel();
-  assert.equal(context.count, 103);
-  assert.equal(links.length, 103);
-  await links[0].onclick();
-  assert.equal(loaded.sessionId, "session-a");
-  assert.equal(loaded.showAll, true);
-  assert.equal(loaded.messages.length, 205);
-  assert.equal(scrolled, true);
+  const questionLinks = links.filter((node) => node.className === "question-link");
+  assert.equal(paths.length, 1, "the first open asks for exactly one page");
+  assert.match(paths[0], /role=user&count=40$/, "one bounded page of prompts, not the transcript");
+  assert.equal(context.count, 40, "the badge counts the prompts that were fetched");
+  assert.equal(questionLinks.length, 20, "only one batch is rendered up front");
+  assert.equal(list.scrollTop, list.scrollHeight, "opening lands on the newest prompt");
+  assert.equal(list.dataset.hasOlder, "1", "older prompts are reachable by scrolling up");
+  // The complaint this pins: every rendered entry carries its real turn number
+  // even though the fetch covered only the newest page.
+  const numbers = created.filter((node) => node.className === "num").map((node) => node.textContent);
+  assert.equal(numbers.length, 20, "every rendered prompt gets a number");
+  assert.deepEqual(numbers, Array.from({ length: 20 }, (_, i) => String(84 + i)));
+  assert.ok(numbers.every((value) => Number(value) >= 84 && Number(value) <= 103));
+  assert.equal(numbers[numbers.length - 1], "103", "the newest prompt keeps the last turn number");
+  // Scrolling to the top of the list asks for the previous page, with no
+  // separate control anywhere in it.
+  assert.equal(links.filter((node) => node.className === "question-more").length, 0, "no load-more button exists");
+  const beforeGrow = links.length;
+  const beforeNums = created.length;
+  list.scrollTop = 0;
+  list.onScroll();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const grown = links.slice(beforeGrow).filter((node) => node.className === "question-link");
+  assert.equal(grown.length, 40, "asking for older prompts re-renders the wider window");
+  const grownNumbers = created.slice(beforeNums)
+    .filter((node) => node.className === "num").map((node) => node.textContent);
+  assert.equal(grownNumbers[grownNumbers.length - 1], "103", "newer numbers stay stable while paging");
+  const oldestGrown = Number(grownNumbers[0]);
+  assert.ok(oldestGrown < 84, "the grown page reaches older turns: " + oldestGrown);
+  // A prompt outside the rendered transcript widens it exactly once.
+  await grown[0].onclick();
+  assert.equal(loaded && loaded.showAll, true, "an off-screen prompt asks for the full transcript");
+  assert.equal(scrolledTo, grown[0].children[1].textContent, "the widened transcript still lands on the tapped prompt");
+  const widenCalls = widened;
+  // A prompt already in the transcript jumps without another fetch.
+  scrolledTo = null;
+  await questionLinks[0].onclick();
+  assert.equal(scrolledTo, "prompt 84", "the jump lands on the exact turn that was tapped");
+  assert.equal(widened, widenCalls, "a target already in the transcript needs no reload");
   loaded = null;
-  scrolled = false;
+  scrolledTo = null;
   context.sessionId = "session-b";
-  await links[0].onclick();
+  await questionLinks[0].onclick();
   assert.equal(loaded, null, "an old question link cannot load its cache into another session");
-  assert.equal(scrolled, false);
+  assert.equal(scrolledTo, null);
 });
 
 test("phone question navigator is a compact session-bar control", () => {
@@ -230,7 +299,7 @@ function rewindDomFixture() {
   return { actions, bubble, createElement, host };
 }
 
-test("phone history exposes a dedicated rewind action without whole-bubble taps", () => {
+test("history exposes a dedicated rewind action instead of whole-bubble taps", () => {
   const start = script.indexOf("function attachUserRewind(");
   const end = script.indexOf("async function rewindTo(", start);
   assert.ok(start >= 0 && end > start);
@@ -253,11 +322,10 @@ test("phone history exposes a dedicated rewind action without whole-bubble taps"
   assert.equal(stopped, true);
   assert.deepEqual(rewinds, [[17, "keep this preview"]]);
   rewinds.length = 0;
-  bubble.onclick({ target: { closest: () => null } });
-  assert.equal(rewinds.length, 0);
-  context.window.matchMedia = () => ({ matches: false });
-  bubble.onclick({ target: { closest: () => null } });
-  assert.deepEqual(rewinds, [[17, "keep this preview"]]);
+  assert.equal(typeof bubble.onclick, "undefined", "the bubble is never a rewind trigger");
+  assert.equal(actions[0].title, "rewind to before this message");
+  actions[0].onclick({ stopPropagation: () => {} });
+  assert.deepEqual(rewinds, [[17, "keep this preview"]], "the dedicated button performs the rewind");
 });
 
 test("a live user bubble resolves the canonical index before rewinding", async () => {
@@ -293,8 +361,8 @@ test("a live user bubble resolves the canonical index before rewinding", async (
   assert.match(script, /addLiveUserBubble\(text \|\| "\(images only\)", prompt, sid, rewindFloor\);/);
 });
 
-test("rewind action is visible only in the phone layout", () => {
-  assert.ok(html.includes(".rewind-action { display:none; }"));
+test("rewind action is visible on both layouts", () => {
+  assert.match(html, /\.rewind-action \{\s*display:inline-flex;/);
   assert.match(html, /@media \(max-width:700px\) \{[\s\S]*?\.user-msg-row > \.rewind-action \{[\s\S]*?display:inline-flex;/);
   assert.match(html, /\.user-msg-row > \.rewind-action \{[\s\S]*?width:34px;[\s\S]*?height:34px;[\s\S]*?border-radius:999px;/);
 });
@@ -1635,7 +1703,9 @@ function indexedHistoryHarness(options = {}) {
   Object.assign(h.context, {
     addUserBubble: (text, index, parent) => append("user", text, parent),
     addMsgMd: (text, parent) => append("assistant", text, parent),
-    addFold: (label, text, parent) => append("tool", text, parent),
+    // Cards carry their <details>; this stub has none, so a stored fold cannot
+    // be restored through it and the row renderer must cope with that.
+    addFold: (label, text, parent) => ({ ...append("tool", text, parent), box: { querySelector: () => null } }),
     FOLD_ROLE_LABELS: {},
   });
   const start = script.indexOf("function historyRowsOf(");
@@ -1855,6 +1925,15 @@ test("phone output follows only while the reader remains near the bottom", () =>
   near.context.followOutput(true);
   assert.equal(near.msgs.scrollTop, 1000);
   assert.equal(near.classes.has("show"), false);
+
+  const directed = scrollHarness({ phone: true, scrollTop: 590 });
+  directed.context.noteTranscriptScroll(600);
+  assert.equal(directed.context.shouldFollowOutput(), false, "an upward gesture locks following even inside the bottom gap");
+  directed.context.followOutput(false);
+  assert.equal(directed.msgs.scrollTop, 590);
+  directed.msgs.scrollTop = 600;
+  directed.context.noteTranscriptScroll(590);
+  assert.equal(directed.context.shouldFollowOutput(), true, "scrolling back to the live edge restores following");
 });
 
 test("desktop output follows only while the reader is at the live edge", () => {

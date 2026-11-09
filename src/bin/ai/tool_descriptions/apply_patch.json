@@ -1,6 +1,6 @@
 {
   "name": "apply_patch",
-  "description": "Apply SMALL localized edits to existing files (one file, a few hunks per call; batch hunks only when each anchor is unique). Supports line replacement, patch envelopes, and unified diffs.",
+  "description": "Apply SMALL localized edits to existing files (one file, a few hunks per call; batch hunks only when each anchor is unique). Supports line replacement, patch envelopes, and unified diffs. Never pass an archive path as patch_file; read current source.",
   "first_use_guidance": "Guidance for later patches in this turn:\n- Keep each patch focused: one file, a few hunks, minimal context. When one file needs several localized edits, read the span once and batch them into ONE call only when every hunk has a unique anchor; for structurally similar blocks, patch one at a time with a distinctive anchor. Split larger edits into sequential calls; never batch unrelated files or hunks to 'save rounds'.\n- Copy source text exactly without `read_file` line prefixes; context lines must match.\n- For a single-line change prefer `*** Replace in line: <path>` (top-level section, fields per schema).\n- When a hunk fails to match, the error echoes the current file text in a `<<<PATCH_TEXT` block; rebuild the patch from that block instead of re-reading the file.\n- `*** Add File:` takes `+`-prefixed content; every `*** ...` header opens a new top-level section and is never nested.\n- Multi-file unified diffs split automatically, but unified diffs cannot delete files.",
   "parameters": {
     "type": "object",

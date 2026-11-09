@@ -1,3 +1,4 @@
+use super::truncate::build_context_overflow_tool_arguments_stub;
 use super::*;
 use crate::ai::types::{FunctionCall, ToolCall};
 use rustc_hash::FxHashSet;
@@ -50,8 +51,8 @@ fn temp_overflow_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("ai-shrink-write-{}", uuid::Uuid::new_v4()))
 }
 
-/// 窗口外成功 write_file：大 content 被替换为 `_context_overflow_truncated` 指针 stub，
-/// 原文零压缩归档到 overflow 目录。
+/// A successful write outside the recent window becomes a metadata-only stub;
+/// its original arguments are archived verbatim.
 #[test]
 fn shrink_successful_write_outside_window() {
     let overflow_dir = temp_overflow_dir();
@@ -72,28 +73,33 @@ fn shrink_successful_write_outside_window() {
     let stub = &messages[3].tool_calls.as_ref().unwrap()[0]
         .function
         .arguments;
-    assert!(
-        stub.contains("\"_context_overflow_truncated\""),
-        "stub should mark truncation: {stub}"
-    );
-    assert!(
-        stub.contains("file_path"),
-        "stub preview keeps file_path anchor"
-    );
-    assert!(
-        stub.contains("archive_file_path"),
-        "stub keeps archive pointer"
-    );
-    // 原文归档：overflow 目录下出现归档文件，且不含窗口内组。
     let archive_path = overflow_dir.join(OVERFLOW_HISTORY_FILENAME);
+    let parsed: Value = serde_json::from_str(stub).expect("stub must remain valid JSON");
+    assert_eq!(
+        parsed,
+        serde_json::json!({
+            "_context_overflow_truncated": true,
+            "original_chars": big_args.chars().count(),
+            "archive_file_path": archive_path.to_string_lossy(),
+        }),
+        "stub must contain only recovery metadata, without preview or payload keys"
+    );
+    assert!(is_context_overflow_truncated_tool_arguments(stub));
+    assert_eq!(messages[3].tool_calls.as_ref().unwrap()[0].id, "call-w");
+    assert_eq!(messages[4].tool_call_id.as_deref(), Some("call-w"));
+    assert_eq!(
+        messages[4].content.as_str(),
+        Some("Successfully wrote to /tmp/out.txt")
+    );
+    // The original arguments are archived without altering their paired result.
     assert!(
         archive_path.is_file(),
         "originals archived to overflow-history.md"
     );
     let archived = std::fs::read_to_string(&archive_path).unwrap();
     assert!(
-        archived.contains("\"content\""),
-        "archived keeps original args"
+        archived.contains(&big_args),
+        "archive keeps the complete original arguments"
     );
     let _ = std::fs::remove_dir_all(&overflow_dir);
 }
@@ -296,7 +302,8 @@ fn non_write_tools_ignored() {
     let _ = std::fs::remove_dir_all(&overflow_dir);
 }
 
-/// 无归档目录（overflow_dir = None）时：不崩溃，stub 仍生效（内联截断预览）。
+/// Without an overflow directory, the metadata-only stub has no archive path
+/// and remains terminal rather than being re-archived as the original payload.
 #[test]
 fn no_overflow_dir_still_works() {
     let mut messages = vec![msg("system", "s"), msg("user", "do")];
@@ -315,7 +322,52 @@ fn no_overflow_dir_still_works() {
     let stub = &messages[2].tool_calls.as_ref().unwrap()[0]
         .function
         .arguments;
-    assert!(stub.contains("\"_context_overflow_truncated\""));
+    assert_eq!(
+        serde_json::from_str::<Value>(stub).unwrap(),
+        serde_json::json!({
+            "_context_overflow_truncated": true,
+            "original_chars": big_args.chars().count(),
+            "archive_file_path": Value::Null,
+        })
+    );
+    assert!(is_context_overflow_truncated_tool_arguments(stub));
+    let first = stub.clone();
+    assert!(!truncate_mutable_field(
+        &mut messages[2],
+        MutableMessageField::ToolArguments(0),
+        usize::MAX,
+        None,
+        FieldArchivePolicy::BestEffort,
+    ));
+    assert_eq!(
+        messages[2].tool_calls.as_ref().unwrap()[0]
+            .function
+            .arguments,
+        first
+    );
+}
+
+#[test]
+fn tool_argument_pointer_keeps_original_chars_and_drops_legacy_preview() {
+    let legacy = serde_json::json!({
+        "_context_overflow_truncated": true,
+        "original_chars": 5_000,
+        "archive_file_path": "/tmp/archive.md",
+        "preview": "{\"file_path\":\"/tmp/out.txt\",\"content\":\"partial payload\"}",
+    })
+    .to_string();
+    let pointer = build_context_overflow_tool_arguments_pointer(&legacy, 160)
+        .expect("legacy preview should minimize to a metadata-only pointer");
+    assert_eq!(
+        serde_json::from_str::<Value>(&pointer).unwrap(),
+        serde_json::json!({
+            "_context_overflow_truncated": true,
+            "original_chars": 5_000,
+            "archive_file_path": "/tmp/archive.md",
+        })
+    );
+    assert!(is_context_overflow_truncated_tool_arguments(&pointer));
+    assert!(build_context_overflow_tool_arguments_pointer(&pointer, usize::MAX).is_none());
 }
 
 /// 回归：中等大小（约 161..=240 字符）成功 write_file 参数——替换成 stub 不会比原文
@@ -404,4 +456,56 @@ fn empty_preview_stub_rejected_when_path_eats_budget() {
         !overflow_dir.join(OVERFLOW_HISTORY_FILENAME).exists(),
         "no archive write when truncation is rejected"
     );
+}
+
+#[test]
+fn metadata_only_tool_argument_stub_rejects_long_archive_path() {
+    let target = 160;
+    let original_args = big_write_args();
+    let original_chars = original_args.chars().count();
+    let overflow_dir = temp_overflow_dir().join("d".repeat(180));
+    let archive_path = overflow_dir.join(OVERFLOW_HISTORY_FILENAME);
+    let archive_path = archive_path.to_string_lossy();
+    assert!(archive_path.chars().count() > target);
+    assert!(
+        build_context_overflow_tool_arguments_stub(original_chars, Some(&archive_path), target)
+            .is_none(),
+        "the final metadata builder must reject an oversized archive locator"
+    );
+
+    let mut message = assistant_call_args("call-long-path", "write_file", &original_args);
+    assert!(!truncate_mutable_field(
+        &mut message,
+        MutableMessageField::ToolArguments(0),
+        original_chars - target,
+        Some(&overflow_dir),
+        FieldArchivePolicy::BestEffort,
+    ));
+    assert_eq!(
+        message.tool_calls.as_ref().unwrap()[0].function.arguments,
+        original_args
+    );
+    assert!(!overflow_dir.join(OVERFLOW_HISTORY_FILENAME).exists());
+
+    let no_path = build_context_overflow_tool_arguments_stub(original_chars, None, target)
+        .expect("the existing no-path shape should still fit");
+    assert_eq!(
+        serde_json::from_str::<Value>(&no_path).unwrap(),
+        serde_json::json!({
+            "_context_overflow_truncated": true,
+            "original_chars": original_chars,
+            "archive_file_path": Value::Null,
+        })
+    );
+    assert!(is_context_overflow_truncated_tool_arguments(&no_path));
+    let pointer_chars = no_path.chars().count();
+    assert!(pointer_chars <= target && pointer_chars < original_chars);
+    assert!(
+        build_context_overflow_tool_arguments_stub(original_chars, None, pointer_chars).is_some()
+    );
+    assert!(
+        build_context_overflow_tool_arguments_stub(original_chars, None, pointer_chars - 1)
+            .is_none()
+    );
+    assert!(build_context_overflow_tool_arguments_stub(1, None, target).is_none());
 }

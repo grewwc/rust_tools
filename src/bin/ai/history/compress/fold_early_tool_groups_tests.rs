@@ -1648,6 +1648,14 @@ fn inline_tool_arguments_fallback_is_not_rearchived_as_full_original() {
         .function
         .arguments
         .clone();
+    let mut legacy: Value = serde_json::from_str(&first).expect("stub must remain JSON");
+    assert!(legacy.get("preview").is_none());
+    let original_chars = legacy["original_chars"].clone();
+    // Older persisted stubs retain a preview; minimizing one must never
+    // re-archive that partial payload as if it were the full original.
+    legacy["preview"] = Value::String("legacy partial arguments".repeat(100));
+    let first = legacy.to_string();
+    message.tool_calls.as_mut().unwrap()[0].function.arguments = first.clone();
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-inline-args-stub-{}", uuid::Uuid::new_v4()));
 
@@ -1663,6 +1671,8 @@ fn inline_tool_arguments_fallback_is_not_rearchived_as_full_original() {
             .expect("compact fallback pointer must remain JSON");
     assert_eq!(collapsed["archive_file_path"], Value::Null);
     assert_eq!(collapsed["original_unavailable"], Value::Bool(true));
+    assert_eq!(collapsed["original_chars"], original_chars);
+    assert!(collapsed.get("preview").is_none());
     assert!(
         !overflow_dir.join(OVERFLOW_HISTORY_FILENAME).exists(),
         "a preview-only fallback must not later be represented as an archived full original"

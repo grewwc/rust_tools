@@ -487,7 +487,7 @@ fn reject_invalid_tool_args(
 }
 
 /// Detect tool arguments that are actually a context-overflow pointer stub
-/// (`{"_context_overflow_truncated": ..., "archive_file_path": ..., "preview": ...}`)
+/// (`{"_context_overflow_truncated": true, "original_chars": ..., "archive_file_path": ...}`)
 /// rather than real parameters. The projection compressor archives oversized
 /// *completed* calls in this shape, and a model that has such a stub in its
 /// visible context sometimes re-emits the stub keys verbatim as a fresh call
@@ -513,27 +513,29 @@ fn overflow_stub_argument_error(tool_call: &ToolCall, args: &Value) -> Option<To
             Value::Number(number) => number.as_u64() == Some(1),
             _ => false,
         });
-    // Fallback shape: no marker but the full archive-pointer key set.
+    // Legacy fallback shape: no marker but the full preview-pointer key set.
     let pointer_shape = ["original_chars", "archive_file_path", "preview"]
         .iter()
         .all(|key| map.contains_key(*key));
     if !(marker_is_stub || pointer_shape) {
         return None;
     }
-    let archive_path = map
+    let archive_location = map
         .get("archive_file_path")
         .and_then(Value::as_str)
-        .unwrap_or("<unknown>");
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| format!("The archived original text is at: {path}."))
+        .unwrap_or_else(|| "This stub has no archive path.".to_string());
     Some(ToolResult {
         tool_call_id: tool_call.id.clone(),
         content: format!(
-            "Error: the arguments for '{}' are a context-overflow pointer stub \
-             (keys _context_overflow_truncated/original_chars/archive_file_path/preview), \
-             not real parameters. The archived original text is at: {archive_path}. \
-             Do NOT resend these stub keys. Regenerate the real arguments for this call \
-             (re-derive the payload from the current file state, or if the payload exceeds \
-             a tool's inline limit, write it to a temp file with write_file(temp=true) and \
-             pass its path via the tool's file parameter, e.g. apply_patch `patch_file`).",
+            "Error: the arguments for '{}' are a context-overflow pointer stub, \
+             not real parameters. This call was not executed; no file changed. \
+             {archive_location} Do NOT resend these stub keys. \
+             Regenerate the real arguments; for file edits, re-read the target file's \
+             current state, not the whole overflow archive. If a patch exceeds the inline \
+             limit, write the real patch to a temp file with write_file(temp=true) and \
+             pass its path as apply_patch `patch_file`.",
             tool_call.function.name
         ),
     })

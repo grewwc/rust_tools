@@ -42,6 +42,7 @@ function streamHarness({ activityOnly = false } = {}) {
   const document = { hidden: false, body: box, addEventListener: listen };
   const context = vm.createContext({
     box, sid: "s", sessionId: "s", finished: false, turnError: false,
+    LIVE_STALL_MS: 300000,
     runEpoch: 0, eventFailures: 0, confirmPollSeq: 0,
     setTimeout: (fn, delay) => { timers.push(delay); return timers.length; }, clearTimeout() {},
     // Extracted slices may arm timers; the assertions drive them directly.
@@ -93,7 +94,7 @@ function streamHarness({ activityOnly = false } = {}) {
   // The watchdogs are `const` in the real script, so they are script-scoped
   // there. As globals here they are reachable from the block loop, which is
   // what arms them for every event, keep-alive comments included.
-  const wdStart = script.indexOf("  const STREAM_STALL_MS");
+  const wdStart = script.indexOf("  const STREAM_SILENCE_MS");
   const wdEnd = script.indexOf("  const goStale", wdStart);
   assert.ok(wdStart > 0 && wdEnd > wdStart);
   vm.runInContext(
@@ -132,6 +133,7 @@ function streamHarness({ activityOnly = false } = {}) {
     pendingVisible: () => vm.runInContext("box.children.includes(phaseBubble)", context),
     fail: () => vm.runInContext('fail("turn failed")', context),
     reply: () => vm.runInContext("(bubble || answerBubbles.at(-1)).innerHTML", context),
+    metrics: () => box.children.filter((item) => item.textContent.startsWith("↳ speed")).map((item) => item.textContent),
     answerCount: () => vm.runInContext("answerBubbles.filter((b) => b.innerHTML).length", context),
   };
 }
@@ -427,6 +429,17 @@ test("live tools separate real thinking phases, while logs cannot split tokens",
   h.emit("done");
   assert.equal(h.reply(), "Final answer");
   assert.equal(h.pendingVisible(), false, "a completed turn must not retain a running indicator");
+});
+
+test("token throughput remains visible instead of being hidden in the activity log", () => {
+  const h = streamHarness();
+  h.emit("progress", "request diagnostic");
+  h.emit("progress", "  \x1b[2m↳ speed · reasoning 800 tok @ 400 tok/s · output 400 tok @ 400 tok/s\x1b[0m");
+  assert.deepEqual(h.metrics(), ["↳ speed · reasoning 800 tok @ 400 tok/s · output 400 tok @ 400 tok/s"]);
+  assert.equal(h.titles().filter((title) => title.startsWith("activity log")).length, 1);
+  assert.doesNotMatch(h.bodies().join("\n"), /400 tok\/s/);
+  h.emit("done");
+  assert.equal(h.metrics().length, 1, "the completed turn keeps its throughput line");
 });
 
 test("parallel tool completion and confirmation preserve the remaining active status", () => {

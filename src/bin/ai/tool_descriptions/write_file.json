@@ -1,6 +1,6 @@
 {
   "name": "write_file",
-  "description": "Write content to a file, replacing its entire contents (no append/merge); returns the absolute path. Writable roots include the working directory (or configured roots) and the session/system temp dirs; temp=true writes under the per-session temp dir. Paths outside them are rejected with `Write blocked`. Sensitive paths/names such as `.ssh/`, `.aws/`, `.npmrc`, and `config.json` are rejected even with temp=true.",
+  "description": "Write content to a file, replacing its entire contents (no append/merge); returns the absolute path. Writable roots include the working directory (or configured roots) and the session/system temp dirs; temp=true writes under the per-session temp dir. Paths outside them are rejected with `Write blocked`. Sensitive paths/names such as `.ssh/`, `.aws/`, `.npmrc`, and `config.json` are rejected even with temp=true. A truncated preview is not a full file body; re-read current source.",
   "parameters": {
     "type": "object",
     "properties": {

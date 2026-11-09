@@ -709,6 +709,41 @@ fn tool_call_with_args(name: &str, arguments: &str) -> ToolCall {
 }
 
 #[test]
+fn overflow_stub_argument_guard_catches_minimal_stubs() {
+    let mcp = McpClient::new();
+    for arguments in [
+        r#"{"_context_overflow_truncated":true,"original_chars":900,"archive_file_path":"/tmp/archive.md"}"#,
+        r#"{"_context_overflow_truncated":true,"original_chars":900,"archive_file_path":null}"#,
+        r#"{"_context_overflow_truncated":"true","original_chars":"900","archive_file_path":"/tmp/archive.md"}"#,
+    ] {
+        let pointer: serde_json::Value = serde_json::from_str(arguments).unwrap();
+        for name in ["apply_patch", "write_file", "read_file"] {
+            let call = tool_call_with_args(name, arguments);
+            let error = super::prepare_tool_call(&mcp, &call, None)
+                .expect_err("minimal archive metadata must be rejected before dispatch");
+            assert_eq!(error.tool_call_id, call.id);
+            assert!(error.content.contains("context-overflow pointer stub"));
+            if let Some(path) = pointer["archive_file_path"].as_str() {
+                assert!(error.content.contains(path));
+            } else {
+                assert!(error.content.contains("This stub has no archive path."));
+            }
+            assert!(
+                error
+                    .content
+                    .contains("This call was not executed; no file changed.")
+            );
+            assert!(
+                error
+                    .content
+                    .contains("re-read the target file's current state")
+            );
+            assert!(error.content.contains("not the whole overflow archive"));
+        }
+    }
+}
+
+#[test]
 fn overflow_stub_argument_guard_catches_transcribed_stubs() {
     // Stringified stub as a model transcribed it after seeing the compressor's
     // pointer in context (observed for apply_patch and write_file in production
@@ -722,7 +757,7 @@ fn overflow_stub_argument_guard_catches_transcribed_stubs() {
         .expect_err("stringified stub arguments must be rejected");
     assert!(err.content.contains("context-overflow pointer stub"));
     assert!(err.content.contains("/tmp/archive.md"));
-    // Runtime-native shape (JSON bool marker + numeric original_chars) is caught too.
+    // Legacy runtime shape (JSON bool marker + numeric original_chars) is caught too.
     let runtime_stub = tool_call_with_args(
         "write_file",
         r#"{"_context_overflow_truncated": true, "original_chars": 900, "archive_file_path": "/tmp/a.md", "preview": "xyz"}"#,

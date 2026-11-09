@@ -601,9 +601,8 @@ pub(in crate::ai) fn build_context_overflow_pointer(text: &str, target: usize) -
     .then(|| CONTEXT_OVERFLOW_UNARCHIVED_POINTER.to_string())
 }
 
-/// Truncated tool arguments are terminal too. When archiving failed, only the
-/// preview remains; re-archiving it would falsely claim the full arguments are
-/// recoverable.
+/// Truncated tool arguments are terminal too. Re-archiving a metadata-only or
+/// legacy preview stub would falsely claim the full arguments are recoverable.
 pub(in crate::ai) fn is_context_overflow_truncated_tool_arguments(arguments: &str) -> bool {
     serde_json::from_str::<Value>(arguments)
         .ok()
@@ -633,21 +632,39 @@ pub(in crate::ai) fn build_context_overflow_tool_arguments_pointer(
         .get("archive_file_path")
         .and_then(Value::as_str)
         .filter(|path| !path.is_empty());
-    let pointer = match archived_path {
+    let mut pointer = match archived_path {
         Some(path) => serde_json::json!({
             "_context_overflow_truncated": true,
             "archive_file_path": path,
-        })
-        .to_string(),
+        }),
         None => serde_json::json!({
             "_context_overflow_truncated": true,
             "archive_file_path": Value::Null,
             "original_unavailable": true,
-        })
-        .to_string(),
+        }),
     };
+    if let Some(original_chars) = value.get("original_chars") {
+        pointer["original_chars"] = original_chars.clone();
+    }
+    let pointer = pointer.to_string();
     (pointer.chars().count() <= target && pointer.chars().count() < arguments.chars().count())
         .then_some(pointer)
+}
+
+/// Build metadata for an already-selected argument field within its target.
+pub(super) fn build_context_overflow_tool_arguments_stub(
+    original_chars: usize,
+    archive_file_path: Option<&str>,
+    target: usize,
+) -> Option<String> {
+    let pointer = serde_json::json!({
+        "_context_overflow_truncated": true,
+        "original_chars": original_chars,
+        "archive_file_path": archive_file_path,
+    })
+    .to_string();
+    let pointer_chars = pointer.chars().count();
+    (pointer_chars <= target && pointer_chars < original_chars).then_some(pointer)
 }
 
 pub(in crate::ai) fn truncate_mutable_field(
@@ -953,11 +970,9 @@ fn truncate_mutable_field_with_policy(
                 call.function.arguments = pointer;
                 return FieldTruncateOutcome::Truncated;
             }
-            // A fixed JSON prefix plus a long archive path can consume the
-            // entire target. Reject empty or near-empty previews: they contain
-            // no real argument data and can make the model replay protocol keys
-            // as tool arguments. Larger previews remain useful even when the
-            // path consumes much of the budget.
+            // Preserve the established preview-based eligibility and size checks.
+            // Preview bytes are used only for sizing; the published pointer below
+            // contains recovery metadata instead of tool payload data.
             const MIN_TOOL_ARGS_PREVIEW_CHARS: usize = 8;
             let build_truncated = |path: Option<&str>, preview: String| {
                 serde_json::json!({
@@ -1005,9 +1020,17 @@ fn truncate_mutable_field_with_policy(
             else {
                 return FieldTruncateOutcome::NoProgress;
             };
-            // Arguments must remain valid JSON; slicing the string directly
-            // would make the provider reject the request.
-            call.function.arguments = truncated;
+            // Arguments must remain valid JSON, but must not resemble a partial
+            // payload that the model can copy into a fresh call.
+            let Some(pointer) = build_context_overflow_tool_arguments_stub(
+                original_chars,
+                archive_file_path.as_deref(),
+                target,
+            ) else {
+                return FieldTruncateOutcome::target_dependent(reduce_by);
+            };
+            debug_assert!(pointer.chars().count() < truncated.chars().count());
+            call.function.arguments = pointer;
             FieldTruncateOutcome::Truncated
         }
     }
@@ -1024,9 +1047,8 @@ fn truncate_mutable_field_with_policy(
 /// body to construct follow-up edits), replace it with a
 /// `_context_overflow_truncated` pointer stub and archive the original with zero
 /// compression. Failed results, in-window results, and current-turn protected ids
-/// are never touched, so agent effectiveness does not degrade (when needed, the
-/// model can still read the original back via the stub's archive_file_path, or
-/// recognize the file's content outline from the preview).
+/// are never touched. Recovery metadata keeps the original accessible via
+/// archive_file_path; current files should be re-read for follow-up edits.
 pub(in crate::ai) fn shrink_successful_write_arguments(
     messages: &mut Vec<Message>,
     overflow_dir: Option<&Path>,

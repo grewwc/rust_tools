@@ -827,7 +827,8 @@ fn context_projection_fingerprint(
     // their author identity and existing turn boundaries.
     // v23: incremental model summaries consume bounded chronological segments,
     // retain original source ranges, and abort when any segment fails.
-    const PROJECTION_VERSION: u8 = 23;
+    // v24: archived tool arguments expose recovery metadata without payload previews.
+    const PROJECTION_VERSION: u8 = 24;
     projection_cache_key(
         PROJECTION_VERSION,
         history_max_chars,
@@ -1405,7 +1406,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_cache_key_is_versioned_and_v23_never_reuses_older_snapshots() {
+    fn projection_cache_key_is_versioned_and_v24_never_reuses_older_snapshots() {
         let params = (
             8_000usize,
             2usize,
@@ -1418,6 +1419,7 @@ mod tests {
         let v20_key = projection_cache_key(20, params.0, params.1, params.2, params.3);
         let v21_key = projection_cache_key(21, params.0, params.1, params.2, params.3);
         let v22_key = projection_cache_key(22, params.0, params.1, params.2, params.3);
+        let v23_key = projection_cache_key(23, params.0, params.1, params.2, params.3);
         assert_ne!(
             v17_key, v18_key,
             "identical projection parameters must not collide across projection versions"
@@ -1425,14 +1427,14 @@ mod tests {
         assert!(v17_key.starts_with("v17|"));
         assert!(v18_key.starts_with("v18|"));
         assert!(v19_key.starts_with("v19|"));
-        // The live fingerprint must carry v23 so older sampling-based
-        // summaries are rebuilt from canonical history.
-        // Updating the v23 literal is a deliberate tripwire for the
+        // The live fingerprint must carry v24 so old tool-argument previews
+        // are rebuilt from canonical history.
+        // Updating the v24 literal is a deliberate tripwire for the
         // next projection-strategy change.
         let live = context_projection_fingerprint(params.0, params.1, params.2, params.3);
         assert_eq!(
             live,
-            projection_cache_key(23, params.0, params.1, params.2, params.3)
+            projection_cache_key(24, params.0, params.1, params.2, params.3)
         );
         assert_ne!(live, v17_key);
         assert_ne!(live, v18_key);
@@ -1440,6 +1442,7 @@ mod tests {
         assert_ne!(live, v20_key);
         assert_ne!(live, v21_key);
         assert_ne!(live, v22_key);
+        assert_ne!(live, v23_key);
     }
 
     #[test]
