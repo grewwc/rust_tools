@@ -16,7 +16,7 @@ use super::{
 #[cfg(test)]
 use crate::ai::history::compress::summary_input::render_summary_message;
 use crate::ai::history::compress::summary_input::{
-    SUMMARY_TRANSCRIPT_MAX_CHARS, build_summary_history_input,
+    build_summary_history_input, summary_transcript_max_chars,
 };
 use crate::ai::{
     history::{
@@ -31,6 +31,7 @@ use crate::ai::{
 /// 会话标题请求的超时（秒）。后台辅助任务，用宽松超时避免阻塞主流程。
 pub(super) const SESSION_TITLE_REQUEST_TIMEOUT_SECS: u64 = 90;
 pub(super) const SESSION_TITLE_BODY_TIMEOUT_SECS: u64 = 45;
+const HISTORY_SUMMARY_USER_PREFIX: &str = "Please compress the earlier conversation below:\n\n";
 
 /// Caller-provided runtime pieces an auxiliary model request needs.
 ///
@@ -321,7 +322,7 @@ pub(crate) async fn summarize_history_via_model(
     }
 
     // Present priority-selected messages in their original chronological order.
-    let transcript = build_summary_history_input(messages, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    let transcript = build_summary_history_input(messages, app.summary_input_max_chars(max_chars));
     if transcript.is_empty() {
         return None;
     }
@@ -341,10 +342,7 @@ pub(crate) async fn summarize_history_via_model(
         },
         Message {
             role: "user".to_string(),
-            content: Value::String(format!(
-                "Please compress the earlier conversation below:\n\n{}",
-                transcript
-            )),
+            content: Value::String(format!("{HISTORY_SUMMARY_USER_PREFIX}{transcript}")),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
@@ -403,6 +401,24 @@ pub(crate) async fn summarize_history_via_model(
 }
 
 impl HistoryMessageSummarizer for App {
+    fn summary_input_max_chars(&self, summary_output_max_chars: usize) -> usize {
+        let cfg = crate::commonw::configw::get_all_config();
+        let additional = cfg.get(
+            crate::ai::config_schema::AiConfig::HISTORY_SUMMARY_PROMPT,
+            "",
+        );
+        let fixed_prompt_chars = history_summary_prompt(summary_output_max_chars, &additional)
+            .chars()
+            .count()
+            .saturating_add(HISTORY_SUMMARY_USER_PREFIX.chars().count());
+        let control_model = control_model_for_aux_tasks(self);
+        summary_transcript_max_chars(
+            models::context_window_tokens(&control_model),
+            summary_output_max_chars,
+            fixed_prompt_chars,
+        )
+    }
+
     fn summarize_history_messages<'a>(
         &'a self,
         messages: &'a [Message],

@@ -394,8 +394,10 @@ pub(super) fn prepare_tool_messages_structured(
                         .and_then(|id| id_to_tool_args.get(id))
                         .map(|args| build_tool_overflow_recall_lines(name, args))
                         .unwrap_or_default();
-                    let stub =
-                        build_preserved_tool_overflow_stub(&path, name, &text, &recall_lines);
+                    let stub = profile_compression_stage!(
+                        "prepare_preserved_stub",
+                        build_preserved_tool_overflow_stub(&path, name, &text, &recall_lines)
+                    );
                     // Anti-bloat: spilling must actually free space. Small
                     // results (e.g. a few hundred bytes of grep output) often
                     // become larger as a stub with a full preview, which only
@@ -425,7 +427,10 @@ pub(super) fn prepare_tool_messages_structured(
             continue;
         }
 
-        let summary = structured_tool_output_summary(&text, max_chars_per_msg);
+        let summary = profile_compression_stage!(
+            "prepare_structured_summary",
+            structured_tool_output_summary(&text, max_chars_per_msg)
+        );
         if !summary.is_empty() && summary != text {
             message.content = Value::String(summary);
         }
@@ -1004,20 +1009,35 @@ fn archived_asset_bare_name_from_raw(raw_path: &str, preserved_dir: &Path) -> Op
 /// requires the archived bytes to equal `expected_output` (edge-whitespace
 /// insensitive: command results are stored trimmed, so a pure `cat` matches
 /// while any transformed or multi-input result falls through to a fresh
-/// content-addressed archive). The archive count is small and candidates are
-/// already bounded by the filename pre-filter, so the extra read cost stays
-/// acceptable.
+/// content-addressed archive). Keep directory order when choosing the first
+/// byte-identical match; unmentioned regular files need no canonicalization.
 fn archived_asset_path_in_command(
     command: &str,
     overflow_dir: &Path,
     cwd: Option<&Path>,
     expected_output: &str,
 ) -> Option<PathBuf> {
+    #[cfg(test)]
+    let _stage = super::cpu_profile_tests::StageTimer::start("archive_command_lookup");
     let preserved_dir = overflow_dir
         .join(PRESERVED_TOOL_OVERFLOW_DIR)
         .canonicalize()
         .ok()?;
     for entry in std::fs::read_dir(&preserved_dir).ok()?.flatten() {
+        // A regular direct child's canonical path retains its entry name. Any
+        // mentioned absolute or nonempty relative path must contain that name.
+        // Symlinks may resolve to a different name, so keep the original checks
+        // for them, unknown file types, and non-UTF-8 names. A cwd equal to this
+        // file makes the relative path empty (which every command contains).
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| !command.contains(name))
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+            && cwd.is_none_or(|cwd| cwd != entry.path())
+        {
+            continue;
+        }
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -2409,6 +2429,10 @@ pub(super) fn spill_oversized_preserved_messages(
 #[cfg(test)]
 #[path = "preserved_spill_tests.rs"]
 mod preserved_spill_tests;
+
+#[cfg(test)]
+#[path = "cpu_hotspot_differential_tests.rs"]
+mod cpu_hotspot_differential_tests;
 
 fn structured_tool_output_summary(text: &str, max_chars: usize) -> String {
     let lines = text

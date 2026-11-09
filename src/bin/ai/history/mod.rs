@@ -11,6 +11,7 @@ mod sqlite;
 mod suspended;
 mod task_evidence;
 pub(in crate::ai) mod tool_guidance;
+pub(in crate::ai) mod turn_lease;
 mod types;
 
 /// The "model summarization" port the history compressor depends on
@@ -23,6 +24,11 @@ mod types;
 /// `Box<dyn Future + Send + '_>` could not satisfy both borrow lifetimes in
 /// type checking (`lifetime may not live long enough`).
 pub(in crate::ai) trait HistoryMessageSummarizer {
+    /// Bound for the deterministic transcript projection used by the summary
+    /// request. Implementations must apply this same bound when rendering
+    /// `messages`, so callers can reject an unrenderable batch before dispatch.
+    fn summary_input_max_chars(&self, summary_output_max_chars: usize) -> usize;
+
     fn summarize_history_messages<'a>(
         &'a self,
         messages: &'a [Message],
@@ -320,8 +326,6 @@ pub(in crate::ai) use suspended::{
     SuspendedSessionEntry, SuspendedSessionStore, current_terminal_key,
     format_suspended_timestamp_label, physical_terminal_key,
 };
-#[cfg(test)]
-pub(in crate::ai) use task_evidence::read_published_task_evidence_status_payload;
 #[cfg(test)]
 pub(in crate::ai) use task_evidence::render_unintegrated_task_evidence;
 pub(in crate::ai) use task_evidence::{

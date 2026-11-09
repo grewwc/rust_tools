@@ -194,11 +194,14 @@ pub(super) fn dedup_repeated_tool_results(
     // file are verbatim identical, delete the overlapping lines from the earlier
     // result; if any line differs (file was edited, output format changed, etc.),
     // keep both as-is.
-    dedup_overlapping_read_file_results(
-        messages,
-        &id_to_signature,
-        &protected_indices,
-        protected_tool_call_ids,
+    profile_compression_stage!(
+        "dedup_numbered_read_overlap",
+        dedup_overlapping_read_file_results(
+            messages,
+            &id_to_signature,
+            &protected_indices,
+            protected_tool_call_ids,
+        )
     );
 
     // (name, args) -> the "newest full-text-kept" tool call under that signature,
@@ -647,7 +650,6 @@ fn dedup_read_file_range_summary(args: &Value) -> Option<String> {
 pub(super) struct NumberedReadFileResult {
     message_idx: usize,
     tool_call_id: String,
-    path: String,
     lines: Vec<(usize, String)>,
 }
 
@@ -658,7 +660,10 @@ pub(super) fn dedup_overlapping_read_file_results(
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) {
     let tool_indices = tool_message_indices(messages);
-    let mut prior_results: Vec<NumberedReadFileResult> = Vec::new();
+    // Results on other paths never participate in a comparison. Each path's
+    // list retains the old chronological visitation order and mutations.
+    let mut prior_results =
+        rust_tools::commonw::FastMap::<String, Vec<NumberedReadFileResult>>::default();
 
     for idx in tool_indices {
         let Some(tool_call_id) = messages[idx].tool_call_id.as_ref() else {
@@ -675,27 +680,41 @@ pub(super) fn dedup_overlapping_read_file_results(
             continue;
         };
 
+        let is_protected =
+            protected_indices.contains(&idx) || protected_tool_call_ids.contains(tool_call_id);
+        let tool_call_id = tool_call_id.clone();
+        let prior_for_path = prior_results.entry(path).or_default();
+
         // Near-end complete tool groups must be kept verbatim, so the model does
         // not see processed just-read content in the next round.
-        if protected_indices.contains(&idx) || protected_tool_call_ids.contains(tool_call_id) {
-            prior_results.push(NumberedReadFileResult {
+        if is_protected {
+            prior_for_path.push(NumberedReadFileResult {
                 message_idx: idx,
-                tool_call_id: tool_call_id.clone(),
-                path,
+                tool_call_id,
                 lines,
             });
             continue;
         }
 
-        for prior in &mut prior_results {
+        // The later lines are immutable across this loop. Construct their
+        // last-writer-wins line-number index once, lazily on the first eligible
+        // comparison, instead of rebuilding it for every earlier result.
+        let mut later_by_number = None;
+        for prior in prior_for_path.iter_mut() {
             if protected_indices.contains(&prior.message_idx)
                 || protected_tool_call_ids.contains(&prior.tool_call_id)
-                || prior.path != path
+                || prior.lines.is_empty()
             {
                 continue;
             }
 
-            let overlapping = matching_line_numbers(&prior.lines, &lines);
+            let later_by_number = later_by_number.get_or_insert_with(|| {
+                lines
+                    .iter()
+                    .map(|(number, content)| (*number, content.as_str()))
+                    .collect::<rust_tools::commonw::FastMap<_, _>>()
+            });
+            let overlapping = matching_line_numbers(&prior.lines, later_by_number);
             if overlapping.is_empty() {
                 continue;
             }
@@ -707,10 +726,9 @@ pub(super) fn dedup_overlapping_read_file_results(
                 Value::String(render_deduped_read_file_output_lines(&prior.lines, removed));
         }
 
-        prior_results.push(NumberedReadFileResult {
+        prior_for_path.push(NumberedReadFileResult {
             message_idx: idx,
-            tool_call_id: tool_call_id.clone(),
-            path,
+            tool_call_id,
             lines,
         });
     }
@@ -741,12 +759,8 @@ fn parse_numbered_read_file_output_lines(text: &str) -> Option<Vec<(usize, Strin
 /// content is exactly identical.
 fn matching_line_numbers(
     earlier: &[(usize, String)],
-    later: &[(usize, String)],
+    later_by_number: &rust_tools::commonw::FastMap<usize, &str>,
 ) -> rustc_hash::FxHashSet<usize> {
-    let later_by_number: rustc_hash::FxHashMap<usize, &str> = later
-        .iter()
-        .map(|(number, content)| (*number, content.as_str()))
-        .collect();
     let mut matching = rustc_hash::FxHashSet::default();
     for (number, content) in earlier {
         let Some(later_content) = later_by_number.get(number) else {

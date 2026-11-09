@@ -4490,14 +4490,14 @@ function recordHistoryFailure(sid, state, key, error) {
 function scheduleHistoryRetry(sid, state) {
   const failure = state.failure;
   if (!failure || failure.key !== state.key || state.loading || sid !== sessionId
-      || failure.timer !== null || failure.retries >= HISTORY_RETRY_DELAYS_MS.length
+      || failure.timer !== null
       || navigator.onLine === false || document.visibilityState !== "visible") return;
   failure.timer = setTimeout(() => {
     failure.timer = null;
     if (sessionId !== sid || historyLoadStates.get(sid) !== state || state.failure !== failure
         || state.key !== failure.key) return;
     void retryHistory();
-  }, HISTORY_RETRY_DELAYS_MS[failure.retries]);
+  }, HISTORY_RETRY_DELAYS_MS[Math.min(failure.retries, HISTORY_RETRY_DELAYS_MS.length - 1)]);
 }
 async function retryHistory() {
   const state = historyLoadStates.get(sessionId);
@@ -4640,7 +4640,9 @@ async function loadHistory(prefetched) {
       attachLiveBox();
       if (!follow && !appendOnly) root.scrollTop = oldScrollTop;
       followOutput(follow, root);
-      // Reconciliation above removes the failure row along with other transient rows.
+      // A partial render below may not rebuild the transcript, so drop the
+      // failure row explicitly instead of relying on reconciliation.
+      if (state.failure?.row) state.failure.row.remove();
       state.key = staleKey;
       state.failure = null;
     } catch (e) {

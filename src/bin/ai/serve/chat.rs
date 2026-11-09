@@ -4911,6 +4911,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
         ctrlc::set_handler(move || handle_serve_sigint(&sigint_state))?;
     }
     let app_config = super::super::config::load_config()?;
+    let session_store = crate::ai::history::SessionStore::new(&app_config.history_file);
 
     let mut session_id = match cli.session {
         Some(id) if !id.trim().is_empty() => id.trim().to_string(),
@@ -4942,6 +4943,10 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
         },
     };
 
+    crate::ai::driver::session_open::hold_if_top_level(
+        &session_store.session_history_file(&session_id),
+        &session_id,
+    )?;
     println!("Connected to {base}, session {session_id}.");
     let use_usage = crate::ai::tools::task_tools::backends::backend_registry().use_usage();
     println!(
@@ -5054,6 +5059,13 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
             }
             "/new" => match create_session(&client, &base, &token) {
                 Ok(id) => {
+                    if let Err(err) = crate::ai::driver::session_open::hold_if_top_level(
+                        &session_store.session_history_file(&id),
+                        &id,
+                    ) {
+                        eprintln!("[serve-chat] {err}");
+                        continue;
+                    }
                     session_id = id;
                     if let Ok(mut cell) = current_session.lock() {
                         *cell = session_id.clone();
@@ -5133,6 +5145,13 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
             "/resume" => match resolve_session_ref(arg, &listed) {
                 Ok(id) => {
                     let title = listed.iter().find(|s| s.id == id).map(remote_session_title);
+                    if let Err(err) = crate::ai::driver::session_open::hold_if_top_level(
+                        &session_store.session_history_file(&id),
+                        &id,
+                    ) {
+                        eprintln!("[serve-chat] {err}");
+                        continue;
+                    }
                     session_id = id;
                     if let Ok(mut cell) = current_session.lock() {
                         *cell = session_id.clone();
@@ -5157,13 +5176,20 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
             },
             "/fork" => match fork_remote_session(&client, &base, &token, &session_id) {
                 Ok(id) => {
-                    println!("Forked '{session_id}' -> '{id}', switched to new branch.");
+                    if let Err(err) = crate::ai::driver::session_open::hold_if_top_level(
+                        &session_store.session_history_file(&id),
+                        &id,
+                    ) {
+                        eprintln!("[serve-chat] {err}");
+                        continue;
+                    }
                     session_id = id;
                     if let Ok(mut cell) = current_session.lock() {
                         *cell = session_id.clone();
                     }
                     CommandCompleter::clear_checkpoint_candidates();
                     editor.set_session_id(session_id.as_str());
+                    println!("Forked into new branch '{session_id}' and switched to it.");
                 }
                 Err(err) => eprintln!("[serve-chat] {err}"),
             },

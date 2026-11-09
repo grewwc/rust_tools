@@ -2073,7 +2073,7 @@ fn task_cancel_refuses_same_session_foreign_owner_task() {
 }
 
 #[test]
-fn orphaned_task_recovery_retains_session_scope_and_retry_collection_gate() {
+fn foreground_failure_destroys_task_and_keeps_other_sessions_isolated() {
     let _env_guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -2109,6 +2109,13 @@ fn orphaned_task_recovery_retains_session_scope_and_retry_collection_gate() {
     };
     let task = spawn(&app.session_id);
     let foreign = spawn(&other_session);
+    let destroyed = super::destroy_pending_tasks_of_dead_foreground(
+        &app.os,
+        &app.session_id,
+        owner,
+        "Failed: fixture",
+    );
+    assert_eq!(destroyed, 1);
     {
         let mut os = app.os.lock().unwrap();
         crate::ai::driver::terminate_and_cleanup(
@@ -2118,6 +2125,15 @@ fn orphaned_task_recovery_retains_session_scope_and_retry_collection_gate() {
             true,
         );
     }
+    assert!(super::with_task_entry(&task.task_id, |_| ()).is_none());
+    assert!(
+        TASK_RETRY_REGISTRY
+            .lock()
+            .unwrap()
+            .get_ref(&task.task_id)
+            .is_none()
+    );
+    super::with_task_entry(&foreign.task_id, |entry| assert_eq!(entry.owner_pid, owner)).unwrap();
     let replacement =
         app.os
             .lock()
@@ -2135,74 +2151,21 @@ fn orphaned_task_recovery_retains_session_scope_and_retry_collection_gate() {
     })
     .unwrap_err();
     assert!(foreign_wait.contains("another session"), "{foreign_wait}");
-    super::with_task_entry(&foreign.task_id, |entry| assert_eq!(entry.owner_pid, owner)).unwrap();
-    assert_eq!(
-        app.os
-            .lock()
-            .unwrap()
-            .get_process(foreign.pid)
-            .unwrap()
-            .parent_pid,
-        None
-    );
-    let before_collection = run(replacement, &|| {
-        execute_task_retry(&serde_json::json!({"task_id": &task.task_id}))
-    })
-    .unwrap_err();
-    assert!(
-        before_collection.contains("no collected terminal failure"),
-        "{before_collection}"
-    );
-    let cancelled = run(replacement, &|| {
-        execute_task_cancel(&serde_json::json!({"task_ids": [&task.task_id]}))
-    })
-    .unwrap();
-    assert!(cancelled.contains("Cancelled 1 task"), "{cancelled}");
-    let still_uncollected = run(replacement, &|| {
-        execute_task_retry(&serde_json::json!({"task_id": &task.task_id}))
-    })
-    .unwrap_err();
-    assert!(
-        still_uncollected.contains("no collected terminal failure"),
-        "{still_uncollected}"
-    );
-    let result = run(replacement, &|| {
+    let gone = run(replacement, &|| {
         execute_task_wait(&serde_json::json!({"task_ids": [&task.task_id]}))
     })
-    .unwrap();
-    assert!(result.contains("CANCELLED"), "{result}");
-    assert!(super::with_task_entry(&task.task_id, |_| ()).is_none());
-    {
-        let mut os = app.os.lock().unwrap();
-        crate::ai::driver::terminate_and_cleanup(
-            os.as_mut(),
-            replacement,
-            "Failed: fixture again".into(),
-            true,
-        );
-    }
-    let next_owner =
-        app.os
-            .lock()
-            .unwrap()
-            .begin_foreground("next".into(), "goal".into(), 10, 8, None);
-    let retried = run(next_owner, &|| {
+    .unwrap_err();
+    assert!(gone.contains("Unknown task_id"), "{gone}");
+    let no_retry = run(replacement, &|| {
         execute_task_retry(&serde_json::json!({"task_id": &task.task_id}))
     })
-    .unwrap();
-    assert!(
-        retried.contains(&format!("retry_of={}", task.task_id)),
-        "{retried}"
-    );
-    assert_eq!(
-        TASK_RETRY_REGISTRY
-            .lock()
-            .unwrap()
-            .get_ref(&task.task_id)
-            .unwrap()
-            .owner_pid,
-        next_owner
-    );
+    .unwrap_err();
+    assert!(no_retry.contains("unknown task_id"), "{no_retry}");
+    if let Ok(cancelled) = run(replacement, &|| {
+        execute_task_cancel(&serde_json::json!({"task_ids": [&task.task_id]}))
+    }) {
+        assert!(!cancelled.contains("Cancelled 1 task"), "{cancelled}");
+    }
     DRIVER_CTX.sync_scope(context, || {
         discard_tasks_for_session(&app.session_id);
         discard_tasks_for_session(&other_session);

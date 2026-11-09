@@ -670,9 +670,12 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
     cwd: Option<&Path>,
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> ContextCompressionOutcome {
-    let before_chars = messages_total_chars(&messages);
+    let before_chars = profile_compression_stage!("initial_total", messages_total_chars(&messages));
     let finish = |messages, status| {
-        ContextCompressionOutcome::new(messages, before_chars, max_chars, status)
+        profile_compression_stage!(
+            "finish_recount",
+            ContextCompressionOutcome::new(messages, before_chars, max_chars, status)
+        )
     };
     let archive_failure = if overflow_dir.is_some() {
         ContextCompressionStatus::ArchiveCommitFailed
@@ -686,30 +689,39 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
         return finish(messages, ContextCompressionStatus::Complete);
     }
 
-    redact_images_except_last(&mut messages, 1);
-    dedup_adjacent(&mut messages);
+    profile_compression_stage!("redact_images", redact_images_except_last(&mut messages, 1));
+    profile_compression_stage!("dedup_adjacent", dedup_adjacent(&mut messages));
     // dedup before offload: same rationale as shrink_messages_to_fit — avoid
     // byte-identical duplicate read_file bodies each being offloaded into a
     // unique-temp-path stub and losing the chance to fold.
-    dedup_repeated_tool_results(&mut messages, protected_tool_call_ids);
-    prepare_tool_messages_structured(
-        &mut messages,
-        480,
-        // The fallback still observes the shared per-result spill floor.
-        0,
-        KEEP_RECENT_TOOL_GROUPS,
-        overflow_dir,
-        cwd,
-        protected_tool_call_ids,
+    profile_compression_stage!(
+        "dedup_repeated_tool_results",
+        dedup_repeated_tool_results(&mut messages, protected_tool_call_ids)
     );
-    enforce_protected_precision_group_budget(
-        &mut messages,
-        KEEP_RECENT_TOOL_GROUPS,
-        max_chars / 2,
-        overflow_dir,
-        cwd,
-        protected_tool_call_ids,
-        false,
+    profile_compression_stage!(
+        "prepare_tool_messages",
+        prepare_tool_messages_structured(
+            &mut messages,
+            480,
+            // The fallback still observes the shared per-result spill floor.
+            0,
+            KEEP_RECENT_TOOL_GROUPS,
+            overflow_dir,
+            cwd,
+            protected_tool_call_ids,
+        )
+    );
+    profile_compression_stage!(
+        "precision_group_budget",
+        enforce_protected_precision_group_budget(
+            &mut messages,
+            KEEP_RECENT_TOOL_GROUPS,
+            max_chars / 2,
+            overflow_dir,
+            cwd,
+            protected_tool_call_ids,
+            false,
+        )
     );
 
     // Unconditionally spill oversized old user/image messages first (except the
@@ -718,7 +730,10 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
     // they must therefore be moved to files with zero compression before the
     // budget check, avoiding a full base64 payload on every request.
     if let Some(dir) = overflow_dir {
-        spill_oversized_preserved_messages(&mut messages, dir, max_chars);
+        profile_compression_stage!(
+            "spill_oversized_preserved",
+            spill_oversized_preserved_messages(&mut messages, dir, max_chars)
+        );
     }
 
     // Age-fold overflow stub preview bodies outside the protected tail window into
@@ -726,23 +741,37 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
     // monotonic accumulation of early read_file previews; the file_path recall
     // anchor is kept. The tail-window turn count is likewise bounded by the
     // max_chars byte cap (see keep_recent_user_turns_when_trimming).
-    let keep_recent_turns = keep_recent_user_turns_when_trimming(&messages, max_chars);
-    age_out_overflow_stub_previews(&mut messages, keep_recent_turns);
+    let keep_recent_turns = profile_compression_stage!(
+        "tail_window",
+        keep_recent_user_turns_when_trimming(&messages, max_chars)
+    );
+    profile_compression_stage!(
+        "age_overflow_previews",
+        age_out_overflow_stub_previews(&mut messages, keep_recent_turns)
+    );
     // Symmetric with plain shrink: merge user/image spill stubs outside the
     // protected tail window, preventing placeholder messages from accumulating
     // monotonically as the session grows.
-    merge_old_user_overflow_stubs(&mut messages, keep_recent_turns, overflow_dir);
+    profile_compression_stage!(
+        "merge_user_overflow_stubs",
+        merge_old_user_overflow_stubs(&mut messages, keep_recent_turns, overflow_dir)
+    );
 
     // Symmetric with shrink_messages_to_fit: proactively replace giant arguments
     // of successfully-written write_file/apply_patch calls with archive stubs
     // (the protection window and failed results are kept).
-    shrink_successful_write_arguments(&mut messages, overflow_dir, protected_tool_call_ids);
+    profile_compression_stage!(
+        "shrink_write_arguments",
+        shrink_successful_write_arguments(&mut messages, overflow_dir, protected_tool_call_ids)
+    );
 
-    let (trimmed_messages, mut evidence_window_failure) =
-        trim_compressed_tool_evidence_with_status(messages, overflow_dir);
+    let (trimmed_messages, mut evidence_window_failure) = profile_compression_stage!(
+        "trim_evidence_initial",
+        trim_compressed_tool_evidence_with_status(messages, overflow_dir)
+    );
     messages = trimmed_messages;
 
-    let mut total = messages_total_chars(&messages);
+    let mut total = profile_compression_stage!("recount_initial", messages_total_chars(&messages));
     if total <= max_chars {
         return finish(
             messages,
@@ -767,17 +796,22 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
         // — same rationale as [`shrink_messages_to_fit`], avoiding a single-group
         // fold loop that iterates dozens of rounds injecting `<empty>`
         // empty-checkpoint notes (see the e75fc2e5 session dump).
-        if fold_noncompressible_tool_groups_to_fit(
-            &mut messages,
-            max_chars,
-            overflow_dir,
-            protected_tool_call_ids,
+        if profile_compression_stage!(
+            "fold_tool_groups",
+            fold_noncompressible_tool_groups_to_fit(
+                &mut messages,
+                max_chars,
+                overflow_dir,
+                protected_tool_call_ids,
+            )
         ) {
-            let (trimmed_messages, failure) =
-                trim_compressed_tool_evidence_with_status(messages, overflow_dir);
+            let (trimmed_messages, failure) = profile_compression_stage!(
+                "trim_evidence_folded",
+                trim_compressed_tool_evidence_with_status(messages, overflow_dir)
+            );
             messages = trimmed_messages;
             evidence_window_failure = evidence_window_failure.or(failure);
-            total = messages_total_chars(&messages);
+            total = profile_compression_stage!("recount_folded", messages_total_chars(&messages));
             continue;
         }
         // Batch the consecutive drop rounds: selection inside
@@ -785,44 +819,52 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
         // `first_trim_candidate` + `Vec::remove` sequence exactly, while
         // turning O(n) rescans and O(n) memmoves per drop into one scan and
         // one splice (see the helper's doc comment for the equivalence proof).
-        if drop_trim_candidates_batch(
-            &mut messages,
-            max_chars,
-            &mut total,
-            &mut messages_before_first_drop,
-            &mut dropped,
-            &mut dropped_internal_notes,
+        if profile_compression_stage!(
+            "drop_trim_batch",
+            drop_trim_candidates_batch(
+                &mut messages,
+                max_chars,
+                &mut total,
+                &mut messages_before_first_drop,
+                &mut dropped,
+                &mut dropped_internal_notes,
+            )
         ) > 0
         {
             continue;
         }
         if let Some(dir) = overflow_dir
-            && try_spill_preserved_message_to_stub(&mut messages, dir, max_chars)
+            && profile_compression_stage!(
+                "try_spill_preserved",
+                try_spill_preserved_message_to_stub(&mut messages, dir, max_chars)
+            )
         {
-            total = messages_total_chars(&messages);
+            total = profile_compression_stage!("recount_spilled", messages_total_chars(&messages));
             continue;
         }
         break;
     }
 
     let dropped_has_user_turn = dropped.iter().any(|m| m.role == "user");
-    let internal_archive_dir =
-        match archive_internal_notes_deduplicated(&dropped_internal_notes, overflow_dir) {
-            Ok(path) => path,
-            Err(()) => {
-                return finish(
-                    messages_before_first_drop.unwrap_or(messages),
-                    archive_failure,
-                );
-            }
-        };
+    let internal_archive_dir = match profile_compression_stage!(
+        "archive_internal_notes",
+        archive_internal_notes_deduplicated(&dropped_internal_notes, overflow_dir)
+    ) {
+        Ok(path) => path,
+        Err(()) => {
+            return finish(
+                messages_before_first_drop.unwrap_or(messages),
+                archive_failure,
+            );
+        }
+    };
 
     if !dropped.is_empty() {
         if let Some(dir) = overflow_dir {
             let mut sink = OverflowSink::new(dir);
             sink.push_messages(&dropped);
 
-            if sink.flush() {
+            if profile_compression_stage!("archive_dropped_messages", sink.flush()) {
                 let file_path_str = sink.file_path().to_string_lossy().to_string();
                 let archive_note = build_overflow_placeholder(&file_path_str);
                 insert_archive_note_if_missing(&mut messages, archive_note);
@@ -833,9 +875,10 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
                     let budget = max_chars
                         .saturating_sub(messages_total_chars(&messages))
                         .min(summary_max_chars);
-                    if let Some(plan) =
+                    if let Some(plan) = profile_compression_stage!(
+                        "plan_dropped_summary",
                         plan_incremental_summary_without_app(&dropped, budget, Some(dir))
-                        && plan.commit()
+                    ) && plan.commit()
                     {
                         // Older increments and policy/checkpoint notes precede
                         // this newly removed span. Keep that chronology even
@@ -873,18 +916,28 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
 
     insert_internal_note_archive_note_if_needed(&mut messages, internal_archive_dir.as_deref());
 
-    if messages_total_chars(&messages) > max_chars {
-        truncate_mutable_messages_to_fit(
-            &mut messages,
-            max_chars,
-            overflow_dir,
-            protected_tool_call_ids,
+    if profile_compression_stage!("recount_before_truncate", messages_total_chars(&messages))
+        > max_chars
+    {
+        profile_compression_stage!(
+            "truncate_mutable",
+            truncate_mutable_messages_to_fit(
+                &mut messages,
+                max_chars,
+                overflow_dir,
+                protected_tool_call_ids,
+            )
         );
     }
 
-    keep_only_recent_reasoning_content(&mut messages);
+    profile_compression_stage!(
+        "reasoning_cleanup",
+        keep_only_recent_reasoning_content(&mut messages)
+    );
 
-    let status = if dropped.is_empty() && messages_total_chars(&messages) > max_chars {
+    let status = if dropped.is_empty()
+        && profile_compression_stage!("recount_status", messages_total_chars(&messages)) > max_chars
+    {
         ContextCompressionStatus::NoEligibleDialogue
     } else {
         ContextCompressionStatus::Complete

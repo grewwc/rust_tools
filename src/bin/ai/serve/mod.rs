@@ -1487,10 +1487,24 @@ pub(in crate::ai) async fn run_serve(
         // One entry per touched session; bounded by session count in practice.
         // Idle eviction is deferred to a later multi-instance pass.
         locks: Arc::new(Mutex::new(HashMap::new())),
+        open_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
         confirms: Arc::new(std::sync::Mutex::new(HashMap::new())),
         events: Arc::new(SessionEventBus::default()),
     };
+    // Browser open claims are renewed by the page; a tab that vanished without
+    // releasing must not pin its session forever.
+    let reaper_sessions = Arc::clone(&state.open_sessions);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            let mut sessions = reaper_sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = std::time::Instant::now();
+            sessions.retain(|_, entry| entry.expires_at > now);
+        }
+    });
     let apk_download_route = format!("/{}", android_apk_filename());
     let app = APP_ENTRY_PATHS
         .into_iter()
@@ -1529,6 +1543,9 @@ pub(in crate::ai) async fn run_serve(
         .route("/sessions/{id}", delete(delete_session))
         .route("/sessions/{id}/history", get(read_history))
         .route("/sessions/{id}/events", get(stream_session_events))
+        .route("/sessions/{id}/open", post(open_session))
+        .route("/sessions/{id}/heartbeat", post(heartbeat_session))
+        .route("/sessions/{id}/release", post(release_session))
         .route("/sessions/{id}/rewind", post(rewind_history))
         .route(
             "/sessions/{id}/checkpoints",

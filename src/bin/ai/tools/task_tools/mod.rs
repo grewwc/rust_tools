@@ -34,6 +34,7 @@ mod agent_team;
 mod backend;
 pub(crate) mod backend_session;
 pub(crate) mod backends;
+mod cascade;
 mod collect;
 mod dispatch;
 mod epoll;
@@ -52,6 +53,7 @@ mod wait;
 // visibility must match exactly: broader would not re-export (warning), and it
 // would leak `AgentManifest` (private to the tree) into a public interface.
 pub(crate) use backend::*;
+pub(crate) use cascade::*;
 pub(crate) use collect::publish_task_result;
 pub(in crate::ai::tools::task_tools) use collect::*;
 pub(crate) use dispatch::*;

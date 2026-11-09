@@ -1,11 +1,11 @@
-//! Regression scenarios for task ownership after a foreground request fails.
+//! Regression scenarios for subagent lifetime after a foreground request fails.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 use super::*;
 use crate::ai::tools::task_tools::{self, BackendId, InheritOptions, PreparedSubagentTask};
@@ -150,15 +150,18 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output
     }
 
     fn fail_foreground(&self, owner: u64, child: u64) {
-        let mut os = self.app.os.lock().unwrap();
-        terminate_and_cleanup(
-            os.as_mut(),
+        let result = "Failed: injected foreground request error".to_string();
+        let destroyed = task_tools::destroy_pending_tasks_of_dead_foreground(
+            &self.app.os,
+            &self.app.session_id,
             owner,
-            "Failed: injected foreground request error".to_string(),
-            true,
+            &result,
         );
+        assert_eq!(destroyed, 1, "the running subagent must be destroyed");
+        let mut os = self.app.os.lock().unwrap();
+        terminate_and_cleanup(os.as_mut(), owner, result, true);
         assert!(os.get_process(owner).is_none());
-        assert_eq!(os.get_process(child).unwrap().parent_pid, None);
+        assert!(os.get_process(child).is_none());
     }
 
     fn replacement(&self) -> u64 {
@@ -202,163 +205,59 @@ impl Drop for TraeCliFixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn orphaned_traecli_completion_survives_foreground_failure() {
+async fn foreground_failure_destroys_running_subagent_and_its_resources() {
     let _env_guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let mut fixture = TraeCliFixture::new();
-    let owner = fixture.app.os.lock().unwrap().begin_foreground(
-        "foreground".to_string(),
-        "fixture".to_string(),
-        10,
-        usize::MAX,
-        None,
-    );
-    let context = fixture.context();
-    let spawned = runtime_ctx::DRIVER_CTX.sync_scope(context.clone(), || {
-        runtime_ctx::TURN_IDENTITY.sync_scope((fixture.app.session_id.clone(), 0), || {
-            TASK_PID.sync_scope(Some(owner), || {
-                task_tools::spawn_subagent_kernel_task(&fixture.prepared()).unwrap()
-            })
-        })
-    });
-    let mut skills = context.skill_manifests.clone();
-    let mut agents = context.agent_manifests.clone();
-    background_dispatch::dispatch_background_batch(
-        &mut fixture.app,
-        &context.mcp_client,
-        &mut skills,
-        &mut agents,
-        &mut true,
-        1,
-    );
-    let (mut control, _) = tokio::time::timeout(Duration::from_secs(10), fixture.listener.accept())
-        .await
-        .expect("fake CLI did not start")
-        .unwrap();
-    let mut started = [0; 8];
-    control.read_exact(&mut started).await.unwrap();
-    assert_eq!(&started, b"started\n");
-    {
-        let mut os = fixture.app.os.lock().unwrap();
-        terminate_and_cleanup(
-            os.as_mut(),
-            owner,
-            "Failed: injected foreground request error".to_string(),
-            true,
-        );
-        assert!(os.get_process(owner).is_none());
-        assert_eq!(os.get_process(spawned.pid).unwrap().parent_pid, None);
-    }
+    let (owner, spawned) = fixture.start();
+    let _control = fixture.started().await;
+    fixture.fail_foreground(owner, spawned.pid);
+
     assert!(
-        !task_tools::with_task_entry(&spawned.task_id, |entry| {
-            entry.cancel_stream.load(Ordering::Acquire)
-        })
-        .unwrap()
+        task_tools::with_task_entry(&spawned.task_id, |_| ()).is_none(),
+        "the destroyed task must not stay in the registry"
     );
-    control.write_all(b"release").await.unwrap();
-    fixture
-        .wait_until(|| BG_SUBAGENT_INFLIGHT.load(Ordering::Acquire) == 0)
-        .await;
-    let new_owner = fixture.app.os.lock().unwrap().begin_foreground(
-        "foreground".to_string(),
-        "next turn".to_string(),
-        10,
-        usize::MAX,
-        None,
-    );
-    let result = runtime_ctx::DRIVER_CTX.sync_scope(fixture.context(), || {
-        runtime_ctx::TURN_IDENTITY.sync_scope((fixture.app.session_id.clone(), 1), || {
-            TASK_PID.sync_scope(Some(new_owner), || {
-                task_tools::execute_task_wait(&serde_json::json!({
-                    "task_ids": [spawned.task_id], "timeout_secs": 300
-                }))
-            })
-        })
-    });
-    eprintln!("foreground owner {owner} -> {new_owner}; CLI completed; task_wait: {result:?}");
-    let result = result.expect("the next foreground must be able to collect the orphaned task");
-    assert!(result.contains("orphaned CLI result is intact"), "{result}");
+    let os = fixture.app.os.lock().unwrap();
+    assert!(os.get_process(spawned.pid).is_none());
     assert!(
-        result.contains("11111111-1111-4111-8111-111111111111"),
-        "{result}"
-    );
-    assert!(!result.contains("IPC publication failed"), "{result}");
-    assert!(
-        crate::ai::history::task_evidence_exists(
-            &fixture.app.config.history_file,
-            &fixture.app.session_id,
-            &spawned.task_id,
-        )
-        .unwrap()
-    );
-    assert!(
-        crate::ai::history::read_published_task_evidence_status_payload(
-            &fixture.app.config.history_file,
-            &fixture.app.session_id,
-            &spawned.task_id,
-        )
-        .unwrap()
+        os.channel_meta(aios_kernel::primitives::ChannelId(
+            spawned.result_channel_id
+        ))
         .is_none()
     );
+    assert!(os.futex_load(spawned.completion_futex_addr).is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn orphaned_traecli_wait_budget_keeps_running_task_and_collects_after_adoption() {
+async fn foreground_failure_prevents_adoption_and_wait() {
     let _env_guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let mut fixture = TraeCliFixture::new();
     let (owner, spawned) = fixture.start();
-    let mut control = fixture.started().await;
+    let _control = fixture.started().await;
     fixture.fail_foreground(owner, spawned.pid);
     let replacement = fixture.replacement();
-    let wait = || {
+
+    let adopted = fixture
+        .scope_owner(replacement, || {
+            task_tools::recover_current_foreground_tasks(&fixture.app.session_id)
+        })
+        .unwrap();
+    assert!(adopted.is_empty(), "{adopted:?}");
+
+    let wait = fixture.scope_owner(replacement, || {
         task_tools::execute_task_wait(&serde_json::json!({
-            "task_ids": [&spawned.task_id], "timeout_secs": 300,
+            "task_ids": [&spawned.task_id], "timeout_secs": 1,
         }))
-    };
-    let parked = fixture.scope_owner(replacement, wait).unwrap();
-    assert!(parked.contains("reason=parked"), "{parked}");
-    fixture.scope_owner(replacement, || {
-        task_tools::expire_task_wait_states_for_test();
-        task_tools::wake_expired_task_waits();
     });
-    let elapsed = fixture.scope_owner(replacement, wait).unwrap();
-    assert!(elapsed.contains("reason=budget_elapsed"), "{elapsed}");
-    assert!(!elapsed.contains("reason=timeout"), "{elapsed}");
-    task_tools::with_task_entry(&spawned.task_id, |entry| {
-        assert_eq!(entry.owner_pid, replacement);
-        assert!(!entry.cancel_stream.load(Ordering::Acquire));
-    })
-    .unwrap();
-    {
-        let os = fixture.app.os.lock().unwrap();
-        assert_eq!(
-            os.get_process(spawned.pid).unwrap().parent_pid,
-            Some(replacement)
-        );
-        assert_eq!(
-            os.channel_meta(aios_kernel::primitives::ChannelId(
-                spawned.result_channel_id
-            ))
-            .unwrap()
-            .owner_pid,
-            Some(replacement)
-        );
-        assert_eq!(os.futex_load(spawned.completion_futex_addr).unwrap(), 0);
-    }
-    control.write_all(b"release").await.unwrap();
-    fixture
-        .wait_until(|| BG_SUBAGENT_INFLIGHT.load(Ordering::Acquire) == 0)
-        .await;
-    let result = fixture.scope_owner(replacement, wait).unwrap();
-    assert!(result.contains("orphaned CLI result is intact"), "{result}");
-    assert!(!result.contains("IPC publication failed"), "{result}");
+    let error = wait.expect_err("a destroyed task must not be collectable");
+    assert!(error.contains("Unknown task_id"), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn orphaned_traecli_cancel_stops_cli_and_continuation_waits_for_exit() {
+async fn foreground_failure_kills_external_backend_process() {
     let _env_guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -366,34 +265,15 @@ async fn orphaned_traecli_cancel_stops_cli_and_continuation_waits_for_exit() {
     let (owner, spawned) = fixture.start();
     let mut control = fixture.started().await;
     fixture.fail_foreground(owner, spawned.pid);
-    let replacement = fixture.replacement();
-    let session = "11111111-1111-4111-8111-111111111111";
-    fixture
-        .wait_until(|| task_tools::resolve_continue_target(session).is_err())
-        .await;
-    let cancelled = fixture
-        .scope_owner(replacement, || {
-            task_tools::execute_task_cancel(&serde_json::json!({"task_ids": [&spawned.task_id]}))
-        })
-        .unwrap();
-    assert!(cancelled.contains("Cancelled 1 task"), "{cancelled}");
-    assert!(
-        task_tools::with_task_entry(&spawned.task_id, |entry| entry
-            .cancel_stream
-            .load(Ordering::Acquire))
-        .unwrap()
-    );
-    let collected = fixture
-        .scope_owner(replacement, || {
-            task_tools::execute_task_wait(&serde_json::json!({"task_ids": [&spawned.task_id]}))
-        })
-        .unwrap();
-    assert!(collected.contains("CANCELLED"), "{collected}");
+
     let mut bytes = Vec::new();
     tokio::time::timeout(Duration::from_secs(10), control.read_to_end(&mut bytes))
         .await
-        .expect("cancel did not terminate the actual CLI")
+        .expect("foreground death did not terminate the external CLI")
         .unwrap();
+    fixture
+        .wait_until(|| BG_SUBAGENT_INFLIGHT.load(Ordering::Acquire) == 0)
+        .await;
     fixture
         .wait_until(|| {
             !task_tools::backend_session::task_backend_run_is_active(
@@ -402,12 +282,4 @@ async fn orphaned_traecli_cancel_stops_cli_and_continuation_waits_for_exit() {
             )
         })
         .await;
-    assert_eq!(
-        task_tools::resolve_continue_target(&spawned.task_id).unwrap(),
-        session
-    );
-    assert_eq!(
-        task_tools::resolve_continue_target(session).unwrap(),
-        session
-    );
 }

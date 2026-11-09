@@ -198,6 +198,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
   vm.runInContext(between("function setPromptValue(value, force)", "// True while the composer"), context);
   vm.runInContext(between("const DRAFT_PREFIX =", "let questionCache ="), context);
   vm.runInContext(between("const composerDrafts = new Map();", "function closeQuestionPanel("), context);
+  vm.runInContext(marked("history retry"), context);
   vm.runInContext(marked("session switch"), context);
   vm.runInContext(between("function renderSessionBar()", "// History is append-only"), context);
   vm.runInContext(marked("composer session adoption"), context);
@@ -257,7 +258,6 @@ test("desktop double-click opens the shared mark/fork/delete sheet after one mar
   assert.equal(h.configLoads(), 0);
   assert.deepEqual(h.requests, [
     { path: "/sessions/target-session/mark", method: "POST", body: { marked: true } },
-    { path: "/sessions", method: "GET", body: null },
   ]);
 });
 
@@ -280,7 +280,6 @@ test("desktop single title click toggles its mark without switching sessions", a
     assert.deepEqual(h.drawers, []);
     assert.deepEqual(h.requests, [
       { path: "/sessions/target-session/mark", method: "POST", body: { marked: !marked } },
-      { path: "/sessions", method: "GET", body: null },
     ]);
   }
 });
@@ -318,7 +317,6 @@ for (const key of ["Enter", " "]) test("desktop focused title " + JSON.stringify
     assert.equal(h.configLoads(), 0);
     assert.deepEqual(h.requests, [
       { path: "/sessions/target-session/mark", method: "POST", body: { marked: !marked } },
-      { path: "/sessions", method: "GET", body: null },
     ]);
     assert.equal(h.elements.sessionactions.hidden, true);
     h.dispatch(title, "dblclick", { detail: 0 });
@@ -367,7 +365,6 @@ for (const initiallyMarked of [false, true]) test("desktop sheet and star " + (i
     await h.dispatch(sheet ? h.elements.sessionactionmark : h.row().querySelector(".mk"), "click").done;
     assert.deepEqual(h.requests.map((request) => ({ path: request.path, method: request.method, body: request.body })), [
       { path: "/sessions/target-session/mark", method: "POST", body: { marked: !initiallyMarked } },
-      { path: "/sessions", method: "GET", body: null },
     ]);
     assert.equal(h.context.sessionId, "open-session");
     assert.equal(h.elements.prompt.value, "draft in A");

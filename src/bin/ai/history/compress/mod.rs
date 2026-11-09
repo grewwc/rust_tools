@@ -10,6 +10,16 @@ use super::types::{
     last_real_user_index, retained_turn_start, user_input_turn_count,
 };
 
+// Stage timing is enabled only by the ignored CPU profile test on its thread.
+// Normal builds expand to the original expression without any timer state.
+macro_rules! profile_compression_stage {
+    ($name:literal, $body:expr) => {{
+        #[cfg(test)]
+        let _stage = $crate::ai::history::compress::cpu_profile_tests::StageTimer::start($name);
+        $body
+    }};
+}
+
 mod dedup;
 mod incremental;
 #[cfg(test)]
@@ -497,16 +507,17 @@ use dedup::{dedup_adjacent, dedup_repeated_tool_results, keep_only_recent_reason
 pub(in crate::ai) use overflow_sink::archive_messages_to_overflow;
 pub(in crate::ai) use overflow_sink::compressed_tool_evidence_exceeds_inline_budget;
 use overflow_sink::{
-    OverflowSink, PlannedArchiveWrite,
-    archive_internal_notes_deduplicated, archive_truncated_field_to_overflow,
-    build_overflow_placeholder, content_sha256_hex, insert_internal_note_archive_note_if_needed,
-    insert_overflow_archive_note_if_exists, trim_compressed_tool_evidence_to_inline_budget,
-    trim_compressed_tool_evidence_with_status, trim_incremental_summary_notes_to_inline_budget,
-    trim_incremental_summary_notes_with_status,
+    OverflowSink, PlannedArchiveWrite, archive_internal_notes_deduplicated,
+    archive_truncated_field_to_overflow, build_overflow_placeholder, content_sha256_hex,
+    insert_internal_note_archive_note_if_needed, insert_overflow_archive_note_if_exists,
+    trim_compressed_tool_evidence_to_inline_budget, trim_compressed_tool_evidence_with_status,
+    trim_incremental_summary_notes_to_inline_budget, trim_incremental_summary_notes_with_status,
 };
 
 #[cfg(test)]
 mod coalesce_summary_notes_tests;
+#[cfg(test)]
+mod cpu_profile_tests;
 #[cfg(test)]
 mod dedup_adjacent_tests;
 #[cfg(test)]

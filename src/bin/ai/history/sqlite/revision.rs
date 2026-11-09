@@ -15,7 +15,7 @@ use super::LAST_ACTIVITY_META_KEY;
 ///
 /// `read_history_revision` runs `Connection::open` + an SQL query on every call
 /// (per-turn context cache validation + session list refresh call it several
-/// times), yet the revision only changes when messages are written. We therefore
+/// times), yet many reads happen between writes. We therefore
 /// cache the result keyed by file metadata fingerprints: any write from this
 /// process or an external one changes the len/mtime of the main DB or the WAL
 /// sidecar, so a fingerprint mismatch triggers a re-query, with semantics
@@ -45,10 +45,9 @@ fn history_file_fingerprint(path: &Path) -> ((u64, Option<SystemTime>), (u64, Op
     (main, wal)
 }
 /// Reads the history DB's write version (stored in the meta table under
-/// key='history_revision'). Every message write/delete/replace increments it via
-/// `bump_history_revision` in the same transaction, so it is a **cross-connection**
-/// monotonically increasing global signal that reliably reflects "did the DB
-/// content change".
+/// key='history_revision'). History writes and mark updates increment it in the
+/// same transaction, so it is a **cross-connection** monotonically increasing
+/// signal for history caches and prune's unchanged check.
 ///
 /// `PRAGMA data_version` cannot replace it: it is a **connection-local** comparison
 /// value — each freshly opened `Connection` treats it only as "has the DB been
@@ -131,15 +130,22 @@ pub(super) fn touch_session_activity(conn: &Connection) -> io::Result<()> {
     Ok(())
 }
 
-/// Increments the history version inside a write transaction and refreshes the
-/// logical activity time in sync.
-pub(super) fn bump_history_revision(conn: &Connection) -> io::Result<()> {
+/// Increments the history version inside a write transaction without recording
+/// session activity.
+pub(super) fn bump_history_revision_without_activity(conn: &Connection) -> io::Result<()> {
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('history_revision', '1')
          ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
         [],
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(())
+}
+
+/// Increments the history version inside a write transaction and refreshes the
+/// logical activity time in sync.
+pub(super) fn bump_history_revision(conn: &Connection) -> io::Result<()> {
+    bump_history_revision_without_activity(conn)?;
     touch_session_activity(conn)
 }
 

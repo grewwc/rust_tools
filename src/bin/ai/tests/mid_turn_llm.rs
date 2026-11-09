@@ -473,6 +473,7 @@ async fn assert_path_a_preserves_raw_archive_pointer(status: &str) {
     let (compressed, before, after, effective, inserted) =
         mid_turn_llm_summarize(app, messages, 1, 4_000, 20_000, None).await;
 
+    eprintln!("before={before} after={after} effective={effective} inserted={inserted} compressed={compressed:?}");
     assert!(after < before, "Path A should reduce earlier history");
     assert!(effective && inserted);
     assert_eq!(after, messages_total_chars_pub(&compressed));

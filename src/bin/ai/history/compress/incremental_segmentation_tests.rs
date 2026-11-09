@@ -1,9 +1,13 @@
-//! End-to-end segmentation evidence through the real summary-input renderer.
+//! End-to-end single-request evidence through the real summary-input renderer.
 
 use std::sync::Mutex;
 
-use super::summary_input::build_summary_history_input;
+use super::summary_input::{
+    SUMMARY_MESSAGE_SEPARATOR, build_summary_history_input, summary_transcript_max_chars,
+};
 use super::*;
+
+const DEFAULT_TEST_SUMMARY_INPUT_MAX_CHARS: usize = 22_000;
 
 struct TestDir(PathBuf);
 
@@ -46,14 +50,31 @@ fn side_note(text: &str, ts: u64) -> Message {
     .remove(0)
 }
 
-#[derive(Default)]
 struct Summarizer {
     calls: Mutex<Vec<Vec<Message>>>,
     failure: Option<(usize, Option<&'static str>)>,
     padding: usize,
+    entries: usize,
+    input_max_chars: usize,
+}
+
+impl Default for Summarizer {
+    fn default() -> Self {
+        Self {
+            calls: Mutex::default(),
+            failure: None,
+            padding: 0,
+            entries: 1,
+            input_max_chars: DEFAULT_TEST_SUMMARY_INPUT_MAX_CHARS,
+        }
+    }
 }
 
 impl HistoryMessageSummarizer for Summarizer {
+    fn summary_input_max_chars(&self, _summary_output_max_chars: usize) -> usize {
+        self.input_max_chars
+    }
+
     fn summarize_history_messages<'a>(
         &'a self,
         messages: &'a [Message],
@@ -73,10 +94,17 @@ impl HistoryMessageSummarizer for Summarizer {
                 .chars()
                 .take(120)
                 .collect();
-            Some(format!(
-                "Main request:\n- CHUNK_{index}: {opening}{}",
-                " detail".repeat(self.padding)
-            ))
+            Some(
+                (0..self.entries)
+                    .map(|entry| {
+                        format!(
+                            "Main request:\n- REQUEST_{index}_ENTRY_{entry}: {opening}{}",
+                            " detail".repeat(self.padding)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
         })
     }
 }
@@ -124,30 +152,35 @@ fn verify_archive(plan: &IncrementalSummaryPlan, original: &[Message]) {
     assert_eq!(restored, original);
 }
 
-fn verify_transcripts(calls: &[Vec<Message>]) {
-    assert!(!calls.is_empty());
-    for call in calls {
-        let transcript = build_summary_history_input(call, SUMMARY_TRANSCRIPT_MAX_CHARS);
-        assert!(!transcript.is_empty(), "a bounded segment must be accepted");
-        assert!(transcript.chars().count() <= SUMMARY_TRANSCRIPT_MAX_CHARS);
-        assert!(
-            !transcript.contains(SUMMARY_MESSAGE_SEPARATOR),
-            "a segment must not sample away chronological rows"
-        );
-        for note in call.iter().filter(|message| is_side_note_message(message)) {
-            assert!(transcript.contains(note.content.as_str().unwrap()));
-            assert!(transcript.contains(&format!(
-                "### SIDE-NOTE\n\n{}",
-                note.content.as_str().unwrap()
-            )));
-            assert!(is_runtime_synthetic_user_message(note));
-            assert!(!crate::ai::history::is_user_input_message(note));
-        }
+fn verify_single_bounded_request(calls: &[Vec<Message>], max_chars: usize) -> String {
+    assert_eq!(
+        calls.len(),
+        1,
+        "one compression attempt gets one model call"
+    );
+    let transcript = build_summary_history_input(&calls[0], max_chars);
+    assert!(
+        !transcript.is_empty(),
+        "the bounded request must be accepted"
+    );
+    assert!(transcript.chars().count() <= max_chars);
+    for note in calls[0]
+        .iter()
+        .filter(|message| is_side_note_message(message))
+    {
+        assert!(transcript.contains(note.content.as_str().unwrap()));
+        assert!(transcript.contains(&format!(
+            "### SIDE-NOTE\n\n{}",
+            note.content.as_str().unwrap()
+        )));
+        assert!(is_runtime_synthetic_user_message(note));
+        assert!(!crate::ai::history::is_user_input_message(note));
     }
+    transcript
 }
 
 #[tokio::test]
-async fn incremental_memory_segments_thousand_turns_with_exact_source_ranges() {
+async fn incremental_memory_uses_one_bounded_request_for_thousand_turns() {
     let dir = TestDir::new();
     let old = plan_incremental_summary(
         &[message("user", "prior evidence")],
@@ -180,47 +213,68 @@ async fn incremental_memory_segments_thousand_turns_with_exact_source_ranges() {
         ));
     }
     let original = input.clone();
-    let summarizer = Summarizer::default();
+    let input_max_chars = summary_transcript_max_chars(1_000_000, 8_000, 2_000);
+    assert_eq!(input_max_chars, 491_952);
+    let summarizer = Summarizer {
+        input_max_chars,
+        ..Default::default()
+    };
     let plan = plan_incremental_summary_with_summarizer(&summarizer, &input, 8_000, Some(&dir.0))
         .await
         .unwrap();
     assert_eq!(input, original);
     assert_eq!(input[1], prior);
     let calls = summarizer.calls.lock().unwrap();
-    assert!(calls.len() > 1);
-    verify_transcripts(&calls);
+    verify_single_bounded_request(&calls, input_max_chars);
     let supplied: Vec<Message> = calls.iter().flatten().cloned().collect();
     assert_eq!(supplied, summary_delta_messages(&original));
     assert!(supplied.contains(&early_note));
     assert!(!supplied.iter().any(is_summary_message));
     let record = record(&plan);
-    assert_eq!(record["summary_input"]["segments"], calls.len());
-    assert_eq!(record["summary_input"]["max_segment_chars"], 22_000);
+    assert_eq!(record["summary_input"]["requests"], 1);
+    assert_eq!(
+        record["summary_input"]["max_request_chars"],
+        input_max_chars
+    );
+    assert_eq!(record["summary_input"]["source_messages"], supplied.len());
+    assert_eq!(
+        record["summary_input"]["selection"],
+        "bounded_priority_sample"
+    );
     let entries = record["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), calls.len());
-    for (index, (entry, call)) in entries.iter().zip(calls.iter()).enumerate() {
-        let start = original
-            .iter()
-            .position(|message| message == &call[0])
-            .unwrap()
-            + 1;
-        let end = original
-            .iter()
-            .position(|message| message == call.last().unwrap())
-            .unwrap()
-            + 1;
-        assert_eq!(entry["segment"], index + 1);
-        assert_eq!(entry["source_range"]["start_line"], start);
-        assert_eq!(entry["source_range"]["end_line"], end);
-        assert_eq!(entry["status"], "derived_unverified");
-    }
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["status"], "derived_unverified");
     assert!(entries[0]["text"].as_str().unwrap().contains("ROUND_0000"));
     assert!(value_to_string(&plan.message().content).chars().count() <= 8_000);
     verify_archive(&plan, &original);
 }
 
 #[tokio::test]
-async fn incremental_memory_segments_oversized_side_note_without_losing_unicode_body() {
+async fn incremental_memory_oversized_source_uses_one_bounded_sampled_request() {
+    let dir = TestDir::new();
+    let input_max_chars = summary_transcript_max_chars(32_000, 8_000, 2_000);
+    assert_eq!(input_max_chars, 7_952);
+    let summarizer = Summarizer {
+        input_max_chars,
+        ..Default::default()
+    };
+    let input: Vec<_> = (0..120)
+        .map(|index| message("user", format!("turn-{index:03}-{}", "x".repeat(100))))
+        .collect();
+
+    let plan =
+        plan_incremental_summary_with_summarizer(&summarizer, &input, 8_000, Some(dir.0.as_path()))
+            .await
+            .unwrap();
+    let calls = summarizer.calls.lock().unwrap();
+    let transcript = verify_single_bounded_request(&calls, input_max_chars);
+    assert_eq!(calls[0], input);
+    assert!(transcript.contains(SUMMARY_MESSAGE_SEPARATOR));
+    verify_archive(&plan, &input);
+}
+
+#[tokio::test]
+async fn incremental_memory_refuses_oversized_side_note_without_model_calls() {
     let dir = TestDir::new();
     let body = format!(
         "OPENING_CONSTRAINT\n{}\nMIDDLE_CONDITION\n{}\nFINAL_CONCLUSION",
@@ -228,58 +282,24 @@ async fn incremental_memory_segments_oversized_side_note_without_losing_unicode_
         "🦀".repeat(30_000)
     );
     let note = side_note(&body, 43);
-    let header = note.content.as_str().unwrap().split_once("\n\n").unwrap().0;
     let input = vec![
         message("user", "opening request"),
         note.clone(),
         message("assistant", "continuation"),
     ];
     let summarizer = Summarizer::default();
-    let plan = plan_incremental_summary_with_summarizer(&summarizer, &input, 8_000, Some(&dir.0))
-        .await
-        .unwrap();
-    let calls = summarizer.calls.lock().unwrap();
-    verify_transcripts(&calls);
-    let fragments: Vec<&Message> = calls
-        .iter()
-        .flatten()
-        .filter(|message| is_side_note_message(message))
-        .collect();
-    assert!(fragments.len() > 1);
-    let mut restored_body = String::new();
-    for fragment in fragments {
-        let text = fragment.content.as_str().unwrap();
-        assert!(text.starts_with(&format!("{header}\n\n")));
-        assert!(text.ends_with("FINAL_CONCLUSION"));
-        assert_eq!(fragment.role, note.role);
-        assert_eq!(fragment.reasoning_content, note.reasoning_content);
-        let (_, continuation) = text.split_once("\n\n").unwrap();
-        let (notice, remainder) = continuation.split_once('\n').unwrap();
-        assert!(notice.contains("source line 2"));
-        let (piece, _) = remainder
-            .rsplit_once("\n\n[Side-note ending repeated for context]\n")
-            .unwrap();
-        restored_body.push_str(piece);
-    }
-    assert_eq!(restored_body, body);
-    let record = record(&plan);
-    assert_eq!(record["summary_input"]["partial_side_note"], true);
-    assert_eq!(
-        record["reuse_guard"],
-        "partial_draft_recover_source_before_using_judgments"
+    assert!(
+        plan_incremental_summary_with_summarizer(&summarizer, &input, 8_000, Some(&dir.0))
+            .await
+            .is_none()
     );
-    for entry in record["entries"].as_array().unwrap() {
-        let index = entry["segment"].as_u64().unwrap() as usize - 1;
-        if calls[index].iter().any(is_side_note_message) {
-            assert!(entry["source_range"]["start_line"].as_u64().unwrap() <= 2);
-            assert!(entry["source_range"]["end_line"].as_u64().unwrap() >= 2);
-        }
-    }
-    verify_archive(&plan, &input);
+    assert!(summarizer.calls.lock().unwrap().is_empty());
+    assert!(!dir.0.join(SOURCE_DIR).exists());
+    assert_eq!(input[1], note);
 }
 
 #[tokio::test]
-async fn incremental_memory_segment_failure_preserves_old_summary_and_source_span() {
+async fn incremental_memory_single_request_failure_preserves_old_summary_and_source_span() {
     let dir = TestDir::new();
     let old = plan_incremental_summary(
         &[message("user", "old source")],
@@ -292,16 +312,16 @@ async fn incremental_memory_segment_failure_preserves_old_summary_and_source_spa
     let prior = old.message().clone();
     let input = vec![
         prior.clone(),
-        side_note(&"a".repeat(18_000), 1),
-        side_note(&"b".repeat(18_000), 2),
-        side_note(&"c".repeat(18_000), 3),
+        message("user", "a".repeat(18_000)),
+        message("assistant", "b".repeat(18_000)),
+        message("user", "c".repeat(18_000)),
     ];
     let original = input.clone();
     let old_bytes = std::fs::read(&old.archive_path).unwrap();
     // Cover transport failure, empty output, and a draft with no usable entries.
     for response in [None, Some(" \n\t"), Some("Main request:\n- none")] {
         let summarizer = Summarizer {
-            failure: Some((1, response)),
+            failure: Some((0, response)),
             ..Default::default()
         };
         assert!(
@@ -309,7 +329,7 @@ async fn incremental_memory_segment_failure_preserves_old_summary_and_source_spa
                 .await
                 .is_none()
         );
-        assert_eq!(summarizer.calls.lock().unwrap().len(), 2);
+        assert_eq!(summarizer.calls.lock().unwrap().len(), 1);
         assert_eq!(input, original);
         assert_eq!(input[0], prior);
         assert_eq!(std::fs::read(&old.archive_path).unwrap(), old_bytes);
@@ -321,33 +341,37 @@ async fn incremental_memory_segment_failure_preserves_old_summary_and_source_spa
 }
 
 #[tokio::test]
-async fn incremental_memory_segment_output_cap_keeps_opening_and_archives_omitted_entries() {
+async fn incremental_memory_single_request_output_cap_archives_omitted_entries() {
     let dir = TestDir::new();
     let input: Vec<Message> = (0..18)
-        .map(|index| {
-            side_note(
-                &format!("ORIGINAL_{index} {} END_{index}", "x".repeat(18_000)),
-                index,
-            )
-        })
+        .map(|index| message("user", format!("ORIGINAL_{index} {}", "x".repeat(18_000))))
         .collect();
     let summarizer = Summarizer {
         padding: 60,
+        entries: 18,
         ..Default::default()
     };
     let plan = plan_incremental_summary_with_summarizer(&summarizer, &input, 4_000, Some(&dir.0))
         .await
         .unwrap();
     let calls = summarizer.calls.lock().unwrap();
-    assert_eq!(calls.len(), input.len());
-    verify_transcripts(&calls);
+    verify_single_bounded_request(&calls, DEFAULT_TEST_SUMMARY_INPUT_MAX_CHARS);
+    assert_eq!(calls[0], input);
     let record = record(&plan);
     let entries = record["entries"].as_array().unwrap();
-    assert!(entries.len() < calls.len());
-    assert_eq!(entries.first().unwrap()["segment"], 1);
-    assert_eq!(entries.last().unwrap()["segment"], 18);
-    assert_eq!(entries.first().unwrap()["source_range"]["start_line"], 1);
-    assert_eq!(entries.last().unwrap()["source_range"]["end_line"], 18);
+    assert!(entries.len() < 18);
+    assert!(
+        entries.first().unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("ENTRY_0")
+    );
+    assert!(
+        entries.last().unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("ENTRY_17")
+    );
     assert_eq!(record["omitted_entries"], true);
     assert_eq!(
         record["reuse_guard"],
@@ -358,9 +382,9 @@ async fn incremental_memory_segment_output_cap_keeps_opening_and_archives_omitte
 }
 
 #[tokio::test]
-async fn incremental_memory_segment_refuses_oversized_identity_before_model_calls() {
+async fn incremental_memory_single_request_refuses_oversized_identity_before_model_calls() {
     let dir = TestDir::new();
-    let author = "x".repeat(SUMMARY_TRANSCRIPT_MAX_CHARS);
+    let author = "x".repeat(DEFAULT_TEST_SUMMARY_INPUT_MAX_CHARS);
     let note = crate::ai::history::runtime_synthetic_user_message(Value::String(format!(
         "[side-note from={author} ts=44] Live guidance (side-note) from upstream agent `{author}`\n\nKeep the conclusion"
     )));
@@ -378,7 +402,7 @@ async fn incremental_memory_segment_refuses_oversized_identity_before_model_call
 }
 
 #[tokio::test]
-async fn incremental_memory_segment_keeps_tool_metadata_and_archives_all_excerpts() {
+async fn incremental_memory_single_request_keeps_tool_metadata_and_archives_all_excerpts() {
     let dir = TestDir::new();
     let call: Message = serde_json::from_value(serde_json::json!({
         "role": "assistant", "content": "inspect tool evidence",
@@ -396,8 +420,8 @@ async fn incremental_memory_segment_keeps_tool_metadata_and_archives_all_excerpt
         .await
         .unwrap();
     let calls = summarizer.calls.lock().unwrap();
-    verify_transcripts(&calls);
-    let transcript = build_summary_history_input(&calls[0], SUMMARY_TRANSCRIPT_MAX_CHARS);
+    verify_single_bounded_request(&calls, DEFAULT_TEST_SUMMARY_INPUT_MAX_CHARS);
+    let transcript = build_summary_history_input(&calls[0], DEFAULT_TEST_SUMMARY_INPUT_MAX_CHARS);
     assert!(transcript.contains("id=read-1"));
     assert!(transcript.contains("name=read_file"));
     assert!(transcript.contains("Tool result for call id: read-1"));

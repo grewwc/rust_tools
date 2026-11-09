@@ -1184,6 +1184,19 @@ pub(in crate::ai::driver) async fn run_turn(
     one_shot_mode: bool,
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
+    // A session's SQLite file is writable by every process that opens it; the
+    // serve daemon's per-session mutex only covers requests inside one daemon.
+    // Hold a cross-process lease for the whole turn so a turn child that
+    // outlives its daemon cannot race a new turn on the same history. Subagent
+    // turns own private history files, so only top-level turns take the lease.
+    let _turn_lease = if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0 {
+        crate::ai::history::turn_lease::TurnLease::acquire_for_history(
+            &app.session_history_file,
+            &app.session_id,
+        )?
+    } else {
+        None
+    };
     // Hot-reload config + theme at the turn boundary so `ai.theme` /
     // `ai.theme.file` edits (or edits to a custom theme JSON) apply on the
     // next user message without restarting the long-lived agent process.

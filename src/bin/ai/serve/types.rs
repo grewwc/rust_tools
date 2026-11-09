@@ -40,6 +40,123 @@ pub(crate) struct ServeState {
     /// numbers so a page that lost its stream can replay progress, including a
     /// pending native or confirmation request.
     pub(crate) events: Arc<SessionEventBus>,
+    /// Session id -> the one browser client that currently has the session
+    /// open. The lease lives as long as that client's event stream does, so a
+    /// second tab fails closed instead of attaching a second view.
+    pub(crate) open_sessions: Arc<std::sync::Mutex<HashMap<String, OpenSession>>>,
+}
+
+#[cfg(feature = "serve")]
+#[derive(Debug)]
+pub(crate) struct OpenSession {
+    pub(crate) owner: String,
+    pub(crate) expires_at: std::time::Instant,
+    pub(crate) _lease: crate::ai::history::turn_lease::SessionOpenLease,
+}
+
+const OPEN_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Claim the single browser open slot for `session_id`. The same client may
+/// renew (reload, reconnect) by presenting the same token; a different client
+/// is rejected while the first still holds the slot. A claim that stops
+/// heartbeating expires after [`OPEN_SESSION_TTL`].
+#[cfg(feature = "serve")]
+pub(crate) fn claim_web_session(
+    state: &ServeState,
+    session_id: &str,
+    client: &str,
+) -> Result<(), String> {
+    let mut sessions = state
+        .open_sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    if let Some(entry) = sessions.get_mut(session_id) {
+        if entry.expires_at > now {
+            if entry.owner == client {
+                entry.expires_at = now + OPEN_SESSION_TTL;
+                return Ok(());
+            }
+            return Err(format!(
+                "session '{session_id}' is already open in another terminal or browser"
+            ));
+        }
+        sessions.remove(session_id);
+    }
+    let history_file =
+        crate::ai::history::SessionStore::new(&state.history_file).session_history_file(session_id);
+    let lease = crate::ai::history::turn_lease::SessionOpenLease::acquire_for_history(
+        &history_file,
+        session_id,
+    )
+    .map_err(|err| err.to_string())?
+    .ok_or_else(|| format!("session '{session_id}' history is not a shared SQLite database"))?;
+    sessions.insert(
+        session_id.to_string(),
+        OpenSession {
+            owner: client.to_string(),
+            expires_at: now + OPEN_SESSION_TTL,
+            _lease: lease,
+        },
+    );
+    Ok(())
+}
+
+#[cfg(feature = "serve")]
+pub(crate) fn heartbeat_web_session(
+    state: &ServeState,
+    session_id: &str,
+    client: &str,
+) -> Result<(), String> {
+    let mut sessions = state
+        .open_sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match sessions.get_mut(session_id) {
+        Some(entry) if entry.owner == client => {
+            entry.expires_at = std::time::Instant::now() + OPEN_SESSION_TTL;
+            Ok(())
+        }
+        Some(_) => Err(format!(
+            "session '{session_id}' is already open in another terminal or browser"
+        )),
+        None => Err(format!("session '{session_id}' is not open")),
+    }
+}
+
+#[cfg(feature = "serve")]
+pub(crate) fn release_web_session(state: &ServeState, session_id: &str, client: &str) {
+    let mut sessions = state
+        .open_sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let owned = sessions
+        .get(session_id)
+        .is_some_and(|entry| entry.owner == client);
+    if owned {
+        sessions.remove(session_id);
+    }
+}
+
+#[cfg(feature = "serve")]
+pub(crate) fn verify_web_session(
+    state: &ServeState,
+    session_id: &str,
+    client: &str,
+) -> Result<(), String> {
+    let sessions = state
+        .open_sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match sessions.get(session_id) {
+        Some(entry) if entry.owner == client && entry.expires_at > std::time::Instant::now() => {
+            Ok(())
+        }
+        Some(_) => Err(format!(
+            "session '{session_id}' is already open in another terminal or browser"
+        )),
+        None => Err(format!("session '{session_id}' is not open")),
+    }
 }
 
 /// One retained SSE event from a running turn.

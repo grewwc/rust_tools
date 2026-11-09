@@ -199,14 +199,13 @@ test("sidebar stars reflect marked state and expose the matching accessible acti
   }
 });
 
-test("a star marks its session through the authenticated API and refreshes without switching", async () => {
+test("a star marks its session through the authenticated API and updates the cached rail without switching", async () => {
   const h = harness(), star = h.row().querySelector(".mk");
   const click = h.dispatch(star, "click");
   assert.equal(click.event.stopped, true);
   await click.done;
   assert.deepEqual(h.requests.map(({ path, method, body }) => ({ path, method, body })), [
     { path: "/sessions/target-session/mark", method: "POST", body: { marked: true } },
-    { path: "/sessions", method: "GET", body: null },
   ]);
   assert.equal(h.requests[0].headers.Authorization, "Bearer test-token");
   assert.equal(h.requests[0].headers["Content-Type"], "application/json");
@@ -215,6 +214,33 @@ test("a star marks its session through the authenticated API and refreshes witho
   assert.deepEqual(h.switches, []);
   assert.equal(h.historyLoads(), 0);
   assert.equal(h.configLoads(), 0);
+});
+
+for (const marked of [false, true]) test("desktop " + (marked ? "unmarking" : "marking") + " a middle session keeps the rendered rail order", async () => {
+  const items = [...sessions(marked), { id: "older-session", summary: "Older session", marked: false, size_bytes: 1024 }];
+  const h = harness({
+    phone: false, items: [...items].reverse(), cachedItems: items,
+    // Persisting a mark makes the target the newest item in store order.
+    sessionsGet: () => response([items[2], items[0], { ...items[1], marked: !marked }]),
+  });
+  const rowOrder = () => h.elements.sesslist.children.map((li) => li.querySelector("span").textContent);
+  const expectedOrder = ["Open session", "Target session", "Older session"];
+  assert.deepEqual(rowOrder(), expectedOrder);
+
+  await h.dispatch(h.row().querySelector(".mk"), "click").done;
+
+  assert.deepEqual(rowOrder(), expectedOrder, "mark changes must keep every rendered row in place");
+  const star = h.row().querySelector(".mk");
+  assert.equal(star.textContent, marked ? "☆" : "★");
+  assert.equal(star.getAttribute("aria-pressed"), String(!marked));
+  assert.equal(star.getAttribute("aria-label"), marked ? "标记会话" : "取消标记");
+  assert.equal(h.row("open-session").querySelector(".mk").getAttribute("aria-pressed"), "false");
+  assert.equal(h.row("older-session").querySelector(".mk").getAttribute("aria-pressed"), "false");
+  assert.deepEqual(h.requests.map(({ path, method, body }) => ({ path, method, body })), [
+    { path: "/sessions/target-session/mark", method: "POST", body: { marked: !marked } },
+  ]);
+  assert.equal(h.context.sessionId, "open-session");
+  assert.deepEqual(h.switches, []);
 });
 
 test("unmarking the current session refreshes the existing session-bar star", async () => {
@@ -241,7 +267,7 @@ for (const marked of [false, true]) test("a failed " + (marked ? "unmark" : "mar
   assert.deepEqual(h.switches, []);
 });
 
-test("a pending mark leaves the old star visible until the server response and refresh", async () => {
+test("a pending mark leaves the old star visible until the server response", async () => {
   let release;
   const pending = new Promise((resolve) => { release = resolve; });
   const h = harness({ beforeMark: () => pending }), star = h.row().querySelector(".mk");
@@ -299,7 +325,7 @@ for (const marked of [false, true]) test("the phone sheet offers " + (marked ? "
   await h.dispatch(h.elements.sessionactionmark, "click").done;
   assert.equal(h.elements.sessionactions.hidden, true);
   assert.deepEqual(h.requests[0].body, { marked: !marked });
-  assert.equal(h.requests[1].path, "/sessions");
+  assert.equal(h.requests.length, 1);
   assert.equal(h.row().querySelector(".mk").getAttribute("aria-pressed"), String(!marked));
   assert.equal(h.context.sessionId, "open-session");
   assert.deepEqual(h.switches, []);
@@ -388,7 +414,6 @@ for (const phone of [false, true]) test(phone ? "phone title and row clicks sele
       assert.equal(h.row().querySelector(".mk").getAttribute("aria-pressed"), "true");
       assert.deepEqual(h.requests.map(({ path, method, body }) => ({ path, method, body })), [
         { path: "/sessions/target-session/mark", method: "POST", body: { marked: true } },
-        { path: "/sessions", method: "GET", body: null },
       ]);
       assert.deepEqual(h.switches, []);
       assert.equal(h.historyLoads(), 0);
@@ -431,7 +456,6 @@ for (const phone of [false, true]) test((phone ? "phone" : "desktop") + " sessio
       assert.equal(h.row().querySelector(".mk").getAttribute("aria-pressed"), "true");
       assert.deepEqual(h.requests.map(({ path, method, body }) => ({ path, method, body })), [
         { path: "/sessions/target-session/mark", method: "POST", body: { marked: true } },
-        { path: "/sessions", method: "GET", body: null },
       ]);
       assert.deepEqual(h.switches, []);
       assert.equal(h.historyLoads(), 0);

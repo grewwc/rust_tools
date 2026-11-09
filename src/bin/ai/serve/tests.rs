@@ -49,10 +49,37 @@ fn lifecycle_test_state() -> super::ServeState {
         token: String::new(),
         cwds: Default::default(),
         locks: Default::default(),
+        open_sessions: Default::default(),
         active_turns: Default::default(),
         confirms: Default::default(),
         events: Default::default(),
     }
+}
+
+#[test]
+fn web_open_slot_allows_owner_reattach_and_rejects_a_second_client() {
+    let root = std::env::temp_dir().join(format!(
+        "a-open-slot-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).expect("create temp root");
+    let state = ServeState {
+        history_file: root.join("history.sqlite"),
+        token: String::new(),
+        cwds: Default::default(),
+        locks: Default::default(),
+        open_sessions: Default::default(),
+        active_turns: Default::default(),
+        confirms: Default::default(),
+        events: Default::default(),
+    };
+    claim_web_session(&state, "session-a", "tab-a").expect("first open");
+    claim_web_session(&state, "session-a", "tab-a").expect("owner renew");
+    let err = claim_web_session(&state, "session-a", "tab-b").expect_err("second tab");
+    assert!(err.contains("already open"), "{err}");
+    release_web_session(&state, "session-a", "tab-a");
+    claim_web_session(&state, "session-a", "tab-b").expect("after release");
 }
 
 /// Preview-path resolution is the security-bearing piece of
@@ -219,6 +246,7 @@ async fn file_route_serves_images_and_guards_access() {
         token: "t".to_string(),
         cwds: Default::default(),
         locks: Default::default(),
+        open_sessions: Default::default(),
         active_turns: Default::default(),
         confirms: Default::default(),
         events: Default::default(),
@@ -426,11 +454,12 @@ async fn session_events_stream_ends_with_the_terminal_marker() {
     let log = state.events.begin("s-finished");
     log.publish("thinking", r#"{"text":"hi"}"#);
     log.finish();
+    claim_web_session(&state, "s-finished", "test").expect("claim finished");
     let response = stream_session_events(
         State(state.clone()),
         HeaderMap::new(),
         Path("s-finished".to_string()),
-        Query(EventsQuery { after: 0 }),
+        Query(EventsQuery { after: 0, client: "test".to_string() }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -446,11 +475,12 @@ async fn session_events_stream_ends_with_the_terminal_marker() {
     // A session with no event log at all: still a terminal marker, not a 404.
     // A 404 is indistinguishable from a lost stream, which is what made
     // clients re-attach forever.
+    claim_web_session(&state, "s-missing", "test").expect("claim missing");
     let response = stream_session_events(
         State(state),
         HeaderMap::new(),
         Path("s-missing".to_string()),
-        Query(EventsQuery { after: 0 }),
+        Query(EventsQuery { after: 0, client: "test".to_string() }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);

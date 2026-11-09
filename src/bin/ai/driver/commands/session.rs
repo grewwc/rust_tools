@@ -265,6 +265,7 @@ fn switch_app_to_session(
     require_existing: bool,
 ) -> std::io::Result<()> {
     let history_file = store.session_history_file(session_id);
+    crate::ai::driver::session_open::hold_if_top_level(&history_file, session_id)?;
     if let Err((path, err)) = crate::ai::driver::session_pid::mark_session_pid(
         store.sessions_root(),
         session_id,
@@ -3580,8 +3581,8 @@ mod tests {
             )
             .unwrap();
         }
-        // Mark first: persisting the mark refreshes activity time, so the
-        // backdate below must come after.
+        // Marking preserves activity time; backdate both sessions below to verify
+        // that pruning keeps stale sessions when they are marked.
         store
             .write_session_mark("sess-marked-old", true, MarkMessageUpdate::Set("keep me"))
             .unwrap();

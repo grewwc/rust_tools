@@ -8,6 +8,7 @@ const { test } = require("node:test");
 
 const html = fs.readFileSync(path.join(__dirname, "app.html"), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+const historyRetrySrc = script.slice(script.indexOf("// BEGIN history retry"), script.indexOf("// END history retry"));
 const userOriginHelpers = script.slice(script.indexOf("function isRuntimeSyntheticUser("), script.indexOf("const PHONE_LAYOUT_QUERY"));
 // The layout-hold helpers are shared by the composer and the turn state; the
 // slices below run on their own, so they carry the helpers with them.
@@ -118,6 +119,7 @@ test("drafts persist independently for each session and restore on switch", () =
     isPhoneLayout: () => true,
   });
   vm.runInContext(layoutHoldSrc, context);
+  vm.runInContext(historyRetrySrc, context);
   vm.runInContext('const DRAFT_PREFIX = "serve.draft."; let questionCache = null; let sessionId = "alpha";\n' + script.slice(start, end), context);
   context.switchSession("beta");
   assert.equal(values.get("serve.draft.alpha"), "alpha draft");
@@ -1252,6 +1254,7 @@ function historyHarness({
   });
   const start = script.indexOf("async function loadHistory(");
   const end = script.indexOf("// Historical user inputs", start);
+  vm.runInContext(historyRetrySrc, context);
   vm.runInContext(script.slice(start, end), context);
   vm.runInContext(script.slice(script.indexOf("function attachLiveBox("), script.indexOf("// A turn the user has left")), context);
   return {

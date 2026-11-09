@@ -66,6 +66,7 @@ pub mod print;
 mod process_context;
 pub mod reflection;
 pub mod runtime_ctx;
+pub mod session_open;
 mod scheduler;
 mod session;
 pub mod session_pid;
@@ -444,6 +445,13 @@ pub(in crate::ai) async fn run_with_cli(
     config.history_file = startup_choice.history_file.clone();
     let session_store = SessionStore::new(config.history_file.as_path());
     let session_id = startup_choice.session_id.clone();
+    // One client per session: a second terminal or browser tab must not open
+    // the same history. Serve turn children and subagents skip this; their
+    // parent client already owns the session and the turn lease covers writes.
+    session_open::hold_if_top_level(
+        &session_store.session_history_file(&session_id),
+        &session_id,
+    )?;
     let startup_notice = startup_choice.startup_notice.clone();
 
     // Handle --clear --session <id>: clear the history and checkpoint of the given
@@ -879,9 +887,18 @@ async fn run_foreground_resume(
             }
         }
         Err(err) => {
+            let result = format!("Failed: {}", err);
+            // A dead foreground must not leave subagents running: they would keep mutating the
+            // workspace, and the next turn could adopt them and continue abandoned work.
+            crate::ai::tools::task_tools::destroy_pending_tasks_of_dead_foreground(
+                &app.os,
+                &app.session_id,
+                pid,
+                &result,
+            );
             let mut os = app.os.lock().unwrap();
             record_scheduler_outcome(os.as_mut(), pid, DispatchOutcomeTag::Failed);
-            terminate_and_cleanup(os.as_mut(), pid, format!("Failed: {}", err), true);
+            terminate_and_cleanup(os.as_mut(), pid, result, true);
         }
     }
 }
@@ -1041,6 +1058,10 @@ async fn run_loop(
     let mut subagent_status_line = SubagentStatusLine::new();
 
     let cleanup_one_shot = |app: &App| {
+        // Session ending: destroy subagents that are still running. Nobody can collect their
+        // results after the main loop returns, and a blocked external backend would otherwise
+        // keep the process alive during Tokio runtime shutdown.
+        crate::ai::tools::task_tools::discard_tasks_for_session(&app.session_id);
         // Session ending: clean up background process groups left by this session (e.g.
         // resident services spawned via `python app.py &`). Every exit path goes
         // through this closure, so this is the unified safety net.
@@ -1714,13 +1735,26 @@ async fn run_loop(
                 outcome
             }
             Err(err) => {
+                let result = format!("Failed: {}", err);
+                let dead_pid = fg_pid.or_else(|| app.os.lock().unwrap().current_process_id());
+                if let Some(pid) = dead_pid {
+                    // A dead foreground must not leave subagents running: they would keep mutating
+                    // the workspace, and the next turn could adopt them and continue abandoned work.
+                    crate::ai::tools::task_tools::destroy_pending_tasks_of_dead_foreground(
+                        &app.os,
+                        &app.session_id,
+                        pid,
+                        &result,
+                    );
+                }
                 let mut os = app.os.lock().unwrap();
                 if let Some(pid) = fg_pid {
                     record_scheduler_outcome(os.as_mut(), pid, DispatchOutcomeTag::Failed);
-                    terminate_and_cleanup(os.as_mut(), pid, format!("Failed: {}", err), true);
+                    terminate_and_cleanup(os.as_mut(), pid, result, true);
                 } else {
-                    os.terminate_current(format!("Failed: {}", err));
+                    os.terminate_current(result);
                 }
+                drop(os);
                 app.session_history_file = original_history_file;
                 crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
                     "[Error] 当前轮请求失败：{}",

@@ -77,7 +77,7 @@ fn value_byte_len(value: &Value) -> Option<usize> {
 
 /// Cross-checks a cached entry against a fresh count so a stale cache fails
 /// loudly in tests instead of silently changing which field gets truncated.
-#[cfg(test)]
+#[cfg(all(test, debug_assertions))]
 fn debug_assert_field_counts(entry: &FieldCountEntry, message: &Message) {
     let fresh = MessageFieldCounts::entry(message);
     assert_eq!(entry.content_chars, fresh.content_chars);
@@ -218,7 +218,7 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
                     continue;
                 }
                 let counts_entry = counts.refresh(index, message);
-                #[cfg(test)]
+                #[cfg(all(test, debug_assertions))]
                 debug_assert_field_counts(counts_entry, message);
                 let content_chars = counts_entry.content_chars;
                 if !message_contains_image(&message.content)

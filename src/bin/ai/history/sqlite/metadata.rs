@@ -8,7 +8,9 @@ use super::super::sessions::is_preserved_content_message;
 use super::connection::{open_history_db, open_history_db_read_only};
 use super::lock::with_session_state_lock;
 use super::migrations::init_history_schema;
-use super::revision::{read_i64_meta_from_conn, touch_session_activity};
+use super::revision::{
+    bump_history_revision_without_activity, read_i64_meta_from_conn, touch_session_activity,
+};
 use super::store::{SessionListMetadata, decode_message_content, decode_tool_calls};
 use super::{
     LAST_ACTIVITY_META_KEY, SESSION_ARCHIVED_META_KEY, SESSION_DEFAULT_SKILLS_META_KEY,
@@ -213,7 +215,7 @@ pub(in crate::ai) fn read_session_archived_sqlite(path: &Path) -> io::Result<boo
 }
 
 /// Persist the formal-archive flag in one lock + one transaction.
-/// Like the mark write, it refreshes the session activity clock, so an
+/// It refreshes the session activity clock, so an
 /// archive racing a prune confirmation is caught by prune's unchanged
 /// check instead of deleting a just-archived session.
 pub(in crate::ai) fn write_session_archived_sqlite(path: &Path, archived: bool) -> io::Result<()> {
@@ -286,7 +288,9 @@ pub(in crate::ai) fn write_session_mark_sqlite(
                 .map_err(|e| io::Error::other(e.to_string()))?;
             }
         }
-        touch_session_activity(&tx)?;
+        // A mark changes session state, not recency. Advance the revision so
+        // prune's unchanged check observes concurrent mark updates.
+        bump_history_revision_without_activity(&tx)?;
         tx.commit().map_err(|e| io::Error::other(e.to_string()))
     })
 }
@@ -437,4 +441,161 @@ pub(in crate::ai) fn write_session_serve_config_sqlite(
         touch_session_activity(&tx)?;
         tx.commit().map_err(|e| io::Error::other(e.to_string()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{
+        append_history_sqlite, close_cached_write_conn, read_history_revision,
+        remove_history_revision_cache_entry, remove_session_state_lock_entry,
+    };
+    use super::*;
+    use crate::ai::history::{Message, PruneSessionDeleteResult, SessionStore};
+
+    #[test]
+    fn session_mark_preserves_activity_and_list_order() {
+        for explicit_activity in [true, false] {
+            let dir = std::env::temp_dir().join(format!(
+                "session_mark_activity_test_{}_{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            let store = SessionStore::new(&dir.join("history.json"));
+            store.ensure_root_dir().unwrap();
+            for (id, activity) in [
+                ("older", 1_700_000_000_000_i64),
+                ("newer", 1_700_000_001_000_i64),
+            ] {
+                let path = store.session_history_file(id);
+                append_history_sqlite(
+                    &path,
+                    vec![Message {
+                        role: "user".to_string(),
+                        content: serde_json::Value::String(id.to_string()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    }],
+                )
+                .unwrap();
+                let conn = open_history_db(&path).unwrap();
+                conn.execute("UPDATE messages SET created_at = ?1", [activity / 1_000])
+                    .unwrap();
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![LAST_ACTIVITY_META_KEY, activity.to_string()],
+                )
+                .unwrap();
+                if id == "older" && !explicit_activity {
+                    // Legacy sessions derive recency from canonical message timestamps.
+                    conn.execute("DELETE FROM meta WHERE key = ?1", [LAST_ACTIVITY_META_KEY])
+                        .unwrap();
+                }
+            }
+
+            let initial = store.list_sessions().unwrap();
+            assert_eq!(initial.len(), 2);
+            for (id, activity) in [
+                ("older", 1_700_000_000_000_i64),
+                ("newer", 1_700_000_001_000_i64),
+            ] {
+                let session = initial.iter().find(|s| s.id == id).unwrap();
+                assert_eq!(session.modified_local.unwrap().timestamp_millis(), activity);
+            }
+            let expected_order: Vec<_> = initial
+                .iter()
+                .map(|s| (s.id.clone(), s.modified_local))
+                .collect();
+            let mut candidate = initial.iter().find(|s| s.id == "older").unwrap().clone();
+            let path = store.session_history_file("older");
+            // Keep a reader open so uncheckpointed WAL commits must remain visible.
+            let reader = open_history_db_read_only(&path).unwrap();
+            let activity_before = read_i64_meta_from_conn(&reader, LAST_ACTIVITY_META_KEY);
+            let mut revision = read_history_revision(&path).unwrap();
+            let cutoff = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_700_000_002_000)
+                .unwrap()
+                .with_timezone(&chrono::Local);
+
+            for (marked, message, expected_message) in [
+                (true, MarkMessageUpdate::Set(" note "), Some("note")),
+                (true, MarkMessageUpdate::Keep, Some("note")),
+                (false, MarkMessageUpdate::Clear, None),
+            ] {
+                write_session_mark_sqlite(&path, marked, message).unwrap();
+                revision += 1;
+                assert_eq!(read_session_marked_from_conn(&reader), marked);
+                assert_eq!(
+                    read_session_mark_message_sqlite(&path).unwrap().as_deref(),
+                    expected_message
+                );
+                assert_eq!(
+                    read_i64_meta_from_conn(&reader, LAST_ACTIVITY_META_KEY),
+                    activity_before
+                );
+                let metadata = read_session_list_metadata_sqlite(&path).unwrap();
+                assert_eq!(metadata.last_activity_unix_ms, Some(1_700_000_000_000));
+                assert_eq!(metadata.marked, marked);
+                assert_eq!(metadata.history_revision, revision);
+                assert_eq!(read_history_revision(&path), Some(revision));
+
+                let listed = store.list_sessions().unwrap();
+                assert_eq!(
+                    listed
+                        .iter()
+                        .map(|s| (s.id.clone(), s.modified_local))
+                        .collect::<Vec<_>>(),
+                    expected_order
+                );
+                let current = listed.iter().find(|s| s.id == "older").unwrap();
+                assert_eq!(current.marked, marked);
+                assert_eq!(
+                    store
+                        .delete_session_if_unchanged(&candidate, cutoff, || Ok(false))
+                        .unwrap(),
+                    PruneSessionDeleteResult::Changed
+                );
+                assert!(path.exists());
+                candidate = current.clone();
+            }
+
+            // Canonical history writes still advance recency and the history revision.
+            append_history_sqlite(
+                &path,
+                vec![Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String("new activity".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+            assert_eq!(read_history_revision(&path), Some(revision + 1));
+            assert!(
+                read_session_list_metadata_sqlite(&path)
+                    .unwrap()
+                    .last_activity_unix_ms
+                    .unwrap()
+                    > 1_700_000_001_000
+            );
+            assert_ne!(
+                store
+                    .list_sessions()
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| s.id)
+                    .collect::<Vec<_>>(),
+                initial.into_iter().map(|s| s.id).collect::<Vec<_>>()
+            );
+
+            drop(reader);
+            for id in ["older", "newer"] {
+                let path = store.session_history_file(id);
+                close_cached_write_conn(&path);
+                remove_history_revision_cache_entry(&path);
+                remove_session_state_lock_entry(&path);
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 }
