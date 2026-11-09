@@ -16,19 +16,28 @@ function between(start, end) {
   assert.ok(a >= 0 && b > a, "missing page functions: " + start);
   return script.slice(a, b);
 }
-const response = (body, status = 200) => ({ ok: status === 200, status, statusText: "Not Found", json: async () => plain(body) });
+const response = (body, status = 200) => ({ ok: status === 200, status, statusText: "Not Found", headers: { get: () => null }, json: async () => plain(body) });
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+const settle = () => new Promise((resolve) => setImmediate(resolve));
 const sessions = (marked = false) => [
   { id: "open-session", summary: "Open session", marked: false, size_bytes: 1024 },
   { id: "target-session", summary: "Target session", marked, size_bytes: 2048 },
 ];
+const longSessions = () => [sessions()[0], ...Array.from({ length: 100 }, (_, index) => ({
+  id: "older-session-" + index, summary: "Older session " + index, marked: false, size_bytes: 1024,
+})), sessions()[1]];
 
-function harness({ phone = false, items = sessions(), markError = "", confirmDelete = true, beforeMark } = {}) {
+function harness({ phone = false, sid = "open-session", items = sessions(), cachedItems = items, markError = "", confirmDelete = true, beforeMark, sessionsGet, historyGet, configGet, realNavigation = false } = {}) {
   const document = { activeElement: null };
   function node(tag = "div") {
     let text = "";
     const classes = new Set();
     const el = {
-      tagName: tag, children: [], parentNode: null, attrs: {}, dataset: {}, hidden: false, disabled: false, title: "",
+      tagName: tag, children: [], parentNode: null, attrs: {}, dataset: {}, hidden: false, disabled: false, title: "", scrollTop: 0,
       get className() { return [...classes].join(" "); },
       set className(value) { classes.clear(); for (const name of value.split(/\s+/).filter(Boolean)) classes.add(name); },
       classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name), contains: (name) => classes.has(name) },
@@ -37,10 +46,16 @@ function harness({ phone = false, items = sessions(), markError = "", confirmDel
         text = String(value);
         for (const child of el.children) child.parentNode = null;
         el.children = [];
+        el.scrollTop = 0;
       },
       setAttribute(key, value) { el.attrs[key] = String(value); },
       getAttribute(key) { return el.attrs[key] ?? null; },
-      appendChild(child) { child.parentNode = el; el.children.push(child); return child; },
+      get lastElementChild() { return el.children.at(-1) || null; },
+      appendChild(child) { child.remove(); child.parentNode = el; el.children.push(child); return child; },
+      remove() {
+        if (el.parentNode) el.parentNode.children = el.parentNode.children.filter((child) => child !== el);
+        el.parentNode = null;
+      },
       matches(selector) {
         return selector.split(",").some((part) => {
           const s = part.trim();
@@ -63,30 +78,34 @@ function harness({ phone = false, items = sessions(), markError = "", confirmDel
     return el;
   }
   document.createElement = node;
-  const elements = { sesslist: node("ul"), sesscount: node(), sesstitle: node(), sessmeta: node() };
+  const elements = { sesslist: node("ul"), sessfilter: node("input"), sesscount: node(), sesstitle: node(), sessmeta: node(), msgs: node(), prompt: node("textarea") };
+  elements.prompt.value = "draft in A";
   for (const match of html.matchAll(/<(div|section|button)[^>]*id="(sessionaction[^"]*)"[^>]*>([^<]*)/g)) {
     const el = elements[match[2]] = node(match[1]);
     el.hidden = /\shidden(?:\s|>)/.test(match[0]);
     el.textContent = match[3];
   }
-  for (const id of ["sessionactionstitle", "sessionactionmark", "sessionactiondelete", "sessionactioncancel"]) elements.sessionactionspanel.appendChild(elements[id]);
+  for (const id of ["sessionactionstitle", "sessionactionmark", "sessionactionfork", "sessionactiondelete", "sessionactioncancel"]) elements.sessionactionspanel.appendChild(elements[id]);
   elements.sessionactions.appendChild(elements.sessionactionsscrim);
   elements.sessionactions.appendChild(elements.sessionactionspanel);
 
-  const serverItems = plain(items), requests = [], switches = [], confirmations = [], draftsCleared = [], messages = [];
+  const serverItems = plain(items), requests = [], switches = [], confirmations = [], draftsCleared = [], messages = [], drawerChanges = [], stored = new Map();
   const media = { matches: phone, listeners: [], addEventListener(_, listener) { this.listeners.push(listener); } };
   const timers = new Map();
   let now = 1000, nextTimer = 1, historyLoads = 0, configLoads = 0;
   const context = vm.createContext({
     document, $: (id) => elements[id], window: { matchMedia: () => media },
     store: { base: "https://serve.test", token: "test-token" },
-    lastItems: plain(items), sessionId: "open-session", pendingNew: null, lastMsgCount: 5, turnRunning: true, PAGE_ID: "test-page",
+    lastItems: plain(cachedItems), sessionId: sid, pendingNew: null, lastMsgCount: 5, turnRunning: true, PAGE_ID: "test-page",
+    localStorage: { getItem: (key) => stored.get(key) || null, setItem: (key, value) => stored.set(key, value), removeItem: (key) => stored.delete(key) },
     Date: { now: () => now },
     setTimeout: (fn, ms) => { const id = nextTimer++; timers.set(id, { fn, at: now + ms }); return id; },
     clearTimeout: (id) => timers.delete(id),
     fetch: async (url, options) => {
-      const request = { path: new URL(url).pathname, method: options.method || "GET", headers: plain(options.headers), body: options.body ? JSON.parse(options.body) : null };
+      const request = { url, path: new URL(url).pathname, method: options.method || "GET", headers: plain(options.headers), body: options.body ? JSON.parse(options.body) : null };
       requests.push(request);
+      if (request.path.endsWith("/history")) return historyGet ? historyGet(request) : response([]);
+      if (request.path.endsWith("/config")) return configGet ? configGet(request) : response({});
       if (request.path.endsWith("/mark")) {
         if (markError) return response({ error: markError }, 404);
         if (beforeMark) await beforeMark(request);
@@ -102,18 +121,43 @@ function harness({ phone = false, items = sessions(), markError = "", confirmDel
         return response({});
       }
       assert.equal(request.path, "/sessions");
-      return response(serverItems);
+      return sessionsGet ? sessionsGet(request) : response(serverItems);
     },
     confirm: (text) => { confirmations.push(text); return confirmDelete; },
     clearDraft: (id) => draftsCleared.push(id),
     switchSession: (id) => { switches.push(id); context.sessionId = id; },
-    loadHistory: async () => { historyLoads += 1; }, loadSessionConfig: async () => { configLoads += 1; },
-    stopStaleFollow() {}, hideConfirm() {}, pollConfirm() {}, setDrawer() {}, resetPicks() {}, composerInUse: () => false,
+    loadHistory: async () => { historyLoads += 1; },
+    loadSessionConfig: async () => {
+      configLoads += 1;
+      if (realNavigation) await (await context.api("/sessions/" + context.sessionId + "/config")).json();
+    },
+    stopStaleFollow() {}, hideConfirm() {}, pollConfirm() {}, setDrawer: (open) => drawerChanges.push(open), resetPicks() {}, composerInUse: () => false,
     addMsg: (...args) => messages.push(args), note: (text) => messages.push(text),
   });
   vm.runInContext(between("function headers(", "const esc ="), context);
   vm.runInContext(between("function sessionTitle(s)", "// Phone drawer floats"), context);
   vm.runInContext(between("function renderSessionBar()", "// History is append-only"), context);
+  if (realNavigation) {
+    Object.assign(context, {
+      historyLoadSeq: 0, historySession: sid, historyKeys: [], canonicalHistoryTotal: 0,
+      pendingUserInputs: new Map(), turns: new Map(), eventSession: "", staleSession: "",
+      staleBox: null, recoveredView: null, FOLD_ROLE_LABELS: {},
+      persistDraft: () => stored.set("draft." + context.sessionId, elements.prompt.value),
+      restoreDraft: () => { elements.prompt.value = stored.get("draft." + context.sessionId) || ""; },
+      syncStopButton() {}, resetQuestionNavigator() {}, restoreSkillPick() {}, restoreTeamPick() {},
+      abortEvents() {}, revokePreviews() {}, updateQuestionButton() {},
+      shouldFollowOutput: () => false, followOutput() {}, isTurnRunning: () => false,
+      textOf: (content) => typeof content === "string" ? content : "",
+      isRuntimeSyntheticUser: () => false, historyEndsUnanswered: () => false,
+      addMsgMd: (text, parent) => { const row = node(); row.textContent = text; parent.appendChild(row); },
+    });
+    vm.runInContext(between("// BEGIN session switch", "// END session switch"), context);
+    vm.runInContext(between("// History is append-only", "// Historical user inputs"), context);
+    const switchSession = context.switchSession, loadHistory = context.loadHistory;
+    context.switchSession = (...args) => { switches.push(args[0]); return switchSession(...args); };
+    context.loadHistory = (...args) => { historyLoads += 1; return loadHistory(...args); };
+  }
+  vm.runInContext(between('$("sessfilter").oninput =', '$("connbtn").onclick ='), context);
   context.wireSessionActions();
   context.renderSessionList(context.lastItems);
   context.renderSessionBar();
@@ -137,7 +181,7 @@ function harness({ phone = false, items = sessions(), markError = "", confirmDel
   }
   const touch = (extra = {}) => ({ pointerType: "touch", isPrimary: true, button: 0, clientX: 10, clientY: 20, ...extra });
   function hold(id) { const li = row(id); dispatch(li, "pointerdown", touch()); advance(650); dispatch(li, "pointerup", touch()); return li; }
-  return { context, document, elements, requests, switches, confirmations, draftsCleared, messages, media, timers, row, advance, touch, hold, dispatch, historyLoads: () => historyLoads, configLoads: () => configLoads };
+  return { context, document, elements, requests, switches, confirmations, draftsCleared, messages, drawerChanges, stored, media, timers, row, advance, touch, hold, dispatch, historyLoads: () => historyLoads, configLoads: () => configLoads };
 }
 
 test("sidebar stars reflect marked state and expose the matching accessible action", () => {
@@ -329,26 +373,236 @@ test("desktop, mouse and row controls do not open the phone action sheet", () =>
   assert.equal(h.timers.size, 0);
 });
 
-test("desktop title clicks toggle the mark while row body clicks select the session", async () => {
-  const h = harness();
-  const click = h.dispatch(h.row().querySelector("span"), "click");
-  assert.equal(click.event.stopped, true);
-  await click.done;
-  assert.equal(h.requests[0].path, "/sessions/target-session/mark");
-  assert.equal(h.requests[0].method, "POST");
-  assert.deepEqual(h.requests[0].body, { marked: true });
-  assert.deepEqual(h.switches, []);
-  assert.equal(h.context.sessionId, "open-session");
-  assert.equal(h.historyLoads(), 0);
-  assert.equal(h.configLoads(), 0);
+for (const phone of [false, true]) test((phone ? "phone" : "desktop") + " title and row clicks select the session without marking", async () => {
+  for (const titleClick of [true, false]) {
+    const h = harness({ phone });
+    const click = h.dispatch(titleClick ? h.row().querySelector("span") : h.row(), "click");
+    assert.equal(click.event.stopped, titleClick);
+    assert.equal(h.context.sessionId, "target-session");
+    assert.equal(h.row().classList.contains("cur"), true, "selection is highlighted before any fetch completes");
+    assert.equal(h.row("open-session").classList.contains("cur"), false);
+    assert.equal(h.elements.sesstitle.textContent, "Target session");
+    assert.doesNotMatch(h.elements.sessmeta.textContent, /5 msgs/);
+    await click.done;
+    assert.deepEqual(h.switches, ["target-session"]);
+    assert.equal(h.historyLoads(), 1);
+    assert.equal(h.configLoads(), 1);
+    assert.equal(h.requests.some((request) => request.path === "/sessions"), false);
+    assert.equal(h.requests.some((request) => request.path.endsWith("/mark")), false);
+    assert.deepEqual(h.drawerChanges, phone ? [false] : []);
+  }
+});
 
-  const body = harness();
-  await body.dispatch(body.row(), "click").done;
-  assert.deepEqual(body.switches, ["target-session"]);
-  assert.equal(body.context.sessionId, "target-session");
-  assert.equal(body.historyLoads(), 1);
-  assert.equal(body.configLoads(), 1);
-  assert.equal(body.requests.some((request) => request.path.endsWith("/mark")), false);
+for (const phone of [false, true]) test((phone ? "phone" : "desktop") + " session titles support Enter and Space navigation", async () => {
+  for (const key of ["Enter", " "]) {
+    const h = harness({ phone }), title = h.row().querySelector("span");
+    assert.equal(title.getAttribute("role"), "button");
+    assert.equal(title.getAttribute("tabindex"), "0");
+    assert.equal(title.getAttribute("aria-label"), "switch to Target session");
+    assert.equal(title.getAttribute("aria-pressed"), null);
+    assert.equal(title.getAttribute("aria-current"), "false");
+    const press = h.dispatch(title, "keydown", { key });
+    assert.equal(press.event.prevented, true);
+    assert.equal(press.event.stopped, true);
+    assert.equal(title.getAttribute("aria-current"), "true");
+    assert.equal(h.row("open-session").querySelector("span").getAttribute("aria-current"), "false");
+    await press.done;
+    assert.equal(h.context.sessionId, "target-session");
+    assert.equal(h.requests.some((request) => request.path === "/sessions"), false);
+    assert.equal(h.requests.some((request) => request.path.endsWith("/mark")), false);
+  }
+});
+
+for (const phone of [false, true]) test((phone ? "phone" : "desktop") + " switching from a deep session rail keeps its rows and scroll without a list request", async () => {
+  for (const titleClick of [true, false]) {
+    const h = harness({ phone, realNavigation: true, items: longSessions(), historyGet: () => response([{ role: "assistant", content: "Target history" }]) });
+    const rail = h.elements.sesslist, rows = rail.children, target = h.row();
+    rail.scrollTop = 1600;
+    await h.dispatch(titleClick ? target.querySelector("span") : target, "click").done;
+    await settle();
+    assert.deepEqual(h.requests.map((request) => request.path), [
+      "/sessions/target-session/history", "/sessions/target-session/config",
+    ]);
+    assert.equal(rail.children, rows, "switching must preserve the mounted list");
+    assert.equal(h.row(), target);
+    assert.equal(rail.scrollTop, 1600);
+    assert.equal(target.classList.contains("cur"), true);
+    assert.equal(target.querySelector("span").getAttribute("aria-current"), "true");
+    assert.equal(h.row("open-session").classList.contains("cur"), false);
+    assert.equal(h.elements.sesstitle.textContent, "Target session");
+    assert.equal(h.context.historySession, "target-session");
+    assert.equal(h.elements.msgs.textContent, "Target history");
+    assert.equal(h.historyLoads(), 1);
+    assert.equal(h.configLoads(), 1);
+    assert.deepEqual(h.drawerChanges, phone ? [false] : []);
+  }
+});
+
+test("session-list re-renders preserve the reader's rail scroll position", () => {
+  const h = harness({ items: longSessions() }), rail = h.elements.sesslist;
+  for (const errText of [undefined, "sessions refresh failed"]) {
+    const rows = rail.children;
+    rail.scrollTop = 1600;
+    h.context.renderSessionList(h.context.lastItems, errText);
+    assert.notEqual(rail.children, rows, "the regression must exercise a list rebuild");
+    assert.equal(rail.scrollTop, 1600);
+    assert.ok(h.row());
+    assert.equal(h.row("open-session").classList.contains("cur"), true);
+    if (errText) assert.equal(rail.children.at(-1).textContent, errText);
+  }
+});
+
+test("filter input resets the session rail while normal re-renders preserve scroll", async () => {
+  const h = harness({ items: longSessions() }), rail = h.elements.sesslist, filter = h.elements.sessfilter;
+  rail.scrollTop = 1600;
+  filter.value = "Older session";
+  await h.dispatch(filter, "input").done;
+  assert.equal(rail.scrollTop, 0);
+  assert.equal(rail.children.length, 100);
+  assert.equal(h.elements.sesscount.textContent, "102 sessions · showing 100");
+  assert.equal(h.row(), undefined);
+
+  rail.scrollTop = 800;
+  h.context.renderSessionList(h.context.lastItems);
+  assert.equal(rail.scrollTop, 800, "a normal refresh must preserve scroll even with an active filter");
+  assert.equal(rail.children.length, 100);
+
+  filter.value = "target";
+  await h.dispatch(filter, "input").done;
+  assert.equal(rail.scrollTop, 0);
+  assert.equal(rail.children.length, 1);
+  assert.ok(h.row());
+  assert.equal(h.elements.sesscount.textContent, "102 sessions · showing 1");
+
+  filter.value = "";
+  await h.dispatch(filter, "input").done;
+  assert.equal(rail.scrollTop, 0);
+  assert.equal(rail.children.length, 102);
+  assert.equal(h.elements.sesscount.textContent, "102 sessions");
+  assert.equal(h.context.sessionId, "open-session");
+  assert.deepEqual(h.requests, []);
+});
+
+test("a fresh session-list render starts at the top", () => {
+  const h = harness({ cachedItems: [] }), rail = h.elements.sesslist;
+  assert.equal(rail.children.length, 0);
+  assert.equal(rail.scrollTop, 0);
+  h.context.renderSessionList(longSessions());
+  assert.equal(rail.children.length, 102);
+  assert.equal(rail.scrollTop, 0);
+});
+
+test("a phone title click after a hold cannot navigate away from the action sheet", async () => {
+  const h = harness({ phone: true }), li = h.hold();
+  await h.dispatch(li.querySelector("span"), "click").done;
+  assert.equal(h.context.sessionId, "open-session");
+  assert.equal(h.elements.sessionactions.hidden, false);
+  assert.deepEqual(h.switches, []);
+  assert.deepEqual(h.requests, []);
+});
+
+test("desktop title navigation requests B history and rejects a late A response", async () => {
+  const a = deferred(), b = deferred();
+  const h = harness({ realNavigation: true, historyGet: (request) => request.path === "/sessions/open-session/history" ? a.promise : b.promise });
+  const oldHistory = h.context.loadHistory();
+  const click = h.dispatch(h.row().querySelector("span"), "click");
+  assert.equal(h.context.sessionId, "target-session");
+  assert.equal(h.row().classList.contains("cur"), true);
+  assert.equal(h.elements.sesstitle.textContent, "Target session");
+  assert.equal(h.stored.get("draft.open-session"), "draft in A");
+  assert.deepEqual(h.requests.filter((request) => request.path.endsWith("/history")).map((request) => request.path), [
+    "/sessions/open-session/history", "/sessions/target-session/history",
+  ]);
+  b.resolve(response([{ role: "assistant", content: "B transcript" }]));
+  await settle();
+  assert.equal(h.context.historySession, "target-session");
+  assert.equal(h.elements.msgs.textContent, "B transcript");
+  a.resolve(response([{ role: "assistant", content: "late A transcript" }]));
+  await oldHistory;
+  await click.done;
+  assert.equal(h.context.sessionId, "target-session");
+  assert.equal(h.context.historySession, "target-session");
+  assert.equal(h.elements.msgs.textContent, "B transcript");
+  assert.equal(h.row().classList.contains("cur"), true);
+});
+
+test("boot renders every fetched session before history and config hydration finish", async () => {
+  const history = deferred(), config = deferred();
+  const h = harness({ realNavigation: true, sid: "", cachedItems: [], historyGet: () => history.promise, configGet: () => config.promise });
+  const boot = h.context.loadSessions();
+  await settle();
+  assert.equal(h.elements.sesslist.children.length, 2);
+  assert.equal(h.elements.sesscount.textContent, "2 sessions");
+  assert.equal(h.context.sessionId, "target-session");
+  assert.equal(h.row().classList.contains("cur"), true);
+  assert.equal(h.elements.sesstitle.textContent, "Target session");
+  assert.equal(h.historyLoads(), 1);
+  assert.equal(h.configLoads(), 0);
+  await h.context.loadSessions();
+  assert.equal(h.historyLoads(), 1, "another list refresh shares the selected session's pending hydration");
+  history.resolve(response([]));
+  await settle();
+  assert.equal(h.elements.sesslist.children.length, 2);
+  assert.equal(h.configLoads(), 1, "rows stay visible while config is still pending");
+  config.resolve(response({}));
+  await boot;
+});
+
+for (const refreshAfterSwitch of [false, true]) test("a stale session list omitting B cannot steal selection (new refresh=" + refreshAfterSwitch + ")", async () => {
+  const stale = deferred();
+  let reads = 0;
+  const h = harness({ realNavigation: true, sessionsGet: () => ++reads === 1 ? stale.promise : response(sessions()) });
+  const oldList = h.context.loadSessions();
+  if (refreshAfterSwitch) {
+    await h.dispatch(h.row().querySelector("span"), "click").done;
+    await h.context.loadSessions();
+  }
+  else h.context.switchSession("target-session");
+  await settle();
+  assert.equal(reads, refreshAfterSwitch ? 2 : 1);
+  stale.resolve(response([sessions()[0]]));
+  await oldList;
+  assert.equal(h.context.sessionId, "target-session");
+  assert.ok(h.row(), "a stale payload cannot remove the selected row from the cached list");
+  assert.equal(h.context.lastItems.length, 2);
+  assert.deepEqual(h.switches, ["target-session"]);
+});
+
+test("an older session refresh cannot overwrite the newest list or its title", async () => {
+  const stale = deferred();
+  let reads = 0;
+  const latest = sessions();
+  latest[0].summary = "Latest open title";
+  const h = harness({ sessionsGet: () => ++reads === 1 ? stale.promise : response(latest) });
+  const oldList = h.context.loadSessions();
+  await h.context.loadSessions();
+  stale.resolve(response(sessions()));
+  await oldList;
+  assert.equal(h.elements.sesstitle.textContent, "Latest open title");
+  assert.equal(h.row("open-session").querySelector("span").textContent, "Latest open title");
+});
+
+test("a session list from the previous server is discarded", async () => {
+  const stale = deferred();
+  const h = harness({ sessionsGet: () => stale.promise });
+  const oldList = h.context.loadSessions();
+  h.context.store.base = "https://other.test";
+  stale.resolve(response([sessions()[1]]));
+  await oldList;
+  assert.equal(h.context.sessionId, "open-session");
+  assert.equal(h.context.lastItems.length, 2);
+  assert.equal(h.elements.sesstitle.textContent, "Open session");
+  assert.deepEqual(h.switches, []);
+});
+
+test("a failed session refresh keeps the last good list and appends its error", async () => {
+  const h = harness({ sessionsGet: () => response({ error: "temporarily offline" }, 503) });
+  await h.context.loadSessions();
+  assert.ok(h.row("open-session"));
+  assert.ok(h.row());
+  assert.equal(h.context.lastItems.length, 2);
+  assert.match(h.elements.sesslist.children.at(-1).textContent, /sessions refresh failed: 503 temporarily offline/);
+  assert.equal(h.context.sessionId, "open-session");
 });
 
 test("sheet keyboard focus cycles through its actions and Escape restores the star focus", () => {

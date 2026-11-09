@@ -86,7 +86,7 @@ test("server base drops the app entry path before API calls", () => {
 });
 
 test("drafts persist independently for each session and restore on switch", () => {
-  const start = script.indexOf("function draftKey(");
+  const start = script.indexOf("const composerDrafts = new Map();");
   const end = script.indexOf("function questionRowsOf(", start);
   assert.ok(start >= 0 && end > start);
   const values = new Map([["serve.draft.beta", "beta draft"]]);
@@ -183,9 +183,16 @@ test("question navigator fetches the complete history and renders an older targe
   assert.equal(context.count, 103);
   assert.equal(links.length, 103);
   await links[0].onclick();
+  assert.equal(loaded.sessionId, "session-a");
   assert.equal(loaded.showAll, true);
   assert.equal(loaded.messages.length, 205);
   assert.equal(scrolled, true);
+  loaded = null;
+  scrolled = false;
+  context.sessionId = "session-b";
+  await links[0].onclick();
+  assert.equal(loaded, null, "an old question link cannot load its cache into another session");
+  assert.equal(scrolled, false);
 });
 
 test("phone question navigator is a compact session-bar control", () => {
@@ -443,7 +450,7 @@ test("phone session hold targets its own row and scrolling cancels it", () => {
   const deleted = [];
   const document = { activeElement: null };
   const elements = Object.fromEntries([
-    "sessionactions", "sessionactionstitle", "sessionactionmark", "sessionactiondelete",
+    "sessionactions", "sessionactionstitle", "sessionactionmark", "sessionactionfork", "sessionactiondelete",
     "sessionactioncancel", "sessionactionsscrim", "sessionactionspanel",
   ].map((id) => [id, { hidden: true, textContent: "", focus() { document.activeElement = this; } }]));
   const media = { matches: true };
@@ -1189,6 +1196,7 @@ function historyHarness({
   const pending = delayed ? new Promise((resolve) => { resolveResponse = () => resolve(response); }) : Promise.resolve(response);
   const root = {
     children: [], scrollTop: 0, scrollHeight: 100,
+    querySelectorAll() { return []; },
     insertBefore(node, anchor) {
       if (node.remove) node.remove();
       const index = anchor === null ? this.children.length : this.children.indexOf(anchor);
@@ -1633,6 +1641,76 @@ function indexedHistoryHarness(options = {}) {
   return h;
 }
 
+test("session history renders stored null tool arguments without losing later rows", async () => {
+  const messages = [
+    { role: "assistant", content: null, tool_calls: [{
+      id: "call-1", type: "function", function: { name: "read_file", arguments: "null" },
+    }] },
+    { role: "tool", tool_call_id: "call-1", content: "Invalid arguments: expected an object" },
+    { role: "assistant", content: "Later reply" },
+  ];
+  const old = { key: "A transcript", dataset: {} };
+  const h = indexedHistoryHarness({ messages, total: "3", existingKeys: ["A"], existingNodes: [old] });
+  const labels = [], errors = [], addFold = h.context.addFold;
+  Object.assign(h.context, {
+    sessionId: "B", historySession: "A", abortEvents() {},
+    console: { error: (...args) => errors.push(args) },
+    addMsg: (role, text) => h.context.addMsgMd(text, h.root),
+    addFold: (label, ...args) => { labels.push(label); return addFold(label, ...args); },
+  });
+  for (const [start, end] of [
+    ["function textOf(", "const PHONE_LAYOUT_QUERY"],
+    ["function toolArgsOf(", "function addFold("],
+  ]) vm.runInContext(script.slice(script.indexOf(start), script.indexOf(end)), h.context);
+  await h.context.loadHistory();
+  assert.equal(h.context.historySession, "B");
+  assert.deepEqual(h.root.children.map((node) => node.key), ["Invalid arguments: expected an object", "Later reply"]);
+  assert.deepEqual(labels, ["read_file"]);
+  assert.deepEqual(errors, []);
+});
+
+test("prefetched history from another session cannot replace or cancel the selected load", async () => {
+  const old = { key: "A transcript", dataset: {} };
+  const h = indexedHistoryHarness({
+    delayed: true, messages: [{ role: "assistant", content: "B transcript" }], total: "1",
+    existingKeys: ["A"], existingNodes: [old],
+  });
+  Object.assign(h.context, { sessionId: "B", historySession: "A", abortEvents() {} });
+  const loading = h.context.loadHistory();
+  await h.context.loadHistory({ sessionId: "A", messages: [{ role: "assistant", content: "Stale A transcript" }], histTotal: 1 });
+  const sequenceAfterPrefetch = h.context.historyLoadSeq, rowsAfterPrefetch = h.root.children.slice();
+  h.resolveResponse();
+  await loading;
+  assert.equal(sequenceAfterPrefetch, 1, "reject stale cached rows before invalidating B's pending response");
+  assert.deepEqual(rowsAfterPrefetch, [old]);
+  assert.equal(h.context.historySession, "B");
+  assert.deepEqual(h.root.children.map((node) => node.key), ["B transcript"]);
+  assert.equal(h.apiCalls(), 1);
+});
+
+for (const stage of ["projection", "row"]) test(`a ${stage} render failure replaces the previous session with a visible error`, async () => {
+  const old = { key: "A transcript", dataset: {} };
+  const h = indexedHistoryHarness({
+    messages: [{ role: "assistant", content: "B transcript" }], total: "1",
+    existingKeys: ["A"], existingNodes: [old],
+  });
+  const failure = new Error("Failed at " + stage), errors = [];
+  Object.assign(h.context, {
+    sessionId: "B", historySession: "A", abortEvents() {},
+    console: { error: (...args) => errors.push(args) },
+    addMsg: (role, text) => h.context.addMsgMd(text, h.root),
+    [stage === "projection" ? "historyRowsOf" : "renderHistoryRow"]: () => { throw failure; },
+  });
+  await h.context.loadHistory();
+  assert.deepEqual(h.root.children.map((node) => node.key), ["history render failed: Failed at " + stage]);
+  assert.equal(h.context.historySession, "");
+  assert.deepEqual(Array.from(h.context.historyKeys), []);
+  assert.equal(h.context.lastMsgCount, null);
+  assert.equal(h.context.canonicalHistoryTotal, 0);
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0][1], failure, "retain the original exception in the Console");
+});
+
 test("identical history refresh preserves canonical nodes around a pending input", async () => {
   const user = { key: "pending user", classList: { contains: (name) => name === "user-msg-row" } };
   const live = { key: "live box" };
@@ -1784,8 +1862,21 @@ test("desktop output preserves always-follow behavior", () => {
   assert.equal(h.classes.has("show"), false);
 });
 
-test("the phone jump button scrolls smoothly to the live edge", () => {
-  const h = scrollHarness({ phone: true, scrollTop: 100 });
+for (const phone of [false, true]) test((phone ? "phone" : "desktop") + " jump button shows away from the bottom and hides near it", () => {
+  const h = scrollHarness({ phone, scrollTop: 100 });
+  h.context.updateJumpButton();
+  assert.equal(h.classes.has("show"), true);
+  assert.equal(h.attrs["aria-hidden"], "false");
+  assert.equal(h.button.tabIndex, 0);
+  h.msgs.scrollTop = 520;
+  h.context.updateJumpButton();
+  assert.equal(h.classes.has("show"), false);
+  assert.equal(h.attrs["aria-hidden"], "true");
+  assert.equal(h.button.tabIndex, -1);
+});
+
+for (const phone of [true, false]) test("the " + (phone ? "phone" : "desktop") + " jump button scrolls smoothly to the live edge", () => {
+  const h = scrollHarness({ phone, scrollTop: 100 });
   h.context.scrollToLatest(true);
   assert.equal(h.msgs.lastScroll.top, 1000);
   assert.equal(h.msgs.lastScroll.behavior, "smooth");
@@ -1804,10 +1895,11 @@ test("same-session history refresh preserves a phone reader's position", async (
   assert.deepEqual(h.root.children.map((node) => node.key), ["mounted-old", "new"]);
 });
 
-test("the jump-to-latest control is a phone-only overlaid round button", () => {
+test("the jump-to-latest control is an overlaid round button on phone and desktop", () => {
   assert.match(html, /<button id="jumpbottom"[^>]*aria-label="jump to latest message"/);
   assert.match(html, /#jumpbottom \{[\s\S]*?position:absolute;[\s\S]*?border-radius:50%;/);
   assert.match(html, /@media \(max-width:700px\) \{[\s\S]*?#jumpbottom\.show \{ opacity:1;/);
+  assert.match(html, /@media \(min-width:701px\) \{[\s\S]*?#jumpbottom \{ display:grid;[\s\S]*?#jumpbottom\.show \{ opacity:1;/);
 });
 
 test("the phone composer keeps an idle prompt compact beside smaller action buttons", () => {

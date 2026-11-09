@@ -23,7 +23,7 @@ const restoreSrc = script.slice(
   script.indexOf("function clearDraft("),
 );
 const loadSessionsSrc = script.slice(
-  script.indexOf("async function loadSessions()"),
+  script.indexOf("let sessionsLoadSeq = 0;"),
   script.indexOf("// History is append-only"),
 );
 const traceSrc = script.slice(
@@ -91,6 +91,8 @@ function makeContext(extra) {
     },
     $: (id) => (id === "prompt" ? prompt : null),
     draftKey: (id) => "draft:" + id,
+    composerDrafts: new Map(),
+    isPhoneLayout: () => false,
   }, extra || {}));
   context.frames = [];
   context.timers = [];
@@ -146,6 +148,7 @@ test("an automatic session switch does not replace the composer's text", async (
   const switched = [];
   const notes = [];
   const context = makeContext({
+    store: { base: "https://serve.test" },
     api: async () => ({ json: async () => [{ id: "new", title: "new" }] }),
     switchSession: (id) => { switched.push(id); },
     note: (text) => { notes.push(text); },

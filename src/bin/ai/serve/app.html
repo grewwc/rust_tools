@@ -673,6 +673,10 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #sessions ul { min-height:0; padding:8px; }
   #sessions li { padding:7px 8px; font-size:13px; }
   #sessions li .rn, #sessions li .mk { padding:2px 6px; }
+  #sessionactionspanel {
+    top:50%; bottom:auto; transform:translateY(-50%); padding:16px;
+    border-bottom:1px solid var(--line); border-radius:var(--radius-card);
+  }
   #sessfilter { min-height:32px; font-size:13px; }
   #sessions .rowbtns { flex-shrink:0; }
   /* Equal outer widths and gutters align transcript, status, and footer. */
@@ -681,6 +685,13 @@ button:active:not(:disabled) { filter:brightness(.96); }
   .turn { gap:8px; }
   .msg { max-width:100%; padding:8px 12px; line-height:1.5; }
   .msg.user { max-width:85%; }
+  /* The wrapper is also the canonical history row, so give it a box instead
+     of flattening its children into the transcript flex scroller. */
+  .user-msg-row {
+    display:flex; flex-shrink:0; width:100%; min-width:0;
+    align-items:center; justify-content:flex-end;
+  }
+  .user-msg-row > .msg.user { min-width:0; align-self:auto; }
   .msg.asst { box-shadow:none; }
   .msg details summary { padding:3px 0; }
   #turnstatus { flex-shrink:0; padding:6px 24px; }
@@ -712,10 +723,23 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #teamtrigger { min-height:36px; min-width:0; max-width:160px; padding:0 10px; border-radius:var(--radius-control); }
   #composer {
     display:grid; grid-template-columns:36px minmax(0,1fr) 36px;
+    grid-template-areas:"image prompt send";
     flex-shrink:0; align-items:end; gap:8px; padding:8px 24px 12px; border-top:0;
   }
-  #prompt { width:100%; min-width:0; min-height:36px; padding:7px 10px; font-size:14px; line-height:1.5; }
+  #composer.side-note-ready {
+    grid-template-columns:36px minmax(0,1fr) 58px 36px;
+    grid-template-areas:"image prompt sidenote send";
+  }
+  #prompt { grid-area:prompt; width:100%; min-width:0; min-height:36px; padding:7px 10px; font-size:14px; line-height:1.5; }
   #img, #send { display:grid; place-items:center; width:36px; min-width:36px; height:36px; padding:0; font-size:16px; }
+  #img { grid-area:image; }
+  #send { grid-area:send; }
+  #sidenote.show {
+    grid-area:sidenote; display:inline-flex; align-items:center; justify-content:center;
+    height:36px; padding:0 8px; gap:4px; border-color:var(--acc-line-soft);
+    background:var(--tint-2); color:var(--acc-soft-2); font-size:11px; line-height:1;
+  }
+  #sidenote svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.9; stroke-linecap:round; stroke-linejoin:round; }
 }
 /* Keep narrow desktop windows usable without borrowing the phone drawer. */
 @media (min-width:701px) and (max-width:1100px) {
@@ -996,6 +1020,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <section id="sessionactionspanel" role="dialog" aria-modal="true" aria-labelledby="sessionactionstitle">
 <div id="sessionactionstitle"></div>
 <button id="sessionactionmark" type="button">标记会话</button>
+<button id="sessionactionfork" type="button" hidden>fork</button>
 <button id="sessionactiondelete" type="button">删除会话</button>
 <button id="sessionactioncancel" type="button">取消</button>
 </section>
@@ -2414,7 +2439,7 @@ function shouldFollowOutput(root = $("msgs")) {
 function updateJumpButton() {
   const button = $("jumpbottom");
   if (!button) return;
-  const show = isPhoneLayout() && !jumpingToBottom && !isNearBottom();
+  const show = !jumpingToBottom && !isNearBottom();
   button.classList.toggle("show", show);
   button.setAttribute("aria-hidden", show ? "false" : "true");
   button.tabIndex = show ? 0 : -1;
@@ -2440,21 +2465,28 @@ function scrollToLatest(smooth = true) {
   if (!smooth) { jumpingToBottom = false; updateJumpButton(); return; }
   setTimeout(() => { jumpingToBottom = false; updateJumpButton(); }, 450);
 }
+// The desktop composer keeps exact unsent text in memory across navigation;
+// phone restores still use the existing durable draft storage.
+const composerDrafts = new Map();
 function draftKey(id) {
   return DRAFT_PREFIX + encodeURIComponent(id || "_new");
 }
 function persistDraft(id = sessionId) {
   const value = $("prompt").value;
+  composerDrafts.set(draftKey(id), value);
   if (value) localStorage.setItem(draftKey(id), value);
   else localStorage.removeItem(draftKey(id));
 }
 function restoreDraft(id = sessionId) {
   // A draft is only restored when the composer is free; replacing the value
   // under an active composition would discard the word being typed.
-  if (!setPromptValue(localStorage.getItem(draftKey(id)) || "")) return;
+  const key = draftKey(id);
+  const value = !isPhoneLayout() && composerDrafts.has(key) ? composerDrafts.get(key) : localStorage.getItem(key) || "";
+  if (!setPromptValue(value)) return;
   growPrompt();
 }
 function clearDraft(id) {
+  composerDrafts.delete(draftKey(id));
   localStorage.removeItem(draftKey(id));
 }
 function closeQuestionPanel() {
@@ -2521,8 +2553,8 @@ async function openQuestionPanel() {
     const res = await api("/sessions/" + forSession + "/history");
     const messages = await res.json();
     const histTotal = Number(res.headers.get("x-history-total")) || messages.length;
-    questionCache = { sessionId: forSession, messages, histTotal, rows: questionRowsOf(messages, histTotal) };
     if (forSession !== sessionId || !panel.classList.contains("open")) return;
+    questionCache = { sessionId: forSession, messages, histTotal, rows: questionRowsOf(messages, histTotal) };
     list.textContent = "";
     const cache = questionCache;
     const rows = cache.rows;
@@ -2540,12 +2572,14 @@ async function openQuestionPanel() {
       text.textContent = row.text;
       button.append(num, text);
       button.onclick = async () => {
+        if (cache.sessionId !== sessionId) return;
         closeQuestionPanel();
         let target = $("msgs").querySelector('[data-history-index="' + row.historyIndex + '"]');
         if (!target) {
-          await loadHistory({ messages: cache.messages, histTotal: cache.histTotal, showAll: true });
+          await loadHistory({ sessionId: cache.sessionId, messages: cache.messages, histTotal: cache.histTotal, showAll: true });
           target = $("msgs").querySelector('[data-history-index="' + row.historyIndex + '"]');
         }
+        if (cache.sessionId !== sessionId) return;
         if (!target) return;
         target.scrollIntoView({ behavior: "smooth", block: "center" });
         target.classList.remove("question-target");
@@ -2722,8 +2756,10 @@ function revokePreviews(root = $("msgs")) {
 // call that produced it (name + most identifying argument).
 function toolArgsOf(call) {
   const raw = call && call.function ? call.function.arguments : null;
-  if (raw && typeof raw === "object") return raw;
-  try { return JSON.parse(raw || "{}"); } catch (e) { return {}; }
+  try {
+    const args = typeof raw === "string" ? JSON.parse(raw || "{}") : raw;
+    return args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  } catch (e) { return {}; }
 }
 function shortLine(v, max) {
   const line = String(v === undefined || v === null ? "" : v).split("\n")[0].trim();
@@ -3956,12 +3992,12 @@ async function toggleSessionMark(s) {
 }
 let sessionActionTarget = null;
 let sessionActionReturnFocus = null;
-function openSessionActions(s, li) {
-  if (!isPhoneLayout()) return;
+function openSessionActions(s, li, returnFocus) {
   sessionActionTarget = s;
-  sessionActionReturnFocus = li.querySelector(".mk");
+  sessionActionReturnFocus = returnFocus || li.querySelector(isPhoneLayout() ? ".mk" : "span");
   $("sessionactionstitle").textContent = sessionTitle(s);
   $("sessionactionmark").textContent = s.marked ? "取消标记" : "标记会话";
+  $("sessionactionfork").hidden = isPhoneLayout();
   $("sessionactions").hidden = false;
   $("sessionactionmark").focus();
 }
@@ -3978,6 +4014,11 @@ function wireSessionActions() {
     closeSessionActions();
     if (s) return toggleSessionMark(s);
   };
+  $("sessionactionfork").onclick = () => {
+    const s = sessionActionTarget;
+    closeSessionActions();
+    if (s) return forkSession(s.id);
+  };
   $("sessionactiondelete").onclick = () => {
     const s = sessionActionTarget;
     closeSessionActions();
@@ -3987,14 +4028,14 @@ function wireSessionActions() {
   $("sessionactionspanel").onkeydown = (ev) => {
     if (ev.key === "Escape") { ev.preventDefault(); closeSessionActions(); }
     else if (ev.key === "Tab") {
-      const buttons = [...$("sessionactionspanel").querySelectorAll("button")];
+      const buttons = [...$("sessionactionspanel").querySelectorAll("button")].filter((button) => !button.hidden && !button.disabled);
       const index = buttons.indexOf(document.activeElement);
       ev.preventDefault();
       buttons[(index + (ev.shiftKey ? -1 : 1) + buttons.length) % buttons.length].focus();
     }
   };
   const media = window.matchMedia && window.matchMedia("(max-width: 700px)");
-  if (media && media.addEventListener) media.addEventListener("change", () => { if (!isPhoneLayout()) closeSessionActions(); });
+  if (media && media.addEventListener) media.addEventListener("change", closeSessionActions);
 }
 let sessFilter = "";
 const SESSION_HOLD_MS = 650;
@@ -4038,6 +4079,18 @@ function bindSessionLongPress(li, s) {
   li.onpointercancel = cancel;
   li.oncontextmenu = (ev) => { if (isPhoneLayout()) ev.preventDefault(); };
 }
+async function forkSession(targetId) {
+  if (!targetId) return;
+  try {
+    const forkedId = (await (await api("/sessions/" + targetId + "/fork", { method: "POST" })).json()).id;
+    if (!isPhoneLayout()) clearDraft(forkedId);
+    switchSession(forkedId);
+    lastMsgCount = null;
+    turnRunning = false; // a running turn (if any) belongs to the source session
+    await loadSessions(); await loadHistory();
+    await loadSessionConfig(); // the fork inherits the source session's picks
+  } catch (e) { addMsg("err", "fork failed: " + e.message, "asst err"); }
+}
 async function deleteSession(targetId) {
   if (!targetId) return;
   const target = lastItems.find((x) => x.id === targetId);
@@ -4062,10 +4115,11 @@ async function deleteSession(targetId) {
 // Render the drawer from cached or fresh items: the filter narrows by title
 // or id, the count line proves no session is hidden, and an optional error
 // row keeps a failed refresh visible without wiping the last good list.
-function renderSessionList(items, errText) {
+function renderSessionList(items, errText, { preserveScroll = true } = {}) {
   const q = sessFilter.trim().toLowerCase();
   const shown = q ? items.filter((s) => (sessionTitle(s) + " " + s.id).toLowerCase().includes(q)) : items;
   const ul = $("sesslist");
+  const scrollTop = preserveScroll && ul.children.length ? ul.scrollTop : 0;
   ul.textContent = "";
   for (const s of shown) {
     const li = document.createElement("li");
@@ -4074,16 +4128,33 @@ function renderSessionList(items, errText) {
     t.textContent = sessionTitle(s);
     t.setAttribute("role", "button");
     t.setAttribute("tabindex", "0");
-    t.title = s.marked ? "取消标记" : "标记会话";
+    t.title = "switch to " + sessionTitle(s);
     t.setAttribute("aria-label", t.title);
-    t.setAttribute("aria-pressed", String(!!s.marked));
+    t.setAttribute("aria-current", String(s.id === sessionId));
+    if (!isPhoneLayout()) {
+      t.setAttribute("aria-haspopup", "dialog");
+      t.setAttribute("aria-controls", "sessionactionspanel");
+      t.setAttribute("aria-keyshortcuts", "Shift+F10");
+    }
     t.onclick = (ev) => {
-      if (isPhoneLayout()) return;
       ev.stopPropagation();
-      return toggleSessionMark(s);
+      if (!isPhoneLayout() && ev.detail > 1) return;
+      return li.onclick();
+    };
+    t.ondblclick = (ev) => {
+      if (isPhoneLayout() || ev.detail === 0) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      openSessionActions(s, li, t);
     };
     t.onkeydown = (ev) => {
-      if (isPhoneLayout() || (ev.key !== "Enter" && ev.key !== " ")) return;
+      if (!isPhoneLayout() && (ev.key === "ContextMenu" || (ev.key === "F10" && ev.shiftKey))) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        openSessionActions(s, li, t);
+        return;
+      }
+      if (ev.key !== "Enter" && ev.key !== " ") return;
       ev.preventDefault();
       return t.onclick(ev);
     };
@@ -4119,6 +4190,13 @@ function renderSessionList(items, errText) {
       if (sessionHoldConsumed(li)) return;
       switchSession(s.id);
       lastMsgCount = null;
+      for (const row of ul.querySelectorAll(".cur")) {
+        row.classList.remove("cur");
+        row.querySelector("span")?.setAttribute("aria-current", "false");
+      }
+      li.classList.add("cur");
+      t.setAttribute("aria-current", "true");
+      renderSessionBar();
       turnRunning = false;
       stopStaleFollow();
       // The question on screen belonged to the session being left; the poll
@@ -4126,7 +4204,6 @@ function renderSessionList(items, errText) {
       hideConfirm();
       if (isPhoneLayout()) setDrawer(false);
       pollConfirm();
-      loadSessions();
       loadHistory();
       loadSessionConfig();
     };
@@ -4138,6 +4215,7 @@ function renderSessionList(items, errText) {
     ul.appendChild(li);
   }
   $("sesscount").textContent = q ? items.length + " sessions · showing " + shown.length : items.length + " sessions";
+  ul.scrollTop = scrollTop;
 }
 // Swap one drawer row title for an inline editor: Enter/blur commits via
 // POST /sessions/{id}/title, Esc cancels. A failed commit keeps the old
@@ -4172,22 +4250,27 @@ function startRename(li, s) {
   inp.onclick = (ev) => ev.stopPropagation();
   inp.onblur = commit;
 }
+let sessionsLoadSeq = 0;
 async function loadSessions() {
+  const loadId = ++sessionsLoadSeq, forSession = sessionId, base = store.base;
   let items;
   try {
     items = await (await api("/sessions")).json();
   } catch (e) {
+    if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base) return;
     // Keep the last good list so one failed refresh (e.g. a token hiccup)
     // cannot hide every session; the error stays as a tail row instead.
     renderSessionList(lastItems, "sessions refresh failed: " + e.message);
     return;
   }
+  if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base) return;
   // `/sessions` returns store order, which is oldest-first (the same order
   // `a /ss` prints and the server keeps unchanged). The drawer reads
   // newest-first, and the session auto-selected below is `items[0]`, so flip
   // the payload once here instead of in the renderer: the drawer, the filter
   // re-render, and the error path all then share one newest-first list.
   items.reverse();
+  let hydrate = false;
   if (items.some((s) => s.id === sessionId)) { pendingNew = null; }
   else if (sessionId === pendingNew && sessionId) {
     // Fresh id, not yet materialized: stay on it; the first turn persists
@@ -4203,17 +4286,23 @@ async function loadSessions() {
       note("当前会话已不在列表中，你的输入已保留");
     } else {
       switchSession(items[0].id);
+      lastMsgCount = null;
       // A running sample from the previous session must not leak onto the new
       // one; re-derive below (the id exists, so a poll is safe here).
       turnRunning = false;
       pollConfirm();
-      await loadHistory();
-      await loadSessionConfig();
+      hydrate = true;
     }
   }
   lastItems = items;
   renderSessionList(items);
   renderSessionBar();
+  if (hydrate) {
+    const selectedId = sessionId;
+    await loadHistory();
+    if (selectedId !== sessionId || base !== store.base) return;
+    await loadSessionConfig();
+  }
 }
 // History is append-only, so "the transcript changed" is one fingerprint of its
 // newest row, and a newest row that is a non-empty assistant message is the
@@ -4326,6 +4415,9 @@ function dropBackgroundTurn(box, why) {
   note("a turn in another session is no longer live (" + why + ") — open that session to follow it");
 }
 async function loadHistory(prefetched) {
+  // Prefetched rows keep the session they were captured for.
+  const forSession = prefetched?.sessionId ?? sessionId;
+  if (forSession !== sessionId) return;
   const loadId = ++historyLoadSeq;
   if (!sessionId) {
     revokePreviews();
@@ -4336,7 +4428,6 @@ async function loadHistory(prefetched) {
     addMsg("asst", "no session yet — tap ＋ to start one.", "asst");
     return;
   }
-  const forSession = sessionId; // the session this fetch describes, checked again before rendering
   if (historySession && historySession !== forSession) abortEvents();
   let msgs = [];
   // One message beyond the rendered window: a tool result sitting at the edge
@@ -4352,7 +4443,7 @@ async function loadHistory(prefetched) {
     histTotal = prefetched.histTotal;
   } else {
     try {
-      const res = await api("/sessions/" + sessionId + "/history?limit=201");
+      const res = await api("/sessions/" + forSession + "/history?limit=201");
       histTotal = Number(res.headers.get("x-history-total")) || 0;
       msgs = await res.json();
     }
@@ -4364,91 +4455,105 @@ async function loadHistory(prefetched) {
     }
   }
   if (forSession !== sessionId || loadId !== historyLoadSeq) return;
-  const history = historyRowsOf(msgs, histTotal, !!(prefetched && prefetched.showAll));
-  canonicalHistoryTotal = histTotal || msgs.length;
-  lastMsgCount = history.shownCount;
-  staleKey = histKey(msgs);
-  staleDone = histEndsTurn(msgs);
-  lastHistoryEndsUnanswered = historyEndsUnanswered(msgs);
-  syncStopButton();
-  renderSessionBar();
   const root = $("msgs");
-  if (!lastHistoryEndsUnanswered) root.querySelectorAll(".turn-interrupted").forEach((node) => node.remove());
-  const sameSession = historySession === forSession;
-  const follow = !sameSession || shouldFollowOutput(root);
-  const oldScrollTop = root.scrollTop;
-  const nextKeys = history.rows.map((row) => row.key);
-  // Keep the overlapping canonical window, including loaded media. The
-  // 200-message window can slide forward without re-decoding every image.
-  const start = sameSession && nextKeys.length ? historyKeys.indexOf(nextKeys[0]) : -1;
-  const retained = start < 0 ? 0 : Math.min(historyKeys.length - start, nextKeys.length);
-  const pending = [];
-  const baseIndex = Math.max(0, (histTotal || msgs.length) - msgs.length);
-  let acknowledgedThrough = 0;
-  for (const input of pendingUserInputs.get(forSession) || []) {
-    const floor = Math.max(pendingHistoryFloor(input, history, msgs, baseIndex, canonicalHistoryTotal), acknowledgedThrough);
-    // Image tokens become reference parts, or OCR is appended for non-vision models.
-    const expected = input.prompt.replace(/\[\[image:[\s\S]*?\]\]/g, "").trim();
-    const hadImages = expected !== input.prompt.trim();
-    const matches = (message) => {
-      if (message.role !== "user" || isRuntimeSyntheticUser(message)) return false;
-      const actual = textOf(message.content).trim();
-      return actual === expected || (hadImages && actual.startsWith(expected)
-        && /^\s*\[Attached Image Content via [^\]\r\n]+\]\n/.test(actual.slice(expected.length)));
+  try {
+    const history = historyRowsOf(msgs, histTotal, !!(prefetched && prefetched.showAll));
+    canonicalHistoryTotal = histTotal || msgs.length;
+    lastMsgCount = history.shownCount;
+    staleKey = histKey(msgs);
+    staleDone = histEndsTurn(msgs);
+    lastHistoryEndsUnanswered = historyEndsUnanswered(msgs);
+    syncStopButton();
+    renderSessionBar();
+    if (!lastHistoryEndsUnanswered) root.querySelectorAll(".turn-interrupted").forEach((node) => node.remove());
+    const sameSession = historySession === forSession;
+    const follow = !sameSession || shouldFollowOutput(root);
+    const oldScrollTop = root.scrollTop;
+    const nextKeys = history.rows.map((row) => row.key);
+    // Keep the overlapping canonical window, including loaded media. The
+    // 200-message window can slide forward without re-decoding every image.
+    const start = sameSession && nextKeys.length ? historyKeys.indexOf(nextKeys[0]) : -1;
+    const retained = start < 0 ? 0 : Math.min(historyKeys.length - start, nextKeys.length);
+    const pending = [];
+    const baseIndex = Math.max(0, (histTotal || msgs.length) - msgs.length);
+    let acknowledgedThrough = 0;
+    for (const input of pendingUserInputs.get(forSession) || []) {
+      const floor = Math.max(pendingHistoryFloor(input, history, msgs, baseIndex, canonicalHistoryTotal), acknowledgedThrough);
+      // Image tokens become reference parts, or OCR is appended for non-vision models.
+      const expected = input.prompt.replace(/\[\[image:[\s\S]*?\]\]/g, "").trim();
+      const hadImages = expected !== input.prompt.trim();
+      const matches = (message) => {
+        if (message.role !== "user" || isRuntimeSyntheticUser(message)) return false;
+        const actual = textOf(message.content).trim();
+        return actual === expected || (hadImages && actual.startsWith(expected)
+          && /^\s*\[Attached Image Content via [^\]\r\n]+\]\n/.test(actual.slice(expected.length)));
+      };
+      let found = msgs.findIndex((message, index) => baseIndex + index >= floor && matches(message));
+      if (found < 0 && input.settled) {
+        // The floor only separates this input from an older identical one. Once
+        // the turn was accepted this input is certainly persisted, so a page
+        // count that drifted above the store (for example a session rewound by
+        // another client) must not strand the local row at the tail: its own
+        // message is the newest row carrying this text.
+        for (let i = msgs.length - 1; i >= 0; i--) if (matches(msgs[i])) { found = i; break; }
+      }
+      if (found >= 0) {
+        input.historyIndex = baseIndex + found;
+        input.historyIdentity = history.rows.find((row) => row.historyIndex === input.historyIndex)?.identity;
+        acknowledgedThrough = Math.max(acknowledgedThrough, baseIndex + found + 1);
+        input.row.remove();
+        revokePreviews(input.row);
+      } else {
+        input.minIndex = floor;
+        input.beforeKey = history.rows.find((row) => row.historyIndex >= floor)?.key || null;
+        pending.push(input);
+      }
+    }
+    if (pending.length) pendingUserInputs.set(forSession, pending);
+    else pendingUserInputs.delete(forSession);
+    const protectedRows = new Set(pending.map((input) => input.row));
+    const liveBox = turns.get(forSession)?.box || (eventSession === forSession ? recoveredView?.box : null);
+    if (liveBox) protectedRows.add(liveBox);
+    // Reconcile only the canonical prefix; pending rows may be interleaved with it.
+    for (const row of protectedRows) row.remove();
+    const appendOnly = retained > 0
+      && nextKeys.slice(0, retained).every((key, i) => key === historyKeys[start + i])
+      && root.children.length >= historyKeys.length;
+    const removeRow = (node) => {
+      if (!protectedRows.has(node)) revokePreviews(node);
+      node.remove();
     };
-    let found = msgs.findIndex((message, index) => baseIndex + index >= floor && matches(message));
-    if (found < 0 && input.settled) {
-      // The floor only separates this input from an older identical one. Once
-      // the turn was accepted this input is certainly persisted, so a page
-      // count that drifted above the store (for example a session rewound by
-      // another client) must not strand the local row at the tail: its own
-      // message is the newest row carrying this text.
-      for (let i = msgs.length - 1; i >= 0; i--) if (matches(msgs[i])) { found = i; break; }
-    }
-    if (found >= 0) {
-      input.historyIndex = baseIndex + found;
-      input.historyIdentity = history.rows.find((row) => row.historyIndex === input.historyIndex)?.identity;
-      acknowledgedThrough = Math.max(acknowledgedThrough, baseIndex + found + 1);
-      input.row.remove();
-      revokePreviews(input.row);
+    if (appendOnly) {
+      for (let i = 0; i < start; i++) removeRow(root.children[0]);
+      while (root.children.length > retained) removeRow(root.lastElementChild);
+      for (let i = retained; i < history.rows.length; i++) renderHistoryRow(history.rows[i], root);
     } else {
-      input.minIndex = floor;
-      input.beforeKey = history.rows.find((row) => row.historyIndex >= floor)?.key || null;
-      pending.push(input);
+      // Fetching has completed, so this synchronous clear-and-render is painted
+      // as one frame instead of exposing an empty transcript during network I/O.
+      // A still-running box is reattached below; its previews remain owned by it.
+      revokePreviews(root);
+      root.textContent = "";
+      for (const row of history.rows) renderHistoryRow(row, root);
     }
+    historySession = forSession;
+    historyKeys = nextKeys;
+    updateQuestionButton();
+    attachLiveBox();
+    if (!follow && !appendOnly) root.scrollTop = oldScrollTop;
+    followOutput(follow, root);
+  } catch (e) {
+    console.error("history render failed for session " + forSession, e);
+    if (historySession !== forSession) {
+      revokePreviews(root);
+      root.textContent = "";
+    }
+    historySession = "";
+    historyKeys = [];
+    canonicalHistoryTotal = 0;
+    lastMsgCount = null;
+    renderSessionBar();
+    addMsg("err", "history render failed: " + (e && e.message ? e.message : String(e)), "asst err");
   }
-  if (pending.length) pendingUserInputs.set(forSession, pending);
-  else pendingUserInputs.delete(forSession);
-  const protectedRows = new Set(pending.map((input) => input.row));
-  const liveBox = turns.get(forSession)?.box || (eventSession === forSession ? recoveredView?.box : null);
-  if (liveBox) protectedRows.add(liveBox);
-  // Reconcile only the canonical prefix; pending rows may be interleaved with it.
-  for (const row of protectedRows) row.remove();
-  const appendOnly = retained > 0
-    && nextKeys.slice(0, retained).every((key, i) => key === historyKeys[start + i])
-    && root.children.length >= historyKeys.length;
-  const removeRow = (node) => {
-    if (!protectedRows.has(node)) revokePreviews(node);
-    node.remove();
-  };
-  if (appendOnly) {
-    for (let i = 0; i < start; i++) removeRow(root.children[0]);
-    while (root.children.length > retained) removeRow(root.lastElementChild);
-    for (let i = retained; i < history.rows.length; i++) renderHistoryRow(history.rows[i], root);
-  } else {
-    // Fetching has completed, so this synchronous clear-and-render is painted
-    // as one frame instead of exposing an empty transcript during network I/O.
-    // A still-running box is reattached below; its previews remain owned by it.
-    revokePreviews(root);
-    root.textContent = "";
-    for (const row of history.rows) renderHistoryRow(row, root);
-  }
-  historySession = forSession;
-  historyKeys = nextKeys;
-  updateQuestionButton();
-  attachLiveBox();
-  if (!follow && !appendOnly) root.scrollTop = oldScrollTop;
-  followOutput(follow, root);
 }
 // Historical user inputs offer a rewind to just before them, mirroring the
 // local `/history rewind u<N>`: that message and everything after it is
@@ -4569,7 +4674,7 @@ async function reloadStale() {
     // session stops it, the page goes hidden): re-check before re-rendering.
     if (!staleSession || staleSession !== forSession || sessionId !== forSession
         || runEpoch !== epoch || loadId !== historyLoadSeq || eventActive || document.visibilityState !== "visible") return;
-    if (histKey(msgs) !== staleKey) await loadHistory({ messages: msgs, histTotal, appendOnly: true });
+    if (histKey(msgs) !== staleKey) await loadHistory({ sessionId: forSession, messages: msgs, histTotal, appendOnly: true });
     if (staleDone) { stopStaleFollow(); return; } // the reply landed: nothing left to follow
     // A successful server poll is authoritative. If it says the turn no longer
     // exists and history still has no final reply, a daemon restart or crash
@@ -6057,7 +6162,7 @@ function wire() {
   const toggleSessions = () => setDrawer(!$("sessions").classList.contains("open"));;
   $("menu").onclick = toggleSessions;
   $("sessbar").onclick = toggleSessions;
-  $("sessfilter").oninput = (e) => { sessFilter = e.target.value; renderSessionList(lastItems); };
+  $("sessfilter").oninput = (e) => { sessFilter = e.target.value; renderSessionList(lastItems, undefined, { preserveScroll: false }); };
   $("connbtn").onclick = () => $("conn").classList.toggle("open");
   // The floating capture button needs a system permission that is granted
   // once; the entry only shows up in shells that know how to open it.
@@ -6110,6 +6215,7 @@ function wire() {
   $("newbtn").onclick = async () => {
     try {
       const newId = (await (await api("/sessions", { method: "POST" })).json()).id;
+      if (!isPhoneLayout()) clearDraft(newId);
       switchSession(newId);
       pendingNew = newId;
       lastMsgCount = null;
@@ -6124,17 +6230,7 @@ function wire() {
     } catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); }
   };
   $("refresh").onclick = async () => { await loadSessions(); await loadHistory(); await loadSessionConfig({ teamOnly: true }); };
-  $("fork").onclick = async () => {
-    if (!sessionId) return;
-    try {
-      const forkedId = (await (await api("/sessions/" + sessionId + "/fork", { method: "POST" })).json()).id;
-      switchSession(forkedId);
-      lastMsgCount = null;
-      turnRunning = false; // a running turn (if any) belongs to the source session
-      await loadSessions(); await loadHistory();
-      await loadSessionConfig(); // the fork inherits the source session's picks
-    } catch (e) { addMsg("err", "fork failed: " + e.message, "asst err"); }
-  };
+  $("fork").onclick = () => forkSession(sessionId);
   $("del").onclick = () => deleteSession(sessionId);
   $("img").onclick = () => $("file").click();
   $("viewer").onclick = () => { $("viewer").classList.remove("on"); $("viewerimg").src = ""; };
