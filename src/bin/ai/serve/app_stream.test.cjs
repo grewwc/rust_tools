@@ -374,7 +374,7 @@ test("restored running sessions distinguish missing live updates from active str
   vm.runInContext(script.slice(script.indexOf("function isTurnRunning()"), script.indexOf("function note(")), context);
   context.syncStopButton();
   assert.equal(elements.turnstatus.hidden, false);
-  assert.match(elements.turnstatus.textContent, /Turn running on server.*live updates unavailable/);
+  assert.match(elements.turnstatus.textContent, /server is still running the previous turn/i);
   // A reattached event stream is a live source even though it is not in `turns`.
   context.eventActive = true; context.eventSession = "a";
   context.syncStopButton();
@@ -384,9 +384,14 @@ test("restored running sessions distinguish missing live updates from active str
   context.turns.set("a", {});
   context.syncStopButton();
   assert.equal(elements.turnstatus.hidden, true);
-  context.turns.clear(); context.turnRunningAt = 0; context.staleSession = "a";
+  context.turns.clear(); context.turnRunningAt = 100000; context.staleSession = "a";
   context.syncStopButton();
-  assert.match(elements.turnstatus.textContent, /Live connection lost/);
+  assert.match(elements.turnstatus.textContent, /server is still running the previous turn/i);
+  context.turnRunningAt = 0;
+  context.syncStopButton();
+  assert.equal(context.isTurnRunning(), false);
+  assert.equal(elements.turnstatus.hidden, true, "an expired server sample must release a stale composer");
+  assert.equal(elements.send.title, "send");
   context.turnRunning = false; context.staleSession = "";
   context.syncStopButton();
   assert.equal(elements.turnstatus.hidden, true);
@@ -566,6 +571,8 @@ test("replayed final text replaces provisional deltas", () => {
 
 test("EOF without the done event follows server history instead of declaring completion", () => {
   assert.match(script, /if \(!finished && !turnError\) \{[\s\S]*?stream ended before completion[\s\S]*?goStale/);
+  assert.match(script, /const goStale = \(msg\) => \{[\s\S]*?turnRunning = true;[\s\S]*?turnRunningAt = Date\.now\(\);[\s\S]*?startStaleFollow\(\);/,
+    "a lost accepted stream must start one bounded running-sample window");
 });
 
 test("a finished event stream is not re-attached on every poll, but a new turn is", async () => {

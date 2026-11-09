@@ -356,6 +356,7 @@ pub(crate) struct SessionItem {
 #[derive(Debug, Deserialize)]
 pub(crate) struct SessionsQuery {
     pub(crate) limit: Option<usize>,
+    pub(crate) offset: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]

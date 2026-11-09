@@ -459,7 +459,10 @@ async fn session_events_stream_ends_with_the_terminal_marker() {
         State(state.clone()),
         HeaderMap::new(),
         Path("s-finished".to_string()),
-        Query(EventsQuery { after: 0, client: "test".to_string() }),
+        Query(EventsQuery {
+            after: 0,
+            client: "test".to_string(),
+        }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -480,7 +483,10 @@ async fn session_events_stream_ends_with_the_terminal_marker() {
         State(state),
         HeaderMap::new(),
         Path("s-missing".to_string()),
-        Query(EventsQuery { after: 0, client: "test".to_string() }),
+        Query(EventsQuery {
+            after: 0,
+            client: "test".to_string(),
+        }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -972,6 +978,56 @@ async fn session_mark_endpoint_roundtrips_and_updates_list() {
         assert!(!store.session_exists("missing").expect("missing session"));
         assert_eq!(store.list_sessions().expect("stored sessions").len(), 1);
     }
+    server.abort();
+    let _ = server.await;
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[tokio::test]
+async fn session_list_offset_matches_the_legacy_full_response() {
+    let state = lifecycle_test_state();
+    let root = state
+        .history_file
+        .parent()
+        .expect("test root")
+        .to_path_buf();
+    let store = SessionStore::new(state.history_file.as_path());
+    for id in ["page-one", "page-two", "page-three"] {
+        store
+            .write_session_title_with_origin(id, id, SessionTitleOrigin::User)
+            .expect("persist session");
+    }
+
+    let app = Router::new()
+        .route("/sessions", get(list_sessions))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listen");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let client = reqwest::Client::new();
+    let all = client
+        .get(format!("{base}/sessions"))
+        .send()
+        .await
+        .expect("full list request")
+        .json::<Vec<serde_json::Value>>()
+        .await
+        .expect("full list json");
+    let page = client
+        .get(format!("{base}/sessions?offset=1&limit=1"))
+        .send()
+        .await
+        .expect("page request")
+        .json::<Vec<serde_json::Value>>()
+        .await
+        .expect("page json");
+
+    assert_eq!(all.len(), 3);
+    assert_eq!(page, vec![all[1].clone()]);
     server.abort();
     let _ = server.await;
     std::fs::remove_dir_all(root).expect("remove test root");

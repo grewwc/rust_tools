@@ -112,7 +112,11 @@ pub(crate) async fn list_sessions(
                 .into_response();
         }
     };
-    // Newest first is already the store order; apply limit only.
+    // Preserve the store order while allowing clients to fetch consecutive
+    // pages. Offset is applied before limit so `/sessions?limit=N&offset=K`
+    // is the same slice as the legacy full response `[K..K + N]`.
+    let offset = q.offset.unwrap_or(0).min(items.len());
+    items.drain(..offset);
     if let Some(limit) = q.limit {
         items.truncate(limit);
     }

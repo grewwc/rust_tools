@@ -174,6 +174,72 @@ test("an automatic session switch does not replace the composer's text", async (
   assert.deepEqual(switched, ["new"]);
 });
 
+test("desktop session loading appends every server page", async () => {
+  const sourceItems = Array.from({ length: 52 }, (_, index) => ({ id: `s-${index}` }));
+  const urls = [];
+  const renders = [];
+  const context = makeContext({
+    store: { base: "https://serve.test" },
+    api: async (url) => {
+      urls.push(url);
+      const offset = Number(url.match(/offset=(\d+)/)?.[1] || 0);
+      return { json: async () => sourceItems.slice(offset, offset + 50) };
+    },
+    switchSession: () => {},
+    note: () => {},
+    renderSessionList: (items) => renders.push(Array.from(items, (item) => item.id)),
+    renderSessionBar: () => {},
+    pollConfirm: () => {},
+    loadHistory: async () => {},
+    loadSessionConfig: async () => {},
+    resetPicks: () => {},
+  });
+  vm.runInContext(loadSessionsSrc, context);
+  vm.runInContext("let lastItems = []; let pendingNew = ''; let sessionId = 's-51'; let turnRunning = false; let sessFilter = '';", context);
+
+  await run(context, "loadSessions()");
+
+  assert.deepEqual(urls, [
+    "/sessions?limit=50&offset=0",
+    "/sessions?limit=50&offset=50",
+  ]);
+  assert.equal(renders[0].length, 50, "the first batch was not rendered immediately");
+  assert.deepEqual(renders.at(-1), sourceItems.map((item) => item.id).reverse());
+});
+
+test("desktop session loading falls back when an older daemon ignores offset", async () => {
+  const sourceItems = Array.from({ length: 52 }, (_, index) => ({ id: `s-${index}` }));
+  const urls = [];
+  const renders = [];
+  const context = makeContext({
+    store: { base: "https://serve.test" },
+    api: async (url) => {
+      urls.push(url);
+      const items = url === "/sessions" ? sourceItems.slice() : sourceItems.slice(0, 50);
+      return { json: async () => items };
+    },
+    switchSession: () => {},
+    note: () => {},
+    renderSessionList: (items) => renders.push(Array.from(items, (item) => item.id)),
+    renderSessionBar: () => {},
+    pollConfirm: () => {},
+    loadHistory: async () => {},
+    loadSessionConfig: async () => {},
+    resetPicks: () => {},
+  });
+  vm.runInContext(loadSessionsSrc, context);
+  vm.runInContext("let lastItems = []; let pendingNew = ''; let sessionId = 's-51'; let turnRunning = false; let sessFilter = '';", context);
+
+  await run(context, "loadSessions()");
+
+  assert.deepEqual(urls, [
+    "/sessions?limit=50&offset=0",
+    "/sessions?limit=50&offset=50",
+    "/sessions",
+  ]);
+  assert.deepEqual(renders.at(-1), sourceItems.map((item) => item.id).reverse());
+});
+
 test("programmatic writes and resizes are marked for the input trace", () => {
   const context = makeContext();
   run(context, "traceMark = (what) => { marks.push(what); };");
