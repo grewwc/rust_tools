@@ -7,7 +7,7 @@
 //! instead, with older records archived verbatim before they leave the projection
 //! (`overflow_sink::trim_incremental_summary_notes_to_inline_budget`).
 
-use super::summary_input::build_summary_history_input;
+use super::summary_input::{SUMMARY_TRANSCRIPT_MAX_CHARS, build_summary_history_input};
 use super::tool_overflow::stub_archive_display_path;
 use super::*;
 use crate::ai::history::HistoryMessageSummarizer;
@@ -275,15 +275,8 @@ async fn plan_incremental_summary_with_summarizer(
         return None;
     }
     prepare_persisted_summary_messages(&mut fresh);
-    let max_request_chars = summarizer.summary_input_max_chars(max_chars);
+    let max_request_chars = SUMMARY_TRANSCRIPT_MAX_CHARS;
     let request_input = build_summary_history_input(&fresh, max_request_chars);
-    #[cfg(test)]
-    eprintln!(
-        "summary preflight fresh={} max_request_chars={} request_chars={}",
-        fresh.len(),
-        max_request_chars,
-        request_input.chars().count()
-    );
     if request_input.is_empty() {
         return None;
     }
@@ -292,12 +285,6 @@ async fn plan_incremental_summary_with_summarizer(
     // bound; never turn an oversized history into a serial model-call loop.
     let draft = build_persisted_summary_text_with_app(summarizer, &fresh, max_chars).await?;
     let entries = memory_entries(&draft);
-    #[cfg(test)]
-    eprintln!(
-        "summary response draft_chars={} entries={}",
-        draft.chars().count(),
-        entries.len()
-    );
     if entries.is_empty() {
         return None;
     }

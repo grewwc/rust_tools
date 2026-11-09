@@ -425,7 +425,7 @@ async fn mid_turn_llm_summary_path_a_preserves_raw_archive_pointer() {
 }
 
 #[tokio::test]
-async fn mid_turn_llm_summary_path_a_http_400_fallback_preserves_raw_archive_pointer() {
+async fn mid_turn_llm_summary_path_a_http_400_uses_mechanical_projection_without_retry() {
     assert_path_a_preserves_raw_archive_pointer("400 Bad Request").await;
 }
 
@@ -471,22 +471,37 @@ async fn assert_path_a_preserves_raw_archive_pointer(status: &str) {
     let tail = messages[3..].to_vec();
     // The budget covers both the draft and its complete source/provenance record.
     let (compressed, before, after, effective, inserted) =
-        mid_turn_llm_summarize(app, messages, 1, 4_000, 20_000, None).await;
+        mid_turn_llm_summarize(app, messages, 1, 4_000, 4_000, None).await;
+    if status != "200 OK" {
+        assert!(after < before);
+        assert!(!effective && !inserted);
+        assert!(compressed.ends_with(&tail));
+        assert!(!compressed.iter().any(|message| {
+            message
+                .content
+                .as_str()
+                .is_some_and(|text| text.starts_with("[incremental-memory-v1]"))
+        }));
+        let request = fixture.request().await;
+        assert!(
+            request["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("早期目标")
+        );
+        return;
+    }
 
-    eprintln!("before={before} after={after} effective={effective} inserted={inserted} compressed={compressed:?}");
-    assert!(after < before, "Path A should reduce earlier history");
-    assert!(effective && inserted);
+    assert!(
+        after < before,
+        "Path A should reduce earlier history: before={before}, after={after}"
+    );
+    assert!(effective);
     assert_eq!(after, messages_total_chars_pub(&compressed));
     assert!(compressed.ends_with(&tail));
+    assert!(inserted);
     let record = assert_summary_source(&compressed, &earlier, app);
-    if status == "200 OK" {
-        assert_eq!(record["entries"][0]["text"], draft.lines().nth(1).unwrap());
-    } else {
-        // A valid JSON body on a rejected response must never be used as a
-        // successful model summary; the deterministic fallback preserves intent.
-        assert!(!record.to_string().contains(draft.lines().nth(1).unwrap()));
-        assert!(record.to_string().contains("早期目标"));
-    }
+    assert_eq!(record["entries"][0]["text"], draft.lines().nth(1).unwrap());
     assert!(compressed.iter().any(|message| {
         message
             .content

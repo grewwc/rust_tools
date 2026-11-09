@@ -4,31 +4,12 @@ use serde_json::Value;
 
 use crate::ai::history::{Message, is_side_note_message};
 
-/// Bound one auxiliary request even when the selected model has a very large
-/// context window. Incremental segments and request rendering use the same
-/// computed budget so priority sampling cannot skip a segment row.
-pub(in crate::ai) const SUMMARY_TRANSCRIPT_MAX_CHARS: usize = 500_000;
-const SUMMARY_REQUEST_MARGIN_TOKENS: usize = 4_096;
+/// Bound one auxiliary request independently of source-history size. Both the
+/// planner preflight and request renderer use this cap so oversized history is
+/// sampled once instead of being split into serial model calls.
+pub(in crate::ai) const SUMMARY_TRANSCRIPT_MAX_CHARS: usize = 22_000;
 pub(super) const SUMMARY_MESSAGE_MAX_CHARS: usize = 6_000;
 pub(super) const SUMMARY_MESSAGE_SEPARATOR: &str = "\n\n[...chronological messages omitted...]\n\n";
-
-/// Reserve the requested summary output, fixed prompt text, and protocol
-/// framing before allocating transcript input. Dividing the remaining tokens
-/// by two is conservative for multilingual text and emoji; the hard cap keeps
-/// request latency bounded on million-token models.
-pub(in crate::ai) fn summary_transcript_max_chars(
-    context_window_tokens: usize,
-    summary_output_max_chars: usize,
-    fixed_prompt_chars: usize,
-) -> usize {
-    let reserved_tokens = summary_output_max_chars
-        .saturating_add(fixed_prompt_chars.saturating_mul(2))
-        .saturating_add(SUMMARY_REQUEST_MARGIN_TOKENS);
-    context_window_tokens
-        .saturating_sub(reserved_tokens)
-        .saturating_div(2)
-        .min(SUMMARY_TRANSCRIPT_MAX_CHARS)
-}
 
 fn truncate_summary_fragment(fragment: &str, max_chars: usize) -> String {
     let total = fragment.chars().count();

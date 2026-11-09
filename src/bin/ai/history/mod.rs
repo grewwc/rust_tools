@@ -24,11 +24,6 @@ mod types;
 /// `Box<dyn Future + Send + '_>` could not satisfy both borrow lifetimes in
 /// type checking (`lifetime may not live long enough`).
 pub(in crate::ai) trait HistoryMessageSummarizer {
-    /// Bound for the deterministic transcript projection used by the summary
-    /// request. Implementations must apply this same bound when rendering
-    /// `messages`, so callers can reject an unrenderable batch before dispatch.
-    fn summary_input_max_chars(&self, summary_output_max_chars: usize) -> usize;
-
     fn summarize_history_messages<'a>(
         &'a self,
         messages: &'a [Message],

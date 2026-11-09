@@ -16,7 +16,7 @@ use super::{
 #[cfg(test)]
 use crate::ai::history::compress::summary_input::render_summary_message;
 use crate::ai::history::compress::summary_input::{
-    build_summary_history_input, summary_transcript_max_chars,
+    SUMMARY_TRANSCRIPT_MAX_CHARS, build_summary_history_input,
 };
 use crate::ai::{
     history::{
@@ -73,6 +73,60 @@ pub(super) async fn send_aux_chat_request_with_key_rotation(
     overall_deadline: Option<Instant>,
 ) -> Result<String, (String, String)> {
     let keys = aux_request_key_candidates(model, endpoint, &ctx.config.api_key);
+    send_aux_chat_request_for_keys(
+        ctx,
+        endpoint,
+        http_body,
+        &keys,
+        header_timeout,
+        body_timeout,
+        overall_deadline,
+    )
+    .await
+}
+
+/// Send one auxiliary request with only the highest-priority configured key.
+///
+/// Automatic history compression uses this path because a failed attempt must
+/// preserve the current projection rather than fan the same summary out across
+/// fallback keys. Other auxiliary tasks retain key rotation through
+/// [`send_aux_chat_request_with_key_rotation`].
+async fn send_aux_chat_request_once(
+    ctx: &AuxRequestContext<'_>,
+    model: &str,
+    endpoint: &str,
+    http_body: Vec<u8>,
+    header_timeout: Duration,
+    body_timeout: Duration,
+) -> Result<String, (String, String)> {
+    let keys = aux_request_key_candidates(model, endpoint, &ctx.config.api_key);
+    let Some(api_key) = keys.first() else {
+        return Err((
+            "request_error".to_string(),
+            "no API key candidate available".to_string(),
+        ));
+    };
+    send_aux_chat_request_for_keys(
+        ctx,
+        endpoint,
+        http_body,
+        std::slice::from_ref(api_key),
+        header_timeout,
+        body_timeout,
+        None,
+    )
+    .await
+}
+
+async fn send_aux_chat_request_for_keys(
+    ctx: &AuxRequestContext<'_>,
+    endpoint: &str,
+    http_body: Vec<u8>,
+    keys: &[String],
+    header_timeout: Duration,
+    body_timeout: Duration,
+    overall_deadline: Option<Instant>,
+) -> Result<String, (String, String)> {
     let mut last_err: (String, String) = ("http_error".to_string(), "unknown".to_string());
 
     for (idx, api_key) in keys.iter().enumerate() {
@@ -322,7 +376,7 @@ pub(crate) async fn summarize_history_via_model(
     }
 
     // Present priority-selected messages in their original chronological order.
-    let transcript = build_summary_history_input(messages, app.summary_input_max_chars(max_chars));
+    let transcript = build_summary_history_input(messages, SUMMARY_TRANSCRIPT_MAX_CHARS);
     if transcript.is_empty() {
         return None;
     }
@@ -366,23 +420,22 @@ pub(crate) async fn summarize_history_via_model(
     let endpoint = endpoint_for_request_model(app, &control_model);
     let http_body =
         super::protocol::build_http_body_for_request(&control_model, &endpoint, &mut request_body);
-    // Auxiliary summaries have explicit deadlines so a stalled provider cannot
-    // block return to the prompt. Rotate the same configured key candidates as
-    // main requests; timeout or exhaustion preserves the original history.
+    // A summary attempt is one bounded model request. On any failure the caller
+    // preserves the original projection; it must not retry the same summary
+    // through fallback keys and multiply compression latency or cost.
     let ctx = AuxRequestContext {
         config: &app.config,
         client: &app.client,
         session_id: &app.session_id,
     };
     let _progress = HistoryCompressionProgress::start();
-    let text = match send_aux_chat_request_with_key_rotation(
+    let text = match send_aux_chat_request_once(
         &ctx,
         &control_model,
         &endpoint,
         http_body,
         Duration::from_secs(60),
         Duration::from_secs(30),
-        None,
     )
     .await
     {
@@ -401,24 +454,6 @@ pub(crate) async fn summarize_history_via_model(
 }
 
 impl HistoryMessageSummarizer for App {
-    fn summary_input_max_chars(&self, summary_output_max_chars: usize) -> usize {
-        let cfg = crate::commonw::configw::get_all_config();
-        let additional = cfg.get(
-            crate::ai::config_schema::AiConfig::HISTORY_SUMMARY_PROMPT,
-            "",
-        );
-        let fixed_prompt_chars = history_summary_prompt(summary_output_max_chars, &additional)
-            .chars()
-            .count()
-            .saturating_add(HISTORY_SUMMARY_USER_PREFIX.chars().count());
-        let control_model = control_model_for_aux_tasks(self);
-        summary_transcript_max_chars(
-            models::context_window_tokens(&control_model),
-            summary_output_max_chars,
-            fixed_prompt_chars,
-        )
-    }
-
     fn summarize_history_messages<'a>(
         &'a self,
         messages: &'a [Message],
@@ -757,8 +792,8 @@ mod session_title_tests {
         );
     }
 
-    #[test]
-    fn aux_request_key_candidates_prefers_named_provider_key() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn summary_request_uses_only_the_preferred_provider_key() {
         // Regression: with a named provider key configured (`opencode.api_key_*`), auxiliary
         // requests (title/summary) must offer the same key candidates as the main request.
         // Using only the primary key fell back to the global api_key, which fails against the
@@ -795,6 +830,66 @@ mod session_title_tests {
             "global-invalid",
         );
         assert_eq!(keys, vec!["named-valid", "global-invalid"]);
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4_096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+            if let Ok(Ok((mut retry, _))) =
+                tokio::time::timeout(Duration::from_millis(250), listener.accept()).await
+            {
+                retry.read(&mut request).await.unwrap();
+                retry
+                    .write_all(
+                        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+                true
+            } else {
+                false
+            }
+        });
+        let config = AppConfig {
+            api_key: "global-invalid".to_string(),
+            base_history_file: Default::default(),
+            history_file: Default::default(),
+            endpoint: String::new(),
+            vl_default_model: String::new(),
+            history_max_chars: 0,
+            history_keep_last: 0,
+            history_summary_max_chars: 0,
+            intent_model: None,
+        };
+        let client = reqwest::Client::new();
+        let ctx = AuxRequestContext {
+            config: &config,
+            client: &client,
+            session_id: "summary-single-request-test",
+        };
+        let result = send_aux_chat_request_once(
+            &ctx,
+            &model.key,
+            &endpoint,
+            b"{}".to_vec(),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            !server.await.unwrap(),
+            "summary failure must not retry with the fallback API key"
+        );
 
         // Restore the previous CONFIGW_PATH (if any) so later tests in this process are unaffected.
         match old_configw_path {

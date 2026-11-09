@@ -3,11 +3,9 @@
 use std::sync::Mutex;
 
 use super::summary_input::{
-    SUMMARY_MESSAGE_SEPARATOR, build_summary_history_input, summary_transcript_max_chars,
+    SUMMARY_MESSAGE_SEPARATOR, SUMMARY_TRANSCRIPT_MAX_CHARS, build_summary_history_input,
 };
 use super::*;
-
-const DEFAULT_TEST_SUMMARY_INPUT_MAX_CHARS: usize = 22_000;
 
 struct TestDir(PathBuf);
 
@@ -55,7 +53,6 @@ struct Summarizer {
     failure: Option<(usize, Option<&'static str>)>,
     padding: usize,
     entries: usize,
-    input_max_chars: usize,
 }
 
 impl Default for Summarizer {
@@ -65,16 +62,11 @@ impl Default for Summarizer {
             failure: None,
             padding: 0,
             entries: 1,
-            input_max_chars: DEFAULT_TEST_SUMMARY_INPUT_MAX_CHARS,
         }
     }
 }
 
 impl HistoryMessageSummarizer for Summarizer {
-    fn summary_input_max_chars(&self, _summary_output_max_chars: usize) -> usize {
-        self.input_max_chars
-    }
-
     fn summarize_history_messages<'a>(
         &'a self,
         messages: &'a [Message],
@@ -213,19 +205,14 @@ async fn incremental_memory_uses_one_bounded_request_for_thousand_turns() {
         ));
     }
     let original = input.clone();
-    let input_max_chars = summary_transcript_max_chars(1_000_000, 8_000, 2_000);
-    assert_eq!(input_max_chars, 491_952);
-    let summarizer = Summarizer {
-        input_max_chars,
-        ..Default::default()
-    };
+    let summarizer = Summarizer::default();
     let plan = plan_incremental_summary_with_summarizer(&summarizer, &input, 8_000, Some(&dir.0))
         .await
         .unwrap();
     assert_eq!(input, original);
     assert_eq!(input[1], prior);
     let calls = summarizer.calls.lock().unwrap();
-    verify_single_bounded_request(&calls, input_max_chars);
+    verify_single_bounded_request(&calls, SUMMARY_TRANSCRIPT_MAX_CHARS);
     let supplied: Vec<Message> = calls.iter().flatten().cloned().collect();
     assert_eq!(supplied, summary_delta_messages(&original));
     assert!(supplied.contains(&early_note));
@@ -234,7 +221,7 @@ async fn incremental_memory_uses_one_bounded_request_for_thousand_turns() {
     assert_eq!(record["summary_input"]["requests"], 1);
     assert_eq!(
         record["summary_input"]["max_request_chars"],
-        input_max_chars
+        SUMMARY_TRANSCRIPT_MAX_CHARS
     );
     assert_eq!(record["summary_input"]["source_messages"], supplied.len());
     assert_eq!(
@@ -252,14 +239,9 @@ async fn incremental_memory_uses_one_bounded_request_for_thousand_turns() {
 #[tokio::test]
 async fn incremental_memory_oversized_source_uses_one_bounded_sampled_request() {
     let dir = TestDir::new();
-    let input_max_chars = summary_transcript_max_chars(32_000, 8_000, 2_000);
-    assert_eq!(input_max_chars, 7_952);
-    let summarizer = Summarizer {
-        input_max_chars,
-        ..Default::default()
-    };
+    let summarizer = Summarizer::default();
     let input: Vec<_> = (0..120)
-        .map(|index| message("user", format!("turn-{index:03}-{}", "x".repeat(100))))
+        .map(|index| message("user", format!("turn-{index:03}-{}", "x".repeat(300))))
         .collect();
 
     let plan =
@@ -267,7 +249,7 @@ async fn incremental_memory_oversized_source_uses_one_bounded_sampled_request() 
             .await
             .unwrap();
     let calls = summarizer.calls.lock().unwrap();
-    let transcript = verify_single_bounded_request(&calls, input_max_chars);
+    let transcript = verify_single_bounded_request(&calls, SUMMARY_TRANSCRIPT_MAX_CHARS);
     assert_eq!(calls[0], input);
     assert!(transcript.contains(SUMMARY_MESSAGE_SEPARATOR));
     verify_archive(&plan, &input);
@@ -355,7 +337,7 @@ async fn incremental_memory_single_request_output_cap_archives_omitted_entries()
         .await
         .unwrap();
     let calls = summarizer.calls.lock().unwrap();
-    verify_single_bounded_request(&calls, DEFAULT_TEST_SUMMARY_INPUT_MAX_CHARS);
+    verify_single_bounded_request(&calls, SUMMARY_TRANSCRIPT_MAX_CHARS);
     assert_eq!(calls[0], input);
     let record = record(&plan);
     let entries = record["entries"].as_array().unwrap();
@@ -384,7 +366,7 @@ async fn incremental_memory_single_request_output_cap_archives_omitted_entries()
 #[tokio::test]
 async fn incremental_memory_single_request_refuses_oversized_identity_before_model_calls() {
     let dir = TestDir::new();
-    let author = "x".repeat(DEFAULT_TEST_SUMMARY_INPUT_MAX_CHARS);
+    let author = "x".repeat(SUMMARY_TRANSCRIPT_MAX_CHARS);
     let note = crate::ai::history::runtime_synthetic_user_message(Value::String(format!(
         "[side-note from={author} ts=44] Live guidance (side-note) from upstream agent `{author}`\n\nKeep the conclusion"
     )));
@@ -420,8 +402,8 @@ async fn incremental_memory_single_request_keeps_tool_metadata_and_archives_all_
         .await
         .unwrap();
     let calls = summarizer.calls.lock().unwrap();
-    verify_single_bounded_request(&calls, DEFAULT_TEST_SUMMARY_INPUT_MAX_CHARS);
-    let transcript = build_summary_history_input(&calls[0], DEFAULT_TEST_SUMMARY_INPUT_MAX_CHARS);
+    verify_single_bounded_request(&calls, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    let transcript = build_summary_history_input(&calls[0], SUMMARY_TRANSCRIPT_MAX_CHARS);
     assert!(transcript.contains("id=read-1"));
     assert!(transcript.contains("name=read_file"));
     assert!(transcript.contains("Tool result for call id: read-1"));
