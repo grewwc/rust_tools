@@ -1857,12 +1857,17 @@ test("phone output follows only while the reader remains near the bottom", () =>
   assert.equal(near.classes.has("show"), false);
 });
 
-test("desktop output preserves always-follow behavior", () => {
-  const h = scrollHarness({ phone: false, scrollTop: 0 });
-  assert.equal(h.context.shouldFollowOutput(), true);
-  h.context.followOutput(true);
-  assert.equal(h.msgs.scrollTop, 1000);
-  assert.equal(h.classes.has("show"), false);
+test("desktop output follows only while the reader is at the live edge", () => {
+  const away = scrollHarness({ phone: false, scrollTop: 0 });
+  assert.equal(away.context.shouldFollowOutput(), false);
+  away.context.followOutput(false);
+  assert.equal(away.msgs.scrollTop, 0);
+  assert.equal(away.classes.has("show"), true);
+  const live = scrollHarness({ phone: false, scrollTop: 600 });
+  assert.equal(live.context.shouldFollowOutput(), true);
+  live.context.followOutput(true);
+  assert.equal(live.msgs.scrollTop, 1000);
+  assert.equal(live.classes.has("show"), false);
 });
 
 for (const phone of [false, true]) test((phone ? "phone" : "desktop") + " jump button shows away from the bottom and hides near it", () => {

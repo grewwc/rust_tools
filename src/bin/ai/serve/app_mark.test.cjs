@@ -399,28 +399,11 @@ test("desktop, mouse and row controls do not open the phone action sheet", () =>
   assert.equal(h.timers.size, 0);
 });
 
-for (const phone of [false, true]) test(phone ? "phone title and row clicks select the session without marking" : "desktop title clicks toggle marks and row clicks select the session", async () => {
+for (const phone of [false, true]) test((phone ? "phone" : "desktop") + " title and row clicks select the session without marking", async () => {
   for (const titleClick of [true, false]) {
     const h = harness({ phone });
     const click = h.dispatch(titleClick ? h.row().querySelector("span") : h.row(), "click");
     assert.equal(click.event.stopped, titleClick);
-    if (!phone && titleClick) {
-      assert.equal(h.context.sessionId, "open-session");
-      await click.done;
-      assert.equal(h.context.sessionId, "open-session");
-      assert.equal(h.row().classList.contains("cur"), false);
-      assert.equal(h.row("open-session").classList.contains("cur"), true);
-      assert.equal(h.elements.sesstitle.textContent, "Open session");
-      assert.equal(h.row().querySelector(".mk").getAttribute("aria-pressed"), "true");
-      assert.deepEqual(h.requests.map(({ path, method, body }) => ({ path, method, body })), [
-        { path: "/sessions/target-session/mark", method: "POST", body: { marked: true } },
-      ]);
-      assert.deepEqual(h.switches, []);
-      assert.equal(h.historyLoads(), 0);
-      assert.equal(h.configLoads(), 0);
-      assert.deepEqual(h.drawerChanges, []);
-      continue;
-    }
     assert.equal(h.context.sessionId, "target-session");
     assert.equal(h.row().classList.contains("cur"), true, "selection is highlighted before any fetch completes");
     assert.equal(h.row("open-session").classList.contains("cur"), false);
@@ -436,7 +419,7 @@ for (const phone of [false, true]) test(phone ? "phone title and row clicks sele
   }
 });
 
-for (const phone of [false, true]) test((phone ? "phone" : "desktop") + " session titles support Enter and Space " + (phone ? "navigation" : "mark toggling"), async () => {
+for (const phone of [false, true]) test((phone ? "phone" : "desktop") + " session titles support Enter and Space navigation", async () => {
   for (const key of ["Enter", " "]) {
     const h = harness({ phone }), title = h.row().querySelector("span");
     assert.equal(title.getAttribute("role"), "button");
@@ -447,21 +430,6 @@ for (const phone of [false, true]) test((phone ? "phone" : "desktop") + " sessio
     const press = h.dispatch(title, "keydown", { key });
     assert.equal(press.event.prevented, true);
     assert.equal(press.event.stopped, true);
-    if (!phone) {
-      assert.equal(title.getAttribute("aria-current"), "false");
-      assert.equal(h.row("open-session").querySelector("span").getAttribute("aria-current"), "true");
-      await press.done;
-      assert.equal(h.context.sessionId, "open-session");
-      assert.equal(h.row().querySelector("span").getAttribute("aria-current"), "false");
-      assert.equal(h.row().querySelector(".mk").getAttribute("aria-pressed"), "true");
-      assert.deepEqual(h.requests.map(({ path, method, body }) => ({ path, method, body })), [
-        { path: "/sessions/target-session/mark", method: "POST", body: { marked: true } },
-      ]);
-      assert.deepEqual(h.switches, []);
-      assert.equal(h.historyLoads(), 0);
-      assert.equal(h.configLoads(), 0);
-      continue;
-    }
     assert.equal(title.getAttribute("aria-current"), "true");
     assert.equal(h.row("open-session").querySelector("span").getAttribute("aria-current"), "false");
     await press.done;
@@ -695,7 +663,9 @@ test("mark styles use theme gold and phone actions have 44px touch targets", () 
   assert.match(css, /#sessions li \.mk\[aria-pressed="true"\] \{ color:var\(--mark\); \}/);
   assert.equal((css.match(/--mark:#[a-f0-9]+/gi) || []).length, 3);
   const phoneCSS = css.slice(css.indexOf("@media (max-width:700px)"));
-  assert.match(phoneCSS, /#sessions li \.rn, #sessions li \.mk \{ min-width:44px; min-height:44px; \}/);
+  assert.match(phoneCSS, /#sessions li \.rn \{ min-width:44px; min-height:44px; \}/);
+  assert.match(phoneCSS, /#sessions li \.mk \{ display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; padding:0; font-size:15px; background:none; \}/);
+  assert.match(phoneCSS, /#sessions li \.mk\[aria-pressed="true"\] \{ color:var\(--mark\); \}/);
   assert.match(css, /#sessionactionspanel button \{ min-width:44px; min-height:44px;/);
   assert.match(html, /id="sessionactions" hidden/);
   assert.match(html, /id="sessionactionspanel" role="dialog" aria-modal="true" aria-labelledby="sessionactionstitle"/);

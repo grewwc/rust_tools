@@ -233,10 +233,10 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     dispatch, row, title, open, select, advance, historyLoads: () => historyLoads, configLoads: () => configLoads, grows: () => grows };
 }
 
-test("desktop double-click opens the shared mark/fork/delete sheet after one mark toggle", async () => {
+test("desktop double-click opens the shared mark/fork/delete sheet without marking", async () => {
   const h = harness(), title = h.title();
   const click = h.dispatch(title, "click", { detail: 1 });
-  assert.equal(h.context.sessionId, "open-session");
+  assert.equal(h.context.sessionId, "target-session");
   const second = h.dispatch(title, "click", { detail: 2 });
   assert.equal(second.event.stopped, true);
   const double = h.dispatch(title, "dblclick", { detail: 2 });
@@ -249,38 +249,45 @@ test("desktop double-click opens the shared mark/fork/delete sheet after one mar
   assert.deepEqual(h.elements.sessionactionspanel.querySelectorAll("button").filter((button) => !button.hidden).map((button) => button.textContent),
     ["标记会话", "fork", "删除会话", "取消"]);
   assert.equal(h.document.activeElement, h.elements.sessionactionmark);
-  assert.equal(h.historyLoads(), 0, "title clicks must not navigate");
+  assert.equal(h.historyLoads(), 1, "the first click selects, the second must not select twice");
   h.dispatch(h.document.activeElement, "keydown", { key: "Escape" });
   assert.equal(h.elements.sessionactions.hidden, true);
   assert.equal(h.document.activeElement, title);
   await Promise.all([click.done, second.done, double.done]);
-  assert.equal(h.context.sessionId, "open-session");
-  assert.equal(h.configLoads(), 0);
-  assert.deepEqual(h.requests, [
-    { path: "/sessions/target-session/mark", method: "POST", body: { marked: true } },
-  ]);
+  assert.equal(h.context.sessionId, "target-session");
+  assert.equal(h.configLoads(), 1);
+  assert.deepEqual(h.requests, []);
 });
 
-test("desktop single title click toggles its mark without switching sessions", async () => {
+test("desktop right-click opens the shared sheet without switching sessions", async () => {
+  const h = harness(), row = h.row();
+  const menu = h.dispatch(row, "contextmenu", {});
+  assert.equal(menu.event.prevented, true);
+  assert.equal(menu.event.stopped, true);
+  assert.equal(h.elements.sessionactions.hidden, false);
+  assert.equal(h.elements.sessionactionstitle.textContent, "Target session");
+  assert.equal(h.elements.sessionactionfork.hidden, false);
+  assert.deepEqual(h.elements.sessionactionspanel.querySelectorAll("button").filter((button) => !button.hidden).map((button) => button.textContent),
+    ["标记会话", "fork", "删除会话", "取消"]);
+  await menu.done;
+  assert.equal(h.context.sessionId, "open-session");
+  assert.equal(h.historyLoads(), 0);
+  assert.deepEqual(h.requests, []);
+});
+
+test("desktop single title click selects the session and leaves the mark alone", async () => {
   for (const marked of [false, true]) {
     const h = harness({ marked });
     const click = h.dispatch(h.title(), "click");
     await click.done;
     assert.equal(click.event.stopped, true);
-    assert.equal(h.context.sessionId, "open-session");
-    assert.equal(h.row().classList.contains("cur"), false);
-    assert.equal(h.title().getAttribute("aria-current"), "false");
-    assert.equal(h.row("open-session").classList.contains("cur"), true);
-    assert.equal(h.elements.sesstitle.textContent, "Open session");
-    assert.equal(h.elements.prompt.value, "draft in A");
-    assert.equal(h.row().querySelector(".mk").getAttribute("aria-pressed"), String(!marked));
+    assert.equal(h.context.sessionId, "target-session");
+    assert.equal(h.row().classList.contains("cur"), true);
+    assert.equal(h.title().getAttribute("aria-current"), "true");
+    assert.equal(h.elements.sesstitle.textContent, marked ? "★ Target session" : "Target session");
+    assert.equal(h.row().querySelector(".mk").getAttribute("aria-pressed"), String(marked));
     assert.equal(h.elements.sessionactions.hidden, true);
-    assert.equal(h.historyLoads(), 0);
-    assert.equal(h.configLoads(), 0);
-    assert.deepEqual(h.drawers, []);
-    assert.deepEqual(h.requests, [
-      { path: "/sessions/target-session/mark", method: "POST", body: { marked: !marked } },
-    ]);
+    assert.deepEqual(h.requests, []);
   }
 });
 
@@ -299,7 +306,7 @@ test("desktop single row body click selects the session", async () => {
   assert.deepEqual(h.requests, []);
 });
 
-for (const key of ["Enter", " "]) test("desktop focused title " + JSON.stringify(key) + " toggles its mark without opening actions", async () => {
+for (const key of ["Enter", " "]) test("desktop focused title " + JSON.stringify(key) + " opens the session without marking", async () => {
   for (const marked of [false, true]) {
     const h = harness({ marked }), title = h.title();
     title.focus();
@@ -309,15 +316,11 @@ for (const key of ["Enter", " "]) test("desktop focused title " + JSON.stringify
     assert.equal(press.event.stopped, true);
     assert.equal(title.getAttribute("role"), "button");
     assert.equal(title.getAttribute("tabindex"), "0");
-    assert.equal(h.context.sessionId, "open-session");
-    assert.equal(h.title().getAttribute("aria-current"), "false");
-    assert.equal(h.row().querySelector(".mk").getAttribute("aria-pressed"), String(!marked));
-    assert.equal(h.elements.prompt.value, "draft in A");
-    assert.equal(h.historyLoads(), 0);
-    assert.equal(h.configLoads(), 0);
-    assert.deepEqual(h.requests, [
-      { path: "/sessions/target-session/mark", method: "POST", body: { marked: !marked } },
-    ]);
+    assert.equal(h.context.sessionId, "target-session");
+    assert.equal(h.title().getAttribute("aria-current"), "true");
+    assert.equal(h.row().querySelector(".mk").getAttribute("aria-pressed"), String(marked));
+    assert.equal(h.historyLoads(), 1);
+    assert.deepEqual(h.requests.filter((request) => request.path.endsWith("/mark")), []);
     assert.equal(h.elements.sessionactions.hidden, true);
     h.dispatch(title, "dblclick", { detail: 0 });
     assert.equal(h.elements.sessionactions.hidden, true, "a keyboard activation cannot become a double-click action");
@@ -564,10 +567,12 @@ test("the sheet has desktop placement, modal attributes and unchanged theme-base
   assert.match(html, /id="sessionactionspanel" role="dialog" aria-modal="true" aria-labelledby="sessionactionstitle"/);
 });
 
-test("desktop user bubbles stay gray and selected sessions retain teal accents", () => {
+test("desktop user bubbles stay neutral but carry a border and accent rule", () => {
   const desktopBubble = responsiveRule(".msg.user");
-  assert.equal(desktopBubble.background, "var(--surface)");
+  assert.equal(desktopBubble.background, "var(--surface-2)");
   assert.equal(desktopBubble.color, "var(--fg)");
+  assert.equal(desktopBubble.border, "1px solid var(--line)");
+  assert.equal(responsiveRule(".user-msg-row > .msg.user")["border-left"], "3px solid var(--acc)");
   for (const [selector, background] of [
     [":root", "#2e2e2e"],
     [':root[data-theme="light"]', "#dfdfdf"],
@@ -575,14 +580,15 @@ test("desktop user bubbles stay gray and selected sessions retain teal accents",
   ]) {
     assert.equal(responsiveRule(selector)["--surface"], background, selector + " user bubble fill");
   }
-  assert.equal(responsiveRule("#sessions li.cur")["box-shadow"], "inset 2px 0 0 var(--acc)");
+  assert.equal(responsiveRule("#sessions li.cur")["box-shadow"], "inset 3px 0 0 var(--acc), inset 0 0 0 1px var(--line)");
   assert.equal(responsiveRule("#sessions li.cur").background, "var(--tint-3)");
+  assert.equal(responsiveRule('#sessions li.cur span[role="button"]')["font-weight"], "600");
   assert.equal(responsiveRule("button.primary").background, "var(--acc)");
   assert.equal(responsiveRule("button.primary").color, "var(--on-acc)");
   const phoneBubble = responsiveRule(".msg.user", true);
   assert.equal(phoneBubble.background, "var(--acc-solid)");
   assert.equal(phoneBubble.color, "var(--on-user)");
-  assert.equal(responsiveRule("#sessions li.cur", true)["box-shadow"], undefined);
+  assert.equal(responsiveRule("#sessions li.cur", true)["box-shadow"], "inset 3px 0 0 var(--acc)");
 });
 
 function loadChat(h) {

@@ -96,7 +96,7 @@ function harness() {
     AbortController, TextDecoder,
     headers: () => ({}),
     api: async (url) => {
-      assert.equal(url, "/sessions/s/history?limit=201");
+      assert.equal(url, "/sessions/s/history?limit=801");
       if (historyError) throw historyError;
       return { headers: { get: () => String(messages.length) }, json: async () => messages };
     },
