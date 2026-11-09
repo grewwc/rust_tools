@@ -261,6 +261,22 @@ test("desktop double-click opens the shared mark/fork/delete sheet after one mar
   ]);
 });
 
+test("desktop right-click opens the shared sheet without switching sessions", async () => {
+  const h = harness(), row = h.row();
+  const menu = h.dispatch(row, "contextmenu", {});
+  assert.equal(menu.event.prevented, true);
+  assert.equal(menu.event.stopped, true);
+  assert.equal(h.elements.sessionactions.hidden, false);
+  assert.equal(h.elements.sessionactionstitle.textContent, "Target session");
+  assert.equal(h.elements.sessionactionfork.hidden, false);
+  assert.deepEqual(h.elements.sessionactionspanel.querySelectorAll("button").filter((button) => !button.hidden).map((button) => button.textContent),
+    ["标记会话", "fork", "删除会话", "取消"]);
+  await menu.done;
+  assert.equal(h.context.sessionId, "open-session");
+  assert.equal(h.historyLoads(), 0);
+  assert.deepEqual(h.requests, []);
+});
+
 test("desktop single title click toggles its mark without switching sessions", async () => {
   for (const marked of [false, true]) {
     const h = harness({ marked });
@@ -575,14 +591,15 @@ test("desktop user bubbles stay gray and selected sessions retain teal accents",
   ]) {
     assert.equal(responsiveRule(selector)["--surface"], background, selector + " user bubble fill");
   }
-  assert.equal(responsiveRule("#sessions li.cur")["box-shadow"], "inset 2px 0 0 var(--acc)");
+  assert.equal(responsiveRule("#sessions li.cur")["box-shadow"], "inset 3px 0 0 var(--acc), inset 0 0 0 1px var(--line)");
   assert.equal(responsiveRule("#sessions li.cur").background, "var(--tint-3)");
+  assert.equal(responsiveRule('#sessions li.cur span[role="button"]')["font-weight"], "600");
   assert.equal(responsiveRule("button.primary").background, "var(--acc)");
   assert.equal(responsiveRule("button.primary").color, "var(--on-acc)");
   const phoneBubble = responsiveRule(".msg.user", true);
   assert.equal(phoneBubble.background, "var(--acc-solid)");
   assert.equal(phoneBubble.color, "var(--on-user)");
-  assert.equal(responsiveRule("#sessions li.cur", true)["box-shadow"], undefined);
+  assert.equal(responsiveRule("#sessions li.cur", true)["box-shadow"], "inset 3px 0 0 var(--acc)");
 });
 
 function loadChat(h) {

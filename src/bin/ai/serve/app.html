@@ -172,8 +172,9 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessions { width:min(78vw,300px); border-right:1px solid var(--line); background:var(--panel); display:none; flex-direction:column; }
 #sessions.open { display:flex; }
 #sessions ul { list-style:none; margin:0; padding:8px; overflow-y:auto; flex:1; }
-#sessions li { padding:8px; border-radius:8px; font-size:14px; }
-#sessions li.cur { background:var(--tint-3); }
+#sessions li { padding:8px; border-radius:8px; font-size:14px; transition:background-color .15s ease, box-shadow .15s ease; }
+#sessions li.cur { background:var(--tint-3); box-shadow:inset 3px 0 0 var(--acc); }
+#sessions li.cur span[role="button"] { font-weight:600; }
 #sessions li.holding { background:var(--tint-4); }
 #sessions li small { color:var(--dim); display:block; font-size:12px; }
 #sessions li .rn, #sessions li .mk { float:right; background:none; border:none; color:var(--dim); font-size:14px; padding:4px 10px; cursor:pointer; }
@@ -700,7 +701,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #sessions { display:flex; flex:0 0 240px; width:240px; min-width:0; min-height:0; }
   #sessions ul { min-height:0; padding:8px; }
   #sessions li { padding:7px 8px; font-size:13px; }
-  #sessions li.cur { box-shadow:inset 2px 0 0 var(--acc); }
+  #sessions li.cur { background:var(--tint-3); box-shadow:inset 3px 0 0 var(--acc), inset 0 0 0 1px var(--line); }
   #sessions li .rn, #sessions li .mk { padding:2px 6px; }
   #sessionactionspanel {
     top:50%; bottom:auto; transform:translateY(-50%); padding:16px;
@@ -4219,6 +4220,14 @@ function renderSessionList(items, errText, { preserveScroll = true } = {}) {
     li.appendChild(t);
     li.appendChild(sm);
     bindSessionLongPress(li, s);
+    // Desktop right-click opens the same mark/fork/delete sheet as a double
+    // click, so the actions stay one gesture away without switching sessions.
+    li.oncontextmenu = (ev) => {
+      if (isPhoneLayout()) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      openSessionActions(s, li, t);
+    };
     // Desktop keeps the inline drawer open for repeated switching; the phone
     // drawer floats over the chat, so only it auto-closes after a pick.
     li.onclick = () => {
