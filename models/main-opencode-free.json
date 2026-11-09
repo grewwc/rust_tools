@@ -1,16 +1,16 @@
 {
-  "key": "iceman-contributor-free",
+  "key": "longcat-2.5-free",
   "aliases": [
     "iceman"
   ],
-  "name": "iceman-contributor-free",
+  "name": "longcat-2.5-free",
   "adapter": "opencode",
-  "quality_tier": "basic",
-  "is_vl": false,
+  "quality_tier": "standard",
+  "is_vl": true,
   "search_enabled": false,
   "tools_default_enabled": true,
   "enable_thinking": true,
-  "default_reasoning_effort": "xhigh",
+  "default_reasoning_effort": "max",
   "subagent_priority": 80,
   "context_window_tokens": 262144,
   "max_output_tokens": 131072,
