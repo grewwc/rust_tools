@@ -175,6 +175,13 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessions li { padding:8px; border-radius:8px; font-size:14px; transition:background-color .15s ease, box-shadow .15s ease; }
 #sessions li.cur { background:var(--tint-3); box-shadow:inset 3px 0 0 var(--acc); }
 #sessions li.cur span[role="button"] { font-weight:600; }
+#promptnav { margin-top:10px; padding-top:8px; border-top:1px solid var(--line); }
+#promptnav > summary { font-size:12px; color:var(--dim); cursor:pointer; list-style:none; }
+#promptnav > summary::-webkit-details-marker { display:none; }
+#promptlist { list-style:none; margin:6px 0 0; padding:0; display:flex; flex-direction:column; gap:2px; max-height:34vh; overflow:auto; }
+#promptlist button { width:100%; padding:5px 6px; border:0; border-radius:6px; background:none; color:var(--fg); font:inherit; font-size:12px; line-height:1.35; text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:pointer; }
+#promptlist button:hover { background:var(--surface-2); }
+#msgs .user-msg-row.flash .msg.user { box-shadow:0 0 0 2px var(--acc); }
 #sessions li.holding { background:var(--tint-4); }
 #sessions li small { color:var(--dim); display:block; font-size:12px; }
 #sessions li .rn, #sessions li .mk { float:right; background:none; border:none; color:var(--dim); font-size:14px; padding:4px 10px; cursor:pointer; }
@@ -926,6 +933,10 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <div id="scrim"></div>
 <nav id="sessions"><input id="sessfilter" placeholder="filter sessions…" autocomplete="off">
 <div id="sesscount"></div><ul id="sesslist"></ul>
+<details id="promptnav" open>
+<summary>我的输入 <span id="promptcount"></span></summary>
+<ol id="promptlist"></ol>
+</details>
 <div class="rowbtns"><button id="fork">fork</button><button id="del">delete</button><button id="refresh">refresh</button></div>
 </nav>
 <main id="chat">
@@ -4364,6 +4375,44 @@ function histEndsTurn(msgs) {
   const tail = msgs[msgs.length - 1];
   return !!tail && tail.role === "assistant" && !!textOf(tail.content).trim();
 }
+// The prompt list mirrors the user rows on screen so a reader can jump back to
+// any of their own turns without hunting through tool output.
+function syncPromptNav() {
+  const list = $("promptlist");
+  if (!list || !$("msgs")) return;
+  const rows = [...$("msgs").querySelectorAll(".user-msg-row")];
+  const count = $("promptcount");
+  if (count) count.textContent = rows.length ? String(rows.length) : "";
+  list.textContent = "";
+  for (const row of rows) {
+    const bubble = row.querySelector(".msg.user");
+    const text = (bubble ? bubble.textContent : "").trim().replace(/\s+/g, " ");
+    if (!text) continue;
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = text.slice(0, 80);
+    button.title = text.slice(0, 400);
+    button.onclick = () => {
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+      row.classList.add("flash");
+      setTimeout(() => row.classList.remove("flash"), 1200);
+    };
+    item.appendChild(button);
+    list.appendChild(item);
+  }
+}
+
+if (typeof MutationObserver === "function" && $("msgs")) {
+  let promptNavQueued = false;
+  const schedule = window.requestAnimationFrame || ((fn) => setTimeout(fn, 16));
+  new MutationObserver(() => {
+    if (promptNavQueued) return;
+    promptNavQueued = true;
+    schedule(() => { promptNavQueued = false; syncPromptNav(); });
+  }).observe($("msgs"), { childList: true, subtree: true });
+}
+
 function historyRowsOf(msgs, histTotal, showAll) {
   // A broad window keeps the user's own prompts on screen: one turn writes dozens
   // of tool rows, so 200 rows can cover only a handful of prompts. The phone stays
