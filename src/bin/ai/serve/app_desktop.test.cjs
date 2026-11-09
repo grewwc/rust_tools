@@ -233,10 +233,10 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     dispatch, row, title, open, select, advance, historyLoads: () => historyLoads, configLoads: () => configLoads, grows: () => grows };
 }
 
-test("desktop double-click opens the shared mark/fork/delete sheet after one mark toggle", async () => {
+test("desktop double-click opens the shared mark/fork/delete sheet without marking", async () => {
   const h = harness(), title = h.title();
   const click = h.dispatch(title, "click", { detail: 1 });
-  assert.equal(h.context.sessionId, "open-session");
+  assert.equal(h.context.sessionId, "target-session");
   const second = h.dispatch(title, "click", { detail: 2 });
   assert.equal(second.event.stopped, true);
   const double = h.dispatch(title, "dblclick", { detail: 2 });
@@ -249,16 +249,14 @@ test("desktop double-click opens the shared mark/fork/delete sheet after one mar
   assert.deepEqual(h.elements.sessionactionspanel.querySelectorAll("button").filter((button) => !button.hidden).map((button) => button.textContent),
     ["标记会话", "fork", "删除会话", "取消"]);
   assert.equal(h.document.activeElement, h.elements.sessionactionmark);
-  assert.equal(h.historyLoads(), 0, "title clicks must not navigate");
+  assert.equal(h.historyLoads(), 1, "the first click selects, the second must not select twice");
   h.dispatch(h.document.activeElement, "keydown", { key: "Escape" });
   assert.equal(h.elements.sessionactions.hidden, true);
   assert.equal(h.document.activeElement, title);
   await Promise.all([click.done, second.done, double.done]);
-  assert.equal(h.context.sessionId, "open-session");
-  assert.equal(h.configLoads(), 0);
-  assert.deepEqual(h.requests, [
-    { path: "/sessions/target-session/mark", method: "POST", body: { marked: true } },
-  ]);
+  assert.equal(h.context.sessionId, "target-session");
+  assert.equal(h.configLoads(), 1);
+  assert.deepEqual(h.requests, []);
 });
 
 test("desktop right-click opens the shared sheet without switching sessions", async () => {
@@ -277,26 +275,19 @@ test("desktop right-click opens the shared sheet without switching sessions", as
   assert.deepEqual(h.requests, []);
 });
 
-test("desktop single title click toggles its mark without switching sessions", async () => {
+test("desktop single title click selects the session and leaves the mark alone", async () => {
   for (const marked of [false, true]) {
     const h = harness({ marked });
     const click = h.dispatch(h.title(), "click");
     await click.done;
     assert.equal(click.event.stopped, true);
-    assert.equal(h.context.sessionId, "open-session");
-    assert.equal(h.row().classList.contains("cur"), false);
-    assert.equal(h.title().getAttribute("aria-current"), "false");
-    assert.equal(h.row("open-session").classList.contains("cur"), true);
-    assert.equal(h.elements.sesstitle.textContent, "Open session");
-    assert.equal(h.elements.prompt.value, "draft in A");
-    assert.equal(h.row().querySelector(".mk").getAttribute("aria-pressed"), String(!marked));
+    assert.equal(h.context.sessionId, "target-session");
+    assert.equal(h.row().classList.contains("cur"), true);
+    assert.equal(h.title().getAttribute("aria-current"), "true");
+    assert.equal(h.elements.sesstitle.textContent, marked ? "★ Target session" : "Target session");
+    assert.equal(h.row().querySelector(".mk").getAttribute("aria-pressed"), String(marked));
     assert.equal(h.elements.sessionactions.hidden, true);
-    assert.equal(h.historyLoads(), 0);
-    assert.equal(h.configLoads(), 0);
-    assert.deepEqual(h.drawers, []);
-    assert.deepEqual(h.requests, [
-      { path: "/sessions/target-session/mark", method: "POST", body: { marked: !marked } },
-    ]);
+    assert.deepEqual(h.requests, []);
   }
 });
 
@@ -315,7 +306,7 @@ test("desktop single row body click selects the session", async () => {
   assert.deepEqual(h.requests, []);
 });
 
-for (const key of ["Enter", " "]) test("desktop focused title " + JSON.stringify(key) + " toggles its mark without opening actions", async () => {
+for (const key of ["Enter", " "]) test("desktop focused title " + JSON.stringify(key) + " opens the session without marking", async () => {
   for (const marked of [false, true]) {
     const h = harness({ marked }), title = h.title();
     title.focus();
@@ -325,15 +316,11 @@ for (const key of ["Enter", " "]) test("desktop focused title " + JSON.stringify
     assert.equal(press.event.stopped, true);
     assert.equal(title.getAttribute("role"), "button");
     assert.equal(title.getAttribute("tabindex"), "0");
-    assert.equal(h.context.sessionId, "open-session");
-    assert.equal(h.title().getAttribute("aria-current"), "false");
-    assert.equal(h.row().querySelector(".mk").getAttribute("aria-pressed"), String(!marked));
-    assert.equal(h.elements.prompt.value, "draft in A");
-    assert.equal(h.historyLoads(), 0);
-    assert.equal(h.configLoads(), 0);
-    assert.deepEqual(h.requests, [
-      { path: "/sessions/target-session/mark", method: "POST", body: { marked: !marked } },
-    ]);
+    assert.equal(h.context.sessionId, "target-session");
+    assert.equal(h.title().getAttribute("aria-current"), "true");
+    assert.equal(h.row().querySelector(".mk").getAttribute("aria-pressed"), String(marked));
+    assert.equal(h.historyLoads(), 1);
+    assert.deepEqual(h.requests.filter((request) => request.path.endsWith("/mark")), []);
     assert.equal(h.elements.sessionactions.hidden, true);
     h.dispatch(title, "dblclick", { detail: 0 });
     assert.equal(h.elements.sessionactions.hidden, true, "a keyboard activation cannot become a double-click action");
