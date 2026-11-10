@@ -1,15 +1,11 @@
-//! 会话级文件变更聚合与外部 Diff 打开。
+//! Session change summaries and external diff viewers.
 //!
-//! 聚合来源：
-//! - 优先 `mutation_log`（本会话内通过 write_file / apply_patch 的精确 before/after）。
-//! - 为空时回退到 `git diff HEAD` / `git status`（覆盖 execute_command 间接触及的文件）。
-//!
-//! 产物：
-//! - 统一的变更摘要文本与统计。
-//! - 联合 patch（mutation 派生或 git 原生），可落盘到 `session_assets/changes.patch`。
-//! - 外部编辑器打开能力：VS Code (`code --diff` / `code <patch>`）、Cursor、JetBrains
-//!   IDEA、git difftool、系统 `open`，优先读 `ai.diff.editor` 配置，未配置时自动探测。
+//! The opt-in deep-audit inventory unions session mutations with Git status and staged/unstaged
+//! diff paths. Complete paths and collection failures stay separate from capped
+//! snippets; session records do not establish request/task ownership.
+//! Patch exports and external viewers retain their existing snapshot rules.
 
+use rust_tools::commonw::FastMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -20,7 +16,7 @@ use crate::ai::tools::storage::mutation_log::{BeforeState, MutationEntry, is_cap
 // Editor
 // ---------------------------------------------------------------------------
 
-/// 支持的外部打开方式。
+/// Supported external diff viewers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorKind {
     Auto,
@@ -56,7 +52,7 @@ impl EditorKind {
     }
 }
 
-/// 从配置 `ai.diff.editor` 解析首选编辑器，未配置则 Auto。
+/// Read the configured diff viewer, defaulting to automatic detection.
 pub fn configured_editor() -> EditorKind {
     let raw = crate::commonw::configw::get_all_config().get(AiConfig::DIFF_EDITOR, "");
     if raw.trim().is_empty() {
@@ -65,9 +61,9 @@ pub fn configured_editor() -> EditorKind {
     EditorKind::from_str(&raw).unwrap_or(EditorKind::Auto)
 }
 
-/// 探测本机可用编辑器（best-effort，不阻塞过久）。
+/// Probe available viewers on a best-effort basis.
 fn probe_executable(name: &str) -> bool {
-    // `which` 在 macOS/Linux 可用；Windows 回退到 where。
+    // Use `which` on macOS/Linux and `where` on Windows.
     let probe = if cfg!(windows) { "where" } else { "which" };
     Command::new(probe)
         .arg(name)
@@ -86,7 +82,7 @@ fn resolve_auto_editor(cwd: &Path) -> EditorKind {
     if is_inside_git_work_tree(cwd) && probe_executable("git") {
         return EditorKind::Git;
     }
-    // macOS `open` 几乎总是存在；Linux `xdg-open` 同理，用 open 统称。
+    // Treat macOS `open` and Linux `xdg-open` as the system viewer.
     EditorKind::SystemOpen
 }
 
@@ -120,6 +116,377 @@ pub fn git_is_available() -> bool {
         &["--version"],
     )
     .is_some()
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct InventoryFile {
+    pub(crate) path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) path_bytes_hex: Option<String>,
+    pub(crate) observations: Vec<String>,
+    pub(crate) ownership: &'static str,
+}
+
+pub(crate) struct ChangeInventory {
+    pub(crate) files: Vec<InventoryFile>,
+    pub(crate) session_changes: Vec<FileChange>,
+    pub(crate) is_git_repo: bool,
+    pub(crate) collection_errors: Vec<String>,
+    pub(crate) coverage_gaps: Vec<String>,
+    log_path: Option<PathBuf>,
+    git_stats: Vec<(&'static str, String)>,
+    path_indices: FastMap<PathBuf, usize>,
+}
+
+/// Collect every observed path before rendering any capped content. Git numstat
+/// is the NUL-delimited path companion to stat, whose display may abbreviate names.
+pub(crate) fn collect_current_changes(include_git: bool) -> ChangeInventory {
+    let mut inventory = ChangeInventory {
+        files: Vec::new(),
+        session_changes: Vec::new(),
+        is_git_repo: false,
+        collection_errors: Vec::new(),
+        coverage_gaps: Vec::new(),
+        log_path: crate::ai::tools::storage::mutation_log::log_path(),
+        git_stats: Vec::new(),
+        path_indices: FastMap::default(),
+    };
+    let entries = inventory.read_mutations();
+    inventory.session_changes = grouped_changes(&entries);
+    for entry in &entries {
+        inventory.add_path(
+            PathBuf::from(&entry.path),
+            format!("session mutation: {}", entry.op),
+        );
+    }
+    if include_git {
+        match crate::ai::driver::runtime_ctx::effective_cwd() {
+            Ok(cwd) => inventory.collect_git(&cwd),
+            Err(error) => inventory.collection_errors.push(format!(
+                "Git collection: working directory unavailable: {error}"
+            )),
+        }
+    } else {
+        inventory.is_git_repo = crate::ai::driver::runtime_ctx::effective_cwd()
+            .ok()
+            .is_some_and(|cwd| is_inside_git_work_tree(&cwd));
+    }
+    if !inventory.files.is_empty() {
+        inventory.coverage_gaps.push(
+            "Request/task ownership is unknown for every path: mutation records identify session tool operations but carry no request/task owner, and Git changes may include concurrent work. Keep these paths in scope until ownership is resolved.".to_string(),
+        );
+    }
+    inventory
+}
+
+impl ChangeInventory {
+    fn read_mutations(&mut self) -> Vec<MutationEntry> {
+        let Some(path) = &self.log_path else {
+            self.coverage_gaps.push("No active session mutation log is available; session tool changes cannot be enumerated.".to_string());
+            return Vec::new();
+        };
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(error) => {
+                self.collection_errors
+                    .push(format!("Session mutation log {}: {error}", path.display()));
+                return Vec::new();
+            }
+        };
+        parse_inventory_mutations(&content, &mut self.collection_errors)
+    }
+
+    fn add_path(&mut self, path: PathBuf, observation: String) {
+        if let Some(&index) = self.path_indices.get(&path) {
+            if !self.files[index].observations.contains(&observation) {
+                self.files[index].observations.push(observation);
+            }
+            return;
+        }
+        let display = path
+            .to_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{:?}", path.as_os_str()));
+        let path_bytes_hex = path.to_str().is_none().then(|| {
+            path.as_os_str()
+                .as_encoded_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join("")
+        });
+        self.path_indices.insert(path, self.files.len());
+        self.files.push(InventoryFile {
+            path: display,
+            path_bytes_hex,
+            observations: vec![observation],
+            ownership: "unknown",
+        });
+    }
+
+    fn collect_git(&mut self, cwd: &Path) {
+        let root = match checked_git_output(cwd, &["rev-parse", "--show-toplevel"]) {
+            Ok(mut root) => {
+                if root.last() == Some(&b'\n') {
+                    root.pop();
+                }
+                match git_path_from_bytes(&root) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        self.collection_errors.push(error);
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                self.collection_errors.push(error);
+                return;
+            }
+        };
+        self.is_git_repo = true;
+        match checked_git_output(
+            &root,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        ) {
+            Ok(status) => match parse_status_paths(&status) {
+                Ok(paths) => {
+                    for (path, status) in paths {
+                        self.add_path(root.join(path), status);
+                    }
+                }
+                Err(error) => self.collection_errors.push(error),
+            },
+            Err(error) => self.collection_errors.push(error),
+        }
+        for (label, staged) in [
+            ("git diff --stat (unstaged)", false),
+            ("git diff --cached --stat (staged)", true),
+        ] {
+            let mut args = vec![
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-relative",
+            ];
+            if staged {
+                args.push("--cached");
+            }
+            args.push("--stat");
+            match checked_git_output(&root, &args) {
+                Ok(stat) => self
+                    .git_stats
+                    .push((label, String::from_utf8_lossy(&stat).into_owned())),
+                Err(error) => self.collection_errors.push(error),
+            }
+            args.pop();
+            args.extend(["--numstat", "-z"]);
+            match checked_git_output(&root, &args) {
+                Ok(stat) => match parse_numstat_paths(&stat) {
+                    Ok(paths) => {
+                        for path in paths {
+                            self.add_path(root.join(path), label.to_string());
+                        }
+                    }
+                    Err(error) => self.collection_errors.push(error),
+                },
+                Err(error) => self.collection_errors.push(error),
+            }
+            if self.session_changes.is_empty() {
+                args.pop();
+                args.pop();
+                match checked_git_output(&root, &args) {
+                    Ok(diff) => self.git_stats.push((
+                        if staged {
+                            "git diff --cached (staged snippet)"
+                        } else {
+                            "git diff (unstaged snippet)"
+                        },
+                        String::from_utf8_lossy(&diff).into_owned(),
+                    )),
+                    Err(error) => self.collection_errors.push(error),
+                }
+            }
+        }
+    }
+
+    /// Ownership uncertainty is separate from whether all sources were collected.
+    pub(crate) fn collection_complete(&self) -> bool {
+        self.log_path.is_some() && self.collection_errors.is_empty()
+    }
+
+    /// This section has no snippet cap: later files must remain visible.
+    pub(crate) fn format_inventory(&self) -> String {
+        let mut out = format!(
+            "## Complete observed path inventory ({} paths)\n\n",
+            self.files.len()
+        );
+        for file in &self.files {
+            let path = serde_json::to_string(&file.path).expect("path string is serializable");
+            out.push_str(&format!(
+                "- {path} [{}; ownership: {}]\n",
+                file.observations.join("; "),
+                file.ownership
+            ));
+        }
+        if self.files.is_empty() {
+            out.push_str("No changed paths were observed from the available sources.\n");
+        }
+        for (label, items) in [
+            ("Collection failures", &self.collection_errors),
+            ("Coverage gaps", &self.coverage_gaps),
+        ] {
+            if !items.is_empty() {
+                out.push_str(&format!("\n## {label}\n\n"));
+                for item in items {
+                    out.push_str(&format!("- {item}\n"));
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn format_snippets(&self) -> String {
+        let mut out = format_mutation_snippets(&self.session_changes, self.log_path.as_deref());
+        const CAP: usize = 32_768;
+        for (label, stat) in &self.git_stats {
+            if stat.trim().is_empty() {
+                continue;
+            }
+            let remaining = CAP.saturating_sub(out.len());
+            let mut end = stat.len().min(remaining);
+            while !stat.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.push_str(&format!("\n## {label}\n{}", &stat[..end]));
+            if end < stat.len() {
+                out.push_str(
+                    "\n[Git snippet truncated; the complete path inventory above is unaffected]\n",
+                );
+            }
+        }
+        out
+    }
+}
+
+fn parse_inventory_mutations(content: &str, errors: &mut Vec<String>) -> Vec<MutationEntry> {
+    content
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| match serde_json::from_str(line) {
+            Ok(entry) => Some(entry),
+            Err(error) => {
+                errors.push(format!(
+                    "Session mutation log record {} could not be collected: {error}",
+                    index + 1
+                ));
+                None
+            }
+        })
+        .collect()
+}
+
+fn checked_git_output(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = crate::fork_guard::output(Command::new("git").args(args).current_dir(cwd))
+        .map_err(|error| format!("git {} collection failed: {error}", args.join(" ")))?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(1024)
+            .collect::<String>();
+        return Err(format!(
+            "git {} collection failed ({}): {}",
+            args.join(" "),
+            output.status,
+            error.trim()
+        ));
+    }
+    Ok(output.stdout)
+}
+
+fn git_path_from_bytes(bytes: &[u8]) -> Result<PathBuf, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes.to_vec())
+            .map(PathBuf::from)
+            .map_err(|_| "Git path collection failed: filename is not UTF-8".to_string())
+    }
+}
+
+fn nul_records(bytes: &[u8]) -> Result<Vec<&[u8]>, String> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(body) = bytes.strip_suffix(&[0]) else {
+        return Err("Git path collection failed: incomplete NUL-delimited output".to_string());
+    };
+    Ok(body.split(|byte| *byte == 0).collect())
+}
+
+fn parse_status_paths(bytes: &[u8]) -> Result<Vec<(PathBuf, String)>, String> {
+    let records = nul_records(bytes)?;
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < records.len() {
+        let record = records[index];
+        if record.len() < 4 || record[2] != b' ' {
+            return Err("git status path collection failed: malformed record".to_string());
+        }
+        let status = String::from_utf8_lossy(&record[..2]);
+        paths.push((
+            git_path_from_bytes(&record[3..])?,
+            format!("git status: {status}"),
+        ));
+        index += 1;
+        if record[..2].iter().any(|byte| matches!(*byte, b'R' | b'C')) {
+            let old = records
+                .get(index)
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| {
+                    "git status path collection failed: missing rename/copy source".to_string()
+                })?;
+            paths.push((
+                git_path_from_bytes(old)?,
+                format!("git status: {status} (rename/copy source)"),
+            ));
+            index += 1;
+        }
+    }
+    Ok(paths)
+}
+
+fn parse_numstat_paths(bytes: &[u8]) -> Result<Vec<PathBuf>, String> {
+    let records = nul_records(bytes)?;
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < records.len() {
+        let mut fields = records[index].splitn(3, |byte| *byte == b'\t');
+        let path = fields.nth(2).ok_or_else(|| {
+            "git diff path collection failed: malformed numstat record".to_string()
+        })?;
+        index += 1;
+        if path.is_empty() {
+            for _ in 0..2 {
+                let path = records
+                    .get(index)
+                    .filter(|path| !path.is_empty())
+                    .ok_or_else(|| {
+                        "git diff path collection failed: missing rename path".to_string()
+                    })?;
+                paths.push(git_path_from_bytes(path)?);
+                index += 1;
+            }
+        } else {
+            paths.push(git_path_from_bytes(path)?);
+        }
+    }
+    Ok(paths)
 }
 
 // ---------------------------------------------------------------------------
@@ -327,7 +694,7 @@ pub(crate) fn diff_snippet(
     }
 }
 
-/// 由 mutation 日志派生的联合 patch（简单 unified 格式，非严格 git 格式但可被编辑器打开）。
+/// Derive a combined patch from mutation records in a viewer-compatible unified format.
 pub fn mutation_patch(entries: &[MutationEntry]) -> Option<String> {
     let grouped = grouped_changes(entries);
     if grouped.is_empty() {
@@ -452,7 +819,7 @@ pub fn mutation_patch(entries: &[MutationEntry]) -> Option<String> {
     }
 }
 
-/// 联合 patch：优先 mutation 派生，否则回退到 `git diff HEAD`。
+/// Prefer a mutation-derived patch, then fall back to `git diff HEAD`.
 pub fn combined_patch() -> Option<String> {
     let entries = read_all();
     if !entries.is_empty() {
@@ -460,14 +827,14 @@ pub fn combined_patch() -> Option<String> {
             return Some(p);
         }
     }
-    // git 回退
+    // Fall back to Git.
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok()?;
     if !is_inside_git_work_tree(&cwd) {
         return None;
     }
     let diff = git_output(&cwd, &["diff", "HEAD", "--no-color"])?;
     if diff.trim().is_empty() {
-        // 无 HEAD 或无差异时尝试无 HEAD 的工作区 diff
+        // Try the worktree diff without HEAD when the initial diff is empty.
         let diff2 = git_output(&cwd, &["diff", "--no-color"])?;
         if diff2.trim().is_empty() {
             return None;
@@ -477,14 +844,13 @@ pub fn combined_patch() -> Option<String> {
     Some(diff)
 }
 
-/// 将联合 patch 落盘到 `session_assets/changes.patch`（无活动会话时回退到系统
-/// 临时目录 `changes.<pid>.patch`），返回绝对路径。
+/// Write a combined patch to session assets or a process-specific temporary
+/// path when no session is active, returning the absolute path.
 pub fn write_combined_patch() -> Result<PathBuf, String> {
     let patch = combined_patch()
         .ok_or_else(|| "当前会话无可导出的变更（无 mutation log 且 git 无差异）".to_string())?;
-    // 优先写入 <session_assets>/changes.patch；无活动会话（one-shot / 测试）时
-    // 回退到 runtime_ctx::temp_dir()（`<tmp>/.agent_tmp/default/`），保证
-    // `/changes --open` 在非交互式调用下也能生成 patch 并打开。
+    // Prefer session assets; without an active session, use the runtime temp
+    // directory so noninteractive `/changes --open` can still export a patch.
     let session_dir = crate::ai::tools::storage::file_store::current_session_assets_dir();
     let dir = match &session_dir {
         Some(assets) => assets.clone(),
@@ -495,7 +861,7 @@ pub fn write_combined_patch() -> Result<PathBuf, String> {
     let name = if session_dir.is_some() {
         "changes.patch".to_string()
     } else {
-        // 无会话回退：加 pid 避免并发 one-shot 调用互相覆盖
+        // Include the process ID to avoid concurrent one-shot exports overwriting each other.
         format!("changes.{}.patch", std::process::id())
     };
     let path = dir.join(name);
@@ -556,13 +922,13 @@ pub fn format_session_summary_with_git(include_git_extra: bool) -> String {
             lp.display()
         ));
     }
-    // 若 git 亦有额外差异且调用方允许混入 git 状态，追加提示；include_git=false 时必须保持纯会话视图
+    // Add a Git-status hint only when the caller allows workspace context.
     if include_git_extra {
         if let Some(cwd) = cwd {
             if is_inside_git_work_tree(&cwd) {
                 let status = git_output(&cwd, &["status", "--porcelain=v1"]).unwrap_or_default();
                 if !status.trim().is_empty() {
-                    // 统计 git 中未被 mutation 覆盖的文件数（简单提示）
+                    // Estimate the number of Git paths outside the mutation log.
                     let git_files: Vec<&str> =
                         status.lines().filter(|l| !l.trim().is_empty()).collect();
                     let git_extra = git_files.len().saturating_sub(grouped.len());
@@ -610,6 +976,59 @@ fn fallback_git_summary() -> String {
     out
 }
 
+pub(crate) fn format_mutation_snippets(grouped: &[FileChange], log_path: Option<&Path>) -> String {
+    let mut out = String::from("## Session mutation snippets (first-change order)\n\n");
+    const CAP: usize = 14_000;
+    let mut shown = 0;
+    for (i, g) in grouped.iter().enumerate() {
+        if out.len() >= CAP {
+            break;
+        }
+        let mut counts = String::new();
+        if g.write_count > 0 {
+            counts.push_str(&format!("{} write", g.write_count));
+        }
+        if g.delete_count > 0 {
+            if !counts.is_empty() {
+                counts.push_str(", ");
+            }
+            counts.push_str(&format!("{} delete", g.delete_count));
+        }
+        out.push_str(&format!(
+            "{}. {:?}  [{}]  ({counts})\n",
+            i + 1,
+            g.rel,
+            g.net
+        ));
+        if let Some(snippet) = file_snippet(g, 30) {
+            let remaining = CAP.saturating_sub(out.len());
+            let mut end = snippet.len().min(remaining);
+            while !snippet.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.push_str(&snippet[..end]);
+            if end < snippet.len() {
+                if snippet.starts_with("```diff\n") && !snippet[..end].contains("\n```") {
+                    out.push_str("\n```");
+                }
+                out.push_str("\n[mutation snippet truncated]\n");
+            }
+            out.push_str("\n\n");
+        }
+        shown += 1;
+    }
+    if shown < grouped.len() {
+        out.push_str(&format!("[Mutation snippets shown for {shown} of {} files; the complete path inventory is separate]\n\n", grouped.len()));
+    }
+    if let Some(lp) = log_path {
+        out.push_str(&format!(
+            "Recorded snapshots and per-write diffs: {}\nSnapshots may be truncated or unavailable; read the log for recorded evidence.\n",
+            lp.display()
+        ));
+    }
+    out
+}
+
 pub fn git_stat() -> Option<String> {
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok()?;
     if !is_inside_git_work_tree(&cwd) {
@@ -628,14 +1047,14 @@ pub fn combined_summary() -> String {
 // External open
 // ---------------------------------------------------------------------------
 
-/// 打开变更：生成 patch 并用指定编辑器打开，返回面向用户的状态文案。
+/// Export changes and open the requested viewer, returning a status message.
 pub fn open_changes(requested: Option<EditorKind>) -> Result<String, String> {
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let editor = resolve_editor(requested, &cwd);
     let patch_path = write_combined_patch()?;
 
-    // 按编辑器分发
+    // Dispatch to the resolved viewer.
     let result = match editor {
         EditorKind::Vscode => open_with_vscode(&patch_path, &cwd),
         EditorKind::Cursor => open_with_cursor(&patch_path),
@@ -662,17 +1081,17 @@ pub fn open_changes(requested: Option<EditorKind>) -> Result<String, String> {
 }
 
 fn open_with_vscode(patch_path: &Path, cwd: &Path) -> Result<String, String> {
-    // 优先尝试 per-file --diff（当恰好单文件时体验更好），否则直接打开 patch 文件。
+    // Prefer per-file comparison for a single file, then open the patch.
     let grouped = session_grouped_changes();
     if grouped.len() == 1 {
         let g = &grouped[0];
-        // 为 before/after 创建临时文件供 code --diff 使用
-        // 与 service::changes::try_open_single_file_diff 保持一致：优先会话临时目录，避免直写系统 /tmp 越界
+        // Prepare comparison files in the session temp directory, matching
+        // service::changes::try_open_single_file_diff.
         let tmp =
             crate::ai::driver::runtime_ctx::temp_dir().unwrap_or_else(|_| std::env::temp_dir());
         let before_path = tmp.join(format!("a_changes_before_{}", sanitize_filename(&g.rel)));
         let after_path = tmp.join(format!("a_changes_after_{}", sanitize_filename(&g.rel)));
-        // best-effort 写入，不影响主流程：失败则回退到直接打开 patch
+        // If writing comparison files fails, fall back to opening the patch.
         let before_ok = g
             .before_first
             .as_deref()
@@ -687,7 +1106,7 @@ fn open_with_vscode(patch_path: &Path, cwd: &Path) -> Result<String, String> {
         // wrong comparison; fall back to opening the patch instead (the patch is
         // built from the authoritative diff recorded at write time).
         if before_ok && after_ok && g.snapshots_full() {
-            // 尝试 --diff 双文件对比（后台 detached）
+            // Launch the two-file comparison in the background.
             let mut cmd = Command::new("code");
             cmd.arg("--diff")
                 .arg(&before_path)
@@ -695,7 +1114,7 @@ fn open_with_vscode(patch_path: &Path, cwd: &Path) -> Result<String, String> {
                 .current_dir(cwd)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
-            // 若在无窗口环境 code 不存在，会在 spawn 阶段失败
+            // Missing executables fail when spawning the viewer.
             match cmd.spawn() {
                 Ok(_) => {
                     return Ok(format!(
@@ -708,7 +1127,7 @@ fn open_with_vscode(patch_path: &Path, cwd: &Path) -> Result<String, String> {
             }
         }
     }
-    // 回退：直接用 code 打开 patch 文件
+    // Fall back to opening the patch in VS Code.
     let mut cmd = Command::new("code");
     cmd.arg(patch_path).current_dir(cwd);
     cmd.stdout(std::process::Stdio::null())
@@ -729,7 +1148,7 @@ fn open_with_cursor(patch_path: &Path) -> Result<String, String> {
 }
 
 fn open_with_idea(patch_path: &Path) -> Result<String, String> {
-    // JetBrains Toolbox 常用 `idea` / `webstorm` 等；先试 idea，其次 open
+    // Probe the usual JetBrains Toolbox executable names.
     for bin in ["idea", "webstorm", "pycharm", "clion"] {
         if probe_executable(bin) {
             return Command::new(bin)
@@ -749,8 +1168,8 @@ fn open_with_git_difftool(cwd: &Path) -> Result<String, String> {
     if !is_inside_git_work_tree(cwd) {
         return Err("不在 git 仓库内，无法使用 git difftool".to_string());
     }
-    // 使用 --dir-diff 可一次性展示所有文件的外部工具对比；用 --no-prompt 避免交互阻塞
-    // 后台 detached 启动，不等待完成
+    // Compare all files with `--dir-diff`, disable prompts, and launch
+    // in the background without waiting for the viewer.
     Command::new("git")
         .args(["difftool", "--dir-diff", "--no-prompt"])
         .current_dir(cwd)
@@ -785,6 +1204,206 @@ fn sanitize_filename(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_inventory() -> ChangeInventory {
+        ChangeInventory {
+            files: Vec::new(),
+            session_changes: Vec::new(),
+            is_git_repo: false,
+            collection_errors: Vec::new(),
+            coverage_gaps: Vec::new(),
+            log_path: None,
+            git_stats: Vec::new(),
+            path_indices: FastMap::default(),
+        }
+    }
+
+    #[test]
+    fn collect_current_changes_unions_nonempty_mutations_with_all_git_paths() {
+        let root =
+            std::env::temp_dir().join(format!("audit-inventory-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        checked_git_output(&root, &["init", "-q"]).unwrap();
+        for name in ["tracked.rs", "deleted.rs", "old\tname.rs"] {
+            std::fs::write(root.join(name), "first\nsecond\nthird\n").unwrap();
+        }
+        checked_git_output(&root, &["add", "."]).unwrap();
+        checked_git_output(
+            &root,
+            &[
+                "-c",
+                "user.name=Audit Tests",
+                "-c",
+                "user.email=audit-tests@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "baseline",
+            ],
+        )
+        .unwrap();
+        checked_git_output(&root, &["mv", "old\tname.rs", "renamed\nfile.rs"]).unwrap();
+        std::fs::write(root.join("staged.rs"), "staged\n").unwrap();
+        checked_git_output(&root, &["add", "staged.rs"]).unwrap();
+        std::fs::write(root.join("tracked.rs"), "updated\n").unwrap();
+        std::fs::remove_file(root.join("deleted.rs")).unwrap();
+        std::fs::write(root.join("untracked\t\nfile.txt"), "new\n").unwrap();
+        let entries = [MutationEntry {
+            seq: 1,
+            ts: "t".into(),
+            path: root.join("mutation-only.rs").display().to_string(),
+            op: "delete".into(),
+            before: Some("removed\n".into()),
+            before_state: Some(BeforeState::Present),
+            after: None,
+            diff: None,
+        }];
+        let mut app = crate::ai::middleware::test_util::test_app();
+        app.config.history_file = root.join(".git/audit-test/history.jsonl");
+        app.session_id = "inventory-test".into();
+        let context = crate::ai::driver::runtime_ctx::DriverContext::new(
+            app,
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+            std::sync::Arc::new(Vec::new()),
+            std::sync::Arc::new(Vec::new()),
+        );
+        let inventory =
+            crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(root.clone(), || {
+                crate::ai::driver::runtime_ctx::DRIVER_CTX.sync_scope(context, || {
+                    let log_path = crate::ai::tools::storage::mutation_log::log_path().unwrap();
+                    assert!(log_path.starts_with(root.join(".git")));
+                    std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+                    std::fs::write(
+                        &log_path,
+                        serde_json::to_string(&entries[0]).unwrap() + "\n",
+                    )
+                    .unwrap();
+                    let session_only = collect_current_changes(false);
+                    assert_eq!(session_only.files.len(), 1);
+                    assert_eq!(session_only.files[0].path, entries[0].path);
+                    collect_current_changes(true)
+                })
+            });
+        assert_eq!(inventory.session_changes.len(), 1);
+        assert!(inventory.collection_complete());
+        assert!(
+            inventory.collection_errors.is_empty(),
+            "{:?}",
+            inventory.collection_errors
+        );
+        for name in [
+            "mutation-only.rs",
+            "tracked.rs",
+            "deleted.rs",
+            "old\tname.rs",
+            "renamed\nfile.rs",
+            "staged.rs",
+            "untracked\t\nfile.txt",
+        ] {
+            let path = root.join(name).display().to_string();
+            assert!(
+                inventory.files.iter().any(|file| file.path == path),
+                "missing {name:?}"
+            );
+        }
+        assert_eq!(inventory.files.len(), 7);
+        assert!(
+            inventory
+                .files
+                .iter()
+                .all(|file| file.ownership == "unknown")
+        );
+        let staged = inventory
+            .files
+            .iter()
+            .find(|file| file.path.ends_with("/staged.rs"))
+            .unwrap();
+        assert!(
+            staged
+                .observations
+                .iter()
+                .any(|source| source.contains("--cached --stat"))
+        );
+        let tracked = inventory
+            .files
+            .iter()
+            .find(|file| file.path.ends_with("/tracked.rs"))
+            .unwrap();
+        assert!(
+            tracked
+                .observations
+                .iter()
+                .any(|source| source.contains("--stat (unstaged)"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn collect_current_changes_inventory_survives_caps_and_exposes_collection_failures() {
+        let mut inventory = empty_inventory();
+        assert!(!inventory.collection_complete());
+        inventory.log_path = Some(PathBuf::from("/proj/mutation_log.jsonl"));
+        assert!(inventory.collection_complete());
+        let entries = [
+            MutationEntry {
+                seq: 1,
+                ts: "t".into(),
+                path: "/proj/first.rs".into(),
+                op: "write".into(),
+                before: None,
+                before_state: Some(BeforeState::Absent),
+                after: Some("x".repeat(20_000)),
+                diff: None,
+            },
+            MutationEntry {
+                seq: 2,
+                ts: "t".into(),
+                path: "/proj/later.rs".into(),
+                op: "delete".into(),
+                before: Some("old\n".into()),
+                before_state: Some(BeforeState::Present),
+                after: None,
+                diff: None,
+            },
+        ];
+        inventory.session_changes = grouped_changes(&entries);
+        for entry in &entries {
+            inventory.add_path(
+                PathBuf::from(&entry.path),
+                format!("session mutation: {}", entry.op),
+            );
+        }
+        assert!(inventory.format_inventory().contains("/proj/later.rs"));
+        assert!(!inventory.format_snippets().contains("/proj/later.rs"));
+        assert!(inventory.format_snippets().contains("1 of 2 files"));
+        let valid = serde_json::to_string(&entries[0]).unwrap();
+        let parsed = parse_inventory_mutations(
+            &format!("{valid}\ninvalid JSON\n"),
+            &mut inventory.collection_errors,
+        );
+        assert_eq!(parsed.len(), 1);
+        assert!(inventory.collection_errors[0].contains("record 2"));
+        assert!(!inventory.collection_complete());
+        assert!(inventory.format_inventory().contains("Collection failures"));
+        assert!(parse_status_paths(b"R  new\0").is_err());
+        assert!(parse_numstat_paths(b"1\t1\t\0old\0").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_keeps_non_utf8_git_filename_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let paths = parse_status_paths(b"?? name-\xff\0").unwrap();
+        assert_eq!(paths[0].0.as_os_str().as_bytes(), b"name-\xff");
+        let mut inventory = empty_inventory();
+        inventory.add_path(paths[0].0.clone(), paths[0].1.clone());
+        assert_eq!(
+            inventory.files[0].path_bytes_hex.as_deref(),
+            Some("6e616d652dff")
+        );
+    }
 
     #[test]
     fn editor_from_str_maps_known_values() {
@@ -991,9 +1610,8 @@ mod tests {
 
     #[test]
     fn write_combined_patch_no_session_falls_back_to_temp_dir() {
-        // 回归：无活动会话（one-shot / 测试）时，/changes --open 不得再报
-        // "无活动会话，无法确定 patch 输出目录"，应回退到系统临时目录。
-        // 测试环境无 DRIVER_CTX，本前置条件成立。
+        // Without an active driver context, patch export must fall back to the
+        // runtime temp directory rather than fail for lack of session assets.
         assert!(
             crate::ai::tools::storage::file_store::current_session_assets_dir().is_none(),
             "测试环境应无活动会话"

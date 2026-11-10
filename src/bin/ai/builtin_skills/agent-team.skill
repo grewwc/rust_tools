@@ -2,7 +2,7 @@
 name: "agent-team"
 description: "Opt-in aggressive orchestration mode. Delegates all feasible, safe execution — breakdown, implementation design, discovery, edits, verification, and documentation — to subagents, keeping only the final cross-worker split, scope and product decisions, consequential-risk decisions, scheduling, acceptance, final review, integration, and synthesis in the parent."
 author: "rust_tools"
-version: "1.0.9"
+version: "1.0.11"
 priority: 20
 delegation: required
 model_invocable: false
@@ -128,10 +128,19 @@ A worker branch must be sized to its own bounded turn budget: the default subage
   in one `task_spawn` call (up to 8); never spawn-wait-spawn-wait independent work.
 - Prefer fewer, larger branches, each owning a self-contained deliverable sized
   to the subagent iteration budget, over many small tasks.
-- While useful parent-side work remains, poll with non-blocking `task_status`.
-  Call `task_wait` only when blocked on results, using `wait_policy=all` and
-  `timeout_secs=300`; completion events still wake the parent early, while budget
-  expiry or `PARKED` is normal.
+- Request a targeted `task_status` snapshot only when a scheduling or
+  cancellation decision needs the current state. When blocked on results and no
+  parent-side decision remains, go straight to `task_wait`, using
+  `wait_policy=all` and `timeout_secs=300`; completion events still wake the
+  parent early, while budget expiry or `PARKED` is normal.
+- When a completion event or `PARKED` partial collection wakes the parent,
+  first consume every delivered result: record its acceptance verdict and call
+  `task_integrate`. Then reassess remaining branches: cancel superseded or
+  low-value work that is no longer needed; narrow a slow branch via
+  `send_side_note` if it can still close and delivery is live; with deferred
+  delivery, the note reaches the branch only on its next continuation; spawn a
+  follow-up within existing round limits when a delivered result exposes a gap.
+  Re-wait only when no parent-side decision remains.
 - Once a branch's decision is settled or its scope is superseded, use
   `task_cancel` instead of waiting. Do not cancel needed work that is advancing.
 - Allow at most 2 rework rounds per branch; then narrow its scope or finish in

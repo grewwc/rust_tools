@@ -68,6 +68,39 @@ fn successful_reads(path: &str) -> Vec<Message> {
 }
 
 #[test]
+fn audit_default_rendered_report_keeps_legacy_bytes_without_hints() {
+    let root = temporary_root("legacy-report");
+    write_fixture(&root);
+    let mut report = complete_report("src/lib.rs");
+    assert_eq!(
+        audit_evidence_gate_action(
+            "audit",
+            &mut Vec::new(),
+            &successful_reads("src/lib.rs"),
+            &mut report,
+            Some(&root),
+            false,
+            1,
+            16
+        ),
+        AuditEvidenceGateAction::Allow
+    );
+    assert_eq!(
+        report,
+        concat!(
+            "## Verified findings\n\n### P1 — A verified defect\n\n",
+            "**Claim.** The branch returns the wrong value.\n\n",
+            "**Trigger.** The caller reaches the affected branch.\n\n",
+            "**Impact.** The caller observes an incorrect result.\n\n",
+            "**Source evidence.**\n- `src/lib.rs:1` — The local branch contains the returned value.\n\n",
+            "**Semantic evidence.**\n- `src/lib.rs:2` — The caller consumes that branch result.\n\n",
+            "**Falsification checks.**\n- `src/lib.rs:3` — The nearby guard does not exclude the trigger.\n\n"
+        )
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn non_audit_agents_keep_existing_final_response_behavior() {
     let mut messages = Vec::new();
     let mut final_text = "ordinary final response".to_string();

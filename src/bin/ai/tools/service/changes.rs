@@ -1,4 +1,4 @@
-//! 变更查看服务：`show_changes` / `open_diff` 两个工具的实现。
+//! Change viewing service for `show_changes` and `open_diff`.
 
 use serde_json::{Value, json};
 
@@ -59,7 +59,7 @@ pub(crate) fn handle_show_changes(args: &Value) -> Value {
         .map(|v| v.max(0) as usize)
         .unwrap_or(120);
 
-    // 读取真实会话链路
+    // Read the current session context.
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
     let is_git_repo = changes::is_inside_git_work_tree(&cwd);
@@ -68,7 +68,7 @@ pub(crate) fn handle_show_changes(args: &Value) -> Value {
     let (patch_opt, text_raw) = if include_git {
         (changes::combined_patch(), changes::combined_summary())
     } else {
-        // 仅会话，不回退 git
+        // Use session mutations only, without a Git fallback.
         let patch = if entries.is_empty() {
             None
         } else {
@@ -77,7 +77,7 @@ pub(crate) fn handle_show_changes(args: &Value) -> Value {
         let text = if entries.is_empty() {
             "当前会话无文件变更（include_git=false，仅统计 mutation log）。".to_string()
         } else {
-            // include_git=false 时不混入 git 状态提示，避免与 schema 承诺不一致
+            // Keep the session-only view free of Git-status hints.
             changes::format_session_summary_with_git(false)
         };
         (patch, text)
@@ -86,7 +86,7 @@ pub(crate) fn handle_show_changes(args: &Value) -> Value {
 
     let mut text = text_raw;
     if !path_filter.is_empty() {
-        // 按路径子串过滤文本：仅保留命中行与上下文
+        // Filter the summary by path substring.
         let mut filtered_lines = Vec::new();
         for line in text.lines() {
             if line.contains(path_filter) {
@@ -99,7 +99,7 @@ pub(crate) fn handle_show_changes(args: &Value) -> Value {
                 path_filter, text
             );
         } else {
-            // 仍附带原摘要头 + 过滤行
+            // Retain the summary header alongside matching lines.
             let header = text.lines().take(4).collect::<Vec<_>>().join("\n");
             text = format!(
                 "{}\n[filter: {}]\n{}",
@@ -119,13 +119,25 @@ pub(crate) fn handle_show_changes(args: &Value) -> Value {
     }
 
     let changed_files = changes::session_grouped_changes().len();
-    json!({
+    let mut result = json!({
         "text": text,
         "changed_files": changed_files,
         "is_git_repo": is_git_repo,
         "has_session_mutations": has_session_mutations,
         "patch_bytes": patch_bytes,
-    })
+    });
+    if include_git {
+        let inventory = changes::collect_current_changes(true);
+        result["coverage"] = json!({
+            "observed_paths": inventory.files.len(),
+            "session_changed_files": inventory.session_changes.len(),
+            "collection_complete": inventory.collection_complete(),
+            "collection_errors": inventory.collection_errors,
+            "coverage_gaps": inventory.coverage_gaps,
+        });
+        result["changed_paths"] = json!(inventory.files);
+    }
+    result
 }
 
 // ── open_diff ──────────────────────────────────────────────────────────
@@ -164,7 +176,7 @@ pub(crate) fn handle_open_diff(args: &Value) -> Value {
         }
     };
 
-    // 当 as_patch == false 时，尝试按文件的 before/after 走 code --diff（仅单文件 + vscode/cursor）
+    // Prefer before/after comparison for a single file in VS Code or Cursor.
     if as_patch_opt == Some(false) {
         let grouped = changes::session_grouped_changes();
         if grouped.len() == 1 {
@@ -174,14 +186,14 @@ pub(crate) fn handle_open_diff(args: &Value) -> Value {
                 editor_str
             };
             let kind = if editor_str.eq_ignore_ascii_case("auto") {
-                // auto 场景下探测；若探测到 vscode/cursor 则允许 diff，否则回退 patch
+                // Automatic selection allows comparisons only in VS Code or Cursor.
                 changes::configured_editor()
             } else {
                 EditorKind::from_str(normalized).unwrap_or_else(changes::configured_editor)
             };
             if matches!(kind, EditorKind::Vscode | EditorKind::Cursor) {
                 let g = &grouped[0];
-                // 构造 before/after 临时文件
+                // Prepare temporary before/after files.
                 if let Some(res) = try_open_single_file_diff(g, &kind) {
                     return match res {
                         Ok(cmd) => json!({
@@ -204,19 +216,19 @@ pub(crate) fn handle_open_diff(args: &Value) -> Value {
                 }
             }
         }
-        // 多文件或非 vscode/cursor / 无 before/after 时回退到 patch file 路径
+        // Fall back to a patch when per-file comparison is unavailable.
     }
 
-    // 明确指定 patch_file 时，覆盖写入该路径而非走会话资产目录
+    // An explicit patch path overrides the session-assets destination.
     if let Some(custom) = patch_file_arg {
         let dest = std::path::PathBuf::from(custom);
-        // 安全校验：patch_file 必须落在可写根（effective_cwd / allowed_roots / session temp / skills）
-        // 或为已注册的隔离临时文件（子代理隔离目录），与 FileStore::validate_write_access 保持一致
+        // Require a writable root or registered isolated temporary file,
+        // matching FileStore::validate_write_access.
         let in_allowed = crate::ai::tools::storage::file_store::path_within_allowed_roots(&dest);
         let is_registered =
             crate::ai::tools::storage::temp_registry::is_registered(&dest.display().to_string());
-        // 相对路径已在 path_within_allowed_roots 内按 effective_cwd 归一化；绝对路径孤立注册文件也放行
-        // 额外兼容：绝对路径若恰好位于 runtime_ctx::temp_dir() 下也视为已授权的 scratch
+        // Root validation resolves relative paths through effective_cwd. Absolute
+        // paths within the runtime temp directory are also authorized scratch.
         let in_session_tmp = dest.is_absolute()
             && dest.starts_with(
                 crate::ai::driver::runtime_ctx::temp_dir().unwrap_or_else(|_| std::env::temp_dir()),
@@ -246,7 +258,7 @@ pub(crate) fn handle_open_diff(args: &Value) -> Value {
                 "is_git_repo": is_git_repo,
             });
         }
-        // 自定义路径：尝试以 resolved 编辑器打开
+        // Open the explicit patch path with the resolved viewer.
         let kind = if editor_str.eq_ignore_ascii_case("auto") {
             changes::configured_editor()
         } else {
@@ -257,7 +269,7 @@ pub(crate) fn handle_open_diff(args: &Value) -> Value {
             };
             EditorKind::from_str(normalized).unwrap_or_else(changes::configured_editor)
         };
-        // 复用存储层 open_patch 逻辑：此处直接调用 open_changes 会忽略自定义路径，因此手动打开
+        // Open directly because open_changes would ignore the explicit path.
         let open_res = open_patch_path_with_editor(&dest, &kind);
         return match open_res {
             Ok(cmd) => json!({
@@ -278,7 +290,7 @@ pub(crate) fn handle_open_diff(args: &Value) -> Value {
         };
     }
 
-    // 默认路径：走存储层统一入口（写入 <session_assets>/changes.patch 并打开）
+    // Use the storage entry point for the default patch destination.
     let requested_kind = if editor_str.eq_ignore_ascii_case("auto") {
         None
     } else {
@@ -291,10 +303,10 @@ pub(crate) fn handle_open_diff(args: &Value) -> Value {
     };
     match changes::open_changes(requested_kind.clone()) {
         Ok(cmd) => {
-            // open_changes 已写入 <session_assets>/changes.patch（或 temp 回退），避免重复落盘
-            // 通过 resolved kind 保持返回一致；patch_file 优先取 open_changes 返回中的路径
+            // open_changes already wrote the patch. Retain the resolved viewer and
+            // prefer its returned path without writing the patch again.
             let resolved = requested_kind.unwrap_or_else(changes::configured_editor);
-            // 从存储层推断实际落盘路径：优先 session_assets，失败则回退 temp
+            // Infer the patch destination from session assets or the temp fallback.
             let patch_path = crate::ai::tools::storage::file_store::current_session_assets_dir()
                 .map(|d| d.join("changes.patch"))
                 .unwrap_or_else(|| {
@@ -332,7 +344,7 @@ fn try_open_single_file_diff(
     if !g.snapshots_full() {
         return None;
     }
-    // 落盘到会话临时目录（与 file_store 沙箱保持一致，避免直接写系统 /tmp 越界）
+    // Write comparison files within the session temp directory sandbox.
     let base_tmp =
         crate::ai::driver::runtime_ctx::temp_dir().unwrap_or_else(|_| std::env::temp_dir());
     let tmp_dir = base_tmp.join(format!("rust_tools_diff_{}", std::process::id()));
@@ -385,6 +397,143 @@ mod snapshot_tests {
     use crate::ai::tools::storage::mutation_log::{BeforeState, MutationEntry};
 
     #[test]
+    fn audit_default_show_changes_keeps_legacy_keys_and_session_text() {
+        let result = handle_show_changes(&json!({"include_git": false, "limit_snippet": 0}));
+        let mut keys = result
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "changed_files",
+                "has_session_mutations",
+                "is_git_repo",
+                "patch_bytes",
+                "text"
+            ]
+        );
+        assert_eq!(
+            result["text"],
+            "当前会话无文件变更（include_git=false，仅统计 mutation log）。"
+        );
+        assert_eq!(result["changed_files"], 0);
+        assert_eq!(result["has_session_mutations"], false);
+        assert_eq!(result["patch_bytes"], 0);
+    }
+
+    #[test]
+    fn show_changes_with_git_exposes_union_inventory_without_changing_legacy_fields() {
+        let root = std::env::temp_dir().join(format!(
+            "show-changes-inventory-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let git = crate::fork_guard::output(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root),
+        )
+        .unwrap();
+        assert!(git.status.success(), "{:?}", git.stderr);
+        let git_path = root.join("git-only\npath.rs");
+        std::fs::write(&git_path, "untracked\n").unwrap();
+        let entry = MutationEntry {
+            seq: 1,
+            ts: "t".into(),
+            path: root.join("mutation-only.rs").display().to_string(),
+            op: "delete".into(),
+            before: Some("removed\n".into()),
+            before_state: Some(BeforeState::Present),
+            after: None,
+            diff: None,
+        };
+        let mut app = crate::ai::middleware::test_util::test_app();
+        app.config.history_file = root.join(".git/audit-test/history.jsonl");
+        app.session_id = "show-changes-test".into();
+        let context = crate::ai::driver::runtime_ctx::DriverContext::new(
+            app,
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+            std::sync::Arc::new(Vec::new()),
+            std::sync::Arc::new(Vec::new()),
+        );
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(root.clone(), || {
+            crate::ai::driver::runtime_ctx::DRIVER_CTX.sync_scope(context, || {
+                let log_path = crate::ai::tools::storage::mutation_log::log_path().unwrap();
+                assert!(log_path.starts_with(root.join(".git")));
+                std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+                let log_entry = serde_json::to_string(&entry).unwrap() + "\n";
+                std::fs::write(&log_path, &log_entry).unwrap();
+                let patch_bytes = changes::combined_patch().unwrap().len();
+                let full = handle_show_changes(&json!({"include_git": true, "limit_snippet": 0}));
+                assert_eq!(full["text"], changes::combined_summary());
+                let result = handle_show_changes(&json!({
+                    "include_git": true,
+                    "path": "mutation-only",
+                    "limit_snippet": 1,
+                }));
+                assert!(
+                    result["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("[truncated to 80 chars")
+                );
+                assert_eq!(result["changed_files"], 1);
+                assert_eq!(result["is_git_repo"], true);
+                assert_eq!(result["has_session_mutations"], true);
+                assert_eq!(result["patch_bytes"], patch_bytes);
+                let inventory = changes::collect_current_changes(true);
+                assert_eq!(
+                    result["changed_paths"],
+                    serde_json::to_value(&inventory.files).unwrap()
+                );
+                assert_eq!(result["changed_paths"], full["changed_paths"]);
+                assert_eq!(result["coverage"]["observed_paths"], 2);
+                assert_eq!(result["coverage"]["session_changed_files"], 1);
+                assert_eq!(result["coverage"]["collection_complete"], true);
+                assert_eq!(result["coverage"]["collection_errors"], json!([]));
+                assert_eq!(
+                    result["coverage"]["coverage_gaps"],
+                    json!(inventory.coverage_gaps)
+                );
+                assert!(
+                    !result["coverage"]["coverage_gaps"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+                for path in [&entry.path, &git_path.display().to_string()] {
+                    assert!(
+                        result["changed_paths"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|file| {
+                                file["path"] == *path && file["ownership"] == "unknown"
+                            })
+                    );
+                }
+                std::fs::write(&log_path, log_entry + "invalid mutation entry\n").unwrap();
+                let incomplete =
+                    handle_show_changes(&json!({"include_git": true, "limit_snippet": 1}));
+                let inventory = changes::collect_current_changes(true);
+                assert_eq!(incomplete["coverage"]["collection_complete"], false);
+                assert!(!inventory.collection_errors.is_empty());
+                assert_eq!(
+                    incomplete["coverage"]["collection_errors"],
+                    json!(inventory.collection_errors)
+                );
+                assert_eq!(incomplete["changed_paths"], result["changed_paths"]);
+            });
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn external_diff_rejects_unavailable_initial_snapshot_before_spawning() {
         for state in [BeforeState::Present, BeforeState::Unknown] {
             let entries = [MutationEntry {
@@ -409,14 +558,14 @@ fn open_patch_path_with_editor(
     patch_path: &std::path::Path,
     kind: &EditorKind,
 ) -> Result<String, String> {
-    // 复刻 storage::changes::open_patch 但允许自定义路径
+    // Match storage::changes::open_patch while allowing an explicit path.
     let patch_str = patch_path.display().to_string();
     let (prog, args): (&str, Vec<String>) = match kind {
         EditorKind::Vscode => ("code", vec![patch_str.clone()]),
         EditorKind::Cursor => ("cursor", vec![patch_str.clone()]),
         EditorKind::Idea => ("idea", vec!["diff".to_string(), patch_str.clone()]),
         EditorKind::Git => {
-            // git difftool 需要仓库上下文；自定义 patch 无仓库则退化为 open
+            // Git difftool requires repository context for the explicit patch.
             return Err("git difftool requires a git work tree; use code/cursor/open".to_string());
         }
         EditorKind::SystemOpen => {
