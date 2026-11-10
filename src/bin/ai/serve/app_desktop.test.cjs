@@ -933,7 +933,7 @@ test("short-thinking early repaint: real send paints and saves its first chunk's
   await frame('event: thinking_start\ndata: \n\nevent: thinking\ndata: ' + JSON.stringify({ text: thought }) + '\n\n');
   h.advance(50);
   const summary = h.elements.msgs.querySelector("summary");
-  assert.equal(summary.textContent, "thinking… · ~31 tok");
+  assert.equal(summary.textContent, "thinking… · ~31 tok @ 124 tok/s");
   h.advance(200);
   assert.equal(summary.textContent, "thinking… · ~31 tok @ 124 tok/s", "the first chunk waited for phase completion or another chunk");
   assert.equal(h.context.turns.has(h.context.sessionId), true);
@@ -947,26 +947,32 @@ test("short-thinking early repaint: real send paints and saves its first chunk's
   await frame('event: thinking_start\ndata: \n\nevent: thinking\ndata: ' + JSON.stringify({ text: legacyThought }) + '\n\nevent: thinking_done\ndata: \n\n');
   h.advance(250);
   assert.deepEqual(h.elements.msgs.querySelectorAll("summary").map((item) => item.textContent), [
-    "thinking · ~31 tok @ 124 tok/s", "thinking · ~10 tok",
-  ], "a completed sample-less phase gained a rate from an uncancelled timer");
+    "thinking · ~31 tok @ 124 tok/s", "thinking · ~10 tok @ 40.0 tok/s",
+  ], "a completed same-tick phase lost its 250ms rate");
   await frame('event: done\ndata: \n\n');
   await pending;
-  assert.equal(h.stored.get("serve.rates"), serialized);
+  const phase2Key = Object.keys(JSON.parse(h.stored.get("serve.rates")))
+    .find((key) => !Object.hasOwn(JSON.parse(serialized), key));
+  const serializedPhases = JSON.stringify({
+    ...JSON.parse(serialized),
+    [phase2Key]: { textKey: h.context.rateTextKey(legacyThought), rate: "~10 tok @ 40.0 tok/s" },
+  });
+  assert.equal(h.stored.get("serve.rates"), serializedPhases);
   const messages = [
     { role: "assistant", content: "", reasoning_content: thought },
     { role: "assistant", content: "", reasoning_content: legacyThought },
   ];
   const refreshed = h.document.createElement("div");
   for (const row of h.context.historyRowsOf(messages, messages.length, false).rows) h.context.renderHistoryRow(row, refreshed);
-  const labels = ["thinking · ~31 tok @ 124 tok/s", "thinking · ~10 tok"];
+  const labels = ["thinking · ~31 tok @ 124 tok/s", "thinking · ~10 tok @ 40.0 tok/s"];
   assert.deepEqual(refreshed.querySelectorAll("summary").map((item) => item.textContent), labels);
   const cold = harness({ phone: true });
   loadChat(cold);
-  cold.stored.set("serve.rates", serialized);
+  cold.stored.set("serve.rates", serializedPhases);
   cold.context.Date = { now() { assert.fail("cold history must not invent a timing sample"); } };
   for (const row of cold.context.historyRowsOf(messages, messages.length, false).rows) cold.context.renderHistoryRow(row, cold.elements.msgs);
   assert.deepEqual(cold.elements.msgs.querySelectorAll("summary").map((item) => item.textContent), labels);
-  assert.equal(cold.stored.get("serve.rates"), serialized);
+  assert.equal(cold.stored.get("serve.rates"), serializedPhases);
 });
 
 for (const [phone, width] of [[true, 320], [true, 375], [true, 700], [false, 1280]]) {

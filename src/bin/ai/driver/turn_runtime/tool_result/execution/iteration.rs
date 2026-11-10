@@ -760,7 +760,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
 /// leave the user with no visible reply. The force-final no-tool retry path is
 /// excluded: finalize commits that body exactly once with its warning
 /// appended, so an intermediate commit would duplicate it.
-fn should_commit_tool_round_body_for_serve(
+pub(in crate::ai::driver::turn_runtime) fn should_commit_tool_round_body_for_serve(
     tool_round_candidate: &Option<String>,
     force_final_response: bool,
     iteration: usize,

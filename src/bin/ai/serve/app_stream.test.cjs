@@ -253,7 +253,7 @@ function replayHarness(options) {
   }
   const msgs = node();
   context.$ = () => msgs;
-  context.document = { createElement: node };
+  context.document = { ...context.document, body: msgs, createElement: node };
   context.addFold = (title, text, parent) => {
     const box = node(); box.summary = { textContent: title }; box.details = { open: false };
     box.className = "msg asst";
@@ -1231,8 +1231,9 @@ for (const recovered of [false, true]) {
     h.emit("thinking_done");
     for (const speed of ["output 4 tok @ 8 tok/s", "reasoning 4 tok @ — tok/s", "reasoning 4 tok @ Infinity tok/s", "reasoning 4 tok @ -1 tok/s"]) {
       h.emit("progress", "↳ speed · " + speed);
-      assert.ok(h.titles().includes("thinking · ~4 tok"));
-      assert.equal(h.context.storedRate("thinking", "s", "first thought"), "", "token counts are not durable timing samples");
+      assert.ok(h.titles().includes("thinking · ~4 tok @ 16.0 tok/s"));
+      assert.equal(h.context.storedRate("thinking", "s", "first thought"), "~4 tok @ 16.0 tok/s",
+        "unrelated or invalid server rates must preserve the arrival sample");
     }
     h.emit("thinking_start");
     // A new response without displayed reasoning cannot lend its terminal
@@ -1240,10 +1241,10 @@ for (const recovered of [false, true]) {
     h.emit("progress", "↳ speed · reasoning 4 tok @ 8 tok/s");
     if (recovered) h.view.finish();
     else h.emit("done");
-    assert.ok(h.titles().includes("thinking · ~4 tok"));
+    assert.ok(h.titles().includes("thinking · ~4 tok @ 16.0 tok/s"));
     const cold = coldHistoryHarness(h.storage.get("serve.rates"));
     cold.mount(JSON.stringify([{ role: "assistant", content: "", reasoning_content: "first thought" }]));
-    assert.equal(cold.root.querySelector("summary").textContent, "thinking · ~4 tok");
+    assert.equal(cold.root.querySelector("summary").textContent, "thinking · ~4 tok @ 16.0 tok/s");
   });
 }
 
@@ -1266,6 +1267,41 @@ test("phone screenshot-sized history distinguishes persisted throughput from mis
 
 const screenshotThought = "The status bar rate removal worker (task_03504bdf97f1481fba03b62252ab9ef4) is completed. Let me collect it with task_wait.";
 
+test("thinking rate floor covers zero and short elapsed time without changing output debounce", () => {
+  const h = streamHarness({ realThinking: true });
+  for (const elapsed of [0, 1, 50, 249, 250]) {
+    assert.equal(h.context.measuredRateText(31, 0, elapsed), "~31 tok @ 124 tok/s");
+    assert.equal(h.context.formatRateText(31, 0, elapsed), "~31 tok");
+  }
+  assert.equal(h.context.measuredRateText(31, 0, 1000), "~31 tok @ 31.0 tok/s");
+  assert.equal(h.context.formatRateText(31, 0, 500), "~31 tok @ 62.0 tok/s");
+  assert.equal(h.context.measuredRateText(31, null, 0), "");
+  assert.equal(h.context.measuredRateText(0, 0, 0), "");
+});
+
+for (const recovered of [false, true]) {
+  for (const phone of [false, true]) {
+    test(`same-tick thinking rate: ${recovered ? "recovered" : "live"} ${phone ? "phone" : "desktop"} survives canonical and cold history`, () => {
+      const options = { phone, realThinking: true, clockStart: 0 };
+      const h = recovered ? replayHarness(options) : streamHarness(options);
+      h.emit("thinking_start");
+      h.emit("thinking", { text: screenshotThought });
+      h.emit("thinking_done");
+      const title = h.titles().find((value) => value.startsWith("thinking"));
+      assert.equal(title, "thinking · ~31 tok @ 124 tok/s");
+      const rate = /@\s+(\S+)\s+tok\/s/.exec(title);
+      assert.ok(rate && Number.isFinite(Number(rate[1])), "same-tick throughput must be finite");
+      assert.equal(h.context.storedRate("thinking", "s", screenshotThought), "~31 tok @ 124 tok/s");
+      if (recovered) h.view.finish();
+      else h.emit("done");
+      assert.equal(historyRateHarness(h.storage, "", screenshotThought, phone).restoredThinking(), title);
+      const cold = coldHistoryHarness(h.storage.get("serve.rates"), { phone });
+      cold.mount(JSON.stringify([{ role: "assistant", content: "", reasoning_content: screenshotThought }]));
+      assert.equal(cold.root.querySelector("summary").textContent, title);
+    });
+  }
+}
+
 for (const recovered of [false, true]) {
   for (const completionDelay of [0, 10]) {
     test(`thinking phase-start timestamp: ${recovered ? "replay" : "live"} single chunk completes at ${50 + completionDelay}ms`, () => {
@@ -1274,20 +1310,20 @@ for (const recovered of [false, true]) {
       h.emit("thinking_start");
       h.ageOutput(50);
       h.emit("thinking", { text: screenshotThought });
-      assert.ok(h.titles().includes((recovered ? "thinking" : "thinking…") + " · ~31 tok @ 620 tok/s"),
-        "the first sample must include the phase time before the thinking chunk");
+      assert.ok(h.titles().includes((recovered ? "thinking" : "thinking…") + " · ~31 tok @ 124 tok/s"),
+        "the first sample must use the floor for a phase shorter than 250ms");
       h.ageOutput(completionDelay);
       h.emit("thinking_done");
       const title = h.titles().find((value) => value.startsWith("thinking"));
-      assert.equal(title, "thinking · ~31 tok @ 620 tok/s",
-        "completion must preserve the phase's cached first timing sample");
+      assert.equal(title, "thinking · ~31 tok @ 124 tok/s",
+        "completion must retain the minimum thinking window");
       if (recovered) h.view.finish();
       else h.emit("done");
     });
   }
 
   for (const emptyPhase of [false, true]) {
-    test(`thinking phase-start timestamp: ${recovered ? "replay" : "live"} single chunk ${emptyPhase ? "after an empty phase" : "without a start"} has no timing sample`, () => {
+    test(`thinking phase-start timestamp: ${recovered ? "replay" : "live"} single chunk ${emptyPhase ? "after an empty phase" : "without a start"} starts an arrival window`, () => {
       const options = { phone: true, realThinking: true, clockStart: 0 };
       const h = recovered ? replayHarness(options) : streamHarness(options);
       if (emptyPhase) {
@@ -1299,9 +1335,8 @@ for (const recovered of [false, true]) {
       h.emit("thinking", { text: screenshotThought });
       h.emit("thinking_done");
       const title = h.titles().find((value) => value.startsWith("thinking"));
-      assert.equal(title, "thinking · ~31 tok");
-      assert.doesNotMatch(title, /tok\/s/);
-      assert.equal(h.context.storedRate("thinking", "s", screenshotThought), "");
+      assert.equal(title, "thinking · ~31 tok @ 124 tok/s");
+      assert.equal(h.context.storedRate("thinking", "s", screenshotThought), "~31 tok @ 124 tok/s");
       if (recovered) h.view.finish();
       else h.emit("done");
     });
@@ -1332,18 +1367,18 @@ test("thinking rate regression: a short measured phase survives completion, refr
   const replay = replayHarness({ phone: true, realThinking: true });
   replay.emit("thinking", { text: screenshotThought, rate: "~31 tok" });
   replay.emit("thinking_done");
-  assert.ok(replay.titles().includes("thinking · ~31 tok"), "same-tick replay invented a timing sample");
+  assert.ok(replay.titles().includes("thinking · ~31 tok @ 124 tok/s"), "same-tick replay must retain its bounded arrival estimate");
   replay.view.finish();
 });
 
-test("short-thinking early repaint: recovered SSE shows a saved rate at 250ms before phase completion", async () => {
+test("short-thinking arrival floor: recovered SSE saves a rate immediately before phase completion", async () => {
   const h = attachmentHarness(false, { phone: true, realThinking: true });
   const pending = h.c.attachEvents();
   await h.settle();
   await h.frame('event: thinking_start\ndata: \n\nevent: thinking\ndata: ' + JSON.stringify({ text: screenshotThought }) + '\n\n');
   const view = h.c.recoveredView;
   const caption = () => view.box.children.find((child) => child.summary).summary.textContent;
-  assert.equal(caption(), "thinking · ~31 tok");
+  assert.equal(caption(), "thinking · ~31 tok @ 124 tok/s");
   h.advance(250);
   assert.equal(caption(), "thinking · ~31 tok @ 124 tok/s", "the running recovered fold waited for thinking_done");
   assert.equal(h.c.eventActive, true);
@@ -1373,7 +1408,7 @@ for (const recovered of [false, true]) {
     const h = recovered ? replayHarness(options) : streamHarness(options);
     h.emit("thinking_start");
     h.emit("thinking", { text: screenshotThought });
-    assert.ok(h.titles().includes((recovered ? "thinking" : "thinking…") + " · ~31 tok"));
+    assert.ok(h.titles().includes((recovered ? "thinking" : "thinking…") + " · ~31 tok @ 124 tok/s"));
     h.ageOutput(250);
     h.emit("thinking_done");
     assert.ok(h.titles().includes("thinking · ~31 tok @ 124 tok/s"));
@@ -1730,6 +1765,35 @@ test("parallel tool completion and confirmation preserve the remaining active st
   assert.ok(h.titles().some((title) => title.includes("interrupted")));
   assert.ok(h.bodies().some((text) => text.includes("B")));
 });
+
+for (const recovered of [false, true]) {
+  for (const phone of [false, true]) {
+    test(`active subagent progress: ${recovered ? "recovered" : "live"} ${phone ? "phone" : "desktop"} opens details and summarizes the latest command`, () => {
+      const h = recovered ? replayHarness({ phone }) : streamHarness({ phone });
+      h.emit("tool", { id: "wait", name: "task_wait", phase: "started" });
+      const header = "subagents · 1 active\n└─ worker · running 5s · task: inspect thinking rates\n";
+      const command = "execute_command rg -n thinking app.html";
+      h.emit("subagent_progress", header + "   ↳ progress: " + command + " · last 0s ago");
+      const box = recovered ? h.view.box : h.box;
+      const card = box.children.find((item) => item.summary?.textContent.startsWith("subagents"));
+      const details = card.querySelector("details");
+      assert.equal(details.open, true, "active child progress must be visible without opening task_wait");
+      assert.ok(card.summary.textContent.includes(command), "the summary omitted the current command");
+      const latest = "read_file Cargo.toml";
+      h.emit("subagent_progress", header + "   ↳ progress: " + latest + " · last 0s ago");
+      assert.equal(details.open, true);
+      assert.ok(card.summary.textContent.includes(latest));
+      assert.ok(!card.summary.textContent.includes(command));
+      h.emit("subagent_progress", "subagents · 0 active");
+      assert.equal(details.open, false, "completed subagents must leave a collapsed card");
+      h.emit("subagent_progress", header + "   ↳ progress: " + latest);
+      assert.equal(details.open, true);
+      if (recovered) h.view.finish();
+      else h.emit("done");
+      assert.equal(details.open, false, "turn completion must collapse the progress card");
+    });
+  }
+}
 
 test("subagent snapshots stay distinct from logs and empty thinking markers", () => {
   const h = streamHarness();
