@@ -1923,6 +1923,7 @@ mod audit_orchestration_tests {
             Ok(ToolResult {
                 tool_call_id: invocation.tool_call_id.clone(),
                 content: "foreground audit started".into(),
+                task_report: None,
             })
         });
         assert_eq!(calls.load(Ordering::Relaxed), 1);
@@ -1944,6 +1945,7 @@ mod audit_orchestration_tests {
             Ok(ToolResult {
                 tool_call_id: invocation.tool_call_id.clone(),
                 content: "fallback started".into(),
+                task_report: None,
             })
         });
         assert_eq!(calls.load(Ordering::Relaxed), 3);
@@ -2039,6 +2041,7 @@ mod audit_orchestration_tests {
             Ok(ToolResult {
                 tool_call_id: invocation.tool_call_id.clone(),
                 content: content.into(),
+                task_report: None,
             })
         });
         assert_eq!(results.len(), 2);
@@ -2108,6 +2111,7 @@ mod audit_orchestration_tests {
                             Ok(ToolResult {
                                 tool_call_id: invocation.tool_call_id.clone(),
                                 content: "round evidence".into(),
+                                task_report: None,
                             })
                         });
                     assert!(results[0].is_ok());
