@@ -27,6 +27,30 @@ function cssRule(source, selector) {
 function responsiveRule(selector, phone = false) {
   return { ...cssRule(baseCss, selector), ...cssRule(phone ? phoneCss : desktopCss, selector) };
 }
+// This reads transcript ancestry from the source markup; it is not a layout
+// engine. The live DOM fixture below separately executes the real send path.
+function shellPathTo(id) {
+  const source = html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/g, "")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/g, "").replace(/<!--[\s\S]*?-->/g, "");
+  const stack = [], voidTags = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
+  for (const match of source.matchAll(/<(\/?)([a-z][\w:-]*)([^>]*)>/gi)) {
+    const tag = match[2].toLowerCase(), attrs = match[3];
+    if (match[1]) {
+      const index = stack.findLastIndex((item) => item.tag === tag);
+      if (index >= 0) stack.length = index;
+      continue;
+    }
+    const item = {
+      tag, id: /\bid="([^"]*)"/.exec(attrs)?.[1] || "",
+      className: /\bclass="([^"]*)"/.exec(attrs)?.[1] || "",
+      hidden: /(?:^|\s)hidden(?:\s|=|$)/.test(attrs),
+      style: /\bstyle="([^"]*)"/.exec(attrs)?.[1] || "",
+    };
+    if (item.id === id) return [...stack, item];
+    if (!voidTags.has(tag) && !/\/\s*$/.test(attrs)) stack.push(item);
+  }
+  assert.fail("missing source element " + id);
+}
 function between(start, end) {
   const a = script.indexOf(start), b = script.indexOf(end, a);
   assert.ok(a >= 0 && b > a, "missing page functions: " + start);
@@ -53,6 +77,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
       tagName: tag, children: [], parentNode: null, attrs: {}, dataset: {}, style: {},
       hidden: false, disabled: false, value: "", title: "", scrollTop: 0,
       get lastElementChild() { return el.children.at(-1) || null; },
+      get nextElementSibling() { return el.parentNode?.children[el.parentNode.children.indexOf(el) + 1] || null; },
       get className() { return [...classes].join(" "); },
       set className(value) { classes.clear(); value.split(/\s+/).filter(Boolean).forEach((name) => classes.add(name)); },
       classList: {
@@ -70,6 +95,15 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
       setAttribute(key, value) { el.attrs[key] = String(value); },
       getAttribute(key) { return el.attrs[key] ?? null; },
       appendChild(child) { child.remove(); child.parentNode = el; el.children.push(child); return child; },
+      insertBefore(child, before) {
+        if (child === before) return child;
+        child.remove();
+        const index = before ? el.children.indexOf(before) : el.children.length;
+        assert.ok(index >= 0, "the insertion anchor must belong to its parent");
+        child.parentNode = el;
+        el.children.splice(index, 0, child);
+        return child;
+      },
       replaceChild(next, current) {
         const index = el.children.indexOf(current);
         assert.ok(index >= 0, "replace an existing transcript child");
@@ -204,6 +238,8 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
   vm.runInContext(marked("composer session adoption"), context);
   vm.runInContext(marked("turn session preparation"), context);
   vm.runInContext(between("function parseBlock(raw)", "// \u0060/cd\u0060 changes"), context);
+  vm.runInContext(between("const RATE_STORAGE =", "function addFold("), context);
+  vm.runInContext(between("function setAnswerRate(", "// Only completed answer bubbles"), context);
   vm.runInContext(marked("composer send"), context);
   vm.runInContext(between('$("newbtn").onclick =', '$("img").onclick ='), context);
   context.wireSessionActions();
@@ -789,3 +825,98 @@ test("phone user rows and side-note CSS retain their geometry and state rules", 
   assert.equal(prompt["font-size"], "16px");
   assert.equal(prompt["max-height"], "calc(var(--app-height, 100vh) * .38)");
 });
+
+test("main throughput rows wrap and retain their height at phone and desktop widths", () => {
+  for (const phone of [true, false]) {
+    const rate = responsiveRule(".turn-rate", phone);
+    assert.equal(rate.flex, "0 0 auto");
+    assert.equal(rate["max-width"], "100%");
+    assert.equal(rate["white-space"], "normal");
+    assert.equal(rate["overflow-wrap"], "anywhere");
+    assert.notEqual(rate.display, "none");
+  }
+});
+
+for (const width of [320, 375, 700]) {
+  test("live main throughput at phone width " + width + " stays outside hidden status ancestors and wraps", async () => {
+    const h = harness({ phone: true });
+    loadChat(h);
+    h.context.window.innerWidth = width;
+    let parent = null;
+    for (const info of shellPathTo("msgs")) {
+      const element = info.id === "msgs" ? h.elements.msgs : h.document.createElement(info.tag);
+      element.id = info.id; element.className = info.className; element.hidden = info.hidden;
+      for (const entry of info.style.split(";")) {
+        const index = entry.indexOf(":");
+        if (index >= 0) element.style[entry.slice(0, index).trim()] = entry.slice(index + 1).trim();
+      }
+      if (parent) parent.appendChild(element);
+      if (info.tag === "body") h.document.body = element;
+      parent = element;
+    }
+    let pendingRead = null;
+    const fetch = h.context.fetch;
+    h.context.fetch = async (url, options) => {
+      if (!new URL(url).pathname.endsWith("/turns/stream")) return fetch(url, options);
+      return { ...response({}), body: { getReader: () => ({
+        read: () => new Promise((resolve) => { pendingRead = resolve; }),
+        cancel() {},
+      }) } };
+    };
+    h.context.addAnswerCopy = () => {};
+    h.context.startStaleFollow = () => assert.fail("unexpected stale stream: " +
+      JSON.stringify(h.elements.msgs.querySelectorAll(".err").map((element) => element.textContent)));
+    const settle = async () => { for (let i = 0; i < 24; i++) await Promise.resolve(); };
+    const frame = async (text) => {
+      assert.ok(pendingRead, "the real send path did not reach its SSE reader");
+      const resolve = pendingRead;
+      pendingRead = null;
+      resolve({ done: false, value: Buffer.from(text) });
+      await settle();
+    };
+    h.elements.prompt.value = "phone prompt";
+    const pending = h.context.send();
+    await settle();
+    await frame('event: delta\ndata: {"delta":"live answer"}\n\n');
+    await frame("data: ↳ speed · output 40 tok @ 20 tok/s\n\n");
+    // The fixture queues browser paint timers until its clock is advanced.
+    h.advance(1000);
+    const lines = h.elements.msgs.querySelectorAll(".turn-rate");
+    assert.equal(lines.length, 1);
+    const line = lines[0];
+    assert.equal(line.textContent, "↳ speed · output 40 tok @ 20 tok/s");
+    assert.ok(line.parentNode.classList.contains("turn"));
+    h.elements.turnstatus.hidden = true;
+    const status = h.elements.msgs.querySelector(".pending");
+    assert.ok(status);
+    status.hidden = true;
+    const ancestors = [];
+    for (let element = line; element; element = element.parentNode) {
+      ancestors.push(element);
+      assert.equal(element.hidden, false, "a hidden ancestor contains the main rate");
+      assert.notEqual(element.id, "turnstatus");
+      assert.ok(!element.classList.contains("pending"), "the main rate was placed in the hidden phase bubble");
+      const selectors = [element.tagName, element.id ? "#" + element.id : "",
+        ...element.className.split(/\s+/).filter(Boolean).map((name) => "." + name)].filter(Boolean);
+      for (const selector of selectors) {
+        const style = responsiveRule(selector, true);
+        assert.notEqual(style.display, "none", selector + " hides main throughput");
+        assert.notEqual(style.visibility, "hidden", selector + " hides main throughput");
+      }
+      assert.notEqual(element.style.display, "none");
+      assert.notEqual(element.style.visibility, "hidden");
+    }
+    assert.ok(ancestors.includes(h.elements.msgs));
+    assert.ok(ancestors.includes(h.document.body));
+    const rate = responsiveRule(".turn-rate", true);
+    assert.equal(rate.flex, "0 0 auto");
+    assert.equal(rate["max-width"], "100%");
+    assert.equal(rate["white-space"], "normal");
+    assert.equal(rate["overflow-wrap"], "anywhere");
+    assert.equal(responsiveRule(".turn", true)["min-width"], "0");
+    assert.equal(responsiveRule("#msgs", true)["overflow-y"], "auto");
+    await frame("event: done\ndata: \n\n");
+    await pending;
+    assert.deepEqual(h.elements.msgs.querySelectorAll(".turn-rate"), lines);
+  });
+}

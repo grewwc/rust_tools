@@ -17,14 +17,16 @@ function nodeList(nodes = []) {
   return list;
 }
 
-function streamHarness({ activityOnly = false } = {}) {
+function streamHarness({ activityOnly = false, phone = false, storage = new Map(), realThinking = false } = {}) {
   const timers = [];
   const box = {
     children: [], isConnected: true,
-    appendChild(node) { if (!this.children.includes(node)) this.children.push(node); },
+    appendChild(node) { if (!this.children.includes(node)) this.children.push(node); node.parentNode = this; return node; },
     insertBefore(node, before) {
       this.children = this.children.filter((child) => child !== node);
-      this.children.splice(this.children.indexOf(before), 0, node);
+      const index = this.children.indexOf(before);
+      this.children.splice(index < 0 ? this.children.length : index, 0, node);
+      node.parentNode = this;
     },
     querySelectorAll() { return nodeList(this.children.filter((child) => child.summary)); },
   };
@@ -33,7 +35,7 @@ function streamHarness({ activityOnly = false } = {}) {
     const item = { dataset: {}, textContent: "", innerHTML: "", querySelector() { return null; }, classList: {
       add: (name) => classes.add(name), remove: (name) => classes.delete(name),
     }, get isConnected() { return box.isConnected && box.children.includes(item); },
-    remove() { box.children = box.children.filter((child) => child !== item); } };
+    remove() { box.children = box.children.filter((child) => child !== item); item.parentNode = null; } };
     return item;
   }
   const clock = { now: 1000 }, intervals = new Map(), listeners = new Map(), observers = [];
@@ -42,25 +44,28 @@ function streamHarness({ activityOnly = false } = {}) {
   const document = { hidden: false, body: box, addEventListener: listen, createElement: () => node() };
   const context = vm.createContext({
     box, sid: "s", sessionId: "s", finished: false, turnError: false, document,
+    Date: { now: () => clock.now }, isPhoneLayout: () => phone,
+    localStorage: {
+      getItem: (key) => storage.get(key) || null,
+      setItem: (key, value) => storage.set(key, value),
+    },
     LIVE_STALL_MS: 300000,
     runEpoch: 0, eventFailures: 0, confirmPollSeq: 0,
     setTimeout: (fn, delay) => { timers.push(delay); return timers.length; }, clearTimeout() {},
     // Extracted slices may arm timers; the assertions drive them directly.
     setInterval: () => 0, clearInterval() {},
     shouldFollowOutput: () => false, followOutput() {}, closeProgressPhase() {},
-    rememberRate() {}, storedRate: () => "",
-    estimateTextTokens: () => 1, measuredRateText: () => "",
     mutateTranscript(mutation) { mutation(); },
-    renderMarkdown: (text) => text, decorateMath() {}, decorateAndLoad() {},
+    renderMarkdown: (text) => text, decorateMath() {}, decorateAndLoad() {}, addAnswerCopy() {},
     showConfirm() {}, hideConfirm() {}, confirmShown: null,
-    addMsgMd() { const item = node(); box.children.push(item); return item; },
+    addMsgMd() { const item = node(); box.appendChild(item); return item; },
     addFold(title, text) {
       const item = node(), summary = { textContent: title }, details = { open: false };
       const body = { textContent: text };
       item.className = "msg asst";
       item.summary = summary; item.body = body;
       item.querySelector = (selector) => selector === "summary" ? summary : details;
-      box.children.push(item);
+      box.appendChild(item);
       return { box: item, body, set(label, value) { summary.textContent = label; body.textContent = value; } };
     },
     ...(activityOnly ? {
@@ -91,6 +96,13 @@ function streamHarness({ activityOnly = false } = {}) {
     };
   }
   vm.runInContext(script.slice(script.indexOf("function replyPaintDelay("), script.indexOf("function sessionTitle(")), context);
+  vm.runInContext(script.slice(script.indexOf("const RATE_STORAGE ="), script.indexOf("function addFold(")), context);
+  // Phase-only fixtures leave unspecified reasoning rates blank. Rate tests
+  // execute the real estimator, storage and output counter from the page.
+  if (!realThinking) {
+    context.estimateTextTokens = () => 1;
+    context.measuredRateText = () => "";
+  }
   vm.runInContext(script.slice(script.indexOf("function setAnswerRate("), script.indexOf("// Only completed answer bubbles")), context);
   const start = script.indexOf('  let bubble = addMsgMd("", box);');
   assert.ok(start > 0);
@@ -115,6 +127,7 @@ function streamHarness({ activityOnly = false } = {}) {
   return {
     context,
     box,
+    storage,
     timers,
     connect() {
       const begin = script.indexOf("  let turnStarted = false;", start);
@@ -136,7 +149,8 @@ function streamHarness({ activityOnly = false } = {}) {
     pending: () => vm.runInContext("phaseBubble.textContent", context),
     pendingVisible: () => vm.runInContext("box.children.includes(phaseBubble)", context),
     answerRate: () => vm.runInContext("(bubble || answerBubbles.at(-1)).dataset.tokenRate || ''", context),
-    ageOutput: (ms) => vm.runInContext(`outputStartedAt = Date.now() - ${ms}`, context),
+    mainRate: () => box.children.find((item) => item.dataset.turnRate && !item.hidden)?.textContent || "",
+    ageOutput: (ms) => { clock.now += ms; },
     fail: () => vm.runInContext('fail("turn failed")', context),
     reply: () => vm.runInContext("(bubble || answerBubbles.at(-1)).innerHTML", context),
     // Only message bubbles count as a leaked speed row; the turn footer that
@@ -146,18 +160,41 @@ function streamHarness({ activityOnly = false } = {}) {
   };
 }
 
-function replayHarness() {
-  const { context } = streamHarness();
+function replayHarness(options) {
+  const live = streamHarness(options), { context, storage } = live;
   function node() {
+    let text = "";
     return {
-      children: [], textContent: "", dataset: {}, classList: { add() {}, remove() {} },
-      appendChild(child) { this.children.push(child); child.parent = this; },
-      insertBefore(child, before) {
-        if (child.parent) child.remove();
-        this.children.splice(this.children.indexOf(before), 0, child); child.parent = this;
+      children: [], dataset: {}, hidden: false, scrollTop: 0, classList: { add() {}, remove() {} },
+      get textContent() { return text + this.children.map((child) => child.textContent).join(""); },
+      set textContent(value) {
+        text = String(value);
+        this.children.forEach((child) => { child.parentNode = null; });
+        this.children = [];
       },
-      remove() { if (this.parent) this.parent.children = this.parent.children.filter((c) => c !== this); },
+      get lastElementChild() { return this.children.at(-1) || null; },
+      get nextElementSibling() { return this.parentNode?.children[this.parentNode.children.indexOf(this) + 1] || null; },
+      appendChild(child) { child.remove(); this.children.push(child); child.parentNode = this; return child; },
+      insertBefore(child, before) {
+        child.remove();
+        const index = this.children.indexOf(before);
+        this.children.splice(index < 0 ? this.children.length : index, 0, child); child.parentNode = this;
+        return child;
+      },
+      remove() {
+        if (this.parentNode) this.parentNode.children = this.parentNode.children.filter((c) => c !== this);
+        this.parentNode = null;
+      },
       querySelector(selector) { return selector === "summary" ? this.summary : this.details; },
+      querySelectorAll(selector) {
+        const found = [];
+        const visit = (parent) => parent.children.forEach((child) => {
+          if (selector.startsWith(".") && String(child.className || "").split(/\s+/).includes(selector.slice(1))) found.push(child);
+          visit(child);
+        });
+        visit(this);
+        return found;
+      },
     };
   }
   const msgs = node();
@@ -174,16 +211,17 @@ function replayHarness() {
   vm.runInContext(script.slice(script.indexOf("function recoveredProgressView("), script.indexOf("async function pollConfirm(")), context);
   const view = context.recoveredProgressView();
   return {
-    context, msgs, view, requests,
-    emit(kind, payload) { context.handleReplayEvent("s", kind, JSON.stringify(payload ?? {}), view); },
+    context, msgs, view, requests, storage, ageOutput: live.ageOutput,
+    emit(kind, payload) { context.handleReplayEvent("s", kind, typeof payload === "string" ? payload : JSON.stringify(payload ?? {}), view); },
     status: () => view.box.children.at(-1).textContent,
-    reply: () => view.box.children.at(-2).textContent,
+    reply: () => view.box.children.filter((item) => !item.summary && item.className === "msg asst" && !item.hidden).at(-1)?.textContent || "",
+    mainRate: () => view.box.children.find((item) => item.dataset.turnRate && !item.hidden)?.textContent || "",
     titles: () => view.box.children.filter((item) => item.summary).map((item) => item.summary.textContent),
   };
 }
 
-function attachmentHarness(headersOnly = false) {
-  const h = replayHarness(), c = h.context, timers = new Map(), requests = [];
+function attachmentHarness(headersOnly = false, options) {
+  const h = replayHarness(options), c = h.context, timers = new Map(), requests = [];
   h.view.remove();
   let timerId = 0, polls = 0, loads = 0;
   Object.assign(c, {
@@ -209,7 +247,7 @@ function attachmentHarness(headersOnly = false) {
   vm.runInContext(script.slice(script.indexOf("function parseBlock("), script.indexOf("async function send()")), c);
   const settle = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
   return {
-    c, requests, timers, settle, polls: () => polls, loads: () => loads,
+    c, requests, timers, settle, storage: h.storage, polls: () => polls, loads: () => loads,
     fire(ms) {
       const timer = [...timers].find(([, item]) => item.ms === ms);
       assert.ok(timer, `missing ${ms}ms timer`);
@@ -219,26 +257,165 @@ function attachmentHarness(headersOnly = false) {
   };
 }
 
+function historyRateHarness(storage, content, reasoning = "", phone = false) {
+  const h = replayHarness({ storage, phone });
+  h.view.remove();
+  h.context.textOf = (text) => text;
+  h.context.addMsgMd = (text, parent) => {
+    const bubble = h.context.document.createElement("div");
+    bubble.className = "msg asst md";
+    bubble.textContent = text;
+    return parent.appendChild(bubble);
+  };
+  const start = script.indexOf("function renderHistoryRow(");
+  vm.runInContext(script.slice(start, script.indexOf("// A session the server reports", start)), h.context);
+  h.context.renderHistoryRow({
+    message: { role: "assistant", content, reasoning_content: reasoning },
+    text: content.trim(), reasoning, identity: "answer", key: "canonical-answer", historyIndex: 1,
+  }, h.msgs);
+  const group = h.msgs.lastElementChild;
+  return {
+    ...h, group,
+    restoredRate: () => group.children.find((item) => item.dataset.turnRate)?.textContent || "",
+    restoredThinking: () => group.children.find((item) => item.summary)?.summary.textContent || "",
+  };
+}
+
+function retainedHistoryHarness(messages) {
+  const h = attachmentHarness(false, { realThinking: true }), c = h.c;
+  const root = c.$("msgs"), historyCalls = [];
+  Object.assign(c, {
+    $: (id) => id === "msgs" ? root : null,
+    navigator: { onLine: true },
+    historySession: "", historyKeys: [], historyLoadSeq: 0, lastMsgCount: null,
+    canonicalHistoryTotal: 0, pendingUserInputs: new Map(),
+    staleSession: "", staleDone: false, staleTries: 0,
+    isRuntimeSyntheticUser: () => false, isTurnRunning: () => false,
+    textOf: (text) => text, FOLD_ROLE_LABELS: { tool: "tool" },
+    histKey: (rows) => JSON.stringify(rows), histEndsTurn: () => true, historyEndsUnanswered: () => false,
+    revokePreviews() {}, renderSessionBar() {}, updateQuestionButton() {}, startStaleFollow() {},
+    addUserBubble(text, index, parent) {
+      const bubble = c.document.createElement("div");
+      bubble.className = "msg user"; bubble.textContent = text;
+      return parent.appendChild(bubble);
+    },
+    addMsgMd(text, parent) {
+      const bubble = c.document.createElement("div");
+      bubble.className = "msg asst md"; bubble.textContent = text;
+      return parent.appendChild(bubble);
+    },
+    addMsg(role, text) { assert.fail(text); },
+    async api(url) {
+      assert.match(url, /^\/sessions\/s\/history\?limit=/);
+      historyCalls.push(url);
+      return { headers: { get: () => String(messages.length) }, json: async () => messages };
+    },
+    console: { error(...args) { assert.fail(args.map(String).join(" ")); } },
+  });
+  c.document.visibilityState = "visible";
+  const start = script.indexOf("function historyRowsOf(");
+  vm.runInContext(script.slice(start, script.indexOf("// Scrolling to the top of the transcript", start)), c);
+  return {
+    ...h, root, historyCalls,
+    visibleRates() {
+      const found = [];
+      const visit = (parent) => parent.children.forEach((child) => {
+        if (child.dataset.turnRate && !child.hidden) found.push(child);
+        visit(child);
+      });
+      visit(root);
+      return found;
+    },
+  };
+}
+
+for (const reasoning of ["", "saved thought"]) {
+  test("retained canonical history gains replay " + (reasoning ? "thinking and output rates" : "output rate") + " without remounting", async () => {
+    const h = retainedHistoryHarness([
+      { role: "user", content: "question" },
+      { role: "tool", content: "tool result" },
+      { role: "assistant", content: "saved answer", reasoning_content: reasoning },
+    ]);
+    await h.c.loadHistory();
+    const original = [...h.root.children], canonical = original.at(-1);
+    const answer = canonical.children.find((child) => child.className === "msg asst md");
+    const thinking = canonical.children.find((child) => child.summary);
+    if (thinking) thinking.details.open = true;
+    assert.equal(h.visibleRates().length, 0);
+    const rate = reasoning ? "reasoning 20 tok @ 10 tok/s · output 40 tok @ 20 tok/s" : "output 40 tok @ 20 tok/s";
+    const pending = h.c.attachEvents();
+    await h.settle();
+    if (reasoning) {
+      await h.frame('event: thinking\ndata: {"text":"saved thought","rate":"~10 tok @ 5 tok/s"}\n\n');
+      await h.frame("event: thinking_done\ndata: \n\n");
+    }
+    await h.frame('event: delta\ndata: {"delta":"saved answer"}\n\n');
+    await h.frame("data: ↳ speed · " + rate + "\n\n");
+    await h.frame("event: done\ndata: \n\n");
+    await pending;
+    assert.equal(h.c.eventFailures, 0);
+    assert.equal(h.c.eventStreamEnded, true);
+    assert.equal(h.historyCalls.length, 2, "completion must run the real loader again");
+    assert.deepEqual(h.root.children, original, "answers and tool rows must retain their nodes and order");
+    assert.equal(canonical.children.find((child) => child.className === "msg asst md"), answer);
+    assert.equal(h.c.storedRate("turn", "s", "saved answer"), rate);
+    const visible = h.visibleRates();
+    assert.equal(visible.length, 1, "retained canonical history did not display the newly cached rate");
+    assert.equal(visible[0].textContent, "↳ speed · " + rate);
+    assert.equal(visible[0].parentNode, canonical);
+    if (thinking) {
+      assert.equal(thinking.summary.textContent, "thinking · ~10 tok @ 5 tok/s");
+      assert.equal(thinking.details.open, true, "rate refresh collapsed a retained thinking fold");
+    }
+    await h.c.loadHistory();
+    assert.deepEqual(h.root.children, original);
+    assert.deepEqual(h.visibleRates(), visible, "another retained load duplicated or replaced the rate row");
+    const updated = rate.replace("40 tok @ 20 tok/s", "60 tok @ 30 tok/s");
+    h.c.rememberRate("turn", "s", "saved answer", updated);
+    if (reasoning) h.c.rememberRate("thinking", "s", reasoning, "~20 tok @ 10 tok/s");
+    await h.c.loadHistory();
+    assert.deepEqual(h.root.children, original);
+    assert.deepEqual(h.visibleRates(), visible);
+    assert.equal(visible[0].textContent, "↳ speed · " + updated);
+    if (thinking) assert.equal(thinking.summary.textContent, "thinking · ~20 tok @ 10 tok/s");
+    h.storage.delete("serve.rates");
+    await h.c.loadHistory();
+    assert.deepEqual(h.root.children, original);
+    assert.equal(h.visibleRates().length, 0, "retained history displayed throughput after the cached metric was removed");
+    if (thinking) assert.equal(thinking.summary.textContent, "thinking");
+  });
+}
+
+test("retained canonical history does not create rates without cached metrics", async () => {
+  const h = retainedHistoryHarness([{ role: "assistant", content: "old answer", reasoning_content: "old thought" }]);
+  await h.c.loadHistory();
+  const canonical = h.root.lastElementChild;
+  await h.c.loadHistory();
+  assert.equal(h.root.lastElementChild, canonical);
+  assert.equal(h.visibleRates().length, 0);
+  assert.equal(canonical.children.find((child) => child.summary).summary.textContent, "thinking");
+});
+
 test("replayed phases paint visible status and separate thinking across tools", () => {
   const h = replayHarness();
-  assert.equal(h.status(), "Connecting…");
+  assert.equal(h.status(), "Connecting… · 0:00");
   h.emit("thinking", { text: "first phase" });
-  assert.equal(h.status(), "Thinking…");
+  assert.equal(h.status(), "Thinking… · 0:00");
   h.emit("thinking_done");
   h.emit("tool", { id: "alarm", name: "phone_action", phase: "started", arguments: "{}" });
-  assert.equal(h.status(), "Running phone_action…");
+  assert.equal(h.status(), "Running phone_action… · 0:00");
   h.emit("input_request", { id: 7, token: "t", prompt: '@@aserve-native {"action":"alarm","hour":9,"minute":30}' });
   assert.equal(h.requests.length, 1);
-  assert.equal(h.status(), "正在手机上执行…");
+  assert.equal(h.status(), "正在手机上执行… · 0:00");
   h.emit("input_done", { id: 7 });
-  assert.equal(h.status(), "Running phone_action…");
+  assert.equal(h.status(), "Running phone_action… · 0:00");
   h.emit("tool", { id: "alarm", name: "phone_action", phase: "finished", ok: true });
-  assert.equal(h.status(), "Processing…");
+  assert.equal(h.status(), "Processing… · 0:00");
   h.emit("thinking", { text: "second phase" });
   assert.equal(h.titles().filter((title) => title === "thinking").length, 2);
   h.emit("delta", { delta: "answer" });
   assert.equal(h.reply(), "answer");
-  assert.equal(h.status(), "Responding…");
+  assert.equal(h.status(), "Responding… · output ~2 tok · 0:00");
 });
 
 test("a reattach rebuilds fresh DOM from the retained log on every connection", async () => {
@@ -270,7 +447,7 @@ test("a reattach rebuilds fresh DOM from the retained log on every connection", 
   vm.runInContext(script.slice(script.indexOf("function parseBlock("), script.indexOf("async function send()")), c);
   await c.attachEvents();
   await c.attachEvents();
-  assert.deepEqual(statuses, ["Thinking…", "Thinking…"]);
+  assert.deepEqual(statuses, ["Thinking… · 0:00", "Thinking… · 0:00"]);
   assert.equal(urls.length, 2);
   assert.ok(urls.every((url) => url.endsWith("after=0")));
 });
@@ -345,19 +522,24 @@ test("prose split by a tool round renders as separate answer bubbles", () => {
   const answers = h.box.children.filter((item) => item.classList && !item.summary && !item.body);
   const texts = answers.map((item) => item.innerHTML).filter(Boolean);
   assert.deepEqual(texts, ["first segment.", "second segment."]);
-  const shape = h.box.children.map((item) => (item.summary ? "fold" : item.innerHTML || "status"));
-  assert.deepEqual(shape, ["first segment.", "fold", "second segment.", "status"]);
+  const rates = h.box.children.filter((item) => item.dataset.turnRate);
+  assert.equal(rates.length, 1);
+  assert.equal(rates[0].hidden, false);
+  assert.equal(rates[0].parentNode, h.box);
+  assert.equal(rates[0].textContent, "↳ speed · output ~4 tok @ — tok/s");
+  const shape = h.box.children.map((item) => (item.summary ? "fold" : item.dataset.turnRate ? "rate" : item.innerHTML || "status"));
+  assert.deepEqual(shape, ["first segment.", "fold", "second segment.", "rate", "status"]);
 });
 
 test("replayed phases remain visible after an early assistant answer", () => {
   const h = replayHarness();
   h.emit("delta", { delta: "I will check that." });
   h.emit("tool", { id: "read", name: "read_file", phase: "started" });
-  assert.equal(h.status(), "Running read_file…");
+  assert.equal(h.status(), "Running read_file… · 0:00");
   h.emit("tool", { id: "read", name: "read_file", phase: "finished", ok: true });
-  assert.equal(h.status(), "Processing…");
+  assert.equal(h.status(), "Processing… · 0:00");
   h.emit("thinking", { text: "next step" });
-  assert.equal(h.status(), "Thinking…");
+  assert.equal(h.status(), "Thinking… · 0:00");
 });
 
 test("pending HTTP request paints a connection indicator before any SSE event", () => {
@@ -441,18 +623,22 @@ test("live tools separate real thinking phases, while logs cannot split tokens",
   assert.equal(h.pendingVisible(), false, "a completed turn must not retain a running indicator");
 });
 
-test("token throughput stays in existing status and answer UI without a separate message", () => {
+test("desktop status keeps counts and elapsed while main throughput stays visible", () => {
   const h = streamHarness();
   h.emit("progress", "request diagnostic");
   h.emit("progress", "↳ speed · reasoning 18 tok @ — tok/s · output 122 tok @ — tok/s");
   assert.deepEqual(h.metrics(), []);
-  assert.match(h.pending(), /reasoning 18 tok @ — tok\/s · output 122 tok @ — tok\/s/);
+  assert.match(h.pending(), /reasoning 18 tok · output 122 tok · 0:00/);
+  assert.doesNotMatch(h.pending(), /tok\/s| @ /);
+  assert.match(h.mainRate(), /reasoning 18 tok @ — tok\/s/);
   h.emit("thinking", { text: "brief thought", rate: "~10 tok @ — tok/s" });
   assert.ok(h.titles().includes("thinking… · ~10 tok @ — tok/s"));
   h.emit("delta", { delta: "Final answer" });
   h.emit("progress", "  \x1b[2m↳ speed · reasoning 800 tok @ 400 tok/s · output 400 tok @ 400 tok/s\x1b[0m");
   assert.deepEqual(h.metrics(), []);
-  assert.match(h.pending(), /reasoning 800 tok @ 400 tok\/s · output 400 tok @ 400 tok\/s/);
+  assert.match(h.pending(), /reasoning 800 tok · output 400 tok · 0:00/);
+  assert.doesNotMatch(h.pending(), /tok\/s| @ /);
+  assert.match(h.mainRate(), /reasoning 800 tok @ 400 tok\/s · output 400 tok @ 400 tok\/s/);
   assert.equal(h.titles().filter((title) => title.startsWith("activity log")).length, 0);
   assert.doesNotMatch(h.bodies().join("\n"), /400 tok\/s/);
   h.emit("done");
@@ -466,10 +652,182 @@ test("ordinary streamed output shows a live rate and keeps a final estimate", ()
   h.emit("delta", { delta: "abcdefgh" });
   h.ageOutput(1000);
   h.emit("delta", { delta: "ijkl" });
-  assert.match(h.pending(), /Responding… · output ~3 tok @ [\d.]+ tok\/s ·/);
+  assert.match(h.pending(), /Responding… · output ~3 tok · 0:01/);
+  assert.doesNotMatch(h.pending(), /tok\/s/);
+  assert.match(h.mainRate(), /output ~3 tok @ [\d.]+ tok\/s/);
   h.emit("done");
   assert.equal(h.metrics().length, 0);
   assert.match(h.answerRate(), /output ~3 tok @ [\d.]+ tok\/s/);
+});
+
+for (const phone of [true, false]) {
+  test((phone ? "phone" : "desktop") + " main rate is visible during output and restores after a page refresh", () => {
+    const h = streamHarness({ phone });
+    h.emit("delta", { delta: "abcdefgh" });
+    h.ageOutput(1000);
+    h.emit("delta", { delta: "ijkl" });
+    const line = h.box.children.find((item) => item.dataset.turnRate);
+    assert.ok(line, "live output has no main rate row");
+    assert.equal(line.hidden, false);
+    assert.equal(line.parentNode, h.box, "the rate must not sit in a hidden answer or status bubble");
+    assert.match(h.mainRate(), /output ~3 tok @ 3.00 tok\/s/);
+    h.emit("done");
+    assert.equal(line.hidden, false);
+    const refreshed = historyRateHarness(h.storage, "abcdefghijkl", "", phone);
+    assert.equal(refreshed.restoredRate(), h.mainRate());
+    assert.equal(refreshed.msgs.children.length, 1, "the rate must not add a canonical reconciliation row");
+    assert.equal(refreshed.group.dataset.canonicalKey, "canonical-answer");
+  });
+}
+
+test("completion after a tool round caches the sealed answer instead of empty raw text", () => {
+  const h = streamHarness();
+  h.emit("delta", { delta: "answer before a tool" });
+  h.ageOutput(1000);
+  h.emit("tool", { phase: "start", name: "read_file", call_id: "r" });
+  h.emit("", "↳ speed · output 20 tok @ 10 tok/s");
+  h.emit("done");
+  assert.equal(h.context.storedRate("turn", "s", "answer before a tool"), "output 20 tok @ 10 tok/s");
+  assert.equal(historyRateHarness(h.storage, "answer before a tool").restoredRate(), "↳ speed · output 20 tok @ 10 tok/s");
+});
+
+test("main throughput follows new answer and tool nodes at the end of the live turn", () => {
+  const h = streamHarness({ phone: true });
+  h.emit("delta", { delta: "first answer" });
+  h.emit("", "↳ speed · output 40 tok @ 20 tok/s");
+  h.emit("tool", { phase: "started", name: "read_file", id: "r" });
+  h.emit("delta", { delta: "next answer" });
+  h.emit("", "↳ speed · output 60 tok @ 30 tok/s");
+  const line = h.box.children.at(-2);
+  assert.equal(line.dataset.turnRate, "1", "the main rate was left above newer transcript nodes");
+  assert.equal(line.textContent, "↳ speed · output 60 tok @ 30 tok/s");
+  h.emit("done");
+  assert.equal(h.box.children.at(-1), line);
+});
+
+test("a replaced display body restores its rate against canonical envelopes and warnings", () => {
+  const notice = "[audit report · machine-checked JSON hidden from the terminal; full text stays in session history]";
+  const canonical = 'answer<<<IMAGE_DIGEST>>>image metadata<<<END_IMAGE_DIGEST>>>\n<audit_report>{"findings":[]}</audit_report>\n\n[Runtime warning]\ninternal warning';
+  const displayed = "answer\n" + notice;
+  const h = streamHarness();
+  h.emit("delta", { delta: canonical });
+  h.ageOutput(1000);
+  h.emit("replace", { text: displayed });
+  h.emit("", "↳ speed · output 40 tok @ 20 tok/s");
+  h.emit("done");
+  const refreshed = historyRateHarness(h.storage, canonical);
+  assert.equal(refreshed.restoredRate(), "↳ speed · output 40 tok @ 20 tok/s");
+  assert.equal(refreshed.group.children.find((item) => item.className === "msg asst md").textContent, canonical,
+    "rate normalization must not rewrite canonical history rendering");
+});
+
+test("uncached history and a replacement without timing do not invent throughput", () => {
+  assert.equal(historyRateHarness(new Map(), "old answer").restoredRate(), "");
+  const h = streamHarness();
+  h.emit("replace", { text: "buffered answer" });
+  h.emit("done");
+  assert.equal(h.mainRate(), "");
+  assert.equal(h.context.storedRate("turn", "s", "buffered answer"), "");
+});
+
+test("payload-only replay speed events are dispatched while comment heartbeats stay separate", async () => {
+  const h = attachmentHarness();
+  const seen = [];
+  const handle = h.c.handleReplayEvent;
+  h.c.handleReplayEvent = (...args) => { seen.push(args[1]); return handle(...args); };
+  const pending = h.c.attachEvents();
+  await h.settle();
+  await h.frame(": keep-alive\n\n");
+  assert.deepEqual(seen, []);
+  await h.frame("data: ↳ speed · reasoning 6.7k tok @ 86.2 tok/s · output 415 tok @ 167 tok/s\n\n");
+  assert.deepEqual(seen, [""]);
+  const box = h.c.recoveredView.box;
+  const main = box.children.find((item) => item.dataset.turnRate);
+  assert.match(main.textContent, /86.2 tok\/s.*167 tok\/s/);
+  assert.match(box.lastElementChild.textContent, /reasoning 6.7k tok · output 415 tok · 0:00/);
+  assert.doesNotMatch(box.lastElementChild.textContent, /tok\/s| @ /);
+  await h.frame("event: done\ndata: \n\n");
+  await pending;
+});
+
+test("replayed completion preserves reasoning and output caches before teardown", async () => {
+  const h = attachmentHarness(false, { phone: true, realThinking: true });
+  const pending = h.c.attachEvents();
+  await h.settle();
+  await h.frame('event: thinking\ndata: {"text":"saved thought","rate":"~10 tok @ 5 tok/s"}\n\n');
+  await h.frame("event: thinking_done\ndata: \n\n");
+  await h.frame('event: delta\ndata: {"delta":"saved answer"}\n\n');
+  await h.frame("data: ↳ speed · output 40 tok @ 20 tok/s\n\n");
+  await h.frame("event: done\ndata: \n\n");
+  await pending;
+  assert.equal(h.c.recoveredView, null);
+  assert.equal(h.loads(), 1);
+  const refreshed = historyRateHarness(h.storage, "saved answer", "saved thought", true);
+  assert.equal(refreshed.restoredThinking(), "thinking · ~10 tok @ 5 tok/s");
+  assert.equal(refreshed.restoredRate(), "↳ speed · output 40 tok @ 20 tok/s");
+  assert.equal(refreshed.msgs.children.length, 1);
+});
+
+test("recovered output counts share live measurement and finish without a server speed line", () => {
+  const h = replayHarness();
+  h.emit("delta", { delta: "abcdefgh" });
+  h.ageOutput(1000);
+  h.emit("delta", { delta: "ijkl" });
+  assert.match(h.mainRate(), /output ~3 tok @ 3.00 tok\/s/);
+  assert.match(h.status(), /output ~3 tok · 0:01/);
+  assert.doesNotMatch(h.status(), /tok\/s/);
+  h.view.finish();
+  assert.equal(historyRateHarness(h.storage, "abcdefghijkl").restoredRate(), h.mainRate());
+});
+
+test("a thinking-only turn keeps its recorded main rate beside the restored fold", () => {
+  const h = streamHarness({ realThinking: true });
+  h.emit("thinking", { text: "tool reasoning", rate: "~10 tok @ 5 tok/s" });
+  h.emit("tool", { phase: "start", name: "read_file", call_id: "r" });
+  h.emit("", "↳ speed · reasoning 20 tok @ 10 tok/s");
+  h.emit("done");
+  const refreshed = historyRateHarness(h.storage, "", "tool reasoning");
+  assert.equal(refreshed.restoredThinking(), "thinking · ~10 tok @ 5 tok/s");
+  assert.equal(refreshed.restoredRate(), "↳ speed · reasoning 20 tok @ 10 tok/s");
+});
+
+test("a recovered single output chunk gains a main rate on the clock and stops ticking at completion", () => {
+  const h = replayHarness(), intervals = new Map();
+  h.view.remove();
+  h.context.setInterval = (fn, ms) => { intervals.set(1, { fn, ms }); return 1; };
+  h.context.clearInterval = (id) => intervals.delete(id);
+  const view = h.context.recoveredProgressView();
+  view.delta("abcdefgh");
+  assert.equal(view.box.children.filter((item) => item.dataset.turnRate).length, 0);
+  const tick = intervals.get(1);
+  assert.equal(tick.ms, 1000);
+  h.ageOutput(1000);
+  tick.fn();
+  const line = view.box.children.find((item) => item.dataset.turnRate);
+  assert.equal(line.textContent, "↳ speed · output ~2 tok @ 2.00 tok/s");
+  assert.match(view.box.lastElementChild.textContent, /output ~2 tok · 0:01/);
+  view.finish();
+  assert.equal(intervals.size, 0);
+  h.ageOutput(1000);
+  tick.fn();
+  assert.equal(line.textContent, "↳ speed · output ~2 tok @ 2.00 tok/s", "a queued clock tick changed completed throughput");
+});
+
+test("legacy raw cache keys remain readable after display-identity normalization", () => {
+  const h = streamHarness(), canonical = "answer\n\n[Runtime warning]\nold warning";
+  const key = "turn|s|" + h.context.rateTextKey(canonical);
+  h.storage.set("serve.rates", JSON.stringify({ [key]: "output 40 tok @ 20 tok/s" }));
+  assert.equal(historyRateHarness(h.storage, canonical).restoredRate(), "↳ speed · output 40 tok @ 20 tok/s");
+});
+
+test("an invalid cache container is replaced by newly recorded throughput", () => {
+  for (const cache of ["true", "[]"]) {
+    const h = streamHarness({ storage: new Map([["serve.rates", cache]]) });
+    h.emit("delta", { delta: "answer" });
+    h.emit("", "↳ speed · output 40 tok @ 20 tok/s");
+    h.emit("done");
+    assert.equal(historyRateHarness(h.storage, "answer").restoredRate(), "↳ speed · output 40 tok @ 20 tok/s");
+  }
 });
 
 test("parallel tool completion and confirmation preserve the remaining active status", () => {
@@ -606,10 +964,10 @@ test("replayed final text replaces provisional deltas", () => {
   h.emit("delta", { delta: "provisional" });
   h.emit("replace", { text: "authoritative" });
   assert.equal(h.reply(), "authoritative");
-  assert.equal(h.status(), "Responding…");
+  assert.equal(h.status(), "Responding… · output ~4 tok · 0:00");
   h.emit("replace", { text: "" });
   assert.equal(h.reply(), "");
-  assert.equal(h.status(), "Processing…");
+  assert.equal(h.status(), "Processing… · 0:00");
 });
 
 test("EOF without the done event follows server history instead of declaring completion", () => {
@@ -650,7 +1008,7 @@ test("a finished event stream is not re-attached on every poll, but a new turn i
 });
 
 test("the terminal marker ends the reattach loop instead of rescheduling it", () => {
-  assert.match(script, /if \(block\.kind === "done"\) \{\s+finished = true; eventStreamEnded = true; eventFailures = 0; confirmPollSeq\+\+;\s+break;\s+\}/);
+  assert.match(script, /if \(block\.kind === "done"\) \{\s+view\.finish\(\);\s+finished = true; eventStreamEnded = true; eventFailures = 0; confirmPollSeq\+\+;\s+break;\s+\}/);
   assert.match(script, /if \(!eventStreamEnded\) void attachEvents\(\);/);
 });
 

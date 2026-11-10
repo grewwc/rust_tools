@@ -577,10 +577,9 @@ select, summary { touch-action:manipulation; }
    pre-wrap source view the other bubbles keep. */
 .msg.md { white-space:normal; }
 .msg.md .answer-actions { display:flex; justify-content:flex-end; align-items:center; gap:8px; margin-top:8px; }
-/* The final throughput belongs to the turn, not to one answer segment: a turn
-   that ends on tool calls still reports it, and it never becomes a card of its
-   own. */
-.turn-rate { align-self:flex-start; padding:0 4px; color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums; }
+/* Throughput stays with the turn while it runs and after it ends, including
+   turns that end on tool calls. Narrow screens wrap this independent row. */
+.turn-rate { flex:0 0 auto; align-self:flex-start; max-width:100%; padding:0 4px; color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums; white-space:normal; overflow-wrap:anywhere; }
 .msg.md .answer-copy { position:relative; flex:0 0 auto; min-width:52px; min-height:32px; padding:4px 10px; border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--dim); font-size:12px; touch-action:manipulation; }
 /* The box stays small; the touch area still reaches the 44px target. */
 .msg.md .answer-copy::after { content:""; position:absolute; inset:-6px; }
@@ -2150,7 +2149,6 @@ let promptComposing = false;
 // Deferred work must check this state when it runs, not just when queued:
 // another composition may have started in the meantime.
 let composingText = "";        // the word the keyboard is assembling
-let composingStartValue = "";  // the field content when the composition began
 let composingBox = null;       // the focused field's box during the composition
 let compositionWatch = 0;
 let traceMark = () => {};
@@ -3112,6 +3110,15 @@ loadFoldOpenState();
 // Live rates are display-only and never persisted in canonical messages.
 // Keep the last value per reasoning/answer text so a reload can still show it.
 const RATE_STORAGE = "serve.rates";
+// Rate identity follows the body's display projection without changing history
+// rendering. Canonical history retains these envelopes and runtime warnings.
+function rateIdentityText(text) {
+  return String(text).split("\n\n[Runtime warning]")[0]
+    .replace(/<<<IMAGE_DIGEST>>>[\s\S]*?<<<END_IMAGE_DIGEST>>>/g, "")
+    .replace(/<<<IMAGE_DIGEST>>>/g, "")
+    .replace(/<audit_report>[\s\S]*?<\/audit_report>/g,
+      "[audit report · machine-checked JSON hidden from the terminal; full text stays in session history]");
+}
 function rateTextKey(text) {
   text = String(text).replace(/\s+/g, " ").trim();
   const head = text.slice(0, 512);
@@ -3129,10 +3136,9 @@ function estimateTextTokens(text) {
   }
   return nonAscii + Math.ceil(ascii / 4);
 }
-// Server rate frames are not replayed when a retained stream starts mid-phase.
-// Fall back to the same client-side estimate the live answer counter uses so a
-// reloaded phone still shows a rate beside its thinking fold.
-function measuredRateText(tokens, startedAt, now = Date.now()) {
+// Older thinking payloads may omit a rate. Arrival estimates carry a "~";
+// history rendering restores recorded values instead of timing message bodies.
+function formatRateText(tokens, startedAt, now = Date.now()) {
   if (!startedAt || !tokens) return "";
   const elapsed = now - startedAt;
   if (elapsed < 500) return "~" + tokens + " tok @ — tok/s";
@@ -3140,12 +3146,72 @@ function measuredRateText(tokens, startedAt, now = Date.now()) {
   const shown = rate >= 100 ? Math.round(rate) : rate >= 10 ? rate.toFixed(1) : rate.toFixed(2);
   return "~" + tokens + " tok @ " + shown + " tok/s";
 }
+function measuredRateText(tokens, startedAt, now = Date.now()) {
+  return formatRateText(tokens, startedAt, now);
+}
+function createOutputRateCounter() {
+  let startedAt = 0, ascii = 0, nonAscii = 0;
+  const count = (text) => {
+    for (const ch of text) {
+      if (ch.charCodeAt(0) < 128) ascii++;
+      else nonAscii++;
+    }
+  };
+  const tokens = () => nonAscii + Math.ceil(ascii / 4);
+  return {
+    observe(text) {
+      if (!text) return;
+      if (!startedAt) startedAt = Date.now();
+      count(text);
+    },
+    replace(text) {
+      ascii = nonAscii = 0;
+      count(text);
+      // A complete replacement is not a timing sample. Preserve the window
+      // observed from deltas; a replacement alone must not invent a rate.
+      if (!text) startedAt = 0;
+    },
+    reset() { startedAt = 0; ascii = nonAscii = 0; },
+    text(includeUnmeasured = false) {
+      if (!includeUnmeasured && Date.now() - startedAt < 500) return "";
+      return formatRateText(tokens(), startedAt);
+    },
+    counts() { return tokens() ? "~" + tokens() + " tok" : ""; },
+  };
+}
+function statusRateText(text) {
+  if (typeof isPhoneLayout === "function" && isPhoneLayout()) return text;
+  return text.replace(/\s*@\s*[^\s·]+\s+tok\/s\b/g, "");
+}
+function createTurnRateLine(parent, before) {
+  let line = null;
+  return (text) => {
+    if (!text) return;
+    if (!line) {
+      line = document.createElement("div");
+      line.className = "turn-rate";
+      line.dataset.turnRate = "1";
+    }
+    const anchor = before && before.parentNode === parent ? before : null;
+    // New tool and answer nodes arrive before the status bubble. Keep throughput
+    // at the current turn's end instead of leaving it above those new nodes.
+    if (line.parentNode !== parent || (anchor ? line.nextElementSibling !== anchor : parent.lastElementChild !== line)) {
+      parent.insertBefore(line, anchor);
+    }
+    line.hidden = false;
+    line.textContent = "↳ speed · " + text;
+  };
+}
 function rememberRate(kind, sid, text, rate) {
   if (!sid || !text || !rate) return;
-  text = String(text).trim();
+  text = (kind === "turn" ? rateIdentityText(text) : String(text)).trim();
+  if (!text) return;
   let store = {};
   try { store = JSON.parse(localStorage.getItem(RATE_STORAGE) || "{}") || {}; } catch (_) {}
-  store[kind + "|" + sid + "|" + rateTextKey(text)] = rate;
+  if (typeof store !== "object" || Array.isArray(store)) store = {};
+  const key = kind + "|" + sid + "|" + rateTextKey(text);
+  delete store[key];
+  store[key] = rate;
   const keys = Object.keys(store);
   for (const key of keys.slice(0, Math.max(0, keys.length - 1000))) delete store[key];
   try { localStorage.setItem(RATE_STORAGE, JSON.stringify(store)); } catch (_) {}
@@ -3155,7 +3221,12 @@ function storedRate(kind, sid, text) {
   text = String(text).trim();
   try {
     const store = JSON.parse(localStorage.getItem(RATE_STORAGE) || "{}") || {};
-    return store[kind + "|" + sid + "|" + rateTextKey(text)] || "";
+    if (typeof store !== "object" || Array.isArray(store)) return "";
+    const projected = kind === "turn" ? rateIdentityText(text) : text;
+    const prefix = kind + "|" + sid + "|";
+    // The original key keeps rates written by older pages readable.
+    const rate = store[prefix + rateTextKey(projected)] || store[prefix + rateTextKey(text)];
+    return typeof rate === "string" ? rate : "";
   } catch (_) { return ""; }
 }
 function addFold(title, bodyText, parent, key) {
@@ -4977,23 +5048,41 @@ function renderHistoryRow(row, parent) {
   const m = row.message;
   if (m.role === "user") addUserBubble(row.text, row.historyIndex, parent);
   else if (m.role === "assistant") {
+    // Reconciliation counts canonical messages. Keep the reasoning, answer and
+    // rate in one row so a later refresh cannot trim the rate as an extra row.
+    const group = document.createElement("div");
+    group.className = "turn";
+    parent.appendChild(group);
+    const rateSession = sessionId;
+    let thinkingSummary = null;
     if (row.reasoning) {
-      const thinkRate = typeof storedRate === "function" ? storedRate("thinking", sessionId, row.reasoning) : "";
-      const fold = addFold(thinkRate ? "thinking · " + thinkRate : "thinking", row.reasoning, parent);
+      const fold = addFold("thinking", row.reasoning, group);
+      thinkingSummary = fold.box.querySelector("summary");
       const det = fold.box.querySelector("details");
       if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + row.identity + ":thinking");
     }
     if (row.text) {
-      addMsgMd(row.text, parent, textOf(m.content));
-      const turnRate = typeof storedRate === "function" ? storedRate("turn", sessionId, row.text) : "";
-      if (turnRate) {
-        const line = document.createElement("div");
-        line.className = "turn-rate";
-        line.textContent = "↳ speed · " + turnRate;
-        line.dataset.turnRate = "1";
-        parent.appendChild(line);
-      }
+      addMsgMd(row.text, group, textOf(m.content));
     }
+    // Replay may fill the rate cache after this canonical row was mounted.
+    // Refresh its metadata without rebuilding answer bodies or open folds.
+    group._aserveRefreshRates = () => {
+      if (thinkingSummary) {
+        const rate = typeof storedRate === "function" ? storedRate("thinking", rateSession, row.reasoning) : "";
+        thinkingSummary.textContent = rate ? "thinking · " + rate : "thinking";
+      }
+      const rate = typeof storedRate === "function" ? storedRate("turn", rateSession, row.text) || storedRate("turn", rateSession, row.reasoning) : "";
+      const lines = Array.from(group.children).filter((child) => child.dataset?.turnRate);
+      const line = lines[0];
+      for (const duplicate of lines.slice(1)) duplicate.remove();
+      if (!rate) {
+        if (line) line.remove();
+      } else if (line) {
+        line.hidden = false;
+        line.textContent = "↳ speed · " + rate;
+      } else createTurnRateLine(group)(rate);
+    };
+    group._aserveRefreshRates();
   }
   else {
     const fold = addFold(row.call ? callLabel(row.call) : FOLD_ROLE_LABELS[m.role] || m.role, row.text.slice(0, 2000), parent);
@@ -5270,6 +5359,7 @@ async function loadHistory(prefetched) {
       if (appendOnly) {
         for (let i = 0; i < start; i++) removeRow(root.children[0]);
         while (root.children.length > retained) removeRow(root.lastElementChild);
+        for (let i = 0; i < retained; i++) root.children[i]._aserveRefreshRates?.();
         for (let i = retained; i < history.rows.length; i++) renderHistoryRow(history.rows[i], root);
       } else {
         // Fetching has completed, so this synchronous clear-and-render is painted
@@ -5727,7 +5817,7 @@ function stopConfirmPoll() {
 // Rebuild a compact progress card from replayed turn events. It is not the
 // original live DOM, but it restores thinking, tool cards, the partial answer
 // and any pending question after a page reload.
-function recoveredProgressView() {
+function recoveredProgressView(sid = sessionId) {
   const box = document.createElement("div");
   box.className = "turn recovered";
   let bubble = document.createElement("div");
@@ -5740,15 +5830,23 @@ function recoveredProgressView() {
   $("msgs").appendChild(box);
   const activity = createLiveActivity(box, bubble);
   const answerBubbles = [bubble];
+  const outputRate = createOutputRateCounter();
+  const showTurnRate = createTurnRateLine(box, phaseBubble);
+  const clockStart = Date.now();
   let think = null;
   let thinking = "";
   let answer = "";
-  let tokenRate = "";
+  let tokenRate = "", closed = false;
+  let sealedAnswerText = "", lastThinkingText = "", lastOutputRate = "", thinkRate = "";
   let thinkStartedAt = 0;
   let thinkTokens = 0;
   const sealAnswerSegment = () => {
     if (!bubble || bubble.dataset.segmentSealed) return;
+    const measured = outputRate.text(true);
+    lastOutputRate = tokenRate || (measured ? "output " + measured : "") || lastOutputRate;
     if (answer.trim()) {
+      sealedAnswerText = answer;
+      rememberRate("turn", sid, answer, lastOutputRate);
       bubble.dataset.segmentSealed = "1";
       bubble.hidden = false;
       bubble.textContent = answer;
@@ -5758,6 +5856,7 @@ function recoveredProgressView() {
     }
     bubble = null;
     answer = "";
+    outputRate.reset();
     activity.anchor(phaseBubble);
   };
   const ensureAnswerBubble = () => {
@@ -5769,13 +5868,27 @@ function recoveredProgressView() {
     answerBubbles.push(bubble);
     activity.anchor(bubble);
   };
-  const paintPhase = () => { phaseBubble.textContent = activity.label() + (tokenRate ? " · " + tokenRate : ""); };
+  const paintPhase = () => {
+    if (closed) return;
+    const measured = outputRate.text();
+    const rate = tokenRate || (measured ? "output " + measured : "");
+    const counts = rate || (outputRate.counts() ? "output " + outputRate.counts() : "");
+    phaseBubble.textContent = activity.label() + (counts ? " · " + statusRateText(counts) : "") + " · " + formatElapsed(Date.now() - clockStart);
+    showTurnRate(rate || lastOutputRate);
+  };
   const paintAnswer = () => {
     if (bubble) { bubble.hidden = !answer; bubble.textContent = answer; }
     activity.setPhase(answer ? "Responding…" : "Processing…");
     paintPhase();
   };
-  const endThinking = () => { think = null; thinking = ""; thinkStartedAt = 0; thinkTokens = 0; };
+  const endThinking = () => {
+    if (think) {
+      lastThinkingText = thinking;
+      rememberRate("thinking", sid, thinking, thinkRate);
+    }
+    think = null; thinking = ""; thinkRate = ""; thinkStartedAt = 0; thinkTokens = 0;
+  };
+  const phaseTimer = setInterval(paintPhase, 1000);
   paintPhase();
   return {
     box,
@@ -5786,25 +5899,42 @@ function recoveredProgressView() {
       thinking += text;
       if (!thinkStartedAt) thinkStartedAt = Date.now();
       thinkTokens += estimateTextTokens(text);
-      const shownRate = rate || measuredRateText(thinkTokens, thinkStartedAt);
+      thinkRate = rate || measuredRateText(thinkTokens, thinkStartedAt);
       if (!think) think = createThinkingFold(box, phaseBubble);
-      think.set(shownRate ? "thinking · " + shownRate : "thinking", thinking.length > 6000 ? "…" + thinking.slice(-6000) : thinking);
+      think.set(thinkRate ? "thinking · " + thinkRate : "thinking", thinking.length > 6000 ? "…" + thinking.slice(-6000) : thinking);
       activity.setPhase("Thinking…");
       paintPhase();
     },
-    delta(text) { endThinking(); ensureAnswerBubble(); answer += text; paintAnswer(); },
-    replace(text) { endThinking(); ensureAnswerBubble(); answer = text; paintAnswer(); },
+    delta(text) { endThinking(); ensureAnswerBubble(); answer += text; outputRate.observe(text); paintAnswer(); },
+    replace(text) { endThinking(); ensureAnswerBubble(); answer = text; outputRate.replace(text); paintAnswer(); },
     rate(text) { tokenRate = text; paintPhase(); },
     tool(event) { endThinking(); sealAnswerSegment(); activity.setPhase("Processing…"); activity.tool(event); paintPhase(); },
     subagents(text) { activity.subagents(text); },
     phase(text, waiting) { activity.setPhase(text, waiting); paintPhase(); },
-    remove() { box.remove(); },
+    finish() {
+      closed = true;
+      clearInterval(phaseTimer);
+      endThinking();
+      activity.finish("ended");
+      const measured = outputRate.text(true);
+      const rate = tokenRate || (measured ? "output " + measured : "") || lastOutputRate;
+      rememberRate("turn", sid, answer.trim() ? answer : sealedAnswerText || lastThinkingText, rate);
+      const last = answerBubbles.at(-1);
+      if (last) setAnswerRate(last, rate);
+      showTurnRate(rate);
+      phaseBubble.remove();
+    },
+    remove() { closed = true; clearInterval(phaseTimer); endThinking(); box.remove(); },
   };
 }
 
 function handleReplayEvent(sid, kind, payload, view) {
   if (sid !== sessionId) return;
-  if (kind === "thinking") {
+  if (kind === "thinking_start") {
+    view.endThinking();
+    view.sealAnswerSegment();
+    view.phase("Waiting for model…");
+  } else if (kind === "thinking") {
     try {
       const event = JSON.parse(payload);
       const text = event.text || "";
@@ -5848,7 +5978,7 @@ function handleReplayEvent(sid, kind, payload, view) {
     try { cid = JSON.parse(payload).id; } catch (_) {}
     if (cid === null || (confirmShown && confirmShown.id === cid)) hideConfirm();
     view.phase("Processing…");
-  } else if (!kind && payload) {
+  } else if ((!kind || kind === "progress") && payload) {
     const plain = payload.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").trim();
     if (/^↳\s+speed(?:\s*·|\s|$)/i.test(plain)) view.rate(plain.replace(/^↳\s+speed\s*·?\s*/i, ""));
   }
@@ -5867,7 +5997,7 @@ async function attachEvents() {
   eventSession = sid;
   syncStopButton();
   ensureConfirmPoll();
-  const view = recoveredProgressView();
+  const view = recoveredProgressView(sid);
   recoveredView = view;
   view.phase("Reconnecting…");
   let buf = "";
@@ -5911,10 +6041,11 @@ async function attachEvents() {
         const block = parseBlock(buf.slice(0, idx));
         buf = buf.slice(idx + 2);
         if (block.kind === "done") {
+          view.finish();
           finished = true; eventStreamEnded = true; eventFailures = 0; confirmPollSeq++;
           break;
         }
-        if (block.kind) {
+        if (block.kind || block.payload) {
           if (block.kind === "confirm_request" || block.kind === "input_request") waiting = true;
           if (block.kind === "confirm_done" || block.kind === "input_done") waiting = false;
           armProgress();
@@ -6342,47 +6473,23 @@ async function send() {
   phaseBubble.classList.add("pending");
   const activity = createLiveActivity(box, bubble);
   const clockStart = Date.now();
-  let outputStartedAt = 0, liveOutputAscii = 0, liveOutputNonAscii = 0, tokenRate = "";
-  const observeLiveOutput = (text) => {
-    if (!text) return;
-    if (!outputStartedAt) outputStartedAt = Date.now();
-    for (const ch of text) {
-      if (/^[\x00-\x7f]$/.test(ch)) liveOutputAscii++;
-      else liveOutputNonAscii++;
-    }
-  };
-  const liveOutputRate = (includeUnmeasured = false) => {
-    if (!outputStartedAt) return "";
-    const elapsed = Date.now() - outputStartedAt;
-    const tokens = liveOutputNonAscii + Math.ceil(liveOutputAscii / 4);
-    if (!tokens) return "";
-    if (elapsed < 500) return includeUnmeasured ? "~" + tokens + " tok @ — tok/s" : "";
-    const rate = tokens * 1000 / elapsed;
-    const shown = rate >= 100 ? Math.round(rate) : rate >= 10 ? rate.toFixed(1) : rate.toFixed(2);
-    return "~" + tokens + " tok @ " + shown + " tok/s";
-  };
+  const outputRate = createOutputRateCounter();
+  let tokenRate = "", sealedAnswerText = "", lastThinkingText = "", lastOutputRate = "";
+  const mainRate = () => tokenRate || (outputRate.text() ? "output " + outputRate.text() : "") || lastOutputRate;
   const phaseLine = () => {
-    const liveRate = liveOutputRate();
-    const rate = tokenRate || (liveRate ? "output " + liveRate : "");
-    return "◌ " + activity.label() + (rate ? " · " + rate : "") + " · " + formatElapsed(Date.now() - clockStart);
+    const liveRate = outputRate.text();
+    const rate = tokenRate || (liveRate ? "output " + liveRate : outputRate.counts() ? "output " + outputRate.counts() : "");
+    return "◌ " + activity.label() + (rate ? " · " + statusRateText(rate) : "") + " · " + formatElapsed(Date.now() - clockStart);
   };
-  // The measured throughput stays on the turn after it ends, including a turn
-  // that stopped on a tool round and therefore has no final answer bubble.
-  let turnRateLine = null;
-  const showTurnRate = (text) => {
-    if (!text) return;
-    if (!turnRateLine) {
-      turnRateLine = document.createElement("div");
-      turnRateLine.className = "turn-rate";
-      box.appendChild(turnRateLine);
-    }
-    turnRateLine.textContent = "↳ speed · " + text;
-  };
+  // This row is independent of the status bubble and visible during generation
+  // on phones too; completion leaves the same row beside the finished answer.
+  const showTurnRate = createTurnRateLine(box, phaseBubble);
   const phaseTimer = setInterval(() => {
     // The box is parked while the user reads another session; keep the clock
     // live through that detach so it is current when attachLiveBox restores it.
     if (turns.get(sid) !== liveEntry) { clearInterval(phaseTimer); return; }
     phaseBubble.textContent = phaseLine();
+    showTurnRate(mainRate());
   }, 1000);
   let activityDirty = true;
   const setPhase = (label, waiting = false) => {
@@ -6440,6 +6547,7 @@ async function send() {
     const follow = sid === sessionId && shouldFollowOutput();
     if (activityDirty) {
       phaseBubble.textContent = phaseLine();
+      showTurnRate(mainRate());
       activityDirty = false;
     }
     if (progressDirty && prog) {
@@ -6478,7 +6586,11 @@ async function send() {
   // the separate assistant messages canonical history stores per model response.
   const sealAnswerSegment = () => {
     if (!bubble || bubble.dataset.segmentSealed) return;
+    const measured = outputRate.text(true);
+    lastOutputRate = tokenRate || (measured ? "output " + measured : "") || lastOutputRate;
     if (raw.trim()) {
+      sealedAnswerText = raw;
+      if (typeof rememberRate === "function") rememberRate("turn", sid, raw, lastOutputRate);
       bubble.dataset.segmentSealed = "1";
       bubble.hidden = false;
       bubble.classList.remove("pending");
@@ -6491,9 +6603,7 @@ async function send() {
     }
     bubble = null;
     raw = "";
-    outputStartedAt = 0;
-    liveOutputAscii = 0;
-    liveOutputNonAscii = 0;
+    outputRate.reset();
     answerDirty = false;
     activity.anchor(phaseBubble);
   };
@@ -6507,6 +6617,7 @@ async function send() {
   };
   const preserveAnswerRate = (text) => {
     if (!text) return;
+    if (typeof rememberRate === "function") rememberRate("turn", sid, raw.trim() ? raw : sealedAnswerText || lastThinkingText, text);
     for (let i = answerBubbles.length - 1; i >= 0; i--) {
       const candidate = answerBubbles[i];
       if (candidate && (candidate.dataset.segmentSealed || (candidate === bubble && raw.trim()))) {
@@ -6517,6 +6628,7 @@ async function send() {
   };
   const closeThinkingPhase = () => {
     if (!think) return;
+    lastThinkingText = thinkRaw;
     if (typeof rememberRate === "function") rememberRate("thinking", sid, thinkRaw, thinkRate);
     thinkingDoneDirty = true;
     flushPaint();
@@ -6626,9 +6738,8 @@ async function send() {
           activity.finish("ended");
           activityDirty = false;
           if (sid === sessionId) confirmPollSeq++;
-          const finalLiveRate = liveOutputRate(true);
-          const finalRate = tokenRate || (finalLiveRate ? "output " + finalLiveRate : "");
-          if (typeof rememberRate === "function") rememberRate("turn", sid, raw, finalRate);
+          const finalLiveRate = outputRate.text(true);
+          const finalRate = tokenRate || (finalLiveRate ? "output " + finalLiveRate : "") || lastOutputRate;
           preserveAnswerRate(finalRate);
           mutateTranscript(() => { phaseBubble.remove(); showTurnRate(finalRate); });
           if (!answerDirty && bubble) mutateTranscript(() => {
@@ -6646,7 +6757,7 @@ async function send() {
           try { delta = JSON.parse(payload).delta || ""; }
           catch (_) { delta = payload; }
           raw += delta;
-          observeLiveOutput(delta);
+          outputRate.observe(delta);
           answerDirty = true;
           setPhase("Responding…");
         }
@@ -6655,10 +6766,7 @@ async function send() {
           ensureAnswerBubble();
           try { raw = JSON.parse(payload).text || ""; }
           catch (_) { raw = payload; }
-          outputStartedAt = 0;
-          liveOutputAscii = 0;
-          liveOutputNonAscii = 0;
-          observeLiveOutput(raw);
+          outputRate.replace(raw);
           answerDirty = true;
           setPhase(raw ? "Responding…" : "Processing…");
         }
@@ -7059,36 +7167,21 @@ function wire() {
   $("prompt").addEventListener("compositionstart", () => {
     promptComposing = true;
     composingText = "";
-    composingStartValue = $("prompt").value;
     composingBox = composerBox();
     watchComposerBox();
   });
   $("prompt").addEventListener("compositionupdate", (e) => {
-    if (e.data) composingText = e.data;
+    composingText = typeof e.data === "string" ? e.data : "";
   });
-  $("prompt").addEventListener("compositionend", (e) => {
-    const committed = typeof e.data === "string" ? e.data : "";
-    const prompt = $("prompt");
-    // A composition the browser dropped reports an empty payload: the word the
-    // user assembled never reached the field. Put it back rather than lose it.
-    const lost = !committed && composingText && prompt.value === composingStartValue &&
-      document.activeElement === prompt;
+  $("prompt").addEventListener("compositionend", () => {
+    // An empty commit also means cancellation or deleted preedit. The browser
+    // owns the resulting value and caret; never reinsert a previous candidate.
     promptComposing = false;
-    let dropped = false;
-    if (lost) {
-      const restored = composingStartValue + composingText;
-      setPromptValue(restored, true);
-      try { prompt.setSelectionRange(restored.length, restored.length); } catch (_) {}
-      traceMark("compositionDropped");
-      dropped = true;
-    }
     composingText = "";
-    composingStartValue = "";
     composingBox = null;
     // Leave the commit event before applying page changes. A newer composition
     // may start before this task runs; keep its pending work for the next end.
     setTimeout(() => {
-      if (dropped) note("输入被打断，已把你正在输入的内容放回输入框");
       if (promptComposing) return;
       flushLayout();
       // A share or an image that landed mid-composition is applied now that
@@ -7115,7 +7208,10 @@ function wire() {
     }, 0);
   });
   $("prompt").addEventListener("input", (e) => {
-    if (promptComposing || e.isComposing) return;
+    if (promptComposing || e.isComposing) {
+      if (e.data === "" || String(e.inputType || "").startsWith("delete") || !$("prompt").value) composingText = "";
+      return;
+    }
     // The resize waits for a frame: an IME word arrives as an input event,
     // and a layout change inside the commit task loses the word.
     scheduleGrow();

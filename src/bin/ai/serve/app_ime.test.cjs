@@ -68,6 +68,10 @@ function makeContext(extra) {
       this.value = this.value.slice(0, start) + text + this.value.slice(end);
       this.selectionStart = this.selectionEnd = start + text.length;
     },
+    setSelectionRange(start, end) {
+      this.selectionStart = start;
+      this.selectionEnd = end;
+    },
     addEventListener(type, handler) {
       if (!listeners.has(type)) listeners.set(type, []);
       listeners.get(type).push(handler);
@@ -464,7 +468,7 @@ test("the side note column does not resize the composer during a composition", (
   assert.ok(toggles.includes("composer.side-note-ready=true"), "the side note column was not applied afterwards");
 });
 
-test("a dropped composition puts the word back instead of losing it", () => {
+test("an empty composition end does not resurrect the previous candidate", () => {
   const notes = [];
   const context = makeContext({
     persistDraft: () => {},
@@ -473,24 +477,81 @@ test("a dropped composition puts the word back instead of losing it", () => {
   vm.runInContext(compositionEndSrc, context);
   context.document.activeElement = context.prompt;
   context.prompt.value = "";
-  run(context, "promptComposing = true; composingText = \"pu'sh\"; composingStartValue = '';");
-  // The browser ends a composition it dropped with an empty payload: the word
-  // the user assembled never reached the field.
+  run(context, "promptComposing = true; composingText = \"pu'sh\";");
+  // Empty composition data also represents cancellation and deleted preedit.
   context.prompt.dispatch("compositionend", { data: "" });
-  assert.equal(context.prompt.value, "pu'sh", "the word being composed was lost");
-  assert.equal(notes.length, 0, "the note changed layout inside the commit task");
+  assert.equal(context.prompt.value, "");
+  assert.equal(run(context, "composingText"), "");
+  assert.equal(run(context, "promptComposing"), false);
   assert.ok(context.timers.length >= 1, "the deferred composition work was not scheduled");
   context.timers.shift()();
-  assert.equal(notes.length, 1, "the drop was not reported");
-  assert.match(notes[0], /输入被打断/);
+  assert.deepEqual(notes, [], "cancellation must not be reported as lost input");
 });
+
+for (const action of ["cancel", "delete"]) {
+  for (const [position, original, caret] of [["middle", "中文末尾", 2], ["end", "中文", 2], ["empty", "", 0]]) {
+    test(action + " preedit at the " + position + " keeps the browser value and caret", () => {
+      const context = makeContext({ persistDraft() {}, note() {} });
+      vm.runInContext(script.slice(
+        script.indexOf('$("prompt").addEventListener("compositionstart"'),
+        script.indexOf('$("prompt").addEventListener("paste"'),
+      ), context);
+      context.document.activeElement = context.prompt;
+      context.prompt.value = original;
+      context.prompt.selectionStart = context.prompt.selectionEnd = caret;
+      context.prompt.dispatch("compositionstart");
+      context.prompt.value = original.slice(0, caret) + "zdd" + original.slice(caret);
+      context.prompt.dispatch("compositionupdate", { data: "zdd" });
+      context.prompt.value = original;
+      context.prompt.selectionStart = context.prompt.selectionEnd = caret;
+      if (action === "delete") {
+        context.prompt.dispatch("compositionupdate", { data: "" });
+        assert.equal(run(context, "composingText"), "", "an empty update retained stale preedit");
+        context.prompt.dispatch("input", { isComposing: true, inputType: "deleteCompositionText", data: null });
+      }
+      run(context, "traceMark = (what) => marks.push(what);");
+      context.prompt.dispatch("compositionend", { data: "" });
+      context.timers.shift()();
+      assert.equal(context.prompt.value, original);
+      assert.equal(context.prompt.selectionStart, caret);
+      assert.equal(context.prompt.selectionEnd, caret);
+      assert.equal(run(context, "composingText"), "");
+      assert.ok(!context.marks.includes("valueWrite"), "the app wrote the cancelled preedit back");
+    });
+  }
+}
+
+test("a composition deletion input clears stale preedit without an update event", () => {
+  const context = makeContext({ persistDraft() {} });
+  vm.runInContext(inputHandlerSrc, context);
+  context.prompt.value = "中文";
+  run(context, "promptComposing = true; composingText = 'zdd';");
+  context.prompt.dispatch("input", { isComposing: true, inputType: "deleteContentBackward", data: null });
+  assert.equal(run(context, "composingText"), "");
+  assert.equal(context.prompt.value, "中文");
+  assert.equal(context.frames.length, 0, "the active composition was resized");
+});
+
+for (const inputType of ["deleteContentBackward", "deleteContentForward"]) {
+  test(inputType + " keeps committed Chinese deletion and persists the empty draft", () => {
+    const saved = [];
+    const context = makeContext({ persistDraft() { saved.push(context.prompt.value); } });
+    vm.runInContext(inputHandlerSrc, context);
+    context.prompt.value = "文";
+    context.prompt.dispatch("input", { isComposing: false, inputType, data: null });
+    context.prompt.value = "";
+    context.prompt.dispatch("input", { isComposing: false, inputType, data: null });
+    assert.equal(context.prompt.value, "");
+    assert.deepEqual(saved, ["文", ""]);
+  });
+}
 
 test("a committed word is not put back into the field", () => {
   const context = makeContext({ persistDraft: () => {}, note: () => {} });
   vm.runInContext(compositionEndSrc, context);
   context.document.activeElement = context.prompt;
   context.prompt.value = "朴实";
-  run(context, "promptComposing = true; composingText = \"pu'sh\"; composingStartValue = '';");
+  run(context, "promptComposing = true; composingText = \"pu'sh\";");
   context.prompt.dispatch("compositionend", { data: "朴实" });
   assert.equal(context.prompt.value, "朴实", "the committed word was replaced");
 });
