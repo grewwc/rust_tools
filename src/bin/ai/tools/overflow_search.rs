@@ -20,14 +20,14 @@
 //! wording, so retrieval must tolerate vocabulary drift. This tool therefore runs
 //! a small ranking engine of its own instead of the shared single-pattern grep:
 //!
-//! 1. **Term fan-out**: a non-regex query is split into whitespace-separated
+//! 1. **Term fan-out**: by default a non-regex query is split into whitespace-separated
 //!    terms searched as an OR, plus the full query as a phrase when it has more
 //!    than one term. A near-miss on one word no longer produces zero hits.
 //! 2. **TF-IDF-flavoured scoring**: rare-in-corpus terms outweigh common ones,
 //!    whole-word and path hits get bonuses, and multi-term coverage lifts
 //!    full-cover lines and files above single-term ones, with nearer terms
 //!    outranking scattered ones.
-//! 3. **Fair-share visibility**: files are picked globally by relevance, but one
+//! 3. **Fair-share visibility**: by default files are picked by relevance, but one
 //!    root can only take ~2× its fair share of the result budget while other
 //!    roots still demand attention; the same reservation applies per file while
 //!    other files still hold candidates, and ties spread round-robin. This
@@ -40,7 +40,8 @@
 //!    selectable — and rendering hides surplus lines with an accurate count
 //!    instead of cutting excerpts away. Long lines are windowed around the first
 //!    match (`…` marks elided text), so the term that caused a hit is never cut
-//!    off.
+//!    off. Explicit matching, source-kind, and recency controls narrow recovery;
+//!    identical normalized lines across roots keep the most direct source.
 //!
 //! Results stay verbatim excerpts with absolute paths and line numbers so they
 //! can be fed directly into `read_file`.
@@ -57,13 +58,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rust_tools::commonw::{FastMap as FxHashMap, FastSet as FxHashSet};
 use serde_json::Value;
 
-use crate::ai::history::compress::SOURCE_DIR;
+use crate::ai::history::compress::{
+    CONTEXT_CHECKPOINT_MARKER_PREFIX, QUERY_MEMORY_INDEX_PREFIX, SOURCE_DIR, is_summary_note_text,
+};
 use crate::ai::tools::common::{
-    ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
-    ToolParallelPolicy, ToolParallelPolicyRegistration, ToolRegistration, ToolRetryPolicy,
+    ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolParallelPolicy,
+    ToolParallelPolicyRegistration, ToolPrunePolicy, ToolRegistration, ToolRetryPolicy,
     ToolRetryPolicyRegistration, ToolSpec,
 };
 use crate::ai::tools::storage::file_store::current_session_assets_dir;
@@ -200,9 +203,17 @@ const MAX_OUTPUT_CHARS: usize = 24_000;
 /// JSON, a base64 payload) would otherwise consume the whole output budget and
 /// could cut away the very term that matched it.
 const MAX_RENDERED_LINE_CHARS: usize = 600;
-/// Output space held back for the truncation notice and the footer, so excerpt
-/// rendering stops early instead of the accounting line being dropped.
+/// Maximum byte size of the search accounting and narrowing block.
+const MAX_FOOTER_BYTES: usize = 600;
+/// Space held back for notices and accounting. Footer metadata shrinks within
+/// the remaining space instead of displacing already budgeted excerpts.
 const FOOTER_RESERVE_CHARS: usize = 700;
+const LARGE_RESULT_COUNT: usize = 50;
+const MARKER_LEGEND: &str = "markers: >> whole-query phrase hit, >t typed-term hit, >b CJK-fragment hit (the phrase may be absent — verify with read_file), two spaces = context line; matching ignores case by default, so a hit may differ in casing from the query\n";
+const CONTEXT_DROP_NOTE: &str =
+    "context lines were dropped to fit more matches; lower max_results to restore context.\n";
+const SURROUNDING_CONTEXT_HINT: &str =
+    "Use `read_file` on listed absolute paths for surrounding context.\n";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SearchScope {
@@ -232,6 +243,128 @@ impl SearchScope {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SearchOrder {
+    #[default]
+    Relevance,
+    Recent,
+}
+
+impl SearchOrder {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Relevance => "relevance",
+            Self::Recent => "recent",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MatchMode {
+    #[default]
+    Any,
+    All,
+    Phrase,
+}
+
+impl MatchMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::All => "all",
+            Self::Phrase => "phrase",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SearchKind {
+    #[default]
+    All,
+    Evidence,
+    Derived,
+}
+
+impl SearchKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Evidence => "evidence",
+            Self::Derived => "derived",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, serde::Deserialize)]
+#[serde(default)]
+struct SearchOptions {
+    order: SearchOrder,
+    #[serde(rename = "match")]
+    match_mode: MatchMode,
+    kind: SearchKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ArchiveSource {
+    ToolOutput,
+    History,
+    Preserved,
+    Folded,
+    InternalNote,
+    Summary,
+    Checkpoint,
+}
+
+const ARCHIVE_SOURCES: &[(&str, ArchiveSource)] = &[
+    ("tool-overflow-compressed", ArchiveSource::ToolOutput),
+    ("tool-overflow", ArchiveSource::ToolOutput),
+    ("overflow-history.md", ArchiveSource::History),
+    ("user-overflow-preserved", ArchiveSource::Preserved),
+    ("image-overflow-preserved", ArchiveSource::Preserved),
+    ("folded-tool-groups", ArchiveSource::Folded),
+    ("internal-note-overflow", ArchiveSource::InternalNote),
+    (SOURCE_DIR, ArchiveSource::Summary),
+    ("context-checkpoints", ArchiveSource::Checkpoint),
+];
+
+impl ArchiveSource {
+    fn kind(self) -> SearchKind {
+        match self {
+            Self::ToolOutput | Self::History | Self::Preserved => SearchKind::Evidence,
+            Self::Folded | Self::InternalNote | Self::Summary | Self::Checkpoint => {
+                SearchKind::Derived
+            }
+        }
+    }
+
+    fn priority(self) -> usize {
+        match self {
+            Self::ToolOutput => 0,
+            Self::History | Self::Preserved => 1,
+            Self::Folded => 2,
+            Self::InternalNote => 3,
+            Self::Summary => 4,
+            Self::Checkpoint => 5,
+        }
+    }
+}
+
+fn archive_source(path: &Path, archive_root: &Path) -> ArchiveSource {
+    let name = path
+        .strip_prefix(archive_root)
+        .ok()
+        .and_then(|relative| relative.components().next());
+    ARCHIVE_SOURCES
+        .iter()
+        .find(|(root, _)| name.is_some_and(|name| name.as_os_str() == *root))
+        .map(|(_, source)| *source)
+        // Unknown future recovery roots retain recall until explicitly classified.
+        .unwrap_or(ArchiveSource::Preserved)
+}
+
 struct OverflowSearchParams<'a> {
     query: &'a str,
     is_regex: bool,
@@ -243,6 +376,7 @@ struct OverflowSearchParams<'a> {
     max_results: usize,
     file_pattern: Option<&'a str>,
     scope: SearchScope,
+    options: SearchOptions,
 }
 
 /// Parses tool arguments into the normalized search parameters, without the
@@ -252,6 +386,14 @@ fn parse_search_params<'a>(args: &'a Value) -> Result<OverflowSearchParams<'a>, 
     let query = args["query"].as_str().ok_or("Missing 'query' parameter")?;
     if query.trim().is_empty() {
         return Err("query must not be empty".to_string());
+    }
+    let options: SearchOptions = serde_json::from_value(args.clone()).map_err(|error| {
+        format!(
+            "Invalid search options: {error}. Use order='relevance'|'recent', match='any'|'all'|'phrase', kind='all'|'evidence'|'derived'."
+        )
+    })?;
+    if options.match_mode == MatchMode::Phrase && args["is_regex"].as_bool().unwrap_or(false) {
+        return Err("match='phrase' requires is_regex=false; use match='any' for a regex.".into());
     }
     Ok(OverflowSearchParams {
         query,
@@ -272,6 +414,7 @@ fn parse_search_params<'a>(args: &'a Value) -> Result<OverflowSearchParams<'a>, 
             None => SearchScope::All,
             Some(raw) => SearchScope::parse(raw)?,
         },
+        options,
     })
 }
 
@@ -299,6 +442,17 @@ struct TermPattern {
 }
 
 fn build_patterns(params: &OverflowSearchParams<'_>) -> Result<Vec<TermPattern>, String> {
+    if params.options.match_mode == MatchMode::Phrase && params.is_regex {
+        return Err("match='phrase' requires is_regex=false; use match='any' for a regex.".into());
+    }
+    if params.options.match_mode == MatchMode::Phrase {
+        return Ok(vec![TermPattern {
+            source: params.query.to_string(),
+            term_id: None,
+            weight: 1.0,
+            regex: compile_pattern(params.query, false, params.case_sensitive)?,
+        }]);
+    }
     if params.is_regex {
         let regex = compile_pattern(params.query, params.is_regex, params.case_sensitive)?;
         return Ok(vec![TermPattern {
@@ -382,12 +536,15 @@ struct CompiledQuery {
     /// Count of caller-typed term patterns (derived CJK expansions excluded).
     /// Lines covering all of these earn the full-coverage bonus.
     typed_term_count: usize,
+    options: SearchOptions,
 }
 
 impl CompiledQuery {
     fn compile(params: &OverflowSearchParams<'_>) -> Result<Self, String> {
         let patterns = build_patterns(params)?;
-        Self::from_patterns(patterns, params.is_regex, params.case_sensitive)
+        let mut query = Self::from_patterns(patterns, params.is_regex, params.case_sensitive)?;
+        query.options = params.options;
+        Ok(query)
     }
 
     fn from_patterns(
@@ -422,6 +579,7 @@ impl CompiledQuery {
             set,
             lowered_sources,
             typed_term_count,
+            options: SearchOptions::default(),
         })
     }
 }
@@ -538,11 +696,14 @@ struct RawHit {
     /// during the scan pass: whole-word (+2.0), lead-proximity, and exact
     /// phrase bonuses. Corpus-wide IDF weights are added in pass B.
     local_score: f64,
+    /// Exact normalized text, interned per file so repeated log lines share storage.
+    normalized: Arc<str>,
 }
 
 struct FileScan {
     /// Index into the per-scope roots vec; drives cross-root fair-share logic.
     root_idx: usize,
+    source: ArchiveSource,
     /// Absolute path, ready for `read_file` round-trips.
     display_path: String,
     /// Version identity (length, mtime, device/inode, change time, session
@@ -555,7 +716,7 @@ struct FileScan {
     hits: Vec<RawHit>,
     /// Line count of the archive file at scan time. The file text itself is
     /// dropped after scanning and re-read only for the few files that survive
-    /// selection, so resident memory scales with match count, not file size.
+    /// selection; normalized matching text remains for exact duplicate checks.
     total_lines: usize,
 }
 
@@ -565,10 +726,11 @@ struct ScoredFile {
     scan: FileScan,
     /// Whole-file score: best line score + multi-term coverage bonus + path bonus.
     file_score: f64,
-    /// Matched lines sorted by descending score. Not truncated here: selection
-    /// applies the per-file ceiling against the live budget.
+    /// Matched lines sorted by the active order. Not truncated here: relevance
+    /// selection applies the per-file ceiling against the live budget.
     scored: Vec<(usize, f64)>,
     total_matches: usize,
+    duplicates_collapsed: usize,
 }
 
 /// Iterates concrete archive files without automatic-recall candidate/depth caps.
@@ -648,7 +810,10 @@ const PARALLEL_SCAN_THRESHOLD: usize = 64;
 
 fn parallel_scan_enabled(candidate_count: usize) -> bool {
     candidate_count > PARALLEL_SCAN_THRESHOLD
-        && std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) >= 2
+        && std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            >= 2
 }
 
 /// Worker count for the parallel scan: the host's parallelism, capped at 8
@@ -681,13 +846,47 @@ struct PerFileScan {
 /// patterns the query expanded to; the individual matchers run only for the
 /// patterns that matched, to obtain the offsets that local scoring and
 /// excerpt windowing need.
+#[cfg(test)]
 fn compute_hits(content: &str, query: &CompiledQuery) -> (Vec<RawHit>, Vec<bool>, usize) {
+    compute_hits_for_source(content, query, ArchiveSource::Preserved)
+}
+
+fn is_derived_history_line(line: &str) -> bool {
+    // History mixes original records with derived projections. Recognize only
+    // leading checkpoint/summary markers, including a pretty-JSON content field;
+    // unknown formats and mentions later in genuine text retain recall. This
+    // deliberately does not infer provenance for unmarked continuation lines.
+    let line = line.trim_start();
+    let payload = line.strip_prefix("\"content\": \"").unwrap_or(line);
+    [
+        "assistant_checkpoint:",
+        "compressed_tool_round:",
+        CONTEXT_CHECKPOINT_MARKER_PREFIX,
+        QUERY_MEMORY_INDEX_PREFIX,
+    ]
+    .iter()
+    .any(|prefix| payload.starts_with(*prefix))
+        || is_summary_note_text(payload)
+}
+
+fn compute_hits_for_source(
+    content: &str,
+    query: &CompiledQuery,
+    source: ArchiveSource,
+) -> (Vec<RawHit>, Vec<bool>, usize) {
     let patterns = &query.patterns;
     let mut hits: Vec<RawHit> = Vec::new();
     let mut file_term_hits: Vec<bool> = vec![false; patterns.len()];
     let mut total_lines = 0usize;
+    let mut normalized_lines: FxHashSet<Arc<str>> = FxHashSet::default();
     for (line_index, line) in content.lines().enumerate() {
         total_lines = line_index + 1;
+        if query.options.kind == SearchKind::Evidence
+            && source == ArchiveSource::History
+            && is_derived_history_line(line)
+        {
+            continue;
+        }
         let set_matches = query.set.matches(line);
         if !set_matches.matched_any() {
             continue;
@@ -695,6 +894,17 @@ fn compute_hits(content: &str, query: &CompiledQuery) -> (Vec<RawHit>, Vec<bool>
         // `SetMatches::iter` yields pattern ids in increasing order, the same
         // order the per-pattern probe loop below replaced.
         let matched: Vec<usize> = set_matches.iter().collect();
+        if query.options.match_mode == MatchMode::All
+            && matched
+                .iter()
+                .filter(|&&pid| {
+                    patterns[pid].term_id.is_some() && !is_derived_pattern(&patterns[pid])
+                })
+                .count()
+                != query.typed_term_count
+        {
+            continue;
+        }
         for &pid in &matched {
             file_term_hits[pid] = true;
         }
@@ -770,19 +980,29 @@ fn compute_hits(content: &str, query: &CompiledQuery) -> (Vec<RawHit>, Vec<bool>
         if first_match == usize::MAX {
             first_match = 0;
         }
+        let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized = match normalized_lines.get(normalized.as_str()) {
+            Some(existing) => Arc::clone(existing),
+            None => {
+                let text: Arc<str> = Arc::from(normalized);
+                normalized_lines.insert(Arc::clone(&text));
+                text
+            }
+        };
         hits.push(RawHit {
             line_index,
             matched,
             first_match,
             local_score,
+            normalized,
         });
     }
     (hits, file_term_hits, total_lines)
 }
 
-/// Scans one candidate archive file. The file text lives only inside this
-/// call, so a worker (serial or parallel) holds at most one file's content at
-/// a time; resident memory scales with hit count, not corpus size.
+/// Scans one candidate archive file. A worker holds at most one full file body
+/// at a time; raw hits retain metadata and interned normalized matching text
+/// for exact duplicate comparisons after the body is released.
 fn scan_one_file(
     archive: &archive_files::ArchiveRoot,
     root_idx: usize,
@@ -798,7 +1018,8 @@ fn scan_one_file(
             unreadable: true,
         };
     };
-    let (hits, file_term_hits, total_lines) = compute_hits(&content, query);
+    let source = archive_source(file, archive.path());
+    let (hits, file_term_hits, total_lines) = compute_hits_for_source(&content, query, source);
     if hits.is_empty() {
         return PerFileScan {
             scan: None,
@@ -809,6 +1030,7 @@ fn scan_one_file(
     PerFileScan {
         scan: Some(FileScan {
             root_idx,
+            source,
             display_path: file.to_string_lossy().to_string(),
             version,
             hits,
@@ -864,7 +1086,10 @@ fn scan_candidates(
     };
     if !parallel || candidates.len() <= 1 {
         for &(root_idx, ref file) in candidates {
-            fold_scan_result(&mut aggregate, scan_one_file(archive, root_idx, file, query));
+            fold_scan_result(
+                &mut aggregate,
+                scan_one_file(archive, root_idx, file, query),
+            );
         }
         return aggregate;
     }
@@ -877,9 +1102,7 @@ fn scan_candidates(
                 scope.spawn(move || {
                     chunk
                         .iter()
-                        .map(|&(root_idx, ref file)| {
-                            scan_one_file(archive, root_idx, file, query)
-                        })
+                        .map(|&(root_idx, ref file)| scan_one_file(archive, root_idx, file, query))
                         .collect::<Vec<PerFileScan>>()
                 })
             })
@@ -907,8 +1130,14 @@ fn run_overflow_search_inner(
     params: &OverflowSearchParams<'_>,
     force_parallel: Option<bool>,
 ) -> Result<String, String> {
+    if params.options.match_mode == MatchMode::Phrase && params.is_regex {
+        return Err("match='phrase' requires is_regex=false; use match='any' for a regex.".into());
+    }
     let Some(archive) = archive_files::ArchiveRoot::new(assets_dir) else {
-        return Ok("No matches found: the session archive root is missing or unavailable; nothing was scanned.".to_string());
+        return Ok(format!(
+            "No matches found: the session archive root is missing or unavailable; nothing was scanned.\n{}",
+            search_footer(&[], params, 0, 0, 0, assets_dir, false)
+        ));
     };
     let mut roots: Vec<PathBuf> = Vec::new();
     if params.scope != SearchScope::ToolOutputs {
@@ -941,8 +1170,9 @@ fn run_overflow_search_inner(
         .collect();
     if roots.is_empty() {
         return Ok(format!(
-            "No matches found in the session archive for query: '{}'. Nothing was scanned: this session has no archive content yet, since files appear here only after content is moved out of context.",
+            "No matches found in the session archive for query: '{}'. Nothing was scanned: this session has no archive content yet, since files appear here only after content is moved out of context.\n{}",
             params.query,
+            search_footer(&[], params, 0, 0, 0, archive.path(), false)
         ));
     }
 
@@ -957,6 +1187,7 @@ fn run_overflow_search_inner(
     // Counted separately so a zero-hit answer can say whether the corpus was
     // empty, filtered away, or unreadable instead of implying absence.
     let mut files_excluded_by_pattern: usize = 0;
+    let mut files_excluded_by_kind: usize = 0;
 
     // Compiled once: the glob is fixed for the whole search. A pattern that
     // trims to empty is treated as "no filter" — an empty glob would only match
@@ -969,6 +1200,12 @@ fn run_overflow_search_inner(
         for file in collect_files(&archive, root) {
             if !path_matches_glob(&file, root, archive.path(), glob.as_ref()) {
                 files_excluded_by_pattern += 1;
+                continue;
+            }
+            if params.options.kind != SearchKind::All
+                && archive_source(&file, archive.path()).kind() != params.options.kind
+            {
+                files_excluded_by_kind += 1;
                 continue;
             }
             candidates.push((*root_idx, file));
@@ -1009,6 +1246,14 @@ fn run_overflow_search_inner(
         } else {
             String::new()
         };
+        let kind_note = if files_excluded_by_kind > 0 {
+            format!(
+                "; kind={} excluded {files_excluded_by_kind} file(s)",
+                params.options.kind.as_str()
+            )
+        } else {
+            String::new()
+        };
         let scope_note = match params.scope {
             SearchScope::All => String::new(),
             SearchScope::History => "; scope=history searched original messages only".to_string(),
@@ -1018,8 +1263,9 @@ fn run_overflow_search_inner(
         };
         if files_seen == 0 {
             return Ok(format!(
-                "No matches found in the session archive for query: '{}'. Nothing was scanned: 0 archive file(s) under the probed roots ({probed}){pattern_note}{unreadable_note}{scope_note}. Archived files appear only after content is moved out of context; canonical session history is not searched here.",
+                "No matches found in the session archive for query: '{}'. Nothing was scanned: 0 archive file(s) under the probed roots ({probed}){pattern_note}{kind_note}{unreadable_note}{scope_note}. Archived files appear only after content is moved out of context; canonical session history is not searched here.\n{}",
                 params.query,
+                search_footer(&[], params, 0, 0, files_seen, archive.path(), false)
             ));
         }
         let mut terms: Vec<&str> = patterns
@@ -1066,12 +1312,27 @@ fn run_overflow_search_inner(
             " Matching is case-sensitive here: retry with case_sensitive=false to widen it."
         } else if params.is_regex || !params.query.chars().any(|c| c.is_ascii_alphabetic()) {
             ""
+        } else if params.options.kind != SearchKind::All {
+            " Matching ignored case; no permitted line matched in any casing."
+        } else if params.options.match_mode == MatchMode::All {
+            " Matching ignored case; no line covered every typed term in any casing."
+        } else if params.options.match_mode == MatchMode::Phrase {
+            " Matching ignored case; the whole literal phrase was absent in every casing."
         } else {
             " Matching ignored case, so no other casing of these terms is present in the searched files either."
         };
+        let match_note = match params.options.match_mode {
+            MatchMode::Any => "no term matched; terms are ORed, so every one of them came up empty",
+            MatchMode::All if !params.is_regex => {
+                "no line covered every typed term; individual terms may still be present"
+            }
+            MatchMode::Phrase => "no line contained the whole query as a literal substring",
+            MatchMode::All => "the single regex pattern did not match",
+        };
         return Ok(format!(
-            "No matches found in the session archive for query: '{}'. {files_seen} file(s) were searched and no term matched (terms: {listed}{expansion_note}{pattern_note}{unreadable_note}{scope_note}); terms are ORed, so every one of them came up empty.{case_note} This archive holds only content moved out of context; canonical session history is not searched here.",
+            "No matches found in the session archive for query: '{}'. {files_seen} file(s) were searched and {match_note} (terms: {listed}{expansion_note}{pattern_note}{kind_note}{unreadable_note}{scope_note}).{case_note} This archive holds only content moved out of context; canonical session history is not searched here.\n{}",
             params.query,
+            search_footer(&[], params, 0, 0, files_seen, archive.path(), false)
         ));
     }
 
@@ -1145,7 +1406,14 @@ fn run_overflow_search_inner(
             + path_bonus;
 
         let total_matches = scored.len();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| match params.options.order {
+            SearchOrder::Relevance => {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.0.cmp(&a.0))
+            }
+            SearchOrder::Recent => b.0.cmp(&a.0),
+        });
         // Deliberately not truncated: the per-file ceiling is applied during
         // selection against the live budget, so a hit ranked below the top
         // dozen stays selectable instead of becoming permanently unreachable.
@@ -1156,6 +1424,7 @@ fn run_overflow_search_inner(
             file_score,
             scored,
             total_matches,
+            duplicates_collapsed: 0,
         });
     }
 
@@ -1166,7 +1435,249 @@ fn run_overflow_search_inner(
         }
     });
 
+    collapse_duplicate_lines(&mut scored_files);
     render_selection(scored_files, params, &query, files_seen, &archive)
+}
+
+fn collapse_duplicate_lines(files: &mut [ScoredFile]) {
+    // Keep all raw hits for truthful corpus counts and markers. Only selection
+    // candidates collapse, and every copy in the winning root survives, including
+    // repetitions in one file and identical lines in two files of that same root.
+    let mut winners: FxHashMap<Arc<str>, (usize, usize)> = FxHashMap::default();
+    for file in files.iter() {
+        let value = (file.scan.source.priority(), file.root_idx);
+        for hit in &file.scan.hits {
+            winners
+                .entry(Arc::clone(&hit.normalized))
+                .and_modify(|winner| *winner = (*winner).min(value))
+                .or_insert(value);
+        }
+    }
+    for file in files {
+        let hit_by_line: FxHashMap<usize, &RawHit> = file
+            .scan
+            .hits
+            .iter()
+            .map(|hit| (hit.line_index, hit))
+            .collect();
+        file.scored.retain(|(line, _)| {
+            hit_by_line
+                .get(line)
+                .is_some_and(|hit| winners[&hit.normalized].1 == file.root_idx)
+        });
+        file.duplicates_collapsed = file.total_matches.saturating_sub(file.scored.len());
+    }
+}
+
+fn narrowing_call(params: &OverflowSearchParams<'_>, key: &str, value: &str) -> String {
+    let mut args = serde_json::json!({"query": params.query});
+    if params.is_regex {
+        args["is_regex"] = true.into();
+    }
+    if params.case_sensitive {
+        args["case_sensitive"] = true.into();
+    }
+    if params.options.order != SearchOrder::Relevance {
+        args["order"] = params.options.order.as_str().into();
+    }
+    if params.options.match_mode != MatchMode::Any {
+        args["match"] = params.options.match_mode.as_str().into();
+    }
+    if params.options.kind != SearchKind::All {
+        args["kind"] = params.options.kind.as_str().into();
+    }
+    match params.scope {
+        SearchScope::All => {}
+        SearchScope::History => args["scope"] = "history".into(),
+        SearchScope::ToolOutputs => args["scope"] = "tool_outputs".into(),
+    }
+    if let Some(pattern) = params
+        .file_pattern
+        .filter(|pattern| !pattern.trim().is_empty())
+    {
+        args["file_pattern"] = pattern.into();
+    }
+    args[key] = value.into();
+    format!("search_overflow({args})")
+}
+
+fn footer_path(path: &str, byte_limit: usize) -> String {
+    if path.len() <= byte_limit {
+        return path.to_string();
+    }
+    if byte_limit < '…'.len_utf8() {
+        return ".".repeat(byte_limit);
+    }
+    // Path labels may be elided, but suggested calls always carry complete values.
+    let half = byte_limit.saturating_sub('…'.len_utf8()) / 2;
+    let mut head = half;
+    while !path.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = path.len().saturating_sub(half);
+    while !path.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}…{}", &path[..head], &path[tail..])
+}
+
+fn search_footer(
+    files: &[ScoredFile],
+    params: &OverflowSearchParams<'_>,
+    shown: usize,
+    shown_files: usize,
+    files_seen: usize,
+    archive_root: &Path,
+    budget_exhausted: bool,
+) -> String {
+    search_footer_with_budget(
+        files,
+        params,
+        shown,
+        shown_files,
+        files_seen,
+        archive_root,
+        budget_exhausted,
+        MAX_FOOTER_BYTES,
+    )
+}
+
+fn search_footer_with_budget(
+    files: &[ScoredFile],
+    params: &OverflowSearchParams<'_>,
+    shown: usize,
+    shown_files: usize,
+    files_seen: usize,
+    archive_root: &Path,
+    budget_exhausted: bool,
+    byte_limit: usize,
+) -> String {
+    let byte_limit = byte_limit.min(MAX_FOOTER_BYTES);
+    let total: usize = files.iter().map(|file| file.total_matches).sum();
+    let collapsed: usize = files.iter().map(|file| file.duplicates_collapsed).sum();
+    let hidden = total.saturating_sub(shown.saturating_add(collapsed));
+    let matching_files = files.iter().filter(|file| file.total_matches > 0).count();
+    let mut footer = format!(
+        "[archive search] showed {shown} matching line(s) across {shown_files}/{matching_files} file(s) (corpus total {total}, files scanned {files_seen}); order={} match={} kind={}; {collapsed} duplicate line(s) collapsed; hidden={hidden}. ",
+        params.options.order.as_str(),
+        params.options.match_mode.as_str(),
+        params.options.kind.as_str(),
+    );
+    if total == 0 && params.options.kind != SearchKind::All {
+        footer.push_str(&format!(
+            "kind={} left 0 matching lines; retry with kind=all. ",
+            params.options.kind.as_str()
+        ));
+    }
+    if hidden == 0 && !budget_exhausted {
+        footer.push_str(SURROUNDING_CONTEXT_HINT);
+        return footer;
+    }
+
+    let mut top: Vec<&ScoredFile> = files.iter().filter(|file| file.total_matches > 0).collect();
+    top.sort_by(|a, b| {
+        b.total_matches
+            .cmp(&a.total_matches)
+            .then_with(|| a.scan.display_path.cmp(&b.scan.display_path))
+    });
+    top.truncate(5);
+    let counts_bytes: usize = top
+        .iter()
+        .map(|file| file.total_matches.to_string().len() + 4)
+        .sum();
+    let minimum_top_bytes = "top files: \n".len() + counts_bytes + top.len() * '…'.len_utf8();
+    // Keep the context recovery hint even when the detailed footer must compact.
+    let context_hint =
+        if footer.len() + SURROUNDING_CONTEXT_HINT.len() + minimum_top_bytes <= byte_limit {
+            SURROUNDING_CONTEXT_HINT
+        } else {
+            "read_file: surrounding context.\n"
+        };
+    footer.push_str(context_hint);
+    let mut suggestions = Vec::new();
+    let mut suggest = |key: &str, value: &str| {
+        let mut edits = serde_json::Map::new();
+        edits.insert(key.to_string(), value.into());
+        suggestions.push((
+            format!("try {}\n", narrowing_call(params, key, value)),
+            format!(
+                "try same search_overflow call with {}\n",
+                Value::Object(edits)
+            ),
+        ));
+    };
+    let path_like = params.query.contains('/') || params.query.contains('\\');
+    if total >= LARGE_RESULT_COUNT
+        && !params.is_regex
+        && params.options.match_mode == MatchMode::Any
+    {
+        if path_like {
+            suggest("match", "phrase");
+        } else if params.query.split_whitespace().count() > 1 {
+            suggest("match", "all");
+        }
+    }
+    let evidence_present = files
+        .iter()
+        .any(|file| file.total_matches > 0 && file.scan.source.kind() == SearchKind::Evidence);
+    let derived_present = files
+        .iter()
+        .any(|file| file.total_matches > 0 && file.scan.source.kind() == SearchKind::Derived);
+    if params.options.kind == SearchKind::All && evidence_present && derived_present {
+        suggest("kind", "evidence");
+    }
+    if let Some(file) = top.first().filter(|file| file.total_matches * 2 >= total) {
+        let relative = Path::new(&file.scan.display_path)
+            .strip_prefix(archive_root)
+            .unwrap_or_else(|_| Path::new(&file.scan.display_path))
+            .to_string_lossy();
+        if params.file_pattern != Some(relative.as_ref()) {
+            suggest("file_pattern", &relative);
+        }
+    }
+    if params.scope == SearchScope::All
+        && files
+            .iter()
+            .any(|file| file.total_matches > 0 && file.scan.source == ArchiveSource::ToolOutput)
+    {
+        suggest("scope", "tool_outputs");
+    }
+
+    let mut calls = String::new();
+    for (full, compact) in suggestions {
+        if let Some(next) = [full, compact]
+            .into_iter()
+            .find(|next| footer.len() + minimum_top_bytes + calls.len() + next.len() <= byte_limit)
+        {
+            calls.push_str(&next);
+            if calls.lines().count() == 2 {
+                break;
+            }
+        }
+    }
+    if !top.is_empty() {
+        let label_budget = byte_limit
+            .saturating_sub(footer.len() + calls.len() + "top files: \n".len() + counts_bytes)
+            / top.len();
+        let labels: Vec<String> = top
+            .iter()
+            .map(|file| {
+                let path = Path::new(&file.scan.display_path)
+                    .strip_prefix(archive_root)
+                    .unwrap_or_else(|_| Path::new(&file.scan.display_path))
+                    .to_string_lossy();
+                format!(
+                    "{}={}",
+                    footer_path(&path, label_budget),
+                    file.total_matches
+                )
+            })
+            .collect();
+        footer.push_str(&format!("top files: {}\n", labels.join("; ")));
+    }
+    footer.push_str(&calls);
+    debug_assert!(footer.len() <= byte_limit);
+    footer
 }
 
 /// Whether `ch` continues a word for whole-word bonus purposes: letters and
@@ -1304,8 +1815,8 @@ fn render_line_window(line: &str, first_match: Option<usize>) -> String {
 
 // ─── Fair-share selection & rendering ────────────────────────────────────────
 
-/// Selects files/lines across roots with relevance-first ordering plus
-/// fair-share visibility, then renders verbatim excerpt blocks.
+/// Selects files/lines with the active order, then renders verbatim excerpts.
+/// Relevance uses fair-share visibility; recent order drains newest files first.
 ///
 /// Selection happens at line granularity: candidates enter a global pool, and
 /// while the answer budget lasts, the pool is drained in relevance order, but a
@@ -1333,13 +1844,20 @@ fn render_with_context(
 ) -> Result<(String, bool), String> {
     let patterns = &query.patterns;
     files.sort_by(|a, b| {
-        b.file_score
-            .partial_cmp(&a.file_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            // Newer archives first: when scores tie, recently folded context
-            // is usually what the caller is recovering.
-            .then_with(|| b.scan.version.mtime.cmp(&a.scan.version.mtime))
-            .then_with(|| a.scan.display_path.cmp(&b.scan.display_path))
+        let recency = b
+            .scan
+            .version
+            .mtime
+            .cmp(&a.scan.version.mtime)
+            .then_with(|| a.scan.display_path.cmp(&b.scan.display_path));
+        match params.options.order {
+            SearchOrder::Relevance => b
+                .file_score
+                .partial_cmp(&a.file_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(recency),
+            SearchOrder::Recent => recency,
+        }
     });
 
     struct Candidate {
@@ -1351,7 +1869,11 @@ fn render_with_context(
     let mut file_consumed = vec![0usize; files.len()];
     let mut root_consumed: FxHashMap<usize, usize> = FxHashMap::default();
     let roots_with_hits: Vec<usize> = {
-        let mut v: Vec<usize> = files.iter().map(|f| f.root_idx).collect();
+        let mut v: Vec<usize> = files
+            .iter()
+            .filter(|file| !file.scored.is_empty())
+            .map(|f| f.root_idx)
+            .collect();
         v.sort_unstable();
         v.dedup();
         v
@@ -1375,67 +1897,86 @@ fn render_with_context(
 
     let mut chosen: Vec<Candidate> = Vec::new();
 
-    // Every pass visits all ranked files once; each visit either pops one
-    // candidate or counts that file as settled. A file is "free" while it holds
-    // an un-drained candidate and is under both ceilings, and a capped file
-    // sits out only while some file is still free: the caps decide who goes
-    // first, never how much of the budget is spent. Once nothing is free, every
-    // ceiling yields so the remaining candidates drain in relevance order — a
-    // capped root cannot stall the answer even when a second root is capped at
-    // the same time. Equal-score ties rotate across files because each pass
-    // re-visits files in stable global relevance order.
-    while chosen.len() < max_results {
-        // A file that is neither drained nor over a ceiling is what the
-        // ceilings reserve room for. Computed once per pass: a file that
-        // exhausts its candidates mid-pass only delays the lift by one pass.
-        let free_anywhere = files.iter().enumerate().any(|(pos, f)| {
-            per_file_cursor[pos] < f.scored.len()
-                && file_consumed[pos] < soft_cap_per_file
-                && root_consumed.get(&f.root_idx).copied().unwrap_or(0) < soft_cap_per_root
-        });
-
-        let mut settled = 0usize;
-        for file_pos in 0..files.len() {
-            if chosen.len() >= max_results {
+    if params.options.order == SearchOrder::Recent {
+        // Recency is a strict order: relevance reservations must not interleave
+        // older files while the newest file still has matching lines.
+        for (file_pos, file) in files.iter().enumerate() {
+            for &(line_index, _) in file.scored.iter().take(max_results - chosen.len()) {
+                chosen.push(Candidate {
+                    file_pos,
+                    line_index,
+                });
+            }
+            if chosen.len() == max_results {
                 break;
             }
-            let file = &files[file_pos];
-            if per_file_cursor[file_pos] >= file.scored.len() {
-                settled += 1;
-                continue;
-            }
-            let root_capped =
-                root_consumed.get(&file.root_idx).copied().unwrap_or(0) >= soft_cap_per_root;
-            let file_capped = file_consumed[file_pos] >= soft_cap_per_file;
-            if (root_capped || file_capped) && free_anywhere {
-                // Capped while another file can still use the room this one
-                // would consume.
-                settled += 1;
-                continue;
-            }
-            let line_index = file.scored[per_file_cursor[file_pos]].0;
-            per_file_cursor[file_pos] += 1;
-            file_consumed[file_pos] += 1;
-            *root_consumed.entry(file.root_idx).or_insert(0) += 1;
-            chosen.push(Candidate {
-                file_pos,
-                line_index,
-            });
         }
-        if settled == files.len() {
-            // Nothing progressed and nothing is left that any ceiling allows.
-            break;
+    } else {
+        // Every pass visits all ranked files once; each visit either pops one
+        // candidate or counts that file as settled. A file is "free" while it holds
+        // an un-drained candidate and is under both ceilings, and a capped file
+        // sits out only while some file is still free: the caps decide who goes
+        // first, never how much of the budget is spent. Once nothing is free, every
+        // ceiling yields so the remaining candidates drain in relevance order — a
+        // capped root cannot stall the answer even when a second root is capped at
+        // the same time. Equal-score ties rotate across files because each pass
+        // re-visits files in stable global relevance order.
+        while chosen.len() < max_results {
+            // A file that is neither drained nor over a ceiling is what the
+            // ceilings reserve room for. Computed once per pass: a file that
+            // exhausts its candidates mid-pass only delays the lift by one pass.
+            let free_anywhere = files.iter().enumerate().any(|(pos, f)| {
+                per_file_cursor[pos] < f.scored.len()
+                    && file_consumed[pos] < soft_cap_per_file
+                    && root_consumed.get(&f.root_idx).copied().unwrap_or(0) < soft_cap_per_root
+            });
+
+            let mut settled = 0usize;
+            for file_pos in 0..files.len() {
+                if chosen.len() >= max_results {
+                    break;
+                }
+                let file = &files[file_pos];
+                if per_file_cursor[file_pos] >= file.scored.len() {
+                    settled += 1;
+                    continue;
+                }
+                let root_capped =
+                    root_consumed.get(&file.root_idx).copied().unwrap_or(0) >= soft_cap_per_root;
+                let file_capped = file_consumed[file_pos] >= soft_cap_per_file;
+                if (root_capped || file_capped) && free_anywhere {
+                    // Capped while another file can still use the room this one
+                    // would consume.
+                    settled += 1;
+                    continue;
+                }
+                let line_index = file.scored[per_file_cursor[file_pos]].0;
+                per_file_cursor[file_pos] += 1;
+                file_consumed[file_pos] += 1;
+                *root_consumed.entry(file.root_idx).or_insert(0) += 1;
+                chosen.push(Candidate {
+                    file_pos,
+                    line_index,
+                });
+            }
+            if settled == files.len() {
+                // Nothing progressed and nothing is left that any ceiling allows.
+                break;
+            }
         }
     }
 
     if chosen.is_empty() {
-        return Ok((format!(
-            "No matches found in the session archive for query: '{}'",
-            params.query
-        ), false));
+        return Ok((
+            format!(
+                "No matches found in the session archive for query: '{}'",
+                params.query
+            ),
+            false,
+        ));
     }
 
-    // Emit grouped by file in global relevance order, expanding context windows
+    // Emit grouped by file in the active order, expanding context windows
     // around chosen lines; two-character markers (`>>`/`>t`/`>b`) explain why
     // each matched line was selected and two spaces mark context lines;
     // numbers are absolute archive-file line numbers usable as `read_file`
@@ -1446,15 +1987,14 @@ fn render_with_context(
     // footer could report lines that the caller never received.
     let mut shown_matches = 0usize;
     let mut shown_files = 0usize;
-    let mut total_matches_all: usize = files.iter().map(|f| f.total_matches).sum();
     // Excerpt rendering stops before the truncation notice and the footer would
     // no longer fit.
     let render_budget = MAX_OUTPUT_CHARS.saturating_sub(FOOTER_RESERVE_CHARS);
     let mut budget_exhausted = false;
 
     for (file_pos, file) in files.iter_mut().enumerate() {
-        // Sorted ascending so context ranges merge correctly; dedup guards
-        // against any duplicate selection.
+        // Source-order sorting makes selection deduplication deterministic;
+        // ranked rendering below follows the file's scored candidate order.
         let mut lis: Vec<usize> = chosen
             .iter()
             .filter(|c| c.file_pos == file_pos)
@@ -1503,8 +2043,8 @@ fn render_with_context(
             // The scan-time matches no longer exist: drop them from the
             // corpus total before reporting, or the footer would still claim
             // hidden matches for an empty file.
-            total_matches_all = total_matches_all.saturating_sub(file.total_matches);
             file.total_matches = 0;
+            file.duplicates_collapsed = 0;
             file.scan.hits.clear();
             file.scan.total_lines = 0;
             chunk.push_str(&format!(
@@ -1525,8 +2065,8 @@ fn render_with_context(
             // Re-scan the current content with the same patterns and recompute
             // the displayed lines; the old markers are never applied to the
             // new text.
-            let (hits, _, total_lines) = compute_hits(&content, query);
-            total_matches_all = total_matches_all.saturating_sub(file.total_matches);
+            let (hits, _, total_lines) = compute_hits_for_source(&content, query, file.scan.source);
+            file.duplicates_collapsed = 0;
             if hits.is_empty() {
                 file.total_matches = 0;
                 // No matches remain in the current content: presenting the
@@ -1547,7 +2087,6 @@ fn render_with_context(
             file.scan.hits = hits;
             file.scan.total_lines = total_lines;
             file.total_matches = file.scan.hits.len();
-            total_matches_all += file.total_matches;
             let new_hit_lines: FxHashSet<usize> =
                 file.scan.hits.iter().map(|h| h.line_index).collect();
             lis.retain(|li| new_hit_lines.contains(li));
@@ -1569,7 +2108,9 @@ fn render_with_context(
             }
         }
 
-        let hidden_here = file.total_matches.saturating_sub(lis.len());
+        let hidden_here = file
+            .total_matches
+            .saturating_sub(file.duplicates_collapsed + lis.len());
         // The section header is written before any excerpt, so it is charged to
         // the same budget: a session-asset path long enough to fill the excerpt
         // budget on its own stops the rendering instead of pushing the answer
@@ -1585,25 +2126,14 @@ fn render_with_context(
         }
         chunk.push_str(&header);
 
-        let mut ranges: Vec<(usize, usize)> = Vec::new();
-        for li in &lis {
-            let start = li.saturating_sub(context_lines);
-            // Clamp against both the scan-time line count and the re-read
-            // length so a concurrently truncated file can never cause an
-            // out-of-bounds index.
-            let end = (*li + context_lines)
-                .min(file.scan.total_lines.saturating_sub(1))
-                .min(n_lines.saturating_sub(1));
-            if let Some(last) = ranges.last_mut() {
-                if start <= last.1.saturating_add(1) {
-                    last.1 = last.1.max(end);
-                    continue;
-                }
-            }
-            ranges.push((start, end));
-        }
-
-        let mut match_set: std::collections::BTreeSet<usize> = lis.iter().copied().collect();
+        let mut match_set: FxHashSet<usize> = lis.iter().copied().collect();
+        let ranked_lines: Vec<usize> = file
+            .scored
+            .iter()
+            .filter(|(line, _)| match_set.contains(line))
+            .map(|(line, _)| *line)
+            .collect();
+        let mut rendered_lines: FxHashSet<usize> = FxHashSet::default();
         // The scan pass kept raw hits per file (scan.hits), so the gutter
         // marker can still classify why each selected line matched.
         // Hits are indexed by line for O(1) lookups: the previous linear scan
@@ -1616,10 +2146,31 @@ fn render_with_context(
             .iter()
             .map(|hit| (hit.line_index, hit))
             .collect();
-        'lines: for (start, end) in ranges {
-            for li in start..=end {
+        'lines: for selected_line in ranked_lines {
+            let start = selected_line.saturating_sub(context_lines);
+            let end = (selected_line + context_lines)
+                .min(file.scan.total_lines.saturating_sub(1))
+                .min(n_lines.saturating_sub(1));
+            for offset in 0..=end - start {
+                let li = if params.options.order == SearchOrder::Recent {
+                    end - offset
+                } else {
+                    start + offset
+                };
+                // Overlapping context never emits a selected hit before its
+                // ranked turn. Equal-score groups therefore stay newest first
+                // even when the file also contains stronger or weaker hits.
+                if (li != selected_line && match_set.contains(&li)) || !rendered_lines.insert(li) {
+                    continue;
+                }
                 let is_match = match_set.remove(&li);
                 let line = content_lines[li];
+                if params.options.kind == SearchKind::Evidence
+                    && file.scan.source == ArchiveSource::History
+                    && is_derived_history_line(line)
+                {
+                    continue;
+                }
                 let hit = if is_match {
                     hit_by_line.get(&li).copied()
                 } else {
@@ -1675,21 +2226,23 @@ fn render_with_context(
     // budget could not hold instead of retroactively dropping counted text.
     if budget_exhausted {
         out.push_str(&format!(
-            "\n... [output truncated at character limit; {} selected matching line(s) not written; narrow the query, scope, or file_pattern] ...\n",
+            "output truncated at character limit; {} selected lines not written.\n",
             chosen.len().saturating_sub(shown_matches)
         ));
     }
-    out.push_str(&format!(
-        "[archive search] showed {} matching line(s) across {} file(s); {} additional matching line(s) hidden (corpus total {}, files scanned {}). Use `read_file` on any listed absolute path for surrounding context.\n",
+    let footer_budget =
+        MAX_OUTPUT_CHARS.saturating_sub(out.len() + MARKER_LEGEND.len() + CONTEXT_DROP_NOTE.len());
+    out.push_str(&search_footer_with_budget(
+        files,
+        params,
         shown_matches,
         shown_files,
-        total_matches_all.saturating_sub(shown_matches),
-        total_matches_all,
-        files_seen
+        files_seen,
+        archive.path(),
+        budget_exhausted,
+        footer_budget,
     ));
-    out.push_str(
-        "markers: >> whole-query phrase hit, >t typed-term hit, >b CJK-fragment hit (the phrase may be absent — verify with read_file), two spaces = context line; matching ignores case by default, so a hit may differ in casing from the query\n",
-    );
+    out.push_str(MARKER_LEGEND);
     debug_assert!(
         out.len() <= MAX_OUTPUT_CHARS,
         "the excerpt budget must leave room for the notice and the footer"
@@ -1723,9 +2276,7 @@ fn render_selection(
         return Ok(out);
     }
     let (bare, _) = render_with_context(&mut files, params, query, files_seen, archive, 0)?;
-    Ok(format!(
-        "{bare}[archive search] context lines were dropped to fit more matches; re-run with a smaller max_results to restore context.\n"
-    ))
+    Ok(format!("{bare}{CONTEXT_DROP_NOTE}"))
 }
 
 inventory::submit!(ToolRegistration {
@@ -1819,6 +2370,7 @@ mod tests {
             max_results: 50,
             file_pattern: None,
             scope: SearchScope::All,
+            options: SearchOptions::default(),
         }
     }
 
@@ -1845,6 +2397,592 @@ mod tests {
                 matches!(marker, Some(">>" | ">t" | ">b"))
             })
             .count()
+    }
+
+    fn matched_text(out: &str) -> Vec<&str> {
+        out.lines()
+            .filter_map(|line| {
+                let line = line.trim_start();
+                let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+                if digits == 0 {
+                    return None;
+                }
+                let rest = &line[digits..];
+                [">> ", ">t ", ">b "]
+                    .iter()
+                    .find_map(|marker| rest.strip_prefix(*marker))
+            })
+            .collect()
+    }
+
+    fn footer_block(out: &str) -> &str {
+        let start = out.find("[archive search] showed ").unwrap();
+        out[start..].split("markers:").next().unwrap()
+    }
+
+    fn set_mtime(path: &Path, seconds: u64) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn defaults_preserve_prechange_selected_evidence() {
+        let dir = make_temp_dir();
+        fs::create_dir_all(dir.join("tool-overflow-compressed")).unwrap();
+        fs::write(dir.join("overflow-history.md"), "xxalpha old narrative\n").unwrap();
+        fs::write(
+            dir.join("tool-overflow-compressed/best.txt"),
+            "alpha beta exact evidence\nalpha less specific\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("tool-overflow-compressed/other.txt"),
+            "alpha noise\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({"query": "alpha beta", "context_lines": 0, "max_results": 2});
+        let p = parse_search_params(&args).unwrap();
+        assert_eq!(p.options.order, SearchOrder::Relevance);
+        assert_eq!(p.options.match_mode, MatchMode::Any);
+        assert_eq!(p.options.kind, SearchKind::All);
+        assert!(!p.is_regex && !p.case_sensitive);
+        let out = run_overflow_search(&dir, &p).unwrap();
+        // This unique-score, unique-text fixture selected these two lines before
+        // ordering and duplicate controls existed; partial-term recall survives.
+        assert_eq!(
+            matched_text(&out),
+            ["alpha beta exact evidence", "alpha noise"]
+        );
+        assert!(out.contains("corpus total 4"), "{out}");
+        assert!(out.contains("order=relevance match=any kind=all"), "{out}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn recent_order_uses_mtime_and_descending_lines_without_fair_share() {
+        let dir = make_temp_dir();
+        fs::create_dir_all(dir.join("tool-overflow-compressed")).unwrap();
+        let old = dir.join("tool-overflow-compressed/old.txt");
+        let new = dir.join("tool-overflow-compressed/new.txt");
+        fs::write(&old, "alpha beta old strong\nalpha beta old tail\n").unwrap();
+        fs::write(
+            &new,
+            "alpha beta new strong\nxxalpha newer weak\nxxxalpha newest weak\n",
+        )
+        .unwrap();
+        set_mtime(&old, 1_000);
+        set_mtime(&new, 2_000);
+        let args = serde_json::json!({"query": "alpha beta", "order": "recent", "context_lines": 0, "max_results": 3});
+        let p = parse_search_params(&args).unwrap();
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert_eq!(
+            matched_text(&out),
+            [
+                "xxxalpha newest weak",
+                "xxalpha newer weak",
+                "alpha beta new strong"
+            ]
+        );
+        assert!(out.contains("corpus total 5, files scanned 2"), "{out}");
+        let mut p = p;
+        p.max_results = 5;
+        p.context_lines = 1;
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert_eq!(
+            matched_text(&out),
+            [
+                "xxxalpha newest weak",
+                "xxalpha newer weak",
+                "alpha beta new strong",
+                "alpha beta old tail",
+                "alpha beta old strong"
+            ]
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn equal_line_scores_select_the_newest_line() {
+        let dir = make_temp_dir();
+        fs::write(
+            dir.join("overflow-history.md"),
+            "alpha oldest\nalpha middle\nalpha newest\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({"query": "alpha", "max_results": 1, "context_lines": 0});
+        let p = parse_search_params(&args).unwrap();
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert_eq!(matched_text(&out), ["alpha newest"]);
+        assert!(out.contains("3>t alpha newest"), "{out}");
+        assert!(out.contains("corpus total 3"), "{out}");
+        let mut p = p;
+        p.max_results = 2;
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert_eq!(matched_text(&out), ["alpha newest", "alpha middle"]);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn mixed_scores_render_equal_score_pairs_newest_first() {
+        let dir = make_temp_dir();
+        fs::write(
+            dir.join("overflow-history.md"),
+            "alpha older\ncontext before medium\nalpha x beta medium\ncontext before strongest\nalpha beta strongest\ncontext before newer\nalpha newer\n",
+        )
+        .unwrap();
+        for context_lines in [0, 1, 2] {
+            let args = serde_json::json!({"query": "alpha beta", "context_lines": context_lines});
+            let out = run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap();
+            assert_eq!(
+                matched_text(&out),
+                [
+                    "alpha beta strongest",
+                    "alpha x beta medium",
+                    "alpha newer",
+                    "alpha older"
+                ],
+                "score order and newest-first ties must survive overlapping context: {out}"
+            );
+            assert_eq!(shown_count(&out), 4, "{out}");
+            assert_eq!(
+                out.matches("context before strongest").count(),
+                usize::from(context_lines > 0),
+                "context is emitted once: {out}"
+            );
+        }
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn all_and_phrase_modes_filter_typed_terms_and_literal_spacing() {
+        let dir = make_temp_dir();
+        fs::write(
+            dir.join("overflow-history.md"),
+            "alpha only\nbeta only\nalpha x beta\nalpha beta\nalpha  beta\nALPHA BETA\n",
+        )
+        .unwrap();
+        for (mode, case_sensitive, expected) in [
+            ("any", true, 5),
+            ("all", true, 3),
+            ("phrase", true, 1),
+            ("phrase", false, 2),
+        ] {
+            let args = serde_json::json!({"query": "alpha beta", "match": mode, "case_sensitive": case_sensitive, "context_lines": 0});
+            let p = parse_search_params(&args).unwrap();
+            let out = run_overflow_search(&dir, &p).unwrap();
+            assert_eq!(shown_count(&out), expected, "{mode}: {out}");
+            assert_eq!(matched_text(&out).len(), expected, "{out}");
+        }
+        let args =
+            serde_json::json!({"query": "alpha  beta", "match": "phrase", "context_lines": 0});
+        assert_eq!(
+            matched_text(&run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap()),
+            ["alpha  beta"]
+        );
+        let mut p = params("压缩的文档");
+        p.options.match_mode = MatchMode::All;
+        assert!(
+            compute_hits("压缩文档\n", &CompiledQuery::compile(&p).unwrap())
+                .0
+                .is_empty()
+        );
+        p.options.match_mode = MatchMode::Phrase;
+        assert!(
+            compute_hits("压缩文档\n", &CompiledQuery::compile(&p).unwrap())
+                .0
+                .is_empty()
+        );
+        let args = serde_json::json!({"query": "alpha beta", "match": "all", "context_lines": 0, "file_pattern": "*history*"});
+        fs::write(dir.join("overflow-history.md"), "alpha only\nbeta only\n").unwrap();
+        let out = run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap();
+        assert!(
+            out.contains("individual terms may still be present"),
+            "{out}"
+        );
+        assert!(!out.contains("every one of them came up empty"), "{out}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn kind_filters_roots_and_history_markers_and_reports_zero_hits() {
+        let dir = make_temp_dir();
+        fs::write(dir.join("overflow-history.md"), "needle raw history\nassistant_checkpoint: needle checkpoint\ncompressed_tool_round: needle projection\n[context_checkpoint path=opaque] needle marker\n[query-memory-index-v1] needle index\n[incremental-memory-v1] needle summary\n\"content\": \"assistant_checkpoint: needle json\"\nordinary needle mentions assistant_checkpoint: keep this\n").unwrap();
+        for (root, body) in [
+            (
+                "tool-overflow-compressed",
+                "assistant_checkpoint: needle genuine raw output unique_tool_only\n",
+            ),
+            ("tool-overflow", "needle live result\n"),
+            ("folded-tool-groups", "needle folded projection\n"),
+            ("internal-note-overflow", "needle internal note\n"),
+            ("summary-sources", "needle summary source\n"),
+            ("context-checkpoints", "needle checkpoint body\n"),
+            ("user-overflow-preserved", "needle user turn\n"),
+            ("image-overflow-preserved", "needle image context\n"),
+        ] {
+            fs::create_dir_all(dir.join(root)).unwrap();
+            fs::write(dir.join(root).join("source.txt"), body).unwrap();
+        }
+        let args = serde_json::json!({"query": "needle", "kind": "evidence", "context_lines": 1});
+        let out = run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap();
+        assert_eq!(shown_count(&out), 6, "{out}");
+        assert!(out.contains("genuine raw output"), "{out}");
+        assert!(
+            out.contains("ordinary needle mentions assistant_checkpoint:"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("needle checkpoint") && !out.contains("needle json"),
+            "{out}"
+        );
+        for root in [
+            "folded-tool-groups",
+            "internal-note-overflow",
+            "summary-sources",
+            "context-checkpoints",
+        ] {
+            assert!(!out.contains(root), "{root}: {out}");
+        }
+        let args = serde_json::json!({"query": "needle", "kind": "derived", "context_lines": 0});
+        let out = run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap();
+        assert_eq!(shown_count(&out), 4, "{out}");
+        let args =
+            serde_json::json!({"query": "unique_tool_only", "kind": "derived", "context_lines": 0});
+        let out = run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap();
+        assert!(out.contains("kind=derived left 0 matching lines"), "{out}");
+        assert!(out.contains("kind=derived excluded 5 file(s)"), "{out}");
+        assert!(out.contains("files scanned 4"), "{out}");
+        assert_eq!(shown_count(&out), 0, "{out}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn cross_root_duplicates_keep_raw_copies_and_report_the_count() {
+        let dir = make_temp_dir();
+        for root in [
+            "tool-overflow-compressed",
+            "tool-overflow",
+            "folded-tool-groups",
+            "internal-note-overflow",
+            "summary-sources",
+            "context-checkpoints",
+        ] {
+            fs::create_dir_all(dir.join(root)).unwrap();
+            fs::write(dir.join(root).join("copy.txt"), "alpha shared result\n").unwrap();
+        }
+        fs::write(
+            dir.join("tool-overflow-compressed/copy.txt"),
+            " alpha\t shared result \nalpha shared result\nalpha shared-result\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("tool-overflow-compressed/second.txt"),
+            "alpha shared result\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("overflow-history.md"),
+            "alpha shared result\nalpha shared result\nALPHA shared result\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({"query": "alpha", "order": "recent", "context_lines": 0});
+        let out = run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap();
+        assert_eq!(shown_count(&out), 5, "{out}");
+        assert!(out.contains("corpus total 12"), "{out}");
+        assert!(out.contains("7 duplicate line(s) collapsed"), "{out}");
+        assert!(
+            out.contains("alpha shared-result") && out.contains("ALPHA shared result"),
+            "nonidentical text must survive: {out}"
+        );
+        assert_eq!(
+            matched_text(&out)
+                .iter()
+                .filter(|line| **line == "alpha shared result")
+                .count(),
+            2,
+            "same-file and same-root copies must survive: {out}"
+        );
+        assert!(out.contains("alpha\t shared result"), "{out}");
+        for pair in [
+            ("tool-overflow", "overflow-history.md"),
+            ("overflow-history.md", "folded-tool-groups"),
+            ("folded-tool-groups", "internal-note-overflow"),
+            ("internal-note-overflow", "summary-sources"),
+            ("summary-sources", "context-checkpoints"),
+        ] {
+            let pair_dir = make_temp_dir();
+            for root in [pair.0, pair.1] {
+                let path = if root.ends_with(".md") {
+                    pair_dir.join(root)
+                } else {
+                    fs::create_dir_all(pair_dir.join(root)).unwrap();
+                    pair_dir.join(root).join("copy.txt")
+                };
+                fs::write(path, "same logical result\n").unwrap();
+            }
+            let mut p = params("same logical result");
+            p.context_lines = 0;
+            let out = run_overflow_search(&pair_dir, &p).unwrap();
+            assert_eq!(shown_count(&out), 1, "{out}");
+            assert!(out.contains("1 duplicate line(s) collapsed"), "{out}");
+            assert!(
+                out.contains(pair.0) && !out.contains(pair.1),
+                "preferred source: {out}"
+            );
+            fs::remove_dir_all(pair_dir).ok();
+        }
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn recent_evidence_phrase_recovers_the_incident_git_output_first() {
+        let dir = make_temp_dir();
+        let branch = "refs/heads/wangwenchao.129/feat/comment-driven-recoding";
+        let hash = "e2ab7c345678901234567890123456789012345678";
+        let output = format!("{hash}\t{branch}");
+        let decoy = format!("unrelated hash: {hash}");
+        assert_eq!(output.split_whitespace().count(), 2);
+        let command = format!("git ls-remote {branch}");
+        let history = dir.join("overflow-history.md");
+        fs::write(&history, format!("{}{output}\nassistant_checkpoint: reconstructed completed tool activity: {command} => {output}\n", "git generic old token\n".repeat(2_000))).unwrap();
+        fs::create_dir_all(dir.join("tool-overflow-compressed")).unwrap();
+        let raw = dir.join("tool-overflow-compressed/ls-remote.txt");
+        fs::write(
+            &raw,
+            format!("original_command: {command}\n{output}\n{decoy}\n"),
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("folded-tool-groups")).unwrap();
+        let folded = dir.join("folded-tool-groups/reasoning.md");
+        fs::write(
+            &folded,
+            format!("folded reasoning quote: `{command}` returned `{output}`\n"),
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("context-checkpoints")).unwrap();
+        fs::write(
+            dir.join("context-checkpoints/copy.md"),
+            format!("assistant_checkpoint: {command} => {output}\n"),
+        )
+        .unwrap();
+        set_mtime(&history, 1_000);
+        set_mtime(&raw, 2_000);
+        set_mtime(&folded, 3_000);
+        let noisy = run_overflow_search(&dir, &params(&command)).unwrap();
+        assert!(noisy.contains("corpus total 2006"), "{noisy}");
+        let args = serde_json::json!({"query": output, "order": "recent", "kind": "evidence", "match": "phrase", "max_results": 1, "context_lines": 0});
+        let out = run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap();
+        assert_eq!(matched_text(&out), [output.as_str()]);
+        assert!(out.contains("corpus total 2, files scanned 2"), "{out}");
+        assert!(out.contains("1 duplicate line(s) collapsed"), "{out}");
+        assert!(
+            !out.contains("folded reasoning") && !out.contains("assistant_checkpoint:"),
+            "{out}"
+        );
+        assert!(!matched_text(&out).contains(&decoy.as_str()), "{out}");
+        let mut broad_args = args;
+        broad_args["match"] = "any".into();
+        let broad = run_overflow_search(&dir, &parse_search_params(&broad_args).unwrap()).unwrap();
+        assert_eq!(
+            matched_text(&broad),
+            [decoy.as_str()],
+            "any mode must expose the newer partial-query decoy: {broad}"
+        );
+        assert!(broad.contains("corpus total 4, files scanned 2"), "{broad}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn footer_bounds_top_files_and_suggests_phrase_without_switching_defaults() {
+        let dir = make_temp_dir();
+        fs::create_dir_all(dir.join("tool-overflow-compressed")).unwrap();
+        for index in 0..6 {
+            let mut body = "git generic token\n".repeat(50 + index);
+            if index == 5 {
+                body.push_str("git refs/heads/topic resolved\n");
+            }
+            fs::write(
+                dir.join("tool-overflow-compressed")
+                    .join(format!("f{index}.txt")),
+                body,
+            )
+            .unwrap();
+        }
+        let args = serde_json::json!({"query": "git refs/heads/topic", "max_results": 1, "context_lines": 0});
+        let p = parse_search_params(&args).unwrap();
+        let out = run_overflow_search(&dir, &p).unwrap();
+        let footer = footer_block(&out);
+        assert!(footer.len() <= MAX_FOOTER_BYTES, "{footer}");
+        assert!(
+            footer.contains("corpus total 316, files scanned 6"),
+            "{footer}"
+        );
+        assert!(
+            footer.contains("match=any") && footer.contains("\"match\":\"phrase\""),
+            "{footer}"
+        );
+        assert!(
+            footer.contains("f5.txt=56") && footer.contains("f1.txt=51"),
+            "{footer}"
+        );
+        assert!(
+            !footer.contains("f0.txt"),
+            "only the top five files belong in the footer: {footer}"
+        );
+        let suggestions = footer.matches("try search_overflow(").count()
+            + footer
+                .matches("try same search_overflow call with ")
+                .count();
+        assert!((1..=2).contains(&suggestions), "{footer}");
+        assert!(footer.contains("across 1/6 file(s)"), "{footer}");
+        let huge_query = format!("git refs/heads/{}", "topic".repeat(1_000));
+        let mut p = p;
+        p.query = &huge_query;
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert!(footer_block(&out).len() <= MAX_FOOTER_BYTES, "{out}");
+        let footer = footer_block(&out);
+        let suggestions = footer.matches("try search_overflow(").count()
+            + footer
+                .matches("try same search_overflow call with ")
+                .count();
+        assert!((1..=2).contains(&suggestions), "{footer}");
+        assert!(
+            footer.contains("try same search_overflow call with "),
+            "long queries must still receive compact suggestions: {footer}"
+        );
+        assert_eq!(
+            shown_count(&out),
+            1,
+            "a long suggestion must not crowd out excerpts: {out}"
+        );
+        assert!(footer_path(&"界".repeat(500), 35).len() <= 35);
+        let mut p = params("resolved");
+        p.context_lines = 0;
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert_eq!(
+            footer_block(&out).lines().count(),
+            1,
+            "small complete results need one footer line: {out}"
+        );
+        assert!(!footer_block(&out).contains("top files:"), "{out}");
+        assert!(out.contains(SURROUNDING_CONTEXT_HINT), "{out}");
+        let mut p = params("generic");
+        p.context_lines = 0;
+        p.max_results = MAX_MATCHES;
+        p.file_pattern = Some("f0.txt");
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert_eq!(shown_count(&out), 50, "{out}");
+        assert_eq!(
+            footer_block(&out).lines().count(),
+            1,
+            "complete answers also stay compact above the large-result threshold: {out}"
+        );
+        assert!(
+            !footer_block(&out).contains("top files:") && !footer_block(&out).contains("try "),
+            "{out}"
+        );
+        assert!(
+            out.contains("across 1/1 file(s)") && out.contains(SURROUNDING_CONTEXT_HINT),
+            "{out}"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invalid_new_controls_and_phrase_regex_are_rejected() {
+        for (key, value) in [
+            ("order", "oldest"),
+            ("match", "approximate"),
+            ("kind", "raw"),
+        ] {
+            let mut args = serde_json::json!({"query": "x"});
+            args[key] = value.into();
+            assert!(
+                parse_search_params(&args)
+                    .err()
+                    .unwrap()
+                    .contains("Invalid search options")
+            );
+        }
+        let args = serde_json::json!({"query": "alpha.*beta", "match": "phrase", "is_regex": true});
+        assert!(
+            parse_search_params(&args)
+                .err()
+                .unwrap()
+                .contains("is_regex=false")
+        );
+        let args = serde_json::json!({"query": "alpha.*beta", "match": "all", "is_regex": true});
+        let p = parse_search_params(&args).unwrap();
+        assert_eq!(
+            compute_hits("alpha x beta\n", &CompiledQuery::compile(&p).unwrap())
+                .0
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn footer_preserves_the_existing_excerpt_byte_budget() {
+        let dir = make_temp_dir();
+        let body: String = (0..100)
+            .map(|index| format!("needle {index:03} {}\n", "x".repeat(550)))
+            .collect();
+        fs::write(dir.join("overflow-history.md"), body).unwrap();
+        let args = serde_json::json!({"query": "needle"});
+        let out = run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap();
+        // Forty complete 572-byte rendered lines fit the original excerpt
+        // budget; reserving extra space for a verbose footer would lose one.
+        assert_eq!(shown_count(&out), 40, "{out}");
+        assert!(matched_text(&out)[0].starts_with("needle 099 "), "{out}");
+        assert_eq!(shown_count(&out), rendered_marker_lines(&out), "{out}");
+        assert!(out.len() <= MAX_OUTPUT_CHARS, "{}", out.len());
+        assert!(
+            out.contains("across 1/1 file(s)") && out.contains(SURROUNDING_CONTEXT_HINT),
+            "default calls retain file counts and context recovery guidance: {out}"
+        );
+        assert!(
+            out.contains("lower max_results to restore context"),
+            "{out}"
+        );
+        assert!(
+            footer_block(&out)
+                .split(CONTEXT_DROP_NOTE)
+                .next()
+                .unwrap()
+                .len()
+                <= MAX_FOOTER_BYTES
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn render_rescan_preserves_explicit_matching_and_kind_filters() {
+        for (mode, replacement) in [
+            ("all", "alpha only\nbeta only\n"),
+            ("phrase", "alpha x beta\n"),
+            ("phrase", "assistant_checkpoint: alpha beta\n"),
+        ] {
+            let dir = make_temp_dir();
+            let path = dir.join("overflow-history.md");
+            fs::write(&path, "alpha beta\n").unwrap();
+            RENDER_HOOK.with(|cell| {
+                *cell.borrow_mut() = Some(Box::new(move || {
+                    fs::write(&path, replacement).unwrap();
+                }));
+            });
+            let args = serde_json::json!({"query": "alpha beta", "match": mode, "kind": "evidence", "context_lines": 0});
+            let out = run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap();
+            assert!(out.contains("file changed during search"), "{out}");
+            assert_eq!(shown_count(&out), 0, "{out}");
+            assert!(out.contains("kind=evidence left 0 matching lines"), "{out}");
+            fs::remove_dir_all(dir).ok();
+        }
     }
 
     #[test]
@@ -1888,7 +3026,10 @@ mod tests {
             p.scope = scope;
             let out = run_overflow_search(&dir, &p).unwrap();
             assert!(out.contains("context-checkpoints/opaque.md"), "{out}");
-            assert!(out.contains("2>t rare_checkpoint_keyword decision"), "{out}");
+            assert!(
+                out.contains("2>t rare_checkpoint_keyword decision"),
+                "{out}"
+            );
             p.query = "rare_tool_keyword";
             assert!(
                 run_overflow_search(&dir, &p)
@@ -2060,6 +3201,7 @@ mod tests {
             root_idx: 0,
             scan: FileScan {
                 root_idx: 0,
+                source: ArchiveSource::History,
                 display_path: path.to_string_lossy().into_owned(),
                 version: overflow_cache::FileVersion {
                     len: before.len,
@@ -2077,6 +3219,7 @@ mod tests {
             file_score: 1.0,
             scored: vec![(0, 1.0)],
             total_matches: 1,
+            duplicates_collapsed: 0,
         };
         fs::rename(&path, dir.join("saved.md")).unwrap();
         fs::write(outside.join("external.md"), "needle external_secret_body\n").unwrap();
@@ -2140,11 +3283,9 @@ mod tests {
             *cell.borrow_mut() = Some(Box::new(move || {
                 fs::write(&hook_path, "equal_needle new body\n").unwrap();
                 let file = fs::File::open(&hook_path).unwrap();
-                file.set_times(
-                    std::fs::FileTimes::new().set_modified(
-                        std::time::SystemTime::now() + std::time::Duration::from_secs(2),
-                    ),
-                )
+                file.set_times(std::fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(2),
+                ))
                 .unwrap();
             }));
         });
@@ -2340,10 +3481,17 @@ mod tests {
         // (>64), with one multi-term file to exercise ordering-sensitive
         // scoring and rendering.
         for index in 0..69 {
-            fs::write(tool_dir.join(format!("f-{index:02}.txt")), format!("needle {index}\n"))
-                .unwrap();
+            fs::write(
+                tool_dir.join(format!("f-{index:02}.txt")),
+                format!("needle {index}\n"),
+            )
+            .unwrap();
         }
-        fs::write(tool_dir.join("phrase.txt"), "needle tail\nneedle tail again\n").unwrap();
+        fs::write(
+            tool_dir.join("phrase.txt"),
+            "needle tail\nneedle tail again\n",
+        )
+        .unwrap();
         let mut p = params("needle tail");
         p.scope = SearchScope::ToolOutputs;
         p.context_lines = 0;
@@ -2354,7 +3502,10 @@ mod tests {
             serial, parallel,
             "parallel pass A must be byte-identical to the serial path"
         );
-        assert!(parallel_scan_enabled(70), "70 candidates cross the threshold");
+        assert!(
+            parallel_scan_enabled(70),
+            "70 candidates cross the threshold"
+        );
         assert!(!parallel_scan_enabled(64), "64 candidates stay serial");
         fs::remove_dir_all(&dir).ok();
     }
@@ -2439,13 +3590,17 @@ mod tests {
     #[test]
     fn flood_does_not_starve_minority_roots() {
         let dir = make_temp_dir();
-        fs::write(dir.join("overflow-history.md"), &"alpha\n".repeat(100)).unwrap();
+        fs::write(
+            dir.join("overflow-history.md"),
+            &"alpha history\n".repeat(100),
+        )
+        .unwrap();
         let tool_dir = dir.join("tool-overflow-compressed");
         fs::create_dir_all(&tool_dir).unwrap();
-        fs::write(tool_dir.join("a.txt"), &"alpha\n".repeat(100)).unwrap();
+        fs::write(tool_dir.join("a.txt"), &"alpha tool\n".repeat(100)).unwrap();
         let folded_dir = dir.join("folded-tool-groups");
         fs::create_dir_all(&folded_dir).unwrap();
-        fs::write(folded_dir.join("a.md"), &"alpha\n".repeat(100)).unwrap();
+        fs::write(folded_dir.join("a.md"), &"alpha folded\n".repeat(100)).unwrap();
         let note_dir = dir.join("internal-note-overflow");
         fs::create_dir_all(&note_dir).unwrap();
         fs::write(note_dir.join("a.md"), "alpha unique-marker\n").unwrap();
@@ -3195,7 +4350,11 @@ mod tests {
         // Pair line: alpha lead 1.9 + beta lead 1.4 (both substrings, no
         // whole-word) + full coverage 3.0 + proximity over the 5-char gap
         // 1.875 = 8.175. Single line: whole-word 2.0 + lead 2.0 = 4.0.
-        assert!((pair[0].local_score - 8.175).abs() < 1e-9, "{}", pair[0].local_score);
+        assert!(
+            (pair[0].local_score - 8.175).abs() < 1e-9,
+            "{}",
+            pair[0].local_score
+        );
         assert!(
             (single[0].local_score - 4.0).abs() < 1e-9,
             "{}",
@@ -3285,10 +4444,8 @@ mod tests {
         let new_path = tool_dir.join("new.md");
         fs::write(&old_path, "alpha marker\n").unwrap();
         fs::write(&new_path, "alpha marker\n").unwrap();
-        let old_time =
-            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
-        let new_time =
-            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000);
+        let old_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let new_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000);
         fs::File::options()
             .write(true)
             .open(&old_path)
@@ -3332,11 +4489,7 @@ mod tests {
             out.contains("context lines were dropped to fit more matches"),
             "fallback must be disclosed:\n{out}"
         );
-        assert_eq!(
-            shown_count(&out),
-            20,
-            "all bare matches must fit:\n{out}"
-        );
+        assert_eq!(shown_count(&out), 20, "all bare matches must fit:\n{out}");
         assert_eq!(
             shown_count(&out),
             rendered_marker_lines(&out),

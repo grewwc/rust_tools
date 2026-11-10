@@ -5,6 +5,14 @@ use std::path::PathBuf;
 pub(super) struct PersistableContextProjection {
     pub(super) message_range: std::ops::Range<usize>,
     pub(super) messages: Vec<Message>,
+    /// Canonical twin of `messages` cloned before digest substitution and
+    /// materialization. The persisted context snapshot must keep image content
+    /// in canonical reference form: the cross-turn digest fingerprint is
+    /// computed on that canonical content, so a snapshot storing materialized
+    /// (base64) images would miss the fingerprint on every later load and
+    /// re-send the image forever. Used only for the snapshot write; the in-turn
+    /// projection gate compares against the materialized `messages`.
+    pub(super) canonical_messages: Vec<Message>,
     pub(super) basis: crate::ai::history::ContextSnapshotBasis,
 }
 

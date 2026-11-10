@@ -19,6 +19,7 @@ function harness() {
   const context = vm.createContext({
     $: (id) => (id === "msgs" ? msgs : null),
     Date: { now: () => clock.now },
+    window: { addEventListener() {} },
   });
   vm.runInContext(script.slice(script.indexOf("let lastFoldTap"), script.indexOf("// The agent sends a phone action")), context);
   // wire() itself needs the whole page, so only its transcript registrations run.

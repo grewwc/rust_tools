@@ -1248,6 +1248,47 @@ fn locate_persistable_context(
         .map(|start| start..start + projection.messages.len())
 }
 
+/// Rewrites a mid-turn LLM summary candidate for snapshot persistence: image
+/// messages kept verbatim from the materialized projection are restored to
+/// their canonical reference form. The persisted snapshot must keep canonical
+/// content so the cross-turn digest fingerprint (computed on that form) still
+/// matches when the snapshot is loaded; a materialized (base64) snapshot would
+/// miss the fingerprint forever and re-send the image on every later turn.
+/// Messages without materialized image parts (summary text, digest text,
+/// archive pointers) pass through untouched; an image message with no matching
+/// projection entry is kept as-is rather than dropped.
+fn canonicalize_snapshot_for_persistence(
+    candidate: Vec<Message>,
+    projection: &[Message],
+    canonical: &[Message],
+) -> Vec<Message> {
+    candidate
+        .into_iter()
+        .map(|mut message| {
+            if !message_has_materialized_image(&message) {
+                return message;
+            }
+            if let Some(index) = projection.iter().position(|p| p == &message)
+                && let Some(twin) = canonical.get(index)
+            {
+                message.content = twin.content.clone();
+            }
+            message
+        })
+        .collect()
+}
+
+/// Whether a message content carries materialized inline images (`image_url`
+/// data-URI parts), the form that must not reach the persisted snapshot.
+fn message_has_materialized_image(message: &Message) -> bool {
+    let Value::Array(parts) = &message.content else {
+        return false;
+    };
+    parts
+        .iter()
+        .any(|part| part.get("type").and_then(Value::as_str) == Some("image_url"))
+}
+
 async fn apply_request_budget(
     app: &App,
     model: &str,
@@ -1341,7 +1382,14 @@ async fn apply_request_budget(
         if inserted {
             let history_file = app.session_history_file.clone();
             let basis = projection.basis;
-            let snapshot_messages = candidate_history.clone();
+            // Persist the snapshot in canonical form (see
+            // `canonicalize_snapshot_for_persistence`) so image messages keep
+            // their reference parts for cross-turn digest lookup.
+            let snapshot_messages = canonicalize_snapshot_for_persistence(
+                candidate_history.clone(),
+                &projection.messages,
+                &projection.canonical_messages,
+            );
             let snapshot_write = tokio::task::spawn_blocking(move || {
                 crate::ai::history::persist_context_snapshot_from_basis(
                     &history_file,
@@ -2991,6 +3039,7 @@ mod tests {
                 let mut projection = persistent.then(|| super::PersistableContextProjection {
                     message_range: 1..1 + history.len(),
                     messages: history.clone(),
+                    canonical_messages: history.clone(),
                     basis: basis.unwrap(),
                 });
                 // Fixed instructions cannot be mechanically trimmed. Their
@@ -3191,5 +3240,81 @@ mod tests {
         assert!(!outcome.model_called);
         assert_eq!(summarizer.calls.load(Ordering::SeqCst), 0);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn canonicalize_snapshot_for_persistence_restores_reference_images() {
+        let canonical_content = serde_json::json!([
+            {"type": "reference", "kind": "image", "name": "shot.png", "asset": "assets/shot.png"},
+            {"type": "text", "text": "what is shown?"}
+        ]);
+        let materialized_content = serde_json::json!([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "text", "text": "what is shown?"}
+        ]);
+        let digest_text_content = serde_json::json!([{"type": "text", "text": "digest"}]);
+        let projection = vec![
+            Message {
+                role: "user".to_string(),
+                content: materialized_content.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: digest_text_content.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+        let canonical = vec![
+            Message {
+                role: "user".to_string(),
+                content: canonical_content.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: digest_text_content.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+        let candidate = vec![
+            // Verbatim copy of the materialized image message: must be restored
+            // to the canonical reference form.
+            Message {
+                role: "user".to_string(),
+                content: materialized_content,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            // Digest-substituted messages carry no image parts: pass through.
+            Message {
+                role: "user".to_string(),
+                content: digest_text_content,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            // New summary text: pass through untouched.
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("summary text"),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+        let out = super::canonicalize_snapshot_for_persistence(candidate, &projection, &canonical);
+        assert_eq!(out[0].content, canonical_content);
+        assert_eq!(out[1].content, serde_json::json!([{"type": "text", "text": "digest"}]));
+        assert_eq!(out[2].content, serde_json::json!("summary text"));
     }
 }

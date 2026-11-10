@@ -828,7 +828,11 @@ fn context_projection_fingerprint(
     // v23: incremental model summaries consume bounded chronological segments,
     // retain original source ranges, and abort when any segment fails.
     // v24: archived tool arguments expose recovery metadata without payload previews.
-    const PROJECTION_VERSION: u8 = 24;
+    // v25: persisted snapshots keep image content in canonical reference form
+    // instead of materialized inline images, so cross-turn digest fingerprints
+    // still match on snapshot-covered loads. Snapshots built under v24 (or
+    // earlier) may carry baked base64 image data and must be rebuilt.
+    const PROJECTION_VERSION: u8 = 25;
     projection_cache_key(
         PROJECTION_VERSION,
         history_max_chars,

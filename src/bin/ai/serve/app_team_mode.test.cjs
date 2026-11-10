@@ -134,6 +134,8 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
     sendBusy: false, promptComposing: false, pendingImages: [],
     turns: new Map(), MAX_LIVE_TURNS: 4, historySession: sid, canonicalHistoryTotal: 0,
     pendingUserInputs: new Map(), questionCache: null, runEpoch: 0, turnRunning: false,
+    turnRunningAt: 0, RUNNING_SAMPLE_TTL_MS: 60000,
+    eventActive: false, eventSession: "", eventStreamEnded: false, staleSession: "", staleDone: false,
     confirmPollSeq: 0, lastHistoryEndsUnanswered: false, LIVE_STALL_MS: 60000,
     validateSkillInput: () => true,
     captureSkillPick: () => ({ skills }), consumeSkillPick: (pick) => consumed.push(pick),
@@ -180,6 +182,9 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
   vm.runInContext(marked("session switch"), context);
   vm.runInContext(marked("composer cd command"), context);
   vm.runInContext(marked("turn session preparation"), context);
+  vm.runInContext(existingFunction("function isTurnRunning()", "// The one send/stop button"), context);
+  vm.runInContext(existingFunction("const RATE_STORAGE =", "function addFold("), context);
+  vm.runInContext(existingFunction("function setAnswerRate(", "// Only completed answer bubbles"), context);
   vm.runInContext(marked("composer send"), context);
   context.wireTeamMode();
   return {
@@ -410,6 +415,59 @@ test("first send creates a session and waits for config success before the actua
   assert.deepEqual(h.turns()[0].body, { prompt: "一起完成这个任务", confirm: true, skills: ["review"], model: "main-model" });
   assert.equal(h.state().pending, false);
   assert.equal(h.consumed.length, 1);
+});
+
+for (const state of ["replay", "server", "stale", "live"]) test(`button and keyboard sends share the running guard (${state})`, async () => {
+  const h = harness(), c = h.context;
+  let aborted = 0, stopped = 0, keydown;
+  Object.assign(c, { eventAbort: { abort() { aborted++; } }, recoveredView: null,
+    stopTurn() { stopped++; },
+  });
+  vm.runInContext(existingFunction("function abortEvents()", "async function pollConfirm()"), c);
+  if (state === "replay") Object.assign(c, { eventActive: true, eventSession: "alpha", staleDone: true });
+  if (state === "server") Object.assign(c, { turnRunning: true, turnRunningAt: Date.now() });
+  if (state === "stale") Object.assign(c, { staleSession: "alpha", staleDone: true });
+  if (state === "live") c.turns.set("alpha", {});
+  const images = c.pendingImages = [{ filename: "draft.png", data_base64: "image" }];
+  const draft = h.elements.prompt.value;
+  h.elements.send = {};
+  h.elements.prompt.addEventListener = (_, listener) => { keydown = listener; };
+  vm.runInContext(existingFunction('$("send").onclick =', '$("sidenote").onclick ='), c);
+  vm.runInContext(existingFunction('$("prompt").addEventListener("keydown"', "const toggleSessions ="), c);
+  h.elements.send.onclick();
+  assert.equal(stopped, 1, "the button must stop the active turn");
+  await c.send();
+  for (const modifier of ["ctrlKey", "metaKey"]) {
+    let prevented = false;
+    keydown({ key: "Enter", [modifier]: true, preventDefault() { prevented = true; } });
+    await settle();
+    assert.equal(prevented, true);
+  }
+  assert.equal(h.turns().length, 0);
+  assert.equal(aborted, 0, "blocked submission must preserve the active event feed");
+  assert.equal(h.elements.prompt.value, draft);
+  assert.equal(c.pendingImages, images);
+  c.turns.clear();
+  Object.assign(c, { eventActive: false, eventSession: "", staleSession: "", eventStreamEnded: true });
+  keydown({ key: "Enter", ctrlKey: true, preventDefault() {} });
+  await settle();
+  assert.equal(h.turns().length, 1, "keyboard submission unlocks after true completion");
+});
+
+test("a replay that starts during async send setup prevents the turn POST and preserves the draft", async () => {
+  const h = harness(), c = h.context, ready = deferred();
+  const draft = h.elements.prompt.value;
+  c.ensureTeamConfig = () => ready.promise;
+  let aborted = false;
+  c.abortEvents = () => { aborted = true; };
+  const sending = c.send();
+  await settle();
+  Object.assign(c, { eventActive: true, eventSession: "alpha", staleDone: true });
+  ready.resolve(true);
+  await sending;
+  assert.equal(h.turns().length, 0);
+  assert.equal(h.elements.prompt.value, draft);
+  assert.equal(aborted, false);
 });
 
 test("failed config blocks the first turn, retains selection, text, images and skills, and can retry", async () => {

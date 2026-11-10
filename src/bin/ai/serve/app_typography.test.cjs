@@ -38,7 +38,7 @@ test("the default reading weight is a token, and it outranks the font shorthand"
 test("the secondary chrome keeps the Regular weight", () => {
   const rule = style.match(/([^{}]*)\{([^}]*font-weight:\s*var\(--fw-meta\)[^}]*)\}/);
   assert.ok(rule, "no rule assigns the secondary weight");
-  for (const selector of ["#info", "#sessmeta", "#turnstatus", ".msg details", ".msg .prog"]) {
+  for (const selector of ["#info", "#sessmeta", ".msg details", ".msg .prog"]) {
     assert.ok(rule[1].includes(selector), "the secondary weight misses " + selector);
   }
 });

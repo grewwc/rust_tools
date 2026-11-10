@@ -585,7 +585,24 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             // (not the tool round's short narration) can suppress that redraw in the
             // next round's terminal dedupe. Only fill the slot when it is empty.
             if terminal_dedupe_candidate.is_none() {
-                *terminal_dedupe_candidate = tool_round_candidate;
+                *terminal_dedupe_candidate = tool_round_candidate.clone();
+            }
+            // Serve web UI renders only committed assistant messages: intermediate
+            // tool-round bodies are streamed as provisional deltas but never
+            // committed, so a long waiting turn (e.g. task_wait loops) leaves the
+            // user with no visible reply. Commit this round's visible body
+            // (digest/audit already projected out) so the web UI shows
+            // intermediate progress. The force-final no-tool retry path is
+            // excluded: finalize commits that body once with its warning appended.
+            if should_commit_tool_round_body_for_serve(
+                &tool_round_candidate,
+                *force_final_response,
+                iteration,
+                max_iterations,
+                final_gate_state.no_tool_retry_consumed(),
+            ) && let Some(visible_text) = tool_round_candidate.as_deref()
+            {
+                crate::ai::background::publish_committed_serve_output(visible_text);
             }
             append_auto_image_followup_message(
                 app,
@@ -735,4 +752,22 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             Ok(TurnLoopStep::Continue)
         }
     }
+}
+
+/// Whether this tool round's visible body should be committed to serve clients
+/// as a provisional reply. Serve web UI renders only committed assistant
+/// messages, so a long waiting turn (e.g. task_wait loops) would otherwise
+/// leave the user with no visible reply. The force-final no-tool retry path is
+/// excluded: finalize commits that body exactly once with its warning
+/// appended, so an intermediate commit would duplicate it.
+fn should_commit_tool_round_body_for_serve(
+    tool_round_candidate: &Option<String>,
+    force_final_response: bool,
+    iteration: usize,
+    max_iterations: usize,
+    no_tool_retry_consumed: bool,
+) -> bool {
+    crate::ai::background::serve_live_streaming()
+        && !(force_final_response && iteration < max_iterations && no_tool_retry_consumed)
+        && tool_round_candidate.is_some()
 }
