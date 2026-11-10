@@ -293,6 +293,12 @@ select, summary { touch-action:manipulation; }
 .msg .task-output .task-identity, .msg .task-output .task-count { color:var(--fg); }
 .msg .task-output .task-progress { padding-inline-start:12px; }
 .msg .task-output .task-error { color:var(--err); }
+/* Task rows carry their own display so they stay readable while the fold is
+   open; that rule would also keep them painted when it closes, because an
+   author display beats the engine's collapsed-content default. Only the task
+   list is narrowed this way: other children of a fold (the turn rate footer
+   among them) must keep the engine's collapsed-content behaviour. */
+.msg details:not([open]) > .task-output { display:none; }
 .msg.err { border-color:var(--err); color:var(--err); }
 #ovr { display:flex; gap:8px; padding:10px 12px 0; }
 /* Agent and effort keep their value in a hidden select (session config, the
@@ -5122,12 +5128,7 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
       hideConfirm();
       if (isPhoneLayout()) setDrawer(false);
       pollConfirm();
-      // An explicit pick enters the transcript: land on its newest turn even
-      // when this session's earlier scroll offset is still remembered.
-      Promise.resolve(loadHistory()).then(
-        () => { if (sessionId === s.id) scrollToLatest(false); },
-        () => {},
-      );
+      Promise.resolve(loadHistory()).catch(() => {});
       loadSessionConfig();
     };
     ul.appendChild(li);
@@ -6562,7 +6563,20 @@ async function attachEvents() {
   try {
     // This connection builds a fresh view; a cursor from a discarded view
     // would skip the very events needed to reconstruct its state.
-    const eventsUrl = store.base + "/sessions/" + sid + "/events?after=0";
+    // The endpoint hands its live slot to one token and answers 409 to every
+    // other, so an anonymous attach is a new identity on each reconnect: a
+    // refresh or resumed stream would be refused, dropping the rates and
+    // subagent progress that only arrive on this stream.
+    let clientToken = "c-ephemeral";
+    try {
+      clientToken = localStorage.getItem("serve.client") || "";
+      if (!clientToken) {
+        clientToken = "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+        localStorage.setItem("serve.client", clientToken);
+      }
+    } catch (_) {}
+    const eventsUrl = store.base + "/sessions/" + sid + "/events?after=0&client=" +
+      encodeURIComponent(clientToken);
     const res = await fetch(eventsUrl, {
       headers: headers(false), signal: controller.signal,
     });

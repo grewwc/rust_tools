@@ -611,6 +611,41 @@ fn decoder_passes_input_frames_through() {
 /// connection dropped": it re-attaches every couple of seconds, and each
 /// attempt tears down and rebuilds its progress view.
 #[tokio::test]
+async fn session_events_stream_allows_a_read_only_follower() {
+    use super::EventsQuery;
+    use axum::body::to_bytes;
+    use axum::extract::{Path, Query, State};
+
+    let state = lifecycle_test_state();
+    let log = state.events.begin("s-shared");
+    log.publish("thinking", r#"{"text":"hi"}"#);
+    log.finish();
+    claim_web_session(&state, "s-shared", "owner").expect("claim owner");
+
+    // A phone or a second tab tails the same log without claiming the session.
+    let response = stream_session_events(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path("s-shared".to_string()),
+        Query(EventsQuery {
+            after: 0,
+            client: "follower".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "a follower must be able to tail the log");
+    let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("event: thinking"), "{text}");
+
+    // Mutation keeps one owner: the follower cannot claim the session.
+    assert!(
+        claim_web_session(&state, "s-shared", "follower").is_err(),
+        "a second client must not take over a session for writing"
+    );
+}
+
+#[tokio::test]
 async fn session_events_stream_ends_with_the_terminal_marker() {
     use super::EventsQuery;
     use axum::body::to_bytes;

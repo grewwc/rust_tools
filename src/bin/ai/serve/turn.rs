@@ -340,9 +340,11 @@ pub(crate) async fn get_confirm(
 pub(crate) struct EventsQuery {
     #[serde(default)]
     pub(crate) after: u64,
-    /// Stable per-tab token. The first token to claim a session owns its open
-    /// slot; a second token gets 409 instead of a second live view.
+    /// Accepted for compatibility with clients that identify themselves. The
+    /// event stream is read-only, so any authenticated client may follow a
+    /// session; ownership is enforced only where a request mutates it.
     #[serde(default)]
+    #[allow(dead_code)]
     pub(crate) client: String,
 }
 
@@ -351,7 +353,6 @@ pub(crate) struct ClientQuery {
     pub(crate) client: String,
 }
 
-static NEXT_ANON: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct AttachState {
     log: Arc<SessionEventLog>,
@@ -373,18 +374,11 @@ pub(crate) async fn stream_session_events(
     if SessionStore::validate_session_id(&id).is_err() {
         return bad_request(format!("invalid session id: {id}")).into_response();
     }
-    let client = if query.client.trim().is_empty() {
-        format!(
-            "anon-{}-{}",
-            std::process::id(),
-            NEXT_ANON.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        )
-    } else {
-        query.client.clone()
-    };
-    if let Err(message) = verify_web_session(&state, &id, &client) {
-        return (axum::http::StatusCode::CONFLICT, message).into_response();
-    }
+    // Read-only follower: attach regardless of who owns the session. Refusing a
+    // second viewer here is what left a phone without live events (no rate, no
+    // subagent progress) whenever another browser already held the session.
+    // Writes stay single-owner: `open_session`, `heartbeat_session` and
+    // `release_session` still verify the claiming token.
     let Some((backlog, running, log)) = state.events.snapshot(&id, query.after) else {
         // Nothing to attach to: this session has no event log because no turn
         // ever ran, or the log was retired. Close the stream with the same

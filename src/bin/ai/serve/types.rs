@@ -138,27 +138,6 @@ pub(crate) fn release_web_session(state: &ServeState, session_id: &str, client: 
     }
 }
 
-#[cfg(feature = "serve")]
-pub(crate) fn verify_web_session(
-    state: &ServeState,
-    session_id: &str,
-    client: &str,
-) -> Result<(), String> {
-    let sessions = state
-        .open_sessions
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match sessions.get(session_id) {
-        Some(entry) if entry.owner == client && entry.expires_at > std::time::Instant::now() => {
-            Ok(())
-        }
-        Some(_) => Err(format!(
-            "session '{session_id}' is already open in another terminal or browser"
-        )),
-        None => Err(format!("session '{session_id}' is not open")),
-    }
-}
-
 /// One retained SSE event from a running turn.
 #[cfg(feature = "serve")]
 #[derive(Debug, Clone)]

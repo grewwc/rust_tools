@@ -678,7 +678,7 @@ test("a reattach rebuilds fresh DOM from the retained log on every connection", 
       return { ok: true, body: { getReader: () => ({ async read() {
         if (!read) {
           read = true;
-          const events = url.endsWith("after=0") ? 'id: 41\nevent: thinking\ndata: {"text":"restored"}\n\n' : "";
+          const events = url.includes("/events?after=0&client=") ? 'id: 41\nevent: thinking\ndata: {"text":"restored"}\n\n' : "";
           return { value: new TextEncoder().encode(events), done: false };
         }
         statuses.push(h.msgs.children.at(-1).children.at(-1).textContent);
@@ -691,7 +691,7 @@ test("a reattach rebuilds fresh DOM from the retained log on every connection", 
   await c.attachEvents();
   assert.deepEqual(statuses, ["Thinking… · 0:00", "Thinking… · 0:00"]);
   assert.equal(urls.length, 2);
-  assert.ok(urls.every((url) => url.endsWith("after=0")));
+  assert.ok(urls.every((url) => url.includes("/events?after=0&client=")), "each connection replays from the start under this client");
 });
 
 for (const headersOnly of [true, false]) test(`a stalled event stream reconnects without switching screens (headers=${headersOnly})`, async () => {
@@ -704,10 +704,34 @@ for (const headersOnly of [true, false]) test(`a stalled event stream reconnects
   h.fire(2000);
   await h.settle();
   assert.equal(h.requests.length, 2);
-  assert.ok(h.requests.every((r) => r.url.endsWith("/events?after=0")), "only GET replay is retried, never the user POST");
+  assert.ok(h.requests.every((r) => r.url.includes("/events?after=0&client=")), "only GET replay is retried, never the user POST");
+  assert.equal(
+    new URL(h.requests[0].url).searchParams.get("client"),
+    new URL(h.requests[1].url).searchParams.get("client"),
+    "a reconnect reattaches as the same client instead of a new anonymous one",
+  );
   h.c.abortEvents();
   await h.settle();
   assert.equal(h.timers.size, 0);
+});
+
+test("a reattached page names the same client so the stream is not refused", async () => {
+  const h = attachmentHarness();
+  const pending = h.c.attachEvents();
+  await h.settle();
+  const first = new URL(h.requests.at(-1).url).searchParams.get("client");
+  assert.ok(first && first.length > 3, "the attach names its client");
+  h.c.abortEvents();
+  await h.settle();
+  h.c.attachEvents();
+  await h.settle();
+  assert.equal(
+    new URL(h.requests.at(-1).url).searchParams.get("client"),
+    first,
+    "the second attach keeps the identity the server already granted",
+  );
+  h.c.abortEvents();
+  await pending;
 });
 
 test("replay heartbeats renew liveness without timing out a pending confirmation", async () => {
@@ -2402,4 +2426,14 @@ test("a feed that dies mid-turn reattaches to the retained event stream", () => 
   assert.match(tail, /wentStale/, "the stale path must be marked");
   assert.match(tail, /attachEvents\(\)/, "the stale path must reattach to the retained stream");
   assert.match(tail, /box\.remove\(\)/, "the dead live box must be replaced by the reattached view");
+});
+
+test("a collapsed fold hides its task rows even though they set their own display", () => {
+  // The task row list carries `display:flex` so rows stay readable while the
+  // fold is open. An author display also beats the engine's collapsed-content
+  // default, which left the subagent card looking uncollapsible.
+  assert.match(html, /\.msg details:not\(\[open\]\) > \.task-output \{ display:none; \}/);
+  // The turn rate footer lives inside the same fold on restored turns, so the
+  // narrowing above must not be widened into a blanket child rule.
+  assert.doesNotMatch(html, /details:not\(\[open\]\) > \*:not\(summary\)/);
 });
