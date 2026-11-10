@@ -18,6 +18,9 @@ fn print_commands_help() {
         crate::ai::tools::task_tools::backends::backend_registry().use_usage()
     );
     println!(
+        "    /subagent [\\n<task>]     set the subagent backend and worker model only (never sticky skills or runtime mode); bare /subagent shows state"
+    );
+    println!(
         "    /reset                    return to the default backend; clear worker model override and sticky agent-team (no arguments)"
     );
     println!("    /theme [name]             list or switch terminal themes live (session-only)");

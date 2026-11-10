@@ -162,6 +162,8 @@ const INTERNAL_COMMANDS: &[&str] = &[
     ":model",
     "/use",
     ":use",
+    "/subagent",
+    ":subagent",
     "/reset",
     ":reset",
     "/audit",
@@ -1347,7 +1349,9 @@ fn generate_bash(
     // COMP_WORDS[0] is the command name a; internal commands live in COMP_WORDS[1].
     println!("  if [ \"$COMP_CWORD\" -ge 2 ]; then");
     println!("    case \"${{COMP_WORDS[1]}}\" in");
-    println!("      /use|:use)");
+    // `/subagent` shares the backend/worker-model grammar with `/use`, but it
+    // never changes sticky skills, so both share one completion block.
+    println!("      /use|:use|/subagent|:subagent)");
     println!("        if [ \"$COMP_CWORD\" -eq 2 ]; then");
     let use_backends = crate::ai::tools::task_tools::backends::backend_registry()
         .use_names()
@@ -1656,7 +1660,9 @@ fn generate_zsh(
     println!("    _a_subcmd_owner=\"$words[2]\"");
     println!("  fi");
     println!("  case \"$_a_subcmd_owner\" in");
-    println!("      /use|:use)");
+    // `/subagent` shares the backend/worker-model grammar with `/use`, but it
+    // never changes sticky skills, so both share one completion block.
+    println!("      /use|:use|/subagent|:subagent)");
     println!("        if (( CURRENT <= 3 )); then");
     println!("          compadd -S ' ' -- \"${{_a_use_backends[@]}}\"");
     for descriptor in backend_model_completion_descriptors() {
@@ -1787,7 +1793,7 @@ end
         .use_names()
         .join(" ");
     println!(
-        "complete -c a -n '__fish_seen_subcommand_from /use :use; and test (count (commandline -opc)) -eq 2' -f -a '{use_backends}' -d 'subagent backend'"
+        "complete -c a -n '__fish_seen_subcommand_from /use :use /subagent :subagent; and test (count (commandline -opc)) -eq 2' -f -a '{use_backends}' -d 'subagent backend'"
     );
     for descriptor in backend_model_completion_descriptors() {
         let backend = backend_completion_key(descriptor);
@@ -1797,9 +1803,11 @@ end
             .worker_model_label
             .unwrap_or(descriptor.text.display_name)
             .replace('\'', "'\\''");
-        println!(
-            "complete -c a -n '__fish_seen_subcommand_from /use :use; and __fish_seen_subcommand_from {names}; and test (count (commandline -opc)) -eq 3' -f -a '(__a_{backend}_models)' -d '{label}'"
-        );
+        for command in ["/use", ":use", "/subagent", ":subagent"] {
+            println!(
+                "complete -c a -n '__fish_seen_subcommand_from {command}; and __fish_seen_subcommand_from {names}; and test (count (commandline -opc)) -eq 3' -f -a '(__a_{backend}_models)' -d '{label}'"
+            );
+        }
     }
     for (name, ty, usage, aliases) in info {
         let escaped = usage.replace('\'', "'\\''");

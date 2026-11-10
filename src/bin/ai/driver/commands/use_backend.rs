@@ -93,6 +93,36 @@ pub(crate) fn reset_subagent_config(config: &mut SessionServeConfig) {
         .retain(|name| !name.eq_ignore_ascii_case("agent-team"));
 }
 
+/// Apply a subagent-only preference: the same backend validation as `/use`, but
+/// never the sticky agent-team skill. `/subagent` therefore never changes the
+/// runtime mode (skill set, task-family gating) — it only steers which backend
+/// spawns subagents and which worker model that backend uses.
+pub(crate) fn apply_subagent_preference(
+    config: &mut SessionServeConfig,
+    name: &str,
+    model: Option<&str>,
+) -> Result<(), String> {
+    let Some(backend) = backend_registry().use_id(name) else {
+        return Err(format!(
+            "Unknown backend '{name}'. Usage: {}",
+            backend_registry().use_usage()
+        ));
+    };
+    let implementation = backend.resolve();
+    let descriptor = implementation.descriptor();
+    if model.is_some() && !descriptor.supports_worker_model {
+        return Err(format!(
+            "{} does not take a worker model. Usage: /subagent {}",
+            descriptor.text.display_name, descriptor.use_names[0]
+        ));
+    }
+    config.subagent_backend = Some(backend.as_str().to_string());
+    if let Some(model) = model {
+        config.subagent_model = Some(model.to_string());
+    }
+    Ok(())
+}
+
 pub(crate) fn format_use_state(config: &SessionServeConfig, kernel_model: &str) -> String {
     let backend = effective_subagent_backend(config);
     let mut output = format!("Session default subagent backend: {}\n", backend.as_str());
@@ -208,6 +238,64 @@ fn parse_reset_command(input: &str) -> Option<Result<(), &'static str>> {
     Some(validate_reset_arguments(
         &normalized.trim_start()["reset".len()..],
     ))
+}
+
+/// `/subagent <backend> [model]`: a subagent-only preference. It parses like
+/// `/use` but applies through [`apply_subagent_preference`], so it never adds or
+/// removes sticky skills and never changes the runtime mode.
+pub(crate) fn try_handle_subagent_command(
+    app: &mut App,
+    input: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+    let (command_line, prompt) = trimmed
+        .split_once('\n')
+        .map_or((trimmed, None), |(head, tail)| {
+            (head.trim(), Some(tail.trim_start()))
+        });
+    let normalized = if let Some(rest) = command_line.strip_prefix('/') {
+        rest
+    } else if let Some(rest) = command_line.strip_prefix(':') {
+        rest
+    } else {
+        return Ok(false);
+    };
+    let mut parts = normalized.split_whitespace();
+    if parts.next() != Some("subagent") {
+        return Ok(false);
+    }
+    let (arg, model) = match parse_use_arguments(&normalized.trim_start()["subagent".len()..]) {
+        Ok(args) => args,
+        Err(usage) => {
+            println!("{usage}");
+            return Ok(true);
+        }
+    };
+    let Some(arg) = arg else {
+        print_use_state(app);
+        if prompt.is_some_and(|prompt| !prompt.is_empty()) {
+            app.forced_question = prompt.map(str::to_string);
+        }
+        return Ok(true);
+    };
+    let mut config = app_subagent_config(app);
+    if let Err(usage) = apply_subagent_preference(&mut config, arg, model) {
+        println!("{usage}");
+        return Ok(true);
+    }
+    // The subagent preference never touches the runtime mode, so the applied
+    // config keeps the session's sticky skills exactly as they were.
+    config.default_skills = app.session_default_skills.clone();
+    apply_app_subagent_config(app, config);
+    super::session::persist_session_runtime_state(app);
+    print_use_state(app);
+    if prompt.is_some_and(|prompt| !prompt.is_empty()) {
+        app.forced_question = prompt.map(str::to_string);
+    }
+    Ok(true)
 }
 
 pub(crate) fn validate_reset_arguments(args: &str) -> Result<(), &'static str> {
@@ -389,6 +477,52 @@ mod tests {
         assert_eq!(app.session_default_skills, ["agent-team"]);
         assert!(app.session_default_subagent_model.is_none());
         assert!(app.pending_skill_continuation.is_none());
+    }
+
+    #[test]
+    fn subagent_command_changes_only_the_subagent_preference() {
+        let mut app = test_app();
+        app.session_default_skills = vec!["first-skill".to_string()];
+        app.pending_skill_continuation = Some(crate::ai::types::PendingSkillContinuation {
+            skill_names: vec!["agent-team".to_string()],
+        });
+        app.current_model = "parent-model".to_string();
+        for command in ["/subagent traecli GPT-5.5", ":subagent traecli"] {
+            assert!(try_handle_subagent_command(&mut app, command).unwrap());
+            assert_eq!(app.session_default_subagent_backend, BackendId::TRAECLI);
+            assert_eq!(
+                app.session_default_subagent_model.as_deref(),
+                Some("GPT-5.5")
+            );
+            // Unlike `/use`, this command never touches sticky skills, the
+            // continuation, or the turn model.
+            assert_eq!(app.session_default_skills, ["first-skill"]);
+            assert_eq!(
+                app.pending_skill_continuation.as_ref().unwrap().skill_names,
+                ["agent-team"]
+            );
+            assert_eq!(app.current_model, "parent-model");
+        }
+        assert!(try_handle_subagent_command(&mut app, "/subagent kernel").unwrap());
+        assert_eq!(app.session_default_subagent_backend, BackendId::KERNEL);
+        assert_eq!(app.session_default_skills, ["first-skill"]);
+    }
+
+    #[test]
+    fn subagent_command_rejects_invalid_arguments_without_changing_state() {
+        let mut app = test_app();
+        app.session_default_skills = vec!["first-skill".to_string()];
+        assert!(try_handle_subagent_command(&mut app, "/subagent unknown").unwrap());
+        assert_eq!(app.session_default_subagent_backend, BackendId::KERNEL);
+        assert_eq!(app.session_default_skills, ["first-skill"]);
+        // A backend without worker models refuses a model argument.
+        assert!(try_handle_subagent_command(&mut app, "/subagent kernel GPT-5.5").unwrap());
+        assert_eq!(app.session_default_subagent_backend, BackendId::KERNEL);
+        assert!(app.session_default_subagent_model.is_none());
+        // Bare `/subagent` is read-only state, and other input is not ours.
+        assert!(try_handle_subagent_command(&mut app, "/subagent").unwrap());
+        assert!(!try_handle_subagent_command(&mut app, "/subagents traecli").unwrap());
+        assert!(!try_handle_subagent_command(&mut app, "plain prompt").unwrap());
     }
 
     #[test]

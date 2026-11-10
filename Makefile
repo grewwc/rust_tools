@@ -13,70 +13,67 @@ $(INSTALL_BINS): install ; @:
 # release builds.
 RELEASE_FEATURES := serve
 
+# Features for a plain `install`. `a` needs serve-client for `a --serve-chat`;
+# the feature has cfg gates only inside src/bin/ai, so all other bins build
+# identical binaries and the whole install fits in one cargo invocation.
+INSTALL_FEATURES := serve-client
+
 RELEASE_DIR := target/release
-DEBUG_DIR := target/debug
-INSTALLW := $(DEBUG_DIR)/installw
-CargoLock := $(wildcard Cargo.lock)
-INSTALLW_DEPS := $(shell find src -type f -name '*.rs') Cargo.toml $(CargoLock)
 
 $(RELEASE_DIR)/%: src/bin/%.rs
 	cargo build --release --bin $*
 
-# mcp_* have no src/bin/*.rs prerequisite; build them from the workspace root.
-# Give each target its own crate's sources only, so touching one crate does not
-# re-trigger the recipes of the others (cargo still skips no-op rebuilds).
-# mcp_pdf links the root lib (crates/mcp_pdf/Cargo.toml), so it also watches the
-# root crate's sources; mcp_browser/mcp_excel do not depend on the root lib.
-$(RELEASE_DIR)/mcp_browser: $(shell find crates/mcp_browser -type f -name '*.rs') Cargo.toml
+# `all` is a manual convenience target; install/install-all do not use these
+# targets — their recipes build everything in one cargo invocation, so cargo
+# itself decides what is stale (no mtime prerequisites, so a touched
+# Cargo.toml no longer re-fires the recipes). mcp_* have no src/bin/*.rs
+# prerequisite; each target watches only its own crate's sources, plus the
+# root crate's sources for mcp_pdf/mcp_computer, which link the root lib
+# (mcp_browser/mcp_excel do not).
+$(RELEASE_DIR)/mcp_browser: $(shell find crates/mcp_browser -type f -name '*.rs')
 	cargo build --release -p mcp_browser --bin mcp_browser
 
-$(RELEASE_DIR)/mcp_computer: $(shell find crates/mcp_computer -type f -name '*.rs') Cargo.toml
+$(RELEASE_DIR)/mcp_computer: $(shell find crates/mcp_computer -type f -name '*.rs') $(shell find src -type f -name '*.rs')
 	cargo build --release -p mcp_computer --bin mcp_computer
 
-$(RELEASE_DIR)/mcp_excel: $(shell find crates/mcp_excel -type f -name '*.rs') Cargo.toml
+$(RELEASE_DIR)/mcp_excel: $(shell find crates/mcp_excel -type f -name '*.rs')
 	cargo build --release -p mcp_excel --bin mcp_excel
 
-$(RELEASE_DIR)/mcp_pdf: $(shell find crates/mcp_pdf -type f -name '*.rs') $(shell find src -type f -name '*.rs') Cargo.toml
+$(RELEASE_DIR)/mcp_pdf: $(shell find crates/mcp_pdf -type f -name '*.rs') $(shell find src -type f -name '*.rs')
 	cargo build --release -p mcp_pdf --bin mcp_pdf
 
 all: $(addprefix $(RELEASE_DIR)/,$(ALL_BINS))
 
-$(INSTALLW): $(INSTALLW_DEPS)
-	cargo build --bin installw
-
-# `re` lives in crates/re, not src/bin/, so installw's build mode (which
-# resolves src/bin/<bin>.rs dependencies) never emits it; build it explicitly
-# and let move_executable.sh's install mode decide whether to re-copy.
-# bin `a` always builds with `serve-client` so `a --serve-chat` works out of
-# the box; the axum server still needs `install-all` (`serve`). `a` builds
-# separately because `--features` cannot mix with `-p` crate builds.
+# Every install builds everything in ONE release cargo invocation:
+# - cargo itself decides what is stale (fingerprints), so nothing rebuilds on
+#   a no-op run and there are no mtime prerequisites to go stale (a touched
+#   Cargo.toml used to re-fire the mcp_* targets).
+# - one invocation means the root lib compiles once per install; the old
+#   split (a with serve-client, then re/mcp_* and the other bins without)
+#   compiled it twice per install. `--bins` selects all rust_tools bins, so
+#   no `--bin`/`-p` mixing is needed; `rust_tools/<feature>` is the syntax
+#   cargo accepts for features of a package other than the first `-p`.
+# - re and the mcp_* crates have no src/bin/*.rs, so their staleness (e.g. a
+#   changed Cargo.lock) is only detectable by cargo; that is why the
+#   invocation runs even when nothing else is stale.
+# A targeted `make install fk` keeps its own (root-bins-only) invocation so
+# it builds just the requested bins; the requested mcp_* crates build in a
+# second invocation because `--bin` (rust_tools) and `-p` (crate) cannot mix.
 .PHONY: install
-install: $(INSTALLW) $(addprefix $(RELEASE_DIR)/,$(MCP_BINS))
+install:
 	$(eval REQUESTED := $(filter-out install,$(MAKECMDGOALS)))
-	$(eval BINS := $(or $(REQUESTED),$(INSTALL_BINS)))
 	@set -e; \
 	if [ -n "$(REQUESTED)" ]; then \
-		args=""; with_a=""; \
-		for b in $(BINS); do \
-			if [ "$$b" = "a" ]; then with_a="yes"; continue; fi; \
-			case "$$b" in mcp_browser|mcp_computer|mcp_excel|mcp_pdf) args="$$args -p $$b --bin $$b";; *) args="$$args --bin $$b";; esac; \
+		root_args=""; mcp_args=""; \
+		for b in $(REQUESTED); do \
+			case "$$b" in mcp_browser|mcp_computer|mcp_excel|mcp_pdf) mcp_args="$$mcp_args -p $$b";; *) root_args="$$root_args --bin $$b";; esac; \
 		done; \
-		if [ -n "$$with_a" ]; then cargo build --release --features serve-client --bin a; fi; \
-		if [ -n "$$args" ]; then cargo build --release $$args; fi; \
-		sh ./move_executable.sh --force $(BINS); \
+		if [ -n "$$root_args" ]; then cargo build --release --features rust_tools/$(INSTALL_FEATURES) $$root_args; fi; \
+		if [ -n "$$mcp_args" ]; then cargo build --release --features rust_tools/$(INSTALL_FEATURES) $$mcp_args; fi; \
+		sh ./move_executable.sh --force $(REQUESTED); \
 	else \
-		bins=$$($(INSTALLW) -- $(BINS)); \
-		if [ -n "$$bins" ]; then \
-			args=""; with_a=""; \
-			for b in $$bins; do \
-				if [ "$$b" = "a" ]; then with_a="yes"; continue; fi; \
-				case "$$b" in mcp_browser|mcp_computer|mcp_excel|mcp_pdf) args="$$args -p $$b --bin $$b";; *) args="$$args --bin $$b";; esac; \
-			done; \
-			if [ -n "$$with_a" ]; then cargo build --release --features serve-client --bin a; fi; \
-			if [ -n "$$args" ]; then cargo build --release $$args; fi; \
-		fi; \
-		cargo build --release -p re; \
-		sh ./move_executable.sh $(BINS); \
+		cargo build --release --features rust_tools/$(INSTALL_FEATURES) --bins -p rust_tools -p re -p mcp_browser -p mcp_computer -p mcp_excel -p mcp_pdf; \
+		sh ./move_executable.sh $(INSTALL_BINS); \
 		sh ./move_executable.sh re $(MCP_BINS); \
 	fi
 
@@ -140,14 +137,13 @@ install-completions:
 	done
 .PHONY: test test-a test-fk clean
 
-# Like `install`, but builds every bin with all release features (incl. `serve`).
-# It builds unconditionally instead of asking installw which bins are stale:
-# a feature change does not touch source mtimes, so installw would wrongly
-# report a previously installed bin as up-to-date and skip the rebuild.
+# Like `install`, but builds everything with all release features (incl.
+# `serve`) in one invocation, so the root lib still compiles only once. It
+# runs unconditionally: a feature change does not touch source mtimes, so an
+# mtime-based staleness check would wrongly skip the rebuild.
 .PHONY: install-all
-install-all: $(addprefix $(RELEASE_DIR)/,$(MCP_BINS))
-	cargo build --release --features $(RELEASE_FEATURES) $(addprefix --bin ,$(filter-out $(MCP_BINS),$(INSTALL_BINS)))
-	cargo build --release -p re
+install-all:
+	cargo build --release --features rust_tools/$(RELEASE_FEATURES) --bins -p rust_tools -p re -p mcp_browser -p mcp_computer -p mcp_excel -p mcp_pdf
 	sh ./move_executable.sh --force $(INSTALL_BINS)
 	sh ./move_executable.sh --force re
 	@$(MAKE) install-completions
