@@ -1,13 +1,31 @@
 {
   "name": "search_overflow",
-  "description": "Search session content moved out of context. Returns verbatim excerpts with file paths and line numbers.",
-  "first_use_guidance": "Guidance for reading later search_overflow answers in this turn:\n- Only content moved out of context is searched (never canonical session history or project files), and every file the filters keep is scanned in full.\n- Narrow with scope or file_pattern first; scope=all is a last resort.\n- The footer reports files scanned plus matching line(s) that were selected but not written; those lines stay reachable by narrowing the query, scope, or file_pattern, or by raising max_results.\n- Each matching line carries a reason marker; the legend is: >> whole-query phrase hit, >t typed-term hit, >b CJK-fragment hit (the phrase may be absent — verify with read_file), two spaces = context line.\n- A zero-hit answer names what it scanned (files searched, file_pattern exclusions, unreadable files, and which terms came up empty; when nothing was scanned it says so and names the roots probed) and names the matching mode, so a case-insensitive zero hit rules out other casings too; read it as 'not found in this archive', not as proof the content never existed, and retry with a wider scope, more distinctive words, or case_sensitive=true to narrow to one specific casing.\n- Excerpts window long lines around the match, with \u2026 marking elided text on either side, so a window is not the whole line: use read_file on the listed absolute path for the full line.",
+  "description": "Search archived session content; return verbatim excerpts with paths and line numbers. For a recent original result, use order:'recent', kind:'evidence', match:'phrase' and text from that result.",
+  "first_use_guidance": "Search only offloaded session content; scan every retained file fully. Evidence is a source tier, not verification: exclude recognized history checkpoint/summary prefixes; unmarked continuations may remain. Cross-root duplicate lines collapse after trim/whitespace normalization; raw totals stay unchanged. The footer reports shown/raw lines, shown/matching files, scanned files, active controls, duplicates and hidden lines. Complete answers keep a one-line footer. Truncation adds top files and up to two narrowing calls/edits; lower max_results if context was dropped. Zero kind hits: retry kind:'all'. Markers: >> phrase/regex, >t typed term, >b CJK fragment (verify full wording); two spaces = context. Long lines show ...; read_file gets full text/context. A miss means not found under these filters, not proof it never existed.",
   "parameters": {
     "type": "object",
     "properties": {
       "query": {
         "type": "string",
-        "description": "Search term (plain substring by default; is_regex=true for regex). A multi-word query matches lines holding any one of its words, and ranks lines holding the whole phrase highest, then lines holding all words close together, so a hit does not prove the phrase is present. For CJK queries the adjacent character pairs of each run of three or more characters match as well (at most 24 pairs per query, sampled across the whole query), so a hit may rest on a shared pair rather than the full run."
+        "description": "Nonempty search text, or one regex when is_regex:true."
+      },
+      "order": {
+        "type": "string",
+        "enum": ["relevance", "recent"],
+        "default": "relevance",
+        "description": "Default relevance: score/fair-share ranking; tied line scores prefer later lines. recent: newest file mtime then latest line; equal mtimes use path order. recent ignores scores/reservations; matching and raw totals stay unchanged."
+      },
+      "match": {
+        "type": "string",
+        "enum": ["any", "all", "phrase"],
+        "default": "any",
+        "description": "Default any: OR substrings plus CJK pairs (runs >=3; up to 24 sampled pairs); full coverage/phrase ranks higher. all: every distinct typed term on one line. phrase: untouched literal substring, no expansion; requires is_regex:false. Regex any/all use one pattern. Paths never switch modes automatically."
+      },
+      "kind": {
+        "type": "string",
+        "enum": ["all", "evidence", "derived"],
+        "default": "all",
+        "description": "Default all. evidence: raw tool snapshots, overflow-history.md, preserved user/image content. derived: folded groups, internal notes, summary-sources/, checkpoints. This labels storage sources, not verified truth."
       },
       "scope": {
         "type": "string",
@@ -16,31 +34,31 @@
           "history",
           "tool_outputs"
         ],
-        "description": "Where to search (default: all). 'history' = overflow-history.md plus summary-sources/ (raw messages behind compressed summaries). 'tool_outputs' includes tool-overflow-compressed/, tool-overflow/, folded-tool-groups/, internal-note-overflow/, and context-checkpoints/. 'all' also includes history and preserved user/image context. Checkpoint bodies are unverified historical context."
+        "description": "Default all: both scopes plus preserved user/image content. history: overflow-history.md + summary-sources/ (raw summary inputs). tool_outputs: tool snapshots, folded groups, internal notes and checkpoints."
       },
       "file_pattern": {
         "type": "string",
-        "description": "Optional glob to restrict searched archive files, matched against the path relative to the archive root or the file name (e.g. '*execute_command*', '*internal-note-overflow*')."
+        "description": "Optional glob on archive-relative path, scope-root-relative path or filename; e.g. '*execute_command*' or '*internal-note-overflow*'."
       },
       "is_regex": {
         "type": "boolean",
-        "description": "Treat query as a regex (default: false, literal substring). The pattern is matched case-insensitively unless case_sensitive is true; an inline flag in the pattern itself (e.g. `(?i)`, `(?-i)`) overrides that."
+        "description": "Default false. true uses query as one regex; case_sensitive applies unless regex inline flags override it."
       },
       "case_sensitive": {
         "type": "boolean",
-        "description": "Case-sensitive match (default: false — matching ignores case by default, so the query also hits other casings; set true to narrow to one exact casing)."
+        "description": "Default false (ignore case); true narrows to exact casing."
       },
       "context_lines": {
         "type": "integer",
         "minimum": 0,
         "maximum": 5,
-        "description": "Context lines around each match (default: 2, max: 5)."
+        "description": "Surrounding lines per match; default 2, range 0-5."
       },
       "max_results": {
         "type": "integer",
         "minimum": 1,
         "maximum": 200,
-        "description": "Max matching lines across all files (default: 50, max: 200). Raising it also raises the per-file ceiling, so one large file exposes more of its matching lines."
+        "description": "Matching lines across all files; default 50, range 1-200. Raising it raises the per-file ceiling."
       }
     },
     "required": [

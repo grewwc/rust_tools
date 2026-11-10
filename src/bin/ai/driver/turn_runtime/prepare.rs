@@ -421,6 +421,16 @@ pub(super) async fn prepare_turn(
         // turn preparation or discarding the retained source messages.
         let compression_diagnostic = outcome.diagnostic();
         let mut history = outcome.messages;
+        // Canonical twin for snapshot persistence: the persisted context
+        // snapshot must keep image content in reference form, because the
+        // cross-turn digest fingerprint is computed on that canonical content.
+        // Clone before digest substitution and materialization, so image
+        // messages still carry their reference parts in the twin.
+        let canonical_history = if snapshot_basis.is_some() {
+            history.clone()
+        } else {
+            Vec::new()
+        };
         // Cross-turn image digests: replace prior turns' raw images with the
         // digest persisted in history metadata, so a new turn does not re-send
         // last turn's images to the model (consistent for all VL models). Images
@@ -443,6 +453,7 @@ pub(super) async fn prepare_turn(
         }
         Ok::<_, String>((
             history,
+            canonical_history,
             compression_diagnostic,
             digest_outcome.pending,
             snapshot_basis,
@@ -462,7 +473,7 @@ pub(super) async fn prepare_turn(
         Ok(result) => result,
         Err(error) => Err(format!("context history task failed: {error}")),
     };
-    let (history, compression_diagnostic, pending_image_digests, snapshot_basis) =
+    let (history, canonical_history, compression_diagnostic, pending_image_digests, snapshot_basis) =
         match history_result {
             Ok(history) => history,
             Err(error) => {
@@ -674,6 +685,7 @@ pub(super) async fn prepare_turn(
         }
     }
     let persistable_history = snapshot_basis.as_ref().map(|_| history.clone());
+    let canonical_persistable_history = snapshot_basis.as_ref().map(|_| canonical_history.clone());
     let history_start = messages.len();
     messages.extend(history);
     let history_end = messages.len();
@@ -791,6 +803,7 @@ pub(super) async fn prepare_turn(
         persistable_context: snapshot_basis.map(|basis| PersistableContextProjection {
             message_range: history_start..history_end,
             messages: persistable_history.unwrap_or_default(),
+            canonical_messages: canonical_persistable_history.unwrap_or_default(),
             basis,
         }),
         turn_messages,

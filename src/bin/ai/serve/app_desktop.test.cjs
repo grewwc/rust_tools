@@ -7,7 +7,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
-const html = fs.readFileSync(path.join(__dirname, "app.html"), "utf8");
+const html = fs.readFileSync(process.env.ASERVE_TEST_APP_HTML || path.join(__dirname, "app.html"), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const css = html.match(/<style>([\s\S]*?)<\/style>/)[1];
 const baseCss = css.slice(0, css.indexOf("@media (min-width:701px)"));
@@ -71,7 +71,7 @@ const sessions = (marked = false) => [
 function harness({ phone = false, sid = "open-session", marked: isMarked = false, confirmDelete = true, deleteError = "", forkError = "" } = {}) {
   const document = { activeElement: null };
   function node(tag = "div") {
-    let text = "";
+    let text = "", markup = "";
     const classes = new Set();
     const el = {
       tagName: tag, children: [], parentNode: null, attrs: {}, dataset: {}, style: {},
@@ -89,9 +89,18 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
       get textContent() { return text + el.children.map((child) => child.textContent).join(""); },
       set textContent(value) {
         text = String(value);
+        markup = "";
         el.children.forEach((child) => { child.parentNode = null; });
         el.children = [];
       },
+      get innerHTML() { return markup; },
+      set innerHTML(value) {
+        markup = String(value);
+        text = markup.replace(/<[^>]*>/g, "");
+        el.children.forEach((child) => { child.parentNode = null; });
+        el.children = [];
+      },
+      addEventListener(type, listener) { el["on" + type] = listener; },
       setAttribute(key, value) { el.attrs[key] = String(value); },
       getAttribute(key) { return el.attrs[key] ?? null; },
       appendChild(child) { child.remove(); child.parentNode = el; el.children.push(child); return child; },
@@ -219,9 +228,15 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     sendBusy: false, pendingImages: [], turns: new Map(), MAX_LIVE_TURNS: 4,
     historySession: sid, canonicalHistoryTotal: 0, pendingUserInputs: new Map(),
     questionCache: null, runEpoch: 0, turnRunning: false, confirmPollSeq: 0,
+    turnRunningAt: 0, RUNNING_SAMPLE_TTL_MS: 60000,
+    eventActive: false, eventSession: "", eventStreamEnded: false, staleSession: "", staleDone: false,
     lastHistoryEndsUnanswered: false, LIVE_STALL_MS: 60000, STREAM_SILENCE_MS: 60000,
     addLiveUserBubble: () => { const row = node(), bubble = node(); row.appendChild(bubble); elements.msgs.appendChild(row); return bubble; },
-    addMsgMd: (_, parent) => parent.appendChild(node()),
+    addMsgMd: (text, parent) => {
+      const bubble = node(); bubble.className = "msg asst md";
+      bubble.dataset.role = "assistant"; bubble.textContent = text;
+      return parent.appendChild(bubble);
+    },
     createLiveActivity: () => ({ label: () => "Connecting", setPhase() {}, finish() {}, anchor() {} }),
     scrollToLatest() {}, shouldFollowOutput: () => false, followOutput() {}, decorateAndLoad() {},
     formatElapsed: () => "0s", replyPaintDelay: () => 0, renderMarkdown: (text) => text,
@@ -237,6 +252,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
   vm.runInContext(between("function renderSessionBar()", "// History is append-only"), context);
   vm.runInContext(marked("composer session adoption"), context);
   vm.runInContext(marked("turn session preparation"), context);
+  vm.runInContext(between("function isTurnRunning()", "// The one send/stop button"), context);
   vm.runInContext(between("function parseBlock(raw)", "// \u0060/cd\u0060 changes"), context);
   vm.runInContext(between("const RATE_STORAGE =", "function addFold("), context);
   vm.runInContext(between("function setAnswerRate(", "// Only completed answer bubbles"), context);
@@ -603,6 +619,53 @@ test("the sheet has desktop placement, modal attributes and unchanged theme-base
   assert.match(html, /id="sessionactionspanel" role="dialog" aria-modal="true" aria-labelledby="sessionactionstitle"/);
 });
 
+for (const phone of [true, false]) test((phone ? "phone" : "desktop") + " session header title stays readable alongside long metadata", () => {
+  const h = harness({ phone });
+  assert.equal(h.context.isPhoneLayout(), phone);
+  const summary = "Investigate mobile session title readability and " + "a_long_unbroken_title_".repeat(8);
+  Object.assign(h.context.lastItems[0], { summary, marked: true, size_bytes: 12800000 });
+  h.context.lastMsgCount = 123456;
+  h.context.renderSessionBar();
+  assert.equal(h.elements.sesstitle.textContent, "★ " + summary);
+  assert.equal(h.elements.sessmeta.textContent, "open-ses · 12500 KB · 123456 msgs · test-page");
+  assert.equal(h.elements.sesstitle.hidden, false);
+  const titlePath = shellPathTo("sesstitle");
+  assert.deepEqual(titlePath.map((item) => item.id).filter(Boolean), ["serve-app", "sessbar", "sesstitle"]);
+  assert.ok(titlePath.every((item) => !item.hidden));
+  const bar = responsiveRule("#sessbar", phone), title = responsiveRule("#sesstitle", phone);
+  const meta = responsiveRule("#sessmeta", phone);
+  assert.notEqual(title.display, "none");
+  assert.equal(title.overflow, "hidden");
+  assert.equal(meta["white-space"], "nowrap");
+  if (phone) {
+    assert.equal(bar.display, "grid");
+    assert.equal(bar["grid-template-columns"], "minmax(0,1fr) auto");
+    assert.equal(bar["flex-shrink"], "0");
+    assert.equal(title["grid-column"], "1 / -1");
+    assert.equal(title["min-width"], "0");
+    assert.equal(title["white-space"], "normal");
+    assert.equal(title["overflow-wrap"], "anywhere");
+    assert.equal(title.display, "-webkit-box");
+    assert.equal(title["-webkit-box-orient"], "vertical");
+    assert.equal(title["-webkit-line-clamp"], "2");
+    assert.equal(title["line-height"], "1.4");
+    assert.equal(title["max-height"], "2.8em");
+    assert.equal(meta["min-width"], "0");
+    assert.equal(meta.overflow, "hidden");
+    assert.equal(meta["text-overflow"], "ellipsis");
+    assert.equal(responsiveRule("#questionbtn.show", true).display, "grid");
+  } else {
+    assert.equal(bar.display, "flex");
+    assert.equal(bar["min-height"], "32px");
+    assert.equal(bar.padding, "6px 16px");
+    assert.equal(title.flex, "1");
+    assert.equal(title["white-space"], "nowrap");
+    assert.equal(title["text-overflow"], "ellipsis");
+    assert.deepEqual(cssRule(desktopCss, "#sesstitle"), {});
+    assert.equal(responsiveRule("#questionbtn").display, "none");
+  }
+});
+
 test("desktop user bubbles stay neutral but carry a border and accent rule", () => {
   const desktopBubble = responsiveRule(".msg.user");
   assert.equal(desktopBubble.background, "var(--surface-2)");
@@ -680,11 +743,13 @@ function loadChat(h) {
     sideNoteBusy: false, turnRunningAt: 1000, RUNNING_SAMPLE_TTL_MS: 30000,
     staleSession: "", staleDone: false, eventActive: false, eventSession: "",
     holdLayout: (_, apply) => apply(),
+    foldOpenByKey: new Map(),
   });
   for (const [start, end] of [
     ["function textOf(", "const PHONE_LAYOUT_QUERY"],
     ["function addMsg(", "// Assistant replies render as markdown"],
     ["function historyRowsOf(", "// A session the server reports as running"],
+    ["function addFold(", "// Detached cards are kept weakly"],
     ["function attachUserRewind(", "async function rewindTo("],
     ["function isTurnRunning(", "// Transient note through"],
     ["async function sendSideNote(", "async function stopTurn("],
@@ -826,21 +891,96 @@ test("phone user rows and side-note CSS retain their geometry and state rules", 
   assert.equal(prompt["max-height"], "calc(var(--app-height, 100vh) * .38)");
 });
 
-test("main throughput rows wrap and retain their height at phone and desktop widths", () => {
+test("throughput footers wrap inside styled cards at phone and desktop widths", () => {
   for (const phone of [true, false]) {
     const rate = responsiveRule(".turn-rate", phone);
     assert.equal(rate.flex, "0 0 auto");
     assert.equal(rate["max-width"], "100%");
     assert.equal(rate["white-space"], "normal");
     assert.equal(rate["overflow-wrap"], "anywhere");
+    assert.equal(rate["border-top"], "1px solid var(--line)");
     assert.notEqual(rate.display, "none");
   }
 });
 
-for (const width of [320, 375, 700]) {
-  test("live main throughput at phone width " + width + " stays outside hidden status ancestors and wraps", async () => {
-    const h = harness({ phone: true });
+test("short-thinking early repaint: real send paints and saves its first chunk's 250ms rate before thinking_done", async () => {
+  const thought = "The status bar rate removal worker (task_03504bdf97f1481fba03b62252ab9ef4) is completed. Let me collect it with task_wait.";
+  const h = harness({ phone: true });
+  loadChat(h);
+  vm.runInContext(between("function toolArgsOf(", "const FOLD_ROLE_LABELS"), h.context);
+  vm.runInContext(between("function createLiveActivity(", "// The three override picks"), h.context);
+  let pendingRead = null;
+  const fetch = h.context.fetch;
+  h.context.fetch = async (url, options) => {
+    if (!new URL(url).pathname.endsWith("/turns/stream")) return fetch(url, options);
+    return { ...response({}), body: { getReader: () => ({
+      read: () => new Promise((resolve) => { pendingRead = resolve; }), cancel() {},
+    }) } };
+  };
+  h.context.addAnswerCopy = () => {};
+  const settle = async () => { for (let i = 0; i < 24; i++) await Promise.resolve(); };
+  const frame = async (text) => {
+    assert.ok(pendingRead, "the real send path did not reach its SSE reader");
+    const resolve = pendingRead;
+    pendingRead = null;
+    resolve({ done: false, value: Buffer.from(text) });
+    await settle();
+  };
+  assert.equal(h.stored.get("serve.rates"), undefined);
+  h.elements.prompt.value = "show thinking rate";
+  const pending = h.context.send();
+  await settle();
+  await frame('event: thinking_start\ndata: \n\nevent: thinking\ndata: ' + JSON.stringify({ text: thought }) + '\n\n');
+  h.advance(50);
+  const summary = h.elements.msgs.querySelector("summary");
+  assert.equal(summary.textContent, "thinking… · ~31 tok @ 124 tok/s");
+  h.advance(200);
+  assert.equal(summary.textContent, "thinking… · ~31 tok @ 124 tok/s", "the first chunk waited for phase completion or another chunk");
+  assert.equal(h.context.turns.has(h.context.sessionId), true);
+  assert.match(h.elements.msgs.querySelector(".pending").textContent, /reasoning ~31 tok @ 124 tok\/s/);
+  const serialized = h.stored.get("serve.rates");
+  assert.ok(serialized);
+  await frame('event: thinking_done\ndata: \n\n');
+  assert.equal(summary.textContent, "thinking · ~31 tok @ 124 tok/s");
+  assert.equal(h.stored.get("serve.rates"), serialized);
+  const legacyThought = "Legacy thinking with no timing sample.";
+  await frame('event: thinking_start\ndata: \n\nevent: thinking\ndata: ' + JSON.stringify({ text: legacyThought }) + '\n\nevent: thinking_done\ndata: \n\n');
+  h.advance(250);
+  assert.deepEqual(h.elements.msgs.querySelectorAll("summary").map((item) => item.textContent), [
+    "thinking · ~31 tok @ 124 tok/s", "thinking · ~10 tok @ 40.0 tok/s",
+  ], "a completed same-tick phase lost its 250ms rate");
+  await frame('event: done\ndata: \n\n');
+  await pending;
+  const phase2Key = Object.keys(JSON.parse(h.stored.get("serve.rates")))
+    .find((key) => !Object.hasOwn(JSON.parse(serialized), key));
+  const serializedPhases = JSON.stringify({
+    ...JSON.parse(serialized),
+    [phase2Key]: { textKey: h.context.rateTextKey(legacyThought), rate: "~10 tok @ 40.0 tok/s" },
+  });
+  assert.equal(h.stored.get("serve.rates"), serializedPhases);
+  const messages = [
+    { role: "assistant", content: "", reasoning_content: thought },
+    { role: "assistant", content: "", reasoning_content: legacyThought },
+  ];
+  const refreshed = h.document.createElement("div");
+  for (const row of h.context.historyRowsOf(messages, messages.length, false).rows) h.context.renderHistoryRow(row, refreshed);
+  const labels = ["thinking · ~31 tok @ 124 tok/s", "thinking · ~10 tok @ 40.0 tok/s"];
+  assert.deepEqual(refreshed.querySelectorAll("summary").map((item) => item.textContent), labels);
+  const cold = harness({ phone: true });
+  loadChat(cold);
+  cold.stored.set("serve.rates", serializedPhases);
+  cold.context.Date = { now() { assert.fail("cold history must not invent a timing sample"); } };
+  for (const row of cold.context.historyRowsOf(messages, messages.length, false).rows) cold.context.renderHistoryRow(row, cold.elements.msgs);
+  assert.deepEqual(cold.elements.msgs.querySelectorAll("summary").map((item) => item.textContent), labels);
+  assert.equal(cold.stored.get("serve.rates"), serializedPhases);
+});
+
+for (const [phone, width] of [[true, 320], [true, 375], [true, 700], [false, 1280]]) {
+  test((phone ? "phone" : "desktop") + " width " + width + " keeps rates on its live surface and restores card footers", async () => {
+    const h = harness({ phone });
     loadChat(h);
+    vm.runInContext(between("function toolArgsOf(", "const FOLD_ROLE_LABELS"), h.context);
+    vm.runInContext(between("function createLiveActivity(", "// The three override picks"), h.context);
     h.context.window.innerWidth = width;
     let parent = null;
     for (const info of shellPathTo("msgs")) {
@@ -877,29 +1017,34 @@ for (const width of [320, 375, 700]) {
     h.elements.prompt.value = "phone prompt";
     const pending = h.context.send();
     await settle();
-    await frame('event: delta\ndata: {"delta":"live answer"}\n\n');
+    // Several phases can share one network read before a browser paint.
+    await frame('event: thinking_start\ndata: \n\nevent: thinking\ndata: {"text":"first thought"}\n\nevent: thinking_done\ndata: \n\nevent: thinking_start\ndata: \n\nevent: thinking\ndata: {"text":"second thought"}\n\nevent: thinking_done\ndata: \n\nevent: delta\ndata: {"delta":"live answer"}\n\n');
     await frame("data: ↳ speed · output 40 tok @ 20 tok/s\n\n");
     // The fixture queues browser paint timers until its clock is advanced.
     h.advance(1000);
     const lines = h.elements.msgs.querySelectorAll(".turn-rate");
-    assert.equal(lines.length, 1);
-    const line = lines[0];
-    assert.equal(line.textContent, "↳ speed · output 40 tok @ 20 tok/s");
-    assert.ok(line.parentNode.classList.contains("turn"));
+    assert.equal(lines.length, phone ? 0 : 1, "only desktop generation needs a speed footer");
+    if (!phone) assert.equal(lines[0].textContent, "↳ speed · output 40 tok @ 20 tok/s");
+    const thoughts = h.elements.msgs.querySelectorAll(".prog");
+    assert.deepEqual(thoughts.map((thought) => thought.textContent), ["first thought", "second thought"]);
     h.elements.turnstatus.hidden = true;
     const status = h.elements.msgs.querySelector(".pending");
     assert.ok(status);
-    status.hidden = true;
+    if (phone) assert.match(status.textContent, /output 40 tok @ 20 tok\/s/);
+    else {
+      assert.equal(status.textContent, "◌ Responding… · 0:01");
+      assert.doesNotMatch(status.textContent, /tok/);
+    }
+    assert.ok(status.classList.contains("msg") && status.classList.contains("asst"));
     const ancestors = [];
-    for (let element = line; element; element = element.parentNode) {
+    for (let element = status; element; element = element.parentNode) {
       ancestors.push(element);
       assert.equal(element.hidden, false, "a hidden ancestor contains the main rate");
       assert.notEqual(element.id, "turnstatus");
-      assert.ok(!element.classList.contains("pending"), "the main rate was placed in the hidden phase bubble");
       const selectors = [element.tagName, element.id ? "#" + element.id : "",
         ...element.className.split(/\s+/).filter(Boolean).map((name) => "." + name)].filter(Boolean);
       for (const selector of selectors) {
-        const style = responsiveRule(selector, true);
+        const style = responsiveRule(selector, phone);
         assert.notEqual(style.display, "none", selector + " hides main throughput");
         assert.notEqual(style.visibility, "hidden", selector + " hides main throughput");
       }
@@ -908,15 +1053,103 @@ for (const width of [320, 375, 700]) {
     }
     assert.ok(ancestors.includes(h.elements.msgs));
     assert.ok(ancestors.includes(h.document.body));
-    const rate = responsiveRule(".turn-rate", true);
+    assert.equal(responsiveRule(".msg.asst", phone).background, "var(--panel)");
+    assert.equal(responsiveRule(".msg.asst", phone).border, "1px solid var(--line)");
+    const rate = responsiveRule(".turn-rate", phone);
     assert.equal(rate.flex, "0 0 auto");
     assert.equal(rate["max-width"], "100%");
     assert.equal(rate["white-space"], "normal");
     assert.equal(rate["overflow-wrap"], "anywhere");
-    assert.equal(responsiveRule(".turn", true)["min-width"], "0");
-    assert.equal(responsiveRule("#msgs", true)["overflow-y"], "auto");
+    assert.equal(responsiveRule(".turn", phone)["min-width"], "0");
+    assert.equal(responsiveRule("#msgs", phone)["overflow-y"], "auto");
     await frame("event: done\ndata: \n\n");
     await pending;
-    assert.deepEqual(h.elements.msgs.querySelectorAll(".turn-rate"), lines);
+    const completed = h.elements.msgs.querySelectorAll(".turn-rate");
+    assert.equal(completed.length, 1);
+    const line = completed[0];
+    assert.equal(line.textContent, "↳ speed · output 40 tok @ 20 tok/s");
+    assert.ok(line.parentNode.classList.contains("msg") && line.parentNode.classList.contains("asst"));
+    assert.ok(!line.parentNode.classList.contains("pending"));
+    assert.equal(h.elements.msgs.querySelectorAll(".pending").length, 0);
+    assert.deepEqual(h.elements.msgs.querySelectorAll(".prog"), thoughts, "completion lost a thinking body");
+
+    // Rebuild canonical history from the same cache a refreshed page reads.
+    const history = h.document.createElement("div");
+    for (const [index, content, reasoning] of [[0, "", "first thought"], [1, "live answer", "second thought"]]) {
+      h.context.renderHistoryRow({
+        message: { role: "assistant", content }, text: content, reasoning,
+        historyIndex: index, identity: "answer-" + index, key: "canonical-" + index,
+      }, history);
+    }
+    const restored = history.querySelectorAll(".turn-rate");
+    assert.equal(restored.length, 1);
+    assert.equal(restored[0].textContent, line.textContent);
+    assert.ok(restored[0].parentNode.classList.contains("msg"));
+    assert.deepEqual(history.querySelectorAll(".prog").map((thought) => thought.textContent), ["first thought", "second thought"]);
+    assert.doesNotMatch(history.textContent, /— tok\/s/);
+  });
+}
+
+for (const [phone, width] of [[true, 320], [true, 375], [true, 700], [false, 1280]]) {
+  test((phone ? "phone" : "desktop") + " width " + width + " displays thinking samples through the real send path and final SSE read", async () => {
+    const h = harness({ phone });
+    loadChat(h);
+    vm.runInContext(between("function toolArgsOf(", "const FOLD_ROLE_LABELS"), h.context);
+    vm.runInContext(between("function createLiveActivity(", "// The three override picks"), h.context);
+    h.context.window.innerWidth = width;
+    let pendingRead = null;
+    const fetch = h.context.fetch;
+    h.context.fetch = async (url, options) => {
+      if (!new URL(url).pathname.endsWith("/turns/stream")) return fetch(url, options);
+      return { ...response({}), body: { getReader: () => ({
+        read: () => new Promise((resolve) => { pendingRead = resolve; }), cancel() {},
+      }) } };
+    };
+    h.context.addAnswerCopy = () => {};
+    const settle = async () => { for (let i = 0; i < 24; i++) await Promise.resolve(); };
+    const frame = async (text) => {
+      assert.ok(pendingRead, "the real send path did not reach its SSE reader");
+      const resolve = pendingRead;
+      pendingRead = null;
+      resolve({ done: false, value: Buffer.from(text) });
+      await settle();
+    };
+    h.elements.prompt.value = "phone thinking prompt";
+    const pending = h.context.send();
+    await settle();
+    await frame('event: thinking_start\ndata: \n\nevent: thinking\ndata: {"text":"first thought","rate":"~1647 tok @ 86.2 tok/s"}\n\n');
+    h.advance(100);
+    const status = h.elements.msgs.querySelector(".pending");
+    assert.equal(status.hidden, false);
+    if (phone) assert.match(status.textContent, /Thinking… · reasoning ~1647 tok @ 86\.2 tok\/s/);
+    else {
+      assert.equal(status.textContent, "◌ Thinking… · 0:00");
+      assert.doesNotMatch(status.textContent, /tok/);
+    }
+    assert.ok(status.classList.contains("msg") && status.classList.contains("asst"));
+    assert.equal(h.elements.msgs.querySelector("summary").textContent, "thinking… · ~1647 tok @ 86.2 tok/s");
+    // The next round ends in one network read with a terminal server sample.
+    // No later thinking event or phase-clock tick can rescue its header.
+    await frame('event: thinking_done\ndata: \n\nevent: tool\ndata: {"id":"lookup","name":"web_search","phase":"finished","ok":true}\n\nevent: thinking_start\ndata: \n\nevent: thinking\ndata: {"text":"second thought","rate":"~431 tok @ — tok/s"}\n\nevent: thinking_done\ndata: \n\ndata: ↳ speed · reasoning 431 tok @ 61 tok/s\n\nevent: done\ndata: \n\n');
+    await pending;
+    const labels = ["thinking · ~1647 tok @ 86.2 tok/s", "thinking · ~431 tok @ 61 tok/s"];
+    const summaries = h.elements.msgs.querySelectorAll("summary").filter((summary) => summary.textContent.startsWith("thinking"));
+    assert.deepEqual(summaries.map((summary) => summary.textContent), labels);
+    for (const summary of summaries) {
+      assert.equal(summary.hidden, false);
+      assert.equal(summary.parentNode.parentNode.hidden, false);
+      assert.notEqual(responsiveRule("summary", phone).display, "none");
+      assert.ok(summary.parentNode.parentNode.classList.contains("msg"));
+    }
+    const history = h.document.createElement("div");
+    for (const [index, reasoning] of ["first thought", "second thought"].entries()) {
+      h.context.renderHistoryRow({
+        message: { role: "assistant", content: "" }, text: "", reasoning,
+        historyIndex: index, identity: "thought-" + index, key: "canonical-" + index,
+      }, history);
+    }
+    assert.deepEqual(history.querySelectorAll("summary").map((summary) => summary.textContent), labels);
+    assert.deepEqual(history.querySelectorAll(".prog").map((thought) => thought.textContent), ["first thought", "second thought"]);
+    assert.doesNotMatch(history.textContent, /— tok\/s/);
   });
 }

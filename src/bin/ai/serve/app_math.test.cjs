@@ -163,13 +163,16 @@ test("question navigator fetches one bounded page and keeps global turn numbers"
   // The transcript on screen holds only its own bounded tail, exactly like the
   // rendered history window.
   const bubbles = userOrdinals.slice(-20).map((row) => ({
-    dataset: { question: row.content },
+    dataset: { question: row.content, historyIndex: String(row.user_ordinal - 1) },
     offsetWidth: 1,
+    focus() {},
     scrollIntoView: () => { scrolledTo = row.content; },
     classList: { remove() {}, add() {} },
   }));
   const context = vm.createContext({
     sessionId: "session-a",
+    historySession: "session-a",
+    outputFollowSuspended: false,
     questionCache: null,
     $: (id) => ({
       questionpanel: panel,
@@ -178,6 +181,7 @@ test("question navigator fetches one bounded page and keeps global turn numbers"
       msgs: { querySelectorAll: (sel) => (sel === ".msg.user" ? bubbles : []) },
     })[id],
     api: async (path) => {
+      if (path === "/sessions/session-a/history?meta=roles") return { json: async () => userOrdinals.map(() => "user") };
       const match = path.match(/^\/sessions\/session-a\/history\?role=user&count=(\d+)$/);
       assert.ok(match, "the navigator asks only for real user prompts, one bounded page: " + path);
       const count = Number(match[1]);
@@ -197,8 +201,9 @@ test("question navigator fetches one bounded page and keeps global turn numbers"
       for (const row of userOrdinals) {
         if (bubbles.some((bubble) => bubble.dataset.question === row.content)) continue;
         bubbles.push({
-          dataset: { question: row.content },
+          dataset: { question: row.content, historyIndex: String(row.user_ordinal - 1) },
           offsetWidth: 1,
+          focus() {},
           scrollIntoView: () => { scrolledTo = row.content; },
           classList: { remove() {}, add() {} },
         });

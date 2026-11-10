@@ -15,7 +15,7 @@ function between(start, end) {
   return script.slice(first, last);
 }
 
-function harness({ clipboard, fallback = true } = {}) {
+function harness({ clipboard, fallback = true, phone = false } = {}) {
   const copied = [], areas = [], focusCalls = [];
   const document = { activeElement: null };
   class Element {
@@ -36,6 +36,7 @@ function harness({ clipboard, fallback = true } = {}) {
     }
     get firstChild() { return this.children[0] || null; }
     get lastElementChild() { return this.children.at(-1) || null; }
+    get nextElementSibling() { return this.parentNode?.children[this.parentNode.children.indexOf(this) + 1] || null; }
     get isConnected() { return this === document.body || !!this.parentNode?.isConnected; }
     appendChild(child) {
       child.remove();
@@ -121,8 +122,11 @@ function harness({ clipboard, fallback = true } = {}) {
   };
   const msgs = document.createElement("div");
   document.body.appendChild(msgs);
+  const rates = new Map();
   const context = vm.createContext({
     document, window: {}, $: () => msgs,
+    sessionId: "s", isPhoneLayout: () => phone,
+    localStorage: { getItem: (key) => rates.get(key) || null, setItem: (key, value) => rates.set(key, value) },
     shouldFollowOutput: () => false, followOutput() {}, updateQuestionButton() {}, decorateAndLoad() {},
     setTimeout: () => 1, clearTimeout() {}, setInterval: () => 1, clearInterval() {},
     formatElapsed: () => "0:00",
@@ -131,6 +135,7 @@ function harness({ clipboard, fallback = true } = {}) {
   });
   vm.runInContext(between("const esc =", "function sessionTitle("), context);
   vm.runInContext(between("function addMsg(", "// --- server-side media"), context);
+  vm.runInContext(between("const RATE_STORAGE =", "function addFold("), context);
   return {
     context, document, msgs, copied, areas, focusCalls,
     answer: (text, parent = msgs) => context.addMsgMd(text, parent),
@@ -144,16 +149,16 @@ function streamHarness(options) {
   h.msgs.appendChild(box);
   Object.assign(h.context, {
     box, sid: "s", sessionId: "s", liveEntry, turns: new Map([["s", liveEntry]]),
-    finished: false, turnError: false, finishFollow: false, confirmPollSeq: 0,
+    finished: false, turnError: false, finishFollow: false, confirmPollSeq: 0, stopStaleFollow() {},
   });
   vm.runInContext(between('  let bubble = addMsgMd("", box);', "  let turnStarted = false;"), h.context);
-  const dispatch = between('        if (kind === "done") {', '        else if (kind === "thinking_start")');
+  const dispatch = between('        if (kind === "done") {', '      if (finished) break;').replace(/\s*}\s*$/, "");
   const completion = between("    flushPaint(); // flush the tail before final decoration or stale recovery", "    if (!finished && !turnError) {");
   return {
     ...h, box,
     emit(kind, value) {
       h.context.kind = kind;
-      h.context.payload = JSON.stringify(value || {});
+      h.context.payload = typeof value === "string" ? value : JSON.stringify(value || {});
       vm.runInContext(`for (;;) { ${dispatch}\nbreak; } flushPaint();`, h.context);
       if (kind === "done") vm.runInContext(completion, h.context);
     },
@@ -300,9 +305,37 @@ test("sealed answer rounds copy independently while the next round is still stre
 
 test("recovered partial answers do not expose a copy control", () => {
   const h = harness();
-  vm.runInContext(between("function recoveredProgressView()", "function handleReplayEvent("), h.context);
+  vm.runInContext(between("function recoveredProgressView(", "function handleReplayEvent("), h.context);
   const view = h.context.recoveredProgressView();
   view.delta("未完成的回答\n");
   view.replace("仍在输出");
   assert.equal(view.box.querySelectorAll("[data-copy-answer]").length, 0);
 });
+
+for (const phone of [true, false]) {
+  test((phone ? "phone" : "desktop") + " final rendering keeps throughput outside copied answer text", async () => {
+    const copied = [];
+    const h = streamHarness({ phone, clipboard: { writeText: async (text) => copied.push(text) } });
+    h.emit("delta", { delta: "provisional answer" });
+    h.emit("progress", "↳ speed · output 40 tok @ 20 tok/s");
+    if (phone) assert.equal(h.box.querySelectorAll(".turn-rate").length, 0);
+    else assert.equal(h.box.querySelectorAll(".turn-rate").length, 1);
+    const raw = "Final answer\nNext line";
+    h.emit("replace", { text: raw });
+    h.emit("done");
+    const footers = h.box.querySelectorAll(".turn-rate");
+    assert.equal(footers.length, 1, "final markdown rendering removed or duplicated throughput");
+    const footer = footers[0], answer = footer.parentNode;
+    assert.ok(answer.classList.contains("msg") && answer.classList.contains("asst"));
+    assert.equal(footer.textContent, "↳ speed · output 40 tok @ 20 tok/s");
+    assert.doesNotMatch(answer.querySelector(".answer-body").textContent, /speed|tok\/s/);
+    assert.equal(h.box.querySelectorAll("[data-copy-answer]").length, 1);
+    assert.equal(await h.tap(answer.querySelector("[data-copy-answer]")), true);
+    assert.deepEqual(copied, [raw], "the new rate footer leaked into copied markdown");
+    answer.querySelector(".answer-body").renderedText = raw;
+    h.context.answer = answer;
+    vm.runInContext("answerCopyTexts.delete(answer);", h.context);
+    assert.equal(await h.tap(answer.querySelector("[data-copy-answer]")), true);
+    assert.deepEqual(copied, [raw, raw], "rendered-text copy included throughput");
+  });
+}
