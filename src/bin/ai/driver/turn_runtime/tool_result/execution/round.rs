@@ -318,6 +318,7 @@ pub(in crate::ai::driver::turn_runtime) fn execute_tool_calls_with_suppressed_re
     for tool_call in tool_calls {
         if let Some(content) = suppressed_results.get(&tool_call.id) {
             tool_results.push(crate::ai::types::ToolResult {
+                task_report: None,
                 tool_call_id: tool_call.id.clone(),
                 content: content.clone(),
             });
@@ -329,6 +330,7 @@ pub(in crate::ai::driver::turn_runtime) fn execute_tool_calls_with_suppressed_re
         }
         let Some((executed_call, result, cached, outcome)) = executed.next() else {
             tool_results.push(crate::ai::types::ToolResult {
+                task_report: None,
                 tool_call_id: tool_call.id.clone(),
                 content: "Error: tool execution returned no result for this call.".to_string(),
             });

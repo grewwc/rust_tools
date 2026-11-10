@@ -13,10 +13,9 @@ use std::time::{Duration as StdDuration, UNIX_EPOCH};
 
 use crate::ai::{
     driver::print::{
-        echo_tool_args, echo_tool_output, format_tool_status_cached, format_tool_status_target,
-        format_tool_status_completed, format_tool_status_deferred, format_tool_status_failed,
-        format_tool_status_running, format_tool_status_skipped,
-        format_tool_status_with_file_target,
+        echo_tool_args, echo_tool_output, format_tool_status_cached, format_tool_status_completed,
+        format_tool_status_deferred, format_tool_status_failed, format_tool_status_running,
+        format_tool_status_skipped, format_tool_status_target, format_tool_status_with_file_target,
     },
     history::ToolExecutionOutcome,
     mcp::{McpClient, SharedMcpClient},
@@ -174,6 +173,7 @@ fn parse_tool_args(tool_call: &ToolCall) -> Result<Value, ToolResult> {
         return Ok(json!({}));
     }
     serde_json::from_str(raw_args).map_err(|err| ToolResult {
+        task_report: None,
         tool_call_id: tool_call.id.clone(),
         content: format!("Error: failed to parse arguments: {}", err),
     })
@@ -186,6 +186,7 @@ fn prepare_tool_call(
 ) -> Result<PreparedToolCall, ToolResult> {
     if tool_call.function.name == crate::ai::types::INVALID_TOOL_CALL_NAME {
         return Err(ToolResult {
+            task_report: None,
             tool_call_id: tool_call.id.clone(),
             content: "Error: the model emitted a malformed tool name; the call was not executed. Retry with exactly one name from the current tool schema.".to_string(),
         });
@@ -197,6 +198,7 @@ fn prepare_tool_call(
             .contains("enable_tools")
             .then_some(" If this is a lazily loaded builtin, call enable_tools with the exact tool name (or run enable_tools list) and retry.");
         return Err(ToolResult {
+            task_report: None,
             tool_call_id: tool_call.id.clone(),
             content: format!(
                 "Error: tool '{}' is not available in this turn's tool schema.{}",
@@ -397,11 +399,9 @@ fn validate_tool_call_args(
             .iter()
             .find(|tool| tool.function.name == tool_call.function.name)
             .map(|tool| tool.function.parameters.clone()),
-        ToolRoute::Builtin => Some(
-            crate::ai::tools::registry::tool_metadata::tool_parameters(
-                &tool_call.function.name,
-            ),
-        ),
+        ToolRoute::Builtin => Some(crate::ai::tools::registry::tool_metadata::tool_parameters(
+            &tool_call.function.name,
+        )),
     };
     let Some(schema) = schema else {
         return Ok(());
@@ -412,21 +412,20 @@ fn validate_tool_call_args(
     }
     match route {
         ToolRoute::Builtin => {
-            let normalized =
-                normalize_for_validation(&tool_call.function.name, args, &schema);
+            let normalized = normalize_for_validation(&tool_call.function.name, args, &schema);
             let unknown = unknown_builtin_arg_keys(&normalized, &schema);
             if !unknown.is_empty() {
                 let declared = schema
                     .get("properties")
                     .and_then(Value::as_object)
                     .map(|properties| {
-                        let mut names: Vec<&str> =
-                            properties.keys().map(String::as_str).collect();
+                        let mut names: Vec<&str> = properties.keys().map(String::as_str).collect();
                         names.sort_unstable();
                         names.join(", ")
                     })
                     .unwrap_or_else(|| "(none)".to_string());
                 return Err(ToolResult {
+                    task_report: None,
                     tool_call_id: tool_call.id.clone(),
                     content: format!(
                         "Error: invalid arguments for '{}': unknown argument(s) {}. Declared parameters are: {declared}. Remove or correct them and retry.",
@@ -478,6 +477,7 @@ fn reject_invalid_tool_args(
         .collect::<Vec<_>>()
         .join("; ");
     Err(ToolResult {
+        task_report: None,
         tool_call_id: tool_call.id.clone(),
         content: format!(
             "Error: invalid arguments for '{}': {details}. Fix the types to match the tool schema and retry.",
@@ -527,6 +527,7 @@ fn overflow_stub_argument_error(tool_call: &ToolCall, args: &Value) -> Option<To
         .map(|path| format!("The archived original text is at: {path}."))
         .unwrap_or_else(|| "This stub has no archive path.".to_string());
     Some(ToolResult {
+        task_report: None,
         tool_call_id: tool_call.id.clone(),
         content: format!(
             "Error: the arguments for '{}' are a context-overflow pointer stub, \
@@ -559,6 +560,7 @@ fn confirm_tool_execution(tool_call: &ToolCall, args: &Value) -> Result<(), RunO
     crate::ai::driver::print::print_line("canceled by user.");
     Err(RunOneResult {
         tool_result: ToolResult {
+            task_report: None,
             tool_call_id: tool_call.id.clone(),
             content: if confirm.is_none() {
                 format!(
@@ -702,6 +704,7 @@ fn format_tool_error(
     available_tool_names: Option<&FastSet<String>>,
 ) -> ToolResult {
     ToolResult {
+        task_report: None,
         tool_call_id: tool_call.id.clone(),
         content: if let Some(hint) =
             remediation_hint(&tool_call.function.name, err, available_tool_names)
@@ -723,13 +726,11 @@ fn execute_prepared_tool_call(
     observer: &mut Option<&mut dyn ToolExecutionObserver>,
 ) -> Result<ToolResult, String> {
     match &prepared.route {
-        ToolRoute::Builtin => {
-            execute_prepared_builtin_tool_call(tool_call, prepared, |chunk| {
-                if let Some(observer) = observer.as_deref_mut() {
-                    observer.on_tool_stream(tool_call, chunk);
-                }
-            })
-        }
+        ToolRoute::Builtin => execute_prepared_builtin_tool_call(tool_call, prepared, |chunk| {
+            if let Some(observer) = observer.as_deref_mut() {
+                observer.on_tool_stream(tool_call, chunk);
+            }
+        }),
         ToolRoute::Mcp {
             server_name,
             tool_name,
@@ -743,6 +744,7 @@ fn execute_prepared_tool_call(
                 .map_err(|_| "Shared MCP client poisoned".to_string())?;
             let content = guard.call_tool(server_name, tool_name, prepared.args.clone())?;
             Ok(ToolResult {
+                task_report: None,
                 tool_call_id: tool_call.id.clone(),
                 content,
             })
@@ -973,6 +975,7 @@ fn reserve_current_process_tool_call_budget(tool_call: &ToolCall) -> Result<(), 
             limit,
         } => Err(RunOneResult {
             tool_result: ToolResult {
+                task_report: None,
                 tool_call_id: tool_call.id.clone(),
                 content: format!(
                     "Error: tool '{}' would exceed the kernel tool-call quota (used={} limit={}).",
@@ -1012,9 +1015,14 @@ pub(super) async fn run_session_distill(
 ) -> RunOneResult {
     let prepared = match prepare_tool_call(mcp_client, tool_call, Some(allowed_tool_names)) {
         Ok(prepared) => prepared,
-        Err(tool_result) => return RunOneResult {
-            tool_result, ok: false, executed: false, cached: false,
-        },
+        Err(tool_result) => {
+            return RunOneResult {
+                tool_result,
+                ok: false,
+                executed: false,
+                cached: false,
+            };
+        }
     };
     if let Err(result) = confirm_tool_execution(tool_call, &prepared.args) {
         return result;
@@ -1027,8 +1035,20 @@ pub(super) async fn run_session_distill(
     }
     let result = crate::ai::tools::session_distill_tools::execute_with_app(app, &prepared.args)
         .await
-        .map(|content| ToolResult { tool_call_id: tool_call.id.clone(), content });
-    finalize_execution_result(session_id, tool_call, &prepared, result, Some(allowed_tool_names), true, false)
+        .map(|content| ToolResult {
+            task_report: None,
+            tool_call_id: tool_call.id.clone(),
+            content,
+        });
+    finalize_execution_result(
+        session_id,
+        tool_call,
+        &prepared,
+        result,
+        Some(allowed_tool_names),
+        true,
+        false,
+    )
 }
 
 fn process_tool_denial(tool_call: &ToolCall) -> Option<RunOneResult> {
@@ -1040,14 +1060,48 @@ fn process_tool_denial(tool_call: &ToolCall) -> Option<RunOneResult> {
     }
     Some(RunOneResult {
         tool_result: ToolResult {
+            task_report: None,
             tool_call_id: tool_call.id.clone(),
-            content: format!("Error: tool '{}' is not in the allowed whitelist for this process.", tool_call.function.name),
+            content: format!(
+                "Error: tool '{}' is not in the allowed whitelist for this process.",
+                tool_call.function.name
+            ),
         },
-        ok: false, executed: false, cached: false,
+        ok: false,
+        executed: false,
+        cached: false,
     })
 }
 
 fn run_one(
+    mcp_client: &McpClient,
+    shared_mcp_client: &SharedMcpClient,
+    session_id: &str,
+    tool_call: &ToolCall,
+    allowed_tool_names: Option<&FastSet<String>>,
+    observer: &mut Option<&mut dyn ToolExecutionObserver>,
+) -> (ToolRoute, RunOneResult) {
+    let ((route, mut result), report) =
+        crate::ai::tools::task_tools::capture_task_report(&tool_call.function.name, || {
+            run_one_inner(
+                mcp_client,
+                shared_mcp_client,
+                session_id,
+                tool_call,
+                allowed_tool_names,
+                observer,
+            )
+        });
+    if let Some(mut report) = report {
+        if !result.ok {
+            report.record_execution_error(&result.tool_result.content);
+        }
+        result.tool_result.task_report = Some(report);
+    }
+    (route, result)
+}
+
+fn run_one_inner(
     mcp_client: &McpClient,
     shared_mcp_client: &SharedMcpClient,
     session_id: &str,
@@ -1501,6 +1555,7 @@ fn run_parallel_readonly_batch(
                         ToolRoute::Builtin,
                         RunOneResult {
                             tool_result: ToolResult {
+                                task_report: None,
                                 tool_call_id: tool_call.id.clone(),
                                 content: "Error: parallel tool execution thread panicked"
                                     .to_string(),
@@ -1568,6 +1623,7 @@ fn load_cached_tool_result(
             continue;
         }
         return Some(ToolResult {
+            task_report: None,
             tool_call_id: tool_call.id.clone(),
             content: payload.result,
         });

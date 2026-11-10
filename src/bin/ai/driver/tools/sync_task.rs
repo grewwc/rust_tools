@@ -777,6 +777,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     )
     .map_err(|error| format!("failed to persist foreground subagent evidence: {error}"))?;
     Ok(ToolResult {
+        task_report: None,
         tool_call_id: tool_call_id.to_string(),
         content,
     })

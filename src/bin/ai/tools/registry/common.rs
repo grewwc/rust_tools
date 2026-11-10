@@ -804,6 +804,7 @@ fn execute_tool_call_with_args_impl(
             record_tool_stat(name, true);
             record_tool_decision_with_time(name, true, "ok", elapsed_ms);
             Ok(ToolResult {
+                task_report: None,
                 tool_call_id: tool_call_id.to_string(),
                 content: result,
             })
@@ -1029,10 +1030,7 @@ mod history_policy_tests {
 
     #[test]
     fn parallel_policy_defaults_to_serial_for_unregistered_tools() {
-        assert_eq!(
-            tool_parallel_policy("tree"),
-            ToolParallelPolicy::Serial
-        );
+        assert_eq!(tool_parallel_policy("tree"), ToolParallelPolicy::Serial);
         assert_eq!(
             tool_parallel_policy("not_a_registered_tool"),
             ToolParallelPolicy::Serial
@@ -1056,7 +1054,10 @@ mod history_policy_tests {
     fn retry_policy_defaults_to_no_retry() {
         // Side effects are not encoded in names. In particular, "forget" and
         // "mailbox" must not inherit retry safety from "get"/"read" substrings.
-        assert_eq!(tool_retry_policy("knowledge_forget"), ToolRetryPolicy::NoRetry);
+        assert_eq!(
+            tool_retry_policy("knowledge_forget"),
+            ToolRetryPolicy::NoRetry
+        );
         assert_eq!(tool_retry_policy("read_mailbox"), ToolRetryPolicy::NoRetry);
         assert_eq!(
             tool_retry_policy("task_evidence_read"),

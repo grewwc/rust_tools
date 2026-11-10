@@ -16,7 +16,11 @@ function between(start, end) {
   assert.ok(a >= 0 && b > a, "missing page functions: " + start);
   return script.slice(a, b);
 }
-const response = (body, status = 200) => ({ ok: status === 200, status, statusText: "Not Found", headers: { get: () => null }, json: async () => plain(body) });
+const response = (body, status = 200, headers = {}) => ({
+  ok: status === 200, status, statusText: "Not Found",
+  headers: { get: (name) => headers[String(name).toLowerCase()] ?? null },
+  json: async () => plain(body),
+});
 function deferred() {
   let resolve;
   const promise = new Promise((done) => { resolve = done; });
@@ -102,7 +106,8 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
     setTimeout: (fn, ms) => { const id = nextTimer++; timers.set(id, { fn, at: now + ms }); return id; },
     clearTimeout: (id) => timers.delete(id),
     fetch: async (url, options) => {
-      const request = { url, path: new URL(url).pathname, method: options.method || "GET", headers: plain(options.headers), body: options.body ? JSON.parse(options.body) : null };
+      const parsed = new URL(url);
+      const request = { url, path: parsed.pathname, searchParams: parsed.searchParams, method: options.method || "GET", headers: plain(options.headers), body: options.body ? JSON.parse(options.body) : null };
       requests.push(request);
       if (request.path.endsWith("/history")) return historyGet ? historyGet(request) : response([]);
       if (request.path.endsWith("/config")) return configGet ? configGet(request) : response({});
@@ -121,7 +126,18 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
         return response({});
       }
       assert.equal(request.path, "/sessions");
-      return sessionsGet ? sessionsGet(request) : response(serverItems);
+      if (sessionsGet) return sessionsGet(request);
+      const ordered = request.searchParams.get("newest") === "true" ? serverItems.slice().reverse() : serverItems.slice();
+      const offset = Number(request.searchParams.get("offset") || 0);
+      const limit = Number(request.searchParams.get("limit") || ordered.length);
+      const page = ordered.slice(offset, offset + limit);
+      const include = request.searchParams.get("include");
+      const selected = include && ordered.find((item) => item.id === include);
+      if (selected && !page.some((item) => item.id === include)) page.push(selected);
+      return response(page, 200, {
+        "x-sessions-total": String(ordered.length),
+        "x-sessions-page-size": String(Math.min(limit, Math.max(0, ordered.length - offset))),
+      });
     },
     confirm: (text) => { confirmations.push(text); return confirmDelete; },
     clearDraft: (id) => draftsCleared.push(id),
@@ -150,6 +166,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
       textOf: (content) => typeof content === "string" ? content : "",
       isRuntimeSyntheticUser: () => false, historyEndsUnanswered: () => false,
       addMsgMd: (text, parent) => { const row = node(); row.textContent = text; parent.appendChild(row); },
+      createTurnRateLine: () => () => {}, estimateTextTokens: () => 0,
     });
     vm.runInContext(between("// BEGIN session switch", "// END session switch"), context);
     vm.runInContext(between("// History is append-only", "// Historical user inputs"), context);
@@ -574,10 +591,28 @@ test("boot renders every fetched session before history and config hydration fin
   await boot;
 });
 
+test("session rail fetches one small newest page and loads older sessions on demand", async () => {
+  const h = harness({ sid: "", items: longSessions(), cachedItems: [] });
+  await h.context.loadSessions();
+  const listRequests = h.requests.filter((request) => request.path === "/sessions");
+  assert.equal(listRequests.length, 1);
+  assert.equal(listRequests[0].searchParams.get("limit"), "12");
+  assert.equal(listRequests[0].searchParams.get("offset"), "0");
+  assert.equal(listRequests[0].searchParams.get("newest"), "true");
+  assert.equal(h.context.lastItems.length, 12);
+  assert.equal(h.elements.sesscount.textContent, "102 sessions");
+
+  await h.context.loadOlderSessions();
+  assert.equal(h.requests.filter((request) => request.path === "/sessions").length, 2);
+  assert.equal(h.requests.at(-1).searchParams.get("offset"), "12");
+  assert.equal(h.context.lastItems.length, 24);
+  assert.equal(h.elements.sesscount.textContent, "102 sessions");
+});
+
 for (const refreshAfterSwitch of [false, true]) test("a stale session list omitting B cannot steal selection (new refresh=" + refreshAfterSwitch + ")", async () => {
   const stale = deferred();
   let reads = 0;
-  const h = harness({ realNavigation: true, sessionsGet: () => ++reads === 1 ? stale.promise : response(sessions()) });
+  const h = harness({ realNavigation: true, sessionsGet: () => ++reads === 1 ? stale.promise : response(sessions(), 200, { "x-sessions-total": "2", "x-sessions-page-size": "2" }) });
   const oldList = h.context.loadSessions();
   if (refreshAfterSwitch) {
     await h.dispatch(h.row(), "click").done;

@@ -86,6 +86,7 @@ pub(crate) fn execute_send_side_note(args: &Value) -> Result<String, String> {
 pub fn handle_send_side_note(tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
     let content = execute_send_side_note(args)?;
     Ok(ToolResult {
+        task_report: None,
         tool_call_id: tool_call_id.to_string(),
         content,
     })

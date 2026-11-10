@@ -716,13 +716,13 @@ fn setup_live_fifo(_session_id: &str) -> Option<LiveFifo> {
 /// 10 = input resolved, 11 = assistant body pending, 12 = tool lifecycle,
 /// 13 = committed body, 14/15/16 = chunked committed body start/chunk/end,
 /// 17 = server-computed live thinking rate, 18/19 = model-backed history
-/// compression start/done).
+/// compression start/done, 23 = terminal-independent throughput metric).
 #[derive(Debug, PartialEq, Eq)]
 #[cfg(feature = "serve")]
 enum ServeLiveEvent {
     Delta(String),
     ThinkingStart,
-    Thinking(String, Option<String>),
+    Thinking(String, Option<background::ServeTokenRate>),
     ThinkingDone,
     OutputComplete,
     /// Raw JSON payload of a remote confirmation request.
@@ -742,6 +742,8 @@ enum ServeLiveEvent {
     Replace(String),
     /// Bounded JSON describing an actual tool dispatch or its completed result.
     Tool(String),
+    /// Exact producer-owned rate for a completed output/reasoning phase.
+    TokenRate(background::ServeTokenRate),
     CompressionStart,
     CompressionDone,
 }
@@ -761,14 +763,74 @@ enum ServeLiveEvent {
 #[cfg(feature = "serve")]
 struct ServeFrameDecoder {
     buf: Vec<u8>,
-    thinking_rate: Option<String>,
+    thinking_rate: Option<background::ServeTokenRate>,
     /// In-flight chunked committed body, present between `ReplaceStart` and
     /// `ReplaceEnd`.
     pending_replace: Option<String>,
+    pending_json: Option<PendingServeJson>,
+}
+
+#[cfg(feature = "serve")]
+struct PendingServeJson {
+    kind: ServeJsonKind,
+    expected_bytes: usize,
+    text: String,
+}
+
+#[cfg(feature = "serve")]
+enum ServeJsonKind {
+    Tool,
+    SubagentProgress,
 }
 
 #[cfg(feature = "serve")]
 impl ServeFrameDecoder {
+    fn append_json_chunk(&mut self, chunk: &str, complete: bool) -> Option<ServeLiveEvent> {
+        let mut pending = self.pending_json.take()?;
+        if pending.text.len() + chunk.len() > pending.expected_bytes {
+            return None;
+        }
+        pending.text.push_str(chunk);
+        if !complete {
+            self.pending_json = Some(pending);
+            return None;
+        }
+        if pending.text.len() != pending.expected_bytes {
+            return None;
+        }
+        Some(match pending.kind {
+            ServeJsonKind::Tool => ServeLiveEvent::Tool(pending.text),
+            ServeJsonKind::SubagentProgress => ServeLiveEvent::SubagentProgress(pending.text),
+        })
+    }
+
+    fn start_json(&mut self, payload: &str) {
+        self.pending_json = None;
+        let Some((header, text)) = payload.split_once('\n') else {
+            return;
+        };
+        let Some((kind, bytes)) = header.split_once(' ') else {
+            return;
+        };
+        let Ok(expected_bytes) = bytes.parse::<usize>() else {
+            return;
+        };
+        if expected_bytes > background::MAX_SERVE_FRAME_LEN as usize || text.len() > expected_bytes
+        {
+            return;
+        }
+        let kind = match kind {
+            "tool" => ServeJsonKind::Tool,
+            "subagent_progress" => ServeJsonKind::SubagentProgress,
+            _ => return,
+        };
+        self.pending_json = Some(PendingServeJson {
+            kind,
+            expected_bytes,
+            text: text.to_string(),
+        });
+    }
+
     /// Append one continuation chunk of a chunked committed body. A chunk with
     /// no start in flight names no body and is dropped; a body past the
     /// defensive cap is abandoned (dropped, never emitted) so a foreign writer
@@ -813,6 +875,11 @@ impl ServeFrameDecoder {
                 || kind == background::ServeLiveKind::Tool as u8
                 || kind == background::ServeLiveKind::CompressionStart as u8
                 || kind == background::ServeLiveKind::CompressionDone as u8;
+            let known = known
+                || kind == background::ServeLiveKind::JsonStart as u8
+                || kind == background::ServeLiveKind::JsonChunk as u8
+                || kind == background::ServeLiveKind::JsonEnd as u8;
+            let known = known || kind == background::ServeLiveKind::TokenRate as u8;
             if !known || len > background::MAX_SERVE_FRAME_LEN as usize {
                 self.buf.clear();
                 break;
@@ -823,6 +890,16 @@ impl ServeFrameDecoder {
             let payload = String::from_utf8_lossy(&self.buf[5..5 + len]).into_owned();
             self.buf.drain(..5 + len);
             let event = match kind {
+                k if k == background::ServeLiveKind::JsonStart as u8 => {
+                    self.start_json(&payload);
+                    None
+                }
+                k if k == background::ServeLiveKind::JsonChunk as u8 => {
+                    self.append_json_chunk(&payload, false)
+                }
+                k if k == background::ServeLiveKind::JsonEnd as u8 => {
+                    self.append_json_chunk(&payload, true)
+                }
                 k if k == background::ServeLiveKind::Delta as u8 => {
                     Some(ServeLiveEvent::Delta(payload))
                 }
@@ -834,7 +911,7 @@ impl ServeFrameDecoder {
                     ServeLiveEvent::Thinking(payload, self.thinking_rate.clone()),
                 ),
                 k if k == background::ServeLiveKind::ThinkingRate as u8 => {
-                    self.thinking_rate = Some(payload);
+                    self.thinking_rate = serde_json::from_str(&payload).ok();
                     None
                 }
                 k if k == background::ServeLiveKind::ThinkingDone as u8 => {
@@ -896,6 +973,11 @@ impl ServeFrameDecoder {
                 k if k == background::ServeLiveKind::CompressionDone as u8 => {
                     Some(ServeLiveEvent::CompressionDone)
                 }
+                k if k == background::ServeLiveKind::TokenRate as u8 => {
+                    serde_json::from_str(&payload)
+                        .ok()
+                        .map(ServeLiveEvent::TokenRate)
+                }
                 // Every kind accepted by the `known` gate above must have an
                 // arm here: falling through would end the turn for a frame
                 // that is not an output-complete marker.
@@ -914,6 +996,7 @@ impl ServeFrameDecoder {
         let tail = std::mem::take(&mut self.buf);
         let events = self.push(&tail);
         self.buf.clear();
+        self.pending_json = None;
         events
     }
 }
@@ -956,7 +1039,7 @@ fn live_event(event: ServeLiveEvent) -> Option<ServeSse> {
         ServeLiveEvent::Thinking(text, rate) => {
             let mut payload = serde_json::json!({"text": text});
             if let Some(rate) = rate {
-                payload["rate"] = serde_json::Value::String(rate);
+                payload["rate"] = serde_json::to_value(rate).ok()?;
             }
             Some(ServeSse::new("thinking", payload.to_string()))
         }
@@ -975,6 +1058,9 @@ fn live_event(event: ServeLiveEvent) -> Option<ServeSse> {
         | ServeLiveEvent::InputDone(_) => None,
         ServeLiveEvent::SubagentProgress(line) => Some(ServeSse::new("subagent_progress", line)),
         ServeLiveEvent::Tool(payload) => Some(ServeSse::new("tool", payload)),
+        ServeLiveEvent::TokenRate(rate) => {
+            Some(ServeSse::new("rate", serde_json::to_string(&rate).ok()?))
+        }
         ServeLiveEvent::CompressionStart => Some(ServeSse::new("compression_start", "")),
         ServeLiveEvent::CompressionDone => Some(ServeSse::new("compression_done", "")),
         ServeLiveEvent::OutputComplete => None,

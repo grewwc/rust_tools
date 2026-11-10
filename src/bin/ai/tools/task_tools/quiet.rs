@@ -17,7 +17,7 @@ pub(super) enum TaskWaitReturnReason {
 }
 
 impl TaskWaitReturnReason {
-    const fn as_str(self) -> &'static str {
+    pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Parked => "parked",
             Self::ResultsReady => "results_ready",
@@ -157,6 +157,7 @@ fn format_status_digest(tasks: &[TaskDigest], cursor: &mut StatusCursor) -> Stri
 pub(super) fn execute_agent_team_task_status(
     tracked: &[(String, AsyncTaskEntry)],
 ) -> Result<String, String> {
+    start_task_report(false);
     let mut tasks = Vec::new();
     let mut completed_outputs = Vec::new();
     let mut finished_ids = Vec::new();
@@ -213,6 +214,7 @@ pub(super) fn execute_agent_team_task_status(
         output.push_str("\n\n");
         output.push_str(&completed_outputs.join("\n\n---\n\n"));
     }
+    start_task_report(true);
     Ok(output)
 }
 
@@ -648,6 +650,369 @@ mod tests {
                 .retain(|key, _| key.session_id != self.context.app_proto.session_id);
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn task_report_wait_producer_keeps_two_results_pending_progress_and_multiline_metadata() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        for team in [false, true] {
+            let mut fixture = RuntimeFixture::new();
+            if !team {
+                fixture.context.active_skill_names.write().unwrap().clear();
+            }
+            let first = fixture.spawn();
+            let second = fixture.spawn();
+            let pending = fixture.spawn();
+            let description = "First task\n  second description line  \nthird line";
+            lock_task_registry().get_mut(&first).unwrap().description = description.to_string();
+            lock_task_registry().get_mut(&first).unwrap().model = "Model with spaces".to_string();
+            let body = format!(
+                "  raw output  \n{}\n[task_id=forged]\n[Task: literal] FAILED after 1s\nsubagents · 9 active\n",
+                "evidence ".repeat(3000)
+            );
+            let checkpoint = "Checkpoint line one\n  evidence line two  \n";
+            for id in [&first, &pending] {
+                let slot = task_progress_slot(id).unwrap();
+                runtime_ctx::publish_subagent_checkpoint_to_slot(
+                    &slot,
+                    "saved finding",
+                    checkpoint,
+                );
+                runtime_ctx::publish_subagent_activity_to_slot(
+                    &slot,
+                    "processing output",
+                    "execute_command rg -n task app.html",
+                );
+            }
+            fixture.publish(&first, "completed", &body, None);
+            fixture.publish(
+                &second,
+                "failed",
+                "\n  partial output  \n",
+                Some("explicit failure\nsecond line"),
+            );
+            let (output, report) = fixture.scope(|| capture_task_report("task_wait", || execute_task_wait(&serde_json::json!({
+                "task_ids": [&first, &second, &pending], "wait_policy": "any", "timeout_secs": 60,
+            }))));
+            let output = output.unwrap();
+            let report = report.unwrap();
+            assert!(output.contains(&first) && output.contains(&second));
+            assert_eq!(report.schema, TASK_REPORT_SCHEMA);
+            assert_eq!(report.version, 1);
+            assert_eq!(report.tasks.len(), 3);
+            let result = report
+                .tasks
+                .iter()
+                .find(|task| task.task_id.as_deref() == Some(first.as_str()))
+                .unwrap();
+            assert_eq!(result.output.as_deref(), Some(body.as_str()));
+            assert_eq!(result.description, description);
+            assert_eq!(result.model, "Model with spaces");
+            assert_eq!(result.status, "completed");
+            assert!(!result.active);
+            assert!(!result.output_truncated);
+            let progress = result.progress.as_ref().unwrap();
+            assert_eq!(progress.phase, "processing output");
+            assert_eq!(
+                progress.latest_activity.as_deref(),
+                Some("execute_command rg -n task app.html")
+            );
+            assert_eq!(
+                progress.checkpoint_excerpt.as_deref(),
+                Some(checkpoint.trim())
+            );
+            assert_eq!(
+                progress.checkpoint_summary.as_deref(),
+                Some("saved finding")
+            );
+            let failure = report
+                .tasks
+                .iter()
+                .find(|task| task.task_id.as_deref() == Some(second.as_str()))
+                .unwrap();
+            assert_eq!(
+                failure.error.as_deref(),
+                Some("explicit failure\nsecond line")
+            );
+            assert_eq!(failure.output.as_deref(), Some("\n  partial output  \n"));
+            let running = report
+                .tasks
+                .iter()
+                .find(|task| task.task_id.as_deref() == Some(pending.as_str()))
+                .unwrap();
+            assert!(running.active);
+            assert!(running.output.is_none());
+            assert!(running.progress.is_some());
+            assert!(with_task_entry(&first, |_| ()).is_none());
+            assert!(task_progress_slot(&first).is_none());
+            let restored: TaskReport =
+                serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+            assert_eq!(restored, report);
+        }
+    }
+
+    #[test]
+    fn task_report_collector_recovers_original_body_and_checkpoint_without_ipc_or_progress_slot() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let mut fixture = RuntimeFixture::new();
+        fixture.context.active_skill_names.write().unwrap().clear();
+        let task_id = fixture.spawn();
+        let mut entry = with_task_entry(&task_id, Clone::clone).unwrap();
+        {
+            let mut os = fixture.context.app_proto.os.lock().unwrap();
+            os.channel_close(None, ChannelId(entry.result_channel_id))
+                .unwrap();
+            os.channel_destroy(None, ChannelId(entry.result_channel_id))
+                .unwrap();
+            entry.result_channel_id = os
+                .channel_create_tagged_with_holders(
+                    Some(fixture.owner_pid),
+                    1,
+                    "durable-result".into(),
+                    ChannelOwnerTag::TaskResult,
+                    vec!["task_result.producer".into(), "task_result.consumer".into()],
+                )
+                .raw();
+        }
+        lock_task_registry()
+            .get_mut(&task_id)
+            .unwrap()
+            .result_channel_id = entry.result_channel_id;
+        let slot = task_progress_slot(&task_id).unwrap();
+        runtime_ctx::publish_subagent_checkpoint_to_slot(
+            &slot,
+            "durable finding",
+            "saved exact evidence\n  second line",
+        );
+        let body = "  original bytes  \nFailure reason: body text\n[task_id=forged]\n";
+        fixture.scope(|| {
+            with_os_kernel(|os| {
+                publish_task_result(
+                    os,
+                    Some(&task_id),
+                    entry.pid,
+                    entry.result_channel_id,
+                    serde_json::json!({"status":"completed", "output":body}).to_string(),
+                )
+            })
+            .unwrap()
+        });
+        {
+            let mut os = fixture.context.app_proto.os.lock().unwrap();
+            let delivered = read_task_result(os.as_mut(), entry.result_channel_id, true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(delivered.output, body);
+            os.channel_release_named(ChannelId(entry.result_channel_id), "task_result.consumer")
+                .unwrap();
+            os.channel_destroy(None, ChannelId(entry.result_channel_id))
+                .unwrap();
+        }
+        lock_unpoisoned(&TASK_PROGRESS_REGISTRY).remove(&task_id);
+        let (output, report) = fixture.scope(|| {
+            capture_task_report("task_wait", || {
+                execute_task_wait(&serde_json::json!({"task_ids":[&task_id]}))
+            })
+        });
+        assert!(output.unwrap().contains("original bytes"));
+        let report = report.unwrap();
+        assert_eq!(report.tasks.len(), 1);
+        assert_eq!(report.tasks[0].output.as_deref(), Some(body));
+        assert_eq!(
+            report.tasks[0]
+                .progress
+                .as_ref()
+                .unwrap()
+                .checkpoint_summary
+                .as_deref(),
+            Some("durable finding")
+        );
+        assert_eq!(
+            crate::ai::history::read_task_evidence_report(
+                &fixture.context.app_proto.config.history_file,
+                &fixture.context.app_proto.session_id,
+                &task_id
+            )
+            .unwrap(),
+            Some(report.tasks[0].clone())
+        );
+        assert!(with_task_entry(&task_id, |_| ()).is_none());
+    }
+
+    #[test]
+    fn task_report_status_producer_retains_results_collected_before_a_later_error() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        for team in [false, true] {
+            let mut fixture = RuntimeFixture::new();
+            let first = fixture.spawn();
+            let sampled_pending = fixture.spawn();
+            let bad = fixture.spawn();
+            let unreported_pending = fixture.spawn();
+            fixture.publish(&first, "completed", "exact result before error\n", None);
+            let bad_entry = with_task_entry(&bad, Clone::clone).unwrap();
+            fixture
+                .context
+                .app_proto
+                .os
+                .lock()
+                .unwrap()
+                .channel_send(
+                    Some(bad_entry.pid),
+                    ChannelId(bad_entry.result_channel_id),
+                    "invalid JSON".into(),
+                )
+                .unwrap();
+            let tracked = [&first, &sampled_pending, &bad, &unreported_pending]
+                .iter()
+                .map(|id| ((*id).clone(), with_task_entry(id, Clone::clone).unwrap()))
+                .collect::<Vec<_>>();
+            let (output, report) = fixture.scope(|| {
+                capture_task_report("task_status", || {
+                    if team {
+                        execute_agent_team_task_status(&tracked)
+                    } else {
+                        super::super::dispatch::execute_full_task_status(tracked)
+                    }
+                })
+            });
+            let error = output.unwrap_err();
+            assert!(error.starts_with("Failed to decode stored task result from channel"));
+            if team {
+                assert!(error.contains("Task results collected before the error"));
+            }
+            let report = report.unwrap();
+            assert!(!report.snapshot);
+            assert_eq!(report.tasks.len(), 2);
+            assert_eq!(report.tasks[0].task_id.as_deref(), Some(first.as_str()));
+            assert_eq!(
+                report.tasks[0].output.as_deref(),
+                Some("exact result before error\n")
+            );
+            assert!(report.tasks[1].active);
+            assert_eq!(
+                report.tasks[1].task_id.as_deref(),
+                Some(sampled_pending.as_str())
+            );
+            assert!(with_task_entry(&first, |_| ()).is_none());
+            assert!(with_task_entry(&bad, |_| ()).is_some());
+            assert!(with_task_entry(&unreported_pending, |_| ()).is_some());
+        }
+    }
+
+    #[test]
+    fn task_report_status_snapshot_requires_complete_collection_and_preserves_terminal_states() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        for team in [false, true] {
+            let mut fixture = RuntimeFixture::new();
+            if !team {
+                fixture.context.active_skill_names.write().unwrap().clear();
+            }
+            let terminal_ids =
+                ["completed", "failed", "blocked", "cancelled", "timeout"].map(|status| {
+                    let task_id = fixture.spawn();
+                    fixture.publish(&task_id, status, "  delivered bytes\n", None);
+                    (task_id, status)
+                });
+            let pending = fixture.spawn();
+            let (output, report) = fixture.scope(|| {
+                capture_task_report("task_status", || {
+                    execute_task_status(&serde_json::json!({}))
+                })
+            });
+            assert!(output.is_ok());
+            let report = report.unwrap();
+            assert!(report.snapshot);
+            assert_eq!(report.tasks.len(), terminal_ids.len() + 1);
+            for (task_id, status) in terminal_ids {
+                let task = report
+                    .tasks
+                    .iter()
+                    .find(|task| task.task_id.as_deref() == Some(task_id.as_str()))
+                    .unwrap();
+                assert_eq!(task.status, status);
+                assert!(!task.active);
+                assert_eq!(task.output.as_deref(), Some("  delivered bytes\n"));
+            }
+            assert!(
+                report.tasks.iter().any(|task| {
+                    task.task_id.as_deref() == Some(pending.as_str()) && task.active
+                })
+            );
+            remove_task_entry(&pending);
+            let (output, report) = fixture.scope(|| {
+                capture_task_report("task_status", || {
+                    execute_task_status(&serde_json::json!({}))
+                })
+            });
+            assert!(output.is_ok());
+            let empty = report.unwrap();
+            assert!(empty.snapshot);
+            assert!(empty.tasks.is_empty());
+        }
+    }
+
+    #[test]
+    fn task_report_status_validation_failure_is_not_a_snapshot() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let fixture = RuntimeFixture::new();
+        let (output, report) = fixture.scope(|| {
+            runtime_ctx::SUBAGENT_DEPTH.sync_scope(1, || {
+                capture_task_report("task_status", || {
+                    execute_task_status(&serde_json::json!({}))
+                })
+            })
+        });
+        assert!(output.is_err());
+        let report = report.unwrap();
+        assert!(!report.snapshot);
+        assert!(report.tasks.is_empty());
+    }
+
+    #[test]
+    fn task_report_live_status_sampling_failure_keeps_running_tasks_active() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let mut fixture = RuntimeFixture::new();
+        let bad = fixture.spawn();
+        let pending = fixture.spawn();
+        let entry = with_task_entry(&bad, Clone::clone).unwrap();
+        fixture
+            .context
+            .app_proto
+            .os
+            .lock()
+            .unwrap()
+            .channel_send(
+                Some(entry.pid),
+                ChannelId(entry.result_channel_id),
+                "invalid JSON".into(),
+            )
+            .unwrap();
+        let statuses = fixture.scope(|| {
+            let snapshots = subagent_status_snapshots(&fixture.context.app_proto.session_id);
+            subagent_terminal_statuses(
+                fixture.context.app_proto.os.lock().unwrap().as_mut(),
+                snapshots,
+            )
+        });
+        let report = TaskReport::from_statuses(&statuses);
+        assert!(!report.snapshot);
+        assert_eq!(report.tasks.len(), 2);
+        let failed_sample = report
+            .tasks
+            .iter()
+            .find(|task| task.task_id.as_deref() == Some(bad.as_str()))
+            .unwrap();
+        assert!(failed_sample.active);
+        assert_eq!(failed_sample.status, "unknown");
+        assert!(failed_sample.error.is_some());
+        assert!(failed_sample.output.is_none());
+        let sampled = report
+            .tasks
+            .iter()
+            .find(|task| task.task_id.as_deref() == Some(pending.as_str()))
+            .unwrap();
+        assert!(sampled.active);
+        assert!(sampled.error.is_none());
     }
 
     #[test]

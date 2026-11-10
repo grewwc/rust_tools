@@ -192,6 +192,7 @@ impl ToolPermissions {
 /// treats a blocked call as reusable success evidence.
 fn denied_tool_result(tool_call: &ToolCall, policy_note: &str) -> ToolResult {
     ToolResult {
+        task_report: None,
         tool_call_id: tool_call.id.clone(),
         content: format!(
             "Error: tool '{}' was blocked by the configured tool-permission policy ({policy_note}). \
@@ -575,6 +576,7 @@ mod tests {
                     tool_results: tool_calls
                         .iter()
                         .map(|c| ToolResult {
+                            task_report: None,
                             tool_call_id: c.id.clone(),
                             content: format!("ok:{}", c.function.name),
                         })

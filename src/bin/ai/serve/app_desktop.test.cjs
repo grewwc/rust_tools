@@ -59,9 +59,9 @@ function between(start, end) {
 function marked(name) {
   return between("// BEGIN " + name, "// END " + name);
 }
-const response = (body, status = 200) => ({
+const response = (body, status = 200, headers = {}) => ({
   ok: status === 200, status, statusText: "Unavailable",
-  headers: { get: () => null }, json: async () => plain(body),
+  headers: { get: (name) => headers[name] ?? null }, json: async () => plain(body),
 });
 const sessions = (marked = false) => [
   { id: "open-session", summary: "Open session", marked: false, size_bytes: 1024 },
@@ -165,8 +165,9 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
   elements.sessionactions.appendChild(elements.sessionactionsscrim);
   elements.sessionactions.appendChild(elements.sessionactionspanel);
   document.querySelectorAll = (selector) => {
-    assert.equal(selector, "#msgs .turn-interrupted");
-    return elements.msgs.querySelectorAll(".turn-interrupted");
+    if (selector === "#msgs .turn-interrupted") return elements.msgs.querySelectorAll(".turn-interrupted");
+    assert.equal(selector, "#msgs [data-task-states], #msgs [data-task-busy], #msgs [data-task-reset]");
+    return [];
   };
   const serverItems = plain(sessions(isMarked)), stored = new Map(), requests = [], confirmations = [], messages = [], notes = [], drawers = [];
   const media = { matches: phone, listeners: [], addEventListener: (_, listener) => media.listeners.push(listener) };
@@ -213,7 +214,11 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
         return response({});
       }
       assert.equal(request.path, "/sessions");
-      return response(request.method === "POST" ? { id: "fresh-session" } : serverItems);
+      if (request.method === "POST") return response({ id: "fresh-session" });
+      return response(serverItems, 200, {
+        "x-sessions-total": String(serverItems.length),
+        "x-sessions-page-size": String(serverItems.length),
+      });
     },
     confirm: (text) => { confirmations.push(text); return confirmDelete; },
     addMsg: (role, text) => { messages.push({ role, text }); return node(); }, note: (text) => notes.push(text),
@@ -229,7 +234,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     historySession: sid, canonicalHistoryTotal: 0, pendingUserInputs: new Map(),
     questionCache: null, runEpoch: 0, turnRunning: false, confirmPollSeq: 0,
     turnRunningAt: 0, RUNNING_SAMPLE_TTL_MS: 60000,
-    eventActive: false, eventSession: "", eventStreamEnded: false, staleSession: "", staleDone: false,
+    eventActive: false, eventSession: "", eventStreamEnded: false, eventStreamFailed: false, staleSession: "", staleDone: false,
     lastHistoryEndsUnanswered: false, LIVE_STALL_MS: 60000, STREAM_SILENCE_MS: 60000,
     addLiveUserBubble: () => { const row = node(), bubble = node(); row.appendChild(bubble); elements.msgs.appendChild(row); return bubble; },
     addMsgMd: (text, parent) => {
@@ -569,6 +574,18 @@ test("desktop new-session creation clears a stale returned-id draft and preserve
   assert.equal(h.elements.prompt.value, "");
 });
 
+test("switching from a completed session lets the selected running session control the stop state", () => {
+  const h = harness();
+  vm.runInContext("eventStreamEnded = true", h.context);
+  vm.runInContext("abortEvents = () => { eventStreamEnded = false; }", h.context);
+
+  h.context.switchSession("fresh-session");
+
+  assert.equal(h.context.eventStreamEnded, false);
+  vm.runInContext("turnRunning = true; turnRunningAt = Date.now()", h.context);
+  assert.equal(h.context.isTurnRunning(), true);
+});
+
 test("a first desktop send clears both the anonymous and adopted session drafts", async () => {
   const h = harness({ sid: "" });
   h.elements.prompt.value = "stale fresh draft";
@@ -718,6 +735,16 @@ test("desktop prompt index starts at the newest question and upward wheel loads 
   h.context.syncPromptNav();
   assert.equal(list.children.at(-1).classList.contains("cur"), true, "the newest prompt is selected by default");
   assert.equal(list.scrollTop, list.scrollHeight, "the initial prompt window opens at its newest end");
+
+  const stableCount = h.elements.promptcount.textContent;
+  const stableItems = list.children.slice();
+  h.elements.msgs.querySelectorAll = () => [];
+  h.context.historyLoadState = () => ({ loading: 1 });
+  h.context.syncPromptNav();
+  assert.equal(h.elements.promptcount.textContent, stableCount, "a transient empty history frame keeps its count badge");
+  assert.deepEqual(list.children, stableItems, "a transient empty history frame keeps the prompt rail mounted");
+  h.context.historyLoadState = () => ({ loading: 0 });
+  h.elements.msgs.querySelectorAll = (selector) => selector === ".user-msg-row" ? rows : [];
 
   list.scrollTop = 0;
   rows.unshift(...[0, 1, 2, 3].map(makeRow));
@@ -898,7 +925,7 @@ test("throughput footers wrap inside styled cards at phone and desktop widths", 
     assert.equal(rate["max-width"], "100%");
     assert.equal(rate["white-space"], "normal");
     assert.equal(rate["overflow-wrap"], "anywhere");
-    assert.equal(rate["border-top"], "1px solid var(--line)");
+    assert.equal(rate["border-top"], undefined);
     assert.notEqual(rate.display, "none");
   }
 });
@@ -937,7 +964,7 @@ test("short-thinking early repaint: real send paints and saves its first chunk's
   h.advance(200);
   assert.equal(summary.textContent, "thinking… · ~31 tok @ 124 tok/s", "the first chunk waited for phase completion or another chunk");
   assert.equal(h.context.turns.has(h.context.sessionId), true);
-  assert.match(h.elements.msgs.querySelector(".pending").textContent, /reasoning ~31 tok @ 124 tok\/s/);
+  assert.doesNotMatch(h.elements.msgs.querySelector(".pending").textContent, /tok/);
   const serialized = h.stored.get("serve.rates");
   assert.ok(serialized);
   await frame('event: thinking_done\ndata: \n\n');
@@ -955,7 +982,7 @@ test("short-thinking early repaint: real send paints and saves its first chunk's
     .find((key) => !Object.hasOwn(JSON.parse(serialized), key));
   const serializedPhases = JSON.stringify({
     ...JSON.parse(serialized),
-    [phase2Key]: { textKey: h.context.rateTextKey(legacyThought), rate: "~10 tok @ 40.0 tok/s" },
+    [phase2Key]: { structured: true, textKey: h.context.rateTextKey(legacyThought), rate: "~10 tok @ 40.0 tok/s" },
   });
   assert.equal(h.stored.get("serve.rates"), serializedPhases);
   const messages = [
@@ -1019,22 +1046,19 @@ for (const [phone, width] of [[true, 320], [true, 375], [true, 700], [false, 128
     await settle();
     // Several phases can share one network read before a browser paint.
     await frame('event: thinking_start\ndata: \n\nevent: thinking\ndata: {"text":"first thought"}\n\nevent: thinking_done\ndata: \n\nevent: thinking_start\ndata: \n\nevent: thinking\ndata: {"text":"second thought"}\n\nevent: thinking_done\ndata: \n\nevent: delta\ndata: {"delta":"live answer"}\n\n');
-    await frame("data: ↳ speed · output 40 tok @ 20 tok/s\n\n");
+    await frame('event: rate\ndata: {"phase":"output","tokens":40,"elapsed_ms":2000}\n\n');
     // The fixture queues browser paint timers until its clock is advanced.
     h.advance(1000);
     const lines = h.elements.msgs.querySelectorAll(".turn-rate");
-    assert.equal(lines.length, phone ? 0 : 1, "only desktop generation needs a speed footer");
-    if (!phone) assert.equal(lines[0].textContent, "↳ speed · output 40 tok @ 20 tok/s");
+    assert.equal(lines.length, 1, "both layouts keep throughput in the assistant card");
+    assert.equal(lines[0].textContent, "↳ speed · output 40 tok @ 20 tok/s");
     const thoughts = h.elements.msgs.querySelectorAll(".prog");
     assert.deepEqual(thoughts.map((thought) => thought.textContent), ["first thought", "second thought"]);
     h.elements.turnstatus.hidden = true;
     const status = h.elements.msgs.querySelector(".pending");
     assert.ok(status);
-    if (phone) assert.match(status.textContent, /output 40 tok @ 20 tok\/s/);
-    else {
-      assert.equal(status.textContent, "◌ Responding… · 0:01");
-      assert.doesNotMatch(status.textContent, /tok/);
-    }
+    assert.equal(status.textContent, "◌ Responding… · 0:01");
+    assert.doesNotMatch(status.textContent, /tok/);
     assert.ok(status.classList.contains("msg") && status.classList.contains("asst"));
     const ancestors = [];
     for (let element = status; element; element = element.parentNode) {
@@ -1117,20 +1141,17 @@ for (const [phone, width] of [[true, 320], [true, 375], [true, 700], [false, 128
     h.elements.prompt.value = "phone thinking prompt";
     const pending = h.context.send();
     await settle();
-    await frame('event: thinking_start\ndata: \n\nevent: thinking\ndata: {"text":"first thought","rate":"~1647 tok @ 86.2 tok/s"}\n\n');
+    await frame('event: thinking_start\ndata: \n\nevent: thinking\ndata: {"text":"first thought","rate":{"phase":"reasoning","tokens":1647,"elapsed_ms":19107,"approximate":true}}\n\n');
     h.advance(100);
     const status = h.elements.msgs.querySelector(".pending");
     assert.equal(status.hidden, false);
-    if (phone) assert.match(status.textContent, /Thinking… · reasoning ~1647 tok @ 86\.2 tok\/s/);
-    else {
-      assert.equal(status.textContent, "◌ Thinking… · 0:00");
-      assert.doesNotMatch(status.textContent, /tok/);
-    }
+    assert.equal(status.textContent, "◌ Thinking… · 0:00");
+    assert.doesNotMatch(status.textContent, /tok/);
     assert.ok(status.classList.contains("msg") && status.classList.contains("asst"));
     assert.equal(h.elements.msgs.querySelector("summary").textContent, "thinking… · ~1647 tok @ 86.2 tok/s");
     // The next round ends in one network read with a terminal server sample.
     // No later thinking event or phase-clock tick can rescue its header.
-    await frame('event: thinking_done\ndata: \n\nevent: tool\ndata: {"id":"lookup","name":"web_search","phase":"finished","ok":true}\n\nevent: thinking_start\ndata: \n\nevent: thinking\ndata: {"text":"second thought","rate":"~431 tok @ — tok/s"}\n\nevent: thinking_done\ndata: \n\ndata: ↳ speed · reasoning 431 tok @ 61 tok/s\n\nevent: done\ndata: \n\n');
+    await frame('event: thinking_done\ndata: \n\nevent: tool\ndata: {"id":"lookup","name":"web_search","phase":"finished","ok":true}\n\nevent: thinking_start\ndata: \n\nevent: thinking\ndata: {"text":"second thought","rate":{"phase":"reasoning","tokens":431,"elapsed_ms":null,"approximate":true}}\n\nevent: thinking_done\ndata: \n\nevent: rate\ndata: {"phase":"reasoning","tokens":431,"elapsed_ms":7066}\n\nevent: done\ndata: \n\n');
     await pending;
     const labels = ["thinking · ~1647 tok @ 86.2 tok/s", "thinking · ~431 tok @ 61 tok/s"];
     const summaries = h.elements.msgs.querySelectorAll("summary").filter((summary) => summary.textContent.startsWith("thinking"));

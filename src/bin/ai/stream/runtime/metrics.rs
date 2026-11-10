@@ -106,17 +106,43 @@ pub(super) fn maybe_print_prompt_cache_metrics(usage: &crate::ai::request::Strea
     }
 }
 
-/// Print provider token counts over observed generation windows. These are arrival
-/// rates, not provider decoding timings; output includes tool-call arguments.
+/// Numeric rate sample produced from provider token counts and an observed window.
+/// These are arrival rates, not provider decoding timings; output includes tool-call
+/// arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TokenRateSample {
+    pub(super) tokens: u64,
+    pub(super) elapsed: Option<Duration>,
+    pub(super) approximate: bool,
+}
+
+/// Print provider token counts over observed generation windows. In serve mode the
+/// browser receives numeric samples over the live FIFO instead of trying to recover
+/// them from this terminal-only footer.
 pub(super) fn maybe_print_token_throughput_metrics(
     usage: &crate::ai::request::StreamUsage,
     content: &StreamContentState,
     finished_at: Instant,
 ) {
+    let samples = token_throughput_samples(usage, content, finished_at);
+    if samples.is_empty() {
+        return;
+    }
+    if crate::ai::background::serve_live_streaming() {
+        for (phase, sample) in samples {
+            crate::ai::background::publish_serve_token_rate(
+                crate::ai::background::ServeLiveKind::TokenRate,
+                phase,
+                sample.tokens,
+                sample.elapsed,
+                sample.approximate,
+            );
+        }
+        return;
+    }
     if !runtime_ctx::terminal_output_enabled() {
         return;
     }
-
     let Some(line) = token_throughput_metrics(usage, content, finished_at) else {
         return;
     };
@@ -128,6 +154,28 @@ pub(super) fn token_throughput_metrics(
     content: &StreamContentState,
     finished_at: Instant,
 ) -> Option<String> {
+    let samples = token_throughput_samples(usage, content, finished_at);
+    if samples.is_empty() {
+        return None;
+    }
+    let mut segments = Vec::with_capacity(samples.len());
+    for (phase, sample) in samples {
+        segments.push(format!(
+            "{phase} {}",
+            format_token_throughput_segment(sample.tokens, sample.elapsed)
+        ));
+    }
+    Some(format!("↳ speed · {}", segments.join(" · ")))
+}
+
+/// Producer-owned token-throughput fields for serve and terminal rendering.
+/// The caller decides whether to serialize these values for the browser or format
+/// them into a terminal footer.
+pub(super) fn token_throughput_samples(
+    usage: &crate::ai::request::StreamUsage,
+    content: &StreamContentState,
+    finished_at: Instant,
+) -> Vec<(&'static str, TokenRateSample)> {
     let reasoning_tokens = usage
         .completion_tokens_details
         .as_ref()
@@ -147,12 +195,17 @@ pub(super) fn token_throughput_metrics(
         let elapsed = started.map(|start| generation_end.saturating_duration_since(start));
         // Interleaved phases or an unknown reasoning slice have no trustworthy
         // split. Use the complete generation window for the completion count.
-        return (usage.completion_tokens > 0 && elapsed.is_some()).then(|| {
-            format!(
-                "↳ speed · generation {}",
-                format_token_throughput_segment(usage.completion_tokens, elapsed),
-            )
-        });
+        return match (usage.completion_tokens, elapsed) {
+            (tokens, elapsed) if tokens > 0 => vec![(
+                "generation",
+                TokenRateSample {
+                    tokens,
+                    elapsed,
+                    approximate: false,
+                },
+            )],
+            _ => Vec::new(),
+        };
     }
     let reasoning_end = content.output_started_at.unwrap_or(generation_end);
     let reasoning_elapsed = content
@@ -162,12 +215,22 @@ pub(super) fn token_throughput_metrics(
         .output_started_at
         .map(|started| generation_end.saturating_duration_since(started));
 
-    format_token_throughput_metrics(
-        reasoning_tokens,
-        output_tokens,
-        reasoning_elapsed,
-        output_elapsed,
-    )
+    [
+        ("reasoning", reasoning_tokens, reasoning_elapsed),
+        ("output", output_tokens, output_elapsed),
+    ]
+    .into_iter()
+    .filter_map(|(phase, tokens, elapsed)| {
+        (tokens > 0).then_some((
+            phase,
+            TokenRateSample {
+                tokens,
+                elapsed,
+                approximate: false,
+            },
+        ))
+    })
+    .collect()
 }
 
 /// Live reasoning-rate text for the in-progress thinking-fold header. It is
@@ -176,22 +239,33 @@ pub(super) fn token_throughput_metrics(
 /// separately at stream end. Returns `None` until the first reasoning token
 /// arrives so the header stays stable during the pre-token window.
 pub(super) fn fold_header_rate(content: &StreamContentState, now: Instant) -> Option<String> {
+    let sample = live_reasoning_rate_sample(content, now)?;
+    Some(format!(
+        "~{} tok @ {} tok/s",
+        format_compact_token_count(sample.tokens),
+        format_token_rate(sample.tokens, sample.elapsed),
+    ))
+}
+
+/// Live (estimated) reasoning rate for serve frames and the terminal fold header.
+pub(super) fn live_reasoning_rate_sample(
+    content: &StreamContentState,
+    now: Instant,
+) -> Option<TokenRateSample> {
     if content.live_reasoning_tokens == 0 {
         return None;
     }
-    let elapsed = content.reasoning_started_at.map(|started| {
-        let end = if content.interleaved_generation {
-            now
-        } else {
-            content.output_started_at.unwrap_or(now)
-        };
-        end.saturating_duration_since(started)
-    });
-    Some(format!(
-        "~{} tok @ {} tok/s",
-        format_compact_token_count(content.live_reasoning_tokens),
-        format_token_rate(content.live_reasoning_tokens, elapsed),
-    ))
+    let started = content.reasoning_started_at?;
+    let end = if content.interleaved_generation {
+        now
+    } else {
+        content.output_started_at.unwrap_or(now)
+    };
+    Some(TokenRateSample {
+        tokens: content.live_reasoning_tokens,
+        elapsed: Some(end.saturating_duration_since(started)),
+        approximate: true,
+    })
 }
 
 /// Approximate token count for live throughput display (heuristic, prefixed with `~`):

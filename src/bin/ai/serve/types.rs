@@ -186,6 +186,8 @@ impl std::fmt::Debug for SessionEventBus {
 pub(crate) struct SessionEventLog {
     next_seq: AtomicU64,
     events: std::sync::Mutex<VecDeque<EventRecord>>,
+    /// Task metadata survives byte-budget eviction; bodies use explicit replay previews.
+    task_reports: std::sync::Mutex<VecDeque<EventRecord>>,
     bytes: AtomicUsize,
     running: AtomicBool,
     notify: Notify,
@@ -197,6 +199,7 @@ impl Default for SessionEventLog {
         Self {
             next_seq: AtomicU64::new(0),
             events: std::sync::Mutex::new(VecDeque::new()),
+            task_reports: std::sync::Mutex::new(VecDeque::new()),
             bytes: AtomicUsize::new(0),
             running: AtomicBool::new(true),
             notify: Notify::new(),
@@ -209,6 +212,38 @@ impl Default for SessionEventLog {
 const MAX_EVENT_RECORDS: usize = 2000;
 #[cfg(feature = "serve")]
 const MAX_EVENT_BYTES: usize = 1 << 20;
+#[cfg(feature = "serve")]
+const TASK_REPLAY_OUTPUT_BYTES: usize = 2000;
+
+#[cfg(feature = "serve")]
+fn task_report_replay_preview(event: &str, data: &str) -> Option<String> {
+    if !matches!(event, "tool" | "subagent_progress") {
+        return None;
+    }
+    let mut value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let mut report: crate::ai::tools::task_tools::TaskReport =
+        serde_json::from_value(value.get("task_report")?.clone()).ok()?;
+    if !report.supported() {
+        return None;
+    }
+    report.truncate_outputs(TASK_REPLAY_OUTPUT_BYTES);
+    value["task_report"] = serde_json::to_value(report).ok()?;
+    if let Some(output) = value
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    {
+        if output.len() > TASK_REPLAY_OUTPUT_BYTES {
+            let mut end = TASK_REPLAY_OUTPUT_BYTES;
+            while !output.is_char_boundary(end) {
+                end -= 1;
+            }
+            value["output"] = serde_json::json!(&output[..end]);
+            value["output_truncated"] = serde_json::json!(true);
+        }
+    }
+    Some(value.to_string())
+}
 
 #[cfg(feature = "serve")]
 impl SessionEventBus {
@@ -269,7 +304,20 @@ impl SessionEventLog {
             data: data.to_string(),
         };
         let size = record.data.len();
+        let preview = task_report_replay_preview(event, data);
         if let Ok(mut events) = self.events.lock() {
+            if let Some(data) = preview {
+                if let Ok(mut reports) = self.task_reports.lock() {
+                    reports.push_back(EventRecord {
+                        seq,
+                        event: event.to_string(),
+                        data,
+                    });
+                    while reports.len() > MAX_EVENT_RECORDS {
+                        reports.pop_front();
+                    }
+                }
+            }
             events.push_back(record);
             self.bytes.fetch_add(size, Ordering::Relaxed);
             while events.len() > MAX_EVENT_RECORDS
@@ -293,7 +341,7 @@ impl SessionEventLog {
         // every event of the new turn.
         let latest = self.next_seq.load(Ordering::Relaxed);
         let after = if after > latest { 0 } else { after };
-        let events = self
+        let mut events: Vec<EventRecord> = self
             .events
             .lock()
             .map(|events| {
@@ -304,6 +352,12 @@ impl SessionEventLog {
                     .collect()
             })
             .unwrap_or_default();
+        if let Ok(reports) = self.task_reports.lock() {
+            events.extend(reports.iter().filter(|record| record.seq > after).cloned());
+        }
+        // Ordinary records are first, so a retained complete payload wins over its preview.
+        events.sort_by_key(|record| record.seq);
+        events.dedup_by_key(|record| record.seq);
         (events, self.running.load(Ordering::Relaxed))
     }
 
@@ -341,7 +395,7 @@ pub(crate) struct Healthz {
     pub(crate) version: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct SessionItem {
     pub(crate) id: String,
     pub(crate) size_bytes: u64,
@@ -357,6 +411,12 @@ pub(crate) struct SessionItem {
 pub(crate) struct SessionsQuery {
     pub(crate) limit: Option<usize>,
     pub(crate) offset: Option<usize>,
+    /// Explicit ordering for paged UI clients; omitted keeps the legacy API.
+    #[serde(default)]
+    pub(crate) newest: bool,
+    /// Keep the selected session addressable when it falls outside the newest
+    /// page. It is appended without contributing to the page offset.
+    pub(crate) include: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -934,6 +994,49 @@ pub(crate) async fn session_lock(state: &ServeState, session_id: &str) -> Arc<Mu
 #[cfg(all(test, feature = "serve"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_report_replay_keeps_metadata_after_large_body_byte_budget_eviction() {
+        use crate::ai::tools::task_tools::{TaskReport, TaskReportTask};
+        let body = "界🙂\n".repeat(MAX_EVENT_BYTES / 4);
+        let mut report = TaskReport::for_task(TaskReportTask {
+            task_id: Some("first".into()),
+            description: "first\n  multiline description  ".into(),
+            agent: "build".into(),
+            model: "model with spaces".into(),
+            status: "completed".into(),
+            output: Some(body.clone()),
+            ..TaskReportTask::default()
+        });
+        report.tasks.push(TaskReportTask {
+            task_id: Some("second".into()),
+            description: "Second task".into(),
+            agent: "review".into(),
+            model: "second model".into(),
+            status: "waiting".into(),
+            active: true,
+            ..TaskReportTask::default()
+        });
+        let payload = serde_json::json!({"id":"call", "name":"task_wait", "phase":"finished", "output":body, "task_report":report}).to_string();
+        let bus = SessionEventBus::default();
+        let log = bus.begin("task-report-budget");
+        log.publish("tool", &payload);
+        log.publish("delta", "later answer");
+        let (records, _, _) = bus.snapshot("task-report-budget", 0).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].seq, 1);
+        assert_eq!(records[1].seq, 2);
+        let value: serde_json::Value = serde_json::from_str(&records[0].data).unwrap();
+        let replay: TaskReport = serde_json::from_value(value["task_report"].clone()).unwrap();
+        assert_eq!(replay.tasks.len(), 2);
+        assert!(replay.tasks[0].output_truncated);
+        assert!(body.starts_with(replay.tasks[0].output.as_deref().unwrap()));
+        assert!(replay.tasks[0].output.as_ref().unwrap().len() <= TASK_REPLAY_OUTPUT_BYTES);
+        assert_eq!(replay.tasks[0].description, report.tasks[0].description);
+        assert_eq!(replay.tasks[1], report.tasks[1]);
+        assert_eq!(value["output_truncated"], true);
+        assert_eq!(bus.snapshot("task-report-budget", 1).unwrap().0.len(), 1);
+    }
 
     #[test]
     fn event_log_replays_after_sequence_and_finishes() {

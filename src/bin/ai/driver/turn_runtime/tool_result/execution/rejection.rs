@@ -52,6 +52,7 @@ pub(in crate::ai::driver::turn_runtime) fn reject_tool_calls(
         tool_results: tool_calls
             .iter()
             .map(|tool_call| crate::ai::types::ToolResult {
+                task_report: None,
                 tool_call_id: tool_call.id.clone(),
                 content: rejected_tool_call_message(&tool_call.function.name, reason.clone()),
             })

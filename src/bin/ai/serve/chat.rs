@@ -2987,11 +2987,11 @@ fn render_turn_stream_to_with_width(
         // The subagent status occupies the active row, so any event that
         // renders output or ends the turn supersedes it. Clear it first so
         // answer/footer bytes never land on top of a stale progress row.
-        // `tool` frames are display-only and `confirm_done` renders nothing,
-        // so keeping the row through them avoids needless flicker.
+        // `tool` and `rate` frames are display-only and `confirm_done` renders
+        // nothing, so keeping the row through them avoids needless flicker.
         if !matches!(
             event_kind.as_str(),
-            "subagent_progress" | "tool" | "confirm_done"
+            "subagent_progress" | "tool" | "rate" | "confirm_done"
         ) {
             hide_subagent_status(&mut subagent_status_rows, &mut line_open, tty, out);
         }
@@ -3075,13 +3075,8 @@ fn render_turn_stream_to_with_width(
                 if tty {
                     thinking_region.header_rate = thinking
                         .as_ref()
-                        .and_then(|v| v.get("rate").and_then(|rate| rate.as_str()))
-                        .map(|rate| {
-                            rate.chars()
-                                .filter(|ch| !ch.is_control())
-                                .take(128)
-                                .collect()
-                        });
+                        .and_then(|v| v.get("rate"))
+                        .and_then(thinking_rate_label);
                     thinking_region.append(&text);
                     thinking_region.redraw(out);
                     line_open = true;
@@ -3113,6 +3108,10 @@ fn render_turn_stream_to_with_width(
             }
             // Text progress already serves the terminal; do not print web UI JSON.
             "tool" => {}
+            // Display-only numeric throughput sample for browser clients. The
+            // terminal chat renderer has no matching row, and printing the
+            // envelope here would leak JSON into the scrollback.
+            "rate" => {}
             "answer_pending" => {
                 answer_pending = true;
                 show_answer_pending_status(
@@ -3329,8 +3328,14 @@ fn render_turn_stream_to_with_width(
                 // scheduler tick in the scrollback, so render it as a single
                 // in-place live block instead, exactly like the local TTY
                 // status block.
+                let event = serde_json::from_str::<serde_json::Value>(payload).ok();
+                let text = event
+                    .as_ref()
+                    .and_then(|event| event.get("text"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(payload);
                 show_subagent_status(
-                    payload,
+                    text,
                     &mut subagent_status_rows,
                     answer_pending_drawn,
                     thinking_active,
@@ -3677,6 +3682,93 @@ fn decide_observer_row(
 /// Approximate folded-thinking line count for the summary row.
 fn thinking_summary(newlines: usize, chars: usize) -> usize {
     if chars == 0 { 0 } else { newlines + 1 }
+}
+
+/// Render a `thinking` event's `rate` field as header text.
+///
+/// Older servers send an already-formatted string (for example
+/// `~8 tok @ 4.00 tok/s`); newer ones send the numeric
+/// `{phase, tokens, elapsed_ms, approximate}` sample. The numeric form uses
+/// a count-only label when the timing window is missing or shorter than
+/// [`MIN_RATE_WINDOW`], matching the browser client's rendering.
+fn thinking_rate_label(rate: &serde_json::Value) -> Option<String> {
+    if let Some(text) = rate.as_str() {
+        return Some(
+            text.chars()
+                .filter(|ch| !ch.is_control())
+                .take(128)
+                .collect(),
+        );
+    }
+    let object = rate.as_object()?;
+    let tokens = object.get("tokens")?.as_u64()?;
+    if tokens == 0 {
+        return None;
+    }
+    let elapsed = object
+        .get("elapsed_ms")
+        .and_then(serde_json::Value::as_u64)
+        .map(Duration::from_millis);
+    let approximate = object
+        .get("approximate")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let prefix = if approximate { "~" } else { "" };
+    let count = format_compact_token_count(tokens);
+    let Some(elapsed) = elapsed.filter(|elapsed| *elapsed >= MIN_RATE_WINDOW) else {
+        return Some(format!("{prefix}{count} tok"));
+    };
+    Some(format!(
+        "{prefix}{count} tok @ {} tok/s",
+        format_token_rate(tokens, Some(elapsed)),
+    ))
+}
+
+/// Minimum elapsed window before an arrival rate is shown. Mirrors
+/// `stream::runtime::metrics` (private to that module) so the remote thinking
+/// header matches the local terminal header.
+const MIN_RATE_WINDOW: Duration = Duration::from_millis(500);
+
+fn format_compact_token_count(tokens: u64) -> String {
+    if tokens < 1_000 {
+        tokens.to_string()
+    } else if tokens < 1_000_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    }
+}
+
+fn format_compact_rate(rate: f64) -> String {
+    if rate < 999.5 {
+        // A value >= 999.5 would round to "1000" below; render it in the next unit instead.
+        if rate >= 100.0 {
+            format!("{rate:.0}")
+        } else if rate >= 10.0 {
+            format!("{rate:.1}")
+        } else {
+            format!("{rate:.2}")
+        }
+    } else if rate < 999_950.0 {
+        // k-branch values >= 999_950 round to "1000.0k"; escalate to the m unit instead.
+        format!("{:.1}k", rate / 1_000.0)
+    } else {
+        format!("{:.1}m", rate / 1_000_000.0)
+    }
+}
+
+fn format_token_rate(tokens: u64, elapsed: Option<Duration>) -> String {
+    let Some(elapsed) = elapsed else {
+        return "—".to_string();
+    };
+    if elapsed < MIN_RATE_WINDOW {
+        return "—".to_string();
+    }
+    let seconds = elapsed.as_secs_f64();
+    if seconds <= 0.0 {
+        return "—".to_string();
+    }
+    format_compact_rate(tokens as f64 / seconds)
 }
 
 /// Whether a stdout-derived footer row is an end-of-stream metrics summary.
@@ -6443,6 +6535,93 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    #[test]
+    fn thinking_rate_label_supports_legacy_text_and_numeric_samples() {
+        assert_eq!(
+            thinking_rate_label(&serde_json::json!("~8 tok @ 4.00 tok/s")).as_deref(),
+            Some("~8 tok @ 4.00 tok/s")
+        );
+        assert_eq!(
+            thinking_rate_label(&serde_json::json!({
+                "phase": "reasoning",
+                "tokens": 8,
+                "elapsed_ms": 2000,
+                "approximate": true,
+            }))
+            .as_deref(),
+            Some("~8 tok @ 4.00 tok/s")
+        );
+        assert_eq!(
+            thinking_rate_label(&serde_json::json!({
+                "phase": "reasoning",
+                "tokens": 800,
+                "elapsed_ms": 2000,
+                "approximate": false,
+            }))
+            .as_deref(),
+            Some("800 tok @ 400 tok/s")
+        );
+    }
+
+    #[test]
+    fn thinking_rate_label_marks_missing_and_short_windows_unknown() {
+        for elapsed in [serde_json::Value::Null, serde_json::json!(200)] {
+            assert_eq!(
+                thinking_rate_label(&serde_json::json!({
+                    "phase": "reasoning",
+                    "tokens": 8,
+                    "elapsed_ms": elapsed,
+                    "approximate": true,
+                }))
+                .as_deref(),
+                Some("~8 tok")
+            );
+        }
+        assert_eq!(thinking_rate_label(&serde_json::json!(null)), None);
+        assert_eq!(thinking_rate_label(&serde_json::json!({"tokens": 0})), None);
+        assert_eq!(
+            thinking_rate_label(&serde_json::json!({"tokens": "8"})),
+            None
+        );
+    }
+
+    #[test]
+    fn sse_thinking_numeric_rate_keeps_live_header_text() {
+        let body = concat!(
+            "event: thinking_start\ndata: \n\n",
+            "event: thinking\ndata: {\"text\":\"abcd\",\"rate\":{\"phase\":\"reasoning\",\"tokens\":8,\"elapsed_ms\":2000,\"approximate\":true}}\n\n",
+            "event: thinking_done\ndata: \n\n",
+            "event: delta\ndata: {\"delta\":\"answer\"}\n\n",
+            "event: done\ndata: \n\n",
+        );
+        let url = serve_body_once(body);
+        let resp = reqwest::blocking::get(url).unwrap();
+        let mut out = Vec::new();
+        render_turn_stream_to(resp, &mut out, true).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("~8 tok @ 4.00 tok/s"), "{text:?}");
+        assert!(!text.contains("elapsed_ms"), "{text:?}");
+    }
+
+    #[test]
+    fn sse_rate_event_and_invalid_thinking_json_do_not_leak_payload() {
+        let body = concat!(
+            "event: thinking_start\ndata: \n\n",
+            "event: thinking\ndata: not-json\n\n",
+            "event: thinking_done\ndata: \n\n",
+            "event: rate\ndata: {\"phase\":\"output\",\"tokens\":42,\"elapsed_ms\":1000,\"approximate\":false}\n\n",
+            "event: done\ndata: \n\n",
+        );
+        let url = serve_body_once(body);
+        let resp = reqwest::blocking::get(url).unwrap();
+        let mut out = Vec::new();
+        render_turn_stream_to(resp, &mut out, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, "✓ thinking (1 line)\n");
+        assert!(!text.contains("phase"), "{text:?}");
+        assert!(!text.contains("tokens"), "{text:?}");
     }
 
     #[test]

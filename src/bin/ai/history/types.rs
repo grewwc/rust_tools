@@ -104,6 +104,7 @@ pub(in crate::ai) fn request_reminder(message: &Message) -> Option<&str> {
 /// was rewritten still never leaks it to a provider.
 pub(in crate::ai) fn has_runtime_message_metadata(message: &Message) -> bool {
     is_runtime_synthetic_user_message(message)
+        || crate::ai::tools::task_tools::TaskReport::is_message_metadata(message)
         || message
             .reasoning_content
             .as_deref()

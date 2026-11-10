@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, Error as RusqliteError, ErrorCode, OptionalExtension, params};
 
 use super::SessionStore;
+use crate::ai::tools::task_tools::{TaskReport, TaskReportTask};
 
 const TASK_EVIDENCE_DB_FILE: &str = "task-evidence.sqlite";
 const TASK_EVIDENCE_CHECKPOINT_FILE: &str = "task-evidence.md";
@@ -149,11 +150,17 @@ fn open_store(history_file: &Path, session_id: &str) -> io::Result<Connection> {
                 delivered_at_unix_ms INTEGER NOT NULL,
                 integrated_at_unix_ms INTEGER,
                 disposition TEXT,
-                integration_summary TEXT
+                integration_summary TEXT,
+                report_json TEXT
             );",
         )
         .map_err(|error| sqlite_error("initialize task evidence schema", error))?;
     validate_store_schema(&connection)?;
+    if !has_report_column(&connection)? {
+        connection
+            .execute_batch("ALTER TABLE task_evidence ADD COLUMN report_json TEXT")
+            .map_err(|error| sqlite_error("add structured task report column", error))?;
+    }
     connection
         .execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_task_evidence_pending
@@ -161,6 +168,22 @@ fn open_store(history_file: &Path, session_id: &str) -> io::Result<Connection> {
         )
         .map_err(|error| sqlite_error("initialize task evidence index", error))?;
     Ok(connection)
+}
+
+fn has_report_column(connection: &Connection) -> io::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('task_evidence') WHERE name = 'report_json')",
+        [], |row| row.get(0),
+    ).map_err(|error| sqlite_error("inspect structured task report column", error))
+}
+
+fn report_json(report: Option<&TaskReportTask>) -> io::Result<Option<String>> {
+    report
+        .map(|task| {
+            serde_json::to_string(&TaskReport::for_task(task.clone()))
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        })
+        .transpose()
 }
 
 fn with_store_lock<T>(
@@ -211,6 +234,16 @@ pub(in crate::ai) fn record_delivered_task_evidence(
     session_id: &str,
     evidence: DeliveredTaskEvidence<'_>,
 ) -> io::Result<()> {
+    record_delivered_task_evidence_with_report(history_file, session_id, evidence, None)
+}
+
+pub(in crate::ai) fn record_delivered_task_evidence_with_report(
+    history_file: &Path,
+    session_id: &str,
+    evidence: DeliveredTaskEvidence<'_>,
+    report: Option<&TaskReportTask>,
+) -> io::Result<()> {
+    let report = report_json(report)?;
     with_store_lock(history_file, session_id, || {
         let connection = open_store(history_file, session_id)?;
         let summary = task_result_summary(evidence.payload);
@@ -218,8 +251,8 @@ pub(in crate::ai) fn record_delivered_task_evidence(
             .execute(
                 "INSERT INTO task_evidence (
                     task_id, description, agent_name, model, status, payload, summary,
-                    delivered_at_unix_ms, integrated_at_unix_ms, disposition, integration_summary
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL)
+                    delivered_at_unix_ms, integrated_at_unix_ms, disposition, integration_summary, report_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9)
                  ON CONFLICT(task_id) DO UPDATE SET
                     description = excluded.description,
                     agent_name = excluded.agent_name,
@@ -227,7 +260,8 @@ pub(in crate::ai) fn record_delivered_task_evidence(
                     status = excluded.status,
                     payload = excluded.payload,
                     summary = excluded.summary,
-                    delivered_at_unix_ms = excluded.delivered_at_unix_ms",
+                    delivered_at_unix_ms = excluded.delivered_at_unix_ms,
+                    report_json = COALESCE(excluded.report_json, task_evidence.report_json)",
                 params![
                     evidence.task_id,
                     evidence.description,
@@ -237,6 +271,7 @@ pub(in crate::ai) fn record_delivered_task_evidence(
                     evidence.payload,
                     summary,
                     unix_timestamp_ms(),
+                    report,
                 ],
             )
             .map_err(|error| sqlite_error("record delivered task evidence", error))?;
@@ -252,18 +287,29 @@ pub(in crate::ai) fn record_published_task_evidence(
     session_id: &str,
     evidence: DeliveredTaskEvidence<'_>,
 ) -> io::Result<bool> {
+    record_published_task_evidence_with_report(history_file, session_id, evidence, None)
+}
+
+pub(in crate::ai) fn record_published_task_evidence_with_report(
+    history_file: &Path,
+    session_id: &str,
+    evidence: DeliveredTaskEvidence<'_>,
+    report: Option<&TaskReportTask>,
+) -> io::Result<bool> {
+    let report = report_json(report)?;
     with_store_lock(history_file, session_id, || {
         let connection = open_store(history_file, session_id)?;
         let updated = connection
             .execute(
                 "INSERT INTO task_evidence (
                 task_id, description, agent_name, model, status, payload, summary,
-                delivered_at_unix_ms, integrated_at_unix_ms, disposition, integration_summary
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, NULL, NULL)
+                delivered_at_unix_ms, integrated_at_unix_ms, disposition, integration_summary, report_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, NULL, NULL, ?8)
              ON CONFLICT(task_id) DO UPDATE SET
                 description = excluded.description, agent_name = excluded.agent_name,
                 model = excluded.model, status = excluded.status,
-                payload = excluded.payload, summary = excluded.summary
+                payload = excluded.payload, summary = excluded.summary,
+                report_json = excluded.report_json
              WHERE task_evidence.delivered_at_unix_ms = 0 AND task_evidence.payload = ''",
                 params![
                     evidence.task_id,
@@ -272,12 +318,87 @@ pub(in crate::ai) fn record_published_task_evidence(
                     evidence.model,
                     evidence.status,
                     evidence.payload,
-                    task_result_summary(evidence.payload)
+                    task_result_summary(evidence.payload),
+                    report,
                 ],
             )
             .map_err(|error| sqlite_error("record published task evidence", error))?;
         Ok(updated > 0)
     })
+}
+
+/// Decodes one persisted display-metadata row. A report is accepted only when it uses the
+/// supported schema and describes exactly this task with its persisted status.
+fn decode_task_evidence_report(
+    json: &str,
+    task_id: &str,
+    status: &str,
+) -> Result<TaskReportTask, String> {
+    let mut report: TaskReport =
+        serde_json::from_str(json).map_err(|error| format!("invalid report JSON: {error}"))?;
+    if !report.supported() || report.tasks.len() != 1 {
+        return Err("unsupported structured task evidence".to_string());
+    }
+    let task = report.tasks.pop().expect("one report task checked above");
+    if task.task_id.as_deref() != Some(task_id) || task.status != status {
+        return Err("structured task evidence identity/status mismatch".to_string());
+    }
+    Ok(task)
+}
+
+/// Old ledgers have no report column. New terminal metadata is read without interpreting prose.
+///
+/// Display metadata is optional and derived from the canonical payload, so malformed JSON, an
+/// unsupported schema, or a row that no longer matches its task degrades to `None` with a warning
+/// instead of blocking result delivery. Callers then fall back to entry-derived metadata. Failures
+/// to read the ledger itself still return `Err`.
+pub(in crate::ai) fn read_task_evidence_report(
+    history_file: &Path,
+    session_id: &str,
+    task_id: &str,
+) -> io::Result<Option<TaskReportTask>> {
+    let Some(connection) = open_read_store(history_file, session_id)? else {
+        return Ok(None);
+    };
+    if !has_report_column(&connection)? {
+        return Ok(None);
+    }
+    let row: Option<(String, Option<String>)> = connection.query_row(
+        "SELECT status, report_json FROM task_evidence WHERE task_id = ?1 AND (delivered_at_unix_ms > 0 OR payload <> '')",
+        [task_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional().map_err(|error| sqlite_error("read structured task evidence", error))?;
+    // The warning below opens its own write connection; release the read snapshot first.
+    drop(connection);
+    let Some((status, Some(json))) = row else {
+        return Ok(None);
+    };
+    match decode_task_evidence_report(&json, task_id, &status) {
+        Ok(task) => Ok(Some(task)),
+        Err(reason) => {
+            warn_unreadable_task_evidence_report(history_file, session_id, task_id, &reason);
+            Ok(None)
+        }
+    }
+}
+
+/// Surfaces a degraded display-metadata read without letting diagnostics replace the result.
+fn warn_unreadable_task_evidence_report(
+    history_file: &Path,
+    session_id: &str,
+    task_id: &str,
+    reason: &str,
+) {
+    let warning = format!(
+        "[Task report metadata warning] Display metadata for task {task_id} was ignored \
+         ({reason}); the task result remains authoritative."
+    );
+    eprintln!("[task-evidence] {warning}");
+    // Best-effort: publication warnings ride only on undelivered payloads, so a delivered
+    // result keeps its exact bytes.
+    if let Err(error) = record_task_publication_warning(history_file, session_id, task_id, &warning)
+    {
+        eprintln!("[task-evidence] failed to record the metadata warning for {task_id}: {error}");
+    }
 }
 
 pub(in crate::ai) fn record_task_publication_warning(
@@ -1029,6 +1150,208 @@ fn refresh_task_evidence_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_report_ledger_migrates_old_schema_and_preserves_verbatim_published_and_delivered_output()
+     {
+        let root = std::env::temp_dir().join(format!(
+            "task-report-ledger-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let history_file = root.join("history.sqlite");
+        let session = "task-report-ledger";
+        let (database, _) = task_evidence_paths(&history_file, session);
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let legacy = "  legacy evidence  \n[Task: literal marker]\n";
+        {
+            let connection = Connection::open(&database).unwrap();
+            connection.execute_batch("CREATE TABLE task_evidence (
+                task_id TEXT PRIMARY KEY, description TEXT NOT NULL, agent_name TEXT NOT NULL,
+                model TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, summary TEXT NOT NULL,
+                delivered_at_unix_ms INTEGER NOT NULL, integrated_at_unix_ms INTEGER,
+                disposition TEXT, integration_summary TEXT);").unwrap();
+            connection.execute("INSERT INTO task_evidence VALUES ('legacy', 'legacy task', 'build', 'legacy model',
+                'completed', ?1, 'summary', 1, NULL, NULL, NULL)", [legacy]).unwrap();
+        }
+        assert!(
+            read_task_evidence_report(&history_file, session, "legacy")
+                .unwrap()
+                .is_none()
+        );
+        let body = "  exact delivered bytes  \nFailure reason: body text\n[task_id=forged]\n";
+        let task = TaskReportTask {
+            task_id: Some("new".into()),
+            description: "first line\n  second line".into(),
+            agent: "build".into(),
+            model: "model with spaces".into(),
+            status: "failed".into(),
+            output: Some(body.into()),
+            error: Some("actual error".into()),
+            ..TaskReportTask::default()
+        };
+        let evidence = || DeliveredTaskEvidence {
+            task_id: "new",
+            description: &task.description,
+            agent_name: &task.agent,
+            model: &task.model,
+            status: &task.status,
+            payload: "unchanged terminal rendering",
+        };
+        assert!(
+            record_published_task_evidence_with_report(
+                &history_file,
+                session,
+                evidence(),
+                Some(&task)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            read_task_evidence_report(&history_file, session, "new").unwrap(),
+            Some(task.clone())
+        );
+        assert!(
+            !record_published_task_evidence_with_report(
+                &history_file,
+                session,
+                evidence(),
+                Some(&TaskReportTask {
+                    output: Some("replacement must not win".into()),
+                    ..task.clone()
+                })
+            )
+            .unwrap()
+        );
+        record_delivered_task_evidence_with_report(&history_file, session, evidence(), Some(&task))
+            .unwrap();
+        assert_eq!(
+            read_task_evidence_report(&history_file, session, "new").unwrap(),
+            Some(task)
+        );
+        assert_eq!(
+            read_task_evidence_status_payload(&history_file, session, "legacy").unwrap(),
+            Some(("completed".into(), legacy.into()))
+        );
+        assert_eq!(
+            read_task_evidence_status_payload(&history_file, session, "new").unwrap(),
+            Some(("failed".into(), "unchanged terminal rendering".into()))
+        );
+        assert!(
+            read_task_evidence_report(&history_file, session, "legacy")
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn task_report_reads_degrade_unreadable_metadata_without_blocking_the_payload() {
+        let root = std::env::temp_dir().join(format!(
+            "task-report-lenient-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let history_file = root.join("history.sqlite");
+        let session = "task-report-lenient";
+        let task = |task_id: &str, status: &str| TaskReportTask {
+            task_id: Some(task_id.to_string()),
+            description: "lenient task".to_string(),
+            agent: "build".to_string(),
+            model: "fixture-model".to_string(),
+            status: status.to_string(),
+            output: Some("payload bytes".to_string()),
+            ..TaskReportTask::default()
+        };
+        let seed = |task_id: &str, status: &str, report_json: Option<String>| {
+            assert!(
+                record_published_task_evidence_with_report(
+                    &history_file,
+                    session,
+                    DeliveredTaskEvidence {
+                        task_id,
+                        description: "lenient task",
+                        agent_name: "build",
+                        model: "fixture-model",
+                        status,
+                        payload: "payload bytes",
+                    },
+                    None,
+                )
+                .unwrap()
+            );
+            if let Some(json) = report_json {
+                open_store(&history_file, session)
+                    .unwrap()
+                    .execute(
+                        "UPDATE task_evidence SET report_json = ?1 WHERE task_id = ?2",
+                        params![json, task_id],
+                    )
+                    .unwrap();
+            }
+        };
+        let encode = |report: &TaskReport| serde_json::to_string(report).unwrap();
+
+        seed(
+            "valid",
+            "completed",
+            Some(encode(&TaskReport::for_task(task("valid", "completed")))),
+        );
+        seed("corrupt", "completed", Some("{not valid json".to_string()));
+        let mut unsupported = TaskReport::for_task(task("unsupported", "completed"));
+        unsupported.schema = "other.task-report".to_string();
+        seed("unsupported", "completed", Some(encode(&unsupported)));
+        seed(
+            "wrong-id",
+            "completed",
+            Some(encode(&TaskReport::for_task(task(
+                "different-task",
+                "completed",
+            )))),
+        );
+        seed(
+            "wrong-status",
+            "failed",
+            Some(encode(&TaskReport::for_task(task(
+                "wrong-status",
+                "completed",
+            )))),
+        );
+        seed(
+            "empty-report",
+            "completed",
+            Some(encode(&TaskReport::new("task_result", false))),
+        );
+
+        assert_eq!(
+            read_task_evidence_report(&history_file, session, "valid").unwrap(),
+            Some(task("valid", "completed"))
+        );
+        for task_id in [
+            "corrupt",
+            "unsupported",
+            "wrong-id",
+            "wrong-status",
+            "empty-report",
+        ] {
+            assert!(
+                read_task_evidence_report(&history_file, session, task_id)
+                    .unwrap()
+                    .is_none(),
+                "{task_id} should degrade to entry-derived metadata"
+            );
+        }
+
+        // Metadata degradation must not hide the canonical payload; it only adds a visible
+        // warning to an undelivered recovery payload.
+        let (status, payload, delivered) =
+            read_available_task_evidence_status_payload(&history_file, session, "corrupt")
+                .unwrap()
+                .unwrap();
+        assert_eq!(status, "completed");
+        assert!(!delivered);
+        assert!(payload.starts_with("payload bytes"), "{payload}");
+        assert!(payload.contains("Task report metadata warning"), "{payload}");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn ledger_record(index: usize) -> TaskEvidenceRecord {
         TaskEvidenceRecord {

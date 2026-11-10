@@ -120,6 +120,7 @@ pub(in crate::ai) fn stale_patch_targets_from_messages(
                 (message.tool_call_id.as_deref(), message.content.as_str())
         {
             tool_results.push(crate::ai::types::ToolResult {
+                task_report: None,
                 tool_call_id: tool_call_id.to_string(),
                 content: content.to_string(),
             });

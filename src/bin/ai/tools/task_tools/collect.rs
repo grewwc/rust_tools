@@ -45,10 +45,20 @@ pub(super) fn persist_rendered_task_evidence(
     status: &str,
     rendered: &str,
 ) -> Result<(), String> {
+    persist_rendered_task_evidence_with_report(task_id, entry, status, rendered, None)
+}
+
+fn persist_rendered_task_evidence_with_report(
+    task_id: &str,
+    entry: &AsyncTaskEntry,
+    status: &str,
+    rendered: &str,
+    report: Option<&TaskReportTask>,
+) -> Result<(), String> {
     let Some(history_file) = task_evidence_history_file(entry) else {
         return Ok(());
     };
-    crate::ai::history::record_delivered_task_evidence(
+    crate::ai::history::record_delivered_task_evidence_with_report(
         &history_file,
         &entry.session_id,
         crate::ai::history::DeliveredTaskEvidence {
@@ -59,6 +69,7 @@ pub(super) fn persist_rendered_task_evidence(
             status,
             payload: rendered,
         },
+        report,
     )
     .map_err(|error| format!("failed to persist task evidence for {task_id}: {error}"))
 }
@@ -111,7 +122,8 @@ pub(crate) fn publish_task_result(
         .filter(|path| !path.as_os_str().is_empty() && !entry.session_id.is_empty());
     let persistence = history_file.as_ref().map(|history_file| {
         let rendered = format_task_result_with_id(&task_id, &entry, result.clone());
-        crate::ai::history::record_published_task_evidence(
+        let report = TaskReportTask::terminal(&task_id, &entry, &result);
+        crate::ai::history::record_published_task_evidence_with_report(
             history_file,
             &entry.session_id,
             crate::ai::history::DeliveredTaskEvidence {
@@ -122,6 +134,7 @@ pub(crate) fn publish_task_result(
                 status: &result.status,
                 payload: &rendered,
             },
+            Some(&report),
         )
     });
     if matches!(&persistence, Some(Ok(false))) {
@@ -236,11 +249,33 @@ pub(super) fn drain_task_result(
                     format!("failed to read available task evidence for {task_id}: {error}")
                 })?
         {
+            // Display metadata is optional: an unreadable report degrades to the entry-derived
+            // fallback instead of blocking the durable payload below.
+            let report = crate::ai::history::read_task_evidence_report(
+                &history_file,
+                &entry.session_id,
+                task_id,
+            )
+            .map_err(|error| {
+                format!("failed to read structured task evidence for {task_id}: {error}")
+            })?
+            .unwrap_or_else(|| TaskReportTask {
+                active: false,
+                output: Some(rendered.clone()),
+                ..TaskReportTask::from_entry(task_id, entry, status.clone(), false)
+            });
             // Durable terminal truth takes precedence over an AIOS process that has not been
             // torn down yet, including a collection interrupted after its ledger commit.
             if !delivered {
-                persist_rendered_task_evidence(task_id, entry, &status, &rendered)?;
+                persist_rendered_task_evidence_with_report(
+                    task_id,
+                    entry,
+                    &status,
+                    &rendered,
+                    Some(&report),
+                )?;
             }
+            record_report_task(report);
             mark_task_retry_status(task_id, &status);
             lock_unpoisoned(&TASK_PROGRESS_REGISTRY).take(&task_id.to_string());
             cleanup_collected_task(os, entry, cleanup_reason);
@@ -256,6 +291,8 @@ pub(super) fn drain_task_result(
             }));
         }
         if is_task_pending(os, entry.pid)? {
+            let (status, active) = task_state_snapshot(os, entry.result_channel_id, entry.pid)?;
+            record_report_task(TaskReportTask::from_entry(task_id, entry, status, active));
             return Ok(None);
         }
         let result = StoredTaskResult {
@@ -273,7 +310,15 @@ pub(super) fn drain_task_result(
             ),
         };
         let rendered = format_task_result_with_id(task_id, entry, result.clone());
-        persist_rendered_task_evidence(task_id, entry, &result.status, &rendered)?;
+        let report = TaskReportTask::terminal(task_id, entry, &result);
+        persist_rendered_task_evidence_with_report(
+            task_id,
+            entry,
+            &result.status,
+            &rendered,
+            Some(&report),
+        )?;
+        record_report_task(report);
         mark_task_retry_status(task_id, &result.status);
         lock_unpoisoned(&TASK_PROGRESS_REGISTRY).take(&task_id.to_string());
         cleanup_collected_task(os, entry, cleanup_reason);
@@ -281,7 +326,15 @@ pub(super) fn drain_task_result(
     };
 
     let rendered = format_task_result_with_id(task_id, entry, result.clone());
-    persist_rendered_task_evidence(task_id, entry, &result.status, &rendered)?;
+    let report = TaskReportTask::terminal(task_id, entry, &result);
+    persist_rendered_task_evidence_with_report(
+        task_id,
+        entry,
+        &result.status,
+        &rendered,
+        Some(&report),
+    )?;
+    record_report_task(report);
     if read_task_result(os, entry.result_channel_id, true)?.is_none() {
         return Err(format!(
             "task result for {task_id} disappeared after durable persistence"

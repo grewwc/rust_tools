@@ -43,6 +43,7 @@ mod progress;
 mod quiet;
 mod recovery;
 mod registry;
+mod report;
 mod spawn;
 mod traecli;
 mod traecli_models;
@@ -63,6 +64,7 @@ pub(crate) use progress::*;
 pub(crate) use quiet::{is_agent_team_mode, is_agent_team_wait_deadline_message};
 pub(crate) use recovery::*;
 pub(crate) use registry::*;
+pub(crate) use report::*;
 pub(crate) use spawn::*;
 #[cfg(test)]
 pub(crate) use traecli::{

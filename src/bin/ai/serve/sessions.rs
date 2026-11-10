@@ -102,7 +102,7 @@ pub(crate) async fn list_sessions(
         return e.into_response();
     }
     let store = SessionStore::new(state.history_file.as_path());
-    let mut items = match store.list_sessions() {
+    let items = match store.list_sessions() {
         Ok(v) => v,
         Err(err) => {
             return (
@@ -112,15 +112,7 @@ pub(crate) async fn list_sessions(
                 .into_response();
         }
     };
-    // Preserve the store order while allowing clients to fetch consecutive
-    // pages. Offset is applied before limit so `/sessions?limit=N&offset=K`
-    // is the same slice as the legacy full response `[K..K + N]`.
-    let offset = q.offset.unwrap_or(0).min(items.len());
-    items.drain(..offset);
-    if let Some(limit) = q.limit {
-        items.truncate(limit);
-    }
-    let out: Vec<SessionItem> = items
+    let mut all: Vec<SessionItem> = items
         .into_iter()
         .map(|s| SessionItem {
             id: s.id,
@@ -131,7 +123,39 @@ pub(crate) async fn list_sessions(
             archived: s.archived,
         })
         .collect();
-    (StatusCode::OK, Json(serde_json::json!(out))).into_response()
+    let total = all.len();
+    if q.newest {
+        all.reverse();
+    }
+    let included = q
+        .include
+        .as_deref()
+        .and_then(|id| all.iter().find(|item| item.id == id).cloned());
+    // Preserve newest-first store order while allowing clients to fetch
+    // consecutive pages. Offset is applied before limit, and an explicitly
+    // selected older session is appended without consuming that page.
+    let offset = q.offset.unwrap_or(0).min(all.len());
+    all.drain(..offset);
+    if let Some(limit) = q.limit {
+        all.truncate(limit);
+    }
+    let page_len = all.len();
+    if offset == 0
+        && let Some(item) = included
+        && !all.iter().any(|shown| shown.id == item.id)
+    {
+        all.push(item);
+    }
+    let mut response = (StatusCode::OK, Json(serde_json::json!(all))).into_response();
+    response.headers_mut().insert(
+        "x-sessions-total",
+        axum::http::HeaderValue::from_str(&total.to_string()).unwrap(),
+    );
+    response.headers_mut().insert(
+        "x-sessions-page-size",
+        axum::http::HeaderValue::from_str(&page_len.to_string()).unwrap(),
+    );
+    response
 }
 
 pub(crate) async fn create_session(
