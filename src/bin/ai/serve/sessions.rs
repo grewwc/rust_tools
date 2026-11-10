@@ -2,8 +2,8 @@
 
 use super::*;
 use crate::ai::driver::commands::use_backend::{
-    agent_team_sticky, apply_subagent_use, effective_subagent_backend, format_use_state,
-    reset_subagent_config,
+    agent_team_sticky, apply_subagent_preference, apply_subagent_use, effective_subagent_backend,
+    format_use_state, reset_subagent_config,
 };
 use crate::ai::history::{MarkMessageUpdate, with_sessions_lifecycle_lock};
 use crate::ai::tools::task_tools::BackendId;
@@ -421,9 +421,23 @@ pub(crate) async fn set_session_config(
                     return bad_request(err).into_response();
                 }
             }
+            // `/subagent` shares the config channel but must not touch sticky
+            // skills: it writes the same backend/model keys without the
+            // agent-team rule, so the runtime mode stays as it was.
+            "subagent" => {
+                let Some(backend) = subagents.backend.as_deref() else {
+                    return bad_request("backend is required for subagents subagent".to_string())
+                        .into_response();
+                };
+                if let Err(err) =
+                    apply_subagent_preference(&mut config, backend, subagents.model.as_deref())
+                {
+                    return bad_request(err).into_response();
+                }
+            }
             "reset" => reset_subagent_config(&mut config),
             _ => {
-                return bad_request("subagents action must be use|reset".to_string())
+                return bad_request("subagents action must be use|subagent|reset".to_string())
                     .into_response();
             }
         }

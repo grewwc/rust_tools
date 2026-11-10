@@ -105,6 +105,8 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":audit",
         "/use",
         ":use",
+        "/subagent",
+        ":subagent",
         "/reset",
         ":reset",
         "/changes",
@@ -371,6 +373,8 @@ impl CommandCompleter {
             ":audit",
             "/use",
             ":use",
+            "/subagent",
+            ":subagent",
             "/reset",
             ":reset",
             "/changes",
@@ -1374,7 +1378,7 @@ impl CommandCompleter {
                     }
                     _ => Vec::new(),
                 }
-            } else if matches!(first, "/use" | ":use") {
+            } else if matches!(first, "/use" | ":use" | "/subagent" | ":subagent") {
                 let registry = crate::ai::tools::task_tools::backends::backend_registry();
                 match words.next() {
                     None if registry.worker_use_id(token).is_some() => {
@@ -4334,6 +4338,21 @@ mod tests {
             assert_eq!(candidates.len(), 1);
             assert_eq!(candidates[0].replacement, "traecli");
         }
+        // `/subagent` shares the backend/worker-model grammar with `/use`.
+        for line in ["/subagent ", ":subagent "] {
+            let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
+            assert_eq!(start, line.len());
+            let labels: Vec<_> = candidates
+                .iter()
+                .map(|candidate| candidate.replacement.as_str())
+                .collect();
+            assert_eq!(labels, ["traecli", "kernel"]);
+        }
+        for line in ["/subagent t", ":subagent t"] {
+            let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].replacement, "traecli");
+        }
     }
 
     #[test]
@@ -4368,6 +4387,31 @@ mod tests {
                     assert_eq!(labels, ["GPT-5.5", "GPT-6.1-Sol", "Seed-Evolving"]);
                 }
                 for line in ["/use traecli", ":use traecli"] {
+                    let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
+                    assert_eq!(start, line.find("traecli").unwrap());
+                    let replacements: Vec<_> = candidates
+                        .iter()
+                        .map(|candidate| candidate.replacement.as_str())
+                        .collect();
+                    assert_eq!(
+                        replacements,
+                        [
+                            "traecli GPT-5.5",
+                            "traecli GPT-6.1-Sol",
+                            "traecli Seed-Evolving"
+                        ]
+                    );
+                }
+                for line in ["/subagent traecli ", ":subagent traecli "] {
+                    let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
+                    assert_eq!(start, line.len());
+                    let labels: Vec<_> = candidates
+                        .iter()
+                        .map(|candidate| candidate.replacement.as_str())
+                        .collect();
+                    assert_eq!(labels, ["GPT-5.5", "GPT-6.1-Sol", "Seed-Evolving"]);
+                }
+                for line in ["/subagent traecli", ":subagent traecli"] {
                     let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
                     assert_eq!(start, line.find("traecli").unwrap());
                     let replacements: Vec<_> = candidates

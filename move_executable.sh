@@ -27,7 +27,10 @@ if [ -n "$FORCE" ]; then
     NEED="$BINS"
 else
     NEED="$(
-        INSTALLW_BIN="${INSTALLW_BIN:-$(pwd)/target/debug/installw}"
+            # installw ships from the release build (built by `make install` /
+            # `make install-all` in one cargo invocation); no debug build is
+            # produced anymore.
+            INSTALLW_BIN="${INSTALLW_BIN:-$(pwd)/target/release/installw}"
         if [ -x "$INSTALLW_BIN" ]; then
             INSTALL_DIR="$INSTALL_DIR" "$INSTALLW_BIN" --mode install -- $BINS
         else

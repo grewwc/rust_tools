@@ -54,7 +54,9 @@ pub use task::try_handle_task_command;
 pub use theme::try_handle_theme_command;
 pub use title::try_handle_title_command;
 pub use usage::try_handle_usage_command;
-pub(crate) use use_backend::{try_handle_reset_command, try_handle_use_command};
+pub(crate) use use_backend::{
+    try_handle_reset_command, try_handle_subagent_command, try_handle_use_command,
+};
 
 pub(super) fn publish_checkpoint_names(store: &crate::ai::history::CheckpointStore) {
     checkpoint::publish_checkpoint_names(store);
@@ -137,7 +139,8 @@ pub fn is_local_command_start(token: &str) -> bool {
 
 /// Commands classified as server-owned even though the local REPL recognizes
 /// them. Serve-chat intercepts `/use` and `/reset` through the config endpoint;
-/// their classifier routes remain compatible. The turn child executes `/memo`
+/// `/subagent` rides the same endpoint without the sticky-skill rule, and all
+/// three classifier routes remain compatible. The turn child executes `/memo`
 /// after pre-turn dispatch, `/audit` and `/distill-session` in the turn
 /// dispatcher, and `/mark`, `/unmark`, `/archive`, `/title`, and `/export-md` in the
 /// pre-turn local-command path. `/task`, `/discuss`, and `/goal` inject a
@@ -167,6 +170,7 @@ fn is_serve_forwarded_command_start(token: &str) -> bool {
             | "audit"
             | "title"
             | "use"
+            | "subagent"
             | "reset"
     )
 }
@@ -216,7 +220,7 @@ pub(crate) fn serve_command_title_seed(input: &str) -> Option<String> {
     let word = local_command_word(trimmed);
     match word {
         "distill-session" | "export-md" | "mark" | "unmark" | "archive" | "title" | "reset"
-        | "memo" => Some(String::new()),
+        | "subagent" | "memo" => Some(String::new()),
         "use" => {
             let tail = trimmed
                 .split_once('\n')
@@ -402,6 +406,9 @@ pub fn try_handle_local_command(
         return Ok(true);
     }
     if try_handle_use_command(app, input)? {
+        return Ok(true);
+    }
+    if try_handle_subagent_command(app, input)? {
         return Ok(true);
     }
     if try_handle_reset_command(app, input)? {

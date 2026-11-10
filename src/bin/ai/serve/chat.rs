@@ -2004,6 +2004,29 @@ fn run_serve_use_command(
     run_serve_subagent_config_request(auth(request, token))
 }
 
+/// `/subagent <backend> [model]`: the same config channel as `/use`, but the
+/// subagent-only action validates and writes the backend/worker-model picks
+/// without the agent-team sticky rule, so the runtime mode is untouched.
+fn run_serve_subagent_command(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    arg: &str,
+) -> Result<ServeSessionConfig, String> {
+    let command_line = arg.split_once('\n').map_or(arg, |(head, _)| head);
+    let (backend, model) = parse_use_arguments(command_line)?;
+    let Some(backend) = backend.filter(|name| !name.is_empty()) else {
+        let url = format!("{base}/sessions/{session_id}/config");
+        return run_serve_subagent_config_request(auth(client.get(url), token));
+    };
+    let url = format!("{base}/sessions/{session_id}/config");
+    let request = client.post(url).json(&serde_json::json!({
+        "subagents": {"action": "subagent", "backend": backend, "model": model},
+    }));
+    run_serve_subagent_config_request(auth(request, token))
+}
+
 fn run_serve_reset_command(
     client: &reqwest::blocking::Client,
     base: &str,
@@ -5332,6 +5355,18 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                     Err(err) => eprintln!("[serve-chat] {err}"),
                 }
             }
+            "/subagent" | ":subagent" => {
+                // Same shape as `/use`, but the subagent-only action never
+                // touches sticky skills, so the runtime mode is unchanged.
+                let arg = &trimmed[cmd.len()..];
+                match run_serve_subagent_command(&client, &base, &token, &session_id, arg) {
+                    Ok(config) => {
+                        merge_restored_session_config(&config, &mut selection);
+                        selection.apply_header(&mut editor);
+                    }
+                    Err(err) => eprintln!("[serve-chat] {err}"),
+                }
+            }
             "/reset" | ":reset" => {
                 match run_serve_reset_command(&client, &base, &token, &session_id, arg) {
                     Ok(config) => {
@@ -7910,6 +7945,23 @@ mod tests {
         );
         assert!(
             run_serve_use_command(&client, &base, "tk", "s1", "traecli model extra")
+                .unwrap_err()
+                .contains("Too many arguments")
+        );
+        let (base, captured) =
+            serve_capture_once(r#"{"subagent_backend":"traecli","output":"subagent state\n"}"#);
+        let config = run_serve_subagent_command(&client, &base, "tk", "s1", " traecli GPT-5.5")
+            .expect("subagent config");
+        assert_eq!(config.subagent_backend, "traecli");
+        let request = captured.lock().unwrap().clone();
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"subagents": {"action": "subagent", "backend": "traecli", "model": "GPT-5.5"}})
+        );
+        assert!(
+            run_serve_subagent_command(&client, &base, "tk", "s1", "traecli model extra")
                 .unwrap_err()
                 .contains("Too many arguments")
         );
