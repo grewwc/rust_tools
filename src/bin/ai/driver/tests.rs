@@ -291,6 +291,7 @@ pub(super) fn test_app(current_agent: &str) -> App {
         current_agent: current_agent.to_string(),
         session_default_subagent_backend: Default::default(),
         session_default_subagent_model: None,
+        session_default_kernel_subagent_model: None,
         session_default_skills: Vec::new(),
         current_agent_manifest: None,
         pending_files: None,

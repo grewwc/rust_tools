@@ -1189,6 +1189,22 @@ fn backend_model_completion_descriptors() -> Vec<&'static crate::ai::tools::task
         .collect()
 }
 
+/// Backends whose model list needs no discovery probe because it lives in the
+/// in-process registry, so the generated script can embed the names directly.
+fn static_model_completion_descriptors() -> Vec<&'static crate::ai::tools::task_tools::Descriptor> {
+    crate::ai::tools::task_tools::backends::backend_registry()
+        .use_descriptors()
+        .into_iter()
+        .filter(|descriptor| descriptor.supports_model_pick && descriptor.model_discovery.is_none())
+        .collect()
+}
+
+fn static_model_completion_candidates(
+    descriptor: &crate::ai::tools::task_tools::Descriptor,
+) -> String {
+    crate::ai::tools::task_tools::backend_model_names(descriptor.id).join(" ")
+}
+
 fn backend_completion_key(descriptor: &crate::ai::tools::task_tools::Descriptor) -> String {
     descriptor
         .id
@@ -1370,6 +1386,18 @@ fn generate_bash(
                 "            COMPREPLY=($(compgen -W \"${{_a_{backend}_models_cache[*]}}\" -- \"$cur\"))"
             );
             println!("          fi");
+        }
+    }
+    for descriptor in static_model_completion_descriptors() {
+        let models = static_model_completion_candidates(descriptor);
+        if models.is_empty() {
+            continue;
+        }
+        for name in descriptor.use_names {
+            println!(
+                "        elif [ \"$COMP_CWORD\" -eq 3 ] && [ \"${{COMP_WORDS[2]}}\" = {name} ]; then"
+            );
+            println!("          COMPREPLY=($(compgen -W '{models}' -- \"$cur\"))");
         }
     }
     println!("        else");
@@ -1673,6 +1701,16 @@ fn generate_zsh(
             println!("          _a_name_candidates _a_{backend}_models_cache");
         }
     }
+    for descriptor in static_model_completion_descriptors() {
+        let models = static_model_completion_candidates(descriptor);
+        if models.is_empty() {
+            continue;
+        }
+        for name in descriptor.use_names {
+            println!("        elif (( CURRENT == 4 )) && [[ \"$words[3]\" == {name} ]]; then");
+            println!("          compadd -S ' ' -- {models}");
+        }
+    }
     println!("        fi");
     println!("        return ;;");
     println!("      /usage|:usage)");
@@ -1806,6 +1844,19 @@ end
         for command in ["/use", ":use", "/subagent", ":subagent"] {
             println!(
                 "complete -c a -n '__fish_seen_subcommand_from {command}; and __fish_seen_subcommand_from {names}; and test (count (commandline -opc)) -eq 3' -f -a '(__a_{backend}_models)' -d '{label}'"
+            );
+        }
+    }
+    for descriptor in static_model_completion_descriptors() {
+        let models = static_model_completion_candidates(descriptor);
+        if models.is_empty() {
+            continue;
+        }
+        let names = descriptor.use_names.join(" ");
+        let label = descriptor.text.display_name.replace('\'', "'\\''");
+        for command in ["/use", ":use", "/subagent", ":subagent"] {
+            println!(
+                "complete -c a -n '__fish_seen_subcommand_from {command}; and __fish_seen_subcommand_from {names}; and test (count (commandline -opc)) -eq 3' -f -a '{models}' -d '{label}'"
             );
         }
     }

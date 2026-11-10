@@ -13,6 +13,7 @@ pub(super) const DESCRIPTOR: Descriptor = Descriptor {
     id: BackendId::TRAECLI,
     task_names: &["traecli", "trae-cli", "coco"],
     use_names: &["traecli"],
+    supports_model_pick: true,
     supports_worker_model: true,
     supports_resume: true,
     side_notes: SideNoteMode::DeferredContinuation,

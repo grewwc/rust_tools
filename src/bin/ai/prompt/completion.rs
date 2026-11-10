@@ -1386,8 +1386,11 @@ impl CommandCompleter {
             } else if matches!(first, "/use" | ":use" | "/subagent" | ":subagent") {
                 let registry = crate::ai::tools::task_tools::backends::backend_registry();
                 match words.next() {
-                    None if registry.worker_use_id(token).is_some() => {
-                        let backend = registry.worker_use_id(token).unwrap();
+                    None if registry.use_id(token).is_some_and(|backend| {
+                        backend.resolve().descriptor().supports_model_pick
+                    }) =>
+                    {
+                        let backend = registry.use_id(token).unwrap();
                         let models = Self::backend_model_candidates(backend, "");
                         if models.is_empty() {
                             vec![CompletionCandidate {
@@ -1404,6 +1407,15 @@ impl CommandCompleter {
                                 .collect()
                         }
                     }
+                    // A backend without a model pick is a complete command word,
+                    // so offer the trailing space. Re-offering the same token
+                    // would make Tab look unresponsive.
+                    None if registry.use_id(token).is_some() => {
+                        vec![CompletionCandidate {
+                            display: token.to_string(),
+                            replacement: format!("{token} "),
+                        }]
+                    }
                     None => Self::plain_candidates(
                         Self::use_backends()
                             .iter()
@@ -1411,7 +1423,8 @@ impl CommandCompleter {
                             .map(|backend| (*backend).to_string()),
                     ),
                     Some(name) if words.next().is_none() => registry
-                        .worker_use_id(name)
+                        .use_id(name)
+                        .filter(|backend| backend.resolve().descriptor().supports_model_pick)
                         .map(|backend| Self::backend_model_candidates(backend, token))
                         .unwrap_or_default(),
                     _ => Vec::new(),
@@ -4450,7 +4463,12 @@ mod tests {
     #[test]
     fn exact_traecli_model_backend_still_completes_when_discovery_fails() {
         crate::ai::tools::task_tools::with_traecli_model_names_for_test(Vec::new(), || {
-            for line in ["/use traecli", ":use traecli"] {
+            for line in [
+                "/use traecli",
+                ":use traecli",
+                "/subagent traecli",
+                ":subagent traecli",
+            ] {
                 let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
                 assert_eq!(start, line.find("traecli").unwrap());
                 assert_eq!(candidates.len(), 1);
@@ -4523,13 +4541,13 @@ mod tests {
                 let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
                 assert_eq!(candidates.len(), 1);
                 assert_eq!(candidates[0].replacement, "GPT-6.1-Sol");
-                for line in ["/use kernel ", ":use kernel ", "/use traecli GPT-5.5 "] {
-                    assert!(
-                        CommandCompleter::complete_for_line(line, line.len())
-                            .1
-                            .is_empty()
-                    );
-                }
+                // Three tokens already exceed the backend/model grammar.
+                let line = "/use traecli GPT-5.5 ";
+                assert!(
+                    CommandCompleter::complete_for_line(line, line.len())
+                        .1
+                        .is_empty()
+                );
             },
         );
     }
@@ -4537,7 +4555,12 @@ mod tests {
     #[test]
     fn use_command_completion_failed_model_listing_has_no_candidates() {
         crate::ai::tools::task_tools::with_traecli_model_names_for_test(Vec::new(), || {
-            for line in ["/use traecli ", ":use traecli "] {
+            for line in [
+                "/use traecli ",
+                ":use traecli ",
+                "/subagent traecli ",
+                ":subagent traecli ",
+            ] {
                 assert!(
                     CommandCompleter::complete_for_line(line, line.len())
                         .1
@@ -4545,6 +4568,91 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn kernel_backend_completion_lists_registry_models() {
+        let first_handle = crate::ai::model_names::all()
+            .first()
+            .map(|model| crate::ai::model_names::model_handle(model))
+            .expect("model registry must contain at least one model");
+        for line in [
+            "/use kernel",
+            ":use kernel",
+            "/subagent kernel",
+            ":subagent kernel",
+        ] {
+            let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
+            assert_eq!(start, line.find("kernel").unwrap());
+            assert!(!candidates.is_empty(), "{line}");
+            assert!(
+                candidates
+                    .iter()
+                    .all(|candidate| candidate.replacement.starts_with("kernel ")),
+                "{line}"
+            );
+        }
+        // After the separating space the candidates are bare, typeable model
+        // selectors: encrypted registry names never surface, and no selector
+        // repeats.
+        for line in [
+            "/use kernel ",
+            ":use kernel ",
+            "/subagent kernel ",
+            ":subagent kernel ",
+        ] {
+            let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
+            assert_eq!(start, line.len());
+            assert!(!candidates.is_empty(), "{line}");
+            assert!(
+                candidates
+                    .iter()
+                    .all(|candidate| candidate.replacement == candidate.display),
+                "{line}"
+            );
+            assert!(
+                candidates
+                    .iter()
+                    .all(|candidate| !candidate.replacement.starts_with("enc:")),
+                "{line}"
+            );
+            let mut unique = rust_tools::commonw::FastSet::default();
+            assert!(
+                candidates
+                    .iter()
+                    .all(|candidate| unique.insert(candidate.replacement.clone())),
+                "{line}"
+            );
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.replacement == first_handle),
+                "{line}"
+            );
+        }
+        // The third token filters the kernel registry, not TraeCLI discovery.
+        let probe = first_handle;
+        let line = format!("/subagent kernel {probe}");
+        let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.replacement == probe),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn kernel_completion_selectors_resolve_back_to_themselves() {
+        let (_, candidates) = CommandCompleter::complete_for_line("/subagent kernel ", 17);
+        assert!(!candidates.is_empty());
+        for candidate in candidates {
+            assert_eq!(
+                crate::ai::models::determine_model(&candidate.replacement),
+                candidate.replacement,
+                "completion selector must be accepted verbatim by /subagent"
+            );
+        }
     }
 
     #[test]

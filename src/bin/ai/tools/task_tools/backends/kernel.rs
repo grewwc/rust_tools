@@ -12,6 +12,7 @@ pub(super) const DESCRIPTOR: Descriptor = Descriptor {
     id: BackendId::KERNEL,
     task_names: &["kernel"],
     use_names: &["kernel"],
+    supports_model_pick: true,
     supports_worker_model: false,
     supports_resume: false,
     side_notes: SideNoteMode::Live,
@@ -66,9 +67,16 @@ impl Backend for KernelBackend {
     }
 
     fn model_names(&self) -> Vec<String> {
+        // Completion candidates must be selectors a user can type: encrypted
+        // registry names are ciphertext, so map through `model_handle` and drop
+        // repeats that resolve to the same selector.
+        let mut seen = rust_tools::commonw::FastSet::default();
         crate::ai::model_names::all()
             .into_iter()
-            .map(|model| model.name.clone())
+            .filter_map(|model| {
+                let handle = crate::ai::model_names::model_handle(model);
+                (!handle.is_empty() && seen.insert(handle.clone())).then_some(handle)
+            })
             .collect()
     }
 

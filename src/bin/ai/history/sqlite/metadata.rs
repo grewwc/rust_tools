@@ -16,7 +16,7 @@ use super::{
     LAST_ACTIVITY_META_KEY, SESSION_ARCHIVED_META_KEY, SESSION_DEFAULT_SKILLS_META_KEY,
     SESSION_MARK_MESSAGE_META_KEY, SESSION_MARKED_META_KEY, SESSION_SERVE_AGENT_META_KEY,
     SESSION_SERVE_EFFORT_META_KEY, SESSION_SERVE_MODEL_META_KEY, SESSION_SUBAGENT_BACKEND_META_KEY,
-    SESSION_SUBAGENT_MODEL_META_KEY,
+    SESSION_SUBAGENT_KERNEL_MODEL_META_KEY, SESSION_SUBAGENT_MODEL_META_KEY,
 };
 
 pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Option<String>> {
@@ -378,6 +378,7 @@ pub(in crate::ai) fn read_session_serve_config_sqlite(
         reasoning_effort: read_meta_optional(&tx, SESSION_SERVE_EFFORT_META_KEY),
         subagent_backend: read_meta_optional(&tx, SESSION_SUBAGENT_BACKEND_META_KEY),
         subagent_model: read_meta_optional(&tx, SESSION_SUBAGENT_MODEL_META_KEY),
+        subagent_kernel_model: read_meta_optional(&tx, SESSION_SUBAGENT_KERNEL_MODEL_META_KEY),
         default_skills: read_meta_optional(&tx, SESSION_DEFAULT_SKILLS_META_KEY)
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or_default(),
@@ -421,6 +422,10 @@ pub(in crate::ai) fn write_session_serve_config_sqlite(
             (
                 SESSION_SUBAGENT_MODEL_META_KEY,
                 config.subagent_model.as_deref(),
+            ),
+            (
+                SESSION_SUBAGENT_KERNEL_MODEL_META_KEY,
+                config.subagent_kernel_model.as_deref(),
             ),
             (SESSION_DEFAULT_SKILLS_META_KEY, default_skills.as_deref()),
         ] {

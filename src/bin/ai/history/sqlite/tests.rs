@@ -606,6 +606,7 @@ fn clear_session_history_preserves_session_runtime_config() {
         reasoning_effort: Some("high".to_string()),
         subagent_backend: Some("traecli".to_string()),
         subagent_model: Some("test-subagent-model".to_string()),
+        subagent_kernel_model: Some("test-kernel-model".to_string()),
         default_skills: vec!["agent-team".to_string(), "test-skill".to_string()],
     };
     write_session_serve_config_sqlite(&path, &config).unwrap();

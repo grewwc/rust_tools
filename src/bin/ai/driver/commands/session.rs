@@ -152,6 +152,7 @@ pub(in crate::ai) fn persist_session_runtime_state(app: &App) {
         subagent_backend: explicit_backend
             .then(|| app.session_default_subagent_backend.as_str().to_string()),
         subagent_model: app.session_default_subagent_model.clone(),
+        subagent_kernel_model: app.session_default_kernel_subagent_model.clone(),
         default_skills: app.session_default_skills.clone(),
     };
     if let Err(error) = store.write_session_serve_config(&app.session_id, &config) {
@@ -188,6 +189,7 @@ fn restore_session_model_agent_effort(app: &mut App, store: &SessionStore) {
     }
     app.session_default_subagent_backend = session_backend;
     app.session_default_subagent_model = stored.subagent_model;
+    app.session_default_kernel_subagent_model = stored.subagent_kernel_model;
     app.session_default_skills = stored.default_skills;
 }
 
@@ -1964,6 +1966,7 @@ mod tests {
             current_agent: "build".to_string(),
             session_default_subagent_backend: Default::default(),
             session_default_subagent_model: None,
+            session_default_kernel_subagent_model: None,
             session_default_skills: Vec::new(),
             current_agent_manifest: None,
             pending_files: None,
@@ -2296,11 +2299,35 @@ mod tests {
         let mut app = test_app(&root);
         let store = SessionStore::new(app.config.history_file.as_path());
 
+        let kernel_model = crate::ai::model_names::all()
+            .last()
+            .map(|model| model.name.as_str())
+            .expect("model registry must define at least one model");
         for backend in [BackendId::KERNEL, BackendId::TRAECLI] {
             let command = format!("/use {}", backend.as_str());
             assert!(super::super::use_backend::try_handle_use_command(&mut app, &command).unwrap());
             let stored = store.read_session_serve_config(&app.session_id).unwrap();
             assert_eq!(stored.subagent_backend.as_deref(), Some(backend.as_str()));
+
+            // Kernel and worker models persist in independent slots.
+            let kernel_slot = backend == BackendId::KERNEL;
+            let model = if kernel_slot {
+                kernel_model
+            } else {
+                "worker-model-y"
+            };
+            let with_model = format!("/use {} {model}", backend.as_str());
+            assert!(
+                super::super::use_backend::try_handle_use_command(&mut app, &with_model).unwrap()
+            );
+            let stored = store.read_session_serve_config(&app.session_id).unwrap();
+            if kernel_slot {
+                assert_eq!(stored.subagent_kernel_model.as_deref(), Some(model));
+                assert!(stored.subagent_model.is_none());
+            } else {
+                assert_eq!(stored.subagent_model.as_deref(), Some(model));
+                assert_eq!(stored.subagent_kernel_model.as_deref(), Some(kernel_model));
+            }
 
             let mut reopened = test_app(&root);
             reopened.session_default_subagent_backend = if backend == BackendId::KERNEL {
@@ -2310,6 +2337,22 @@ mod tests {
             };
             restore_session_local_runtime_state(&mut reopened).unwrap();
             assert_eq!(reopened.session_default_subagent_backend, backend);
+            if kernel_slot {
+                assert_eq!(
+                    reopened.session_default_kernel_subagent_model.as_deref(),
+                    Some(model)
+                );
+                assert!(reopened.session_default_subagent_model.is_none());
+            } else {
+                assert_eq!(
+                    reopened.session_default_subagent_model.as_deref(),
+                    Some(model)
+                );
+                assert_eq!(
+                    reopened.session_default_kernel_subagent_model.as_deref(),
+                    Some(kernel_model)
+                );
+            }
         }
 
         for legacy_backend in [None, Some("")] {

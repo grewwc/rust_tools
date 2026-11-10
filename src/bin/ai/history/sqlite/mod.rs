@@ -37,6 +37,7 @@ const SESSION_SERVE_AGENT_META_KEY: &str = "serve_agent";
 const SESSION_SERVE_EFFORT_META_KEY: &str = "serve_reasoning_effort";
 const SESSION_SUBAGENT_BACKEND_META_KEY: &str = "session_subagent_backend";
 const SESSION_SUBAGENT_MODEL_META_KEY: &str = "session_subagent_model";
+const SESSION_SUBAGENT_KERNEL_MODEL_META_KEY: &str = "session_subagent_kernel_model";
 const SESSION_DEFAULT_SKILLS_META_KEY: &str = "session_default_skills";
 
 pub(super) use lock::{

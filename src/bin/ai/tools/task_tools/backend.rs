@@ -126,6 +126,10 @@ pub(crate) struct Descriptor {
     pub(crate) task_names: &'static [&'static str],
     /// Includes every accepted `/use` name, independently of task-field aliases.
     pub(crate) use_names: &'static [&'static str],
+    /// Whether `/use` and `/subagent` accept a model pick for this backend:
+    /// a worker model for an external backend, the kernel model for the kernel
+    /// backend.
+    pub(crate) supports_model_pick: bool,
     pub(crate) supports_worker_model: bool,
     pub(crate) supports_resume: bool,
     pub(crate) side_notes: SideNoteMode,

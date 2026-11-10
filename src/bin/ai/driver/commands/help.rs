@@ -17,11 +17,15 @@ fn print_commands_help() {
         "    {} [\\n<task>]  set backend and sticky agent-team; optionally start <task>; bare /use shows state",
         crate::ai::tools::task_tools::backends::backend_registry().use_usage()
     );
+    let subagent_grammar = crate::ai::tools::task_tools::backends::backend_registry()
+        .use_usage()
+        .trim_start_matches("/use ")
+        .to_string();
     println!(
-        "    /subagent [\\n<task>]     set the subagent backend and worker model only (never sticky skills or runtime mode); bare /subagent shows state"
+        "    /subagent {subagent_grammar}  set the subagent backend and its model only (kernel or worker; never sticky skills or runtime mode); bare /subagent shows state"
     );
     println!(
-        "    /reset                    return to the default backend; clear worker model override and sticky agent-team (no arguments)"
+        "    /reset                    return to the default backend; clear subagent model overrides and sticky agent-team (no arguments)"
     );
     println!("    /theme [name]             list or switch terminal themes live (session-only)");
     println!(

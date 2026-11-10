@@ -487,13 +487,18 @@ pub(crate) fn is_deterministic_status_error(status: StatusCode, body: &str) -> b
 /// Whether a failure is the Azure "item created under a different resource"
 /// rejection of a replayed Responses item.
 ///
-/// The gateway answers HTTP 400 with code `modelhub_err_code_-4003` and the
-/// message "The requested item was created under a different Azure OpenAI
-/// resource. Use the same resource that created the item to access it.".
-/// Resending the identical payload can never succeed, but dropping replayed
-/// items does, so the transport drops replay tiers and retries. `-4003` alone
-/// is not enough: the same code also covers deterministic "Duplicate item
-/// found" rejections, which this repair cannot cure.
+/// The gateway answers HTTP 400 with the message "The requested item was
+/// created under a different Azure OpenAI resource. Use the same resource that
+/// created the item to access it.". Resending the identical payload can never
+/// succeed, but dropping replayed items does, so the transport drops replay
+/// tiers and retries.
+///
+/// The message alone is the discriminator: it is unique to this rejection,
+/// while the `modelhub_err_code_-4003` code it sometimes carries also covers
+/// deterministic "Duplicate item found" rejections, which this repair cannot
+/// cure. Requiring the code is what let a relay that omits it (inner
+/// `code: null`, outer `InvalidParameter`) bypass the repair entirely, so the
+/// code is treated as an optional corroborating signal rather than a gate.
 pub(crate) fn is_cross_resource_replay_rejection(err: &RequestError) -> bool {
     match err.kind {
         RequestErrorKind::Status(status) if status.as_u16() == 400 => {
@@ -507,9 +512,7 @@ pub(crate) fn is_cross_resource_replay_rejection(err: &RequestError) -> bool {
 /// text; shared with [`is_deterministic_status_error`] so the retry ladder and
 /// the replay repair cannot drift.
 fn cross_resource_replay_body_markers(lower_text: &str) -> bool {
-    let compact: String = lower_text.split_whitespace().collect();
-    let code = lower_text.contains("modelhub_err_code_-4003") || compact.contains("\"code\":-4003");
-    code && lower_text.contains("different azure openai resource")
+    lower_text.contains("different azure openai resource")
 }
 
 /// Returns `true` if the error indicates an auth or quota issue with the API key
@@ -718,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn is_cross_resource_replay_rejection_requires_400_code_and_resource_text() {
+    fn is_cross_resource_replay_rejection_matches_the_resource_phrase() {
         // Real incident shape: Azure rejects a replayed Responses item that was
         // created under another resource behind the same gateway.
         let cross_resource = r#"{"error":{"code":"modelhub_err_code_-4003","message":"The requested item was created under a different Azure OpenAI resource. Use the same resource that created the item to access it."}}"#;
@@ -727,7 +730,25 @@ mod tests {
             cross_resource.to_string(),
         )));
 
-        // Same code, different cause: dropping replayed items cannot cure it.
+        // Same phrase without the gateway code: a relay that wraps the inner
+        // body as a string and answers with outer code `InvalidParameter` while
+        // the inner `code` is null. This shape bypassed the repair and turned a
+        // recoverable cross-resource rejection into an abandoned turn.
+        let relayed_null_code = r#"{"error":{"message":"{\n  \"error\": {\n    \"message\": \"The requested item was created under a different Azure OpenAI resource. Use the same resource that created the item to access it.\",\n    \"type\": \"invalid_request_error\",\n    \"param\": null,\n    \"code\": null\n  }\n}","type":"BadRequest","param":"","code":"InvalidParameter"}}"#;
+        assert!(is_cross_resource_replay_rejection(&RequestError::status(
+            StatusCode::BAD_REQUEST,
+            relayed_null_code.to_string(),
+        )));
+
+        // The rejection stays deterministic so the replay repair runs on the
+        // first answer instead of after `max_attempts` identical resends.
+        assert!(is_deterministic_status_error(
+            StatusCode::BAD_REQUEST,
+            relayed_null_code
+        ));
+
+        // Different cause, no resource phrase: dropping replayed items cannot
+        // cure it, and the phrase (not the code) is what excludes it.
         let duplicate =
             r#"{"error":{"code":"modelhub_err_code_-4003","message":"Duplicate item found"}}"#;
         assert!(!is_cross_resource_replay_rejection(&RequestError::status(

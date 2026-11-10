@@ -571,8 +571,8 @@ pub(super) fn commit_dropped_replay_tiers(
 /// cross-resource repair had to drop, mirrored in the session's durable
 /// history state.
 ///
-/// A 400 `modelhub_err_code_-4003` "created under a different Azure OpenAI
-/// resource" rejects the request because at least one replayed item was
+/// A 400 "created under a different Azure OpenAI resource" rejects the request
+/// because at least one replayed item was
 /// created by a resource this route can no longer reach; resending it can
 /// never succeed. The rejection does not name the item, so the repair drops a
 /// whole tier at a time — persisted owners first, live owners only when the

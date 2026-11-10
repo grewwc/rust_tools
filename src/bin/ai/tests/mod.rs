@@ -86,6 +86,7 @@ pub(in crate::ai) fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>)
         current_agent: "build".to_string(),
         session_default_subagent_backend: Default::default(),
         session_default_subagent_model: None,
+        session_default_kernel_subagent_model: None,
         session_default_skills: Vec::new(),
         current_agent_manifest: None,
         pending_files: None,

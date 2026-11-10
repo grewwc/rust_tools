@@ -31,6 +31,7 @@ fn session_config_response(config: &SessionServeConfig) -> serde_json::Value {
         "reasoning_effort": config.reasoning_effort.as_deref().unwrap_or_default(),
         "subagent_backend": subagent_backend,
         "subagent_model": config.subagent_model.as_deref().unwrap_or_default(),
+        "subagent_kernel_model": config.subagent_kernel_model.as_deref().unwrap_or_default(),
         "default_skills": config.default_skills,
         "output": format_use_state(config, &kernel_model),
     })

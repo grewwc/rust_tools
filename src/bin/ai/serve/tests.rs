@@ -1394,7 +1394,6 @@ async fn session_config_subagents_use_reset_roundtrip() {
     for subagents in [
         serde_json::json!({"action": "use", "backend": "unknown"}),
         serde_json::json!({"action": "use", "backend": "TRAECLI"}),
-        serde_json::json!({"action": "use", "backend": "kernel", "model": "worker"}),
         serde_json::json!({"action": "use"}),
         serde_json::json!({"action": "unknown"}),
     ] {
@@ -1408,6 +1407,24 @@ async fn session_config_subagents_use_reset_roundtrip() {
         assert!(body["error"].is_string());
         assert_eq!(store.read_session_serve_config(id).unwrap(), before);
     }
+    // A kernel pick carries the kernel model its subagents run.
+    let (status, picked) = session_config_test_response(
+        state.clone(),
+        id,
+        Some(serde_json::json!({
+            "subagents": {"action": "subagent", "backend": "kernel", "model": "glm-5.3"}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(picked["subagent_backend"], "kernel");
+    assert_eq!(picked["subagent_kernel_model"], "glm-5.3");
+    let stored_pick = store.read_session_serve_config(id).unwrap();
+    assert_eq!(stored_pick.subagent_backend.as_deref(), Some("kernel"));
+    assert_eq!(
+        stored_pick.subagent_kernel_model.as_deref(),
+        Some("glm-5.3")
+    );
     let (status, reset) = session_config_test_response(
         state.clone(),
         id,

@@ -345,6 +345,7 @@ pub(super) fn test_app_with_model(current_model: String) -> App {
         current_agent: "build".to_string(),
         session_default_subagent_backend: Default::default(),
         session_default_subagent_model: None,
+        session_default_kernel_subagent_model: None,
         session_default_skills: Vec::new(),
         current_agent_manifest: None,
         pending_files: None,
@@ -834,6 +835,82 @@ fn use_command_task_preparation_prefers_explicit_worker_model_over_session() {
             assert_eq!(prepared.backend_model.as_deref(), expected_model);
             assert_eq!(crate::ai::driver::runtime_ctx::try_current().unwrap().app_proto.current_model, current_model);
         }
+    });
+}
+
+/// `/subagent kernel <model>` stores a kernel model, so the prepared task must
+/// hand it to the child kernel driver instead of auto-selecting a model.
+#[test]
+fn kernel_session_model_drives_the_child_kernel_model() {
+    let current_model = crate::ai::model_names::all()
+        .first()
+        .map(|model| crate::ai::model_names::model_handle(model))
+        .expect("model registry must contain at least one model");
+    let kernel_model = crate::ai::model_names::all()
+        .last()
+        .map(|model| model.name.clone())
+        .expect("model registry must contain at least one model");
+    let navigator = manifest(
+        "navigator",
+        "Read-only codebase navigation agent",
+        AgentMode::Subagent,
+    );
+    let mut app = test_app_with_model(current_model);
+    app.session_default_subagent_backend = SubagentBackend::Kernel;
+    app.session_default_kernel_subagent_model = Some(kernel_model.clone());
+    let ctx = DriverContext::new(
+        app,
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(vec![navigator]),
+    );
+    DRIVER_CTX.sync_scope(ctx, || {
+        let prepared = prepare_subagent_task(&serde_json::json!({
+            "description": "Locate task tool",
+            "prompt": "Find task spawning.",
+            "agent": "navigator",
+        }))
+        .unwrap();
+        assert_eq!(prepared.backend, SubagentBackend::Kernel);
+        assert_eq!(
+            prepared.model,
+            crate::ai::models::determine_model(&kernel_model)
+        );
+        assert!(!prepared.is_model_auto_selected);
+    });
+}
+
+#[test]
+fn stale_kernel_session_model_falls_back_instead_of_reaching_the_child() {
+    let current_model = crate::ai::model_names::all()
+        .first()
+        .map(|model| crate::ai::model_names::model_handle(model))
+        .expect("model registry must contain at least one model");
+    let stale = "model-that-does-not-exist";
+    let navigator = manifest(
+        "navigator",
+        "Read-only codebase navigation agent",
+        AgentMode::Subagent,
+    );
+    let mut app = test_app_with_model(current_model);
+    app.session_default_subagent_backend = SubagentBackend::Kernel;
+    app.session_default_kernel_subagent_model = Some(stale.to_string());
+    let ctx = DriverContext::new(
+        app,
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(vec![navigator]),
+    );
+    DRIVER_CTX.sync_scope(ctx, || {
+        let prepared = prepare_subagent_task(&serde_json::json!({
+            "description": "Locate task tool",
+            "prompt": "Find task spawning.",
+            "agent": "navigator",
+        }))
+        .unwrap();
+        assert_eq!(prepared.backend, SubagentBackend::Kernel);
+        assert_eq!(prepared.model, crate::ai::models::determine_model(stale));
+        assert_ne!(prepared.model, stale);
     });
 }
 

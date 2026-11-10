@@ -56,6 +56,54 @@ pub(crate) fn parse_use_arguments(args: &str) -> Result<(Option<&str>, Option<&s
     Ok((backend, model))
 }
 
+/// True when `backend` accepts a model pick: an external backend takes its own
+/// worker model, and the kernel backend takes the kernel model its subagents run.
+fn accepts_model(backend: BackendId) -> bool {
+    backend.resolve().descriptor().supports_model_pick
+}
+
+/// Reject a pick the backend cannot honor before any state changes: a backend
+/// without a model pick, or a kernel model outside the kernel registry. An
+/// unknown kernel name would otherwise resolve to the default model at spawn,
+/// so the command would report success while running a different model.
+fn validate_subagent_pick(
+    backend: BackendId,
+    model: Option<&str>,
+    command: &str,
+) -> Result<(), String> {
+    let descriptor = backend.resolve().descriptor();
+    if model.is_some() && !accepts_model(backend) {
+        return Err(format!(
+            "{} does not take a model. Usage: {command} {} [<model>]",
+            descriptor.text.display_name, descriptor.use_names[0]
+        ));
+    }
+    if backend == BackendId::KERNEL
+        && let Some(model) = model
+        && crate::ai::model_names::find_by_identifier(model).is_none()
+    {
+        return Err(format!(
+            "Unknown kernel model '{model}'. `/model <TAB>` lists available models."
+        ));
+    }
+    Ok(())
+}
+
+/// Store one backend/model pick. The kernel and worker model slots stay
+/// independent, so a kernel pick never overwrites the TraeCLI worker model
+/// (or the reverse).
+fn store_subagent_pick(config: &mut SessionServeConfig, backend: BackendId, model: Option<&str>) {
+    config.subagent_backend = Some(backend.as_str().to_string());
+    let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
+        return;
+    };
+    if backend == BackendId::KERNEL {
+        config.subagent_kernel_model = Some(model.to_string());
+    } else {
+        config.subagent_model = Some(model.to_string());
+    }
+}
+
 /// Apply the same backend validation and sticky-skill rule for local and HTTP commands.
 pub(crate) fn apply_subagent_use(
     config: &mut SessionServeConfig,
@@ -68,19 +116,9 @@ pub(crate) fn apply_subagent_use(
             backend_registry().use_usage()
         ));
     };
-    let implementation = backend.resolve();
-    let descriptor = implementation.descriptor();
-    if model.is_some() && !descriptor.supports_worker_model {
-        return Err(format!(
-            "{} does not take a worker model. Usage: /use {}",
-            descriptor.text.display_name, descriptor.use_names[0]
-        ));
-    }
+    validate_subagent_pick(backend, model, "/use")?;
     // Keep explicit choices distinct from the available session default.
-    config.subagent_backend = Some(backend.as_str().to_string());
-    if let Some(model) = model {
-        config.subagent_model = Some(model.to_string());
-    }
+    store_subagent_pick(config, backend, model);
     ensure_agent_team_sticky(config);
     Ok(())
 }
@@ -88,6 +126,7 @@ pub(crate) fn apply_subagent_use(
 pub(crate) fn reset_subagent_config(config: &mut SessionServeConfig) {
     config.subagent_backend = None;
     config.subagent_model = None;
+    config.subagent_kernel_model = None;
     config
         .default_skills
         .retain(|name| !name.eq_ignore_ascii_case("agent-team"));
@@ -96,7 +135,8 @@ pub(crate) fn reset_subagent_config(config: &mut SessionServeConfig) {
 /// Apply a subagent-only preference: the same backend validation as `/use`, but
 /// never the sticky agent-team skill. `/subagent` therefore never changes the
 /// runtime mode (skill set, task-family gating) — it only steers which backend
-/// spawns subagents and which worker model that backend uses.
+/// spawns subagents and which model that backend uses: a worker model for an
+/// external backend, the kernel model for the kernel backend.
 pub(crate) fn apply_subagent_preference(
     config: &mut SessionServeConfig,
     name: &str,
@@ -108,24 +148,22 @@ pub(crate) fn apply_subagent_preference(
             backend_registry().use_usage()
         ));
     };
-    let implementation = backend.resolve();
-    let descriptor = implementation.descriptor();
-    if model.is_some() && !descriptor.supports_worker_model {
-        return Err(format!(
-            "{} does not take a worker model. Usage: /subagent {}",
-            descriptor.text.display_name, descriptor.use_names[0]
-        ));
-    }
-    config.subagent_backend = Some(backend.as_str().to_string());
-    if let Some(model) = model {
-        config.subagent_model = Some(model.to_string());
-    }
+    validate_subagent_pick(backend, model, "/subagent")?;
+    store_subagent_pick(config, backend, model);
     Ok(())
 }
 
 pub(crate) fn format_use_state(config: &SessionServeConfig, kernel_model: &str) -> String {
     let backend = effective_subagent_backend(config);
     let mut output = format!("Session default subagent backend: {}\n", backend.as_str());
+    // Both model slots persist independently of the active backend, so print
+    // any set slot and keep a later backend switch predictable.
+    if let Some(model) = config.subagent_kernel_model.as_deref() {
+        output.push_str(&format!(
+            "Kernel subagent model: {}\n",
+            crate::ai::models::determine_model(model)
+        ));
+    }
     if let Some(worker_backend) = backend_registry().worker_backend_for(backend) {
         let implementation = worker_backend.resolve();
         if let Some(label) = implementation.descriptor().text.worker_model_label {
@@ -155,6 +193,7 @@ fn app_subagent_config(app: &App) -> SessionServeConfig {
     SessionServeConfig {
         subagent_backend: app.session_default_subagent_backend.stored_value(),
         subagent_model: app.session_default_subagent_model.clone(),
+        subagent_kernel_model: app.session_default_kernel_subagent_model.clone(),
         default_skills: app.session_default_skills.clone(),
         ..SessionServeConfig::default()
     }
@@ -163,6 +202,7 @@ fn app_subagent_config(app: &App) -> SessionServeConfig {
 fn apply_app_subagent_config(app: &mut App, config: SessionServeConfig) {
     app.session_default_subagent_backend = effective_subagent_backend(&config);
     app.session_default_subagent_model = config.subagent_model;
+    app.session_default_kernel_subagent_model = config.subagent_kernel_model;
     app.session_default_skills = config.default_skills;
 }
 
@@ -369,6 +409,7 @@ mod tests {
             current_agent: "build".to_string(),
             session_default_subagent_backend: BackendId::KERNEL,
             session_default_subagent_model: None,
+            session_default_kernel_subagent_model: None,
             session_default_skills: Vec::new(),
             current_agent_manifest: None,
             pending_files: None,
@@ -509,14 +550,59 @@ mod tests {
     }
 
     #[test]
+    fn subagent_command_accepts_a_kernel_model_without_touching_skills() {
+        let mut app = test_app();
+        app.session_default_skills = vec!["first-skill".to_string()];
+        app.session_default_subagent_model = Some("worker-model".to_string());
+        assert!(try_handle_subagent_command(&mut app, "/subagent kernel glm-5.3").unwrap());
+        assert_eq!(app.session_default_subagent_backend, BackendId::KERNEL);
+        assert_eq!(
+            app.session_default_kernel_subagent_model.as_deref(),
+            Some("glm-5.3")
+        );
+        // The TraeCLI worker slot is independent of the kernel slot.
+        assert_eq!(
+            app.session_default_subagent_model.as_deref(),
+            Some("worker-model")
+        );
+        assert_eq!(app.session_default_skills, ["first-skill"]);
+        // Re-selecting the same backend without a model keeps the pick.
+        assert!(try_handle_subagent_command(&mut app, "/subagent kernel").unwrap());
+        assert_eq!(
+            app.session_default_kernel_subagent_model.as_deref(),
+            Some("glm-5.3")
+        );
+        // Switching backends keeps the kernel pick; the worker slot is untouched.
+        assert!(try_handle_subagent_command(&mut app, "/subagent traecli").unwrap());
+        assert_eq!(
+            app.session_default_kernel_subagent_model.as_deref(),
+            Some("glm-5.3")
+        );
+        // The kernel pick stays visible while another backend is active.
+        assert!(
+            format_use_state(&app_subagent_config(&app), "parent-model")
+                .contains("Kernel subagent model: ")
+        );
+        assert_eq!(
+            app.session_default_subagent_model.as_deref(),
+            Some("worker-model")
+        );
+        assert_eq!(app.session_default_skills, ["first-skill"]);
+    }
+
+    #[test]
     fn subagent_command_rejects_invalid_arguments_without_changing_state() {
         let mut app = test_app();
         app.session_default_skills = vec!["first-skill".to_string()];
         assert!(try_handle_subagent_command(&mut app, "/subagent unknown").unwrap());
         assert_eq!(app.session_default_subagent_backend, BackendId::KERNEL);
         assert_eq!(app.session_default_skills, ["first-skill"]);
-        // A backend without worker models refuses a model argument.
-        assert!(try_handle_subagent_command(&mut app, "/subagent kernel GPT-5.5").unwrap());
+        // A kernel pick must name a kernel model; a typo would otherwise
+        // resolve to the default model at spawn time.
+        assert!(try_handle_subagent_command(&mut app, "/subagent kernel not-a-model").unwrap());
+        assert!(app.session_default_kernel_subagent_model.is_none());
+        // Extra arguments are rejected before any state changes.
+        assert!(try_handle_subagent_command(&mut app, "/subagent kernel GPT-5.5 extra").unwrap());
         assert_eq!(app.session_default_subagent_backend, BackendId::KERNEL);
         assert!(app.session_default_subagent_model.is_none());
         // Bare `/subagent` is read-only state, and other input is not ours.
@@ -799,11 +885,7 @@ mod tests {
     #[test]
     fn use_command_rejects_invalid_arguments_without_changing_state() {
         let mut app = test_app();
-        for input in [
-            "/use other\n任务",
-            "/use kernel GPT-5.5\n任务",
-            "/use traecli M extra\n任务",
-        ] {
+        for input in ["/use other\n任务", "/use traecli M extra\n任务"] {
             assert!(try_handle_use_command(&mut app, input).unwrap());
             assert_eq!(app.session_default_subagent_backend, BackendId::KERNEL);
             assert!(app.session_default_subagent_model.is_none());

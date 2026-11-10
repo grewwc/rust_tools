@@ -198,6 +198,8 @@ pub(in crate::ai) struct SessionServeConfig {
     pub reasoning_effort: Option<String>,
     pub subagent_backend: Option<String>,
     pub subagent_model: Option<String>,
+    /// Kernel model `/subagent kernel <model>` selects for kernel subagents.
+    pub subagent_kernel_model: Option<String>,
     pub default_skills: Vec<String>,
 }
 

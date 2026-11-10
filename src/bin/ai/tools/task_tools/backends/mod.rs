@@ -118,7 +118,7 @@ impl BackendRegistry {
             .into_iter()
             .map(|descriptor| {
                 let name = descriptor.use_names[0];
-                if descriptor.supports_worker_model {
+                if descriptor.supports_model_pick {
                     format!("{name} [model]")
                 } else {
                     name.to_string()
@@ -353,7 +353,10 @@ mod tests {
         ] {
             assert_eq!(BackendId::parse(Some(&value)).unwrap_err(), expected);
         }
-        assert_eq!(registry.use_usage(), "/use [traecli [model]|kernel]");
+        assert_eq!(
+            registry.use_usage(),
+            "/use [traecli [model]|kernel [model]]"
+        );
         assert_eq!(registry.use_names(), ["traecli", "kernel"]);
         assert_eq!(
             registry.resume_backend_for(BackendId::KERNEL),
@@ -401,7 +404,7 @@ mod tests {
         assert_eq!(plugins.canonical_id("codex-cli"), None);
         assert_eq!(
             plugins.use_usage(),
-            "/use [traecli [model]|kernel|codex [model]]"
+            "/use [traecli [model]|kernel [model]|codex [model]]"
         );
         assert_eq!(plugins.use_names(), ["traecli", "kernel", "codex", "cx"]);
         assert_eq!(plugins.resume_backend_for(CODEX.id), CODEX.id);

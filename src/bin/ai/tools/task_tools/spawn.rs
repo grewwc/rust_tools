@@ -356,13 +356,14 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
     // The worker model belongs to the external backend, never to the main
     // agent's model registry. Per-call choices override the session pick.
     let backend_model = backend_model.or_else(|| {
-        if descriptor.supports_worker_model {
-            cached
-                .as_ref()
-                .and_then(|ctx| ctx.app_proto.session_default_subagent_model.clone())
-        } else {
-            None
-        }
+        descriptor
+            .supports_worker_model
+            .then(|| {
+                cached
+                    .as_ref()
+                    .and_then(|ctx| ctx.app_proto.session_default_subagent_model.clone())
+            })
+            .flatten()
     });
     let show_backend_launch_tag = explicit_backend.is_some()
         || implementation.execution_mode() == ExecutionMode::External
@@ -403,8 +404,19 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
             selected.agent.name,
         ));
     }
+    // `/subagent kernel <model>` stores the child kernel model, so apply it
+    // exactly like an explicit per-call model.
+    let model_override = model_override.map(str::to_string).or_else(|| {
+        (backend == BackendId::KERNEL)
+            .then(|| {
+                cached
+                    .as_ref()
+                    .and_then(|ctx| ctx.app_proto.session_default_kernel_subagent_model.clone())
+            })
+            .flatten()
+    });
     let (selected_model, is_model_auto_selected, auto_model_fallback, inherited_parent_model) =
-        if let Some(model_override) = model_override {
+        if let Some(model_override) = model_override.as_ref() {
             (models::determine_model(model_override), false, None, false)
         } else {
             let parent_model = cached
@@ -426,7 +438,7 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
     let selection_explanation = build_selection_explanation_for_parent(
         &selected,
         &selected_model,
-        model_override,
+        model_override.as_deref(),
         inherited_parent_model,
         parent_agent,
     );

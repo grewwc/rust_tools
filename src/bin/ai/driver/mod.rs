@@ -66,9 +66,9 @@ pub mod print;
 mod process_context;
 pub mod reflection;
 pub mod runtime_ctx;
-pub mod session_open;
 mod scheduler;
 mod session;
+pub mod session_open;
 pub mod session_pid;
 pub mod side_note;
 pub mod signal;
@@ -633,6 +633,7 @@ pub(in crate::ai) async fn run_with_cli(
         current_agent: cli.agent.clone().unwrap_or_else(|| "build".to_string()),
         session_default_subagent_backend: Default::default(),
         session_default_subagent_model: None,
+        session_default_kernel_subagent_model: None,
         session_default_skills: Vec::new(),
         current_agent_manifest: None,
         session_id: session_id.clone(),

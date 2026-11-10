@@ -70,6 +70,9 @@ impl App {
             current_agent: self.current_agent.clone(),
             session_default_subagent_backend: self.session_default_subagent_backend,
             session_default_subagent_model: self.session_default_subagent_model.clone(),
+            session_default_kernel_subagent_model: self
+                .session_default_kernel_subagent_model
+                .clone(),
             session_default_skills: self.session_default_skills.clone(),
             current_agent_manifest: self.current_agent_manifest.clone(),
             pending_files: self.pending_files.clone(),
@@ -183,6 +186,9 @@ pub(super) struct App {
     pub(super) session_default_subagent_backend: crate::ai::tools::task_tools::BackendId,
     /// TraeCLI worker model selected for this session; independent of `current_model`.
     pub(super) session_default_subagent_model: Option<String>,
+    /// Kernel model the kernel backend runs subagents with; independent of the
+    /// main turn model and of the TraeCLI worker model.
+    pub(super) session_default_kernel_subagent_model: Option<String>,
     /// Skills activated on ordinary turns unless the user explicitly selects skills.
     pub(super) session_default_skills: Vec<String>,
     pub(super) current_agent_manifest: Option<AgentManifest>,

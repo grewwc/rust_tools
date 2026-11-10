@@ -74,8 +74,8 @@ fn should_open_popup_on_first_tab(ctx: &PendingTabCompletion) -> bool {
         .is_some_and(|rest| {
             let name = rest.split_once(' ').map_or(rest, |(name, _)| name);
             crate::ai::tools::task_tools::backends::backend_registry()
-                .worker_use_id(name)
-                .is_some()
+                .use_id(name)
+                .is_some_and(|backend| backend.resolve().descriptor().supports_model_pick)
         });
     (matches!(trimmed, "/model" | ":model")
         || trimmed.starts_with("/model ")
