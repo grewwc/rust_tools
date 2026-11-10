@@ -47,6 +47,7 @@ fn partial_stream_with_structured_failure_never_renders_success() {
     );
     let result = tools::RunOneResult {
         tool_result: crate::ai::types::ToolResult {
+            task_report: None,
             tool_call_id: call.id.clone(),
             content: "partial output before timeout".to_string(),
         },

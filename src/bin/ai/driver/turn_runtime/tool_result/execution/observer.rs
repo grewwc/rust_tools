@@ -456,14 +456,14 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
         if crate::ai::background::serve_live_streaming()
             && crate::ai::driver::runtime_ctx::terminal_output_enabled()
         {
-            if let Some(payload) = crate::ai::background::serve_tool_finished_payload(
+            if let Some(payload) = crate::ai::background::serve_tool_result_payload(
                 tool_call,
-                &run_result.tool_result.content,
+                &run_result.tool_result,
                 run_result.ok,
                 run_result.cached,
                 run_result.executed,
             ) {
-                crate::ai::background::publish_serve_frame(
+                crate::ai::background::publish_serve_json_frame(
                     crate::ai::background::ServeLiveKind::Tool,
                     &payload,
                 );

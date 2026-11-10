@@ -108,6 +108,16 @@ pub(super) fn split_serve_thinking_chunk<'a>(
     vec![(ServeLiveKind::Thinking, content)]
 }
 
+/// Whether a live rate sample is worth publishing to the serve client.
+///
+/// Mirrors the terminal's `MIN_RATE_WINDOW` gate: a shorter window (typically
+/// the first thinking chunk) would make the client compute a misleadingly
+/// large rate. `None` carries no timing window, so clients can still render
+/// the token count without inventing a rate.
+pub(super) fn live_rate_visible(elapsed: Option<Duration>) -> bool {
+    elapsed.is_none_or(|elapsed| elapsed >= MIN_RATE_WINDOW)
+}
+
 /// Serve-mode thinking sink: publish the classified frames for the chat
 /// client to fold remotely. Everything returns here, so nothing thinking
 /// related reaches child stdout.
@@ -121,9 +131,16 @@ pub(super) fn write_thinking_content_serve(
         split_serve_thinking_chunk(content, &markers.thinking_tag, &markers.end_thinking_tag)
     {
         if kind == ServeLiveKind::Thinking
-            && let Some(rate) = fold_header_rate(metrics, Instant::now())
+            && let Some(rate) = live_reasoning_rate_sample(metrics, Instant::now())
+                .filter(|rate| live_rate_visible(rate.elapsed))
         {
-            publish_serve_frame(ServeLiveKind::ThinkingRate, &rate);
+            crate::ai::background::publish_serve_token_rate(
+                ServeLiveKind::ThinkingRate,
+                "reasoning",
+                rate.tokens,
+                rate.elapsed,
+                rate.approximate,
+            );
         }
         publish_serve_frame(kind, text);
     }
@@ -784,4 +801,17 @@ fn extend_fold_line_layout(
         layout.recent_rows.pop_front();
     }
     layout.source_bytes = line.len();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_rate_visible_requires_the_terminal_minimum_window() {
+        assert!(live_rate_visible(None));
+        assert!(!live_rate_visible(Some(Duration::from_millis(499))));
+        assert!(live_rate_visible(Some(MIN_RATE_WINDOW)));
+        assert!(live_rate_visible(Some(Duration::from_secs(1))));
+    }
 }

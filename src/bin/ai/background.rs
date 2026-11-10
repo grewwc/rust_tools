@@ -364,11 +364,17 @@ fn serve_payload_chunks(text: &str) -> Vec<&str> {
 }
 
 fn publish_live_output_bytes(bytes: &[u8]) {
+    let _ = publish_live_output_bytes_impl(bytes, false);
+}
+
+fn publish_live_output_bytes_impl(bytes: &[u8], wait_for_reader: bool) -> bool {
     if bytes.is_empty() {
-        return;
+        return true;
     }
     let mut guard = LIVE_OUTPUT_FIFO.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(fifo) = guard.as_mut() else { return };
+    let Some(fifo) = guard.as_mut() else {
+        return false;
+    };
     if fifo.fd.is_none() {
         // Open the writer on demand. On macOS an O_WRONLY|O_NONBLOCK FIFO open
         // fails with ENXIO while no reader holds the pipe: exactly the
@@ -380,10 +386,11 @@ fn publish_live_output_bytes(bytes: &[u8]) {
             .open(&fifo.path)
         {
             Ok(fd) => fifo.fd = Some(fd.into()),
-            Err(_) => return,
+            Err(_) => return false,
         }
     }
     let mut written = 0usize;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while written < bytes.len() {
         // Rust's std ignores SIGPIPE, so EPIPE (reader gone) is a plain error.
         let n = unsafe {
@@ -394,15 +401,34 @@ fn publish_live_output_bytes(bytes: &[u8]) {
             )
         };
         if n <= 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EPIPE) {
+            let error = std::io::Error::last_os_error().raw_os_error();
+            if error == Some(libc::EINTR) {
+                continue;
+            }
+            if wait_for_reader
+                && error == Some(libc::EAGAIN)
+                && std::time::Instant::now() < deadline
+            {
+                let mut poll = libc::pollfd {
+                    fd: fifo.fd.as_ref().expect("fd set above").as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // A connected reader can drain a large structured result between atomic writes.
+                if unsafe { libc::poll(&mut poll, 1, 100) } >= 0 {
+                    continue;
+                }
+            }
+            if error == Some(libc::EPIPE) {
                 // The attach reader closed: drop the cached fd so the next
                 // chunk re-probes (and finds ENXIO until a new reader attaches).
                 fifo.fd = None;
             }
-            break; // EAGAIN (no reader) / EPIPE / other: drop the rest
+            return false;
         }
         written += n as usize;
     }
+    true
 }
 
 /// Environment handoff for serve-mode chunk streaming: the serve SSE endpoint
@@ -534,10 +560,7 @@ thread_local! {
 /// Scoped test override for [`serve_live_streaming`]; see the thread-local
 /// above.
 #[cfg(test)]
-pub(crate) fn with_serve_live_streaming_for_test<T>(
-    value: bool,
-    run: impl FnOnce() -> T,
-) -> T {
+pub(crate) fn with_serve_live_streaming_for_test<T>(value: bool, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<bool>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -631,6 +654,47 @@ pub(crate) enum ServeLiveKind {
     CompressionStart = 18,
     /// The current model-backed history compression request has ended.
     CompressionDone = 19,
+    /// Tagged, length-checked chunks of one authoritative JSON tool/progress event.
+    JsonStart = 20,
+    JsonChunk = 21,
+    JsonEnd = 22,
+    /// Exact producer-owned throughput sample for a completed stream phase.
+    TokenRate = 23,
+}
+
+/// Numeric throughput sample carried over the serve FIFO. The terminal owns
+/// its own formatted footer; clients render these fields directly instead of
+/// recovering rates from that footer's display text.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct ServeTokenRate {
+    pub(crate) phase: String,
+    pub(crate) tokens: u64,
+    /// `None` means the producer knows the token count but did not observe a
+    /// timing window; clients render a count, never a fake or dash rate.
+    pub(crate) elapsed_ms: Option<u64>,
+    pub(crate) approximate: bool,
+}
+
+pub(crate) fn publish_serve_token_rate(
+    kind: ServeLiveKind,
+    phase: &str,
+    tokens: u64,
+    elapsed: Option<std::time::Duration>,
+    approximate: bool,
+) {
+    if tokens == 0 {
+        return;
+    }
+    let elapsed_ms = elapsed.map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64);
+    let payload = ServeTokenRate {
+        phase: phase.to_string(),
+        tokens,
+        elapsed_ms,
+        approximate,
+    };
+    if let Ok(payload) = serde_json::to_string(&payload) {
+        publish_serve_frame(kind, &payload);
+    }
 }
 
 /// Max payload bytes per serve frame: header (5) + payload stays under the
@@ -690,6 +754,161 @@ pub(crate) fn serve_tool_finished_payload(
         "output",
         output,
     )
+}
+
+pub(crate) fn serve_tool_result_payload(
+    call: &crate::ai::types::ToolCall,
+    result: &crate::ai::types::ToolResult,
+    ok: bool,
+    cached: bool,
+    executed: bool,
+) -> Option<String> {
+    if let Some(report) = &result.task_report {
+        bounded_serve_task_report_payload(
+            serde_json::json!({
+                "id": call.id, "name": call.function.name, "phase": "finished",
+                "ok": ok, "cached": cached, "executed": executed,
+                "output": result.content, "output_truncated": false, "task_report": report,
+            }),
+            report,
+            "output",
+            &result.content,
+        )
+    } else {
+        serve_tool_finished_payload(call, &result.content, ok, cached, executed)
+    }
+}
+
+pub(crate) fn serve_subagent_progress_payload(
+    text: &str,
+    report: &crate::ai::tools::task_tools::TaskReport,
+) -> Option<String> {
+    bounded_serve_task_report_payload(
+        serde_json::json!({"text": text, "task_report": report}),
+        report,
+        "text",
+        text,
+    )
+}
+
+fn bounded_serve_task_report_payload(
+    mut payload: serde_json::Value,
+    report: &crate::ai::tools::task_tools::TaskReport,
+    field: &str,
+    text: &str,
+) -> Option<String> {
+    use crate::ai::tools::task_tools::TASK_REPORT_PREVIEW_BYTES;
+
+    let encoded = payload.to_string();
+    if encoded.len() <= MAX_SERVE_FRAME_LEN as usize {
+        return Some(encoded);
+    }
+    let mut preview = report.clone();
+    if preview.truncate_errors(TASK_REPORT_PREVIEW_BYTES) {
+        payload["task_report"] =
+            serde_json::to_value(&preview).expect("serializing task preview cannot fail");
+        let encoded = payload.to_string();
+        if encoded.len() <= MAX_SERVE_FRAME_LEN as usize {
+            return Some(encoded);
+        }
+    }
+    if text.len() > TASK_REPORT_PREVIEW_BYTES {
+        let mut end = TASK_REPORT_PREVIEW_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        payload[field] = serde_json::json!(&text[..end]);
+        payload[format!("{field}_truncated")] = serde_json::json!(true);
+        payload[format!("{field}_total_bytes")] = serde_json::json!(text.len());
+        let encoded = payload.to_string();
+        if encoded.len() <= MAX_SERVE_FRAME_LEN as usize {
+            return Some(encoded);
+        }
+    }
+    if preview.tasks.iter().any(|task| {
+        task.output
+            .as_ref()
+            .is_some_and(|output| output.len() > TASK_REPORT_PREVIEW_BYTES)
+    }) {
+        preview.truncate_outputs(TASK_REPORT_PREVIEW_BYTES);
+        payload["task_report"] =
+            serde_json::to_value(&preview).expect("serializing task preview cannot fail");
+        let encoded = payload.to_string();
+        if encoded.len() <= MAX_SERVE_FRAME_LEN as usize {
+            return Some(encoded);
+        }
+    }
+    // Oversized metadata can also exceed the cap. An incomplete task set is always a delta.
+    preview.omit_tasks_for_transport();
+    payload["task_report"] =
+        serde_json::to_value(preview).expect("serializing task preview cannot fail");
+    let encoded = payload.to_string();
+    // Identity fields remain exact; never publish an event the decoder would discard.
+    (encoded.len() <= MAX_SERVE_FRAME_LEN as usize).then_some(encoded)
+}
+
+static SERVE_JSON_PUBLISH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Preserve whole JSON events instead of truncating metadata or emitting independent fragments.
+pub(crate) fn serve_json_frames(kind: ServeLiveKind, text: &str) -> Vec<(ServeLiveKind, String)> {
+    if text.len() <= MAX_SERVE_FRAME_BYTES {
+        return vec![(kind, text.to_string())];
+    }
+    let name = match kind {
+        ServeLiveKind::Tool => "tool",
+        ServeLiveKind::SubagentProgress => "subagent_progress",
+        _ => panic!("only tool and subagent progress JSON events support chunking"),
+    };
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    // Reserve the first frame's event kind and complete UTF-8 byte length.
+    let header = format!("{name} {}\n", text.len());
+    let budget = MAX_SERVE_FRAME_BYTES - header.len();
+    while start < text.len() {
+        let mut end = (start + budget).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(text[start..end].to_string());
+        start = end;
+    }
+    let last = chunks.len() - 1;
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            if index == 0 {
+                (ServeLiveKind::JsonStart, header.clone() + &chunk)
+            } else if index == last {
+                (ServeLiveKind::JsonEnd, chunk)
+            } else {
+                (ServeLiveKind::JsonChunk, chunk)
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn publish_serve_json_frame(kind: ServeLiveKind, text: &str) {
+    if !serve_live_streaming() {
+        return;
+    }
+    let _guard = SERVE_JSON_PUBLISH_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for (kind, payload) in serve_json_frames(kind, text) {
+        #[cfg(test)]
+        if TEST_SERVE_FRAMES.with(|slot| slot.borrow().is_some()) {
+            publish_serve_frame(kind, &payload);
+            continue;
+        }
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(kind as u8);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload.as_bytes());
+        if !publish_live_output_bytes_impl(&frame, true) {
+            break;
+        }
+    }
 }
 
 /// Publish one framed event to the serve-owned live FIFO. No-op unless
@@ -1450,6 +1669,179 @@ mod tests {
                 arguments: arguments.to_string(),
             },
         }
+    }
+
+    #[test]
+    fn task_report_failed_tool_payload_preserves_fitting_diagnostics_verbatim() {
+        use crate::ai::tools::task_tools::{TaskReport, TaskReportTask};
+        let error = "  exact failure\n\u{0000}\"\\literal bytes\n";
+        let mut report = TaskReport::for_task(TaskReportTask {
+            task_id: Some("failed".into()),
+            status: "failed".into(),
+            error: Some(error.into()),
+            output: Some("  exact partial output\n".repeat(300)),
+            ..TaskReportTask::default()
+        });
+        report.record_execution_error(error);
+        let result = crate::ai::types::ToolResult {
+            tool_call_id: "call".into(),
+            content: error.into(),
+            task_report: Some(report.clone()),
+        };
+        let payload =
+            serve_tool_result_payload(&lifecycle_call("{}"), &result, false, false, true).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let restored: TaskReport = serde_json::from_value(value["task_report"].clone()).unwrap();
+        assert_eq!(restored, report);
+        assert_eq!(value["output"], error);
+        assert_eq!(value["output_truncated"], false);
+        assert_eq!(value["ok"], false);
+        assert!(value["task_report"].get("error_truncated").is_none());
+    }
+
+    #[test]
+    fn task_report_failed_tool_payload_bounds_report_and_task_errors_after_json_escaping() {
+        use crate::ai::tools::task_tools::{TASK_REPORT_PREVIEW_BYTES, TaskReport, TaskReportTask};
+        let error = format!(
+            "collector diagnostic\n{}\nfinal error context 界🙂",
+            "\u{0000}".repeat(MAX_SERVE_FRAME_LEN as usize / 6 + 1)
+        );
+        let mut report = TaskReport::for_task(TaskReportTask {
+            task_id: Some("failed".into()),
+            description: "multiline\n  task description".into(),
+            agent: "build".into(),
+            model: "Model with spaces".into(),
+            status: "failed".into(),
+            error: Some(error.clone()),
+            output: Some("  exact partial output\n".repeat(300)),
+            ..TaskReportTask::default()
+        });
+        report.record_execution_error(&error);
+        let result = crate::ai::types::ToolResult {
+            tool_call_id: "call".into(),
+            content: error.clone(),
+            task_report: Some(report.clone()),
+        };
+        let payload =
+            serve_tool_result_payload(&lifecycle_call("{}"), &result, false, false, true).unwrap();
+        assert!(payload.len() <= MAX_SERVE_FRAME_LEN as usize);
+        assert!(payload.len() < 64 * 1024);
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let preview: TaskReport = serde_json::from_value(value["task_report"].clone()).unwrap();
+        assert_eq!(preview.tasks.len(), 1);
+        let task = &preview.tasks[0];
+        assert_eq!(task.task_id, report.tasks[0].task_id);
+        assert_eq!(task.description, report.tasks[0].description);
+        assert_eq!(task.output, report.tasks[0].output);
+        assert!(!task.output_truncated);
+        assert!(task.output_total_bytes.is_none());
+        for (error, truncated, total, shown) in [
+            (
+                preview.error.as_ref().unwrap(),
+                preview.error_truncated,
+                preview.error_total_bytes,
+                preview.error_shown_bytes,
+            ),
+            (
+                task.error.as_ref().unwrap(),
+                task.error_truncated,
+                task.error_total_bytes,
+                task.error_shown_bytes,
+            ),
+        ] {
+            assert!(error.len() <= TASK_REPORT_PREVIEW_BYTES);
+            assert!(error.starts_with("collector diagnostic\n"));
+            assert!(error.ends_with("\nfinal error context 界🙂"));
+            assert!(truncated);
+            assert_eq!(total, Some(result.content.len()));
+            assert!(shown.unwrap() < error.len());
+        }
+        assert_eq!(value["output_truncated"], true);
+        assert_eq!(value["output_total_bytes"], result.content.len());
+        assert_eq!(result.task_report.as_ref(), Some(&report));
+        assert_eq!(report.error.as_deref(), Some(error.as_str()));
+        assert!(!report.error_truncated);
+        assert!(!report.tasks[0].error_truncated);
+    }
+
+    #[test]
+    fn task_report_live_payload_omits_oversized_metadata_without_authoritative_snapshot() {
+        use crate::ai::tools::task_tools::{TaskReport, TaskReportTask};
+        let oversized = "\u{0000}".repeat(MAX_SERVE_FRAME_LEN as usize / 6 + 1);
+        let mut report = TaskReport::for_task(TaskReportTask {
+            task_id: Some("active".into()),
+            description: oversized.clone(),
+            active: true,
+            status: "running".into(),
+            ..TaskReportTask::default()
+        });
+        report.snapshot = true;
+        report.error = Some("collector diagnostic".into());
+        let result = crate::ai::types::ToolResult {
+            tool_call_id: "call".into(),
+            content: "exact text".into(),
+            task_report: Some(report.clone()),
+        };
+        for payload in [
+            serve_tool_result_payload(&lifecycle_call("{}"), &result, false, false, true).unwrap(),
+            serve_subagent_progress_payload("exact text", &report).unwrap(),
+        ] {
+            assert!(payload.len() <= MAX_SERVE_FRAME_LEN as usize);
+            let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            let preview: TaskReport = serde_json::from_value(value["task_report"].clone()).unwrap();
+            assert!(!preview.snapshot);
+            assert!(preview.tasks.is_empty());
+            assert_eq!(preview.tasks_omitted, Some(1));
+            assert_eq!(preview.error, report.error);
+        }
+        assert!(report.snapshot);
+        assert_eq!(report.tasks.len(), 1);
+        let mut call = lifecycle_call("{}");
+        call.id = oversized;
+        assert!(serve_tool_result_payload(&call, &result, false, false, true).is_none());
+    }
+
+    #[test]
+    fn task_report_oversized_tool_payload_preserves_metadata_and_marks_body_previews() {
+        use crate::ai::tools::task_tools::{TaskReport, TaskReportTask};
+        let body = "x".repeat(MAX_SERVE_FRAME_LEN as usize + 1);
+        let mut report = TaskReport::for_task(TaskReportTask {
+            task_id: Some("first".into()),
+            description: "first\nsecond description line".into(),
+            agent: "build".into(),
+            model: "Model with spaces".into(),
+            status: "completed".into(),
+            output: Some(body.clone()),
+            ..TaskReportTask::default()
+        });
+        report.tasks.push(TaskReportTask {
+            task_id: Some("second".into()),
+            description: "Second result".into(),
+            agent: "review".into(),
+            model: "Second model".into(),
+            status: "failed".into(),
+            error: Some("actual error".into()),
+            output: Some("  exact partial output  \n".into()),
+            ..TaskReportTask::default()
+        });
+        let result = crate::ai::types::ToolResult {
+            tool_call_id: "call".into(),
+            content: body.clone(),
+            task_report: Some(report.clone()),
+        };
+        let payload =
+            serve_tool_result_payload(&lifecycle_call("{}"), &result, true, false, true).unwrap();
+        assert!(payload.len() < MAX_SERVE_FRAME_LEN as usize);
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let preview: TaskReport = serde_json::from_value(value["task_report"].clone()).unwrap();
+        assert_eq!(preview.tasks.len(), 2);
+        assert!(preview.tasks[0].output_truncated);
+        assert_eq!(preview.tasks[0].description, report.tasks[0].description);
+        assert_eq!(preview.tasks[1], report.tasks[1]);
+        assert_eq!(preview.tasks[0].output.as_ref().unwrap().len(), 2000);
+        assert_eq!(value["output_truncated"], true);
+        assert_eq!(result.task_report.unwrap(), report);
+        assert_eq!(result.content, body);
     }
 
     #[test]

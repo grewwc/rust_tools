@@ -164,6 +164,7 @@ pub(super) fn ledger_from_messages(messages: &[Message]) -> rustc_hash::FxHashSe
 
 pub(super) fn tool_result(id: &str, content: &str) -> crate::ai::types::ToolResult {
     crate::ai::types::ToolResult {
+        task_report: None,
         tool_call_id: id.to_string(),
         content: content.to_string(),
     }

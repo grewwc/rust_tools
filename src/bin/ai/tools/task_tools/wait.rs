@@ -207,6 +207,7 @@ pub(super) fn parse_task_wait_options(
 }
 
 pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
+    start_task_report(false);
     ensure_top_level_task_orchestration("task_wait")?;
     let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
     let requested_task_ids = args["task_ids"]
@@ -297,6 +298,16 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 format!("failed to inspect durable task evidence for {task_id}: {error}")
             })?;
             if delivered {
+                if let Some(report) = crate::ai::history::read_task_evidence_report(
+                    context.app_proto.config.history_file.as_path(),
+                    &current_session_id,
+                    &task_id,
+                )
+                .map_err(|error| {
+                    format!("failed to read structured delivered task {task_id}: {error}")
+                })? {
+                    record_report_task(report);
+                }
                 already_delivered.push(task_id);
             } else {
                 unknown_task_ids.push(task_id);
@@ -478,6 +489,11 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             // starting to wait" as "subtask stuck" and give up early to fall back to manual
             // analysis.
             if !pending.is_empty() && wait.suspended && !(return_on_ready && !ready.is_empty()) {
+                record_report_wait(
+                    TaskWaitReturnReason::Parked,
+                    wait_started_at.elapsed(),
+                    timeout_secs,
+                );
                 let mut parts = Vec::new();
                 if !ready.is_empty() {
                     parts.push(ready.join("\n\n---\n\n"));
@@ -538,6 +554,15 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         // Deliver terminal evidence immediately, including partial `all` waits. The quiet
         // deadline must never postpone a result or an error already collected from the channel.
         let mut parts = vec![ready.join("\n\n---\n\n")];
+        record_report_wait(
+            if wait_budget_elapsed && !pending.is_empty() {
+                TaskWaitReturnReason::BudgetElapsed
+            } else {
+                TaskWaitReturnReason::ResultsReady
+            },
+            wait_started_at.elapsed(),
+            timeout_secs,
+        );
         if !pending.is_empty() {
             let pending_ids = pending
                 .iter()
@@ -562,6 +587,11 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     // results alone would hide the still-pending tasks and clear the elapsed wait state.
     // Fall through to the pending status branch, which reports ready output and pending ids.
     if wait_policy == WaitPolicy::Any && !ready.is_empty() && !wait_budget_elapsed {
+        record_report_wait(
+            TaskWaitReturnReason::ResultsReady,
+            wait_started_at.elapsed(),
+            timeout_secs,
+        );
         clear_task_wait_state(&wait_key);
         return Ok(ready.join("\n\n---\n\n"));
     }
@@ -587,6 +617,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         } else {
             TaskWaitReturnReason::Woke
         };
+        record_report_wait(reason, wait_started_at.elapsed(), timeout_secs);
         let pending_message = if agent_team_mode {
             super::quiet::format_agent_team_task_wait(
                 &pending_ids,
@@ -633,6 +664,11 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     }
 
     clear_task_wait_state(&wait_key);
+    record_report_wait(
+        TaskWaitReturnReason::ResultsReady,
+        wait_started_at.elapsed(),
+        timeout_secs,
+    );
     Ok(ready.join("\n\n---\n\n"))
 }
 
@@ -735,21 +771,29 @@ pub(super) fn task_state_string(
     result_channel_id: u64,
     pid: u64,
 ) -> Result<String, String> {
+    task_state_snapshot(os, result_channel_id, pid).map(|(status, _)| status)
+}
+
+pub(super) fn task_state_snapshot(
+    os: &mut dyn Kernel,
+    result_channel_id: u64,
+    pid: u64,
+) -> Result<(String, bool), String> {
     if let Some(result) = read_task_result(os, result_channel_id, false)? {
-        return Ok(result.status);
+        return Ok((result.status, false));
     }
-    let state = match os.get_process(pid) {
+    let (state, active) = match os.get_process(pid) {
         Some(proc) => match proc.state {
-            ProcessState::Ready => "ready",
-            ProcessState::Running => "running",
-            ProcessState::Waiting { .. } => "waiting",
-            ProcessState::Sleeping { .. } => "sleeping",
-            ProcessState::Stopped => "stopped",
-            ProcessState::Terminated => "terminated",
+            ProcessState::Ready => ("ready", true),
+            ProcessState::Running => ("running", true),
+            ProcessState::Waiting { .. } => ("waiting", true),
+            ProcessState::Sleeping { .. } => ("sleeping", true),
+            ProcessState::Stopped => ("stopped", true),
+            ProcessState::Terminated => ("terminated", false),
         },
-        None => "unknown",
+        None => ("unknown", false),
     };
-    Ok(state.to_string())
+    Ok((state.to_string(), active))
 }
 
 pub(crate) fn format_subagent_model_label(model: &str, reasoning_effort: Option<&str>) -> String {

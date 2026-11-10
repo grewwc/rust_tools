@@ -30,6 +30,80 @@ function nodeList(nodes = []) {
   return list;
 }
 
+function structuredSubagents(tasks, text = "raw backend progress") {
+  return { text, task_report: { schema: "ai.task-report", version: 1, operation: "subagent_progress", snapshot: true, tasks } };
+}
+function structuredTask(task_id, elapsed_ms, overrides = {}) {
+  return { task_id, agent: task_id, model: "model", description: "task " + task_id, status: "running", active: true,
+    elapsed_ms, progress: { phase: "working", latest_activity: "reading files", stale_for_ms: 0, sequence: 1 }, ...overrides };
+}
+function structuredIdentityRows(h) {
+  return h.box.children.flatMap((card) => card.children || []).flatMap((panel) => panel.children || [])
+    .filter((row) => row.className === "task-identity").map((row) => row.textContent);
+}
+
+// Most fixtures predate the typed rate frame. Translate only their fixture
+// input at the test boundary so the renderer is exercised through the current
+// structured protocol, never through the retired terminal-footer parser.
+function legacyRateNumber(text) {
+  const value = String(text).trim().replace(/^~/, "");
+  const suffix = value.at(-1)?.toLowerCase();
+  const multiplier = suffix === "k" ? 1_000 : suffix === "m" ? 1_000_000 : 1;
+  const number = Number(multiplier === 1 ? value : value.slice(0, -1));
+  return Number.isFinite(number) && number > 0 ? number * multiplier : null;
+}
+function legacyRateSamples(value) {
+  const clean = String(value).replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").trim();
+  const prefix = "↳ speed";
+  if (!clean.startsWith(prefix)) return [];
+  const payload = clean.slice(prefix.length).trim().replace(/^·\s*/, "");
+  return payload.split(" · ").flatMap((segment) => {
+    const first = segment.indexOf(" ");
+    const marker = segment.indexOf(" tok @ ");
+    if (first < 1 || marker < first) return [];
+    const phase = segment.slice(0, first);
+    if (phase !== "reasoning" && phase !== "output" && phase !== "generation") return [];
+    const tokensText = segment.slice(first + 1, marker);
+    const tokens = legacyRateNumber(tokensText);
+    if (!tokens) return [];
+    const rate = legacyRateNumber(segment.slice(marker + " tok @ ".length).replace(" tok/s", ""));
+    return [{ phase, tokens, elapsed_ms: rate ? Math.round(tokens * 1000 / rate) : null,
+      approximate: tokensText.startsWith("~") }];
+  });
+}
+function structuredFixtureEvents(kind, value) {
+  if ((kind === "" || kind === "progress") && typeof value === "string") {
+    const samples = legacyRateSamples(value);
+    return samples.length ? samples.map((sample) => ["rate", sample]) : [[kind, value]];
+  }
+  if (kind === "thinking" && value && typeof value === "object" && typeof value.rate === "string") {
+    const sample = legacyRateSamples("↳ speed · reasoning " + value.rate)[0];
+    return [[kind, { ...value, rate: sample || null }]];
+  }
+  return [[kind, value]];
+}
+function structuredFixtureFrame(frame) {
+  return String(frame).split("\n\n").flatMap((block) => {
+    const lines = block.split("\n");
+    const event = lines.find((line) => line.startsWith("event: "))?.slice(7) || "";
+    const dataIndex = lines.findIndex((line) => line.startsWith("data: "));
+    if (dataIndex < 0) return [block];
+    const data = lines[dataIndex].slice(6);
+    const rates = event ? [] : legacyRateSamples(data);
+    if (rates.length) return rates.map((rate) => "event: rate\ndata: " + JSON.stringify(rate));
+    if (event === "thinking") {
+      try {
+        const value = JSON.parse(data);
+        if (typeof value.rate === "string") {
+          const sample = legacyRateSamples("↳ speed · reasoning " + value.rate)[0];
+          lines[dataIndex] = "data: " + JSON.stringify({ ...value, rate: sample || null });
+        }
+      } catch (_) {}
+    }
+    return [lines.join("\n")];
+  }).join("\n\n");
+}
+
 function streamHarness({ activityOnly = false, phone = false, storage = new Map(), realThinking = false, phaseClock = false, clockStart = 1000 } = {}) {
   const timers = [];
   const box = {
@@ -60,6 +134,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
       get innerHTML() { return markup; },
       set innerHTML(value) { clearChildren(); markup = String(value); text = ""; },
       get lastElementChild() { return item.children.at(-1) || null; },
+      get nextElementSibling() { return item.parentNode?.children[item.parentNode.children.indexOf(item) + 1] || null; },
       appendChild(child) { child.remove(); item.children.push(child); child.parentNode = item; return child; },
       insertBefore(child, before) {
         if (child === before) return child;
@@ -91,7 +166,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
       setItem: (key, value) => storage.set(key, value),
     },
     LIVE_STALL_MS: Number(/const LIVE_STALL_MS = (\d+)/.exec(script)[1]),
-    runEpoch: 0, eventFailures: 0, confirmPollSeq: 0, eventStreamEnded: false,
+    runEpoch: 0, eventFailures: 0, confirmPollSeq: 0, eventStreamEnded: false, eventStreamFailed: false,
     setTimeout: (fn, delay) => { timers.push(delay); return timers.length; }, clearTimeout() {},
     // Extracted slices may arm timers; the assertions drive them directly.
     setInterval(fn, delay) {
@@ -187,9 +262,11 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
       );
     },
     emit(kind, value) {
-      context.kind = kind;
-      context.payload = typeof value === "string" ? value : JSON.stringify(value ?? {});
-      vm.runInContext("for (;;) { " + dispatch + "\nbreak; } flushPaint();", context);
+      for (const [eventKind, eventValue] of structuredFixtureEvents(kind, value)) {
+        context.kind = eventKind;
+        context.payload = typeof eventValue === "string" ? eventValue : JSON.stringify(eventValue ?? {});
+        vm.runInContext("for (;;) { " + dispatch + "\nbreak; } flushPaint();", context);
+      }
     },
     titles: () => box.children.filter((item) => item.summary).map((item) => item.summary.textContent),
     bodies: () => box.children.filter((item) => item.body).map((item) => item.body.textContent),
@@ -267,7 +344,11 @@ function replayHarness(options) {
   const view = context.recoveredProgressView();
   return {
     context, msgs, view, requests, storage, ageOutput: live.ageOutput, step: live.step,
-    emit(kind, payload) { context.handleReplayEvent("s", kind, typeof payload === "string" ? payload : JSON.stringify(payload ?? {}), view); },
+    emit(kind, payload) {
+      for (const [eventKind, eventValue] of structuredFixtureEvents(kind, payload)) {
+        context.handleReplayEvent("s", eventKind, typeof eventValue === "string" ? eventValue : JSON.stringify(eventValue ?? {}), view);
+      }
+    },
     status: () => view.box.children.at(-1).textContent,
     reply: () => view.box.children.filter((item) => !item.summary && item.className === "msg asst" && !item.hidden).at(-1)?.textContent || "",
     mainRate: () => rateNodes(view.box)[0]?.textContent || "",
@@ -281,7 +362,7 @@ function attachmentHarness(headersOnly = false, options) {
   let timerId = 0, polls = 0, loads = 0;
   Object.assign(c, {
     eventActive: false, eventAbort: null, eventSession: "", recoveredView: null,
-    eventStreamEnded: false, turns: new Map(), store: { base: "https://server" },
+    eventStreamEnded: false, eventStreamFailed: false, turns: new Map(), store: { base: "https://server" },
     staleSession: "", staleDone: false, staleTimer: null, staleBox: null, staleTries: 0,
     turnRunning: true, turnRunningAt: Date.now(), RUNNING_SAMPLE_TTL_MS: 60000,
     AbortController, TextDecoder, headers: () => ({}), syncStopButton() {},
@@ -300,7 +381,7 @@ function attachmentHarness(headersOnly = false, options) {
         signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
       });
       return { ok: true, body: { getReader: () => ({ read: () => new Promise((resolve, reject) => {
-        request.frame = (frame) => resolve({ value: new TextEncoder().encode(frame), done: false });
+        request.frame = (frame) => resolve({ value: new TextEncoder().encode(structuredFixtureFrame(frame)), done: false });
         signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
       }) }) } };
     },
@@ -498,6 +579,7 @@ for (const reasoning of ["", "saved thought"]) {
     ]);
     await h.c.loadHistory();
     const original = [...h.root.children], canonical = original.at(-1);
+  assert.equal(canonical.dataset.taskReset, "true", "a canonical final answer must terminate earlier task state");
     const answer = canonical.children.find((child) => child.className === "msg asst md");
     const thinking = canonical.children.find((child) => child.summary);
     if (thinking) thinking.details.open = true;
@@ -524,7 +606,7 @@ for (const reasoning of ["", "saved thought"]) {
     assert.equal(visible[0].textContent, "↳ speed · " + rate);
     assert.equal(visible[0].parentNode, answer);
     if (thinking) {
-      assert.equal(thinking.summary.textContent, "thinking · ~10 tok @ 5 tok/s");
+      assert.equal(thinking.summary.textContent, "thinking · ~20 tok @ 10 tok/s");
       assert.equal(thinking.details.open, true, "rate refresh collapsed a retained thinking fold");
     }
     await h.c.loadHistory();
@@ -784,6 +866,21 @@ test("replayed phases remain visible after an early assistant answer", () => {
   assert.equal(h.status(), "Thinking… · 0:00");
 });
 
+test("turn throughput never duplicates the rate inside a thinking-only card", () => {
+  const h = streamHarness({ realThinking: true });
+  h.connect();
+  h.emit("thinking", { text: "reasoning" });
+  h.emit("", "↳ speed · reasoning 22 tok · output 82 tok @ 151 tok/s");
+  assert.equal(rateNodes(h.box).length, 0,
+    "turn throughput must not attach below a thinking fold");
+  h.emit("delta", { delta: "answer" });
+  h.emit("", "↳ speed · reasoning 22 tok · output 82 tok @ 151 tok/s");
+  const line = rateNodes(h.box)[0];
+  assert.ok(line);
+  assert.ok(line.parentNode.classList.contains("asst"));
+  assert.ok(line.parentNode.classList.contains("md"));
+});
+
 test("pending HTTP request paints a connection indicator before any SSE event", () => {
   const h = streamHarness();
   h.connect();
@@ -801,7 +898,7 @@ test("status strip regression: restored sessions keep stop and busy state withou
   const context = vm.createContext({
     $: (id) => { assert.notEqual(id, "turnstatus", "the removed strip is still accessed"); return elements[id]; },
     sessionId: "a", turns: new Map(),
-    eventActive: false, eventSession: "", eventStreamEnded: false,
+    eventActive: false, eventSession: "", eventStreamEnded: false, eventStreamFailed: false,
     staleSession: "", staleDone: false, sideNoteBusy: false,
     turnRunning: true, turnRunningAt: 100000, RUNNING_SAMPLE_TTL_MS: 60000,
     Date: { now: () => 100001 },
@@ -917,6 +1014,23 @@ test("desktop status keeps only phase and elapsed while main throughput stays vi
   assert.doesNotMatch(h.mainRate() + h.titles().join("\n"), /— tok\/s/);
 });
 
+test("typed rate events render producer metrics without parsing terminal output", () => {
+  const h = streamHarness({ phone: true, realThinking: true });
+  h.emit("thinking_start");
+  h.emit("thinking", { text: "brief thought", rate: {
+    phase: "reasoning", tokens: 4, elapsed_ms: 500, approximate: true,
+  } });
+  assert.ok(h.titles().includes("thinking… · ~4 tok @ 8 tok/s"));
+  h.emit("delta", { delta: "Final answer" });
+  h.emit("rate", { phase: "reasoning", tokens: 8, elapsed_ms: 1_000, approximate: false });
+  h.emit("rate", { phase: "output", tokens: 40, elapsed_ms: 2_000, approximate: false });
+  assert.equal(h.mainRate(), "↳ speed · reasoning 8 tok @ 8 tok/s · output 40 tok @ 20 tok/s");
+  // Plain terminal stdout is not a rate event and cannot change this display.
+  h.context.kind = "";
+  h.context.payload = "↳ speed · output 999 tok @ 999 tok/s";
+  assert.equal(h.mainRate(), "↳ speed · reasoning 8 tok @ 8 tok/s · output 40 tok @ 20 tok/s");
+});
+
 test("ordinary streamed output shows a live rate and keeps a final estimate", () => {
   const h = streamHarness();
   h.emit("delta", { delta: "abcdefgh" });
@@ -937,8 +1051,9 @@ for (const phone of [true, false]) {
     h.ageOutput(1000);
     h.emit("delta", { delta: "ijkl" });
     if (phone) {
-      assert.match(h.pending(), /output ~3 tok @ 3.00 tok\/s/);
-      assert.equal(rateNodes(h.box).length, 0, "the live phone status already owns throughput");
+      assert.doesNotMatch(h.pending(), /tok/, "the phone status bar must stay compact");
+      assert.match(h.mainRate(), /output ~3 tok @ 3.00 tok\/s/);
+      assert.match(rateNodes(h.box)[0].parentNode.className, /\bmsg asst\b/);
     } else {
       assert.match(h.mainRate(), /output ~3 tok @ 3.00 tok\/s/);
       assert.equal(rateNodes(h.box)[0].parentNode, h.box.children.at(-2));
@@ -981,7 +1096,7 @@ test("desktop throughput follows new answer and tool cards at the end of the liv
   assert.equal(line.parentNode, h.box.children.at(-1));
 });
 
-test("a replaced display body restores its rate against canonical envelopes and warnings", () => {
+test("a display replacement does not attach a rate to a different canonical body", () => {
   const notice = "[audit report · machine-checked JSON hidden from the terminal; full text stays in session history]";
   const canonical = 'answer<<<IMAGE_DIGEST>>>image metadata<<<END_IMAGE_DIGEST>>>\n<audit_report>{"findings":[]}</audit_report>\n\n[Runtime warning]\ninternal warning';
   const displayed = "answer\n" + notice;
@@ -992,21 +1107,22 @@ test("a replaced display body restores its rate against canonical envelopes and 
   h.emit("", "↳ speed · output 40 tok @ 20 tok/s");
   h.emit("done");
   const refreshed = historyRateHarness(h.storage, canonical);
-  assert.equal(refreshed.restoredRate(), "↳ speed · output 40 tok @ 20 tok/s");
+  assert.equal(refreshed.restoredRate(), "");
   assert.equal(refreshed.group.children.find((item) => item.className === "msg asst md").textContent.slice(0, canonical.length), canonical,
     "rate normalization must not rewrite canonical history rendering");
 });
 
-test("uncached history and a replacement without timing do not invent throughput", () => {
+test("uncached history stays empty while a replacement starts a local timing window", () => {
   assert.equal(historyRateHarness(new Map(), "old answer").restoredRate(), "");
   const h = streamHarness();
   h.emit("replace", { text: "buffered answer" });
+  h.ageOutput(1000);
   h.emit("done");
-  assert.equal(h.mainRate(), "");
-  assert.equal(h.context.storedRate("turn", "s", "buffered answer"), "");
+  assert.match(h.mainRate(), /^↳ speed · output ~4 tok @ [\d.]+ tok\/s$/);
+  assert.match(h.context.storedRate("turn", "s", "buffered answer"), /^output ~4 tok @ [\d.]+ tok\/s$/);
 });
 
-test("payload-only replay speed events are dispatched while comment heartbeats stay separate", async () => {
+test("typed replay rate events are dispatched while comment heartbeats stay separate", async () => {
   const h = attachmentHarness();
   const seen = [];
   const handle = h.c.handleReplayEvent;
@@ -1016,7 +1132,7 @@ test("payload-only replay speed events are dispatched while comment heartbeats s
   await h.frame(": keep-alive\n\n");
   assert.deepEqual(seen, []);
   await h.frame("data: ↳ speed · reasoning 6.7k tok @ 86.2 tok/s · output 415 tok @ 167 tok/s\n\n");
-  assert.deepEqual(seen, [""]);
+  assert.deepEqual(seen, ["rate", "rate"]);
   const box = h.c.recoveredView.box;
   const main = rateNodes(box)[0];
   assert.match(main.textContent, /86.2 tok\/s.*167 tok\/s/);
@@ -1062,11 +1178,11 @@ for (const recovered of [false, true]) {
     h.emit("delta", { delta: "answer" });
     h.emit("progress", "↳ speed · reasoning 67 tok @ 69.6 tok/s · output 148 tok @ — tok/s");
     const status = recovered ? h.status() : h.pending();
-    assert.match(status, /reasoning 67 tok @ 69\.6 tok\/s · output 148 tok/);
-    assert.doesNotMatch(status, /— tok\/s/);
-    assert.equal(h.mainRate(), "", "the phone status must not have a duplicate speed footer");
+    assert.doesNotMatch(status, /tok/, "the phone status bar must not own throughput");
+    assert.match(h.mainRate(), /reasoning 67 tok @ 69\.6 tok\/s · output 148 tok/);
+    assert.doesNotMatch(h.mainRate(), /— tok\/s/);
     const box = recovered ? h.view.box : h.box;
-    assert.equal(rateNodes(box).length, 0);
+    assert.equal(rateNodes(box).length, 1);
     if (recovered) h.view.finish();
     else h.emit("done");
     const rates = rateNodes(box);
@@ -1107,8 +1223,8 @@ for (const recovered of [false, true]) {
   test((recovered ? "replayed" : "live") + " phone status shows the current thinking rate before output exists", () => {
     const h = recovered ? replayHarness({ phone: true, realThinking: true }) : streamHarness({ phone: true, realThinking: true });
     h.emit("thinking", { text: "current thought", rate: "~1647 tok @ 86.2 tok/s" });
-    assert.match(recovered ? h.status() : h.pending(), /Thinking… · reasoning ~1647 tok @ 86\.2 tok\/s/);
-    assert.equal(h.mainRate(), "", "phone throughput must stay in its existing status card");
+    assert.doesNotMatch(recovered ? h.status() : h.pending(), /tok/);
+    assert.ok(h.titles().includes((recovered ? "thinking" : "thinking…") + " · ~1647 tok @ 86.2 tok/s"));
     h.emit("thinking_done");
     assert.ok(h.titles().includes("thinking · ~1647 tok @ 86.2 tok/s"));
     assert.doesNotMatch(recovered ? h.status() : h.pending(), /reasoning ~1647/,
@@ -1116,7 +1232,8 @@ for (const recovered of [false, true]) {
     h.emit("delta", { delta: "early answer" });
     h.emit("progress", "↳ speed · output 40 tok @ 20 tok/s");
     h.emit("thinking", { text: "next thought", rate: "~431 tok @ 61 tok/s" });
-    assert.match(recovered ? h.status() : h.pending(), /Thinking… · reasoning ~431 tok @ 61 tok\/s/);
+    assert.doesNotMatch(recovered ? h.status() : h.pending(), /tok/);
+    assert.ok(h.titles().includes((recovered ? "thinking" : "thinking…") + " · ~431 tok @ 61 tok/s"));
     assert.doesNotMatch(recovered ? h.status() : h.pending(), /output 40/,
       "the previous answer's rate hid the current thinking measurement");
     h.emit("thinking_done");
@@ -1135,7 +1252,8 @@ for (const recovered of [false, true]) {
     h.step();
     assert.equal(h.context.storedRate("thinking", "s", "first thought"), "~4 tok @ 4.00 tok/s",
       "the clock displayed a measurement without persisting it for refresh");
-    assert.match(recovered ? h.status() : h.pending(), /reasoning ~4 tok @ 4\.00 tok\/s/);
+    assert.doesNotMatch(recovered ? h.status() : h.pending(), /tok/);
+    assert.ok(h.titles().includes((recovered ? "thinking" : "thinking…") + " · ~4 tok @ 4.00 tok/s"));
     const refreshed = replayHarness({ phone: true, realThinking: true, storage: h.storage });
     refreshed.emit("thinking", { text: "first thought" });
     refreshed.emit("thinking_done");
@@ -1148,7 +1266,7 @@ for (const recovered of [false, true]) {
 }
 
 for (const recovered of [false, true]) {
-  test((recovered ? "replayed" : "live") + " desktop thinking throughput stays in its fold while status retains elapsed time", () => {
+  test((recovered ? "replayed" : "live") + " desktop thinking throughput appears once in its fold while status retains elapsed time", () => {
     const options = { realThinking: true, phaseClock: true };
     const h = recovered ? replayHarness(options) : streamHarness(options);
     const status = () => recovered ? h.status() : h.pending();
@@ -1160,7 +1278,7 @@ for (const recovered of [false, true]) {
     assert.ok(h.titles().includes((recovered ? "thinking" : "thinking…") + " · ~1647 tok @ 86.2 tok/s"));
     h.step(88000);
     assert.equal(status(), prefix + "Thinking… · 1:28");
-    assert.equal(h.mainRate(), "↳ speed · reasoning 1647 tok @ 86.2 tok/s");
+    assert.equal(h.mainRate(), "", "turn throughput duplicated the measured thinking rate");
     h.emit("thinking_done");
     assert.equal(status(), prefix + "Processing… · 1:28");
     assert.ok(h.titles().includes("thinking · ~1647 tok @ 86.2 tok/s"));
@@ -1168,7 +1286,7 @@ for (const recovered of [false, true]) {
     else h.emit("done");
     const refreshed = historyRateHarness(h.storage, "", "current thought");
     assert.equal(refreshed.restoredThinking(), "thinking · ~1647 tok @ 86.2 tok/s");
-    assert.equal(refreshed.restoredRate(), "↳ speed · reasoning 1647 tok @ 86.2 tok/s");
+    assert.equal(refreshed.restoredRate(), "", "cold history duplicated the measured thinking rate");
   });
 }
 
@@ -1192,7 +1310,7 @@ for (const recovered of [false, true]) {
     if (recovered) h.view.finish();
     else h.emit("done");
     assert.deepEqual(h.titles().filter((title) => title.startsWith("thinking")), [
-      "thinking · ~4 tok @ 8 tok/s", "thinking · ~4 tok @ 16 tok/s",
+      "thinking · ~4 tok @ 8 tok/s", "thinking · ~4 tok",
     ]);
     const cold = coldHistoryHarness(h.storage.get("serve.rates"));
     cold.mount(JSON.stringify([
@@ -1200,7 +1318,7 @@ for (const recovered of [false, true]) {
       { role: "assistant", content: "", reasoning_content: "second thought" },
     ]));
     assert.deepEqual(cold.root.querySelectorAll("summary").map((summary) => summary.textContent), [
-      "thinking · ~4 tok @ 8 tok/s", "thinking · ~4 tok @ 16 tok/s",
+      "thinking · ~4 tok @ 8 tok/s", "thinking · ~4 tok",
     ]);
   });
 
@@ -1212,8 +1330,11 @@ for (const recovered of [false, true]) {
     h.ageOutput(100);
     h.emit("thinking_start");
     h.emit("thinking", { text: "second thought", rate: "~4 tok @ 16 tok/s" });
-    assert.match(recovered ? h.status() : h.pending(), /reasoning ~4 tok @ 16 tok\/s/);
-    assert.equal(h.context.storedRate("thinking", "s", "second thought"), "~4 tok @ 16 tok/s",
+    assert.doesNotMatch(recovered ? h.status() : h.pending(), /tok/);
+    // The fixture's 16 tok/s implies a 250 ms window, below the 500 ms display
+    // gate, so the timed sample renders tokens only and stays authoritative.
+    assert.ok(h.titles().includes((recovered ? "thinking" : "thinking…") + " · ~4 tok"));
+    assert.equal(h.context.storedRate("thinking", "s", "second thought"), "~4 tok",
       "the current phase's valid sample was throttled behind an earlier phase");
     const refreshed = replayHarness({ phone: true, realThinking: true, storage: h.storage });
     refreshed.emit("thinking", { text: "second thought" });
@@ -1221,7 +1342,24 @@ for (const recovered of [false, true]) {
     refreshed.view.finish();
     const cold = coldHistoryHarness(refreshed.storage.get("serve.rates"));
     cold.mount(JSON.stringify([{ role: "assistant", content: "", reasoning_content: "second thought" }]));
-    assert.equal(cold.root.querySelector("summary").textContent, "thinking · ~4 tok @ 16 tok/s");
+    assert.equal(cold.root.querySelector("summary").textContent, "thinking · ~4 tok");
+  });
+
+  test((recovered ? "replayed" : "live") + " phone thinking uses generation throughput when reasoning usage is unavailable", () => {
+    const h = recovered ? replayHarness({ phone: true, realThinking: true }) : streamHarness({ phone: true, realThinking: true });
+    const thought = "中".repeat(129);
+    h.emit("thinking_start");
+    h.emit("thinking", { text: thought });
+    h.emit("thinking_done");
+    h.emit("progress", "↳ speed · generation 180 tok @ 86.2 tok/s");
+    if (recovered) h.view.finish();
+    else h.emit("done");
+    assert.ok(h.titles().includes("thinking · ~129 tok @ 86.2 tok/s"));
+    assert.equal(h.context.storedRate("thinking", "s", thought), "~129 tok @ 86.2 tok/s");
+
+    const cold = coldHistoryHarness(h.storage.get("serve.rates"), { phone: true });
+    cold.mount(JSON.stringify([{ role: "assistant", content: "", reasoning_content: thought }]));
+    assert.equal(cold.root.querySelector("summary").textContent, "thinking · ~129 tok @ 86.2 tok/s");
   });
 
   test((recovered ? "replayed" : "live") + " phone thinking excludes unrelated and unmeasured terminal speeds", () => {
@@ -1231,9 +1369,9 @@ for (const recovered of [false, true]) {
     h.emit("thinking_done");
     for (const speed of ["output 4 tok @ 8 tok/s", "reasoning 4 tok @ — tok/s", "reasoning 4 tok @ Infinity tok/s", "reasoning 4 tok @ -1 tok/s"]) {
       h.emit("progress", "↳ speed · " + speed);
-      assert.ok(h.titles().includes("thinking · ~4 tok @ 16.0 tok/s"));
+      assert.ok(h.titles().some((title) => title.includes("~4 tok")));
       assert.equal(h.context.storedRate("thinking", "s", "first thought"), "~4 tok @ 16.0 tok/s",
-        "unrelated or invalid server rates must preserve the arrival sample");
+        "unrelated or invalid server rates must preserve the bounded arrival estimate");
     }
     h.emit("thinking_start");
     // A new response without displayed reasoning cannot lend its terminal
@@ -1241,7 +1379,7 @@ for (const recovered of [false, true]) {
     h.emit("progress", "↳ speed · reasoning 4 tok @ 8 tok/s");
     if (recovered) h.view.finish();
     else h.emit("done");
-    assert.ok(h.titles().includes("thinking · ~4 tok @ 16.0 tok/s"));
+    assert.ok(h.titles().some((title) => title.includes("~4 tok")));
     const cold = coldHistoryHarness(h.storage.get("serve.rates"));
     cold.mount(JSON.stringify([{ role: "assistant", content: "", reasoning_content: "first thought" }]));
     assert.equal(cold.root.querySelector("summary").textContent, "thinking · ~4 tok @ 16.0 tok/s");
@@ -1251,8 +1389,10 @@ for (const recovered of [false, true]) {
 test("phone screenshot-sized history distinguishes persisted throughput from missing timing", () => {
   const first = "x".repeat(1647 * 4), second = "y".repeat(431 * 4);
   const h = coldHistoryHarness("{}");
-  const key = "thinking|s|" + h.context.rateTextKey(first);
-  h.storage.set("serve.rates", JSON.stringify({ [key]: "~1647 tok @ 86.2 tok/s" }));
+  const key = "thinking|s|phase:fixture";
+  h.storage.set("serve.rates", JSON.stringify({ [key]: {
+    structured: true, textKey: h.context.rateTextKey(first, true), rate: "~1647 tok @ 86.2 tok/s",
+  } }));
   const messages = Array.from({ length: 198 }, (_, i) => ({ role: "user", content: "question " + i }));
   messages.push({ role: "assistant", content: "", reasoning_content: first },
     { role: "assistant", content: "", reasoning_content: second });
@@ -1277,6 +1417,8 @@ test("thinking rate floor covers zero and short elapsed time without changing ou
   assert.equal(h.context.formatRateText(31, 0, 500), "~31 tok @ 62.0 tok/s");
   assert.equal(h.context.measuredRateText(31, null, 0), "");
   assert.equal(h.context.measuredRateText(0, 0, 0), "");
+  assert.equal(h.context.rateTextFromSample({ phase: "output", tokens: 8, elapsed_ms: 6_667 }), "8 tok @ 1.2 tok/s");
+  assert.equal(h.context.rateTextFromSample({ phase: "output", tokens: 8, elapsed_ms: null }), "8 tok");
 });
 
 for (const recovered of [false, true]) {
@@ -1482,7 +1624,7 @@ test("thinking rate regression: full-body keys distinguish sample-less rows with
   const legacyKey = "thinking|s|" + h.context.rateTextKey(measured);
   const legacy = coldHistoryHarness(JSON.stringify({ [legacyKey]: "~258 tok @ 86 tok/s" }));
   legacy.mount(JSON.stringify([{ role: "assistant", content: "", reasoning_content: measured }]));
-  assert.equal(legacy.root.querySelector("summary").textContent, "thinking · ~258 tok @ 86 tok/s");
+  assert.equal(legacy.root.querySelector("summary").textContent, "thinking · ~258 tok");
 });
 
 test("thinking rate regression: a new phase cannot replace a completed sample merely by sharing its prefix", () => {
@@ -1518,14 +1660,14 @@ test("instant thinking replay preserves an existing measured rate and fold body"
   assert.equal(historyRateHarness(h.storage, "", "first thought", true).restoredThinking(), "thinking · ~4 tok @ 8 tok/s");
 });
 
-test("unmeasured samples and legacy cached rates never render a dash rate", () => {
+test("unmeasured structured samples never render a dash rate", () => {
   const h = streamHarness({ realThinking: true });
   assert.equal(h.context.formatRateText(10, 1000, 1100), "~10 tok");
-  const thoughtKey = "thinking|s|" + h.context.rateTextKey("old thought");
+  const thoughtKey = "thinking|s|phase:fixture";
   const answerKey = "turn|s|" + h.context.rateTextKey("old answer");
   h.storage.set("serve.rates", JSON.stringify({
-    [thoughtKey]: "~10 tok @ — tok/s",
-    [answerKey]: "reasoning 67 tok @ 69.6 tok/s · output 148 tok @ — tok/s",
+    [thoughtKey]: { structured: true, textKey: h.context.rateTextKey("old thought", true), rate: "~10 tok" },
+    [answerKey]: { structured: true, rate: "reasoning 67 tok @ 69.6 tok/s · output 148 tok" },
   }));
   for (const phone of [false, true]) {
     const refreshed = historyRateHarness(h.storage, "old answer", "old thought", phone);
@@ -1626,16 +1768,17 @@ test("history reasoning display filtering leaves live SSE thinking unchanged", (
 });
 
 test("desktop cold reload restores thinking rates and counts across a 316-message history", () => {
-  const savedRates = JSON.stringify({
-    "thinking|s|13:12hhll1": "~4 tok @ 8 tok/s",
-    "turn|s|12:ysn1mt": "output 40 tok @ 20 tok/s",
-  });
   const uncachedThought = "x".repeat(312);
   const messages = Array.from({ length: 158 }, (_, i) => [
     { role: "user", content: "question " + i },
     { role: "assistant", content: i === 0 ? "saved answer" : "answer " + i,
       reasoning_content: i === 0 ? "\n saved  thought \n" : i === 1 ? uncachedThought : "thought " + i },
   ]).flat();
+  const seed = coldHistoryHarness("{}");
+  const savedRates = JSON.stringify({
+    "thinking|s|phase:fixture": { structured: true, textKey: seed.context.rateTextKey(messages[1].reasoning_content, true), rate: "~4 tok @ 8 tok/s" },
+    ["turn|s|" + seed.context.rateTextKey("saved answer")]: { structured: true, rate: "output 40 tok @ 20 tok/s" },
+  });
   const h = coldHistoryHarness(savedRates, { phone: false });
   assert.equal(h.context.storedRate("thinking", "s", messages[1].reasoning_content), "~4 tok @ 8 tok/s");
   assert.equal(h.context.storedRate("thinking", "s", uncachedThought), "");
@@ -1657,11 +1800,10 @@ test("desktop cold reload restores thinking rates and counts across a 316-messag
 });
 
 test("phone cold reopen restores persisted rates inside assistant cards without live turn state", () => {
-  // These are serialized cache keys for "saved thought" and "saved answer".
-  // No live page or rate counter generates this cold-load fixture.
+  const seed = coldHistoryHarness("{}");
   const savedRates = JSON.stringify({
-    "thinking|s|13:12hhll1": "~4 tok @ 8 tok/s",
-    "turn|s|12:ysn1mt": "reasoning 67 tok @ 69.6 tok/s · output 148 tok @ 20 tok/s",
+    "thinking|s|phase:fixture": { structured: true, textKey: seed.context.rateTextKey("saved thought", true), rate: "~4 tok @ 8 tok/s" },
+    ["turn|s|" + seed.context.rateTextKey("saved answer")]: { structured: true, rate: "reasoning 67 tok @ 69.6 tok/s · output 148 tok @ 20 tok/s" },
   });
   const h = coldHistoryHarness(savedRates);
   assert.equal(h.root.children.length, 0, "a cold document already contains a turn");
@@ -1682,10 +1824,11 @@ test("phone cold reopen restores persisted rates inside assistant cards without 
   assert.equal(h.storage.get("serve.rates"), savedRates, "history replay rewrote persisted timing");
 });
 
-test("phone cold reopen omits dash rates from legacy persisted samples", () => {
+test("phone cold reopen omits rate text when structured samples lack timing", () => {
+  const seed = coldHistoryHarness("{}");
   const savedRates = JSON.stringify({
-    "thinking|s|13:12hhll1": "~4 tok @ — tok/s",
-    "turn|s|12:ysn1mt": "reasoning 67 tok @ 69.6 tok/s · output 148 tok @ — tok/s",
+    "thinking|s|phase:fixture": { structured: true, textKey: seed.context.rateTextKey("saved thought", true), rate: "~4 tok" },
+    ["turn|s|" + seed.context.rateTextKey("saved answer")]: { structured: true, rate: "reasoning 67 tok @ 69.6 tok/s · output 148 tok" },
   });
   const h = coldHistoryHarness(savedRates);
   h.mount(JSON.stringify([{ role: "assistant", content: "saved answer", reasoning_content: "saved thought" }]));
@@ -1700,15 +1843,15 @@ test("phone cold reopen omits dash rates from legacy persisted samples", () => {
   assert.equal(h.storage.get("serve.rates"), savedRates);
 });
 
-test("a thinking-only turn keeps its recorded main rate beside the restored fold", () => {
+test("a thinking-only turn restores one rate inside its fold", () => {
   const h = streamHarness({ realThinking: true });
   h.emit("thinking", { text: "tool reasoning", rate: "~10 tok @ 5 tok/s" });
   h.emit("tool", { phase: "start", name: "read_file", call_id: "r" });
   h.emit("", "↳ speed · reasoning 20 tok @ 10 tok/s");
   h.emit("done");
   const refreshed = historyRateHarness(h.storage, "", "tool reasoning");
-  assert.equal(refreshed.restoredThinking(), "thinking · ~10 tok @ 5 tok/s");
-  assert.equal(refreshed.restoredRate(), "↳ speed · reasoning 20 tok @ 10 tok/s");
+  assert.equal(refreshed.restoredThinking(), "thinking · ~20 tok @ 10 tok/s");
+  assert.equal(refreshed.restoredRate(), "");
 });
 
 test("a recovered single output chunk gains a main rate on the clock and stops ticking at completion", () => {
@@ -1734,11 +1877,11 @@ test("a recovered single output chunk gains a main rate on the clock and stops t
   assert.equal(line.textContent, "↳ speed · output ~2 tok @ 2.00 tok/s", "a queued clock tick changed completed throughput");
 });
 
-test("legacy raw cache keys remain readable after display-identity normalization", () => {
+test("untyped legacy rate cache entries are ignored", () => {
   const h = streamHarness(), canonical = "answer\n\n[Runtime warning]\nold warning";
   const key = "turn|s|" + h.context.rateTextKey(canonical);
   h.storage.set("serve.rates", JSON.stringify({ [key]: "output 40 tok @ 20 tok/s" }));
-  assert.equal(historyRateHarness(h.storage, canonical).restoredRate(), "↳ speed · output 40 tok @ 20 tok/s");
+  assert.equal(historyRateHarness(h.storage, canonical).restoredRate(), "");
 });
 
 test("an invalid cache container is replaced by newly recorded throughput", () => {
@@ -1761,9 +1904,11 @@ test("parallel tool completion and confirmation preserve the remaining active st
   assert.match(h.pending(), /Running read_file…/);
   h.emit("tool", { id: "b", name: "read_file", phase: "finished", output: "B" });
   assert.equal(h.titles().length, 2);
+  h.emit("", "↳ speed · output 40 tok @ 20 tok/s");
   h.fail();
   assert.ok(h.titles().some((title) => title.includes("interrupted")));
   assert.ok(h.bodies().some((text) => text.includes("B")));
+  assert.equal(h.mainRate(), "↳ speed · output 40 tok @ 20 tok/s");
 });
 
 for (const recovered of [false, true]) {
@@ -1773,20 +1918,20 @@ for (const recovered of [false, true]) {
       h.emit("tool", { id: "wait", name: "task_wait", phase: "started" });
       const header = "subagents · 1 active\n└─ worker · running 5s · task: inspect thinking rates\n";
       const command = "execute_command rg -n thinking app.html";
-      h.emit("subagent_progress", header + "   ↳ progress: " + command + " · last 0s ago");
+      h.emit("subagent_progress", structuredSubagents([structuredTask("worker", 5000, { progress: { phase: "working", latest_activity: command } })], header));
       const box = recovered ? h.view.box : h.box;
       const card = box.children.find((item) => item.summary?.textContent.startsWith("subagents"));
       const details = card.querySelector("details");
       assert.equal(details.open, true, "active child progress must be visible without opening task_wait");
       assert.ok(card.summary.textContent.includes(command), "the summary omitted the current command");
       const latest = "read_file Cargo.toml";
-      h.emit("subagent_progress", header + "   ↳ progress: " + latest + " · last 0s ago");
+      h.emit("subagent_progress", structuredSubagents([structuredTask("worker", 5000, { progress: { phase: "working", latest_activity: latest } })], header));
       assert.equal(details.open, true);
       assert.ok(card.summary.textContent.includes(latest));
       assert.ok(!card.summary.textContent.includes(command));
-      h.emit("subagent_progress", "subagents · 0 active");
+      h.emit("subagent_progress", structuredSubagents([]));
       assert.equal(details.open, false, "completed subagents must leave a collapsed card");
-      h.emit("subagent_progress", header + "   ↳ progress: " + latest);
+      h.emit("subagent_progress", structuredSubagents([structuredTask("worker", 5000, { progress: { phase: "working", latest_activity: latest } })], header));
       assert.equal(details.open, true);
       if (recovered) h.view.finish();
       else h.emit("done");
@@ -1807,98 +1952,74 @@ test("subagent snapshots stay distinct from logs and empty thinking markers", ()
   assert.equal(h.bodies()[0], "worker: finished");
 });
 
-test("subagent elapsed ticker advances task rows and reanchors to server snapshots", () => {
+test("subagent elapsed ticker advances explicit numeric fields and reanchors to server snapshots", () => {
   const h = streamHarness({ activityOnly: true });
-  const snapshot = "subagents · 2 active\n├─ [backend=traecli] alpha · running 59s · task: audit\n│  ↳ progress: running 3s · last activity 2s ago\n├─ beta · active · 1m59s · task: implement\n└─ gamma · completed 7m3s · task: running 5s";
-  h.progress(snapshot);
-  const card = h.box.children[0];
-  h.step();
-  assert.equal(h.bodies()[0], snapshot.replace("running 59s", "running 1m0s").replace("active · 1m59s", "active · 2m0s"));
-  assert.equal(h.intervals.size, 1);
-  assert.equal([...h.intervals.values()][0].delay, 1000);
-  assert.equal(h.box.children[0], card);
-  assert.equal(card.className, "msg asst");
-  assert.deepEqual(card.dataset, {});
+  const snapshot = structuredSubagents([
+    structuredTask("alpha", 59000, { description: "audit" }),
+    structuredTask("beta", 119000, { description: "implement" }),
+    structuredTask("gamma", 423000, { status: "completed", active: false, description: "running 5s", output: "exact output\n" }),
+  ], "raw terminal text containing running 999s");
+  h.progress(snapshot); const card = h.box.children[0]; h.step();
+  let identities = structuredIdentityRows(h);
+  assert.ok(identities.some((text) => text.includes("alpha") && text.includes("running 1m0s")));
+  assert.ok(identities.some((text) => text.includes("beta") && text.includes("running 2m0s")));
+  assert.ok(identities.some((text) => text.includes("gamma") && text.includes("completed 7m3s")));
+  assert.equal(h.bodies()[0], snapshot.text, "raw backend text is never rewritten by the clock");
+  assert.equal(h.intervals.size, 1); assert.equal([...h.intervals.values()][0].delay, 1000);
+  assert.equal(h.box.children[0], card); assert.equal(card.dataset.subagents, "true");
   h.step(5000);
-  assert.match(h.bodies()[0], /alpha · running 1m5s/);
-  h.progress("subagents · 1 active\n└─ [backend=traecli] alpha · running 8s · task: audit");
-  assert.match(h.bodies()[0], /running 8s/);
+  assert.ok(structuredIdentityRows(h).some((text) => text.includes("alpha") && text.includes("running 1m5s")));
+  h.progress(structuredSubagents([structuredTask("alpha", 8000)]));
   h.step(2000);
-  assert.match(h.bodies()[0], /running 10s/);
-  h.newActivity().subagents("other: running 42s");
-  h.step();
+  assert.ok(structuredIdentityRows(h).some((text) => text.includes("alpha") && text.includes("running 10s")));
+  h.newActivity().subagents(structuredSubagents([structuredTask("other", 42000)])); h.step();
   assert.equal(h.intervals.size, 1, "all activity cards share one interval");
-  assert.ok(h.bodies().some((text) => text.includes("alpha · running 11s")));
-  assert.ok(h.bodies().includes("other: running 43s"));
+  assert.ok(structuredIdentityRows(h).some((text) => text.includes("other") && text.includes("running 43s")));
 });
 
-test("subagent elapsed ticker preserves first-seen fallback across row and progress changes", () => {
+test("subagent elapsed ticker uses stable task ids across row and progress updates", () => {
   const h = streamHarness({ activityOnly: true });
-  h.progress("subagents · 2 active\n├─ worker · ready · task: audit\n└─ peer · running 3s · task: other");
+  h.progress(structuredSubagents([structuredTask("worker", 0), structuredTask("peer", 3000)]));
   h.step(4000);
-  h.progress("subagents · 1 active\n└─ worker · running · task: audit\n   ↳ progress: reading files");
+  h.progress(structuredSubagents([structuredTask("worker", 4000, { progress: { phase: "working", latest_activity: "reading files" } })]));
   h.step(2000);
-  assert.match(h.bodies()[0], /worker · running 6s · task: audit/);
-  h.progress("subagents · 1 active\n└─ worker · running · task: audit\n   ↳ progress: editing files");
+  assert.ok(structuredIdentityRows(h).some((text) => text.includes("worker") && text.includes("running 6s")));
+  h.progress(structuredSubagents([structuredTask("worker", 6000, { progress: { phase: "working", latest_activity: "editing files" } })]));
   h.step(2000);
-  assert.match(h.bodies()[0], /worker · running 8s · task: audit/);
-  assert.match(h.bodies()[0], /progress: editing files/);
-  h.progress("subagents · 0 active");
-  assert.equal(h.intervals.size, 0);
-  h.progress("worker: running");
-  h.step();
-  assert.equal(h.bodies()[0], "worker: running 1s");
+  assert.ok(structuredIdentityRows(h).some((text) => text.includes("worker") && text.includes("running 8s")));
+  assert.ok(h.titles()[0].includes("editing files"));
+  h.progress(structuredSubagents([])); assert.equal(h.intervals.size, 0);
+  h.progress("worker: running"); h.step();
+  assert.equal(h.bodies()[0], "worker: running", "legacy text does not invent an elapsed clock");
 });
 
-test("subagent elapsed ticker preserves terminal text and stops when activity finishes", () => {
+test("subagent elapsed ticker preserves terminal text and stops on explicit completion", () => {
   const h = streamHarness({ activityOnly: true });
-  h.progress("worker: running 1h1m");
-  h.step();
-  assert.equal(h.bodies()[0], "worker: running 1h1m1s");
+  h.progress(structuredSubagents([structuredTask("worker", 3660000)])); h.step();
+  assert.ok(structuredIdentityRows(h)[0].includes("running 1h1m1s"));
   const terminal = "worker: completed · 1h1m7s\n   ↳ final: running 42s\n";
-  h.progress(terminal);
-  const title = h.titles()[0];
-  assert.equal(h.intervals.size, 0);
-  h.step(30000);
-  assert.equal(h.bodies()[0], terminal);
-  assert.equal(h.titles()[0], title);
-  h.progress("worker: running 9s");
-  h.step();
-  h.finish("ended");
-  const frozen = h.bodies()[0];
-  assert.equal(h.intervals.size, 0);
-  h.step(3000);
-  assert.equal(h.bodies()[0], frozen);
+  h.progress(structuredSubagents([structuredTask("worker", 3667000, { status: "completed", active: false, output: "raw output\n" })], terminal));
+  const title = h.titles()[0]; const identities = structuredIdentityRows(h);
+  assert.equal(h.intervals.size, 0); h.step(30000);
+  assert.equal(h.bodies()[0], terminal); assert.equal(h.titles()[0], title);
+  assert.deepEqual(structuredIdentityRows(h), identities);
+  h.progress(structuredSubagents([structuredTask("new-worker", 9000)])); h.step(); h.finish("ended");
+  const frozen = structuredIdentityRows(h);
+  assert.equal(h.intervals.size, 0); h.step(3000); assert.deepEqual(structuredIdentityRows(h), frozen);
 });
 
 test("subagent elapsed ticker pauses while hidden or detached and resumes one interval", () => {
   const h = streamHarness({ activityOnly: true });
-  h.progress("worker: running 42s");
-  h.step();
-  h.visible(false);
-  assert.equal(h.intervals.size, 0);
-  h.step(5000);
-  assert.equal(h.bodies()[0], "worker: running 43s");
-  h.visible(true);
-  assert.equal(h.bodies()[0], "worker: running 48s");
-  h.visible(true);
-  assert.equal(h.intervals.size, 1);
-  h.fire("pagehide");
-  assert.equal(h.intervals.size, 0);
-  h.step(3000);
-  assert.equal(h.bodies()[0], "worker: running 48s");
-  h.fire("pageshow");
-  assert.equal(h.bodies()[0], "worker: running 51s");
-  h.detach();
-  assert.equal(h.intervals.size, 0);
-  h.step(4000);
-  assert.equal(h.bodies()[0], "worker: running 51s");
-  h.attach();
-  assert.equal(h.bodies()[0], "worker: running 55s");
-  assert.equal(h.intervals.size, 1);
-  h.remove(h.box.children[0]);
-  assert.equal(h.intervals.size, 0);
-  assert.deepEqual(h.bodies(), []);
+  h.progress(structuredSubagents([structuredTask("worker", 42000)])); h.step(); h.visible(false);
+  assert.equal(h.intervals.size, 0); h.step(5000);
+  assert.ok(structuredIdentityRows(h)[0].includes("running 43s")); h.visible(true);
+  assert.ok(structuredIdentityRows(h)[0].includes("running 48s")); h.visible(true); assert.equal(h.intervals.size, 1);
+  h.fire("pagehide"); assert.equal(h.intervals.size, 0); h.step(3000);
+  assert.ok(structuredIdentityRows(h)[0].includes("running 48s")); h.fire("pageshow");
+  assert.ok(structuredIdentityRows(h)[0].includes("running 51s")); h.detach(); assert.equal(h.intervals.size, 0); h.step(4000);
+  assert.ok(structuredIdentityRows(h)[0].includes("running 51s")); h.attach();
+  assert.ok(structuredIdentityRows(h)[0].includes("running 55s")); assert.equal(h.intervals.size, 1);
+  h.remove(h.box.children[0]); assert.equal(h.intervals.size, 0); assert.deepEqual(h.bodies(), []);
 });
 
 test("a final replace supersedes provisional streaming text", () => {
@@ -1977,6 +2098,147 @@ test("a terminal replay leaves no running view or retry timers", async () => {
   assert.equal(elements.send.title, "send");
   assert.equal(h.timers.size, 0);
   assert.equal(h.loads(), 1);
+});
+
+for (const phone of [false, true]) {
+  test(`confirmed live failure clears structured task activity and composer busy state (phone=${phone})`, () => {
+    const h = streamHarness({ phone, phaseClock: true }), c = h.context;
+    Object.assign(c, { eventActive: false, eventSession: "", staleSession: "s", turnRunning: true,
+      turnRunningAt: c.Date.now(), RUNNING_SAMPLE_TTL_MS: 60000 });
+    c.document.querySelectorAll = () => h.box.children.filter((card) =>
+      card.dataset.taskStates || card.dataset.taskBusy || card.dataset.taskReset);
+    const elements = runningComposer(c);
+    elements.composer.setAttribute = (name, value) => { elements.composer[name] = value; };
+    const active = structuredTask("task_failure", 5000);
+    h.emit("tool", { id: "spawn", name: "task_spawn", phase: "finished", output: "raw spawn\n",
+      task_report: { ...structuredSubagents([active]).task_report, operation: "task_spawn", snapshot: false } });
+    h.emit("subagent_progress", structuredSubagents([active], "raw backend says completed, but active is true\n"));
+    const card = h.box.children.find((node) => node.dataset.subagents === "true");
+    assert.equal(card.dataset.taskBusy, "true");
+    assert.throws(() => h.emit("error", { error: "confirmed turn failure" }), /confirmed turn failure/);
+    h.fail();
+    c.turns.clear();
+    c.syncStopButton();
+    assert.equal(c.isTurnRunning(), false);
+    assert.equal(elements.send.title, "send");
+    assert.equal(elements.composer["aria-busy"], "false");
+    assert.notEqual(card.dataset.taskBusy, "true", "a terminal interruption must clear active task metadata");
+    assert.ok(JSON.parse(card.dataset.taskStates || "[]").every(([, active]) => active !== true));
+    assert.equal(c.eventStreamEnded, true);
+    assert.equal(c.eventStreamFailed, true);
+    assert.equal(h.bodies().find((text) => text.startsWith("raw backend")), "raw backend says completed, but active is true\n");
+    assert.equal(h.box.children.find((node) => node.summary?.textContent.includes("task_spawn")).body.textContent, "raw spawn\n");
+  });
+
+  test(`confirmed replay error overrides active canonical task state after history refresh (phone=${phone})`, async () => {
+    const h = attachmentHarness(false, { phone }), c = h.c;
+    const oldCard = { dataset: { taskBusy: "true", taskStates: JSON.stringify([["task_replay_failure", true]]) } };
+    c.document.querySelectorAll = () => [oldCard];
+    const elements = runningComposer(c);
+    elements.composer.setAttribute = (name, value) => { elements.composer[name] = value; };
+    c.staleSession = "s";
+    const pending = c.attachEvents();
+    await h.settle();
+    await h.frame("event: subagent_progress\ndata: " + JSON.stringify(structuredSubagents([structuredTask("task_replay_failure", 5000)]))
+      + '\n\nevent: error\ndata: {"error":"confirmed interruption"}\n\nevent: done\ndata: {}\n\n');
+    await pending;
+    assert.equal(c.eventStreamFailed, true);
+    assert.equal(c.eventStreamEnded, true);
+    assert.equal(c.eventActive, false);
+    assert.equal(c.staleSession, "");
+    assert.equal(c.isTurnRunning(), false, "confirmed failure must take precedence over a stale canonical active report");
+    assert.equal(elements.send.title, "send");
+    assert.equal(elements.composer["aria-busy"], "false");
+    assert.equal(h.timers.size, 0);
+    assert.equal(h.loads(), 1);
+    c.abortEvents();
+    assert.equal(c.eventStreamFailed, false, "a new attachment/session lifecycle must clear the old failure marker");
+  });
+}
+
+test("a parked active task keeps the composer stopped after output complete", () => {
+  const h = attachmentHarness(), c = h.c, elements = runningComposer(c);
+  Object.assign(c, {
+    sessionId: "s", turns: new Map(), eventStreamEnded: true,
+    eventActive: false, eventSession: "", staleSession: "",
+    turnRunning: false, turnRunningAt: 0,
+  });
+  const card = { dataset: {
+    taskStates: JSON.stringify([["task_demo", true]]), taskBusy: "true",
+  } };
+  c.document.querySelectorAll = () => [card];
+  c.syncStopButton();
+  assert.equal(elements.send.textContent, "⏹");
+  assert.equal(elements.send.title, "stop this turn");
+
+  const finalAnswer = { dataset: { taskReset: "true" } };
+  c.document.querySelectorAll = () => [card, finalAnswer];
+  c.syncStopButton();
+  assert.equal(c.isTurnRunning(), false, "a final answer after the task must clear stale running metadata");
+  assert.equal(elements.send.textContent, "➤");
+  assert.equal(elements.send.title, "send");
+
+  card.dataset.taskStates = JSON.stringify([["task_demo", false]]);
+  card.dataset.taskBusy = "false";
+  c.syncStopButton();
+  assert.equal(elements.send.textContent, "➤");
+  assert.equal(elements.send.title, "send");
+});
+
+test("a confirmed failure stays authoritative through an idle poll and resets for the next remote turn", async () => {
+  const h = attachmentHarness(), c = h.c;
+  const oldCard = { dataset: { taskBusy: "true", taskStates: JSON.stringify([["old_task", true]]) } };
+  c.document.querySelectorAll = () => [oldCard];
+  const elements = runningComposer(c);
+  Object.assign(c, { confirmBusy: false, confirmShown: null, armHistoryFollow() {},
+    api: async () => ({ json: async () => ({ running: false, pending: null }) }),
+  });
+  vm.runInContext(script.slice(script.indexOf("async function pollConfirm()"), script.indexOf("function isTurnRunning()")), c);
+  const pending = c.attachEvents();
+  await h.settle();
+  await h.frame('event: error\ndata: {"error":"confirmed failure"}\n\nevent: done\ndata: {}\n\n');
+  await pending;
+  await c.pollConfirm();
+  assert.equal(c.eventStreamEnded, false, "an idle poll permits the next remote turn to attach");
+  assert.equal(c.eventStreamFailed, true, "idle history may still contain a superseded active task report");
+  assert.equal(elements.send.title, "send");
+  c.api = async () => ({ json: async () => ({ running: true, pending: null }) });
+  await c.pollConfirm();
+  await h.settle();
+  assert.equal(c.eventStreamFailed, false);
+  assert.equal(h.requests.length, 2);
+  assert.equal(elements.send.title, "stop this turn");
+  c.abortEvents();
+  await h.settle();
+});
+
+test("retained canonical task history moves merged details when a later wait is appended", async () => {
+  const spawned = structuredTask("task_retained", 5000);
+  const spawnReport = { ...structuredSubagents([spawned]).task_report, operation: "task_spawn", snapshot: false };
+  const messages = [
+    { role: "assistant", content: "", tool_calls: [{ id: "spawn", function: { name: "task_spawn", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "spawn", content: "raw spawn\n", task_report: spawnReport },
+  ];
+  const h = retainedHistoryHarness(messages);
+  await h.c.loadHistory();
+  assert.equal(h.root.querySelectorAll(".task-output").length, 2);
+  const done = { ...spawned, status: "completed", active: false, output: "  delivered exact bytes\n" };
+  messages.push(
+    { role: "assistant", content: "", tool_calls: [{ id: "wait", function: { name: "task_wait", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "wait", content: "raw wait\n", task_report: { ...spawnReport, operation: "task_wait", tasks: [done] } },
+  );
+  await h.c.loadHistory();
+  const cards = h.root.querySelectorAll(".task-output").filter((panel) => panel.parentNode.dataset.subagents === "true");
+  assert.equal(cards.length, 1);
+  assert.equal(h.root.children.length, 2, "task display must retain one root child per canonical display row");
+  assert.equal(h.root.children[0].children.filter((child) => child.dataset.subagents === "true").length, 0);
+  const waitRow = h.root.children[1], [waitFold, subagents] = waitRow.children;
+  assert.equal(waitFold.body.textContent, "raw wait\n");
+  assert.equal(waitFold.nextElementSibling, subagents);
+  assert.equal(subagents.dataset.subagents, "true");
+  assert.equal(subagents.querySelectorAll(".task-output-body")[0].textContent, done.output);
+  assert.equal(h.root.children[0].dataset.canonicalIndex, "1");
+  assert.equal(waitRow.dataset.canonicalIndex, "3");
 });
 
 test("active replay remains stopped after assistant-ending history and an expired running sample", async () => {

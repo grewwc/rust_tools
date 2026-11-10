@@ -15,6 +15,7 @@ fn tool_call_round_no_longer_requests_terminal_dedupe() {
             },
         }],
         tool_results: vec![ToolResult {
+            task_report: None,
             tool_call_id: "call_1".to_string(),
             content: "1\n2\n3\n".to_string(),
         }],
@@ -39,6 +40,7 @@ fn first_use_guidance_is_emitted_once_per_tool_per_turn() {
         tool_results: calls
             .iter()
             .map(|call| ToolResult {
+                task_report: None,
                 tool_call_id: call.id.clone(),
                 content: "ok".to_string(),
             })
@@ -93,6 +95,7 @@ fn reused_tool_call_id_is_rewritten_for_the_whole_occurrence() {
             serde_json::json!({ "command": "true", "pty": false }),
         )],
         tool_results: vec![crate::ai::types::ToolResult {
+            task_report: None,
             tool_call_id: "reused".to_string(),
             content: "done".to_string(),
         }],

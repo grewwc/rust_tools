@@ -466,6 +466,9 @@ pub(crate) fn normalize_tool_call_name(name: &str) -> &str {
 pub(crate) struct ToolResult {
     pub(crate) tool_call_id: String,
     pub(crate) content: String,
+    /// Display metadata travels beside the unchanged model/terminal result text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) task_report: Option<crate::ai::tools::task_tools::TaskReport>,
 }
 
 /// Runtime context for an agent, containing its available tools,

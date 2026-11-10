@@ -56,7 +56,11 @@ fn read_projected_canonical_messages_after_id(
 
     let mut messages = Vec::new();
     for row in rows {
-        let (message, source_model) = row?;
+        let (mut message, source_model) = row?;
+        // Task reports are canonical display metadata, never model context.
+        if crate::ai::tools::task_tools::TaskReport::is_message_metadata(&message) {
+            message.reasoning_content = None;
+        }
         messages.push(match source_model.as_deref() {
             Some(model) => {
                 compress::sanitize_message_for_persisted_history_for_model(model, &message)

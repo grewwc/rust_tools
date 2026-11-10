@@ -20,6 +20,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
 });
 
 pub(super) fn execute_task_retry(args: &Value) -> Result<String, String> {
+    start_task_report(false);
     ensure_top_level_task_orchestration("task_retry")?;
     let task_id = args
         .get("task_id")
@@ -732,6 +733,7 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
 }
 
 pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
+    start_task_report(false);
     ensure_top_level_task_orchestration("task_status")?;
     let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
     let current_owner_pid = current_task_owner_pid()?;
@@ -750,8 +752,12 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
     }
 }
 
-fn execute_full_task_status(tracked: Vec<(String, AsyncTaskEntry)>) -> Result<String, String> {
+pub(super) fn execute_full_task_status(
+    tracked: Vec<(String, AsyncTaskEntry)>,
+) -> Result<String, String> {
+    start_task_report(false);
     if tracked.is_empty() {
+        start_task_report(true);
         return Ok("No async tasks currently tracked.".to_string());
     }
 
@@ -832,5 +838,6 @@ fn execute_full_task_status(tracked: Vec<(String, AsyncTaskEntry)>) -> Result<St
         lines.push(completed_outputs.join("\n\n---\n\n"));
     }
 
+    start_task_report(true);
     Ok(lines.join("\n"))
 }

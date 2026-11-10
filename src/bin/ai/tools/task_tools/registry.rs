@@ -141,6 +141,9 @@ pub(crate) struct SubagentTerminalStatus {
     /// unknown/default behavior.
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) state: String,
+    pub(crate) active: bool,
+    /// A failed state sample is not terminal truth or an authoritative snapshot.
+    pub(crate) state_error: Option<String>,
     pub(crate) elapsed_secs: u64,
     pub(crate) progress: Option<String>,
     /// Sampled once with the text above so the shared tree can use typed activity.
@@ -221,19 +224,32 @@ pub(crate) fn subagent_terminal_statuses(
     let mut statuses = snapshots
         .into_iter()
         .filter(|snapshot| snapshot.owner_pid == owner_pid)
-        .map(|snapshot| SubagentTerminalStatus {
-            task_id: snapshot.task_id,
-            started_at: snapshot.started_at,
-            description: snapshot.description,
-            agent_name: snapshot.agent_name,
-            backend: snapshot.backend,
-            model: snapshot.display_model,
-            reasoning_effort: snapshot.reasoning_effort,
-            state: task_state_string(os, snapshot.result_channel_id, snapshot.pid)
-                .unwrap_or_else(|_| "unknown".to_string()),
-            elapsed_secs: snapshot.started_at.elapsed().as_secs(),
-            progress: snapshot.progress,
-            progress_snapshot: snapshot.progress_snapshot,
+        .map(|snapshot| {
+            let (state, active, state_error) =
+                match task_state_snapshot(os, snapshot.result_channel_id, snapshot.pid) {
+                    Ok((state, active)) => (state, active, None),
+                    Err(error) => (
+                        "unknown".to_string(),
+                        os.get_process(snapshot.pid)
+                            .is_none_or(|process| process.state != ProcessState::Terminated),
+                        Some(error),
+                    ),
+                };
+            SubagentTerminalStatus {
+                task_id: snapshot.task_id,
+                started_at: snapshot.started_at,
+                description: snapshot.description,
+                agent_name: snapshot.agent_name,
+                backend: snapshot.backend,
+                model: snapshot.display_model,
+                reasoning_effort: snapshot.reasoning_effort,
+                state,
+                active,
+                state_error,
+                elapsed_secs: snapshot.started_at.elapsed().as_secs(),
+                progress: snapshot.progress,
+                progress_snapshot: snapshot.progress_snapshot,
+            }
         })
         .collect::<Vec<_>>();
     statuses.sort_by(|a, b| a.description.cmp(&b.description));

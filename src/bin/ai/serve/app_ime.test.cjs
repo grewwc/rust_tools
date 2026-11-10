@@ -178,8 +178,8 @@ test("an automatic session switch does not replace the composer's text", async (
   assert.deepEqual(switched, ["new"]);
 });
 
-test("desktop session loading appends every server page", async () => {
-  const sourceItems = Array.from({ length: 52 }, (_, index) => ({ id: `s-${index}` }));
+test("desktop session loading fetches only the bounded newest page", async () => {
+  const sourceItems = Array.from({ length: 52 }, (_, index) => ({ id: `s-${51 - index}` }));
   const urls = [];
   const renders = [];
   const context = makeContext({
@@ -187,7 +187,10 @@ test("desktop session loading appends every server page", async () => {
     api: async (url) => {
       urls.push(url);
       const offset = Number(url.match(/offset=(\d+)/)?.[1] || 0);
-      return { json: async () => sourceItems.slice(offset, offset + 50) };
+      return {
+        json: async () => sourceItems.slice(offset, offset + 12),
+        headers: { get: (name) => name === "x-sessions-total" ? "52" : name === "x-sessions-page-size" ? "12" : null },
+      };
     },
     switchSession: () => {},
     note: () => {},
@@ -204,11 +207,10 @@ test("desktop session loading appends every server page", async () => {
   await run(context, "loadSessions()");
 
   assert.deepEqual(urls, [
-    "/sessions?limit=50&offset=0",
-    "/sessions?limit=50&offset=50",
+    "/sessions?newest=true&limit=12&offset=0&include=s-51",
   ]);
-  assert.equal(renders[0].length, 50, "the first batch was not rendered immediately");
-  assert.deepEqual(renders.at(-1), sourceItems.map((item) => item.id).reverse());
+  assert.equal(renders[0].length, 12, "the first bounded batch was not rendered immediately");
+  assert.deepEqual(renders.at(-1), sourceItems.slice(0, 12).map((item) => item.id));
 });
 
 test("desktop session loading falls back when an older daemon ignores offset", async () => {
@@ -237,8 +239,7 @@ test("desktop session loading falls back when an older daemon ignores offset", a
   await run(context, "loadSessions()");
 
   assert.deepEqual(urls, [
-    "/sessions?limit=50&offset=0",
-    "/sessions?limit=50&offset=50",
+    "/sessions?newest=true&limit=12&offset=0&include=s-51",
     "/sessions",
   ]);
   assert.deepEqual(renders.at(-1), sourceItems.map((item) => item.id).reverse());

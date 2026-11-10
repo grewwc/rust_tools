@@ -220,10 +220,15 @@ impl SubagentStatusLine {
         let status_line = render_subagent_status_line(&statuses);
         if crate::ai::background::serve_live_streaming() {
             self.publish_status_if_changed(&statuses, &status_line, |status_line| {
-                crate::ai::background::publish_serve_frame(
-                    crate::ai::background::ServeLiveKind::SubagentProgress,
-                    status_line,
-                );
+                let report = crate::ai::tools::task_tools::TaskReport::from_statuses(&statuses);
+                if let Some(payload) =
+                    crate::ai::background::serve_subagent_progress_payload(status_line, &report)
+                {
+                    crate::ai::background::publish_serve_json_frame(
+                        crate::ai::background::ServeLiveKind::SubagentProgress,
+                        &payload,
+                    );
+                }
             });
         }
 
@@ -387,9 +392,12 @@ fn subagent_status_semantic_key(
                 ),
             };
             serde_json::json!({
+                "id": status.task_id,
                 "task": [status.description, status.agent_name, status.backend,
                     status.model, status.reasoning_effort],
                 "state": status.state,
+                "active": status.active,
+                "state_error": status.state_error,
                 "phase": phase,
                 "latest": latest,
                 "plan": plan,
@@ -884,6 +892,41 @@ mod tests {
     }
 
     #[test]
+    fn task_report_live_status_dedup_tracks_identity_activity_and_sampling_errors() {
+        let mut status = SubagentTerminalStatus {
+            task_id: "first".into(),
+            started_at: std::time::Instant::now(),
+            description: "same description".into(),
+            agent_name: "build".into(),
+            backend: None,
+            model: None,
+            reasoning_effort: None,
+            state: "unknown".into(),
+            active: true,
+            state_error: None,
+            elapsed_secs: 0,
+            progress: None,
+            progress_snapshot: None,
+        };
+        let mut line = SubagentStatusLine::new();
+        let mut published = 0;
+        for change in 0..5 {
+            match change {
+                1 => status.state_error = Some("first sampling error".into()),
+                2 => status.state_error = Some("second sampling error".into()),
+                3 => status.active = false,
+                4 => status.task_id = "second".into(),
+                _ => {}
+            }
+            let rendered = render_subagent_status_line_at_width(&[status.clone()], 120);
+            for _ in 0..2 {
+                line.publish_status_if_changed(&[status.clone()], &rendered, |_| published += 1);
+            }
+            assert_eq!(published, change + 1);
+        }
+    }
+
+    #[test]
     fn live_status_dedup_ignores_elapsed_and_activity_age() {
         for activity in [None, Some("command: rg -n foo src")] {
             let slot = new_subagent_progress_slot();
@@ -897,6 +940,8 @@ mod tests {
             snapshot.elapsed = std::time::Duration::from_secs(5);
             snapshot.stale_for = std::time::Duration::from_secs(1);
             let mut status = SubagentTerminalStatus {
+                state_error: None,
+                active: true,
                 task_id: "task-focus".to_string(),
                 started_at: std::time::Instant::now(),
                 description: "inspect".to_string(),
@@ -938,6 +983,8 @@ mod tests {
     #[test]
     fn live_status_dedup_publishes_semantic_changes_and_resets_on_finish() {
         let mut status = SubagentTerminalStatus {
+            state_error: None,
+            active: true,
             task_id: "task-focus".to_string(),
             started_at: std::time::Instant::now(),
             description: "inspect".to_string(),
@@ -999,6 +1046,8 @@ mod tests {
         let started_at = std::time::Instant::now();
         let statuses = [
             SubagentTerminalStatus {
+                state_error: None,
+                active: true,
                 task_id: "task-review-stream".to_string(),
                 started_at,
                 description: "review stream".to_string(),
@@ -1015,6 +1064,8 @@ mod tests {
                 progress_snapshot: None,
             },
             SubagentTerminalStatus {
+                state_error: None,
+                active: true,
                 task_id: "task-review-driver".to_string(),
                 started_at: started_at + std::time::Duration::from_secs(1),
                 description: "review driver".to_string(),
@@ -1028,6 +1079,8 @@ mod tests {
                 progress_snapshot: None,
             },
             SubagentTerminalStatus {
+                state_error: None,
+                active: true,
                 task_id: "task-compile-check".to_string(),
                 started_at: started_at + std::time::Duration::from_secs(2),
                 description: "compile check".to_string(),
@@ -1041,6 +1094,8 @@ mod tests {
                 progress_snapshot: None,
             },
             SubagentTerminalStatus {
+                state_error: None,
+                active: true,
                 task_id: "task-extra".to_string(),
                 started_at: started_at + std::time::Duration::from_secs(3),
                 description: "extra task".to_string(),
@@ -1054,6 +1109,8 @@ mod tests {
                 progress_snapshot: None,
             },
             SubagentTerminalStatus {
+                state_error: None,
+                active: true,
                 task_id: "task-last".to_string(),
                 started_at: started_at + std::time::Duration::from_secs(4),
                 description: "last task".to_string(),
@@ -1103,6 +1160,8 @@ mod tests {
     #[test]
     fn subagent_status_line_labels_external_backends_only() {
         let kernel = SubagentTerminalStatus {
+            state_error: None,
+            active: true,
             task_id: "task-kernel".to_string(),
             started_at: std::time::Instant::now(),
             description: "inspect".to_string(),
@@ -1121,6 +1180,8 @@ mod tests {
         );
 
         let mut external = SubagentTerminalStatus {
+            state_error: None,
+            active: true,
             task_id: "task-external".to_string(),
             started_at: std::time::Instant::now(),
             description: "inspect".to_string(),
@@ -1148,6 +1209,8 @@ mod tests {
     #[test]
     fn subagent_status_block_is_three_width_bounded_lines_with_live_activity() {
         let status = SubagentTerminalStatus {
+            state_error: None,
+            active: true,
             task_id: "task-live".to_string(),
             started_at: std::time::Instant::now(),
             description:
@@ -1257,6 +1320,8 @@ mod tests {
     fn agent_team_status_block_shows_all_active_subagents_stably() {
         let spawned = std::time::Instant::now();
         let status = |task_id: &str, label: &str, spawn_offset_secs: u64| SubagentTerminalStatus {
+            state_error: None,
+            active: true,
             task_id: task_id.to_string(),
             started_at: spawned + std::time::Duration::from_secs(spawn_offset_secs),
             description: format!("{label} task"),
@@ -1386,6 +1451,8 @@ mod tests {
             snapshot.elapsed = std::time::Duration::from_secs(65);
             snapshot.stale_for = std::time::Duration::from_secs(3);
             let status = SubagentTerminalStatus {
+                state_error: None,
+                active: true,
                 task_id: "task-kernel".to_string(),
                 started_at: std::time::Instant::now(),
                 description: "inspect scheduler".to_string(),
@@ -1448,6 +1515,8 @@ mod tests {
             out.flush()?;
         }
         let mut status = SubagentTerminalStatus {
+            state_error: None,
+            active: true,
             task_id: "status-fixture".to_string(),
             started_at: std::time::Instant::now(),
             description: "Audit false compile-pass claim and independently verify every resize frame".to_string(),
@@ -1578,6 +1647,8 @@ mod tests {
     #[test]
     fn status_line_redraw_and_finish_skip_writes_while_composer_is_open() {
         let status = SubagentTerminalStatus {
+            state_error: None,
+            active: true,
             task_id: "task-parked".to_string(),
             started_at: std::time::Instant::now(),
             description: "wait for a task".to_string(),

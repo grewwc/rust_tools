@@ -275,7 +275,7 @@ pub(crate) async fn read_history(
             if !role_matches {
                 continue;
             }
-            let mut value = match serde_json::to_value(message) {
+            let mut value = match serve_history_message(message) {
                 Ok(v) => v,
                 Err(err) => {
                     return (
@@ -327,11 +327,36 @@ pub(crate) async fn read_history(
             messages = messages.split_off(messages.len() - limit);
         }
     }
-    let mut resp = (StatusCode::OK, Json(messages)).into_response();
+    let rows = messages
+        .iter()
+        .map(serve_history_message)
+        .collect::<Result<Vec<_>, _>>();
+    let mut resp = (
+        StatusCode::OK,
+        Json(rows.expect("serializing canonical history cannot fail")),
+    )
+        .into_response();
     resp.headers_mut().insert(
         "x-history-total",
         axum::http::HeaderValue::from_str(&total.to_string())
             .unwrap_or(axum::http::HeaderValue::from_static("0")),
     );
     resp
+}
+
+/// Canonical tool content stays verbatim; its runtime sidecar becomes an explicit UI field.
+pub(super) fn serve_history_message(
+    message: &Message,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut value = serde_json::to_value(message)?;
+    if let Some(report) = crate::ai::tools::task_tools::TaskReport::from_message(message) {
+        value["task_report"] = serde_json::to_value(report)?;
+    }
+    if crate::ai::tools::task_tools::TaskReport::is_message_metadata(message) {
+        value
+            .as_object_mut()
+            .expect("serialized message is an object")
+            .remove("reasoning_content");
+    }
+    Ok(value)
 }

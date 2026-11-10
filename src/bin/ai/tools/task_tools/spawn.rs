@@ -733,6 +733,11 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
     );
     crate::ai::driver::notify_scheduler_after(SUBAGENT_WALL_CLOCK_TIMEOUT);
 
+    if let Some(task) = with_task_entry(&task_id, |entry| {
+        TaskReportTask::from_entry(&task_id, entry, "spawned".to_string(), true)
+    }) {
+        record_report_task(task);
+    }
     Ok(SpawnedSubagentTask {
         task_id,
         pid,
@@ -741,6 +746,7 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
     })
 }
 pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
+    start_task_report(false);
     ensure_top_level_task_orchestration("task_spawn")?;
     let tasks = args
         .get("tasks")
@@ -794,6 +800,7 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
                 entries.push(entry);
             }
             Err(error) => {
+                record_report_task(TaskReportTask::failed_spawn(index, task, &error));
                 let mut entry = serde_json::json!({
                     "index": index,
                     "status": "failed",

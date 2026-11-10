@@ -116,6 +116,7 @@ test("drafts persist independently for each session and restore on switch", () =
     syncStopButton() {},
     restoreSkillPick() {},
     restoreTeamPick() {},
+    abortEvents() {},
     isPhoneLayout: () => true,
   });
   vm.runInContext(layoutHoldSrc, context);
@@ -1148,13 +1149,19 @@ test("progress cannot split an active thinking phase", () => {
   const start = script.indexOf('const { kind, payload } = parseBlock');
   const end = script.indexOf("if (finished) break;", start);
   const blockDispatch = script.slice(start, end);
-  const progressBranch = blockDispatch.match(/else if \(payload\) \{([\s\S]*?)\n        \}/);
+  // Payload-derived speed was removed because the structured `rate` event now
+  // carries the display sample.
+  const rateBranch = blockDispatch.match(/else if \(kind === "rate"\) \{([\s\S]*?)\n        \}/);
   const subagentBranch = blockDispatch.match(/else if \(kind === "subagent_progress"\) \{([\s\S]*?)\n        \}/);
-  assert.ok(progressBranch);
+  assert.ok(rateBranch);
   assert.ok(subagentBranch);
-  assert.doesNotMatch(progressBranch[1], /closeThinkingPhase/);
+  assert.match(rateBranch[1], /rateSampleOf\(JSON\.parse\(payload\)\)/);
+  assert.match(rateBranch[1], /thinkingRates\.speed\(sample\)/);
+  assert.match(rateBranch[1], /setTokenRate\(sample\)/);
+  assert.doesNotMatch(blockDispatch, /else if \(payload\)/);
+  assert.doesNotMatch(rateBranch[1], /closeThinkingPhase/);
   assert.doesNotMatch(subagentBranch[1], /closeThinkingPhase/);
-  assert.doesNotMatch(progressBranch[1], /ensureProgressPhase\(\)|progLines\.push/);
+  assert.doesNotMatch(rateBranch[1], /ensureProgressPhase\(\)|progLines\.push/);
   assert.match(subagentBranch[1], /activity.subagents\(payload\)/);
   assert.doesNotMatch(blockDispatch, /closeProgressPhase/);
   assert.doesNotMatch(script, /finalizing response/);
@@ -1900,6 +1907,8 @@ function scrollHarness({ phone = true, scrollTop = 0 } = {}) {
   const classes = new Set();
   const attrs = {};
   let timer = null;
+  let frame = null;
+  let frameRequests = 0;
   const button = {
     tabIndex: -1,
     classList: { toggle(name, on) { if (on) classes.add(name); else classes.delete(name); } },
@@ -1913,11 +1922,17 @@ function scrollHarness({ phone = true, scrollTop = 0 } = {}) {
     window: { matchMedia: () => ({ matches: phone }) },
     $: (id) => id === "msgs" ? msgs : button,
     setTimeout(fn) { timer = fn; return 1; },
+    requestAnimationFrame(fn) { frame = fn; frameRequests++; return frameRequests; },
   });
   const start = script.indexOf("const PHONE_LAYOUT_QUERY");
   const end = script.indexOf("// `parent` mounts", start);
   vm.runInContext(script.slice(start, end), context);
-  return { context, msgs, button, classes, attrs, flushTimer: () => { if (timer) timer(); } };
+  return {
+    context, msgs, button, classes, attrs,
+    flushTimer: () => { if (timer) timer(); },
+    flushFrame: () => { const fn = frame; frame = null; if (fn) fn(); },
+    frameRequests: () => frameRequests,
+  };
 }
 
 test("phone output follows only while the reader remains near the bottom", () => {
@@ -1931,6 +1946,9 @@ test("phone output follows only while the reader remains near the bottom", () =>
   const near = scrollHarness({ phone: true, scrollTop: 596 });
   assert.equal(near.context.shouldFollowOutput(), true);
   near.context.followOutput(true);
+  near.context.followOutput(true);
+  assert.equal(near.frameRequests(), 1, "stream paints must coalesce into one scroll per frame");
+  near.flushFrame();
   assert.equal(near.msgs.scrollTop, 1000);
   assert.equal(near.classes.has("show"), false);
 
@@ -1961,6 +1979,7 @@ test("desktop output follows only while the reader is at the live edge", () => {
   const live = scrollHarness({ phone: false, scrollTop: 600 });
   assert.equal(live.context.shouldFollowOutput(), true);
   live.context.followOutput(true);
+  live.flushFrame();
   assert.equal(live.msgs.scrollTop, 1000);
   assert.equal(live.classes.has("show"), false);
 });

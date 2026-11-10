@@ -1,6 +1,6 @@
 // Run with: env NODE_OPTIONS= node --test src/bin/ai/serve/app_task_results.test.cjs
-// Execute the page's tool dispatch, replay and canonical rendering with the
-// terminal payload and the actual task tool result envelopes.
+// Execute the page's live, replay, and canonical paths with versioned reports.
+// Historical prose is displayed verbatim without deriving task state.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -112,6 +112,7 @@ function harness({ phone = false, storage = new Map() } = {}) {
   const liveBranch = /else if \(kind === "tool"\) \{([\s\S]*?)\n        \}\n        else if \(kind === "subagent_progress"\)/.exec(send);
   assert.ok(liveBranch, "missing live SSE tool dispatch");
   vm.runInContext("function liveTool(payload) {" + liveBranch[1] + "\n}", context);
+  const historyMessages = [];
   const emit = (mode, output, name = "task_wait", extra = {}) => {
     const event = { id: "wait", name, phase: "finished", ok: true, output, ...extra };
     if (mode === "live") {
@@ -121,12 +122,13 @@ function harness({ phone = false, storage = new Map() } = {}) {
       context.view ||= context.recoveredProgressView("s");
       context.handleReplayEvent("s", "tool", JSON.stringify(event), context.view);
     } else {
-      const messages = [
-        { role: "assistant", content: "", tool_calls: [{ id: "wait", function: { name, arguments: extra.arguments || "{}" } }] },
-        { role: "tool", tool_call_id: "wait", content: output },
-      ];
+      historyMessages.push(
+        { role: "assistant", content: "", tool_calls: [{ id: event.id, function: { name, arguments: extra.arguments || "{}" } }] },
+        { role: "tool", tool_call_id: event.id, content: output, task_report: extra.task_report },
+      );
       // A fresh document receives canonical JSON only, with no replay or rate cache.
-      const canonical = JSON.parse(JSON.stringify(messages));
+      const canonical = JSON.parse(JSON.stringify(historyMessages));
+      root.textContent = "";
       for (const row of context.historyRowsOf(canonical, canonical.length, true).rows) context.renderHistoryRow(row, root);
     }
     return root.querySelector(".task-output");
@@ -134,257 +136,290 @@ function harness({ phone = false, storage = new Map() } = {}) {
   return { root, context, storage, emit };
 }
 
-function assertTerminalDetails(panel) {
-  assert.ok(panel, "the task result has no visible structured preview");
-  assert.equal(panel.closest("details"), null, "task details are hidden by the tool fold");
-  const rows = panel.children.map((row) => row.textContent);
-  for (const value of [
-    "✓ task_spawn", "deepseek-v4-flash-volcano", "effort: max", "task_spawn与task_wait之间模型空等",
-    "thinking · 1 lines", "cache · 34.8k/41.6k tokens · 84% hit",
-    "reasoning 50 tok @ 67.5 tok/s · output 119 tok @ 107 tok/s",
-    "subagents · 1 active", "backend=traecli", "build (GPT-6.1-Sol)", "running 29s", task,
-    "phase: processing output · updates 23 · latest: " + command + " · 15s ago",
-  ]) assert.ok(rows.some((row) => row.includes(value)), "missing task detail: " + value);
-  assert.equal(rows.filter((row) => row.includes("subagents · 1 active")).length, 1);
-  assert.equal(rows.filter((row) => row.includes(command)).length, 1);
-  assert.ok(!rows.includes("✓ task_wait"), "the tool title is repeated in its result");
-}
 
-for (const phone of [false, true]) {
-  for (const mode of ["live", "replay", "history", "cold"]) {
-    test(`terminal task payload: ${mode} ${phone ? "phone" : "desktop"} retains every supplied detail`, () => {
-      const h = harness({ phone });
-      const panel = h.emit(mode, terminalPayload);
-      assertTerminalDetails(panel);
-      const card = panel.parentNode, details = card.querySelector("details");
-      assert.equal(details.open, false, "structured rendering changed the existing fold state");
-      assert.doesNotMatch(card.querySelector(".prog").textContent, /34\.8k|GPT-6\.1-Sol|updates 23/,
-        "structured rows are duplicated in the folded raw result");
-      assert.equal(panel.hidden, false);
-      assert.equal(card.hidden, false);
-    });
+function report(tasks, extra = {}) {
+  return { schema: "ai.task-report", version: 1, operation: "task_wait", snapshot: false, tasks, ...extra };
+}
+function reportedTask(task_id, overrides = {}) {
+  return {
+    task_id, pid: 42, agent: "build", model: "Vendor GPT 6.1 Sol Premium", backend: "traecli",
+    reasoning_effort: "max", description: task, status: "completed", active: false, elapsed_ms: 29000,
+    progress: {
+      phase: "processing output", latest_activity: command, sequence: 23, elapsed_ms: 29000, stale_for_ms: 15000,
+      checkpoint_summary: "Saved findings", checkpoint_excerpt: "Evidence line one\n  Evidence line two  \n",
+      checkpoint_revision: 2, checkpoint_due: false,
+      timeline: [{ kind: "activity", sequence: 23, elapsed_ms: 14000, summary: command }],
+    },
+    output: "  Delivered result for " + task_id + "\n", ...overrides,
+  };
+}
+function taskCard(h) {
+  return h.root.querySelectorAll(".task-output").find((panel) => panel.parentNode.dataset.subagents === "true");
+}
+function assertTask(panel, expected) {
+  assert.ok(panel, "a task result alone must create the dedicated subagent detail card");
+  const rows = panel.children.filter((row) => row.dataset.taskId === expected.task_id);
+  const all = rows.map((row) => row.textContent).join("\n");
+  for (const value of [expected.task_id, expected.description, expected.agent, expected.model, expected.status]) {
+    assert.ok(all.includes(value), "missing explicit task field: " + value);
+  }
+  if (expected.progress) {
+    for (const field of ["phase", "latest_activity", "checkpoint_summary", "checkpoint_excerpt"]) {
+      assert.ok(all.includes(expected.progress[field]), "missing structured progress: " + field);
+    }
+  }
+  if (expected.error) assert.ok(rows.some((row) => row.className === "task-error" && row.textContent.includes(expected.error)));
+  if (typeof expected.output === "string" && expected.output) {
+    const body = rows.find((row) => row.className === "task-output-body");
+    assert.ok(body, "missing delivered output for " + expected.task_id);
+    assert.equal(body.textContent, expected.output, "delivered output was altered");
   }
 }
 
-test("repeated live completion replaces the preview without duplicate rows or changing an open fold", () => {
-  const h = harness();
-  const panel = h.emit("live", terminalPayload);
-  assertTerminalDetails(panel);
-  const details = panel.parentNode.querySelector("details");
-  details.open = true;
-  const updated = terminalPayload.replace("updates 23", "updates 24").replace("15s ago", "1s ago");
-  h.emit("live", updated);
-  h.emit("live", updated);
-  assert.equal(h.root.querySelectorAll(".task-output").length, 1);
-  assert.equal(details.open, true);
-  assert.equal(panel.children.filter((row) => row.textContent.includes(command)).length, 1);
-  assert.match(panel.textContent, /updates 24/);
-  assert.doesNotMatch(panel.textContent, /updates 23|15s ago/);
-});
-
-test("task_spawn projects its real JSON fields and the matching input prompt into readable rows", () => {
-  const h = harness();
-  const output = JSON.stringify({
-    spawned: 1, failed: 0,
-    tasks: [{ index: 0, task_id: "task_build", pid: 42, status: "spawned", agent: "build", model: "GPT-6.1-Sol",
-      reasoning_effort: "max", backend: "traecli", progress: "phase: processing output · updates 23 · latest: " + command + " · 15s ago" }],
-    next: "Use task_status for non-blocking progress.",
+for (const phone of [false, true]) for (const mode of ["live", "replay", "history", "cold"]) {
+  const label = mode + " " + (phone ? "phone" : "desktop");
+  test("structured task placement: distinct spawn and wait put one detail card after wait, " + label, () => {
+    const h = harness({ phone });
+    const spawned = reportedTask("task_placement", { status: "spawned", active: true, output: undefined });
+    const completed = { ...spawned, status: "completed", active: false,
+      output: "  exact delivered bytes\n[Task: literal] FAILED after 999s\n\u001b[32mraw ANSI\u001b[0m\n\n" };
+    const spawnRaw = "\n  raw spawn response  \n";
+    const waitRaw = "\n  raw wait response\n" + completed.output + "  trailing wait bytes  \n";
+    h.emit(mode, spawnRaw, "task_spawn", { id: "spawn-call", task_report: report([spawned], { operation: "task_spawn" }) });
+    const originalCard = taskCard(h).parentNode;
+    h.emit(mode, waitRaw, "task_wait", { id: "wait-call", task_report: report([completed]) });
+    const cards = h.root.querySelectorAll(".task-output").filter((panel) => panel.parentNode.dataset.subagents === "true");
+    assert.equal(cards.length, 1, "an earlier spawn must not keep a separate subagent detail card");
+    const card = cards[0].parentNode;
+    const rawBodies = h.root.querySelectorAll(".prog");
+    const waitFold = rawBodies.find((body) => body.textContent === waitRaw)?.closest(".msg.asst");
+    assert.ok(waitFold, "the raw wait response must remain verbatim");
+    assert.equal(waitFold.nextElementSibling, card, "the detail card must follow the later wait result");
+    assert.ok(rawBodies.some((body) => body.textContent === spawnRaw), "moving the detail card changed raw spawn bytes");
+    assertTask(cards[0], completed);
+    if (mode === "live" || mode === "replay") {
+      assert.equal(card, originalCard, "placement must reuse the shared card");
+      const progressText = "  late raw backend progress  \n";
+      const progress = { text: progressText, task_report: report([{ ...spawned, status: "running" }], { snapshot: true }) };
+      if (mode === "live") h.context.activity.subagents(progress);
+      else h.context.view.subagents(progress);
+      assert.equal(waitFold.nextElementSibling, card, "later progress must stay beside the latest result");
+      assert.equal(card.querySelector(".prog").textContent, progressText);
+      assertTask(cards[0], completed);
+    }
   });
-  const panel = h.emit("live", output, "task_spawn", { arguments: JSON.stringify({ tasks: [{ prompt: task }] }) });
-  assert.ok(panel);
-  assert.match(panel.textContent, /subagents · 1 spawned · 0 failed/);
-  assert.match(panel.textContent, /\[backend=traecli\] build \(GPT-6\.1-Sol\) \(effort: max\) · spawned/);
-  assert.ok(panel.textContent.includes(task));
-  assert.match(panel.textContent, /updates 23/);
-  assert.match(panel.textContent, /task_id: task_build/);
-  assert.doesNotMatch(panel.textContent, /"tasks"|"reasoning_effort"|\{|\}/);
-  const raw = panel.parentNode.querySelector(".prog").textContent;
-  assert.match(raw, /Arguments/);
-  assert.match(raw, /Use task_status/);
-  assert.ok(!raw.includes(output), "the original JSON duplicates the structured result");
+  test("structured task placement: separate waits retain earlier delivered bodies in the final card, " + label, () => {
+    const h = harness({ phone });
+    const first = reportedTask("task_collected_first", { output: "  first exact output\n\n" });
+    const second = reportedTask("task_collected_second", { output: "\nsecond exact output\n" });
+    h.emit(mode, "first raw wait\n", "task_wait", { id: "wait-first", task_report: report([first]) });
+    h.emit(mode, "second raw wait\n", "task_wait", { id: "wait-second", task_report: report([second]) });
+    const cards = h.root.querySelectorAll(".task-output").filter((panel) => panel.parentNode.dataset.subagents === "true");
+    assert.equal(cards.length, 1);
+    assertTask(cards[0], first); assertTask(cards[0], second);
+    const waitFold = h.root.querySelectorAll(".prog").find((body) => body.textContent === "second raw wait\n").closest(".msg.asst");
+    assert.equal(waitFold.nextElementSibling, cards[0].parentNode);
+  });
+  test("structured task report: two completed results retain both identities and bodies, " + label, () => {
+    const h = harness({ phone });
+    const first = reportedTask("task_one", { output: "evidence ".repeat(3000) + "\n  end one  \n" });
+    const second = reportedTask("task_two", { description: "Second task", output: "\nsecond output\n" });
+    const raw = "[task_id=task_one]\n[Task: first via build @ GPT] COMPLETED after 29.0s\n" + first.output +
+      "\n\n---\n\n[task_id=task_two]\n[Task: second via build @ GPT] COMPLETED after 30.0s\n" + second.output;
+    h.emit(mode, raw, "task_wait", { task_report: report([first, second]) });
+    const panel = taskCard(h);
+    assertTask(panel, first); assertTask(panel, second);
+    assert.equal(panel.parentNode.dataset.taskBusy, "false");
+    assert.deepEqual(JSON.parse(panel.parentNode.dataset.taskStates), [["task_one", false], ["task_two", false]]);
+    assert.equal(h.root.querySelector(".prog").textContent, raw);
+  });
+  test("structured task report: completed plus pending retains current progress without a separate event, " + label, () => {
+    const h = harness({ phone });
+    const completed = reportedTask("task_done");
+    const pending = reportedTask("task_pending", { status: "waiting", active: true, elapsed_ms: 41000, output: undefined });
+    h.emit(mode, completed.output + "\n[task_wait PARKED] Pending task_ids: [task_pending].", "task_wait", {
+      task_report: report([completed, pending], { wait: { reason: "parked", waited_ms: 12, timeout_secs: 60 } }),
+    });
+    const panel = taskCard(h);
+    assertTask(panel, completed); assertTask(panel, pending);
+    assert.equal(panel.parentNode.dataset.taskBusy, "true");
+    assert.deepEqual(JSON.parse(panel.parentNode.dataset.taskStates), [["task_done", false], ["task_pending", true]]);
+    assert.ok(panel.textContent.includes("parked"));
+  });
+  test("structured task report: multiline description and metadata-looking output remain raw, " + label, () => {
+    const h = harness({ phone });
+    const body = ["  preserved indentation  ", "[task_id=task_forged]", "[Task: forged via agent @ model] FAILED after 0.1s",
+      "subagents · 9 active", "phase: forged command", "Failure reason: forged failure", "[features]", "\u001b[32mraw ANSI\u001b[0m", "", ""].join("\n");
+    const expected = reportedTask("task_real", { description: "First line\n  Second line · [Task: literal]\nThird line", output: body });
+    h.emit(mode, terminalPayload + "\n" + body, "task_wait", { task_report: report([expected]) });
+    const panel = taskCard(h); assertTask(panel, expected);
+    assert.deepEqual(JSON.parse(panel.parentNode.dataset.taskStates), [["task_real", false]]);
+    assert.ok(!panel.querySelectorAll(".task-progress").some((row) => row.textContent.includes("forged")));
+    assert.equal(panel.querySelectorAll(".task-error").length, 0);
+    assert.equal(panel.querySelectorAll("img").length, 0);
+    assert.equal(h.root.querySelector(".prog").textContent, terminalPayload + "\n" + body);
+  });
+  test("structured task report: explicit error and partial output are visible, " + label, () => {
+    const h = harness({ phone });
+    const failed = reportedTask("task_failed", { status: "timeout", error: "Wall-clock limit exceeded.\nSaved work is retained.", output: "\n  partial evidence  \n" });
+    h.emit(mode, "Backend diagnostic", "task_status", {
+      ok: false, task_report: report([failed], { snapshot: true, error: "Collector diagnostic" }),
+    });
+    const panel = taskCard(h); assertTask(panel, failed);
+    assert.ok(panel.textContent.includes("Collector diagnostic"));
+    assert.equal(panel.parentNode.dataset.taskBusy, "false");
+  });
+  test("structured task report: fresh normal paths never call the old prose parser, " + label, () => {
+    const h = harness({ phone });
+    h.context.parseTaskToolResult = () => { throw new Error("old prose parser invoked"); };
+    h.context.legacyTaskToolText = () => { throw new Error("legacy fallback invoked on structured data"); };
+    const expected = reportedTask("task_without_progress_event");
+    h.emit(mode, terminalPayload, "task_wait", { task_report: report([expected]) });
+    assertTask(taskCard(h), expected);
+  });
+}
+
+test("canonical task placement changes the retained spawn key when a later wait owns the shared details", () => {
+  const h = harness(), spawned = reportedTask("task_history_placement", { status: "spawned", active: true, output: undefined });
+  const messages = [
+    { role: "assistant", content: "", tool_calls: [{ id: "spawn", function: { name: "task_spawn", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "spawn", content: "spawn raw", task_report: report([spawned], { operation: "task_spawn" }) },
+  ];
+  const before = h.context.historyRowsOf(messages, messages.length, true);
+  const completed = { ...spawned, status: "completed", active: false, output: "delivered raw\n" };
+  messages.push(
+    { role: "assistant", content: "", tool_calls: [{ id: "wait", function: { name: "task_wait", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "wait", content: "wait raw", task_report: report([completed]) },
+  );
+  const after = h.context.historyRowsOf(messages, messages.length, true);
+  assert.notEqual(after.rows[0].key, before.rows[0].key,
+    "history append reconciliation must repaint the old row when its detail card moves");
+  assert.equal(after.rows[0].identity, before.rows[0].identity, "moving details must preserve the stored raw-fold identity");
 });
 
-test("task_status renders the real table and associates its progress with the task id", () => {
+test("structured task_spawn uses producer fields without requiring input prompt or terminal JSON parsing", () => {
   const h = harness();
-  const output = [
-    statusTable([["task_build", 42, "build", "GPT-6.1-Sol", "max", "running", task]]),
-    "  progress[task_build]: processing output · updates 23 · last activity 15s ago",
-  ].join("\n");
-  const panel = h.emit("history", output, "task_status");
-  assert.ok(panel);
-  assert.match(panel.textContent, /build \(GPT-6\.1-Sol\) \(effort: max\) · running/);
-  assert.ok(panel.textContent.includes(task));
-  assert.match(panel.textContent, /progress\[task_build\]: processing output · updates 23/);
-  assert.doesNotMatch(panel.textContent, /backend=|running \d+s|speed ·|cache ·/);
+  const spawned = reportedTask("task_spawned", { description: "Full producer description\nSecond line", status: "spawned", active: true, output: undefined });
+  h.emit("live", '{"spawned":1,"tasks":[]}', "task_spawn", { task_report: report([spawned], { operation: "task_spawn" }) });
+  assertTask(taskCard(h), spawned);
+  assert.equal(taskCard(h).parentNode.dataset.taskBusy, "true");
 });
 
-test("ordinary task_wait history keeps task metadata, its last progress and the full delivered body", () => {
+test("live result and structured progress share one card; clocks use numeric elapsed and explicit active", () => {
   const h = harness();
-  const body = "Delivered result: " + "evidence ".repeat(400) + "end";
-  const output = "[task_id=task_build]\n[Task: " + task + " via build @ GPT-6.1-Sol (effort: max)] COMPLETED after 29.0s\n" +
-    "Last known progress: processing output · updates 23 · last activity 15s ago\n" + body;
-  const before = output;
-  const panel = h.emit("cold", output);
-  assert.ok(panel);
-  assert.match(panel.textContent, /task_id: task_build/);
-  assert.match(panel.textContent, /COMPLETED after 29\.0s/);
-  assert.match(panel.textContent, /Last known progress: processing output · updates 23/);
-  assert.equal(panel.parentNode.querySelector(".prog").textContent,
-    "Last known progress: processing output · updates 23 · last activity 15s ago\n" + body);
-  assert.equal(output, before, "the display parser mutated canonical evidence");
+  const running = reportedTask("task_clock", { status: "arbitrary backend phase", active: true, output: undefined, elapsed_ms: 5000 });
+  h.emit("live", "raw tool text", "task_wait", { task_report: report([running]) });
+  const panel = taskCard(h), card = panel.parentNode, details = card.querySelector("details");
+  assert.equal(details.open, true);
+  assert.ok(card.querySelector("summary").textContent.includes(command));
+  const progress = reportedTask("task_clock", { status: "arbitrary backend phase", active: true, output: undefined, elapsed_ms: 9000,
+    progress: { ...running.progress, latest_activity: "read_file Cargo.toml", sequence: 24 } });
+  h.context.activity.subagents(JSON.stringify({ text: "Backend text says FAILED after 999s", task_report: report([progress], { snapshot: true }) }));
+  assert.equal(h.root.querySelectorAll(".task-output").filter((item) => item.parentNode.dataset.subagents === "true").length, 1);
+  assert.ok(card.querySelector("summary").textContent.includes("read_file Cargo.toml"));
+  const clock = vm.runInContext("subagentClocks.get(activityCard)", Object.assign(h.context, { activityCard: card }));
+  clock.paint(6000);
+  assert.ok(panel.querySelector(".task-identity").textContent.includes("14s"));
+  assert.ok(!panel.querySelector(".task-identity").textContent.includes("999s"));
+  const done = { ...progress, active: false, status: "running", output: "exact completed bytes\n" };
+  h.emit("live", "raw completion", "task_wait", { task_report: report([done]) });
+  assert.equal(details.open, false, "active=false is authoritative even when status text says running");
+  assertTask(panel, done);
 });
 
-test("task parser regression: delivered metadata-looking lines remain byte-for-byte in the body", () => {
-  const selection = "agent_reason=explicit agent override\nmodel_reason=explicit model override";
-  const body = [
-    "Delivered config:", "```toml", "[features]", "rate = true", "```",
-    "[diagnostic]", "Last known progress: text supplied by the subagent",
-    "Failure reason: text supplied by the subagent", "subagents · 9 active",
-    "  indented evidence  ", "", "\u001b[32mcolored delivered text\u001b[0m", "",
-  ].join("\n");
-  const output = "[task_id=task_build]\n[Task: " + task + " via build @ GPT-6.1-Sol (effort: max)] COMPLETED after 29.0s\n" +
-    selection + "\nLast known progress: processing output · updates 23\n" + body;
-  for (const mode of ["live", "replay", "cold"]) {
-    const h = harness(), panel = h.emit(mode, output);
-    assert.ok(panel);
-    assert.equal(panel.parentNode.querySelector(".prog").textContent,
-      selection + "\nLast known progress: processing output · updates 23\n" + body);
-    assert.doesNotMatch(panel.textContent, /\[features\]|\[diagnostic\]|text supplied by the subagent|9 active/);
-  }
+test("a late progress snapshot cannot overwrite a delivered result or reopen its clock", () => {
+  const h = harness(), done = reportedTask("task_done");
+  h.emit("live", "terminal", "task_wait", { task_report: report([done]) });
+  const panel = taskCard(h);
+  h.context.activity.subagents(JSON.stringify({ text: "late raw progress", task_report: report([
+    reportedTask("task_done", { status: "running", active: true, output: undefined }),
+  ], { snapshot: true }) }));
+  assertTask(panel, done);
+  assert.equal(panel.parentNode.querySelector("details").open, false);
 });
 
-test("task parser regression: an unclosed Task marker retains the plain-text fallback", () => {
-  const output = "[Task: truncated without closing bracket";
-  for (const mode of ["live", "replay", "cold"]) {
+test("structured repeat completions replace their own tool rows and preserve open raw folds", () => {
+  const h = harness(), first = reportedTask("task_repeat");
+  h.emit("live", "raw one", "task_wait", { task_report: report([first]) });
+  const details = h.root.querySelector("details"); details.open = true;
+  const second = { ...first, output: "raw delivered two\n", description: "Updated description" };
+  h.emit("live", "raw two", "task_wait", { task_report: report([second]) });
+  h.emit("live", "raw two", "task_wait", { task_report: report([second]) });
+  assert.equal(details.open, true);
+  assert.equal(h.root.querySelectorAll(".task-output").length, 2);
+  assertTask(taskCard(h), second);
+});
+
+for (const mode of ["live", "replay", "history", "cold"]) {
+  test("legacy task prose is an isolated verbatim plain-text fallback, " + mode, () => {
     const h = harness();
+    const output = terminalPayload + "\n\n" + "[Task: literal] ".repeat(300) + "\n  trailing bytes  \n";
     assert.equal(h.emit(mode, output), null);
     assert.equal(h.root.querySelector(".prog").textContent, output);
-  }
-});
+    assert.equal(taskCard(h), undefined);
+  });
+  test("unsupported/malformed fresh report retains raw output without prose inference, " + mode, () => {
+    for (const invalid of [report([], { version: 2 }), { schema: "ai.task-report", version: 1, tasks: "invalid" }]) {
+      const h = harness();
+      h.context.parseTaskToolResult = () => { throw new Error("old parser invoked"); };
+      assert.equal(h.emit(mode, terminalPayload, "task_wait", { task_report: invalid }), null);
+      assert.equal(h.root.querySelector(".prog").textContent, terminalPayload);
+    }
+  });
+}
 
-test("task parser regression: incidental task and bracket markers retain the plain-text fallback", () => {
-  for (const output of [
-    "Cannot parse output\ntask_wait is unavailable\n[diagnostic]",
-    "✓ task_wait\n[features]",
-    "[task_id=task_build]\n[Task: truncated without closing bracket",
-  ]) {
-    const h = harness();
-    assert.equal(h.emit("live", output), null);
-    assert.equal(h.root.querySelector(".prog").textContent, output);
-  }
-});
-
-test("task parser regression: padded table columns preserve models with spaces and dynamic widths", () => {
-  for (const model of ["GPT 6.1 Sol", "Vendor GPT 6.1 Sol Premium"]) {
-    const output = statusTable([["task_build", 42, "build", model, "max", "running", task]]);
-    const h = harness(), panel = h.emit("history", output, "task_status");
-    assert.ok(panel);
-    assert.equal(panel.querySelector(".task-identity").textContent, "build (" + model + ") (effort: max) · running");
-    assert.equal(panel.querySelector(".task-description").textContent, "task: " + task);
-    assert.equal(panel.querySelector(".task-meta").textContent, "task_id: task_build · pid: 42");
-  }
-});
-
-test("task parser regression: textual failure reasons render visibly beside the tool fold", () => {
-  const reason = "The subagent exceeded its wall-clock limit.";
-  const output = "[task_id=task_build]\n[Task: " + task + " via build @ GPT-6.1-Sol (effort: max)] FAILED after 29.0s\n" +
-    "agent_reason=explicit agent override\nmodel_reason=explicit model override\nFailure reason: " + reason +
-    "\nLast known progress: processing output · updates 23\nPartial output:\nSaved evidence";
-  for (const mode of ["live", "replay", "cold"]) {
-    const h = harness(), panel = h.emit(mode, output, "task_wait", { ok: false });
-    assert.ok(panel);
-    const error = panel.querySelector(".task-error");
-    assert.ok(error, "the textual failure reason is hidden in the raw fold");
-    assert.equal(error.textContent, "Failure reason: " + reason);
-    assert.equal(error.closest("details"), null);
-    assert.match(panel.parentNode.querySelector(".prog").textContent, /Partial output:\nSaved evidence/);
-  }
-});
-
-test("quiet task wait and status digests show their supplied state without fabricated metrics", () => {
-  for (const [name, output] of [
-    ["task_wait", "[task-wait] still running: reason=budget_elapsed waited=60s task_build(idle=15s,phase=processing output)"],
-    ["task_status", "[task-status] running=1 done=0 failed=0\ntask_build status=running phase=processing output idle=15s rev=2 checkpoint=saved finding"],
-  ]) {
-    const h = harness(), panel = h.emit("history", output, name);
-    assert.ok(panel);
-    assert.ok(panel.textContent.includes("processing output"));
-    assert.doesNotMatch(panel.textContent, /backend=|\(effort:|cache ·|speed ·|tok\/s|latest:/);
-  }
-});
-
-test("pending task_wait exposes the real latest-progress snapshot below its parked status", () => {
+test("an empty structured status snapshot resets active task state", () => {
   const h = harness();
-  const output = "[task_wait PARKED] Yielded CPU so 1 pending subagent task(s) can run. Pending task_ids: [task_build].\n" +
-    "Latest progress snapshots:\n- task_build: processing output · updates 23 · last activity 15s ago";
-  const panel = h.emit("history", output);
-  assert.ok(panel);
-  assert.match(panel.textContent, /wait · parked · 1 pending/);
-  assert.match(panel.textContent, /task_build: processing output · updates 23 · last activity 15s ago/);
-  assert.doesNotMatch(panel.parentNode.querySelector(".prog").textContent, /updates 23/);
+  h.emit("live", "none", "task_status", { task_report: report([], { snapshot: true }) });
+  const panel = taskCard(h);
+  assert.ok(panel); assert.equal(panel.parentNode.dataset.taskBusy, "false");
+  assert.equal(panel.parentNode.dataset.taskReset, "true");
 });
 
-test("missing JSON task fields omit identity, phase, elapsed time and throughput rather than inventing them", () => {
+test("structured history preserves raw fold expansion across a fresh document", () => {
+  const storage = new Map(), h = harness({ storage }), expected = reportedTask("task_history");
+  h.emit("history", "raw history bytes", "task_wait", { task_report: report([expected]) });
+  const details = h.root.querySelector("details"); details.open = true; details.fire("toggle");
+  const cold = harness({ storage: new Map(storage) });
+  cold.emit("cold", "raw history bytes", "task_wait", { task_report: report([expected]) });
+  assert.equal(cold.root.querySelector("details").open, true);
+  assertTask(taskCard(cold), expected);
+});
+
+test("truncated unrelated tools keep their existing notices and task CSS stays unchanged", () => {
   const h = harness();
-  const panel = h.emit("live", '{"tasks":[{"task_id":"task_build","status":"running"}]}');
-  assert.ok(panel);
-  assert.match(panel.textContent, /task_id: task_build/);
-  assert.match(panel.textContent, /running/);
-  assert.doesNotMatch(panel.textContent, /backend=|model|effort|phase:|latest:|updates|\d+s|cache|speed|tok/);
-});
-
-test("malformed task JSON and unrelated tools keep the raw fallback and truncation notices", () => {
-  for (const [name, output] of [["task_wait", '{"tasks":[{'], ["task_spawn", '{"unknown":42}'], ["read_file", terminalPayload]]) {
-    const h = harness();
-    assert.equal(h.emit("live", output, name, { arguments: "{", arguments_truncated: true, output_truncated: true, ok: false }), null);
-    assert.equal(h.root.querySelector("details").open, false);
-    const raw = h.root.querySelector(".prog").textContent;
-    assert.ok(raw.includes(output));
-    assert.match(raw, /Arguments\n\{\n\[preview truncated\]/);
-    assert.match(raw, /full output in history/);
-    assert.match(h.root.querySelector("summary").textContent, /^! /);
-  }
-});
-
-test("truncated recognized previews keep the warning and parsed-to-raw updates remove stale task rows", () => {
-  const h = harness();
-  const panel = h.emit("live", terminalPayload, "task_wait", { output_truncated: true });
-  assert.ok(panel);
-  assert.match(panel.parentNode.querySelector(".prog").textContent, /full output in history/);
-  h.emit("live", "Error: result unavailable", "task_wait", { output_truncated: false, ok: false });
-  assert.equal(h.root.querySelector(".task-output"), null);
-  assert.equal(h.root.querySelectorAll("summary").length, 1);
-  assert.equal(h.root.querySelector(".prog").textContent, "Error: result unavailable");
-});
-
-test("history refresh and a fresh document retain fold expansion while structured details stay visible", () => {
-  const storage = new Map(), h = harness({ storage });
-  const panel = h.emit("history", terminalPayload), details = panel.parentNode.querySelector("details");
-  details.open = true;
-  details.fire("toggle");
-  h.root.textContent = "";
-  const refreshed = h.emit("history", terminalPayload);
-  assert.equal(refreshed.parentNode.querySelector("details").open, true);
-  const cold = harness({ storage: new Map(storage) }), reopened = cold.emit("cold", terminalPayload);
-  assert.equal(reopened.parentNode.querySelector("details").open, true);
-  assertTerminalDetails(reopened);
-  const closed = reopened.parentNode.querySelector("details");
-  closed.open = false;
-  closed.fire("toggle");
-  const next = harness({ storage: new Map(cold.storage) }), collapsed = next.emit("cold", terminalPayload);
-  assert.equal(collapsed.parentNode.querySelector("details").open, false);
-  assertTerminalDetails(collapsed);
-});
-
-test("terminal control sequences are removed from parsed rows and command text stays selectable plain text", () => {
-  const h = harness();
-  const injection = '<img src=x onerror="alert(1)">';
-  const panel = h.emit("live", "\u001b[32m" + terminalPayload.replace(command, injection) + "\u001b[0m");
-  assert.ok(panel);
-  assert.ok(panel.textContent.includes(injection));
-  assert.doesNotMatch(panel.textContent, /\u001b/);
-  assert.equal(panel.querySelectorAll("img").length, 0);
+  assert.equal(h.emit("live", terminalPayload, "read_file", { arguments: "{", arguments_truncated: true, output_truncated: true, ok: false }), null);
+  assert.ok(h.root.querySelector(".prog").textContent.includes(terminalPayload));
+  assert.match(h.root.querySelector(".prog").textContent, /full output in history/);
   assert.match(css, /\.msg \.task-output\s*\{[^}]*overflow-wrap:\s*anywhere/);
   assert.match(css, /\.msg \.task-output\s*\{[^}]*white-space:\s*pre-wrap/);
-  assert.doesNotMatch(css, /\.task-output[^}]*user-select:\s*none/);
+});
+
+test("bounded replay output keeps all metadata and explicitly points to the complete history body", () => {
+  const expected = reportedTask("task_preview", { description: "Multiline\n" + "metadata ".repeat(600), output: "exact output ".repeat(800) + "\n  end  \n" });
+  const preview = { ...expected, output: expected.output.slice(0, 2000), output_truncated: true };
+  const replay = harness();
+  replay.emit("replay", "raw preview", "task_wait", { task_report: report([preview]), output_truncated: true });
+  assertTask(taskCard(replay), preview);
+  assert.ok(taskCard(replay).textContent.includes("full output in history"));
+  const cold = harness();
+  cold.emit("cold", "full raw history", "task_wait", { task_report: report([expected]) });
+  assertTask(taskCard(cold), expected);
+  assert.ok(!taskCard(cold).textContent.includes("preview truncated"));
+});
+
+test("later progress and replay previews preserve a complete delivered result and its explicit error", () => {
+  const h = harness(), expected = reportedTask("task_terminal", { status: "failed", error: "actual error", output: "exact output ".repeat(800) });
+  h.emit("live", "raw terminal", "task_wait", { task_report: report([expected]) });
+  h.context.activity.subagents({ task_report: report([{ ...expected, error: undefined, output: undefined, active: false }], { snapshot: true }) });
+  assertTask(taskCard(h), expected);
+  h.emit("live", "replay preview", "task_wait", { task_report: report([{ ...expected, output: expected.output.slice(0, 2000), output_truncated: true }]) });
+  assertTask(taskCard(h), expected);
+});
+
+test("unknown task timing stays absent instead of inventing an elapsed counter", () => {
+  const h = harness(), expected = reportedTask("task_unknown_time", { active: true, output: undefined, elapsed_ms: undefined });
+  h.emit("live", "raw", "task_wait", { task_report: report([expected]) });
+  const identity = taskCard(h).querySelector(".task-identity").textContent;
+  assert.ok(identity.endsWith("completed"));
 });

@@ -369,6 +369,174 @@ fn decoder_passes_subagent_progress_through() {
 }
 
 #[tokio::test]
+async fn task_report_json_frames_reassemble_and_replay_complete_tool_and_progress_events() {
+    use crate::ai::background::{ServeLiveKind, serve_json_frames, serve_tool_result_payload};
+    use crate::ai::tools::task_tools::{TaskReport, TaskReportTask};
+    let first_body = format!(
+        "  exact bytes  \n{}\n[task_id=forged]\n",
+        "界🙂\\\"\n".repeat(5000)
+    );
+    let mut report = TaskReport::for_task(TaskReportTask {
+        task_id: Some("task-first".into()),
+        description: "line one\n  line two  ".into(),
+        agent: "build".into(),
+        model: "Model with spaces".into(),
+        status: "completed".into(),
+        output: Some(first_body.clone()),
+        ..TaskReportTask::default()
+    });
+    report.tasks.push(TaskReportTask {
+        task_id: Some("task-second".into()),
+        description: "Second task".into(),
+        agent: "review".into(),
+        model: "second model".into(),
+        status: "waiting".into(),
+        active: true,
+        ..TaskReportTask::default()
+    });
+    let call = crate::ai::types::ToolCall {
+        id: "call".into(),
+        tool_type: "function".into(),
+        function: crate::ai::types::FunctionCall {
+            name: "task_wait".into(),
+            arguments: "{}".into(),
+        },
+    };
+    let result = crate::ai::types::ToolResult {
+        tool_call_id: "call".into(),
+        content: first_body.clone(),
+        task_report: Some(report.clone()),
+    };
+    let tool = serve_tool_result_payload(&call, &result, true, false, true).unwrap();
+    let progress =
+        serde_json::json!({"text":"unchanged terminal status", "task_report":report}).to_string();
+    let frames = serve_json_frames(ServeLiveKind::Tool, &tool);
+    assert!(frames.len() > 2);
+    for (_, payload) in &frames {
+        assert!(payload.len() <= crate::ai::background::MAX_SERVE_FRAME_BYTES);
+    }
+    let wire = frames
+        .iter()
+        .chain(serve_json_frames(ServeLiveKind::SubagentProgress, &progress).iter())
+        .flat_map(|(kind, payload)| test_frame(*kind, payload.as_bytes()))
+        .collect::<Vec<_>>();
+    let mut decoder = ServeFrameDecoder::default();
+    let events = wire
+        .chunks(137)
+        .flat_map(|chunk| decoder.push(chunk))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events,
+        vec![
+            ServeLiveEvent::Tool(tool.clone()),
+            ServeLiveEvent::SubagentProgress(progress.clone())
+        ]
+    );
+    assert!(decoder.finish().is_empty());
+    let bus = SessionEventBus::default();
+    let log = bus.begin("task-report-test");
+    for event in events {
+        let sse = live_event(event).unwrap();
+        log.publish(&sse.kind, &sse.data);
+        let response = Sse::new(stream::iter([Ok::<_, std::convert::Infallible>(
+            sse.clone().into_event(),
+        )]))
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains(&format!("event: {}", sse.kind)));
+        assert!(text.contains(&sse.data));
+    }
+    let (replay, _, _) = bus.snapshot("task-report-test", 0).unwrap();
+    assert_eq!(replay.len(), 2);
+    assert_eq!(replay[0].data, tool);
+    assert_eq!(replay[1].data, progress);
+    let restored: serde_json::Value = serde_json::from_str(&replay[0].data).unwrap();
+    assert_eq!(restored["task_report"]["tasks"][0]["output"], first_body);
+
+    let mut truncated = ServeFrameDecoder::default();
+    for (index, (kind, payload)) in frames.iter().enumerate() {
+        if index == 1 {
+            continue;
+        }
+        assert!(
+            truncated
+                .push(&test_frame(*kind, payload.as_bytes()))
+                .is_empty()
+        );
+    }
+    assert!(
+        truncated.finish().is_empty(),
+        "a dropped chunk must never become a corrupted authoritative report"
+    );
+}
+
+#[tokio::test]
+async fn task_report_cold_and_filtered_history_expose_complete_metadata_beside_verbatim_content() {
+    use crate::ai::history::Message;
+    use crate::ai::tools::task_tools::{TaskReport, TaskReportTask};
+    let state = lifecycle_test_state();
+    let root = state.history_file.parent().unwrap().to_path_buf();
+    let store = SessionStore::new(&state.history_file);
+    let body = format!(
+        "  full body  \n{}\n[task_id=literal]\n",
+        "evidence ".repeat(4000)
+    );
+    let report = TaskReport::for_task(TaskReportTask {
+        task_id: Some("task-history".into()),
+        description: "Description\n  second line  ".into(),
+        agent: "build".into(),
+        model: "Model with spaces".into(),
+        status: "completed".into(),
+        output: Some(body.clone()),
+        ..TaskReportTask::default()
+    });
+    let message = Message {
+        role: "tool".into(),
+        content: serde_json::json!(&body),
+        tool_call_id: Some("call".into()),
+        tool_calls: None,
+        reasoning_content: TaskReport::message_metadata(Some(&report)),
+    };
+    crate::ai::history::append_history_messages(
+        &store.session_history_file("task-report-history"),
+        std::slice::from_ref(&message),
+    )
+    .unwrap();
+    for query in [
+        serde_json::json!({}),
+        serde_json::json!({"role":"tool"}),
+        serde_json::json!({"limit":1}),
+    ] {
+        let response = super::read_history(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("task-report-history".into()),
+            Query(serde_json::from_value(query).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(rows[0]["content"], body);
+        assert_eq!(
+            rows[0]["task_report"],
+            serde_json::to_value(&report).unwrap()
+        );
+        assert!(rows[0].get("reasoning_content").is_none());
+    }
+    let restored = store.read_all_messages("task-report-history").unwrap();
+    assert_eq!(restored[0], message);
+    assert_eq!(TaskReport::from_message(&restored[0]), Some(report));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn serve_tool_lifecycle_decoder_and_sse_preserve_order() {
     use crate::ai::background::{
         ServeLiveKind, serve_tool_finished_payload, serve_tool_started_payload,
@@ -1025,9 +1193,36 @@ async fn session_list_offset_matches_the_legacy_full_response() {
         .json::<Vec<serde_json::Value>>()
         .await
         .expect("page json");
+    let newest_response = client
+        .get(format!(
+            "{base}/sessions?newest=true&offset=0&limit=2&include={}",
+            all[0]["id"].as_str().expect("included id")
+        ))
+        .send()
+        .await
+        .expect("newest page request");
+    assert_eq!(
+        newest_response
+            .headers()
+            .get("x-sessions-total")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    assert_eq!(
+        newest_response
+            .headers()
+            .get("x-sessions-page-size")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    let newest = newest_response
+        .json::<Vec<serde_json::Value>>()
+        .await
+        .expect("newest page json");
 
     assert_eq!(all.len(), 3);
     assert_eq!(page, vec![all[1].clone()]);
+    assert_eq!(newest, vec![all[2].clone(), all[1].clone(), all[0].clone()]);
     server.abort();
     let _ = server.await;
     std::fs::remove_dir_all(root).expect("remove test root");
@@ -2990,11 +3185,17 @@ async fn history_compression_frames_map_to_sse_progress_events() {
 
 #[tokio::test]
 async fn serve_thinking_rate_frames_attach_metrics_without_changing_legacy_text() {
-    use crate::ai::background::ServeLiveKind;
-    let rate = "~8 tok @ 4.00 tok/s";
+    use crate::ai::background::{ServeLiveKind, ServeTokenRate};
+    let rate = ServeTokenRate {
+        phase: "reasoning".to_string(),
+        tokens: 8,
+        elapsed_ms: Some(2_000),
+        approximate: true,
+    };
+    let rate_payload = serde_json::to_vec(&rate).unwrap();
     let wire = [
         test_frame(ServeLiveKind::ThinkingStart, b""),
-        test_frame(ServeLiveKind::ThinkingRate, rate.as_bytes()),
+        test_frame(ServeLiveKind::ThinkingRate, &rate_payload),
         test_frame(ServeLiveKind::Thinking, b"first"),
         test_frame(ServeLiveKind::ThinkingDone, b""),
         test_frame(ServeLiveKind::ThinkingStart, b""),
@@ -3009,7 +3210,7 @@ async fn serve_thinking_rate_frames_attach_metrics_without_changing_legacy_text(
         .collect();
     assert_eq!(
         events[1],
-        ServeLiveEvent::Thinking("first".to_string(), Some(rate.to_string()))
+        ServeLiveEvent::Thinking("first".to_string(), Some(rate.clone()))
     );
     assert_eq!(
         events[4],
@@ -3025,7 +3226,7 @@ async fn serve_thinking_rate_frames_attach_metrics_without_changing_legacy_text(
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert_eq!(text.matches("event: thinking\n").count(), 2, "{text}");
     assert_eq!(text.matches("\"rate\"").count(), 1, "{text}");
-    assert!(text.contains(rate), "{text}");
+    assert!(text.contains(r#""elapsed_ms":2000"#), "{text}");
     assert!(text.contains("legacy"), "{text}");
 }
 

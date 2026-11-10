@@ -1126,7 +1126,9 @@ pub(super) fn append_tool_result_messages_for_model(
             content: Value::String(result.content.clone()),
             tool_calls: None,
             tool_call_id: Some(result.tool_call_id.clone()),
-            reasoning_content: None,
+            reasoning_content: crate::ai::tools::task_tools::TaskReport::message_metadata(
+                result.task_report.as_ref(),
+            ),
         };
         messages.push(projected_tool_message);
         turn_messages.push(raw_tool_message);
@@ -1584,6 +1586,7 @@ mod tests {
                 .iter()
                 .zip(contents.iter())
                 .map(|(call, content)| ToolResult {
+                    task_report: None,
                     tool_call_id: call.id.clone(),
                     content: content.clone(),
                 })
