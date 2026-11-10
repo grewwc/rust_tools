@@ -32,6 +32,9 @@ fn print_commands_help() {
         "    /audit <instruction>      run the audit subagent synchronously (up to 15 min), then verify and fix findings"
     );
     println!(
+        "    /audit --deep [--fast] <instruction>  opt into inventory, scoped audit rounds, and disposition checks"
+    );
+    println!(
         "    /changes [/diff] [--stat|--json|--patch|--open]  show session file changes & open diff externally"
     );
     println!("    /clear                    clear the terminal screen");

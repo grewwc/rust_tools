@@ -1220,45 +1220,40 @@ pub(in crate::ai::driver) async fn run_turn(
     app.fire_turn_start_hooks(turn_index);
 
     let result = (async {
-        // `/audit` with an instruction runs the audit subagent in the foreground, then
-        // auto-fixes by default: the same turn continues in the normal model loop
-        // with the audit report as the fix prompt. `/audit` / `/audit -f` without
-        // an instruction is NOT short-circuited: the audit scope is left to the
-        // lead agent, which must generate the audit content itself in a normal
-        // turn (the note is injected in run_turn_body). Subagents (depth > 0) never match.
-        let self_generated_audit =
+        // Default audits retain the single foreground runner; only --deep enters planning.
+        let (self_generated_audit, pending_audit) =
             if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0 {
                 match crate::ai::driver::commands::audit::parse_audit_command(&question) {
                     Some(crate::ai::driver::commands::audit::AuditCommand::SelfGenerated {
-                        fast,
-                    }) => Some(fast),
-                    Some(
-                        crate::ai::driver::commands::audit::AuditCommand::Run {
-                            instruction,
-                            fast,
-                        },
-                    ) => match run_audit_subagent(app, &instruction, fast) {
+                        fast, deep: false,
+                    }) => (Some(fast), None),
+                    Some(crate::ai::driver::commands::audit::AuditCommand::Run {
+                        instruction, fast, deep: false,
+                    }) => match run_audit_subagent(app, &instruction, fast) {
                         Some(report) => {
-                            question =
-                                crate::ai::driver::commands::audit::build_audit_fix_followup(
-                                    &instruction,
-                                    &report,
-                                );
-                            None
+                            question = crate::ai::driver::commands::audit::build_audit_fix_followup(
+                                &instruction, &report,
+                            );
+                            (None, None)
                         }
-                        // Subagent failed to start: nothing to fix, end the turn.
                         None => {
-                            return Ok(if should_quit {
-                                TurnOutcome::Quit
-                            } else {
-                                TurnOutcome::Continue
-                            })
+                            return Ok(if should_quit { TurnOutcome::Quit } else { TurnOutcome::Continue });
                         }
                     },
-                    None => None,
+                    Some(command) => {
+                        if let crate::ai::driver::commands::audit::AuditCommand::Run {
+                            instruction, fast, ..
+                        } = &command {
+                            question = crate::ai::driver::commands::audit::build_audit_lead_request(
+                                instruction, *fast, &app.current_model,
+                            );
+                        }
+                        (None, Some(PendingAudit::new(command)))
+                    }
+                    None => (None, None),
                 }
             } else {
-                None
+                (None, None)
             };
         // Inject (session_id, turn_id) into task-local storage so downstream tool calls and
         // feedback write paths see the correct identity. turn_id is allocated atomically by the
@@ -1331,22 +1326,58 @@ pub(in crate::ai::driver) async fn run_turn(
                 crate::ai::driver::runtime_ctx::DECISION_LOG_TARGET
                     .scope(
                         decision_log_target,
-                        run_turn_body(
+                        async {
+                            let fallback = pending_audit.clone();
+                            let turn = run_turn_body(
                             app,
                             mcp_client,
                             skill_manifests,
                             history_count,
                             turn_index,
                             question,
-                            attachments_text,
-                            next_model,
+                            attachments_text.clone(),
+                            next_model.clone(),
                             precomputed_ocr,
                             one_shot_mode,
                             self_generated_audit,
+                            pending_audit,
                             should_quit,
                             DelegationAdvisoryState::default(),
                             LlmSummaryBudget::default(),
-                        ),
+                            );
+                            if fallback.is_none() {
+                                return turn.await;
+                            }
+                            let result = turn.await.map_err(|error| error.to_string());
+                            match result {
+                                Ok(outcome) => Ok(outcome),
+                                Err(error) => {
+                                    if let Some(pending) = fallback
+                                        && let Some(report) = pending.recover_lead_error_with(
+                                            app.last_turn_interrupted, |instruction, fast| {
+                                                crate::ai::driver::print::print_line(&format!(
+                                                    "\n[audit] Lead planning failed: {error}; running the original foreground audit."
+                                                ));
+                                                run_audit_scope_round(app, instruction, fast, None, true)
+                                            },
+                                        )
+                                    {
+                                        if let Some(report) = report {
+                                            let crate::ai::driver::commands::audit::AuditCommand::Run { instruction, .. } = &pending.command else { unreachable!() };
+                                            let fix_question = crate::ai::driver::commands::audit::build_audit_round_followup(instruction, &report, 1);
+                                            return run_turn_body(
+                                                app, mcp_client, skill_manifests, history_count, turn_index,
+                                                fix_question, attachments_text, next_model, None,
+                                                one_shot_mode, None, pending.next_round(), should_quit,
+                                                DelegationAdvisoryState::default(), LlmSummaryBudget::default(),
+                                            ).await;
+                                        }
+                                        return Err(format!("audit lead planning failed and foreground startup failed: {error}").into());
+                                    }
+                                    Err(error.into())
+                                }
+                            }
+                        },
                     )
                     .await
             })
@@ -1424,6 +1455,820 @@ fn run_audit_subagent(app: &App, instruction: &str, fast: bool) -> Option<String
             ));
             None
         }
+    }
+}
+
+#[derive(Clone)]
+struct PendingAudit {
+    command: crate::ai::driver::commands::audit::AuditCommand,
+    round: u8,
+    dispatch_attempted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PendingAudit {
+    fn new(command: crate::ai::driver::commands::audit::AuditCommand) -> Self {
+        Self {
+            command,
+            round: 1,
+            dispatch_attempted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn is_deep(&self) -> bool {
+        matches!(
+            self.command,
+            crate::ai::driver::commands::audit::AuditCommand::Run { deep: true, .. }
+                | crate::ai::driver::commands::audit::AuditCommand::SelfGenerated {
+                    deep: true,
+                    ..
+                }
+        )
+    }
+
+    fn mark_dispatch(&self) {
+        self.dispatch_attempted
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn fallback_after_lead_error(&self, interrupted: bool) -> bool {
+        self.is_deep()
+            && !interrupted
+            && self.round == 1
+            && matches!(
+                self.command,
+                crate::ai::driver::commands::audit::AuditCommand::Run { .. }
+            )
+            && !self
+                .dispatch_attempted
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn recover_lead_error_with<T>(
+        &self,
+        interrupted: bool,
+        run: impl FnOnce(&str, bool) -> T,
+    ) -> Option<T> {
+        if !self.fallback_after_lead_error(interrupted) {
+            return None;
+        }
+        let crate::ai::driver::commands::audit::AuditCommand::Run {
+            instruction, fast, ..
+        } = &self.command
+        else {
+            return None;
+        };
+        self.mark_dispatch();
+        Some(run(instruction, *fast))
+    }
+
+    fn next_round(&self) -> Option<Self> {
+        (self.is_deep() && self.round < 2).then(|| Self {
+            round: self.round + 1,
+            ..self.clone()
+        })
+    }
+}
+
+struct AuditDispatch {
+    instruction: String,
+    fast: bool,
+    scopes: Option<Vec<String>>,
+}
+
+/// Plans and startup fallback must be consumed before any final response is committed.
+fn pending_audit_dispatch_before_finalization(
+    pending: Option<&PendingAudit>,
+    assistant_text: &str,
+    turn_messages: &[history::Message],
+    interrupted: bool,
+) -> Result<Option<AuditDispatch>, String> {
+    let Some(pending) = pending.filter(|pending| pending.is_deep() && !interrupted) else {
+        return Ok(None);
+    };
+    let plan = if pending.round == 1 {
+        crate::ai::driver::commands::audit::parse_audit_scope_plan(assistant_text)
+    } else if assistant_text.contains("<audit_plan>") {
+        crate::ai::driver::commands::audit::parse_audit_followup_scope_plan(assistant_text)
+    } else {
+        return Ok(None);
+    };
+    let scopes = match plan {
+        Ok(scopes) => Some(scopes),
+        Err(error) if pending.round == 1 => {
+            crate::ai::driver::print::print_line(&format!(
+                "\n[audit] Lead scope plan unavailable: {error}; running the original foreground audit."
+            ));
+            None
+        }
+        Err(error) => return Err(format!("audit round-two plan rejected: {error}")),
+    };
+    match &pending.command {
+        crate::ai::driver::commands::audit::AuditCommand::Run {
+            instruction, fast, ..
+        } => Ok(Some(AuditDispatch {
+            instruction: instruction.clone(),
+            fast: *fast,
+            scopes,
+        })),
+        crate::ai::driver::commands::audit::AuditCommand::SelfGenerated { fast, .. } => {
+            if scopes.is_none() {
+                if crate::ai::driver::commands::audit::turn_successfully_spawned_audit_subagent(
+                    turn_messages,
+                ) {
+                    return Ok(None);
+                }
+                crate::ai::driver::print::print_line(
+                    "\n[audit] No audit child started successfully; running the foreground fallback.",
+                );
+            }
+            Ok(Some(AuditDispatch {
+                instruction: assistant_text.to_string(),
+                fast: *fast,
+                scopes,
+            }))
+        }
+    }
+}
+
+/// Persist intermediate model output without rendering or publishing a committed serve body.
+fn persist_audit_intermediate_output(
+    app: &App,
+    output: &TurnOutputState,
+    response_model: &str,
+    turn_messages: &mut Vec<history::Message>,
+    one_shot_mode: bool,
+    persisted_turn_messages: &mut usize,
+) {
+    if !output.assistant_recorded && !output.assistant_text.trim().is_empty() {
+        turn_messages.push(history::Message {
+            role: "assistant".into(),
+            content: serde_json::Value::String(output.assistant_text.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+    }
+    persist_pending_turn_messages_for_model(
+        app,
+        response_model,
+        one_shot_mode,
+        turn_messages,
+        persisted_turn_messages,
+    );
+}
+
+enum TurnBodyStage {
+    Finished(TurnOutcome),
+    AuditFollowup {
+        question: String,
+        pending_audit: Option<PendingAudit>,
+        delegation_advisory: DelegationAdvisoryState,
+        llm_summary_budget: LlmSummaryBudget,
+    },
+}
+
+/// Use the foreground runner for every scope so timeout, cancellation and V1 recovery stay shared.
+fn run_audit_scope_round(
+    app: &App,
+    instruction: &str,
+    fast: bool,
+    scopes: Option<&[String]>,
+    allow_startup_fallback: bool,
+) -> Option<String> {
+    use crate::ai::driver::{commands::audit, runtime_ctx};
+    let fallback = audit::foreground_audit_fallback(instruction, fast, &app.current_model);
+    let invocations = scopes
+        .map(|scopes| {
+            audit::foreground_audit_invocations(instruction, scopes, fast, &app.current_model)
+        })
+        .unwrap_or_default();
+    let context = runtime_ctx::try_current();
+    let cwd = runtime_ctx::effective_cwd().ok();
+    let identity = runtime_ctx::TURN_IDENTITY.try_with(Clone::clone).ok();
+    let handle = tokio::runtime::Handle::current();
+    let run = |invocation: &audit::ForegroundAuditInvocation| {
+        let Some(context) = &context else {
+            return Err("foreground audit requires DRIVER_CTX".into());
+        };
+        let _runtime = handle.enter();
+        let execute = || {
+            crate::ai::driver::tools::execute_direct_subagent_task(
+                &invocation.tool_call_id,
+                &invocation.args,
+                invocation.hard_timeout,
+                invocation.wrap_up_lead_time,
+            )
+        };
+        runtime_ctx::DRIVER_CTX.sync_scope(context.clone(), || {
+            let execute = || match &identity {
+                Some(identity) => runtime_ctx::TURN_IDENTITY.sync_scope(identity.clone(), execute),
+                None => execute(),
+            };
+            match &cwd {
+                Some(cwd) => runtime_ctx::SUBAGENT_CWD.sync_scope(cwd.clone(), execute),
+                None => execute(),
+            }
+        })
+    };
+    let results = if invocations.len() > 1 {
+        tokio::task::block_in_place(|| {
+            execute_audit_round_with(&invocations, &fallback, allow_startup_fallback, &run)
+        })
+    } else {
+        execute_audit_round_with(&invocations, &fallback, allow_startup_fallback, &run)
+    };
+    let mut reports = Vec::new();
+    let mut started = false;
+    for result in results {
+        match result {
+            Ok(result) => {
+                started = true;
+                crate::ai::driver::print::print_line(&format!(
+                    "\n{}",
+                    audit::terminal_audit_result(&result.content)
+                ));
+                reports.push(audit::audit_report_for_fix(&result.content));
+            }
+            Err(error) => {
+                crate::ai::driver::print::print_line(&format!(
+                    "\n[audit] Unable to start audit scope: {error}"
+                ));
+                reports.push(format!(
+                    "Audit scope startup failed; coverage remains unresolved: {error}"
+                ));
+            }
+        }
+    }
+    started.then(|| reports.join("\n\n===== Next audit scope =====\n\n"))
+}
+
+/// Attempt the prepared scopes together; only actual runner results can suppress startup fallback.
+fn execute_audit_round_with(
+    invocations: &[crate::ai::driver::commands::audit::ForegroundAuditInvocation],
+    fallback: &crate::ai::driver::commands::audit::ForegroundAuditInvocation,
+    allow_startup_fallback: bool,
+    run: &(
+         impl Fn(
+        &crate::ai::driver::commands::audit::ForegroundAuditInvocation,
+    ) -> Result<crate::ai::types::ToolResult, String>
+         + Sync
+     ),
+) -> Vec<Result<crate::ai::types::ToolResult, String>> {
+    if invocations.is_empty() {
+        return vec![run(fallback)];
+    }
+    let mut results = if invocations.len() == 1 {
+        vec![run(&invocations[0])]
+    } else {
+        std::thread::scope(|scope| {
+            let handles = invocations
+                .iter()
+                .map(|invocation| scope.spawn(|| run(invocation)))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err("foreground audit scope runner panicked".into()))
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    if allow_startup_fallback && results.iter().all(Result::is_err) {
+        results.push(run(fallback));
+    }
+    results
+}
+
+#[cfg(test)]
+mod audit_orchestration_tests {
+    use super::*;
+    use crate::ai::driver::commands::audit;
+    use crate::ai::types::{FunctionCall, ToolCall, ToolResult};
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn successful_audit_spawn_messages() -> Vec<history::Message> {
+        vec![
+            history::Message {
+                role: "assistant".into(),
+                content: serde_json::Value::Null,
+                tool_calls: Some(vec![ToolCall {
+                    id: "successful-audit-spawn".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "task_spawn".into(),
+                        arguments: r#"{"tasks":[{"agent":"audit"}]}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            history::Message {
+                role: "tool".into(),
+                content: serde_json::json!({
+                    "tasks": [{"status": "spawned", "agent": "audit", "task_id": "audit-child", "pid": 1}]
+                })
+                .to_string()
+                .into(),
+                tool_calls: None,
+                tool_call_id: Some("successful-audit-spawn".into()),
+                reasoning_content: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn audit_orchestration_self_generated_plan_dispatches_scopes() {
+        let pending = PendingAudit::new(audit::AuditCommand::SelfGenerated {
+            fast: true,
+            deep: true,
+        });
+        let plan = r#"Review the generated change. <audit_plan>{"scopes":["producer invariant","consumer invariant"]}</audit_plan>"#;
+        for messages in [Vec::new(), successful_audit_spawn_messages()] {
+            let dispatch =
+                pending_audit_dispatch_before_finalization(Some(&pending), plan, &messages, false)
+                    .unwrap()
+                    .expect("a valid self-generated plan must dispatch its scopes");
+            assert_eq!(dispatch.instruction, plan);
+            assert!(dispatch.fast);
+            assert_eq!(
+                dispatch.scopes.unwrap(),
+                ["producer invariant", "consumer invariant"]
+            );
+        }
+    }
+
+    #[test]
+    fn audit_orchestration_self_generated_missing_or_invalid_plan_uses_foreground_fallback() {
+        let pending = PendingAudit::new(audit::AuditCommand::SelfGenerated {
+            fast: false,
+            deep: true,
+        });
+        for text in [
+            "Review the generated change",
+            "<audit_plan>invalid</audit_plan>",
+        ] {
+            let dispatch =
+                pending_audit_dispatch_before_finalization(Some(&pending), text, &[], false)
+                    .unwrap()
+                    .expect("an unavailable plan with no child must use the foreground fallback");
+            assert_eq!(dispatch.instruction, text);
+            assert!(!dispatch.fast);
+            assert!(dispatch.scopes.is_none());
+            assert!(
+                pending_audit_dispatch_before_finalization(
+                    Some(&pending),
+                    text,
+                    &successful_audit_spawn_messages(),
+                    false,
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn audit_orchestration_self_generated_followup_requires_trigger_and_changed_axis() {
+        let pending = PendingAudit::new(audit::AuditCommand::SelfGenerated {
+            fast: false,
+            deep: true,
+        })
+        .next_round()
+        .expect("deep self-generated audits must allow a second round");
+        assert_eq!(pending.round, 2);
+        assert!(pending.next_round().is_none());
+        let plan = r#"<audit_plan>{"scopes":["new consumer invariant"],"triggers":[{"trigger":"T1","evidence":"consumer coverage gap remains"}],"changed_axis":"previously unread consumer"}</audit_plan>"#;
+        let dispatch = pending_audit_dispatch_before_finalization(Some(&pending), plan, &[], false)
+            .unwrap()
+            .expect("a compliant followup plan must dispatch");
+        assert_eq!(dispatch.scopes.unwrap(), ["new consumer invariant"]);
+        for invalid in [
+            r#"<audit_plan>{"scopes":["repeat"]}</audit_plan>"#.to_string(),
+            plan.replace("\"T1\"", "\"T4\""),
+            plan.replace("consumer coverage gap remains", ""),
+            plan.replace("previously unread consumer", ""),
+        ] {
+            let error =
+                pending_audit_dispatch_before_finalization(Some(&pending), &invalid, &[], false)
+                    .err()
+                    .expect("round two must validate triggers, evidence, and changed axis");
+            assert!(
+                error.starts_with("audit round-two plan rejected: "),
+                "{error}"
+            );
+        }
+        assert!(
+            pending_audit_dispatch_before_finalization(
+                Some(&pending),
+                "Verified dispositions are closed",
+                &[],
+                false,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            pending_audit_dispatch_before_finalization(Some(&pending), plan, &[], true)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn audit_orchestration_preflight_rejection_still_dispatches_foreground_fallback() {
+        let args = serde_json::json!({"tasks": [{"agent": "audit", "description": "review"}]});
+        let error = crate::ai::tools::task_tools::execute_task_spawn(&args).unwrap_err();
+        assert!(error.contains("Missing 'prompt'"), "{error}");
+        let attempted = history::Message {
+            role: "assistant".into(),
+            content: serde_json::Value::Null,
+            tool_calls: Some(vec![ToolCall {
+                id: "rejected-spawn".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "task_spawn".into(),
+                    arguments: args.to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let rejected = history::Message {
+            role: "tool".into(),
+            content: serde_json::Value::String(format!("Error: {error}")),
+            tool_calls: None,
+            tool_call_id: Some("rejected-spawn".into()),
+            reasoning_content: None,
+        };
+        assert!(!audit::turn_successfully_spawned_audit_subagent(&[
+            attempted, rejected
+        ]));
+        let fallback =
+            audit::foreground_audit_fallback("original instruction", false, "test-model");
+        let calls = AtomicUsize::new(0);
+        let results = execute_audit_round_with(&[], &fallback, true, &|invocation| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(invocation.tool_call_id, "slash-audit");
+            assert!(
+                invocation.args["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("original instruction")
+            );
+            Ok(ToolResult {
+                tool_call_id: invocation.tool_call_id.clone(),
+                content: "foreground audit started".into(),
+            })
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(results[0].is_ok());
+    }
+
+    #[test]
+    fn audit_orchestration_failed_scoped_starts_use_original_foreground_fallback() {
+        let scopes = vec!["producer invariant".into(), "consumer invariant".into()];
+        let invocations =
+            audit::foreground_audit_invocations("original", &scopes, false, "test-model");
+        let fallback = audit::foreground_audit_fallback("original", false, "test-model");
+        let calls = AtomicUsize::new(0);
+        let results = execute_audit_round_with(&invocations, &fallback, true, &|invocation| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            if invocation.tool_call_id != "slash-audit" {
+                return Err("scope startup rejected".into());
+            }
+            Ok(ToolResult {
+                tool_call_id: invocation.tool_call_id.clone(),
+                content: "fallback started".into(),
+            })
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 2);
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    }
+
+    #[test]
+    fn audit_orchestration_lead_error_fallback_and_round_limit() {
+        let pending = PendingAudit::new(audit::AuditCommand::Run {
+            instruction: "original".into(),
+            fast: false,
+            deep: true,
+        });
+        assert!(pending.fallback_after_lead_error(false));
+        assert!(!pending.fallback_after_lead_error(true));
+        let calls = AtomicUsize::new(0);
+        assert_eq!(
+            pending.recover_lead_error_with(false, |instruction, fast| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(instruction, "original");
+                assert!(!fast);
+                "foreground recovery"
+            }),
+            Some("foreground recovery")
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(
+            pending
+                .recover_lead_error_with(false, |_, _| panic!(
+                    "must not duplicate a dispatched audit"
+                ))
+                .is_none()
+        );
+        assert!(!pending.fallback_after_lead_error(false));
+        let round_two = pending.next_round().unwrap();
+        assert_eq!(round_two.round, 2);
+        assert!(round_two.next_round().is_none());
+        assert!(!round_two.fallback_after_lead_error(false));
+        let fallback = audit::foreground_audit_fallback("original", false, "test-model");
+        let scoped = audit::foreground_audit_invocations(
+            "original",
+            &["new consumer".into()],
+            false,
+            "test-model",
+        );
+        let calls = AtomicUsize::new(0);
+        let results = execute_audit_round_with(&scoped, &fallback, false, &|_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Err("round two startup rejected".into())
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(results[0].is_err());
+    }
+
+    #[test]
+    fn audit_orchestration_parallel_scopes_keep_timeout_wrap_up_and_v1_recovery() {
+        let scopes = audit::parse_audit_scope_plan(
+            r#"<audit_plan>{"scopes":["producer invariant","consumer invariant"]}</audit_plan>"#,
+        )
+        .unwrap();
+        let invocations =
+            audit::foreground_audit_invocations("original", &scopes, true, "test-model");
+        let fallback = audit::foreground_audit_fallback("original", true, "test-model");
+        assert_eq!(
+            fallback.hard_timeout,
+            audit::FAST_AUDIT_SUBAGENT_HARD_TIMEOUT
+        );
+        assert_eq!(
+            fallback.wrap_up_lead_time,
+            Some(audit::FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME)
+        );
+        assert_eq!(fallback.args["model"], "test-model");
+        assert_eq!(fallback.args["reasoning_effort"], "high");
+        let started = Arc::new(Barrier::new(2));
+        let results = execute_audit_round_with(&invocations, &fallback, true, &|invocation| {
+            if invocation.tool_call_id == "slash-audit" {
+                return Err("unexpected fallback after a timeout result".into());
+            }
+            started.wait();
+            assert_eq!(invocation.hard_timeout, audit::AUDIT_SUBAGENT_HARD_TIMEOUT);
+            assert_eq!(
+                invocation.wrap_up_lead_time,
+                Some(audit::AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME)
+            );
+            assert_eq!(invocation.args["agent"], "audit");
+            assert!(invocation.args.get("response_schema").is_none());
+            let content = if invocation.tool_call_id.ends_with('1') {
+                "SUBAGENT_TIMEOUT_RECOVERY_V1\nstatus: timed_out\npreserved_child_history: /tmp/audit-test.sqlite\nAUDIT_CHECKPOINT: named consumer gap\nError: exceeded hard timeout"
+            } else {
+                "Completed consumer audit"
+            };
+            Ok(ToolResult {
+                tool_call_id: invocation.tool_call_id.clone(),
+                content: content.into(),
+            })
+        });
+        assert_eq!(results.len(), 2);
+        let report = results
+            .into_iter()
+            .map(|result| audit::audit_report_for_fix(&result.unwrap().content))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let followup = audit::build_audit_round_followup("original", &report, 1);
+        assert!(followup.contains("SUBAGENT_TIMEOUT_RECOVERY_V1"));
+        assert!(followup.contains("AUDIT_CHECKPOINT: named consumer gap"));
+        assert!(followup.contains("Completed consumer audit"));
+    }
+
+    #[test]
+    fn audit_orchestration_serve_stays_open_through_both_rounds() {
+        use crate::ai::background::{self, ServeLiveKind};
+        let app = crate::ai::middleware::test_util::test_app();
+        assert!(app.cli.session.is_none());
+        let mut pending = Some(PendingAudit::new(audit::AuditCommand::Run {
+            instruction: "review the request-owned change".into(),
+            fast: false,
+            deep: true,
+        }));
+        let first_plan = r#"<audit_plan>{"scopes":["source invariant"]}</audit_plan>"#;
+        let second_plan = r#"<audit_plan>{"scopes":["new consumer invariant"],"triggers":[{"trigger":"T1","evidence":"consumer coverage gap remains"}],"changed_axis":"previously unread consumer"}</audit_plan>"#;
+        let (_, frames) = background::capture_serve_frames(|| {
+            background::with_serve_live_streaming_for_test(true, || {
+                for plan in [first_plan, second_plan] {
+                    // Existing deltas remain previews; no accepted body or done marker is sent.
+                    background::publish_serve_frame(ServeLiveKind::Delta, plan);
+                    let dispatch = pending_audit_dispatch_before_finalization(
+                        pending.as_ref(),
+                        plan,
+                        &[],
+                        false,
+                    )
+                    .unwrap()
+                    .expect("both audit plans must dispatch before finalization");
+                    let output = TurnOutputState {
+                        assistant_text: plan.into(),
+                        ..Default::default()
+                    };
+                    let mut messages = Vec::new();
+                    persist_audit_intermediate_output(
+                        &app,
+                        &output,
+                        "test-model",
+                        &mut messages,
+                        true,
+                        &mut 0,
+                    );
+                    assert_eq!(messages[0].content.as_str(), Some(plan));
+                    let invocations = audit::foreground_audit_invocations(
+                        &dispatch.instruction,
+                        dispatch.scopes.as_deref().unwrap(),
+                        dispatch.fast,
+                        "test-model",
+                    );
+                    let fallback = audit::foreground_audit_fallback(
+                        &dispatch.instruction,
+                        dispatch.fast,
+                        "test-model",
+                    );
+                    let results =
+                        execute_audit_round_with(&invocations, &fallback, true, &|invocation| {
+                            Ok(ToolResult {
+                                tool_call_id: invocation.tool_call_id.clone(),
+                                content: "round evidence".into(),
+                            })
+                        });
+                    assert!(results[0].is_ok());
+                    pending = pending.as_ref().unwrap().next_round();
+                }
+                assert!(pending.is_none());
+                assert!(
+                    pending_audit_dispatch_before_finalization(
+                        pending.as_ref(),
+                        "Verified dispositions are closed",
+                        &[],
+                        false,
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+            });
+        });
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|(kind, _)| *kind == ServeLiveKind::Delta));
+
+        // Pin the production boundary as well as the frame-free intermediate path above.
+        let source = include_str!("orchestrator.rs");
+        let body = source
+            .rsplit_once("async fn run_turn_body_round(")
+            .unwrap()
+            .1;
+        let classify = body
+            .find(
+                "let audit_dispatch = if pending_audit.as_ref().is_some_and(PendingAudit::is_deep)",
+            )
+            .unwrap();
+        let handoff = body.find("return Ok(TurnBodyStage::AuditFollowup").unwrap();
+        let finalize = body.find("let outcome = finalize_turn(").unwrap();
+        assert!(classify < handoff && handoff < finalize);
+        assert!(
+            !body.contains("run_turn_body("),
+            "audit handoff must not recursively re-enter the turn"
+        );
+    }
+
+    #[test]
+    fn audit_default_explicit_bypasses_lead_planning_and_scope_dispatch() {
+        let source = include_str!("orchestrator.rs");
+        let routing = source
+            .split("// Default audits retain the single foreground runner;")
+            .nth(1)
+            .unwrap();
+        let legacy = routing
+            .split("deep: false,")
+            .nth(2)
+            .unwrap()
+            .split("Some(command) =>")
+            .next()
+            .unwrap();
+        assert!(legacy.contains("run_audit_subagent(app, &instruction, fast)"));
+        assert!(legacy.contains("build_audit_fix_followup"));
+        assert!(!legacy.contains("build_audit_lead_request"));
+        assert!(!legacy.contains("run_audit_scope_round"));
+        assert!(!legacy.contains("PendingAudit::new"));
+    }
+
+    #[test]
+    fn audit_default_bare_fallback_follows_finalization_and_legacy_detection() {
+        let source = include_str!("orchestrator.rs");
+        let body = source
+            .rsplit_once("async fn run_turn_body_round(")
+            .unwrap()
+            .1;
+        let finalize = body.find("let outcome = finalize_turn(").unwrap();
+        let fallback = body
+            .find("// Preserve the legacy finalize-before-fallback ordering")
+            .unwrap();
+        assert!(finalize < fallback);
+        let legacy = &body[fallback..];
+        assert!(legacy.contains("!app.last_turn_interrupted"));
+        assert!(legacy.contains("turn_spawned_audit_subagent("));
+        assert!(legacy.contains("run_audit_subagent(app, &instruction, fast)"));
+        assert!(legacy.contains("build_audit_fix_followup"));
+        assert!(!legacy.contains("run_audit_scope_round"));
+        let call = history::Message {
+            role: "assistant".into(),
+            content: serde_json::Value::Null,
+            tool_calls: Some(vec![ToolCall {
+                id: "attempt".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "task_spawn".into(),
+                    arguments: r#"{"tasks":[{"agent":"audit-fast"}]}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        assert!(audit::turn_spawned_audit_subagent(&[call.clone()]));
+        assert!(!audit::turn_successfully_spawned_audit_subagent(&[call]));
+    }
+
+    #[test]
+    fn audit_orchestration_final_responses_keep_the_normal_finalization_path() {
+        for command in [
+            audit::AuditCommand::Run {
+                instruction: "original".into(),
+                fast: false,
+                deep: false,
+            },
+            audit::AuditCommand::SelfGenerated {
+                fast: true,
+                deep: false,
+            },
+        ] {
+            let legacy = PendingAudit::new(command);
+            assert!(!legacy.fallback_after_lead_error(false));
+            assert!(legacy.next_round().is_none());
+            assert!(
+                pending_audit_dispatch_before_finalization(
+                    Some(&legacy),
+                    "<audit_plan>invalid</audit_plan>",
+                    &[],
+                    false,
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        assert!(
+            pending_audit_dispatch_before_finalization(
+                None,
+                "<audit_plan>ordinary prose</audit_plan>",
+                &[],
+                false
+            )
+            .unwrap()
+            .is_none()
+        );
+        let round_two = PendingAudit::new(audit::AuditCommand::Run {
+            instruction: "original".into(),
+            fast: false,
+            deep: true,
+        })
+        .next_round()
+        .unwrap();
+        assert!(
+            pending_audit_dispatch_before_finalization(
+                Some(&round_two),
+                "Verified disposition evidence",
+                &[],
+                false
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            pending_audit_dispatch_before_finalization(
+                Some(&round_two),
+                "<audit_plan>invalid</audit_plan>",
+                &[],
+                false
+            )
+            .is_err()
+        );
     }
 }
 
@@ -1515,16 +2360,71 @@ async fn run_turn_body(
     skill_manifests: &[crate::ai::skills::SkillManifest],
     history_count: usize,
     turn_index: usize,
+    mut question: String,
+    attachments_text: String,
+    next_model: String,
+    mut precomputed_ocr: Option<crate::ai::driver::model::OcrExtraction>,
+    one_shot_mode: bool,
+    mut self_generated_audit: Option<bool>,
+    mut pending_audit: Option<PendingAudit>,
+    should_quit: bool,
+    mut delegation_advisory: DelegationAdvisoryState,
+    mut llm_summary_budget: LlmSummaryBudget,
+) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
+    loop {
+        match run_turn_body_round(
+            app,
+            mcp_client,
+            skill_manifests,
+            history_count,
+            turn_index,
+            question,
+            attachments_text.clone(),
+            next_model.clone(),
+            precomputed_ocr.take(),
+            one_shot_mode,
+            self_generated_audit,
+            pending_audit,
+            should_quit,
+            delegation_advisory,
+            llm_summary_budget,
+        )
+        .await?
+        {
+            TurnBodyStage::Finished(outcome) => return Ok(outcome),
+            TurnBodyStage::AuditFollowup {
+                question: followup,
+                pending_audit: next_audit,
+                delegation_advisory: next_advisory,
+                llm_summary_budget: next_budget,
+            } => {
+                question = followup;
+                self_generated_audit = None;
+                pending_audit = next_audit;
+                delegation_advisory = next_advisory;
+                llm_summary_budget = next_budget;
+            }
+        }
+    }
+}
+
+async fn run_turn_body_round(
+    app: &mut App,
+    mcp_client: &SharedMcpClient,
+    skill_manifests: &[crate::ai::skills::SkillManifest],
+    history_count: usize,
+    turn_index: usize,
     question: String,
     attachments_text: String,
     next_model: String,
     precomputed_ocr: Option<crate::ai::driver::model::OcrExtraction>,
     one_shot_mode: bool,
     self_generated_audit: Option<bool>,
+    pending_audit: Option<PendingAudit>,
     should_quit: bool,
     delegation_advisory: DelegationAdvisoryState,
     mut llm_summary_budget: LlmSummaryBudget,
-) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
+) -> Result<TurnBodyStage, Box<dyn std::error::Error>> {
     // Clear the previous round's interrupt flag at the start of every round so it
     // reflects only whether THIS round was interrupted by Ctrl+C.
     app.last_turn_interrupted = false;
@@ -1562,9 +2462,7 @@ async fn run_turn_body(
         Err(err) => return Err(err),
     };
 
-    // `/audit` / `/audit -f` without an instruction: tell the lead agent to generate the audit
-    // content itself (only it knows the change details) and start the audit subagent via
-    // `task_spawn`; the note is injected into the request projection only, not persisted history.
+    // The legacy bare-command note stays independent of deep pending state.
     if let Some(fast) = self_generated_audit {
         crate::ai::driver::commands::audit::inject_self_generated_audit_note(&mut messages, fast);
         crate::ai::driver::print::print_tool_note_line(
@@ -1575,6 +2473,25 @@ async fn run_turn_body(
                 "/audit 未带指令：审计内容由 lead agent 自生成"
             },
         );
+    }
+    if let Some(crate::ai::driver::commands::audit::AuditCommand::SelfGenerated {
+        fast,
+        deep: true,
+    }) = pending_audit.as_ref().map(|pending| &pending.command)
+    {
+        messages.push(history::Message {
+            role: history::ROLE_INTERNAL_NOTE.into(),
+            content: serde_json::Value::String(
+                crate::ai::driver::commands::audit::build_audit_lead_request(
+                    "Audit the changes owned for this request in this session",
+                    *fast,
+                    &app.current_model,
+                ),
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
     }
 
     persist_pending_turn_messages(
@@ -2795,7 +3712,7 @@ async fn run_turn_body(
     match loop_result {
         Ok(Some(outcome)) => {
             app.last_turn_had_tool_calls = false;
-            Ok(outcome)
+            Ok(TurnBodyStage::Finished(outcome))
         }
         Ok(_) => {
             // Cross-turn image-digest persistence (only on the normal turn-completion path; the
@@ -2844,8 +3761,65 @@ async fn run_turn_body(
                     "[image] backfilled {backfilled_digests} image digest(s) into history metadata"
                 ));
             }
-            // `?` (not `match`) so the boxed error never lives across the
-            // forced-audit fix `await` below (`Box<dyn Error>` is not `Send`).
+            // Audit plans are intermediate output. Dispatch and verification precede
+            // finalize_turn, which alone may commit the body and close a serve response.
+            let audit_dispatch = if pending_audit.as_ref().is_some_and(PendingAudit::is_deep) {
+                pending_audit_dispatch_before_finalization(
+                    pending_audit.as_ref(),
+                    &output.assistant_text,
+                    &turn_messages,
+                    app.last_turn_interrupted,
+                )?
+            } else {
+                None
+            };
+            if let Some(AuditDispatch {
+                fast,
+                instruction,
+                scopes,
+            }) = audit_dispatch
+            {
+                let pending = pending_audit
+                    .as_ref()
+                    .expect("dispatch requires a pending audit");
+                persist_audit_intermediate_output(
+                    app,
+                    &output,
+                    output.response_model.as_deref().unwrap_or(&next_model),
+                    &mut turn_messages,
+                    one_shot_mode,
+                    &mut persisted_turn_messages,
+                );
+                pending.mark_dispatch();
+                match run_audit_scope_round(
+                    app,
+                    &instruction,
+                    fast,
+                    scopes.as_deref(),
+                    pending.round == 1,
+                ) {
+                    Some(report) => {
+                        let fix_question =
+                            crate::ai::driver::commands::audit::build_audit_round_followup(
+                                &instruction,
+                                &report,
+                                pending.round,
+                            );
+                        return Ok(TurnBodyStage::AuditFollowup {
+                            question: fix_question,
+                            pending_audit: pending.next_round(),
+                            delegation_advisory: supervisor.progress.delegation_advisory,
+                            llm_summary_budget,
+                        });
+                    }
+                    None => {
+                        return Err(
+                            "foreground audit startup failed; no verified disposition was produced"
+                                .into(),
+                        );
+                    }
+                }
+            }
             let outcome = finalize_turn(
                 app,
                 &next_model,
@@ -2862,11 +3836,7 @@ async fn run_turn_body(
                 output.had_tool_error,
             )
             .await?;
-            // Self-generated `/audit` enforcement: the injected note tells the lead agent
-            // to start the audit subagent itself through task_spawn. If the turn ended
-            // without that (and was not interrupted), force a foreground `/audit` with
-            // this turn's final text as the instruction, so the audit always runs in a
-            // subagent instead of silently degrading to a lead-agent self-audit.
+            // Preserve the legacy finalize-before-fallback ordering for bare commands.
             if let Some(fast) = self_generated_audit
                 && !app.last_turn_interrupted
                 && !crate::ai::driver::commands::audit::turn_spawned_audit_subagent(
@@ -2876,47 +3846,31 @@ async fn run_turn_body(
                 crate::ai::driver::print::print_line(&format!(
                     "\n[audit] The lead agent did not start an audit subagent this turn; \
                      forcing `/audit{}` with this turn's output as the audit instruction.",
-                    if fast { " --fast" } else { "" }
+                    if fast { " --fast" } else { "" },
                 ));
-                // Forced audit also auto-fixes by default: run the audit
-                // subagent, then continue the same turn with the report
-                // as the fix prompt.
                 let instruction = output.assistant_text.clone();
                 match run_audit_subagent(app, &instruction, fast) {
                     Some(report) => {
-                        let fix_question =
-                            crate::ai::driver::commands::audit::build_audit_fix_followup(
+                        return Ok(TurnBodyStage::AuditFollowup {
+                            question: crate::ai::driver::commands::audit::build_audit_fix_followup(
                                 &instruction,
                                 &report,
-                            );
-                        return Box::pin(run_turn_body(
-                            app,
-                            mcp_client,
-                            skill_manifests,
-                            history_count,
-                            turn_index,
-                            fix_question,
-                            attachments_text.clone(),
-                            next_model.clone(),
-                            None,
-                            one_shot_mode,
-                            None,
-                            should_quit,
-                            supervisor.progress.delegation_advisory,
+                            ),
+                            pending_audit: None,
+                            delegation_advisory: supervisor.progress.delegation_advisory,
                             llm_summary_budget,
-                        ))
-                        .await;
+                        });
                     }
                     None => {
-                        return Ok(if should_quit {
+                        return Ok(TurnBodyStage::Finished(if should_quit {
                             TurnOutcome::Quit
                         } else {
                             TurnOutcome::Continue
-                        });
+                        }));
                     }
                 }
             }
-            Ok(outcome)
+            Ok(TurnBodyStage::Finished(outcome))
         }
         Err(err_str) => Err(err_str.into()),
     }

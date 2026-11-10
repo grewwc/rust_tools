@@ -2,6 +2,7 @@
 //! before a review observation may be published as a verified finding.
 
 use super::*;
+use rust_tools::commonw::FastMap;
 use serde::Deserialize;
 
 use crate::ai::types::{AUDIT_REPORT_CLOSE, AUDIT_REPORT_OPEN};
@@ -67,7 +68,7 @@ struct EvidenceLocation {
 #[derive(Debug, Clone)]
 struct ObservedRead {
     path: PathBuf,
-    shown_lines: HashSet<u64>,
+    shown_lines: FastSet<u64>,
     message_index: usize,
 }
 
@@ -311,7 +312,7 @@ fn finding_has_complete_evidence(
         return false;
     }
 
-    let mut locations = HashSet::new();
+    let mut locations = FastSet::default();
     finding
         .source_evidence
         .iter()
@@ -366,7 +367,7 @@ fn observed_successful_reads(
     turn_messages: &[Message],
     effective_cwd: Option<&Path>,
 ) -> Vec<ObservedRead> {
-    let mut calls_by_id = HashMap::new();
+    let mut calls_by_id = FastMap::default();
     let mut reads = Vec::new();
     for (message_index, message) in turn_messages.iter().enumerate() {
         if let Some(tool_calls) = &message.tool_calls {
@@ -443,7 +444,7 @@ fn observed_rendered_line_numbers(
     content: &str,
     requested_start: u64,
     requested_end: u64,
-) -> HashSet<u64> {
+) -> FastSet<u64> {
     content
         .lines()
         .filter_map(|line| {
@@ -465,7 +466,7 @@ fn is_evidence_snapshot_path(path: &Path) -> bool {
 }
 
 fn last_successful_direct_mutation(turn_messages: &[Message]) -> Option<usize> {
-    let mut calls_by_id = HashMap::new();
+    let mut calls_by_id = FastMap::default();
     let mut last_mutation = None;
     for (message_index, message) in turn_messages.iter().enumerate() {
         if let Some(tool_calls) = &message.tool_calls {

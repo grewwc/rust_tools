@@ -1156,6 +1156,11 @@ impl CommandCompleter {
         &["cmd", "commands", "shortcuts"]
     }
 
+    /// Leading flags accepted by `/audit` and its `:` alias.
+    fn audit_subcommands() -> &'static [&'static str] {
+        &["--deep", "--fast", "-f"]
+    }
+
     /// Subcommands of `/changes` / `/diff` (-- long options are primary, matching the command docs;
     /// the bare-word forms `stat`/`json`/`patch`/`open`/`help` are accepted by the parser too).
     fn changes_subcommands() -> &'static [&'static str] {
@@ -1712,6 +1717,11 @@ impl CommandCompleter {
                     "/personas" | ":personas" => Self::persona_subcommands(),
                     "/usage" | ":usage" => Self::usage_subcommands(),
                     "/help" | ":help" => Self::help_topics(),
+                    "/audit" | ":audit" => match words.next() {
+                        None => Self::audit_subcommands(),
+                        Some("--deep") if words.next().is_none() => &["--fast", "-f"],
+                        _ => &[],
+                    },
                     // `/git` is handled by its own branch above (third-token
                     // checkpoint names), so it has no arm here.
                     "/model" | ":model" => Self::model_subcommands(),
@@ -3759,6 +3769,88 @@ mod tests {
         // :changes completes in the colon form too
         let (_, candidates) = CommandCompleter::complete_for_line(":ch", 3);
         assert!(candidates.iter().any(|c| c.replacement == ":changes"));
+    }
+
+    #[test]
+    fn audit_subcommand_completion_lists_leading_flags() {
+        for command in ["/audit", ":audit"] {
+            for (prefix, expected) in [
+                ("", vec!["--deep", "--fast", "-f"]),
+                ("-", vec!["--deep", "--fast", "-f"]),
+                ("--", vec!["--deep", "--fast"]),
+                ("--d", vec!["--deep"]),
+                ("-f", vec!["-f"]),
+            ] {
+                let line = format!("{command} {prefix}");
+                let (start, candidates) = CommandCompleter::complete_for_line(&line, line.len());
+                assert_eq!(start, command.len() + 1, "{line}");
+                let replacements: Vec<_> = candidates
+                    .iter()
+                    .map(|candidate| candidate.replacement.as_str())
+                    .collect();
+                assert_eq!(replacements, expected, "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn audit_subcommand_completion_after_deep_lists_fast_flags() {
+        for command in ["/audit", ":audit"] {
+            for (prefix, expected) in [
+                ("", vec!["--fast", "-f"]),
+                ("-", vec!["--fast", "-f"]),
+                ("--", vec!["--fast"]),
+                ("-f", vec!["-f"]),
+                ("--d", vec![]),
+            ] {
+                let line = format!("{command} --deep {prefix}");
+                let (start, candidates) = CommandCompleter::complete_for_line(&line, line.len());
+                assert_eq!(start, format!("{command} --deep ").len(), "{line}");
+                let replacements: Vec<_> = candidates
+                    .iter()
+                    .map(|candidate| candidate.replacement.as_str())
+                    .collect();
+                assert_eq!(replacements, expected, "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn audit_subcommand_completion_stops_after_fast_or_instruction() {
+        for command in ["/audit", ":audit"] {
+            for arguments in [
+                "--fast ",
+                "-f ",
+                "--deep --fast ",
+                "--deep -f ",
+                "review ",
+                "review --deep ",
+                "--deep review ",
+                "--fast --deep ",
+            ] {
+                let line = format!("{command} {arguments}");
+                let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
+                assert!(candidates.is_empty(), "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn audit_subcommand_completion_requires_exact_deep_token() {
+        for command in ["/audit", ":audit"] {
+            for arguments in [
+                "--deeply ",
+                "--deeply --",
+                "--deeply review ",
+                "--dee ",
+                "--deep=all ",
+                "--deep --deep ",
+            ] {
+                let line = format!("{command} {arguments}");
+                let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
+                assert!(candidates.is_empty(), "{line}");
+            }
+        }
     }
 
     #[test]
