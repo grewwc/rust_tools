@@ -710,6 +710,10 @@ button:active:not(:disabled) { filter:brightness(.96); }
    independent of the rail, reading column, and compact footer. */
 #img::before { content:"+"; font-size:20px; font-weight:300; line-height:1; }
 @media (min-width:701px) {
+  /* Desktop body copy sits a touch heavier than Regular. 480 resolves to
+     Medium where the UI family provides one and stays at Regular otherwise,
+     so phones keep the base text weight untouched. */
+  body { font-weight:480; }
   /* Gray reading surfaces keep teal on actions and focus indicators. The
      shared palettes above continue to own every phone colour. */
   :root {
@@ -2769,6 +2773,10 @@ function switchSession(nextId, saveCurrent = true) {
   // being opened; the next poll or live stream re-derives it for this one.
   turnRunning = false;
   syncStopButton();
+  // Scroll intent belongs to the transcript being left: a scroll lock from the
+  // old conversation must not veto the follow request for the new one.
+  outputFollowSuspended = false;
+  jumpingToBottom = false;
   restoreDraft();
   resetQuestionNavigator();
   restoreSkillPick();
@@ -3645,7 +3653,18 @@ function formatSubagentElapsed(seconds) {
 }
 function createSubagentClock(fold) {
   let report = null, records = new Map(), rawText = "", lastTitle = "", lastRawText = null;
+  // The fold opens once when a run starts; after that its state belongs to the
+  // reader, so streaming progress never re-opens a card the reader collapsed.
+  // Completion still tidies away a card nobody touched.
+  let started = false, autoOpened = false, programmatic = null;
   const details = fold.box.querySelector("details");
+  if (typeof details.addEventListener === "function") {
+    details.addEventListener("toggle", () => {
+      if (programmatic !== null && details.open === programmatic) { programmatic = null; return; }
+      programmatic = null;
+      autoOpened = false;
+    });
+  }
   const render = (now) => {
     const value = report && { ...report, tasks: [...records.values()].map(({ task, at }) => {
       if (!task.active) return task;
@@ -3678,7 +3697,8 @@ function createSubagentClock(fold) {
         rawText = typeof event?.text === "string" ? event.text : typeof payload === "string" ? payload : "";
       }
       const running = [...records.values()].some((row) => row.task.active);
-      details.open = running;
+      if (running && !started) { started = true; programmatic = true; details.open = true; autoOpened = true; }
+      else if (!running && autoOpened) { programmatic = false; details.open = false; autoOpened = false; started = false; }
       render(Date.now());
       if (running) {
         subagentClocks.set(fold.box, clock);
@@ -3690,7 +3710,7 @@ function createSubagentClock(fold) {
       syncSubagentTicker();
     },
     stop() {
-      details.open = false;
+      if (autoOpened) { programmatic = false; details.open = false; autoOpened = false; started = false; }
       subagentClocks.delete(fold.box); tickingSubagents.delete(clock);
       syncSubagentTicker();
     },
@@ -4924,6 +4944,9 @@ function isPhoneLayout() {
 function sessionHoldConsumed(li) {
   return Number(li.dataset.holdSuppressUntil || 0) > Date.now();
 }
+// The hold timer of the row currently under a finger, so a list scroll can
+// drop it before it swallows the tap the reader meant as a pick.
+let cancelActiveSessionHold = null;
 // Phones have no hover affordance for per-session actions. A deliberate hold
 // opens an action sheet for that exact row; scrolling,
 // mouse input, and controls inside the row never start the hold timer.
@@ -4931,20 +4954,29 @@ function bindSessionLongPress(li, s) {
   let timer = null;
   let startX = 0;
   let startY = 0;
+  let startScroll = 0;
   const cancel = () => {
     if (timer !== null) clearTimeout(timer);
     timer = null;
+    if (cancelActiveSessionHold === cancel) cancelActiveSessionHold = null;
     li.classList.remove("holding");
   };
+  cancelActiveSessionHold = cancel;
   li.onpointerdown = (ev) => {
     if (!isPhoneLayout() || ev.pointerType === "mouse" || ev.isPrimary === false) return;
     if (ev.button != null && ev.button !== 0) return;
     if (ev.target && ev.target.closest && ev.target.closest("button,input")) return;
     startX = ev.clientX;
     startY = ev.clientY;
+    startScroll = li.parentNode ? li.parentNode.scrollTop : 0;
     li.classList.add("holding");
     timer = setTimeout(() => {
       timer = null;
+      // A finger that dragged the list is scrolling, not holding this row.
+      if (li.parentNode && li.parentNode.scrollTop !== startScroll) {
+        li.classList.remove("holding");
+        return;
+      }
       li.classList.remove("holding");
       li.dataset.holdSuppressUntil = String(Date.now() + 1200);
       openSessionActions(s, li);
@@ -5090,7 +5122,12 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
       hideConfirm();
       if (isPhoneLayout()) setDrawer(false);
       pollConfirm();
-      loadHistory();
+      // An explicit pick enters the transcript: land on its newest turn even
+      // when this session's earlier scroll offset is still remembered.
+      Promise.resolve(loadHistory()).then(
+        () => { if (sessionId === s.id) scrollToLatest(false); },
+        () => {},
+      );
       loadSessionConfig();
     };
     ul.appendChild(li);
@@ -5192,6 +5229,7 @@ async function loadOlderSessions() {
 if ($("sesslist") && typeof $("sesslist").addEventListener === "function") {
   const list = $("sesslist");
   list.addEventListener("scroll", () => {
+    if (cancelActiveSessionHold) cancelActiveSessionHold();
     if (list.scrollHeight > list.clientHeight
         && list.scrollTop + list.clientHeight >= list.scrollHeight - 24) loadOlderSessions();
   }, { passive: true });

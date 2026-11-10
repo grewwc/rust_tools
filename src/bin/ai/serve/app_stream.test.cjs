@@ -1940,6 +1940,24 @@ for (const recovered of [false, true]) {
   }
 }
 
+for (const phone of [false, true]) {
+  test(`reader collapse survives streaming subagent progress ${phone ? "phone" : "desktop"}`, () => {
+    const h = streamHarness({ phone });
+    const header = "subagents · 1 active\n└─ worker · running 5s · task: inspect\n";
+    const active = (command) => structuredSubagents(
+      [structuredTask("worker", 5000, { progress: { phase: "working", latest_activity: command } })], header);
+    h.emit("subagent_progress", active("execute_command ls"));
+    const card = h.box.children.find((item) => item.summary?.textContent.startsWith("subagents"));
+    const details = card.querySelector("details");
+    assert.equal(details.open, true, "a run opens the card once");
+    details.open = false;
+    h.emit("subagent_progress", active("read_file a"));
+    assert.equal(details.open, false, "streaming progress must not re-open a card the reader collapsed");
+    h.emit("subagent_progress", active("read_file b"));
+    assert.equal(details.open, false);
+  });
+}
+
 test("subagent snapshots stay distinct from logs and empty thinking markers", () => {
   const h = streamHarness();
   h.emit("thinking_start"); h.emit("thinking_done");

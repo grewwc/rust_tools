@@ -2007,6 +2007,20 @@ for (const phone of [true, false]) test("the " + (phone ? "phone" : "desktop") +
   assert.equal(h.attrs["aria-hidden"], "true");
 });
 
+test("an explicit landing clears the previous transcript's scroll lock", () => {
+  const h = scrollHarness({ phone: false, scrollTop: 120 });
+  h.context.noteTranscriptIntent(-1);
+  assert.equal(h.context.shouldFollowOutput(), false, "the reader is locked away from the live edge");
+  h.context.scrollToLatest(false);
+  assert.equal(h.msgs.scrollTop, 1000, "the landing jumps to the newest turn");
+  assert.equal(h.context.shouldFollowOutput(), true, "and the lock no longer vetoes following");
+});
+
+test("a sidebar pick lands on the newest turn after its history loads", () => {
+  assert.match(html, /Promise\.resolve\(loadHistory\(\)\)\.then\(\n\s+\(\) => \{ if \(sessionId === s\.id\) scrollToLatest\(false\); \},/);
+  assert.match(html, /outputFollowSuspended = false;\n  jumpingToBottom = false;\n  restoreDraft\(\);/);
+});
+
 test("same-session history refresh preserves a phone reader's position", async () => {
   const old = { key: "mounted-old" };
   const h = historyHarness({ existingKeys: ["old"], existingNodes: [old], follow: false });
