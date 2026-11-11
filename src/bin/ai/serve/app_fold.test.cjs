@@ -129,6 +129,16 @@ viewportTest("a closed subagent summary double-click toggles once on desktop and
   assert.equal(events.second.defaultPrevented, width >= 701);
 });
 
+viewportTest("an expanded task card collapses on a double tap in its report rows", (width) => {
+  const h = harness({ width }), fold = makeFold(true);
+  fold.card.dataset.taskOutput = "true";
+  // Task rows live in .task-output next to <details>, not inside it.
+  const row = node("DIV");
+  row.parentNode = fold.card;
+  doubleTap(h, row);
+  assert.equal(fold.details.open, width <= 700, "desktop closes the card; phones keep it open");
+});
+
 viewportTest("subagent summary single clicks and keyboard activation retain native toggles", (width) => {
   const h = harness({ width }), fold = makeFold(false, true);
   for (const [detail, expected] of [[1, true], [1, false], [0, true], [0, false]]) {

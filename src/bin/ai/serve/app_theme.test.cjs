@@ -187,9 +187,9 @@ test("desktop palette overrides use neutral surfaces and keep the shared accent"
       "--tint-4": "rgba(231,231,231,.11)"
     },
     "light": {
-      "--bg": "#efefef",
-      "--code-bg": "#e2e2e2",
-      "--code-toolbar": "#ececec",
+      "--bg": "#f1f1f1",
+      "--code-bg": "#e8e8e8",
+      "--code-toolbar": "#efefef",
       "--control-border": "#737373",
       "--card-edge": "rgba(46,46,46,.12)",
       "--card-shadow": "0 2px 4px rgba(46,46,46,.03), 0 10px 28px rgba(46,46,46,.05)",
@@ -203,44 +203,44 @@ test("desktop palette overrides use neutral surfaces and keep the shared accent"
       "--glass-strong": "rgba(243,243,243,.98)",
       "--line": "#9a9a9a",
       "--line-2": "#858585",
-      "--media-bg": "#dadada",
+      "--media-bg": "#e0e0e0",
       "--panel": "#f3f3f3",
       "--shadow-panel": "0 8px 28px rgba(46,46,46,.10)",
       "--shadow-sm": "0 2px 8px rgba(46,46,46,.05)",
-      "--surface": "#dfdfdf",
-      "--surface-2": "#ececec",
-      "--surface-hover": "#d3d3d3",
+      "--surface": "#e5e5e5",
+      "--surface-2": "#efefef",
+      "--surface-hover": "#d9d9d9",
       "--tint": "rgba(46,46,46,.06)",
       "--tint-2": "rgba(46,46,46,.04)",
       "--tint-3": "rgba(46,46,46,.14)",
       "--tint-4": "rgba(46,46,46,.13)"
     },
     "warm": {
-      "--bg": "#e9e7e7",
-      "--card-edge": "rgba(48,46,46,.12)",
-      "--card-shadow": "0 2px 8px rgba(48,46,46,.06)",
-      "--code-bg": "#e3e1e1",
-      "--code-toolbar": "#edebeb",
-      "--control-border": "#737373",
-      "--dim": "#585656",
-      "--edge": "rgba(48,46,46,.18)",
-      "--fg": "#302e2e",
-      "--field": "#edebeb",
-      "--glass": "rgba(242,240,240,.95)",
-      "--glass-strong": "rgba(242,240,240,.98)",
-      "--line": "#d1cfcf",
-      "--line-2": "#b4b2b2",
-      "--media-bg": "#dbd9d9",
-      "--panel": "#f2f0f0",
-      "--shadow-panel": "0 8px 28px rgba(48,46,46,.10)",
-      "--shadow-sm": "0 2px 8px rgba(48,46,46,.05)",
-      "--surface": "#e0dede",
-      "--surface-2": "#edebeb",
-      "--surface-hover": "#d4d2d2",
-      "--tint": "rgba(48,46,46,.06)",
-      "--tint-2": "rgba(48,46,46,.04)",
-      "--tint-3": "rgba(48,46,46,.08)",
-      "--tint-4": "rgba(48,46,46,.13)"
+      "--bg": "#edeae4",
+      "--card-edge": "rgba(72,66,52,.12)",
+      "--card-shadow": "0 2px 8px rgba(64,60,46,.06)",
+      "--code-bg": "#e9e6df",
+      "--code-toolbar": "#f0ede7",
+      "--control-border": "#6f6a5b",
+      "--dim": "#5b5d51",
+      "--edge": "rgba(52,54,45,.18)",
+      "--fg": "#34362b",
+      "--field": "#f0ede7",
+      "--glass": "rgba(245,242,236,.95)",
+      "--glass-strong": "rgba(245,242,236,.98)",
+      "--line": "#d9d2c2",
+      "--line-2": "#c8c0ae",
+      "--media-bg": "#e6e3db",
+      "--panel": "#f5f2ec",
+      "--shadow-panel": "0 8px 28px rgba(64,60,46,.10)",
+      "--shadow-sm": "0 2px 8px rgba(64,60,46,.05)",
+      "--surface": "#e8e5de",
+      "--surface-2": "#f0ede7",
+      "--surface-hover": "#e2dfd7",
+      "--tint": "rgba(53,105,93,.10)",
+      "--tint-2": "rgba(53,105,93,.06)",
+      "--tint-3": "rgba(53,105,93,.13)",
+      "--tint-4": "rgba(53,105,93,.18)"
     }
   };
   const desktop = desktopMediaQueries()[0].body;
@@ -263,7 +263,7 @@ test("desktop light text and control boundaries retain contrast on a brighter ne
     assert.ok(contrast(palette["--dim"], palette[token]) >= 7, "muted text on " + token);
     assert.ok(contrast(palette["--fg"], palette[token]) >= 7, "body text on " + token);
   }
-  assert.equal(palette["--bg"], "#efefef");
+  assert.equal(palette["--bg"], "#f1f1f1");
   assert.equal(palette["--panel"], "#f3f3f3");
   assert.ok(relativeLuminance(palette["--bg"]) > relativeLuminance("#e9e9e9"));
   assert.ok(relativeLuminance(palette["--panel"]) < 0.9, "reading surface stays below paper white");
@@ -281,11 +281,11 @@ test("desktop light text and control boundaries retain contrast on a brighter ne
   assert.ok(contrast(palette["--acc"], palette["--field"]) >= 4.5, "side-note text and boundary");
 });
 
-test("desktop light chrome gains a small weight step and retains hover and focus cues", () => {
+test("desktop light chrome keeps metadata weight and retains hover and focus cues", () => {
   const desktop = desktopMediaQueries()[0].body;
   const light = ':root[data-theme="light"] ';
   assert.deepEqual(ruleValues(desktop, light + "body"), {
-    "font-weight": "450", "--radius-card": "16px", "--radius-control": "10px"
+    "--radius-card": "16px", "--radius-control": "10px"
   });
   assert.equal(tokenValues(tokenBlock(PALETTES.light, desktop))["--fw-meta"], "450");
   const shared = style.slice(0, style.indexOf("@media (min-width:701px)"));
@@ -315,28 +315,27 @@ test("desktop light chrome gains a small weight step and retains hover and focus
   }
 });
 
-test("desktop dark prose gains a clearer bold step and a calmer bottom edge", () => {
+test("desktop dark prose keeps the shared weights and the composer keeps its bottom edge", () => {
   const desktop = desktopMediaQueries()[0].body;
   const dark = ':root:not([data-theme="light"]):not([data-theme="warm"]) ';
-  assert.deepEqual(
-    ruleValues(desktop, dark + "body"),
-    {},
-    "dark mode must not tune the rendering of non-bold text"
-  );
-  for (const selector of [".msg.md strong", ".msg.md b"]) {
+  for (const selector of ["body", ".msg.md strong", ".msg.md b", ".msg.md .h"]) {
     assert.deepEqual(
       ruleValues(desktop, dark + selector),
-      { "font-weight": "800", color: "#fff", "-webkit-text-stroke": ".35px currentColor" },
-      selector
+      {},
+      "dark mode must not tune prose weight on its own"
     );
   }
-  assert.deepEqual(
-    ruleValues(desktop, dark + ".msg.md .h"),
-    { "font-weight": "800", color: "#fff", "-webkit-text-stroke": ".35px currentColor" },
-    "dark section labels need the same bold step"
-  );
   assert.equal(ruleValues(desktop, "#composer")["padding"], "8px 24px 20px");
-  assert.equal(ruleValues(desktop, ':root[data-theme="light"] body')["font-weight"], "450");
+});
+
+test("eye-care desktop copy keeps the shared prose weight", () => {
+  const desktop = desktopMediaQueries()[0].body, warm = ':root[data-theme="warm"] ';
+  assert.deepEqual(ruleValues(desktop, warm + ".msg.md"), {}, "warm body copy keeps the shared weight");
+  assert.deepEqual(
+    ruleValues(desktop, ':root[data-theme="light"] body'),
+    { "--radius-card": "16px", "--radius-control": "10px" },
+    "light body only carries the card shape"
+  );
 });
 
 test("desktop sidebar and cards share soft shapes across all three palettes", () => {
@@ -424,11 +423,15 @@ test("desktop themes share a lightly inset content width and light top separator
   for (const edge of ["top", "right", "bottom", "left"]) {
     assert.equal(ruleValues(shared, "#msgs")[edge], "0", "transcript fills its wrapper on " + edge);
   }
-  assert.equal(ruleValues(desktop, "#msgs").padding, "18px 24px 56px", "reading gutters stay unchanged");
+  assert.equal(
+    ruleValues(desktop, "#msgs").padding,
+    "18px 40px 56px",
+    "the left reading gutter stays put; only the right one widens to clear the scrollbar"
+  );
   assert.equal(ruleValues(narrow, "#ovrwrap")["grid-template-columns"], "repeat(3,minmax(0,1fr))", "narrow desktop keeps shrinkable picker columns");
 });
 
-test("desktop surfaces, text and shadows stay gray without yellow or teal drift", () => {
+test("desktop dark and light stay neutral while eye-care keeps a bounded warm band", () => {
   const desktop = desktopMediaQueries()[0].body;
   const tokens = ["--bg", "--panel", "--surface", "--surface-hover", "--surface-2", "--field",
     "--code-toolbar", "--code-bg", "--media-bg", "--glass", "--glass-strong", "--tint", "--tint-2",
@@ -440,13 +443,39 @@ test("desktop surfaces, text and shadows stay gray without yellow or teal drift"
       assert.ok(color, name + " " + token + " has no parsable color");
       const [r, g, b] = color[1] ? color[1].match(/../g).map((channel) => parseInt(channel, 16)) : color.slice(2).map(Number);
       const high = Math.max(r, g, b), low = Math.min(r, g, b), chroma = high - low;
-      assert.ok(chroma <= 6, name + " " + token + " channel spread " + chroma + " is not neutral");
       if (chroma === 0) continue;
       const sector = high === r ? ((g - b) / chroma + 6) % 6 : high === g ? (b - r) / chroma + 2 : (r - g) / chroma + 4;
       const hue = sector * 60;
+      if (name === "warm" && token.startsWith("--tint")) {
+        // Selection and hover washes stay on the teal accent, not on a second hue.
+        assert.ok(hue > 140 && hue < 210, name + " " + token + " left the accent hue at " + hue);
+        continue;
+      }
+      if (name === "warm") {
+        // Eye-care is warm on purpose, but only inside a paper band: no orange
+        // and no saturated cream that would compete with the accent.
+        assert.ok(chroma <= 26, name + " " + token + " channel spread " + chroma + " is too saturated for paper");
+        assert.ok(hue > 25 && hue < 75, name + " " + token + " has a hue " + hue + " outside the warm paper band");
+        continue;
+      }
+      assert.ok(chroma <= 6, name + " " + token + " channel spread " + chroma + " is not neutral");
       assert.ok(hue < 20 || hue > 80, name + " " + token + " has a yellow/orange hue " + hue);
       assert.ok(hue < 140 || hue > 210, name + " " + token + " has a teal hue " + hue);
     }
+  }
+});
+
+test("desktop eye-care surfaces keep only a subtle warm paper tint", () => {
+  const desktop = desktopMediaQueries()[0].body;
+  const palette = tokenValues(tokenBlock(PALETTES.warm, desktop));
+  const surfaces = ["--bg", "--panel", "--surface", "--surface-hover", "--surface-2", "--field",
+    "--code-toolbar", "--code-bg", "--media-bg", "--glass", "--glass-strong"];
+  for (const token of surfaces) {
+    const color = palette[token].match(/#([a-f0-9]{6})(?![a-f0-9])|rgba\((\d+),(\d+),(\d+),[.\d]+\)/i);
+    assert.ok(color, token + " has no parsable paper color");
+    const [r, g, b] = color[1] ? color[1].match(/../g).map((channel) => parseInt(channel, 16)) : color.slice(2).map(Number);
+    assert.ok(r > g && g > b, token + " lost its gentle warm tint");
+    assert.ok(r - b <= 11, token + " has too much yellow: channel spread " + (r - b));
   }
 });
 

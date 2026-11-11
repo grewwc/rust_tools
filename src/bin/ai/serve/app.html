@@ -777,15 +777,6 @@ button:active:not(:disabled) { filter:brightness(.96); }
     -webkit-font-smoothing:antialiased;
     -moz-osx-font-smoothing:grayscale;
   }
-  /* Body text keeps the shared rendering. Only bold runs and section labels
-     get a dark-only step: the macOS CJK fallback has no face heavier than
-     Semibold, so asking for 800 alone barely thickens Chinese glyphs. The
-     sub-pixel stroke adds the missing weight without blurring the edges. */
-  :root:not([data-theme="light"]):not([data-theme="warm"]) .msg.md strong,
-  :root:not([data-theme="light"]):not([data-theme="warm"]) .msg.md b,
-  :root:not([data-theme="light"]):not([data-theme="warm"]) .msg.md .h {
-    font-weight:800; color:#fff; -webkit-text-stroke:.35px currentColor;
-  }
   /* The settings row packs two inputs and five buttons; without wrapping the
      inputs shrink to a sliver and the token field cannot be used. */
   #conn.open { flex-wrap:wrap; }
@@ -804,11 +795,11 @@ button:active:not(:disabled) { filter:brightness(.96); }
     --card-shadow:0 2px 8px rgba(0,0,0,.12);
   }
   :root[data-theme="light"] {
-    --bg:#efefef; --panel:#f3f3f3; --line:#9a9a9a; --fg:#242424; --dim:#3e3e3e;
-    --surface:#dfdfdf; --surface-hover:#d3d3d3; --surface-2:#ececec; --line-2:#858585;
+    --bg:#f1f1f1; --panel:#f3f3f3; --line:#9a9a9a; --fg:#242424; --dim:#3e3e3e;
+    --surface:#e5e5e5; --surface-hover:#d9d9d9; --surface-2:#efefef; --line-2:#858585;
     --control-border:#737373; --danger-text:#9f3029;
     --fw-meta:450;
-    --field:#f3f3f3; --code-bg:#e2e2e2; --media-bg:#dadada; --code-toolbar:#ececec;
+    --field:#f3f3f3; --code-bg:#e8e8e8; --media-bg:#e0e0e0; --code-toolbar:#efefef;
     --glass:rgba(243,243,243,.95); --glass-strong:rgba(243,243,243,.98);
     --tint:rgba(46,46,46,.06); --tint-2:rgba(46,46,46,.04); --tint-3:rgba(46,46,46,.14); --tint-4:rgba(46,46,46,.13);
     --edge:rgba(46,46,46,.18);
@@ -816,9 +807,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
     --card-edge:rgba(46,46,46,.12);
     --card-shadow:0 2px 4px rgba(46,46,46,.03), 0 10px 28px rgba(46,46,46,.05);
   }
-  /* Light desktop text gains a small weight step without changing type size.
-     Existing heading weights still apply. */
-  :root[data-theme="light"] body { font-weight:450; --radius-card:16px; --radius-control:10px; }
+  :root[data-theme="light"] body { --radius-card:16px; --radius-control:10px; }
   /* Passive surfaces use quiet edges; form, focus, and activity cues retain
      stronger boundaries. */
   :root[data-theme="light"] header,
@@ -861,17 +850,19 @@ button:active:not(:disabled) { filter:brightness(.96); }
   :root[data-theme="light"] #oeffortbtn:focus-visible,
   :root[data-theme="light"] #oskill:focus-visible { border-color:var(--acc-focus); }
   :root[data-theme="light"] #sidenote.show { background:var(--field); border-color:var(--acc); color:var(--acc); }
+  /* Desktop eye-care uses a low-chroma paper tint instead of saturated cream.
+     Surfaces stay below paper white, and accent tints keep their teal hue. */
   :root[data-theme="warm"] {
-    --bg:#e9e7e7; --panel:#f2f0f0; --line:#d1cfcf; --fg:#302e2e; --dim:#585656;
-    --surface:#e0dede; --surface-hover:#d4d2d2; --surface-2:#edebeb; --line-2:#b4b2b2;
-    --control-border:#737373;
-    --field:#edebeb; --code-bg:#e3e1e1; --media-bg:#dbd9d9; --code-toolbar:#edebeb;
-    --glass:rgba(242,240,240,.95); --glass-strong:rgba(242,240,240,.98);
-    --tint:rgba(48,46,46,.06); --tint-2:rgba(48,46,46,.04); --tint-3:rgba(48,46,46,.08); --tint-4:rgba(48,46,46,.13);
-    --edge:rgba(48,46,46,.18);
-    --card-edge:rgba(48,46,46,.12);
-    --card-shadow:0 2px 8px rgba(48,46,46,.06);
-    --shadow-sm:0 2px 8px rgba(48,46,46,.05); --shadow-panel:0 8px 28px rgba(48,46,46,.10);
+    --bg:#edeae4; --panel:#f5f2ec; --line:#d9d2c2; --fg:#34362b; --dim:#5b5d51;
+    --surface:#e8e5de; --surface-hover:#e2dfd7; --surface-2:#f0ede7; --line-2:#c8c0ae;
+    --control-border:#6f6a5b;
+    --field:#f0ede7; --code-bg:#e9e6df; --media-bg:#e6e3db; --code-toolbar:#f0ede7;
+    --glass:rgba(245,242,236,.95); --glass-strong:rgba(245,242,236,.98);
+    --tint:rgba(53,105,93,.10); --tint-2:rgba(53,105,93,.06); --tint-3:rgba(53,105,93,.13); --tint-4:rgba(53,105,93,.18);
+    --edge:rgba(52,54,45,.18);
+    --card-edge:rgba(72,66,52,.12);
+    --card-shadow:0 2px 8px rgba(64,60,46,.06);
+    --shadow-sm:0 2px 8px rgba(64,60,46,.05); --shadow-panel:0 8px 28px rgba(64,60,46,.10);
   }
   body { --radius-card:10px; --radius-control:8px; font-size:14px; line-height:1.5; }
   header { flex-shrink:0; padding:8px 16px; border-bottom-color:var(--line); }
@@ -984,7 +975,9 @@ button:active:not(:disabled) { filter:brightness(.96); }
   /* Equal outer widths align transcript and footer across desktop themes.
      Percentage gutters keep small windows usable; the cap bounds long lines. */
   #msgwrap, #ovrwrap, #sidequeue, #composer { width:96%; max-width:1280px; align-self:center; }
-  #msgs { padding:18px 24px 56px; gap:10px; }
+  /* Keep the left reading gutter fixed; the right one carries the scrollbar,
+     so it takes a slightly wider step to keep text off the track. */
+  #msgs { padding:18px 40px 56px; gap:10px; }
   .turn { gap:8px; }
   .msg { max-width:100%; padding:8px 12px; font-size:17px; line-height:1.65; }
   /* Thinking, tool folds and task rows are reading surfaces too; keep them
@@ -994,7 +987,20 @@ button:active:not(:disabled) { filter:brightness(.96); }
   /* Task provenance selects active work and the latest delivered batch;
      earlier results remain in the raw tool folds and the mobile projection. */
   .msg.asst[data-subagents="true"] > .task-output > [data-task-current="false"] { display:none; }
-  .msg.md code, .msg.md table { font-size:14px; }
+  .msg.md code { font-size:14px; }
+  /* Tables keep their intrinsic width and scroll wrapper; horizontal rules
+     and lighter code capsules separate data without repeating a cell grid. */
+  .msg.md .tablewrap { margin:12px 0; }
+  .msg.md table { font-size:15px; }
+  .msg.md th, .msg.md td {
+    border:0; border-bottom:1px solid var(--card-edge); padding:8px 12px; vertical-align:top;
+  }
+  .msg.md th {
+    background:var(--surface-2); color:var(--fg); font-weight:600; border-bottom-color:var(--line);
+  }
+  .msg.md table code {
+    font-size:14px; background:var(--tint-2); border:0; border-radius:3px; padding:1px 3px;
+  }
   .msg.md .h.lv2 { font-size:18px; }
   .msg.md .h.lv3 { font-size:17px; }
   .msg.md .h.lv4, .msg.md .h.lv5, .msg.md .h.lv6 { font-size:16px; }
@@ -1608,8 +1614,8 @@ let staleTimer = null; // follow-up reload timer while the reply is pending
 let staleTries = 0; // bounded follow-ups: an idle page must not ask forever
 let staleBusy = false; // one history fetch at a time; ticks may overlap a slow one
 let lastHistoryEndsUnanswered = false; // loaded history has no reply after its user turn
-const STALE_FOLLOW_MS = 4000; // follow-up reload interval
-const STALE_FOLLOW_TRIES = 300; // ~20 min of visible following, then ↻ takes over
+const STALE_FOLLOW_MS = 1500; // follow-up reload interval: a finished reply must land at once
+const STALE_FOLLOW_TRIES = 800; // ~20 min of visible following, then ↻ takes over
 const LIVE_STALL_MS = 60000; // no byte at all for this long => the live socket is dead
 
 // A turn can stop and ask for confirmation, and the question is answered over
@@ -1621,6 +1627,7 @@ let confirmPollTimer = null; // keeps answering native requests even when histor
 let eventAbort = null; // AbortController for the reattached event stream
 let eventFailures = 0;
 let confirmPollSeq = 0;
+let confirmPollTick = 0; // idle ticks are cheap: only every fifth one asks the server
 let eventActive = false; // one reattach stream at a time
 let eventSession = ""; // session the reattach stream belongs to
 let recoveredView = null; // progress card rendered from replayed events
@@ -1936,8 +1943,10 @@ function collapseFoldForTap(event) {
   if (!double) return;
   for (let node = target; node; node = node.parentNode) {
     // Structured subagent rows are siblings of <details> in their owning card.
-    const details = node.tagName === "DETAILS" ? node :
-      desktop && node.dataset?.subagents === "true" ? node.querySelector("details") : null;
+    // Structured rows (subagents, task reports) are siblings of <details> in
+    // their owning card, so the card itself has to stand in for the fold.
+    const structured = desktop && (node.dataset?.subagents === "true" || node.dataset?.taskOutput === "true");
+    const details = node.tagName === "DETAILS" ? node : structured ? node.querySelector("details") : null;
     if (details?.open) { details.open = false; break; }
   }
 }
@@ -2267,6 +2276,32 @@ function renderMarkdown(src, allowPreviews) {
   const math = protectMath(String(src).replace(/\r\n?/g, "\n"));
   const lines = math.source.split("\n");
   const inline = (s) => math.restore(mdInline(esc(s)));
+  // Infer only a complete, consistently shaped pipe block. Short or ragged
+  // blocks remain text; a missing delimiter must not make us invent cells.
+  const framedRow = (line) => {
+    const source = line.trim();
+    const pipes = [];
+    // Code spans and escaped characters are opaque, as they are to mdInline.
+    for (const match of source.matchAll(/`[^`]+`|\\.|\|/g)) {
+      if (match[0] === "|") pipes.push(match.index);
+    }
+    if (pipes.length < 3 || pipes[0] !== 0 || pipes[pipes.length - 1] !== source.length - 1) return null;
+    return pipes.slice(1).map((end, index) => source.slice(pipes[index] + 1, end).trim()
+      .replace(/`[^`]+`|\\\|/g, (token) => token === "\\|" ? "|" : token));
+  };
+  const implicitTableAt = (index) => {
+    if (!compactEdges || (index > 0 && /^\s*\|.*\|\s*$/.test(lines[index - 1]))) return null;
+    const header = framedRow(lines[index]);
+    if (!header || header.some((cell) => !cell) || /^\s*\|[\s:|-]+\|\s*$/.test(lines[index])) return null;
+    const rows = [];
+    let end = index + 1;
+    for (; end < lines.length && /^\s*\|.*\|\s*$/.test(lines[end]); end++) {
+      const row = framedRow(lines[end]);
+      if (!row || row.length !== header.length || !row.some(Boolean) || /^\s*\|[\s:|-]+\|\s*$/.test(lines[end])) return null;
+      rows.push(row);
+    }
+    return rows.length >= 2 ? { header, rows, end } : null;
+  };
   const out = [];
   let text = [];
   const flushText = () => {
@@ -2351,13 +2386,21 @@ function renderMarkdown(src, allowPreviews) {
       out.push("<blockquote>" + quoted.map(inline).join("<br>") + "</blockquote>");
       continue;
     }
-    if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+    const inferred = implicitTableAt(i);
+    if (inferred || (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1]))) {
       flushText();
-      const cells = (l) => l.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
-      const ths = cells(line);
-      i += 2; // the delimiter row is markup, not content
-      const rows = [];
-      for (; i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]); i++) rows.push(cells(lines[i]));
+      let ths, rows;
+      if (inferred) {
+        ths = inferred.header;
+        rows = inferred.rows;
+        i = inferred.end;
+      } else {
+        const cells = (l) => l.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+        ths = cells(line);
+        i += 2; // the delimiter row is markup, not content
+        rows = [];
+        for (; i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]); i++) rows.push(cells(lines[i]));
+      }
       out.push('<div class="tablewrap"><table><thead><tr>' +
         ths.map((c) => "<th>" + inline(c) + "</th>").join("") + "</tr></thead><tbody>" +
         rows.map((r) => "<tr>" + r.map((c) => "<td>" + inline(c) + "</td>").join("") + "</tr>").join("") +
@@ -2369,6 +2412,7 @@ function renderMarkdown(src, allowPreviews) {
       flushText();
       const indent = item[1].replace(/\t/g, "  ").length;
       const body = [inline(item[3])];
+      let continuationFence = null;
       // A deeper-indented plain line continues this bullet; anything else ends
       // it, so the next line starts its own block.
       for (i++; i < lines.length; i++) {
@@ -2378,6 +2422,16 @@ function renderMarkdown(src, allowPreviews) {
         // so the main loop renders it as its own item instead of a literal "-"
         // glued to the end of this one.
         if (/^([-*+]|\d{1,3}[.)])(\s|$)/.test(cont[2])) break;
+        if (compactEdges) {
+          // A pipe block may follow a bullet, but fenced examples stay literal.
+          if (continuationFence) {
+            if (new RegExp("^" + continuationFence + "{3,}\\s*$").test(cont[2])) continuationFence = null;
+          } else {
+            const fence = /^(`{3,}|~{3,})\s*([^\s`]*)\s*$/.exec(cont[2]);
+            if (fence) continuationFence = fence[1][0];
+            else if (implicitTableAt(i)) break;
+          }
+        }
         body.push(inline(cont[2]));
       }
       // Cap the indent: replies routinely nest 6+ spaces deep, which on a phone
@@ -2926,7 +2980,12 @@ function beginTranscriptScroll(id, root = $("msgs")) {
   transcriptScrollState = {
     sessionId: id, generation: ++transcriptScrollGeneration, root,
     landing: true, following: false, children: new Set(), resizeObserver: null, mutationObserver: null,
+    composerHeight: composerOffsetHeight(),
   };
+}
+function composerOffsetHeight() {
+  const composer = $("composer");
+  return composer && typeof composer.offsetHeight === "number" ? composer.offsetHeight : null;
 }
 function syncTranscriptScrollChildren(state) {
   const children = new Set(state.root.children);
@@ -2937,6 +2996,14 @@ function syncTranscriptScrollChildren(state) {
 function queueTranscriptScrollResize(state) {
   if (!isDesktopTranscriptScroll()) { clearTranscriptScrollGoal(state); return; }
   if (ownedTranscriptScroll(state.root) !== state || !state.following || outputFollowSuspended || jumpingToBottom) return;
+  // A taller composer (a pasted image adds a marker line, a pending side note
+  // appears) only shortens the scrollport; it produces no new rows. Following it
+  // would move a reader who never scrolled, so leave the offset to the reader.
+  const height = composerOffsetHeight();
+  if (height !== null && height !== state.composerHeight) {
+    state.composerHeight = height;
+    return;
+  }
   if (!isNearBottom(state.root)) followOutput(true, state.root);
 }
 function watchTranscriptScroll(state) {
@@ -3629,6 +3696,7 @@ function renderTaskToolResult(fold, result) {
     delete fold.box.dataset.taskStates;
     delete fold.box.dataset.taskBusy;
     delete fold.box.dataset.taskReset;
+    delete fold.box.dataset.taskOutput;
     if (typeof syncStopButton === "function") syncStopButton();
     return;
   }
@@ -3636,6 +3704,7 @@ function renderTaskToolResult(fold, result) {
     fold.taskPreview = document.createElement("div");
     fold.taskPreview.className = "task-output";
     fold.box.appendChild(fold.taskPreview);
+    fold.box.dataset.taskOutput = "true";
   }
   const existing = Array.from(fold.taskPreview.children);
   const reusable = existing.length === result.rows.length && result.rows.every((row, index) =>
@@ -3692,7 +3761,9 @@ function rememberSessionFoldState() {
     for (const det of row.querySelectorAll("details")) {
       const key = det.dataset.foldKey;
       if (!key) continue;
-      if (det.open) foldOpenState.set(key, true);
+      // A fold painted open for live progress is not a reader choice, so it must
+      // not come back expanded (and out of its completed group) after a reload.
+      if (det.open && det.dataset.autoOpen !== "true") foldOpenState.set(key, true);
       else foldOpenState.delete(key);
     }
   }
@@ -3706,6 +3777,8 @@ function bindStoredFold(det, key) {
   det.dataset.foldKey = key;
   if (foldOpenState.has(key)) det.open = foldOpenState.get(key);
   det.addEventListener("toggle", () => {
+    // Same rule as live folds: a painted-open card is not a reader choice.
+    if (det.dataset.autoOpen === "true") { delete det.dataset.autoOpen; return; }
     // Detached desktop folds no longer own the remembered state for their key.
     if (window.matchMedia && window.matchMedia("(min-width:701px)").matches && !det.isConnected) return;
     if (det.open) foldOpenState.set(key, true);
@@ -4029,6 +4102,9 @@ function addFold(title, bodyText, parent, key) {
   pre.textContent = bodyText;
   det.appendChild(pre);
   if (key) det.addEventListener("toggle", () => {
+    // Progress paints open a fold to show live work; remembering that choice
+    // would keep the finished card open and out of the completed group forever.
+    if (det.dataset.autoOpen === "true") { delete det.dataset.autoOpen; return; }
     if (foldOpenByKey.size > 2000) foldOpenByKey.clear();
     foldOpenByKey.set(key, det.open);
     // An expanded card is held in place; merge it once the reader closes it.
@@ -4071,7 +4147,18 @@ function executionGroupsFor(parent, stored = false) {
       }
       saveFoldOpenState();
     }
-    for (const { node, owner, before } of slots.slice().reverse()) owner.insertBefore(node, before?.parentNode === owner ? before : null);
+    // A remembered sibling that a group has since swallowed is no longer a child
+    // of the owner. Falling back to `null` appended the record to the end of the
+    // transcript, so old records surfaced below newer rows; restore in front of the
+    // box that holds that sibling instead.
+    const refIn = (before, owner) => {
+      if (before?.parentNode === owner) return before;
+      for (let box = before?.parentNode; box && box !== owner; box = box.parentNode) {
+        if (box.classList?.contains("execution-group") && box.parentNode === owner) return box;
+      }
+      return null;
+    };
+    for (const { node, owner, before } of slots.slice().reverse()) owner.insertBefore(node, refIn(before, owner));
     for (const fold of folds.values()) fold.box.remove();
     for (const wrapper of wrappers) wrapper.classList.remove("execution-empty");
     slots = []; wrappers = []; lastPlan = [];
@@ -4090,7 +4177,10 @@ function executionGroupsFor(parent, stored = false) {
     visit(parent);
     // The most recent progress stays outside, even after it finishes. A new
     // execution item or answer advances the boundary; status paint does not.
-    const latest = units.findLast((node) => !node.hidden && !node.classList.contains("pending"));
+    // A trailing rate line is metadata, not the newest record: the run boundary
+    // must still be the latest real card, or a fresh record could be swallowed.
+    const rates = (node) => node.dataset?.turnRate !== undefined;
+    const latest = units.findLast((node) => !node.hidden && !node.classList.contains("pending") && !rates(node));
     // A card the reader has expanded must not move. Records already inside a
     // group stay there; records outside wait for a collapse before merging.
     const expanded = (node) => {
@@ -4125,7 +4215,11 @@ function executionGroupsFor(parent, stored = false) {
     const anchor = !following && viewport
       ? (units.find((node) => expanded(node) && visible(node)) || units.find(visible))
       : null;
-    const anchorTop = anchor?.getBoundingClientRect().top;
+    // Measure the same element before and after: a grouped record is represented
+    // by its group box on both sides, so compensating cannot add a fixed offset.
+    const anchorBox = (node) => node.parentNode?.classList.contains("execution-items")
+      ? node.parentNode.parentNode.parentNode : node;
+    const anchorTop = anchor ? anchorBox(anchor).getBoundingClientRect?.().top : undefined;
     restore();
     const collectWrappers = (owner) => {
       for (const node of owner.children) if (node.classList.contains("turn") && (!stored || node.dataset.canonicalKey !== undefined)) {
@@ -4136,6 +4230,9 @@ function executionGroupsFor(parent, stored = false) {
     const used = new Map();
     let fold = null;
     for (const node of units) {
+      // Per-message rate text sits between records; it neither joins a group nor
+      // breaks one. Without this a stored turn's trailing rate ends every run.
+      if (rates(node)) continue;
       if (!folding.has(node)) { fold = null; continue; }
       if (!fold) {
         const inner = node.querySelector("details");
@@ -4162,9 +4259,7 @@ function executionGroupsFor(parent, stored = false) {
     if (!mounted) return;
     if (following) followOutput(true, root);
     else if (anchor) {
-      const visibleAnchor = anchor.parentNode?.classList.contains("execution-items")
-        ? anchor.parentNode.parentNode.parentNode : anchor;
-      root.scrollTop = top + (visibleAnchor.getBoundingClientRect?.().top ?? anchorTop) - anchorTop;
+      root.scrollTop = top + (anchorBox(anchor).getBoundingClientRect?.().top ?? anchorTop) - anchorTop;
     } else root.scrollTop = top;
   };
   return parent._executionGroups = { restore, sync };
@@ -4325,7 +4420,9 @@ function createLiveActivity(parent, before) {
     if (!cardDetails?.open && after?.parentNode === parent && after.nextElementSibling !== subagents.box) {
       parent.insertBefore(subagents.box, after.nextElementSibling);
     }
-    subagents.box.dataset.executionState = subagents.box.dataset.taskBusy === "false" ? "completed" : "running";
+    // Only an explicit busy flag means work is still in flight. A report without
+    // one settles the card, otherwise it would never join the completed group.
+    subagents.box.dataset.executionState = subagents.box.dataset.taskBusy === "true" ? "running" : "completed";
   };
   const renderTool = (tool) => {
     const call = { function: { name: tool.name, arguments: tool.arguments || "{}" } };
@@ -6988,11 +7085,15 @@ function ensureConfirmPoll() {
   if (confirmPollTimer !== null) return;
   confirmPollTimer = setInterval(async () => {
     if (document.visibilityState !== "visible") return;
+    // While this page believes a turn is in flight, ask often: that answer
+    // decides the composer and the transcript refresh. An idle page keeps the
+    // slow cadence for native requests that arrive long after the turn.
+    if (!isTurnRunning() && ++confirmPollTick % 5 !== 0) return;
     const sid = sessionId, epoch = runEpoch;
     const running = await pollConfirm();
     if (sid !== sessionId || epoch !== runEpoch) return;
     if (running === false && !turns.has(sessionId) && staleSession !== sessionId) stopConfirmPoll();
-  }, 10000); // fallback only; the reattached event stream is the primary path
+  }, 2000); // fallback only; the reattached event stream is the primary path
 }
 function stopConfirmPoll() {
   if (confirmPollTimer === null) return;
@@ -8014,6 +8115,7 @@ async function send() {
       activityDirty = false;
     }
     if (progressDirty && prog) {
+      if (expandProgress && !progDetails.open) progDetails.dataset.autoOpen = "true";
       if (expandProgress) progDetails.open = true;
       renderProgress();
       progressDirty = false;

@@ -720,6 +720,63 @@ for (const phone of [true, false]) test((phone ? "phone" : "desktop") + " sessio
   }
 });
 
+test("desktop Markdown tables use readable spacing without stretching or clipping wide tables", () => {
+  const table = responsiveRule(".msg.md table");
+  const wrap = responsiveRule(".msg.md .tablewrap");
+  assert.equal(table["font-size"], "15px");
+  assert.equal(table["border-collapse"], "collapse");
+  assert.equal(wrap.margin, "12px 0");
+  assert.equal(wrap["overflow-x"], "auto", "wide tables keep the existing horizontal scroll region");
+  for (const rule of [table, wrap]) {
+    for (const property of ["width", "min-width", "max-width", "table-layout", "white-space", "overflow", "display"]) {
+      assert.equal(rule[property], undefined, property + " must not replace intrinsic sizing or scrolling");
+    }
+  }
+  assert.equal(responsiveRule(".msg")["font-size"], "17px", "body copy is not resized");
+});
+
+test("desktop Markdown tables use horizontal separators and a theme-aware header", () => {
+  const cells = responsiveRule(".msg.md th, .msg.md td");
+  assert.equal(cells.border, "0", "remove the shared full cell grid");
+  assert.equal(cells["border-bottom"], "1px solid var(--card-edge)");
+  assert.equal(cells.padding, "8px 12px");
+  assert.equal(cells["vertical-align"], "top", "multiline cells align at their first line");
+  assert.equal(cells["text-align"], "left");
+  assert.deepEqual(cssRule(desktopCss, ".msg.md th"), {
+    background: "var(--surface-2)", color: "var(--fg)", "font-weight": "600",
+    "border-bottom-color": "var(--line)",
+  });
+});
+
+test("desktop table code is quieter without changing code outside tables", () => {
+  assert.deepEqual(cssRule(desktopCss, ".msg.md table code"), {
+    "font-size": "14px", background: "var(--tint-2)", border: "0",
+    "border-radius": "3px", padding: "1px 3px",
+  });
+  const code = responsiveRule(".msg.md code");
+  assert.equal(code["font-size"], "14px");
+  assert.equal(code.background, "var(--code-bg)");
+  assert.equal(code.border, "1px solid var(--line)");
+  assert.equal(code.padding, "0 4px");
+  assert.equal(code["overflow-wrap"], "anywhere");
+  assert.deepEqual(cssRule(desktopCss, ".msg.md pre code"), {}, "code blocks keep their existing rules");
+});
+
+test("phone Markdown tables retain compact cells and the original code capsules", () => {
+  assert.deepEqual(responsiveRule(".msg.md table", true), { "border-collapse": "collapse", "font-size": "13px" });
+  assert.deepEqual(responsiveRule(".msg.md th, .msg.md td", true), {
+    border: "1px solid var(--line)", padding: "2px 6px", "text-align": "left",
+  });
+  assert.deepEqual(responsiveRule(".msg.md .tablewrap", true), { "overflow-x": "auto", margin: "6px 0" });
+  const code = responsiveRule(".msg.md code", true);
+  assert.equal(code["font-size"], "13px");
+  assert.equal(code.background, "var(--code-bg)");
+  assert.equal(code.border, "1px solid var(--line)");
+  assert.equal(code["border-radius"], "5px");
+  assert.equal(code.padding, "0 4px");
+  assert.deepEqual(responsiveRule(".msg.md table code", true), {});
+});
+
 test("desktop user bubbles stay neutral but carry a border and accent rule", () => {
   const desktopBubble = responsiveRule(".msg.user");
   assert.equal(desktopBubble.background, "var(--surface-2)");
@@ -728,8 +785,8 @@ test("desktop user bubbles stay neutral but carry a border and accent rule", () 
   assert.equal(responsiveRule(".user-msg-row > .msg.user")["border-left"], "3px solid var(--acc)");
   for (const [selector, background] of [
     [":root", "#2e2e2e"],
-    [':root[data-theme="light"]', "#dfdfdf"],
-    [':root[data-theme="warm"]', "#e0dede"],
+    [':root[data-theme="light"]', "#e5e5e5"],
+    [':root[data-theme="warm"]', "#e8e5de"],
   ]) {
     assert.equal(responsiveRule(selector)["--surface"], background, selector + " user bubble fill");
   }
@@ -976,6 +1033,66 @@ for (const width of [390, 1280]) {
     assert.equal(root.scrollTop, 75, "unchanged progress does not move the reading position");
     activity.finish("interrupted");
     assert.equal(activeTool.parentNode, box, "an interrupted tool stays visible rather than becoming hidden success");
+  });
+
+  test(`stored task_wait rows merge into one completed group at ${width}px`, async () => {
+    const h = sessionFoldHarness(width), parent = h.document.createElement("div");
+    h.elements.msgs.appendChild(parent);
+    const report = (id, output) => ({ schema: "ai.task-report", version: 1, operation: "task_wait", snapshot: false,
+      tasks: [{ task_id: id, agent: "build", status: "running", active: true, output }] });
+    const rows = [
+      { role: "assistant", content: "", reasoning_content: "first wait", tool_calls: [{ id: "c1", type: "function", function: { name: "task_wait", arguments: "{}" } }] },
+      { role: "tool", content: "wait one", task_report: report("t1", "one") },
+      { role: "assistant", content: "", reasoning_content: "second wait", tool_calls: [{ id: "c2", type: "function", function: { name: "task_wait", arguments: "{}" } }] },
+      { role: "tool", content: "wait two", task_report: report("t2", "two") },
+      { role: "assistant", content: "Final answer" },
+    ];
+    for (const row of h.context.historyRowsOf(rows, rows.length, true).rows) h.context.renderHistoryRow(row, parent);
+    for (const turn of parent.querySelectorAll(".turn")) {
+      const rate = h.document.createElement("div");
+      rate.className = "rate"; rate.dataset.turnRate = "1";
+      turn.appendChild(rate);
+    }
+    h.context.executionGroupsFor(parent, true).sync();
+    // One stored turn ends each assistant row with a rate line; it must not split
+    // the run, or every task card stays in its own "Completed execution · 1" group.
+    assert.deepEqual(parent.querySelectorAll(".execution-group").map((group) => group.querySelector("summary").textContent),
+      ["Completed execution · 5"], "consecutive stored task records share one group");
+    assert.equal(parent.querySelectorAll(".execution-items .rate").length, 0, "rate text stays outside the wrapped records");
+  });
+
+  test(`stored records keep their place when a live row arrives at ${width}px`, () => {
+    const h = sessionFoldHarness(width), parent = h.document.createElement("div");
+    h.elements.msgs.appendChild(parent);
+    const call = (id, name) => ({ role: "assistant", content: "",
+      tool_calls: [{ id, type: "function", function: { name, arguments: "{}" } }] });
+    const rows = [
+      call("c1", "read_file"), { role: "tool", content: "one" },
+      call("c2", "execute_command"), { role: "tool", content: "two" },
+      call("c3", "task_wait"), { role: "tool", content: "three" },
+      { role: "assistant", content: "Older answer" },
+    ];
+    for (const row of h.context.historyRowsOf(rows, rows.length, true).rows) h.context.renderHistoryRow(row, parent);
+    const groups = h.context.executionGroupsFor(parent, true);
+    groups.sync();
+    const group = parent.querySelectorAll(".execution-group")[0];
+    const items = group.querySelectorAll(".execution-items")[0];
+    const order = Array.from(items.children).map((node) => node.textContent.trim().slice(0, 16));
+    const live = h.document.createElement("div");
+    live.className = "turn";
+    live.dataset.canonicalKey = "live";
+    const pending = h.document.createElement("div");
+    pending.className = "msg asst pending";
+    pending.textContent = "Processing…";
+    live.appendChild(pending);
+    parent.appendChild(live);
+    groups.sync();
+    // Re-inserting the old members must not fall back to "append at the end":
+    // that moved the earliest record below newer rows and dragged the group with it.
+    assert.equal(parent.lastElementChild, live, "a new live row stays last");
+    assert.deepEqual(Array.from(items.children).map((node) => node.textContent.trim().slice(0, 16)), order,
+      "merged records keep their order");
+    assert.equal(parent.querySelectorAll(".execution-group")[0], group, "the group keeps its place");
   });
 
   test(`expanded progress keeps its place until the reader collapses it at ${width}px`, async () => {
@@ -1256,6 +1373,7 @@ function sessionScrollHarness(width, withTasks) {
     pendingFrames: () => frames.size,
     growLayout(height, node = root.lastElementChild) { growth.set(node, (growth.get(node) || 0) + height); },
     resizeViewport(height) { root.clientHeight = height; root.scrollTop = top; },
+    resizeComposer(height) { h.elements.composer.offsetHeight = height; },
     resizeObservers: () => resizeObservers,
     queuedPositionSave: () => positionSaves.at(-1),
     deferHistory(id) {
@@ -1434,6 +1552,15 @@ for (const width of [390, 700, 701, 1280]) {
     assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : before);
     assert.equal(h.resizeObservers().some((observer) => observer.targets.has(h.root)), desktop,
       "the scrollport observer handles viewport changes independently of its children");
+  });
+  test("a taller composer keeps the reader's row instead of following" + suffix, async () => {
+    if (!desktop) return;
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    const before = h.root.scrollTop;
+    h.resizeComposer(140); // a pasted screenshot adds a marker line to the prompt
+    h.resizeViewport(h.root.clientHeight - 40); h.settleLayout();
+    assert.equal(h.root.scrollTop, before, "the composer's own growth never moves the transcript");
   });
   test("desktop transcript ownership respects upward input during the fetch" + suffix, async () => {
     const h = sessionScrollHarness(width, true);

@@ -442,6 +442,24 @@ test("structured history preserves raw fold expansion across a fresh document", 
   assertTask(taskCard(cold), expected);
 });
 
+test("a painted-open progress fold is not remembered as a reader expansion", () => {
+  const h = harness(), parent = h.root, key = "row:autopen";
+  const fold = h.context.addFold("task_wait", "raw bytes", parent, key);
+  const det = fold.box.querySelector("details");
+  // The live progress paint marks the fold it opens; the reader never clicked it.
+  det.dataset.autoOpen = "true";
+  det.open = true;
+  det.fire("toggle");
+  det.open = false;
+  det.fire("toggle");
+  assert.equal(h.context.addFold("task_wait", "raw bytes", parent, key).box.querySelector("details").open, false,
+    "an auto-open must not come back expanded");
+  det.open = true;
+  det.fire("toggle");
+  assert.equal(h.context.addFold("task_wait", "raw bytes", parent, key).box.querySelector("details").open, true,
+    "a reader expansion must survive");
+});
+
 test("truncated unrelated tools keep their existing notices and task CSS stays unchanged", () => {
   const h = harness();
   assert.equal(h.emit("live", terminalPayload, "read_file", { arguments: "{", arguments_truncated: true, output_truncated: true, ok: false }), null);

@@ -7,6 +7,37 @@ const vm = require("node:vm");
 const { test } = require("node:test");
 
 const html = fs.readFileSync(path.join(__dirname, "app.html"), "utf8");
+// Assistant and tool rows render inside a per-turn wrapper, so ordered
+// assertions read row keys through that wrapper instead of assuming the
+// transcript's direct children are the rows themselves.
+function renderedNodes(root) {
+  const nodes = [];
+  const walk = (node) => {
+    if (typeof node.key === "string") {
+      nodes.push(node);
+      return;
+    }
+    for (const child of node.children || []) walk(child);
+  };
+  for (const child of root.children || []) walk(child);
+  return nodes;
+}
+function renderedKeys(root) {
+  return renderedNodes(root).map((node) => node.key);
+}
+// The slices below exercise individual functions; grouping and image drafts
+// pull in whole-page state those slices do not carry. Supply inert versions so
+// a call succeeds; app_desktop/app_task_results cover the real behaviour.
+const createContext = vm.createContext.bind(vm);
+vm.createContext = (sandbox = {}) => createContext({
+  executionGroupsFor: () => ({ sync() {}, restore() {} }),
+  pendingImages: [],
+  window: { matchMedia: () => ({ matches: false }), addEventListener() {}, removeEventListener() {} },
+  createTurnRateLine: () => () => {},
+  // Rate decoration is display-only; app_desktop covers its real rendering.
+  showTurnRate: () => {},
+  ...sandbox,
+});
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const historyRetrySrc = script.slice(script.indexOf("// BEGIN history retry"), script.indexOf("// END history retry"));
 const userOriginHelpers = script.slice(script.indexOf("function isRuntimeSyntheticUser("), script.indexOf("const PHONE_LAYOUT_QUERY"));
@@ -40,7 +71,20 @@ function harness() {
     querySelectorAll() { return nodeList(this.nodes.filter((node) => "tex" in node.dataset)); },
     querySelector() { return this.querySelectorAll()[0] || null; },
   };
-  const document = { createElement: (tag) => ({ tag }), head: { appendChild: (el) => assets.push(el) } };
+  const element = (tag) => ({
+    tag, children: [], dataset: {}, hidden: false, className: "",
+    classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    appendChild(node) { this.children.push(node); return node; },
+    append(node) { this.children.push(node); },
+    insertBefore(node, anchor) {
+      const index = anchor ? this.children.indexOf(anchor) : -1;
+      if (index >= 0) this.children.splice(index, 0, node);
+      else this.children.push(node);
+      return node;
+    },
+    remove() {}, querySelector: () => null, querySelectorAll: () => [],
+  });
+  const document = { createElement: element, createTextNode: (text) => ({ text }), head: { appendChild: (el) => assets.push(el) } };
   const context = vm.createContext({ document, window: {}, $: () => msgs });
   vm.runInContext(renderer, context);
   const render = (input) => context.renderMarkdown(input);
@@ -80,6 +124,108 @@ for (const width of [390, 700, 701, 1280]) {
     assert.match(code, /<pre data-lang="text"><code> \t\n  code  \n<\/code><\/pre>/);
   });
 }
+
+function pipeTableHarness(width = 1280) {
+  const h = harness();
+  h.context.window.matchMedia = (query) => ({ matches: query === "(min-width:701px)" && width >= 701 });
+  return h;
+}
+
+const missingDelimiterTable = [
+  "| 区域 | 原色 → 新色 |",
+  "| 页面背景 | `#ede7db` → `#edeae4` |",
+  "| 面板 | `#f6f0e4` → `#f5f2ec` |",
+  "| 卡片底色 | `#e8e2d4` → `#e8e5de` |",
+].join("\n");
+
+for (const width of [390, 700, 701, 1280]) {
+  test("pipe table without delimiter renders conservatively at " + width + "px", () => {
+    const { render } = pipeTableHarness(width);
+    const output = render(missingDelimiterTable);
+    if (width < 701) {
+      assert.doesNotMatch(output, /<table>/);
+      assert.match(output, /\| 区域 \| 原色 → 新色 \|<br>/);
+    } else {
+      assert.match(output, /<thead><tr><th>区域<\/th><th>原色 → 新色<\/th><\/tr>/);
+      assert.equal((output.match(/<td>/g) || []).length, 6);
+      assert.match(output, /<td><code>#ede7db<\/code> → <code>#edeae4<\/code><\/td>/);
+    }
+    const standard = render("| a | b |\n| --- | --- |\n| c | d |");
+    assert.equal(standard, '<div class="tablewrap"><table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td>c</td><td>d</td></tr></tbody></table></div>');
+  });
+
+  test("pipe table without delimiter escapes list continuation at " + width + "px", () => {
+    const { render } = pipeTableHarness(width);
+    const output = render("- 表格可见内容：\n" + missingDelimiterTable.replace(/^/gm, "  ") + "\n- 后续说明");
+    assert.equal((output.match(/class="li"/g) || []).length, 2);
+    assert.equal((output.match(/<table>/g) || []).length, width >= 701 ? 1 : 0);
+    assert.match(output, /后续说明/);
+    assert.doesNotMatch(output, /<td>后续说明/);
+  });
+}
+
+test("pipe table without delimiter protects code, escaped and math pipes", () => {
+  const { render } = pipeTableHarness();
+  const output = render("| label | value |\n| `a|b` | left\\|right |\n| $|x|$ | **bold** |");
+  assert.equal((output.match(/<td>/g) || []).length, 4);
+  assert.match(output, /<td><code>a\|b<\/code><\/td><td>left\|right<\/td>/);
+  assert.equal(nodesOf(output).length, 1);
+  assert.match(output, /<td><b>bold<\/b><\/td>/);
+  const codeEscape = render("| label | value |\n| `a\\|b` | c |\n| d | e |");
+  assert.match(codeEscape, /<code>a\\\|b<\/code>/);
+  const escaped = render('| label | value |\n| <script>alert(1)</script> | & |\n| "quote" | <img src=x onerror=bad> |');
+  assert.match(escaped, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.doesNotMatch(escaped, /<(?:script|img)\b/);
+});
+
+test("pipe table without delimiter rejects short, ragged and ambiguous text", () => {
+  const { render } = pipeTableHarness();
+  for (const source of [
+    "| a | b |", "| a | b |\n| c | d |",
+    "a | b\nc | d\ne | f", "| a |\n| b |\n| c |",
+    "| a | b |\n| c | d | e |\n| f | g |\n| h | i |",
+    "| a | b |\n| c | d |\n| e | f |\n| g | h | i |",
+    "| a | b |\n| c | d |\n| e | f |\n| truncated |",
+    "| | b |\n| c | d |\n| e | f |",
+    "| a | b |\n| c | d |\n   \n| e | f |",
+    "| a | b |\n| c | d |\n| --- | ---",
+    "| a | b \\|\n| c | d \\|\n| e | f \\|",
+  ]) assert.doesNotMatch(render(source), /<table>/, source);
+});
+
+test("pipe table inference preserves the legacy delimiter grammar", () => {
+  const { render } = pipeTableHarness();
+  // A blank pipe row or a later delimiter already starts a standard table
+  // with its preceding row as the header, rather than an inferred table.
+  for (const delimiter of ["| | |", "| --- | --- |"])
+    assert.equal(render("| a | b |\n| c | d |\n" + delimiter + "\n| e | f |"),
+      '<div class="p">| a | b |</div><div class="tablewrap"><table><thead><tr><th>c</th><th>d</th></tr></thead><tbody><tr><td>e</td><td>f</td></tr></tbody></table></div>');
+});
+
+test("pipe table without delimiter stays literal inside fenced code", () => {
+  const { render } = pipeTableHarness();
+  for (const fence of ["```", "~~~"]) {
+    for (const ending of ["", "\n" + fence]) {
+      const output = render(fence + "text\n" + missingDelimiterTable + ending);
+      assert.match(output, /<pre data-lang="text">/);
+      assert.doesNotMatch(output, /<table>/);
+    }
+    const nested = render("- code\n  " + fence + "text\n" + missingDelimiterTable.replace(/^/gm, "  ") + "\n  " + fence);
+    assert.doesNotMatch(nested, /<table>/);
+  }
+});
+
+test("pipe table without delimiter tolerates streaming prefixes without inventing cells", () => {
+  const h = pipeTableHarness();
+  const source = "| a | b |\n| c | d |\n| e | f |";
+  for (const preview of [false, true]) {
+    const render = (input) => h.context.renderMarkdown(input, preview);
+    assert.doesNotMatch(render("| a | b |\n| c | d |\n| e | f"), /<table>/);
+    assert.equal((render(source).match(/<td>/g) || []).length, 4);
+    assert.equal((render(source + "\n\nfollowing prose").match(/<td>/g) || []).length, 4);
+    assert.match(render(source + "\n\nfollowing prose"), /<\/table><\/div><div class="p">following prose<\/div>/);
+  }
+});
 
 test("history ending in an unanswered user message is treated as interrupted", () => {
   const start = script.indexOf("function isRuntimeSyntheticUser(");
@@ -137,6 +283,7 @@ test("drafts persist independently for each session and restore on switch", () =
     restoreTeamPick() {},
     abortEvents() {},
     isPhoneLayout: () => true,
+    pendingImages: [],
   });
   vm.runInContext(layoutHoldSrc, context);
   vm.runInContext(historyRetrySrc, context);
@@ -383,7 +530,7 @@ test("a live user bubble resolves the canonical index before rewinding", async (
   await actions[0].onclick({ stopPropagation() {} });
   assert.deepEqual(rewinds, [[10, "repeat", "session-1"]]);
   assert.deepEqual(notes, []);
-  assert.match(script, /addLiveUserBubble\(text \|\| "\(images only\)", prompt, sid, rewindFloor\);/);
+  assert.match(script, /addLiveUserBubble\(text\.trim\(\) \? text : "\(images only\)", prompt, sid, rewindFloor\);/);
 });
 
 test("rewind action is visible on both layouts", () => {
@@ -1107,6 +1254,7 @@ test("the real streaming paint leaves the formulas for the final render", async 
     bubble, raw: "$x", paintTimer: null, sid: "s", sessionId: "s",
     activityDirty: false,
     answerDirty: true, progressDirty: false, thinkingDirty: false, thinkingDoneDirty: false,
+    mainRate: () => "",
     shouldFollowOutput: () => true, followOutput() {},
   });
   const paint = script.match(/const paint = \(\) => \{([\s\S]*?)\n  \};/)[1];
@@ -1143,7 +1291,8 @@ test("stream paint batches answer, thinking and progress into one follow pass", 
   let progressWrites = 0;
   let thinkingWrites = 0;
   let answerWrites = 0;
-  const summary = { set textContent(value) { assert.equal(value, "thinking"); } };
+  const summaryWrites = [];
+  const summary = { set textContent(value) { summaryWrites.push(value); } };
   const think = {
     body: { set textContent(value) { thinkingWrites++; assert.equal(value, "reasoning"); } },
     box: { querySelector: () => summary },
@@ -1155,9 +1304,9 @@ test("stream paint batches answer, thinking and progress into one follow pass", 
     querySelectorAll: () => nodeList(),
   };
   Object.assign(h.context, {
-    answerDirty: true, progressDirty: true, thinkingDirty: true, thinkingDoneDirty: true,
+    answerDirty: true, progressDirty: true, thinkingDirty: true, thinkingDoneDirty: true, thinkRate: "", mainRate: () => "",
     activityDirty: false,
-    expandProgress: true, prog: {}, progDetails: { open: false }, renderProgress: () => { progressWrites++; },
+    expandProgress: true, prog: {}, progDetails: { open: false, dataset: {} }, renderProgress: () => { progressWrites++; },
     think, thinkRaw: "reasoning", bubble, raw: "answer", paintTimer: 1,
     sid: "s", sessionId: "s",
     shouldFollowOutput: () => { followChecks++; return true; },
@@ -1170,12 +1319,14 @@ test("stream paint batches answer, thinking and progress into one follow pass", 
     { followChecks, follows, progressWrites, thinkingWrites, answerWrites },
     { followChecks: 1, follows: 1, progressWrites: 1, thinkingWrites: 1, answerWrites: 1 },
   );
+  assert.deepEqual(summaryWrites, ["thinking…", "thinking"]);
   assert.equal(h.context.progDetails.open, true);
   runPaint();
   assert.deepEqual(
     { followChecks, follows, progressWrites, thinkingWrites, answerWrites },
     { followChecks: 1, follows: 1, progressWrites: 1, thinkingWrites: 1, answerWrites: 1 },
   );
+  assert.deepEqual(summaryWrites, ["thinking…", "thinking"]);
 });
 
 test("separate thinking phases create separate folds", () => {
@@ -1184,10 +1335,15 @@ test("separate thinking phases create separate folds", () => {
   assert.ok(start >= 0 && end > start);
   const summary = { textContent: "thinking" };
   const body = { textContent: "" };
-  const fold = () => ({ box: { querySelector: () => summary }, body });
+  const fold = () => ({ box: { dataset: {}, querySelector: () => summary }, body });
   let creations = 0;
   let insertions = 0;
-  const parent = { insertBefore(node, before) { insertions++; assert.ok(node); assert.equal(before, reply); } };
+  const parent = {
+    children: [],
+    dataset: {},
+    classList: { contains: () => false },
+    insertBefore(node, before) { insertions++; assert.ok(node); assert.equal(before, reply); },
+  };
   const reply = { parentNode: parent };
   const context = vm.createContext({
     addFold(title, text, host) {
@@ -1252,7 +1408,7 @@ test("prompt composition defers reflow, draft writes and keyboard shortcuts", ()
   assert.ok(start >= 0 && end > start);
   assert.match(promptHandlers, /compositionstart[\s\S]*?promptComposing = true/);
   assert.match(promptHandlers, /compositionend[\s\S]*?promptComposing = false[\s\S]*?growPrompt\(\)[\s\S]*?persistDraft\(\)/);
-  assert.match(promptHandlers, /addEventListener\("input", \(e\)[\s\S]*?if \(promptComposing \|\| e\.isComposing\) return/);
+  assert.match(promptHandlers, /addEventListener\("input", \(e\)[\s\S]*?if \(promptComposing \|\| e\.isComposing\) \{[\s\S]*?return;/);
   assert.match(promptHandlers, /addEventListener\("keydown", \(e\)[\s\S]*?if \(e\.isComposing \|\| e\.keyCode === 229\) return/);
   // A layout change during a composition cancels the word on Android WebView,
   // so the composer holds its height until the composition ends.
@@ -1359,6 +1515,12 @@ function historyHarness({
     querySelectorAll() { return []; },
     insertBefore(node, anchor) {
       if (node.remove) node.remove();
+      // Real DOM inserts a fragment's children, not the fragment itself.
+      if (node && node.fragment) {
+        for (const child of node.children.slice()) this.insertBefore(child, anchor);
+        node.children = [];
+        return node;
+      }
       const index = anchor === null ? this.children.length : this.children.indexOf(anchor);
       assert.ok(index >= 0, "the insertion anchor must be a child");
       this.children.splice(index, 0, node);
@@ -1373,7 +1535,7 @@ function historyHarness({
     get lastElementChild() { return this.children[this.children.length - 1]; },
     set textContent(value) { assert.equal(value, ""); clears += 1; this.children = []; },
   };
-  for (const node of existingNodes) root.appendChild(node);
+  for (const node of existingNodes) { node.children ||= []; node.dataset ||= {}; root.appendChild(node); }
   for (const node of root.children) node.remove = function remove() {
     const i = root.children.indexOf(this);
     if (i >= 0) root.children.splice(i, 1);
@@ -1388,17 +1550,30 @@ function historyHarness({
     pendingUserInputs: new Map(), historyLoadSeq: 0, staleBox: null,
     recoveredView: null, eventSession: "", armHistoryFollow() {},
     textOf: (content) => content, isRuntimeSyntheticUser: (message) => !!message.synthetic,
+    // loadHistory builds its failure row through the real DOM helpers.
+    document: {
+      createElement: () => ({
+        children: [], dataset: {}, classList: { add() {}, remove() {}, toggle() {} },
+        appendChild(node) { this.children.push(node); return node; },
+        remove() {}, querySelector: () => null, querySelectorAll: () => [],
+      }),
+      createDocumentFragment: () => ({
+        children: [], fragment: true,
+        appendChild(node) { this.children.push(node); return node; },
+      }),
+    },
     $: () => root,
     api: async () => { apiCalls += 1; return pending; },
     historyRowsOf: () => ({ rows, shownCount: rows.length }),
     histKey: () => "tail", histEndsTurn: () => true, historyEndsUnanswered: () => true,
-    syncStopButton() {}, renderSessionBar() {}, attachLiveBox() {},
+    syncStopButton() {}, renderSessionBar() {}, attachLiveBox() {}, showTurnRate() {},
     updateQuestionButton() {},
     shouldFollowOutput: () => follow,
     followOutput(wasFollowing) { if (wasFollowing) root.scrollTop = root.scrollHeight; },
     revokePreviews(node) { retired.push(node); },
     renderHistoryRow(row, parent) {
       const node = {
+        children: [],
         key: row.key, parent, dataset: { canonicalIndex: String(row.historyIndex ?? rows.indexOf(row)), canonicalKey: row.key },
         classList: { contains: (name) => row.role === "user" && name === "user-msg-row" },
       };
@@ -1408,7 +1583,8 @@ function historyHarness({
       };
       parent.appendChild(node);
     },
-    addMsg() {},
+    // A swallowed render error would otherwise show up as an empty transcript.
+    addMsg(kind, text) { if (kind === "err") throw new Error(String(text)); },
   });
   const start = script.indexOf("async function loadHistory(");
   const end = script.indexOf("// Historical user inputs", start);
@@ -1432,7 +1608,7 @@ test("history stays mounted while a refresh is in flight", async () => {
   await loading;
   assert.equal(h.apiCalls(), 1);
   assert.equal(h.clears(), 1);
-  assert.deepEqual(h.root.children.map((node) => node.key), ["old", "new"]);
+  assert.deepEqual(renderedKeys(h.root), ["old", "new"]);
 });
 
 test("stale history appends canonical progress without replacing its prefix", async () => {
@@ -1446,13 +1622,13 @@ test("stale history appends canonical progress without replacing its prefix", as
   assert.equal(h.clears(), 0);
   assert.deepEqual(h.retired, [staleBox, liveUser]);
   assert.equal(h.root.children[0], old);
-  assert.deepEqual(h.root.children.map((node) => node.key), ["mounted-old", "new"]);
+  assert.deepEqual(renderedKeys(h.root), ["mounted-old", "new"]);
   h.rows.push({ key: "newer", text: "later progress" });
   await h.context.loadHistory({ messages: [], histTotal: 3, appendOnly: true });
   assert.equal(h.clears(), 0);
   assert.equal(h.root.children[0], old);
   assert.equal(h.root.children[1], firstProgress);
-  assert.deepEqual(h.root.children.map((node) => node.key), ["mounted-old", "new", "newer"]);
+  assert.deepEqual(renderedKeys(h.root), ["mounted-old", "new", "newer"]);
 });
 
 test("a settled input whose recorded floor drifted is reconciled, not duplicated", async () => {
@@ -1487,7 +1663,7 @@ test("an in-flight input never claims an older identical message", async () => {
   ]);
   await h.context.loadHistory();
   assert.equal(h.context.pendingUserInputs.has("s"), true, "it stays pending");
-  assert.equal(h.root.children.includes(row), true, "its local row stays in the transcript");
+  assert.equal(renderedNodes(h.root).includes(row), true, "its local row stays in the transcript");
 });
 
 test("history retains image nodes and URLs across repeated progress and normal refresh", async () => {
@@ -1536,14 +1712,14 @@ for (const prefix of ["old", "different"]) test(`unacknowledged user input survi
   h.context.turns.set("s", { box: live });
   const older = [{ role: "user", content: "prompt" }, { role: "assistant", content: "reply" }];
   await h.context.loadHistory({ messages: older, histTotal: 2 });
-  assert.deepEqual(h.root.children.map((node) => node.key), ["old", "new", "pending-user", "running"]);
+  assert.deepEqual(renderedKeys(h.root), ["old", "new", "pending-user", "running"]);
   assert.equal(h.root.children[2], user);
   assert.equal(h.root.lastElementChild, live);
   assert.equal(h.retired.includes(user), false, "pending input previews must stay owned by the input");
   h.rows.push({ key: "canonical-user", text: "prompt" });
   await h.context.loadHistory({ messages: [...older, { role: "user", content: "prompt" }], histTotal: 3 });
-  assert.equal(h.root.children.includes(user), false, "canonical acknowledgement replaces, not duplicates, the pending input");
-  assert.equal(h.root.children.filter((node) => node.key === "canonical-user").length, 1);
+  assert.equal(renderedNodes(h.root).includes(user), false, "canonical acknowledgement replaces, not duplicates, the pending input");
+  assert.equal(renderedKeys(h.root).filter((key) => key === "canonical-user").length, 1);
   assert.equal(h.context.pendingUserInputs.has("s"), false);
 });
 
@@ -1560,9 +1736,9 @@ for (const caption of ["caption", ""]) for (const ocr of [false, true]) test(`pe
   const history = { messages: [{ role: "user", content }, { role: "assistant", content: "reply" }], histTotal: 2 };
   await h.context.loadHistory(history);
   assert.equal(h.context.pendingUserInputs.has("s"), false);
-  assert.deepEqual(h.root.children.map((node) => node.key), ["canonical-user", "reply"]);
+  assert.deepEqual(renderedKeys(h.root), ["canonical-user", "reply"]);
   await h.context.loadHistory(history);
-  assert.deepEqual(h.root.children.map((node) => node.key), ["canonical-user", "reply"]);
+  assert.deepEqual(renderedKeys(h.root), ["canonical-user", "reply"]);
 });
 
 for (const prefix of ["old", "different"]) test(`history refresh retains the active recovered stream (${prefix})`, async () => {
@@ -1575,7 +1751,7 @@ for (const prefix of ["old", "different"]) test(`history refresh retains the act
   await h.context.loadHistory({ messages: [], histTotal: 2 });
   assert.equal(h.root.lastElementChild, live, "the stream must keep painting a mounted view");
   assert.equal(retiredLive, false, "stream previews must survive canonical history refresh");
-  assert.equal(h.root.children.filter((node) => node === live).length, 1);
+  assert.equal(renderedNodes(h.root).filter((node) => node === live).length, 1);
 });
 
 test("an older in-flight history response cannot overwrite a newer snapshot", async () => {
@@ -1589,7 +1765,7 @@ test("an older in-flight history response cannot overwrite a newer snapshot", as
   await fresh;
   responses[0](respond("old"));
   await old;
-  assert.deepEqual(h.root.children.map((node) => node.key), ["new"]);
+  assert.deepEqual(renderedKeys(h.root), ["new"]);
 });
 
 for (const change of ["refresh", "turn", "session", "stream"]) test(`stale history fetch cannot outlive a newer ${change}`, async () => {
@@ -1611,7 +1787,7 @@ for (const change of ["refresh", "turn", "session", "stream"]) test(`stale histo
   if (change === "turn") c.runEpoch++;
   if (change === "session") { c.sessionId = "other"; c.staleSession = "other"; }
   if (change === "stream") c.eventActive = true;
-  const expected = h.root.children.slice();
+  const expected = renderedNodes(h.root);
   respond({ headers: { get: () => "1" }, json: async () => [{ role: "assistant", content: "stale" }] });
   await loading;
   assert.deepEqual(h.root.children, expected);
@@ -1623,6 +1799,7 @@ test("user image references stay visible as placeholders; assistant media stays 
   const rendered = [];
   Object.assign(h.context, {
     callLabel: () => "tool",
+    sessionId: "session-a",
     addUserBubble: (text, index) => rendered.push({ user: text, index }),
     addMsgMd: (text) => rendered.push({ assistant: h.render(text) }),
   });
@@ -1636,7 +1813,10 @@ test("user image references stay visible as placeholders; assistant media stays 
   ];
   const history = h.context.historyRowsOf(messages, 12, false);
   assert.equal(history.rows.length, 3);
-  history.rows.forEach((row) => h.context.renderHistoryRow(row));
+  // The page wraps rows in a per-turn container, so the renderer always
+  // receives a parent; a bare root keeps the placeholder assertions local.
+  const root = { children: [], appendChild(child) { this.children.push(child); } };
+  history.rows.forEach((row) => h.context.renderHistoryRow(row, root));
   assert.equal(rendered[0].user, "[image: photo.png]");
   assert.equal(rendered[0].index, 9);
   assert.equal(rendered[1].user, "caption\n[image]");
@@ -1656,11 +1836,13 @@ test("image reread followups stay internal without losing real prompts or canoni
   ];
   for (const [start, end] of chunks) vm.runInContext(script.slice(script.indexOf(start), script.indexOf(end)), h.context);
   Object.assign(h.context, {
+    sessionId: "session-a",
+    taskReportOf: () => null,
     addUserBubble: (text, index) => rendered.push({ role: "user", text, index }),
     addMsgMd: (text) => rendered.push({ role: "assistant", text }),
     addFold: (label, text) => {
       rendered.push({ role: "tool", label, text });
-      return { box: { querySelector: () => null } };
+      return { box: { querySelector: () => null, dataset: {} } };
     },
     FOLD_ROLE_LABELS: {},
   });
@@ -1677,7 +1859,8 @@ test("image reread followups stay internal without losing real prompts or canoni
   const history = h.context.historyRowsOf(messages, 20, false);
   assert.equal(history.shownCount, 5, "hidden messages still occupy canonical slots");
   assert.deepEqual(Array.from(history.rows, (r) => r.historyIndex), [15, 16, 18, 19]);
-  history.rows.forEach((row) => h.context.renderHistoryRow(row));
+  const root = { children: [], appendChild(child) { this.children.push(child); } };
+  history.rows.forEach((row) => h.context.renderHistoryRow(row, root));
   assert.deepEqual(rendered.map((r) => r.role), ["user", "tool", "assistant", "user"]);
   assert.equal(rendered[0].text, "[image: hand.jpg]\nwhich tile?");
   assert.equal(rendered[2].text, messages[3].content, "assistant images remain Markdown");
@@ -1690,8 +1873,10 @@ test("image reread followups stay internal without losing real prompts or canoni
   windowed[2] = messages[2];
   windowed[3] = messages[0];
   const tail = h.context.historyRowsOf(windowed, 302, false);
-  assert.equal(tail.shownCount, 200);
-  assert.equal(tail.rows[0].historyIndex, 103, "filtering does not shift a truncated window");
+  // Internal rows are identified by runtime origin metadata only; image-bearing
+  // prompts stay visible, so nothing is filtered out of this window.
+  assert.equal(tail.shownCount, 202);
+  assert.equal(tail.rows[0].historyIndex, 100, "window indices stay absolute when nothing is filtered");
 });
 
 test("synthetic origin is exact metadata, never a content or image heuristic", () => {
@@ -1783,7 +1968,7 @@ function indexedHistoryHarness(options = {}) {
   const h = historyHarness(options);
   const append = (role, text, parent = h.root) => {
     const node = {
-      key: text, dataset: {},
+      key: text, children: [], dataset: {},
       classList: { contains: (name) => role === "user" && name === "user-msg-row" },
       remove() {
         const index = h.root.children.indexOf(this);
@@ -1798,12 +1983,22 @@ function indexedHistoryHarness(options = {}) {
     addMsgMd: (text, parent) => append("assistant", text, parent),
     // Cards carry their <details>; this stub has none, so a stored fold cannot
     // be restored through it and the row renderer must cope with that.
-    addFold: (label, text, parent) => ({ ...append("tool", text, parent), box: { querySelector: () => null } }),
+    addFold: (label, text, parent) => ({ ...append("tool", text, parent), box: { querySelector: () => null, dataset: {} } }),
     FOLD_ROLE_LABELS: {},
   });
   const start = script.indexOf("function historyRowsOf(");
   const end = script.indexOf("// A session the server reports", start);
   vm.runInContext(script.slice(start, end), h.context);
+  // Record what the row renderer was asked to draw: the transcript's own
+  // labels are internal to the page, but "this row reached the renderer" is
+  // the guarantee these tests are about.
+  const rendered = [];
+  const renderRow = h.context.renderHistoryRow;
+  h.context.renderHistoryRow = (row, parent) => {
+    rendered.push(row.message?.content ?? row.text);
+    return renderRow(row, parent);
+  };
+  h.rendered = rendered;
   return h;
 }
 
@@ -1816,7 +2011,7 @@ test("session history renders stored null tool arguments without losing later ro
     { role: "assistant", content: "Later reply" },
   ];
   const old = { key: "A transcript", dataset: {} };
-  const h = indexedHistoryHarness({ messages, total: "3", existingKeys: ["A"], existingNodes: [old] });
+  const h = indexedHistoryHarness({ messages, total: "2", existingKeys: ["A"], existingNodes: [old] });
   const labels = [], errors = [], addFold = h.context.addFold;
   Object.assign(h.context, {
     sessionId: "B", historySession: "A", abortEvents() {},
@@ -1830,7 +2025,7 @@ test("session history renders stored null tool arguments without losing later ro
   ]) vm.runInContext(script.slice(script.indexOf(start), script.indexOf(end)), h.context);
   await h.context.loadHistory();
   assert.equal(h.context.historySession, "B");
-  assert.deepEqual(h.root.children.map((node) => node.key), ["Invalid arguments: expected an object", "Later reply"]);
+  assert.deepEqual(renderedKeys(h.root), ["Invalid arguments: expected an object", "Later reply"]);
   assert.deepEqual(labels, ["read_file"]);
   assert.deepEqual(errors, []);
 });
@@ -1844,13 +2039,13 @@ test("prefetched history from another session cannot replace or cancel the selec
   Object.assign(h.context, { sessionId: "B", historySession: "A", abortEvents() {} });
   const loading = h.context.loadHistory();
   await h.context.loadHistory({ sessionId: "A", messages: [{ role: "assistant", content: "Stale A transcript" }], histTotal: 1 });
-  const sequenceAfterPrefetch = h.context.historyLoadSeq, rowsAfterPrefetch = h.root.children.slice();
+  const sequenceAfterPrefetch = h.context.historyLoadSeq, rowsAfterPrefetch = renderedNodes(h.root);
   h.resolveResponse();
   await loading;
   assert.equal(sequenceAfterPrefetch, 1, "reject stale cached rows before invalidating B's pending response");
   assert.deepEqual(rowsAfterPrefetch, [old]);
   assert.equal(h.context.historySession, "B");
-  assert.deepEqual(h.root.children.map((node) => node.key), ["B transcript"]);
+  assert.deepEqual(renderedKeys(h.root), ["B transcript"]);
   assert.equal(h.apiCalls(), 1);
 });
 
@@ -1868,7 +2063,7 @@ for (const stage of ["projection", "row"]) test(`a ${stage} render failure repla
     [stage === "projection" ? "historyRowsOf" : "renderHistoryRow"]: () => { throw failure; },
   });
   await h.context.loadHistory();
-  assert.deepEqual(h.root.children.map((node) => node.key), ["history render failed: Failed at " + stage]);
+  assert.deepEqual(renderedKeys(h.root), ["history render failed: Failed at " + stage]);
   assert.equal(h.context.historySession, "");
   assert.deepEqual(Array.from(h.context.historyKeys), []);
   assert.equal(h.context.lastMsgCount, null);
@@ -1890,14 +2085,14 @@ test("identical history refresh preserves canonical nodes around a pending input
   h.context.turns.set("s", { box: live });
   const snapshot = { messages, histTotal: 3 };
   await h.context.loadHistory(snapshot);
-  assert.deepEqual(h.root.children.map((node) => node.key), ["old prompt", "pending user", "owned answer", "live box"]);
-  const first = h.root.children.slice(), answer = first[2];
+  assert.deepEqual(renderedKeys(h.root), ["old prompt", "pending user", "owned answer", "live box"]);
+  const first = renderedNodes(h.root), rawFirst = h.root.children.slice(), answer = first[2];
   const clears = h.clears();
   await h.context.loadHistory(snapshot);
-  assert.deepEqual(h.root.children.map((node) => node.key), first.map((node) => node.key));
-  assert.deepEqual(h.root.children, first);
-  h.root.children.forEach((node, index) => assert.equal(node, first[index], "unchanged canonical rows keep their nodes"));
-  assert.equal(h.root.children.filter((node) => node === answer).length, 1, "the canonical answer is retained exactly once");
+  assert.deepEqual(renderedKeys(h.root), first.map((node) => node.key));
+  assert.deepEqual(h.root.children, rawFirst, "the mounted transcript is not rebuilt");
+  renderedNodes(h.root).forEach((node, index) => assert.equal(node, first[index], "unchanged canonical rows keep their nodes"));
+  assert.equal(renderedNodes(h.root).filter((node) => node === answer).length, 1, "the canonical answer is retained exactly once");
   assert.equal(h.retired.includes(answer), false, "a retained answer keeps its previews");
   assert.equal(h.clears(), clears, "unchanged history is not rebuilt");
 });
@@ -1910,7 +2105,7 @@ test("a later pending input follows the previous turn's finished answer", async 
   h.context.pendingUserInputs.set("s", [{ row: user, prompt: "next prompt", minIndex: 2 }]);
   h.context.turns.set("s", { box: live });
   await h.context.loadHistory({ messages, histTotal: 2 });
-  assert.deepEqual(h.root.children.map((node) => node.key), ["old prompt", "finished answer", "pending user", "live box"]);
+  assert.deepEqual(renderedKeys(h.root), ["old prompt", "finished answer", "pending user", "live box"]);
   assert.equal(h.root.children[2], user);
   assert.equal(h.root.lastElementChild, live);
 });
@@ -1932,7 +2127,7 @@ for (const drift of ["grew", "shrank"]) test(`pending placement follows its hist
   const expected = drift === "shrank"
     ? ["old prompt", "pending user", "owned answer", "live box"]
     : ["old prompt", "finished answer", "pending user", "live box"];
-  assert.deepEqual(h.root.children.map((node) => node.key), expected);
+  assert.deepEqual(renderedKeys(h.root), expected);
   const first = h.root.children.slice();
   await h.context.loadHistory({ messages, histTotal: messages.length });
   assert.deepEqual(h.root.children, first, "reattachment keeps the same prompt and answer nodes in order");
@@ -1953,7 +2148,7 @@ for (const acknowledged of [false, true]) test(`two pending prompts keep their h
   const messages = [oldPrompt, { role: "assistant", content: "finished answer" }];
   if (acknowledged) messages.push({ role: "user", content: "first prompt" }, { role: "assistant", content: "first answer" });
   await h.context.loadHistory({ messages, histTotal: messages.length });
-  assert.deepEqual(h.root.children.map((node) => node.key), acknowledged
+  assert.deepEqual(renderedKeys(h.root), acknowledged
     ? ["old prompt", "finished answer", "first prompt", "first answer", "second pending", "live box"]
     : ["old prompt", "finished answer", "first pending", "second pending", "live box"]);
   assert.equal(h.context.pendingUserInputs.get("s").length, acknowledged ? 1 : 2);
@@ -1977,7 +2172,7 @@ test("an identical earlier prompt cannot move the anchor past the first pending 
   h.context.turns.set("s", { box: live });
   const messages = [oldPrompt, { role: "assistant", content: "old answer" }, oldPrompt, { role: "assistant", content: "new answer" }];
   await h.context.loadHistory({ messages, histTotal: 4 });
-  assert.deepEqual(h.root.children.map((node) => node.key), ["repeat", "old answer", "repeat", "new answer", "second pending", "live box"]);
+  assert.deepEqual(renderedKeys(h.root), ["repeat", "old answer", "repeat", "new answer", "second pending", "live box"]);
   assert.equal(h.context.pendingUserInputs.get("s")[0], second);
 });
 
@@ -2096,7 +2291,10 @@ test("an explicit landing clears the previous transcript's scroll lock", () => {
 });
 
 test("a sidebar pick lands on the newest turn after its history loads", () => {
-  assert.match(html, /Promise\.resolve\(loadHistory\(\)\)\.then\(\n\s+\(\) => \{ if \(sessionId === s\.id\) scrollToLatest\(false\); \},/);
+  // The pick starts a landing transcript scroll for the incoming session and
+  // loads its history behind that intent; a failed load must not break the pick.
+  assert.match(html, /if \(window\.matchMedia && window\.matchMedia\("\(min-width:701px\)"\)\.matches\n\s+&& typeof beginTranscriptScroll === "function"\) beginTranscriptScroll\(nextId\);/);
+  assert.match(html, /Promise\.resolve\(loadHistory\(\)\)\.catch\(\(\) => \{\}\);/);
   assert.match(html, /outputFollowSuspended = false;\n  jumpingToBottom = false;\n  restoreDraft\(\);/);
 });
 
@@ -2107,7 +2305,7 @@ test("same-session history refresh preserves a phone reader's position", async (
   await h.context.loadHistory({ messages: [], histTotal: 2, appendOnly: false });
   assert.equal(h.root.scrollTop, 37);
   assert.equal(h.root.children[0], old);
-  assert.deepEqual(h.root.children.map((node) => node.key), ["mounted-old", "new"]);
+  assert.deepEqual(renderedKeys(h.root), ["mounted-old", "new"]);
 });
 
 test("the jump-to-latest control is an overlaid round button on phone and desktop", () => {
@@ -2187,6 +2385,9 @@ function pasteHarness(value = "") {
     note: (message) => calls.push(message),
     pendingImages: [],
     FileReader: Reader,
+    sessionId: "session-a",
+    composerImageDrafts: new Map(),
+    draftKey: (id) => "draft:" + id,
   });
   const start = script.indexOf("function insertPromptText(");
   const end = script.indexOf("function textOf(", start);
