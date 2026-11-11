@@ -3255,6 +3255,11 @@ function switchSession(nextId, saveCurrent = true) {
   // The queue belongs to the session being left; clear it immediately while
   // the first poll for the new session is in flight.
   if (typeof renderSideNotes === "function") renderSideNotes([]);
+  // A queued follow frame belongs to the transcript being left. The desktop
+  // mount above already replaces its own state, so the phone drops it here
+  // instead of letting it scroll the session that is about to render.
+  if (!(window.matchMedia && window.matchMedia("(min-width:701px)").matches)
+      && typeof resetTranscriptScroll === "function") resetTranscriptScroll();
   // Scroll intent belongs to the transcript being left: a scroll lock from the
   // old conversation must not veto the follow request for the new one.
   outputFollowSuspended = false;
@@ -6700,8 +6705,13 @@ async function loadHistory(prefetched, canCommit = () => true) {
       if (!follow && !appendOnly) root.scrollTop = oldScrollTop;
       // A rebuilt transcript can clamp the old offset and queue a scroll event.
       // Compare that event with the new layout before following its live edge.
-      if ((!sameSession || navigating || follow) && window.matchMedia && window.matchMedia("(min-width:701px)").matches
-          && typeof resetTranscriptScroll === "function") resetTranscriptScroll();
+      // Every layout resets here: without the fresh baseline the clamp reads as
+      // a reader scroll-up and vetoes the follow below, and an outgoing frame
+      // would drag a restored reading position to the session just left.
+      if (!sameSession || navigating || follow) {
+        if (typeof resetTranscriptScroll === "function") resetTranscriptScroll();
+        else root._resetScrollTracking?.();
+      }
       followOutput(follow, root);
       // A partial render below may not rebuild the transcript, so drop the
       // failure row explicitly instead of relying on reconciliation.
@@ -7744,6 +7754,25 @@ async function sendSideNote() {
   }
 }
 let sideNotesSeq = 0;
+// A queued note is drained by the turn child at its next request, which can land
+// after the turn's own polling stopped. Keep a slow re-check while the queue is
+// non-empty so the bar cannot stay on a stale waiting state.
+let sideNoteWatchTimer = null;
+const SIDE_NOTE_WATCH_MS = 5000;
+function watchSideNotes(active) {
+  if (!active) {
+    if (sideNoteWatchTimer !== null) {
+      clearInterval(sideNoteWatchTimer);
+      sideNoteWatchTimer = null;
+    }
+    return;
+  }
+  if (sideNoteWatchTimer !== null) return;
+  sideNoteWatchTimer = setInterval(() => {
+    if (document.visibilityState !== "visible") return;
+    void refreshSideNotes();
+  }, SIDE_NOTE_WATCH_MS);
+}
 function renderSideNotes(notes) {
   const box = $("sidequeue");
   if (!box) return;
@@ -7766,6 +7795,7 @@ function renderSideNotes(notes) {
     li.appendChild(text);
     list.appendChild(li);
   }
+  watchSideNotes(notes.length > 0);
 }
 // The queue is server-side and a turn child can drain it between any two
 // polls. A sequence guard keeps a slow response for an old session from

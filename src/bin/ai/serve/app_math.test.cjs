@@ -539,6 +539,38 @@ test("rewind action is visible on both layouts", () => {
   assert.match(html, /\.user-msg-row > \.rewind-action \{[\s\S]*?width:34px;[\s\S]*?height:34px;[\s\S]*?border-radius:999px;/);
 });
 
+test("a pending side note keeps re-checking the queue until it drains", () => {
+  const start = script.indexOf("let sideNotesSeq = 0;");
+  const end = script.indexOf("// The queue is server-side", start);
+  assert.ok(start >= 0 && end > start);
+  const intervals = [];
+  const nodes = {
+    sidequeue: { hidden: false },
+    sidequeuelist: { children: [], appendChild(el) { this.children.push(el); } },
+    sidequeuecount: { textContent: "" },
+  };
+  const context = vm.createContext({
+    document: {
+      visibilityState: "visible",
+      createElement: () => ({ className: "", textContent: "", title: "", appendChild() {} }),
+    },
+    $: (id) => nodes[id],
+    setInterval: (fn, ms) => { intervals.push({ fn, ms, cleared: false }); return intervals.length; },
+    clearInterval: (id) => { if (intervals[id - 1]) intervals[id - 1].cleared = true; },
+    refreshSideNotes: () => { context.refreshed = (context.refreshed || 0) + 1; },
+  });
+  vm.runInContext(script.slice(start, end), context);
+  context.renderSideNotes([{ from: "user", content: "hello" }]);
+  assert.equal(intervals.length, 1);
+  assert.equal(intervals[0].ms, 5000);
+  context.renderSideNotes([{ from: "user", content: "hello" }]);
+  assert.equal(intervals.length, 1, "a second pending render reuses the running watch");
+  intervals[0].fn();
+  assert.equal(context.refreshed, 1);
+  context.renderSideNotes([]);
+  assert.equal(intervals[0].cleared, true, "an empty queue stops the watch");
+});
+
 test("a mobile side note queues text without stopping the running turn", async () => {
   const start = script.indexOf("async function sendSideNote(");
   const end = script.indexOf("async function stopTurn(", start);
@@ -1505,6 +1537,7 @@ function historyHarness({
   let apiCalls = 0;
   let clears = 0;
   const retired = [];
+  const scrollEvents = [];
   const response = {
     headers: { get: () => total },
     json: async () => messages,
@@ -1565,12 +1598,18 @@ function historyHarness({
     },
     $: () => root,
     api: async () => { apiCalls += 1; return pending; },
+    // Phone layout: no desktop owner state absorbs the rebuild's clamp.
+    window: { matchMedia: () => ({ matches: false }) },
+    resetTranscriptScroll() { scrollEvents.push("reset"); },
     historyRowsOf: () => ({ rows, shownCount: rows.length }),
     histKey: () => "tail", histEndsTurn: () => true, historyEndsUnanswered: () => true,
     syncStopButton() {}, renderSessionBar() {}, attachLiveBox() {}, showTurnRate() {},
     updateQuestionButton() {},
     shouldFollowOutput: () => follow,
-    followOutput(wasFollowing) { if (wasFollowing) root.scrollTop = root.scrollHeight; },
+    followOutput(wasFollowing) {
+      scrollEvents.push("follow");
+      if (wasFollowing) root.scrollTop = root.scrollHeight;
+    },
     revokePreviews(node) { retired.push(node); },
     renderHistoryRow(row, parent) {
       const node = {
@@ -1595,6 +1634,7 @@ function historyHarness({
   return {
     context, root, rows, resolveResponse,
     apiCalls: () => apiCalls, clears: () => clears, revokes: () => retired.length, retired,
+    scrollEvents: () => scrollEvents.slice(),
   };
 }
 
@@ -1610,6 +1650,18 @@ test("history stays mounted while a refresh is in flight", async () => {
   assert.equal(h.apiCalls(), 1);
   assert.equal(h.clears(), 1);
   assert.deepEqual(renderedKeys(h.root), ["old", "new"]);
+});
+
+test("a phone switch resets the scroll baseline before following the tail", async () => {
+  const h = historyHarness({ delayed: true, follow: true });
+  h.root.scrollHeight = 900;
+  const loading = h.context.loadHistory();
+  h.resolveResponse();
+  await loading;
+  // The rebuilt transcript clamps the old offset, and that queued scroll event
+  // would read as a reader scroll-up and veto the follow without the reset.
+  assert.deepEqual(h.scrollEvents().slice(-2), ["reset", "follow"]);
+  assert.equal(h.root.scrollTop, h.root.scrollHeight);
 });
 
 test("stale history appends canonical progress without replacing its prefix", async () => {

@@ -1420,8 +1420,8 @@ for (const width of [390, 700, 701, 1280]) for (const withTasks of [false, true]
     h.growLayout(180);
     h.flushFrame();
     h.flushScroll();
-    assert.equal(h.root.scrollTop, width >= 701 ? h.root.scrollHeight - h.root.clientHeight : 0,
-      "desktop follows the fully rendered history; mobile retains its existing queued-scroll policy");
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
+      "every layout follows the fully rendered history");
     await h.selectHistory("open-session");
     h.growLayout(240);
     h.flushFrame();
@@ -1470,12 +1470,12 @@ for (const width of [390, 700, 701, 1280]) {
     h.context.followOutput(true);
     assert.equal(h.pendingFrames(), 1);
     const switched = h.selectHistory("target-session");
-    assert.equal(h.pendingFrames(), width >= 701 ? 0 : 1,
-      "desktop cancels the outgoing frame while the new history is still fetching; mobile keeps its existing frame");
+    assert.equal(h.pendingFrames(), 0,
+      "the outgoing frame is cancelled while the new history is still fetching");
     await switched;
     h.flushFrame();
     h.flushScroll();
-    assert.equal(h.root.scrollTop, width >= 701 ? h.root.scrollHeight - h.root.clientHeight : 0);
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
     assert.equal(h.pendingFrames(), 0, "no follow frame remains after the landing");
   });
 }
@@ -1530,10 +1530,6 @@ for (const width of [390, 700, 701, 1280]) {
     await h.openHistory();
     await openOtherTranscriptAtBottom(h, width);
     await h.selectHistory("open-session"); h.settleLayout();
-    if (!desktop) {
-      assert.equal(h.root.scrollTop, 0, "mobile retains the clamp policy when returning from B's live edge");
-      h.context.scrollToLatest(false); h.flushScroll();
-    }
     assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
     const before = h.root.scrollTop, child = h.root.lastElementChild;
     h.growLayout(240, child); h.settleLayout();
@@ -1613,7 +1609,7 @@ for (const width of [390, 700, 701, 1280]) {
     assert.equal(h.pendingFrames(), 0, "the outgoing generation cannot enqueue another follow callback");
     assert.equal(obsolete.every((observer) => observer.targets.size === 0), true);
     release(); await selecting; h.settleLayout();
-    assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : 0);
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
   });
   test("desktop transcript ownership survives A to B to A before B finishes fetching" + suffix, async () => {
     const h = sessionScrollHarness(width, true);
