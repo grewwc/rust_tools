@@ -648,7 +648,6 @@ test("targeted session delete preserves the open session", async () => {
     lastItems: [{ id: "hi-session", title: "hi" }, { id: "open-session", title: "open" }],
     sessionId: "open-session", pendingNew: null, lastMsgCount: 5, turnRunning: true,
     sessionTitle: (s) => s.title,
-    confirm: (text) => { calls.push(["confirm", text]); return true; },
     api: async (path, options) => { calls.push([path, options]); },
     loadSessions: async () => { sessionsLoaded += 1; },
     loadHistory: async () => { historyLoaded += 1; },
@@ -659,10 +658,9 @@ test("targeted session delete preserves the open session", async () => {
     addMsg: () => {},
   });
   vm.runInContext(script.slice(start, end), context);
-  await vm.runInContext('deleteSession("hi-session")', context);
-  assert.deepEqual(calls[0], ["confirm", 'delete "hi"?']);
-  assert.equal(calls[1][0], "/sessions/hi-session");
-  assert.equal(calls[1][1].method, "DELETE");
+  await vm.runInContext('deleteSession("hi-session", true)', context);
+  assert.equal(calls[0][0], "/sessions/hi-session");
+  assert.equal(calls[0][1].method, "DELETE");
   assert.equal(context.sessionId, "open-session");
   assert.equal(sessionsLoaded, 1);
   assert.equal(historyLoaded, 0);

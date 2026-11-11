@@ -159,6 +159,12 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     el.hidden = /\shidden(?:\s|>)/.test(match[0]);
     el.textContent = match[3];
   }
+  for (const [id, tag] of [
+    ["sessdel", "div"], ["sessdelscrim", "div"], ["sessdelpanel", "section"],
+    ["sessdeltitle", "div"], ["sessdeltext", "div"], ["sessdelbtns", "div"],
+    ["sessdelcancel", "button"], ["sessdelconfirm", "button"],
+  ]) elements[id] = node(tag);
+  elements.sessdel.hidden = true;
   for (const id of ["sessionactionstitle", "sessionactionmark", "sessionactionfork", "sessionactiondelete", "sessionactioncancel"]) {
     elements.sessionactionspanel.appendChild(elements[id]);
   }
@@ -459,21 +465,24 @@ test("a failed desktop fork keeps selection and the draft", async () => {
   assert.match(h.messages.at(-1).text, /fork failed: 503 fork unavailable/);
 });
 
-for (const confirmDelete of [false, true]) test("deleting a marked desktop session preserves confirmation (accept=" + confirmDelete + ")", async () => {
-  const h = harness({ marked: true, confirmDelete });
+for (const acceptDelete of [false, true]) test("deleting a marked desktop session asks in-app (accept=" + acceptDelete + ")", async () => {
+  const h = harness({ marked: true });
   h.elements.prompt.value = "target draft";
   h.context.persistDraft("target-session");
   h.elements.prompt.value = "keep the open draft";
   h.open();
   await h.dispatch(h.elements.sessionactiondelete, "click").done;
-  assert.deepEqual(h.confirmations, ['delete "Target session"?']);
   assert.equal(h.elements.sessionactions.hidden, true);
+  assert.equal(h.elements.sessdel.hidden, false);
+  assert.match(h.elements.sessdeltext.textContent, /Target session/);
+  await h.dispatch(acceptDelete ? h.elements.sessdelconfirm : h.elements.sessdelcancel, "click").done;
+  assert.equal(h.elements.sessdel.hidden, true);
   assert.equal(h.context.sessionId, "open-session");
   assert.equal(h.elements.prompt.value, "keep the open draft");
-  assert.equal(h.requests.some((request) => request.method === "DELETE"), confirmDelete);
-  assert.equal(h.drafts.has(h.context.draftKey("target-session")), !confirmDelete);
-  assert.equal(h.stored.has(h.context.draftKey("target-session")), !confirmDelete);
-  if (confirmDelete) {
+  assert.equal(h.requests.some((request) => request.method === "DELETE"), acceptDelete);
+  assert.equal(h.drafts.has(h.context.draftKey("target-session")), !acceptDelete);
+  assert.equal(h.stored.has(h.context.draftKey("target-session")), !acceptDelete);
+  if (acceptDelete) {
     h.context.restoreDraft("target-session");
     assert.equal(h.elements.prompt.value, "");
   } else assert.deepEqual(h.requests, []);
@@ -487,6 +496,7 @@ test("deleting the selected desktop session cannot re-stash its removed draft", 
   h.context.persistDraft();
   h.open();
   await h.dispatch(h.elements.sessionactiondelete, "click").done;
+  await h.dispatch(h.elements.sessdelconfirm, "click").done;
   assert.equal(h.context.sessionId, "open-session");
   assert.equal(h.elements.prompt.value, "A survives deletion");
   assert.equal(h.drafts.has(h.context.draftKey("target-session")), false);
@@ -498,6 +508,7 @@ test("a failed deletion retains its session draft", async () => {
   h.context.persistDraft("target-session");
   h.open();
   await h.dispatch(h.elements.sessionactiondelete, "click").done;
+  await h.dispatch(h.elements.sessdelconfirm, "click").done;
   assert.equal(h.drafts.get(h.context.draftKey("target-session")), "draft in A");
   assert.equal(h.context.sessionId, "open-session");
   assert.match(h.messages.at(-1).text, /delete failed: 503 delete unavailable/);

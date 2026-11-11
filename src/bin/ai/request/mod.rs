@@ -38,11 +38,12 @@ pub(crate) use error::{
     api_key_for_request_model, apply_request_auth, clear_stale_request_interrupt_before_request,
     config_bool_is_true, config_forces_thinking, control_model_for_aux_tasks,
     control_model_for_aux_tasks_from, endpoint_for_request_model, is_context_overflow_error,
-    is_retryable_reqwest_error, is_retryable_status_with_body, is_retryable_stream_error,
-    is_transient_error, parse_retry_after, request_retry_policy,
-    request_retry_policy_for_current_context, retry_delay, should_abort_retry_wait,
-    should_retry_status, should_rotate_key, should_temporarily_disable_auto_selected_model,
-    should_temporarily_disable_model, should_try_model_fallback, sleep_with_cancel,
+    is_rate_limited_stream_error, is_retryable_reqwest_error, is_retryable_status_with_body,
+    is_retryable_stream_error, is_transient_error, parse_retry_after, request_retry_policy,
+    request_retry_policy_for_current_context, retry_delay, retry_delay_429,
+    should_abort_retry_wait, should_retry_status, should_rotate_key,
+    should_temporarily_disable_auto_selected_model, should_temporarily_disable_model,
+    should_try_model_fallback, sleep_with_cancel,
 };
 pub(crate) use image_digest::{
     DIGEST_BEGIN, DIGEST_END, PendingImageDigest, backfill_batch, content_has_image,

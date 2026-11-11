@@ -89,6 +89,12 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
     el.hidden = /\shidden(?:\s|>)/.test(match[0]);
     el.textContent = match[3];
   }
+  for (const [id, tag] of [
+    ["sessdel", "div"], ["sessdelscrim", "div"], ["sessdelpanel", "section"],
+    ["sessdeltitle", "div"], ["sessdeltext", "div"], ["sessdelbtns", "div"],
+    ["sessdelcancel", "button"], ["sessdelconfirm", "button"],
+  ]) elements[id] = node(tag);
+  elements.sessdel.hidden = true;
   for (const id of ["sessionactionstitle", "sessionactionmark", "sessionactionfork", "sessionactiondelete", "sessionactioncancel"]) elements.sessionactionspanel.appendChild(elements[id]);
   elements.sessionactions.appendChild(elements.sessionactionsscrim);
   elements.sessionactions.appendChild(elements.sessionactionspanel);
@@ -352,7 +358,9 @@ test("the sheet delete entry confirms and deletes its target while keeping the o
   const h = harness({ phone: true });
   h.hold();
   await h.dispatch(h.elements.sessionactiondelete, "click").done;
-  assert.deepEqual(h.confirmations, ['delete "Target session"?']);
+  assert.equal(h.elements.sessdel.hidden, false);
+  assert.match(h.elements.sessdeltext.textContent, /Target session/);
+  await h.dispatch(h.elements.sessdelconfirm, "click").done;
   assert.deepEqual(h.requests.map(({ path, method }) => ({ path, method })), [
     { path: "/sessions/target-session", method: "DELETE" }, { path: "/sessions", method: "GET" },
   ]);
@@ -365,10 +373,11 @@ test("the sheet delete entry confirms and deletes its target while keeping the o
 });
 
 test("declining the sheet delete confirmation preserves the session", async () => {
-  const h = harness({ phone: true, confirmDelete: false });
+  const h = harness({ phone: true });
   h.hold();
   await h.dispatch(h.elements.sessionactiondelete, "click").done;
-  assert.equal(h.confirmations.length, 1);
+  await h.dispatch(h.elements.sessdelcancel, "click").done;
+  assert.equal(h.elements.sessdel.hidden, true);
   assert.ok(h.row());
   assert.equal(h.elements.sessionactions.hidden, true);
   assert.deepEqual(h.requests, []);

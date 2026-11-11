@@ -1982,6 +1982,15 @@ for (const phone of [false, true]) {
   });
 }
 
+test("a subagent fold does not leak the turn rate as a separate bubble", () => {
+  const h = streamHarness();
+  h.emit("subagent_progress", "worker: running");
+  h.emit("rate", { phase: "output", tokens: 40, elapsed_ms: 2000, approximate: false });
+  assert.equal(rateNodes(h.box).length, 0, "a rate must not mount under a subagent fold");
+  h.emit("delta", { delta: "Final answer" });
+  assert.equal(rateNodes(h.box).length, 1, "the rate belongs to the answer once it exists");
+});
+
 test("subagent snapshots stay distinct from logs and empty thinking markers", () => {
   const h = streamHarness();
   h.emit("thinking_start"); h.emit("thinking_done");
@@ -2431,8 +2440,10 @@ test("a feed that dies mid-turn reattaches to the retained event stream", () => 
 test("a collapsed fold hides its task rows even though they set their own display", () => {
   // The task row list carries `display:flex` so rows stay readable while the
   // fold is open. An author display also beats the engine's collapsed-content
-  // default, which left the subagent card looking uncollapsible.
-  assert.match(html, /\.msg details:not\(\[open\]\) > \.task-output \{ display:none; \}/);
+  // default, which left the subagent card looking uncollapsible. The rows are
+  // siblings of <details> inside the message card, so the rule needs the
+  // general sibling combinator rather than a child one.
+  assert.match(html, /\.msg details:not\(\[open\]\) ~ \.task-output \{ display:none; \}/);
   // The turn rate footer lives inside the same fold on restored turns, so the
   // narrowing above must not be widened into a blanket child rule.
   assert.doesNotMatch(html, /details:not\(\[open\]\) > \*:not\(summary\)/);

@@ -544,6 +544,34 @@ fn is_account_error_body(msg: &str) -> bool {
     lower.contains("risk_control") || lower.contains("\"code\":\"441\"")
 }
 
+/// Returns true when a mid-stream provider error is a rate-limit/quota
+/// rejection, i.e. the stream carried an in-band 429-equivalent error.
+///
+/// Billing exhaustion (`insufficient_quota`) is deliberately excluded: it also
+/// arrives as a 429, but resending the request cannot fix it. Matching the bare
+/// digits `429` is avoided because a context-overflow message can contain a
+/// token count such as `129429`.
+pub(crate) fn is_rate_limited_stream_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("insufficient_quota")
+        || lower.contains("insufficient quota")
+        || lower.contains("billing")
+    {
+        return false;
+    }
+    lower.contains("too_many_requests")
+        || lower.contains("too many requests")
+        || lower.contains("rate_limit")
+        || lower.contains("rate limit")
+        || lower.contains("ratelimit")
+        || lower.contains("quota exceeded")
+        || lower.contains("throughput limit")
+        || lower.contains("resource_exhausted")
+        || lower.contains("resource exhausted")
+        || lower.contains("throttl")
+        || lower.contains("429 too many")
+}
+
 /// Decides whether an error occurring mid-stream is worth retrying.
 ///
 /// Stream errors (`provider stream error: ...`) happen after the response
@@ -553,7 +581,8 @@ fn is_account_error_body(msg: &str) -> bool {
 /// significantly reduces the user-perceived failure rate.
 pub(crate) fn is_retryable_stream_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
-    lower.contains("server_error")
+    is_rate_limited_stream_error(err)
+        || lower.contains("server_error")
         || lower.contains("cancelled")
         || lower.contains("canceled")
         || lower.contains("upstream")
@@ -804,6 +833,40 @@ mod tests {
         // Deterministic request rejections must stay non-retryable.
         assert!(!is_retryable_stream_error(
             "provider stream error: invalid_request_error: unsupported parameter"
+        ));
+    }
+
+    #[test]
+    fn rate_limited_stream_error_is_retryable_but_billing_quota_is_not() {
+        let ptu = "provider stream error: too_many_requests: Requests have exceeded the throughput limit on your Provisioned-Managed deployment.";
+        assert!(is_rate_limited_stream_error(ptu));
+        assert!(is_retryable_stream_error(ptu));
+        assert!(is_rate_limited_stream_error(
+            "provider stream error: rate_limit_reached"
+        ));
+        assert!(is_rate_limited_stream_error(
+            "provider stream error: 429: Too Many Requests"
+        ));
+        assert!(is_rate_limited_stream_error(
+            "provider stream error: Too Many Requests"
+        ));
+        assert!(is_rate_limited_stream_error(
+            "provider stream error: 429: Quota exceeded for quota metric 'Generate Content API requests per minute'"
+        ));
+        assert!(is_rate_limited_stream_error(
+            "provider stream error: resource_exhausted"
+        ));
+        assert!(is_rate_limited_stream_error(
+            "provider stream error: request throttled"
+        ));
+        // Billing exhaustion is a 429 too, but resending cannot fix it.
+        assert!(!is_rate_limited_stream_error(
+            "provider stream error: insufficient_quota: You exceeded your current quota, please check your plan and billing details"
+        ));
+        // A context-overflow token count can contain the digits 429; it must not
+        // be mistaken for an HTTP 429.
+        assert!(!is_rate_limited_stream_error(
+            "provider stream error: context_length_exceeded: maximum context length is 128000 tokens, but 129429 were provided"
         ));
     }
 }

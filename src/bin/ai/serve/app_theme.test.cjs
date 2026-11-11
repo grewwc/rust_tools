@@ -145,9 +145,9 @@ test("desktop palette overrides use neutral surfaces and keep the shared accent"
       "--bg": "#1b1b1b",
       "--code-bg": "#1f1f1f",
       "--code-toolbar": "#292929",
-      "--dim": "#b4b4b4",
+      "--dim": "#b5b5b5",
       "--edge": "rgba(231,231,231,.20)",
-      "--fg": "#e7e7e7",
+      "--fg": "#dcdcdc",
       "--field": "#292929",
       "--glass": "rgba(36,36,36,.95)",
       "--glass-strong": "rgba(36,36,36,.98)",
@@ -161,7 +161,7 @@ test("desktop palette overrides use neutral surfaces and keep the shared accent"
       "--tint": "rgba(231,231,231,.08)",
       "--tint-2": "rgba(231,231,231,.05)",
       "--tint-3": "rgba(231,231,231,.10)",
-      "--tint-4": "rgba(231,231,231,.16)"
+      "--tint-4": "rgba(231,231,231,.11)"
     },
     "light": {
       "--bg": "#e9e9e9",

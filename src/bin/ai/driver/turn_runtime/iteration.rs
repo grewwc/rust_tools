@@ -2047,7 +2047,13 @@ pub(super) async fn execute_turn_iteration(
     // A streaming response can break mid-stream on transient backend errors (e.g. "Cancelled by backend");
     // retry the whole request+stream for such retryable errors instead of abandoning the entire turn.
     const MAX_STREAM_RETRIES: usize = 16;
+    /// Rate-limit errors use a smaller cap than transport drops: 429 backoff
+    /// starts at 4s and is clamped to 16s, so five retries spend up to 60s
+    /// waiting for a quota window. Keeping this separate also prevents the
+    /// turn-level stream-error retry from multiplying the inner attempts.
+    const MAX_STREAM_RATE_LIMIT_RETRIES: usize = 5;
     let mut stream_attempt = 0usize;
+    let mut rate_limit_attempts = 0usize;
     loop {
         if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
             request::print_info(app, &actual_model);
@@ -2105,18 +2111,43 @@ pub(super) async fn execute_turn_iteration(
                 }));
             }
             Err(err_msg) => {
-                if stream_attempt < MAX_STREAM_RETRIES
-                    && request::is_retryable_stream_error(&err_msg)
-                {
+                let rate_limited = request::is_rate_limited_stream_error(&err_msg);
+                let can_retry = stream_attempt < MAX_STREAM_RETRIES
+                    && (!rate_limited || rate_limit_attempts < MAX_STREAM_RATE_LIMIT_RETRIES)
+                    && (rate_limited || request::is_retryable_stream_error(&err_msg));
+                if can_retry {
                     stream_attempt += 1;
-                    crate::ai::driver::runtime_ctx::publish_subagent_phase(&format!(
-                        "retrying stream ({stream_attempt}/{MAX_STREAM_RETRIES})"
-                    ));
+                    if rate_limited {
+                        rate_limit_attempts += 1;
+                    }
+                    let retry_wait = if rate_limited {
+                        request::retry_delay_429(rate_limit_attempts)
+                    } else {
+                        request::retry_delay(stream_attempt)
+                    };
+                    let phase = if rate_limited {
+                        format!(
+                            "retrying rate-limited stream ({rate_limit_attempts}/{MAX_STREAM_RATE_LIMIT_RETRIES})"
+                        )
+                    } else {
+                        format!("retrying stream ({stream_attempt}/{MAX_STREAM_RETRIES})")
+                    };
+                    crate::ai::driver::runtime_ctx::publish_subagent_phase(&phase);
                     if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
-                        eprintln!(
-                            "\n[Info] 流式响应中断（{}），第 {}/{} 次重试...",
-                            err_msg, stream_attempt, MAX_STREAM_RETRIES
-                        );
+                        if rate_limited {
+                            eprintln!(
+                                "\n[Warning] 流式响应被限流（{}），{} 秒后第 {}/{} 次重试...",
+                                err_msg,
+                                retry_wait.as_secs_f32(),
+                                rate_limit_attempts,
+                                MAX_STREAM_RATE_LIMIT_RETRIES
+                            );
+                        } else {
+                            eprintln!(
+                                "\n[Info] 流式响应中断（{}），第 {}/{} 次重试...",
+                                err_msg, stream_attempt, MAX_STREAM_RETRIES
+                            );
+                        }
                     }
                     current_history.clear();
                     app.streaming
@@ -2131,7 +2162,7 @@ pub(super) async fn execute_turn_iteration(
                             should_quit,
                         ));
                     }
-                    if request::sleep_with_cancel(app, request::retry_delay(stream_attempt)).await {
+                    if request::sleep_with_cancel(app, retry_wait).await {
                         return Ok(interrupted_iteration_execution(
                             app,
                             one_shot_mode,
@@ -2184,6 +2215,37 @@ pub(super) async fn execute_turn_iteration(
                         }
                     }
                     continue;
+                }
+
+                if rate_limited {
+                    // A quota/rate-limit rejection is not a network drop. Retrying
+                    // again at the turn level would immediately re-hit the same
+                    // quota window, so end the round with an explicit message.
+                    let err_text = format!(
+                        "provider rate limit persisted after {rate_limit_attempts} retries: {err_msg}"
+                    );
+                    if crate::ai::driver::runtime_ctx::has_subagent_result_slot() {
+                        return Err(err_text.into());
+                    }
+                    app.streaming
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    persist_pending_turn_messages(
+                        app,
+                        one_shot_mode,
+                        turn_messages,
+                        persisted_turn_messages,
+                    );
+                    if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                        eprintln!("\n[Error] 流式响应持续被限流：{}", err_msg);
+                        eprintln!(
+                            "[Info] 已重试 {} 次；请稍后重试，或提高 provisioned throughput units / 切换模型。",
+                            rate_limit_attempts
+                        );
+                    }
+                    return Ok(IterationExecution::RequestFailed(
+                        "[Provider rate limit persisted after retries; please retry later or increase provisioned throughput units]"
+                            .to_string(),
+                    ));
                 }
 
                 // Not retryable or retries exhausted — never fabricate a Completed
@@ -3314,7 +3376,10 @@ mod tests {
         ];
         let out = super::canonicalize_snapshot_for_persistence(candidate, &projection, &canonical);
         assert_eq!(out[0].content, canonical_content);
-        assert_eq!(out[1].content, serde_json::json!([{"type": "text", "text": "digest"}]));
+        assert_eq!(
+            out[1].content,
+            serde_json::json!([{"type": "text", "text": "digest"}])
+        );
         assert_eq!(out[2].content, serde_json::json!("summary text"));
     }
 }
