@@ -2802,7 +2802,15 @@ function renderPhoneFrame(data, sid) {
     phoneFrameUrls.set(img, url);
   }
   note.appendChild(cap);
-  parent.appendChild(note);
+  // The live turn keeps its status row as the trailing child and inserts later
+  // output ahead of it, so appending here would strand the frame below status
+  // text and every update that follows the capture.
+  let anchor = null;
+  for (let i = parent.children.length - 1; i >= 0; i--) {
+    const child = parent.children[i];
+    if (String(child.className || "").split(/\s+/).includes("pending")) { anchor = child; break; }
+  }
+  parent.insertBefore(note, anchor);
   return note;
 }
 async function queueImageFiles(files) {

@@ -31,6 +31,14 @@ function fakeElement(tag) {
     append(...kids) {
       for (const kid of kids) this.appendChild(kid);
     },
+    insertBefore(child, ref) {
+      const at = ref ? this.children.indexOf(ref) : -1;
+      child.__root = this.__root || this;
+      child.parent = this;
+      if (at < 0) this.children.push(child);
+      else this.children.splice(at, 0, child);
+      return child;
+    },
     querySelectorAll() {
       return [];
     },
@@ -119,6 +127,21 @@ test("a result without an image renders nothing", () => {
   assert.equal(h.context.renderPhoneFrame({}, "sid"), null);
   assert.equal(h.context.renderPhoneFrame({ image_base64: "" }, "sid"), null);
   assert.equal(h.box.children.length, 0);
+});
+
+test("a captured frame stays ahead of the trailing status row", () => {
+  const h = harness();
+  const status = fakeElement("div");
+  status.className = "msg asst pending";
+  h.box.appendChild(status);
+  h.context.renderPhoneFrame({ image_base64: JPEG_BASE64, mime_type: "image/jpeg" }, "sid");
+  h.context.renderPhoneFrame({ image_base64: JPEG_BASE64, mime_type: "image/jpeg" }, "sid");
+  // Later live output is inserted ahead of the status row, so a frame appended
+  // after it would sink below everything the turn emits from then on.
+  assert.equal(h.box.children.length, 3);
+  assert.equal(h.box.children[2], status, "the status row must stay last");
+  assert.match(h.box.children[0].className, /phone-frame/);
+  assert.match(h.box.children[1].className, /phone-frame/);
 });
 
 test("the frame URL is released when the view is rebuilt", () => {
