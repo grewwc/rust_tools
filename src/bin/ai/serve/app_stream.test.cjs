@@ -2437,3 +2437,16 @@ test("a collapsed fold hides its task rows even though they set their own displa
   // narrowing above must not be widened into a blanket child rule.
   assert.doesNotMatch(html, /details:not\(\[open\]\) > \*:not\(summary\)/);
 });
+
+test("the desktop settings row wraps instead of collapsing its inputs", () => {
+  // Both inputs carry min-width:0 and every button refuses to shrink, so on a
+  // narrow desktop window the token field used to collapse to a sliver and
+  // could not be filled in; wrapping keeps the pair usable.
+  assert.match(html, /#conn\.open \{ flex-wrap:wrap; \}/);
+  assert.match(html, /#conn input \{ flex:1 1 260px; \}/);
+  // Phones keep the single-line row: the override lives in the desktop query.
+  const desktopStart = html.indexOf("@media (min-width:701px) {");
+  assert.ok(desktopStart > 0, "desktop media query is present");
+  assert.ok(html.indexOf("#conn.open { flex-wrap:wrap; }") > desktopStart,
+    "the wrap rule sits inside the desktop media query");
+});

@@ -720,6 +720,10 @@ button:active:not(:disabled) { filter:brightness(.96); }
      Medium where the UI family provides one and stays at Regular otherwise,
      so phones keep the base text weight untouched. */
   body { font-weight:480; }
+  /* The settings row packs two inputs and five buttons; without wrapping the
+     inputs shrink to a sliver and the token field cannot be used. */
+  #conn.open { flex-wrap:wrap; }
+  #conn input { flex:1 1 260px; }
   /* Gray reading surfaces keep teal on actions and focus indicators. The
      shared palettes above continue to own every phone colour. */
   :root {
