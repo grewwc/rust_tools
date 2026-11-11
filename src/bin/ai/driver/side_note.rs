@@ -136,7 +136,6 @@ fn read_pending_side_notes_locked(
     }))
 }
 
-#[cfg(test)]
 pub(super) fn read_pending_side_notes(
     history_file: &Path,
     target: Option<&str>,
@@ -252,6 +251,26 @@ pub(crate) fn pending_side_note_count(history_file: &Path, target: Option<&str>)
         .unwrap_or(0)
 }
 
+/// Read-only snapshot of notes still waiting for delivery.
+///
+/// The turn child removes a note only after committing it to canonical input,
+/// so this list is the queue a UI should show as "waiting to send". A missing
+/// queue file is an empty queue; a malformed line is surfaced as plain text by
+/// `read_pending_side_notes_locked`, matching delivery behavior.
+pub fn list_pending_side_notes(
+    history_file: &Path,
+    target: Option<&str>,
+) -> Result<Vec<SideNote>, String> {
+    let file = side_note_file(history_file, target);
+    if !file.exists() {
+        return Ok(Vec::new());
+    }
+    let _lock = lock_side_note_queue(&file)?;
+    Ok(read_pending_side_notes_locked(file, target)?
+        .map(|pending| pending.notes)
+        .unwrap_or_default())
+}
+
 fn sanitize_task_id(id: &str) -> String {
     id.chars()
         .map(|c| {
@@ -348,23 +367,71 @@ pub(super) fn consume_side_notes(
     Ok(batch.notes.len())
 }
 
+/// Commit a prepared snapshot without holding the queue lock during image
+/// parsing. Concurrent appends remain as a suffix; a replaced prefix is retried.
+pub(super) fn commit_side_note_snapshot(
+    batch: &PendingSideNotes,
+    target: Option<&str>,
+    commit: impl FnOnce(&[SideNote]) -> Result<(), String>,
+) -> Result<usize, String> {
+    let mut wake_state = is_foreground_target(target).then(|| {
+        WOKEN_FOREGROUND_QUEUES
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    });
+    let _queue_lock = lock_side_note_queue(&batch.file)?;
+    let current = fs::read_to_string(&batch.file)
+        .map_err(|error| format!("read prepared side-note queue: {error}"))?;
+    if !current.starts_with(&batch.content) {
+        return Ok(0);
+    }
+    commit(batch.notes())?;
+    batch.acknowledge_locked()?;
+    if let Some(woken) = wake_state.as_mut() {
+        woken.remove(&batch.file);
+        if current.len() > batch.content.len() {
+            super::notify_scheduler();
+        }
+    }
+    Ok(batch.notes.len())
+}
+
+#[derive(Default)]
+pub(super) struct SideNoteInput {
+    pub(super) notes: Vec<SideNote>,
+    pub(super) question: String,
+    pub(super) image_files: Vec<String>,
+}
+
 /// The next-input path can handle a local command without appending canonical
 /// dialogue. Archive its exact guidance using the existing overflow format
 /// before dequeue, then let the ordinary input path retain its original framing.
 pub(super) fn drain_side_notes_to_archive(
     history_file: &Path,
     target: Option<&str>,
-) -> Result<Vec<SideNote>, String> {
-    let mut notes = Vec::new();
+) -> Result<SideNoteInput, String> {
+    let mut input = SideNoteInput::default();
     consume_side_notes(history_file, target, |pending| {
         let archived = side_notes_to_messages(pending.to_vec());
         let root = assets_dir_for_history(history_file);
+        let mut question = pending
+            .iter()
+            .map(|note| note.content.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let image_files = super::input::prepare_inline_image_attachments(&mut question, &root)
+            .map_err(|error| format!("prepare side-note images: {error}"))?;
         crate::ai::history::archive_messages_to_overflow(&archived, Some(&root))
             .ok_or_else(|| "side-note archive commit failed; input remains queued".to_string())?;
-        notes = pending.to_vec();
+        input = SideNoteInput {
+            notes: pending.to_vec(),
+            question,
+            image_files,
+        };
         Ok(())
     })?;
-    Ok(notes)
+    Ok(input)
 }
 
 /// Queue-only fixture helper; production consumers require a durable commit.
@@ -397,6 +464,41 @@ pub fn side_notes_to_messages(notes: Vec<SideNote>) -> Vec<Message> {
             runtime_synthetic_user_message(serde_json::Value::String(text))
         })
         .collect()
+}
+
+/// Prepare separate durable references and inline request content before dequeue.
+/// The text-only conversion remains the exact source form used by overflow archives.
+pub(super) fn prepare_side_note_messages(
+    notes: Vec<SideNote>,
+    model: &str,
+    assets_dir: &Path,
+    mut parse_images: impl FnMut(&[String]) -> Result<Option<super::model::OcrExtraction>, String>,
+) -> Result<(Vec<Message>, Vec<Message>), String> {
+    let mut canonical = side_notes_to_messages(notes);
+    let mut request = canonical.clone();
+    for (persisted, projected) in canonical.iter_mut().zip(request.iter_mut()) {
+        let mut text = persisted.content.as_str().unwrap_or_default().to_string();
+        let images = super::input::prepare_inline_image_attachments(&mut text, assets_dir)
+            .map_err(|error| format!("prepare side-note images: {error}"))?;
+        let ocr = if !images.is_empty() && !crate::ai::models::supports_image_input(model) {
+            parse_images(&images)?
+        } else {
+            None
+        };
+        let ocr_pair = ocr
+            .as_ref()
+            .filter(|ocr| {
+                ocr.has_usable_text() || ocr.images.iter().any(|image| image.error.is_some())
+            })
+            .map(|ocr| (ocr.tool_name.as_str(), ocr.content.as_str()));
+        let text = super::turn_runtime::assemble_effective_question(&text, "", ocr_pair);
+        projected.content = crate::ai::request::build_content(model, &text, &images)
+            .map_err(|error| format!("read side-note images: {error}"))?;
+        persisted.content =
+            crate::ai::request::build_reference_content(model, &text, &images, "", assets_dir)
+                .map_err(|error| format!("capture side-note image references: {error}"))?;
+    }
+    Ok((canonical, request))
 }
 
 /// The current process's target identifier: None for foreground; subagents learn their task_id

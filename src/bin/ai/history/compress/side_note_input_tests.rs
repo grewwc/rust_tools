@@ -163,3 +163,74 @@ fn side_note_is_not_replaced_by_offload_or_mutable_truncation() {
     );
     assert!(shrunk.contains(&note));
 }
+
+#[test]
+fn image_side_note_keeps_origin_envelope_and_attachments_through_compression() {
+    let dir = TestDir::new();
+    let source = side_note(&format!(
+        "OPENING_CONSTRAINT\n{}\nMIDDLE_CORRECTION\n{}\nFINAL_CONDITION",
+        "a".repeat(3_400),
+        "b".repeat(3_400)
+    ));
+    for image in [
+        serde_json::json!({"type": "reference", "kind": "image", "asset": "attachments/captured/shot.png"}),
+        serde_json::json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,c2hvdA=="}}),
+    ] {
+        let mut note = source.clone();
+        note.content = serde_json::json!([image, {"type": "text", "text": source.content}]);
+        assert!(is_side_note_message(&note));
+        assert!(!is_user_input_message(&note));
+        let mut lookalike = note.clone();
+        lookalike.reasoning_content = None;
+        assert!(!is_side_note_message(&lookalike));
+        let mut attachment_only = source.clone();
+        attachment_only.content =
+            serde_json::json!([{"type": "reference", "kind": "file", "text": source.content}]);
+        assert!(!is_side_note_message(&attachment_only));
+
+        let mut messages = vec![
+            message("system", "system instructions"),
+            message("user", "opening request"),
+            note.clone(),
+            message("assistant", "opening response"),
+        ];
+        for turn in 1..1_000 {
+            messages.push(message("user", format!("request {turn}")));
+            messages.push(message(
+                "assistant",
+                format!("response {turn}: {}", "detail ".repeat(20)),
+            ));
+        }
+        let compressed = compress_messages_for_context_with_outcome(
+            messages,
+            14_000,
+            2,
+            4_000,
+            Some(dir.0.clone()),
+            None,
+        );
+        assert!(compressed.messages.iter().any(is_incremental_summary));
+        assert!(compressed.messages.contains(&note));
+        let mut shrunk = shrink_messages_to_fit(
+            compressed.messages,
+            1_000,
+            Some(&dir.0),
+            None,
+            &rustc_hash::FxHashSet::default(),
+        );
+        truncate_mutable_messages_to_fit(
+            &mut shrunk,
+            100,
+            Some(&dir.0),
+            &rustc_hash::FxHashSet::default(),
+        );
+        emergency_cap_messages_to_fit(
+            &mut shrunk,
+            100,
+            80,
+            Some(&dir.0),
+            &rustc_hash::FxHashSet::default(),
+        );
+        assert!(shrunk.contains(&note));
+    }
+}

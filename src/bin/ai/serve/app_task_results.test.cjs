@@ -36,12 +36,22 @@ function source(first, last) {
   return script.slice(start, end);
 }
 
-function harness({ phone = false, storage = new Map() } = {}) {
+function harness({ phone = false, width = phone ? 390 : 1280, storage = new Map() } = {}) {
+  const clock = { now: 1000 };
+  function checkPlacement(owner, child) {
+    for (let ancestor = owner; ancestor; ancestor = ancestor.parentNode) {
+      assert.notEqual(ancestor, child, "DOM placement cannot insert an ancestor into its descendant");
+    }
+  }
   function element(tag = "div") {
     let text = "";
     const listeners = new Map();
     const el = {
       tagName: tag.toUpperCase(), children: [], parentNode: null, className: "", dataset: {}, hidden: false, open: false,
+      get isConnected() {
+        for (let node = this; node; node = node.parentNode) if (node === root) return true;
+        return false;
+      },
       get textContent() { return text + this.children.map((child) => child.textContent).join(""); },
       set textContent(value) {
         text = String(value);
@@ -50,9 +60,10 @@ function harness({ phone = false, storage = new Map() } = {}) {
       },
       get lastElementChild() { return this.children.at(-1) || null; },
       get nextElementSibling() { return this.parentNode?.children[this.parentNode.children.indexOf(this) + 1] || null; },
-      appendChild(child) { child.remove(); this.children.push(child); child.parentNode = this; return child; },
+      appendChild(child) { checkPlacement(this, child); child.remove(); this.children.push(child); child.parentNode = this; return child; },
       insertBefore(child, anchor) {
         if (child === anchor) return child;
+        checkPlacement(this, child);
         assert.ok(!anchor || anchor.parentNode === this, "the insertion anchor belongs to this card");
         child.remove();
         const index = anchor ? this.children.indexOf(anchor) : this.children.length;
@@ -64,6 +75,7 @@ function harness({ phone = false, storage = new Map() } = {}) {
         this.parentNode = null;
       },
       matches(selector) {
+        if (selector.includes(",")) return selector.split(",").some((part) => this.matches(part.trim()));
         const classes = [...selector.matchAll(/\.([\w-]+)/g)].map((match) => match[1]);
         const tag = /^[\w-]+/.exec(selector)?.[0];
         return (!tag || this.tagName === tag.toUpperCase()) && classes.every((name) => this.classList.contains(name));
@@ -90,11 +102,17 @@ function harness({ phone = false, storage = new Map() } = {}) {
   }
   const root = element(), context = vm.createContext({
     document: { createElement: element, hidden: false, body: root, addEventListener() {} },
-    window: { addEventListener() {} }, MutationObserver: class { observe() {} },
+    window: {
+      addEventListener() {},
+      matchMedia(query) {
+        assert.equal(query, "(min-width:701px)");
+        return { matches: width >= 701 };
+      },
+    }, MutationObserver: class { observe() {} },
     $: () => root, sessionId: "s", isPhoneLayout: () => phone,
     localStorage: { getItem: (key) => storage.get(key) || null, setItem: (key, value) => storage.set(key, value) },
     textOf: (text) => typeof text === "string" ? text : "", isRuntimeSyntheticUser: () => false,
-    Date: { now: () => 1000 }, setInterval: () => 1, clearInterval() {},
+    Date: { now: () => clock.now }, setInterval: () => 1, clearInterval() {},
     createTurnRateLine: () => () => {},
     createOutputRateCounter: () => ({ text: () => "", counts: () => "", reset() {} }),
     createThinkingRateRecorder: () => ({ start() {}, close() {} }),
@@ -102,6 +120,7 @@ function harness({ phone = false, storage = new Map() } = {}) {
     closeThinkingPhase() {}, sealAnswerSegment() {}, mutateTranscript: (fn) => fn(), schedulePaint() {},
   });
   for (const [first, last] of [
+    ["let lastFoldTap", "// The agent sends a phone action"],
     ["function toolArgsOf(", "const RATE_STORAGE ="],
     ["function addFold(", "// The three override picks"],
     ["function historyRowsOf(", "// A session the server reports as running"],
@@ -133,7 +152,7 @@ function harness({ phone = false, storage = new Map() } = {}) {
     }
     return root.querySelector(".task-output");
   };
-  return { root, context, storage, emit };
+  return { root, context, storage, clock, emit };
 }
 
 
@@ -155,6 +174,9 @@ function reportedTask(task_id, overrides = {}) {
 }
 function taskCard(h) {
   return h.root.querySelectorAll(".task-output").find((panel) => panel.parentNode.dataset.subagents === "true");
+}
+function displayFold(node) {
+  return node.parentNode.classList.contains("execution-items") ? node.parentNode.parentNode.parentNode : node;
 }
 function assertTask(panel, expected) {
   assert.ok(panel, "a task result alone must create the dedicated subagent detail card");
@@ -178,6 +200,40 @@ function assertTask(panel, expected) {
 
 for (const phone of [false, true]) for (const mode of ["live", "replay", "history", "cold"]) {
   const label = mode + " " + (phone ? "phone" : "desktop");
+  for (const width of phone ? [390, 700] : [701, 1280]) test("structured subagent row double tap respects the desktop breakpoint, " + label + " " + width + "px", () => {
+    const h = harness({ phone, width }), expected = reportedTask("task_collapse");
+    h.emit(mode, "raw task result", "task_wait", { task_report: report([expected]) });
+    const panel = taskCard(h), details = panel.parentNode.querySelector("details");
+    const rawDetails = h.root.querySelector("details");
+    const body = panel.querySelector(".task-output-body");
+    assert.equal(body.closest("details"), null, "the delivered output is outside the disclosure");
+    assert.equal(details.parentNode, panel.parentNode, "the disclosure and task rows share one owner");
+    rawDetails.open = true; rawDetails.fire("toggle");
+    details.open = true; details.fire("toggle");
+    const click = (target, detail) => {
+      const event = {
+        target, detail, clientX: 100, clientY: 200, defaultPrevented: false,
+        preventDefault() { this.defaultPrevented = true; },
+      };
+      h.context.collapseFoldForTap(event);
+      return event;
+    };
+    assert.equal(click(body, 1).defaultPrevented, false);
+    assert.equal(details.open, true, "a single click leaves the report open");
+    h.clock.now += 100;
+    assert.equal(click(body, 2).defaultPrevented, false, "task text retains native selection events");
+    assert.equal(details.open, phone, "only desktop closes the sibling disclosure; mobile retains its open state");
+    if (!phone) details.fire("toggle");
+    assert.equal(rawDetails.open, true, "the separate tool disclosure must stay open");
+    if (mode === "live" || mode === "replay") {
+      assert.equal(vm.runInContext('foldOpenByKey.get("subagents")', h.context), phone);
+    } else {
+      const cold = harness({ phone, width, storage: new Map(h.storage) });
+      cold.emit("cold", "raw task result", "task_wait", { task_report: report([expected]) });
+      assert.equal(taskCard(cold).parentNode.querySelector("details").open, phone,
+        "canonical reconstruction must retain the desktop collapse or the untouched mobile expansion");
+    }
+  });
   test("structured task placement: distinct spawn and wait put one detail card after wait, " + label, () => {
     const h = harness({ phone });
     const spawned = reportedTask("task_placement", { status: "spawned", active: true, output: undefined });
@@ -194,7 +250,7 @@ for (const phone of [false, true]) for (const mode of ["live", "replay", "histor
     const rawBodies = h.root.querySelectorAll(".prog");
     const waitFold = rawBodies.find((body) => body.textContent === waitRaw)?.closest(".msg.asst");
     assert.ok(waitFold, "the raw wait response must remain verbatim");
-    assert.equal(waitFold.nextElementSibling, card, "the detail card must follow the later wait result");
+    assert.ok(displayFold(waitFold).nextElementSibling === card, "the detail card must follow the later wait result's display group");
     assert.ok(rawBodies.some((body) => body.textContent === spawnRaw), "moving the detail card changed raw spawn bytes");
     assertTask(cards[0], completed);
     if (mode === "live" || mode === "replay") {
@@ -203,7 +259,7 @@ for (const phone of [false, true]) for (const mode of ["live", "replay", "histor
       const progress = { text: progressText, task_report: report([{ ...spawned, status: "running" }], { snapshot: true }) };
       if (mode === "live") h.context.activity.subagents(progress);
       else h.context.view.subagents(progress);
-      assert.equal(waitFold.nextElementSibling, card, "later progress must stay beside the latest result");
+      assert.ok(displayFold(waitFold).nextElementSibling === card, "later progress must stay beside the latest result's display group");
       assert.equal(card.querySelector(".prog").textContent, progressText);
       assertTask(cards[0], completed);
     }
@@ -218,7 +274,7 @@ for (const phone of [false, true]) for (const mode of ["live", "replay", "histor
     assert.equal(cards.length, 1);
     assertTask(cards[0], first); assertTask(cards[0], second);
     const waitFold = h.root.querySelectorAll(".prog").find((body) => body.textContent === "second raw wait\n").closest(".msg.asst");
-    assert.equal(waitFold.nextElementSibling, cards[0].parentNode);
+    assert.ok(displayFold(waitFold).nextElementSibling === cards[0].parentNode);
   });
   test("structured task report: two completed results retain both identities and bodies, " + label, () => {
     const h = harness({ phone });
@@ -422,4 +478,103 @@ test("unknown task timing stays absent instead of inventing an elapsed counter",
   h.emit("live", "raw", "task_wait", { task_report: report([expected]) });
   const identity = taskCard(h).querySelector(".task-identity").textContent;
   assert.ok(identity.endsWith("completed"));
+});
+
+for (const mode of ["live", "replay", "history", "cold"]) {
+  test("subagent display keeps active work and the latest delivered batch without losing history, " + mode, () => {
+    const h = harness();
+    const earlier = Array.from({ length: 5 }, (_, index) => reportedTask("task_earlier_" + index,
+      { status: "running", output: "  earlier exact bytes " + index + "\n\n" }));
+    for (const expected of earlier) h.emit(mode, expected.output, "task_wait", {
+      id: "wait-" + expected.task_id, task_report: report([expected]),
+    });
+    const recent = [reportedTask("task_recent_one"), reportedTask("task_recent_two")];
+    const batch = report(recent), original = JSON.stringify(batch);
+    h.emit(mode, "latest raw batch\n", "task_wait", { id: "wait-recent", task_report: batch });
+    const active = reportedTask("task_active_audit", { status: "completed", active: true, output: undefined });
+    h.emit(mode, "current raw progress\n", "task_status", {
+      id: "status-current", task_report: report([active], { operation: "task_status", snapshot: true }),
+    });
+    const panel = taskCard(h);
+    for (const expected of [...earlier, ...recent, active]) assertTask(panel, expected);
+    for (const expected of earlier) {
+      assert.ok(panel.children.filter((row) => row.dataset.taskId === expected.task_id)
+        .every((row) => row.dataset.taskCurrent === "false"), "older completed work must be outside the current display");
+      assert.ok(h.root.querySelectorAll(".prog").some((body) => body.textContent === expected.output),
+        "the original tool fold must retain the exact historical output");
+    }
+    for (const expected of [...recent, active]) assert.ok(panel.children.filter((row) => row.dataset.taskId === expected.task_id)
+      .every((row) => row.dataset.taskCurrent === "true"), "active work and the whole latest batch remain current");
+    assert.equal(panel.querySelector(".task-count").textContent, "subagents · 8 tasks · 1 active");
+    assert.equal(panel.parentNode.dataset.taskBusy, "true");
+    assert.equal(JSON.parse(panel.parentNode.dataset.taskStates).length, 8);
+    assert.equal(JSON.stringify(batch), original, "display selection must not mutate the producer report");
+    for (const raw of h.root.querySelectorAll(".task-output").filter((item) => item !== panel)) {
+      assert.ok(raw.children.every((row) => row.dataset.taskCurrent === "true"), "raw task tool metadata remains complete");
+    }
+  });
+
+  test("subagent display follows delivery order instead of spawn order, " + mode, () => {
+    const h = harness();
+    const first = reportedTask("task_spawned_first", { active: true, output: undefined });
+    const second = reportedTask("task_spawned_second", { active: true, output: undefined });
+    h.emit(mode, "spawn raw", "task_spawn", { id: "spawn-both", task_report: report([first, second], { operation: "task_spawn" }) });
+    h.emit(mode, "second completes first", "task_wait", { id: "wait-second", task_report: report([{ ...second, active: false, output: "second exact\n" }]) });
+    h.emit(mode, "first completes last", "task_wait", { id: "wait-first", task_report: report([{ ...first, active: false, output: "first exact\n" }]) });
+    const panel = taskCard(h);
+    assert.ok(panel.children.filter((row) => row.dataset.taskId === first.task_id).every((row) => row.dataset.taskCurrent === "true"));
+    assert.ok(panel.children.filter((row) => row.dataset.taskId === second.task_id).every((row) => row.dataset.taskCurrent === "false"));
+    assert.equal(panel.querySelector(".task-count").textContent, "subagents · 2 tasks · 0 active");
+  });
+
+  test("late progress and truncated previews cannot replace the current delivered batch, " + mode, () => {
+    const h = harness(), earlier = reportedTask("task_old_result"), latest = reportedTask("task_latest_result");
+    h.emit(mode, earlier.output, "task_wait", { id: "wait-old", task_report: report([earlier]) });
+    h.emit(mode, latest.output, "task_wait", { id: "wait-latest", task_report: report([latest]) });
+    h.emit(mode, "late progress", "task_status", { id: "late-status", task_report: report([
+      { ...earlier, active: true, output: undefined },
+    ], { operation: "task_status", snapshot: true }) });
+    h.emit(mode, "old preview", "task_wait", { id: "old-preview", task_report: report([
+      { ...earlier, output: "old", output_truncated: true },
+    ]) });
+    const panel = taskCard(h);
+    assertTask(panel, earlier); assertTask(panel, latest);
+    assert.ok(panel.children.filter((row) => row.dataset.taskId === earlier.task_id).every((row) => row.dataset.taskCurrent === "false"));
+    assert.ok(panel.children.filter((row) => row.dataset.taskId === latest.task_id).every((row) => row.dataset.taskCurrent === "true"));
+    assert.equal(panel.parentNode.dataset.taskBusy, "false");
+  });
+}
+
+test("current task display provenance supports results without task IDs", () => {
+  const h = harness();
+  const first = reportedTask(undefined, { index: 0, description: "First anonymous result" });
+  const second = reportedTask(undefined, { index: 1, description: "Second anonymous result" });
+  h.emit("live", "anonymous raw", "task_wait", { task_report: report([first, second]) });
+  h.emit("live", "first anonymous redelivery", "task_wait", { task_report: report([first]) });
+  const descriptions = taskCard(h).querySelectorAll(".task-description");
+  assert.equal(descriptions.find((row) => row.textContent.includes(first.description)).dataset.taskCurrent, "true");
+  assert.equal(descriptions.find((row) => row.textContent.includes(second.description)).dataset.taskCurrent, "false");
+});
+
+test("a current terminal error without output stays in the subagent display", () => {
+  const h = harness(), earlier = reportedTask("task_old_success");
+  h.emit("live", earlier.output, "task_wait", { id: "wait-success", task_report: report([earlier]) });
+  const failed = reportedTask("task_current_failure", { status: "failed", error: "Current failure", output: undefined });
+  h.emit("live", "failure raw", "task_status", { id: "failed-status", task_report: report([failed], { snapshot: true }) });
+  const panel = taskCard(h);
+  assertTask(panel, failed);
+  assert.equal(panel.querySelector(".task-error").dataset.taskCurrent, "true");
+  assert.ok(panel.children.filter((row) => row.dataset.taskId === earlier.task_id).every((row) => row.dataset.taskCurrent === "false"));
+});
+
+test("subagent history display is gated to desktop while raw tool folds and mobile stay complete", () => {
+  const selector = '.msg.asst[data-subagents="true"] > .task-output > [data-task-current="false"]';
+  const desktopStart = css.indexOf("@media (min-width:701px)"), desktopEnd = css.indexOf("/* Keep narrow desktop", desktopStart);
+  const desktop = css.slice(desktopStart, desktopEnd);
+  assert.ok(desktop.includes(selector + " { display:none; }"));
+  assert.ok(!css.slice(0, desktopStart).includes("data-task-current"));
+  assert.ok(!css.slice(desktopEnd).includes("data-task-current"));
+  assert.equal(css.split(selector).length - 1, 1, "only the dedicated subagent body receives the desktop display filter");
+  assert.match(css, /\.msg details:not\(\[open\]\) ~ \.task-output\s*\{\s*display:none;\s*\}/,
+    "the owning disclosure must continue to collapse its sibling task rows");
 });

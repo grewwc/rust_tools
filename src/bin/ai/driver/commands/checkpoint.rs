@@ -199,7 +199,7 @@ pub fn try_handle_checkpoint_command(
                 Err(err) => println!("Failed to save checkpoint: {err}"),
             }
         }
-        "list" | "ls" | "tree" | "log" | "" => {
+        "list" | "ls" | "tree" | "log" | "status" | "" => {
             print_tree(app, &store)?;
         }
         "branch" | "br" => match parts.next() {
@@ -827,7 +827,7 @@ fn print_help() {
     println!("  /git save [name] [-m <message>]");
     println!("                                compatible alias; name and message are optional");
     println!(
-        "  /git tree              show commit ancestry and branch pointers (default; `list` works too)"
+        "  /git tree              show commit ancestry and branch pointers (default; aliases: `list`, `status`)"
     );
     println!("  /git checkout <branch|checkpoint> [--save <name> | --discard]");
     println!("                                switch to a branch or detach at a checkpoint; dirty");

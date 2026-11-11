@@ -1606,6 +1606,23 @@ pub(crate) fn snapshot_image_attachments(
         .collect()
 }
 
+/// Prepare inline images for input paths that do not run `finalize_question`.
+/// Capture before acknowledging queued input so failures remain retryable.
+pub(super) fn prepare_inline_image_attachments(
+    question: &mut String,
+    assets_dir: &Path,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let images = extract_inline_image_paths(question);
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+    let resolved = images
+        .into_iter()
+        .map(|raw| resolve_inline_image_path(&raw, assets_dir))
+        .collect();
+    snapshot_image_attachments(resolved, assets_dir)
+}
+
 fn apply_text_files_prefix(
     attachments: &mut String,
     text_files: &[String],

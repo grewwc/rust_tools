@@ -104,10 +104,30 @@ function structuredFixtureFrame(frame) {
   }).join("\n\n");
 }
 
+function descendants(parent) {
+  return (parent.children || []).flatMap((child) => [child, ...descendants(child)]);
+}
+
+// Phase assertions still inspect the original inner records after grouping.
+function executionRecords(parent) {
+  return descendants(parent).filter((child) => child.summary && !child.classList.contains("execution-group"));
+}
+
+function fixtureFold(createNode, title, text, parent, key) {
+  const box = createNode(), details = createNode(), summary = createNode(), body = createNode();
+  box.className = "msg asst";
+  details.tagName = "DETAILS"; details.open = false; details.dataset.foldKey = key || "fixture:" + descendants(parent).length;
+  summary.tagName = "SUMMARY"; summary.textContent = title;
+  body.className = "prog"; body.textContent = text;
+  details.appendChild(summary); details.appendChild(body); box.appendChild(details); parent.appendChild(box);
+  box.summary = summary; box.body = body; box.details = details;
+  return { box, body, set(label, value) { summary.textContent = label; body.textContent = value; } };
+}
+
 function streamHarness({ activityOnly = false, phone = false, storage = new Map(), realThinking = false, phaseClock = false, clockStart = 1000 } = {}) {
   const timers = [];
   const box = {
-    children: [], isConnected: true,
+    children: [], isConnected: true, scrollTop: 0, scrollHeight: 0,
     appendChild(node) { if (!this.children.includes(node)) this.children.push(node); node.parentNode = this; return node; },
     insertBefore(node, before) {
       if (before && before.parentNode !== this) throw new Error("foreign insertion anchor");
@@ -117,7 +137,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
       this.children.splice(index < 0 ? this.children.length : index, 0, node);
       node.parentNode = this;
     },
-    querySelectorAll() { return nodeList(this.children.filter((child) => child.summary)); },
+    querySelectorAll(selector) { return nodeList(descendants(this).filter((child) => child.matches?.(selector))); },
   };
   function node() {
     const classes = new Set();
@@ -144,9 +164,17 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
         item.children.splice(index, 0, child); child.parentNode = item;
         return child;
       },
-      querySelector() { return null; }, querySelectorAll() { return []; }, classList: {
+      addEventListener() {},
+      matches(selector) { return selector.startsWith(".")
+        ? selector.slice(1).split(".").every((name) => classes.has(name))
+        : item.tagName === selector.toUpperCase(); },
+      querySelector(selector) { return item.querySelectorAll(selector)[0] || null; },
+      querySelectorAll(selector) { return descendants(item).filter((child) => child.matches?.(selector)); }, classList: {
       add: (name) => classes.add(name), remove: (name) => classes.delete(name), contains: (name) => classes.has(name),
-    }, get isConnected() { return box.isConnected && box.children.includes(item); },
+    }, get isConnected() {
+      for (let owner = item; owner; owner = owner.parentNode) if (owner === box) return box.isConnected;
+      return false;
+    },
     remove() {
       if (item.parentNode) item.parentNode.children = item.parentNode.children.filter((child) => child !== item);
       item.parentNode = null;
@@ -158,7 +186,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
   const listen = (type, fn) => listeners.set(type, (listeners.get(type) || []).concat(fn));
   const document = { hidden: false, body: box, addEventListener: listen, createElement: () => node() };
   const context = vm.createContext({
-    box, sid: "s", sessionId: "s", finished: false, turnError: false, document,
+    box, sid: "s", sessionId: "s", finished: false, turnError: false, document, $: () => box,
     turns: new Map(), liveEntry: {},
     Date: { now: () => clock.now }, isPhoneLayout: () => phone,
     localStorage: {
@@ -167,6 +195,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
     },
     LIVE_STALL_MS: Number(/const LIVE_STALL_MS = (\d+)/.exec(script)[1]),
     runEpoch: 0, eventFailures: 0, confirmPollSeq: 0, eventStreamEnded: false, eventStreamFailed: false,
+    turnRunningPid: 0, endedTurnPid: 0,
     setTimeout: (fn, delay) => { timers.push(delay); return timers.length; }, clearTimeout() {},
     // Extracted slices may arm timers; the assertions drive them directly.
     setInterval(fn, delay) {
@@ -179,15 +208,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
     renderMarkdown: (text) => text, decorateMath() {}, decorateAndLoad() {}, addAnswerCopy() {},
     showConfirm() {}, hideConfirm() {}, confirmShown: null, stopStaleFollow() {},
     addMsgMd() { const item = node(); item.className = "msg asst md"; box.appendChild(item); return item; },
-    addFold(title, text) {
-      const item = node(), summary = { textContent: title }, details = { open: false };
-      const body = { textContent: text };
-      item.className = "msg asst";
-      item.summary = summary; item.body = body;
-      item.querySelector = (selector) => selector === "summary" ? summary : selector === "details" ? details : null;
-      box.appendChild(item);
-      return { box: item, body, set(label, value) { summary.textContent = label; body.textContent = value; } };
-    },
+    addFold(title, text, parent = box, key) { return fixtureFold(node, title, text, parent, key); },
     window: { addEventListener: listen },
     MutationObserver: class { constructor(fn) { observers.push(fn); } observe() {} },
     ...(activityOnly ? {
@@ -213,8 +234,8 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
       detach() { box.isConnected = false; mutate(); },
       attach() { box.isConnected = true; mutate([box]); },
       remove(item) { item.remove(); mutate(); },
-      titles: () => box.children.filter((item) => item.summary).map((item) => item.summary.textContent),
-      bodies: () => box.children.filter((item) => item.body).map((item) => item.body.textContent),
+      titles: () => executionRecords(box).map((item) => item.summary.textContent),
+      bodies: () => executionRecords(box).map((item) => item.body.textContent),
     };
   }
   vm.runInContext(script.slice(script.indexOf("function replyPaintDelay("), script.indexOf("function sessionTitle(")), context);
@@ -268,8 +289,8 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
         vm.runInContext("for (;;) { " + dispatch + "\nbreak; } flushPaint();", context);
       }
     },
-    titles: () => box.children.filter((item) => item.summary).map((item) => item.summary.textContent),
-    bodies: () => box.children.filter((item) => item.body).map((item) => item.body.textContent),
+    titles: () => executionRecords(box).map((item) => item.summary.textContent),
+    bodies: () => executionRecords(box).map((item) => item.body.textContent),
     pending: () => vm.runInContext("phaseBubble.textContent", context),
     pendingVisible: () => vm.runInContext("box.children.includes(phaseBubble)", context),
     answerRate: () => vm.runInContext("(bubble || answerBubbles.at(-1)).dataset.tokenRate || ''", context),
@@ -315,11 +336,15 @@ function replayHarness(options) {
         if (this.parentNode) this.parentNode.children = this.parentNode.children.filter((c) => c !== this);
         this.parentNode = null;
       },
-      querySelector(selector) { return selector === "summary" ? this.summary : selector === "details" ? this.details : null; },
+      addEventListener() {},
+      matches(selector) { return selector.startsWith(".")
+        ? selector.slice(1).split(".").every((name) => this.classList.contains(name))
+        : this.tagName === selector.toUpperCase(); },
+      querySelector(selector) { return this.querySelectorAll(selector)[0] || null; },
       querySelectorAll(selector) {
         const found = [];
         const visit = (parent) => parent.children.forEach((child) => {
-          if (selector.startsWith(".") && String(child.className || "").split(/\s+/).includes(selector.slice(1))) found.push(child);
+          if (child.matches?.(selector)) found.push(child);
           visit(child);
         });
         visit(this);
@@ -331,12 +356,7 @@ function replayHarness(options) {
   const msgs = node();
   context.$ = () => msgs;
   context.document = { ...context.document, body: msgs, createElement: node };
-  context.addFold = (title, text, parent) => {
-    const box = node(); box.summary = { textContent: title }; box.details = { open: false };
-    box.className = "msg asst";
-    box.body = { textContent: text }; parent.appendChild(box);
-    return { box, set(label, value) { box.summary.textContent = label; box.body.textContent = value; } };
-  };
+  context.addFold = (title, text, parent, key) => fixtureFold(node, title, text, parent, key);
   context.NATIVE_PREFIX = "@@aserve-native ";
   const requests = [];
   context.handleNativeRequest = (...args) => requests.push(args);
@@ -352,7 +372,7 @@ function replayHarness(options) {
     status: () => view.box.children.at(-1).textContent,
     reply: () => view.box.children.filter((item) => !item.summary && item.className === "msg asst" && !item.hidden).at(-1)?.textContent || "",
     mainRate: () => rateNodes(view.box)[0]?.textContent || "",
-    titles: () => view.box.children.filter((item) => item.summary).map((item) => item.summary.textContent),
+    titles: () => executionRecords(view.box).map((item) => item.summary.textContent),
   };
 }
 
@@ -365,7 +385,9 @@ function attachmentHarness(headersOnly = false, options) {
     eventStreamEnded: false, eventStreamFailed: false, turns: new Map(), store: { base: "https://server" },
     staleSession: "", staleDone: false, staleTimer: null, staleBox: null, staleTries: 0,
     turnRunning: true, turnRunningAt: Date.now(), RUNNING_SAMPLE_TTL_MS: 60000,
+    turnRunningPid: 0, endedTurnPid: 0,
     AbortController, TextDecoder, headers: () => ({}), syncStopButton() {},
+    refreshSideNotes() {},
     ensureConfirmPoll() { polls++; }, stopConfirmPoll() {},
     addMsg(role, text, cls, parent) {
       const row = c.document.createElement("div");
@@ -635,7 +657,7 @@ test("retained canonical history does not create rates without cached metrics", 
   await h.c.loadHistory();
   assert.equal(h.root.lastElementChild, canonical);
   assert.equal(h.visibleRates().length, 0);
-  assert.equal(canonical.children.find((child) => child.summary).summary.textContent, "thinking · ~3 tok");
+  assert.equal(executionRecords(canonical)[0].summary.textContent, "thinking · ~3 tok");
 });
 
 test("replayed phases paint visible status and separate thinking across tools", () => {
@@ -1232,9 +1254,12 @@ for (const recovered of [false, true]) {
     h.emit("thinking", { text: "second thought", rate: "~4 tok @ 8 tok/s" });
     h.emit("thinking_done");
     const box = recovered ? h.view.box : h.box;
-    const thinking = box.children.filter((child) => child.summary?.textContent.startsWith("thinking"));
+    const thinking = executionRecords(box).filter((child) => child.summary.textContent.startsWith("thinking"));
     assert.deepEqual(thinking.map((child) => child.body.textContent), ["first thought", "second thought"]);
-    assert.ok(thinking.every((child) => !child.hidden && child.parentNode === box));
+    assert.ok(thinking.every((child) => !child.hidden));
+    assert.equal(thinking[0].parentNode.classList.contains("execution-items"), true);
+    assert.equal(thinking[0].parentNode.parentNode.open, false, "old phases default closed but remain expandable");
+    assert.equal(thinking[1].parentNode, box, "the latest completed phase stays separately visible until another item arrives");
     if (recovered) h.view.finish();
     else h.emit("done");
     const refreshed = historyRateHarness(h.storage, "", "first thought", true);
@@ -1543,7 +1568,7 @@ test("short-thinking arrival floor: recovered SSE saves a rate immediately befor
   await h.settle();
   await h.frame('event: thinking_start\ndata: \n\nevent: thinking\ndata: ' + JSON.stringify({ text: screenshotThought }) + '\n\n');
   const view = h.c.recoveredView;
-  const caption = () => view.box.children.find((child) => child.summary).summary.textContent;
+  const caption = () => executionRecords(view.box)[0].summary.textContent;
   assert.equal(caption(), "thinking · ~31 tok @ 124 tok/s");
   h.advance(250);
   assert.equal(caption(), "thinking · ~31 tok @ 124 tok/s", "the running recovered fold waited for thinking_done");
@@ -2104,11 +2129,12 @@ test("a finished event stream is not re-attached on every poll, but a new turn i
     sessionId: "s", confirmBusy: false, runEpoch: 0, confirmPollSeq: 0,
     eventActive: false, eventSession: "", eventFailures: 0,
     turnRunning: false, turnRunningAt: 0, turns: new Map(), staleSession: "",
+    turnRunningPid: 0, endedTurnPid: 0,
     confirmShown: null, eventStreamEnded: false, NATIVE_PREFIX: "@@",
-    api: async () => ({ json: async () => ({ running: true, pending: null }) }),
+    api: async () => ({ json: async () => ({ running: true, turn: 1, pending: null }) }),
     armHistoryFollow() {}, ensureConfirmPoll() {}, stopConfirmPoll() {},
     attachEvents() { attachCalls++; },
-    syncStopButton() {}, showConfirm() {}, hideConfirm() {}, handleNativeRequest() {},
+    syncStopButton() {}, refreshSideNotes() {}, showConfirm() {}, hideConfirm() {}, handleNativeRequest() {},
   });
   const start = script.indexOf("async function pollConfirm()");
   const end = script.indexOf("function isTurnRunning()", start);
@@ -2120,17 +2146,17 @@ test("a finished event stream is not re-attached on every poll, but a new turn i
   // The stream closed with the server's terminal marker, so the turn it
   // belonged to is over. Polling again must not re-attach: that would rebuild
   // the progress view and re-render the transcript on every poll.
-  vm.runInContext("eventStreamEnded = true", context);
+  vm.runInContext("eventStreamEnded = true; endedTurnPid = turnRunningPid", context);
   await vm.runInContext("pollConfirm()", context);
   assert.equal(attachCalls, 1);
-  // The turn ends server-side and a new one starts: attach to the new stream.
-  vm.runInContext("turnRunning = false; eventStreamEnded = false", context);
+  // A different child pid proves a new turn even before an idle poll.
+  context.api = async () => ({ json: async () => ({ running: true, turn: 2, pending: null }) });
   await vm.runInContext("pollConfirm()", context);
   assert.equal(attachCalls, 2);
 });
 
 test("the terminal marker ends the reattach loop instead of rescheduling it", () => {
-  assert.match(script, /if \(block\.kind === "done"\) \{\s+view\.finish\(\);\s+finished = true; eventStreamEnded = true; eventFailures = 0; confirmPollSeq\+\+;\s+stopStaleFollow\(\);\s+break;\s+\}/);
+  assert.match(script, /if \(block\.kind === "done"\) \{\s+view\.finish\(\);\s+endedTurnPid = turnRunningPid;\s+finished = true; eventStreamEnded = true; eventFailures = 0; confirmPollSeq\+\+;\s+stopStaleFollow\(\);\s+break;\s+\}/);
   assert.match(script, /if \(!eventStreamEnded\) void attachEvents\(\);/);
 });
 
@@ -2283,9 +2309,9 @@ test("retained canonical task history moves merged details when a later wait is 
   assert.equal(cards.length, 1);
   assert.equal(h.root.children.length, 2, "task display must retain one root child per canonical display row");
   assert.equal(h.root.children[0].children.filter((child) => child.dataset.subagents === "true").length, 0);
-  const waitRow = h.root.children[1], [waitFold, subagents] = waitRow.children;
+  const waitRow = h.root.children[1], [waitFold, subagents] = executionRecords(waitRow);
   assert.equal(waitFold.body.textContent, "raw wait\n");
-  assert.equal(waitFold.nextElementSibling, subagents);
+  assert.equal(waitFold.parentNode.parentNode.parentNode.nextElementSibling, subagents);
   assert.equal(subagents.dataset.subagents, "true");
   assert.equal(subagents.querySelectorAll(".task-output-body")[0].textContent, done.output);
   assert.equal(h.root.children[0].dataset.canonicalIndex, "1");
@@ -2343,6 +2369,29 @@ test("terminal replay ignores child reap lag until an idle poll acknowledges com
   assert.equal(elements.send.title, "stop this turn");
   await h.frame('event: done\ndata: {}\n\n');
   await h.settle();
+});
+
+test("a different child pid after a terminal event shows the stop button", async () => {
+  const h = attachmentHarness(), c = h.c, elements = runningComposer(c);
+  Object.assign(c, { confirmBusy: false, confirmShown: null, armHistoryFollow() {},
+    api: async () => ({ json: async () => ({ running: true, turn: 1, pending: null }) }),
+  });
+  vm.runInContext(script.slice(script.indexOf("async function pollConfirm()"), script.indexOf("function isTurnRunning()")), c);
+  const pending = c.attachEvents();
+  await h.settle();
+  c.turnRunningPid = 1;
+  await h.frame('event: done\ndata: {}\n\n');
+  await pending;
+  assert.equal(c.endedTurnPid, 1, "the terminal event records the child it ended in");
+  assert.equal(elements.send.title, "send");
+  await c.pollConfirm();
+  assert.equal(c.eventStreamEnded, true, "the same child is only reap lag");
+  assert.equal(elements.send.title, "send");
+  c.api = async () => ({ json: async () => ({ running: true, turn: 2, pending: null }) });
+  await c.pollConfirm();
+  await h.settle();
+  assert.equal(c.eventStreamEnded, false, "a different child starts a new turn");
+  assert.equal(elements.send.title, "stop this turn");
 });
 
 for (const running of [true, null, false]) test(`assistant-ending stale history resolves only on an idle server poll (running=${running})`, async () => {

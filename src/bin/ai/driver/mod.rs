@@ -1274,20 +1274,17 @@ async fn run_loop(
                 crate::ai::background::is_serve_child(),
                 crate::ai::driver::side_note::current_target_id().is_some(),
             ) {
-                Vec::new()
+                crate::ai::driver::side_note::SideNoteInput::default()
             } else {
                 crate::ai::driver::side_note::drain_side_notes_to_archive(
                     &app.session_history_file,
                     None,
                 )?
             };
-            let pending_side_note_count = pending_side_notes.len();
-            let pending_side_note_input = pending_side_notes
-                .iter()
-                .map(|note| note.content.trim())
-                .filter(|content| !content.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n\n");
+            let pending_side_note_count = pending_side_notes.notes.len();
+            let pending_side_note_input = pending_side_notes.question;
+            let has_pending_side_note =
+                !pending_side_note_input.is_empty() || !pending_side_notes.image_files.is_empty();
 
             // ── Pending talk mail → next user input ──
             // Same delivery guarantee as side-notes, but only when no side-note
@@ -1295,7 +1292,7 @@ async fn run_loop(
             // the following iteration-top drain. Draining here is lazy so mail is
             // never consumed without being delivered.
             let mut card_skills: Vec<String> = Vec::new();
-            let pending_talk_input = if pending_side_note_input.is_empty() {
+            let pending_talk_input = if !has_pending_side_note {
                 let mut pending = crate::ai::driver::talk::drain_talk(&app.session_history_file);
                 if pending.is_empty() {
                     String::new()
@@ -1345,7 +1342,7 @@ async fn run_loop(
                 .filter(|g| !g.is_empty() && app.last_turn_had_tool_calls && !one_shot_mode)
                 .map(|g| commands::goal::build_goal_continuation_prompt(g));
 
-            if !pending_side_note_input.is_empty() {
+            if has_pending_side_note {
                 // Notice first: the user must see why a turn starts without new input
                 // and which note is being delivered.
                 let preview: String = pending_side_note_input
@@ -1373,6 +1370,7 @@ async fn run_loop(
                     let _ = notifier.send(());
                 }
                 question = pending_side_note_input;
+                app.attached_image_files = pending_side_notes.image_files;
                 attachments_text = String::new();
                 history_count = 0;
             } else if !pending_talk_input.is_empty() {

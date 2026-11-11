@@ -237,6 +237,9 @@ select, summary { touch-action:manipulation; }
 #msgwrap { flex:1; min-height:0; position:relative; }
 #msgs { position:absolute; top:0; right:0; bottom:0; left:0; box-sizing:border-box; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:10px; overscroll-behavior-y:contain; }
 .turn { display:flex; flex-direction:column; gap:8px; min-width:0; }
+.turn.execution-empty:empty { display:none; }
+.execution-group { flex-shrink:0; }
+.execution-group > details > .execution-items { padding-top:8px; }
 .turn .tool-activity summary { color:var(--fg); }
 .turn .tool-activity[data-running="true"] { border-color:var(--acc-line); }
 #jumpbottom {
@@ -302,6 +305,7 @@ select, summary { touch-action:manipulation; }
 .rewind-action:hover { opacity:1; color:var(--acc); border-color:var(--acc-line-soft); }
 #sidenote { display:none; }
 .msg .prog { font-size:13px; color:var(--dim); }
+.msg.git-output .prog { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:var(--fg); }
 /* Task metadata stays visible while arguments and delivered prose keep the
    existing disclosure. Both layouts inherit the same selectable rows. */
 .msg .task-output { display:flex; flex-direction:column; gap:4px; min-width:0; margin-top:4px;
@@ -567,6 +571,27 @@ select, summary { touch-action:manipulation; }
 #skillempty[hidden] { display:none; }
 #skillclear { flex:0 0 auto; width:100%; min-height:44px; padding:8px 10px; background:var(--surface-2); border-radius:10px; }
 #skillhint { padding:5px 8px; color:var(--dim); font-size:12px; }
+#sidequeue {
+  flex:0 0 auto; display:flex; flex-direction:column; gap:4px; padding:8px 12px 0;
+  background:var(--panel); border-top:1px solid var(--line);
+}
+#sidequeue[hidden] { display:none; }
+#sidequeue:not([hidden]) + #composer { border-top:0; }
+#sidequeuehead { display:flex; align-items:center; justify-content:space-between; font-size:11px; color:var(--dim); }
+#sidequeuelist {
+  list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:4px;
+  max-height:132px; overflow:auto;
+}
+#sidequeuelist li {
+  display:flex; align-items:flex-start; gap:6px; padding:6px 8px;
+  border:1px solid var(--line); border-radius:8px; background:var(--tint-2);
+  font-size:12px; line-height:1.4;
+}
+#sidequeuelist .from {
+  flex:0 0 auto; padding-top:2px; color:var(--acc-soft-2);
+  font-size:10px; letter-spacing:.04em; text-transform:uppercase;
+}
+#sidequeuelist .text { min-width:0; white-space:pre-wrap; overflow-wrap:anywhere; }
 #composer { display:flex; gap:8px; padding:10px 12px calc(10px + env(safe-area-inset-bottom)); background:var(--panel); border-top:1px solid var(--line); }
 #prompt {
   flex:1; min-height:44px; max-height:30vh; max-height:calc(var(--app-height, 100vh) * .30); padding:9px 10px; resize:none;
@@ -680,6 +705,14 @@ select, summary { touch-action:manipulation; }
 #confirmerr.show { display:block; }
 #confirmbtns { display:flex; gap:8px; }
 #confirmbtns button { flex:1; min-height:44px; }
+/* Checkpoint confirmations belong to a composer command, outside a turn. */
+#gitconfirmwrap[hidden] { display:none; }
+#gitconfirmwrap { position:fixed; inset:0; z-index:21; display:flex; align-items:center; justify-content:center; padding:16px; background:rgba(0,0,0,.55); }
+#gitconfirmpanel { width:min(100%,440px); max-height:calc(var(--app-height, 100vh) * .80); overflow-y:auto; padding:18px; background:var(--panel); border:1px solid var(--line); border-radius:var(--radius-card); box-shadow:var(--shadow-panel); display:flex; flex-direction:column; gap:12px; }
+#gitconfirmtitle { font-size:16px; font-weight:600; }
+#gitconfirmtext { white-space:pre-wrap; overflow-wrap:anywhere; }
+#gitconfirmbtns { display:flex; justify-content:flex-end; gap:8px; }
+#gitconfirmbtns button { flex:1; min-height:44px; }
 /* Shared visual language; layout and state visibility stay with their owners. */
 header { gap:8px; padding-bottom:12px; border-bottom-color:transparent; }
 header b { font-size:20px; font-weight:700; letter-spacing:-.03em; }
@@ -744,6 +777,15 @@ button:active:not(:disabled) { filter:brightness(.96); }
     -webkit-font-smoothing:antialiased;
     -moz-osx-font-smoothing:grayscale;
   }
+  /* Body text keeps the shared rendering. Only bold runs and section labels
+     get a dark-only step: the macOS CJK fallback has no face heavier than
+     Semibold, so asking for 800 alone barely thickens Chinese glyphs. The
+     sub-pixel stroke adds the missing weight without blurring the edges. */
+  :root:not([data-theme="light"]):not([data-theme="warm"]) .msg.md strong,
+  :root:not([data-theme="light"]):not([data-theme="warm"]) .msg.md b,
+  :root:not([data-theme="light"]):not([data-theme="warm"]) .msg.md .h {
+    font-weight:800; color:#fff; -webkit-text-stroke:.35px currentColor;
+  }
   /* The settings row packs two inputs and five buttons; without wrapping the
      inputs shrink to a sliver and the token field cannot be used. */
   #conn.open { flex-wrap:wrap; }
@@ -751,29 +793,84 @@ button:active:not(:disabled) { filter:brightness(.96); }
   /* Gray reading surfaces keep teal on actions and focus indicators. The
      shared palettes above continue to own every phone colour. */
   :root {
-    --bg:#1b1b1b; --panel:#242424; --line:#3e3e3e; --fg:#dcdcdc; --dim:#b5b5b5;
+    --bg:#1b1b1b; --panel:#242424; --line:#3e3e3e; --fg:#e9e9e9; --dim:#c4c4c4;
     --surface:#2e2e2e; --surface-hover:#383838; --surface-2:#292929; --line-2:#5c5c5c;
+    --control-border:#858585;
     --field:#292929; --code-bg:#1f1f1f; --media-bg:#161616; --code-toolbar:#292929;
     --glass:rgba(36,36,36,.95); --glass-strong:rgba(36,36,36,.98);
     --tint:rgba(231,231,231,.08); --tint-2:rgba(231,231,231,.05); --tint-3:rgba(231,231,231,.10); --tint-4:rgba(231,231,231,.11);
     --edge:rgba(231,231,231,.20);
+    --card-edge:rgba(231,231,231,.12);
+    --card-shadow:0 2px 8px rgba(0,0,0,.12);
   }
   :root[data-theme="light"] {
-    --bg:#e9e9e9; --panel:#f2f2f2; --line:#d0d0d0; --fg:#2e2e2e; --dim:#575757;
-    --surface:#dfdfdf; --surface-hover:#d3d3d3; --surface-2:#ececec; --line-2:#b1b1b1;
-    --field:#ececec; --code-bg:#e2e2e2; --media-bg:#dadada; --code-toolbar:#ececec;
-    --glass:rgba(242,242,242,.95); --glass-strong:rgba(242,242,242,.98);
-    --tint:rgba(46,46,46,.06); --tint-2:rgba(46,46,46,.04); --tint-3:rgba(46,46,46,.08); --tint-4:rgba(46,46,46,.13);
+    --bg:#efefef; --panel:#f3f3f3; --line:#9a9a9a; --fg:#242424; --dim:#3e3e3e;
+    --surface:#dfdfdf; --surface-hover:#d3d3d3; --surface-2:#ececec; --line-2:#858585;
+    --control-border:#737373; --danger-text:#9f3029;
+    --fw-meta:450;
+    --field:#f3f3f3; --code-bg:#e2e2e2; --media-bg:#dadada; --code-toolbar:#ececec;
+    --glass:rgba(243,243,243,.95); --glass-strong:rgba(243,243,243,.98);
+    --tint:rgba(46,46,46,.06); --tint-2:rgba(46,46,46,.04); --tint-3:rgba(46,46,46,.14); --tint-4:rgba(46,46,46,.13);
     --edge:rgba(46,46,46,.18);
     --shadow-sm:0 2px 8px rgba(46,46,46,.05); --shadow-panel:0 8px 28px rgba(46,46,46,.10);
+    --card-edge:rgba(46,46,46,.12);
+    --card-shadow:0 2px 4px rgba(46,46,46,.03), 0 10px 28px rgba(46,46,46,.05);
   }
+  /* Light desktop text gains a small weight step without changing type size.
+     Existing heading weights still apply. */
+  :root[data-theme="light"] body { font-weight:450; --radius-card:16px; --radius-control:10px; }
+  /* Passive surfaces use quiet edges; form, focus, and activity cues retain
+     stronger boundaries. */
+  :root[data-theme="light"] header,
+  :root[data-theme="light"] #sessbar { border-bottom-color:#d8d8d8; }
+  :root[data-theme="light"] .msg.asst:not(.git-output) {
+    border-color:var(--card-edge); border-radius:var(--radius-card); box-shadow:var(--card-shadow);
+  }
+  :root[data-theme="light"] .msg.asst.tool-activity[data-running="true"] { border-color:var(--acc-line); }
+  :root[data-theme="light"] #sessions { border-right-color:var(--card-edge); }
+  :root[data-theme="light"] #promptnav,
+  :root[data-theme="light"] #ovrwrap { border-top-color:var(--card-edge); }
+  :root[data-theme="light"] #prompt {
+    background:var(--field); border-radius:12px; box-shadow:var(--shadow-sm);
+  }
+  :root[data-theme="light"] .execution-group > details > summary:focus-visible {
+    outline:2px solid var(--acc-focus); outline-offset:2px;
+  }
+  :root[data-theme="light"] input::placeholder,
+  :root[data-theme="light"] textarea::placeholder { color:var(--dim); opacity:1; }
+  :root[data-theme="light"] .msg.asst.tool-activity:not(.git-output):not(:has(> .task-output)):not([data-running="true"]),
+  :root[data-theme="light"] .msg.asst:has(> details[data-fold-key^="thinking:"]),
+  :root[data-theme="light"] .msg.asst:has(> details[data-fold-key$=":thinking"]) { border-color:var(--card-edge); box-shadow:none; }
+  :root[data-theme="light"] #ovr select,
+  :root[data-theme="light"] #omodelbtn,
+  :root[data-theme="light"] #oagentbtn,
+  :root[data-theme="light"] #oeffortbtn,
+  :root[data-theme="light"] #oskill {
+    background-color:var(--field); border-color:var(--control-border); font-weight:450;
+  }
+  @media (hover:hover) {
+    :root[data-theme="light"] #ovr select:hover,
+    :root[data-theme="light"] #omodelbtn:hover:not(:disabled),
+    :root[data-theme="light"] #oagentbtn:hover:not(:disabled),
+    :root[data-theme="light"] #oeffortbtn:hover:not(:disabled),
+    :root[data-theme="light"] #oskill:hover:not(:disabled) { background-color:var(--surface-hover); }
+  }
+  :root[data-theme="light"] #ovr select:focus-visible,
+  :root[data-theme="light"] #omodelbtn:focus-visible,
+  :root[data-theme="light"] #oagentbtn:focus-visible,
+  :root[data-theme="light"] #oeffortbtn:focus-visible,
+  :root[data-theme="light"] #oskill:focus-visible { border-color:var(--acc-focus); }
+  :root[data-theme="light"] #sidenote.show { background:var(--field); border-color:var(--acc); color:var(--acc); }
   :root[data-theme="warm"] {
     --bg:#e9e7e7; --panel:#f2f0f0; --line:#d1cfcf; --fg:#302e2e; --dim:#585656;
     --surface:#e0dede; --surface-hover:#d4d2d2; --surface-2:#edebeb; --line-2:#b4b2b2;
+    --control-border:#737373;
     --field:#edebeb; --code-bg:#e3e1e1; --media-bg:#dbd9d9; --code-toolbar:#edebeb;
     --glass:rgba(242,240,240,.95); --glass-strong:rgba(242,240,240,.98);
     --tint:rgba(48,46,46,.06); --tint-2:rgba(48,46,46,.04); --tint-3:rgba(48,46,46,.08); --tint-4:rgba(48,46,46,.13);
     --edge:rgba(48,46,46,.18);
+    --card-edge:rgba(48,46,46,.12);
+    --card-shadow:0 2px 8px rgba(48,46,46,.06);
     --shadow-sm:0 2px 8px rgba(48,46,46,.05); --shadow-panel:0 8px 28px rgba(48,46,46,.10);
   }
   body { --radius-card:10px; --radius-control:8px; font-size:14px; line-height:1.5; }
@@ -781,29 +878,77 @@ button:active:not(:disabled) { filter:brightness(.96); }
   header b { font-size:18px; }
   header button { min-width:34px; height:34px; padding:0 10px; }
   #menu, #scrim, #scrim.on { display:none; }
-  #sessbar { flex-shrink:0; min-height:32px; padding:6px 16px; cursor:default; }
+  #sessbar { flex-shrink:0; min-height:32px; padding:6px 16px; font-size:15px; cursor:default; }
+  #sesstitle { min-width:0; font-size:15px; }
+  #sessmeta { min-width:0; overflow:hidden; text-overflow:ellipsis; font-size:13px; }
   #views, #chat { min-width:0; min-height:0; }
   #sessions { display:flex; flex:0 0 240px; width:240px; min-width:0; min-height:0; }
   #sessions ul { min-height:0; padding:8px; }
-  #sessions li { padding:7px 8px; font-size:13px; }
-  #sessions li.cur { background:var(--tint-3); box-shadow:inset 3px 0 0 var(--acc), inset 0 0 0 1px var(--line); }
-  #sessions li .rn, #sessions li .mk { padding:2px 6px; }
+  #sessions li { padding:7px 8px; font-size:14px; line-height:1.4; }
+  #sessions li.cur { background:var(--tint-3); box-shadow:inset 3px 0 0 var(--acc); }
+  #sessions li span[role="button"] { overflow-wrap:anywhere; }
+  #sessions li small { margin-top:3px; font-size:12px; }
+  #sessions li .rn, #sessions li .mk { width:28px; height:28px; padding:0; font-size:16px; line-height:1; border-radius:6px; }
+  #sessions li .rn:hover, #sessions li .mk:hover,
+  #sessions li .rn:focus-visible, #sessions li .mk:focus-visible { background:var(--surface-hover); }
   #sessionactionspanel {
     top:50%; bottom:auto; transform:translateY(-50%); padding:16px;
     border-bottom:1px solid var(--line); border-radius:var(--radius-card);
   }
-  #sessfilter { min-height:32px; font-size:13px; }
+  #sessfilter { min-height:32px; font-size:13px; border-color:var(--control-border); }
+  /* Desktop surfaces share their shape while each palette owns the contrast. */
+  body { --radius-card:16px; --radius-control:10px; }
+  header, #sessbar { border-bottom-color:var(--card-edge); }
+  .msg.asst:not(.git-output) {
+    border-color:var(--card-edge); border-radius:var(--radius-card); box-shadow:var(--card-shadow);
+  }
+  .msg.asst.tool-activity[data-running="true"] { border-color:var(--acc-line); }
+  .execution-group > details > summary:focus-visible {
+    outline:2px solid var(--acc-focus); outline-offset:2px;
+  }
+  #prompt { background:var(--field); border-radius:12px; box-shadow:var(--shadow-sm); }
+  #sessions { border-right-color:var(--card-edge); }
+  #sessfilter { padding:8px 12px; border-radius:12px; background:var(--field); }
+  #sesscount { padding:6px 16px; }
+  #sessions ul { padding:4px 8px; }
+  #sessions li { padding:10px 12px; margin:3px 0; border-radius:12px; }
+  #sessions li:hover { background:var(--surface-2); }
+  #sessions li.cur, #sessions li.cur:hover {
+    background:var(--tint-3); box-shadow:inset 3px 0 0 var(--acc);
+  }
+  #sessions li .rn, #sessions li .mk { border-radius:8px; }
+  #sessions .rowbtns {
+    display:flex; flex:0 0 auto; gap:6px; padding:10px 12px;
+    border:0; border-top:1px solid var(--card-edge);
+  }
+  #sessions .rowbtns button {
+    flex:1; min-width:0; min-height:34px; padding:6px 10px; font-size:13px; border:1px solid var(--card-edge);
+    border-radius:10px; background:var(--field); box-shadow:none;
+  }
+  #sessions .rowbtns button:hover:not(:disabled) { background:var(--surface-hover); }
+  #sessions .rowbtns button.danger { color:var(--danger-text, var(--err)); }
+  #sessions button:focus-visible, #sessions span[role="button"]:focus-visible,
+  #sessfilter:focus-visible { outline:2px solid var(--acc-focus); outline-offset:2px; }
+  #skillhint { display:none; }
+  .modelrowcheck { border-color:var(--control-border); }
+  #sesscount { padding-left:16px; }
   #sessions .rowbtns { flex-shrink:0; }
+  #sessions .rowbtns button:hover:not(:disabled),
+  #sessions .rowbtns button:focus-visible { background:var(--surface-hover); }
+  #del { color:var(--err); }
+  :root[data-theme="light"] #sessionactiondelete,
+  :root[data-theme="light"] #sessdelconfirm,
+  :root[data-theme="light"] #del,
+  :root[data-theme="light"] #teamtrigger[data-state="error"] #teamstatus { color:var(--danger-text); }
   /* A per-answer affordance must not outweigh the answer: keep the control a
      quiet text button on desktop, where the pointer already targets precisely. */
   .msg.md .answer-copy { min-width:0; min-height:0; padding:2px 8px; font-size:11px; letter-spacing:.02em; border-color:transparent; }
   .msg.md .answer-copy:hover, .msg.md .answer-copy:focus-visible { border-color:var(--line); }
-  /* Session prompt index: a bordered card so it reads as a first-class
-     sidebar section instead of a footnote under the session list. */
+  /* A divider separates the prompt index without nesting another sidebar card. */
   #promptnav {
-    display:block; flex:0 0 auto; min-height:0; margin:6px 8px 10px;
-    padding:8px 8px 6px; border:1px solid var(--line); border-radius:var(--radius-card);
-    background:var(--surface); box-shadow:var(--shadow-sm);
+    display:block; flex:0 0 auto; min-height:0; margin:6px 12px 2px;
+    padding:8px 8px 6px; border:1px solid var(--card-edge); border-radius:12px;
+    background:var(--surface-2); box-shadow:none;
   }
   #promptnav > summary {
     display:flex; align-items:center; gap:8px; padding:2px 4px 7px;
@@ -836,15 +981,19 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #promptlist .pnt { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #promptlist li.cur button { background:var(--tint-3); border-left-color:var(--acc); font-weight:500; }
   #promptlist .pempty { padding:6px 7px; color:var(--dim); font-size:12px; }
-  /* Equal outer widths and gutters align transcript and footer. */
-  #msgwrap, #ovrwrap, #composer { width:100%; max-width:1000px; align-self:center; }
-  #msgs { padding:18px 24px; gap:10px; }
+  /* Equal outer widths align transcript and footer across desktop themes.
+     Percentage gutters keep small windows usable; the cap bounds long lines. */
+  #msgwrap, #ovrwrap, #sidequeue, #composer { width:96%; max-width:1280px; align-self:center; }
+  #msgs { padding:18px 24px 56px; gap:10px; }
   .turn { gap:8px; }
   .msg { max-width:100%; padding:8px 12px; font-size:17px; line-height:1.65; }
   /* Thinking, tool folds and task rows are reading surfaces too; keep them
      one step under the message body instead of the phone's compact 13px. */
   .msg details, .msg .prog { font-size:15px; }
   .msg .task-output { font-size:14px; }
+  /* Task provenance selects active work and the latest delivered batch;
+     earlier results remain in the raw tool folds and the mobile projection. */
+  .msg.asst[data-subagents="true"] > .task-output > [data-task-current="false"] { display:none; }
   .msg.md code, .msg.md table { font-size:14px; }
   .msg.md .h.lv2 { font-size:18px; }
   .msg.md .h.lv3 { font-size:17px; }
@@ -864,14 +1013,27 @@ button:active:not(:disabled) { filter:brightness(.96); }
     align-items:center; justify-content:flex-end;
   }
   .user-msg-row > .msg.user { min-width:0; align-self:auto; }
+  .rewind-action { opacity:1; }
   .msg.asst { box-shadow:none; }
-  .msg details summary { padding:3px 0; }
-  #jumpbottom { display:grid; right:24px; bottom:12px; width:34px; height:34px; }
+  /* Known fold markers keep notes, task reports and Git cards on their own surfaces. */
+  .msg.asst.tool-activity:not(.git-output):not(:has(> .task-output)),
+  .msg.asst:has(> details[data-fold-key^="thinking:"]),
+  .msg.asst:has(> details[data-fold-key$=":thinking"]),
+  .msg.asst[data-canonical-identity^='["tool",']:not(.git-output):not([data-subagents]):not(:has(> .task-output)):has(> details[data-fold-key*='\a ["tool",']) {
+    background:transparent; border-width:0 0 0 2px; border-radius:6px; padding:4px 12px;
+  }
+  .msg.asst > details > summary { min-height:32px; padding:4px 0; font-size:14px; line-height:1.5; border-radius:6px; }
+  .msg.asst > details:not([open]) > summary { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .msg.asst > details[open] > summary { white-space:normal; overflow-wrap:anywhere; }
+  .msg.asst > details[data-fold-key^="thinking:"] > .prog,
+  .msg.asst > details[data-fold-key$=":thinking"] > .prog { color:var(--fg); line-height:1.6; padding:4px 0 8px; }
+  #jumpbottom { display:grid; right:24px; bottom:12px; width:34px; height:34px; background:var(--panel); color:var(--fg); box-shadow:var(--shadow-sm); }
+  #jumpbottom:hover { background:var(--surface-2); }
   #jumpbottom.show { opacity:1; transform:translateY(0) scale(1); pointer-events:auto; }
   #ovrwrap {
     display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:start;
     position:relative; flex-shrink:0; gap:4px 8px; padding:10px 24px 4px;
-    border-top:1px solid var(--line); background:var(--panel);
+    border-top:1px solid var(--line); background:transparent; box-shadow:none;
   }
   /* A phone may have closed the disclosure before the viewport widened. */
   #ovrwrap::details-content { display:contents; content-visibility:visible; }
@@ -882,12 +1044,23 @@ button:active:not(:disabled) { filter:brightness(.96); }
     display:grid; grid-template-columns:minmax(0,1.3fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1.2fr);
     grid-column:1; grid-row:1; position:relative; min-width:0; align-items:start; gap:4px 8px; padding:0;
   }
-  #ovr select, #omodelbtn, #oagentbtn, #oeffortbtn, #oskill { width:100%; height:36px; min-height:36px; padding:0 10px; font-size:13px; }
+  #ovr select, #omodelbtn, #oagentbtn, #oeffortbtn, #oskill {
+    width:100%; height:32px; min-height:32px; padding:0 10px; font-size:13px; font-weight:400;
+    background-color:transparent; border-color:transparent;
+  }
   #ovr select { padding-right:30px; }
+  @media (hover:hover) {
+    #ovr select:hover, #omodelbtn:hover:not(:disabled), #oagentbtn:hover:not(:disabled),
+    #oeffortbtn:hover:not(:disabled), #oskill:hover:not(:disabled) { background-color:var(--surface-hover); }
+  }
+  #ovr select:focus-visible, #omodelbtn:focus-visible, #oagentbtn:focus-visible, #oeffortbtn:focus-visible, #oskill:focus-visible,
+  #omodelbtn[aria-expanded="true"], #oagentbtn[aria-expanded="true"], #oeffortbtn[aria-expanded="true"], #oskill[aria-expanded="true"] {
+    background-color:var(--surface-2);
+  }
   /* The hint spans the row without changing the skill button's alignment. */
   #skillpicker { display:contents; }
   #skillfield { min-width:0; }
-  #skillhint { grid-column:1 / -1; padding:0; font-size:11px; }
+  #skillhint { grid-column:1 / -1; padding:0; font-size:12px; }
   #skillmenu { left:auto; right:0; width:min(360px,100%); }
   #teamcontrols { display:flex; }
   #ovrsummaryline #teamcontrols { min-width:0; max-width:100%; }
@@ -895,15 +1068,16 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #composer {
     display:grid; grid-template-columns:36px minmax(0,1fr) 36px;
     grid-template-areas:"image prompt send";
-    flex-shrink:0; align-items:end; gap:8px; padding:8px 24px 12px; border-top:0;
+    flex-shrink:0; align-items:end; gap:8px; padding:8px 24px 20px; border-top:0; background:transparent; box-shadow:none;
   }
   #composer.side-note-ready {
     grid-template-columns:36px minmax(0,1fr) 58px 36px;
     grid-template-areas:"image prompt sidenote send";
   }
-  #prompt { grid-area:prompt; width:100%; min-width:0; min-height:36px; padding:7px 10px; font-size:15px; line-height:1.5; }
+  #prompt { grid-area:prompt; width:100%; min-width:0; min-height:40px; padding:7px 10px; font-size:16px; line-height:1.5; border-color:var(--control-border); }
   #img, #send { display:grid; place-items:center; width:36px; min-width:36px; height:36px; padding:0; font-size:16px; }
-  #img { grid-area:image; }
+  #img { grid-area:image; background:transparent; border-color:transparent; color:var(--dim); }
+  #img:hover:not(:disabled), #img:focus-visible { background:var(--surface-2); color:var(--fg); }
   #send { grid-area:send; }
   #sidenote.show {
     grid-area:sidenote; display:inline-flex; align-items:center; justify-content:center;
@@ -992,6 +1166,8 @@ button:active:not(:disabled) { filter:brightness(.96); }
   }
   .msg.md .math.display { margin:4px 0; padding:0; }
   .msg.md .code-preview-toolbar button, .msg.md .code-block-toolbar button { min-height:40px; padding:6px 12px; }
+  #sidequeue { padding:6px 10px 0; border-top:0; background:transparent; }
+  #sidequeuelist { max-height:96px; }
   #composer {
     display:grid; grid-template-columns:42px minmax(0,1fr) 42px;
     grid-template-areas:"image prompt send";
@@ -1056,9 +1232,12 @@ button:active:not(:disabled) { filter:brightness(.96); }
   .rewind-confirm-cancel, .rewind-confirm-ok { flex:0 0 auto; height:30px; padding:0 14px;
     border-radius:8px; border:1px solid var(--line); background:var(--surface-2); color:var(--fg);
     font:inherit; cursor:pointer; }
-  .rewind-confirm-ok { border-color:var(--acc); background:var(--acc); color:#fff; }
+  .rewind-confirm-ok { border-color:var(--acc); background:var(--acc); color:var(--on-acc); }
   .rewind-confirm-cancel:hover { background:var(--tint-2); }
   .rewind-confirm-ok:hover { filter:brightness(.94); }
+  @media (hover:hover) {
+    .rewind-confirm-ok:hover { color:var(--fg); }
+  }
   .rewind-confirm-cancel:focus-visible, .rewind-confirm-ok:focus-visible { outline:2px solid var(--acc); outline-offset:2px; }
 }
 </style>
@@ -1227,6 +1406,10 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <div id="teamactions"><button id="teamcancel" type="button">取消</button><button id="teamapply" type="button" class="primary">应用模式</button></div>
 </section>
 </div>
+<div id="sidequeue" hidden>
+<div id="sidequeuehead"><span id="sidequeuecount" role="status" aria-live="polite"></span></div>
+<ul id="sidequeuelist" aria-label="等待发送的 side note"></ul>
+</div>
 <div id="composer">
 <button id="img" aria-label="上传文件" title="上传文件"></button>
 <input id="file" type="file" accept="image/*" multiple hidden>
@@ -1265,6 +1448,13 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <div id="confirmerr"></div>
 <div id="confirmbtns"><button id="cdeny">Deny</button><button id="callow" class="primary">Allow</button></div>
 </div>
+</div>
+<div id="gitconfirmwrap" hidden>
+<section id="gitconfirmpanel" role="alertdialog" aria-modal="true" aria-labelledby="gitconfirmtitle" aria-describedby="gitconfirmtext">
+<div id="gitconfirmtitle">Git checkpoint confirmation</div>
+<div id="gitconfirmtext"></div>
+<div id="gitconfirmbtns"><button id="gitcancel" type="button">Cancel</button><button id="gitaccept" type="button" class="primary">Confirm</button></div>
+</section>
 </div>
 <div id="viewer"><img id="viewerimg" alt=""></div>
 <script>
@@ -1389,6 +1579,13 @@ let runEpoch = 0; // bumped every time this page starts a stream: a poll sent
 // sample must not hold the stop button forever.
 let turnRunning = false;
 let turnRunningAt = 0; // Date.now() of the last poll that reported running
+// Child pids from the same /confirm samples. A terminal event remembers the
+// pid it ended in endedTurnPid, so a later running sample with that same pid
+// is only the finished child waiting to be reaped, while a different pid is a
+// new turn whose stream must be attached even before an idle poll clears the
+// terminal marker.
+let turnRunningPid = 0;
+let endedTurnPid = 0;
 const RUNNING_SAMPLE_TTL_MS = 60000; // a running sample older than this is stale
 let stopBusy = false; // one interrupt POST at a time: a double tap must not send two
 let sideNoteBusy = false; // one queued note at a time; the running turn itself continues
@@ -1717,19 +1914,31 @@ function handlePreviewClick(event) {
   if (answerButton) return copyNearbyAnswer(answerButton);
 }
 // Double-clicking inside an open fold closes it, which saves a scroll back to
-// its summary. Single clicks, controls, and the summary keep their own behavior.
+// its summary. Single clicks, keyboard activation, and controls stay native.
 let lastFoldTap = { at: 0, x: 0, y: 0 };
 function collapseFoldForTap(event) {
   if (!event.detail) return;
   const target = event.target;
-  if (!target || !target.closest || target.closest("button, a, input, select, textarea, summary")) return;
+  if (!target || !target.closest || target.closest("button, a, input, select, textarea")) return;
+  // Subagent shortcuts follow the desktop CSS breakpoint; ordinary folds do not.
+  const desktop = !!(window.matchMedia && window.matchMedia("(min-width:701px)").matches);
+  const summary = target.closest("summary");
+  if (summary) {
+    // The first click already toggled the disclosure. Its second click default
+    // would toggle it back before dblclick, so cancel only that native toggle.
+    if (desktop && event.detail === 2 && summary.closest(".msg.asst")?.dataset.subagents === "true") event.preventDefault();
+    return;
+  }
   const now = Date.now();
   const double = now - lastFoldTap.at < 350 &&
     Math.abs(event.clientX - lastFoldTap.x) < 40 && Math.abs(event.clientY - lastFoldTap.y) < 40;
   lastFoldTap = double ? { at: 0, x: 0, y: 0 } : { at: now, x: event.clientX, y: event.clientY };
   if (!double) return;
   for (let node = target; node; node = node.parentNode) {
-    if (node.tagName === "DETAILS" && node.open) { node.open = false; break; }
+    // Structured subagent rows are siblings of <details> in their owning card.
+    const details = node.tagName === "DETAILS" ? node :
+      desktop && node.dataset?.subagents === "true" ? node.querySelector("details") : null;
+    if (details?.open) { details.open = false; break; }
   }
 }
 // The agent sends a phone action as JSON over the serve input channel. The
@@ -2053,14 +2262,19 @@ function typesetMath(root) {
 // finished reply is rendered again with previews on.
 function renderMarkdown(src, allowPreviews) {
   const previews = allowPreviews !== false;
+  const compactEdges = typeof window !== "undefined" && typeof window.matchMedia === "function"
+    && window.matchMedia("(min-width:701px)").matches;
   const math = protectMath(String(src).replace(/\r\n?/g, "\n"));
   const lines = math.source.split("\n");
   const inline = (s) => math.restore(mdInline(esc(s)));
   const out = [];
   let text = [];
   const flushText = () => {
-    while (text.length && !text[0]) text.shift();
-    while (text.length && !text[text.length - 1]) text.pop();
+    // Whitespace-only prose edges should not create empty rows on desktop.
+    // Code fences and internal paragraph line breaks keep their source bytes.
+    const emptyEdge = (line) => !line || (compactEdges && /^[ \t]*$/.test(line));
+    while (text.length && emptyEdge(text[0])) text.shift();
+    while (text.length && emptyEdge(text[text.length - 1])) text.pop();
     if (text.length) out.push('<div class="p">' + text.map(inline).join("<br>") + "</div>");
     text = [];
   };
@@ -2538,9 +2752,12 @@ function renderPhoneFrame(data, sid) {
   return note;
 }
 async function queueImageFiles(files) {
+  const targetSession = sessionId;
+  const key = draftKey(targetSession);
   const added = [];
   for (const file of files) {
-    if (pendingImages.length >= 10) break;
+    const currentImages = sessionId === targetSession ? pendingImages : composerImageDrafts.get(key) || [];
+    if (currentImages.length >= 10) break;
     if (!file || !String(file.type || "").startsWith("image/")) continue;
     try {
       const dataUrl = await new Promise((resolve, reject) => {
@@ -2553,13 +2770,23 @@ async function queueImageFiles(files) {
       if (!data) continue;
       const filename = (file.name || "pasted-image").replace(/[^\w.\-]+/g, "_");
       const image = { filename, data_base64: data };
-      pendingImages.push(image);
+      const images = sessionId === targetSession ? pendingImages : composerImageDrafts.get(key) || [];
+      if (images.length >= 10) break;
+      images.push(image);
+      composerImageDrafts.set(key, images);
       added.push(image);
     } catch (error) {
       note("could not attach image: " + (error && error.message ? error.message : error));
     }
   }
   if (!added.length) return;
+  if (sessionId !== targetSession) {
+    const value = composerDrafts.get(key) || localStorage.getItem(key) || "";
+    const marker = (value && !value.endsWith("\n") ? "\n" : "") +
+      added.map((image) => "[[image:" + image.filename + "]]").join("\n");
+    storeDraft(targetSession, value + marker, composerImageDrafts.get(key));
+    return;
+  }
   const prompt = $("prompt");
   const marker = (prompt.value && !prompt.value.endsWith("\n") ? "\n" : "") +
     added.map((image) => "[[image:" + image.filename + "]]").join("\n");
@@ -2664,11 +2891,79 @@ const PHONE_LAYOUT_QUERY = "(max-width:700px)";
 const FOLLOW_BOTTOM_GAP = 4;
 let jumpingToBottom = false;
 let outputFollowSuspended = false;
+let transcriptScrollGeneration = 0;
+let transcriptScrollState = null;
 function isPhoneLayout() {
   return !!(window.matchMedia && window.matchMedia(PHONE_LAYOUT_QUERY).matches);
 }
+function isDesktopTranscriptScroll() {
+  return !!(window.matchMedia && window.matchMedia("(min-width:701px)").matches);
+}
 function isNearBottom(root = $("msgs")) {
   return root.scrollHeight - root.scrollTop - root.clientHeight <= FOLLOW_BOTTOM_GAP;
+}
+function ownedTranscriptScroll(root = $("msgs"), mounted = true) {
+  const state = transcriptScrollState;
+  return isDesktopTranscriptScroll() && state?.sessionId && state.root === root && state.sessionId === sessionId
+    && state.generation === transcriptScrollGeneration && (!mounted || root._transcriptScrollOwner === state)
+    ? state : null;
+}
+function clearTranscriptScrollGoal(state = transcriptScrollState) {
+  if (!state) return;
+  state.following = false;
+  state.resizeObserver?.disconnect();
+  state.mutationObserver?.disconnect();
+  state.resizeObserver = null;
+  state.mutationObserver = null;
+  state.children.clear();
+}
+function beginTranscriptScroll(id, root = $("msgs")) {
+  if (!isDesktopTranscriptScroll()) return;
+  clearTranscriptScrollGoal();
+  if (scrollPositionTimer !== null) clearTimeout(scrollPositionTimer);
+  scrollPositionTimer = null;
+  resetTranscriptScroll();
+  transcriptScrollState = {
+    sessionId: id, generation: ++transcriptScrollGeneration, root,
+    landing: true, following: false, children: new Set(), resizeObserver: null, mutationObserver: null,
+  };
+}
+function syncTranscriptScrollChildren(state) {
+  const children = new Set(state.root.children);
+  for (const child of state.children) if (!children.has(child)) state.resizeObserver.unobserve(child);
+  for (const child of children) if (!state.children.has(child)) state.resizeObserver.observe(child);
+  state.children = children;
+}
+function queueTranscriptScrollResize(state) {
+  if (!isDesktopTranscriptScroll()) { clearTranscriptScrollGoal(state); return; }
+  if (ownedTranscriptScroll(state.root) !== state || !state.following || outputFollowSuspended || jumpingToBottom) return;
+  if (!isNearBottom(state.root)) followOutput(true, state.root);
+}
+function watchTranscriptScroll(state) {
+  if (state.resizeObserver || typeof ResizeObserver !== "function") return;
+  state.resizeObserver = new ResizeObserver(() => queueTranscriptScrollResize(state));
+  // The fixed scrollport reports viewport changes; its direct children report
+  // growth inside the transcript, including media and expanded task cards.
+  state.resizeObserver.observe(state.root);
+  syncTranscriptScrollChildren(state);
+  if (typeof MutationObserver === "function") {
+    state.mutationObserver = new MutationObserver(() => {
+      if (ownedTranscriptScroll(state.root) !== state || !state.following) return;
+      syncTranscriptScrollChildren(state);
+      queueTranscriptScrollResize(state);
+    });
+    state.mutationObserver.observe(state.root, { childList: true });
+  }
+}
+function mountTranscriptScroll(id, follow, root = $("msgs")) {
+  if (!isDesktopTranscriptScroll()) return;
+  if (!transcriptScrollState || transcriptScrollState.sessionId !== id || transcriptScrollState.root !== root) beginTranscriptScroll(id, root);
+  const state = transcriptScrollState;
+  root._transcriptScrollOwner = state;
+  state.landing = follow;
+  state.following = follow && !outputFollowSuspended;
+  if (state.following) watchTranscriptScroll(state);
+  else clearTranscriptScrollGoal(state);
 }
 // Scroll position survives a reload per session. `atBottom` is stored instead
 // of a raw offset when the reader is at the live edge, so new output still
@@ -2683,34 +2978,53 @@ function savedTranscriptPosition(id) {
   } catch (_) {}
   return null;
 }
-function rememberTranscriptPosition(root = $("msgs")) {
-  if (!sessionId) return;
-  const atBottom = isNearBottom(root);
+function rememberTranscriptPosition(root = $("msgs"), owner = ownedTranscriptScroll(root)) {
+  if (!sessionId || isDesktopTranscriptScroll() && (!owner || ownedTranscriptScroll(root) !== owner)) return;
+  const id = isDesktopTranscriptScroll() ? owner.sessionId : sessionId;
+  const atBottom = isNearBottom(root) || !!(owner?.following && !outputFollowSuspended);
   try {
-    localStorage.setItem(SCROLL_POSITION_PREFIX + sessionId,
+    localStorage.setItem(SCROLL_POSITION_PREFIX + id,
       JSON.stringify({ top: atBottom ? 0 : root.scrollTop, atBottom }));
   } catch (_) {}
 }
 let scrollPositionTimer = null;
 function scheduleRememberTranscriptPosition() {
   if (scrollPositionTimer !== null) return;
-  scrollPositionTimer = setTimeout(() => {
+  const root = $("msgs"), desktop = isDesktopTranscriptScroll(), owner = ownedTranscriptScroll(root);
+  if (desktop && !owner) return;
+  const timer = setTimeout(() => {
+    if (scrollPositionTimer !== timer) return;
     scrollPositionTimer = null;
-    rememberTranscriptPosition();
+    if (desktop && (!isDesktopTranscriptScroll() || ownedTranscriptScroll(root) !== owner)) return;
+    rememberTranscriptPosition(root, desktop ? owner : null);
   }, 200);
+  scrollPositionTimer = timer;
 }
 // New output follows only while the reader is already at the live edge, on both
 // layouts: dragging a desktop transcript down on every chunk makes reading
 // anything above impossible, and the jump button is the way back.
 function shouldFollowOutput(root = $("msgs")) {
-  return !outputFollowSuspended && isNearBottom(root);
+  const state = ownedTranscriptScroll(root, false);
+  if (state && root._transcriptScrollOwner !== state) return false;
+  return !outputFollowSuspended && (!!state?.following || isNearBottom(root));
 }
-function noteTranscriptScroll(previousTop, root = $("msgs")) {
-  if (root.scrollTop < previousTop) outputFollowSuspended = true;
+function noteTranscriptScroll(previousTop, root = $("msgs"), layoutChanged = false, dragging = false) {
+  if (root.scrollTop >= previousTop) return false;
+  const state = ownedTranscriptScroll(root, false);
+  if (state && !dragging && (root._transcriptScrollOwner !== state || state.landing || state.following && layoutChanged)) return false;
+  if (isDesktopTranscriptScroll()) clearTranscriptScrollGoal();
+  outputFollowSuspended = true;
+  return true;
 }
 function noteTranscriptIntent(deltaY) {
-  if (deltaY < 0) outputFollowSuspended = true;
-  else if (deltaY > 0 && isNearBottom()) outputFollowSuspended = false;
+  if (deltaY < 0) {
+    outputFollowSuspended = true;
+    if (isDesktopTranscriptScroll()) clearTranscriptScrollGoal();
+  } else if (deltaY > 0 && isNearBottom()) {
+    outputFollowSuspended = false;
+    const state = ownedTranscriptScroll();
+    if (state) { state.following = true; watchTranscriptScroll(state); }
+  }
 }
 function updateJumpButton() {
   const button = $("jumpbottom");
@@ -2730,18 +3044,37 @@ function scheduleJumpButtonUpdate() {
 }
 let outputFollowFrame = null;
 let outputFollowRoot = null;
+let outputFollowRequest = null;
+function resetTranscriptScroll() {
+  if (outputFollowFrame !== null) cancelAnimationFrame(outputFollowFrame);
+  outputFollowFrame = null;
+  outputFollowRoot = null;
+  outputFollowRequest = null;
+  $("msgs")._resetScrollTracking?.();
+}
 function followOutput(wasFollowing, root = $("msgs")) {
   if (!wasFollowing) { updateJumpButton(); return; }
+  const state = ownedTranscriptScroll(root);
+  if (isDesktopTranscriptScroll() && ownedTranscriptScroll(root, false) && !state) return;
+  if (state && !outputFollowSuspended) { state.following = true; watchTranscriptScroll(state); }
   outputFollowRoot = root;
   if (outputFollowFrame !== null) return;
+  const request = { sessionId, generation: transcriptScrollGeneration, desktop: isDesktopTranscriptScroll(), owner: state };
+  outputFollowRequest = request;
   outputFollowFrame = requestAnimationFrame(() => {
+    if (outputFollowRequest !== request) return;
     outputFollowFrame = null;
+    outputFollowRequest = null;
     const target = outputFollowRoot;
     outputFollowRoot = null;
+    if (request.desktop && (!isDesktopTranscriptScroll() || request.sessionId !== sessionId
+        || request.generation !== transcriptScrollGeneration || request.owner && ownedTranscriptScroll(target) !== request.owner)) return;
     // A wheel/touch gesture can arrive after a paint requested following but
     // before this frame. Never pull the reader back down after that gesture.
+    if (request.owner) request.owner.landing = false;
     if (!target || outputFollowSuspended) { updateJumpButton(); return; }
     target.scrollTop = target.scrollHeight;
+    if (request.desktop) target._resetScrollTracking?.(false);
     updateJumpButton();
   });
 }
@@ -2749,23 +3082,35 @@ function scrollToLatest(smooth = true) {
   const root = $("msgs");
   outputFollowSuspended = false;
   jumpingToBottom = smooth;
+  const state = ownedTranscriptScroll(root);
+  if (state) { state.following = true; state.landing = smooth; watchTranscriptScroll(state); }
   updateJumpButton();
   if (smooth && root.scrollTo) root.scrollTo({ top: root.scrollHeight, behavior: "smooth" });
   else root.scrollTop = root.scrollHeight;
-  if (!smooth) { jumpingToBottom = false; updateJumpButton(); return; }
-  setTimeout(() => { jumpingToBottom = false; updateJumpButton(); }, 450);
+  if (!smooth) { if (state) root._resetScrollTracking?.(false); jumpingToBottom = false; updateJumpButton(); return; }
+  setTimeout(() => {
+    if (state && ownedTranscriptScroll(root) !== state) return;
+    jumpingToBottom = false;
+    if (state) { state.landing = false; queueTranscriptScrollResize(state); }
+    updateJumpButton();
+  }, 450);
 }
 // The desktop composer keeps exact unsent text in memory across navigation;
 // phone restores still use the existing durable draft storage.
 const composerDrafts = new Map();
+// Image payloads stay in memory, owned by the same session as their draft text.
+const composerImageDrafts = new Map();
 function draftKey(id) {
   return DRAFT_PREFIX + encodeURIComponent(id || "_new");
 }
-function persistDraft(id = sessionId) {
-  const value = $("prompt").value;
+function storeDraft(id, value, images) {
   composerDrafts.set(draftKey(id), value);
+  composerImageDrafts.set(draftKey(id), images);
   if (value) localStorage.setItem(draftKey(id), value);
   else localStorage.removeItem(draftKey(id));
+}
+function persistDraft(id = sessionId) {
+  storeDraft(id, $("prompt").value, pendingImages);
 }
 function restoreDraft(id = sessionId) {
   // A draft is only restored when the composer is free; replacing the value
@@ -2773,10 +3118,12 @@ function restoreDraft(id = sessionId) {
   const key = draftKey(id);
   const value = !isPhoneLayout() && composerDrafts.has(key) ? composerDrafts.get(key) : localStorage.getItem(key) || "";
   if (!setPromptValue(value)) return;
+  pendingImages = composerImageDrafts.get(key) || [];
   growPrompt();
 }
 function clearDraft(id) {
   composerDrafts.delete(draftKey(id));
+  composerImageDrafts.delete(draftKey(id));
   localStorage.removeItem(draftKey(id));
 }
 function closeQuestionPanel() {
@@ -2808,9 +3155,12 @@ function switchSession(nextId, saveCurrent = true) {
   if (nextId === sessionId) return;
   if (saveCurrent) {
     persistDraft();
+    if (typeof rememberSessionFoldState === "function") rememberSessionFoldState();
     if (typeof rememberTranscriptPosition === "function") rememberTranscriptPosition();
   }
   pauseHistoryRetry(sessionId);
+  if (window.matchMedia && window.matchMedia("(min-width:701px)").matches
+      && typeof beginTranscriptScroll === "function") beginTranscriptScroll(nextId);
   // Event attachment state belongs to the session being left. In particular,
   // a terminal marker from that session must not suppress reattachment or the
   // stop state when the newly selected session is still running.
@@ -2824,7 +3174,12 @@ function switchSession(nextId, saveCurrent = true) {
   // Carrying it here would paint that session's stop button on the session
   // being opened; the next poll or live stream re-derives it for this one.
   turnRunning = false;
+  turnRunningPid = 0;
+  endedTurnPid = 0;
   syncStopButton();
+  // The queue belongs to the session being left; clear it immediately while
+  // the first poll for the new session is in flight.
+  if (typeof renderSideNotes === "function") renderSideNotes([]);
   // Scroll intent belongs to the transcript being left: a scroll lock from the
   // old conversation must not veto the follow request for the new one.
   outputFollowSuspended = false;
@@ -3189,6 +3544,7 @@ function taskReportOf(value) {
 }
 function mergeTaskReport(records, report, at) {
   const incoming = new Set(report.tasks.map((task) => task.task_id).filter(Boolean));
+  const delivered = new Set();
   if (report.snapshot) for (const [id, row] of records) {
     if (row.task.active && !incoming.has(id)) records.delete(id);
   }
@@ -3199,9 +3555,14 @@ function mergeTaskReport(records, report, at) {
     if (previous && typeof previous.task.output === "string"
       && (typeof task.output !== "string" || (task.output_truncated === true && previous.task.output_truncated !== true))) continue;
     const output = typeof task.output === "string" ? task.output : previous?.task.output;
-    records.set(id, { task: { ...task, ...(output === undefined ? {} : { output }) }, at });
+    if (!task.active && (typeof task.output === "string" || task.error || previous?.task.active)) delivered.add(id);
+    records.set(id, { task: { ...task, ...(output === undefined ? {} : { output }) }, at, current: previous?.current === true });
   }
-  return { ...report, tasks: [...records.values()].map((row) => row.task) };
+  // Progress snapshots do not make every retained completion current again.
+  if (delivered.size) for (const [id, row] of records) row.current = delivered.has(id);
+  const merged = [...records.values()];
+  return { ...report, tasks: merged.map((row) => row.task),
+    currentTaskIndexes: merged.flatMap((row, index) => row.current ? [index] : []) };
 }
 // All identity, status, activity and timing come from producer fields. Body text
 // never participates in state, command or progress discovery.
@@ -3209,6 +3570,7 @@ function projectTaskReport(value, includeOutput = true) {
   const report = taskReportOf(value);
   if (!report) return null;
   const rows = [], taskStates = [];
+  const current = Array.isArray(report.currentTaskIndexes) ? new Set(report.currentTaskIndexes) : null;
   const text = (value) => typeof value === "string" ? value : "";
   const number = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
   const add = (kind, value, taskId = "") => { if (value !== "") rows.push({ kind, text: value, taskId }); };
@@ -3218,7 +3580,8 @@ function projectTaskReport(value, includeOutput = true) {
     const waited = number(report.wait.waited_ms);
     add("meta", "wait · " + text(report.wait.reason) + (waited === null ? "" : " · waited " + waited / 1000 + "s"));
   }
-  for (const task of report.tasks) {
+  for (const [index, task] of report.tasks.entries()) {
+    const firstRow = rows.length;
     const id = text(task.task_id), pid = number(task.pid), elapsed = number(task.elapsed_ms);
     if (id) taskStates.push([id, task.active]);
     const identity = [task.backend ? "[backend=" + text(task.backend) + "]" : "", text(task.agent),
@@ -3245,6 +3608,9 @@ function projectTaskReport(value, includeOutput = true) {
     if (text(task.inherit)) add("meta", "inherit: " + task.inherit, id);
     if (includeOutput && typeof task.output === "string") add("output-body", task.output, id);
     if (includeOutput && task.output_truncated === true) add("meta", "[output preview truncated; full output in history]", id);
+    // Keep the complete rows and task state; only desktop subagent cards use
+    // this display choice, so resizing to mobile restores the full projection.
+    for (const row of rows.slice(firstRow)) row.currentTask = !current || task.active || current.has(index);
   }
   if (text(report.error)) add("error", report.error);
   return { rows, taskStates, busy: active > 0, resetTasks: report.snapshot === true };
@@ -3279,6 +3645,7 @@ function renderTaskToolResult(fold, result) {
     const line = reusable ? existing[index] : document.createElement("div");
     line.className = "task-" + row.kind;
     line.dataset.taskId = row.taskId;
+    line.dataset.taskCurrent = String(row.currentTask !== false);
     if (line.textContent !== row.text) line.textContent = row.text;
     if (!reusable) fold.taskPreview.appendChild(line);
   }
@@ -3315,12 +3682,32 @@ function saveFoldOpenState() {
     localStorage.setItem(FOLD_OPEN_STORAGE, JSON.stringify([...foldOpenState.keys()].slice(-300)));
   } catch (_) {}
 }
+// Desktop navigation can precede the queued toggle event. Snapshot canonical
+// folds before replacing their rows; live turn boxes keep their own lifecycle.
+function rememberSessionFoldState() {
+  if (!(window.matchMedia && window.matchMedia("(min-width:701px)").matches)) return;
+  if (typeof executionGroupsFor === "function") executionGroupsFor($("msgs"), true).restore();
+  for (const row of $("msgs").children) {
+    if (row.dataset?.canonicalKey === undefined) continue;
+    for (const det of row.querySelectorAll("details")) {
+      const key = det.dataset.foldKey;
+      if (!key) continue;
+      if (det.open) foldOpenState.set(key, true);
+      else foldOpenState.delete(key);
+    }
+  }
+  while (foldOpenState.size > 300) foldOpenState.delete(foldOpenState.keys().next().value);
+  saveFoldOpenState();
+  if (typeof executionGroupsFor === "function") executionGroupsFor($("msgs"), true).sync();
+}
 // History rows are rebuilt from canonical messages, so their open state is
 // keyed by message identity and kept across reloads.
 function bindStoredFold(det, key) {
   det.dataset.foldKey = key;
   if (foldOpenState.has(key)) det.open = foldOpenState.get(key);
   det.addEventListener("toggle", () => {
+    // Detached desktop folds no longer own the remembered state for their key.
+    if (window.matchMedia && window.matchMedia("(min-width:701px)").matches && !det.isConnected) return;
     if (det.open) foldOpenState.set(key, true);
     else foldOpenState.delete(key);
     const oldest = foldOpenState.keys().next();
@@ -3644,6 +4031,13 @@ function addFold(title, bodyText, parent, key) {
   if (key) det.addEventListener("toggle", () => {
     if (foldOpenByKey.size > 2000) foldOpenByKey.clear();
     foldOpenByKey.set(key, det.open);
+    // An expanded card is held in place; merge it once the reader closes it.
+    if (!det.open) for (let owner = d.parentNode; owner; owner = owner.parentNode) {
+      if (owner._executionGroups) {
+        owner._executionGroups.sync();
+        break;
+      }
+    }
   });
   d.appendChild(det);
   (parent || $("msgs")).appendChild(d);
@@ -3653,12 +4047,131 @@ function addFold(title, bodyText, parent, key) {
 // Create a fold only after real thinking text arrives. Explicit lifecycle
 // events close each phase; concurrent progress cannot split the reasoning text.
 function createThinkingFold(parent, before) {
+  const groups = executionGroupsFor(parent);
   const ordinal = (parent._thinkingOrdinal = (parent._thinkingOrdinal || 0) + 1);
   const next = addFold("thinking…", "", parent, "thinking:" + ordinal);
+  next.box.dataset.executionState = "running";
   // A recovered turn can hand over a node from an older box; inserting against
   // a foreign parent throws, and the caller's guard would drop the whole phase.
   parent.insertBefore(next.box, before && before.parentNode === parent ? before : null);
+  groups.sync();
   return next;
+}
+
+// Group original cards, never copies or history records. Restoring their exact
+// slots keeps canonical row reconciliation and live insertion anchors intact.
+function executionGroupsFor(parent, stored = false) {
+  if (parent._executionGroups) return parent._executionGroups;
+  let slots = [], wrappers = [], folds = new Map(), lastPlan = [];
+  const restore = () => {
+    if (stored && folds.size && typeof foldOpenState !== "undefined") {
+      for (const [key, fold] of folds) {
+        if (fold.box.querySelector("details").open) foldOpenState.set(key, true);
+        else foldOpenState.delete(key);
+      }
+      saveFoldOpenState();
+    }
+    for (const { node, owner, before } of slots.slice().reverse()) owner.insertBefore(node, before?.parentNode === owner ? before : null);
+    for (const fold of folds.values()) fold.box.remove();
+    for (const wrapper of wrappers) wrapper.classList.remove("execution-empty");
+    slots = []; wrappers = []; lastPlan = [];
+  };
+  const sync = () => {
+    const units = [];
+    const visit = (owner) => {
+      for (const node of Array.from(owner.children)) {
+        if (node.classList.contains("execution-group")) {
+          visit(node.querySelector(".execution-items"));
+        } else if (node.classList.contains("turn") && (!stored || node.dataset.canonicalKey !== undefined)) {
+          visit(node);
+        } else units.push(node);
+      }
+    };
+    visit(parent);
+    // The most recent progress stays outside, even after it finishes. A new
+    // execution item or answer advances the boundary; status paint does not.
+    const latest = units.findLast((node) => !node.hidden && !node.classList.contains("pending"));
+    // A card the reader has expanded must not move. Records already inside a
+    // group stay there; records outside wait for a collapse before merging.
+    const expanded = (node) => {
+      for (const details of node.querySelectorAll?.("details") || []) if (details.open) return true;
+      return false;
+    };
+    const grouped = (node) => node.parentNode?.classList?.contains("execution-items") === true;
+    const eligible = (node) => node.dataset.executionState === "completed"
+      && node.dataset.executionException !== "true" && node.dataset.running !== "true"
+      && !node.classList.contains("pending")
+      && node !== latest
+      && (grouped(node) || !expanded(node))
+      && (node.dataset.taskBusy !== "true" || node.dataset.executionSettled === "true");
+    const plan = units.map((node) => ({ node, fold: eligible(node) }));
+    if (plan.length === lastPlan.length && plan.every((item, i) => item.node === lastPlan[i].node && item.fold === lastPlan[i].fold)) return;
+    // Eligibility is a property of the tree before restore() re-homes grouped
+    // records, so the rebuild must follow this plan rather than re-test the DOM.
+    const folding = new Set(units.filter((node, i) => plan[i].fold));
+
+    const root = $("msgs"), top = root.scrollTop;
+    let mounted = false;
+    for (let owner = parent; owner; owner = owner.parentNode) if (owner === root) { mounted = true; break; }
+    const following = mounted && typeof shouldFollowOutput === "function" && shouldFollowOutput(root);
+    const viewport = mounted ? root.getBoundingClientRect?.() : null;
+    const visible = (node) => {
+      if (node.hidden) return false;
+      const rect = node.getBoundingClientRect?.();
+      return rect && rect.bottom > viewport.top && rect.top < viewport.bottom;
+    };
+    // Prefer the expanded card as the scroll anchor so a merge elsewhere never
+    // slides the text the reader is watching.
+    const anchor = !following && viewport
+      ? (units.find((node) => expanded(node) && visible(node)) || units.find(visible))
+      : null;
+    const anchorTop = anchor?.getBoundingClientRect().top;
+    restore();
+    const collectWrappers = (owner) => {
+      for (const node of owner.children) if (node.classList.contains("turn") && (!stored || node.dataset.canonicalKey !== undefined)) {
+        wrappers.push(node); collectWrappers(node);
+      }
+    };
+    collectWrappers(parent);
+    const used = new Map();
+    let fold = null;
+    for (const node of units) {
+      if (!folding.has(node)) { fold = null; continue; }
+      if (!fold) {
+        const inner = node.querySelector("details");
+        const key = "execution:" + (stored ? sessionId + "\n" : "") + (inner?.dataset.foldKey || node.dataset.canonicalKey);
+        fold = folds.get(key);
+        if (!fold) {
+          fold = addFold("Completed execution", "", parent, stored ? null : key);
+          fold.box.classList.add("execution-group");
+          fold.body.className = "turn execution-items";
+          if (stored && typeof bindStoredFold === "function") bindStoredFold(fold.box.querySelector("details"), key);
+        }
+        used.set(key, fold);
+        node.parentNode.insertBefore(fold.box, node);
+      }
+      slots.push({ node, owner: node.parentNode, before: node.nextElementSibling });
+      fold.body.appendChild(node);
+    }
+    for (const fold of used.values()) fold.box.querySelector("summary").textContent = "Completed execution · " + fold.body.children.length;
+    folds = used;
+    for (const wrapper of wrappers) if (!wrapper.children.length) wrapper.classList.add("execution-empty");
+    lastPlan = plan;
+    // Compensate a real collapse in the same paint. Repeated progress updates
+    // leave the tree and scroll position untouched, including open disclosures.
+    if (!mounted) return;
+    if (following) followOutput(true, root);
+    else if (anchor) {
+      const visibleAnchor = anchor.parentNode?.classList.contains("execution-items")
+        ? anchor.parentNode.parentNode.parentNode : anchor;
+      root.scrollTop = top + (visibleAnchor.getBoundingClientRect?.().top ?? anchorTop) - anchorTop;
+    } else root.scrollTop = top;
+  };
+  return parent._executionGroups = { restore, sync };
+}
+function completeExecution(fold, parent) {
+  fold.box.dataset.executionState = "completed";
+  executionGroupsFor(parent).sync();
 }
 
 // Detached cards are kept weakly so reattachment can resume without retaining
@@ -3737,6 +4250,8 @@ function createSubagentClock(fold) {
       fold.set(title, rawText); lastTitle = title; lastRawText = rawText;
     }
     renderTaskToolResult(fold, projectTaskReport(value));
+    fold.box.dataset.executionException = String(Boolean(value?.error)
+      || Boolean(value?.tasks.some((task) => task.error)));
   };
   const clock = {
     box: fold.box,
@@ -3780,6 +4295,7 @@ function createSubagentClock(fold) {
 // Live tools use the same call labels as history, keyed by call id rather than
 // inferred from stderr. Completion updates its own card, even for parallel tools.
 function createLiveActivity(parent, before) {
+  const groups = executionGroupsFor(parent);
   const tools = new Map();
   let phase = "Connecting…";
   let waiting = false;
@@ -3798,18 +4314,28 @@ function createLiveActivity(parent, before) {
     if (!subagents) {
       subagents = insert("subagents", "subagents");
       subagents.box.dataset.subagents = "true";
+      subagents.box.dataset.executionState = "running";
       subagentClock = createSubagentClock(subagents);
     }
-    if (after?.parentNode === parent && after.nextElementSibling !== subagents.box) {
+    subagentClock.set(payload);
+    // Re-anchoring is invisible only once the card is collapsed; set() above may
+    // close it in this same paint. Moving a card that is still open would scroll
+    // the text the reader is looking at.
+    const cardDetails = subagents.box.querySelector("details");
+    if (!cardDetails?.open && after?.parentNode === parent && after.nextElementSibling !== subagents.box) {
       parent.insertBefore(subagents.box, after.nextElementSibling);
     }
-    subagentClock.set(payload);
+    subagents.box.dataset.executionState = subagents.box.dataset.taskBusy === "false" ? "completed" : "running";
   };
   const renderTool = (tool) => {
     const call = { function: { name: tool.name, arguments: tool.arguments || "{}" } };
     const icon = tool.running ? "◌ " : tool.ok === false ? "! " : tool.ok === true ? "✓ " : "• ";
     const title = icon + callLabel(call) + (tool.cached ? " · cached" : "");
+    const taskReport = taskReportOf(tool.task_report);
     tool.fold.box.dataset.running = String(tool.running);
+    tool.fold.box.dataset.executionState = tool.running ? "running" : "completed";
+    tool.fold.box.dataset.executionException = String(tool.ok === false || Boolean(taskReport?.error)
+      || Boolean(taskReport?.tasks.some((task) => task.error)));
     const args = tool.arguments ? "Arguments\n" + tool.arguments + (tool.arguments_truncated ? "\n[preview truncated]" : "") + "\n\n" : "";
     const taskResult = projectTaskReport(tool.task_report, false);
     tool.fold.set(title, args + (tool.output || "")
@@ -3843,13 +4369,16 @@ function createLiveActivity(parent, before) {
       tool.running = event.phase === "started";
       phase = "Processing…";
       renderTool(tool);
+      groups.sync();
     },
-    subagents(payload) { showSubagents(payload); },
+    subagents(payload) { showSubagents(payload); groups.sync(); },
     finish(reason) {
       if (subagentClock) subagentClock.stop();
       for (const tool of tools.values()) if (tool.running) {
         tool.running = false;
         tool.fold.box.dataset.running = "false";
+        tool.fold.box.dataset.executionState = "completed";
+        tool.fold.box.dataset.executionException = "true";
         tool.fold.set(callLabel({ function: { name: tool.name, arguments: tool.arguments || "{}" } }) + " · " + reason,
           (tool.arguments || "") + "\n" + (tool.output || ""));
       }
@@ -3857,13 +4386,16 @@ function createLiveActivity(parent, before) {
         const folds = [...tools.values()].map((tool) => tool.fold);
         if (subagents) folds.push(subagents);
         for (const fold of folds) {
+          if (fold.box.dataset.taskBusy === "true") fold.box.dataset.executionException = "true";
           delete fold.box.dataset.taskStates;
           fold.box.dataset.taskBusy = "false";
           fold.box.dataset.taskReset = "true";
+          fold.box.dataset.executionState = "completed";
         }
       }
       phase = reason;
       waiting = false;
+      groups.sync();
     },
   };
 }
@@ -5212,10 +5744,11 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
       turnRunning = false;
       stopStaleFollow();
       // The question on screen belonged to the session being left; the poll
-      // below rebuilds it for the one being opened.
+      // below rebuilds it for the one being opened and retries a dropped
+      // sample, so a turn started in another page shows its stop/note controls.
       hideConfirm();
       if (isPhoneLayout()) setDrawer(false);
-      pollConfirm();
+      pollSwitchRunningState();
       Promise.resolve(loadHistory()).catch(() => {});
       loadSessionConfig();
     };
@@ -5594,10 +6127,17 @@ function historyRowsOf(msgs, histTotal, showAll) {
     // history refresh cannot retain the previous placement. Fold identity stays stable.
     row.key = JSON.stringify([row.key, row.subagentReport !== null]);
   }
+  let settled = false;
+  for (const row of rows.slice().reverse()) {
+    if (row.message.role === "user") settled = false;
+    else if (row.message.role === "assistant" && !row.message.tool_calls?.length) settled = true;
+    row.executionSettled = settled;
+  }
   return { rows, shownCount: shown.length };
 }
 function renderHistoryRow(row, parent) {
   const m = row.message;
+  const executionBoxes = [];
   if (m.role === "user") addUserBubble(row.text, row.historyIndex, parent);
   else if (m.role === "assistant") {
     // Reconciliation counts canonical messages. Keep the reasoning, answer and
@@ -5615,6 +6155,7 @@ function renderHistoryRow(row, parent) {
     let thinkingSummary = null;
     if (row.reasoning) {
       const fold = addFold("thinking", row.reasoning, group);
+      fold.box.dataset.executionState = "completed";
       thinkingSummary = fold.box.querySelector("summary");
       const det = fold.box.querySelector("details");
       if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + row.identity + ":thinking");
@@ -5645,13 +6186,24 @@ function renderHistoryRow(row, parent) {
     const fallback = taskResult ? raw : row.call ? legacyTaskToolText(row.call, raw) : null;
     const fold = addFold(row.call ? callLabel(row.call) : FOLD_ROLE_LABELS[m.role] || m.role,
       fallback === null ? row.text.slice(0, 2000) : fallback, container);
+    if (m.role === "tool") {
+      executionBoxes.push(fold.box);
+      fold.box.dataset.executionState = "completed";
+      fold.box.dataset.executionSettled = String(row.executionSettled === true);
+      const taskReport = taskReportOf(m.task_report);
+      fold.box.dataset.executionException = String(Boolean(taskReport?.error) || Boolean(taskReport?.tasks.some((task) => task.error)));
+    }
     if (taskResult) renderTaskToolResult(fold, taskResult);
     const det = fold.box.querySelector("details");
     if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + row.identity);
     if (row.subagentReport) {
       // History reports are frozen observations. Their elapsed clocks do not run.
       const subagents = addFold(taskReportLabel(row.subagentReport), "", container);
+      executionBoxes.push(subagents.box);
       subagents.box.dataset.subagents = "true";
+      subagents.box.dataset.executionState = "completed";
+      subagents.box.dataset.executionSettled = String(row.executionSettled === true);
+      subagents.box.dataset.executionException = String(Boolean(row.subagentReport.error) || Boolean(row.subagentReport.tasks.some((task) => task.error)));
       renderTaskToolResult(subagents, projectTaskReport(row.subagentReport));
       const details = subagents.box.querySelector("details");
       if (details && typeof bindStoredFold === "function") bindStoredFold(details, sessionId + "\n" + row.identity + ":subagents");
@@ -5664,6 +6216,11 @@ function renderHistoryRow(row, parent) {
     data.canonicalIndex = String(row.historyIndex);
     data.canonicalKey = row.key;
     data.canonicalIdentity = row.identity;
+    // A final answer can settle an unchanged task row. Refresh presentation
+    // state without rebuilding its original disclosure or attachment nodes.
+    node._aserveRefreshExecution = (next) => {
+      for (const box of executionBoxes) box.dataset.executionSettled = String(next.executionSettled === true);
+    };
   }
 }
 // A session the server reports as running while this page holds no stream for
@@ -5687,6 +6244,7 @@ function attachLiveBox() {
   const root = $("msgs");
   const follow = shouldFollowOutput(root);
   attachPendingInputs(root);
+  if (typeof executionGroupsFor === "function") executionGroupsFor(root, true).sync();
   const box = turns.get(sessionId)?.box || (eventSession === sessionId ? recoveredView?.box : null);
   if (!box) { followOutput(follow, root); armHistoryFollow(); return; }
   // A failed feed is now represented by canonical history. reloadStale can
@@ -5699,6 +6257,7 @@ function attachLiveBox() {
 function attachPendingInputs(root) {
   const pending = pendingUserInputs.get(sessionId) || [];
   if (!pending.length) return;
+  if (typeof executionGroupsFor === "function") executionGroupsFor(root, true).restore();
   // Each refresh resolves the owning turn before the DOM rows are reconciled.
   const rows = new Map(Array.from(root.children).map((node) => [node.dataset?.canonicalKey, node]));
   for (const input of pending) {
@@ -5788,6 +6347,8 @@ async function loadHistory(prefetched, canCommit = () => true) {
   // Prefetched rows keep the session they were captured for.
   const forSession = prefetched?.sessionId ?? sessionId;
   if (forSession !== sessionId || !canCommit()) return;
+  if (typeof beginTranscriptScroll === "function" && isDesktopTranscriptScroll()
+      && (!transcriptScrollState || transcriptScrollState.sessionId !== forSession)) beginTranscriptScroll(forSession);
   const loadId = ++historyLoadSeq;
   const current = () => forSession === sessionId && loadId === historyLoadSeq && canCommit();
   if (!sessionId) {
@@ -5796,6 +6357,7 @@ async function loadHistory(prefetched, canCommit = () => true) {
     historySession = "";
     historyKeys = [];
     canonicalHistoryTotal = 0;
+    if (typeof mountTranscriptScroll === "function") mountTranscriptScroll("", false);
     const nav = $("promptlist");
     if (nav) nav._signature = "";
     addMsg("asst", "no session yet — tap ＋ to start one.", "asst");
@@ -5866,9 +6428,10 @@ async function loadHistory(prefetched, canCommit = () => true) {
       renderSessionBar();
       if (!lastHistoryEndsUnanswered) root.querySelectorAll(".turn-interrupted").forEach((node) => node.remove());
       const sameSession = historySession === forSession;
-      const savedPosition = sameSession ? null
+      const navigating = typeof ownedTranscriptScroll === "function" && !!ownedTranscriptScroll(root, false) && !ownedTranscriptScroll(root);
+      const savedPosition = sameSession && !navigating ? null
         : (typeof savedTranscriptPosition === "function" ? savedTranscriptPosition(forSession) : null);
-      const follow = sameSession
+      const follow = sameSession && !navigating
         ? shouldFollowOutput(root)
         : (!savedPosition || savedPosition.atBottom);
       const oldScrollTop = savedPosition && !savedPosition.atBottom ? savedPosition.top : root.scrollTop;
@@ -5915,35 +6478,63 @@ async function loadHistory(prefetched, canCommit = () => true) {
       if (pending.length) pendingUserInputs.set(forSession, pending);
       else pendingUserInputs.delete(forSession);
       const protectedRows = new Set(pending.map((input) => input.row));
-      const liveBox = turns.get(forSession)?.box || (eventSession === forSession ? recoveredView?.box : null);
-      if (liveBox) protectedRows.add(liveBox);
-      // Reconcile only the canonical prefix; pending rows may be interleaved with it.
-      for (const row of protectedRows) row.remove();
-      const appendOnly = retained > 0
-        && nextKeys.slice(0, retained).every((key, i) => key === historyKeys[start + i])
-        && root.children.length >= historyKeys.length;
-      const removeRow = (node) => {
-        if (!protectedRows.has(node)) revokePreviews(node);
-        node.remove();
+      const mounted = new Map();
+      const collect = (owner) => {
+        for (const node of owner.children) {
+          if (node.dataset.canonicalKey !== undefined) mounted.set(node.dataset.canonicalKey, node);
+          // A group can carry later canonical rows inside an earlier row.
+          collect(node);
+        }
       };
-      if (appendOnly) {
-        for (let i = 0; i < start; i++) removeRow(root.children[0]);
-        while (root.children.length > retained) removeRow(root.lastElementChild);
-        for (let i = 0; i < retained; i++) root.children[i]._aserveRefreshRates?.();
-        for (let i = retained; i < history.rows.length; i++) renderHistoryRow(history.rows[i], root);
+      collect(root);
+      const unchanged = sameSession && start === 0 && nextKeys.length === historyKeys.length
+        && nextKeys.every((key, i) => key === historyKeys[i] && mounted.has(key));
+      let appendOnly = unchanged;
+      if (unchanged) {
+        for (const row of history.rows) {
+          mounted.get(row.key)?._aserveRefreshRates?.();
+          mounted.get(row.key)?._aserveRefreshExecution?.(row);
+        }
       } else {
-        // Fetching has completed, so this synchronous clear-and-render is painted
-        // as one frame instead of exposing an empty transcript during network I/O.
-        // A still-running box is reattached below; its previews remain owned by it.
-        revokePreviews(root);
-        root.textContent = "";
-        for (const row of history.rows) renderHistoryRow(row, root);
+        if (typeof executionGroupsFor === "function") executionGroupsFor(root, true).restore();
+        const liveBox = turns.get(forSession)?.box || (eventSession === forSession ? recoveredView?.box : null);
+        if (liveBox) protectedRows.add(liveBox);
+        // Reconcile only the canonical prefix; pending rows may be interleaved with it.
+        for (const row of protectedRows) row.remove();
+        appendOnly = retained > 0
+          && nextKeys.slice(0, retained).every((key, i) => key === historyKeys[start + i])
+          && root.children.length >= historyKeys.length;
+        const removeRow = (node) => {
+          if (!protectedRows.has(node)) revokePreviews(node);
+          node.remove();
+        };
+        if (appendOnly) {
+          for (let i = 0; i < start; i++) removeRow(root.children[0]);
+          while (root.children.length > retained) removeRow(root.lastElementChild);
+          for (let i = 0; i < retained; i++) {
+            root.children[i]._aserveRefreshRates?.();
+            root.children[i]._aserveRefreshExecution?.(history.rows[i]);
+          }
+          for (let i = retained; i < history.rows.length; i++) renderHistoryRow(history.rows[i], root);
+        } else {
+          // Fetching has completed, so this synchronous clear-and-render is painted
+          // as one frame instead of exposing an empty transcript during network I/O.
+          // A still-running box is reattached below; its previews remain owned by it.
+          revokePreviews(root);
+          root.textContent = "";
+          for (const row of history.rows) renderHistoryRow(row, root);
+        }
       }
       historySession = forSession;
       historyKeys = nextKeys;
       updateQuestionButton();
+      if (typeof mountTranscriptScroll === "function") mountTranscriptScroll(forSession, follow, root);
       attachLiveBox();
       if (!follow && !appendOnly) root.scrollTop = oldScrollTop;
+      // A rebuilt transcript can clamp the old offset and queue a scroll event.
+      // Compare that event with the new layout before following its live edge.
+      if ((!sameSession || navigating || follow) && window.matchMedia && window.matchMedia("(min-width:701px)").matches
+          && typeof resetTranscriptScroll === "function") resetTranscriptScroll();
       followOutput(follow, root);
       // A partial render below may not rebuild the transcript, so drop the
       // failure row explicitly instead of relying on reconciliation.
@@ -5982,6 +6573,8 @@ async function loadOlderHistory() {
   if (!canonicalHistoryTotal || lastMsgCount >= canonicalHistoryTotal) return;
   const state = historyLoadState(sessionId);
   if (state && state.loading) return;
+  const desktop = typeof isDesktopTranscriptScroll === "function" && isDesktopTranscriptScroll();
+  const scrollOwner = desktop ? ownedTranscriptScroll(root) : null;
   root._histOlder = true;
   const beforeTop = root.scrollTop;
   const beforeHeight = root.scrollHeight;
@@ -5991,6 +6584,8 @@ async function loadOlderHistory() {
   );
   try {
     await loadHistory();
+    // A superseded pager no longer owns this transcript's scroll position.
+    if (desktop && (!scrollOwner || ownedTranscriptScroll(root) !== scrollOwner)) return;
     root.scrollTop = beforeTop + (root.scrollHeight - beforeHeight);
   } finally {
     root._histOlder = false;
@@ -6003,7 +6598,25 @@ if ($("msgs") && typeof $("msgs").addEventListener === "function") {
   // live edge must not trigger a fetch, and a transcript shorter than its viewport
   // has no older rows to reveal.
   let previousTop = $("msgs").scrollTop;
+  let previousHeight = $("msgs").scrollHeight;
+  let previousViewport = $("msgs").clientHeight;
   let previousTouchY = null;
+  let pointerDown = false;
+  $("msgs")._resetScrollTracking = (resetInput = true) => {
+    previousTop = $("msgs").scrollTop;
+    previousHeight = $("msgs").scrollHeight;
+    previousViewport = $("msgs").clientHeight;
+    if (resetInput) { previousTouchY = null; pointerDown = false; }
+  };
+  $("msgs").addEventListener("pointerdown", (event) => { pointerDown = event.target === $("msgs"); }, { passive: true });
+  $("msgs").addEventListener("pointerup", () => { pointerDown = false; }, { passive: true });
+  $("msgs").addEventListener("pointercancel", () => { pointerDown = false; }, { passive: true });
+  if (typeof window.addEventListener === "function") window.addEventListener("pointerup", () => { pointerDown = false; }, { passive: true });
+  $("msgs").addEventListener("keydown", (event) => {
+    if (typeof isDesktopTranscriptScroll === "function" && isDesktopTranscriptScroll()
+        && ["ArrowUp", "PageUp", "Home"].includes(event.key)
+        && !event.target.closest?.("input, textarea, select")) noteTranscriptIntent(-1);
+  });
   $("msgs").addEventListener("wheel", (event) => noteTranscriptIntent(event.deltaY), { passive: true });
   $("msgs").addEventListener("touchstart", (event) => {
     previousTouchY = event.touches?.[0]?.clientY ?? null;
@@ -6016,13 +6629,15 @@ if ($("msgs") && typeof $("msgs").addEventListener === "function") {
   // Releasing a drag at the live edge is the reader's way back to following.
   $("msgs").addEventListener("touchend", () => {
     previousTouchY = null;
-    if (isNearBottom()) outputFollowSuspended = false;
+    if (isNearBottom()) noteTranscriptIntent(1);
   }, { passive: true });
   $("msgs").addEventListener("scroll", () => {
     const root = $("msgs");
-    const movedUp = root.scrollTop < previousTop;
-    noteTranscriptScroll(previousTop, root);
+    const layoutChanged = root.scrollHeight !== previousHeight || root.clientHeight !== previousViewport;
+    const movedUp = noteTranscriptScroll(previousTop, root, layoutChanged, pointerDown);
     previousTop = root.scrollTop;
+    previousHeight = root.scrollHeight;
+    previousViewport = root.clientHeight;
     if (!movedUp || root.scrollTop > 0) return;
     if (root.scrollHeight <= root.clientHeight + 8) return;
     loadOlderHistory();
@@ -6384,6 +6999,27 @@ function stopConfirmPoll() {
   clearInterval(confirmPollTimer);
   confirmPollTimer = null;
 }
+// A pick is the moment the stop/note controls must match the server, but the
+// one poll it sends can be dropped (a terminal marker or a newer turn bumped
+// the sequence while it was in flight) or fail transiently. Retry a few times
+// instead of leaving the composer idle until the next scheduled sample.
+let switchPollTimer = null;
+let switchPollTries = 0;
+function pollSwitchRunningState() {
+  if (switchPollTimer !== null) { clearTimeout(switchPollTimer); switchPollTimer = null; }
+  const sid = sessionId;
+  switchPollTries = 0;
+  const tick = async () => {
+    switchPollTimer = null;
+    if (!sid || sid !== sessionId) return;
+    const running = await pollConfirm();
+    if (sid !== sessionId) return;
+    if (running !== null) return; // a server sample landed
+    if (++switchPollTries >= 4) return;
+    switchPollTimer = setTimeout(tick, 400 * switchPollTries);
+  };
+  void tick();
+}
 // Rebuild a compact progress card from replayed turn events. It is not the
 // original live DOM, but it restores thinking, tool cards, the partial answer
 // and any pending question after a page reload.
@@ -6477,6 +7113,7 @@ function recoveredProgressView(sid = sessionId) {
       lastThinkingText = thinking;
       thinkingRates.observe(think, thinking, thinkRate, thinkStartedAt, Boolean(thinkRecordedRate), thinkRecordedTimed);
       thinkingRates.close(thinkRate);
+      completeExecution(think, box);
     }
     think = null; thinking = ""; thinkRate = ""; thinkRecordedRate = ""; thinkRecordedTimed = false; thinkStartedAt = phaseStartedAt; thinkTokens = 0;
     if (newRound) thinkingRates.start();
@@ -6685,6 +7322,7 @@ async function attachEvents() {
         buf = buf.slice(idx + 2);
         if (block.kind === "done") {
           view.finish();
+          endedTurnPid = turnRunningPid;
           finished = true; eventStreamEnded = true; eventFailures = 0; confirmPollSeq++;
           stopStaleFollow();
           break;
@@ -6695,6 +7333,7 @@ async function attachEvents() {
           try { message = JSON.parse(block.payload).error || message; } catch (_) {}
           const row = addMsg("err", message, "asst err");
           row.dataset.taskReset = "true";
+          endedTurnPid = turnRunningPid;
           finished = true; eventStreamEnded = true; eventStreamFailed = true; eventFailures = 0; confirmPollSeq++;
           stopStaleFollow();
           break;
@@ -6762,7 +7401,9 @@ async function pollConfirm() {
   // older server, treated as "not running".
   const wasRunning = turnRunning;
   turnRunning = body.running === true;
+  const pid = Number(body.turn) || 0;
   if (turnRunning) {
+    turnRunningPid = pid;
     turnRunningAt = Date.now();
     if (!wasRunning && !eventStreamEnded) { eventFailures = 0; eventStreamFailed = false; }
     armHistoryFollow();
@@ -6771,7 +7412,14 @@ async function pollConfirm() {
     // turn: the server already said so. Re-attaching on every poll would
     // rebuild the progress view and re-render the transcript each time. A new
     // turn starts a fresh stream after an idle poll clears the terminal marker.
-    // A running boolean alone cannot distinguish child reap lag from a new turn.
+    // A running boolean alone cannot distinguish child reap lag from a new turn;
+    // the child pid can. The terminal event recorded the pid it ended in, so
+    // only a different, known pid is a new turn. An older server without the
+    // field reports 0 and keeps the marker instead of risking a replay loop.
+    if (eventStreamEnded && pid !== 0 && pid !== endedTurnPid) {
+      eventStreamEnded = false;
+      eventStreamFailed = false;
+    }
     if (!eventStreamEnded) void attachEvents();
   }
   else {
@@ -6784,6 +7432,9 @@ async function pollConfirm() {
     if (!turns.has(sessionId) && staleSession !== sessionId) stopConfirmPoll();
   }
   syncStopButton();
+  // Queue state follows the same poll as the running state: a note may be
+  // drained by the turn child between any two samples.
+  void refreshSideNotes();
   const pending = body.pending;
   if (!pending) { if (confirmShown) hideConfirm(); return turnRunning; }
   if (pending.input && typeof pending.prompt === "string" && pending.prompt.startsWith(NATIVE_PREFIX)) {
@@ -6875,16 +7526,19 @@ async function sendSideNote() {
   if (sideNoteBusy || !sessionId) return;
   const input = $("prompt");
   const draft = input.value;
-  const text = draft.trim();
-  if (!text) {
+  let text = draft.trim();
+  const images = pendingImages.slice();
+  if (!text && !images.length) {
     note("type a side note first");
     input.focus();
     return;
   }
-  if (pendingImages.length) {
-    note("side notes are text only — send the pending images after this turn");
-    return;
+  for (const image of images) {
+    const marker = "[[image:" + image.filename + "]]";
+    if (!text.includes(marker)) text += (text && !text.endsWith("\n") ? "\n" : "") + marker;
   }
+  const body = { text };
+  if (images.length) body.images = images;
   // The queue accepts notes even between turns. Do not gate delivery on a
   // running-state poll, or let that wait change the target session or text.
   const targetSession = sessionId;
@@ -6893,22 +7547,61 @@ async function sendSideNote() {
   note("sending side note…");
   try {
     await api("/sessions/" + targetSession + "/side-notes", {
-      method: "POST", body: JSON.stringify({ text }),
+      method: "POST", body: JSON.stringify(body),
     });
-    // Do not erase a different session's draft, or text added while the POST
-    // was in flight. In either case the submitted note was still queued.
-    if (sessionId === targetSession && input.value === draft) {
+    // Do not erase another session's draft or text/images changed in flight.
+    // Clear the submitted attachments only with their unchanged draft.
+    if (sessionId === targetSession && input.value === draft &&
+        pendingImages.length === images.length && pendingImages.every((image, i) => image === images[i])) {
       input.value = "";
       input.style.height = "auto";
+      pendingImages = [];
       clearDraft(targetSession);
     }
     note("side note queued — applies at the next model request");
+    void refreshSideNotes();
   } catch (e) {
     note("side note failed: " + e.message);
   } finally {
     sideNoteBusy = false;
     $("sidenote").disabled = false;
   }
+}
+let sideNotesSeq = 0;
+function renderSideNotes(notes) {
+  const box = $("sidequeue");
+  if (!box) return;
+  const list = $("sidequeuelist");
+  box.hidden = notes.length === 0;
+  $("sidequeuecount").textContent = notes.length
+    ? notes.length + " 条 side note 等待发送"
+    : "";
+  list.textContent = "";
+  for (const item of notes) {
+    const li = document.createElement("li");
+    const from = document.createElement("span");
+    from.className = "from";
+    from.textContent = item.from === "user" ? "你" : (item.from || "agent");
+    const text = document.createElement("span");
+    text.className = "text";
+    text.textContent = item.content || "";
+    text.title = item.content || "";
+    li.appendChild(from);
+    li.appendChild(text);
+    list.appendChild(li);
+  }
+}
+// The queue is server-side and a turn child can drain it between any two
+// polls. A sequence guard keeps a slow response for an old session from
+// repainting the queue after the user switches sessions.
+async function refreshSideNotes() {
+  if (!sessionId) { renderSideNotes([]); return; }
+  const sid = sessionId, seq = ++sideNotesSeq;
+  let body;
+  try { body = await (await api("/sessions/" + sid + "/side-notes")).json(); }
+  catch (_) { return; }
+  if (sid !== sessionId || seq !== sideNotesSeq) return;
+  renderSideNotes(Array.isArray(body.notes) ? body.notes : []);
 }
 async function stopTurn() {
   if (stopBusy || !sessionId) return;
@@ -6962,11 +7655,12 @@ function cdCommandLine(text) {
 }
 
 // BEGIN composer session adoption
-// Both a first turn and /cd may create a lazy session. Carry committed picks
+// A first turn, /cd or /git may create a lazy session. Carry committed picks
 // to that id without restoring an empty draft over the user's current input.
 function adoptComposerSession(newId, previousId, base) {
   if (sessionId !== previousId || store.base !== base) return false;
   sessionId = newId;
+  if (typeof mountTranscriptScroll === "function") mountTranscriptScroll(newId, false);
   pendingNew = newId;
   localStorage.setItem("serve.session", newId);
   carrySkillPick(previousId, newId);
@@ -7010,6 +7704,94 @@ async function runCdCommand(text) {
 }
 // END composer cd command
 
+// BEGIN composer git command
+const GIT_LINE_RE = /^[:/]git(?:\s|$)/;
+function gitCommandLine(text) {
+  const t = text.trim();
+  return t && !/[\r\n]/.test(text) && GIT_LINE_RE.test(t) ? t : "";
+}
+function askGitConfirmation(prompt) {
+  const wrap = $("gitconfirmwrap"), panel = $("gitconfirmpanel");
+  const cancel = $("gitcancel"), accept = $("gitaccept");
+  const returnFocus = document.activeElement || $("prompt");
+  $("gitconfirmtext").textContent = prompt;
+  wrap.hidden = false;
+  return new Promise((resolve) => {
+    let settled = false;
+    const close = (confirmed) => {
+      if (settled) return;
+      settled = true;
+      wrap.hidden = true;
+      cancel.onclick = accept.onclick = wrap.onclick = panel.onkeydown = null;
+      returnFocus.focus({ preventScroll: true });
+      resolve(confirmed);
+    };
+    cancel.onclick = () => close(false);
+    accept.onclick = () => close(true);
+    wrap.onclick = (ev) => { if (ev.target === wrap) close(false); };
+    panel.onkeydown = (ev) => {
+      if (ev.isComposing || ev.keyCode === 229) return;
+      if (ev.key === "Escape" || ev.key === "Enter") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (!ev.repeat) close(ev.key === "Enter" && document.activeElement !== cancel);
+      } else if (ev.key === "Tab") {
+        ev.preventDefault();
+        const buttons = [cancel, accept], index = buttons.indexOf(document.activeElement);
+        buttons[(index + (ev.shiftKey ? -1 : 1) + buttons.length) % buttons.length].focus();
+      }
+    };
+    accept.focus({ preventScroll: true });
+  });
+}
+function renderGitOutput(output) {
+  const out = output || "";
+  const last = out.split("\n").filter((line) => line.trim()).pop() || "done";
+  addFold("activity log (1) · " + shortLine(last, 80), out).box.classList.add("tool-activity", "git-output");
+  scrollToLatest(false);
+}
+async function runGitCommand(text) {
+  const command = gitCommandLine(text);
+  if (!command) return false;
+  if (!sessionId) {
+    const previousId = sessionId, base = store.base;
+    let newId;
+    try { newId = (await (await api("/sessions", { method: "POST" })).json()).id; }
+    catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); return true; }
+    if (!adoptComposerSession(newId, previousId, base)) return true;
+  }
+  const sid = sessionId, base = store.base;
+  const stillSelected = () => sid === sessionId && base === store.base;
+  setPromptValue("", true);
+  $("prompt").style.height = "auto";
+  clearDraft(sid);
+  addMsg("user", command, "user rewindable");
+  const post = async (confirmed) => (await api("/sessions/" + sid + "/checkpoints", {
+    method: "POST", body: JSON.stringify({ command, confirmed }),
+  })).json();
+  try {
+    let data = await post(false);
+    if (!stillSelected()) return true;
+    if (data.confirmation != null) {
+      if (data.output) renderGitOutput(data.output);
+      const confirmed = await askGitConfirmation(data.confirmation);
+      if (!stillSelected()) return true;
+      if (!confirmed) {
+        addMsg("asst", "Canceled: nothing was changed.", "asst");
+        scrollToLatest(false);
+        return true;
+      }
+      data = await post(true);
+      if (!stillSelected()) return true;
+    }
+    renderGitOutput(data.output);
+  } catch (e) {
+    if (stillSelected()) addMsg("err", "git failed: " + e.message, "asst err");
+  }
+  return true;
+}
+// END composer git command
+
 // BEGIN turn session preparation
 async function prepareTurnSession(previousId, base) {
   if (sessionId !== previousId || store.base !== base) return "";
@@ -7036,7 +7818,9 @@ async function prepareTurnSession(previousId, base) {
 // END turn session preparation
 // BEGIN composer send
 function pendingInputAnchor(root) {
+  if (typeof executionGroupsFor === "function") executionGroupsFor(root, true).restore();
   const previous = Array.from(root.children).findLast((node) => node.dataset?.canonicalIdentity);
+  if (typeof executionGroupsFor === "function") executionGroupsFor(root, true).sync();
   return { afterHistoryKey: previous?.dataset.canonicalIdentity || "", afterHistoryIndex: Number(previous?.dataset.canonicalIndex) };
 }
 async function send() {
@@ -7052,8 +7836,9 @@ async function send() {
   sendBusy = true;
   let sid;
   try {
-    // A cd line belongs to the session, not to this turn (see runCdCommand).
+    // Session commands use their own endpoints before preparing a model turn.
     if (await runCdCommand(text)) return;
+    if (await runGitCommand(text)) return;
     sid = await prepareTurnSession(draftSession, sendBase);
     if (!sid) return;
   } finally { sendBusy = false; } // the stream below owns itself: other sessions may send now
@@ -7325,6 +8110,7 @@ async function send() {
       thinkingRates.close(thinkRate);
       thinkingDoneDirty = true;
       flushPaint();
+      completeExecution(think, box);
     }
     think = null;
     thinkRaw = "";
@@ -7341,10 +8127,12 @@ async function send() {
     if (sid === sessionId) followOutput(follow);
   };
   const fail = (msg) => {
+    closeThinkingPhase();
     if (paintTimer !== null) { clearTimeout(paintTimer); paintTimer = null; }
     if (sid === sessionId) {
       confirmPollSeq++;
       eventStreamEnded = true;
+      endedTurnPid = turnRunningPid;
       eventStreamFailed = true;
       stopStaleFollow();
     }
@@ -7449,6 +8237,7 @@ async function send() {
           activityDirty = false;
           if (sid === sessionId) {
             eventStreamEnded = true;
+            endedTurnPid = turnRunningPid;
             confirmPollSeq++;
             stopStaleFollow();
           }

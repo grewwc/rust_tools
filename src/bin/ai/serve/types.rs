@@ -839,16 +839,10 @@ pub(crate) const TURN_IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp
 /// real policy; this only lets those requests reach the handler.
 pub(crate) const MAX_TURN_REQUEST_BYTES: usize = 48 * 1024 * 1024;
 
-/// Stage uploaded turn images into the session assets dir under the uploaded
-/// filenames, so the one-shot child's existing `[[image:name]]` resolution
-/// finds them exactly as if they had been pasted locally. Pure filesystem
-/// work; runs before the per-session lock is taken.
-pub(crate) fn stage_turn_images(
-    assets_dir: &std::path::Path,
-    images: &[ServeImageUpload],
-) -> Result<(), String> {
+/// Validate and decode a complete batch without filesystem side effects.
+fn decode_turn_images(images: &[ServeImageUpload]) -> Result<Vec<(&str, Vec<u8>)>, String> {
     if images.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     if images.len() > MAX_TURN_IMAGES {
         return Err(format!(
@@ -895,6 +889,21 @@ pub(crate) fn stage_turn_images(
         }
         staged.push((name, bytes));
     }
+    Ok(staged)
+}
+
+/// Stage uploaded turn images into the session assets dir under the uploaded
+/// filenames, so the one-shot child's existing `[[image:name]]` resolution
+/// finds them exactly as if they had been pasted locally. Pure filesystem
+/// work; runs before the per-session lock is taken.
+pub(crate) fn stage_turn_images(
+    assets_dir: &std::path::Path,
+    images: &[ServeImageUpload],
+) -> Result<(), String> {
+    let staged = decode_turn_images(images)?;
+    if staged.is_empty() {
+        return Ok(());
+    }
     std::fs::create_dir_all(assets_dir)
         .map_err(|err| format!("cannot prepare session assets dir: {err}"))?;
     for (name, bytes) in &staged {
@@ -902,6 +911,31 @@ pub(crate) fn stage_turn_images(
             .map_err(|err| format!("cannot stage image {name:?}: {err}"))?;
     }
     Ok(())
+}
+
+/// Capture each side-note upload at a distinct path, retaining its extension.
+/// Return normalized client names and their written paths in upload order so
+/// marker binding never reconstructs a path from an unvalidated filename.
+#[cfg(feature = "serve")]
+pub(super) fn stage_side_note_images<'a>(
+    images_dir: &std::path::Path,
+    images: &'a [ServeImageUpload],
+) -> Result<Vec<(&'a str, std::path::PathBuf)>, String> {
+    let staged = decode_turn_images(images)?;
+    if staged.is_empty() {
+        return Ok(Vec::new());
+    }
+    std::fs::create_dir_all(images_dir)
+        .map_err(|err| format!("cannot prepare session assets dir: {err}"))?;
+    let mut captured = Vec::with_capacity(staged.len());
+    for (index, (name, bytes)) in staged.into_iter().enumerate() {
+        let extension = std::path::Path::new(name).extension().unwrap_or_default();
+        let path = images_dir.join(index.to_string()).with_extension(extension);
+        std::fs::write(&path, bytes)
+            .map_err(|err| format!("cannot stage image {name:?}: {err}"))?;
+        captured.push((name, path));
+    }
+    Ok(captured)
 }
 
 #[derive(Debug, Serialize)]

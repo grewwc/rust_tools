@@ -31,7 +31,7 @@ use crate::ai::exe_path::runtime_exe;
 use crate::commonw::configw;
 
 #[cfg(feature = "serve")]
-use super::driver::side_note::push_side_note;
+use super::driver::side_note::{list_pending_side_notes, push_side_note};
 #[cfg(feature = "serve")]
 use super::driver::turn_runtime::{
     SERVE_TITLE_SEED_ENV, SERVE_TITLE_SESSION_ENV, SessionTitleSeed,
@@ -266,16 +266,18 @@ async fn post_turn(
         .into_response()
 }
 
-/// Request body for `POST /sessions/{id}/side-notes`: one guidance text for
-/// the running turn, the remote counterpart of the local REPL's Ctrl+G
-/// side-note. The text is appended to the session's side-note file queue,
-/// which the turn child drains at the top of every iteration; queue appends
-/// and the drain-side atomic rename compose without loss, so notes sent
-/// mid-turn are seen by the next model request.
+/// Request body for `POST /sessions/{id}/side-notes`: guidance text and optional
+/// images for the running turn, the remote counterpart of the REPL's Ctrl+G
+/// side-note. Uploads are captured as immutable attachments before their paths
+/// enter the session's queue. The turn child consumes guidance before its next
+/// model request and acknowledges it only after a durable history commit.
 #[derive(Debug, Deserialize)]
 #[cfg(feature = "serve")]
 struct SideNoteReq {
+    #[serde(default)]
     text: String,
+    #[serde(default)]
+    images: Vec<ServeImageUpload>,
 }
 
 /// `POST /sessions/{id}/side-notes` (authed): queue one side-note for this
@@ -294,7 +296,7 @@ async fn post_side_note(
     if SessionStore::validate_session_id(&id).is_err() {
         return bad_request(format!("invalid session id: {id}")).into_response();
     }
-    if req.text.trim().is_empty() {
+    if req.text.trim().is_empty() && req.images.is_empty() {
         return bad_request("side-note text is empty".to_string()).into_response();
     }
     // No session-file existence check: the queue file is independent of the
@@ -303,7 +305,38 @@ async fn post_side_note(
     // compose without loss either way.
     let store = SessionStore::new(state.history_file.as_path());
     let session_file = store.session_history_file(&id);
-    if let Err(err) = push_side_note(&session_file, req.text.trim(), "user", None) {
+    let mut text = req.text.trim().to_string();
+    if !req.images.is_empty() {
+        // Each note owns its uploads. Reusing a client filename must not replace
+        // an image already queued or used by the running turn.
+        let images_dir = store
+            .session_assets_dir(&id)
+            .join("attachments")
+            .join(uuid::Uuid::new_v4().to_string());
+        let images = match stage_side_note_images(&images_dir, &req.images) {
+            Ok(images) => images,
+            Err(err) => return bad_request(err).into_response(),
+        };
+        for (name, path) in images {
+            let captured = format!("[[image:{}]]", path.display());
+            // Bind one bare marker per upload, including whitespace accepted
+            // by filename validation. Equal names consume markers in order.
+            let marker_range = text.match_indices("[[image:").find_map(|(start, _)| {
+                let value_start = start + "[[image:".len();
+                let end = value_start + text[value_start..].find("]]")?;
+                (text[value_start..end].trim() == name).then_some(start..end + "]]".len())
+            });
+            if let Some(range) = marker_range {
+                text.replace_range(range, &captured);
+            } else {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&captured);
+            }
+        }
+    }
+    if let Err(err) = push_side_note(&session_file, &text, "user", None) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": err.to_string()})),
@@ -315,6 +348,38 @@ async fn post_side_note(
         Json(serde_json::json!({"session_id": id, "queued": true})),
     )
         .into_response()
+}
+
+/// `GET /sessions/{id}/side-notes` (authed): the pending queue in append
+/// order. A missing queue file is an empty list; notes disappear only after
+/// the turn child commits them to canonical input, so this is the set a UI
+/// should present as waiting to send.
+#[cfg(feature = "serve")]
+async fn get_side_notes(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if SessionStore::validate_session_id(&id).is_err() {
+        return bad_request(format!("invalid session id: {id}")).into_response();
+    }
+    let store = SessionStore::new(state.history_file.as_path());
+    let session_file = store.session_history_file(&id);
+    match list_pending_side_notes(&session_file, None) {
+        Ok(notes) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"session_id": id, "notes": notes})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(feature = "serve")]
@@ -1646,7 +1711,12 @@ pub(in crate::ai) async fn run_serve(
             post(post_turn_sse).layer(DefaultBodyLimit::max(MAX_TURN_REQUEST_BYTES)),
         )
         .route("/sessions/{id}/interrupt", post(post_interrupt))
-        .route("/sessions/{id}/side-notes", post(post_side_note))
+        .route(
+            "/sessions/{id}/side-notes",
+            get(get_side_notes)
+                .post(post_side_note)
+                .layer(DefaultBodyLimit::max(MAX_TURN_REQUEST_BYTES)),
+        )
         .route("/sessions/{id}/file", get(get_session_file))
         .route(
             "/sessions/{id}/confirm",

@@ -300,7 +300,10 @@ pub(crate) fn conflict(msg: String) -> (StatusCode, Json<serde_json::Value>) {
 /// reloaded, phone woke up) can still show and answer it. `{"pending": null}`
 /// means there is nothing to answer right now. `running` travels with it
 /// because clients already poll this endpoint: a page that never saw the
-/// stream can still offer to stop a turn that is running here.
+/// stream can still offer to stop a turn that is running here. `turn` is the
+/// active child pid (0 when idle): a page that saw the previous turn's
+/// terminal event uses it to tell that turn's child reap lag apart from a
+/// newly started turn.
 pub(crate) async fn get_confirm(
     State(state): State<ServeState>,
     headers: HeaderMap,
@@ -313,11 +316,13 @@ pub(crate) async fn get_confirm(
         return bad_request(format!("invalid session id: {id}")).into_response();
     }
     let pending = confirm_slot(&state, &id).and_then(|slot| slot.lock().ok()?.pending.clone());
-    let running = state
+    let turn = state
         .active_turns
         .lock()
         .ok()
-        .is_some_and(|turns| turns.contains_key(&id));
+        .and_then(|turns| turns.get(&id).copied());
+    let running = turn.is_some();
+    let turn = turn.unwrap_or(0);
     let body = match pending {
         Some(p) => {
             serde_json::json!({
@@ -328,9 +333,10 @@ pub(crate) async fn get_confirm(
                     "input": p.kind == ConfirmKind::Input,
                 },
                 "running": running,
+                "turn": turn,
             })
         }
-        None => serde_json::json!({"pending": null, "running": running}),
+        None => serde_json::json!({"pending": null, "running": running, "turn": turn}),
     };
     (StatusCode::OK, Json(body)).into_response()
 }

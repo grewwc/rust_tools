@@ -47,6 +47,7 @@ pub(crate) use orchestrator::{checkpoint, progress};
 #[cfg(test)]
 use persistence::persist_pending_turn_messages;
 pub(crate) use prepare::QuestionShape;
+pub(super) use prepare::assemble_effective_question;
 pub(in crate::ai) use tool_result::is_evidence_gated_audit_agent;
 pub(in crate::ai) use tool_result::stale_patch_targets_from_messages;
 #[cfg(test)]

@@ -96,7 +96,9 @@ fn side_note_next_input_archives_before_dequeue_and_retains_on_failure() {
     assert_eq!(fs::read_to_string(&queue).unwrap(), original);
     fs::remove_dir(&archive).unwrap();
     let notes = drain_side_notes_to_archive(&history, None).unwrap();
-    assert_eq!(notes.len(), 1);
+    assert_eq!(notes.notes.len(), 1);
+    assert_eq!(notes.question, "NEXT_INPUT_GUIDANCE");
+    assert!(notes.image_files.is_empty());
     assert!(archive.is_file());
     assert!(!has_pending_side_notes(&history, None));
     assert!(
@@ -124,6 +126,58 @@ fn side_note_next_input_archives_before_dequeue_and_retains_on_failure() {
             .iter()
             .map(|(message, _)| message.clone())
             .collect::<Vec<_>>(),
-        side_notes_to_messages(notes)
+        side_notes_to_messages(notes.notes)
     );
+}
+
+#[test]
+fn side_note_next_input_snapshots_images_before_dequeue() {
+    let dir = TestDir::new();
+    let history = dir.history();
+    let assets = assets_dir_for_history(&history);
+    let queue = push_side_note(&history, "[[image:shot.png]]", "user", None).unwrap();
+    let original_queue = fs::read_to_string(&queue).unwrap();
+    assert!(drain_side_notes_to_archive(&history, None).is_err());
+    assert_eq!(fs::read_to_string(&queue).unwrap(), original_queue);
+    let source = assets.join("shot.png");
+    fs::write(&source, b"first screenshot").unwrap();
+    let input = drain_side_notes_to_archive(&history, None).unwrap();
+    assert_eq!(input.notes.len(), 1);
+    assert!(input.question.is_empty());
+    assert_eq!(input.image_files.len(), 1);
+    let snapshot = PathBuf::from(&input.image_files[0]);
+    assert!(snapshot.starts_with(assets.join("attachments")));
+    fs::write(source, b"replacement").unwrap();
+    assert_eq!(fs::read(snapshot).unwrap(), b"first screenshot");
+    assert!(!has_pending_side_notes(&history, None));
+}
+
+#[test]
+fn side_note_snapshot_commit_failure_and_replaced_prefix_preserve_queue() {
+    let dir = TestDir::new();
+    let history = dir.history();
+    let queue = push_side_note(&history, "[[image:shot.png]]", "user", None).unwrap();
+    let original = fs::read_to_string(&queue).unwrap();
+    let batch = read_pending_side_notes(&history, None).unwrap().unwrap();
+    assert!(commit_side_note_snapshot(&batch, None, |_| Err("append failed".to_string())).is_err());
+    assert_eq!(fs::read_to_string(&queue).unwrap(), original);
+    assert_eq!(
+        commit_side_note_snapshot(&batch, None, |notes| {
+            assert_eq!(notes.len(), 1);
+            Ok(())
+        })
+        .unwrap(),
+        1
+    );
+    assert!(!has_pending_side_notes(&history, None));
+    push_side_note(&history, "new queue prefix", "user", None).unwrap();
+    let replacement = fs::read_to_string(&queue).unwrap();
+    assert_eq!(
+        commit_side_note_snapshot(&batch, None, |_| panic!(
+            "a replaced snapshot must not commit twice"
+        ))
+        .unwrap(),
+        0
+    );
+    assert_eq!(fs::read_to_string(&queue).unwrap(), replacement);
 }

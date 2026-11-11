@@ -62,6 +62,25 @@ function harness() {
 
 test("embedded script parses", () => { new vm.Script(script); });
 
+for (const width of [390, 700, 701, 1280]) {
+  test("prose whitespace edges compact only on desktop at " + width + "px", () => {
+    const h = harness();
+    h.context.window.matchMedia = (query) => {
+      assert.equal(query, "(min-width:701px)");
+      return { matches: width >= 701 };
+    };
+    const raw = "\n \t\n \n短回复\n \t\n";
+    assert.equal(h.render(raw), width >= 701
+      ? '<div class="p">短回复</div>'
+      : '<div class="p"> \t<br> <br>短回复<br> \t</div>');
+    assert.equal(h.render("\n短回复\n"), '<div class="p">短回复</div>');
+    assert.equal(h.render("first\n \t\nsecond"), '<div class="p">first<br> \t<br>second</div>');
+    assert.equal(h.render(" \t\n "), width >= 701 ? "" : '<div class="p"> \t<br> </div>');
+    const code = h.render("```text\n \t\n  code  \n\n```");
+    assert.match(code, /<pre data-lang="text"><code> \t\n  code  \n<\/code><\/pre>/);
+  });
+}
+
 test("history ending in an unanswered user message is treated as interrupted", () => {
   const start = script.indexOf("function isRuntimeSyntheticUser(");
   const end = script.indexOf("const PHONE_LAYOUT_QUERY", start);
@@ -436,7 +455,7 @@ test("a side note posts immediately despite an expired running-state sample", as
   assert.equal(button.disabled, false);
 });
 
-test("a failed side note preserves the draft and pending images never enter a note", async () => {
+test("a failed side note preserves the draft and pending images", async () => {
   const start = script.indexOf("async function sendSideNote(");
   const end = script.indexOf("async function stopTurn(", start);
   let apiCalls = 0;
@@ -458,10 +477,71 @@ test("a failed side note preserves the draft and pending images never enter a no
   await context.sendSideNote();
   assert.equal(prompt.value, "keep this");
   assert.equal(notices.at(-1), "side note failed: offline");
-  context.pendingImages.push({ filename: "photo.png" });
+  const image = { filename: "photo.png", data_base64: "cGhvdG8=" };
+  context.pendingImages.push(image);
   await context.sendSideNote();
-  assert.equal(apiCalls, 1);
-  assert.match(notices.at(-1), /side notes are text only/);
+  assert.equal(apiCalls, 2);
+  assert.equal(prompt.value, "keep this");
+  assert.equal(prompt.style.height, "80px");
+  assert.deepEqual(Array.from(context.pendingImages), [image]);
+  assert.equal(notices.at(-1), "side note failed: offline");
+  assert.equal(context.sideNoteBusy, false);
+  assert.equal(button.disabled, false);
+});
+
+test("image side notes upload screenshots once and accept images without text", async () => {
+  const start = script.indexOf("async function sendSideNote(");
+  const end = script.indexOf("async function stopTurn(", start);
+  for (const draft of ["look here\n[[image:photo.png]]", "look here", ""]) {
+    const image = { filename: "photo.png", data_base64: "cGhvdG8=" };
+    const prompt = { value: draft, style: { height: "80px" } };
+    const button = { disabled: false };
+    const posts = [], cleared = [];
+    const context = vm.createContext({
+      sideNoteBusy: false, sessionId: "session-a", pendingImages: [image],
+      $: (id) => id === "prompt" ? prompt : button,
+      api: async (path, options) => posts.push([path, JSON.parse(options.body)]),
+      clearDraft: (id) => cleared.push(id), refreshSideNotes() {}, note() {}, JSON,
+    });
+    vm.runInContext(script.slice(start, end), context);
+    await context.sendSideNote();
+    const text = draft ? "look here\n[[image:photo.png]]" : "[[image:photo.png]]";
+    assert.deepEqual(posts, [["/sessions/session-a/side-notes", { text, images: [image] }]]);
+    assert.equal(prompt.value, "");
+    assert.equal(prompt.style.height, "auto");
+    assert.equal(context.pendingImages.length, 0);
+    assert.deepEqual(cleared, ["session-a"]);
+    assert.equal(context.sideNoteBusy, false);
+    assert.equal(button.disabled, false);
+  }
+});
+
+test("a slow image side-note acknowledgement preserves new attachments", async () => {
+  const start = script.indexOf("async function sendSideNote(");
+  const end = script.indexOf("async function stopTurn(", start);
+  let finishPost;
+  const response = new Promise((resolve) => { finishPost = resolve; });
+  const image = { filename: "photo.png", data_base64: "cGhvdG8=" };
+  const nextImage = { filename: "next.png", data_base64: "bmV4dA==" };
+  const prompt = { value: "look here", style: { height: "80px" } };
+  const button = { disabled: false };
+  const posts = [];
+  const context = vm.createContext({
+    sideNoteBusy: false, sessionId: "session-a", pendingImages: [image],
+    $: (id) => id === "prompt" ? prompt : button,
+    api: (path, options) => { posts.push(JSON.parse(options.body)); return response; },
+    clearDraft: () => assert.fail("new attachments must keep their draft"),
+    refreshSideNotes() {}, note() {}, JSON,
+  });
+  vm.runInContext(script.slice(start, end), context);
+  const sending = context.sendSideNote();
+  context.pendingImages.push(nextImage);
+  finishPost();
+  await sending;
+  assert.deepEqual(posts, [{ text: "look here\n[[image:photo.png]]", images: [image] }]);
+  assert.equal(prompt.value, "look here");
+  assert.equal(prompt.style.height, "80px");
+  assert.deepEqual(Array.from(context.pendingImages), [image, nextImage]);
 });
 
 test("a slow side-note acknowledgement preserves edits and another session's draft", async () => {
@@ -1917,7 +1997,8 @@ function scrollHarness({ phone = true, scrollTop = 0 } = {}) {
     scrollTo(options) { this.lastScroll = options; this.scrollTop = options.top; },
   };
   const context = vm.createContext({
-    window: { matchMedia: () => ({ matches: phone }) },
+    window: { matchMedia: (query) => ({ matches: query === "(min-width:701px)" ? !phone : phone }) },
+    sessionId: "scroll-session",
     $: (id) => id === "msgs" ? msgs : button,
     setTimeout(fn) { timer = fn; return 1; },
     requestAnimationFrame(fn) { frame = fn; frameRequests++; return frameRequests; },

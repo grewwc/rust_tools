@@ -151,6 +151,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     ["prompt", "textarea"], ["msgs", "div"], ["promptlist", "ol"], ["promptcount", "span"], ["newbtn", "button"], ["fork", "button"],
     ["refresh", "button"], ["del", "button"], ["omodel", "select"], ["oagent", "select"], ["oeffort", "select"],
     ["composer", "div"], ["img", "button"], ["sidenote", "button"], ["send", "button"], ["turnstatus", "div"],
+    ["sidequeue", "div"], ["sidequeuecount", "span"], ["sidequeuelist", "ul"],
   ]) elements[id] = node(tag);
   for (const id of ["img", "prompt", "sidenote", "send"]) elements.composer.appendChild(elements[id]);
   elements.prompt.value = "draft in A";
@@ -175,7 +176,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     assert.equal(selector, "#msgs [data-task-states], #msgs [data-task-busy], #msgs [data-task-reset]");
     return [];
   };
-  const serverItems = plain(sessions(isMarked)), stored = new Map(), requests = [], confirmations = [], messages = [], notes = [], drawers = [];
+  const serverItems = plain(sessions(isMarked)), stored = new Map(), requests = [], confirmations = [], messages = [], notes = [], drawers = [], sideNotes = [];
   const media = { matches: phone, listeners: [], addEventListener: (_, listener) => media.listeners.push(listener) };
   const timers = new Map();
   let nextTimer = 1, now = 1000, historyLoads = 0, configLoads = 0, grows = 0;
@@ -193,7 +194,10 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
         body: options.body ? JSON.parse(options.body) : null,
       };
       requests.push(request);
-      if (request.path.endsWith("/side-notes")) return response({});
+      if (request.path.endsWith("/side-notes")) {
+        if (request.method === "GET") return response({ notes: sideNotes });
+        return response({});
+      }
       if (request.path.endsWith("/turns/stream")) {
         let read = false;
         return { ...response({}), body: { getReader: () => ({
@@ -240,6 +244,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     historySession: sid, canonicalHistoryTotal: 0, pendingUserInputs: new Map(),
     questionCache: null, runEpoch: 0, turnRunning: false, confirmPollSeq: 0,
     turnRunningAt: 0, RUNNING_SAMPLE_TTL_MS: 60000,
+    turnRunningPid: 0, endedTurnPid: 0,
     eventActive: false, eventSession: "", eventStreamEnded: false, eventStreamFailed: false, staleSession: "", staleDone: false,
     lastHistoryEndsUnanswered: false, LIVE_STALL_MS: 60000, STREAM_SILENCE_MS: 60000,
     addLiveUserBubble: () => { const row = node(), bubble = node(); row.appendChild(bubble); elements.msgs.appendChild(row); return bubble; },
@@ -262,8 +267,10 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
   vm.runInContext(marked("session switch"), context);
   vm.runInContext(between("function renderSessionBar()", "// History is append-only"), context);
   vm.runInContext(marked("composer session adoption"), context);
+  vm.runInContext(marked("composer git command"), context);
   vm.runInContext(marked("turn session preparation"), context);
   vm.runInContext(between("function isTurnRunning()", "// The one send/stop button"), context);
+  vm.runInContext(between("let switchPollTimer = null;", "// Rebuild a compact progress card"), context);
   vm.runInContext(between("function parseBlock(raw)", "// \u0060/cd\u0060 changes"), context);
   vm.runInContext(between("const RATE_STORAGE =", "function addFold("), context);
   vm.runInContext(between("function setAnswerRate(", "// Only completed answer bubbles"), context);
@@ -292,7 +299,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     now += ms;
     for (const [id, timer] of [...timers]) if (timer.at <= now) { timers.delete(id); timer.fn(); }
   };
-  return { context, document, elements, drafts, stored, requests, confirmations, messages, notes, drawers, media,
+  return { context, document, elements, drafts, stored, requests, confirmations, messages, notes, drawers, sideNotes, media,
     dispatch, row, title, open, select, advance, historyLoads: () => historyLoads, configLoads: () => configLoads, grows: () => grows };
 }
 
@@ -597,6 +604,25 @@ test("switching from a completed session lets the selected running session contr
   assert.equal(h.context.isTurnRunning(), true);
 });
 
+test("a picked session retries a dropped running-state sample", async () => {
+  const h = harness();
+  vm.runInContext("turnRunning = false; turnRunningAt = 0; eventStreamEnded = false; eventStreamFailed = false", h.context);
+  let calls = 0;
+  h.context.pollConfirm = async () => {
+    calls += 1;
+    if (calls === 1) return null; // dropped while a newer marker bumped the sequence
+    vm.runInContext("turnRunning = true; turnRunningAt = Date.now()", h.context);
+    return true;
+  };
+  h.context.pollSwitchRunningState();
+  for (let i = 0; i < 3; i++) await Promise.resolve();
+  assert.equal(calls, 1, "the first pick poll is sent");
+  h.advance(400);
+  for (let i = 0; i < 3; i++) await Promise.resolve();
+  assert.equal(calls, 2, "a dropped sample is retried once");
+  assert.equal(h.context.isTurnRunning(), true);
+});
+
 test("a first desktop send clears both the anonymous and adopted session drafts", async () => {
   const h = harness({ sid: "" });
   h.elements.prompt.value = "stale fresh draft";
@@ -689,7 +715,7 @@ for (const phone of [true, false]) test((phone ? "phone" : "desktop") + " sessio
     assert.equal(title.flex, "1");
     assert.equal(title["white-space"], "nowrap");
     assert.equal(title["text-overflow"], "ellipsis");
-    assert.deepEqual(cssRule(desktopCss, "#sesstitle"), {});
+    assert.deepEqual(cssRule(desktopCss, "#sesstitle"), { "min-width": "0", "font-size": "15px" });
     assert.equal(responsiveRule("#questionbtn").display, "none");
   }
 });
@@ -707,7 +733,7 @@ test("desktop user bubbles stay neutral but carry a border and accent rule", () 
   ]) {
     assert.equal(responsiveRule(selector)["--surface"], background, selector + " user bubble fill");
   }
-  assert.equal(responsiveRule("#sessions li.cur")["box-shadow"], "inset 3px 0 0 var(--acc), inset 0 0 0 1px var(--line)");
+  assert.equal(responsiveRule("#sessions li.cur")["box-shadow"], "inset 3px 0 0 var(--acc)");
   assert.equal(responsiveRule("#sessions li.cur").background, "var(--tint-3)");
   assert.equal(responsiveRule('#sessions li.cur span[role="button"]')["font-weight"], "600");
   assert.equal(responsiveRule("button.primary").background, "var(--acc)");
@@ -794,6 +820,939 @@ function loadChat(h) {
     ['$("send").onclick =', "// The dialog is the only way"],
   ]) vm.runInContext(between(start, end), h.context);
 }
+
+function sessionFoldHarness(width) {
+  const h = harness({ phone: width <= 700 }), pendingToggles = new Set(), historyLoads = [];
+  const createElement = h.document.createElement;
+  h.document.createElement = (tag) => {
+    const el = createElement(tag);
+    if (tag === "details") {
+      let open = false;
+      Object.defineProperty(el, "isConnected", {
+        get() {
+          for (let node = el; node; node = node.parentNode) if (node === h.elements.msgs) return true;
+          return false;
+        },
+      });
+      Object.defineProperty(el, "open", {
+        get: () => open,
+        set(value) {
+          value = !!value;
+          if (value === open) return;
+          open = value;
+          // Browsers queue and coalesce toggle events independently of clicks.
+          pendingToggles.add(el);
+        },
+      });
+    }
+    return el;
+  };
+  const matchMedia = h.context.window.matchMedia;
+  h.context.window.matchMedia = (query) => query === "(min-width:701px)"
+    ? { matches: width >= 701 } : matchMedia(query);
+  loadChat(h);
+  vm.runInContext(between("function toolArgsOf(", "const RATE_STORAGE ="), h.context);
+  Object.assign(h.context, {
+    historySession: "", historyKeys: [], historyLoadSeq: 0,
+    navigator: { onLine: true }, staleKey: "", staleBox: null, recoveredView: null, staleTries: 0,
+    histKey: (messages) => JSON.stringify(messages), histEndsTurn: () => true,
+    revokePreviews() {},
+    console: { error(...args) { assert.fail(args.map(String).join(" ")); } },
+  });
+  h.document.visibilityState = "visible";
+  vm.runInContext(between("function armHistoryFollow()", "// BEGIN history retry"), h.context);
+  vm.runInContext(between("async function loadHistory(", "// Scrolling to the top of the transcript"), h.context);
+  const messages = [
+    { role: "assistant", content: "Finished answer", reasoning_content: "Stored reasoning" },
+    { role: "tool", content: "Plain tool output" },
+    { role: "tool", content: "Raw task result", task_report: {
+      schema: "ai.task-report", version: 1, operation: "task_wait", snapshot: false,
+      tasks: [{ task_id: "fold-task", agent: "build", status: "completed", active: false, output: "Delivered output" }],
+    } },
+    { role: "internal_note", content: "Explicitly expanded control" },
+  ];
+  const fetch = h.context.fetch;
+  h.context.fetch = async (url, options = {}) => {
+    const path = new URL(url).pathname;
+    if (/^\/sessions\/(open-session|target-session)\/history$/.test(path)) {
+      h.requests.push({ path, method: options.method || "GET", body: null });
+      return response(plain(messages), 200, { "x-history-total": String(messages.length) });
+    }
+    return fetch(url, options);
+  };
+  const loadHistory = h.context.loadHistory;
+  h.context.loadHistory = (...args) => {
+    const load = loadHistory(...args);
+    historyLoads.push(load);
+    return load;
+  };
+  return {
+    ...h,
+    // Existing fold-state tests still exercise every original disclosure. The
+    // outer execution disclosures have their own default/state tests below.
+    folds: () => h.elements.msgs.querySelectorAll("details").filter((details) => !details.parentNode.classList.contains("execution-group")),
+    async activateSummary(details, detail = 1) {
+      const click = h.dispatch(details.querySelector("summary"), "click", { detail });
+      if (!click.event.prevented) details.open = !details.open;
+      await click.done;
+    },
+    flushToggles() {
+      const queued = [...pendingToggles]; pendingToggles.clear();
+      for (const details of queued) h.dispatch(details, "toggle");
+    },
+    deliverToggle(details) {
+      assert.equal(pendingToggles.delete(details), true, "the selected element must have a queued toggle");
+      h.dispatch(details, "toggle");
+    },
+    async selectHistory(id) {
+      await h.select(id);
+      await Promise.all(historyLoads.splice(0));
+      assert.equal(h.context.sessionId, id);
+      assert.equal(h.context.historySession, id, "the real sidebar selection must finish the history render");
+    },
+  };
+}
+
+for (const width of [390, 1280]) {
+  test(`completed execution groups keep current execution outside and retain both disclosures at ${width}px`, async () => {
+    const h = sessionFoldHarness(width), root = h.elements.msgs;
+    vm.runInContext(between("function createLiveActivity(", "// The three override picks"), h.context);
+    const box = h.document.createElement("div"); box.className = "turn"; root.appendChild(box);
+    const pending = h.document.createElement("div"); pending.className = "msg asst pending";
+    pending.textContent = "Processing…"; box.appendChild(pending);
+    const activity = h.context.createLiveActivity(box, pending);
+    const first = h.context.createThinkingFold(box, pending);
+    first.body.textContent = "first reasoning";
+    const inner = first.box.querySelector("details");
+    h.context.completeExecution(first, box);
+    assert.equal(first.box.parentNode, box, "the latest completed item stays visible until another execution appears");
+    assert.equal(box.querySelector(".execution-group"), null);
+    activity.tool({ id: "run", name: "execute_command", phase: "started" });
+    const outerBox = box.querySelector(".execution-group"), outer = outerBox.querySelector("details");
+    assert.equal(outer.open, false, "completed records default closed on both layouts");
+    assert.equal(inner.open, false);
+    assert.equal(first.box.parentNode, outerBox.querySelector(".execution-items"));
+    await h.activateSummary(inner); h.flushToggles();
+    assert.equal(inner.open, true);
+    h.context.executionGroupsFor(box).sync();
+    assert.equal(inner.open, true, "merging leaves an expanded inner disclosure open");
+    assert.equal(first.box.parentNode, outerBox.querySelector(".execution-items"), "an expanded record inside a group stays there");
+    await h.activateSummary(outer); h.flushToggles(); assert.equal(outer.open, true);
+    await h.activateSummary(outer); h.flushToggles(); assert.equal(outer.open, false);
+
+    const activeTool = box.children.find((child) => child.classList.contains("tool-activity"));
+    assert.ok(activeTool, "a started tool must be a direct, visible sibling of the completed group");
+    assert.equal(activeTool.dataset.running, "true");
+    assert.equal(activeTool.dataset.executionState, "running");
+    assert.equal(pending.parentNode, box);
+    assert.equal(box.classList.contains("execution-empty"), false);
+    activity.tool({ id: "run", name: "execute_command", phase: "finished", ok: true, output: "done" });
+    assert.equal(activeTool.parentNode, box, "finishing does not hide the latest progress");
+    assert.equal(outer.open, false);
+    activity.tool({ id: "next", name: "read_file", phase: "started" });
+    assert.equal(activeTool.parentNode, outerBox.querySelector(".execution-items"), "a third item merges previous progress with the old group");
+    assert.equal(outerBox.querySelector(".execution-items").children.length, 2);
+    activity.tool({ id: "run", name: "execute_command", phase: "started" });
+    assert.equal(activeTool.parentNode, box, "reactivation extracts the same node from the closed group");
+    assert.equal(activeTool.dataset.running, "true");
+
+    const second = h.context.createThinkingFold(box, pending);
+    second.body.textContent = "current reasoning";
+    h.context.executionGroupsFor(box).sync();
+    assert.equal(second.box.parentNode, box, "current reasoning remains outside old execution");
+    assert.equal(second.box.dataset.executionState, "running");
+    assert.equal(second.body.textContent, "current reasoning");
+    assert.equal(pending.parentNode, box);
+    assert.equal(outerBox.querySelector(".execution-items").children.length, 1);
+    const body = outerBox.querySelector(".execution-items");
+    let moves = 0;
+    const append = body.appendChild.bind(body), insert = box.insertBefore.bind(box);
+    body.appendChild = (...args) => { moves++; return append(...args); };
+    box.insertBefore = (...args) => { moves++; return insert(...args); };
+    root.scrollTop = 75;
+    h.context.executionGroupsFor(box).sync();
+    h.context.executionGroupsFor(box).sync();
+    assert.equal(moves, 0, "unchanged progress does not detach or remount completed records");
+    assert.equal(root.scrollTop, 75, "unchanged progress does not move the reading position");
+    activity.finish("interrupted");
+    assert.equal(activeTool.parentNode, box, "an interrupted tool stays visible rather than becoming hidden success");
+  });
+
+  test(`expanded progress keeps its place until the reader collapses it at ${width}px`, async () => {
+    const h = sessionFoldHarness(width), root = h.elements.msgs;
+    vm.runInContext(between("function createLiveActivity(", "// The three override picks"), h.context);
+    const box = h.document.createElement("div"); box.className = "turn"; root.appendChild(box);
+    const pending = h.document.createElement("div"); pending.className = "msg asst pending";
+    pending.textContent = "Processing…"; box.appendChild(pending);
+    const activity = h.context.createLiveActivity(box, pending);
+    const first = h.context.createThinkingFold(box, pending);
+    first.body.textContent = "watching";
+    h.context.completeExecution(first, box);
+    const inner = first.box.querySelector("details");
+    await h.activateSummary(inner); h.flushToggles();
+    assert.equal(inner.open, true);
+    activity.tool({ id: "run", name: "execute_command", phase: "started" });
+    assert.equal(first.box.parentNode, box, "an expanded record is not absorbed by the next execution");
+    assert.equal(box.querySelector(".execution-group"), null);
+    await h.activateSummary(inner); h.flushToggles();
+    const outerBox = box.querySelector(".execution-group");
+    assert.ok(outerBox, "closing the record lets the deferred merge run");
+    assert.equal(first.box.parentNode, outerBox.querySelector(".execution-items"));
+  });
+
+  test(`an expanded subagent card is not re-anchored by later progress at ${width}px`, async () => {
+    const h = sessionFoldHarness(width), root = h.elements.msgs;
+    Object.defineProperty(h.document, "hidden", { value: true, configurable: true });
+    h.document.addEventListener = () => {};
+    h.context.window.addEventListener = () => {};
+    h.context.MutationObserver = class { observe() {} disconnect() {} };
+    vm.runInContext(between("const subagentClocks = new WeakMap();", "// The three override picks"), h.context);
+    const box = h.document.createElement("div"); box.className = "turn"; root.appendChild(box);
+    const pending = h.document.createElement("div"); pending.className = "msg asst pending";
+    pending.textContent = "Processing…"; box.appendChild(pending);
+    const activity = h.context.createLiveActivity(box, pending);
+    const report = { schema: "ai.task-report", version: 1, tasks: [{ task_id: "worker", status: "running", active: true, agent: "build", elapsed_ms: 4000 }] };
+    activity.tool({ id: "spawn", name: "task_spawn", phase: "started", task_report: report });
+    const card = box.children.find((child) => child.dataset?.subagents === "true"), details = card.querySelector("details");
+    assert.equal(details.open, true, "a running report opens the card");
+    const index = () => box.children.indexOf(card), before = index();
+    activity.tool({ id: "wait", name: "task_wait", phase: "started", task_report: report });
+    assert.equal(index(), before, "a later task row does not move an open subagent card");
+    await h.activateSummary(details); h.flushToggles();
+    assert.equal(details.open, false);
+    activity.tool({ id: "wait2", name: "task_wait", phase: "started", task_report: report });
+    assert.ok(index() > before, "a collapsed card follows the newest task row again");
+  });
+
+  test(`execution merges compensate the reading anchor and ignore detached turns at ${width}px`, () => {
+    const h = sessionFoldHarness(width), root = h.elements.msgs;
+    const createElement = h.document.createElement;
+    h.document.createElement = (tag) => {
+      const node = createElement(tag);
+      node.getBoundingClientRect = () => node.classList.contains("execution-group")
+        ? { top: -30, bottom: 10 } : { top: 20, bottom: 60 };
+      return node;
+    };
+    root.getBoundingClientRect = () => ({ top: 0, bottom: 300 });
+    h.context.shouldFollowOutput = () => false;
+    const box = h.document.createElement("div"); box.className = "turn"; root.appendChild(box);
+    const first = h.context.createThinkingFold(box);
+    h.context.completeExecution(first, box);
+    root.scrollTop = 100;
+    const second = h.context.createThinkingFold(box);
+    assert.equal(root.scrollTop, 50, "a 50px upward anchor shift is compensated in the same mutation");
+    h.context.completeExecution(second, box);
+    h.context.shouldFollowOutput = () => true;
+    const frames = [];
+    h.context.followOutput = (follow, target) => { if (follow) frames.push(() => { target.scrollTop = target.scrollHeight; }); };
+    root.scrollHeight = 1234;
+    const third = h.context.createThinkingFold(box);
+    assert.equal(root.scrollTop, 50, "a merge does not move the reader before the cancellable follow frame");
+    frames.shift()();
+    assert.equal(root.scrollTop, 1234, "the follow frame retains the live edge");
+    box.remove();
+    root.scrollTop = 77;
+    h.context.completeExecution(third, box);
+    h.context.createThinkingFold(box);
+    assert.equal(root.scrollTop, 77, "background updates cannot scroll the mounted session");
+    assert.equal(frames.length, 0, "detached updates cannot queue a follow for the mounted session");
+  });
+
+  test(`history execution groups preserve boundaries and settle retained task rows at ${width}px`, async () => {
+    const h = sessionFoldHarness(width), root = h.elements.msgs;
+    let messages = [
+      { role: "user", content: "request" },
+      { role: "assistant", content: "", reasoning_content: "old reasoning" },
+      { role: "tool", content: "old tool output" },
+      { role: "assistant", content: "Visible answer" },
+      { role: "tool", content: "active task", task_report: {
+        schema: "ai.task-report", version: 1, operation: "task_wait", snapshot: false,
+        tasks: [{ task_id: "active", agent: "build", status: "running", active: true, output: "still running" }],
+      } },
+    ];
+    const fetch = h.context.fetch;
+    h.context.fetch = async (url, options) => new URL(url).pathname.endsWith("/history")
+      ? response(plain(messages), 200, { "x-history-total": String(messages.length) }) : fetch(url, options);
+    await h.context.loadHistory();
+    const outer = root.querySelector(".execution-group"), detail = outer.querySelector("details");
+    const records = outer.querySelector(".execution-items").children.slice();
+    assert.equal(detail.open, false);
+    assert.equal(records.length, 2, "only contiguous old reasoning and tool rows share an outer group");
+    const active = root.children.find((node) => node.dataset.canonicalIndex === "4");
+    const task = active.querySelector(".task-output-body");
+    assert.ok(task);
+    assert.equal(active.parentNode, root);
+    assert.equal(active.querySelector(".execution-group"), null, "active subagent progress stays directly visible");
+    assert.equal(root.children.find((node) => node.dataset.canonicalIndex === "0").textContent.includes("request"), true);
+    assert.equal(root.children.find((node) => node.dataset.canonicalIndex === "3").textContent.includes("Visible answer"), true);
+    await h.activateSummary(detail); h.flushToggles(); assert.equal(detail.open, true);
+    messages = [...messages, { role: "assistant", content: "Final answer" }];
+    await h.context.loadHistory();
+    assert.equal(root.querySelector(".execution-group"), outer, "unchanged rows keep the original outer node");
+    assert.equal(detail.open, true, "an explicit expansion survives an incremental history load");
+    assert.deepEqual(outer.querySelector(".execution-items").children, records);
+    assert.equal(active.querySelector(".task-output-body"), task, "settlement never remounts the retained attachment node");
+    assert.equal(active.querySelector(".execution-group").querySelector("details").open, false);
+    assert.ok(root.textContent.includes("Final answer"));
+    let removals = 0;
+    const remove = outer.remove.bind(outer);
+    const present = new Set();
+    const collect = (owner) => {
+      for (const node of owner.children) {
+        if (node.dataset.canonicalKey !== undefined) present.add(node.dataset.canonicalKey);
+        collect(node);
+      }
+    };
+    collect(root);
+    assert.equal(vm.runInContext("historyKeys", h.context).every((key) => present.has(key)), true,
+      "nested groups retain every canonical row identity");
+    outer.remove = () => { removals++; remove(); };
+    await h.context.loadHistory();
+    assert.equal(removals, 0, "an unchanged history refresh never dismantles the outer disclosure");
+    assert.equal(root.querySelector(".execution-group"), outer);
+    assert.equal(detail.open, true);
+  });
+}
+
+function sessionScrollHarness(width, withTasks) {
+  const h = sessionFoldHarness(width), root = h.elements.msgs;
+  const frames = new Map(), growth = new Map(), historyGates = new Map();
+  const resizeObservers = [], mutationObservers = [], positionSaves = [];
+  let nextFrame = 1, top = 0, scrollQueued = false;
+  // Both real transcript scroll listeners run; addEventListener does not replace
+  // the direction listener when wire() installs position persistence.
+  const addListener = root.addEventListener;
+  root.addEventListener = (type, listener) => {
+    const previous = root["on" + type];
+    addListener(type, (event) => {
+      const results = [previous?.(event), listener(event)];
+      if (results.some((result) => result?.then)) return Promise.all(results);
+    });
+  };
+  const setTimeout = h.context.setTimeout;
+  h.context.setTimeout = (fn, ms) => {
+    if (ms === 200) positionSaves.push(fn);
+    return setTimeout(fn, ms);
+  };
+  h.elements.jumpbottom = h.document.createElement("button");
+  h.context.requestAnimationFrame = (fn) => {
+    const id = nextFrame++;
+    frames.set(id, fn);
+    return id;
+  };
+  h.context.cancelAnimationFrame = (id) => frames.delete(id);
+  h.context.window.requestAnimationFrame = h.context.requestAnimationFrame;
+  const heightOf = (node) => {
+    if (node.classList.contains("task-output") && !node.parentNode.querySelector("details").open) return 0;
+    if (width >= 701 && node.dataset.taskCurrent === "false" && node.parentNode?.parentNode?.dataset.subagents === "true") return 0;
+    let height;
+    if (node.tagName === "details") height = heightOf(node.children[0]) +
+      (node.open ? node.children.slice(1).reduce((sum, child) => sum + heightOf(child), 0) : 0);
+    else if (node.children.length) height = node.children.reduce((sum, child) => sum + heightOf(child), 0) + 12;
+    else height = Math.max(24, Math.ceil(node.textContent.length / Math.max(20, Math.floor(width / 12))) * 20);
+    return height + (growth.get(node) || 0);
+  };
+  h.context.ResizeObserver = class {
+    constructor(callback) { this.callback = callback; this.targets = new Map(); resizeObservers.push(this); }
+    observe(target) { if (!this.targets.has(target)) this.targets.set(target, null); }
+    unobserve(target) { this.targets.delete(target); }
+    disconnect() { this.targets.clear(); }
+  };
+  h.context.MutationObserver = class {
+    constructor(callback) { this.callback = callback; mutationObservers.push(this); }
+    observe(target) { assert.equal(target, root); this.children = root.children.slice(); }
+    disconnect() { this.children = null; }
+  };
+  root.clientHeight = 240;
+  Object.defineProperty(root, "scrollHeight", {
+    get: () => Math.max(root.clientHeight, 40 + root.children.reduce((sum, child) => sum + heightOf(child), 0)),
+  });
+  Object.defineProperty(root, "scrollTop", {
+    get: () => top,
+    set(value) {
+      const next = Math.max(0, Math.min(Number(value), root.scrollHeight - root.clientHeight));
+      if (top !== next) { top = next; scrollQueued = true; }
+    },
+  });
+  const content = Object.getOwnPropertyDescriptor(root, "textContent");
+  Object.defineProperty(root, "textContent", {
+    get: content.get,
+    set(value) {
+      content.set(value);
+      growth.clear();
+      // Clearing a transcript clamps its old offset and queues a scroll event.
+      root.scrollTop = top;
+    },
+  });
+  vm.runInContext(between("const PHONE_LAYOUT_QUERY", "// The desktop composer"), h.context);
+  // Jump-button drawing is synchronous here; only transcript-follow callbacks
+  // use the frame queue. Persistence still uses the real wire() registration.
+  h.context.scheduleJumpButtonUpdate = () => h.context.updateJumpButton();
+  vm.runInContext(between("async function loadOlderHistory()", "// Historical user inputs"), h.context);
+  vm.runInContext(between('$("msgs").addEventListener("scroll", () => {\n    scheduleJumpButtonUpdate();',
+    'window.addEventListener("pagehide"'), h.context);
+  const histories = new Map(["open-session", "target-session"].map((id, sessionIndex) => {
+    const messages = [];
+    for (let i = 0; i < 8 + sessionIndex * 3; i++) {
+      messages.push({ role: "user", content: id + " prompt " + i });
+      messages.push({ role: "assistant", content: id + " answer " + i });
+    }
+    if (withTasks) messages.splice(messages.length - 1, 0, {
+      role: "tool", content: "Raw task result", task_report: {
+        schema: "ai.task-report", version: 1, operation: "task_wait", snapshot: false,
+        tasks: [{ task_id: id + "-task", agent: "build", status: "completed", active: false,
+          output: ("Delivered output for " + id + "\n").repeat(12) }],
+      },
+    });
+    return [id, messages];
+  }));
+  const fetch = h.context.fetch;
+  h.context.fetch = async (url, options = {}) => {
+    const path = new URL(url).pathname;
+    const id = /^\/sessions\/(open-session|target-session)\/history$/.exec(path)?.[1];
+    if (!id) return fetch(url, options);
+    h.requests.push({ path, method: options.method || "GET", body: null });
+    if (historyGates.has(id)) await historyGates.get(id).promise;
+    const messages = histories.get(id);
+    return response(messages, 200, { "x-history-total": String(messages.length) });
+  };
+  const flushMutations = () => {
+    for (const observer of mutationObservers) {
+      if (!observer.children || observer.children.length === root.children.length &&
+          observer.children.every((child, index) => child === root.children[index])) continue;
+      observer.children = root.children.slice();
+      observer.callback([{ target: root }]);
+    }
+  };
+  const flushResizes = () => {
+    for (const observer of resizeObservers) {
+      const entries = [];
+      for (const [target, previous] of observer.targets) {
+        const height = target === root ? root.clientHeight : heightOf(target);
+        if (height === previous) continue;
+        observer.targets.set(target, height);
+        entries.push({ target, contentRect: { width, height } });
+      }
+      if (entries.length) observer.callback(entries);
+    }
+  };
+  const flushScroll = () => {
+    if (!scrollQueued) return;
+    scrollQueued = false;
+    h.dispatch(root, "scroll");
+  };
+  const flushFrame = () => {
+    flushMutations();
+    // Browser scroll events run before the frame's animation callbacks.
+    flushScroll();
+    const batch = [...frames];
+    for (const [id, fn] of batch) if (frames.delete(id)) fn();
+    // ResizeObserver delivers after animation callbacks. Following requested
+    // by a resize therefore runs in the next frame, not this one.
+    flushResizes();
+  };
+  return {
+    ...h, root, histories, flushFrame, flushScroll,
+    pendingFrames: () => frames.size,
+    growLayout(height, node = root.lastElementChild) { growth.set(node, (growth.get(node) || 0) + height); },
+    resizeViewport(height) { root.clientHeight = height; root.scrollTop = top; },
+    resizeObservers: () => resizeObservers,
+    queuedPositionSave: () => positionSaves.at(-1),
+    deferHistory(id) {
+      let resolve;
+      const promise = new Promise((done) => { resolve = done; });
+      historyGates.set(id, { promise });
+      const release = () => { historyGates.delete(id); resolve(); };
+      release.allowNewRequests = () => historyGates.delete(id);
+      return release;
+    },
+    async selectWhileHistoryPending(id) {
+      const loadHistory = h.context.loadHistory;
+      let selectedLoad;
+      h.context.loadHistory = (...args) => { selectedLoad = loadHistory(...args); return selectedLoad; };
+      try { await h.select(id); }
+      finally { h.context.loadHistory = loadHistory; }
+      assert.ok(selectedLoad, "the sidebar starts the selected session's history load");
+      await selectedLoad;
+      assert.equal(h.context.sessionId, id);
+      assert.equal(h.context.historySession, id, "the selected render finishes independently of an outgoing pager");
+    },
+    settleLayout() { flushFrame(); flushFrame(); flushScroll(); },
+    async openHistory() {
+      await h.context.loadHistory();
+      flushFrame();
+      flushScroll();
+      assert.equal(root.scrollTop, root.scrollHeight - root.clientHeight, "the initial history opens at the live edge");
+    },
+  };
+}
+
+for (const width of [390, 700, 701, 1280]) for (const withTasks of [false, true]) {
+  const suffix = " at " + width + "px " + (withTasks ? "with task-output bubbles" : "without task-output bubbles");
+  test("session-switch scroll A to B to A handles queued layout scrolls" + suffix, async () => {
+    const h = sessionScrollHarness(width, withTasks);
+    await h.openHistory();
+    const oldRows = h.root.children.slice();
+    await h.selectHistory("target-session");
+    if (withTasks) assert.equal(h.root.querySelectorAll(".task-output").length, 2,
+      "the real history renderer mounts the raw task and merged subagent projections");
+    assert.equal(h.root.children.includes(oldRows[0]), false);
+    // Intrinsic layout can settle after loadHistory, before its follow frame.
+    h.growLayout(180);
+    h.flushFrame();
+    h.flushScroll();
+    assert.equal(h.root.scrollTop, width >= 701 ? h.root.scrollHeight - h.root.clientHeight : 0,
+      "desktop follows the fully rendered history; mobile retains its existing queued-scroll policy");
+    await h.selectHistory("open-session");
+    h.growLayout(240);
+    h.flushFrame();
+    h.flushScroll();
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
+      "desktop returns to A's current bottom; mobile keeps its existing return-to-A behavior");
+    assert.deepEqual(h.requests.filter((request) => request.path.endsWith("/history")).map((request) => request.path), [
+      "/sessions/open-session/history", "/sessions/target-session/history", "/sessions/open-session/history",
+    ]);
+  });
+  test("session-switch scroll preserves a saved reading position" + suffix, async () => {
+    const h = sessionScrollHarness(width, withTasks);
+    await h.openHistory();
+    h.root.scrollTop = 120;
+    h.flushScroll();
+    await h.selectHistory("target-session");
+    h.flushFrame();
+    h.flushScroll();
+    const saved = h.stored.get("serve.scroll.open-session");
+    assert.deepEqual(JSON.parse(saved), { top: 120, atBottom: false });
+    await h.selectHistory("open-session");
+    h.flushFrame();
+    h.flushScroll();
+    assert.equal(h.root.scrollTop, 120, "an intentionally scrolled-up session keeps the existing restoration policy");
+    assert.equal(h.stored.get("serve.scroll.open-session"), saved, "restoration does not rewrite the saved preference");
+    h.histories.get("open-session").push({ role: "assistant", content: "An ordinary in-session update" });
+    await h.context.loadHistory();
+    h.flushFrame();
+    h.flushScroll();
+    assert.equal(h.root.scrollTop, 120, "an in-session refresh does not pull a reader to the bottom");
+  });
+}
+
+for (const width of [390, 700, 701, 1280]) {
+  test("session-switch scroll respects upward input before the follow frame at " + width + "px", async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    await h.selectHistory("target-session");
+    h.dispatch(h.root, "wheel", { deltaY: -1 });
+    h.flushFrame();
+    assert.equal(h.root.scrollTop, 0, "fresh upward reader intent still cancels the pending follow");
+  });
+  test("session-switch scroll cancels the outgoing desktop follow frame at " + width + "px", async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    h.context.followOutput(true);
+    assert.equal(h.pendingFrames(), 1);
+    const switched = h.selectHistory("target-session");
+    assert.equal(h.pendingFrames(), width >= 701 ? 0 : 1,
+      "desktop cancels the outgoing frame while the new history is still fetching; mobile keeps its existing frame");
+    await switched;
+    h.flushFrame();
+    h.flushScroll();
+    assert.equal(h.root.scrollTop, width >= 701 ? h.root.scrollHeight - h.root.clientHeight : 0);
+    assert.equal(h.pendingFrames(), 0, "no follow frame remains after the landing");
+  });
+}
+
+async function openOtherTranscriptAtBottom(h, width) {
+  await h.selectHistory("target-session");
+  h.settleLayout();
+  if (width <= 700) { h.context.scrollToLatest(false); h.flushScroll(); }
+  assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
+}
+
+for (const width of [390, 700, 701, 1280]) {
+  const desktop = width >= 701, suffix = " at " + width + "px";
+  test("desktop transcript ownership ignores outgoing clamps during the history fetch" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    await openOtherTranscriptAtBottom(h, width);
+    const release = h.deferHistory("open-session"), selecting = h.selectHistory("open-session");
+    assert.equal(h.context.sessionId, "open-session");
+    assert.equal(h.context.historySession, "target-session", "B stays mounted while A is fetching");
+    const before = h.root.scrollTop;
+    h.resizeViewport(h.root.clientHeight + 80);
+    h.flushScroll();
+    assert.equal(h.root.scrollTop, before - 80, "the outgoing layout really clamps and dispatches a scroll");
+    release(); await selecting; h.settleLayout();
+    assert.equal(h.root.querySelectorAll(".task-output").length, 2);
+    assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : 0,
+      "desktop ignores the outgoing clamp; mobile retains its existing suspension");
+  });
+  test("desktop transcript ownership invalidates pending position saves on navigation" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    await openOtherTranscriptAtBottom(h, width);
+    h.advance(200);
+    h.root.scrollTop = 120; h.flushScroll();
+    const pendingSave = h.queuedPositionSave();
+    assert.equal(typeof pendingSave, "function", "the real wire listener queues the position save");
+    const savedA = h.stored.get("serve.scroll.open-session");
+    assert.equal(JSON.parse(savedA).atBottom, true);
+    const release = h.deferHistory("open-session"), selecting = h.selectHistory("open-session");
+    h.advance(200);
+    if (desktop) pendingSave(); // A callback already queued before cancellation must also be harmless.
+    assert.equal(h.stored.get("serve.scroll.open-session"), desktop ? savedA : JSON.stringify({ top: 120, atBottom: false }),
+      "only desktop rejects B's pending offset under A's storage key");
+    release(); await selecting; h.settleLayout();
+    assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : 120);
+    assert.deepEqual(JSON.parse(h.stored.get("serve.scroll.target-session")), { top: 120, atBottom: false },
+      "navigation still saves B's intentional reading position under B");
+  });
+  test("desktop transcript ownership follows child growth after the landing frame" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    await openOtherTranscriptAtBottom(h, width);
+    await h.selectHistory("open-session"); h.settleLayout();
+    if (!desktop) {
+      assert.equal(h.root.scrollTop, 0, "mobile retains the clamp policy when returning from B's live edge");
+      h.context.scrollToLatest(false); h.flushScroll();
+    }
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
+    const before = h.root.scrollTop, child = h.root.lastElementChild;
+    h.growLayout(240, child); h.settleLayout();
+    assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : before,
+      "content grows after the first follow callback, while the scrollport keeps the same size");
+    assert.equal(h.resizeObservers().some((observer) => observer.targets.has(child)), desktop,
+      "desktop observes content children; mobile installs no observer");
+    h.context.rememberTranscriptPosition();
+    assert.equal(JSON.parse(h.stored.get("serve.scroll.open-session")).atBottom, desktop,
+      "late layout does not turn a desktop bottom goal into a saved reading offset");
+  });
+  test("desktop transcript ownership follows a viewport shrink after landing" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    const before = h.root.scrollTop;
+    h.resizeViewport(h.root.clientHeight - 60); h.settleLayout();
+    assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : before);
+    assert.equal(h.resizeObservers().some((observer) => observer.targets.has(h.root)), desktop,
+      "the scrollport observer handles viewport changes independently of its children");
+  });
+  test("desktop transcript ownership respects upward input during the fetch" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    await openOtherTranscriptAtBottom(h, width);
+    const release = h.deferHistory("open-session"), selecting = h.selectHistory("open-session");
+    h.resizeViewport(h.root.clientHeight + 80); h.flushScroll();
+    h.dispatch(h.root, "wheel", { deltaY: -1 });
+    release(); await selecting; h.settleLayout();
+    assert.equal(h.root.scrollTop, 0, "explicit upward intent still cancels A's landing");
+    assert.equal(h.resizeObservers().every((observer) => observer.targets.size === 0), true);
+    assert.equal(h.pendingFrames(), 0);
+  });
+  test("desktop transcript ownership releases following when the reader scrolls away" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    h.root.scrollTop -= 40; h.flushScroll();
+    const readingTop = h.root.scrollTop;
+    h.growLayout(180); h.settleLayout();
+    for (const observer of h.resizeObservers()) observer.callback([]);
+    h.settleLayout();
+    assert.equal(h.root.scrollTop, readingTop, "late resize callbacks never move an active reader");
+    assert.equal(h.resizeObservers().every((observer) => observer.targets.size === 0), true);
+    h.context.rememberTranscriptPosition();
+    assert.deepEqual(JSON.parse(h.stored.get("serve.scroll.open-session")), { top: readingTop, atBottom: false });
+    await h.selectHistory("target-session"); h.settleLayout();
+    await h.selectHistory("open-session"); h.settleLayout();
+    h.growLayout(100); h.settleLayout();
+    assert.equal(h.root.scrollTop, readingTop, "a restored reading position also stays free of resize following");
+    assert.equal(h.resizeObservers().every((observer) => observer.targets.size === 0), true);
+    h.context.scrollToLatest(false); h.flushScroll();
+    const resumedTop = h.root.scrollTop;
+    h.growLayout(60); h.settleLayout();
+    assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : resumedTop,
+      "the explicit jump resumes desktop following while mobile keeps its current jump behavior");
+  });
+  test("desktop transcript ownership observes new children and rejects obsolete resize callbacks" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    const child = h.document.createElement("div"); child.className = "msg asst"; child.textContent = "Late task output";
+    const before = h.root.scrollTop;
+    h.root.appendChild(child); h.settleLayout();
+    assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : before);
+    assert.equal(h.resizeObservers().some((observer) => observer.targets.has(child)), desktop);
+    const obsolete = h.resizeObservers().slice();
+    const release = h.deferHistory("target-session"), selecting = h.selectHistory("target-session");
+    h.growLayout(120, child);
+    for (const observer of obsolete) observer.callback([]);
+    assert.equal(h.pendingFrames(), 0, "the outgoing generation cannot enqueue another follow callback");
+    assert.equal(obsolete.every((observer) => observer.targets.size === 0), true);
+    release(); await selecting; h.settleLayout();
+    assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : 0);
+  });
+  test("desktop transcript ownership survives A to B to A before B finishes fetching" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory(); h.advance(200);
+    h.root.scrollTop = 120; h.flushScroll();
+    const pendingSave = h.queuedPositionSave(), firstRow = h.root.children[0];
+    const release = h.deferHistory("target-session");
+    h.context.switchSession("target-session");
+    const obsoleteLoad = h.context.loadHistory();
+    h.context.switchSession("open-session");
+    await h.context.loadHistory(); h.settleLayout();
+    if (desktop) pendingSave();
+    assert.equal(h.root.children[0], firstRow, "the retained A transcript can acquire a new scroll generation");
+    assert.equal(h.root.scrollTop, 120);
+    assert.equal(h.stored.get("serve.scroll.target-session"), desktop ? undefined : JSON.stringify({ top: 120, atBottom: false }),
+      "desktop never saves A's mounted DOM under the unmounted B session");
+    release(); await obsoleteLoad; h.settleLayout();
+    assert.equal(h.context.historySession, "open-session");
+    assert.equal(h.root.children[0], firstRow, "B's superseded response cannot replace A");
+    assert.deepEqual(JSON.parse(h.stored.get("serve.scroll.open-session")), { top: 120, atBottom: false });
+  });
+  test("desktop transcript ownership carries lazy session adoption into following" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    h.context.switchSession(""); await h.context.loadHistory(); h.settleLayout();
+    assert.equal(h.context.adoptComposerSession("created-session", "", "https://serve.test"), true);
+    h.context.scrollToLatest(false); h.flushScroll();
+    const before = h.root.scrollTop;
+    h.growLayout(400); h.settleLayout();
+    assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : before,
+      "first-turn session creation keeps the same desktop following lifecycle");
+    h.context.rememberTranscriptPosition();
+    assert.equal(JSON.parse(h.stored.get("serve.scroll.created-session")).atBottom, desktop);
+  });
+  test("desktop transcript ownership ignores stale older-history pagination after returning to A" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory(); await openOtherTranscriptAtBottom(h, width);
+    // Supply the count of a partial server window so the real upward-scroll
+    // listener starts pagination rather than stopping at the loaded tail.
+    h.context.canonicalHistoryTotal = h.histories.get("target-session").length + 50;
+    const release = h.deferHistory("target-session"), loadOlderHistory = h.context.loadOlderHistory;
+    let paging;
+    h.context.loadOlderHistory = (...args) => {
+      const completion = loadOlderHistory(...args); paging ||= completion; return completion;
+    };
+    h.root.scrollTop = 0; h.flushScroll();
+    assert.ok(paging?.then, "scrolling up starts B's deferred older-history request");
+    assert.equal(h.root._histOlder, true);
+    await h.selectWhileHistoryPending("open-session"); h.settleLayout();
+    const bottom = h.root.scrollHeight - h.root.clientHeight;
+    assert.equal(h.root.scrollTop, bottom, "A reaches its bottom while B's pager is still pending");
+    assert.equal(h.root.querySelectorAll(".task-output").length, 2);
+    release(); await paging; h.settleLayout();
+    assert.equal(h.context.historySession, "open-session");
+    assert.equal(h.root.scrollTop, desktop ? bottom : 0,
+      "only desktop rejects B's stale compensation; mobile keeps its current compensation policy");
+    assert.equal(h.context.shouldFollowOutput(), desktop);
+    assert.equal(vm.runInContext("outputFollowSuspended", h.context), !desktop);
+    if (desktop) assert.equal(h.context.ownedTranscriptScroll(h.root).following, true);
+    assert.equal(h.root._histOlder, false);
+  });
+  test("desktop transcript ownership keeps current older-history pagination compensation" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory(); await openOtherTranscriptAtBottom(h, width);
+    h.root.scrollTop = 120; h.flushScroll();
+    const beforeTop = h.root.scrollTop, beforeHeight = h.root.scrollHeight;
+    h.context.canonicalHistoryTotal = h.histories.get("target-session").length + 50;
+    const release = h.deferHistory("target-session"), paging = h.context.loadOlderHistory();
+    assert.equal(h.root._histOlder, true);
+    h.histories.get("target-session").unshift(
+      { role: "user", content: "Older prompt" }, { role: "assistant", content: "Older answer" },
+    );
+    release(); await paging; h.settleLayout();
+    assert.ok(h.root.scrollHeight > beforeHeight, "older rows add height above the existing transcript");
+    const readingTop = beforeTop + h.root.scrollHeight - beforeHeight;
+    assert.equal(h.root.scrollTop, readingTop, "the current owner still compensates for prepended rows");
+    assert.equal(h.context.shouldFollowOutput(), false);
+    h.context.rememberTranscriptPosition();
+    assert.deepEqual(JSON.parse(h.stored.get("serve.scroll.target-session")), { top: readingTop, atBottom: false });
+    assert.equal(h.root._histOlder, false);
+  });
+  test("desktop transcript ownership rejects older-history pagination from an earlier B generation" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory(); await openOtherTranscriptAtBottom(h, width);
+    h.context.canonicalHistoryTotal = h.histories.get("target-session").length + 50;
+    const firstOwner = h.context.ownedTranscriptScroll(h.root);
+    const release = h.deferHistory("target-session"), loadOlderHistory = h.context.loadOlderHistory;
+    let paging;
+    h.context.loadOlderHistory = (...args) => {
+      const completion = loadOlderHistory(...args); paging ||= completion; return completion;
+    };
+    h.root.scrollTop = 0; h.flushScroll();
+    assert.ok(paging?.then);
+    await h.selectWhileHistoryPending("open-session"); h.settleLayout();
+    // The outstanding request is already waiting on its gate. Let a fresh B
+    // history request run while keeping the original pager promise deferred.
+    release.allowNewRequests();
+    await h.selectWhileHistoryPending("target-session"); h.settleLayout();
+    h.context.scrollToLatest(false); h.flushScroll();
+    const bottom = h.root.scrollHeight - h.root.clientHeight;
+    if (desktop) assert.notEqual(h.context.ownedTranscriptScroll(h.root).generation, firstOwner.generation);
+    release(); await paging; h.settleLayout();
+    assert.equal(h.root.scrollTop, desktop ? bottom : 0);
+    assert.equal(h.context.shouldFollowOutput(), desktop);
+  });
+}
+
+for (const width of [701, 1280]) for (const input of ["touch", "keyboard", "scrollbar"]) {
+  test("desktop transcript ownership respects " + input + " input before the landing frame at " + width + "px", async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    await h.selectHistory("target-session");
+    let expected = 0;
+    if (input === "touch") {
+      h.dispatch(h.root, "touchstart", { touches: [{ clientY: 100 }] });
+      h.dispatch(h.root, "touchmove", { touches: [{ clientY: 120 }] });
+    } else if (input === "keyboard") h.dispatch(h.root, "keydown", { key: "PageUp" });
+    else {
+      h.root.scrollTop = 100; h.flushScroll();
+      h.dispatch(h.root, "pointerdown");
+      h.root.scrollTop = expected = 60; h.flushScroll();
+    }
+    h.settleLayout();
+    assert.equal(h.root.scrollTop, expected, "reader input wins over the pending desktop landing");
+    assert.equal(h.resizeObservers().every((observer) => observer.targets.size === 0), true);
+  });
+}
+
+for (const width of [390, 700, 701, 1280]) {
+  for (const queued of [false, true]) test("session A to B to A preserves fold choices with " +
+    (queued ? "queued" : "settled") + " toggles at " + width + "px", async () => {
+    const h = sessionFoldHarness(width);
+    await h.context.loadHistory();
+    const original = h.folds();
+    assert.equal(original.length, 5, "history must render thinking, tool, raw task, subagent and control folds");
+    assert.deepEqual(original.map((details) => details.open), [false, false, false, false, false]);
+    for (const details of original) await h.activateSummary(details);
+    h.flushToggles();
+    for (const details of original.slice(0, -1)) await h.activateSummary(details);
+    assert.deepEqual(original.map((details) => details.open), [false, false, false, false, true],
+      "A is collapsed before the sidebar switch, with one explicitly expanded control");
+    if (!queued) h.flushToggles();
+    await h.selectHistory("target-session");
+    assert.deepEqual(h.folds().map((details) => details.open), [false, false, false, false, false],
+      "B must not inherit A's fold state even with identical message identities");
+    await h.activateSummary(h.folds()[0]);
+    await h.selectHistory("open-session");
+    const returned = h.folds();
+    assert.notEqual(returned[0], original[0], "returning to A must rebuild its canonical rows");
+    assert.deepEqual(returned.map((details) => details.dataset.foldKey), original.map((details) => details.dataset.foldKey));
+    const expected = queued && width <= 700 ? [true, true, true, true, true] : [false, false, false, false, true];
+    assert.deepEqual(returned.map((details) => details.open), expected,
+      "desktop must preserve the collapsed DOM state; mobile keeps its existing queued-toggle behavior");
+    assert.equal(returned.at(-1).open, true, "the explicitly expanded control must remain expanded");
+    h.flushToggles();
+    await h.selectHistory("target-session");
+    await h.selectHistory("open-session");
+    assert.deepEqual(h.folds().map((details) => details.open), expected,
+      "late toggle events from detached rows must not corrupt the next desktop restore");
+    assert.deepEqual(h.requests.filter((request) => request.path.endsWith("/history")).map((request) => request.path), [
+      "/sessions/open-session/history", "/sessions/target-session/history", "/sessions/open-session/history",
+      "/sessions/target-session/history", "/sessions/open-session/history",
+    ]);
+  });
+  test("session A to B to A preserves a queued explicit expansion on desktop at " + width + "px", async () => {
+    const h = sessionFoldHarness(width);
+    await h.context.loadHistory();
+    const control = h.folds().at(-1);
+    await h.activateSummary(control, 0);
+    assert.equal(control.open, true, "keyboard activation expands A's control before navigation");
+    await h.selectHistory("target-session");
+    await h.selectHistory("open-session");
+    assert.deepEqual(h.folds().map((details) => details.open), [false, false, false, false, width >= 701],
+      "desktop captures a pending expansion; mobile retains its prior restoration timing");
+  });
+}
+
+for (const width of [701, 1280]) test("session A to B to A rejects a detached toggle after a conflicting newer collapse at " + width + "px", async () => {
+  const h = sessionFoldHarness(width);
+  await h.context.loadHistory();
+  const obsolete = h.folds();
+  for (const details of obsolete) await h.activateSummary(details);
+  await h.selectHistory("target-session");
+  await h.selectHistory("open-session");
+  const current = h.folds();
+  assert.deepEqual(current.map((details) => details.open), [true, true, true, true, true]);
+  assert.notEqual(current[0], obsolete[0], "returning to A creates new fold owners");
+  for (const details of current) await h.activateSummary(details);
+  assert.deepEqual(current.map((details) => details.open), [false, false, false, false, false]);
+  await h.selectHistory("target-session");
+  const collapsedStorage = h.stored.get("serve.foldopen");
+  assert.equal(collapsedStorage, "[]", "navigation snapshots A's newer collapsed choices");
+  for (const details of obsolete) {
+    assert.equal(details.isConnected, false);
+    assert.equal(details.open, true, "the old queued event conflicts with the newer collapsed owner");
+    h.deliverToggle(details);
+  }
+  const afterObsoleteToggle = h.stored.get("serve.foldopen");
+  await h.selectHistory("open-session");
+  assert.deepEqual(h.folds().map((details) => details.open), [false, false, false, false, false],
+    "obsolete expanded events must not reopen any of A's newly collapsed folds");
+  assert.equal(afterObsoleteToggle, collapsedStorage, "obsolete fold events must not write storage");
+});
+
+for (const width of [390, 700, 701, 1280]) test("session A to B to A keeps connected expansion and collapse toggles persistent at " + width + "px", async () => {
+  const h = sessionFoldHarness(width);
+  await h.context.loadHistory();
+  const details = h.folds()[0], key = details.dataset.foldKey;
+  assert.equal(details.isConnected, true);
+  await h.activateSummary(details);
+  h.deliverToggle(details);
+  assert.equal(JSON.parse(h.stored.get("serve.foldopen")).includes(key), true,
+    "a connected expansion must persist before any navigation snapshot");
+  await h.activateSummary(details);
+  h.deliverToggle(details);
+  assert.equal(JSON.parse(h.stored.get("serve.foldopen")).includes(key), false,
+    "a connected collapse must persist before any navigation snapshot");
+  await h.selectHistory("target-session");
+  await h.selectHistory("open-session");
+  assert.equal(h.folds()[0].open, false);
+});
+
+for (const width of [390, 700]) test("session A to B to A preserves legacy detached toggle persistence on mobile at " + width + "px", async () => {
+  const h = sessionFoldHarness(width);
+  await h.context.loadHistory();
+  const old = h.folds()[0], key = old.dataset.foldKey;
+  await h.activateSummary(old);
+  await h.selectHistory("target-session");
+  assert.equal(old.isConnected, false);
+  h.deliverToggle(old);
+  assert.equal(JSON.parse(h.stored.get("serve.foldopen")).includes(key), true,
+    "mobile must retain its existing handling of detached toggles");
+  await h.selectHistory("open-session");
+  assert.equal(h.folds()[0].open, true);
+});
+
+test("desktop historical tool folds use canonical roles and preserve report surfaces", () => {
+  const selector = String.raw`.msg.asst[data-canonical-identity^='["tool",']:not(.git-output):not([data-subagents]):not(:has(> .task-output)):has(> details[data-fold-key*='\a ["tool",'])`;
+  assert.deepEqual(cssRule(desktopCss, selector), {
+    background: "transparent", "border-width": "0 0 0 2px", "border-radius": "6px", padding: "4px 12px",
+  });
+  assert.deepEqual(cssRule(baseCss, selector), {});
+  assert.deepEqual(cssRule(phoneCss, selector), {});
+
+  // Opaque session IDs and payload text must not supply the canonical role.
+  const h = harness({ sid: 'session\n["tool",prefix' });
+  loadChat(h);
+  vm.runInContext(between("function taskReportOf(", "function mergeTaskReport("), h.context);
+  vm.runInContext(between("const FOLD_ROLE_LABELS", "// Live rates are display-only"), h.context);
+  const messages = [
+    { role: "tool", content: 'output\n["internal_note",text' },
+    { role: "internal_note", content: 'note\n["tool",text' },
+  ];
+  const { rows } = h.context.historyRowsOf(messages, messages.length, true);
+  for (const row of rows) h.context.renderHistoryRow(row, h.elements.msgs);
+  const [tool, note] = h.elements.msgs.children;
+  assert.equal(tool.classList.contains("tool-activity"), false);
+  assert.equal(tool.dataset.canonicalIdentity, rows[0].identity);
+  assert.equal(note.dataset.canonicalIdentity, rows[1].identity);
+  for (const [index, card] of [tool, note].entries()) {
+    const key = card.querySelector("details").dataset.foldKey;
+    assert.equal(key, h.context.sessionId + "\n" + rows[index].identity);
+    assert.ok(key.includes('\n["tool",'), "the key substring alone cannot prove a tool role");
+  }
+  assert.ok(tool.dataset.canonicalIdentity.startsWith('["tool",'));
+  assert.equal(note.dataset.canonicalIdentity.startsWith('["tool",'), false);
+});
 
 test("desktop user rows own a nonshrinking layout box for stored and live inputs", () => {
   const h = harness();
@@ -889,13 +1848,39 @@ test("desktop side-note clicks queue the composer text without interrupting the 
   const click = h.dispatch(h.elements.sidenote, "click");
   assert.equal(h.elements.sidenote.disabled, true);
   await click.done;
-  assert.deepEqual(h.requests, [{ path: "/sessions/open-session/side-notes", method: "POST", body: { text: "steer left" } }]);
+  assert.deepEqual(h.requests, [
+    { path: "/sessions/open-session/side-notes", method: "POST", body: { text: "steer left" } },
+    // The queued note is read back so the waiting list reflects server state.
+    { path: "/sessions/open-session/side-notes", method: "GET", body: null },
+  ]);
   assert.equal(h.context.turns.has("open-session"), true);
   assert.equal(h.elements.send.textContent, "⏹");
   assert.equal(h.elements.prompt.value, "");
   assert.equal(h.elements.sidenote.disabled, false);
   assert.equal(h.drafts.has(h.context.draftKey("open-session")), false);
   assert.equal(h.notes.at(-1), "side note queued — applies at the next model request");
+});
+
+test("desktop side-note queue lists waiting notes and clears after drain", async () => {
+  const h = harness();
+  loadChat(h);
+  h.sideNotes.push({ from: "user", content: "steer left", ts: 1 });
+  h.sideNotes.push({ from: "lead", content: "check tests", ts: 2 });
+  await h.context.refreshSideNotes();
+  assert.equal(h.elements.sidequeue.hidden, false);
+  assert.equal(h.elements.sidequeuecount.textContent, "2 条 side note 等待发送");
+  const rows = h.elements.sidequeuelist.children;
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].children[0].textContent, "你");
+  assert.equal(rows[0].children[1].textContent, "steer left");
+  assert.equal(rows[1].children[0].textContent, "lead");
+  assert.equal(rows[1].children[1].textContent, "check tests");
+  // The turn child drained the queue: the next sample hides the panel instead
+  // of leaving stale "waiting" rows on screen.
+  h.sideNotes.length = 0;
+  await h.context.refreshSideNotes();
+  assert.equal(h.elements.sidequeue.hidden, true);
+  assert.equal(h.elements.sidequeuelist.children.length, 0);
 });
 
 test("phone user rows and side-note CSS retain their geometry and state rules", () => {
@@ -984,7 +1969,7 @@ test("short-thinking early repaint: real send paints and saves its first chunk's
   const legacyThought = "Legacy thinking with no timing sample.";
   await frame('event: thinking_start\ndata: \n\nevent: thinking\ndata: ' + JSON.stringify({ text: legacyThought }) + '\n\nevent: thinking_done\ndata: \n\n');
   h.advance(250);
-  assert.deepEqual(h.elements.msgs.querySelectorAll("summary").map((item) => item.textContent), [
+  assert.deepEqual(h.elements.msgs.querySelectorAll("summary").filter((item) => item.textContent.startsWith("thinking")).map((item) => item.textContent), [
     "thinking · ~31 tok @ 124 tok/s", "thinking · ~10 tok @ 40.0 tok/s",
   ], "a completed same-tick phase lost its 250ms rate");
   await frame('event: done\ndata: \n\n');

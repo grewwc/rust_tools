@@ -236,6 +236,16 @@ pub(in crate::ai) async fn parse_attached_images_via_subagent(
     vl_model: &str,
     image_files: &[String],
 ) -> Result<Option<OcrExtraction>, String> {
+    parse_attached_images_for_input(mcp_client, vl_model, image_files)
+}
+
+/// The image parser dispatches and waits synchronously. Live side-note delivery
+/// uses the same route without replacing the running turn's image attachments.
+pub(in crate::ai) fn parse_attached_images_for_input(
+    mcp_client: &SharedMcpClient,
+    vl_model: &str,
+    image_files: &[String],
+) -> Result<Option<OcrExtraction>, String> {
     if image_files.is_empty() {
         return Ok(None);
     }

@@ -87,7 +87,9 @@ test("the light palettes stay below paper white so the screen does not glare", (
     assert.ok(bg !== null && panel !== null, name + " palette has an unparsable surface colour");
     // Light enough to read as a light theme, dark enough not to be a lamp.
     assert.ok(bg >= 0.6 && bg <= 0.9, name + " background luminance " + bg.toFixed(3) + " is out of range");
-    assert.ok(panel <= 0.9, name + " panel luminance " + panel.toFixed(3) + " is too bright");
+    // The light panels were deliberately brightened so the grey no longer
+    // reads yellow; they still stop short of paper white (1.0).
+    assert.ok(panel <= 0.95, name + " panel luminance " + panel.toFixed(3) + " is too bright");
     // The card still reads as a raised surface.
     assert.ok(panel > bg, name + " panel is not lighter than its background");
   }
@@ -139,15 +141,36 @@ function tokenValues(block) {
     .map((match) => [match[1], match[2].trim()]));
 }
 
+function ruleValues(source, selector) {
+  const values = {};
+  for (const match of source.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    const selectors = match[1].replace(/\/\*[\s\S]*?\*\//g, "").trim().split(",").map((value) => value.trim());
+    if (!selectors.includes(selector)) continue;
+    for (const entry of match[2].split(";")) {
+      const colon = entry.indexOf(":");
+      if (colon >= 0) values[entry.slice(0, colon).trim()] = entry.slice(colon + 1).trim();
+    }
+  }
+  return values;
+}
+
+function brightnessColor(hex, factor) {
+  return "#" + hex.slice(1).match(/../g).map((channel) => Math.round(parseInt(channel, 16) * factor)
+    .toString(16).padStart(2, "0")).join("");
+}
+
 test("desktop palette overrides use neutral surfaces and keep the shared accent", () => {
   const expected = {
     "dark": {
       "--bg": "#1b1b1b",
+      "--card-edge": "rgba(231,231,231,.12)",
+      "--card-shadow": "0 2px 8px rgba(0,0,0,.12)",
       "--code-bg": "#1f1f1f",
       "--code-toolbar": "#292929",
-      "--dim": "#b5b5b5",
+      "--control-border": "#858585",
+      "--dim": "#c4c4c4",
       "--edge": "rgba(231,231,231,.20)",
-      "--fg": "#dcdcdc",
+      "--fg": "#e9e9e9",
       "--field": "#292929",
       "--glass": "rgba(36,36,36,.95)",
       "--glass-strong": "rgba(36,36,36,.98)",
@@ -164,19 +187,24 @@ test("desktop palette overrides use neutral surfaces and keep the shared accent"
       "--tint-4": "rgba(231,231,231,.11)"
     },
     "light": {
-      "--bg": "#e9e9e9",
+      "--bg": "#efefef",
       "--code-bg": "#e2e2e2",
       "--code-toolbar": "#ececec",
-      "--dim": "#575757",
+      "--control-border": "#737373",
+      "--card-edge": "rgba(46,46,46,.12)",
+      "--card-shadow": "0 2px 4px rgba(46,46,46,.03), 0 10px 28px rgba(46,46,46,.05)",
+      "--danger-text": "#9f3029",
+      "--dim": "#3e3e3e",
       "--edge": "rgba(46,46,46,.18)",
-      "--fg": "#2e2e2e",
-      "--field": "#ececec",
-      "--glass": "rgba(242,242,242,.95)",
-      "--glass-strong": "rgba(242,242,242,.98)",
-      "--line": "#d0d0d0",
-      "--line-2": "#b1b1b1",
+      "--fg": "#242424",
+      "--field": "#f3f3f3",
+      "--fw-meta": "450",
+      "--glass": "rgba(243,243,243,.95)",
+      "--glass-strong": "rgba(243,243,243,.98)",
+      "--line": "#9a9a9a",
+      "--line-2": "#858585",
       "--media-bg": "#dadada",
-      "--panel": "#f2f2f2",
+      "--panel": "#f3f3f3",
       "--shadow-panel": "0 8px 28px rgba(46,46,46,.10)",
       "--shadow-sm": "0 2px 8px rgba(46,46,46,.05)",
       "--surface": "#dfdfdf",
@@ -184,13 +212,16 @@ test("desktop palette overrides use neutral surfaces and keep the shared accent"
       "--surface-hover": "#d3d3d3",
       "--tint": "rgba(46,46,46,.06)",
       "--tint-2": "rgba(46,46,46,.04)",
-      "--tint-3": "rgba(46,46,46,.08)",
+      "--tint-3": "rgba(46,46,46,.14)",
       "--tint-4": "rgba(46,46,46,.13)"
     },
     "warm": {
       "--bg": "#e9e7e7",
+      "--card-edge": "rgba(48,46,46,.12)",
+      "--card-shadow": "0 2px 8px rgba(48,46,46,.06)",
       "--code-bg": "#e3e1e1",
       "--code-toolbar": "#edebeb",
+      "--control-border": "#737373",
       "--dim": "#585656",
       "--edge": "rgba(48,46,46,.18)",
       "--fg": "#302e2e",
@@ -225,11 +256,183 @@ test("desktop palette overrides use neutral surfaces and keep the shared accent"
   }
 });
 
+test("desktop light text and control boundaries retain contrast on a brighter neutral canvas", () => {
+  const desktop = desktopMediaQueries()[0].body;
+  const palette = { ...tokenValues(tokenBlock(PALETTES.light)), ...tokenValues(tokenBlock(PALETTES.light, desktop)) };
+  for (const token of ["--bg", "--panel", "--surface", "--surface-hover", "--surface-2", "--field", "--code-bg", "--code-toolbar", "--media-bg"]) {
+    assert.ok(contrast(palette["--dim"], palette[token]) >= 7, "muted text on " + token);
+    assert.ok(contrast(palette["--fg"], palette[token]) >= 7, "body text on " + token);
+  }
+  assert.equal(palette["--bg"], "#efefef");
+  assert.equal(palette["--panel"], "#f3f3f3");
+  assert.ok(relativeLuminance(palette["--bg"]) > relativeLuminance("#e9e9e9"));
+  assert.ok(relativeLuminance(palette["--panel"]) < 0.9, "reading surface stays below paper white");
+  assert.ok(contrast(palette["--line-2"], palette["--bg"]) >= 3, "folded tool boundary");
+  for (const token of ["--bg", "--panel", "--field", "--surface-hover"]) {
+    assert.ok(contrast(palette["--control-border"], palette[token]) >= 3, "control boundary on " + token);
+  }
+  const rgba = palette["--tint-3"].match(/^rgba\((\d+),(\d+),(\d+),([.\d]+)\)$/);
+  assert.ok(rgba);
+  const selected = "#" + palette["--panel"].slice(1).match(/../g).map((channel, index) =>
+    Math.round(parseInt(channel, 16) * (1 - Number(rgba[4])) + Number(rgba[index + 1]) * Number(rgba[4]))
+      .toString(16).padStart(2, "0")).join("");
+  assert.ok(contrast(selected, palette["--panel"]) >= 1.2, "selected row differs from its panel");
+  assert.ok(contrast(palette["--dim"], selected) >= 7, "selected row metadata remains readable");
+  assert.ok(contrast(palette["--acc"], palette["--field"]) >= 4.5, "side-note text and boundary");
+});
+
+test("desktop light chrome gains a small weight step and retains hover and focus cues", () => {
+  const desktop = desktopMediaQueries()[0].body;
+  const light = ':root[data-theme="light"] ';
+  assert.deepEqual(ruleValues(desktop, light + "body"), {
+    "font-weight": "450", "--radius-card": "16px", "--radius-control": "10px"
+  });
+  assert.equal(tokenValues(tokenBlock(PALETTES.light, desktop))["--fw-meta"], "450");
+  const shared = style.slice(0, style.indexOf("@media (min-width:701px)"));
+  for (const selector of ["#info", "#sessmeta", "#sessions li small", ".msg details", ".msg .prog"]) {
+    assert.equal(ruleValues(shared, selector)["font-weight"], "var(--fw-meta)", selector + " uses the light metadata weight override");
+  }
+  for (const selector of ["input::placeholder", "textarea::placeholder"]) {
+    assert.deepEqual(ruleValues(desktop, light + selector), { color: "var(--dim)", opacity: "1" });
+  }
+  for (const selector of ["#ovr select", "#omodelbtn", "#oagentbtn", "#oeffortbtn", "#oskill"]) {
+    assert.deepEqual(ruleValues(desktop, light + selector), {
+      "background-color": "var(--field)", "border-color": "var(--control-border)", "font-weight": "450"
+    });
+    const hover = selector + (selector === "#ovr select" ? ":hover" : ":hover:not(:disabled)");
+    assert.equal(ruleValues(desktop, light + hover)["background-color"], "var(--surface-hover)");
+    assert.equal(ruleValues(desktop, light + selector + ":focus-visible")["border-color"], "var(--acc-focus)");
+  }
+  assert.deepEqual(ruleValues(desktop, light + "#sidenote.show"), {
+    background: "var(--field)", "border-color": "var(--acc)", color: "var(--acc)"
+  });
+  for (const selector of [
+    '.msg.asst.tool-activity:not(.git-output):not(:has(> .task-output)):not([data-running="true"])',
+    '.msg.asst:has(> details[data-fold-key^="thinking:"])',
+    '.msg.asst:has(> details[data-fold-key$=":thinking"])'
+  ]) {
+    assert.deepEqual(ruleValues(desktop, light + selector), { "border-color": "var(--card-edge)", "box-shadow": "none" });
+  }
+});
+
+test("desktop dark prose gains a clearer bold step and a calmer bottom edge", () => {
+  const desktop = desktopMediaQueries()[0].body;
+  const dark = ':root:not([data-theme="light"]):not([data-theme="warm"]) ';
+  assert.deepEqual(
+    ruleValues(desktop, dark + "body"),
+    {},
+    "dark mode must not tune the rendering of non-bold text"
+  );
+  for (const selector of [".msg.md strong", ".msg.md b"]) {
+    assert.deepEqual(
+      ruleValues(desktop, dark + selector),
+      { "font-weight": "800", color: "#fff", "-webkit-text-stroke": ".35px currentColor" },
+      selector
+    );
+  }
+  assert.deepEqual(
+    ruleValues(desktop, dark + ".msg.md .h"),
+    { "font-weight": "800", color: "#fff", "-webkit-text-stroke": ".35px currentColor" },
+    "dark section labels need the same bold step"
+  );
+  assert.equal(ruleValues(desktop, "#composer")["padding"], "8px 24px 20px");
+  assert.equal(ruleValues(desktop, ':root[data-theme="light"] body')["font-weight"], "450");
+});
+
+test("desktop sidebar and cards share soft shapes across all three palettes", () => {
+  const desktop = desktopMediaQueries()[0].body;
+  for (const selector of Object.values(PALETTES)) {
+    const palette = { ...tokenValues(tokenBlock(selector)), ...tokenValues(tokenBlock(selector, desktop)) };
+    assert.match(palette["--card-edge"], /^rgba\([\d,]+,\.12\)$/);
+    assert.ok(palette["--card-shadow"] && palette["--card-shadow"] !== "none");
+  }
+  assert.equal(ruleValues(desktop, '.msg.asst:not(.git-output)')["border-color"], "var(--card-edge)");
+  assert.equal(ruleValues(desktop, '.msg.asst:not(.git-output)')["border-radius"], "var(--radius-card)");
+  assert.equal(ruleValues(desktop, '.msg.asst.tool-activity[data-running="true"]')["border-color"], "var(--acc-line)");
+  assert.equal(ruleValues(desktop, '#sessfilter')["border-radius"], "12px");
+  assert.equal(ruleValues(desktop, '#sessions li')["border-radius"], "12px");
+  assert.equal(ruleValues(desktop, '#sessions li.cur')["box-shadow"], "inset 3px 0 0 var(--acc)");
+  const actions = ruleValues(desktop, '#sessions .rowbtns');
+  assert.equal(actions.display, "flex");
+  assert.equal(actions.gap, "6px");
+  const button = ruleValues(desktop, '#sessions .rowbtns button');
+  assert.equal(button.flex, "1");
+  assert.equal(button["min-width"], "0");
+  assert.equal(button["min-height"], "34px");
+  assert.equal(button.background, "var(--field)");
+  assert.equal(button["border-radius"], "10px");
+  assert.equal(ruleValues(desktop, '#sessions .rowbtns button:hover:not(:disabled)').background, "var(--surface-hover)");
+  assert.equal(ruleValues(desktop, '#sessions .rowbtns button.danger').color, "var(--danger-text, var(--err))");
+  assert.equal(ruleValues(desktop, '#sessions button:focus-visible').outline, "2px solid var(--acc-focus)");
+  assert.equal(ruleValues(desktop, '#sessions span[role="button"]:focus-visible').outline, "2px solid var(--acc-focus)");
+  assert.equal(ruleValues(desktop, '#promptnav')["border-radius"], "12px");
+  assert.equal(ruleValues(desktop, '#skillhint').display, "none");
+});
+
+test("desktop light surfaces soften without losing activity and keyboard focus cues", () => {
+  const desktop = desktopMediaQueries()[0].body, light = ':root[data-theme="light"] ';
+  assert.deepEqual(ruleValues(desktop, light + '.msg.asst:not(.git-output)'), {
+    "border-color": "var(--card-edge)", "border-radius": "var(--radius-card)", "box-shadow": "var(--card-shadow)"
+  });
+  assert.deepEqual(ruleValues(desktop, light + '.msg.asst.tool-activity[data-running="true"]'), {
+    "border-color": "var(--acc-line)"
+  });
+  assert.deepEqual(ruleValues(desktop, light + '#sessions'), { "border-right-color": "var(--card-edge)" });
+  for (const selector of ["#promptnav", "#ovrwrap"]) {
+    assert.deepEqual(ruleValues(desktop, light + selector), { "border-top-color": "var(--card-edge)" });
+  }
+  assert.deepEqual(ruleValues(desktop, light + '#prompt'), {
+    background: "var(--field)", "border-radius": "12px", "box-shadow": "var(--shadow-sm)"
+  });
+  assert.deepEqual(ruleValues(desktop, light + '.execution-group > details > summary:focus-visible'), {
+    outline: "2px solid var(--acc-focus)", "outline-offset": "2px"
+  });
+  const palette = { ...tokenValues(tokenBlock(PALETTES.light)), ...tokenValues(tokenBlock(PALETTES.light, desktop)) };
+  const rgba = palette["--card-edge"].match(/^rgba\((\d+),(\d+),(\d+),([.\d]+)\)$/);
+  const edge = "#" + palette["--panel"].slice(1).match(/../g).map((channel, index) =>
+    Math.round(parseInt(channel, 16) * (1 - Number(rgba[4])) + Number(rgba[index + 1]) * Number(rgba[4]))
+      .toString(16).padStart(2, "0")).join("");
+  assert.ok(contrast(edge, palette["--panel"]) < contrast(palette["--line"], palette["--panel"]), "passive card edges recede");
+});
+
+test("desktop themes share a lightly inset content width and light top separators stay subtle", () => {
+  const blocks = desktopMediaQueries();
+  const desktop = blocks[0].body, narrow = blocks[1].body;
+  const light = ':root[data-theme="light"] ';
+  const palette = { ...tokenValues(tokenBlock(PALETTES.light)), ...tokenValues(tokenBlock(PALETTES.light, desktop)) };
+  for (const selector of ["header", "#sessbar"]) {
+    const rule = ruleValues(desktop, light + selector);
+    assert.deepEqual(rule, { "border-bottom-color": "#d8d8d8" });
+    assert.ok(contrast(rule["border-bottom-color"], palette["--panel"]) < contrast(palette["--line"], palette["--panel"]), "quiet top separator");
+  }
+  for (const selector of ["#msgwrap", "#ovrwrap", "#sidequeue", "#composer"]) {
+    for (const [theme, root] of Object.entries(PALETTES)) {
+      const expected = theme === "light" && selector === "#ovrwrap" ? { "border-top-color": "var(--card-edge)" } : {};
+      const scope = root.replace(/\s*\{$/, "");
+      assert.deepEqual(ruleValues(desktop, scope + " " + selector), expected, theme + " inherits the shared content width");
+    }
+    const outer = ruleValues(desktop, selector);
+    assert.equal(outer.width, "96%", selector + " retains a small percentage gutter inside the chat column");
+    assert.equal(outer["align-self"], "center", selector + " retains shared alignment");
+    assert.equal(outer["max-width"], "1280px", "all desktop themes share the wider capped content area");
+    assert.equal(ruleValues(narrow, selector).width, undefined, "narrow desktop must not replace the percentage width");
+    assert.equal(ruleValues(narrow, selector)["min-width"], undefined, "no fixed minimum can force horizontal overflow");
+  }
+  const shared = style.slice(0, style.indexOf("@media (min-width:701px)"));
+  assert.equal(ruleValues(shared, "*")["box-sizing"], "border-box");
+  assert.equal(ruleValues(shared, "#chat")["min-width"], "0");
+  for (const edge of ["top", "right", "bottom", "left"]) {
+    assert.equal(ruleValues(shared, "#msgs")[edge], "0", "transcript fills its wrapper on " + edge);
+  }
+  assert.equal(ruleValues(desktop, "#msgs").padding, "18px 24px 56px", "reading gutters stay unchanged");
+  assert.equal(ruleValues(narrow, "#ovrwrap")["grid-template-columns"], "repeat(3,minmax(0,1fr))", "narrow desktop keeps shrinkable picker columns");
+});
+
 test("desktop surfaces, text and shadows stay gray without yellow or teal drift", () => {
   const desktop = desktopMediaQueries()[0].body;
   const tokens = ["--bg", "--panel", "--surface", "--surface-hover", "--surface-2", "--field",
     "--code-toolbar", "--code-bg", "--media-bg", "--glass", "--glass-strong", "--tint", "--tint-2",
-    "--tint-3", "--tint-4", "--edge", "--line", "--line-2", "--fg", "--dim", "--shadow-sm", "--shadow-panel"];
+    "--tint-3", "--tint-4", "--edge", "--line", "--line-2", "--control-border", "--fg", "--dim", "--shadow-sm", "--shadow-panel"];
   for (const [name, selector] of Object.entries(PALETTES)) {
     const palette = { ...tokenValues(tokenBlock(selector)), ...tokenValues(tokenBlock(selector, desktop)) };
     for (const token of tokens) {
@@ -276,13 +479,143 @@ test("desktop text and selected rows stay readable on neutral surfaces", () => {
   }
 });
 
+test("desktop rewind confirmation text stays readable through hover and pressed filters", () => {
+  const desktop = desktopMediaQueries().map((block) => block.body).join("\n");
+  const shared = style.slice(0, style.indexOf("@media (min-width:701px)"));
+  const ok = ruleValues(desktop, ".rewind-confirm-ok");
+  assert.equal(ok.color, "var(--on-acc)");
+  assert.equal(ok.background, "var(--acc)");
+  assert.equal(ok["border-color"], "var(--acc)");
+  assert.deepEqual(ruleValues(desktop, ".rewind-confirm-ok:hover"), { filter: "brightness(.94)", color: "var(--fg)" });
+  assert.equal(ruleValues(shared, "button:hover:not(:disabled):not(.primary):not(.stop)")["background-color"], "var(--surface-hover)");
+  assert.equal(ruleValues(shared, "button:active:not(:disabled)").filter, "brightness(.96)");
+  for (const [name, selector] of Object.entries(PALETTES)) {
+    const palette = { ...tokenValues(tokenBlock(selector)), ...tokenValues(tokenBlock(selector, desktop)) };
+    for (const factor of [1, .96]) {
+      assert.ok(contrast(brightnessColor(palette["--on-acc"], factor), brightnessColor(palette["--acc"], factor)) >= 4.5,
+        name + " rewind confirmation contrast at brightness " + factor);
+    }
+    for (const factor of [.94, .96]) {
+      assert.ok(contrast(brightnessColor(palette["--fg"], factor), brightnessColor(palette["--surface-hover"], factor)) >= 4.5,
+        name + " rewind confirmation hover contrast at brightness " + factor);
+    }
+  }
+});
+
+test("desktop rewind confirmation retains accent text without hover capability", () => {
+  function withoutHoverCapability(source) {
+    const ranges = [];
+    for (const match of source.matchAll(/@media \(hover:hover\)\s*\{/g)) {
+      let end = match.index + match[0].length, depth = 1;
+      while (end < source.length && depth) {
+        if (source[end] === "{") depth++;
+        if (source[end] === "}") depth--;
+        end++;
+      }
+      assert.equal(depth, 0, "unclosed hover capability media query");
+      ranges.push([match.index, end]);
+    }
+    for (const [start, end] of ranges.reverse()) source = source.slice(0, start) + source.slice(end);
+    return source;
+  }
+  const desktop = withoutHoverCapability(desktopMediaQueries().map((block) => block.body).join("\n"));
+  const shared = withoutHoverCapability(style.slice(0, style.indexOf("@media (min-width:701px)")));
+  const idle = ruleValues(desktop, ".rewind-confirm-ok"), hover = ruleValues(desktop, ".rewind-confirm-ok:hover");
+  assert.deepEqual(hover, { filter: "brightness(.94)" });
+  const effective = { ...idle, ...hover };
+  assert.equal(effective.color, "var(--on-acc)");
+  assert.equal(effective.background, "var(--acc)");
+  assert.equal(ruleValues(shared, "button:hover:not(:disabled):not(.primary):not(.stop)")["background-color"], undefined);
+  for (const [name, selector] of Object.entries(PALETTES)) {
+    const palette = { ...tokenValues(tokenBlock(selector)), ...tokenValues(tokenBlock(selector, desktop)) };
+    for (const factor of [.94, .96]) {
+      assert.ok(contrast(brightnessColor(palette["--on-acc"], factor), brightnessColor(palette["--acc"], factor)) >= 4.5,
+        name + " rewind confirmation without hover capability at brightness " + factor);
+    }
+  }
+});
+
+test("desktop danger text is light-only and readable on idle, hover and pressed fills", () => {
+  const desktop = desktopMediaQueries()[0].body;
+  const palette = { ...tokenValues(tokenBlock(PALETTES.light)), ...tokenValues(tokenBlock(PALETTES.light, desktop)) };
+  for (const selector of ["#sessionactiondelete", "#sessdelconfirm", "#del", '#teamtrigger[data-state="error"] #teamstatus']) {
+    assert.deepEqual(ruleValues(desktop, ':root[data-theme="light"] ' + selector), { color: "var(--danger-text)" });
+  }
+  assert.equal(palette["--err"], "#b53e36");
+  assert.equal(ruleValues(style, "#sessdelconfirm")["border-color"], "var(--err)");
+  for (const name of ["dark", "warm"]) assert.equal(tokenValue(tokenBlock(PALETTES[name], desktop), "--danger-text"), null);
+  for (const token of ["--panel", "--surface", "--surface-hover", "--surface-2"]) {
+    for (const factor of [1, .96]) {
+      assert.ok(contrast(brightnessColor(palette["--danger-text"], factor), brightnessColor(palette[token], factor)) >= 4.5,
+        "light danger text contrast on " + token + " at brightness " + factor);
+    }
+  }
+});
+
+test("desktop default control borders meet 3:1 and preserve selected accents and focus outlines", () => {
+  const desktop = desktopMediaQueries()[0].body;
+  const shared = style.slice(0, style.indexOf("@media (min-width:701px)"));
+  for (const selector of ["#prompt", "#sessfilter", ".modelrowcheck"]) {
+    assert.equal(ruleValues(desktop, selector)["border-color"], "var(--control-border)");
+    assert.equal(ruleValues(desktop, selector).outline, undefined);
+  }
+  assert.equal(ruleValues(shared, "input").border, "1px solid var(--line)");
+  assert.equal(ruleValues(shared, ".modelrowcheck").border, "1.5px solid var(--line-2)");
+  for (const selector of ['.modelrow[aria-selected="true"] .modelrowcheck', '.teamchoice[aria-checked="true"] .modelrowcheck']) {
+    assert.deepEqual(ruleValues(shared, selector), { background: "var(--acc)", "border-color": "var(--acc)" });
+    assert.deepEqual(ruleValues(desktop, selector), {});
+  }
+  for (const selector of ["input:focus-visible", "textarea:focus-visible", "#modelpicklist .modelrow:focus-visible"]) {
+    assert.equal(ruleValues(shared, selector).outline, "2px solid var(--acc-focus)");
+  }
+  for (const [name, selector] of Object.entries(PALETTES)) {
+    const palette = { ...tokenValues(tokenBlock(selector)), ...tokenValues(tokenBlock(selector, desktop)) };
+    for (const token of ["--bg", "--panel", "--field", "--surface", "--surface-hover", "--surface-2"]) {
+      for (const factor of [1, .96]) {
+        assert.ok(contrast(brightnessColor(palette["--control-border"], factor), brightnessColor(palette[token], factor)) >= 3,
+          name + " control border contrast on " + token + " at brightness " + factor);
+      }
+    }
+  }
+});
+
+test("desktop rewind opacity and light metadata retain readable foregrounds", () => {
+  const desktop = desktopMediaQueries()[0].body;
+  const shared = style.slice(0, style.indexOf("@media (min-width:701px)"));
+  assert.deepEqual(ruleValues(desktop, ".rewind-action"), { opacity: "1" });
+  assert.equal(ruleValues(shared, ".rewind-action").opacity, ".62");
+  for (const [name, selector] of Object.entries(PALETTES)) {
+    const palette = { ...tokenValues(tokenBlock(selector)), ...tokenValues(tokenBlock(selector, desktop)) };
+    const rgba = palette["--glass"].match(/^rgba\((\d+),(\d+),(\d+),([.\d]+)\)$/);
+    const base = palette["--bg"].slice(1).match(/../g).map((channel) => parseInt(channel, 16));
+    const alpha = Number(rgba[4]);
+    const background = "#" + base.map((channel, index) => Math.round(channel * (1 - alpha) + Number(rgba[index + 1]) * alpha)
+      .toString(16).padStart(2, "0")).join("");
+    assert.ok(contrast(palette["--dim"], background) >= 4.5, name + " opaque rewind action contrast");
+    if (name === "light") {
+      assert.equal(palette["--dim"], "#3e3e3e");
+      for (const token of ["--panel", "--surface-hover"]) {
+        assert.ok(contrast(palette["--dim"], palette[token]) > contrast("#575757", palette[token]), "light metadata contrast on " + token);
+      }
+    }
+  }
+});
+
+test("desktop contrast rules preserve the current shared and mobile CSS bytes", () => {
+  const phoneApplicable = desktopMediaQueries().reduce((source, block) => source.replace(block.css, ""), style);
+  assert.doesNotMatch(phoneApplicable, /--(?:control-border|danger-text)/);
+  assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
+    "50a36b9e0849691262f11bdbafd58ced31781295a173996b65cff3f1f5bd3f48",
+    "desktop contrast changed shared or mobile CSS");
+});
+
 test("desktop overrides leave all phone-applicable CSS byte-identical", () => {
   const desktop = desktopMediaQueries();
-  assert.equal(desktop.length, 2, "expected the desktop and narrow desktop media queries");
+  assert.equal(desktop.length, 3, "expected the desktop layout, narrow desktop layout, and width tuning media queries");
   let phoneApplicable = style;
   for (const block of desktop) phoneApplicable = phoneApplicable.replace(block.css, "");
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "ac44e1349f15f6dc514b580c84878518d9aa9c588dd3c4a14862b10bcfae2535",
+    "50a36b9e0849691262f11bdbafd58ced31781295a173996b65cff3f1f5bd3f48",
     "shared or phone CSS changed outside the desktop queries");
 });
 

@@ -233,6 +233,7 @@ mod tests {
     #[test]
     fn only_checkpoint_commands_are_accepted() {
         assert!(validate_checkpoint_command("/git tree").is_ok());
+        assert!(validate_checkpoint_command("/git status").is_ok());
         assert!(validate_checkpoint_command(":git list").is_ok());
         assert!(validate_checkpoint_command("/cp tree").is_err());
         assert!(validate_checkpoint_command("/history").is_err());

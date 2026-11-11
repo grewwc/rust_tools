@@ -159,7 +159,7 @@ fn session_origin_fact(
     (!replayed).then_some(fact)
 }
 
-fn assemble_effective_question(
+pub(in crate::ai::driver) fn assemble_effective_question(
     question: &str,
     attachments_text: &str,
     image_ocr: Option<(&str, &str)>,

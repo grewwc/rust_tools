@@ -135,7 +135,7 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
     turns: new Map(), MAX_LIVE_TURNS: 4, historySession: sid, canonicalHistoryTotal: 0,
     pendingUserInputs: new Map(), questionCache: null, runEpoch: 0, turnRunning: false,
     turnRunningAt: 0, RUNNING_SAMPLE_TTL_MS: 60000,
-    eventActive: false, eventSession: "", eventStreamEnded: false, staleSession: "", staleDone: false,
+    eventActive: false, eventSession: "", eventStreamEnded: false, eventStreamFailed: false, staleSession: "", staleDone: false,
     confirmPollSeq: 0, lastHistoryEndsUnanswered: false, LIVE_STALL_MS: 60000,
     validateSkillInput: () => true,
     captureSkillPick: () => ({ skills }), consumeSkillPick: (pick) => consumed.push(pick),
@@ -144,7 +144,7 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
     addMsgMd: (_, parent) => parent.appendChild(node()),
     createLiveActivity: () => ({ label: () => "Connecting", setPhase() {}, finish() {} }),
     setPromptValue: (value) => { elements.prompt.value = value; }, clearDraft() {},
-    syncStopButton() {}, scrollToLatest() {}, stopStaleFollow() {},
+    syncStopButton() {}, scrollToLatest() {}, stopStaleFollow() {}, abortEvents() {},
     shouldFollowOutput: () => false, followOutput() {}, decorateAndLoad() {},
     formatElapsed: () => "0s", replyPaintDelay: () => 0, renderMarkdown: (s) => s,
     parseBlock: () => ({ kind: "done", payload: "" }),
@@ -181,6 +181,7 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
   vm.runInContext(existingFunction("async function persistPicks()", "// A changed pick belongs"), context);
   vm.runInContext(marked("session switch"), context);
   vm.runInContext(marked("composer cd command"), context);
+  vm.runInContext(marked("composer git command"), context);
   vm.runInContext(marked("turn session preparation"), context);
   vm.runInContext(existingFunction("function isTurnRunning()", "// The one send/stop button"), context);
   vm.runInContext(existingFunction("const RATE_STORAGE =", "function addFold("), context);

@@ -96,6 +96,8 @@ function makeContext(extra) {
     $: (id) => (id === "prompt" ? prompt : null),
     draftKey: (id) => "draft:" + id,
     composerDrafts: new Map(),
+    composerImageDrafts: new Map(),
+    pendingImages: [],
     isPhoneLayout: () => false,
   }, extra || {}));
   context.frames = [];
@@ -138,15 +140,68 @@ test("a draft restore does not overwrite the text being typed", () => {
   const context = makeContext();
   vm.runInContext(restoreSrc, context);
   context.localStorage.store.set("draft:old", "stored draft");
+  const currentImage = { filename: "current.png", data_base64: "Y3VycmVudA==" };
+  const restoredImage = { filename: "old.png", data_base64: "b2xk" };
+  context.pendingImages.push(currentImage);
+  context.composerImageDrafts.set("draft:old", [restoredImage]);
   context.prompt.value = "正在输入";
   run(context, "promptComposing = true;");
   run(context, "restoreDraft('old');");
   assert.equal(context.prompt.value, "正在输入", "the restore replaced the text being typed");
+  assert.equal(context.pendingImages[0], currentImage, "the blocked restore replaced the current attachment");
   // With the composer free the draft is restored as before.
   run(context, "promptComposing = false;");
   run(context, "restoreDraft('old');");
   assert.equal(context.prompt.value, "stored draft");
+  assert.equal(context.pendingImages[0], restoredImage);
 });
+
+for (const phone of [false, true]) {
+  test((phone ? "phone" : "desktop") + " image drafts isolate sessions and delayed file reads", async () => {
+    const readers = [];
+    const context = makeContext({
+      DRAFT_PREFIX: "draft:", sessionId: "old", pendingAppend: "",
+      isPhoneLayout: () => phone,
+      note: (text) => assert.fail(text),
+      FileReader: class {
+        readAsDataURL() { readers.push(this); }
+      },
+    });
+    run(context, script.slice(script.indexOf("const composerDrafts = new Map();"), script.indexOf("function closeQuestionPanel(")));
+    run(context, script.slice(script.indexOf("async function queueImageFiles("), script.indexOf("// Entry point for the Android share target.")));
+    const oldImage = { filename: "old.png", data_base64: "b2xk" };
+    const newImage = { filename: "new.png", data_base64: "bmV3" };
+    context.prompt.value = "old draft";
+    context.pendingImages.push(oldImage);
+    run(context, "persistDraft(); sessionId = 'new'; restoreDraft();");
+    assert.equal(context.prompt.value, "");
+    assert.equal(context.pendingImages.length, 0);
+    context.prompt.value = "new draft";
+    context.pendingImages.push(newImage);
+    run(context, "persistDraft(); sessionId = 'old'; restoreDraft();");
+    assert.equal(context.prompt.value, "old draft");
+    assert.equal(context.pendingImages[0], oldImage);
+
+    const upload = run(context, "queueImageFiles([{name: 'late.png', type: 'image/png'}]);");
+    assert.equal(readers.length, 1);
+    run(context, "persistDraft(); sessionId = 'new'; restoreDraft();");
+    readers[0].result = "data:image/png;base64,bGF0ZQ==";
+    readers[0].onload();
+    await upload;
+    assert.equal(context.prompt.value, "new draft");
+    assert.deepEqual(Array.from(context.pendingImages), [newImage]);
+    run(context, "persistDraft(); sessionId = 'old'; restoreDraft();");
+    assert.equal(context.prompt.value, "old draft\n[[image:late.png]]");
+    assert.equal(context.pendingImages[0], oldImage);
+    assert.equal(context.pendingImages[1].filename, "late.png");
+    assert.equal(context.pendingImages[1].data_base64, "bGF0ZQ==");
+    run(context, "pendingImages = []; clearDraft('old'); sessionId = 'new'; restoreDraft();");
+    assert.deepEqual(Array.from(context.pendingImages), [newImage]);
+    run(context, "sessionId = 'old'; restoreDraft();");
+    assert.equal(context.prompt.value, "");
+    assert.equal(context.pendingImages.length, 0);
+  });
+}
 
 test("an automatic session switch does not replace the composer's text", async () => {
   const switched = [];

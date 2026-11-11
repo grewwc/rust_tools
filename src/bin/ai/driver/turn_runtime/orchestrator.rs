@@ -2286,18 +2286,34 @@ mod audit_orchestration_tests {
 /// it and detaches the terminal client itself, so only plain guidance is injected.
 fn drain_side_notes_and_inject(
     app: &crate::ai::types::App,
+    model: &str,
+    parse_images: impl FnMut(
+        &[String],
+    ) -> Result<Option<crate::ai::driver::model::OcrExtraction>, String>,
     messages: &mut Vec<crate::ai::history::Message>,
     turn_messages: &mut Vec<crate::ai::history::Message>,
     persisted_turn_messages: &mut usize,
 ) -> Result<(), String> {
     let target = crate::ai::driver::side_note::current_target_id();
-    let n = crate::ai::driver::side_note::consume_side_notes(
+    let Some(batch) = crate::ai::driver::side_note::read_pending_side_notes(
         &app.session_history_file,
         target.as_deref(),
-        |notes| {
-            let injected = crate::ai::driver::side_note::side_notes_to_messages(notes.to_vec());
+    )?
+    else {
+        return Ok(());
+    };
+    let assets_dir =
+        crate::ai::driver::side_note::assets_dir_for_history(&app.session_history_file);
+    let (canonical, injected) = crate::ai::driver::side_note::prepare_side_note_messages(
+        batch.notes().to_vec(),
+        model,
+        &assets_dir,
+        parse_images,
+    )?;
+    let n =
+        crate::ai::driver::side_note::commit_side_note_snapshot(&batch, target.as_deref(), |_| {
             let previous_len = turn_messages.len();
-            turn_messages.extend(injected.iter().cloned());
+            turn_messages.extend(canonical);
             // Even an ephemeral turn must commit queued input before clearing it.
             // The usual lifecycle cleanup still owns ephemeral-session removal.
             if !persist_pending_turn_messages(app, false, turn_messages, persisted_turn_messages) {
@@ -2306,8 +2322,7 @@ fn drain_side_notes_and_inject(
             }
             messages.extend(injected);
             Ok(())
-        },
-    )?;
+        })?;
     if n > 0 {
         crate::ai::driver::print::print_tool_note_line(
             "side-note",
@@ -2685,6 +2700,14 @@ async fn run_turn_body_round(
         // directly — so every drained note is plain guidance.
         if let Err(error) = drain_side_notes_and_inject(
             app,
+            &next_model,
+            |images| {
+                crate::ai::driver::model::parse_attached_images_for_input(
+                    mcp_client,
+                    &app.config.vl_default_model,
+                    images,
+                )
+            },
             &mut messages,
             &mut turn_messages,
             &mut persisted_turn_messages,

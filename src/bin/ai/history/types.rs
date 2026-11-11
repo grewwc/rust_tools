@@ -137,10 +137,18 @@ pub(in crate::ai) fn is_runtime_synthetic_user_message(message: &Message) -> boo
 
 /// Recognizes side-notes by their runtime origin and envelope. Compression gives
 /// them the same retention protection as user input while preserving their
-/// author identity and existing turn boundaries.
+/// author identity and existing turn boundaries. Image-bearing notes carry the
+/// envelope in a text part, not in an attachment's reference metadata.
 pub(in crate::ai) fn is_side_note_message(message: &Message) -> bool {
+    let text = message.content.as_str().or_else(|| {
+        message.content.as_array()?.iter().find_map(|part| {
+            (part.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| part.get("text").and_then(Value::as_str))
+                .flatten()
+        })
+    });
     is_runtime_synthetic_user_message(message)
-        && message.content.as_str().is_some_and(|text| {
+        && text.is_some_and(|text| {
             text.strip_prefix("[side-note from=")
                 .and_then(|rest| rest.split_once("] Live guidance (side-note) from "))
                 .is_some_and(|(metadata, _)| {

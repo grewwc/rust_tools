@@ -633,7 +633,11 @@ async fn session_events_stream_allows_a_read_only_follower() {
         }),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::OK, "a follower must be able to tail the log");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a follower must be able to tail the log"
+    );
     let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert!(text.contains("event: thinking"), "{text}");
@@ -1027,6 +1031,7 @@ async fn side_note_queues_without_prior_history() {
         Path("fresh".to_string()),
         Json(super::SideNoteReq {
             text: "  steer left  ".to_string(),
+            images: Vec::new(),
         }),
     )
     .await
@@ -1047,6 +1052,64 @@ async fn side_note_queues_without_prior_history() {
 }
 
 #[tokio::test]
+async fn side_note_list_reports_pending_queue() {
+    use axum::{
+        Json,
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+    };
+    let state = lifecycle_test_state();
+    for text in ["first note", "second note"] {
+        let resp = super::post_side_note(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("fresh".to_string()),
+            Json(super::SideNoteReq {
+                text: text.to_string(),
+                images: Vec::new(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    let resp = super::get_side_notes(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path("fresh".to_string()),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    let notes = v["notes"].as_array().expect("notes array");
+    assert_eq!(notes.len(), 2);
+    assert_eq!(notes[0]["from"], "user");
+    assert_eq!(notes[0]["content"], "first note");
+    assert_eq!(notes[1]["content"], "second note");
+    // The read endpoint is a queue snapshot, not a consumer: draining is what
+    // clears it for the next model request.
+    let store = super::SessionStore::new(state.history_file.as_path());
+    let drained = super::super::driver::side_note::drain_side_notes(
+        &store.session_history_file("fresh"),
+        None,
+    );
+    assert_eq!(drained.len(), 2);
+    let resp = super::get_side_notes(State(state), HeaderMap::new(), Path("fresh".to_string()))
+        .await
+        .into_response();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(v["notes"].as_array().expect("notes array").len(), 0);
+}
+
+#[tokio::test]
 async fn side_note_rejects_empty_text_and_bad_id() {
     use axum::{
         Json,
@@ -1061,6 +1124,7 @@ async fn side_note_rejects_empty_text_and_bad_id() {
         Path("fresh".to_string()),
         Json(super::SideNoteReq {
             text: "   ".to_string(),
+            images: Vec::new(),
         }),
     )
     .await
@@ -1072,11 +1136,243 @@ async fn side_note_rejects_empty_text_and_bad_id() {
         Path("../evil".to_string()),
         Json(super::SideNoteReq {
             text: "x".to_string(),
+            images: Vec::new(),
         }),
     )
     .await
     .into_response();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn side_note_images_are_isolated_and_accept_images_only() {
+    use axum::{
+        Json,
+        extract::{Path, State},
+        http::HeaderMap,
+        response::IntoResponse,
+    };
+    use base64::Engine as _;
+    let state = lifecycle_test_state();
+    let store = SessionStore::new(state.history_file.as_path());
+    let assets = store.session_assets_dir("fresh");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("shot.png"), b"running turn image").unwrap();
+    for (text, bytes) in [
+        ("", b"first".as_slice()),
+        ("look [[image:shot.png]]", b"second".as_slice()),
+    ] {
+        let req = serde_json::from_value(serde_json::json!({
+            "text": text,
+            "images": [{"filename": "shot.png", "data_base64": base64::engine::general_purpose::STANDARD.encode(bytes)}]
+        })).unwrap();
+        let resp = super::post_side_note(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("fresh".to_string()),
+            Json(req),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+    let notes =
+        crate::ai::driver::side_note::drain_side_notes(&store.session_history_file("fresh"), None);
+    assert_eq!(notes.len(), 2);
+    let paths: Vec<_> = notes
+        .iter()
+        .map(|note| {
+            let start = note.content.find("[[image:").unwrap() + "[[image:".len();
+            let end = note.content[start..].find("]]").unwrap() + start;
+            assert_eq!(note.content.matches("[[image:").count(), 1);
+            std::path::PathBuf::from(&note.content[start..end])
+        })
+        .collect();
+    assert_ne!(paths[0], paths[1]);
+    assert!(
+        paths
+            .iter()
+            .all(|path| path.starts_with(assets.join("attachments")))
+    );
+    assert_eq!(std::fs::read(&paths[0]).unwrap(), b"first");
+    assert_eq!(std::fs::read(&paths[1]).unwrap(), b"second");
+    assert_eq!(
+        std::fs::read(assets.join("shot.png")).unwrap(),
+        b"running turn image"
+    );
+}
+
+fn side_note_image_paths(content: &str) -> Vec<std::path::PathBuf> {
+    content
+        .split("[[image:")
+        .skip(1)
+        .map(|marker| {
+            let (path, _) = marker.split_once("]]").expect("closed image marker");
+            std::path::PathBuf::from(path)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn side_note_images_with_equal_names_keep_each_upload_in_order() {
+    use axum::{
+        Json,
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+    };
+    for text in [
+        "look [[image:shot.png]] then [[image:shot.png]]",
+        "look [[image:shot.png]]",
+        "",
+    ] {
+        let state = lifecycle_test_state();
+        let resp = super::post_side_note(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("fresh".to_string()),
+            Json(super::SideNoteReq {
+                text: text.to_string(),
+                images: vec![upload("shot.png", b"first"), upload("shot.png", b"second")],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let store = SessionStore::new(state.history_file.as_path());
+        let notes = crate::ai::driver::side_note::drain_side_notes(
+            &store.session_history_file("fresh"),
+            None,
+        );
+        assert_eq!(notes.len(), 1);
+        let paths = side_note_image_paths(&notes[0].content);
+        assert_eq!(paths.len(), 2, "each upload must bind exactly one marker");
+        assert_ne!(paths[0], paths[1]);
+        assert_eq!(paths[0].parent(), paths[1].parent());
+        assert!(paths.iter().all(|path| {
+            path.starts_with(store.session_assets_dir("fresh").join("attachments"))
+                && path.extension().and_then(|ext| ext.to_str()) == Some("png")
+        }));
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"first");
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), b"second");
+        assert!(!notes[0].content.contains("[[image:shot.png]]"));
+    }
+}
+
+#[tokio::test]
+async fn side_note_images_bind_trimmed_names_to_written_paths() {
+    use axum::{
+        Json,
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+    };
+    for text in ["look [[image: shot.PNG \t]]", "look [[image:shot.PNG]]", ""] {
+        let state = lifecycle_test_state();
+        let resp = super::post_side_note(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("fresh".to_string()),
+            Json(super::SideNoteReq {
+                text: text.to_string(),
+                images: vec![upload(" shot.PNG \t", b"pixels")],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let store = SessionStore::new(state.history_file.as_path());
+        let notes = crate::ai::driver::side_note::drain_side_notes(
+            &store.session_history_file("fresh"),
+            None,
+        );
+        assert_eq!(notes.len(), 1);
+        let paths = side_note_image_paths(&notes[0].content);
+        assert_eq!(paths.len(), 1, "a supplied marker must not be left unbound");
+        assert!(paths[0].starts_with(store.session_assets_dir("fresh").join("attachments")));
+        assert_eq!(
+            paths[0].extension().and_then(|ext| ext.to_str()),
+            Some("PNG")
+        );
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"pixels");
+    }
+}
+
+#[tokio::test]
+async fn side_note_invalid_images_validate_the_whole_batch_before_staging() {
+    use axum::{
+        Json,
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+    };
+    for images in [
+        vec![upload("good.png", b"good"), upload("../bad.png", b"bad")],
+        vec![
+            upload("good.png", b"good"),
+            ServeImageUpload {
+                filename: "bad.png".to_string(),
+                data_base64: "!!!".to_string(),
+            },
+        ],
+        (0..MAX_TURN_IMAGES + 1)
+            .map(|_| upload("shot.png", b"pixels"))
+            .collect(),
+    ] {
+        let state = lifecycle_test_state();
+        let resp = super::post_side_note(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("fresh".to_string()),
+            Json(super::SideNoteReq {
+                text: "keep draft".to_string(),
+                images,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let store = SessionStore::new(state.history_file.as_path());
+        assert!(!store.session_assets_dir("fresh").exists());
+        assert!(
+            crate::ai::driver::side_note::drain_side_notes(
+                &store.session_history_file("fresh"),
+                None,
+            )
+            .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn side_note_invalid_images_do_not_queue_or_replace_existing_files() {
+    use axum::{
+        Json,
+        extract::{Path, State},
+        http::HeaderMap,
+        response::IntoResponse,
+    };
+    let state = lifecycle_test_state();
+    let req = serde_json::from_value(serde_json::json!({
+        "text": "keep draft",
+        "images": [{"filename": "../shot.png", "data_base64": "c2hvdA=="}]
+    }))
+    .unwrap();
+    let resp = super::post_side_note(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path("fresh".to_string()),
+        Json(req),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    let store = SessionStore::new(state.history_file.as_path());
+    assert!(!store.session_assets_dir("fresh").exists());
+    assert!(
+        crate::ai::driver::side_note::drain_side_notes(&store.session_history_file("fresh"), None)
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -3495,11 +3791,12 @@ async fn interrupt_dismisses_the_pending_question_and_unblocks_the_child() {
     // removed before the interrupt below: this stand-in must not be
     // signalled, and the stop path is what the test is about, not the
     // signal.
+    let active_pid = std::process::id();
     state
         .active_turns
         .lock()
         .expect("active turns")
-        .insert("sid".to_string(), std::process::id());
+        .insert("sid".to_string(), active_pid);
     let busy = super::get_confirm(
         State(state.clone()),
         HeaderMap::new(),
@@ -3512,6 +3809,7 @@ async fn interrupt_dismisses_the_pending_question_and_unblocks_the_child() {
         .expect("body");
     let view: serde_json::Value = serde_json::from_slice(&body).expect("json");
     assert_eq!(view["running"], true);
+    assert_eq!(view["turn"].as_u64(), Some(u64::from(active_pid)));
     assert_eq!(view["pending"]["id"], 1);
     state
         .active_turns
@@ -3545,6 +3843,7 @@ async fn interrupt_dismisses_the_pending_question_and_unblocks_the_child() {
     let view: serde_json::Value = serde_json::from_slice(&body).expect("json");
     assert_eq!(view["pending"], serde_json::Value::Null);
     assert_eq!(view["running"], false);
+    assert_eq!(view["turn"], 0);
     // The dismissed question can no longer be answered: the dialog a
     // client rebuilds from a stale view is refused, not silently accepted.
     let late = super::post_confirm(
