@@ -4520,7 +4520,8 @@ function teamPickState(sid = sessionId, base = store.base) {
   const key = teamPickKey(sid, base);
   if (!teamPicks.has(key)) teamPicks.set(key, {
     choice: { mode: "normal", backend: "traecli", model: "" }, confirmed: null,
-    pending: false, saving: null, error: "", revision: 0,
+    pending: false, saving: null, error: "", errorSource: "", revision: 0,
+    configRetryTimer: null, configRetries: 0,
     loadEpoch: 0, fullLoadEpoch: 0, appliedTeamLoadEpoch: 0,
   });
   return teamPicks.get(key);
@@ -4546,6 +4547,30 @@ function teamChoiceLabel(choice) {
 }
 function teamBackendLabel(choice) {
   return choice.backend === "traecli" ? "TraeCLI" : "Kernel";
+}
+// A failed config read has no other exit than a later read, so a single
+// network blip used to latch the mode chip on "retry" until the session
+// changed. Retry the read in place with the history loader's backoff shape.
+const CONFIG_RETRY_DELAYS_MS = [1000, 3000, 8000];
+function clearConfigRetry(state) {
+  if (state.configRetryTimer !== null && state.configRetryTimer !== undefined) clearTimeout(state.configRetryTimer);
+  state.configRetryTimer = null;
+  state.configRetries = 0;
+}
+function scheduleConfigRetry(team, sid, base) {
+  if (team.configRetryTimer !== null && team.configRetryTimer !== undefined) return;
+  if (!team.error || team.errorSource !== "read" || team.pending || team.saving) return;
+  if (sid !== sessionId || base !== store.base) return;
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+  if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+  const delay = CONFIG_RETRY_DELAYS_MS[Math.min(team.configRetries || 0, CONFIG_RETRY_DELAYS_MS.length - 1)];
+  team.configRetries = (team.configRetries || 0) + 1;
+  team.configRetryTimer = setTimeout(() => {
+    team.configRetryTimer = null;
+    if (sid !== sessionId || base !== store.base) return;
+    if (!team.error || team.errorSource !== "read") return;
+    void loadSessionConfig({ teamOnly: true });
+  }, delay);
 }
 function syncTeamTrigger() {
   // Keep the capsule's label on one line and defer updates around the IME.
@@ -4581,6 +4606,8 @@ function hydrateTeamConfig(cfg, revision, loadEpoch) {
   state.confirmed = { ...state.choice };
   if (loadEpoch !== undefined) state.appliedTeamLoadEpoch = loadEpoch;
   state.error = "";
+  state.errorSource = "";
+  clearConfigRetry(state);
   syncTeamTrigger();
   if (teamDraft && teamDraft.key === teamPickKey() && !teamDraft.edited && !teamDraft.saving) {
     teamDraft.choice = { ...state.choice };
@@ -4594,6 +4621,8 @@ async function ensureTeamConfig(sid, base = store.base) {
   if (!sid || base !== store.base) return false;
   const choice = { ...state.choice }, revision = state.revision;
   state.error = "";
+  state.errorSource = "";
+  clearConfigRetry(state);
   state.saving = (async () => {
     try {
       const cfg = await (await api("/sessions/" + sid + "/config", { method: "POST", body: JSON.stringify(teamConfigPayload(choice)) })).json();
@@ -4607,6 +4636,7 @@ async function ensureTeamConfig(sid, base = store.base) {
       return true;
     } catch (e) {
       state.error = "模式保存失败，选择与输入已保留：" + e.message;
+      state.errorSource = "save";
       if (key === teamPickKey()) note(state.error);
       return false;
     } finally {
@@ -4945,6 +4975,14 @@ async function loadSessionConfig({ teamOnly = false } = {}) {
   try {
     const cfg = await (await api("/sessions/" + sid + "/config")).json();
     if (sid !== sessionId || base !== store.base) return;
+    // A successful read answers the failure the chip shows, even when the
+    // value is discarded below because a newer local intent owns this state.
+    clearConfigRetry(team);
+    if (team.errorSource === "read") {
+      team.error = "";
+      team.errorSource = "";
+      syncTeamTrigger();
+    }
     if (!teamOnly && fullEpoch === team.fullLoadEpoch) applySessionConfig(cfg, { teamRevision, teamLoadEpoch: epoch });
     else hydrateTeamConfig(cfg, teamRevision, epoch);
   } catch (e) {
@@ -4952,7 +4990,9 @@ async function loadSessionConfig({ teamOnly = false } = {}) {
     if (epoch !== team.loadEpoch && (teamOnly || fullEpoch !== team.fullLoadEpoch)) return;
     if (epoch === team.loadEpoch && !team.pending && !team.saving && team.revision === teamRevision) {
       team.error = "读取对话模式失败，请重试：" + e.message;
+      team.errorSource = "read";
       syncTeamTrigger();
+      scheduleConfigRetry(team, sid, base);
       if (teamDraft && teamDraft.key === teamPickKey()) renderTeamSheet();
     }
     note("loading session config failed: " + e.message);
@@ -7612,14 +7652,19 @@ function syncStopButton() {
   b.setAttribute("aria-label", label);
   b.title = label;
   const sideNote = $("sidenote");
+  // The note affordance follows the live view, not the stop glyph's terminal
+  // latches: a feed that dropped (or a page resumed mid-turn) still shows the
+  // running transcript, and the composer can queue a note into that turn.
+  const noteReady = running || (eventActive && eventSession === sessionId)
+    || staleSession === sessionId || turns.has(sessionId);
   sideNote.disabled = sideNoteBusy;
-  sideNote.setAttribute("aria-hidden", String(!running));
-  sideNote.tabIndex = running ? 0 : -1;
+  sideNote.setAttribute("aria-hidden", String(!noteReady));
+  sideNote.tabIndex = noteReady ? 0 : -1;
   // The side note joins the composer grid as a column of its own, which
   // resizes the focused field. That waits for a composition to end.
   holdLayout("sideNote", () => {
-    $("composer").classList.toggle("side-note-ready", running);
-    sideNote.classList.toggle("show", running);
+    $("composer").classList.toggle("side-note-ready", noteReady);
+    sideNote.classList.toggle("show", noteReady);
   });
   const attachedEvents = eventActive && eventSession === sessionId;
   const detached = sessionId && running && !turns.has(sessionId) && !attachedEvents;

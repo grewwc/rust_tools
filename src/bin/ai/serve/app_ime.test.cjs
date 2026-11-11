@@ -511,7 +511,7 @@ test("the side note column does not resize the composer during a composition", (
   });
   vm.runInContext(
     "let sideNoteBusy = false; let eventActive = false; let eventSession = '';" +
-    "let sessionId = 's1'; let turnRunning = false; let turnRunningAt = 0;" +
+    "let sessionId = 's1'; let staleSession = ''; let turnRunning = false; let turnRunningAt = 0;" +
     "const RUNNING_SAMPLE_TTL_MS = 1000; const turns = new Set();",
     context,
   );
@@ -522,6 +522,36 @@ test("the side note column does not resize the composer during a composition", (
   run(context, "promptComposing = false;");
   vm.runInContext("flushLayout();", context);
   assert.ok(toggles.includes("composer.side-note-ready=true"), "the side note column was not applied afterwards");
+});
+
+test("a live view keeps the note affordance when the running latch is stale", () => {
+  const toggles = [];
+  const composer = { classList: { toggle: (name, on) => toggles.push("composer." + name + "=" + on) } };
+  const sidenote = {
+    classList: { toggle: (name, on) => toggles.push("sidenote." + name + "=" + on) },
+    disabled: false,
+    setAttribute() {},
+    tabIndex: -1,
+  };
+  const send = { textContent: "", classList: { toggle() {} }, setAttribute() {}, title: "" };
+  const context = makeContext({
+    $: (id) => ({ send, sidenote, composer })[id] || null,
+    isTurnRunning: () => false,
+    note: () => {},
+  });
+  vm.runInContext(
+    "let sideNoteBusy = false; let eventActive = true; let eventSession = 's1';" +
+    "let sessionId = 's1'; let staleSession = ''; let turnRunning = false; let turnRunningAt = 0;" +
+    "const RUNNING_SAMPLE_TTL_MS = 1000; const turns = new Set();",
+    context,
+  );
+  vm.runInContext(syncStopSrc, context);
+  vm.runInContext("syncStopButton();", context);
+  assert.ok(toggles.includes("sidenote.show=true"), "the live view lost its note affordance");
+  toggles.length = 0;
+  run(context, "eventActive = false; eventSession = '';");
+  vm.runInContext("syncStopButton();", context);
+  assert.ok(toggles.includes("sidenote.show=false"), "the note affordance outlived its live view");
 });
 
 test("an empty composition end does not resurrect the previous candidate", () => {

@@ -1194,3 +1194,82 @@ test("the layout hosts the team entry and the accessible sheet uses the existing
   assert.equal((html.match(/id="teamcontrols"/g) || []).length, 1);
   assert.ok(html.indexOf('<summary id="ovrsummaryline">') < html.indexOf('<div id="composer">'));
 });
+
+// A config read that failed has no other exit than a later read, so the chip
+// used to stay on its retry state until the session changed. The page schedules
+// its own bounded retry; these cases drive that timer instead of sleeping.
+function recorder(h) {
+  const timers = new Map();
+  let next = 1;
+  h.elements.teamstatus.textContent = "";
+  h.context.document.visibilityState = "visible";
+  h.context.setTimeout = (fn, ms) => { const id = next++; timers.set(id, { fn, ms }); return id; };
+  h.context.clearTimeout = (id) => { timers.delete(id); };
+  return timers;
+}
+
+test("a failed config read retries itself and clears the mode chip", async () => {
+  let reads = 0, fail = true;
+  const h = harness({ configGet: () => {
+    reads++;
+    if (fail) return Promise.reject(new Error("network down"));
+    return response(NORMAL);
+  } });
+  const timers = recorder(h);
+  const state = h.context.teamPickState();
+
+  await h.context.loadSessionConfig();
+  await settle();
+  assert.equal(reads, 1);
+  assert.equal(h.elements.teamstatus.textContent, "重试");
+  assert.equal(h.elements.teamtrigger.dataset.state, "error");
+  const id = state.configRetryTimer;
+  assert.ok(id !== null && id !== undefined, "a failed read schedules its own retry");
+  assert.equal(timers.get(id).ms, 1000);
+
+  fail = false;
+  timers.get(id).fn();
+  await settle();
+  await settle();
+  assert.equal(reads, 2);
+  assert.equal(state.configRetryTimer, null);
+  assert.equal(h.elements.teamstatus.textContent, "");
+  assert.equal(h.elements.teamtrigger.dataset.state, "ready");
+});
+
+test("a hidden or offline config failure waits for the next read instead of retrying", async () => {
+  let fail = true;
+  const h = harness({ configGet: () => fail ? Promise.reject(new Error("network down")) : response(NORMAL) });
+  const timers = recorder(h);
+  const state = h.context.teamPickState();
+  h.context.document.visibilityState = "hidden";
+  h.context.navigator = { onLine: false };
+
+  await h.context.loadSessionConfig();
+  await settle();
+  assert.equal(h.elements.teamstatus.textContent, "重试");
+  assert.equal(state.configRetryTimer, null);
+  assert.equal(timers.size, 0);
+
+  fail = false;
+  h.context.document.visibilityState = "visible";
+  h.context.navigator = { onLine: true };
+  await h.context.loadSessionConfig({ teamOnly: true });
+  await settle();
+  assert.equal(h.elements.teamstatus.textContent, "");
+});
+
+test("a failed mode save keeps the user's retry and schedules no read", async () => {
+  const h = harness({ configPost: () => Promise.reject(new Error("save down")) });
+  const timers = recorder(h);
+  const state = h.context.teamPickState();
+  state.pending = true;
+  state.choice = { mode: "team", backend: "kernel", model: "" };
+
+  await h.context.ensureTeamConfig("alpha");
+  await settle();
+  assert.equal(state.errorSource, "save");
+  assert.equal(h.elements.teamstatus.textContent, "重试");
+  assert.equal(state.configRetryTimer, null);
+  assert.equal(timers.size, 0);
+});
