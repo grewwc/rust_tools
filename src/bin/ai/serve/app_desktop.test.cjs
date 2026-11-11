@@ -911,6 +911,7 @@ function sessionFoldHarness(width) {
   vm.runInContext(between("function toolArgsOf(", "const RATE_STORAGE ="), h.context);
   Object.assign(h.context, {
     historySession: "", historyKeys: [], historyLoadSeq: 0,
+    AbortController,
     navigator: { onLine: true }, staleKey: "", staleBox: null, recoveredView: null, staleTries: 0,
     histKey: (messages) => JSON.stringify(messages), histEndsTurn: () => true,
     revokePreviews() {},

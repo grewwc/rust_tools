@@ -159,8 +159,10 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
   vm.runInContext(between("function headers(", "const esc ="), context);
   vm.runInContext(between("function sessionTitle(s)", "// Phone drawer floats"), context);
   vm.runInContext(between("function renderSessionBar()", "// History is append-only"), context);
+  vm.runInContext(between("let switchPollTimer = null;", "// Rebuild a compact progress card"), context);
   if (realNavigation) {
     Object.assign(context, {
+      AbortController,
       historyLoadSeq: 0, historySession: sid, historyKeys: [], canonicalHistoryTotal: 0,
       pendingUserInputs: new Map(), turns: new Map(), eventSession: "", staleSession: "",
       staleBox: null, recoveredView: null, FOLD_ROLE_LABELS: {},

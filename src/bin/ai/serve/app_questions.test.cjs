@@ -80,9 +80,11 @@ function harness({ messages, phone = true, requestHook } = {}) {
   const response = (body, total = current.length) => ({ headers: { get: () => String(total) }, json: async () => body });
   const context = vm.createContext({
     document, $: (id) => elements[id], sessionId: "session-a", questionCache: null,
+    window: { matchMedia: () => ({ matches: !phone }) },
     historySession: "", historyKeys: [], historyLoadSeq: 0, canonicalHistoryTotal: 0, lastMsgCount: 0,
     pendingUserInputs: new Map(), turns: new Map(), eventSession: "", recoveredView: null,
     outputFollowSuspended: false, navigator: { onLine: true },
+    AbortController, setTimeout, clearTimeout,
     isPhoneLayout: () => phone, esc: (value) => String(value), requestAnimationFrame: (fn) => fn(),
     note: (text) => notes.push(text), console: { error: (...args) => failures.push(args) },
     api: async (request) => {
@@ -113,6 +115,7 @@ function harness({ messages, phone = true, requestHook } = {}) {
   context.updateQuestionButton = (count) => { if (count !== undefined) elements.questioncount.textContent = String(count); };
   vm.runInContext(between("function questionRowsOf(", "// Assistant replies render"), context);
   vm.runInContext(between("function historyRowsOf(", "// A session the server reports as running"), context);
+  vm.runInContext(between("// BEGIN history retry", "const HISTORY_RETRY_DELAYS_MS"), context);
   vm.runInContext(between("async function loadHistory(", "// Scrolling to the top of the transcript"), context);
   vm.runInContext(between("function attachUserRewind(", "function findUserHistoryIndex("), context);
   context.addMsgMd = (text, parent) => context.addMsg("assistant", text, "asst md", parent);

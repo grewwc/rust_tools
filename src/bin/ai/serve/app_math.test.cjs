@@ -1549,6 +1549,7 @@ function historyHarness({
     lastMsgCount: null, staleKey: "", staleDone: false, previewUrls: new Map(), turns: new Map(),
     pendingUserInputs: new Map(), historyLoadSeq: 0, staleBox: null,
     recoveredView: null, eventSession: "", armHistoryFollow() {},
+    AbortController, setTimeout, clearTimeout,
     textOf: (content) => content, isRuntimeSyntheticUser: (message) => !!message.synthetic,
     // loadHistory builds its failure row through the real DOM helpers.
     document: {

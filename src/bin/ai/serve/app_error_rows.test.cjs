@@ -23,7 +23,7 @@ function nodeList(nodes) {
   };
 }
 
-function harness() {
+function harness({ realApi = false } = {}) {
   function element() {
     let text = "", markup = "";
     const node = {
@@ -72,7 +72,8 @@ function harness() {
     return node;
   }
 
-  const root = element(), timers = new Map(), renderErrors = [];
+  const root = element(), prompt = { value: "unsent draft" }, promptlist = element();
+  const timers = new Map(), renderErrors = [];
   let timerId = 0, historyError = null;
   const messages = [
     { role: "user", content: "prompt" },
@@ -80,9 +81,13 @@ function harness() {
   ];
   const context = vm.createContext({
     document: { createElement: element, visibilityState: "visible" },
+    window: { matchMedia: () => ({ matches: false }) },
     navigator: { onLine: true },
     console: { error: (...args) => renderErrors.push(args) },
-    $: (id) => { assert.equal(id, "msgs"); return root; },
+    $: (id) => {
+      assert.ok(["msgs", "prompt", "promptlist"].includes(id), id);
+      return { msgs: root, prompt, promptlist }[id];
+    },
     setTimeout(callback, delay) { const id = ++timerId; timers.set(id, { callback, delay }); return id; },
     clearTimeout(id) { timers.delete(id); },
     sessionId: "s", historySession: "", historyKeys: [], historyLoadSeq: 0,
@@ -103,6 +108,7 @@ function harness() {
     shouldFollowOutput: () => false,
     followOutput() {}, updateQuestionButton() {}, syncStopButton() {}, renderSessionBar() {},
     ensureConfirmPoll() {}, armHistoryFollow() {}, revokePreviews() {}, decorateAndLoad() {}, addAnswerCopy() {},
+    createTurnRateLine: () => () => {},
     textOf: (content) => content || "", isRuntimeSyntheticUser: () => false,
   });
   for (const [start, end] of [
@@ -113,6 +119,7 @@ function harness() {
     ["// BEGIN history retry", "// Historical user inputs"],
     ["function handleReplayEvent(", "async function pollConfirm("],
   ]) vm.runInContext(source(start, end), context);
+  if (realApi) vm.runInContext(source("async function api(", "const esc ="), context);
   Object.assign(context, {
     renderMarkdown: vm.runInContext("esc", context),
     historyEndsUnanswered: (rows) => rows.at(-1)?.role === "user",
@@ -128,7 +135,14 @@ function harness() {
   const rows = (prefix) => root.children.filter((row) => row.dataset.role === "err"
     && row.textContent.startsWith(prefix));
   return {
-    context, root, timers, renderErrors, rows,
+    context, root, prompt, messages, timers, renderErrors, rows,
+    deadlineMs: vm.runInContext("HISTORY_FETCH_TIMEOUT_MS", context),
+    fireTimer(delay) {
+      const entry = [...timers].find(([, timer]) => timer.delay === delay);
+      assert.ok(entry, "missing timer with delay " + delay);
+      timers.delete(entry[0]);
+      entry[1].callback();
+    },
     liveRows: () => rows("live progress unavailable:"),
     historyRows: () => rows("history failed:"),
     async failLive(message) {
@@ -157,6 +171,144 @@ function harness() {
     },
     setHistoryFailure(message) { historyError = new Error(message); },
   };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((finish) => { resolve = finish; });
+  return { promise, resolve };
+}
+
+function historyResponse(messages, total = String(messages.length)) {
+  return { ok: true, headers: { get: () => total }, json: async () => messages };
+}
+
+function hangHistory(h, stage) {
+  const pending = deferred(), signals = [];
+  let calls = 0, bodyReads = 0;
+  h.context.fetch = async (url, options) => {
+    assert.equal(url, "https://server.test/sessions/s/history?limit=801");
+    signals.push(options.signal);
+    calls++;
+    if (calls > 1) return historyResponse(h.messages);
+    // Deliberately ignore abort to prove the deadline itself releases loading.
+    if (stage === "headers") return pending.promise;
+    return {
+      ...historyResponse([]), ok: stage !== "error body", status: 503, statusText: "Unavailable",
+      json() { bodyReads++; return pending.promise; },
+    };
+  };
+  return {
+    signals, calls: () => calls, bodyReads: () => bodyReads,
+    settleLate() {
+      const stale = [{ role: "assistant", content: "obsolete response" }];
+      pending.resolve(stage === "headers" ? historyResponse(stale)
+        : stage === "body" ? stale : { error: "obsolete error" });
+    },
+  };
+}
+
+for (const stage of ["headers", "body", "error body"]) for (const mounted of [false, true]) {
+  test(`history ${stage} timeout automatically recovers without navigation (mounted=${mounted})`, async () => {
+    const h = harness({ realApi: true });
+    if (mounted) await h.context.loadHistory({ sessionId: "s", messages: h.messages, histTotal: 2 });
+    const retained = h.root.children.slice(), loadKey = h.context.historyLoadState("s").key;
+    const request = hangHistory(h, stage);
+    const loading = h.context.loadHistory();
+    await new Promise(setImmediate);
+    assert.ok(h.context.historyLoadState("s").loading);
+    assert.deepEqual(h.root.children, retained, "do not clear mounted content while fetching");
+    assert.equal(request.bodyReads(), stage === "headers" ? 0 : 1, "reach the intended waiting stage");
+    assert.equal(request.signals[0].aborted, false);
+    h.fireTimer(h.deadlineMs);
+    await loading;
+    const state = h.context.historyLoadState("s");
+    assert.equal(request.signals[0].aborted, true, "abort the underlying request");
+    assert.equal(state.loading, 0, "timeout must release the loading lock");
+    assert.equal(state.key, loadKey);
+    assert.equal(h.historyRows().length, 1, "record exactly one failure");
+    assert.equal(h.historyRows()[0].textContent, "history failed: history request timed out");
+    assert.deepEqual(h.root.children.slice(0, retained.length), retained);
+    assert.equal(h.context.sessionId, "s");
+    assert.equal(h.prompt.value, "unsent draft");
+    assert.deepEqual([...h.timers.values()].map((timer) => timer.delay), [1000]);
+
+    h.fireTimer(1000);
+    await new Promise(setImmediate);
+    assert.equal(request.calls(), 2, "the scheduled retry fetches the same session");
+    assert.equal(state.loading, 0);
+    assert.equal(state.failure, null);
+    assert.equal(h.historyRows().length, 0);
+    assert.deepEqual(h.root.children.map((node) => node.textContent), ["prompt", "reply"]);
+    assert.deepEqual(h.root.children.slice(0, retained.length), retained, "reuse mounted transcript nodes on recovery");
+    assert.equal(h.context.historySession, "s");
+    assert.equal(h.context.canonicalHistoryTotal, 2);
+    assert.equal(h.context.sessionId, "s");
+    assert.equal(h.prompt.value, "unsent draft");
+    assert.equal(h.timers.size, 0, "success clears the deadline and retry");
+    assert.equal(request.signals[1].aborted, false);
+    assert.deepEqual(h.renderErrors, []);
+
+    const recovered = h.root.children.slice();
+    request.settleLate();
+    await new Promise(setImmediate);
+    assert.deepEqual(h.root.children, recovered, "a late timed-out response cannot overwrite the retry");
+    assert.equal(state.failure, null, "a late error body cannot recreate the failure");
+    assert.equal(h.timers.size, 0);
+  });
+}
+
+for (const stage of ["headers", "body", "error body"]) {
+  test(`obsolete history ${stage} timeout cannot affect a newly selected session`, async () => {
+    const h = harness({ realApi: true }), request = hangHistory(h, stage);
+    const loading = h.context.loadHistory();
+    await new Promise(setImmediate);
+    h.context.sessionId = "other";
+    await h.context.loadHistory({ sessionId: "other", messages: [{ role: "assistant", content: "current session" }], histTotal: 1 });
+    const current = h.root.children.slice();
+    h.fireTimer(h.deadlineMs);
+    await loading;
+    assert.equal(request.signals[0].aborted, true);
+    assert.equal(h.context.historyLoadState("s").loading, 0);
+    assert.equal(h.context.historyLoadState("s").failure, null, "superseded failures are not recorded");
+    request.settleLate();
+    await new Promise(setImmediate);
+    assert.deepEqual(h.root.children, current);
+    assert.equal(h.context.historySession, "other");
+    assert.equal(h.context.sessionId, "other");
+    assert.equal(h.prompt.value, "unsent draft");
+    assert.equal(h.context.historyLoadState("other").failure, null);
+    assert.equal(h.timers.size, 0, "obsolete loads cannot schedule a retry in the selected session");
+    assert.deepEqual(h.renderErrors, []);
+  });
+}
+
+for (const outcome of ["success", "missing total", "invalid total", "API error", "invalid body"]) {
+  test(`settled history ${outcome} clears its deadline`, async () => {
+    const h = harness({ realApi: true });
+    let signal;
+    h.context.fetch = async (_, options) => {
+      signal = options.signal;
+      if (outcome === "API error") return { ok: false, status: 503, json: async () => ({ error: "try later" }) };
+      const response = historyResponse(h.messages, outcome === "missing total" ? null : outcome === "invalid total" ? "invalid" : "2");
+      if (outcome === "invalid body") response.json = async () => { throw new Error("bad JSON"); };
+      return response;
+    };
+    await h.context.loadHistory();
+    assert.equal(signal.aborted, false, "normal settlement must not abort a completed request");
+    assert.equal(h.context.historyLoadState("s").loading, 0);
+    assert.ok(![...h.timers.values()].some((timer) => timer.delay === h.deadlineMs));
+    if (outcome === "API error" || outcome === "invalid body") {
+      assert.equal(h.historyRows().length, 1);
+      assert.equal(h.historyRows()[0].textContent, "history failed: " + (outcome === "API error" ? "503 try later" : "bad JSON"));
+      assert.deepEqual([...h.timers.values()].map((timer) => timer.delay), [1000]);
+    } else {
+      assert.deepEqual(h.root.children.map((node) => node.textContent), ["prompt", "reply"]);
+      assert.equal(h.context.canonicalHistoryTotal, 2, "preserve the missing/invalid-header fallback to fetched length");
+      assert.equal(h.timers.size, 0);
+    }
+    assert.deepEqual(h.renderErrors, []);
+  });
 }
 
 test("two consecutive live-progress request failures update one DOM row", async () => {

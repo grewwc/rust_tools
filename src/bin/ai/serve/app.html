@@ -6381,6 +6381,28 @@ function dropBackgroundTurn(box, why) {
   note("a turn in another session is no longer live (" + why + ") — open that session to follow it");
 }
 // BEGIN history retry
+const HISTORY_FETCH_TIMEOUT_MS = 5000;
+async function readHistorySnapshot(path) {
+  const controller = new AbortController();
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error("history request timed out"));
+      controller.abort();
+    }, HISTORY_FETCH_TIMEOUT_MS);
+  });
+  try {
+    // Bound headers and both success/error bodies, even if abort is ignored.
+    return await Promise.race([(async () => {
+      const res = await api(path, { signal: controller.signal });
+      const histTotal = Number(res.headers.get("x-history-total")) || 0;
+      const messages = await res.json();
+      return { messages, histTotal };
+    })(), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 const HISTORY_RETRY_DELAYS_MS = [1000, 3000, 8000];
 const historyLoadStates = new Map(); // session -> last rendered fingerprint and pending failure
 function historyLoadState(sid) {
@@ -6493,9 +6515,9 @@ async function loadHistory(prefetched, canCommit = () => true) {
         const want = pager._histWinSession === forSession && (pager._histWin || 0) > rowWindow + 1
           ? pager._histWin
           : rowWindow + 1;
-        const res = await api("/sessions/" + forSession + "/history" + (prefetched?.showAll ? "" : "?limit=" + want));
-        histTotal = Number(res.headers.get("x-history-total")) || 0;
-        msgs = await res.json();
+        const snapshot = await readHistorySnapshot("/sessions/" + forSession + "/history" + (prefetched?.showAll ? "" : "?limit=" + want));
+        histTotal = snapshot.histTotal;
+        msgs = snapshot.messages;
       }
       catch (e) {
         if (!current()) return;
