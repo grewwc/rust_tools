@@ -32,6 +32,7 @@ mod stream;
 mod theme;
 pub(crate) mod tools;
 mod types;
+mod write_roots;
 
 /// Kill child processes owned by persistent command sessions. The caller owns
 /// the process-exit path; sessions have no other way to outlive a normal exit
@@ -122,7 +123,7 @@ pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
         background::detach_daemon_session()?;
     }
 
-    let mut cli = cli::parse_cli_args(args.clone().into_iter());
+    let mut cli = cli::try_parse_cli_args(args.clone().into_iter())?;
 
     // Attach before loading session history or creating a runtime: a live worker
     // remains the sole owner of its conversation and in-flight model request.

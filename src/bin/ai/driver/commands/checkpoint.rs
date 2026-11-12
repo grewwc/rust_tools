@@ -698,13 +698,12 @@ pub fn try_handle_checkpoint_command(
                 println!("Failed to create branch '{branch}': {err}");
                 return Ok(true);
             }
-            let switch_result = match branch_name.as_deref() {
+            let switch_result = restore_and_refresh_runtime(app, || match branch_name.as_deref() {
                 Some(branch) => store.switch_branch(branch),
                 None => store.rollback(&name),
-            };
+            });
             match switch_result {
                 Ok(()) => {
-                    refresh_runtime_after_rollback(app);
                     let (verb, destination) =
                         match (create_branch.as_deref(), branch_name.as_deref()) {
                             (Some(branch), _) => ("Switched to a new branch", branch),
@@ -1499,9 +1498,8 @@ fn switch_to_unborn_branch(
         }
     }
 
-    match store.switch_branch(branch) {
+    match restore_and_refresh_runtime(app, || store.switch_branch(branch)) {
         Ok(()) => {
-            refresh_runtime_after_rollback(app);
             publish_checkpoint_names(store);
             match preserved_as {
                 Some(saved) => println!(
@@ -1532,13 +1530,27 @@ fn save_preserving_current(store: &CheckpointStore, preserve_name: &str) -> Resu
     }
 }
 
+/// Apply an already authorized restore and keep the App aligned with its published database.
+pub(in crate::ai) fn restore_and_refresh_runtime(
+    app: &mut App,
+    restore: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    restore()?;
+    refresh_runtime_after_rollback(app)
+}
+
 /// Rebuild history-derived runtime state after an in-place rollback so the
 /// next turn does not act on deleted messages. User-pinned state (attached
 /// images, forced skills, enabled tools) is intentionally left untouched;
 /// only the ledger rebuilt from the restored messages plus prune marks is reset.
-fn refresh_runtime_after_rollback(app: &mut App) {
+fn refresh_runtime_after_rollback(app: &mut App) -> std::io::Result<()> {
     crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
     let session_store = SessionStore::new(app.config.history_file.as_path());
+    if let Err(error) = super::session::refresh_session_write_roots(app) {
+        app.cli.session_add_dirs.clear();
+        eprintln!("[checkpoint] failed to refresh writable directories after checkout: {error}");
+        return Err(error);
+    }
     match session_store.read_all_messages(&app.session_id) {
         Ok(messages) => {
             if let Err(err) =
@@ -1554,6 +1566,7 @@ fn refresh_runtime_after_rollback(app: &mut App) {
     if let Err(err) = super::session::restore_prune_marks_for_history(app) {
         eprintln!("[checkpoint] failed to restore prune marks after checkout: {err}");
     }
+    Ok(())
 }
 
 #[cfg(test)]

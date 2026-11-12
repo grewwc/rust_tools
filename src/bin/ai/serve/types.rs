@@ -19,6 +19,8 @@ pub(crate) const DEFAULT_BIND: &str = "127.0.0.1:8080";
 pub(crate) struct ServeState {
     pub(crate) history_file: PathBuf,
     pub(crate) token: String,
+    /// Daemon defaults apply to all sessions; session commands never mutate this set.
+    pub(crate) default_add_dirs: Arc<Vec<PathBuf>>,
     /// Session id -> per-session virtual working directory (serve-chat
     /// `/cd`). The daemon keeps a single real process cwd, but every session's
     /// turn child is spawned with `.current_dir()` set to its own entry here,
@@ -384,6 +386,10 @@ pub(crate) struct SessionItem {
     /// Formal archive flag (`/archive`). Clients hide these from the default
     /// listing and expose them through a dedicated archive view.
     pub(crate) archived: bool,
+    /// The session's virtual working directory (`/cd`), or the daemon's own
+    /// directory when the session never switched. The web UI shows it in the
+    /// session bar so a new session's default directory is visible.
+    pub(crate) cwd: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -401,6 +407,8 @@ pub(crate) struct SessionsQuery {
 #[derive(Debug, Serialize)]
 pub(crate) struct CreateSessionResp {
     pub(crate) id: String,
+    /// The directory the new session's first turn will run in.
+    pub(crate) cwd: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -517,6 +525,7 @@ pub(crate) struct TurnOverrides {
     pub(crate) agent: Option<String>,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) skills: Vec<String>,
+    pub(crate) add_dirs: Vec<PathBuf>,
 }
 
 /// Validate one free-form model/agent override: non-empty after trim, short,
@@ -652,6 +661,7 @@ pub(crate) fn turn_overrides(req: &TurnReq) -> Result<TurnOverrides, String> {
         agent: sanitize_turn_name_override(req.agent.clone(), "agent")?,
         reasoning_effort: sanitize_turn_effort_override(req.reasoning_effort.clone())?,
         skills: sanitize_turn_skills(req.skills.clone())?,
+        add_dirs: Vec::new(),
     })
 }
 
@@ -717,6 +727,9 @@ pub(crate) fn push_turn_args(
 ) {
     cmd.arg("--session").arg(session_id);
     push_turn_override_args(cmd, overrides);
+    for root in &overrides.add_dirs {
+        cmd.arg("--add-dir").arg(root);
+    }
     cmd.arg("--").arg(prompt);
 }
 

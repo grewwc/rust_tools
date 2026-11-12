@@ -1525,6 +1525,10 @@ pub(crate) fn build_daemon_args(cli: &ParsedCli, session_id: &str) -> Vec<std::f
         args.push(OsString::from("--files"));
         args.push(OsString::from(&cli.files));
     }
+    for directory in &cli.add_dirs {
+        args.push(OsString::from("--add-dir"));
+        args.push(directory.as_os_str().to_os_string());
+    }
     if cli.list_tools {
         args.push(OsString::from("--list-tools"));
     }
@@ -1897,6 +1901,37 @@ mod tests {
         call.id = "x".repeat(MAX_SERVE_FRAME_BYTES);
         assert!(serve_tool_started_payload(&call).is_none());
         assert!(serve_tool_finished_payload(&call, "", true, false, true).is_none());
+    }
+
+    #[test]
+    fn add_dir_daemon_args_forward_each_normalized_root() {
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let cli = crate::ai::cli::try_parse_cli_args(
+            [
+                "a",
+                "--add-dir",
+                ".",
+                "--add-dir",
+                "..",
+                "--",
+                "--add-dir is prompt text",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let args = build_daemon_args(&cli, "add-dir-test");
+        let forwarded = crate::ai::cli::try_parse_cli_args(
+            std::iter::once("a".to_string()).chain(
+                args.into_iter()
+                    .skip(2)
+                    .map(|arg| arg.to_string_lossy().into_owned()),
+            ),
+        )
+        .unwrap();
+        assert_eq!(forwarded.add_dirs, cli.add_dirs);
+        assert_eq!(forwarded.add_dirs[0], cwd);
+        assert_eq!(forwarded.args, ["--add-dir is prompt text"]);
     }
 
     #[test]

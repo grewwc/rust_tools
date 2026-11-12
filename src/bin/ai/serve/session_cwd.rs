@@ -233,6 +233,7 @@ mod tests {
                 std::process::id()
             )),
             token: String::new(),
+            default_add_dirs: Default::default(),
             cwds: Arc::new(std::sync::Mutex::new(HashMap::new())),
             locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             open_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -391,6 +392,7 @@ mod tests {
         ServeState {
             history_file: dir.join("history.sqlite"),
             token: String::new(),
+            default_add_dirs: Default::default(),
             cwds: Arc::new(std::sync::Mutex::new(HashMap::new())),
             locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             open_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),

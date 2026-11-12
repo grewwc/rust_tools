@@ -585,6 +585,45 @@ test("a current terminal error without output stays in the subagent display", ()
   assert.ok(panel.children.filter((row) => row.dataset.taskId === earlier.task_id).every((row) => row.dataset.taskCurrent === "false"));
 });
 
+test("raw task tools keep every byte while the duplicate preview and payload stay secondary", () => {
+  const h = harness();
+  const expected = reportedTask("task_raw_payload");
+  const raw = "  raw wait bytes\n" + expected.output + "  trailing  \n";
+  h.emit("live", raw, "task_wait", {
+    id: "wait-raw",
+    task_report: report([expected], { wait: { reason: "parked", waited_ms: 0 } }),
+  });
+  const panel = taskCard(h);
+  assertTask(panel, expected);
+  assert.equal(panel.querySelector(".task-count").textContent, "subagents · 1 task · 0 active");
+  assert.equal(panel.querySelector(".task-wait").textContent, "wait · parked · waited 0s");
+  assert.ok(panel.querySelector(".task-meta").textContent.includes("task_id: task_raw_payload"));
+  assert.ok(panel.querySelector(".task-identity").textContent.includes("completed"));
+  assert.match(panel.parentNode.querySelector("summary").textContent, /subagents · 1 task · complete/);
+
+  const rawCard = h.root.querySelectorAll(".msg.asst").find((card) => card.dataset.taskRawTool === "true");
+  assert.ok(rawCard, "the raw task tool card must be marked for its secondary style");
+  assert.equal(rawCard.dataset.taskMerged, "true", "a live report always owns the dedicated card");
+  assert.equal(rawCard.querySelector(".prog").textContent, raw, "raw output must stay verbatim");
+  assert.ok(rawCard.querySelector(".task-output"), "the duplicate structured preview stays in the DOM for readers");
+  assert.match(css, /\.msg \.task-output \.task-identity\s*\{[^}]*border-top/);
+  assert.match(css, /\.msg \.task-output \.task-meta\s*\{[^}]*font-size:\s*12px/);
+  assert.match(css, /\[data-task-raw-tool="true"\]\[data-task-merged="true"\]:has\(\+ \.msg\.asst\[data-subagents="true"\]\) > \.task-output\s*\{\s*display:none;\s*\}/);
+  assert.match(css, /\.execution-items > \.msg\.asst\[data-task-raw-tool="true"\]\[data-task-merged="true"\]:has\(~ \.msg\.asst\[data-subagents="true"\]\) > \.task-output\s*\{\s*display:none;\s*\}/);
+  // The hidden duplicate must be the raw card's preview, never the dedicated
+  // card's own structured rows.
+  assert.doesNotMatch(css, /\+ \.msg\.asst\[data-subagents="true"\] > \.task-output\s*\{\s*display:none/);
+  assert.match(css, /\[data-task-raw-tool="true"\] > details\[open\] > \.prog\s*\{[^}]*max-height/);
+
+  const history = harness();
+  history.emit("cold", raw, "task_wait", { id: "wait-raw", task_report: report([expected]) });
+  const historyRaw = history.root.querySelectorAll(".msg.asst").find((card) => card.dataset.taskRawTool === "true");
+  assert.ok(historyRaw, "the canonical raw task tool card must be marked too");
+  assert.equal(historyRaw.dataset.taskMerged, "true", "the canonical row that owns the report may hide its duplicate");
+  assert.equal(historyRaw.querySelector(".prog").textContent, raw, "canonical raw output must stay verbatim");
+  assert.match(historyRaw.querySelector("summary").textContent, / · raw$/);
+});
+
 test("subagent history display is gated to desktop while raw tool folds and mobile stay complete", () => {
   const selector = '.msg.asst[data-subagents="true"] > .task-output > [data-task-current="false"]';
   const desktopStart = css.indexOf("@media (min-width:701px)"), desktopEnd = css.indexOf("/* Keep narrow desktop", desktopStart);

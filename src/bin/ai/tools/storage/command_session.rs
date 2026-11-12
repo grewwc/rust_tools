@@ -8,12 +8,12 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Once};
 use std::time::{Duration, Instant};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
@@ -75,7 +75,8 @@ impl StreamBuffer {
             .bytes
             .len()
             .min(offset.saturating_add(MAX_RETURN_BYTES));
-        let body = String::from_utf8_lossy(&self.bytes[offset.min(self.bytes.len())..end]).to_string();
+        let body =
+            String::from_utf8_lossy(&self.bytes[offset.min(self.bytes.len())..end]).to_string();
         let mut out = String::new();
         if cursor < first_available {
             out.push_str(&format!(
@@ -84,7 +85,10 @@ impl StreamBuffer {
             ));
         }
         out.push_str(&body);
-        (out, start.saturating_add((end.saturating_sub(offset)) as u64))
+        (
+            out,
+            start.saturating_add((end.saturating_sub(offset)) as u64),
+        )
     }
 }
 
@@ -334,7 +338,11 @@ pub(crate) fn start(
         // shape as the one-shot runner; `bash -lc` additionally sources login
         // profiles and silently changes PATH/aliases between the two paths.
         let mut cmd = Command::new("script");
-        cmd.arg("-q").arg("/dev/null").arg("sh").arg("-c").arg(command);
+        cmd.arg("-q")
+            .arg("/dev/null")
+            .arg("sh")
+            .arg("-c")
+            .arg(command);
         cmd
     } else {
         crate::cmd::run::build_session_command(command, cwd)
@@ -351,6 +359,7 @@ pub(crate) fn start(
     // Same environment contract as the one-shot runner: default non-interactive
     // (pager/editor/prompt suppression), PTY keeps terminal capabilities.
     crate::cmd::run::apply_session_env_policy(&mut cmd, pty);
+    cmd.env(crate::ai::write_roots::AGENT_COMMAND_ENV, "1");
     #[cfg(unix)]
     unsafe {
         // Give each session its own process group so reaping is transitive.
@@ -371,9 +380,8 @@ pub(crate) fn start(
 
     // All spawns go through the macOS fork guard: forking while another
     // thread initializes Objective-C classes crashes the child.
-    let mut child = crate::fork_guard::spawn(&mut cmd).map_err(|err| {
-        format!("Command session failed to start: {err}")
-    })?;
+    let mut child = crate::fork_guard::spawn(&mut cmd)
+        .map_err(|err| format!("Command session failed to start: {err}"))?;
     // `setsid()` in `pre_exec` makes the child a session leader, so its pid is
     // also its process-group id; `spawn` fails rather than silently continuing
     // when `setsid` fails.
@@ -401,7 +409,11 @@ pub(crate) fn start(
     spawn_reader(stdout, Arc::clone(&stdout_buf), Arc::clone(&readers));
     spawn_reader(stderr, Arc::clone(&stderr_buf), Arc::clone(&readers));
 
-    let id = format!("cmd-{}-{}", child.id(), NEXT_SESSION.fetch_add(1, Ordering::Relaxed));
+    let id = format!(
+        "cmd-{}-{}",
+        child.id(),
+        NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+    );
     let mut session = Session {
         child,
         pgid,
@@ -558,9 +570,11 @@ pub(crate) fn shutdown_all() {
 pub(crate) fn shutdown_all_best_effort() {
     let removed: Vec<Arc<Mutex<Session>>> = match SESSIONS.try_lock() {
         Ok(mut sessions) => sessions.drain().map(|(_, session)| session).collect(),
-        Err(std::sync::TryLockError::Poisoned(poison)) => {
-            poison.into_inner().drain().map(|(_, session)| session).collect()
-        }
+        Err(std::sync::TryLockError::Poisoned(poison)) => poison
+            .into_inner()
+            .drain()
+            .map(|(_, session)| session)
+            .collect(),
         Err(std::sync::TryLockError::WouldBlock) => return,
     };
     for handle in removed {
@@ -662,7 +676,9 @@ pub(crate) mod tests {
     pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_guard() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn unique_command(marker: &str) -> String {
@@ -948,11 +964,9 @@ pub(crate) mod tests {
         assert!(first_available > 0);
 
         let (first, next) = buffer.since(0);
-        assert!(
-            first.contains(&format!(
-                "{first_available} bytes of older output permanently dropped"
-            ))
-        );
+        assert!(first.contains(&format!(
+            "{first_available} bytes of older output permanently dropped"
+        )));
         assert_eq!(next, first_available + MAX_RETURN_BYTES as u64);
 
         let (second, mut cursor) = buffer.since(next);

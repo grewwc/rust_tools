@@ -11,11 +11,6 @@ pub(crate) async fn healthz() -> Json<Healthz> {
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
-/// Mobile web client (`GET /app`, public like `/healthz`): a single-file
-/// chat UI compiled in via `include_str!`, available both in a browser and as
-/// an installed PWA. The page
-/// itself carries no session data; the bearer token lives in the phone's
-/// `localStorage` and every API call reuses the existing authed routes.
 /// Android shell version published by the download route. `versionName` in
 /// `android/a-serve/app/build.gradle` is its build-side twin; a test keeps the
 /// two equal so bumping one cannot leave the download advertising the other.
@@ -62,6 +57,12 @@ fn page_source() -> std::borrow::Cow<'static, str> {
 // `no-store` keeps phones from running a stale cached copy of this page
 // after an upgrade (a stale page hides new diagnostics like the stored
 // token length below the save row).
+/// Mobile web client (`GET /app`, public like `/healthz`): a single-file chat
+/// UI served from the checkout's `app.html` when present and from the
+/// `include_str!` copy otherwise, available both in a browser and as an
+/// installed PWA. The page itself carries no session data; the bearer token
+/// lives in the phone's `localStorage` and every API call reuses the existing
+/// authed routes.
 pub(crate) async fn serve_app() -> (
     [(axum::http::header::HeaderName, &'static str); 1],
     Html<String>,

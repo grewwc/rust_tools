@@ -2568,3 +2568,20 @@ test("the desktop settings row wraps instead of collapsing its inputs", () => {
   assert.ok(html.indexOf("#conn.open { flex-wrap:wrap; }") > desktopStart,
     "the wrap rule sits inside the desktop media query");
 });
+
+test("a thinking card that lost its completion event joins the run before the next tool record", () => {
+  const h = streamHarness();
+  const cards = () => executionRecords(h.box);
+  h.emit("thinking", { text: "one" });
+  h.emit("thinking_done");
+  const think = cards().find((card) => card.dataset.thinkingPhase === "true");
+  assert.ok(think, "a reasoning phase renders a thinking card");
+  // A reattached stream or a recovered view drops the phase binding, leaving a
+  // finished card "running" while newer tool records keep arriving below it.
+  think.dataset.executionState = "running";
+  h.emit("tool", { id: "t1", name: "task_wait", phase: "started", arguments: "{}" });
+  h.emit("tool", { id: "t1", name: "task_wait", phase: "finished", output: "ok" });
+  assert.equal(think.dataset.executionState, "completed", "a later tool record proves the reasoning ended");
+  assert.ok(think.parentNode.classList.contains("execution-items"),
+    "the settled card joins the completed run instead of splitting it");
+});

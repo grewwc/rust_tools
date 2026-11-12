@@ -115,13 +115,20 @@ pub(crate) async fn list_sessions(
     };
     let mut all: Vec<SessionItem> = items
         .into_iter()
-        .map(|s| SessionItem {
-            id: s.id,
-            size_bytes: s.size_bytes,
-            summary: s.summary,
-            first_user_prompt: s.first_user_prompt,
-            marked: s.marked,
-            archived: s.archived,
+        .map(|s| {
+            // Resolve before moving `s.id`: the value is the session's live
+            // `/cd` entry, falling back to the daemon cwd exactly like the
+            // turn child will.
+            let cwd = session_cwd(&state, &s.id).display().to_string();
+            SessionItem {
+                id: s.id,
+                size_bytes: s.size_bytes,
+                summary: s.summary,
+                first_user_prompt: s.first_user_prompt,
+                marked: s.marked,
+                archived: s.archived,
+                cwd,
+            }
         })
         .collect();
     let total = all.len();
@@ -179,7 +186,8 @@ pub(crate) async fn create_session(
     // files appear on the first turn (`--session <id>` one-shot). Until then
     // GET history 404s, matching CLI one-shot semantics.
     debug_assert!(SessionStore::validate_session_id(&id).is_ok());
-    (StatusCode::OK, Json(CreateSessionResp { id })).into_response()
+    let cwd = session_cwd(&state, &id).display().to_string();
+    (StatusCode::OK, Json(CreateSessionResp { id, cwd })).into_response()
 }
 
 /// Fork session `{id}` into a new branch, mirroring the local `/fork`:
@@ -222,7 +230,8 @@ pub(crate) async fn fork_session(
     // The branch keeps working where its parent was; otherwise the fork would
     // silently revert to the daemon cwd on its first turn.
     copy_session_cwd(&state, &id, &dst);
-    (StatusCode::OK, Json(CreateSessionResp { id: dst })).into_response()
+    let cwd = session_cwd(&state, &dst).display().to_string();
+    (StatusCode::OK, Json(CreateSessionResp { id: dst, cwd })).into_response()
 }
 
 /// Delete session `{id}`, mirroring the local `/close` (minus the local

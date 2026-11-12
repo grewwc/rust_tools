@@ -1024,6 +1024,26 @@ fn system_prompt_explains_tool_result_evidence_markers() {
 }
 
 #[test]
+fn add_dir_runtime_environment_shows_session_write_directories() {
+    let mut app = crate::ai::driver::tests::test_app("build");
+    app.cli.add_dirs = vec![
+        PathBuf::from("/projects/first"),
+        PathBuf::from("/projects/second"),
+    ];
+    let context = crate::ai::driver::runtime_ctx::DriverContext::new(
+        app,
+        std::sync::Arc::new(std::sync::Mutex::new(McpClient::new())),
+        std::sync::Arc::new(Vec::new()),
+        std::sync::Arc::new(Vec::new()),
+    );
+    let prompt = crate::ai::driver::runtime_ctx::DRIVER_CTX
+        .sync_scope(context, super::runtime_environment_prompt);
+    assert!(prompt.contains("Additional writable directories for this run (--add-dir)"));
+    assert!(prompt.contains("`/projects/first`"));
+    assert!(prompt.contains("`/projects/second`"));
+}
+
+#[test]
 fn system_prompt_includes_runtime_environment_and_effective_cwd() {
     let available = SkipSet::new(16);
     let effective_cwd = std::env::temp_dir().join("rust_tools_prompt_cwd");

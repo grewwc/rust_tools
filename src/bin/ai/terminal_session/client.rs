@@ -110,6 +110,9 @@ pub(super) fn maybe_run_impl(
             }
             return Ok(None);
         };
+        if !spawned && !cli.add_dirs.is_empty() {
+            return Err("--add-dir cannot change a running terminal worker's writable roots; reconnect without --add-dir or close the live session and start it again with the desired directories".into());
+        }
         break stream;
     };
     let end = attach(stream, terminal, query_window(stdin_fd), stdin_fd, stdout_fd)?;

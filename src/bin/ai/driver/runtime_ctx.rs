@@ -797,6 +797,24 @@ pub(crate) fn try_current() -> Option<Arc<DriverContext>> {
         .or_else(|| THREAD_CTX_FALLBACK.with(|slot| slot.borrow().clone()))
 }
 
+/// Additional writable directories belong to the current App snapshot, never global config.
+/// Native children inherit them with the App; raw tool threads use `try_current`'s fallback.
+pub(crate) fn additional_write_roots() -> Vec<PathBuf> {
+    try_current()
+        .map(|context| {
+            let mut roots = context.app_proto.cli.add_dirs.clone();
+            for root in
+                crate::ai::write_roots::available_roots(&context.app_proto.cli.session_add_dirs).0
+            {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+            crate::ai::write_roots::bounded_roots(&roots).0
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) fn auto_model_fallback_spec() -> Option<AutoModelFallbackSpec> {
     AUTO_MODEL_FALLBACK.try_with(|value| *value).ok()
 }
@@ -1197,6 +1215,55 @@ mod tests {
     fn is_resume_turn_true_inside_scope() {
         let got = IS_RESUME_TURN.sync_scope(true, || is_resume_turn());
         assert!(got);
+    }
+
+    #[test]
+    fn add_dir_context_isolation_inheritance_and_thread_fallback() {
+        let make_context = |directory: &str| {
+            let mut app = crate::ai::driver::tests::test_app("build");
+            app.cli.add_dirs = vec![PathBuf::from(directory)];
+            DriverContext::new(
+                app,
+                Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+            )
+        };
+        let first = make_context("/projects/first");
+        let second = make_context("/projects/second");
+        assert!(additional_write_roots().is_empty());
+        DRIVER_CTX.sync_scope(first.clone(), || {
+            assert_eq!(additional_write_roots(), [PathBuf::from("/projects/first")]);
+            SUBAGENT_CWD.sync_scope(PathBuf::from("/scratch/child"), || {
+                assert_eq!(additional_write_roots(), [PathBuf::from("/projects/first")]);
+            });
+            DRIVER_CTX.sync_scope(second.clone(), || {
+                assert_eq!(
+                    additional_write_roots(),
+                    [PathBuf::from("/projects/second")]
+                );
+            });
+            let child = DriverContext::new(
+                first.app_proto.clone(),
+                first.mcp_client.clone(),
+                first.skill_manifests.clone(),
+                first.agent_manifests.clone(),
+            );
+            DRIVER_CTX.sync_scope(child, || {
+                assert_eq!(additional_write_roots(), [PathBuf::from("/projects/first")]);
+            });
+        });
+        std::thread::scope(|scope| {
+            for (context, expected) in [(first, "/projects/first"), (second, "/projects/second")] {
+                scope.spawn(move || {
+                    let fallback = DriverCtxThreadFallback::install(Some(context));
+                    assert_eq!(additional_write_roots(), [PathBuf::from(expected)]);
+                    drop(fallback);
+                    assert!(additional_write_roots().is_empty());
+                });
+            }
+        });
+        assert!(additional_write_roots().is_empty());
     }
 
     #[test]

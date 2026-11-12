@@ -64,8 +64,8 @@ const response = (body, status = 200, headers = {}) => ({
   headers: { get: (name) => headers[name] ?? null }, json: async () => plain(body),
 });
 const sessions = (marked = false) => [
-  { id: "open-session", summary: "Open session", marked: false, size_bytes: 1024 },
-  { id: "target-session", summary: "Target session", marked, size_bytes: 2048 },
+  { id: "open-session", summary: "Open session", marked: false, size_bytes: 1024, cwd: "/srv/open-session" },
+  { id: "target-session", summary: "Target session", marked, size_bytes: 2048, cwd: "/srv/target-session" },
 ];
 
 function harness({ phone = false, sid = "open-session", marked: isMarked = false, confirmDelete = true, deleteError = "", forkError = "" } = {}) {
@@ -147,7 +147,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
   document.createElement = node;
   const elements = {};
   for (const [id, tag] of [
-    ["sesslist", "ul"], ["sesscount", "div"], ["sesstitle", "div"], ["sessmeta", "div"],
+    ["sesslist", "ul"], ["sesscount", "div"], ["sesstitle", "div"], ["sesscwd", "span"], ["sessmeta", "div"],
     ["prompt", "textarea"], ["msgs", "div"], ["promptlist", "ol"], ["promptcount", "span"], ["newbtn", "button"], ["fork", "button"],
     ["refresh", "button"], ["del", "button"], ["omodel", "select"], ["oagent", "select"], ["oeffort", "select"],
     ["composer", "div"], ["img", "button"], ["sidenote", "button"], ["send", "button"], ["turnstatus", "div"],
@@ -183,7 +183,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
   const context = vm.createContext({
     document, $: (id) => elements[id], window: { matchMedia: () => media }, promptHistory: null,
     store: { base: "https://serve.test", token: "test-token" },
-    sessionId: sid, lastItems: plain(serverItems), pendingNew: null, lastMsgCount: 5, PAGE_ID: "test-page",
+    sessionId: sid, lastItems: plain(serverItems), pendingNew: null, pendingCwd: "", lastMsgCount: 5, PAGE_ID: "test-page",
     localStorage: { getItem: (key) => stored.get(key) ?? null, setItem: (key, value) => stored.set(key, value), removeItem: (key) => stored.delete(key) },
     Date: { now: () => now }, TextDecoder,
     setTimeout: (fn, ms) => { const id = nextTimer++; timers.set(id, { fn, at: now + ms }); return id; },
@@ -682,12 +682,16 @@ for (const phone of [true, false]) test((phone ? "phone" : "desktop") + " sessio
   h.context.renderSessionBar();
   assert.equal(h.elements.sesstitle.textContent, "★ " + summary);
   assert.equal(h.elements.sessmeta.textContent, "open-ses · 12500 KB · 123456 msgs · test-page");
+  assert.equal(h.elements.sesscwd.textContent, "📁 /srv/open-session");
+  assert.equal(h.elements.sesscwd.title, "当前路径: /srv/open-session");
+  assert.equal(h.elements.sesscwd.hidden, false);
   assert.equal(h.elements.sesstitle.hidden, false);
   const titlePath = shellPathTo("sesstitle");
   assert.deepEqual(titlePath.map((item) => item.id).filter(Boolean), ["serve-app", "sessbar", "sesstitle"]);
   assert.ok(titlePath.every((item) => !item.hidden));
   const bar = responsiveRule("#sessbar", phone), title = responsiveRule("#sesstitle", phone);
   const meta = responsiveRule("#sessmeta", phone);
+  const cwd = responsiveRule("#sesscwd", phone);
   assert.notEqual(title.display, "none");
   assert.equal(title.overflow, "hidden");
   assert.equal(meta["white-space"], "nowrap");
@@ -704,6 +708,8 @@ for (const phone of [true, false]) test((phone ? "phone" : "desktop") + " sessio
     assert.equal(title["-webkit-line-clamp"], "2");
     assert.equal(title["line-height"], "1.4");
     assert.equal(title["max-height"], "2.8em");
+    assert.equal(cwd["grid-column"], "1 / -1");
+    assert.equal(cwd["max-width"], "none");
     assert.equal(meta["min-width"], "0");
     assert.equal(meta.overflow, "hidden");
     assert.equal(meta["text-overflow"], "ellipsis");

@@ -23,6 +23,7 @@ use super::{
     SESSION_DEFAULT_SKILLS_META_KEY, SESSION_SERVE_AGENT_META_KEY, SESSION_SERVE_EFFORT_META_KEY,
     SESSION_SERVE_MODEL_META_KEY, SESSION_SUBAGENT_BACKEND_META_KEY,
     SESSION_SUBAGENT_KERNEL_MODEL_META_KEY, SESSION_SUBAGENT_MODEL_META_KEY,
+    SESSION_WRITE_ROOTS_META_KEY,
 };
 
 /// Relocate the asset paths recorded in the history to a new session.
@@ -225,6 +226,7 @@ fn clear_session_history_sqlite_unlocked(path: &Path) -> io::Result<()> {
         SESSION_SUBAGENT_KERNEL_MODEL_META_KEY,
         SESSION_SUBAGENT_MODEL_META_KEY,
         SESSION_DEFAULT_SKILLS_META_KEY,
+        SESSION_WRITE_ROOTS_META_KEY,
     ];
     let placeholders = std::iter::repeat_n("?", preserved_meta_keys.len())
         .collect::<Vec<_>>()

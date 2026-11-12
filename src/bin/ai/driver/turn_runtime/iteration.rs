@@ -600,10 +600,8 @@ pub(super) fn project_instruction_target_paths_from_tool_calls(
                 }
             }
         }
-        if tool_call.function.name == "apply_patch"
-            && let Some(patch) = args.get("patch").and_then(Value::as_str)
-        {
-            for path in crate::ai::tools::apply_patch_target_paths_from_patch(patch) {
+        if tool_call.function.name == "apply_patch" {
+            for path in crate::ai::tools::apply_patch_target_paths_from_args(&args) {
                 push_project_target(&mut targets, &mut seen, &path.to_string_lossy());
             }
         }
@@ -2675,6 +2673,73 @@ mod tests {
         refresh_outstanding_task_anchor(&mut messages, "session-without-tasks");
 
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn add_dir_patch_file_targets_preload_added_project_instructions() {
+        use super::project_instruction_target_paths_from_tool_calls;
+        use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext, SUBAGENT_CWD};
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("add-dir-patch-preflight-{}", uuid::Uuid::new_v4()));
+        let primary = root.join("primary");
+        let added = root.join("added");
+        std::fs::create_dir_all(primary.join(".git")).unwrap();
+        std::fs::create_dir_all(added.join(".git")).unwrap();
+        std::fs::write(added.join("AGENTS.md"), "added patch rules").unwrap();
+        let target = added.join("new/deep/file.rs");
+        let source = primary.join("source.patch");
+        std::fs::write(
+            &source,
+            format!(
+                "*** Begin Patch\n*** Add File: {}\n+new\n*** End Patch\n",
+                target.display()
+            ),
+        )
+        .unwrap();
+        let call = |source: &std::path::Path| crate::ai::types::ToolCall {
+            id: "patch".into(),
+            tool_type: "function".into(),
+            function: crate::ai::types::FunctionCall {
+                name: "apply_patch".into(),
+                arguments: serde_json::json!({"patch_file": source}).to_string(),
+            },
+        };
+        let mut app = crate::ai::tests::test_app_with_cancel_stream(std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        app.cli.add_dirs = vec![added.canonicalize().unwrap()];
+        let context = DriverContext::new(
+            app,
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+            std::sync::Arc::new(Vec::new()),
+            std::sync::Arc::new(Vec::new()),
+        );
+        DRIVER_CTX.sync_scope(context, || {
+            SUBAGENT_CWD.sync_scope(primary.clone(), || {
+                let targets =
+                    project_instruction_target_paths_from_tool_calls(&[call(&source)], false);
+                assert_eq!(targets, [target]);
+                let docs =
+                    crate::ai::agents::load_scoped_project_instruction_docs_for_targets(&targets);
+                assert!(docs.iter().any(|doc| doc.content == "added patch rules"));
+                assert!(
+                    project_instruction_target_paths_from_tool_calls(
+                        &[call(&primary.join("missing.patch"))],
+                        false
+                    )
+                    .is_empty()
+                );
+                std::fs::write(&source, "*** Begin Patch\n*** Add File: missing\n+new").unwrap();
+                assert!(
+                    project_instruction_target_paths_from_tool_calls(&[call(&source)], false)
+                        .is_empty()
+                );
+            })
+        });
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

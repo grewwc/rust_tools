@@ -88,27 +88,32 @@ impl FileStore {
         let resolved = self.path.display();
         // Tell the model explicitly "where it can write", not just "it cannot write here". The previous message only mentioned
         // temp=true (scratch semantics); when the model's real goal is to write a final artifact to some specified
-        // directory it had no way to proceed and kept retrying the same out-of-bounds path. Provide the writable root +
-        // two concrete options (write inside the root / use temp=true) so the model can correct course in one step.
-        let roots = writable_roots_for_hint();
-        let root_hint = match roots.first() {
-            Some(root) => format!(
-                "\nWritable root: '{}'. To fix, either (a) write to a path under \
-                 that root, or (b) for scratch/intermediate files pass a relative \
-                 filename with temp=true (e.g. file_path='script.py', temp=true). \
+        // directory it had no way to proceed and kept retrying the same out-of-bounds path. List all
+        // effective roots so an added project is just as discoverable as the cwd.
+        let roots = writable_roots_for_hint(allow_system_temp);
+        let root_hint = if roots.is_empty() {
+            "\nHint: for temporary/scratch files, use temp=true with a \
+             relative filename to write under the session temp directory. \
+             Do NOT retry the same absolute path — it will keep failing."
+                .to_string()
+        } else {
+            format!(
+                "\nWritable roots: {}. To fix, write to a path under one of \
+                 these roots, or for scratch/intermediate files use write_file \
+                 with a relative filename and temp=true. \
                  Do NOT retry the same absolute path — it will keep failing.",
-                root.display()
-            ),
-            None => "\nHint: for temporary/scratch files, use temp=true with a \
-                 relative filename to write under the session temp directory. \
-                 Do NOT retry the same absolute path — it will keep failing."
-                .to_string(),
+                roots
+                    .iter()
+                    .map(|root| format!("'{}'", root.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         };
         Err(AiError::file(
             self.original.display().to_string(),
             format!(
                 "Write blocked: path '{resolved}' is outside the allowed write \
-                 directory (effective_cwd).{root_hint}"
+                 roots.{root_hint}"
             ),
         ))
     }
@@ -704,10 +709,7 @@ pub(crate) fn session_overflow_asset_for_bare_name(
 /// The alias encodes its asset class, so it cannot collide with a project path
 /// or another session asset directory. Only one direct child is accepted;
 /// absolute paths and traversal components fail closed.
-pub(crate) fn session_asset_for_alias(
-    alias: &str,
-    session_assets: &Path,
-) -> Option<PathBuf> {
+pub(crate) fn session_asset_for_alias(alias: &str, session_assets: &Path) -> Option<PathBuf> {
     let (directory, name) = parse_session_asset_alias(alias)?;
     Some(session_assets.join(directory).join(name))
 }
@@ -855,7 +857,8 @@ fn config_extra_sensitive_substrings() -> Vec<String> {
 }
 
 /// Compute the effective writable root set: use `ai.sandbox.allowed_roots` when non-empty;
-/// fall back to `effective_cwd()` when empty (default). The session temp dir, user skills dir
+/// fall back to `effective_cwd()` when empty (default), then append the session's `--add-dir`
+/// roots. The session temp dir, user skills dir
 /// (`ai.skills.dir`, default `~/.config/rust_tools/skills`), and the rust_tools user config dir
 /// (default `~/.config/rust_tools`) are always appended as writable roots.
 /// The result feeds both the write-permission check and the writable-path suggestions in "write denied" errors, keeping them from drifting apart.
@@ -872,6 +875,11 @@ fn configured_write_roots(base: &Path) -> Vec<PathBuf> {
         .collect();
     if roots.is_empty() {
         roots.push(normalize_lexical(base));
+    }
+    for directory in crate::ai::driver::runtime_ctx::additional_write_roots() {
+        if !roots.iter().any(|root| directory.starts_with(root)) {
+            roots.push(directory);
+        }
     }
     // The session temp dir is always writable: the model may discover a temp path in earlier tool output and then
     // write to it by absolute path (without temp=true); that must not be blocked by the sandbox.
@@ -909,14 +917,27 @@ fn configured_write_roots(base: &Path) -> Vec<PathBuf> {
 
 /// Writable roots for the "write denied" error message: prefer effective_cwd-style project roots,
 /// listed first so the model can correct course (the session temp dir is unsuitable for final artifacts and is not suggested first).
-fn writable_roots_for_hint() -> Vec<PathBuf> {
+fn writable_roots_for_hint(allow_system_temp: bool) -> Vec<PathBuf> {
     let base =
         crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| PathBuf::from("."));
-    configured_write_roots(&base)
+    let mut roots = configured_write_roots(&base);
+    if allow_system_temp {
+        for directory in std::iter::once(normalize_lexical(&std::env::temp_dir())).chain(
+            shared_temp_roots()
+                .into_iter()
+                .flat_map(|(spelling, real)| [spelling, real]),
+        ) {
+            if !roots.iter().any(|root| directory.starts_with(root)) {
+                roots.push(directory);
+            }
+        }
+    }
+    roots
 }
 
 /// When `ai.sandbox.allowed_roots` is non-empty, file paths must lie under one of its roots.
-/// When empty (default), fall back to `effective_cwd()` as the single sandbox root.
+/// When empty (default), fall back to `effective_cwd()`. Session `--add-dir` roots and
+/// runtime-managed writable directories are appended in either case.
 pub(crate) fn path_within_allowed_roots(path: &Path) -> bool {
     // Relative paths are resolved against effective_cwd into absolute paths before normalization.
     let base =
@@ -950,6 +971,286 @@ mod tests {
     use crate::ai::path_utils::normalize_lexical;
     use crate::ai::test_support::ENV_LOCK;
     use std::path::{Path, PathBuf};
+
+    struct AddDirFixture {
+        root: PathBuf,
+        cwd: PathBuf,
+        added: PathBuf,
+        configured: PathBuf,
+        outside: PathBuf,
+        previous_config: Option<std::ffi::OsString>,
+        context: std::sync::Arc<crate::ai::driver::runtime_ctx::DriverContext>,
+    }
+
+    impl AddDirFixture {
+        // Callers hold ENV_LOCK while the fixture overrides CONFIGW_PATH.
+        fn new(configured_roots: bool) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("file-store-add-dir-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            let cwd = root.join("cwd");
+            let added = root.join("added");
+            let configured = root.join("configured");
+            for directory in [&cwd, &added, &configured] {
+                std::fs::create_dir_all(directory).unwrap();
+            }
+            let config_path = root.join("test.configw");
+            std::fs::write(
+                &config_path,
+                if configured_roots {
+                    format!("ai.sandbox.allowed_roots={}\n", configured.display())
+                } else {
+                    String::new()
+                },
+            )
+            .unwrap();
+            let mut app = crate::ai::tests::test_app_with_cancel_stream(std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ));
+            app.cli.add_dirs = vec![added.clone()];
+            app.session_id = format!("add-dir-{}", uuid::Uuid::new_v4());
+            app.config.history_file = root.join("history.sqlite");
+            app.config.base_history_file = app.config.history_file.clone();
+            app.session_history_file = root.join("session.sqlite");
+            let context = crate::ai::driver::runtime_ctx::DriverContext::new(
+                app,
+                std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+                std::sync::Arc::new(Vec::new()),
+                std::sync::Arc::new(Vec::new()),
+            );
+            let outside = std::env::current_dir()
+                .unwrap()
+                .join(format!("add-dir-outside-{}.txt", uuid::Uuid::new_v4()));
+            let previous_config = std::env::var_os("CONFIGW_PATH");
+            unsafe { std::env::set_var("CONFIGW_PATH", config_path) };
+            crate::commonw::configw::refresh();
+            Self {
+                root,
+                cwd,
+                added,
+                configured,
+                outside,
+                previous_config,
+                context,
+            }
+        }
+
+        fn run<T>(&self, f: impl FnOnce() -> T) -> T {
+            crate::ai::driver::runtime_ctx::DRIVER_CTX.sync_scope(self.context.clone(), || {
+                crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(self.cwd.clone(), f)
+            })
+        }
+    }
+
+    impl Drop for AddDirFixture {
+        fn drop(&mut self) {
+            match self.previous_config.take() {
+                Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+                None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+            }
+            crate::commonw::configw::refresh();
+            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_file(&self.outside);
+        }
+    }
+
+    #[test]
+    fn add_dir_command_origin_marker_preserves_existing_shell_boundary() {
+        use crate::ai::tools::service::command::execute_command;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let fixture = AddDirFixture::new(false);
+        fixture.run(|| {
+            assert!(FileStore::new(fixture.outside.clone()).validate_write_access().is_err());
+            let unlisted = fixture.outside.parent().unwrap();
+            for command in [
+                format!("a -- '/add-dir {}'", unlisted.display()),
+                format!("a --add-dir {} --help", unlisted.display()),
+            ] { assert!(crate::ai::tools::validate_execute_command(&command).is_ok()); }
+            let quote = crate::ai::shell_quote::shell_single_quote;
+            execute_command(&serde_json::json!({"command": format!("printf outside > {}", quote(fixture.outside.to_str().unwrap())), "cwd": fixture.cwd})).unwrap();
+            assert_eq!(std::fs::read_to_string(&fixture.outside).unwrap(), "outside");
+            execute_command(&serde_json::json!({"command": format!("printf tee | tee {}", quote(fixture.outside.to_str().unwrap())), "cwd": fixture.cwd})).unwrap();
+            assert_eq!(std::fs::read_to_string(&fixture.outside).unwrap(), "tee");
+            for (name, yielding) in [("marker.txt", false), ("session-marker.txt", true)] {
+                let marker = fixture.cwd.join(name);
+                let mut args = serde_json::json!({"command": format!("printf '%s' \"$AI_AGENT_COMMAND\" > {}", quote(marker.to_str().unwrap())), "cwd": fixture.cwd});
+                if yielding { args["yield_time_ms"] = serde_json::json!(1000); }
+                execute_command(&args).unwrap();
+                assert_eq!(std::fs::read_to_string(marker).unwrap(), "1");
+            }
+            let probe = format!("{} --exact ai::write_roots::tests::add_dir_tool_subprocess_origin_is_rejected --nocapture", quote(std::env::current_exe().unwrap().to_str().unwrap()));
+            let result = execute_command(&serde_json::json!({"command": probe, "cwd": fixture.cwd})).unwrap();
+            assert!(result.contains("1 passed"), "{result}");
+        });
+    }
+
+    #[test]
+    fn add_dir_checkpoint_rollback_refreshes_memory_and_reopened_write_access() {
+        use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext};
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let fixture = AddDirFixture::new(false);
+        fixture.run(|| {
+            let mut app = fixture.context.app_proto.clone();
+            let store = crate::ai::history::SessionStore::new(&app.config.history_file);
+            app.session_history_file = store.session_history_file(&app.session_id);
+            crate::ai::history::append_history_messages(
+                &app.session_history_file,
+                &[crate::ai::history::Message {
+                    role: "user".into(),
+                    content: serde_json::json!("initial task"),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+            let checkpoints =
+                crate::ai::history::CheckpointStore::new(&app.config.history_file, &app.session_id);
+            checkpoints.save("before").unwrap();
+            let extra = fixture.outside.parent().unwrap().canonicalize().unwrap();
+            assert!(
+                crate::ai::driver::commands::try_handle_local_command(
+                    &mut app,
+                    &format!("/add-dir {}", extra.display())
+                )
+                .unwrap()
+            );
+            crate::ai::history::append_history_messages(
+                &app.session_history_file,
+                &[crate::ai::history::Message {
+                    role: "user".into(),
+                    content: serde_json::json!("work after granting the directory"),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+            app.cli.session_add_dirs.clear();
+            crate::ai::driver::commands::checkpoint::restore_and_refresh_runtime(&mut app, || {
+                checkpoints.rollback("before")
+            })
+            .unwrap();
+            assert_eq!(store.read_all_messages(&app.session_id).unwrap().len(), 1);
+            assert_eq!(app.cli.session_add_dirs, [extra.clone()]);
+            let mut reopened = fixture.context.app_proto.clone();
+            reopened.session_history_file = app.session_history_file;
+            crate::ai::driver::commands::session::refresh_session_write_roots(&mut reopened)
+                .unwrap();
+            assert_eq!(reopened.cli.session_add_dirs, [extra]);
+            let context = DriverContext::new(
+                reopened,
+                fixture.context.mcp_client.clone(),
+                fixture.context.skill_manifests.clone(),
+                fixture.context.agent_manifests.clone(),
+            );
+            DRIVER_CTX.sync_scope(context, || {
+                crate::ai::tools::service::file::execute_write_file(
+                    &serde_json::json!({"file_path": fixture.outside, "content": "after rollback"}),
+                )
+                .unwrap();
+            });
+            assert_eq!(
+                std::fs::read_to_string(&fixture.outside).unwrap(),
+                "after rollback"
+            );
+        });
+    }
+
+    #[test]
+    fn add_dir_roots_preserve_cwd_and_reject_unlisted_paths() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let fixture = AddDirFixture::new(false);
+        fixture.run(|| {
+            FileStore::new(fixture.cwd.join("file.txt"))
+                .validate_write_access()
+                .unwrap();
+            FileStore::new(fixture.added.join("file.txt"))
+                .validate_write_access()
+                .unwrap();
+            let error = FileStore::new(fixture.outside.clone())
+                .validate_write_access()
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("Write blocked: path '"), "{error}");
+            assert!(error.contains("Writable roots:"), "{error}");
+            for root in [&fixture.cwd, &fixture.added] {
+                assert!(error.contains(&root.display().to_string()), "{error}");
+            }
+        });
+        assert!(!fixture.outside.exists());
+    }
+
+    #[test]
+    fn add_dir_roots_keep_allowed_roots_replacement_semantics() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let fixture = AddDirFixture::new(true);
+        fixture.run(|| {
+            FileStore::new(fixture.configured.join("file.txt"))
+                .validate_write_access()
+                .unwrap();
+            FileStore::new(fixture.added.join("file.txt"))
+                .validate_write_access()
+                .unwrap();
+            assert!(!path_within_allowed_roots(&fixture.cwd.join("file.txt")));
+            assert!(!path_within_allowed_roots(&fixture.outside));
+            let error = FileStore::new(fixture.outside.clone())
+                .validate_write_access()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&fixture.configured.display().to_string()),
+                "{error}"
+            );
+            assert!(
+                error.contains(&fixture.added.display().to_string()),
+                "{error}"
+            );
+        });
+    }
+
+    #[test]
+    fn add_dir_file_mutations_share_roots_and_preserve_patch_source_limits() {
+        use crate::ai::tools::patch_tools::{execute_apply_patch, execute_apply_patch_streaming};
+        use crate::ai::tools::service::file::{execute_write_file, execute_write_file_streaming};
+        use serde_json::json;
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let fixture = AddDirFixture::new(false);
+        fixture.run(|| {
+            let first = fixture.added.join("main.txt");
+            let streamed = fixture.added.join("streamed.txt");
+            execute_write_file(&json!({"file_path": first, "content": "before\n"})).unwrap();
+            let mut output = Vec::new();
+            execute_write_file_streaming(&json!({"file_path": streamed, "content": "streamed\n"}), &mut |chunk| output.extend_from_slice(chunk)).unwrap();
+            assert_eq!(std::fs::read_to_string(&streamed).unwrap(), "streamed\n");
+            assert!(!output.is_empty());
+            let created = fixture.added.join("created.txt");
+            execute_apply_patch(&json!({"patch": format!(
+                "*** Begin Patch\n*** Update File: {}\n@@\n-before\n+after\n*** Add File: {}\n+created\n*** End Patch\n", first.display(), created.display()
+            )})).unwrap();
+            assert_eq!(std::fs::read_to_string(&first).unwrap(), "after\n");
+            assert_eq!(std::fs::read_to_string(&created).unwrap(), "created");
+            execute_apply_patch_streaming(&json!({"patch": format!(
+                "*** Begin Patch\n*** Delete File: {}\n*** End Patch\n", created.display()
+            )}), &mut |_| {}).unwrap();
+            assert!(!created.exists());
+            let outside_args = json!({"file_path": fixture.outside, "content": "blocked"});
+            assert!(execute_write_file(&outside_args).unwrap_err().contains("Write blocked"));
+            assert!(execute_write_file_streaming(&outside_args, &mut |_| {}).unwrap_err().contains("Write blocked"));
+            assert!(execute_apply_patch(&json!({"patch": format!(
+                "*** Begin Patch\n*** Add File: {}\n+blocked\n*** End Patch\n", fixture.outside.display()
+            )})).unwrap_err().contains("Write blocked"));
+            assert!(!fixture.outside.exists());
+            let patch_file = fixture.added.join("source.patch");
+            std::fs::write(&patch_file, "*** Begin Patch\n*** End Patch\n").unwrap();
+            assert!(execute_apply_patch(&json!({"patch_file": patch_file})).unwrap_err().contains("not an allowed patch source"));
+            execute_write_file(&json!({"file_path": "scratch.txt", "content": "scratch", "temp": true})).unwrap();
+            let scratch = crate::ai::driver::runtime_ctx::temp_dir().unwrap().join("scratch.txt");
+            assert_eq!(std::fs::read_to_string(scratch).unwrap(), "scratch");
+        });
+    }
 
     #[test]
     fn normalize_lexical_resolves_dot_and_dotdot() {
@@ -1053,10 +1354,7 @@ mod tests {
             )
         );
         assert_eq!(
-            session_asset_for_alias(
-                "session-asset:tool-overflow/../evil.txt",
-                assets
-            ),
+            session_asset_for_alias("session-asset:tool-overflow/../evil.txt", assets),
             None
         );
     }
@@ -1396,7 +1694,7 @@ mod tests {
         // Keep the stable category prefix (parsed by the orchestrator's write_blocked_outside_root_path).
         assert!(msg.contains("Write blocked: path '"), "msg: {msg}");
         // Must state the writable roots explicitly, not just "cannot write here".
-        assert!(msg.contains("Writable root:"), "msg: {msg}");
+        assert!(msg.contains("Writable roots:"), "msg: {msg}");
         assert!(
             msg.contains(&temp_root.display().to_string()),
             "hint must name the effective_cwd root: {msg}"

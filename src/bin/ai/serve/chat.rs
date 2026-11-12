@@ -5480,7 +5480,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                     ServeInputRoute::Unsupported => {
                         let command = trimmed.split_whitespace().next().unwrap_or(&trimmed);
                         eprintln!(
-                            "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /cd, /pwd, /git, /history, /export-md, /model, /effort, /agent, /use, /reset, /skills, /sessions, /resume, /fork, /close, /bg, /new, /audit, /distill-session, /mark, /unmark, /archive, /title (see /help)."
+                            "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /dirs (/add-dir), /cd, /pwd, /git, /history, /export-md, /model, /effort, /agent, /use, /reset, /skills, /sessions, /resume, /fork, /close, /bg, /new, /audit, /distill-session, /mark, /unmark, /archive, /title (see /help)."
                         );
                     }
                     // Unknown command shapes must not fall through to the

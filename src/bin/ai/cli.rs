@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::ai::provider::ReasoningEffort;
 use crate::ai::shell_quote::shell_single_quote;
@@ -20,6 +20,11 @@ pub(super) struct ParsedCli {
     pub(super) talk_max_turns: u32,
     pub(super) talk_idle_secs: u64,
     pub(super) files: String,
+    /// Existing, absolute directories added to this run's writable roots.
+    /// These travel with `App` snapshots; serve treats them as daemon defaults.
+    pub(super) add_dirs: Vec<PathBuf>,
+    /// Persisted session grants loaded at session restore; not a startup flag.
+    pub(super) session_add_dirs: Vec<PathBuf>,
     pub(super) args: Vec<String>,
     pub(super) list_tools: bool,
     pub(super) list_mcp_tools: bool,
@@ -138,6 +143,8 @@ pub(super) struct ParsedCli {
 
 /// List of `a` internal "/" / ":" commands, used for shell completion.
 const INTERNAL_COMMANDS: &[&str] = &[
+    "/add-dir",
+    ":add-dir",
     "/help",
     ":help",
     "/h",
@@ -185,6 +192,7 @@ const INTERNAL_COMMANDS: &[&str] = &[
 ];
 
 const FILES_USAGE: &str = "input file names (repeat -f or use comma-separated list)";
+const ADD_DIR_USAGE: &str = "append an existing directory to writable roots for this run (serve: daemon default); repeat --add-dir DIR for multiple projects (cwd unchanged)";
 const NOTE_SEARCH_USAGE: &str = "search knowledge base (memo category); with a positional query answer once, without it enter interactive memo search";
 const GENERATE_COMPLETIONS_USAGE: &str =
     "generate shell completion script (bash/zsh/fish) and exit";
@@ -197,6 +205,7 @@ fn build_cli_parser() -> TermParser {
 }
 
 fn register_cli_flags(parser: &mut TermParser) {
+    parser.add_string("add-dir", "", ADD_DIR_USAGE);
     parser.add_bool(
         "clear",
         false,
@@ -390,11 +399,14 @@ fn register_cli_flags(parser: &mut TermParser) {
 
 fn rewrite_legacy_session_aliases(argv: &mut [String]) {
     for arg in argv {
-        if arg == "--ss" || arg.starts_with("--ss=") {
-            *arg = arg.replace("--ss", "--session");
+        // A local command's terminator ends the CLI option region too.
+        if arg == "--" {
+            break;
         }
-        if arg == "-ss" || arg.starts_with("-ss=") {
-            *arg = arg.replace("-ss", "--session");
+        if let Some(suffix) = arg.strip_prefix("--ss").or_else(|| arg.strip_prefix("-ss"))
+            && (suffix.is_empty() || suffix.starts_with('='))
+        {
+            *arg = format!("--session{suffix}");
         }
     }
 }
@@ -514,6 +526,11 @@ fn protect_slash_command_args(argv: &mut Vec<String>, kinds: &FastMap<String, Cl
     let mut i = idx;
     while i < argv.len() {
         let tok = argv[i].as_str();
+        // The command's own terminator makes the remaining tokens opaque data.
+        if tok == "--" {
+            command_text.extend(argv[i..].iter().map(String::as_str));
+            break;
+        }
         if is_reserved_command_flag(tok, reserved) {
             command_text.push(tok);
             i += 1;
@@ -541,6 +558,7 @@ fn protect_slash_command_args(argv: &mut Vec<String>, kinds: &FastMap<String, Cl
             CliOptionKind::Files => {
                 if !tok.contains('=')
                     && let Some(next) = argv.get(i)
+                    && next != "--"
                 {
                     extracted.push(next.clone());
                     i += 1;
@@ -712,6 +730,66 @@ fn normalize_cli_argv(raw: &[String], kinds: &FastMap<String, CliOptionKind>) ->
     normalize_files_flags(argv)
 }
 
+/// Collect repeatable directory options before terminalw folds repeated string flags.
+/// The verbatim prompt and folded local-command body never enter this option scan.
+fn extract_add_dir_args(argv: &mut Vec<String>) -> Result<Vec<PathBuf>, String> {
+    let mut remaining = Vec::with_capacity(argv.len());
+    let mut directories = Vec::new();
+    let mut idx = 0;
+    while idx < argv.len() {
+        let arg = &argv[idx];
+        let inline = arg
+            .strip_prefix("--add-dir=")
+            .or_else(|| arg.strip_prefix("-add-dir="));
+        let value = if let Some(value) = inline {
+            idx += 1;
+            value
+        } else if arg == "--add-dir" || arg == "-add-dir" {
+            let value = argv
+                .get(idx + 1)
+                .filter(|value| !value.starts_with('-'))
+                .ok_or("--add-dir requires a directory path (repeat --add-dir DIR for multiple directories)")?;
+            idx += 2;
+            value.as_str()
+        } else {
+            remaining.push(arg.clone());
+            idx += 1;
+            continue;
+        };
+        if value.trim().is_empty() {
+            return Err("--add-dir requires a non-empty directory path".to_string());
+        }
+        directories.push(PathBuf::from(value));
+    }
+    *argv = remaining;
+    Ok(directories)
+}
+
+impl ParsedCli {
+    /// Resolve once against the startup cwd; later `/cd` calls never rebase these roots.
+    pub(super) fn validate_add_dirs(&mut self) -> Result<(), String> {
+        if self.add_dirs.is_empty() {
+            return Ok(());
+        }
+        crate::ai::write_roots::require_user_grant_origin()
+            .map_err(|error| format!("--add-dir {error}"))?;
+        let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
+            .map_err(|error| format!("--add-dir cannot resolve the working directory: {error}"))?;
+        let mut roots = Vec::with_capacity(self.add_dirs.len());
+        for directory in &self.add_dirs {
+            let root = crate::ai::write_roots::resolve_directory(directory, &cwd)
+                .map_err(|error| format!("--add-dir {error}"))?;
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+        crate::ai::write_roots::validate_root_limits(&roots)
+            .map_err(|error| format!("--add-dir {error}"))?;
+        self.add_dirs = roots;
+        Ok(())
+    }
+}
+
 impl Default for ParsedCli {
     fn default() -> Self {
         Self {
@@ -726,6 +804,8 @@ impl Default for ParsedCli {
             talk_max_turns: 30,
             talk_idle_secs: 180,
             files: String::new(),
+            add_dirs: Vec::new(),
+            session_add_dirs: Vec::new(),
             args: Vec::new(),
             list_tools: false,
             list_mcp_tools: false,
@@ -795,10 +875,10 @@ fn verbatim_tail_start(argv: &[String], command_start: Option<usize>) -> Option<
 ///
 /// A local command (`/ss mark -- last`) owns everything from its first token
 /// onward, so a `--` inside that region is command syntax, never a terminator.
-pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
+pub(super) fn try_parse_cli_args(args: impl Iterator<Item = String>) -> Result<ParsedCli, String> {
     let raw: Vec<String> = args.collect();
     if raw.is_empty() {
-        return ParsedCli::default();
+        return Ok(ParsedCli::default());
     }
     let mut parser = build_cli_parser();
     let kinds = cli_option_kinds(&parser);
@@ -810,13 +890,15 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         None => (&raw[..], Vec::new()),
     };
 
-    let argv = normalize_cli_argv(head, &kinds);
+    let mut argv = normalize_cli_argv(head, &kinds);
+    let add_dirs = extract_add_dir_args(&mut argv)?;
 
     // Parse arguments with terminalw.
     parser.parse_argv(&argv, &[]);
 
     // Build the ParsedCli struct.
     let mut cli = ParsedCli::default();
+    cli.add_dirs = add_dirs;
 
     // Handle help (needs special handling because it is an alias).
     cli.help = parser.contains_flag_strict("help") || parser.contains_flag_strict("h");
@@ -1042,7 +1124,13 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     cli.args = parser.positional_args(false);
     cli.args.extend(verbatim);
 
-    cli
+    cli.validate_add_dirs()?;
+    Ok(cli)
+}
+
+#[cfg(test)]
+pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
+    try_parse_cli_args(args).expect("valid CLI arguments")
 }
 
 /// Print help information.

@@ -260,6 +260,12 @@ fn restore_rollback_database(
 ) -> io::Result<()> {
     with_session_state_lock(live_path, || {
         let live = read_live_rollback_metadata(live_path)?;
+        let live_roots = if live_path.exists() {
+            let conn = super::connection::open_history_db_read_only(live_path)?;
+            super::metadata::read_write_roots(&conn)?
+        } else {
+            Vec::new()
+        };
         let parent = live_path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
         let working = parent.join(format!(".rollback-rebased-{}.sqlite", uuid::Uuid::new_v4()));
@@ -275,6 +281,9 @@ fn restore_rollback_database(
                 live.turn_seq,
                 transaction_id,
             )?;
+            // Grants are live session authorization, never restored from imported checkpoint data.
+            // The lock keeps grants appended after the checkpoint in this published replacement.
+            store_live_write_roots_before_publish(&working, &live_roots)?;
             // Materialize the working WAL before renaming, without copying the
             // entire DB again. The marker and rebased counters publish together.
             publish_rebased_sqlite(&working, live_path)
@@ -283,6 +292,18 @@ fn restore_rollback_database(
         let _ = remove_sqlite_sidecars(&working);
         result
     })
+}
+
+fn store_live_write_roots_before_publish(path: &Path, roots: &[PathBuf]) -> io::Result<()> {
+    let mut conn = open_history_db(path)?;
+    let result = (|| {
+        let tx = conn.transaction().map_err(io::Error::other)?;
+        super::metadata::store_write_roots(&tx, roots)?;
+        tx.commit().map_err(io::Error::other)
+    })();
+    // Publication and error cleanup both require the working DB to be closed.
+    conn.close();
+    result
 }
 
 /// Clone only private staged DBs with no sidecars. Live/WAL sources always use
@@ -438,6 +459,52 @@ mod projection_tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_write_roots_close_connections_on_success_and_error() {
+        for reject_write in [false, true] {
+            let fixture = Fixture::new();
+            append_history_sqlite(&fixture.live, vec![msg("user", "live")]).unwrap();
+            let conn = open_history_db(&fixture.live).unwrap();
+            // This connection-local setting survives a cache return, but not a close.
+            conn.pragma_update(None, "cache_size", 12345).unwrap();
+            if reject_write {
+                conn.execute_batch(
+                    "CREATE TRIGGER reject_roots BEFORE INSERT ON meta
+                     WHEN NEW.key='session_write_roots'
+                     BEGIN SELECT RAISE(ABORT, 'reject roots'); END;",
+                )
+                .unwrap();
+            }
+            drop(conn);
+
+            let result = store_live_write_roots_before_publish(
+                &fixture.live,
+                std::slice::from_ref(&fixture.dir),
+            );
+            assert_eq!(result.is_err(), reject_write);
+            // Check before any rename or deletion can hide a cached source handle.
+            for suffix in ["-wal", "-shm"] {
+                assert!(!PathBuf::from(format!("{}{suffix}", fixture.live.display())).exists());
+            }
+            let conn = open_history_db(&fixture.live).unwrap();
+            let cache_size: i64 = conn
+                .pragma_query_value(None, "cache_size", |row| row.get(0))
+                .unwrap();
+            assert_ne!(cache_size, 12345, "grant writer must not remain cached");
+            let roots = super::super::metadata::read_write_roots(&conn).unwrap();
+            assert_eq!(
+                roots,
+                if reject_write {
+                    vec![]
+                } else {
+                    vec![fixture.dir.clone()]
+                }
+            );
+            conn.close();
         }
     }
 

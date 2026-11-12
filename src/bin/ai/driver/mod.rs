@@ -360,7 +360,7 @@ fn restore_consumed_suspended_session(entry: Option<&SuspendedSessionEntry>, fal
 ///   8. Load and activate agents
 ///   9. Enter run_loop
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = cli::parse_cli_args(std::env::args());
+    let cli = cli::try_parse_cli_args(std::env::args())?;
     run_with_cli(cli).await
 }
 
@@ -368,8 +368,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// Reused by entry points such as background mode that need to modify the cli first
 /// (injecting a session id / persistence directives).
 pub(in crate::ai) async fn run_with_cli(
-    cli: cli::ParsedCli,
+    mut cli: cli::ParsedCli,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    cli.validate_add_dirs()?;
     crate::ai::tools::task_tools::backends::backend_registry();
     aios_kernel::kernel::register_current_pid_provider(current_task_pid);
 

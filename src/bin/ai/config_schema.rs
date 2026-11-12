@@ -162,8 +162,9 @@ impl AiConfig {
     /// Hard upper bound (seconds) for any `execute_command` timeout. Falls
     /// back to 300 when unset/invalid.
     pub const SANDBOX_COMMAND_TIMEOUT_MAX: &str = "ai.sandbox.command_timeout_max";
-    /// Comma-separated absolute roots that file read/write tools are confined
-    /// to. Empty = no extra confinement (preserves default behavior).
+    /// Comma-separated absolute writable roots. Non-empty replaces the cwd
+    /// fallback; session `--add-dir` roots and runtime-managed writable dirs
+    /// are appended in either case. Reads are not confined to these roots.
     pub const SANDBOX_ALLOWED_ROOTS: &str = "ai.sandbox.allowed_roots";
     /// Comma-separated extra path substrings to treat as sensitive (blocked
     /// for file read/write), merged with the built-in sensitive list.

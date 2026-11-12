@@ -5,7 +5,7 @@ use super::git::{
 };
 use super::lexer::{
     command_word_index, effective_chain_uses_xargs, effective_command_tokens,
-    indirect_command_index, tokenize_shell_words,
+    indirect_command_index, parse_env_options, tokenize_shell_words,
 };
 use super::osascript;
 use super::substitute::{expand_tilde_and_home, normalize_path, validate_substitution_positions};
@@ -54,6 +54,7 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
     // All later comparisons use the basename uniformly, so `/bin/rm` and `rm`
     // are treated alike.
     let program = program_basename;
+    validate_env_origin_marker_unsets(command_tokens, raw_command_tokens)?;
     let extra_blocked = config_blocked_commands();
     // ---- tilde / $HOME escape detection ----
     // home and its subpaths are normally accessible; only `~/..` / `$HOME/..`
@@ -557,6 +558,39 @@ fn is_env_program(program: &str) -> bool {
     program_matches(program, "env")
 }
 
+fn validate_env_origin_marker_unsets(
+    tokens: &[String],
+    raw_tokens: &[String],
+) -> Result<(), String> {
+    let mut index = 0;
+    while index < tokens.len() {
+        let program = std::path::Path::new(&tokens[index])
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&tokens[index]);
+        let offset = if is_env_program(program) {
+            let options = parse_env_options(&raw_tokens[index..]);
+            let marker = crate::ai::write_roots::AGENT_COMMAND_ENV;
+            if options.clears_environment || options.unset_variables.contains(&marker) {
+                return Err(format!(
+                    "env cannot remove the execute_command origin marker {marker}"
+                ));
+            }
+            options.command_index
+        } else {
+            indirect_command_index(program, &tokens[index..], &raw_tokens[index..])
+        };
+        let Some(offset) = offset else {
+            break;
+        };
+        if offset == 0 {
+            break;
+        }
+        index += offset;
+    }
+    Ok(())
+}
+
 /// Workspace-wide formatting gate shared by the direct path, wrapper peeling,
 /// and deep unwrapping: `cargo fmt` (any toolchain/option form) and the
 /// `cargo-fmt` binary are rejected, while per-file `rustfmt` stays allowed.
@@ -573,50 +607,7 @@ fn blocked_cargo_formatting(program: &str, command_tokens: &[String]) -> Option<
 /// `env -S`/`--split-string` splits one argument into a command line that the
 /// audit never sees. Fail closed instead of trying to re-tokenize it.
 fn env_split_string_index(tokens: &[String]) -> Option<usize> {
-    let mut index = 1;
-    while index < tokens.len() {
-        let token = tokens[index].as_str();
-        if token == "--" {
-            return None;
-        }
-        if token == "-S"
-            || token == "-s"
-            || token == "--split-string"
-            || token.starts_with("--split-string=")
-            || (token.starts_with('-')
-                && !token.starts_with("--")
-                && token != "-"
-                && token[1..].contains(['s', 'S']))
-        {
-            return Some(index);
-        }
-        if matches!(
-            token,
-            "-u" | "--unset" | "-c" | "--chdir" | "-a" | "--argv0"
-        ) {
-            index += 2;
-            continue;
-        }
-        if token.starts_with("--unset=")
-            || token.starts_with("--chdir=")
-            || token.starts_with("--argv0=")
-        {
-            index += 1;
-            continue;
-        }
-        if token.starts_with('-') && token != "-" {
-            index += 1;
-            continue;
-        }
-        // Env assignments may precede the utility; keep scanning so
-        // `env FOO=1 -S '...'` cannot hide the split-string option.
-        if token.contains('=') {
-            index += 1;
-            continue;
-        }
-        return None;
-    }
-    None
+    parse_env_options(tokens).split_string_index
 }
 
 fn env_split_string_message() -> String {

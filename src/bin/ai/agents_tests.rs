@@ -1,6 +1,7 @@
 use super::{
-    AgentModelTier, BUILTIN_AGENTS, ProjectInstructionDoc, load_project_instruction_docs_from,
-    limit_project_instruction_docs, load_scoped_project_instruction_docs_for_target_priority_from,
+    AgentModelTier, BUILTIN_AGENTS, ProjectInstructionDoc, limit_project_instruction_docs,
+    load_project_instruction_docs_from,
+    load_scoped_project_instruction_docs_for_target_priority_from,
     load_scoped_project_instruction_docs_for_target_tiers_from,
     load_scoped_project_instruction_docs_for_targets_from, parse_agent_front_matter,
 };
@@ -39,7 +40,10 @@ fn with_fake_home<T>(fake_home: &Path, f: impl FnOnce() -> T) -> T {
 
 #[test]
 fn builtin_audit_agents_request_progress_checkpoints() {
-    for (name, source) in BUILTIN_AGENTS.iter().filter(|(name, _)| name.starts_with("audit")) {
+    for (name, source) in BUILTIN_AGENTS
+        .iter()
+        .filter(|(name, _)| name.starts_with("audit"))
+    {
         let manifest = parse_agent_front_matter(source).expect("audit agent manifest parses");
         assert!(
             manifest.audit_checkpoints,
@@ -176,7 +180,11 @@ fn builtin_pure_agent_pins_minimal_rendering_contract() {
     assert!(agent.tools.is_empty());
     assert!(agent.tool_groups.is_empty());
     assert!(agent.prompt.contains("<pure_mode>"));
-    assert!(agent.prompt.contains("You are a general-purpose AI assistant"));
+    assert!(
+        agent
+            .prompt
+            .contains("You are a general-purpose AI assistant")
+    );
 }
 
 #[test]
@@ -226,7 +234,11 @@ fn builtin_build_agent_prompt_preserves_end_to_end_behavior_tracing() {
     // without demoting stable knowledge to inference.
     assert!(agent.prompt.contains("Ground analysis answers too"));
     assert!(agent.prompt.contains("or mark it as inference"));
-    assert!(agent.prompt.contains("stable general knowledge and stated derivations need no such tie"));
+    assert!(
+        agent
+            .prompt
+            .contains("stable general knowledge and stated derivations need no such tie")
+    );
 }
 
 #[test]
@@ -560,6 +572,141 @@ fn target_scoped_instruction_docs_add_only_nested_rules() {
 }
 
 #[test]
+fn add_dir_scoped_instructions_include_added_projects_only() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let root = temp_dir("add_dir_scoped");
+    let primary = root.join("primary");
+    let added = root.join("added");
+    let excluded = root.join("excluded");
+    for project in [&primary, &added, &excluded] {
+        fs::create_dir_all(project.join(".git")).unwrap();
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("src/file.rs"), "// source\n").unwrap();
+    }
+    fs::write(primary.join("AGENTS.md"), "primary rules").unwrap();
+    fs::write(added.join("AGENTS.md"), "added root rules").unwrap();
+    fs::write(added.join("src/AGENTS.md"), "added source rules").unwrap();
+    fs::write(excluded.join("AGENTS.md"), "excluded rules").unwrap();
+    let targets = [added.join("src/file.rs"), excluded.join("src/file.rs")];
+    with_fake_home(&root.join("home"), || {
+        assert!(
+            load_scoped_project_instruction_docs_for_targets_from(&primary, &targets).is_empty()
+        );
+        let mut app = crate::ai::tests::test_app_with_cancel_stream(std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        app.cli.add_dirs = vec![added.canonicalize().unwrap()];
+        let context = crate::ai::driver::runtime_ctx::DriverContext::new(
+            app,
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+            std::sync::Arc::new(Vec::new()),
+            std::sync::Arc::new(Vec::new()),
+        );
+        let docs = crate::ai::driver::runtime_ctx::DRIVER_CTX.sync_scope(context, || {
+            load_scoped_project_instruction_docs_for_targets_from(&primary, &targets)
+        });
+        assert!(docs.iter().any(|doc| doc.content == "added root rules"));
+        assert!(docs.iter().any(|doc| doc.content == "added source rules"));
+        assert!(
+            docs.iter()
+                .all(|doc| !doc.content.contains("excluded rules"))
+        );
+    });
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn add_dir_scoped_instructions_load_existing_ancestor_for_new_paths() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let root = temp_dir("add_dir_new_paths");
+    let primary = root.join("primary");
+    let added = root.join("added");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    fs::create_dir_all(added.join(".git")).unwrap();
+    fs::write(added.join("AGENTS.md"), "added root rules").unwrap();
+    let target = added.join("new/deep/file.rs");
+    assert!(!target.parent().unwrap().exists());
+    with_fake_home(&root.join("home"), || {
+        let mut app = crate::ai::tests::test_app_with_cancel_stream(std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        app.cli.add_dirs = vec![added.canonicalize().unwrap()];
+        let context = crate::ai::driver::runtime_ctx::DriverContext::new(
+            app,
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+            std::sync::Arc::new(Vec::new()),
+            std::sync::Arc::new(Vec::new()),
+        );
+        let docs = crate::ai::driver::runtime_ctx::DRIVER_CTX.sync_scope(context, || {
+            load_scoped_project_instruction_docs_for_targets_from(
+                &primary,
+                std::slice::from_ref(&target),
+            )
+        });
+        assert!(docs.iter().any(|doc| doc.content == "added root rules"));
+    });
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn add_dir_scoped_instructions_cover_root_above_nested_project_marker() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let root = temp_dir("add_dir_nested_project");
+    let primary = root.join("primary");
+    let added = root.join("added");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    fs::create_dir_all(added.join("sub/.git")).unwrap();
+    fs::write(added.join("AGENTS.md"), "added root rules").unwrap();
+    fs::write(added.join("sub/AGENTS.md"), "nested project rules").unwrap();
+    let target = added.join("sub/new/deep/file.rs");
+    assert!(!target.parent().unwrap().exists());
+    with_fake_home(&root.join("home"), || {
+        let mut app = crate::ai::tests::test_app_with_cancel_stream(std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        app.cli.add_dirs = vec![added.canonicalize().unwrap()];
+        let context = crate::ai::driver::runtime_ctx::DriverContext::new(
+            app,
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+            std::sync::Arc::new(Vec::new()),
+            std::sync::Arc::new(Vec::new()),
+        );
+        crate::ai::driver::runtime_ctx::DRIVER_CTX.sync_scope(context, || {
+            let docs = load_scoped_project_instruction_docs_for_targets_from(
+                &primary,
+                std::slice::from_ref(&target),
+            );
+            assert_eq!(
+                docs.iter()
+                    .map(|doc| doc.content.as_str())
+                    .collect::<Vec<_>>(),
+                ["added root rules", "nested project rules"]
+            );
+
+            // A pre-existing outer project boundary must still win over the grant.
+            fs::create_dir(root.join(".git")).unwrap();
+            fs::write(root.join("AGENTS.md"), "outer project rules").unwrap();
+            let docs = load_scoped_project_instruction_docs_for_targets_from(
+                &primary,
+                std::slice::from_ref(&target),
+            );
+            assert_eq!(
+                docs.iter()
+                    .map(|doc| doc.content.as_str())
+                    .collect::<Vec<_>>(),
+                ["added root rules", "nested project rules"]
+            );
+            let scope = super::project_instruction_search_scope_with_boundary(
+                &added.join("sub").canonicalize().unwrap(),
+                Some(&added.canonicalize().unwrap()),
+            );
+            assert_eq!(scope.first(), Some(&root.canonicalize().unwrap()));
+        });
+    });
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn target_scoped_instruction_budget_preserves_deepest_rules_first() {
     let root = temp_dir("target_scoped_budget");
     let target = root.join("src/bin/ai/driver/deep/iteration.rs");
@@ -680,7 +827,11 @@ fn resident_scoped_instructions_outrank_new_observed_targets_but_not_pending_mut
         .iter()
         .filter(|doc| doc.path.contains("/resident_"))
         .collect::<Vec<_>>();
-    assert_eq!(resident.len(), 2, "resident rules must not be evicted by observed targets");
+    assert_eq!(
+        resident.len(),
+        2,
+        "resident rules must not be evicted by observed targets"
+    );
     assert!(resident.iter().all(|doc| doc.content == resident_rules));
     assert!(
         docs.iter()

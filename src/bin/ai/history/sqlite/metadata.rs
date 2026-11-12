@@ -1,4 +1,7 @@
-use std::{io, path::Path};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -17,6 +20,7 @@ use super::{
     SESSION_MARK_MESSAGE_META_KEY, SESSION_MARKED_META_KEY, SESSION_SERVE_AGENT_META_KEY,
     SESSION_SERVE_EFFORT_META_KEY, SESSION_SERVE_MODEL_META_KEY, SESSION_SUBAGENT_BACKEND_META_KEY,
     SESSION_SUBAGENT_KERNEL_MODEL_META_KEY, SESSION_SUBAGENT_MODEL_META_KEY,
+    SESSION_WRITE_ROOTS_META_KEY,
 };
 
 pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Option<String>> {
@@ -372,6 +376,8 @@ pub(in crate::ai) fn read_session_serve_config_sqlite(
     let tx = conn
         .transaction()
         .map_err(|error| io::Error::other(error.to_string()))?;
+    let (additional_write_roots, additional_write_root_warnings) =
+        crate::ai::write_roots::bounded_roots(&read_write_roots(&tx)?);
     let config = SessionServeConfig {
         model: read_meta_optional(&tx, SESSION_SERVE_MODEL_META_KEY),
         agent: read_meta_optional(&tx, SESSION_SERVE_AGENT_META_KEY),
@@ -382,6 +388,8 @@ pub(in crate::ai) fn read_session_serve_config_sqlite(
         default_skills: read_meta_optional(&tx, SESSION_DEFAULT_SKILLS_META_KEY)
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or_default(),
+        additional_write_roots,
+        additional_write_root_warnings,
     };
     tx.commit()
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -392,7 +400,7 @@ pub(in crate::ai) fn read_session_serve_config_sqlite(
 /// transaction: these keys are one logical value, so a crash mid-write must
 /// not leave a half-updated config (e.g. a new model with the old agent).
 /// The keys live in the meta table, so they survive clear-history and are
-/// copied by fork / import (which copy the whole SQLite file).
+/// copied by fork / import, except directory grants, which import clears.
 pub(in crate::ai) fn write_session_serve_config_sqlite(
     path: &Path,
     config: &SessionServeConfig,
@@ -408,6 +416,20 @@ pub(in crate::ai) fn write_session_serve_config_sqlite(
         let tx = conn
             .transaction()
             .map_err(|e| io::Error::other(e.to_string()))?;
+        // Config snapshots may predate a concurrent directory grant. Never replace newer roots.
+        let mut roots = read_write_roots(&tx)?;
+        for root in &config.additional_write_roots {
+            if !root.is_absolute() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "session writable roots must be absolute",
+                ));
+            }
+            if !roots.contains(root) {
+                roots.push(root.clone());
+            }
+        }
+        store_write_roots(&tx, &roots)?;
         for (key, value) in [
             (SESSION_SERVE_MODEL_META_KEY, config.model.as_deref()),
             (SESSION_SERVE_AGENT_META_KEY, config.agent.as_deref()),
@@ -445,6 +467,156 @@ pub(in crate::ai) fn write_session_serve_config_sqlite(
         }
         touch_session_activity(&tx)?;
         tx.commit().map_err(|e| io::Error::other(e.to_string()))
+    })
+}
+
+pub(super) fn read_write_roots(conn: &Connection) -> io::Result<Vec<PathBuf>> {
+    // Legacy live databases without metadata have no directory authorization to preserve.
+    let meta_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(io::Error::other)?
+        .is_some();
+    if !meta_exists {
+        return Ok(Vec::new());
+    }
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [SESSION_WRITE_ROOTS_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(io::Error::other)?;
+    let roots: Vec<PathBuf> = raw
+        .map(|raw| serde_json::from_str(&raw))
+        .transpose()
+        .map_err(io::Error::other)?
+        .unwrap_or_default();
+    if roots.iter().any(|root| !root.is_absolute()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stored session writable roots must be absolute",
+        ));
+    }
+    Ok(roots)
+}
+
+pub(super) fn store_write_roots(conn: &Connection, roots: &[PathBuf]) -> io::Result<()> {
+    crate::ai::write_roots::validate_root_limits(roots)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if roots.is_empty() {
+        conn.execute(
+            "DELETE FROM meta WHERE key=?1",
+            [SESSION_WRITE_ROOTS_META_KEY],
+        )
+        .map_err(io::Error::other)?;
+        return Ok(());
+    }
+    let raw = serde_json::to_string(roots).map_err(io::Error::other)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key,value,created_at) VALUES (?1,?2,unixepoch())",
+        rusqlite::params![SESSION_WRITE_ROOTS_META_KEY, raw],
+    )
+    .map_err(io::Error::other)?;
+    Ok(())
+}
+
+pub(in crate::ai) fn add_session_write_root_sqlite(
+    path: &Path,
+    root: &Path,
+    defaults: &[PathBuf],
+) -> io::Result<(Vec<PathBuf>, bool)> {
+    if !root.is_absolute() || !root.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session writable root must be an existing absolute directory",
+        ));
+    }
+    with_session_state_lock(path, || {
+        let mut conn = open_history_db(path)?;
+        init_history_schema(&conn)?;
+        let tx = conn.transaction().map_err(io::Error::other)?;
+        let mut roots = read_write_roots(&tx)?;
+        let added = !roots.iter().any(|stored| stored == root);
+        if added {
+            roots.push(root.to_path_buf());
+        }
+        crate::ai::write_roots::validate_root_limits(&roots)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let mut effective = defaults.to_vec();
+        for root in &roots {
+            if !effective.contains(root) {
+                effective.push(root.clone());
+            }
+        }
+        crate::ai::write_roots::validate_root_limits(&effective)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        if added {
+            store_write_roots(&tx, &roots)?;
+        }
+        touch_session_activity(&tx)?;
+        tx.commit().map_err(io::Error::other)?;
+        Ok((roots, added))
+    })
+}
+
+/// Remove one stored grant. An absent grant reports `removed = false` without a write.
+pub(in crate::ai) fn remove_session_write_root_sqlite(
+    path: &Path,
+    root: &Path,
+) -> io::Result<(Vec<PathBuf>, bool)> {
+    // Opening a missing SQLite path would create a session file for a command
+    // that only reports an absent grant; such a database holds no grants.
+    if !path.is_file() {
+        return Ok((Vec::new(), false));
+    }
+    with_session_state_lock(path, || {
+        let mut conn = open_history_db(path)?;
+        init_history_schema(&conn)?;
+        let tx = conn.transaction().map_err(io::Error::other)?;
+        let mut roots = read_write_roots(&tx)?;
+        let removed = roots.iter().any(|stored| stored == root);
+        if removed {
+            roots.retain(|stored| stored != root);
+            store_write_roots(&tx, &roots)?;
+            touch_session_activity(&tx)?;
+        }
+        tx.commit().map_err(io::Error::other)?;
+        Ok((roots, removed))
+    })
+}
+
+pub(in crate::ai) fn clear_session_write_roots_sqlite(path: &Path) -> io::Result<()> {
+    with_session_state_lock(path, || {
+        let conn = open_history_db(path)?;
+        let result = (|| {
+            // History migrations create no triggers. Reject archive-supplied code
+            // before any content write can restore grants or alter imported data.
+            let trigger: Option<String> = conn
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(io::Error::other)?;
+            if let Some(trigger) = trigger {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("session archive contains unsupported SQLite trigger: {trigger}"),
+                ));
+            }
+            init_history_schema(&conn)?;
+            store_write_roots(&conn, &[])
+        })();
+        // Imports publish or discard this private DB immediately after preparation.
+        conn.close();
+        result
     })
 }
 

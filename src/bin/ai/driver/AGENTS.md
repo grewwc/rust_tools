@@ -27,12 +27,16 @@ routing, commands, observation, and terminal output.
 10. **Persist the actual response model.** Auto fallback doesn't rewrite `app.current_model`; projection/provenance use the model that produced each response. Provenance is per message and never inferred: `Message` carries no model (`source_model` travels beside it), overflow archives persist bodies only, so expanded messages report unknown instead of inheriting the stub's model, and `/history` labels assistant rows only.
 11. **Mutation preflight.** Load target-scoped instructions root-to-deep before
     first write and prioritize paused mutation over observed targets. Target
-    instruction discovery is limited to the project scope by
+    instruction discovery is limited to the project scope and session `--add-dir` roots by
     `load_scoped_project_instruction_docs_for_targets` and its downstream loader
     `load_scoped_project_instruction_docs_for_target_tiers_from`
     (`src/bin/ai/agents.rs`);
     write authorization is owned by `configured_write_roots`
-    (`src/bin/ai/tools/storage/file_store.rs`). Keep preflight grace separate from
+    (`src/bin/ai/tools/storage/file_store.rs`). Writable roots and the
+    `AGENT_COMMAND_ENV` origin marker in `src/bin/ai/write_roots.rs` are guardrails,
+    not a security boundary: models with command execution can bypass the marker
+    and write outside these roots. User-only grant expansion is not an implemented
+    security guarantee. Keep preflight grace separate from
     tool/kernel quotas. Reasoning control needs a parsed control channel; redirect
     notes never quote user content.
 12. **Final-response gates.** Quality gates share one bounded reopen; the

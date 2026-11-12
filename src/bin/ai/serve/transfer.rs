@@ -34,11 +34,7 @@ fn attachment_name(session_id: &str, extension: &str) -> String {
 }
 
 /// Build an attachment response. `filename` is server-controlled and ASCII.
-fn attachment_response(
-    bytes: Vec<u8>,
-    content_type: &'static str,
-    filename: &str,
-) -> Response {
+fn attachment_response(bytes: Vec<u8>, content_type: &'static str, filename: &str) -> Response {
     let mut resp = Response::new(axum::body::Body::from(bytes));
     let h = resp.headers_mut();
     h.insert(
@@ -67,11 +63,7 @@ fn io_error_response(err: std::io::Error) -> Response {
         std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (
-        status,
-        Json(serde_json::json!({"error": err.to_string()})),
-    )
-        .into_response()
+    (status, Json(serde_json::json!({"error": err.to_string()}))).into_response()
 }
 
 /// `GET /sessions/{id}/export` (authed): the session as a migration archive,
@@ -91,10 +83,7 @@ pub(crate) async fn export_session_zip(
     let session_id = id.clone();
     let result = tokio::task::spawn_blocking(move || {
         let store = SessionStore::new(&history_file);
-        let tmp = std::env::temp_dir().join(format!(
-            "a-serve-export-{}.zip",
-            uuid::Uuid::new_v4()
-        ));
+        let tmp = std::env::temp_dir().join(format!("a-serve-export-{}.zip", uuid::Uuid::new_v4()));
         let outcome = (|| {
             store.export_session_archive(&session_id, &tmp)?;
             std::fs::read(&tmp)
@@ -104,11 +93,9 @@ pub(crate) async fn export_session_zip(
     })
     .await;
     match result {
-        Ok(Ok(bytes)) => attachment_response(
-            bytes,
-            "application/zip",
-            &attachment_name(&id, "zip"),
-        ),
+        Ok(Ok(bytes)) => {
+            attachment_response(bytes, "application/zip", &attachment_name(&id, "zip"))
+        }
         Ok(Err(err)) => io_error_response(err),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -205,7 +192,9 @@ pub(crate) async fn import_session(
     }
     let bytes = match base64::engine::general_purpose::STANDARD.decode(req.data.as_bytes()) {
         Ok(bytes) => bytes,
-        Err(_) => return bad_request("archive data is not valid base64".to_string()).into_response(),
+        Err(_) => {
+            return bad_request("archive data is not valid base64".to_string()).into_response();
+        }
     };
     if bytes.is_empty() || bytes.len() > MAX_IMPORT_BYTES {
         return bad_request("archive is empty or larger than the import cap".to_string())
@@ -220,14 +209,15 @@ pub(crate) async fn import_session(
         }
         id
     };
+    let lock = session_lock(&state, &dst_id).await;
+    let session_guard = lock.lock_owned().await;
     let history_file = state.history_file.clone();
     let import_id = dst_id.clone();
     let result = tokio::task::spawn_blocking(move || {
+        // Keep the turn lock until import finishes, even if the HTTP request is cancelled.
+        let _session_guard = session_guard;
         let store = SessionStore::new(&history_file);
-        let tmp = std::env::temp_dir().join(format!(
-            "a-serve-import-{}.zip",
-            uuid::Uuid::new_v4()
-        ));
+        let tmp = std::env::temp_dir().join(format!("a-serve-import-{}.zip", uuid::Uuid::new_v4()));
         let outcome = (|| {
             std::fs::write(&tmp, &bytes)?;
             store.import_session_archive(&tmp, &import_id)
@@ -250,6 +240,64 @@ pub(crate) async fn import_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn import_session_waits_for_turn_lock_before_publishing() {
+        let root = std::env::temp_dir().join(format!("serve-import-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let history_file = root.join("history.sqlite");
+        let store = SessionStore::new(&history_file);
+        let source_db = store.session_history_file("source");
+        crate::ai::history::append_history_messages(
+            &source_db,
+            &[crate::ai::history::Message {
+                role: "user".into(),
+                content: serde_json::json!("import me"),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        store.add_session_write_root("source", &root).unwrap();
+        let archive = root.join("archive.zip");
+        store.export_session_archive("source", &archive).unwrap();
+        let state = ServeState {
+            history_file,
+            token: String::new(),
+            default_add_dirs: Default::default(),
+            cwds: Default::default(),
+            locks: Default::default(),
+            open_sessions: Default::default(),
+            active_turns: Default::default(),
+            confirms: Default::default(),
+            events: Default::default(),
+        };
+        let lock = session_lock(&state, "imported").await;
+        let guard = lock.lock().await;
+        let req = ImportSessionReq {
+            filename: "archive.zip".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(std::fs::read(archive).unwrap()),
+            id: "imported".into(),
+        };
+        let mut import = tokio::spawn(import_session(State(state), HeaderMap::new(), Json(req)));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut import)
+                .await
+                .is_err()
+        );
+        assert!(!store.session_history_file("imported").exists());
+        drop(guard);
+        assert_eq!(import.await.unwrap().status(), StatusCode::OK);
+        assert!(
+            store
+                .read_session_serve_config("imported")
+                .unwrap()
+                .additional_write_roots
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn attachment_names_stay_ascii_and_short() {
@@ -288,6 +336,9 @@ mod tests {
             text("   "),
             text("final"),
         ];
-        assert_eq!(last_assistant_conclusion(&messages).as_deref(), Some("final"));
+        assert_eq!(
+            last_assistant_conclusion(&messages).as_deref(),
+            Some("final")
+        );
     }
 }

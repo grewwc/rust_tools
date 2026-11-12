@@ -18,7 +18,10 @@ HTTP/SSE surface lives in `mod.rs`.
    `DEFERRED_RESTART_WAIT`, and skip abandoned or superseded requests. Turn-free
    requests use the immediate path. A successful in-turn command confirms
    scheduling only; verify the restart in a later turn.
-3. **Each turn is a child process.** `run_one_shot_turn` (`mod.rs`) spawns the turn, so a
+3. **Model turns are child processes.** The `/dirs add|ls|del` family (with
+   `/add-dir <DIR>` as an add alias) is intercepted in the daemon;
+   session grants live in `SessionServeConfig` and cwd/grants are read under the
+   session lock before forwarding roots to a child. `run_one_shot_turn` (`mod.rs`) spawns model turns, so a
    panicking tool aborts the turn and every tool result in it, while the daemon
    survives. Tool implementations must turn panics into ordinary tool errors.
 4. **Health follows the TLS setting.** `serve_url` (`ctl.rs`) prefixes `https://`

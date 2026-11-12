@@ -203,6 +203,19 @@ fn runtime_environment_prompt() -> String {
     let effective_cwd = super::runtime_ctx::effective_cwd()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+    let additional_roots = super::runtime_ctx::additional_write_roots();
+    let additional_write_roots = if additional_roots.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n- Additional writable directories for this run (--add-dir): {}.",
+            additional_roots
+                .iter()
+                .map(|root| format!("`{}`", root.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
 
     format!(
         include_str!("system_prompts/runtime_environment.md"),
@@ -211,6 +224,7 @@ fn runtime_environment_prompt() -> String {
         arch = arch,
         shell = shell,
         effective_cwd = effective_cwd,
+        additional_write_roots = additional_write_roots,
     )
 }
 

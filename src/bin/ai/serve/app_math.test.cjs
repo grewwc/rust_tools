@@ -215,6 +215,24 @@ test("pipe table without delimiter stays literal inside fenced code", () => {
   }
 });
 
+test("a fenced block that continues a bullet renders as a code block", () => {
+  const { render } = pipeTableHarness(1280);
+  const output = render("- 登记 Redirect URI，格式为：\n  ```text\n  https://<域名>/oauth/codebase/callback\n  ```\n例如登记：");
+  assert.doesNotMatch(output, /```/);
+  assert.match(output, /<pre data-lang="text"><code>https:\/\/&lt;域名&gt;\/oauth\/codebase\/callback<\/code><\/pre>/);
+  assert.match(output, /<div class="li"[^>]*><span class="bullet">•<\/span><span>登记 Redirect URI，格式为：<div class="code-block">/);
+  assert.match(output, /<\/div><\/span><\/div><div class="p">例如登记：<\/div>/);
+  const streaming = render("- code\n  ```text\n  partial");
+  assert.match(streaming, /<pre data-lang="text"><code>partial<\/code><\/pre>/);
+  assert.doesNotMatch(streaming, /```/);
+  const bounded = render("- code\n  ```text\n  partial\nnext paragraph");
+  assert.match(bounded, /<pre data-lang="text"><code>partial<\/code><\/pre>/);
+  assert.match(bounded, /<div class="p">next paragraph<\/div>/);
+  const spaced = render("1. step\n   ```text\n   a\n\n   b\n   ```\n   after");
+  assert.match(spaced, /<pre data-lang="text"><code>a\n\nb<\/code><\/pre>/);
+  assert.match(spaced, /<\/div>after<\/span><\/div>/);
+});
+
 test("pipe table without delimiter tolerates streaming prefixes without inventing cells", () => {
   const h = pipeTableHarness();
   const source = "| a | b |\n| c | d |\n| e | f |";
@@ -2425,7 +2443,7 @@ function pasteHarness(value = "") {
   };
   class Reader {
     readAsDataURL(file) {
-      this.result = "data:" + file.type + ";base64,aW1hZ2U=";
+      this.result = "data:" + file.type + ";base64," + (file.data || "aW1hZ2U=");
       this.onload();
     }
   }
@@ -2489,4 +2507,26 @@ test("prompt paste accepts mobile clipboard image files without DataTransfer ite
   });
   assert.equal(h.prompt.value, "[[image:mobile.png]]");
   assert.equal(h.context.pendingImages.length, 1);
+});
+
+test("prompt paste gives same-named clipboard images distinct upload names", async () => {
+  const h = pasteHarness();
+  const paste = (file) => h.context.handlePromptPaste({
+    clipboardData: {
+      items: [{ kind: "file", type: "image/png", getAsFile: () => file }],
+      getData: () => "",
+    },
+    preventDefault() {},
+  });
+  // Browsers hand every clipboard image the same generic filename; the server
+  // stages uploads by name, so equal names would collapse to one picture.
+  await paste({ name: "image.png", type: "image/png", data: "b25l" });
+  await paste({ name: "image.png", type: "image/png", data: "dHdv" });
+  await paste({ name: "IMAGE.PNG", type: "image/png", data: "dGhyZWU=" });
+  assert.equal(h.prompt.value,
+    "[[image:image.png]]\n[[image:image-2.png]]\n[[image:IMAGE-3.PNG]]");
+  assert.equal(JSON.stringify(h.context.pendingImages),
+    '[{"filename":"image.png","data_base64":"b25l"},'
+    + '{"filename":"image-2.png","data_base64":"dHdv"},'
+    + '{"filename":"IMAGE-3.PNG","data_base64":"dGhyZWU="}]');
 });

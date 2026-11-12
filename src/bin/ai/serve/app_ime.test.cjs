@@ -168,7 +168,7 @@ for (const phone of [false, true]) {
       },
     });
     run(context, script.slice(script.indexOf("const composerDrafts = new Map();"), script.indexOf("function closeQuestionPanel(")));
-    run(context, script.slice(script.indexOf("async function queueImageFiles("), script.indexOf("// Entry point for the Android share target.")));
+    run(context, script.slice(script.indexOf("function uniqueImageFilename("), script.indexOf("// Entry point for the Android share target.")));
     const oldImage = { filename: "old.png", data_base64: "b2xk" };
     const newImage = { filename: "new.png", data_base64: "bmV3" };
     context.prompt.value = "old draft";

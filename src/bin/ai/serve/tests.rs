@@ -47,6 +47,7 @@ fn lifecycle_test_state() -> super::ServeState {
     super::ServeState {
         history_file: root.join("history.sqlite"),
         token: String::new(),
+        default_add_dirs: Default::default(),
         cwds: Default::default(),
         locks: Default::default(),
         open_sessions: Default::default(),
@@ -67,6 +68,7 @@ fn web_open_slot_allows_owner_reattach_and_rejects_a_second_client() {
     let state = ServeState {
         history_file: root.join("history.sqlite"),
         token: String::new(),
+        default_add_dirs: Default::default(),
         cwds: Default::default(),
         locks: Default::default(),
         open_sessions: Default::default(),
@@ -244,6 +246,7 @@ async fn file_route_serves_images_and_guards_access() {
     let state = super::ServeState {
         history_file,
         token: "t".to_string(),
+        default_add_dirs: Default::default(),
         cwds: Default::default(),
         locks: Default::default(),
         open_sessions: Default::default(),
@@ -1439,6 +1442,65 @@ async fn delete_unknown_session_still_succeeds() {
 }
 
 #[tokio::test]
+async fn session_create_and_cd_report_the_working_directory() {
+    use axum::{
+        Json,
+        body::to_bytes,
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+    };
+
+    let state = lifecycle_test_state();
+    let root = state
+        .history_file
+        .parent()
+        .expect("test root")
+        .to_path_buf();
+    let daemon_cwd = std::env::current_dir()
+        .expect("daemon cwd")
+        .display()
+        .to_string();
+
+    let created = super::create_session(State(state.clone()), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(created.status(), StatusCode::OK);
+    let body = to_bytes(created.into_body(), usize::MAX)
+        .await
+        .expect("create body");
+    let created: serde_json::Value = serde_json::from_slice(&body).expect("create json");
+    let id = created["id"].as_str().expect("created id").to_string();
+    assert_eq!(created["cwd"], serde_json::json!(daemon_cwd));
+
+    let target = root.join("nested");
+    std::fs::create_dir_all(&target).expect("create target dir");
+    let target = target.canonicalize().expect("canonical target");
+    let request = serde_json::from_value(serde_json::json!({
+        "command": format!("/cd {}", target.display()),
+    }))
+    .expect("cd request");
+    let moved = super::post_session_cd(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(id),
+        Json(request),
+    )
+    .await;
+    assert_eq!(moved.status(), StatusCode::OK);
+    let body = to_bytes(moved.into_body(), usize::MAX)
+        .await
+        .expect("cd body");
+    let moved: serde_json::Value = serde_json::from_slice(&body).expect("cd json");
+    assert_eq!(
+        moved["cwd"],
+        serde_json::json!(target.display().to_string())
+    );
+
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[tokio::test]
 async fn session_mark_endpoint_roundtrips_and_updates_list() {
     use crate::ai::history::MarkMessageUpdate;
 
@@ -1598,6 +1660,15 @@ async fn session_list_offset_matches_the_legacy_full_response() {
         .expect("newest page json");
 
     assert_eq!(all.len(), 3);
+    let daemon_cwd = std::env::current_dir()
+        .expect("daemon cwd")
+        .display()
+        .to_string();
+    assert!(
+        all.iter()
+            .all(|item| item["cwd"].as_str() == Some(daemon_cwd.as_str())),
+        "every listed session reports the daemon cwd it will start in: {all:?}"
+    );
     assert_eq!(page, vec![all[1].clone()]);
     assert_eq!(newest, vec![all[2].clone(), all[1].clone(), all[0].clone()]);
     server.abort();
@@ -2137,6 +2208,7 @@ fn merge_session_config_fills_absent_fields_only() {
         agent: None,
         reasoning_effort: None,
         skills: Vec::new(),
+        add_dirs: Vec::new(),
     };
     super::merge_session_config(&mut overrides, &stored);
     assert_eq!(
@@ -2165,6 +2237,7 @@ fn turn_args_keep_options_before_terminator_and_prompt_verbatim() {
         agent: Some("sharp".to_string()),
         reasoning_effort: Some("high".to_string()),
         skills: Vec::new(),
+        add_dirs: Vec::new(),
     };
     let mut cmd = std::process::Command::new("a");
     super::push_turn_args(&mut cmd, "s1", prompt, &overrides);

@@ -132,6 +132,12 @@ impl App {
 
     pub(super) fn fork_for_subagent(&self) -> Self {
         let mut app = self.fork_baseline();
+        // Child history is independent; retain inherited grants as runtime roots before restore.
+        for root in app.cli.session_add_dirs.drain(..) {
+            if root.is_dir() && !app.cli.add_dirs.contains(&root) {
+                app.cli.add_dirs.push(root);
+            }
+        }
         Self::reset_child_reasoning_controls(&mut app);
         // Team orchestration belongs to the parent turn; worker turns keep
         // their own manifest instead of activating the session's team default.

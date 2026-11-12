@@ -16,6 +16,29 @@ fn show_final_response_validation_status(
     }
 }
 
+fn bind_patch_file_sources_for_preflight(tool_calls: &[ToolCall]) -> impl Drop {
+    struct SourceBindings<T>(Vec<T>);
+    impl<T> Drop for SourceBindings<T> {
+        fn drop(&mut self) {
+            // Duplicate source bindings must unwind in reverse insertion order.
+            while self.0.pop().is_some() {}
+        }
+    }
+    let mut bindings = Vec::new();
+    for call in tool_calls {
+        if call.function.name != "apply_patch" {
+            continue;
+        }
+        let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) else {
+            continue;
+        };
+        bindings.push(
+            crate::ai::tools::apply_patch_target_paths_from_args(&args).bind_patch_file_source(),
+        );
+    }
+    SourceBindings(bindings)
+}
+
 pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
     app: &mut App,
     question: &str,
@@ -511,6 +534,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             Ok(TurnLoopStep::Break)
         }
         IterationExecution::ToolCall(tool_call_execution) => {
+            let _patch_source_bindings = (!*force_final_response).then(|| {
+                bind_patch_file_sources_for_preflight(&tool_call_execution.stream_result.tool_calls)
+            });
             let patch_retry_needs_fresh_read = !*force_final_response
                 && patch_retry_requires_fresh_read(
                     &app.stale_patch_targets,

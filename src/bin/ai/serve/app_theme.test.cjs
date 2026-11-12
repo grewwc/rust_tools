@@ -647,7 +647,7 @@ test("desktop contrast rules preserve the current shared and mobile CSS bytes", 
   const phoneApplicable = desktopMediaQueries().reduce((source, block) => source.replace(block.css, ""), style);
   assert.doesNotMatch(phoneApplicable, /--(?:control-border|danger-text)/);
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "84c4c7ed96e3501d437fee64bf5942e1dc99132e680dce348604dcb163833bca",
+    "53fc93f51d7dada2ed866072de3e2131009a261540b31a84b4a4e5abc111cf5e",
     "desktop contrast changed shared or mobile CSS");
 });
 
@@ -657,7 +657,7 @@ test("desktop overrides leave all phone-applicable CSS byte-identical", () => {
   let phoneApplicable = style;
   for (const block of desktop) phoneApplicable = phoneApplicable.replace(block.css, "");
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "84c4c7ed96e3501d437fee64bf5942e1dc99132e680dce348604dcb163833bca",
+    "53fc93f51d7dada2ed866072de3e2131009a261540b31a84b4a4e5abc111cf5e",
     "shared or phone CSS changed outside the desktop queries");
 });
 

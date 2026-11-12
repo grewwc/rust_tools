@@ -39,6 +39,7 @@ const SESSION_SUBAGENT_BACKEND_META_KEY: &str = "session_subagent_backend";
 const SESSION_SUBAGENT_MODEL_META_KEY: &str = "session_subagent_model";
 const SESSION_SUBAGENT_KERNEL_MODEL_META_KEY: &str = "session_subagent_kernel_model";
 const SESSION_DEFAULT_SKILLS_META_KEY: &str = "session_default_skills";
+const SESSION_WRITE_ROOTS_META_KEY: &str = "session_write_roots";
 
 pub(super) use lock::{
     delete_session_state_lock, remove_session_state_lock_entry, with_session_state_lock,
@@ -60,11 +61,12 @@ pub(in crate::ai) use context::{
     write_context_snapshot_sqlite_if_revision,
 };
 pub(in crate::ai) use metadata::{
-    MarkMessageUpdate, read_first_user_prompt_sqlite, read_session_archived_sqlite,
-    read_session_list_metadata_sqlite, read_session_mark_message_sqlite,
-    read_session_marked_sqlite, read_session_origin_sqlite, read_session_serve_config_sqlite,
-    read_session_title_origin_sqlite, read_session_title_sqlite, write_session_archived_sqlite,
-    write_session_mark_sqlite, write_session_serve_config_sqlite, write_session_title_sqlite,
+    MarkMessageUpdate, add_session_write_root_sqlite, clear_session_write_roots_sqlite,
+    read_first_user_prompt_sqlite, read_session_archived_sqlite, read_session_list_metadata_sqlite,
+    read_session_mark_message_sqlite, read_session_marked_sqlite, read_session_origin_sqlite,
+    read_session_serve_config_sqlite, read_session_title_origin_sqlite, read_session_title_sqlite,
+    remove_session_write_root_sqlite, write_session_archived_sqlite, write_session_mark_sqlite,
+    write_session_serve_config_sqlite, write_session_title_sqlite,
 };
 pub(in crate::ai) use outcomes::{
     ENCRYPTED_REASONING_REPLAY_REJECTIONS_MAX_ENTRIES, append_interrupted_stream_diagnostic_sqlite,

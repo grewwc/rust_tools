@@ -33,6 +33,14 @@ fn print_commands_help() {
     );
     println!("    /pwd                      show the session working directory (same as bare /cd)");
     println!(
+        "    /dirs                     list writable directories (working dir, session and startup grants)"
+    );
+    println!("    /dirs add <DIR>           add a persistent writable directory to this session");
+    println!(
+        "    /dirs del <DIR>           remove a session writable directory (startup grants need a restart)"
+    );
+    println!("    /add-dir <DIR>            alias for /dirs add <DIR>");
+    println!(
         "    /audit <instruction>      run the audit subagent synchronously (up to 15 min), then verify and fix findings"
     );
     println!(

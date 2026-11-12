@@ -173,6 +173,8 @@ fn default_cli() -> ParsedCli {
         talk_max_turns: 30,
         talk_idle_secs: 180,
         files: String::new(),
+        add_dirs: Vec::new(),
+        session_add_dirs: Vec::new(),
         args: Vec::new(),
         list_tools: false,
         list_mcp_tools: false,
@@ -388,6 +390,46 @@ fn client_eligibility_is_restricted_to_bare_interactive_invocations() {
     let mut cli = default_cli();
     cli.model = Some("gpt-5".into());
     assert!(!eligible(&cli));
+}
+
+#[test]
+fn add_dir_live_terminal_attach_rejects_ignored_startup_permissions() {
+    let _lock = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut worker = Command::new("/bin/sh");
+    worker.args(["-c", "sleep 1"]);
+    let (root, socket) = start_host(worker);
+    registry::bind_terminal(
+        &root,
+        "tmux:add-dir-test-pane",
+        &registry::Binding {
+            socket: socket.file_name().unwrap().to_string_lossy().into_owned(),
+            session: None,
+        },
+    )
+    .unwrap();
+    let previous = std::env::var_os("TMUX_PANE");
+    unsafe { std::env::set_var("TMUX_PANE", "add-dir-test-pane") };
+    let (_master, slave) = pty_pair();
+    let mut cli = default_cli();
+    cli.add_dirs = vec![root.clone()];
+    let result = maybe_run_impl(
+        &cli,
+        &["a".to_string()],
+        &root,
+        slave.as_raw_fd(),
+        slave.as_raw_fd(),
+    );
+    match previous {
+        Some(value) => unsafe { std::env::set_var("TMUX_PANE", value) },
+        None => unsafe { std::env::remove_var("TMUX_PANE") },
+    }
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.contains("--add-dir cannot change a running terminal worker"),
+        "{error}"
+    );
 }
 
 #[test]

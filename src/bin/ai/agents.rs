@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
-use crate::commonw::{configw, utils::expanduser, FastSet};
+use crate::commonw::{FastSet, configw, utils::expanduser};
 
 const BUILTIN_AGENTS: &[(&str, &str)] = &[
     ("build.agent", include_str!("builtin_agents/build.agent")),
@@ -466,7 +466,10 @@ fn load_scoped_project_instruction_docs_for_target_tiers_from(
         .collect::<std::collections::BTreeSet<_>>();
     let scope = project_instruction_search_scope(cwd);
     let project_root = scope.first().map(PathBuf::as_path).unwrap_or(cwd);
-    let canonical_root = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.into());
+    let mut canonical_roots =
+        vec![fs::canonicalize(project_root).unwrap_or_else(|_| project_root.into())];
+    let additional_roots = crate::ai::driver::runtime_ctx::additional_write_roots();
+    canonical_roots.extend(additional_roots.iter().cloned());
 
     let mut seen_paths = std::collections::BTreeSet::new();
     let mut required_candidates = Vec::new();
@@ -495,13 +498,24 @@ fn load_scoped_project_instruction_docs_for_target_tiers_from(
                 };
                 parent
             };
-            let Ok(target_dir) = fs::canonicalize(dir) else {
+            let Some(target_dir) = dir
+                .ancestors()
+                .find_map(|ancestor| fs::canonicalize(ancestor).ok().filter(|path| path.is_dir()))
+            else {
                 continue;
             };
-            if !target_dir.starts_with(&canonical_root) {
+            if !canonical_roots
+                .iter()
+                .any(|root| target_dir.starts_with(root))
+            {
                 continue;
             }
-            for doc in load_project_instruction_candidates_from(&target_dir) {
+            let minimum_root = additional_roots
+                .iter()
+                .filter(|root| target_dir.starts_with(root))
+                .min_by_key(|root| root.components().count())
+                .map(PathBuf::as_path);
+            for doc in load_project_instruction_candidates_from(&target_dir, minimum_root) {
                 if base_paths.contains(doc.path.as_str()) || !seen_paths.insert(doc.path.clone()) {
                     continue;
                 }
@@ -645,7 +659,14 @@ fn load_project_instruction_docs_uncached(cwd: &Path) -> Vec<ProjectInstructionD
     limit_project_instruction_docs(candidates, PROJECT_INSTRUCTION_MAX_TOTAL_CHARS)
 }
 
-fn load_project_instruction_candidates_from(cwd: &Path) -> Vec<ProjectInstructionDoc> {
+fn load_project_instruction_candidates_from(
+    cwd: &Path,
+    minimum_root: Option<&Path>,
+) -> Vec<ProjectInstructionDoc> {
+    if let Some(root) = minimum_root {
+        let scope = project_instruction_search_scope_with_boundary(cwd, Some(root));
+        return discover_project_instruction_docs_in_scope(cwd, &scope);
+    }
     let fingerprint = fingerprint_project_instruction_files(cwd);
     if let Ok(mut cache) = project_instruction_cache().lock() {
         let key = cwd.to_path_buf();
@@ -672,6 +693,13 @@ fn load_project_instruction_candidates_from(cwd: &Path) -> Vec<ProjectInstructio
 
 fn discover_project_instruction_docs(cwd: &Path) -> Vec<ProjectInstructionDoc> {
     let scope = project_instruction_search_scope(cwd);
+    discover_project_instruction_docs_in_scope(cwd, &scope)
+}
+
+fn discover_project_instruction_docs_in_scope(
+    cwd: &Path,
+    scope: &[PathBuf],
+) -> Vec<ProjectInstructionDoc> {
     let project_root = scope.first().map(PathBuf::as_path).unwrap_or(cwd);
     let cfg_dir = project_config_instruction_dir(project_root);
     // Instruction families (case-insensitive basenames, e.g. `agents.md`) present in
@@ -694,7 +722,7 @@ fn discover_project_instruction_docs(cwd: &Path) -> Vec<ProjectInstructionDoc> {
 
     let mut docs = Vec::new();
     let mut seen_paths = std::collections::BTreeSet::new();
-    for dir in &scope {
+    for dir in scope {
         let at_project_root = dir.as_path() == project_root;
         let mut family_seen = FastSet::<String>::default();
         for name in PROJECT_INSTRUCTION_FILENAMES {
@@ -807,6 +835,13 @@ fn limit_project_instruction_docs(
 }
 
 fn project_instruction_search_scope(cwd: &Path) -> Vec<PathBuf> {
+    project_instruction_search_scope_with_boundary(cwd, None)
+}
+
+fn project_instruction_search_scope_with_boundary(
+    cwd: &Path,
+    minimum_root: Option<&Path>,
+) -> Vec<PathBuf> {
     let home_dir = std::env::var_os("HOME").map(PathBuf::from);
     let mut ancestors = Vec::new();
     for dir in cwd.ancestors() {
@@ -816,6 +851,19 @@ fn project_instruction_search_scope(cwd: &Path) -> Vec<PathBuf> {
         ancestors.push(dir.to_path_buf());
     }
 
+    // A granted root must remain in scope even when a nested project marker
+    // or the usual home-directory stop would otherwise hide its instructions.
+    let minimum_boundary = minimum_root.and_then(|root| {
+        let index = cwd.ancestors().position(|dir| dir == root)?;
+        if index >= ancestors.len() {
+            ancestors = cwd
+                .ancestors()
+                .take(index + 1)
+                .map(Path::to_path_buf)
+                .collect();
+        }
+        Some(index)
+    });
     let boundary = ancestors
         .iter()
         .rposition(|dir| has_project_root_marker(dir))
@@ -824,6 +872,7 @@ fn project_instruction_search_scope(cwd: &Path) -> Vec<PathBuf> {
                 .iter()
                 .rposition(|dir| has_project_instruction_doc(dir))
         });
+    let boundary = boundary.into_iter().chain(minimum_boundary).max();
 
     let mut scope = match boundary {
         Some(idx) => ancestors[..=idx].iter().rev().cloned().collect(),

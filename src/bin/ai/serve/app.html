@@ -125,7 +125,7 @@ body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.55 -apple-sy
 body { font-weight:var(--fw-text); }
 /* Secondary chrome keeps the Regular weight: the hierarchy is carried by
    colour and size, and 11-12px labels turn muddy at Medium. */
-#info, #sesscount, #sessmeta, #connstat, #confirmtitle, #confirmerr,
+#info, #sesscount, #sessmeta, #sesscwd, #connstat, #confirmtitle, #confirmerr,
 #skillhint, #skillmenu small, #sessions li small, #sessions li .rn,
 #questionlist .empty, #ovrwrap > summary, .msg.pending, .msg details, .msg .prog,
 .msg.md .li > .bullet, .msg.md blockquote, .msg.md .media-caption,
@@ -308,13 +308,38 @@ select, summary { touch-action:manipulation; }
 #sidenote { display:none; }
 .msg .prog { font-size:13px; color:var(--dim); }
 .msg.git-output .prog { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:var(--fg); }
-/* Task metadata stays visible while arguments and delivered prose keep the
-   existing disclosure. Both layouts inherit the same selectable rows. */
-.msg .task-output { display:flex; flex-direction:column; gap:4px; min-width:0; margin-top:4px;
+/* Task reports keep every row but read as one compact report: a summary
+   header, then each task's identity, description and progress, with debug
+   metadata demoted below. Raw tool payloads stay in their own disclosure. */
+.msg .task-output { display:flex; flex-direction:column; gap:3px; min-width:0; margin-top:4px;
   font-size:13px; color:var(--dim); white-space:pre-wrap; overflow-wrap:anywhere; }
-.msg .task-output .task-identity, .msg .task-output .task-count { color:var(--fg); }
-.msg .task-output .task-progress { padding-inline-start:12px; }
+.msg .task-output .task-count { color:var(--fg); font-weight:600; margin-bottom:2px; }
+.msg .task-output .task-wait { color:var(--fg); }
+.msg .task-output .task-identity {
+  color:var(--fg); font-weight:600; margin-top:8px; padding-top:7px;
+  border-top:1px solid var(--line);
+}
+.msg .task-output .task-description { color:var(--fg); }
+.msg .task-output .task-progress {
+  padding-inline-start:10px; border-inline-start:2px solid var(--acc-line-soft);
+}
+.msg .task-output .task-meta { font-size:12px; }
+.msg .task-output .task-output-body {
+  margin-top:5px; padding-top:6px; border-top:1px dashed var(--line);
+}
 .msg .task-output .task-error { color:var(--err); }
+/* The raw task-tool card keeps its Arguments and exact output, but hides the
+   duplicated structured preview when the dedicated subagents card follows. */
+.msg.asst[data-task-raw-tool="true"][data-task-merged="true"]:has(+ .msg.asst[data-subagents="true"]) > .task-output { display:none; }
+/* Desktop merges completed cards into .execution-items, so there the dedicated
+   card is a later sibling rather than an adjacent one; keep the hide scoped to
+   that one group so an unrelated card elsewhere never hides task details. */
+.execution-items > .msg.asst[data-task-raw-tool="true"][data-task-merged="true"]:has(~ .msg.asst[data-subagents="true"]) > .task-output { display:none; }
+/* A long raw payload stays fully reachable by scrolling instead of pushing the
+   rest of the turn off-screen. */
+.msg.asst[data-task-raw-tool="true"] > details[open] > .prog {
+  max-height:44vh; max-height:min(44vh, 380px); overflow:auto; overscroll-behavior:contain;
+}
 /* Task rows carry their own display so they stay readable while the fold is
    open; an author display also beats the engine's collapsed-content default,
    which made the subagent card look uncollapsible. The rows are siblings of
@@ -624,6 +649,9 @@ select, summary { touch-action:manipulation; }
 #sessbar { display:flex; align-items:baseline; gap:8px; padding:6px 12px; background:var(--panel); border-bottom:1px solid var(--line); font-size:13px; cursor:pointer; }
 #sesstitle { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1; }
 #sessmeta { color:var(--dim); font-size:12px; white-space:nowrap; }
+/* The session's virtual working directory. A long absolute path yields to the
+   title and metadata; its full value stays in the tooltip. */
+#sesscwd { min-width:0; max-width:40%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--dim); font-size:12px; }
 /* Rendered markdown for assistant replies (.md): block layout instead of the
    pre-wrap source view the other bubbles keep. */
 .msg.md { white-space:normal; }
@@ -728,6 +756,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 #sessbar { align-items:center; padding:8px 16px; min-height:40px; }
 #sesstitle { font-size:14px; }
 #sessmeta { font-variant-numeric:tabular-nums; }
+#sesscwd { font-size:13px; }
 #sessions ul { padding:10px; }
 #sessions li { border-radius:var(--radius-control); margin-bottom:4px; }
 #sessfilter { border-radius:var(--radius-control); background:var(--surface-2); }
@@ -1124,6 +1153,9 @@ button:active:not(:disabled) { filter:brightness(.96); }
     display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2;
     line-height:1.4; max-height:2.8em;
   }
+  /* A path is one unbroken token on the phone; give it its own row instead of
+     letting it squeeze the metadata or the question button. */
+  #sesscwd { grid-column:1 / -1; max-width:none; }
   #sessmeta { min-width:0; overflow:hidden; text-overflow:ellipsis; }
   #apkdownload {
     display:grid; flex:0 0 44px; width:44px; height:44px; place-items:center;
@@ -1264,7 +1296,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <button id="connbtn" aria-label="connection">⚙</button>
 <button id="newbtn" class="primary">＋</button>
 </header>
-<div id="sessbar" title="sessions"><span id="sesstitle">no session</span><span id="sessmeta"></span><button id="questionbtn" type="button" aria-label="show my questions" aria-expanded="false" title="show my questions"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></svg><span id="questioncount" class="count">0</span></button></div>
+<div id="sessbar" title="sessions"><span id="sesstitle">no session</span><span id="sesscwd" hidden></span><span id="sessmeta"></span><button id="questionbtn" type="button" aria-label="show my questions" aria-expanded="false" title="show my questions"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></svg><span id="questioncount" class="count">0</span></button></div>
 <div id="conn">
 <input id="base" placeholder="server, e.g. http://192.168.1.5:8080 (empty = this page)">
 <input id="token" type="password" placeholder="bearer token (ai.serve.token)" style="flex:1">
@@ -1560,6 +1592,9 @@ let questionCache = null;
 // GET /sessions until then. While set, loadSessions keeps it selected
 // instead of jumping to the first stored session.
 let pendingNew = null;
+// The cwd reported by POST /sessions for a lazy id: it is not in /sessions
+// yet, so the session bar reads this value until the first turn persists it.
+let pendingCwd = "";
 let lastItems = []; // latest /sessions payload (newest-first), backing the session bar
 let lastMsgCount = null; // message count from the last history load
 let canonicalHistoryTotal = 0; // full canonical count, including rows outside the 200-row window
@@ -2434,8 +2469,9 @@ function renderMarkdown(src, allowPreviews) {
     if (item) {
       flushText();
       const indent = item[1].replace(/\t/g, "  ").length;
-      const body = [inline(item[3])];
-      let continuationFence = null;
+      const body = [];
+      let run = [inline(item[3])];
+      const flushRun = () => { if (run.length) { body.push(run.join("<br>")); run = []; } };
       // A deeper-indented plain line continues this bullet; anything else ends
       // it, so the next line starts its own block.
       for (i++; i < lines.length; i++) {
@@ -2445,23 +2481,46 @@ function renderMarkdown(src, allowPreviews) {
         // so the main loop renders it as its own item instead of a literal "-"
         // glued to the end of this one.
         if (/^([-*+]|\d{1,3}[.)])(\s|$)/.test(cont[2])) break;
-        if (compactEdges) {
-          // A pipe block may follow a bullet, but fenced examples stay literal.
-          if (continuationFence) {
-            if (new RegExp("^" + continuationFence + "{3,}\\s*$").test(cont[2])) continuationFence = null;
-          } else {
-            const fence = /^(`{3,}|~{3,})\s*([^\s`]*)\s*$/.exec(cont[2]);
-            if (fence) continuationFence = fence[1][0];
-            else if (implicitTableAt(i)) break;
+        // A fence that continues the bullet opens a real code block: its
+        // markers never reach the reader, and the block ends the text run so
+        // the listing is not glued to the sentence that introduced it.
+        const fence = /^(`{3,}|~{3,})\s*([^\s`]*)\s*$/.exec(cont[2]);
+        if (fence) {
+          const base = cont[1].replace(/\t/g, "  ").length;
+          const closer = new RegExp("^" + fence[1][0] + "{" + fence[1].length + ",}\\s*$");
+          const dedent = (raw) => {
+            let remove = base, cut = 0;
+            while (cut < raw.length && remove > 0 && (raw[cut] === " " || raw[cut] === "\t")) {
+              remove -= raw[cut] === "\t" ? 2 : 1;
+              cut++;
+            }
+            return raw.slice(cut);
+          };
+          const code = [];
+          let end = i + 1;
+          let closed = false;
+          for (; end < lines.length; end++) {
+            const text = dedent(lines[end]);
+            if (closer.test(text)) { closed = true; break; }
+            // The bullet ends before the fence closed: the listing is cut off
+            // there, and the shallower line belongs to the next block.
+            if (lines[end].trim() && /^[ \t]*/.exec(lines[end])[0].replace(/\t/g, "  ").length <= indent) break;
+            code.push(text);
           }
+          flushRun();
+          body.push(codeBlock(code.join("\n"), fence[2]));
+          i = closed ? end : end - 1;
+          continue;
         }
-        body.push(inline(cont[2]));
+        if (compactEdges && implicitTableAt(i)) break;
+        run.push(inline(cont[2]));
       }
+      flushRun();
       // Cap the indent: replies routinely nest 6+ spaces deep, which on a phone
       // (92% of ~360px) would leave almost no room for the text itself.
       const pad = Math.min(indent, 6) * 8;
       out.push('<div class="li" style="padding-left:' + pad + 'px"><span class="bullet">' +
-        (/^\d/.test(item[2]) ? esc(item[2]) : "•") + '</span><span>' + body.join("<br>") + "</span></div>");
+        (/^\d/.test(item[2]) ? esc(item[2]) : "•") + '</span><span>' + body.join("") + "</span></div>");
       continue;
     }
     text.push(line);
@@ -2948,6 +3007,21 @@ function renderPhoneFrame(data, sid) {
   parent.insertBefore(note, anchor);
   return note;
 }
+// Clipboard images routinely carry the same generic name ("image.png"), and
+// the server stages each upload under the sent filename. Without a distinct
+// name per attachment the later file overwrites the earlier bytes and every
+// `[[image:name]]` marker resolves to the same picture.
+function uniqueImageFilename(name, images) {
+  const base = String(name || "pasted-image").replace(/[^\w.\-]+/g, "_") || "pasted-image";
+  const dot = base.lastIndexOf(".");
+  const stem = dot > 0 ? base.slice(0, dot) : base;
+  const ext = dot > 0 ? base.slice(dot) : "";
+  const taken = (candidate) => images.some(
+    (image) => String(image.filename || "").toLowerCase() === candidate.toLowerCase());
+  let candidate = base;
+  for (let n = 2; taken(candidate); n++) candidate = stem + "-" + n + ext;
+  return candidate;
+}
 async function queueImageFiles(files) {
   const targetSession = sessionId;
   const key = draftKey(targetSession);
@@ -2965,10 +3039,9 @@ async function queueImageFiles(files) {
       });
       const data = String(dataUrl).split(",", 2)[1] || "";
       if (!data) continue;
-      const filename = (file.name || "pasted-image").replace(/[^\w.\-]+/g, "_");
-      const image = { filename, data_base64: data };
       const images = sessionId === targetSession ? pendingImages : composerImageDrafts.get(key) || [];
       if (images.length >= 10) break;
+      const image = { filename: uniqueImageFilename(file.name, images), data_base64: data };
       images.push(image);
       composerImageDrafts.set(key, images);
       added.push(image);
@@ -3009,7 +3082,7 @@ if (typeof window !== "undefined") {
     let text = typeof share.text === "string" ? share.text : "";
     if (share.kind === "image" && typeof share.data_base64 === "string" && share.data_base64) {
       if (pendingImages.length >= 10) { note("最多只能附带 10 张图片"); return false; }
-      const filename = String(share.filename || "shared-image").replace(/[^\w.\-]+/g, "_");
+      const filename = uniqueImageFilename(share.filename || "shared-image", pendingImages);
       pendingImages.push({ filename, data_base64: share.data_base64 });
       text = (text ? text + "\n" : "") + "[[image:" + filename + "]]";
     }
@@ -3792,10 +3865,11 @@ function projectTaskReport(value, includeOutput = true) {
   const number = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
   const add = (kind, value, taskId = "") => { if (value !== "") rows.push({ kind, text: value, taskId }); };
   const active = report.tasks.filter((task) => task.active).length;
-  add("count", "subagents · " + report.tasks.length + " tasks · " + active + " active");
+  const noun = report.tasks.length === 1 ? " task" : " tasks";
+  add("count", "subagents · " + report.tasks.length + noun + " · " + active + " active");
   if (report.wait) {
     const waited = number(report.wait.waited_ms);
-    add("meta", "wait · " + text(report.wait.reason) + (waited === null ? "" : " · waited " + waited / 1000 + "s"));
+    add("wait", "wait · " + text(report.wait.reason) + (waited === null ? "" : " · waited " + waited / 1000 + "s"));
   }
   for (const [index, task] of report.tasks.entries()) {
     const firstRow = rows.length;
@@ -3836,7 +3910,10 @@ function taskReportLabel(report) {
   const active = report.tasks.filter((task) => task.active);
   const latest = active.slice().reverse().find((task) => task.progress?.latest_activity || task.progress?.checkpoint_summary || task.progress?.phase);
   const detail = latest?.progress?.latest_activity || latest?.progress?.checkpoint_summary || latest?.progress?.phase;
-  return "subagents" + (detail ? " · " + shortLine(detail, 100) : " · " + active.length + " active");
+  const total = report.tasks.length;
+  const count = total + (total === 1 ? " task" : " tasks");
+  const state = active.length ? active.length + " active" : "complete";
+  return "subagents · " + count + " · " + state + (detail ? " · " + shortLine(detail, 100) : "");
 }
 // Live and canonical cards share this renderer. The visible projection is a
 // sibling of <details>, so updates preserve the reader's disclosure choice.
@@ -4277,6 +4354,7 @@ function createThinkingFold(parent, before) {
   const ordinal = (parent._thinkingOrdinal = (parent._thinkingOrdinal || 0) + 1);
   const next = addFold("thinking…", "", parent, "thinking:" + ordinal);
   next.box.dataset.executionState = "running";
+  next.box.dataset.thinkingPhase = "true";
   // A recovered turn can hand over a node from an older box; inserting against
   // a foreign parent throws, and the caller's guard would drop the whole phase.
   parent.insertBefore(next.box, before && before.parentNode === parent ? before : null);
@@ -4325,6 +4403,19 @@ function executionGroupsFor(parent, stored = false) {
       }
     };
     visit(parent);
+    // Tool calls only run after reasoning ended, so a thinking card with a tool
+    // record after it has finished even when its completion event never reached
+    // this view (a reattached stream or a recovered view drops the phase
+    // binding). Left "running", that card stays outside every group and splits
+    // the completed run around it; settle it here so the transcript order, not
+    // a lost event, decides.
+    let toolAfter = false;
+    for (let i = units.length - 1; i >= 0; i--) {
+      const node = units[i];
+      if (node.dataset?.running !== undefined) toolAfter = true;
+      else if (toolAfter && node.dataset?.thinkingPhase === "true"
+        && node.dataset.executionState === "running") node.dataset.executionState = "completed";
+    }
     // The most recent progress stays outside, even after it finishes. A new
     // execution item or answer advances the boundary; status paint does not.
     // A trailing rate line is metadata, not the newest record: the run boundary
@@ -4587,18 +4678,26 @@ function createLiveActivity(parent, before) {
   const renderTool = (tool) => {
     const call = { function: { name: tool.name, arguments: tool.arguments || "{}" } };
     const icon = tool.running ? "◌ " : tool.ok === false ? "! " : tool.ok === true ? "✓ " : "• ";
-    const title = icon + callLabel(call) + (tool.cached ? " · cached" : "");
     const taskReport = taskReportOf(tool.task_report);
+    const taskResult = projectTaskReport(tool.task_report, false);
+    const title = icon + callLabel(call) + (taskResult ? " · raw" : "") + (tool.cached ? " · cached" : "");
     tool.fold.box.dataset.running = String(tool.running);
     tool.fold.box.dataset.executionState = tool.running ? "running" : "completed";
     tool.fold.box.dataset.executionException = String(tool.ok === false || Boolean(taskReport?.error)
       || Boolean(taskReport?.tasks.some((task) => task.error)));
     const args = tool.arguments ? "Arguments\n" + tool.arguments + (tool.arguments_truncated ? "\n[preview truncated]" : "") + "\n\n" : "";
-    const taskResult = projectTaskReport(tool.task_report, false);
     tool.fold.set(title, args + (tool.output || "")
       + (tool.output_truncated ? "\n[preview truncated; full output in history]" : ""));
-    renderTaskToolResult(tool.fold, taskResult);
-    if (taskResult) showSubagents({ task_report: tool.task_report }, tool.fold.box);
+    if (taskResult) {
+      tool.fold.box.dataset.taskRawTool = "true";
+      tool.fold.box.dataset.taskMerged = "true";
+      renderTaskToolResult(tool.fold, taskResult);
+      showSubagents({ task_report: tool.task_report }, tool.fold.box);
+    } else {
+      delete tool.fold.box.dataset.taskRawTool;
+      delete tool.fold.box.dataset.taskMerged;
+      renderTaskToolResult(tool.fold, null);
+    }
   };
   return {
     anchor(node) { anchor = node; },
@@ -5824,6 +5923,13 @@ async function loadInfo() {
 // fork marker, and (when history was loaded) message count.
 function renderSessionBar() {
   const s = lastItems.find((x) => x.id === sessionId);
+  const cwd = s ? (s.cwd || "") : (sessionId && sessionId === pendingNew ? (pendingCwd || "") : "");
+  const cwdEl = $("sesscwd");
+  if (cwdEl) {
+    cwdEl.textContent = cwd ? "📁 " + cwd : "";
+    cwdEl.title = cwd ? "当前路径: " + cwd : "";
+    cwdEl.hidden = !cwd;
+  }
   if (!s) {
     $("sesstitle").textContent = sessionId ? "session " + sessionId.slice(0, 8) + "…" : "no session — tap ＋";
     $("sessmeta").textContent = PAGE_ID;
@@ -6561,7 +6667,15 @@ function renderHistoryRow(row, parent) {
       const taskReport = taskReportOf(m.task_report);
       fold.box.dataset.executionException = String(Boolean(taskReport?.error) || Boolean(taskReport?.tasks.some((task) => task.error)));
     }
-    if (taskResult) renderTaskToolResult(fold, taskResult);
+    if (taskResult) {
+      fold.box.dataset.taskRawTool = "true";
+      // Only a tool row whose report also owns the dedicated card may hide its
+      // preview; an earlier report without that card must stay fully visible.
+      if (row.subagentReport) fold.box.dataset.taskMerged = "true";
+      renderTaskToolResult(fold, taskResult);
+      const summary = fold.box.querySelector("summary");
+      if (summary) summary.textContent += " · raw";
+    }
     const det = fold.box.querySelector("details");
     if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + row.identity);
     if (row.subagentReport) {
@@ -8146,6 +8260,18 @@ function cdCommandLine(text) {
   const t = text.trim();
   return t && !t.includes("\n") && CD_LINE_RE.test(t) ? t : "";
 }
+// Record the cwd a server response reported for `sid`, so the session bar
+// follows `/cd` (and the daemon cwd of a fresh session) before the next
+// /sessions refresh.
+function applySessionCwd(sid, cwd) {
+  if (!sid || typeof cwd !== "string" || !cwd) return;
+  const item = lastItems.find((x) => x.id === sid);
+  if (item) item.cwd = cwd;
+  if (sid === sessionId) {
+    if (sid === pendingNew) pendingCwd = cwd;
+    renderSessionBar();
+  }
+}
 
 // BEGIN composer session adoption
 // A first turn, /cd or /git may create a lazy session. Carry committed picks
@@ -8166,10 +8292,11 @@ async function runCdCommand(text) {
   if (!command || pendingImages.length) return false;
   if (!sessionId) {
     const previousId = sessionId, base = store.base;
-    let newId;
-    try { newId = (await (await api("/sessions", { method: "POST" })).json()).id; }
+    let created;
+    try { created = await (await api("/sessions", { method: "POST" })).json(); }
     catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); return true; }
-    if (!adoptComposerSession(newId, previousId, base)) return true;
+    if (!adoptComposerSession(created.id, previousId, base)) return true;
+    pendingCwd = created.cwd || "";
   }
   const sid = sessionId;
   setPromptValue("", true);
@@ -8186,6 +8313,7 @@ async function runCdCommand(text) {
     }
     const data = await res.json();
     out = [data.stdout || "", data.stderr || ""].filter(Boolean).join("\n").trim();
+    applySessionCwd(sid, data.cwd);
   } catch (e) {
     addMsg("err", "cd failed: " + e.message, "asst err");
     return true;
@@ -8248,10 +8376,11 @@ async function runGitCommand(text) {
   if (!command) return false;
   if (!sessionId) {
     const previousId = sessionId, base = store.base;
-    let newId;
-    try { newId = (await (await api("/sessions", { method: "POST" })).json()).id; }
+    let created;
+    try { created = await (await api("/sessions", { method: "POST" })).json(); }
     catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); return true; }
-    if (!adoptComposerSession(newId, previousId, base)) return true;
+    if (!adoptComposerSession(created.id, previousId, base)) return true;
+    pendingCwd = created.cwd || "";
   }
   const sid = sessionId, base = store.base;
   const stillSelected = () => sid === sessionId && base === store.base;
@@ -8425,11 +8554,12 @@ async function prepareTurnSession(previousId, base) {
   if (sessionId !== previousId || store.base !== base) return "";
   let sid = previousId;
   if (!sid) {
-    let newId;
-    try { newId = (await (await api("/sessions", { method: "POST" })).json()).id; }
+    let created;
+    try { created = await (await api("/sessions", { method: "POST" })).json(); }
     catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); return ""; }
-    if (!adoptComposerSession(newId, previousId, base)) return "";
-    sid = newId;
+    if (!adoptComposerSession(created.id, previousId, base)) return "";
+    pendingCwd = created.cwd || "";
+    sid = created.id;
     persistPicks();
   }
   if (isTurnRunning()) { note("this session is already running a turn — stop it, or send from another session"); return ""; }
@@ -9458,10 +9588,12 @@ function wire() {
   };
   $("newbtn").onclick = async () => {
     try {
-      const newId = (await (await api("/sessions", { method: "POST" })).json()).id;
+      const created = await (await api("/sessions", { method: "POST" })).json();
+      const newId = created.id;
       if (!isPhoneLayout()) clearDraft(newId);
       switchSession(newId);
       pendingNew = newId;
+      pendingCwd = created.cwd || "";
       lastMsgCount = null;
       turnRunning = false; // fresh id: no turn can be running here (and it 404s a poll)
       // The id is lazy (no history yet): show it optimistically instead of

@@ -81,12 +81,39 @@ const DEFERRED_RESTART_WAIT: Duration = Duration::from_secs(30 * 60);
 #[cfg(unix)]
 const RESPONSE_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
-/// On-disk serve state: the legacy three lines followed by optional JSON TLS paths.
+/// On-disk serve state: the legacy three lines followed by JSON TLS paths and default roots.
 struct ServeState {
     pid: u32,
     bind: String,
     started_unix: u64,
     tls: Option<ServeTlsConfig>,
+    add_dirs: Vec<PathBuf>,
+}
+
+pub(super) const DEFAULT_WRITE_ROOTS_ENV: &str = "A_SERVE_DEFAULT_WRITE_ROOTS";
+
+pub(super) fn parse_runtime_default_add_dirs(raw: &str) -> Result<Vec<PathBuf>, String> {
+    let roots: Vec<PathBuf> = serde_json::from_str(raw)
+        .map_err(|error| format!("invalid managed writable directories: {error}"))?;
+    if roots.iter().any(|root| !root.is_absolute()) {
+        return Err("managed writable directories must be absolute".to_string());
+    }
+    let (roots, warnings) = crate::ai::write_roots::bounded_roots(&roots);
+    for warning in warnings {
+        eprintln!("[serve] {warning}");
+    }
+    Ok(roots)
+}
+
+pub(super) fn runtime_default_add_dirs(cli: &ParsedCli) -> Result<Vec<PathBuf>, String> {
+    match std::env::var(DEFAULT_WRITE_ROOTS_ENV) {
+        Ok(raw) => {
+            crate::ai::write_roots::require_user_grant_origin()?;
+            parse_runtime_default_add_dirs(&raw)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(cli.add_dirs.clone()),
+        Err(error) => Err(format!("invalid managed writable directories: {error}")),
+    }
 }
 
 /// Entry point for the four `--serve-*` management flags. Synchronous: no
@@ -293,11 +320,18 @@ fn parse_state(text: &str) -> Result<ServeState, String> {
         (None, None) => None,
         _ => return Err("incomplete TLS state".to_string()),
     };
+    let add_dirs = lines
+        .next()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| "bad writable directories line".to_string())?
+        .unwrap_or_default();
     Ok(ServeState {
         pid,
         bind,
         started_unix,
         tls,
+        add_dirs,
     })
 }
 
@@ -305,13 +339,64 @@ fn format_state(state: &ServeState) -> String {
     let cert = state.tls.as_ref().map(|tls| tls.cert.as_str());
     let key = state.tls.as_ref().map(|tls| tls.key.as_str());
     format!(
-        "{}\n{}\n{}\n{}\n{}\n",
+        "{}\n{}\n{}\n{}\n{}\n{}\n",
         state.pid,
         state.bind,
         state.started_unix,
         serde_json::to_string(&cert).expect("TLS certificate path serializes"),
-        serde_json::to_string(&key).expect("TLS key path serializes")
+        serde_json::to_string(&key).expect("TLS key path serializes"),
+        serde_json::to_string(&state.add_dirs).expect("writable directories serialize")
     )
+}
+
+fn push_add_dir_args(cmd: &mut std::process::Command, roots: &[PathBuf]) {
+    for root in roots {
+        cmd.arg("--add-dir").arg(root);
+    }
+}
+
+fn push_daemon_add_dir_context(
+    cmd: &mut std::process::Command,
+    roots: &[PathBuf],
+) -> Result<(), String> {
+    crate::ai::write_roots::validate_root_limits(roots)?;
+    // The control CLI has validated new grants; this re-exec only inherits its authorized roots.
+    cmd.env_remove(crate::ai::write_roots::AGENT_COMMAND_ENV);
+    // Startup flags validate existing directories; the daemon keeps absent grants for later turns.
+    cmd.env(
+        DEFAULT_WRITE_ROOTS_ENV,
+        serde_json::to_string(roots).map_err(|error| error.to_string())?,
+    );
+    let (available, warnings) = crate::ai::write_roots::available_roots(roots);
+    for warning in warnings {
+        eprintln!("[serve] {warning}");
+    }
+    push_add_dir_args(cmd, &available);
+    Ok(())
+}
+
+fn daemon_add_dirs(cli: &ParsedCli, previous: Option<&ServeState>) -> Vec<PathBuf> {
+    if cli.add_dirs.is_empty() {
+        previous
+            .map(|state| state.add_dirs.clone())
+            .unwrap_or_default()
+    } else {
+        cli.add_dirs.clone()
+    }
+}
+
+fn foreground_add_dirs(roots: &[PathBuf], previous: Option<&ServeState>, pid: u32) -> Vec<PathBuf> {
+    // A managed child receives only available roots; retain the manager's complete grant list.
+    let mut retained = previous
+        .filter(|state| state.pid == pid)
+        .map(|state| state.add_dirs.clone())
+        .unwrap_or_default();
+    for root in roots {
+        if !retained.contains(root) {
+            retained.push(root.clone());
+        }
+    }
+    retained
 }
 
 /// Read the state file. `Ok(None)` means no daemon was ever recorded here;
@@ -481,6 +566,11 @@ fn start_daemon(
         let _ = std::fs::remove_file(&pid_path);
     }
     let bind = resolve_ctl_bind(cli, previous.map(|state| state.bind.as_str()));
+    let (add_dirs, warnings) =
+        crate::ai::write_roots::bounded_roots(&daemon_add_dirs(cli, previous));
+    for warning in warnings {
+        eprintln!("[serve] {warning}");
+    }
     let managed_tls = default_serve_tls_config()?;
     let tls = resolve_serve_tls(
         &cli.serve_tls_cert,
@@ -512,6 +602,7 @@ fn start_daemon(
             .arg("--serve-tls-key")
             .arg(&tls.key);
     }
+    push_daemon_add_dir_context(&mut cmd, &add_dirs)?;
     let child = crate::fork_guard::spawn(&mut cmd)?;
     write_state_file(
         &pid_path,
@@ -520,6 +611,7 @@ fn start_daemon(
             bind: bind.clone(),
             started_unix: now_unix(),
             tls: tls.clone(),
+            add_dirs,
         },
     )?;
     let base = serve_url(&bind, tls.as_ref());
@@ -823,6 +915,7 @@ fn schedule_restart_after_turn(
     if !cli.serve_tls_key.trim().is_empty() {
         cmd.arg("--serve-tls-key").arg(&cli.serve_tls_key);
     }
+    push_add_dir_args(&mut cmd, &cli.add_dirs);
     cmd.env(RESTART_AFTER_PID_ENV, turn_pid.to_string())
         .env(RESTART_REQUEST_ENV, &request)
         .env_remove(crate::ai::background::SERVE_TURN_OWNER_PID_ENV)
@@ -895,7 +988,11 @@ fn report_status() -> Result<(), Box<dyn std::error::Error>> {
 /// Best-effort state-file write for a foreground `a --serve`, so
 /// `--serve-status` and `--serve-stop` see it too. Never fails the server:
 /// a missing state file only costs manageability, never availability.
-pub(super) fn note_foreground_serve(bind: &str, tls: Option<&ServeTlsConfig>) {
+pub(super) fn note_foreground_serve(
+    bind: &str,
+    tls: Option<&ServeTlsConfig>,
+    add_dirs: &[PathBuf],
+) {
     let dir = match state_dir() {
         Ok(dir) => dir,
         Err(err) => {
@@ -907,11 +1004,12 @@ pub(super) fn note_foreground_serve(bind: &str, tls: Option<&ServeTlsConfig>) {
     };
     let me = std::process::id();
     let pid_path = dir.join(PID_FILE);
+    let existing = read_state_file(&pid_path).ok().flatten();
     // Single-slot state file: never evict a live daemon record. A foreground
     // server on another bind would otherwise orphan the daemon (and on clean
     // exit delete the file, leaving a ghost daemon `--serve-stop` cannot see).
     #[cfg(unix)]
-    if let Ok(Some(existing)) = read_state_file(&pid_path) {
+    if let Some(existing) = existing.as_ref() {
         if existing.pid != me && process_alive(existing.pid) {
             eprintln!(
                 "[serve] warning: serve daemon already running (pid={} bind={}); this foreground server will not claim --serve-status/--serve-stop",
@@ -926,6 +1024,7 @@ pub(super) fn note_foreground_serve(bind: &str, tls: Option<&ServeTlsConfig>) {
         bind: bind.to_string(),
         started_unix: now_unix(),
         tls: tls.cloned(),
+        add_dirs: foreground_add_dirs(add_dirs, existing.as_ref(), me),
     };
     if let Err(err) =
         std::fs::create_dir_all(&dir).and_then(|_| write_state_file(&pid_path, &state))
@@ -1148,6 +1247,79 @@ mod tests {
     }
 
     #[test]
+    fn add_dir_managed_runtime_keeps_absent_defaults_in_environment() {
+        let present = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let absent = present.join(format!(".absent-add-dir-{}", uuid::Uuid::new_v4()));
+        let roots = vec![present.clone(), absent.clone()];
+        let mut command = std::process::Command::new("a");
+        command.env(crate::ai::write_roots::AGENT_COMMAND_ENV, "1");
+        push_daemon_add_dir_context(&mut command, &roots).unwrap();
+        assert!(command.get_envs().any(|(key, value)| key
+            == crate::ai::write_roots::AGENT_COMMAND_ENV
+            && value.is_none()));
+        let raw = command
+            .get_envs()
+            .find(|(key, _)| *key == DEFAULT_WRITE_ROOTS_ENV)
+            .unwrap()
+            .1
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(parse_runtime_default_add_dirs(raw).unwrap(), roots);
+        let args: Vec<_> = command.get_args().collect();
+        assert!(args.contains(&present.as_os_str()));
+        assert!(!args.contains(&absent.as_os_str()));
+    }
+
+    #[test]
+    fn add_dir_managed_state_and_restart_args_preserve_default_roots() {
+        let roots = vec![
+            PathBuf::from("/projects/first"),
+            PathBuf::from("/projects/second"),
+        ];
+        let previous = ServeState {
+            pid: 42,
+            bind: "127.0.0.1:8080".into(),
+            started_unix: 1,
+            tls: None,
+            add_dirs: roots.clone(),
+        };
+        let restored = parse_state(&format_state(&previous)).unwrap();
+        assert_eq!(restored.add_dirs, roots);
+        assert_eq!(
+            foreground_add_dirs(&roots[..1], Some(&restored), restored.pid),
+            roots
+        );
+        assert_eq!(
+            foreground_add_dirs(&roots[..1], Some(&restored), restored.pid + 1),
+            roots[..1]
+        );
+        assert_eq!(
+            daemon_add_dirs(&ParsedCli::default(), Some(&restored)),
+            roots
+        );
+        let mut cli = ParsedCli::default();
+        cli.add_dirs = vec![PathBuf::from("/projects/new")];
+        assert_eq!(daemon_add_dirs(&cli, Some(&restored)), cli.add_dirs);
+        let mut command = std::process::Command::new("a");
+        command.arg("--serve-restart");
+        push_add_dir_args(&mut command, &cli.add_dirs);
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["--serve-restart", "--add-dir", "/projects/new"]
+        );
+        assert!(
+            parse_state("42\n127.0.0.1:8080\n1\n")
+                .unwrap()
+                .add_dirs
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn state_file_round_trip() {
         let state = ServeState {
             pid: 4242,
@@ -1157,6 +1329,7 @@ mod tests {
                 cert: "/tmp/local cert.pem".into(),
                 key: "/tmp/local key.pem".into(),
             }),
+            add_dirs: Vec::new(),
         };
         let back = parse_state(&format_state(&state)).expect("round trip");
         assert_eq!(back.pid, 4242);

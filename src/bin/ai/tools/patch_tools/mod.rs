@@ -11,9 +11,12 @@ use crate::ai::tools::common::ToolStreamingRegistration;
 use crate::ai::tools::common::short_path;
 use crate::ai::tools::storage::file_store::FileStore;
 use crate::ai::tools::storage::temp_registry;
+use crate::commonw::FastMap;
 use rustc_hash::FxHashMap;
 use serde_json::Value;
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 mod types;
 pub(crate) use types::*;
@@ -101,6 +104,80 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     },
 });
 
+const MAX_PATCH_FILE_CHARS: usize = 64_000;
+
+type PatchSourceKey = (String, usize, String, PathBuf, String);
+
+struct PatchSourceSnapshot {
+    source: Result<(String, bool), String>,
+    targets: Vec<PathBuf>,
+}
+
+thread_local! {
+    // Mutating tools dispatch on the driver thread. Round guards restore this
+    // cache on every exit, including a paused preflight or an execution error.
+    static PREFLIGHT_PATCH_SOURCES: RefCell<FastMap<PatchSourceKey, Arc<PatchSourceSnapshot>>> =
+        RefCell::new(FastMap::default());
+}
+
+fn patch_source_key(patch_file: &str) -> PatchSourceKey {
+    (
+        crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
+        crate::ai::driver::runtime_ctx::current_turn_id_or_zero(),
+        crate::ai::driver::runtime_ctx::SUBAGENT_TASK_ID
+            .try_with(Clone::clone)
+            .unwrap_or_default(),
+        crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_default(),
+        patch_file.to_string(),
+    )
+}
+
+pub(crate) struct ApplyPatchTargets {
+    targets: Vec<PathBuf>,
+    source: Option<(PatchSourceKey, Arc<PatchSourceSnapshot>)>,
+}
+
+impl IntoIterator for ApplyPatchTargets {
+    type Item = PathBuf;
+    type IntoIter = std::vec::IntoIter<PathBuf>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.targets.into_iter()
+    }
+}
+
+impl ApplyPatchTargets {
+    pub(crate) fn bind_patch_file_source(self) -> Option<PatchFileSourceGuard> {
+        let (key, snapshot) = self.source?;
+        let previous = PREFLIGHT_PATCH_SOURCES
+            .with(|sources| sources.borrow_mut().insert(key.clone(), snapshot));
+        Some(PatchFileSourceGuard {
+            key,
+            previous,
+            thread_bound: std::marker::PhantomData,
+        })
+    }
+}
+
+pub(crate) struct PatchFileSourceGuard {
+    key: PatchSourceKey,
+    previous: Option<Arc<PatchSourceSnapshot>>,
+    thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for PatchFileSourceGuard {
+    fn drop(&mut self) {
+        PREFLIGHT_PATCH_SOURCES.with(|sources| {
+            let mut sources = sources.borrow_mut();
+            if let Some(previous) = self.previous.take() {
+                sources.insert(self.key.clone(), previous);
+            } else {
+                sources.remove(&self.key);
+            }
+        });
+    }
+}
+
 fn optional_patch_source_arg(args: &Value, key: &str) -> Result<Option<String>, String> {
     match args.get(key) {
         // Some providers / tool bridges materialize optional schema fields as null
@@ -122,8 +199,10 @@ fn optional_patch_source_arg(args: &Value, key: &str) -> Result<Option<String>, 
     }
 }
 
-fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<String, String> {
-    let legacy_dry_run = legacy_dry_run_arg(args)?;
+fn read_patch_source_unbound(
+    args: &Value,
+    mut emit: impl FnMut(&str),
+) -> Result<(String, bool), String> {
     let inline_patch = optional_patch_source_arg(args, "patch")?;
     let patch_file = optional_patch_source_arg(args, "patch_file")?;
     let (raw_patch, from_file) = match (inline_patch, patch_file) {
@@ -175,6 +254,92 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
             );
         }
     };
+    Ok((raw_patch, from_file))
+}
+
+fn read_patch_source(args: &Value, emit: impl FnMut(&str)) -> Result<(String, bool), String> {
+    let inline_patch = optional_patch_source_arg(args, "patch")?;
+    let patch_file = optional_patch_source_arg(args, "patch_file")?;
+    let snapshot = if inline_patch.is_none() {
+        patch_file.as_deref().and_then(|path| {
+            PREFLIGHT_PATCH_SOURCES
+                .with(|sources| sources.borrow().get(&patch_source_key(path)).cloned())
+        })
+    } else {
+        None
+    };
+    let expected = snapshot
+        .as_ref()
+        .map(|snapshot| {
+            snapshot.source.as_ref().map_err(|error| {
+                format!(
+                    "patch_file '{}' was unavailable during scoped-instruction preflight ({error}); \
+                     retry apply_patch in a later tool round after creating the patch file",
+                    patch_file.as_deref().unwrap_or_default()
+                )
+            })
+        })
+        .transpose()?;
+    let current = read_patch_source_unbound(args, emit).map_err(|error| {
+        if expected.is_some() {
+            format!(
+                "{error}; patch_file could not be validated after scoped-instruction preflight; \
+                 retry apply_patch in a later tool round"
+            )
+        } else {
+            error
+        }
+    })?;
+    if let Some((expected, _)) = expected
+        && current.0 != *expected
+    {
+        return Err(format!(
+            "patch_file '{}' changed after scoped-instruction preflight; \
+             retry apply_patch in a later tool round so its current targets can be loaded",
+            patch_file.as_deref().unwrap_or_default()
+        ));
+    }
+    Ok(current)
+}
+
+fn patch_targets_from_source(source: &Result<(String, bool), String>) -> Vec<PathBuf> {
+    let Ok((raw_patch, from_file)) = source else {
+        return Vec::new();
+    };
+    let patch = strip_code_fence(raw_patch);
+    if (*from_file && patch.chars().count() > MAX_PATCH_FILE_CHARS)
+        || parse_patch_envelopes(&patch).is_err()
+    {
+        return Vec::new();
+    }
+    apply_patch_target_paths_from_patch(&patch)
+}
+
+pub(crate) fn apply_patch_target_paths_from_args(args: &Value) -> ApplyPatchTargets {
+    let key = match (
+        optional_patch_source_arg(args, "patch"),
+        optional_patch_source_arg(args, "patch_file"),
+    ) {
+        (Ok(None), Ok(Some(path))) => Some(patch_source_key(&path)),
+        _ => None,
+    };
+    let snapshot = key
+        .as_ref()
+        .and_then(|key| PREFLIGHT_PATCH_SOURCES.with(|sources| sources.borrow().get(key).cloned()))
+        .unwrap_or_else(|| {
+            let source = read_patch_source_unbound(args, |_| {});
+            let targets = patch_targets_from_source(&source);
+            Arc::new(PatchSourceSnapshot { source, targets })
+        });
+    ApplyPatchTargets {
+        targets: snapshot.targets.clone(),
+        source: key.map(|key| (key, snapshot)),
+    }
+}
+
+fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<String, String> {
+    let legacy_dry_run = legacy_dry_run_arg(args)?;
+    let (raw_patch, from_file) = read_patch_source(args, &mut emit)?;
     let patch = strip_code_fence(&raw_patch);
     // Truncation heuristic: when an inline patch ends with an unclosed envelope, a
     // partial `***` marker, or a bare hunk header, it was likely cut off by the
@@ -192,7 +357,6 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
         // patch_file is meant to carry large patches (inline patches get truncated
         // by the context manager), so it is exempt from the 8K inline limit; only a
         // loose safety cap is set to stop the model from misreading oversized files.
-        const MAX_PATCH_FILE_CHARS: usize = 64_000;
         if patch.chars().count() > MAX_PATCH_FILE_CHARS {
             return Err(format!(
                 "patch_file too large ({} chars; limit 64000). Split the patch into multiple \

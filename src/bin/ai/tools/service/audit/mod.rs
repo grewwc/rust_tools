@@ -207,6 +207,35 @@ mod tests {
         assert_eq!(cargo[cargo_index], "check");
     }
 
+    #[test]
+    fn env_option_parser_resolves_nested_commands_and_preserves_values() {
+        let marker = crate::ai::write_roots::AGENT_COMMAND_ENV;
+        for command in [
+            format!("env -vP /usr/bin env -u OTHER printenv {marker}"),
+            format!("env -P/usr/bin env -vuOTHER printenv {marker}"),
+            format!("env -C /tmp FOO=1 env -P /usr/bin printenv {marker}"),
+            format!("env -- FOO=1 printenv {marker}"),
+            format!("env -a {marker} printenv {marker}"),
+            format!("env --argv0={marker} printenv {marker}"),
+        ] {
+            assert_eq!(
+                effective_command_tokens(&command),
+                ["printenv", marker],
+                "{command}"
+            );
+        }
+
+        for command in [
+            "env -vS 'printenv AI_AGENT_COMMAND'",
+            "env --split-string='printenv AI_AGENT_COMMAND'",
+        ] {
+            let tokens = tokenize_shell_words(command);
+            let options = super::lexer::parse_env_options(&tokens);
+            assert_eq!(options.split_string_index, Some(1));
+            assert!(options.command_index.is_none());
+        }
+    }
+
     // ---- injection surface ----
 
     #[test]
@@ -716,6 +745,242 @@ mod tests {
     fn leading_env_assignment_only_has_shell_meaning_when_shell_is_used() {
         assert!(validate("FOO=1 rm -rf target").is_ok());
         assert!(validate("FOO=1 rm -rf *.tmp").is_err());
+    }
+
+    #[test]
+    fn blocks_env_unsetting_agent_command_origin_marker() {
+        let marker = crate::ai::write_roots::AGENT_COMMAND_ENV;
+        for command in [
+            format!("env -u {marker} a --session A -- '/add-dir /outside'"),
+            format!("env --unset {marker} echo ok"),
+            format!("env --unset={marker} echo ok"),
+            format!("env -u{marker} echo ok"),
+            format!("/usr/bin/env -u '{marker}' echo ok"),
+            format!("timeout 5 env -u {marker} echo ok"),
+            format!("nohup timeout 5 /usr/bin/env --unset={marker} echo ok"),
+            format!("env FOO=1 env -u {marker} echo ok"),
+            format!("echo ok && env -u {marker} echo ok"),
+        ] {
+            let error = validate(&command).unwrap_err();
+            assert!(error.contains(marker), "{command}: {error}");
+        }
+        for command in [
+            "env -u OTHER echo ok".to_string(),
+            "env --unset=OTHER echo ok".to_string(),
+            format!("env echo --unset {marker}"),
+            format!("env -C {marker} echo ok"),
+            format!("printf '%s' 'env -u {marker}'"),
+        ] {
+            validate(&command).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    #[test]
+    fn blocks_env_guardrail_native_assignments_unsetting_agent_command_origin_marker() {
+        let marker = crate::ai::write_roots::AGENT_COMMAND_ENV;
+        for assignment in ["NAME.WITH.DOTS=1", "NAME-WITH-DASHES=1", "1ABC=1"] {
+            let command =
+                format!("env {assignment} env -u {marker} a --session A -- '/add-dir /outside'");
+            let error = validate(&command).unwrap_err();
+            assert!(error.contains(marker), "{command}: {error}");
+        }
+    }
+
+    #[test]
+    fn blocks_env_guardrail_assignment_phase_unsetting_agent_command_origin_marker() {
+        let marker = crate::ai::write_roots::AGENT_COMMAND_ENV;
+        let expected_error =
+            format!("env cannot remove the execute_command origin marker {marker}");
+        for assignments in ["-- -NAME=1", "FOO=1 -NAME=1", "=1"] {
+            let command =
+                format!("env {assignments} env -u {marker} a --session A -- /add-dir /outside");
+            let error = validate(&command).unwrap_err();
+            assert!(error.contains(&expected_error), "{command}: {error}");
+        }
+    }
+
+    #[test]
+    fn env_guardrail_dash_assignment_before_assignments_remains_an_option() {
+        let marker = crate::ai::write_roots::AGENT_COMMAND_ENV;
+        let command = format!("env -NAME=1 -u OTHER printenv {marker}");
+        let tokens = tokenize_shell_words(&command);
+        let options = super::lexer::parse_env_options(&tokens);
+        assert_eq!(options.command_index, Some(4));
+        assert_eq!(options.unset_variables, ["OTHER"]);
+        assert!(!options.clears_environment);
+        validate(&command).unwrap_or_else(|error| panic!("{command}: {error}"));
+
+        let command = format!("env -NAME=1 -u {marker} printenv {marker}");
+        let error = validate(&command).unwrap_err();
+        let expected_error =
+            format!("env cannot remove the execute_command origin marker {marker}");
+        assert!(error.contains(&expected_error), "{command}: {error}");
+    }
+
+    #[test]
+    fn blocks_env_guardrail_abbreviated_options_unsetting_agent_command_origin_marker() {
+        let marker = crate::ai::write_roots::AGENT_COMMAND_ENV;
+        for command in [
+            format!("env --un {marker} a --session A -- '/add-dir /outside'"),
+            format!("env --unse {marker} a --session A -- '/add-dir /outside'"),
+            format!("env --un={marker} a --session A -- '/add-dir /outside'"),
+            format!("env --unse={marker} a --session A -- '/add-dir /outside'"),
+            "env --ignore-env a --session A -- '/add-dir /outside'".to_string(),
+            "env --ignore-e a --session A -- '/add-dir /outside'".to_string(),
+        ] {
+            let error = validate(&command).unwrap_err();
+            assert!(error.contains(marker), "{command}: {error}");
+        }
+
+        let command = "env --split='printenv AI_AGENT_COMMAND'";
+        let error = validate(command).unwrap_err();
+        assert!(error.contains("split-string"), "{command}: {error}");
+    }
+
+    #[test]
+    fn env_guardrail_option_values_preserve_command_boundaries() {
+        let marker = crate::ai::write_roots::AGENT_COMMAND_ENV;
+        for command in [
+            format!("env --un=OTHER printenv {marker}"),
+            format!("env --un OTHER printenv {marker}"),
+            format!("env --ch=/tmp printenv {marker}"),
+            format!("env --ch {marker} printenv {marker}"),
+            format!("env --ar={marker} printenv {marker}"),
+            format!("env --ar {marker} printenv {marker}"),
+            format!("env --block printenv {marker}"),
+            format!("env --block=INT printenv {marker}"),
+            format!("env --default printenv {marker}"),
+            format!("env --default=INT printenv {marker}"),
+            format!("env --ignore-s printenv {marker}"),
+            format!("env --ignore-s=INT printenv {marker}"),
+            format!("env --list printenv {marker}"),
+            format!("env --deb printenv {marker}"),
+            format!("env --he printenv {marker}"),
+            format!("env --ve printenv {marker}"),
+            format!("env --n printenv {marker}"),
+            format!("env --unknown-option printenv {marker}"),
+            format!("env --unknown-option={marker} printenv {marker}"),
+            format!("env --ignore printenv {marker}"),
+            format!("env --i printenv {marker}"),
+        ] {
+            assert_eq!(
+                effective_command_tokens(&command),
+                ["printenv", marker],
+                "{command}"
+            );
+            validate(&command).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    #[test]
+    fn env_guardrail_allows_benign_assignments_and_unknown_options() {
+        for command in [
+            "env FOO=1 printenv",
+            "env NAME.WITH.DOTS=1 printenv",
+            "env NAME-WITH-DASHES=1 printenv",
+            "env 1ABC=1 printenv",
+            "env -- -NAME=1 printenv",
+            "env FOO=1 -NAME=1 printenv",
+            "env =1 printenv",
+            "env --unknown-option true",
+            "env --unknown-option=AI_AGENT_COMMAND true",
+            "env --ignore true",
+            "env --un=OTHER true",
+        ] {
+            validate(command).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    #[test]
+    fn env_guardrail_keeps_shell_assignment_rules_strict() {
+        let tokens = tokenize_shell_words("FOO=1 printenv");
+        assert_eq!(super::lexer::command_word_index(&tokens, true), Some(1));
+        for assignment in [
+            "NAME.WITH.DOTS=1",
+            "NAME-WITH-DASHES=1",
+            "1ABC=1",
+            "-NAME=1",
+            "=1",
+        ] {
+            let tokens = tokenize_shell_words(&format!("{assignment} printenv"));
+            assert_eq!(
+                super::lexer::command_word_index(&tokens, true),
+                Some(0),
+                "{assignment}"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_env_combined_options_unsetting_agent_command_origin_marker() {
+        let marker = crate::ai::write_roots::AGENT_COMMAND_ENV;
+        for command in [
+            format!("env -vu{marker} printenv {marker}"),
+            format!("env -vu {marker} printenv {marker}"),
+            format!("env -vvu{marker} printenv {marker}"),
+            format!("env -iu {marker} printenv {marker}"),
+            format!("timeout 5 /usr/bin/env -vu{marker} printenv {marker}"),
+        ] {
+            let error = validate(&command).unwrap_err();
+            assert!(error.contains(marker), "{command}: {error}");
+        }
+        for command in [
+            format!("env -vuOTHER printenv {marker}"),
+            format!("env -uSOME printenv {marker}"),
+            format!("env printenv -vu{marker}"),
+        ] {
+            validate(&command).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    #[test]
+    fn blocks_env_clearing_agent_command_origin_marker() {
+        let marker = crate::ai::write_roots::AGENT_COMMAND_ENV;
+        for command in [
+            format!("env -i printenv {marker}"),
+            format!("env - printenv {marker}"),
+            format!("env -vi printenv {marker}"),
+            format!("env --ignore-environment printenv {marker}"),
+            format!("nohup env FOO=1 env -i printenv {marker}"),
+            format!("env -P /usr/bin env - printenv {marker}"),
+        ] {
+            let error = validate(&command).unwrap_err();
+            assert!(error.contains(marker), "{command}: {error}");
+        }
+        for command in [
+            format!("env printenv -i {marker}"),
+            format!("env -- printenv -i {marker}"),
+            format!("env FOO=1 printenv --ignore-environment {marker}"),
+        ] {
+            validate(&command).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    #[test]
+    fn blocks_env_path_wrappers_unsetting_agent_command_origin_marker() {
+        let marker = crate::ai::write_roots::AGENT_COMMAND_ENV;
+        for command in [
+            format!("env -P /usr/bin env -u {marker} printenv {marker}"),
+            format!("env -P/usr/bin env -vu{marker} printenv {marker}"),
+            format!("env -vP /usr/bin env --unset={marker} printenv {marker}"),
+            format!("timeout 5 env -C /tmp -P /usr/bin env -u {marker} printenv {marker}"),
+            format!("env --chdir=/tmp -- env -u {marker} printenv {marker}"),
+        ] {
+            let error = validate(&command).unwrap_err();
+            assert!(error.contains(marker), "{command}: {error}");
+        }
+        for command in [
+            format!("env -P {marker} printenv {marker}"),
+            format!("env -C {marker} printenv {marker}"),
+            format!("env -a {marker} printenv {marker}"),
+            format!("env --argv0 {marker} printenv {marker}"),
+            format!("env -P /usr/bin printenv --unset {marker}"),
+        ] {
+            validate(&command).unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+        let command = "env -P /usr/bin env -vS 'printenv AI_AGENT_COMMAND'";
+        let error = validate(command).unwrap_err();
+        assert!(error.contains("split-string"), "{command}: {error}");
     }
 
     #[test]

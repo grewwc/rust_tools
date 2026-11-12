@@ -530,40 +530,128 @@ fn xargs_command_index(tokens: &[String]) -> Option<usize> {
     None
 }
 
-fn env_command_index(tokens: &[String], raw_tokens: &[String]) -> Option<usize> {
-    let mut i = 1usize;
-    while i < tokens.len() {
-        let tok = tokens[i].as_str();
-        if tok == "--" {
-            return (i + 1 < tokens.len()).then_some(i + 1);
-        }
-        if matches!(
-            tok,
-            "-u" | "--unset" | "-c" | "--chdir" | "-s" | "--split-string"
-        ) || tok == "-a"
-        {
-            i += 2;
-            continue;
-        }
-        if tok.starts_with("--unset=")
-            || tok.starts_with("--chdir=")
-            || tok.starts_with("--split-string=")
-            || tok.starts_with("--argv0=")
-        {
-            i += 1;
-            continue;
-        }
-        if tok.starts_with('-') && tok != "-" {
-            i += 1;
-            continue;
-        }
-        if is_env_assignment_word(&raw_tokens[i]) {
-            i += 1;
-            continue;
-        }
-        return Some(i);
+#[derive(Default)]
+pub(super) struct EnvOptions<'a> {
+    pub(super) command_index: Option<usize>,
+    pub(super) clears_environment: bool,
+    pub(super) unset_variables: Vec<&'a str>,
+    pub(super) split_string_index: Option<usize>,
+}
+
+fn is_native_env_assignment_word(token: &str) -> bool {
+    // After option parsing ends, native env treats any word containing '=' as an assignment.
+    token.contains('=')
+}
+
+fn env_long_option_name(name: &str) -> Option<&'static str> {
+    const OPTIONS: &[&str] = &[
+        "argv0",
+        "ignore-environment",
+        "null",
+        "unset",
+        "chdir",
+        "split-string",
+        "block-signal",
+        "default-signal",
+        "ignore-signal",
+        "list-signal-handling",
+        "debug",
+        "help",
+        "version",
+    ];
+    if let Some(option) = OPTIONS.iter().copied().find(|option| *option == name) {
+        return Some(option);
     }
-    None
+    let mut matches = OPTIONS
+        .iter()
+        .copied()
+        .filter(|option| option.starts_with(name));
+    let option = matches.next()?;
+    matches.next().is_none().then_some(option)
+}
+
+/// Parse env options in their original case so wrapper resolution and policy
+/// checks consume the same values and stop at the same command boundary.
+pub(super) fn parse_env_options(raw_tokens: &[String]) -> EnvOptions<'_> {
+    let mut options = EnvOptions::default();
+    let mut i = 1usize;
+    while let Some(token) = raw_tokens.get(i).map(String::as_str) {
+        if token == "--" {
+            i += 1;
+            break;
+        }
+        if !token.starts_with('-') || token == "-" {
+            break;
+        }
+        if let Some(long) = token.strip_prefix("--") {
+            let (name, attached) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            match env_long_option_name(name) {
+                Some("ignore-environment") => options.clears_environment = true,
+                Some(name @ ("unset" | "chdir" | "argv0" | "split-string")) => {
+                    if name == "split-string" {
+                        options.split_string_index = Some(i);
+                    }
+                    let value = attached.or_else(|| raw_tokens.get(i + 1).map(String::as_str));
+                    if name == "unset"
+                        && let Some(value) = value
+                    {
+                        options.unset_variables.push(value);
+                    }
+                    if attached.is_none() {
+                        i += 1;
+                    }
+                }
+                // Signal lists are optional attached values; other flags and
+                // unknown or ambiguous options never consume the next word.
+                _ => {}
+            }
+        } else {
+            let cluster = &token[1..];
+            for (offset, option) in cluster.char_indices() {
+                match option {
+                    'i' => options.clears_environment = true,
+                    'u' | 'P' | 'C' | 'c' | 'S' | 's' | 'a' => {
+                        if matches!(option, 'S' | 's') {
+                            options.split_string_index = Some(i);
+                        }
+                        // A value-taking option consumes the rest of its cluster
+                        // or the next word; those bytes are never more options.
+                        let attached = &cluster[offset + option.len_utf8()..];
+                        let value = if attached.is_empty() {
+                            i += 1;
+                            raw_tokens.get(i).map(String::as_str)
+                        } else {
+                            Some(attached)
+                        };
+                        if option == 'u'
+                            && let Some(value) = value
+                        {
+                            options.unset_variables.push(value);
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        i += 1;
+    }
+    // Conservatively treat the legacy standalone dash before assignments as
+    // clearing the environment, including after an explicit option terminator.
+    if raw_tokens.get(i).is_some_and(|token| token == "-") {
+        options.clears_environment = true;
+        i += 1;
+    }
+    while raw_tokens
+        .get(i)
+        .is_some_and(|token| is_native_env_assignment_word(token))
+    {
+        i += 1;
+    }
+    options.command_index = (i < raw_tokens.len()).then_some(i);
+    options
 }
 
 fn command_builtin_index(tokens: &[String]) -> Option<usize> {
@@ -712,7 +800,7 @@ pub(crate) fn indirect_command_index(
 ) -> Option<usize> {
     match program {
         "xargs" => xargs_command_index(tokens),
-        "env" => env_command_index(tokens, raw_tokens),
+        "env" => parse_env_options(raw_tokens).command_index,
         "nohup" | "setsid" => first_non_option_index(tokens, 1, &[]),
         "nice" => nice_command_index(tokens),
         "time" => time_command_index(tokens),

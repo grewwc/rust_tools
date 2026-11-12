@@ -85,9 +85,11 @@ pub fn is_local_command_start(token: &str) -> bool {
     matches!(
         word,
         "agent"
+            | "add-dir"
             | "agents"
             | "archive"
             | "audit"
+            | "dirs"
             | "use"
             | "reset"
             | "bg"
@@ -160,6 +162,8 @@ fn is_serve_forwarded_command_start(token: &str) -> bool {
     matches!(
         word,
         "task"
+            | "add-dir"
+            | "dirs"
             | "discuss"
             | "goal"
             | "distill-session"
@@ -187,7 +191,7 @@ pub(crate) fn is_serve_local_command_start(token: &str) -> bool {
 pub(crate) enum ServeInputRoute {
     /// A local command this client cannot execute: reject without sending.
     Unsupported,
-    /// A command the server turn child executes: forward as a prompt.
+    /// A server-owned command: forward for daemon or turn-child handling.
     ServerCommand,
     /// A slash/colon command shape no handler claims: reject without sending.
     UnknownCommand,
@@ -360,6 +364,50 @@ pub fn try_handle_local_command(
     app: &mut App,
     input: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Some(command) = crate::ai::write_roots::parse_dirs_command(input) {
+        use crate::ai::write_roots::DirsCommand;
+        let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
+            .map_err(|error| format!("cannot read the working directory: {error}"))?;
+        let history_file = app.config.history_file.clone();
+        let result = command.and_then(|command| match command {
+            DirsCommand::Add(value) => {
+                crate::ai::write_roots::require_user_grant_origin()?;
+                crate::ai::write_roots::add_session_directory(
+                    &crate::ai::history::SessionStore::new(&history_file),
+                    &app.session_id,
+                    &value,
+                    &cwd,
+                    &app.cli.add_dirs,
+                )
+            }
+            DirsCommand::List => Ok((
+                crate::ai::write_roots::writable_directory_report(
+                    &cwd,
+                    &app.cli.add_dirs,
+                    &app.cli.session_add_dirs,
+                ),
+                app.cli.session_add_dirs.clone(),
+            )),
+            DirsCommand::Delete(value) => {
+                crate::ai::write_roots::require_user_grant_origin()?;
+                crate::ai::write_roots::remove_session_directory(
+                    &crate::ai::history::SessionStore::new(&history_file),
+                    &app.session_id,
+                    &value,
+                    &cwd,
+                    &app.cli.add_dirs,
+                )
+            }
+        });
+        match result {
+            Ok((message, roots)) => {
+                app.cli.session_add_dirs = roots;
+                println!("{message}");
+            }
+            Err(error) => eprintln!("{error}"),
+        }
+        return Ok(true);
+    }
     if try_handle_help_command(input) {
         return Ok(true);
     }

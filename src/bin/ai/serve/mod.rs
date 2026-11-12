@@ -73,6 +73,8 @@ mod transfer;
 #[cfg(feature = "serve")]
 mod turn;
 mod types;
+#[cfg(feature = "serve")]
+mod write_roots;
 
 #[cfg(feature = "serve")]
 pub(crate) use checkpoint::*;
@@ -184,6 +186,9 @@ async fn post_turn(
     if prompt.trim().is_empty() {
         return bad_request("prompt is empty".to_string()).into_response();
     }
+    if let Some(response) = write_roots::dirs_command_response(&state, &id, &prompt, false).await {
+        return response;
+    }
     let title_seed = turn_title_seed(&req);
     if let Err(err) = stage_turn_images(
         &SessionStore::new(&state.history_file).session_assets_dir(&id),
@@ -203,8 +208,13 @@ async fn post_turn(
     // A per-turn override wins; absent fields fall back to the session's
     // persisted serve config (then to the server default), so a turn spawned
     // without client flags still runs with the session's picks.
-    let store = SessionStore::new(state.history_file.as_path());
-    merge_session_config(&mut overrides, &read_session_config_or_default(&store, &id));
+    let write_roots::TurnWriteContext {
+        cwd: session_cwd,
+        warnings,
+    } = match write_roots::prepare_turn_write_context(&state, &id, &mut overrides) {
+        Ok(context) => context,
+        Err(error) => return bad_request(error).into_response(),
+    };
     // Forced skills ride in the prompt, not argv: the child has no `--skill`
     // flag, but its input pipeline extracts `@skills:` tokens into forced
     // skills exactly like the local REPL.
@@ -220,7 +230,6 @@ async fn post_turn(
         title_seed.clone(),
     );
     let session_id = id.clone();
-    let session_cwd = session_cwd(&state, &id);
     let child_title_seed = title_seed.clone();
     let output = tokio::task::spawn_blocking(move || {
         run_one_shot_turn(
@@ -249,6 +258,11 @@ async fn post_turn(
                 .into_response();
         }
         Err(e) => return e.into_response(),
+    };
+    let output = if warnings.is_empty() {
+        output
+    } else {
+        format!("{}\n{output}", warnings.join("\n"))
     };
     // The child is gone: retry the title request outside the lock it held for
     // its whole run, in case the parallel attempt above failed or raced an
@@ -410,6 +424,9 @@ async fn post_turn_sse(
     if prompt.trim().is_empty() {
         return bad_request("prompt is empty".to_string()).into_response();
     }
+    if let Some(response) = write_roots::dirs_command_response(&state, &id, &prompt, true).await {
+        return response;
+    }
     let title_seed = turn_title_seed(&req);
     if let Err(err) = stage_turn_images(
         &SessionStore::new(&state.history_file).session_assets_dir(&id),
@@ -462,16 +479,26 @@ async fn post_turn_sse(
     let title_session_id = session_id.clone();
     // The turn child runs in the session's virtual cwd: every relative path
     // in its tools then resolves per session, not against the daemon's cwd.
-    let session_cwd = session_cwd(&state, &id);
     tokio::task::spawn(async move {
         let guard = lock.lock().await;
         // Read defaults only after the previous writer has finished, including
         // config patches queued behind a running turn.
-        let store = SessionStore::new(&history_file);
-        merge_session_config(
-            &mut overrides,
-            &read_session_config_or_default(&store, &title_session_id),
-        );
+        let write_roots::TurnWriteContext {
+            cwd: session_cwd,
+            warnings,
+        } = match write_roots::prepare_turn_write_context(&state, &title_session_id, &mut overrides)
+        {
+            Ok(context) => context,
+            Err(error) => {
+                let log = bus.begin(&bus_session);
+                for event in [error_event(error), done_event()] {
+                    log.publish(&event.kind, &event.data);
+                    let _ = tx.send(Ok(event.into_event())).await;
+                }
+                log.finish();
+                return;
+            }
+        };
         let title_model = overrides.model.clone();
         // The title seed stays separate from the skill-prefixed child input.
         spawn_session_title_task(
@@ -493,6 +520,9 @@ async fn post_turn_sse(
             }
             event_log.finish();
         });
+        for warning in warnings {
+            let _ = raw_tx.send(Ok(ServeSse::new("", warning))).await;
+        }
         let child_title_seed = title_seed.clone();
         let _ = tokio::task::spawn_blocking(move || {
             stream_child_turn(
@@ -1494,8 +1524,14 @@ async fn post_session_cd(
     }
     match run_session_cd(&state, &id, &req.command) {
         Some(outcome) => {
-            Json(serde_json::json!({ "stdout": outcome.stdout, "stderr": outcome.stderr }))
-                .into_response()
+            // `cwd` lets the web UI update the session bar immediately; the
+            // printed `stdout` is the same value for clients that shell out.
+            Json(serde_json::json!({
+                "stdout": outcome.stdout,
+                "stderr": outcome.stderr,
+                "cwd": session_cwd(&state, &id).display().to_string(),
+            }))
+            .into_response()
         }
         None => bad_request("not a /cd command".to_string()).into_response(),
     }
@@ -1610,6 +1646,7 @@ pub(in crate::ai) async fn run_serve(
         managed_tls.as_ref(),
     )?;
     let token = cfg.get_opt(AiConfig::SERVE_TOKEN).unwrap_or_default();
+    let default_add_dirs = ctl::runtime_default_add_dirs(&cli)?;
     if token.is_empty() && !is_loopback_bind(&bind) {
         return Err(
             "refusing to serve without ai.serve.token on a non-loopback bind; set ai.serve.token or bind 127.0.0.1".into(),
@@ -1638,6 +1675,7 @@ pub(in crate::ai) async fn run_serve(
     let state = ServeState {
         history_file,
         token,
+        default_add_dirs: Arc::new(default_add_dirs.clone()),
         cwds: Arc::new(std::sync::Mutex::new(restored_cwds)),
         // One entry per touched session; bounded by session count in practice.
         // Idle eviction is deferred to a later multi-instance pass.
@@ -1744,12 +1782,12 @@ pub(in crate::ai) async fn run_serve(
         let server = tls::TlsServer::bind(&bind, tls).await?;
         // Record this process in the global serve state file so
         // `--serve-status` and `--serve-stop` see a foreground server too.
-        ctl::note_foreground_serve(&bind, Some(tls));
+        ctl::note_foreground_serve(&bind, Some(tls), &default_add_dirs);
         eprintln!("[serve] listening on https://{bind}");
         server.serve(app).await?;
     } else {
         let listener = tokio::net::TcpListener::bind(&bind).await?;
-        ctl::note_foreground_serve(&bind, None);
+        ctl::note_foreground_serve(&bind, None, &default_add_dirs);
         eprintln!("[serve] listening on http://{bind}");
         axum::serve(listener, app).await?;
     }

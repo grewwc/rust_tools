@@ -4,7 +4,7 @@ use std::{
     fs::File,
     fs::{self},
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::SystemTime,
 };
 
@@ -19,12 +19,13 @@ use super::{
     compress::is_preserved_user_or_image_stub,
     markdown::messages_to_markdown,
     sqlite::{
-        MarkMessageUpdate, SessionListMetadata, backup_sqlite, message_count_sqlite_read_only,
-        read_all_messages_sqlite, read_first_user_prompt_sqlite, read_session_archived_sqlite,
-        read_session_list_metadata_sqlite, read_session_mark_message_sqlite,
-        read_session_marked_sqlite, read_session_serve_config_sqlite,
-        read_session_title_origin_sqlite, read_session_title_sqlite,
-        remap_session_asset_paths_sqlite, with_session_state_lock, write_session_archived_sqlite,
+        MarkMessageUpdate, SessionListMetadata, add_session_write_root_sqlite, backup_sqlite,
+        message_count_sqlite_read_only, read_all_messages_sqlite, read_first_user_prompt_sqlite,
+        read_session_archived_sqlite, read_session_list_metadata_sqlite,
+        read_session_mark_message_sqlite, read_session_marked_sqlite,
+        read_session_serve_config_sqlite, read_session_title_origin_sqlite,
+        read_session_title_sqlite, remap_session_asset_paths_sqlite,
+        remove_session_write_root_sqlite, with_session_state_lock, write_session_archived_sqlite,
         write_session_mark_sqlite, write_session_serve_config_sqlite, write_session_title_sqlite,
     },
     types::Message,
@@ -201,6 +202,10 @@ pub(in crate::ai) struct SessionServeConfig {
     /// Kernel model `/subagent kernel <model>` selects for kernel subagents.
     pub subagent_kernel_model: Option<String>,
     pub default_skills: Vec<String>,
+    /// Append-only session directory grants; defaults and CLI roots are not stored here.
+    pub additional_write_roots: Vec<PathBuf>,
+    /// Read-time diagnostics are not persisted as session configuration.
+    pub additional_write_root_warnings: Vec<String>,
 }
 
 impl SessionStore {
@@ -1116,8 +1121,8 @@ impl SessionStore {
 
     /// Whether the session is empty (no user messages or persisted checkpoint state).
     /// Used to clean up empty sessions when the user exits with Ctrl+C in
-    /// interactive mode. A missing file or no role='user' rows in the
-    /// messages table both count as empty.
+    /// interactive mode. No-user-message sessions are empty only when they
+    /// carry neither checkpoint state nor directory grants.
     pub(in crate::ai) fn is_empty_session(&self, session_id: &str) -> io::Result<bool> {
         Self::validate_session_id(session_id)?;
         let path = self.session_history_file(session_id);
@@ -1133,7 +1138,12 @@ impl SessionStore {
             return Ok(true);
         }
         let count = super::sqlite::count_user_turns_sqlite(&path)?;
-        Ok(count == 0)
+        if count != 0 {
+            return Ok(false);
+        }
+        let config = self.read_session_serve_config(session_id)?;
+        Ok(config.additional_write_roots.is_empty()
+            && config.additional_write_root_warnings.is_empty())
     }
 
     /// Read the session title.
@@ -1266,6 +1276,34 @@ impl SessionStore {
     ) -> io::Result<()> {
         Self::validate_session_id(session_id)?;
         write_session_serve_config_sqlite(&self.session_history_file(session_id), config)
+    }
+
+    #[cfg(test)]
+    pub(in crate::ai) fn add_session_write_root(
+        &self,
+        session_id: &str,
+        root: &Path,
+    ) -> io::Result<(Vec<PathBuf>, bool)> {
+        self.add_session_write_root_with_defaults(session_id, root, &[])
+    }
+
+    pub(in crate::ai) fn add_session_write_root_with_defaults(
+        &self,
+        session_id: &str,
+        root: &Path,
+        defaults: &[PathBuf],
+    ) -> io::Result<(Vec<PathBuf>, bool)> {
+        Self::validate_session_id(session_id)?;
+        add_session_write_root_sqlite(&self.session_history_file(session_id), root, defaults)
+    }
+
+    pub(in crate::ai) fn remove_session_write_root(
+        &self,
+        session_id: &str,
+        root: &Path,
+    ) -> io::Result<(Vec<PathBuf>, bool)> {
+        Self::validate_session_id(session_id)?;
+        remove_session_write_root_sqlite(&self.session_history_file(session_id), root)
     }
 
     /// Whether an LLM-generated title already exists.
@@ -1519,76 +1557,139 @@ impl SessionStore {
         let dst_checkpoints = self.checkpoints_dir(dst_id);
         self.ensure_root_dir()?;
         super::checkpoint::with_checkpoint_lock(&dst_checkpoints, || {
-            if dst_sqlite.exists() || dst_assets.exists() || dst_checkpoints.exists() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("destination session '{dst_id}' already exists"),
-                ));
-            }
-
-            let result = (|| {
-                // Extract session.sqlite
-                {
-                    let mut entry = archive.by_name("session.sqlite").map_err(|e| {
-                        io::Error::other(format!("session.sqlite not found in archive: {e}"))
-                    })?;
-                    let mut out = File::create(&dst_sqlite)?;
-                    std::io::copy(&mut entry, &mut out)?;
+            with_session_state_lock(&dst_sqlite, || {
+                if dst_sqlite.exists() || dst_assets.exists() || dst_checkpoints.exists() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("destination session '{dst_id}' already exists"),
+                    ));
                 }
 
-                // Extract assets/ (if present)
-                for i in 0..archive.len() {
-                    let mut entry = archive
-                        .by_index(i)
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    let name = entry.name().to_string();
-                    if name == "manifest.json" || name == "session.sqlite" {
-                        continue;
+                let import_id = uuid::Uuid::new_v4();
+                let staged_sqlite = self.root.join(format!(".session-import-{import_id}.tmp"));
+                let staged_assets = self
+                    .root
+                    .join(format!(".session-import-{import_id}.assets.tmp"));
+                let prepared = (|| {
+                    // Prepare the database privately so concurrent readers cannot see archive grants.
+                    {
+                        let mut entry = archive.by_name("session.sqlite").map_err(|e| {
+                            io::Error::other(format!("session.sqlite not found in archive: {e}"))
+                        })?;
+                        let mut options = File::options();
+                        options.write(true).create_new(true);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::OpenOptionsExt;
+                            options.mode(0o600);
+                        }
+                        let mut out = options.open(&staged_sqlite)?;
+                        std::io::copy(&mut entry, &mut out)?;
                     }
-                    let rel = entry.enclosed_name().ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("unsafe archive entry: {name}"),
-                        )
-                    })?;
-                    let rel = rel.strip_prefix("assets").map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("unexpected archive entry: {name}"),
-                        )
-                    })?;
-                    if rel.as_os_str().is_empty() {
-                        continue;
-                    }
-                    let out_path = dst_assets.join(rel);
-                    if entry.is_dir() {
-                        fs::create_dir_all(&out_path)?;
-                        continue;
-                    }
-                    if let Some(parent) = out_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    let mut out = File::create(&out_path)?;
-                    std::io::copy(&mut entry, &mut out)?;
-                }
 
-                remap_session_asset_paths_sqlite(&dst_sqlite, None, &dst_assets)?;
-                Ok(dst_id.to_string())
-            })();
-            if result.is_err() {
-                let _ = delete_history_artifacts(&dst_sqlite);
-                let _ = delete_assets_dir(&dst_assets);
-            }
-            result
-        })
-        .and_then(|id| {
-            // An import is new live work the handler switches into, so never
-            // inherit the formal-archive flag (mirrors fork). Runs after the
-            // checkpoint locks are released.
-            write_session_archived_sqlite(&dst_sqlite, false)?;
-            Ok(id)
+                    // Reject triggers and clear authorization before any other imported content writes.
+                    super::sqlite::clear_session_write_roots_sqlite(&staged_sqlite)?;
+
+                    // Extract assets/ (if present)
+                    for i in 0..archive.len() {
+                        let mut entry = archive
+                            .by_index(i)
+                            .map_err(|e| io::Error::other(e.to_string()))?;
+                        let name = entry.name().to_string();
+                        if name == "manifest.json" || name == "session.sqlite" {
+                            continue;
+                        }
+                        let rel = archive_asset_relative_path(&name, entry.is_dir())?;
+                        if rel.as_os_str().is_empty() {
+                            continue;
+                        }
+                        let out_path = staged_assets.join(rel);
+                        if entry.is_dir() {
+                            fs::create_dir_all(&out_path)?;
+                            continue;
+                        }
+                        if let Some(parent) = out_path.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        let mut out = File::create(&out_path)?;
+                        std::io::copy(&mut entry, &mut out)?;
+                    }
+
+                    // The database publishes last, after every referenced asset is available.
+                    if staged_assets.exists() {
+                        fs::rename(&staged_assets, &dst_assets)?;
+                    }
+                    remap_session_asset_paths_sqlite(&staged_sqlite, None, &dst_assets)?;
+                    // An import is new live work, so never inherit the formal-archive flag.
+                    write_session_archived_sqlite(&staged_sqlite, false)
+                })();
+                // Metadata/remapping helpers cache their handles. Close every staged
+                // writer on both paths before Online Backup publishes or cleanup unlinks it.
+                super::sqlite::close_cached_write_conn(&staged_sqlite);
+                let result = prepared.and_then(|()| {
+                    backup_sqlite(&staged_sqlite, &dst_sqlite)?;
+                    Ok(dst_id.to_string())
+                });
+                cleanup_archive_import(
+                    &staged_sqlite,
+                    &staged_assets,
+                    &dst_sqlite,
+                    result.is_err(),
+                );
+                result
+            })
         })
     }
+}
+
+fn cleanup_archive_import(
+    staged_sqlite: &Path,
+    staged_assets: &Path,
+    dst_sqlite: &Path,
+    failed: bool,
+) {
+    let _ = delete_history_artifacts(staged_sqlite);
+    let _ = super::sqlite::delete_session_state_lock(staged_sqlite);
+    super::sqlite::remove_session_state_lock_entry(staged_sqlite);
+    // Only private staging belongs exclusively to the import. Published assets
+    // are intentionally retained to protect concurrent uploads if the import fails.
+    // Retrying the same session ID returns AlreadyExists because that directory
+    // remains; use a new session ID or manually clean up the residual assets directory.
+    let _ = delete_assets_dir(staged_assets);
+    if failed {
+        let _ = delete_history_artifacts(dst_sqlite);
+    }
+}
+
+fn archive_asset_relative_path(name: &str, is_dir: bool) -> io::Result<&Path> {
+    let relative = Path::new(name).strip_prefix("assets").map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected archive entry: {name}"),
+        )
+    })?;
+    // Validate the exact path joined to the staging directory, after stripping
+    // the archive prefix. Even a parent within the original prefix is unsafe.
+    if name.contains('\0')
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsafe archive entry: {name}"),
+        ));
+    }
+    if relative.as_os_str().is_empty() && !is_dir {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "assets entry must be a directory",
+        ));
+    }
+    Ok(relative)
 }
 
 /// Validate the archive layout, rejecting Zip Slip, duplicate SQLite files,
@@ -1621,24 +1722,7 @@ fn validate_archive_entries(archive: &mut zip::ZipArchive<File>) -> io::Result<(
                 manifest_count += 1;
             }
             _ => {
-                let enclosed_name = entry.enclosed_name().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unsafe archive entry: {name}"),
-                    )
-                })?;
-                let relative = enclosed_name.strip_prefix("assets").map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unexpected archive entry: {name}"),
-                    )
-                })?;
-                if relative.as_os_str().is_empty() && !entry.is_dir() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "assets entry must be a directory",
-                    ));
-                }
+                archive_asset_relative_path(&name, entry.is_dir())?;
             }
         }
     }
@@ -2884,6 +2968,129 @@ mod tests {
     }
 
     #[test]
+    fn archive_import_publishes_only_sanitized_database() {
+        use crate::ai::history::sqlite::add_session_write_root_sqlite;
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let history_file = temp_history_file();
+        let store = SessionStore::new(&history_file);
+        let source_db = store.session_history_file("source");
+        let source_asset = store.session_assets_dir("source").join("payload.txt");
+        fs::create_dir_all(source_asset.parent().unwrap()).unwrap();
+        fs::write(&source_asset, vec![b'x'; 1024 * 1024]).unwrap();
+        append_history_messages(&source_db, &[checkpoint_marker(&source_asset)]).unwrap();
+        add_session_write_root_sqlite(&source_db, store.sessions_root(), &[]).unwrap();
+        let archive = history_file.with_extension("zip");
+        store.export_session_archive("source", &archive).unwrap();
+        assert!(
+            !store
+                .read_session_serve_config("source")
+                .unwrap()
+                .additional_write_roots
+                .is_empty()
+        );
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(Barrier::new(2));
+        let reader_finished = finished.clone();
+        let reader_ready = ready.clone();
+        let reader_history = history_file.clone();
+        let reader = std::thread::spawn(move || {
+            let observer = SessionStore::new(&reader_history);
+            reader_ready.wait();
+            loop {
+                assert!(
+                    observer
+                        .read_session_serve_config("imported")
+                        .unwrap()
+                        .additional_write_roots
+                        .is_empty(),
+                    "a concurrent reader observed archive authorization"
+                );
+                if reader_finished.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        });
+        ready.wait();
+        let imported = store.import_session_archive(&archive, "imported");
+        finished.store(true, Ordering::Release);
+        reader.join().unwrap();
+        assert_eq!(imported.unwrap(), "imported");
+        assert_eq!(
+            fs::read(store.session_assets_dir("imported").join("payload.txt"))
+                .unwrap()
+                .len(),
+            1024 * 1024
+        );
+        assert!(fs::read_dir(store.sessions_root()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("session-import-")
+        }));
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(store.sessions_root());
+    }
+
+    #[test]
+    fn archive_import_rejects_authorization_restoring_trigger_before_publication() {
+        use crate::ai::history::sqlite::{add_session_write_root_sqlite, close_cached_write_conn};
+
+        let history_file = temp_history_file();
+        let store = SessionStore::new(&history_file);
+        let source_db = store.session_history_file("source");
+        append_history_messages(&source_db, &[checkpoint_marker(store.sessions_root())]).unwrap();
+        add_session_write_root_sqlite(&source_db, store.sessions_root(), &[]).unwrap();
+        close_cached_write_conn(&source_db);
+        let conn = rusqlite::Connection::open(&source_db).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER restore_roots AFTER DELETE ON meta
+             WHEN OLD.key='session_write_roots'
+             BEGIN INSERT OR REPLACE INTO meta(key,value,created_at)
+                 VALUES(OLD.key,OLD.value,OLD.created_at); END;
+             DELETE FROM meta WHERE key='session_write_roots';",
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            !store
+                .read_session_serve_config("source")
+                .unwrap()
+                .additional_write_roots
+                .is_empty()
+        );
+        let archive = history_file.with_extension("zip");
+        store.export_session_archive("source", &archive).unwrap();
+
+        let error = store
+            .import_session_archive(&archive, "imported")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported SQLite trigger: restore_roots")
+        );
+        assert!(!store.session_history_file("imported").exists());
+        assert!(!store.session_assets_dir("imported").exists());
+        assert!(fs::read_dir(store.sessions_root()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("session-import-")
+        }));
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(store.sessions_root());
+    }
+
+    #[test]
     fn archive_import_rejects_zip_slip_before_creating_session_files() {
         use std::io::Write;
 
@@ -2911,6 +3118,141 @@ mod tests {
         assert!(!store.session_assets_dir("imported").exists());
 
         let _ = fs::remove_file(archive_path);
+        let _ = fs::remove_dir_all(store.sessions_root());
+    }
+
+    #[test]
+    fn archive_import_rejects_asset_parent_traversal_before_creating_session_files() {
+        use crate::ai::history::sqlite::{add_session_write_root_sqlite, backup_sqlite};
+        use std::io::Write;
+
+        let history_file = temp_history_file();
+        let store = SessionStore::new(&history_file);
+        let source_db = store.session_history_file("source");
+        append_history_messages(&source_db, &[checkpoint_marker(store.sessions_root())]).unwrap();
+        add_session_write_root_sqlite(&source_db, store.sessions_root(), &[]).unwrap();
+        let source_roots = store
+            .read_session_serve_config("source")
+            .unwrap()
+            .additional_write_roots;
+        assert!(!source_roots.is_empty());
+        let snapshot = history_file.with_extension("snapshot.sqlite");
+        backup_sqlite(&source_db, &snapshot).unwrap();
+        let sqlite_bytes = fs::read(&snapshot).unwrap();
+
+        let other_asset = store.session_assets_dir("other").join("existing.png");
+        fs::create_dir_all(other_asset.parent().unwrap()).unwrap();
+        fs::write(&other_asset, b"existing attachment").unwrap();
+        let other_messages = vec![checkpoint_marker(&other_asset)];
+        append_history_messages(&store.session_history_file("other"), &other_messages).unwrap();
+
+        let archive_path = history_file.with_extension("zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("session.sqlite", options).unwrap();
+        zip.write_all(&sqlite_bytes).unwrap();
+        zip.start_file("assets/first.txt", options).unwrap();
+        zip.write_all(b"must not be extracted").unwrap();
+        zip.start_file("assets/../victim.sqlite", options).unwrap();
+        zip.write_all(&sqlite_bytes).unwrap();
+        zip.finish().unwrap();
+
+        let root_entries = || {
+            let mut names: Vec<_> = fs::read_dir(store.sessions_root())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = root_entries();
+        let error = store
+            .import_session_archive(&archive_path, "imported")
+            .expect_err("asset parent traversal must be rejected before extraction");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("assets/../victim.sqlite"));
+        assert!(!store.session_history_file("imported").exists());
+        assert!(!store.session_assets_dir("imported").exists());
+        assert!(!store.sessions_root().join("victim.sqlite").exists());
+        assert_eq!(root_entries(), before);
+        assert_eq!(store.read_all_messages("other").unwrap(), other_messages);
+        assert_eq!(fs::read(&other_asset).unwrap(), b"existing attachment");
+        assert_eq!(
+            store
+                .read_session_serve_config("source")
+                .unwrap()
+                .additional_write_roots,
+            source_roots
+        );
+
+        let _ = fs::remove_file(archive_path);
+        let _ = fs::remove_file(snapshot);
+        let _ = fs::remove_dir_all(store.sessions_root());
+    }
+
+    #[test]
+    fn archive_import_cleanup_preserves_uploads_when_asset_rename_fails() {
+        let history_file = temp_history_file();
+        let store = SessionStore::new(&history_file);
+        store.ensure_root_dir().unwrap();
+        let staged_sqlite = store.sessions_root().join(".private-import.tmp");
+        let staged_assets = store.sessions_root().join(".private-import.assets.tmp");
+        let dst_sqlite = store.session_history_file("imported");
+        let dst_assets = store.session_assets_dir("imported");
+        assert!(!dst_assets.exists());
+        fs::write(&staged_sqlite, b"private database").unwrap();
+        fs::create_dir(&staged_assets).unwrap();
+        fs::write(staged_assets.join("imported.txt"), b"private attachment").unwrap();
+
+        // An upload wins the race after the import's destination check.
+        fs::create_dir(&dst_assets).unwrap();
+        let concurrent_image = dst_assets.join("concurrent.png");
+        fs::write(&concurrent_image, b"queued attachment").unwrap();
+        let publication = fs::rename(&staged_assets, &dst_assets);
+        assert!(publication.is_err());
+        super::cleanup_archive_import(
+            &staged_sqlite,
+            &staged_assets,
+            &dst_sqlite,
+            publication.is_err(),
+        );
+
+        assert_eq!(fs::read(&concurrent_image).unwrap(), b"queued attachment");
+        assert!(!staged_sqlite.exists());
+        assert!(!staged_assets.exists());
+        assert!(!dst_sqlite.exists());
+        let _ = fs::remove_dir_all(store.sessions_root());
+    }
+
+    #[test]
+    fn archive_import_rollback_preserves_uploads_after_asset_publication() {
+        let history_file = temp_history_file();
+        let store = SessionStore::new(&history_file);
+        store.ensure_root_dir().unwrap();
+        let staged_sqlite = store.sessions_root().join(".private-import.tmp");
+        let staged_assets = store.sessions_root().join(".private-import.assets.tmp");
+        let dst_sqlite = store.session_history_file("imported");
+        let dst_assets = store.session_assets_dir("imported");
+        fs::write(&staged_sqlite, b"private database").unwrap();
+        fs::create_dir(&staged_assets).unwrap();
+        fs::write(staged_assets.join("imported.txt"), b"published attachment").unwrap();
+        fs::rename(&staged_assets, &dst_assets).unwrap();
+
+        let concurrent_image = dst_assets.join("attachments").join("concurrent.png");
+        fs::create_dir_all(concurrent_image.parent().unwrap()).unwrap();
+        fs::write(&concurrent_image, b"queued attachment").unwrap();
+        fs::write(&dst_sqlite, b"failed database publication").unwrap();
+        super::cleanup_archive_import(&staged_sqlite, &staged_assets, &dst_sqlite, true);
+
+        assert_eq!(fs::read(&concurrent_image).unwrap(), b"queued attachment");
+        // Publishing relinquishes exclusive ownership of the assets directory.
+        assert_eq!(
+            fs::read(dst_assets.join("imported.txt")).unwrap(),
+            b"published attachment"
+        );
+        assert!(!staged_sqlite.exists());
+        assert!(!staged_assets.exists());
+        assert!(!dst_sqlite.exists());
         let _ = fs::remove_dir_all(store.sessions_root());
     }
 

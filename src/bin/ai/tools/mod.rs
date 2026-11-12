@@ -26,7 +26,9 @@ mod web_tools;
 #[cfg(test)]
 pub use command_tools::validate_execute_command;
 
-pub(crate) use patch_tools::{PATCH_TEXT_BLOCK_START, apply_patch_target_paths_from_patch};
+pub(crate) use patch_tools::{
+    PATCH_TEXT_BLOCK_START, apply_patch_target_paths_from_args, apply_patch_target_paths_from_patch,
+};
 #[cfg(test)]
 pub(crate) use registry::common::ToolReplayRegistration;
 #[cfg(test)]

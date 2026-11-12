@@ -145,6 +145,8 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":title",
         "/cd",
         ":cd",
+        "/dirs",
+        ":dirs",
         "/pwd",
         ":pwd",
         "/theme",
@@ -1450,6 +1452,17 @@ impl CommandCompleter {
                     None if token == "-" => Vec::new(),
                     None => complete_cd_fragment(token),
                     Some(_) => Vec::new(),
+                }
+            } else if matches!(first, "/dirs" | ":dirs") {
+                match words.next() {
+                    None => Self::plain_candidates(
+                        ["add", "del", "ls"]
+                            .into_iter()
+                            .filter(|sub| sub.starts_with(token))
+                            .map(str::to_string),
+                    ),
+                    Some("add") if words.next().is_none() => complete_cd_fragment(token),
+                    _ => Vec::new(),
                 }
             } else if matches!(first, "/resume") {
                 // Serve-chat only: the local REPL has no `/resume` command, and
@@ -3106,6 +3119,28 @@ mod tests {
         assert!(candidates.iter().any(|c| c.replacement == "/pwd"));
         let (_, after) = CommandCompleter::complete_for_line("/pwd ", 5);
         assert!(after.is_empty());
+    }
+
+    #[test]
+    fn dirs_completion_offers_subcommands_and_adds_only_directory_paths() {
+        let tmp = std::env::temp_dir().join(format!("a-dirs-complete-{}", std::process::id()));
+        let _ = fs::create_dir_all(tmp.join("alpha"));
+        let line = "/dirs ";
+        let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
+        assert_eq!(start, line.len());
+        let values: Vec<_> = candidates.iter().map(|c| c.replacement.as_str()).collect();
+        assert_eq!(values, ["add", "del", "ls"]);
+        let frag = format!("{}/al", tmp.to_str().unwrap());
+        let line = format!("/dirs add {frag}");
+        let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].replacement,
+            format!("{}/alpha/", tmp.to_str().unwrap())
+        );
+        let line = "/dirs ls ";
+        let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
+        assert!(candidates.is_empty());
     }
 
     #[test]

@@ -154,6 +154,8 @@ pub(in crate::ai) fn persist_session_runtime_state(app: &App) {
         subagent_model: app.session_default_subagent_model.clone(),
         subagent_kernel_model: app.session_default_kernel_subagent_model.clone(),
         default_skills: app.session_default_skills.clone(),
+        additional_write_roots: app.cli.session_add_dirs.clone(),
+        additional_write_root_warnings: Vec::new(),
     };
     if let Err(error) = store.write_session_serve_config(&app.session_id, &config) {
         eprintln!("[session] failed to persist session runtime picks: {error}");
@@ -164,10 +166,12 @@ pub(in crate::ai) fn persist_session_runtime_state(app: &App) {
 /// model/agent/effort picks, mirroring serve's per-turn override precedence, so
 /// `a -ss <id> --model X` still starts with X.
 fn restore_session_model_agent_effort(app: &mut App, store: &SessionStore) {
+    app.cli.session_add_dirs.clear();
     let Ok(stored) = store.read_session_serve_config(&app.session_id) else {
         return;
     };
     let session_backend = super::use_backend::effective_subagent_backend(&stored);
+    install_session_write_roots(app, &stored);
     if app.cli.model.is_none() {
         if let Some(model) = stored.model {
             app.current_model = model;
@@ -191,6 +195,33 @@ fn restore_session_model_agent_effort(app: &mut App, store: &SessionStore) {
     app.session_default_subagent_model = stored.subagent_model;
     app.session_default_kernel_subagent_model = stored.subagent_kernel_model;
     app.session_default_skills = stored.default_skills;
+}
+
+fn install_session_write_roots(app: &mut App, stored: &SessionServeConfig) {
+    let mut combined = app.cli.add_dirs.clone();
+    combined.extend(stored.additional_write_roots.clone());
+    let (bounded, mut warnings) = crate::ai::write_roots::bounded_roots(&combined);
+    app.cli.session_add_dirs = stored
+        .additional_write_roots
+        .iter()
+        .filter(|root| bounded.contains(root))
+        .cloned()
+        .collect();
+    warnings.extend(crate::ai::write_roots::available_roots(&bounded).1);
+    for warning in stored
+        .additional_write_root_warnings
+        .iter()
+        .chain(&warnings)
+    {
+        eprintln!("[session] {warning}");
+    }
+}
+
+pub(in crate::ai) fn refresh_session_write_roots(app: &mut App) -> std::io::Result<()> {
+    let stored =
+        SessionStore::new(&app.config.history_file).read_session_serve_config(&app.session_id)?;
+    install_session_write_roots(app, &stored);
+    Ok(())
 }
 
 /// Session-derived prune authorization for the current request projection.

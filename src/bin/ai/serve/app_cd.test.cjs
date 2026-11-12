@@ -11,12 +11,15 @@ const vm = require("node:vm");
 const html = fs.readFileSync(path.join(__dirname, "app.html"), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 
-function harness({ sessionId = "s1", images = [], respond } = {}) {
+function harness({ sessionId = "s1", images = [], items = [], respond } = {}) {
   const calls = [];
   const cards = [];
+  let renders = 0;
   const context = vm.createContext({
     sessionId,
     pendingNew: null,
+    pendingCwd: "",
+    lastItems: JSON.parse(JSON.stringify(items)),
     store: { base: "https://a.test" },
     carrySkillPick: () => {},
     carryTeamPick: () => {},
@@ -38,6 +41,7 @@ function harness({ sessionId = "s1", images = [], respond } = {}) {
     clearDraft: (sid) => { cards.push({ cleared: sid }); },
     shortLine: (s) => s.slice(0, 80),
     scrollToLatest: () => {},
+    renderSessionBar: () => { renders += 1; },
     localStorage: { setItem: () => {} },
   });
   const code = script.slice(script.indexOf("const CD_LINE_RE"), script.indexOf("async function send()"));
@@ -45,6 +49,8 @@ function harness({ sessionId = "s1", images = [], respond } = {}) {
   return {
     calls,
     cards,
+    context,
+    renders: () => renders,
     run: (text) => vm.runInContext(`runCdCommand(${JSON.stringify(text)})`, context),
     line: (text) => vm.runInContext(`cdCommandLine(${JSON.stringify(text)})`, context),
   };
@@ -71,6 +77,16 @@ test("a bare cd line and the :cd spelling are both handled", async () => {
   }
 });
 
+test("the /cd response updates the session bar's path immediately", async () => {
+  const h = harness({
+    items: [{ id: "s1", cwd: "/old" }],
+    respond: () => ({ ok: true, json: async () => ({ stdout: "Working directory: /tmp\n", stderr: "", cwd: "/tmp" }) }),
+  });
+  assert.equal(await h.run("/cd /tmp"), true);
+  assert.equal(h.context.lastItems[0].cwd, "/tmp");
+  assert.equal(h.renders(), 1, "the bar re-renders once from the response");
+});
+
 test("multi-line text, other prompts and pending images still go to the model", async () => {
   for (const text of ["/cd /tmp\nand also list the files", "what is in /tmp", "/cdx"]) {
     const h = harness();
@@ -86,11 +102,12 @@ test("no session yet creates one, then applies the cd there", async () => {
   const h = harness({
     sessionId: "",
     respond: (url) => url === "/sessions"
-      ? { ok: true, json: async () => ({ id: "fresh" }) }
-      : { ok: true, json: async () => ({ stdout: "Working directory: /tmp\n", stderr: "" }) },
+      ? { ok: true, json: async () => ({ id: "fresh", cwd: "/srv" }) }
+      : { ok: true, json: async () => ({ stdout: "Working directory: /tmp\n", stderr: "", cwd: "/tmp" }) },
   });
   assert.equal(await h.run("/cd /tmp"), true);
   assert.deepEqual(h.calls.map((c) => c.url), ["/sessions", "/sessions/fresh/cd"]);
+  assert.equal(h.context.pendingCwd, "/tmp");
 });
 
 test("a rejected cd shows the server error and no activity card", async () => {

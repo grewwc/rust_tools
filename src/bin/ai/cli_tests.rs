@@ -2,6 +2,253 @@ use std::fs;
 use std::path::PathBuf;
 
 #[test]
+fn add_dir_cli_accumulates_and_normalizes_existing_directories() {
+    let root = std::env::temp_dir().join(format!("ai-add-dir-{}", uuid::Uuid::new_v4()));
+    let first = root.join("project a");
+    let second = root.join("project,b");
+    fs::create_dir_all(&first).unwrap();
+    fs::create_dir_all(&second).unwrap();
+    let mut cli = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(root.clone(), || {
+        super::try_parse_cli_args(
+            [
+                "a",
+                "--add-dir",
+                "project a/../project a/.",
+                "--add-dir=project,b",
+                "--add-dir",
+                "project a",
+                "fix both projects",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+    });
+    assert_eq!(
+        cli.add_dirs,
+        [
+            first.canonicalize().unwrap(),
+            second.canonicalize().unwrap()
+        ]
+    );
+    assert_eq!(cli.args, ["fix both projects"]);
+    crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(second, || {
+        cli.validate_add_dirs().unwrap();
+    });
+    assert_eq!(cli.add_dirs[0], first.canonicalize().unwrap());
+    let help = super::build_cli_parser().collect_completion_info();
+    let (_, kind, description, _) = help
+        .iter()
+        .find(|(name, _, _, _)| name == "add-dir")
+        .unwrap();
+    assert_eq!(kind, "string");
+    assert!(description.contains("writable roots"));
+    assert!(description.contains("repeat --add-dir"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn add_dir_cli_rejects_missing_empty_nonexistent_and_file_values() {
+    let root = std::env::temp_dir().join(format!("ai-add-dir-invalid-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("file.txt"), "not a directory").unwrap();
+    crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(root.clone(), || {
+        for argv in [
+            vec!["a", "--add-dir"],
+            vec!["a", "--add-dir", "--model", "test"],
+            vec!["a", "--add-dir="],
+            vec!["a", "--add-dir", " "],
+            vec!["a", "--add-dir", "missing"],
+            vec!["a", "--add-dir", "file.txt"],
+        ] {
+            let error = super::try_parse_cli_args(argv.into_iter().map(str::to_owned)).unwrap_err();
+            assert!(error.contains("--add-dir"), "{error}");
+        }
+    });
+    assert!(
+        !root.join("missing").exists(),
+        "invalid directories must not be created"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn add_dir_cli_preserves_verbatim_prompt_and_local_commands() {
+    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+    let cli = super::try_parse_cli_args(
+        [
+            "a",
+            "--add-dir",
+            ".",
+            "--",
+            "--add-dir",
+            "/missing",
+            "quoted prompt",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    )
+    .unwrap();
+    assert_eq!(cli.add_dirs, [cwd.clone()]);
+    assert_eq!(cli.args, ["--add-dir", "/missing", "quoted prompt"]);
+    let command = super::try_parse_cli_args(
+        ["a", "/sessions", "list", "--add-dir", "."]
+            .into_iter()
+            .map(str::to_owned),
+    )
+    .unwrap();
+    assert_eq!(command.add_dirs, [cwd]);
+    assert_eq!(command.args, ["/sessions list"]);
+}
+
+#[test]
+fn add_dir_cli_never_extracts_grants_from_command_data() {
+    let directory = std::env::current_dir().unwrap().canonicalize().unwrap();
+    let grant = format!("--add-dir={}", directory.display());
+    let expected = format!("/ss mark -- --ss=note -ss=note {grant}");
+    for command in [
+        vec![
+            "/ss".to_string(),
+            "mark".into(),
+            "--".into(),
+            "--ss=note".into(),
+            "-ss=note".into(),
+            grant,
+        ],
+        vec![expected.clone()],
+    ] {
+        let cli = super::try_parse_cli_args(
+            ["a".to_string(), "--interactive".into()]
+                .into_iter()
+                .chain(command),
+        )
+        .unwrap();
+        assert!(cli.interactive);
+        assert!(cli.add_dirs.is_empty());
+        assert!(cli.session.is_none());
+        assert_eq!(cli.args, [expected.clone()]);
+    }
+}
+
+#[test]
+fn add_dir_cli_files_flag_preserves_command_terminator() {
+    let directory = std::env::current_dir().unwrap().canonicalize().unwrap();
+    let grant = format!("--add-dir={}", directory.display());
+    for files_flag in ["--files", "-f"] {
+        for note in ["note", "--ss=note", "-ss=note"] {
+            let cli = super::try_parse_cli_args(
+                [
+                    "a",
+                    "--interactive",
+                    "/ss",
+                    "mark",
+                    files_flag,
+                    "--",
+                    note,
+                    &grant,
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .unwrap();
+            assert!(cli.interactive);
+            assert!(cli.add_dirs.is_empty());
+            assert!(cli.files.is_empty());
+            assert!(cli.session.is_none());
+            assert_eq!(cli.args, [format!("/ss mark -- {note} {grant}")]);
+        }
+    }
+}
+
+#[test]
+fn add_dir_cli_legacy_session_aliases_still_parse_before_terminators() {
+    for alias in ["--ss", "-ss", "--ss=active", "-ss=active"] {
+        let mut option = vec![alias];
+        if !alias.contains('=') {
+            option.push("active");
+        }
+        for before_command in [true, false] {
+            let mut argv = vec!["a"];
+            if before_command {
+                argv.extend(&option);
+            }
+            argv.extend(["/ss", "mark"]);
+            if !before_command {
+                argv.extend(&option);
+            }
+            argv.extend(["--", "--ss=note", "-ss=note", "--add-dir=/projectB"]);
+            let cli = super::try_parse_cli_args(argv.into_iter().map(str::to_owned)).unwrap();
+            assert_eq!(cli.session.as_deref(), Some("active"));
+            assert!(cli.add_dirs.is_empty());
+            assert_eq!(
+                cli.args,
+                ["/ss mark -- --ss=note -ss=note --add-dir=/projectB"]
+            );
+        }
+    }
+}
+
+#[test]
+fn add_dir_cli_rejects_excessive_root_count_and_serialized_bytes() {
+    let root = std::env::temp_dir().join(format!("add-dir-cli-limits-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let mut count_args = vec!["a".to_string()];
+    for i in 0..=crate::ai::write_roots::MAX_ADDITIONAL_WRITE_ROOTS {
+        let path = root.join(format!("project-{i}"));
+        fs::create_dir(&path).unwrap();
+        count_args.extend(["--add-dir".into(), path.to_str().unwrap().into()]);
+    }
+    assert!(
+        super::try_parse_cli_args(count_args.into_iter())
+            .unwrap_err()
+            .contains("limit")
+    );
+    let mut deep = root.clone();
+    for _ in 0..6 {
+        deep.push("\"".repeat(100));
+        fs::create_dir(&deep).unwrap();
+    }
+    let mut byte_args = vec!["a".to_string()];
+    for i in 0..crate::ai::write_roots::MAX_ADDITIONAL_WRITE_ROOTS {
+        let path = deep.join(format!("project-{i}"));
+        fs::create_dir(&path).unwrap();
+        byte_args.extend(["--add-dir".into(), path.to_str().unwrap().into()]);
+    }
+    assert!(
+        super::try_parse_cli_args(byte_args.into_iter())
+            .unwrap_err()
+            .contains("bytes")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn add_dir_cli_expands_home_and_accepts_serve_modes() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let expanded = crate::commonw::utils::expanduser("~");
+    let home = PathBuf::from(expanded.as_ref()).canonicalize().unwrap();
+    let cli =
+        super::try_parse_cli_args(["a", "--add-dir", "~"].into_iter().map(str::to_owned)).unwrap();
+    assert_eq!(cli.add_dirs, [home]);
+    for mode in [
+        "--serve",
+        "--serve-chat",
+        "--serve-start",
+        "--serve-restart",
+    ] {
+        let server =
+            super::try_parse_cli_args(["a", mode, "--add-dir", "."].into_iter().map(str::to_owned))
+                .unwrap();
+        assert_eq!(
+            server.add_dirs,
+            [std::env::current_dir().unwrap().canonicalize().unwrap()]
+        );
+    }
+}
+
+#[test]
 fn top_level_archive_commands_are_recognized_by_cli_and_shell_completion() {
     for (command, arguments) in [
         ("/export", ""),

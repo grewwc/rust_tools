@@ -608,6 +608,8 @@ fn clear_session_history_preserves_session_runtime_config() {
         subagent_model: Some("test-subagent-model".to_string()),
         subagent_kernel_model: Some("test-kernel-model".to_string()),
         default_skills: vec!["agent-team".to_string(), "test-skill".to_string()],
+        additional_write_roots: Vec::new(),
+        additional_write_root_warnings: Vec::new(),
     };
     write_session_serve_config_sqlite(&path, &config).unwrap();
     append_history_sqlite(&path, vec![msg("user", "before clear")]).unwrap();
