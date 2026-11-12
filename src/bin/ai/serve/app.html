@@ -239,7 +239,7 @@ select, summary { touch-action:manipulation; }
 .turn { display:flex; flex-direction:column; gap:8px; min-width:0; }
 .turn.execution-empty:empty { display:none; }
 .execution-group { flex-shrink:0; }
-.execution-group > details > .execution-items { padding-top:8px; }
+.execution-group > details > .execution-items { padding:12px; }
 .turn .tool-activity summary { color:var(--fg); }
 .turn .tool-activity[data-running="true"] { border-color:var(--acc-line); }
 #jumpbottom {
@@ -2478,6 +2478,7 @@ function syncOvrSummary() {
 // The composer grows with its content (up to the CSS cap) instead of
 // trapping multi-line input in a 44px box with an inner scroll.
 let promptComposing = false;
+let promptHistory = null;
 // Avoid programmatic value and layout changes while the IME owns the field.
 // Deferred work must check this state when it runs, not just when queued:
 // another composition may have started in the meantime.
@@ -2538,11 +2539,119 @@ function watchComposerBox() {
   };
   compositionWatch = requestAnimationFrame(step);
 }
-function setPromptValue(value, force) {
+// Scripted edits do not enter the browser's undo stack, so the composer owns
+// text and selection history for both native input and app insertions.
+function createPromptHistory(prompt) {
+  const undo = [], redo = [];
+  const limit = 100, typingDelay = 1000;
+  let current = null, before = null, group = null;
+  let compositionBefore = null, compositionPending = false;
+  let owner = sessionId;
+  function snapshot() {
+    const start = Number.isInteger(prompt.selectionStart) ? prompt.selectionStart : prompt.value.length;
+    const end = Number.isInteger(prompt.selectionEnd) ? prompt.selectionEnd : start;
+    return { value: prompt.value, start, end, direction: prompt.selectionDirection || "none" };
+  }
+  function reset() {
+    undo.length = redo.length = 0;
+    before = group = compositionBefore = null;
+    // Final IME events still need to settle after the old draft is discarded.
+    compositionPending = promptComposing;
+    owner = sessionId;
+    current = promptComposing ? null : snapshot();
+  }
+  function record(kind, previous = before || current) {
+    if (promptComposing) return;
+    if (owner !== sessionId) { reset(); return; }
+    const next = snapshot();
+    before = null;
+    if (!previous || previous.value === next.value) {
+      current = next;
+      group = null;
+      return;
+    }
+    const at = Date.now();
+    const typing = ["insertText", "deleteContentBackward", "deleteContentForward"].includes(kind)
+      && previous.start === previous.end && next.start === next.end;
+    const merge = typing && group && group.kind === kind && at - group.at <= typingDelay
+      && current && previous.value === current.value
+      && previous.start === current.start && previous.end === current.end && undo.length;
+    if (merge) undo[undo.length - 1].after = next;
+    else {
+      undo.push({ before: previous, after: next });
+      if (undo.length > limit) undo.shift();
+    }
+    redo.length = 0;
+    current = next;
+    group = typing ? { kind, at } : null;
+  }
+  function commitComposition() {
+    if (promptComposing || !compositionPending) return;
+    const previous = compositionBefore;
+    compositionPending = false;
+    compositionBefore = null;
+    record("composition", previous);
+  }
+  function capture() {
+    if (promptComposing) return null;
+    if (owner !== sessionId) reset();
+    commitComposition();
+    return snapshot();
+  }
+  function beginComposition() {
+    compositionBefore = capture();
+    compositionPending = true;
+    before = group = null;
+  }
+  function replay(forward) {
+    if (promptComposing) return;
+    if (owner !== sessionId) { reset(); return; }
+    commitComposition();
+    const source = forward ? redo : undo;
+    if (!source.length) return;
+    const edit = source.pop();
+    (forward ? undo : redo).push(edit);
+    const next = forward ? edit.after : edit.before;
+    prompt.value = next.value;
+    if (typeof prompt.setSelectionRange === "function") prompt.setSelectionRange(next.start, next.end, next.direction);
+    else {
+      prompt.selectionStart = next.start;
+      prompt.selectionEnd = next.end;
+      prompt.selectionDirection = next.direction;
+    }
+    current = snapshot();
+    before = group = null;
+    traceMark("valueWrite");
+    growPrompt();
+    persistDraft();
+  }
+  function beforeInput(event) {
+    if (promptComposing || event.isComposing || event.keyCode === 229) return;
+    if (event.cancelable && ["historyUndo", "historyRedo"].includes(event.inputType)) {
+      event.preventDefault();
+      replay(event.inputType === "historyRedo");
+      return;
+    }
+    if (!compositionPending) before = capture();
+  }
+  function recordInput(event) {
+    if (promptComposing || event.isComposing || event.keyCode === 229 || compositionPending) return;
+    record(event.inputType || "");
+  }
+  reset();
+  return { reset, capture, record, beginComposition, commitComposition, replay, beforeInput, recordInput };
+}
+function setPromptValue(value, force, { resetHistory = false } = {}) {
   const p = $("prompt");
-  if (promptComposing && !force) return false;
+  if (promptComposing && !force) {
+    if (resetHistory) promptHistory?.reset();
+    return false;
+  }
+  const before = force || resetHistory ? null : promptHistory?.capture();
   p.value = value;
   traceMark("valueWrite");
+  if (force || resetHistory) promptHistory?.reset();
+  else promptHistory?.record("programmatic", before);
   return true;
 }
 // True while the composer holds the user's attention: an active IME
@@ -2610,13 +2719,16 @@ function scheduleGrow() {
 function insertPromptText(text) {
   const prompt = $("prompt");
   if (promptComposing) return;
+  const before = promptHistory?.capture();
   const start = Number.isInteger(prompt.selectionStart) ? prompt.selectionStart : prompt.value.length;
   const end = Number.isInteger(prompt.selectionEnd) ? prompt.selectionEnd : start;
   if (typeof prompt.setRangeText === "function") prompt.setRangeText(text, start, end, "end");
   else {
-    setPromptValue(prompt.value.slice(0, start) + text + prompt.value.slice(end));
+    prompt.value = prompt.value.slice(0, start) + text + prompt.value.slice(end);
     prompt.selectionStart = prompt.selectionEnd = start + text.length;
   }
+  traceMark("valueWrite");
+  promptHistory?.record("paste", before);
   growPrompt();
   persistDraft();
 }
@@ -3192,7 +3304,7 @@ function restoreDraft(id = sessionId) {
   // under an active composition would discard the word being typed.
   const key = draftKey(id);
   const value = !isPhoneLayout() && composerDrafts.has(key) ? composerDrafts.get(key) : localStorage.getItem(key) || "";
-  if (!setPromptValue(value)) return;
+  if (!setPromptValue(value, false, { resetHistory: true })) return;
   pendingImages = composerImageDrafts.get(key) || [];
   growPrompt();
 }
@@ -4255,7 +4367,17 @@ function executionGroupsFor(parent, stored = false) {
           fold = addFold("Completed execution", "", parent, stored ? null : key);
           fold.box.classList.add("execution-group");
           fold.body.className = "turn execution-items";
-          if (stored && typeof bindStoredFold === "function") bindStoredFold(fold.box.querySelector("details"), key);
+          const { box, body } = fold;
+          const details = box.querySelector("details");
+          // Only the outer padding and gaps belong to this shortcut. Inner
+          // cards keep their own disclosures, controls and text selection.
+          box.addEventListener("dblclick", (event) => {
+            if (!details.open || (event.target !== box && event.target !== details && event.target !== body)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            details.open = false;
+          });
+          if (stored && typeof bindStoredFold === "function") bindStoredFold(details, key);
         }
         used.set(key, fold);
         node.parentNode.insertBefore(fold.box, node);
@@ -5360,6 +5482,18 @@ function setSkillPick(key, names, query) {
   else skillPicks.delete(key);
   persistSkillPick(key);
 }
+function setSkillSearchValue(value) {
+  skillComposing = false;
+  $("skillsearch").value = value;
+}
+function settleSkillComposition() {
+  // Move focus only after a click starts, so committing the IME cannot
+  // replace its target before the click handler receives the skill name.
+  if (skillComposing && document.activeElement === $("skillsearch")) {
+    try { $("oskill").focus({ preventScroll: true }); } catch (_) { $("oskill").focus(); }
+  }
+  skillComposing = false;
+}
 function skillInputChanged() {
   const key = skillPickKey(), pick = readSkillPick() || { names: [], query: "" };
   pick.query = $("skillsearch").value;
@@ -5368,7 +5502,7 @@ function skillInputChanged() {
   persistSkillPick(key);
   skillActive = -1;
   syncSkillInput();
-  if (!skillComposing) renderSkillMenu();
+  renderSkillMenu();
 }
 function syncSkillInput() {
   const button = $("oskill"), pick = skillPicks.get(skillPickKey());
@@ -5380,7 +5514,7 @@ function syncSkillInput() {
   button.setAttribute("aria-label", $("skillvalue").textContent + " (next message)");
   $("skillsearch").disabled = button.disabled;
   $("skillsearchclear").hidden = !$("skillsearch").value;
-  $("skillclear").disabled = button.disabled || skillComposing;
+  $("skillclear").disabled = button.disabled;
   $("skillclear").setAttribute("aria-pressed", String(!names.length));
   $("skillhint").hidden = button.disabled;
   $("skillhint").textContent = (names.length === MAX_PICKED_SKILLS ? "Selection limit reached. " : "") + "Next message only; up to " + MAX_PICKED_SKILLS + " skills. Session defaults still apply.";
@@ -5396,13 +5530,14 @@ function restoreSkillPick() {
       pick = skillPicks.get(key);
     }
   }
-  $("skillsearch").value = pick ? pick.query : "";
+  setSkillSearchValue(pick ? pick.query : "");
   closeSkillMenu();
   syncSkillInput();
   syncOvrSummary();
 }
 function closeSkillMenu(returnFocus = false) {
   const wasOpen = !$("skillmenu").hidden;
+  skillComposing = false;
   $("skillmenu").hidden = true;
   $("oskill").setAttribute("aria-expanded", "false");
   $("skillsearch").setAttribute("aria-expanded", "false");
@@ -5413,20 +5548,22 @@ function closeSkillMenu(returnFocus = false) {
   }
 }
 function openSkillMenu() {
-  if ($("oskill").disabled || skillComposing) return;
+  if ($("oskill").disabled) return;
+  settleSkillComposition();
   $("skillmenu").hidden = false;
   $("oskill").setAttribute("aria-expanded", "true");
   $("skillsearch").setAttribute("aria-expanded", "true");
   renderSkillMenu();
   try { $("skillsearch").focus({ preventScroll: true }); } catch (_) { $("skillsearch").focus(); }
 }
-function chooseSkill(name) {
-  if (skillComposing || $("oskill").disabled) return;
+function chooseSkill(name, fromClick = false) {
+  if ($("oskill").disabled || (skillComposing && !fromClick)) return;
   if (name && !skillCatalog.some((s) => s.name === name)) return;
+  if (fromClick) settleSkillComposition();
   const names = (readSkillPick()?.names || []).slice();
   if (!name) {
     names.length = 0;
-    $("skillsearch").value = "";
+    setSkillSearchValue("");
   } else {
     const index = names.indexOf(name);
     if (index >= 0) names.splice(index, 1);
@@ -5437,10 +5574,15 @@ function chooseSkill(name) {
   syncSkillInput();
   syncOvrSummary();
   if (!name) closeSkillMenu(true);
-  else renderSkillMenu();
+  else {
+    renderSkillMenu();
+    if (fromClick) {
+      try { $("skillsearch").focus({ preventScroll: true }); } catch (_) { $("skillsearch").focus(); }
+    }
+  }
 }
 function renderSkillMenu() {
-  if ($("oskill").disabled || skillComposing || $("skillmenu").hidden) return;
+  if ($("oskill").disabled || $("skillmenu").hidden) return;
   const box = $("skilloptions"), query = $("skillsearch").value.trim().toLowerCase();
   const names = readSkillPick()?.names || [], activeName = skillMatches[skillActive]?.name;
   skillMatches = skillCatalog.filter((s) => (s.name + " " + (s.description || "")).toLowerCase().includes(query));
@@ -5471,7 +5613,7 @@ function renderSkillMenu() {
     option.appendChild(text); option.appendChild(check);
     // Keep focus in the input until the click, including when using touch.
     option.onpointerdown = (e) => e.preventDefault();
-    option.onclick = () => chooseSkill(skill.name);
+    option.onclick = () => chooseSkill(skill.name, true);
     box.appendChild(option);
   });
   $("skillempty").hidden = !!skillMatches.length;
@@ -6607,11 +6749,6 @@ async function loadHistory(prefetched, canCommit = () => true) {
         ? shouldFollowOutput(root)
         : (!savedPosition || savedPosition.atBottom);
       const oldScrollTop = savedPosition && !savedPosition.atBottom ? savedPosition.top : root.scrollTop;
-      const nextKeys = history.rows.map((row) => row.key);
-      // Keep the overlapping canonical window, including loaded media. The
-      // 200-message window can slide forward without re-decoding every image.
-      const start = sameSession && nextKeys.length ? historyKeys.indexOf(nextKeys[0]) : -1;
-      const retained = start < 0 ? 0 : Math.min(historyKeys.length - start, nextKeys.length);
       const pending = [];
       const baseIndex = Math.max(0, (histTotal || msgs.length) - msgs.length);
       let acknowledgedThrough = 0;
@@ -6649,6 +6786,27 @@ async function loadHistory(prefetched, canCommit = () => true) {
       }
       if (pending.length) pendingUserInputs.set(forSession, pending);
       else pendingUserInputs.delete(forSession);
+      // The original stream already owns this turn's execution and answer.
+      // History persists those records mid-turn; rendering them here as well
+      // duplicates the live transcript on refresh or session reattachment.
+      // Bind ownership to the acknowledged input, not to equal prompt text:
+      // earlier identical submissions and later turns remain canonical.
+      const live = turns.get(forSession);
+      const input = live?.userInput;
+      const owningRow = live?.box !== staleBox && input?.historyIdentity
+        ? history.rows.find((row) => row.historyIndex === input.historyIndex && row.identity === input.historyIdentity)
+        : null;
+      if (owningRow) {
+        const nextInput = history.rows.find((row) => row.historyIndex > owningRow.historyIndex
+          && row.message.role === "user" && !isRuntimeSyntheticUser(row.message));
+        history.rows = history.rows.filter((row) => row.historyIndex <= owningRow.historyIndex
+          || (nextInput && row.historyIndex >= nextInput.historyIndex));
+      }
+      const nextKeys = history.rows.map((row) => row.key);
+      // Keep the overlapping canonical window, including loaded media. The
+      // 200-message window can slide forward without re-decoding every image.
+      const start = sameSession && nextKeys.length ? historyKeys.indexOf(nextKeys[0]) : -1;
+      const retained = start < 0 ? 0 : Math.min(historyKeys.length - start, nextKeys.length);
       const protectedRows = new Set(pending.map((input) => input.row));
       const mounted = new Map();
       const collect = (owner) => {
@@ -7739,7 +7897,7 @@ async function sendSideNote() {
     // Clear the submitted attachments only with their unchanged draft.
     if (sessionId === targetSession && input.value === draft &&
         pendingImages.length === images.length && pendingImages.every((image, i) => image === images[i])) {
-      input.value = "";
+      setPromptValue("", true);
       input.style.height = "auto";
       pendingImages = [];
       clearDraft(targetSession);
@@ -8106,6 +8264,7 @@ async function send() {
   let reader = null;
   const liveEntry = {
     box,
+    userInput,
     lastEventAt: Date.now(),
     recover: (reason = "", ended = false) => {
       recoverReason = reason;
@@ -8781,6 +8940,7 @@ function wire() {
   syncStopButton();
   if (uiWired) return;
   uiWired = true;
+  promptHistory = createPromptHistory($("prompt"));
   const inputTrace = createInputTrace($("prompt"));
   // Programmatic writes and resizes leave no DOM event behind, so they are
   // marked explicitly so their timing can be compared with composition events;
@@ -8875,25 +9035,28 @@ function wire() {
   $("ovrwrap").ontoggle = () => { if ($("ovrwrap").open && !skillCatalog.length) return loadSkills(); };
   $("oskill").onclick = () => { if ($("skillmenu").hidden) openSkillMenu(); else closeSkillMenu(true); };
   $("skillsearch").oninput = (e) => {
-    if (e.isComposing) skillComposing = true;
+    skillComposing = !!e.isComposing;
     skillInputChanged();
   };
   $("skillsearch").oncompositionstart = () => { skillComposing = true; syncSkillInput(); };
   $("skillsearch").oncompositionend = () => { skillComposing = false; skillInputChanged(); };
+  $("skillsearch").onblur = () => { skillComposing = false; syncSkillInput(); };
   $("skillmenu").onkeydown = skillKeydown;
   $("skillsearchclear").onpointerdown = (e) => e.preventDefault();
   $("skillsearchclear").onclick = () => {
-    if (skillComposing) return;
-    $("skillsearch").value = "";
+    if ($("oskill").disabled) return;
+    settleSkillComposition();
+    setSkillSearchValue("");
     skillInputChanged();
     $("skillsearch").focus();
   };
   $("skillclear").onpointerdown = (e) => e.preventDefault();
-  $("skillclear").onclick = () => chooseSkill("");
+  $("skillclear").onclick = () => chooseSkill("", true);
   $("skillpicker").onfocusout = (e) => { if (!$("skillpicker").contains(e.relatedTarget)) closeSkillMenu(); };
   document.addEventListener("pointerdown", (e) => { if (!$("skillpicker").contains(e.target)) closeSkillMenu(); });
   // END skill picker events
   $("prompt").addEventListener("compositionstart", () => {
+    promptHistory.beginComposition();
     promptComposing = true;
     composingText = "";
     composingBox = composerBox();
@@ -8912,6 +9075,8 @@ function wire() {
     // may start before this task runs; keep its pending work for the next end.
     setTimeout(() => {
       if (promptComposing) return;
+      // Final input events settle before this task; preedit never enters history.
+      promptHistory.commitComposition();
       flushLayout();
       // A share or an image that landed mid-composition is applied now that
       // the field is free again.
@@ -8936,11 +9101,13 @@ function wire() {
       persistDraft();
     }, 0);
   });
+  $("prompt").addEventListener("beforeinput", (e) => promptHistory.beforeInput(e));
   $("prompt").addEventListener("input", (e) => {
     if (promptComposing || e.isComposing) {
       if (e.data === "" || String(e.inputType || "").startsWith("delete") || !$("prompt").value) composingText = "";
       return;
     }
+    promptHistory.recordInput(e);
     // The resize waits for a frame: an IME word arrives as an input event,
     // and a layout change inside the commit task loses the word.
     scheduleGrow();
@@ -8951,7 +9118,14 @@ function wire() {
   $("prompt").addEventListener("keydown", (e) => {
     // Plain Enter inserts a newline (mobile keyboards included); only the
     // send button — or Ctrl/Cmd+Enter for hardware keyboards — submits.
-    if (e.isComposing || e.keyCode === 229) return;
+    if (promptComposing || e.isComposing || e.keyCode === 229) return;
+    const key = e.key.toLowerCase();
+    if (!e.altKey && (e.ctrlKey || e.metaKey)
+        && (key === "z" || (key === "y" && e.ctrlKey && !e.shiftKey))) {
+      e.preventDefault();
+      promptHistory.replay(key === "y" || e.shiftKey);
+      return;
+    }
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
   });
   const toggleSessions = () => setDrawer(!$("sessions").classList.contains("open"));;

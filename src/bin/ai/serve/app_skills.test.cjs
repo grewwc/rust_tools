@@ -372,18 +372,25 @@ test("late HTTP acceptance consumes selected skills and preserves a newer indepe
   assert.equal(h.context.validateSkillInput(), true);
 });
 
-test("Chinese composition cannot pick, clear, or submit until committed", async () => {
+test("Chinese composition filters skills, preserves IME keys, and permits explicit clicks", async () => {
   const h = harness();
-  h.context.api = async () => ({ json: async () => [{ name: "mahjong", description: "麻将分析" }] });
+  h.context.api = async () => ({ json: async () => [
+    { name: "mahjong", description: "麻将分析" },
+    { name: "review", description: "Review changes" },
+  ] });
+  h.context.isTurnRunning = () => false;
   await h.context.loadSkills();
-  h.open(); h.elements.skillsearch.oncompositionstart();
+  h.open();
+  assert.deepEqual(h.names(), ["mahjong", "review"]);
+  h.elements.skillsearch.oncompositionstart();
   h.type("ma", true);
   assert.equal(h.elements.skillmenu.hidden, false);
-  for (const extra of [{}, { isComposing: true }, { keyCode: 229 }]) {
-    assert.equal(h.key("Enter", extra).prevented, undefined);
+  assert.deepEqual(h.names(), ["mahjong"], "composition must still filter the catalog");
+  for (const key of ["ArrowDown", "ArrowUp", "Home", "End", "Enter"]) {
+    for (const extra of [{}, { isComposing: true }, { keyCode: 229 }]) {
+      assert.equal(h.key(key, extra).prevented, undefined);
+    }
   }
-  h.elements.skillclear.onclick();
-  h.choose("mahjong");
   assert.equal(h.elements.skillsearch.value, "ma");
   assert.deepEqual(h.selected(), []);
   assert.equal(h.context.validateSkillInput(), false);
@@ -395,12 +402,45 @@ test("Chinese composition cannot pick, clear, or submit until committed", async 
   assert.equal(h.context.pendingImages.length, 1);
   assert.equal(h.requests.length, 0);
   assert.equal(h.context.sendBusy, false);
+
+  h.options()[0].click();
+  assert.equal(h.elements.skillsearch.value, "ma");
+  assert.deepEqual(h.selected(), ["mahjong"], "an explicit click settles composition and selects");
+  assert.equal(h.context.validateSkillInput(), true);
+  assert.equal(h.elements.skillmenu.hidden, false);
+
+  h.elements.skillsearch.oncompositionstart(); h.type("ma", true);
+  assert.equal(h.context.validateSkillInput(), false);
+  h.elements.skillsearchclear.click();
+  assert.equal(h.elements.skillsearch.value, "");
+  assert.deepEqual(h.names(), ["mahjong", "review"]);
+  assert.deepEqual(h.selected(), ["mahjong"], "search clear preserves the pending choice");
+  assert.equal(h.context.validateSkillInput(), true);
+  assert.equal(h.elements.skillmenu.hidden, false);
+
+  h.elements.skillsearch.oncompositionstart(); h.type("ma", true);
+  assert.equal(h.context.validateSkillInput(), false);
+  assert.equal(h.elements.skillclear.disabled, false);
+  h.elements.skillclear.click();
+  assert.equal(h.elements.skillsearch.value, "");
+  assert.deepEqual(h.selected(), [], "session default clears pending choices during composition");
+  assert.equal(h.context.validateSkillInput(), true);
+  assert.equal(h.elements.skillmenu.hidden, true);
+
+  h.open(); h.elements.skillsearch.oncompositionstart(); h.type("ma", true);
   h.elements.skillsearch.value = "麻将";
   h.elements.skillsearch.oncompositionend();
   assert.equal(h.elements.skillsearch.value, "麻将");
   assert.deepEqual(h.names(), ["mahjong"]);
-  assert.equal(h.key("Enter", { keyCode: 229 }).prevented, undefined);
-  h.options()[0].onclick(); await h.context.submit();
+  assert.equal(h.context.validateSkillInput(), true);
+  for (const extra of [{ isComposing: true }, { keyCode: 229 }]) {
+    assert.equal(h.key("Enter", extra).prevented, undefined);
+  }
+  assert.deepEqual(h.selected(), []);
+  assert.equal(h.key("Enter").prevented, true);
+  assert.deepEqual(h.selected(), ["mahjong"]);
+  await h.context.submit();
+  assert.equal(h.requests.length, 1);
   assert.deepEqual(h.requests[0].body.skills, ["mahjong"]);
 });
 

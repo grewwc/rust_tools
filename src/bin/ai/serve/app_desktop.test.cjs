@@ -181,7 +181,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
   const timers = new Map();
   let nextTimer = 1, now = 1000, historyLoads = 0, configLoads = 0, grows = 0;
   const context = vm.createContext({
-    document, $: (id) => elements[id], window: { matchMedia: () => media },
+    document, $: (id) => elements[id], window: { matchMedia: () => media }, promptHistory: null,
     store: { base: "https://serve.test", token: "test-token" },
     sessionId: sid, lastItems: plain(serverItems), pendingNew: null, lastMsgCount: 5, PAGE_ID: "test-page",
     localStorage: { getItem: (key) => stored.get(key) ?? null, setItem: (key, value) => stored.set(key, value), removeItem: (key) => stored.delete(key) },
@@ -260,7 +260,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
   });
   vm.runInContext(between("function headers(", "const esc ="), context);
   vm.runInContext(between("function sessionTitle(s)", "// Phone drawer floats"), context);
-  vm.runInContext(between("function setPromptValue(value, force)", "// True while the composer"), context);
+  vm.runInContext(between("function setPromptValue(", "// True while the composer"), context);
   vm.runInContext(between("const DRAFT_PREFIX =", "let questionCache ="), context);
   vm.runInContext(between("const composerDrafts = new Map();", "function closeQuestionPanel("), context);
   vm.runInContext(marked("history retry"), context);
@@ -971,7 +971,72 @@ function sessionFoldHarness(width) {
   };
 }
 
+test("completed execution groups leave padding around their inner cards on both layouts", () => {
+  for (const phone of [false, true]) {
+    assert.equal(responsiveRule(".execution-group > details > .execution-items", phone).padding, "12px");
+  }
+  // The stylesheet has multiple media blocks, so enumerate every gap rule
+  // rather than relying on the fixture's slices around the first media block.
+  const turnRules = [...css.matchAll(/(?:^|\n)\s*\.turn\s*\{[^}]*\}/g)];
+  assert.deepEqual(turnRules.map(([rule]) => cssRule(rule, ".turn").gap), ["8px", "12px", "8px"],
+    "base, shared visual and phone card spacing declarations stay unchanged");
+});
+
 for (const width of [390, 1280]) {
+  for (const stored of [false, true]) test(`completed execution groups collapse only on blank double clicks (${stored ? "history" : "live"}) at ${width}px`, async () => {
+    const h = sessionFoldHarness(width), parent = h.document.createElement("div");
+    parent.className = "turn"; h.elements.msgs.appendChild(parent);
+    const first = h.context.addFold("read_file", "selectable output", parent, "blank:first");
+    const second = h.context.addFold("thinking", "reasoning", parent, "blank:second");
+    first.box.dataset.executionState = second.box.dataset.executionState = "completed";
+    h.context.addFold("current execution", "running", parent, "blank:current");
+    const groups = h.context.executionGroupsFor(parent, stored);
+    groups.sync();
+    const box = parent.querySelector(".execution-group"), details = box.querySelector("details");
+    const items = box.querySelector(".execution-items"), inner = first.box.querySelector("details");
+    const key = details.dataset.foldKey;
+    const rememberedOpen = () => vm.runInContext(stored ? "foldOpenState" : "foldOpenByKey", h.context).get(key) === true;
+    const button = h.document.createElement("button"), text = h.document.createElement("span");
+    text.textContent = "copy this text"; first.body.appendChild(text); first.body.appendChild(button);
+    let activations = 0;
+    button.ondblclick = () => { activations++; };
+    await h.activateSummary(inner); h.flushToggles();
+    await h.activateSummary(details); h.flushToggles();
+    assert.equal(rememberedOpen(), true);
+    for (const target of [box, details, items]) {
+      h.dispatch(target, "click");
+      assert.equal(details.open, true, "single clicks in blank space do not collapse the group");
+    }
+    for (const target of [details.querySelector("summary"), first.box, inner, inner.querySelector("summary"), first.body, text, button]) {
+      const { event } = h.dispatch(target, "dblclick", { detail: 2 });
+      assert.equal(details.open, true, "nested cards and summaries do not invoke the outer shortcut");
+      assert.equal(event.prevented, false, "text selection and control defaults remain available");
+    }
+    assert.equal(activations, 1, "an inner control still receives its double click");
+    for (const target of [items, details, box]) {
+      const { event } = h.dispatch(target, "dblclick", { detail: 2 });
+      assert.equal(details.open, false, "double clicking outer padding or a gap closes only this group");
+      assert.equal(event.prevented, true);
+      assert.equal(event.stopped, true);
+      assert.equal(inner.open, true, "closing the outer group retains the inner disclosure");
+      h.flushToggles();
+      assert.equal(rememberedOpen(), false, "the existing fold cache remembers the collapse");
+      // Restoring takes cards out of the group; close the inner disclosure so
+      // the existing expanded-card safeguard allows it to be grouped again.
+      await h.activateSummary(inner); h.flushToggles();
+      groups.restore(); groups.sync(); h.flushToggles();
+      assert.equal(parent.querySelector(".execution-group"), box, "regrouping reuses the original group");
+      assert.equal(details.open, false, "regrouping does not reopen a collapsed group");
+      assert.equal(first.box.parentNode, items);
+      await h.activateSummary(inner); h.flushToggles();
+      await h.activateSummary(details); h.flushToggles();
+    }
+    await h.activateSummary(details); h.flushToggles();
+    const { event } = h.dispatch(box, "dblclick", { detail: 2 });
+    assert.equal(details.open, false, "double clicking a closed group never reopens it");
+    assert.equal(event.prevented, false);
+  });
+
   test(`completed execution groups keep current execution outside and retain both disclosures at ${width}px`, async () => {
     const h = sessionFoldHarness(width), root = h.elements.msgs;
     vm.runInContext(between("function createLiveActivity(", "// The three override picks"), h.context);

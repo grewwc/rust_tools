@@ -650,6 +650,53 @@ for (const reasoning of ["", "saved thought"]) {
   });
 }
 
+for (const retire of ["completed", "stale"]) test("owned live turn reconciles history without duplicate input or execution before " + retire, async () => {
+  const messages = [
+    { role: "user", content: "question" },
+    { role: "assistant", content: "previous answer" },
+    { role: "user", content: "question" },
+    { role: "tool", content: "current tool result" },
+  ];
+  const h = retainedHistoryHarness(messages), c = h.c;
+  const optimistic = c.document.createElement("div");
+  optimistic.className = "msg user"; optimistic.textContent = "question";
+  h.root.appendChild(optimistic);
+  const box = c.document.createElement("div"); box.className = "turn";
+  h.root.appendChild(box);
+  fixtureFold(() => c.document.createElement("div"), "tool", "current tool result", box);
+  const input = { row: optimistic, prompt: "question", minIndex: 2, settled: false };
+  c.pendingUserInputs.set("s", [input]);
+  c.turns.set("s", { box, userInput: input });
+  const assertOwned = () => {
+    assert.equal(h.root.querySelectorAll(".user").length, 2, "an earlier identical question remains, but this submission appears once");
+    assert.equal(executionRecords(h.root).filter((row) => row.body.textContent === "current tool result").length, 1,
+      "the same running turn must not be rendered by history and its original stream");
+    assert.equal(box.parentNode, h.root);
+    assert.equal(c.canonicalHistoryTotal, messages.length, "projection ownership does not change the canonical count");
+  };
+  await c.loadHistory();
+  assert.equal(c.pendingUserInputs.has("s"), false);
+  assert.equal(input.historyIndex, 2, "acknowledgment belongs to this submission, not the older identical input");
+  assertOwned();
+  await c.loadHistory(); assertOwned();
+  // Navigation rebuilds the canonical prefix and reattaches the same live box.
+  c.sessionId = "other";
+  await c.loadHistory({ sessionId: "other", messages: [], histTotal: 0 });
+  c.sessionId = "s";
+  await c.loadHistory(); assertOwned();
+  if (retire === "completed") {
+    c.turns.delete("s"); box.remove();
+    messages.push({ role: "assistant", content: "finished answer" });
+  } else {
+    c.staleBox = box;
+  }
+  await c.loadHistory();
+  assert.equal(box.parentNode, null, "a retired original stream is not reattached");
+  assert.equal(h.root.querySelectorAll(".user").length, 2);
+  assert.equal(executionRecords(h.root).filter((row) => row.body.textContent === "current tool result").length, 1);
+  assert.equal(c.historyKeys.length, messages.length, "completion or feed failure restores all canonical rows");
+});
+
 test("retained canonical history does not create rates without cached metrics", async () => {
   const h = retainedHistoryHarness([{ role: "assistant", content: "old answer", reasoning_content: "old thought" }]);
   await h.c.loadHistory();
