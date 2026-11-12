@@ -196,6 +196,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
     LIVE_STALL_MS: Number(/const LIVE_STALL_MS = (\d+)/.exec(script)[1]),
     runEpoch: 0, eventFailures: 0, confirmPollSeq: 0, eventStreamEnded: false, eventStreamFailed: false,
     turnRunningPid: 0, endedTurnPid: 0,
+    remoteTurnPid: "", remoteTurnAt: 0, REMOTE_RUNNING_TTL_MS: 30000,
     setTimeout: (fn, delay) => { timers.push(delay); return timers.length; }, clearTimeout() {},
     // Extracted slices may arm timers; the assertions drive them directly.
     setInterval(fn, delay) {
@@ -386,6 +387,7 @@ function attachmentHarness(headersOnly = false, options) {
     staleSession: "", staleDone: false, staleTimer: null, staleBox: null, staleTries: 0,
     turnRunning: true, turnRunningAt: Date.now(), RUNNING_SAMPLE_TTL_MS: 60000,
     turnRunningPid: 0, endedTurnPid: 0,
+    remoteTurnPid: "", remoteTurnAt: 0, REMOTE_RUNNING_TTL_MS: 30000,
     AbortController, TextDecoder, headers: () => ({}), syncStopButton() {},
     refreshSideNotes() {},
     ensureConfirmPoll() { polls++; }, stopConfirmPoll() {},
@@ -435,7 +437,7 @@ function runningComposer(c) {
     $: (id) => elements[id] || lookup(id), sideNoteBusy: false,
     holdLayout: (_, apply) => apply(),
   });
-  vm.runInContext(script.slice(script.indexOf("function isTurnRunning()"), script.indexOf("function note(")), c);
+  vm.runInContext(script.slice(script.indexOf("function isRemoteTurn()"), script.indexOf("function note(")), c);
   return elements;
 }
 
@@ -994,10 +996,11 @@ test("status strip regression: restored sessions keep stop and busy state withou
     eventActive: false, eventSession: "", eventStreamEnded: false, eventStreamFailed: false,
     staleSession: "", staleDone: false, sideNoteBusy: false,
     turnRunning: true, turnRunningAt: 100000, RUNNING_SAMPLE_TTL_MS: 60000,
+    remoteTurnPid: "", remoteTurnAt: 0, REMOTE_RUNNING_TTL_MS: 30000,
     Date: { now: () => 100001 },
   });
   vm.runInContext(script.slice(script.indexOf("let promptComposing = false;"), script.indexOf("function composerBox()")), context);
-  vm.runInContext(script.slice(script.indexOf("function isTurnRunning()"), script.indexOf("function note(")), context);
+  vm.runInContext(script.slice(script.indexOf("function isRemoteTurn()"), script.indexOf("function note(")), context);
   context.syncStopButton();
   assert.equal(elements.send.title, "stop this turn");
   assert.equal(elements.composer.attrs["aria-busy"], "true");
@@ -2177,6 +2180,7 @@ test("a finished event stream is not re-attached on every poll, but a new turn i
     eventActive: false, eventSession: "", eventFailures: 0,
     turnRunning: false, turnRunningAt: 0, turns: new Map(), staleSession: "",
     turnRunningPid: 0, endedTurnPid: 0,
+    remoteTurnPid: "", remoteTurnAt: 0, REMOTE_RUNNING_TTL_MS: 30000,
     confirmShown: null, eventStreamEnded: false, NATIVE_PREFIX: "@@",
     api: async () => ({ json: async () => ({ running: true, turn: 1, pending: null }) }),
     armHistoryFollow() {}, ensureConfirmPoll() {}, stopConfirmPoll() {},
@@ -2479,6 +2483,13 @@ test("reconnect does not bind input listeners twice and diagnostics never contai
   elements.inputtraceclear = {};
   const context = vm.createContext({
     $: (id) => elements[id], localStorage: { getItem: () => "" }, showStored() {}, syncStopButton() {},
+    // `wire()` now installs the composer undo history; this test exercises the
+    // input trace, so a no-op history keeps the wiring dependency satisfied.
+    createPromptHistory: () => ({
+      reset() {}, capture() { return null; }, record() {},
+      beginComposition() {}, commitComposition() {}, beforeInput() {},
+      recordInput() {}, replay() {},
+    }),
     document: { activeElement: prompt, addEventListener() {} },
     window: { innerHeight: 600, addEventListener() {} }, navigator: { userAgent: "WebView-test" },
   });

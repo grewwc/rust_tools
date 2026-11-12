@@ -135,6 +135,7 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
     turns: new Map(), MAX_LIVE_TURNS: 4, historySession: sid, canonicalHistoryTotal: 0,
     pendingUserInputs: new Map(), questionCache: null, runEpoch: 0, turnRunning: false,
     turnRunningAt: 0, RUNNING_SAMPLE_TTL_MS: 60000,
+    remoteTurnPid: "", remoteTurnAt: 0, REMOTE_RUNNING_TTL_MS: 30000,
     eventActive: false, eventSession: "", eventStreamEnded: false, eventStreamFailed: false, staleSession: "", staleDone: false,
     confirmPollSeq: 0, lastHistoryEndsUnanswered: false, LIVE_STALL_MS: 60000,
     validateSkillInput: () => true,
@@ -183,7 +184,7 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
   vm.runInContext(marked("composer cd command"), context);
   vm.runInContext(marked("composer git command"), context);
   vm.runInContext(marked("turn session preparation"), context);
-  vm.runInContext(existingFunction("function isTurnRunning()", "// The one send/stop button"), context);
+  vm.runInContext(existingFunction("function isRemoteTurn()", "// The one send/stop button"), context);
   vm.runInContext(existingFunction("const RATE_STORAGE =", "function addFold("), context);
   vm.runInContext(existingFunction("function setAnswerRate(", "// Only completed answer bubbles"), context);
   vm.runInContext(marked("composer send"), context);

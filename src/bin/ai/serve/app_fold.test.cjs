@@ -111,22 +111,22 @@ function doubleClick(h, target) {
   return { first, second, double: event };
 }
 
-viewportTest("an expanded subagent summary keeps desktop collapse and native mobile toggles", (width) => {
+viewportTest("an expanded subagent summary collapses on a double click at every width", (width) => {
   const h = harness({ width }), fold = makeFold(true, true), label = node("SPAN");
   label.parentNode = fold.summary;
   const events = doubleClick(h, label);
-  assert.equal(fold.details.open, width <= 700, "only desktop suppresses the second native summary toggle");
+  assert.equal(fold.details.open, false, "the second native summary toggle is suppressed");
   assert.equal(events.first.defaultPrevented, false);
-  assert.equal(events.second.defaultPrevented, width >= 701);
+  assert.equal(events.second.defaultPrevented, true);
   assert.equal(events.double.defaultPrevented, false, "double-click selection keeps its default action");
 });
 
-viewportTest("a closed subagent summary double-click toggles once on desktop and twice on mobile", (width) => {
+viewportTest("a closed subagent summary opens and stays open on a double click", (width) => {
   const h = harness({ width }), fold = makeFold(false, true);
   const events = doubleClick(h, fold.summary);
-  assert.equal(fold.details.open, width >= 701);
+  assert.equal(fold.details.open, true);
   assert.equal(events.first.defaultPrevented, false);
-  assert.equal(events.second.defaultPrevented, width >= 701);
+  assert.equal(events.second.defaultPrevented, true);
 });
 
 viewportTest("an expanded task card collapses on a double tap in its report rows", (width) => {
@@ -225,17 +225,20 @@ viewportTest("subagent sibling rows keep the old ancestor collapse owner on mobi
   assert.equal(outer.details.open, width >= 701, "mobile must retain the pre-existing ancestor search");
 });
 
-test("subagent summary gating follows viewport changes across 700px and 701px", () => {
-  const h = harness({ width: 701 }), fold = makeFold(true, true);
-  doubleClick(h, fold.summary);
-  assert.equal(fold.details.open, false);
-  h.viewport.width = 700;
-  fold.details.open = true;
-  assert.equal(doubleClick(h, fold.summary).second.defaultPrevented, false);
-  assert.equal(fold.details.open, true);
-  h.viewport.width = 701;
-  assert.equal(doubleClick(h, fold.summary).second.defaultPrevented, true);
-  assert.equal(fold.details.open, false);
+test("subagent summary double-click collapses on both sides of the phone breakpoint", () => {
+  for (const width of [700, 701]) {
+    const h = harness({ width }), fold = makeFold(true, true);
+    assert.equal(doubleClick(h, fold.summary).second.defaultPrevented, true);
+    assert.equal(fold.details.open, false);
+  }
+});
+
+viewportTest("a subagent summary double tap without detail=2 still collapses", (width) => {
+  const h = harness({ width }), open = makeFold(true, true), closed = makeFold(false, true);
+  doubleTap(h, open.summary);
+  assert.equal(open.details.open, false);
+  doubleTap(h, closed.summary);
+  assert.equal(closed.details.open, true);
 });
 
 viewportTest("wire() registers the gesture and folds do not double-tap zoom", (width) => {

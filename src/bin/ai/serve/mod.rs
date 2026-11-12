@@ -69,6 +69,8 @@ mod tests;
 #[cfg(feature = "serve")]
 mod tls;
 #[cfg(feature = "serve")]
+mod transfer;
+#[cfg(feature = "serve")]
 mod turn;
 mod types;
 
@@ -84,6 +86,8 @@ pub(crate) use info::*;
 pub(crate) use session_cwd::*;
 #[cfg(feature = "serve")]
 pub(crate) use sessions::*;
+#[cfg(feature = "serve")]
+pub(crate) use transfer::*;
 #[cfg(feature = "serve")]
 pub(crate) use turn::*;
 pub(crate) use types::*;
@@ -1684,6 +1688,10 @@ pub(in crate::ai) async fn run_serve(
         .route("/info", get(server_info))
         .route("/subagent-models", get(subagent_models))
         .route("/sessions", get(list_sessions).post(create_session))
+        .route(
+            "/sessions/import",
+            post(import_session).layer(DefaultBodyLimit::max(MAX_IMPORT_REQUEST_BYTES)),
+        )
         .route("/sessions/{id}/fork", post(fork_session))
         .route("/sessions/{id}/title", post(set_session_title))
         .route("/sessions/{id}/mark", post(set_session_mark))
@@ -1693,6 +1701,8 @@ pub(in crate::ai) async fn run_serve(
         )
         .route("/sessions/{id}", delete(delete_session))
         .route("/sessions/{id}/history", get(read_history))
+        .route("/sessions/{id}/export", get(export_session_zip))
+        .route("/sessions/{id}/export-md", get(export_session_markdown))
         .route("/sessions/{id}/events", get(stream_session_events))
         .route("/sessions/{id}/open", post(open_session))
         .route("/sessions/{id}/heartbeat", post(heartbeat_session))

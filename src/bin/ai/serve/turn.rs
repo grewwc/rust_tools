@@ -303,7 +303,9 @@ pub(crate) fn conflict(msg: String) -> (StatusCode, Json<serde_json::Value>) {
 /// stream can still offer to stop a turn that is running here. `turn` is the
 /// active child pid (0 when idle): a page that saw the previous turn's
 /// terminal event uses it to tell that turn's child reap lag apart from a
-/// newly started turn.
+/// newly started turn. `remote` is the owner pid of a turn running in another
+/// process (a terminal or a `/bg` session): such a turn has no local event log,
+/// so the page can only report it and refresh history when it ends.
 pub(crate) async fn get_confirm(
     State(state): State<ServeState>,
     headers: HeaderMap,
@@ -323,6 +325,15 @@ pub(crate) async fn get_confirm(
         .and_then(|turns| turns.get(&id).copied());
     let running = turn.is_some();
     let turn = turn.unwrap_or(0);
+    // Probe the cross-process lease only when this daemon owns no turn. A web
+    // turn child holds that lease too, and its pid is already in `active_turns`,
+    // so this keeps the probe off the normal served-turn path.
+    let remote = if running {
+        None
+    } else {
+        let store = SessionStore::new(state.history_file.as_path());
+        crate::ai::history::turn_lease::turn_lease_owner(&store.session_history_file(&id))
+    };
     let body = match pending {
         Some(p) => {
             serde_json::json!({
@@ -334,9 +345,15 @@ pub(crate) async fn get_confirm(
                 },
                 "running": running,
                 "turn": turn,
+                "remote": remote,
             })
         }
-        None => serde_json::json!({"pending": null, "running": running, "turn": turn}),
+        None => serde_json::json!({
+            "pending": null,
+            "running": running,
+            "turn": turn,
+            "remote": remote,
+        }),
     };
     (StatusCode::OK, Json(body)).into_response()
 }

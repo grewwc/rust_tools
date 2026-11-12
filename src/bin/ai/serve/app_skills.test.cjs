@@ -542,7 +542,7 @@ test("overlapping catalog fetches cannot restore options from an old server", as
   assert.deepEqual(h.names(), ["new-skill"]);
 });
 
-test("completion matches case-insensitive substrings in catalog order", async () => {
+test("completion matches case-insensitive substrings and boundary fuzzy names", async () => {
   const h = harness();
   h.context.api = async () => ({ json: async () => [
     { name: "play_mahjong_discard", description: "Analyze mahjong discards" },
@@ -555,7 +555,8 @@ test("completion matches case-insensitive substrings in catalog order", async ()
   h.type("Analyze mahjong");
   assert.deepEqual(h.names(), ["play_mahjong_discard"]);
   h.type("mhd");
-  assert.deepEqual(h.names(), []);
+  assert.deepEqual(h.names(), ["play_mahjong_discard"],
+    "the boundary-anchored acronym matches like /skills completion");
   h.type("build");
   assert.deepEqual(h.names(), ["build"]);
   assert.deepEqual(h.selected(), [], "an exact search still needs an explicit choice");
@@ -566,6 +567,30 @@ test("completion matches case-insensitive substrings in catalog order", async ()
   assert.deepEqual(h.names(), ["build"]);
   h.type(" ");
   assert.deepEqual(h.names(), ["play_mahjong_discard", "review", "build"]);
+});
+
+test("boundary-anchored fuzzy names rank audit_own_changes above auditor suffixes", async () => {
+  const h = harness();
+  h.context.api = async () => ({ json: async () => [
+    { name: "agent-sandbox-auditor", description: "Python Agent 沙箱与安全隔离审查" },
+    { name: "async-agent-auditor", description: "Python Agent 异步并发模式审查" },
+    { name: "llm-call-auditor", description: "LLM 调用安全与成本优化审查" },
+    { name: "audit_own_changes", description: "Audit your own changes" },
+    { name: "unrelated-skill", description: "audit own changes" },
+  ] });
+  await h.context.loadSkills();
+  h.type("audito");
+  assert.deepEqual(h.names(), [
+    "audit_own_changes",
+    "agent-sandbox-auditor",
+    "async-agent-auditor",
+    "llm-call-auditor",
+  ], "the boundary-anchored fuzzy hit outranks substrings inside auditor");
+  assert.equal(h.key("Enter").prevented, true);
+  assert.deepEqual(h.selected(), ["audit_own_changes"]);
+  h.type("own");
+  assert.deepEqual(h.names(), ["audit_own_changes", "unrelated-skill"],
+    "description-only hits trail every name hit");
 });
 
 test("skill search ignores composing Enter flags after composition has ended", async () => {

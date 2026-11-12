@@ -202,6 +202,41 @@ fn read_owner(path: &Path) -> Option<String> {
         .filter(|owner| !owner.is_empty())
 }
 
+/// Read-only probe for a turn lease held by another live process.
+///
+/// The serve daemon uses this to notice a turn started by a terminal or a
+/// background `/bg` session, which never appears in its in-process turn table.
+/// The probe never creates the lock file and never writes the owner marker: a
+/// free lock is acquired and released immediately by closing this descriptor,
+/// and a held lock only reports its owner. Non-Unix targets always report no
+/// owner because the lease itself is unsupported there.
+pub(in crate::ai) fn turn_lease_owner(history_file: &Path) -> Option<String> {
+    if !crate::ai::history::is_sqlite_path(history_file) {
+        return None;
+    }
+    let path = history_file.with_extension("turn.lock");
+    let file = open_existing_lock_file(&path).ok()?;
+    match try_lock_exclusive(&file) {
+        Ok(()) => None,
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => read_owner(&path),
+        Err(_) => None,
+    }
+}
+
+#[cfg(unix)]
+fn open_existing_lock_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_existing_lock_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).write(true).open(path)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -270,6 +305,27 @@ mod tests {
         let turn = TurnLease::acquire(&history, "session-a").expect("turn lease beside open");
         drop(turn);
         drop(open);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn probe_reports_a_held_turn_lease_without_touching_it() {
+        let root = temp_root();
+        let history = root.join("session-a.sqlite");
+        fs::write(&history, b"").expect("history file");
+        let lock = history.with_extension("turn.lock");
+        assert_eq!(turn_lease_owner(&history), None);
+        assert!(
+            !lock.exists(),
+            "an idle probe must not create the lock file"
+        );
+        let lease = TurnLease::acquire(&history, "session-a").expect("lease");
+        assert_eq!(
+            turn_lease_owner(&history),
+            Some(std::process::id().to_string())
+        );
+        drop(lease);
+        assert_eq!(turn_lease_owner(&history), None);
         fs::remove_dir_all(&root).ok();
     }
 }

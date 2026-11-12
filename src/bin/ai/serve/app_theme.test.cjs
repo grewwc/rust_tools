@@ -171,7 +171,9 @@ test("desktop palette overrides use neutral surfaces and keep the shared accent"
       "--dim": "#c4c4c4",
       "--edge": "rgba(231,231,231,.20)",
       "--fg": "#e9e9e9",
+      "--fg-bold": "#ffffff",
       "--field": "#292929",
+      "--fw-bold": "800",
       "--glass": "rgba(36,36,36,.95)",
       "--glass-strong": "rgba(36,36,36,.98)",
       "--line": "#3e3e3e",
@@ -315,14 +317,25 @@ test("desktop light chrome keeps metadata weight and retains hover and focus cue
   }
 });
 
-test("desktop dark prose keeps the shared weights and the composer keeps its bottom edge", () => {
+test("desktop dark inline emphasis stands out while prose and headings keep their shared weights", () => {
   const desktop = desktopMediaQueries()[0].body;
   const dark = ':root:not([data-theme="light"]):not([data-theme="warm"]) ';
-  for (const selector of ["body", ".msg.md strong", ".msg.md b", ".msg.md .h"]) {
+  const palette = { ...tokenValues(tokenBlock(PALETTES.dark)), ...tokenValues(tokenBlock(PALETTES.dark, desktop)) };
+  for (const tag of ["strong", "b"]) {
+    assert.deepEqual(ruleValues(desktop, dark + ".msg.asst.md " + tag + ":not(.h *)"), {
+      "font-weight": "var(--fw-bold)", color: "var(--fg-bold)"
+    });
+  }
+  assert.ok(Number(palette["--fw-bold"]) > 700, "dark emphasis is heavier than the browser's usual bold weight");
+  assert.ok(
+    contrast(palette["--fg-bold"], palette["--panel"]) > contrast(palette["--fg"], palette["--panel"]),
+    "dark emphasis has more contrast than surrounding prose"
+  );
+  for (const selector of ["body", ".msg.md .h"]) {
     assert.deepEqual(
-      ruleValues(desktop, dark + selector),
+      ruleValues(style, dark + selector),
       {},
-      "dark mode must not tune prose weight on its own"
+      "dark body copy and headings keep their shared weights"
     );
   }
   assert.equal(ruleValues(desktop, "#composer")["padding"], "8px 24px 20px");
@@ -634,7 +647,7 @@ test("desktop contrast rules preserve the current shared and mobile CSS bytes", 
   const phoneApplicable = desktopMediaQueries().reduce((source, block) => source.replace(block.css, ""), style);
   assert.doesNotMatch(phoneApplicable, /--(?:control-border|danger-text)/);
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "50a36b9e0849691262f11bdbafd58ced31781295a173996b65cff3f1f5bd3f48",
+    "84c4c7ed96e3501d437fee64bf5942e1dc99132e680dce348604dcb163833bca",
     "desktop contrast changed shared or mobile CSS");
 });
 
@@ -644,7 +657,7 @@ test("desktop overrides leave all phone-applicable CSS byte-identical", () => {
   let phoneApplicable = style;
   for (const block of desktop) phoneApplicable = phoneApplicable.replace(block.css, "");
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "50a36b9e0849691262f11bdbafd58ced31781295a173996b65cff3f1f5bd3f48",
+    "84c4c7ed96e3501d437fee64bf5942e1dc99132e680dce348604dcb163833bca",
     "shared or phone CSS changed outside the desktop queries");
 });
 

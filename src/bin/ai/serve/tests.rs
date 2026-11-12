@@ -702,6 +702,52 @@ async fn session_events_stream_ends_with_the_terminal_marker() {
     assert!(text.contains("event: done"), "{text}");
 }
 
+/// A terminal or `/bg` turn holds the cross-process turn lease but never
+/// appears in the daemon's `active_turns`. `/confirm` must report its owner so
+/// the page can follow history instead of treating the session as idle.
+#[cfg(unix)]
+#[tokio::test]
+async fn confirm_reports_a_remote_turn_owner_from_the_turn_lease() {
+    use axum::{
+        extract::{Path, State},
+        http::HeaderMap,
+        response::IntoResponse,
+    };
+    let state = lifecycle_test_state();
+    let store = SessionStore::new(state.history_file.as_path());
+    let history = store.session_history_file("sid");
+    if let Some(parent) = history.parent() {
+        std::fs::create_dir_all(parent).expect("create history root");
+    }
+    std::fs::write(&history, b"").expect("create history file");
+    let lease = crate::ai::history::turn_lease::TurnLease::acquire(&history, "sid")
+        .expect("terminal turn lease");
+
+    let read = super::get_confirm(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path("sid".to_string()),
+    )
+    .await
+    .into_response();
+    let body = axum::body::to_bytes(read.into_body(), 4096)
+        .await
+        .expect("body");
+    let view: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(view["running"], false);
+    assert_eq!(view["remote"], std::process::id().to_string());
+
+    drop(lease);
+    let read = super::get_confirm(State(state), HeaderMap::new(), Path("sid".to_string()))
+        .await
+        .into_response();
+    let body = axum::body::to_bytes(read.into_body(), 4096)
+        .await
+        .expect("body");
+    let view: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(view["remote"], serde_json::Value::Null);
+}
+
 /// The `/confirm` route pair: the pending question is readable, an answer
 /// reaches the turn child's stdin exactly once, and answering the same
 /// question again is refused instead of writing a second line.

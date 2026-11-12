@@ -239,7 +239,9 @@ select, summary { touch-action:manipulation; }
 .turn { display:flex; flex-direction:column; gap:8px; min-width:0; }
 .turn.execution-empty:empty { display:none; }
 .execution-group { flex-shrink:0; }
-.execution-group > details > .execution-items { padding:12px; }
+/* Keep the merged rows on the shared card gutter: the same 16px inset on
+   every side separates them from the group border and header. */
+.execution-group > details > .execution-items { padding:16px; }
 .turn .tool-activity summary { color:var(--fg); }
 .turn .tool-activity[data-running="true"] { border-color:var(--acc-line); }
 #jumpbottom {
@@ -793,6 +795,11 @@ button:active:not(:disabled) { filter:brightness(.96); }
     --edge:rgba(231,231,231,.20);
     --card-edge:rgba(231,231,231,.12);
     --card-shadow:0 2px 8px rgba(0,0,0,.12);
+    --fw-bold:800; --fg-bold:#ffffff;
+  }
+  :root:not([data-theme="light"]):not([data-theme="warm"]) .msg.asst.md strong:not(.h *),
+  :root:not([data-theme="light"]):not([data-theme="warm"]) .msg.asst.md b:not(.h *) {
+    font-weight:var(--fw-bold); color:var(--fg-bold);
   }
   :root[data-theme="light"] {
     --bg:#f1f1f1; --panel:#f3f3f3; --line:#9a9a9a; --fg:#242424; --dim:#3e3e3e;
@@ -1593,6 +1600,12 @@ let turnRunningAt = 0; // Date.now() of the last poll that reported running
 let turnRunningPid = 0;
 let endedTurnPid = 0;
 const RUNNING_SAMPLE_TTL_MS = 60000; // a running sample older than this is stale
+// A turn owned by another process (a terminal or a `/bg` session) has no local
+// event stream. `/confirm` reports its owner pid; the page can only show that
+// it is running and follow persisted history until the round lands.
+let remoteTurnPid = "";
+let remoteTurnAt = 0; // Date.now() of the last poll that reported that owner
+const REMOTE_RUNNING_TTL_MS = 30000; // idle /confirm samples arrive every 10s
 let stopBusy = false; // one interrupt POST at a time: a double tap must not send two
 let sideNoteBusy = false; // one queued note at a time; the running turn itself continues
 let noteTimer = null; // pending auto-clear of the transient #connstat note
@@ -1921,19 +1934,29 @@ function handlePreviewClick(event) {
   if (answerButton) return copyNearbyAnswer(answerButton);
 }
 // Double-clicking inside an open fold closes it, which saves a scroll back to
-// its summary. Single clicks, keyboard activation, and controls stay native.
+// its summary. Subagent summaries collapse the same way on phones. Single
+// clicks, keyboard activation, and controls stay native.
 let lastFoldTap = { at: 0, x: 0, y: 0 };
+let lastSubagentTap = { at: 0, x: 0, y: 0 };
 function collapseFoldForTap(event) {
   if (!event.detail) return;
   const target = event.target;
   if (!target || !target.closest || target.closest("button, a, input, select, textarea")) return;
-  // Subagent shortcuts follow the desktop CSS breakpoint; ordinary folds do not.
+  // Structured subagent rows own the ancestor collapse only on desktop; ordinary
+  // folds do not.
   const desktop = !!(window.matchMedia && window.matchMedia("(min-width:701px)").matches);
   const summary = target.closest("summary");
   if (summary) {
-    // The first click already toggled the disclosure. Its second click default
-    // would toggle it back before dblclick, so cancel only that native toggle.
-    if (desktop && event.detail === 2 && summary.closest(".msg.asst")?.dataset.subagents === "true") event.preventDefault();
+    // A subagent summary is the only fold whose double-click must collapse it on
+    // phones too. Other summaries keep both native clicks.
+    if (summary.closest(".msg.asst")?.dataset.subagents !== "true") return;
+    // The first click already toggled the disclosure. Cancelling the second
+    // click's default keeps an open card closed instead of reopening it.
+    const now = Date.now();
+    const double = event.detail === 2 || (now - lastSubagentTap.at < 350 &&
+      Math.abs(event.clientX - lastSubagentTap.x) < 40 && Math.abs(event.clientY - lastSubagentTap.y) < 40);
+    lastSubagentTap = double ? { at: 0, x: 0, y: 0 } : { at: now, x: event.clientX, y: event.clientY };
+    if (double) event.preventDefault();
     return;
   }
   const now = Date.now();
@@ -3363,6 +3386,8 @@ function switchSession(nextId, saveCurrent = true) {
   turnRunning = false;
   turnRunningPid = 0;
   endedTurnPid = 0;
+  remoteTurnPid = "";
+  remoteTurnAt = 0;
   syncStopButton();
   // The queue belongs to the session being left; clear it immediately while
   // the first poll for the new session is in flight.
@@ -5581,11 +5606,62 @@ function chooseSkill(name, fromClick = false) {
     }
   }
 }
+// Separators in skill names are formatting, not content: "audito" should find
+// audit_own_changes because the name reads as "audit own changes". Name hits
+// rank above description-only hits; -1 means no match.
+function skillCharBoundary(chars, i) {
+  return i === 0
+    || "-._/: ".includes(chars[i - 1])
+    || (chars[i - 1] >= "a" && chars[i - 1] <= "z" && chars[i] >= "A" && chars[i] <= "Z");
+}
+// Same score as `fuzzy_match_score` in `prompt/completion.rs`: reward word
+// boundaries and consecutive runs, penalize gaps, and reject a scattered match
+// unless it is a contiguous substring or starts on a word boundary.
+function skillFuzzyScore(query, candidate) {
+  if (!query) return null;
+  const wanted = Array.from(query);
+  const chars = Array.from(candidate);
+  const lowered = Array.from(candidate.replace(/[A-Z]/g, (c) => c.toLowerCase()));
+  let qi = 0, prev = null, first = null, score = 0;
+  for (let i = 0; i < lowered.length && qi < wanted.length; i++) {
+    if (lowered[i] !== wanted[qi]) continue;
+    score += 1;
+    if (skillCharBoundary(chars, i)) score += 8;
+    if (prev !== null) {
+      if (prev + 1 === i) score += 5;
+      else score -= Math.trunc((Math.min(i - prev - 1, 8) + 1) / 2);
+    }
+    prev = i;
+    if (first === null) first = i;
+    qi += 1;
+  }
+  if (qi !== wanted.length) return null;
+  if (first === null || (!skillCharBoundary(chars, first) && !candidate.toLowerCase().includes(query))) return null;
+  return score;
+}
+// Mirrors `name_token_match_rank`: a name prefix ranks 0 and fuzzy names rank
+// 1..=255. The web search box also searches descriptions, which `/skills`
+// completion treats as display-only, so those hits trail every name hit.
+function skillMatchRank(skill, query) {
+  if (!query) return 0;
+  const name = String(skill.name || "");
+  if (name.toLowerCase().startsWith(query)) return 0;
+  const score = skillFuzzyScore(query, name);
+  if (score !== null) return Math.min(255, Math.max(1, 255 - score));
+  return String(skill.description || "").toLowerCase().includes(query) ? 256 : -1;
+}
 function renderSkillMenu() {
   if ($("oskill").disabled || $("skillmenu").hidden) return;
   const box = $("skilloptions"), query = $("skillsearch").value.trim().toLowerCase();
   const names = readSkillPick()?.names || [], activeName = skillMatches[skillActive]?.name;
-  skillMatches = skillCatalog.filter((s) => (s.name + " " + (s.description || "")).toLowerCase().includes(query));
+  const ranked = [];
+  skillCatalog.forEach((skill, order) => {
+    const rank = skillMatchRank(skill, query);
+    if (rank >= 0) ranked.push({ skill, rank, order });
+  });
+  // A name hit outranks a description-only hit; equal ranks keep catalog order.
+  ranked.sort((a, b) => a.rank - b.rank || a.order - b.order);
+  skillMatches = ranked.map((entry) => entry.skill);
   skillActive = activeName ? skillMatches.findIndex((s) => s.name === activeName) : -1;
   // Use DOM text nodes: catalog descriptions are untrusted plain text.
   box.textContent = "";
@@ -7169,7 +7245,7 @@ async function reloadStale() {
 // with the user's message and the server reports nothing running. Say so
 // explicitly instead of leaving a blank-looking conversation.
 function checkInterruptedTurn() {
-  if (!sessionId || turnRunning || turns.has(sessionId)) return;
+  if (!sessionId || turnRunning || turns.has(sessionId) || isRemoteTurn()) return;
   if (!lastHistoryEndsUnanswered) return;
   const root = $("msgs");
   if (root.querySelector(".turn-interrupted")) return;
@@ -7229,7 +7305,7 @@ async function resumeSync() {
         // retained stream, not the turn, is gone: let the normal stale path
         // reattach instead of leaving the old "Thinking…" box on screen.
         if (live && Date.now() - (live.lastEventAt || 0) > LIVE_STALL_MS) live.recover?.();
-      } else if (!eventActive) {
+      } else if (!eventActive && !isRemoteTurn()) {
         void attachEvents();
       }
       startStaleFollow();
@@ -7330,7 +7406,9 @@ function ensureConfirmPoll() {
     const sid = sessionId, epoch = runEpoch;
     const running = await pollConfirm();
     if (sid !== sessionId || epoch !== runEpoch) return;
-    if (running === false && !turns.has(sessionId) && staleSession !== sessionId) stopConfirmPoll();
+    // Keep the slow idle cadence for remote turns; it returns early while the
+    // page is hidden, so an open tab costs one sample per 10s.
+    if (!sessionId) stopConfirmPoll();
   }, 2000); // fallback only; the reattached event stream is the primary path
 }
 function stopConfirmPoll() {
@@ -7725,6 +7803,10 @@ function abortEvents() {
 
 async function pollConfirm() {
   if (!sessionId || confirmBusy) return null;
+  // Start the idle cadence on the first sample: a terminal or `/bg` turn can
+  // begin after this page finished booting, and this poll is the only
+  // cross-process way to notice it.
+  ensureConfirmPoll();
   const seq = ++confirmPollSeq;
   const sid = sessionId;
   const epoch = runEpoch;
@@ -7741,6 +7823,15 @@ async function pollConfirm() {
   const wasRunning = turnRunning;
   turnRunning = body.running === true;
   const pid = Number(body.turn) || 0;
+  const remote = typeof body.remote === "string" ? body.remote : "";
+  const wasRemote = isRemoteTurn();
+  if (remote && !turnRunning) {
+    remoteTurnPid = remote;
+    remoteTurnAt = Date.now();
+  } else if (!remote) {
+    remoteTurnPid = "";
+    remoteTurnAt = 0;
+  }
   if (turnRunning) {
     turnRunningPid = pid;
     turnRunningAt = Date.now();
@@ -7761,6 +7852,20 @@ async function pollConfirm() {
     }
     if (!eventStreamEnded) void attachEvents();
   }
+  else if (remote) {
+    // Another process owns this turn: there is no local event log to attach
+    // and no interrupt endpoint that can reach it. Show that it is running and
+    // follow persisted history so the round appears when it lands.
+    if (!wasRemote && !$("msgs").querySelector(".remote-turn-note")) {
+      addMsg(
+        "asst pending",
+        "正在终端中运行（pid " + remote + "）；本轮结束后结果会自动出现在这里。",
+        "asst pending remote-turn-note"
+      );
+    }
+    armHistoryFollow();
+    ensureConfirmPoll();
+  }
   else {
     eventStreamEnded = false;
     if (eventActive && eventSession === sid) {
@@ -7768,30 +7873,41 @@ async function pollConfirm() {
       await loadHistory();
       if (sid !== sessionId || epoch !== runEpoch || seq !== confirmPollSeq) return null;
     }
-    if (!turns.has(sessionId) && staleSession !== sessionId) stopConfirmPoll();
+    if (wasRemote) {
+      await loadHistory();
+      void loadSessions();
+    }
+    // The idle cadence stays alive while a session is open; the tick above
+    // already samples only every 10s when nothing is running.
   }
   syncStopButton();
   // Queue state follows the same poll as the running state: a note may be
   // drained by the turn child between any two samples.
-  void refreshSideNotes();
+  if (turnRunning || isRemoteTurn()) void refreshSideNotes();
   const pending = body.pending;
-  if (!pending) { if (confirmShown) hideConfirm(); return turnRunning; }
+  if (!pending) { if (confirmShown) hideConfirm(); return turnRunning || isRemoteTurn(); }
   if (pending.input && typeof pending.prompt === "string" && pending.prompt.startsWith(NATIVE_PREFIX)) {
     if (confirmShown) hideConfirm();
     void handleNativeRequest(pending.id, pending.token, pending.prompt);
-    return turnRunning;
+    return turnRunning || isRemoteTurn();
   }
   // The token, not the id, is the question's identity: child-side ids restart
   // at 1 every turn, so an equal id can still be different text.
   if (!confirmShown || confirmShown.token !== pending.token) showConfirm(pending.id, pending.prompt, pending.token, pending.input);
-  return turnRunning;
+  return turnRunning || isRemoteTurn();
 }
 
 // Live streams, replay streams, unresolved recovery and fresh server samples
 // cover different running states. History can end in provisional assistant
 // text, so only a terminal event or an idle server poll resolves recovery.
+function isRemoteTurn() {
+  return !!remoteTurnPid && Date.now() - remoteTurnAt < REMOTE_RUNNING_TTL_MS;
+}
 function isTurnRunning() {
   if (!sessionId) return false;
+  // Another process's turn has no local stream and no `turnRunning` sample,
+  // but it must still block a second send and keep history follow alive.
+  if (typeof isRemoteTurn === "function" && isRemoteTurn()) return true;
   if (turns.has(sessionId)) return true;
   if (eventStreamFailed) return false;
   // A parked foreground turn can close its model-output stream while a
@@ -7824,7 +7940,10 @@ function syncStopButton() {
   const running = isTurnRunning();
   b.textContent = running ? "⏹" : "➤";
   b.classList.toggle("stop", running);
-  const label = running ? "stop this turn" : "send";
+  const remote = typeof isRemoteTurn === "function" && isRemoteTurn();
+  const label = remote
+    ? "running in a terminal — stop it there"
+    : running ? "stop this turn" : "send";
   b.setAttribute("aria-label", label);
   b.title = label;
   const sideNote = $("sidenote");
@@ -7969,6 +8088,16 @@ async function refreshSideNotes() {
 }
 async function stopTurn() {
   if (stopBusy || !sessionId) return;
+  if (typeof isRemoteTurn === "function" && isRemoteTurn()) {
+    if (!$("msgs").querySelector(".remote-turn-note")) {
+      addMsg(
+        "err",
+        "这一轮在终端里运行（pid " + remoteTurnPid + "）；请在那里停止（Esc 或 Ctrl+C）。",
+        "asst err remote-turn-note"
+      );
+    }
+    return;
+  }
   stopBusy = true;
   let interrupted = false;
   try {
@@ -8156,6 +8285,141 @@ async function runGitCommand(text) {
 }
 // END composer git command
 
+// BEGIN composer export/import commands
+// `/export` downloads the current session archive, `/export-md` downloads the
+// last model conclusion, and `/import` uploads one archive into a new session.
+// These mirror the local commands but move bytes over HTTP instead of the
+// daemon's filesystem.
+const TRANSFER_LINE_RE = /^[:/](export-md|export-current|export-cur|export|import)(?:\s|$)/;
+function transferCommandLine(text) {
+  const t = text.trim();
+  if (!t || /[\r\n]/.test(text) || !TRANSFER_LINE_RE.test(t)) return null;
+  const parts = t.slice(1).split(/\s+/);
+  return { cmd: parts[0], args: parts.slice(1) };
+}
+function transferFilename(res, fallback) {
+  const header = res.headers.get("content-disposition") || "";
+  const match = /filename="([^"]+)"/.exec(header);
+  return (match ? match[1] : fallback).replace(/[\\/:*?"<>|]+/g, "_") || fallback;
+}
+function safeDownloadName(name, fallback) {
+  return String(name || "").split(/[\\/]/).pop().replace(/[:*?"<>|]+/g, "_") || fallback;
+}
+function pickTransferArchive() {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".zip,application/zip";
+    input.style.display = "none";
+    input.addEventListener("change", () => {
+      const file = input.files && input.files[0];
+      input.remove();
+      resolve(file || null);
+    }, { once: true });
+    input.addEventListener("cancel", () => { input.remove(); resolve(null); }, { once: true });
+    document.body.appendChild(input);
+    input.click();
+  });
+}
+function readFileBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.onerror = () => reject(reader.error || new Error("read failed"));
+    reader.readAsDataURL(file);
+  });
+}
+async function deliverDownload(blob, filename) {
+  // Android's WebView blocks blob downloads, so hand the file to the system
+  // share sheet when the shell supports it; browsers keep the anchor path.
+  if (typeof nativeBridgeReady === "function" && nativeBridgeReady()) {
+    try {
+      const file = new File([blob], filename, { type: blob.type || "application/octet-stream" });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: filename });
+        return;
+      }
+    } catch (_) { /* fall through to the anchor download */ }
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+async function runTransferCommand(text) {
+  const command = transferCommandLine(text);
+  if (!command) return false;
+  const args = command.args;
+
+  if (command.cmd === "import") {
+    const asArg = args.find((arg) => arg.startsWith("as="));
+    const dst = asArg ? asArg.slice(3).trim() : "";
+    if (asArg && !dst) { addMsg("err", "import failed: empty as= id", "asst err"); return true; }
+    const file = await pickTransferArchive();
+    if (!file) return true; // cancelled: keep the typed command
+    setPromptValue("", true);
+    $("prompt").style.height = "auto";
+    if (sessionId) clearDraft(sessionId);
+    addMsg("user", text, "user rewindable");
+    try {
+      const data = await readFileBase64(file);
+      const res = await api("/sessions/import", {
+        method: "POST",
+        body: JSON.stringify({ filename: file.name, data, id: dst }),
+      });
+      const out = await res.json();
+      switchSession(out.id);
+      if (typeof lastMsgCount !== "undefined") lastMsgCount = null;
+      if (typeof loadHistory === "function") Promise.resolve(loadHistory()).catch(() => {});
+      if (typeof loadSessions === "function") loadSessions();
+      addMsg("asst", "已导入会话 " + out.id, "asst");
+    } catch (e) {
+      addMsg("err", "import failed: " + e.message, "asst err");
+    }
+    scrollToLatest(false);
+    return true;
+  }
+
+  const markdown = command.cmd === "export-md";
+  if (!markdown && ["last", "latest"].includes(args[0])) {
+    addMsg("err", "/export last is not available in the WebUI; open that session and export it there", "asst err");
+    return true;
+  }
+  // `/export [selector] [output.zip]` keeps the CLI's optional target; the
+  // WebUI only needs the current session, but an explicit id still works.
+  const selector = !markdown && args[0] && !["current", "last", "latest"].includes(args[0]) ? args[0] : "";
+  const target = markdown ? sessionId : (selector || sessionId);
+  if (!target) { addMsg("err", "export failed: no session selected", "asst err"); return true; }
+  setPromptValue("", true);
+  $("prompt").style.height = "auto";
+  if (sessionId) clearDraft(sessionId);
+  addMsg("user", text, "user rewindable");
+  try {
+    const res = await api("/sessions/" + encodeURIComponent(target) + (markdown ? "/export-md" : "/export"));
+    const blob = await res.blob();
+    const fallback = markdown ? "_summary.md" : "session-" + target.slice(0, 8) + ".zip";
+    const filename = markdown && args[0]
+      ? safeDownloadName(args[0], fallback)
+      : transferFilename(res, fallback);
+    await deliverDownload(blob, filename);
+    addMsg("asst", "已导出 " + filename, "asst");
+  } catch (e) {
+    addMsg("err", "export failed: " + e.message, "asst err");
+  }
+  scrollToLatest(false);
+  return true;
+}
+// END composer export/import commands
+
 // BEGIN turn session preparation
 async function prepareTurnSession(previousId, base) {
   if (sessionId !== previousId || store.base !== base) return "";
@@ -8188,6 +8452,16 @@ function pendingInputAnchor(root) {
   return { afterHistoryKey: previous?.dataset.canonicalIdentity || "", afterHistoryIndex: Number(previous?.dataset.canonicalIndex) };
 }
 async function send() {
+  if (typeof isRemoteTurn === "function" && isRemoteTurn()) {
+    if (!$("msgs").querySelector(".remote-turn-note")) {
+      addMsg(
+        "err",
+        "这个会话正在终端里运行（pid " + remoteTurnPid + "）；请等它结束或在终端里停止。",
+        "asst err remote-turn-note"
+      );
+    }
+    return;
+  }
   if (sendBusy || isTurnRunning()) return;
   // Send the textarea bytes as typed: the server stores them unchanged, so a
   // client-side trim would make the transcript differ from the input. The
@@ -8203,6 +8477,7 @@ async function send() {
     // Session commands use their own endpoints before preparing a model turn.
     if (await runCdCommand(text)) return;
     if (await runGitCommand(text)) return;
+    if (typeof runTransferCommand === "function" && await runTransferCommand(text)) return;
     sid = await prepareTurnSession(draftSession, sendBase);
     if (!sid) return;
   } finally { sendBusy = false; } // the stream below owns itself: other sessions may send now

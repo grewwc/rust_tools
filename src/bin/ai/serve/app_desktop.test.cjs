@@ -971,9 +971,14 @@ function sessionFoldHarness(width) {
   };
 }
 
-test("completed execution groups leave padding around their inner cards on both layouts", () => {
+test("completed execution groups add vertical breathing room without changing the shared gutter on both layouts", () => {
   for (const phone of [false, true]) {
-    assert.equal(responsiveRule(".execution-group > details > .execution-items", phone).padding, "12px");
+    const items = responsiveRule(".execution-group > details > .execution-items", phone);
+    assert.equal(items.padding, "16px", "the same inset applies on every side");
+    assert.deepEqual([items.background, items.border, items["border-radius"]], [undefined, undefined, undefined],
+      "the merged rows keep the shared card surface instead of a nested well");
+    const summary = responsiveRule(".msg.asst.execution-group > details > summary", phone);
+    assert.deepEqual(summary, {}, "the group header keeps the shared summary inset");
   }
   // The stylesheet has multiple media blocks, so enumerate every gap rule
   // rather than relying on the fixture's slices around the first media block.
