@@ -59,6 +59,7 @@ function harness(confirm) {
     document: { visibilityState: "visible", querySelectorAll: () => [] },
   };
   vm.createContext(context);
+  vm.runInContext(script.slice(script.indexOf("// BEGIN execution model"), script.indexOf("// END execution model")), context);
   const start = script.indexOf("async function pollConfirm()");
   const end = script.indexOf("function note(msg)");
   vm.runInContext(script.slice(start, end), context);

@@ -45,6 +45,7 @@ function harness({ sessionId = "s1", images = [], items = [], respond } = {}) {
     localStorage: { setItem: () => {} },
   });
   const code = script.slice(script.indexOf("const CD_LINE_RE"), script.indexOf("async function send()"));
+  vm.runInContext(script.slice(script.indexOf("// BEGIN execution model"), script.indexOf("// END execution model")), context);
   vm.runInContext(code, context);
   return {
     calls,

@@ -1608,7 +1608,7 @@ const pendingUserInputs = new Map(); // local rows survive until canonical histo
 // never interleave into one transcript. A turn whose session is not on screen
 // keeps updating its detached box, and `appendChild` on return re-attaches it
 // with everything that streamed while the user was away.
-let turns = new Map(); // session id -> {box}
+// `turns` is the execution model's live session registry (session id -> {box}).
 // A browser gives one origin a handful of parallel connections and a live turn
 // holds one open until its stream ends, so the cap keeps session polling and
 // image fetches from starving behind streaming turns.
@@ -1616,7 +1616,7 @@ const MAX_LIVE_TURNS = 4;
 // Guards one send's own setup (creating the session, waiting for its POST to be
 // accepted); the per-session entry takes over from there, so a turn in another
 // session never waits behind this one.
-let sendBusy = false;
+// `sendBusy` is the execution model's setup lock.
 let runEpoch = 0; // bumped every time this page starts a stream: a poll sent
 // under an older epoch must not revive `turnRunning` after a newer turn.
 // True while the server reports a live turn for the shown session (GET
@@ -1625,24 +1625,20 @@ let runEpoch = 0; // bumped every time this page starts a stream: a poll sent
 // expires (RUNNING_SAMPLE_TTL_MS): stale ticks refresh it every 4s and event
 // polls refresh it on return, so only a dead sample can go stale — and a dead
 // sample must not hold the stop button forever.
-let turnRunning = false;
-let turnRunningAt = 0; // Date.now() of the last poll that reported running
+// `turnRunning` and `turnRunningAt` project the selected session's sample.
 // Child pids from the same /confirm samples. A terminal event remembers the
 // pid it ended in endedTurnPid, so a later running sample with that same pid
 // is only the finished child waiting to be reaped, while a different pid is a
 // new turn whose stream must be attached even before an idle poll clears the
 // terminal marker.
-let turnRunningPid = 0;
-let endedTurnPid = 0;
+// `turnRunningPid` and `endedTurnPid` belong to the selected execution record.
 const RUNNING_SAMPLE_TTL_MS = 60000; // a running sample older than this is stale
 // A turn owned by another process (a terminal or a `/bg` session) has no local
 // event stream. `/confirm` reports its owner pid; the page can only show that
 // it is running and follow persisted history until the round lands.
-let remoteTurnPid = "";
-let remoteTurnAt = 0; // Date.now() of the last poll that reported that owner
+// `remoteTurnPid` and `remoteTurnAt` project the selected remote owner sample.
 const REMOTE_RUNNING_TTL_MS = 30000; // idle /confirm samples arrive every 10s
-let stopBusy = false; // one interrupt POST at a time: a double tap must not send two
-let sideNoteBusy = false; // one queued note at a time; the running turn itself continues
+// `stopBusy` and `sideNoteBusy` are execution model request locks.
 let noteTimer = null; // pending auto-clear of the transient #connstat note
 let infoRetryTimer = null; // retries GET /info after a transient failure
 let resumeBusy = false; // one foreground/network resync at a time
@@ -1654,7 +1650,7 @@ let pendingImages = []; // {filename, data_base64}
 // not a failed turn: the turn child keeps running server-side and only this
 // page loses the live feed. Such a view is stale, not broken — see
 // startStaleFollow, which reloads it from history.
-let staleSession = ""; // session whose live feed was lost; "" when none
+// `staleSession` is the execution model's unresolved recovery owner.
 let staleKey = ""; // fingerprint of the newest history row already rendered
 let staleDone = false; // newest history row has assistant text, possibly provisional
 let staleBox = null; // live turn box to update if the server confirms it ended
@@ -1676,15 +1672,180 @@ let eventAbort = null; // AbortController for the reattached event stream
 let eventFailures = 0;
 let confirmPollSeq = 0;
 let confirmPollTick = 0; // idle ticks are cheap: only every fifth one asks the server
-let eventActive = false; // one reattach stream at a time
-let eventSession = ""; // session the reattach stream belongs to
+// `eventActive` and `eventSession` project the execution model's replay owner.
 let recoveredView = null; // progress card rendered from replayed events
 // True once the reattached event stream closed with the server's terminal
 // marker: the turn it belonged to is over, so re-attaching would only
 // re-render the transcript on every poll.
-let eventStreamEnded = false;
+// `eventStreamEnded` projects the selected execution's terminal marker.
 // A confirmed failure overrides old active reports until a new turn or session.
-let eventStreamFailed = false;
+// `eventStreamFailed` projects the selected execution's confirmed failure.
+
+// BEGIN execution model
+// Execution observations have producer-owned slots. Rendering may regroup the
+// corresponding cards, but never changes the order or authority of these slots.
+const executionModel = (() => {
+  const servers = new Map();
+  const requests = { sendBusy: false, stopBusy: false, sideNoteBusy: false };
+  // Selection can move before its history arrives. The task-ledger gate follows
+  // the transcript that has actually committed, not the selection in flight.
+  const displayed = { base: "", sessionId: "", taskStates: new Map(), taskBusy: null };
+  // The page owns one recovery timer and one replay controller. Their address
+  // prevents a feed from becoming the running source of another server.
+  const recovery = { base: "", sessionId: "" };
+  const replay = { base: "", sessionId: "", active: false };
+  const feedFields = ["staleSession", "eventActive", "eventSession"];
+  const sessionFields = {
+    turnRunning: "running", turnRunningAt: "runningAt", turnRunningPid: "pid",
+    endedTurnPid: "endedPid", remoteTurnPid: "remotePid", remoteTurnAt: "remoteAt",
+    eventStreamEnded: "ended", eventStreamFailed: "failed",
+  };
+  const serverFields = { turns: "liveTurns" };
+  const freshServer = () => ({ sessions: new Map(), liveTurns: new Map() });
+  const freshSession = () => ({ turn: 0, pid: 0, endedPid: 0, running: false, runningAt: 0,
+    remotePid: "", remoteAt: 0, ended: false, failed: false, history: [], activities: new Map(),
+    nextActivity: 0, taskStates: new Map(), taskBusy: null });
+  const emptyServer = freshServer(), emptySession = freshSession();
+  const serverFor = (base, create = false) => {
+    let server = servers.get(base);
+    if (!server && create) { server = freshServer(); servers.set(base, server); }
+    return server || emptyServer;
+  };
+  const sessionFor = (server, sid, create = false) => {
+    let state = server.sessions.get(sid);
+    if (!state && create) { state = freshSession(); server.sessions.set(sid, state); }
+    return state || emptySession;
+  };
+  const summarize = (state) => {
+    state.taskStates.clear(); state.taskBusy = null;
+    const apply = (summary) => {
+      if (!summary) return;
+      if (summary.resetTasks) { state.taskStates.clear(); state.taskBusy = null; }
+      for (const [id, active] of summary.taskStates) state.taskStates.set(id, active);
+      if (summary.busy !== null) state.taskBusy = summary.busy;
+    };
+    state.history.forEach(apply);
+    for (const activity of state.activities.values()) for (const summary of activity.slots.values()) apply(summary);
+  };
+  const summaryOf = (value) => value ? {
+    taskStates: value.taskStates.map(([id, active]) => [id, active]),
+    busy: value.busy, resetTasks: value.resetTasks === true,
+  } : null;
+  const value = (name, sid, base) => {
+    if (name in requests) return requests[name];
+    if (name === "staleSession") return recovery.base === base ? recovery.sessionId : "";
+    if (name === "eventActive") return replay.base === base && replay.active;
+    if (name === "eventSession") return replay.base === base ? replay.sessionId : "";
+    const server = serverFor(base);
+    return name in serverFields ? server[serverFields[name]] : sessionFor(server, sid)[sessionFields[name]];
+  };
+  const read = (sid, base) => {
+    const server = serverFor(base), state = sessionFor(server, sid);
+    return { ...state, sessionId: sid, base,
+      live: server.liveTurns.has(sid), liveEntry: server.liveTurns.get(sid),
+      attached: replay.base === base && replay.active && replay.sessionId === sid,
+      recovering: recovery.base === base && recovery.sessionId === sid && !!sid,
+      liveCount: [...servers.values()].reduce((count, owner) => count + owner.liveTurns.size, 0),
+      ...requests };
+  };
+  const snapshotDisplayed = (state) => {
+    displayed.taskStates = new Map(state.taskStates);
+    displayed.taskBusy = state.taskBusy;
+  };
+  const readDisplayed = () => ({ ...read(displayed.sessionId, displayed.base),
+    taskStates: new Map(displayed.taskStates), taskBusy: displayed.taskBusy });
+  const update = (event, sid, base) => {
+    const server = serverFor(base, true), state = sessionFor(server, sid, true);
+    if (event.kind === "field") {
+      if (event.name in requests) requests[event.name] = event.value;
+      else if (event.name === "staleSession") { recovery.base = base; recovery.sessionId = event.value; }
+      else if (event.name === "eventActive") { if (event.value) replay.base = base; replay.active = event.value; }
+      else if (event.name === "eventSession") { replay.base = base; replay.sessionId = event.value; }
+      else if (event.name in serverFields) server[serverFields[event.name]] = event.value;
+      else if (event.name in sessionFields) state[sessionFields[event.name]] = event.value;
+    } else if (event.kind === "display") {
+      displayed.base = base; displayed.sessionId = sid;
+      if (event.empty) {
+        displayed.taskStates.clear(); displayed.taskBusy = null;
+      } else snapshotDisplayed(state);
+    } else if (event.kind === "begin") {
+      state.turn++; state.running = false; state.ended = false; state.failed = false;
+      state.activities.clear(); summarize(state);
+    } else if (event.kind === "live") {
+      if (event.entry) server.liveTurns.set(sid, event.entry);
+      else server.liveTurns.delete(sid);
+    } else if (event.kind === "select") {
+      state.running = false; state.pid = 0; state.endedPid = 0;
+      state.remotePid = ""; state.remoteAt = 0; state.ended = false; state.failed = false;
+      if (!server.liveTurns.has(sid)) state.activities.clear();
+      summarize(state);
+    } else if (event.kind === "history") {
+      if (event.replaceActivities && !server.liveTurns.has(sid)
+          && !(replay.base === base && replay.active && replay.sessionId === sid)) state.activities.clear();
+      state.history = event.summaries.map(summaryOf); summarize(state);
+    } else if (event.kind === "activity") {
+      const id = ++state.nextActivity;
+      state.activities.set(id, { slots: new Map() });
+      return { sessionId: sid, base, turn: state.turn, id };
+    } else if (event.owner?.turn === state.turn) {
+      const activity = state.activities.get(event.owner.id);
+      if (!activity) return;
+      if (event.kind === "task") {
+        activity.slots.set(event.slot, summaryOf(event.summary));
+        // A completed report may advance its logical observation beside the
+        // tool that produced it. The renderer uses this same explicit action.
+        if (event.after && activity.slots.has(event.after)) {
+          const entries = [...activity.slots].filter(([slot]) => slot !== event.slot);
+          entries.splice(entries.findIndex(([slot]) => slot === event.after) + 1, 0,
+            [event.slot, summaryOf(event.summary)]);
+          activity.slots = new Map(entries);
+        }
+      } else if (event.kind === "finish") {
+        if (event.reason === "interrupted" || event.reason === "failed") {
+          for (const slot of activity.slots.keys()) activity.slots.set(slot,
+            { taskStates: [], busy: false, resetTasks: true });
+          state.failed = true;
+        }
+        if (event.answer) activity.slots.set("answer", { taskStates: [], busy: null, resetTasks: true });
+        state.ended = true;
+        state.endedPid = state.pid;
+      } else if (event.kind === "remove") state.activities.delete(event.owner.id);
+      summarize(state);
+      if (displayed.base === base && displayed.sessionId === sid) snapshotDisplayed(state);
+    }
+    return read(sid, base);
+  };
+  return { fields: [...Object.keys(sessionFields), ...Object.keys(serverFields), ...Object.keys(requests), ...feedFields],
+    value, read, readDisplayed, update };
+})();
+function executionBase() { return typeof store === "undefined" ? "" : store.base; }
+function executionState(sid = typeof sessionId === "undefined" ? "" : sessionId, base = executionBase()) {
+  return executionModel.read(sid, base);
+}
+// Every execution write, including the legacy identifier accessors, enters here.
+function updateExecutionModel(event, sid = event.owner?.sessionId ?? (typeof sessionId === "undefined" ? "" : sessionId), base = event.owner?.base ?? executionBase()) {
+  return executionModel.update(event, sid, base);
+}
+function displayedExecutionState() { return executionModel.readDisplayed(); }
+function commitExecutionView(sid = typeof sessionId === "undefined" ? "" : sessionId, base = executionBase()) {
+  return updateExecutionModel({ kind: "display" }, sid, base);
+}
+function clearExecutionView(base = executionBase()) {
+  return updateExecutionModel({ kind: "display", empty: true }, "", base);
+}
+function bindExecutionModel() {
+  const seed = executionModel.fields.map((name) => [name, globalThis[name]]);
+  updateExecutionModel({ kind: "select" });
+  for (const [name, value] of seed) if (value !== undefined) updateExecutionModel({ kind: "field", name, value });
+  commitExecutionView();
+  for (const name of executionModel.fields) Object.defineProperty(globalThis, name, {
+    configurable: true,
+    get() { return executionModel.value(name, typeof sessionId === "undefined" ? "" : sessionId, executionBase()); },
+    set(value) { updateExecutionModel({ kind: "field", name, value }); },
+  });
+}
+bindExecutionModel();
+// END execution model
 
 function headers(json) {
   const h = {};
@@ -3459,6 +3620,7 @@ function switchSession(nextId, saveCurrent = true) {
   eventStreamEnded = false;
   eventStreamFailed = false;
   sessionId = nextId;
+  updateExecutionModel({ kind: "select" });
   if (sessionId) localStorage.setItem("serve.session", sessionId);
   else localStorage.removeItem("serve.session");
   // The server running sample belongs to the session that was on screen.
@@ -3926,13 +4088,13 @@ function taskReportLabel(report) {
 // Live and canonical cards share this renderer. The visible projection is a
 // sibling of <details>, so updates preserve the reader's disclosure choice.
 function renderTaskToolResult(fold, result) {
+  fold.box._taskResult = result;
   if (!result) {
     if (fold.taskPreview) { fold.taskPreview.remove(); fold.taskPreview = null; }
     delete fold.box.dataset.taskStates;
     delete fold.box.dataset.taskBusy;
     delete fold.box.dataset.taskReset;
     delete fold.box.dataset.taskOutput;
-    if (typeof syncStopButton === "function") syncStopButton();
     return;
   }
   if (!fold.taskPreview) {
@@ -3959,7 +4121,6 @@ function renderTaskToolResult(fold, result) {
   else fold.box.dataset.taskBusy = String(result.busy);
   if (result.resetTasks) fold.box.dataset.taskReset = "true";
   else delete fold.box.dataset.taskReset;
-  if (typeof syncStopButton === "function") syncStopButton();
 }
 // Roles that reach the fold path and deserve a readable title.
 const FOLD_ROLE_LABELS = { tool: "tool", internal_note: "internal note" };
@@ -4361,7 +4522,7 @@ function createThinkingFold(parent, before) {
   const groups = executionGroupsFor(parent);
   const ordinal = (parent._thinkingOrdinal = (parent._thinkingOrdinal || 0) + 1);
   const next = addFold("thinking…", "", parent, "thinking:" + ordinal);
-  next.box.dataset.executionState = "running";
+  next.box.dataset.executionState = next.box._executionState = "running";
   next.box.dataset.thinkingPhase = "true";
   // A recovered turn can hand over a node from an older box; inserting against
   // a foreign parent throws, and the caller's guard would drop the whole phase.
@@ -4420,9 +4581,9 @@ function executionGroupsFor(parent, stored = false) {
     let toolAfter = false;
     for (let i = units.length - 1; i >= 0; i--) {
       const node = units[i];
-      if (node.dataset?.running !== undefined) toolAfter = true;
+      if (node._executionRunning !== undefined) toolAfter = true;
       else if (toolAfter && node.dataset?.thinkingPhase === "true"
-        && node.dataset.executionState === "running") node.dataset.executionState = "completed";
+        && node._executionState === "running") node.dataset.executionState = node._executionState = "completed";
     }
     // The most recent progress stays outside, even after it finishes. A new
     // execution item or answer advances the boundary; status paint does not.
@@ -4437,12 +4598,12 @@ function executionGroupsFor(parent, stored = false) {
       return false;
     };
     const grouped = (node) => node.parentNode?.classList?.contains("execution-items") === true;
-    const eligible = (node) => node.dataset.executionState === "completed"
-      && node.dataset.executionException !== "true" && node.dataset.running !== "true"
+    const eligible = (node) => node._executionState === "completed"
+      && node._executionException !== "true" && node._executionRunning !== "true"
       && !node.classList.contains("pending")
       && node !== latest
       && (grouped(node) || !expanded(node))
-      && (node.dataset.taskBusy !== "true" || node.dataset.executionSettled === "true");
+      && (node._taskResult?.busy !== true || node._executionSettled === "true");
     const plan = units.map((node) => ({ node, fold: eligible(node) }));
     if (plan.length === lastPlan.length && plan.every((item, i) => item.node === lastPlan[i].node && item.fold === lastPlan[i].fold)) return;
     // Eligibility is a property of the tree before restore() re-homes grouped
@@ -4524,7 +4685,7 @@ function executionGroupsFor(parent, stored = false) {
   return parent._executionGroups = { restore, sync };
 }
 function completeExecution(fold, parent) {
-  fold.box.dataset.executionState = "completed";
+  fold.box.dataset.executionState = fold.box._executionState = "completed";
   executionGroupsFor(parent).sync();
 }
 
@@ -4577,7 +4738,7 @@ function formatSubagentElapsed(seconds) {
   const hours = Math.floor(seconds / 3600), minutes = Math.floor(seconds / 60) % 60;
   return (hours ? hours + "h" : "") + (hours || minutes ? minutes + "m" : "") + seconds % 60 + "s";
 }
-function createSubagentClock(fold) {
+function createSubagentClock(fold, owner) {
   let report = null, records = new Map(), rawText = "", lastTitle = "", lastRawText = null;
   // The fold opens once when a run starts; after that its state belongs to the
   // reader, so streaming progress never re-opens a card the reader collapsed.
@@ -4604,13 +4765,14 @@ function createSubagentClock(fold) {
       fold.set(title, rawText); lastTitle = title; lastRawText = rawText;
     }
     renderTaskToolResult(fold, projectTaskReport(value));
-    fold.box.dataset.executionException = String(Boolean(value?.error)
+    fold.box.dataset.executionException = fold.box._executionException = String(Boolean(value?.error)
       || Boolean(value?.tasks.some((task) => task.error)));
   };
   const clock = {
     box: fold.box,
+    busy() { return report ? [...records.values()].some((row) => row.task.active) : null; },
     paint(now) { render(now); },
-    set(payload) {
+    set(payload, after = null) {
       let event = payload;
       if (typeof payload === "string") {
         try { event = JSON.parse(payload); } catch (_) { event = null; }
@@ -4625,6 +4787,9 @@ function createSubagentClock(fold) {
         rawText = typeof event?.text === "string" ? event.text : typeof payload === "string" ? payload : "";
       }
       const running = [...records.values()].some((row) => row.task.active);
+      const nextOpen = running && !started ? true : !running && autoOpened ? false : details.open;
+      if (owner) updateExecutionModel({ kind: "task", owner, slot: "subagents",
+        summary: projectTaskReport(report), after: !nextOpen ? after : null });
       if (running && !started) { started = true; programmatic = true; details.open = true; autoOpened = true; }
       else if (!running && autoOpened) { programmatic = false; details.open = false; autoOpened = false; started = false; }
       render(Date.now());
@@ -4648,7 +4813,8 @@ function createSubagentClock(fold) {
 
 // Live tools use the same call labels as history, keyed by call id rather than
 // inferred from stderr. Completion updates its own card, even for parallel tools.
-function createLiveActivity(parent, before) {
+function createLiveActivity(parent, before, sid = sessionId, base = executionBase()) {
+  const owner = updateExecutionModel({ kind: "activity" }, sid, base);
   const groups = executionGroupsFor(parent);
   const tools = new Map();
   let phase = "Connecting…";
@@ -4663,15 +4829,15 @@ function createLiveActivity(parent, before) {
     parent.insertBefore(fold.box, anchor && anchor.parentNode === parent ? anchor : null);
     return fold;
   };
-  const showSubagents = (payload, after = null) => {
+  const showSubagents = (payload, after = null, afterSlot = null) => {
     if (!subagents && !payload) return;
     if (!subagents) {
       subagents = insert("subagents", "subagents");
       subagents.box.dataset.subagents = "true";
-      subagents.box.dataset.executionState = "running";
-      subagentClock = createSubagentClock(subagents);
+      subagents.box.dataset.executionState = subagents.box._executionState = "running";
+      subagentClock = createSubagentClock(subagents, owner);
     }
-    subagentClock.set(payload);
+    subagentClock.set(payload, afterSlot);
     // Re-anchoring is invisible only once the card is collapsed; set() above may
     // close it in this same paint. Moving a card that is still open would scroll
     // the text the reader is looking at.
@@ -4681,7 +4847,7 @@ function createLiveActivity(parent, before) {
     }
     // Only an explicit busy flag means work is still in flight. A report without
     // one settles the card, otherwise it would never join the completed group.
-    subagents.box.dataset.executionState = subagents.box.dataset.taskBusy === "true" ? "running" : "completed";
+    subagents.box.dataset.executionState = subagents.box._executionState = subagentClock.busy() === true ? "running" : "completed";
   };
   const renderTool = (tool) => {
     const call = { function: { name: tool.name, arguments: tool.arguments || "{}" } };
@@ -4689,9 +4855,9 @@ function createLiveActivity(parent, before) {
     const taskReport = taskReportOf(tool.task_report);
     const taskResult = projectTaskReport(tool.task_report, false);
     const title = icon + callLabel(call) + (taskResult ? " · raw" : "") + (tool.cached ? " · cached" : "");
-    tool.fold.box.dataset.running = String(tool.running);
-    tool.fold.box.dataset.executionState = tool.running ? "running" : "completed";
-    tool.fold.box.dataset.executionException = String(tool.ok === false || Boolean(taskReport?.error)
+    tool.fold.box.dataset.running = tool.fold.box._executionRunning = String(tool.running);
+    tool.fold.box.dataset.executionState = tool.fold.box._executionState = tool.running ? "running" : "completed";
+    tool.fold.box.dataset.executionException = tool.fold.box._executionException = String(tool.ok === false || Boolean(taskReport?.error)
       || Boolean(taskReport?.tasks.some((task) => task.error)));
     const args = tool.arguments ? "Arguments\n" + tool.arguments + (tool.arguments_truncated ? "\n[preview truncated]" : "") + "\n\n" : "";
     tool.fold.set(title, args + (tool.output || "")
@@ -4700,7 +4866,7 @@ function createLiveActivity(parent, before) {
       tool.fold.box.dataset.taskRawTool = "true";
       tool.fold.box.dataset.taskMerged = "true";
       renderTaskToolResult(tool.fold, taskResult);
-      showSubagents({ task_report: tool.task_report }, tool.fold.box);
+      showSubagents({ task_report: tool.task_report }, tool.fold.box, "tool:" + tool.id);
     } else {
       delete tool.fold.box.dataset.taskRawTool;
       delete tool.fold.box.dataset.taskMerged;
@@ -4719,7 +4885,7 @@ function createLiveActivity(parent, before) {
       if (!event || !event.id || !event.name || !["started", "finished"].includes(event.phase)) return;
       let tool = tools.get(event.id);
       if (!tool) {
-        tool = { fold: insert(event.name, "tool:" + (event.id || event.name + ":" + tools.size)), name: event.name };
+        tool = { id: event.id, fold: insert(event.name, "tool:" + (event.id || event.name + ":" + tools.size)), name: event.name };
         tool.fold.box.classList.add("tool-activity");
         tools.set(event.id, tool);
       }
@@ -4732,35 +4898,44 @@ function createLiveActivity(parent, before) {
       }
       tool.running = event.phase === "started";
       phase = "Processing…";
+      updateExecutionModel({ kind: "task", owner, slot: "tool:" + event.id,
+        summary: projectTaskReport(tool.task_report, false) });
       renderTool(tool);
       groups.sync();
+      if (typeof syncStopButton === "function") syncStopButton();
     },
-    subagents(payload) { showSubagents(payload); groups.sync(); },
-    finish(reason) {
+    subagents(payload) {
+      showSubagents(payload); groups.sync();
+      if (typeof syncStopButton === "function") syncStopButton();
+    },
+    finish(reason, answer = false) {
+      updateExecutionModel({ kind: "finish", owner, reason, answer });
       if (subagentClock) subagentClock.stop();
       for (const tool of tools.values()) if (tool.running) {
         tool.running = false;
-        tool.fold.box.dataset.running = "false";
-        tool.fold.box.dataset.executionState = "completed";
-        tool.fold.box.dataset.executionException = "true";
+        tool.fold.box.dataset.running = tool.fold.box._executionRunning = "false";
+        tool.fold.box.dataset.executionState = tool.fold.box._executionState = "completed";
+        tool.fold.box.dataset.executionException = tool.fold.box._executionException = "true";
         tool.fold.set(callLabel({ function: { name: tool.name, arguments: tool.arguments || "{}" } }) + " · " + reason,
           (tool.arguments || "") + "\n" + (tool.output || ""));
       }
       if (reason === "interrupted" || reason === "failed") {
-        const folds = [...tools.values()].map((tool) => tool.fold);
-        if (subagents) folds.push(subagents);
-        for (const fold of folds) {
-          if (fold.box.dataset.taskBusy === "true") fold.box.dataset.executionException = "true";
+        const folds = [...tools.values()].map((tool) => ({ fold: tool.fold, busy: projectTaskReport(tool.task_report, false)?.busy }));
+        if (subagents) folds.push({ fold: subagents, busy: subagentClock.busy() });
+        for (const { fold, busy } of folds) {
+          if (busy === true) fold.box.dataset.executionException = fold.box._executionException = "true";
+          fold.box._taskResult = { taskStates: [], busy: false, resetTasks: true };
           delete fold.box.dataset.taskStates;
           fold.box.dataset.taskBusy = "false";
           fold.box.dataset.taskReset = "true";
-          fold.box.dataset.executionState = "completed";
+          fold.box.dataset.executionState = fold.box._executionState = "completed";
         }
       }
       phase = reason;
       waiting = false;
       groups.sync();
     },
+    remove() { updateExecutionModel({ kind: "remove", owner }); },
   };
 }
 
@@ -6617,6 +6792,20 @@ function historyRowsOf(msgs, histTotal, showAll) {
   }
   return { rows, shownCount: shown.length };
 }
+function historyExecutionOf(rows) {
+  const summaries = [];
+  for (const row of rows) {
+    const m = row.message;
+    if (m.role === "assistant" && (!Array.isArray(m.tool_calls) || !m.tool_calls.length)) {
+      summaries.push({ taskStates: [], busy: null, resetTasks: true });
+    } else if (m.role !== "user" && m.role !== "assistant") {
+      const raw = m.task_report ? projectTaskReport(m.task_report, false) : null;
+      if (raw) summaries.push(raw);
+      if (row.subagentReport) summaries.push(projectTaskReport(row.subagentReport));
+    }
+  }
+  return summaries;
+}
 function renderHistoryRow(row, parent) {
   const m = row.message;
   const executionBoxes = [];
@@ -6637,7 +6826,7 @@ function renderHistoryRow(row, parent) {
     let thinkingSummary = null;
     if (row.reasoning) {
       const fold = addFold("thinking", row.reasoning, group);
-      fold.box.dataset.executionState = "completed";
+      fold.box.dataset.executionState = fold.box._executionState = "completed";
       thinkingSummary = fold.box.querySelector("summary");
       const det = fold.box.querySelector("details");
       if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + row.identity + ":thinking");
@@ -6670,10 +6859,10 @@ function renderHistoryRow(row, parent) {
       fallback === null ? row.text.slice(0, 2000) : fallback, container);
     if (m.role === "tool") {
       executionBoxes.push(fold.box);
-      fold.box.dataset.executionState = "completed";
-      fold.box.dataset.executionSettled = String(row.executionSettled === true);
+      fold.box.dataset.executionState = fold.box._executionState = "completed";
+      fold.box.dataset.executionSettled = fold.box._executionSettled = String(row.executionSettled === true);
       const taskReport = taskReportOf(m.task_report);
-      fold.box.dataset.executionException = String(Boolean(taskReport?.error) || Boolean(taskReport?.tasks.some((task) => task.error)));
+      fold.box.dataset.executionException = fold.box._executionException = String(Boolean(taskReport?.error) || Boolean(taskReport?.tasks.some((task) => task.error)));
     }
     if (taskResult) {
       fold.box.dataset.taskRawTool = "true";
@@ -6691,9 +6880,9 @@ function renderHistoryRow(row, parent) {
       const subagents = addFold(taskReportLabel(row.subagentReport), "", container);
       executionBoxes.push(subagents.box);
       subagents.box.dataset.subagents = "true";
-      subagents.box.dataset.executionState = "completed";
-      subagents.box.dataset.executionSettled = String(row.executionSettled === true);
-      subagents.box.dataset.executionException = String(Boolean(row.subagentReport.error) || Boolean(row.subagentReport.tasks.some((task) => task.error)));
+      subagents.box.dataset.executionState = subagents.box._executionState = "completed";
+      subagents.box.dataset.executionSettled = subagents.box._executionSettled = String(row.executionSettled === true);
+      subagents.box.dataset.executionException = subagents.box._executionException = String(Boolean(row.subagentReport.error) || Boolean(row.subagentReport.tasks.some((task) => task.error)));
       renderTaskToolResult(subagents, projectTaskReport(row.subagentReport));
       const details = subagents.box.querySelector("details");
       if (details && typeof bindStoredFold === "function") bindStoredFold(details, sessionId + "\n" + row.identity + ":subagents");
@@ -6709,7 +6898,7 @@ function renderHistoryRow(row, parent) {
     // A final answer can settle an unchanged task row. Refresh presentation
     // state without rebuilding its original disclosure or attachment nodes.
     node._aserveRefreshExecution = (next) => {
-      for (const box of executionBoxes) box.dataset.executionSettled = String(next.executionSettled === true);
+      for (const box of executionBoxes) box.dataset.executionSettled = box._executionSettled = String(next.executionSettled === true);
     };
   }
 }
@@ -6742,6 +6931,11 @@ function attachLiveBox() {
   // retired live box beside the newly rendered reply.
   if (box === staleBox) return;
   root.appendChild(box);
+  const displayed = displayedExecutionState();
+  if (displayed.sessionId !== sessionId || displayed.base !== executionBase()) {
+    commitExecutionView();
+    syncStopButton();
+  }
   followOutput(follow, root);
 }
 function attachPendingInputs(root) {
@@ -6858,12 +7052,14 @@ async function retryHistory() {
 async function loadHistory(prefetched, canCommit = () => true) {
   // Prefetched rows keep the session they were captured for.
   const forSession = prefetched?.sessionId ?? sessionId;
+  const base = executionBase();
   if (forSession !== sessionId || !canCommit()) return;
   if (typeof beginTranscriptScroll === "function" && isDesktopTranscriptScroll()
       && (!transcriptScrollState || transcriptScrollState.sessionId !== forSession)) beginTranscriptScroll(forSession);
   const loadId = ++historyLoadSeq;
-  const current = () => forSession === sessionId && loadId === historyLoadSeq && canCommit();
+  const current = () => forSession === sessionId && base === executionBase() && loadId === historyLoadSeq && canCommit();
   if (!sessionId) {
+    updateExecutionModel({ kind: "history", summaries: [] });
     revokePreviews();
     $("msgs").textContent = "";
     historySession = "";
@@ -6873,6 +7069,8 @@ async function loadHistory(prefetched, canCommit = () => true) {
     const nav = $("promptlist");
     if (nav) nav._signature = "";
     addMsg("asst", "no session yet — tap ＋ to start one.", "asst");
+    commitExecutionView("", base);
+    syncStopButton();
     return;
   }
   const state = historyLoadState(forSession), loadKey = state.key;
@@ -6936,7 +7134,6 @@ async function loadHistory(prefetched, canCommit = () => true) {
       staleKey = histKey(msgs);
       staleDone = histEndsTurn(msgs);
       lastHistoryEndsUnanswered = historyEndsUnanswered(msgs);
-      syncStopButton();
       renderSessionBar();
       if (!lastHistoryEndsUnanswered) root.querySelectorAll(".turn-interrupted").forEach((node) => node.remove());
       const sameSession = historySession === forSession;
@@ -7053,8 +7250,13 @@ async function loadHistory(prefetched, canCommit = () => true) {
           for (const row of history.rows) renderHistoryRow(row, root);
         }
       }
+      updateExecutionModel({ kind: "history", summaries: historyExecutionOf(history.rows),
+        replaceActivities: !sameSession || nextKeys.length !== historyKeys.length
+          || nextKeys.some((key, index) => key !== historyKeys[index]) }, forSession, base);
       historySession = forSession;
       historyKeys = nextKeys;
+      commitExecutionView(forSession, base);
+      syncStopButton();
       updateQuestionButton();
       if (typeof mountTranscriptScroll === "function") mountTranscriptScroll(forSession, follow, root);
       attachLiveBox();
@@ -7076,7 +7278,8 @@ async function loadHistory(prefetched, canCommit = () => true) {
       state.failure = null;
     } catch (e) {
       console.error("history render failed for session " + forSession, e);
-      if (historySession !== forSession) {
+      const clearedTranscript = historySession !== forSession;
+      if (clearedTranscript) {
         revokePreviews(root);
         root.textContent = "";
       }
@@ -7086,6 +7289,8 @@ async function loadHistory(prefetched, canCommit = () => true) {
       lastMsgCount = null;
       renderSessionBar();
       addMsg("err", "history render failed: " + (e && e.message ? e.message : String(e)), "asst err");
+      if (clearedTranscript) clearExecutionView(base);
+      syncStopButton();
     }
   } finally {
     if (state.loading === loadId) {
@@ -7573,7 +7778,7 @@ function recoveredProgressView(sid = sessionId) {
   phaseBubble.className = "msg asst pending";
   box.appendChild(phaseBubble);
   $("msgs").appendChild(box);
-  const activity = createLiveActivity(box, bubble);
+  const activity = createLiveActivity(box, bubble, sid);
   const answerBubbles = [bubble];
   const outputRate = createOutputRateCounter();
   const thinkingRates = createThinkingRateRecorder(sid, () => paintPhase());
@@ -7698,7 +7903,7 @@ function recoveredProgressView(sid = sessionId) {
       closed = true;
       clearInterval(phaseTimer);
       endThinking();
-      activity.finish(reason);
+      activity.finish(reason, Boolean(answer.trim()));
       const measured = outputRate.text(true);
       const rate = tokenRate || (measured ? "output " + measured : "") || lastOutputRate;
       rememberRate("turn", sid, answer.trim() ? answer : sealedAnswerText || lastThinkingText, rate);
@@ -7710,7 +7915,7 @@ function recoveredProgressView(sid = sessionId) {
       phaseBubble.remove();
       showTurnRate(rate);
     },
-    remove() { closed = true; clearInterval(phaseTimer); endThinking(); box.remove(); },
+    remove() { closed = true; clearInterval(phaseTimer); endThinking(); activity.remove?.(); box.remove(); },
   };
 }
 
@@ -7795,21 +8000,28 @@ function clearEventWarnings(sid, epoch) {
 async function attachEvents() {
   if (!sessionId || eventActive || turns.has(sessionId) || eventFailures >= 5) return;
   const sid = sessionId;
+  const base = executionBase();
   const epoch = runEpoch;
+  const mountedView = displayedExecutionState();
   const controller = new AbortController();
   eventAbort = controller;
   eventActive = true;
   eventSession = sid;
-  syncStopButton();
   ensureConfirmPoll();
   const view = recoveredProgressView(sid);
   recoveredView = view;
+  // Replay is appended to the mounted transcript. It may be the first view for
+  // this session, but it must not claim a different session's retained rows.
+  if (!mountedView.sessionId || (mountedView.base === base && mountedView.sessionId === sid)) {
+    commitExecutionView(sid, base);
+  }
+  syncStopButton();
   view.phase("Reconnecting…");
   let buf = "";
   let finished = false;
   let timedOut = false, waiting = false;
   let silenceTimer = null, progressTimer = null;
-  const ownsStream = () => sid === sessionId && epoch === runEpoch && eventAbort === controller;
+  const ownsStream = () => sid === sessionId && base === executionBase() && epoch === runEpoch && eventAbort === controller;
   const expire = () => { if (ownsStream()) { timedOut = true; controller.abort(); } };
   const armSilence = () => {
     clearTimeout(silenceTimer);
@@ -7839,7 +8051,7 @@ async function attachEvents() {
         localStorage.setItem("serve.client", clientToken);
       }
     } catch (_) {}
-    const eventsUrl = store.base + "/sessions/" + sid + "/events?after=0&client=" +
+    const eventsUrl = base + "/sessions/" + sid + "/events?after=0&client=" +
       encodeURIComponent(clientToken);
     const res = await fetch(eventsUrl, {
       headers: headers(false), signal: controller.signal,
@@ -7931,13 +8143,14 @@ async function pollConfirm() {
   ensureConfirmPoll();
   const seq = ++confirmPollSeq;
   const sid = sessionId;
+  const base = executionBase();
   const epoch = runEpoch;
   let body;
   try { body = await (await api("/sessions/" + sid + "/confirm")).json(); }
   catch (_) { return null; } // transient (hidden mid-flight, server restarting): retry next tick
   // The fetch can outlive what it describes (answered while it was in flight,
   // session switched, newer turn started): re-check before touching anything.
-  if (confirmBusy || sid !== sessionId) return null;
+  if (confirmBusy || sid !== sessionId || base !== executionBase()) return null;
   if (epoch !== runEpoch || seq !== confirmPollSeq) return null;
   // The same poll reports a live turn for this session: the server is the only
   // source that survives this page losing the stream. A missing field means an
@@ -7993,7 +8206,7 @@ async function pollConfirm() {
     if (eventActive && eventSession === sid) {
       abortEvents();
       await loadHistory();
-      if (sid !== sessionId || epoch !== runEpoch || seq !== confirmPollSeq) return null;
+      if (sid !== sessionId || base !== executionBase() || epoch !== runEpoch || seq !== confirmPollSeq) return null;
     }
     if (wasRemote) {
       await loadHistory();
@@ -8023,41 +8236,34 @@ async function pollConfirm() {
 // cover different running states. History can end in provisional assistant
 // text, so only a terminal event or an idle server poll resolves recovery.
 function isRemoteTurn() {
-  return !!remoteTurnPid && Date.now() - remoteTurnAt < REMOTE_RUNNING_TTL_MS;
+  const state = executionState();
+  return !!state.remotePid && Date.now() - state.remoteAt < REMOTE_RUNNING_TTL_MS;
 }
 function isTurnRunning() {
-  if (!sessionId) return false;
+  const state = executionState();
+  const displayed = displayedExecutionState();
+  if (!state.sessionId) return false;
   // Another process's turn has no local stream and no `turnRunning` sample,
   // but it must still block a second send and keep history follow alive.
-  if (typeof isRemoteTurn === "function" && isRemoteTurn()) return true;
-  if (turns.has(sessionId)) return true;
-  if (eventStreamFailed) return false;
+  if (state.remotePid && Date.now() - state.remoteAt < REMOTE_RUNNING_TTL_MS) return true;
+  if (state.live) return true;
+  if (state.failed) return false;
   // A parked foreground turn can close its model-output stream while a
-  // subagent is still running. Reconcile task result cards in transcript
-  // order so a later completion clears an earlier spawn/running state.
-  const taskStates = new Map();
-  let taskBusy = null;
-  const taskCards = typeof document !== "undefined" && document.querySelectorAll
-    ? document.querySelectorAll("#msgs [data-task-states], #msgs [data-task-busy], #msgs [data-task-reset]") : [];
-  for (const card of taskCards) {
-    if (card.dataset.taskReset === "true") { taskStates.clear(); taskBusy = null; }
-    try {
-      for (const [id, state] of JSON.parse(card.dataset.taskStates || "[]")) taskStates.set(id, state);
-    } catch (_) {}
-    if (card.dataset.taskBusy === "true") taskBusy = true;
-    else if (card.dataset.taskBusy === "false") taskBusy = false;
-  }
-  const activeTask = [...taskStates.values()].some((active) => active === true);
-  if (activeTask || taskBusy === true) return true;
+  // subagent is still running. Producer observations for the displayed view,
+  // never card placement, decide whether a later snapshot settled that ledger.
+  if ([...displayed.taskStates.values()].some((active) => active === true) || displayed.taskBusy === true) return true;
   // OutputComplete ends the visible turn before its child is reaped. Do not
   // let that child's running sample keep the composer stopped after done.
-  if (eventStreamEnded) return false;
-  const freshServerTurn = turnRunning && (Date.now() - turnRunningAt) < RUNNING_SAMPLE_TTL_MS;
-  return (eventActive && eventSession === sessionId) || staleSession === sessionId || freshServerTurn;
+  if (state.ended) return false;
+  const freshServerTurn = state.running && (Date.now() - state.runningAt) < RUNNING_SAMPLE_TTL_MS;
+  return state.attached || state.recovering || freshServerTurn;
 }
+function canSend() { return !executionState().sendBusy && !isTurnRunning(); }
+function canStop() { return isTurnRunning(); }
 // The one send/stop button reflects that predicate: stop glyph plus the stop
 // class while a turn runs, the plain send look otherwise.
 function syncStopButton() {
+  const state = executionState();
   const b = $("send");
   const running = isTurnRunning();
   b.textContent = running ? "⏹" : "➤";
@@ -8072,9 +8278,8 @@ function syncStopButton() {
   // The note affordance follows the live view, not the stop glyph's terminal
   // latches: a feed that dropped (or a page resumed mid-turn) still shows the
   // running transcript, and the composer can queue a note into that turn.
-  const noteReady = running || (eventActive && eventSession === sessionId)
-    || staleSession === sessionId || turns.has(sessionId);
-  sideNote.disabled = sideNoteBusy;
+  const noteReady = running || state.attached || state.recovering || state.live;
+  sideNote.disabled = state.sideNoteBusy;
   sideNote.setAttribute("aria-hidden", String(!noteReady));
   sideNote.tabIndex = noteReady ? 0 : -1;
   // The side note joins the composer grid as a column of its own, which
@@ -8083,8 +8288,7 @@ function syncStopButton() {
     $("composer").classList.toggle("side-note-ready", noteReady);
     sideNote.classList.toggle("show", noteReady);
   });
-  const attachedEvents = eventActive && eventSession === sessionId;
-  const detached = sessionId && running && !turns.has(sessionId) && !attachedEvents;
+  const detached = state.sessionId && running && !state.live && !state.attached;
   const box = $("composer");
   if (box && typeof box.setAttribute === "function") { box.setAttribute("aria-busy", detached ? "true" : "false"); }
 }
@@ -8209,7 +8413,8 @@ async function refreshSideNotes() {
   renderSideNotes(Array.isArray(body.notes) ? body.notes : []);
 }
 async function stopTurn() {
-  if (stopBusy || !sessionId) return;
+  const state = executionState();
+  if (state.stopBusy || !state.sessionId) return;
   if (typeof isRemoteTurn === "function" && isRemoteTurn()) {
     if (!$("msgs").querySelector(".remote-turn-note")) {
       addMsg(
@@ -8233,7 +8438,8 @@ async function stopTurn() {
     return;
   }
   stopBusy = false;
-  turnRunning = false; // the POST returned: the next poll re-asserts the truth
+  // The POST returned for this owner; the next poll re-asserts its truth.
+  updateExecutionModel({ kind: "field", name: "turnRunning", value: false }, state.sessionId, state.base);
   if (interrupted) note("stopping…");
   else { note("no turn running"); await loadHistory(); await loadSessions(); }
   // The server is the truth for both the pending question and `running`, so an
@@ -8287,6 +8493,8 @@ function applySessionCwd(sid, cwd) {
 function adoptComposerSession(newId, previousId, base) {
   if (sessionId !== previousId || store.base !== base) return false;
   sessionId = newId;
+  updateExecutionModel({ kind: "select" });
+  commitExecutionView(newId, base);
   if (typeof mountTranscriptScroll === "function") mountTranscriptScroll(newId, false);
   pendingNew = newId;
   localStorage.setItem("serve.session", newId);
@@ -8571,7 +8779,7 @@ async function prepareTurnSession(previousId, base) {
     persistPicks();
   }
   if (isTurnRunning()) { note("this session is already running a turn — stop it, or send from another session"); return ""; }
-  if (turns.size >= MAX_LIVE_TURNS) { note("already streaming " + turns.size + " turns — wait for one to finish"); return ""; }
+  if (executionState().liveCount >= MAX_LIVE_TURNS) { note("already streaming " + executionState().liveCount + " turns — wait for one to finish"); return ""; }
   // Finish an earlier UI config write before forwarding the original input.
   // The child owns /use and /reset, so their later persisted result wins.
   if (!await ensureTeamConfig(sid, base)) return "";
@@ -8600,7 +8808,7 @@ async function send() {
     }
     return;
   }
-  if (sendBusy || isTurnRunning()) return;
+  if (!canSend()) return;
   // Send the textarea bytes as typed: the server stores them unchanged, so a
   // client-side trim would make the transcript differ from the input. The
   // trimmed view only decides whether there is anything to send.
@@ -8661,6 +8869,7 @@ async function send() {
 
   stopStaleFollow(); // this turn's own stream owns the view from here on
   runEpoch++; // late polls from any previous turn no longer vote on the button
+  updateExecutionModel({ kind: "begin" }, sid, sendBase);
   turnRunning = false; // this page's own feed is the running-turn truth now
   // Everything this turn writes goes into a container of its own, registered
   // under its session: the stream stays readable while the user works in
@@ -8686,7 +8895,8 @@ async function send() {
       try { if (reader) reader.cancel(); } catch (_) {}
     },
   };
-  turns.set(sid, liveEntry);
+  updateExecutionModel({ kind: "live", entry: liveEntry }, sid, sendBase);
+  commitExecutionView(sid, sendBase);
   syncStopButton(); // only now does isTurnRunning() see this session's own turn
   // Progress and thinking folds are inserted lazily in stream order ahead of
   // the final reply, so tool phases remain visible between reasoning phases.
@@ -8701,11 +8911,11 @@ async function send() {
   // Mount the first visible turn state before following once; scrolling the
   // user row and then the status row produces the visible two-step jump.
   if (typeof scrollToLatest === "function") scrollToLatest(false);
-  const activity = createLiveActivity(box, bubble);
+  const activity = createLiveActivity(box, bubble, sid, sendBase);
   const clockStart = Date.now();
   const outputRate = createOutputRateCounter();
   const thinkingRates = createThinkingRateRecorder(sid, () => {
-    if (turns.get(sid) === liveEntry) refreshThinkingRate();
+    if (executionState(sid, sendBase).liveEntry === liveEntry) refreshThinkingRate();
   });
   let tokenRate = "", sealedAnswerText = "", lastThinkingText = "", lastOutputRate = "";
   const tokenRates = new Map();
@@ -8727,7 +8937,7 @@ async function send() {
   const phaseTimer = setInterval(() => {
     // The box is parked while the user reads another session; keep the clock
     // live through that detach so it is current when attachLiveBox restores it.
-    if (turns.get(sid) !== liveEntry) { clearInterval(phaseTimer); return; }
+    if (executionState(sid, sendBase).liveEntry !== liveEntry) { clearInterval(phaseTimer); return; }
     refreshThinkingRate();
     phaseBubble.textContent = phaseLine();
     showTurnRate(mainRate());
@@ -8908,7 +9118,7 @@ async function send() {
   const fail = (msg) => {
     closeThinkingPhase();
     if (paintTimer !== null) { clearTimeout(paintTimer); paintTimer = null; }
-    if (sid === sessionId) {
+    if (sid === sessionId && sendBase === executionBase()) {
       confirmPollSeq++;
       eventStreamEnded = true;
       endedTurnPid = turnRunningPid;
@@ -9012,9 +9222,9 @@ async function send() {
         if (kind !== "" || payload) armProgress();
         if (kind === "done") {
           closeThinkingPhase();
-          activity.finish("ended");
+          activity.finish("ended", Boolean(bubble && raw.trim()));
           activityDirty = false;
-          if (sid === sessionId) {
+          if (sid === sessionId && sendBase === executionBase()) {
             eventStreamEnded = true;
             endedTurnPid = turnRunningPid;
             confirmPollSeq++;
@@ -9192,7 +9402,7 @@ async function send() {
       // turn in a session the user has left is retired, and its reply is what
       // that session renders when it is opened again.
       const reason = recoverReason || (stalled ? "stream stalled (no progress for 5 minutes)" : "stream ended before completion");
-      if (sid === sessionId) goStale(reason + " — checking server history");
+      if (sid === sessionId && sendBase === executionBase()) goStale(reason + " — checking server history");
       else dropBackgroundTurn(box, reason);
     }
     else if (bubble && !raw.trim()) {
@@ -9215,7 +9425,7 @@ async function send() {
       // stale. Follow the transcript instead of declaring the turn dead — for
       // the session on screen only: a turn the user has left keeps running
       // unheard, and that session follows it from history when it comes back.
-      if (sid === sessionId) goStale("connection lost: " + e.message + " — the turn keeps running on the server (following history)");
+      if (sid === sessionId && sendBase === executionBase()) goStale("connection lost: " + e.message + " — the turn keeps running on the server (following history)");
       else dropBackgroundTurn(box, "connection lost");
     } else fail("turn failed: " + e.message);
   }
@@ -9223,11 +9433,12 @@ async function send() {
   // whether or not the box stays on screen.
   clearInterval(phaseTimer);
   thinkingRates.stop();
-  turns.delete(sid);
+  updateExecutionModel({ kind: "live", entry: null }, sid, sendBase);
+  if (wentStale || sid !== sessionId || sendBase !== executionBase()) activity.remove?.();
   // The server persisted this input before it ran the turn, so history keeps
   // it even if the page's message count drifted.
   if (turnStarted) userInput.settled = true;
-  if (wentStale && sid === sessionId) {
+  if (wentStale && sid === sessionId && sendBase === executionBase()) {
     // The live feed died but its turn is still running on the server, and the
     // server kept that turn's event stream: reattach to it so the reply keeps
     // streaming (with its thinking and its partial answer) instead of leaving
@@ -9249,7 +9460,7 @@ async function send() {
   // stale ticks, boot) re-derive the truth when there is something to see.
   // ... only for the session this feed belongs to: a sample that describes the
   // session on screen (some other session's turn) is not this stream's to clear.
-  if (sid === sessionId) turnRunning = false;
+  updateExecutionModel({ kind: "field", name: "turnRunning", value: false }, sid, sendBase);
   syncStopButton();
   // A box for a turn that finished while the user was elsewhere is dropped:
   // that session's transcript is rebuilt from history when it is opened, which
@@ -9386,7 +9597,7 @@ function wire() {
     output.value = "";
     output.hidden = true;
   };
-  $("send").onclick = () => { if (isTurnRunning()) stopTurn(); else send(); };
+  $("send").onclick = () => { if (canStop()) stopTurn(); else send(); };
   $("sidenote").onclick = sendSideNote;
   // The dialog is the only way to unblock a turn that stopped to ask; both
   // answers post to /sessions/{id}/confirm through answerConfirm.
@@ -9609,6 +9820,8 @@ function wire() {
       // loadSessions refresh only the drawer/bar around the pending id.
       $("msgs").textContent = "";
       addMsg("asst", "new session — type below to start.", "asst");
+      commitExecutionView(newId, executionBase());
+      syncStopButton();
       await loadSessions();
       loadSessionConfig(); // a fresh session owns no config; clear the picks
     } catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); }

@@ -108,6 +108,8 @@ function harness({ sid = "s1", images = [], respond } = {}) {
     loadInfo: async () => {}, loadSessions: async () => {}, loadSessionConfig: async () => {},
   });
   for (const code of [
+    between("// BEGIN execution model", "// END execution model"),
+    between("function canSend()", "// The one send/stop button"),
     between("function headers(", "const esc ="),
     marked("composer cd command"), marked("composer git command"), marked("turn session preparation"),
     between("function parseBlock(raw)", "// `/cd` changes"),

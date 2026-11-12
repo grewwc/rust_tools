@@ -120,6 +120,7 @@ function harness({ phone = false, width = phone ? 390 : 1280, storage = new Map(
     closeThinkingPhase() {}, sealAnswerSegment() {}, mutateTranscript: (fn) => fn(), schedulePaint() {},
   });
   for (const [first, last] of [
+    ["// BEGIN execution model", "// END execution model"],
     ["let lastFoldTap", "// The agent sends a phone action"],
     ["function toolArgsOf(", "const RATE_STORAGE ="],
     ["function addFold(", "// The three override picks"],

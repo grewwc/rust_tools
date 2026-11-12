@@ -236,7 +236,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     setDrawer: (open) => drawers.push(open), growPrompt: () => { grows++; },
     promptComposing: false, traceMark() {}, composerInUse: () => false,
     syncStopButton() {}, resetQuestionNavigator() {}, restoreSkillPick() {}, restoreTeamPick() {},
-    stopStaleFollow() {}, hideConfirm() {}, pollConfirm() {}, resetPicks() {}, abortEvents() {},
+    stopStaleFollow() {}, startStaleFollow() {}, hideConfirm() {}, pollConfirm() {}, resetPicks() {}, abortEvents() {},
     carrySkillPick() {}, carryTeamPick() {}, persistPicks() {}, ensureTeamConfig: async () => true,
     runCdCommand: async () => false, validateSkillInput: () => true,
     captureSkillPick: () => ({ skills: [] }), consumeSkillPick() {},
@@ -258,6 +258,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     formatElapsed: () => "0s", replyPaintDelay: () => 0, renderMarkdown: (text) => text,
     loadInfo: async () => {},
   });
+  vm.runInContext(marked("execution model"), context);
   vm.runInContext(between("function headers(", "const esc ="), context);
   vm.runInContext(between("function sessionTitle(s)", "// Phone drawer floats"), context);
   vm.runInContext(between("function setPromptValue(", "// True while the composer"), context);
@@ -999,7 +1000,7 @@ for (const width of [390, 1280]) {
     parent.className = "turn"; h.elements.msgs.appendChild(parent);
     const first = h.context.addFold("read_file", "selectable output", parent, "blank:first");
     const second = h.context.addFold("thinking", "reasoning", parent, "blank:second");
-    first.box.dataset.executionState = second.box.dataset.executionState = "completed";
+    first.box.dataset.executionState = first.box._executionState = second.box.dataset.executionState = second.box._executionState = "completed";
     h.context.addFold("current execution", "running", parent, "blank:current");
     const groups = h.context.executionGroupsFor(parent, stored);
     groups.sync();

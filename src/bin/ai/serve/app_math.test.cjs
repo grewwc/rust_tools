@@ -29,15 +29,20 @@ function renderedKeys(root) {
 // pull in whole-page state those slices do not carry. Supply inert versions so
 // a call succeeds; app_desktop/app_task_results cover the real behaviour.
 const createContext = vm.createContext.bind(vm);
-vm.createContext = (sandbox = {}) => createContext({
+vm.createContext = (sandbox = {}) => {
+  const context = createContext({
   executionGroupsFor: () => ({ sync() {}, restore() {} }),
   pendingImages: [],
   window: { matchMedia: () => ({ matches: false }), addEventListener() {}, removeEventListener() {} },
   createTurnRateLine: () => () => {},
   // Rate decoration is display-only; app_desktop covers its real rendering.
   showTurnRate: () => {},
+  historyExecutionOf: () => [],
   ...sandbox,
-});
+  });
+  vm.runInContext(script.slice(script.indexOf("// BEGIN execution model"), script.indexOf("// END execution model")), context);
+  return context;
+};
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const historyRetrySrc = script.slice(script.indexOf("// BEGIN history retry"), script.indexOf("// END history retry"));
 const userOriginHelpers = script.slice(script.indexOf("function isRuntimeSyntheticUser("), script.indexOf("const PHONE_LAYOUT_QUERY"));
@@ -619,8 +624,10 @@ test("a mobile side note queues text without stopping the running turn", async (
     pendingImages: [],
     isTurnRunning: () => true,
     $: (id) => id === "prompt" ? prompt : button,
+    setPromptValue: (value) => { prompt.value = value; return true; },
     api: async (path, options) => { calls.push([path, options]); },
     clearDraft: (id) => calls.push(["clearDraft", id]),
+    refreshSideNotes() {},
     note: (message) => notices.push(message),
     JSON,
   });
@@ -650,8 +657,9 @@ test("a side note posts immediately despite an expired running-state sample", as
     isTurnRunning: () => false,
     pollConfirm: () => { polls++; return new Promise(() => {}); },
     $: (id) => id === "prompt" ? prompt : button,
+    setPromptValue: (value) => { prompt.value = value; return true; },
     api: (path, options) => { posts.push([path, JSON.parse(options.body)]); return response; },
-    clearDraft() {}, note: (message) => notices.push(message), syncStopButton() {}, JSON,
+    clearDraft() {}, refreshSideNotes() {}, note: (message) => notices.push(message), syncStopButton() {}, JSON,
   });
   vm.runInContext(script.slice(start, end), context);
   const sending = context.sendSideNote();
@@ -714,6 +722,7 @@ test("image side notes upload screenshots once and accept images without text", 
     const context = vm.createContext({
       sideNoteBusy: false, sessionId: "session-a", pendingImages: [image],
       $: (id) => id === "prompt" ? prompt : button,
+      setPromptValue: (value) => { prompt.value = value; return true; },
       api: async (path, options) => posts.push([path, JSON.parse(options.body)]),
       clearDraft: (id) => cleared.push(id), refreshSideNotes() {}, note() {}, JSON,
     });
@@ -1476,7 +1485,7 @@ test("prompt composition defers reflow, draft writes and keyboard shortcuts", ()
   assert.match(promptHandlers, /compositionstart[\s\S]*?promptComposing = true/);
   assert.match(promptHandlers, /compositionend[\s\S]*?promptComposing = false[\s\S]*?growPrompt\(\)[\s\S]*?persistDraft\(\)/);
   assert.match(promptHandlers, /addEventListener\("input", \(e\)[\s\S]*?if \(promptComposing \|\| e\.isComposing\) \{[\s\S]*?return;/);
-  assert.match(promptHandlers, /addEventListener\("keydown", \(e\)[\s\S]*?if \(e\.isComposing \|\| e\.keyCode === 229\) return/);
+  assert.match(promptHandlers, /addEventListener\("keydown", \(e\)[\s\S]*?if \(promptComposing \|\| e\.isComposing \|\| e\.keyCode === 229\) return/);
   // A layout change during a composition cancels the word on Android WebView,
   // so the composer holds its height until the composition ends.
   assert.match(script, /function growPrompt\(\)[\s\S]*?if \(promptComposing\) return;/);
@@ -2469,6 +2478,7 @@ function pasteHarness(value = "") {
     growPrompt: () => calls.push("grow"),
     persistDraft: () => calls.push("draft"),
     promptComposing: false,
+    promptHistory: null, traceMark() {},
     setPromptValue: (value) => { prompt.value = value; return true; },
     note: (message) => calls.push(message),
     pendingImages: [],

@@ -176,6 +176,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
       addMsgMd: (text, parent) => { const row = node(); row.textContent = text; parent.appendChild(row); },
       createTurnRateLine: () => () => {}, estimateTextTokens: () => 0,
     });
+    vm.runInContext(between("// BEGIN execution model", "// END execution model"), context);
     vm.runInContext(between("// BEGIN session switch", "// END session switch"), context);
     vm.runInContext(between("// History is append-only", "// Historical user inputs"), context);
     const switchSession = context.switchSession, loadHistory = context.loadHistory;

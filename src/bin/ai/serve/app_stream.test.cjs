@@ -186,7 +186,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
   const listen = (type, fn) => listeners.set(type, (listeners.get(type) || []).concat(fn));
   const document = { hidden: false, body: box, addEventListener: listen, createElement: () => node() };
   const context = vm.createContext({
-    box, sid: "s", sessionId: "s", finished: false, turnError: false, document, $: () => box,
+    box, sid: "s", sessionId: "s", sendBase: "", finished: false, turnError: false, document, $: () => box,
     turns: new Map(), liveEntry: {},
     Date: { now: () => clock.now }, isPhoneLayout: () => phone,
     localStorage: {
@@ -218,6 +218,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
       clearInterval(id) { intervals.delete(id); },
     } : {}),
   });
+  vm.runInContext(script.slice(script.indexOf("// BEGIN execution model"), script.indexOf("// END execution model")), context);
   context.turns.set("s", context.liveEntry);
   vm.runInContext(script.slice(script.indexOf("function toolArgsOf("), script.indexOf("const FOLD_ROLE_LABELS")), context);
   vm.runInContext(script.slice(script.indexOf("function createThinkingFold("), script.indexOf("// The three override picks")), context);
@@ -410,6 +411,7 @@ function attachmentHarness(headersOnly = false, options) {
       }) }) } };
     },
   });
+  c.commitExecutionView(c.sessionId, c.executionBase());
   vm.runInContext(script.slice(script.indexOf("function parseBlock("), script.indexOf("async function send()")), c);
   vm.runInContext(script.slice(script.indexOf("function stopStaleFollow()"), script.indexOf("function startStaleFollow()")), c);
   const settle = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
@@ -1000,6 +1002,7 @@ test("status strip regression: restored sessions keep stop and busy state withou
     Date: { now: () => 100001 },
   });
   vm.runInContext(script.slice(script.indexOf("let promptComposing = false;"), script.indexOf("function composerBox()")), context);
+  vm.runInContext(script.slice(script.indexOf("// BEGIN execution model"), script.indexOf("// END execution model")), context);
   vm.runInContext(script.slice(script.indexOf("function isRemoteTurn()"), script.indexOf("function note(")), context);
   context.syncStopButton();
   assert.equal(elements.send.title, "stop this turn");
@@ -1025,7 +1028,7 @@ test("status strip regression: restored sessions keep stop and busy state withou
   context.syncStopButton();
   assert.equal(elements.composer.attrs["aria-busy"], "false");
   assert.equal(elements.send.title, "send");
-  context.sessionId = "b"; context.staleSession = "a";
+  context.sessionId = "b"; context.commitExecutionView("b", context.executionBase()); context.staleSession = "a";
   context.syncStopButton();
   assert.equal(elements.composer.attrs["aria-busy"], "false");
 });
@@ -2190,6 +2193,7 @@ test("a finished event stream is not re-attached on every poll, but a new turn i
   const start = script.indexOf("async function pollConfirm()");
   const end = script.indexOf("function isTurnRunning()", start);
   assert.ok(start > 0 && end > start);
+  vm.runInContext(script.slice(script.indexOf("// BEGIN execution model"), script.indexOf("// END execution model")), context);
   vm.runInContext(script.slice(start, end), context);
   // The server reports a running turn: the page attaches to the event stream.
   await vm.runInContext("pollConfirm()", context);
@@ -2260,8 +2264,9 @@ for (const phone of [false, true]) {
 
   test(`confirmed replay error overrides active canonical task state after history refresh (phone=${phone})`, async () => {
     const h = attachmentHarness(false, { phone }), c = h.c;
-    const oldCard = { dataset: { taskBusy: "true", taskStates: JSON.stringify([["task_replay_failure", true]]) } };
-    c.document.querySelectorAll = () => [oldCard];
+    c.updateExecutionModel({ kind: "history", summaries: [
+      { taskStates: [["task_replay_failure", true]], busy: true, resetTasks: false },
+    ] });
     const elements = runningComposer(c);
     elements.composer.setAttribute = (name, value) => { elements.composer[name] = value; };
     c.staleSession = "s";
@@ -2291,23 +2296,21 @@ test("a parked active task keeps the composer stopped after output complete", ()
     eventActive: false, eventSession: "", staleSession: "",
     turnRunning: false, turnRunningAt: 0,
   });
-  const card = { dataset: {
-    taskStates: JSON.stringify([["task_demo", true]]), taskBusy: "true",
-  } };
-  c.document.querySelectorAll = () => [card];
+  const owner = c.updateExecutionModel({ kind: "activity" });
+  c.updateExecutionModel({ kind: "task", owner, slot: "subagents",
+    summary: { taskStates: [["task_demo", true]], busy: true, resetTasks: false } });
   c.syncStopButton();
   assert.equal(elements.send.textContent, "⏹");
   assert.equal(elements.send.title, "stop this turn");
 
-  const finalAnswer = { dataset: { taskReset: "true" } };
-  c.document.querySelectorAll = () => [card, finalAnswer];
+  c.updateExecutionModel({ kind: "finish", owner, reason: "ended", answer: true });
   c.syncStopButton();
   assert.equal(c.isTurnRunning(), false, "a final answer after the task must clear stale running metadata");
   assert.equal(elements.send.textContent, "➤");
   assert.equal(elements.send.title, "send");
 
-  card.dataset.taskStates = JSON.stringify([["task_demo", false]]);
-  card.dataset.taskBusy = "false";
+  c.updateExecutionModel({ kind: "task", owner, slot: "subagents",
+    summary: { taskStates: [["task_demo", false]], busy: false, resetTasks: false } });
   c.syncStopButton();
   assert.equal(elements.send.textContent, "➤");
   assert.equal(elements.send.title, "send");
@@ -2315,8 +2318,9 @@ test("a parked active task keeps the composer stopped after output complete", ()
 
 test("a confirmed failure stays authoritative through an idle poll and resets for the next remote turn", async () => {
   const h = attachmentHarness(), c = h.c;
-  const oldCard = { dataset: { taskBusy: "true", taskStates: JSON.stringify([["old_task", true]]) } };
-  c.document.querySelectorAll = () => [oldCard];
+  c.updateExecutionModel({ kind: "history", summaries: [
+    { taskStates: [["old_task", true]], busy: true, resetTasks: false },
+  ] });
   const elements = runningComposer(c);
   Object.assign(c, { confirmBusy: false, confirmShown: null, armHistoryFollow() {},
     api: async () => ({ json: async () => ({ running: false, pending: null }) }),
@@ -2536,9 +2540,9 @@ test("a keep-alive comment proves the connection is alive, and only a real event
 });
 
 test("a feed that dies mid-turn reattaches to the retained event stream", () => {
-  const at = script.indexOf("turns.delete(sid);");
+  const at = script.indexOf('updateExecutionModel({ kind: "live", entry: null }, sid, sendBase);');
   assert.ok(at > 0);
-  const tail = script.slice(at, at + 900);
+  const tail = script.slice(at, script.indexOf("// The feed that just ended", at));
   assert.match(tail, /wentStale/, "the stale path must be marked");
   assert.match(tail, /attachEvents\(\)/, "the stale path must reattach to the retained stream");
   assert.match(tail, /box\.remove\(\)/, "the dead live box must be replaced by the reattached view");
@@ -2578,7 +2582,7 @@ test("a thinking card that lost its completion event joins the run before the ne
   assert.ok(think, "a reasoning phase renders a thinking card");
   // A reattached stream or a recovered view drops the phase binding, leaving a
   // finished card "running" while newer tool records keep arriving below it.
-  think.dataset.executionState = "running";
+  think.dataset.executionState = think._executionState = "running";
   h.emit("tool", { id: "t1", name: "task_wait", phase: "started", arguments: "{}" });
   h.emit("tool", { id: "t1", name: "task_wait", phase: "finished", output: "ok" });
   assert.equal(think.dataset.executionState, "completed", "a later tool record proves the reasoning ended");

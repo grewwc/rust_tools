@@ -115,7 +115,7 @@ test("multi-line text and other prompts still go to the model", async () => {
 });
 
 test("send() consults the transfer bridge before opening a turn stream", () => {
-  const call = script.indexOf("if (await runTransferCommand(text)) return;");
+  const call = script.indexOf('if (typeof runTransferCommand === "function" && await runTransferCommand(text)) return;');
   assert.ok(call > 0, "send() must call the bridge");
   assert.ok(call < script.indexOf('"/turns/stream"'), "the bridge runs before the turn request");
 });

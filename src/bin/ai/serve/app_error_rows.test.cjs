@@ -112,6 +112,7 @@ function harness({ realApi = false } = {}) {
     textOf: (content) => content || "", isRuntimeSyntheticUser: () => false,
   });
   for (const [start, end] of [
+    ["// BEGIN execution model", "// END execution model"],
     ["const esc =", "// --- markdown"],
     ["function addMsg(", "// --- server-side media"],
     ["function histKey(", "// A session the server reports"],
@@ -311,23 +312,33 @@ for (const outcome of ["success", "missing total", "invalid total", "API error",
   });
 }
 
-test("two consecutive live-progress request failures update one DOM row", async () => {
+// app_stream covers transient 409 warnings that are deduplicated and cleared on
+// reconnect. Ordinary attachment errors remain separate conversation rows.
+test("two consecutive live-progress request failures preserve distinct error rows", async () => {
   const h = harness();
   await h.failLive("network error");
   const row = h.liveRows()[0];
   assert.equal(h.liveRows().length, 1);
   await h.failLive("Failed to fetch");
-  assert.equal(h.liveRows().length, 1);
-  assert.equal(h.liveRows()[0], row, "reuse the original DOM node");
-  assert.equal(row.textContent, "live progress unavailable: Failed to fetch");
+  const rows = h.liveRows();
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0], row, "preserve the first failure's DOM node");
+  assert.notEqual(rows[1], row, "the next failure gets its own error row");
+  assert.equal(row.textContent, "live progress unavailable: network error");
+  assert.equal(rows[1].textContent, "live progress unavailable: Failed to fetch");
+  assert.ok(rows.every((error) => !error.classList.contains("live-progress-warning")));
 });
 
-test("a successful live-progress reconnect immediately removes its error row", async () => {
+test("a successful live-progress reconnect preserves its ordinary error row", async () => {
   const h = harness();
   await h.failLive("network error");
+  const row = h.liveRows()[0];
   const connection = await h.connectLive();
   try {
-    assert.equal(h.liveRows().length, 0, "clear as soon as the successful stream is attached");
+    assert.equal(h.liveRows().length, 1, "reconnecting clears warnings, not ordinary errors");
+    assert.equal(h.liveRows()[0], row);
+    assert.equal(row.textContent, "live progress unavailable: network error");
+    assert.equal(row.parentNode, h.root);
   } finally { await connection.close(); }
 });
 
@@ -367,16 +378,19 @@ test("live recovery preserves history errors and real conversation nodes", async
   await h.failHistory("Failed to fetch");
   const historyError = h.historyRows().find((row) => row !== realError);
   await h.failLive("network error");
+  const liveError = h.liveRows()[0];
   const connection = await h.connectLive();
   try {
-    assert.equal(h.liveRows().length, 0);
+    assert.equal(h.liveRows().length, 1);
+    assert.equal(h.liveRows()[0], liveError, "the ordinary live error remains on reconnect");
+    assert.equal(liveError.textContent, "live progress unavailable: network error");
     assert.deepEqual(h.historyRows(), [realError, historyError]);
     assert.equal(historyError.textContent, "history failed: Failed to fetch");
     assert.deepEqual(h.root.children.slice(0, content.length), content);
   } finally { await connection.close(); }
 });
 
-for (const rendered of [false, true]) test(`history recovery preserves the live error (history already rendered=${rendered})`, async () => {
+for (const rendered of [false, true]) test(`history recovery ${rendered ? "preserves" : "replaces"} the live error (history already rendered=${rendered})`, async () => {
   const h = harness();
   if (rendered) await h.recoverHistory();
   const content = h.root.children.slice();
@@ -386,8 +400,13 @@ for (const rendered of [false, true]) test(`history recovery preserves the live 
   assert.equal(h.liveRows()[0], liveError, "a history failure cannot replace the live status");
   await h.recoverHistory();
   assert.equal(h.historyRows().length, 0);
-  assert.equal(h.liveRows().length, 1);
-  assert.equal(h.liveRows()[0], liveError, "history rendering must preserve the other error node");
+  assert.equal(h.liveRows().length, rendered ? 1 : 0);
+  if (rendered) {
+    assert.equal(h.liveRows()[0], liveError, "history rendering must preserve the other error node");
+  } else {
+    assert.equal(liveError.parentNode, null, "the first canonical render replaces the local error row");
+    assert.ok(!h.root.children.includes(liveError));
+  }
   assert.equal(liveError.textContent, "live progress unavailable: Failed to fetch");
   assert.deepEqual(h.root.children.slice(0, 2).map((node) => node.textContent), ["prompt", "reply"]);
   if (rendered) assert.deepEqual(h.root.children.slice(0, content.length), content);

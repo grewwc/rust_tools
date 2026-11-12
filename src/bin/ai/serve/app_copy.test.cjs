@@ -133,6 +133,7 @@ function harness({ clipboard, fallback = true, phone = false } = {}) {
     createLiveActivity: () => ({ label: () => "Processing…", setPhase() {}, anchor() {}, finish() {}, tool() {}, subagents() {} }),
     ...(clipboard === undefined ? {} : { navigator: { clipboard } }),
   });
+  vm.runInContext(between("// BEGIN execution model", "// END execution model"), context);
   vm.runInContext(between("const esc =", "function sessionTitle("), context);
   vm.runInContext(between("function addMsg(", "// --- server-side media"), context);
   vm.runInContext(between("const RATE_STORAGE =", "function addFold("), context);
@@ -148,7 +149,8 @@ function streamHarness(options) {
   const box = h.document.createElement("div"), liveEntry = { box };
   h.msgs.appendChild(box);
   Object.assign(h.context, {
-    box, sid: "s", sessionId: "s", liveEntry, turns: new Map([["s", liveEntry]]),
+    box, sid: "s", sessionId: "s", sendBase: "", liveEntry, turns: new Map([["s", liveEntry]]),
+    turnRunningPid: 0, endedTurnPid: 0,
     finished: false, turnError: false, finishFollow: false, confirmPollSeq: 0, stopStaleFollow() {},
   });
   vm.runInContext(between('  let bubble = addMsgMd("", box);', "  let turnStarted = false;"), h.context);
@@ -317,9 +319,9 @@ for (const phone of [true, false]) {
     const copied = [];
     const h = streamHarness({ phone, clipboard: { writeText: async (text) => copied.push(text) } });
     h.emit("delta", { delta: "provisional answer" });
-    h.emit("progress", "↳ speed · output 40 tok @ 20 tok/s");
-    if (phone) assert.equal(h.box.querySelectorAll(".turn-rate").length, 0);
-    else assert.equal(h.box.querySelectorAll(".turn-rate").length, 1);
+    // app_stream's phone generation tests also keep one styled rate surface visible.
+    h.emit("rate", { phase: "output", tokens: 40, elapsed_ms: 2000 });
+    assert.equal(h.box.querySelectorAll(".turn-rate").length, 1);
     const raw = "Final answer\nNext line";
     h.emit("replace", { text: raw });
     h.emit("done");

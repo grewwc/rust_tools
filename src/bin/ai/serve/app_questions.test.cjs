@@ -83,7 +83,7 @@ function harness({ messages, phone = true, requestHook } = {}) {
     window: { matchMedia: () => ({ matches: !phone }) },
     historySession: "", historyKeys: [], historyLoadSeq: 0, canonicalHistoryTotal: 0, lastMsgCount: 0,
     pendingUserInputs: new Map(), turns: new Map(), eventSession: "", recoveredView: null,
-    outputFollowSuspended: false, navigator: { onLine: true },
+    staleBox: null, outputFollowSuspended: false, navigator: { onLine: true },
     AbortController, setTimeout, clearTimeout,
     isPhoneLayout: () => phone, esc: (value) => String(value), requestAnimationFrame: (fn) => fn(),
     note: (text) => notes.push(text), console: { error: (...args) => failures.push(args) },
@@ -110,6 +110,7 @@ function harness({ messages, phone = true, requestHook } = {}) {
     recordHistoryFailure: (...args) => failures.push(args),
     createTurnRateLine: () => () => {},
   });
+  vm.runInContext(between("// BEGIN execution model", "// END execution model"), context);
   vm.runInContext(between("function textOf(", "const PHONE_LAYOUT_QUERY"), context);
   vm.runInContext(between("function closeQuestionPanel(", "// BEGIN session switch"), context);
   context.updateQuestionButton = (count) => { if (count !== undefined) elements.questioncount.textContent = String(count); };

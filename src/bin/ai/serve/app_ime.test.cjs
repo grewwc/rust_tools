@@ -84,6 +84,7 @@ function makeContext(extra) {
   const document = { activeElement: null };
   const context = vm.createContext(Object.assign({
     document,
+    sessionId: "",
     window: { matchMedia: () => ({ matches: false }), innerHeight: 800 },
     requestAnimationFrame: (fn) => { context.frames.push(fn); return context.frames.length; },
     setTimeout: (fn) => { context.timers.push(fn); return context.timers.length; },
@@ -105,6 +106,8 @@ function makeContext(extra) {
   context.prompt = prompt;
   context.marks = [];
   vm.runInContext(imeSrc, context);
+  // Mirror wire() before any composition or input handler is registered.
+  vm.runInContext("promptHistory = createPromptHistory(prompt);", context);
   return context;
 }
 
@@ -510,11 +513,10 @@ test("the side note column does not resize the composer during a composition", (
     note: () => {},
   });
   vm.runInContext(
-    "let sideNoteBusy = false; let eventActive = false; let eventSession = '';" +
-    "let sessionId = 's1'; let staleSession = ''; let turnRunning = false; let turnRunningAt = 0;" +
-    "const RUNNING_SAMPLE_TTL_MS = 1000; const turns = new Set();",
+    "let sessionId = 's1'; const RUNNING_SAMPLE_TTL_MS = 1000;",
     context,
   );
+  vm.runInContext(script.slice(script.indexOf("// BEGIN execution model"), script.indexOf("// END execution model")), context);
   vm.runInContext(syncStopSrc, context);
   run(context, "promptComposing = true;");
   vm.runInContext("syncStopButton();", context);
@@ -540,11 +542,11 @@ test("a live view keeps the note affordance when the running latch is stale", ()
     note: () => {},
   });
   vm.runInContext(
-    "let sideNoteBusy = false; let eventActive = true; let eventSession = 's1';" +
-    "let sessionId = 's1'; let staleSession = ''; let turnRunning = false; let turnRunningAt = 0;" +
-    "const RUNNING_SAMPLE_TTL_MS = 1000; const turns = new Set();",
+    "let sessionId = 's1'; const RUNNING_SAMPLE_TTL_MS = 1000;",
     context,
   );
+  vm.runInContext(script.slice(script.indexOf("// BEGIN execution model"), script.indexOf("// END execution model")), context);
+  vm.runInContext("eventActive = true; eventSession = 's1';", context);
   vm.runInContext(syncStopSrc, context);
   vm.runInContext("syncStopButton();", context);
   assert.ok(toggles.includes("sidenote.show=true"), "the live view lost its note affordance");

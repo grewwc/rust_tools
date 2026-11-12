@@ -92,6 +92,8 @@ function harness({ storage = new Map(), base = "https://a.test", sid = "alpha", 
     },
     fetch: async (url, opts) => { requests.push({ url, ...opts, body: JSON.parse(opts.body) }); return { ok: true }; },
   });
+  vm.runInContext(between("// BEGIN execution model", "// END execution model"), context);
+  vm.runInContext(between("function canSend()", "// The one send/stop button"), context);
   vm.runInContext(between("function syncOvrSummary()", "// The composer grows"), context);
   vm.runInContext(between("function fillSelect(", "async function loadInfo()"), context);
   vm.runInContext(between("// BEGIN skill picker events", "// END skill picker events"), context);

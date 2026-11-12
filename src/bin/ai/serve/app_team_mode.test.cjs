@@ -134,7 +134,7 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
     sendBusy: false, promptComposing: false, pendingImages: [],
     turns: new Map(), MAX_LIVE_TURNS: 4, historySession: sid, canonicalHistoryTotal: 0,
     pendingUserInputs: new Map(), questionCache: null, runEpoch: 0, turnRunning: false,
-    turnRunningAt: 0, RUNNING_SAMPLE_TTL_MS: 60000,
+    turnRunningAt: 0, turnRunningPid: 0, endedTurnPid: 0, RUNNING_SAMPLE_TTL_MS: 60000,
     remoteTurnPid: "", remoteTurnAt: 0, REMOTE_RUNNING_TTL_MS: 30000,
     eventActive: false, eventSession: "", eventStreamEnded: false, eventStreamFailed: false, staleSession: "", staleDone: false,
     confirmPollSeq: 0, lastHistoryEndsUnanswered: false, LIVE_STALL_MS: 60000,
@@ -176,6 +176,7 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
       throw new Error("unexpected request: " + pathname);
     },
   });
+  vm.runInContext(marked("execution model"), context);
   vm.runInContext(existingFunction("async function api(", "const esc ="), context);
   vm.runInContext(marked("mobile team mode"), context);
   vm.runInContext(marked("session config hydration"), context);
