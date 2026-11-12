@@ -1741,18 +1741,26 @@ const mdText = (s) => s
       '<span class="media-caption">' + label + '</span></span>')
   .replace(/\[([^\]\n]+?)\]\((https?:\/\/(?:[^()\s]|\([^()\s]*\))+)\)/g, (_all, label, url) => mdLink(label, url))
   .replace(/&lt;(https?:\/\/[^\s&]+)&gt;/g, (_all, url) => mdLink(url, url));
-// Protect code without splitting enclosing emphasis into separate fragments.
+// Protect code and backslash escapes without splitting enclosing emphasis into
+// separate fragments. A backslash before ASCII punctuation is Markdown syntax,
+// so `\"` displays one quote instead of a visible escape; it is slotted before
+// emphasis parsing so `\*` stays literal text rather than opening `<i>`.
 const mdInline = (src) => {
-  // Whitespace keeps a slot out of URL attributes; src is already escaped.
+  // Whitespace keeps a slot out of URL attributes.
   let key = "\uE000code ";
   while (src.includes(key)) key += "X";
   const slots = [];
-  const text = src.replace(/`([^`]+)`/g, (_, code) => {
+  let text = src.replace(/`([^`]+)`/g, (_, code) => {
     const slot = key + slots.length + "\uE001";
-    slots.push("<code>" + code + "</code>");
+    slots.push("<code>" + esc(code) + "</code>");
     return slot;
   });
-  return mdText(text).replace(new RegExp(key + "(\\d+)\uE001", "g"), (_, n) => slots[Number(n)]);
+  text = text.replace(/\\([!"#$%&'()*+,\-.\/:;<=>?@\[\\\]^_`{|}~])/g, (_, ch) => {
+    const slot = key + slots.length + "\uE001";
+    slots.push(esc(ch));
+    return slot;
+  });
+  return mdText(esc(text)).replace(new RegExp(key + "(\\d+)\uE001", "g"), (_, n) => slots[Number(n)]);
 };
 const MAX_INLINE_SVG_CHARS = 200000;
 const MAX_HTML_PREVIEW_CHARS = 300000;
@@ -2333,7 +2341,7 @@ function renderMarkdown(src, allowPreviews) {
     && window.matchMedia("(min-width:701px)").matches;
   const math = protectMath(String(src).replace(/\r\n?/g, "\n"));
   const lines = math.source.split("\n");
-  const inline = (s) => math.restore(mdInline(esc(s)));
+  const inline = (s) => math.restore(mdInline(s));
   // Infer only a complete, consistently shaped pipe block. Short or ragged
   // blocks remain text; a missing delimiter must not make us invent cells.
   const framedRow = (line) => {

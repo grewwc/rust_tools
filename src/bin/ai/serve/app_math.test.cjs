@@ -193,6 +193,23 @@ test("pipe table without delimiter rejects short, ragged and ambiguous text", ()
   ]) assert.doesNotMatch(render(source), /<table>/, source);
 });
 
+test("markdown shows backslash-escaped punctuation without the backslash", () => {
+  const { render } = harness();
+  // JSON-encoded reply text reaches the page with `\"`; Markdown treats the
+  // backslash as syntax for the quote, not as a character to display.
+  const prose = render('他说\\"你好\\"，路径 C:\\Users\\demo，正则 \\n，字面 \\*星号\\*');
+  assert.equal(prose,
+    '<div class="p">他说&quot;你好&quot;，路径 C:\\Users\\demo，正则 \\n，字面 *星号*</div>');
+  assert.doesNotMatch(prose, /<i>|<b>/);
+  // Code keeps its exact source, including a backslash before a quote.
+  assert.match(render('代码 `a\\"b`'), /<code>a\\&quot;b<\/code>/);
+  assert.match(render('```js\nconst s = \\"x\\";\n```'), /<code>const s = \\&quot;x\\&quot;;<\/code>/);
+  // Unescaping happens before markup is emitted, so it cannot inject tags.
+  const hostile = render('<img src=x onerror=\\"alert(1)\\">');
+  assert.doesNotMatch(hostile, /<img\b/);
+  assert.match(hostile, /&lt;img src=x onerror=&quot;alert\(1\)&quot;&gt;/);
+});
+
 test("pipe table inference preserves the legacy delimiter grammar", () => {
   const { render } = pipeTableHarness();
   // A blank pipe row or a later delimiter already starts a standard table
