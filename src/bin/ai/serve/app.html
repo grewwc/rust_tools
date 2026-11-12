@@ -619,7 +619,32 @@ select, summary { touch-action:manipulation; }
   font-size:10px; letter-spacing:.04em; text-transform:uppercase;
 }
 #sidequeuelist .text { min-width:0; white-space:pre-wrap; overflow-wrap:anywhere; }
-#composer { display:flex; gap:8px; padding:10px 12px calc(10px + env(safe-area-inset-bottom)); background:var(--panel); border-top:1px solid var(--line); }
+#composer { display:flex; position:relative; gap:8px; padding:10px 12px calc(10px + env(safe-area-inset-bottom)); background:var(--panel); border-top:1px solid var(--line); }
+/* Slash-command completion sits above the composer, like the skill picker,
+   so opening it never reflows the transcript or the input row. */
+#cmdmenu {
+  position:absolute; left:0; right:0; bottom:calc(100% + 8px); z-index:14;
+  display:flex; flex-direction:column; max-height:min(360px,60vh);
+  max-height:min(360px,calc(var(--app-height, 100vh) * .60));
+  padding:6px; background:var(--panel); border:1px solid var(--line-2);
+  border-radius:14px; box-shadow:0 18px 42px rgba(0,0,0,.38);
+  animation:workerpop .14s ease-out;
+}
+#cmdmenu[hidden] { display:none; }
+#cmdoptions { flex:1 1 auto; min-height:0; display:flex; flex-direction:column; gap:2px; overflow-y:auto; overscroll-behavior:contain; touch-action:pan-y; }
+#cmdempty { padding:10px; color:var(--dim); font-size:12px; }
+#cmdempty[hidden] { display:none; }
+.cmdrow {
+  display:flex; flex-direction:column; align-items:flex-start; gap:2px;
+  width:100%; min-height:44px; padding:7px 10px; text-align:left;
+  background:transparent; border:0; border-radius:10px; cursor:pointer;
+}
+.cmdrow .cmdname { font-weight:600; }
+.cmdrow .cmdusage { color:var(--dim); font-size:12px; font-weight:400; overflow-wrap:anywhere; }
+.cmdrow .cmddesc { color:var(--dim); font-size:12px; overflow-wrap:anywhere; }
+.cmdrow:hover, .cmdrow[data-active="true"] { background:var(--surface-2); }
+.cmdrow[data-active="true"] { box-shadow:inset 3px 0 0 var(--acc); }
+#cmdhint { flex:0 0 auto; padding:4px 10px 2px; color:var(--dim); font-size:11px; }
 #prompt {
   flex:1; min-height:44px; max-height:30vh; max-height:calc(var(--app-height, 100vh) * .30); padding:9px 10px; resize:none;
   -webkit-user-select:text; user-select:text; -webkit-touch-callout:default;
@@ -1253,6 +1278,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 @media (prefers-reduced-motion:reduce) { #jumpbottom, #prompt { transition:none; } body, header, #sessbar, #composer, #msgs, .msg, button, select, input, textarea, #sessions, #conn, #connstat, #questionpanel, #skillmenu, .code-preview, .code-preview-toolbar, .code-block-toolbar, .mediaprev { transition:none; } }
 @media (prefers-reduced-motion:reduce) { #modelpickpanel, #modelpickscrim { animation:none; } }
 @media (prefers-reduced-motion:reduce) { #skillmenu { animation:none; } }
+@media (prefers-reduced-motion:reduce) { #cmdmenu { animation:none; } }
 @media (prefers-reduced-motion:reduce) { #teampickpanel, #teampickscrim { animation:none; } }
 /* Server-side images in a reply: the path text stays, the fetched picture
    sits under it (see decorateMedia in the script below). */
@@ -1461,6 +1487,11 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <textarea id="prompt" placeholder="ask…" rows="1"></textarea>
 <button id="sidenote" type="button" aria-label="send as side note" aria-hidden="true" tabindex="-1" title="send as side note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v11H9l-4 3V5Z"/><path d="M9 9h6"/></svg><span>note</span></button>
 <button id="send" class="primary">➤</button>
+<div id="cmdmenu" hidden>
+<div id="cmdoptions" role="listbox" aria-label="slash commands"></div>
+<div id="cmdempty" role="status" hidden>No matching commands</div>
+<div id="cmdhint">↑↓ navigate · Tab complete · Esc close</div>
+</div>
 </div>
 </main>
 </div>
@@ -5888,6 +5919,198 @@ function loadSkills() {
   skillLoadRequest = request;
   return request.promise;
 }
+// Slash-command completion. The catalog comes from `GET /commands` so the
+// page and the server cannot drift; matching and rendering stay local so
+// typing never waits on the network.
+let commandCatalog = [], commandMatches = [], commandActive = -1;
+let commandLoadRequest = null, commandLoadEpoch = 0;
+function normalizeCommands(list) {
+  if (!Array.isArray(list)) return [];
+  const seen = new Set(), out = [];
+  for (const raw of list) {
+    if (!raw || typeof raw.name !== "string") continue;
+    const name = raw.name.trim().replace(/^[:/]+/, "");
+    if (!name || !/^[a-z0-9-]+$/i.test(name) || seen.has(name.toLowerCase())) continue;
+    seen.add(name.toLowerCase());
+    out.push({
+      name,
+      usage: typeof raw.usage === "string" ? raw.usage.trim() : "",
+      description: typeof raw.description === "string" ? raw.description.trim() : "",
+    });
+  }
+  return out;
+}
+function loadCommands() {
+  const base = store.base;
+  if (commandLoadRequest?.base === base) return commandLoadRequest.promise;
+  const epoch = ++commandLoadEpoch;
+  commandCatalog = [];
+  const request = { base, promise: null };
+  request.promise = (async () => {
+    try {
+      const commands = await (await api("/commands")).json();
+      if (epoch !== commandLoadEpoch || base !== store.base) return;
+      commandCatalog = normalizeCommands(commands);
+      refreshCommandMenu();
+    } catch (_) {
+      if (epoch !== commandLoadEpoch || base !== store.base) return;
+      commandCatalog = [];
+      closeCommandMenu();
+    }
+  })().finally(() => { if (commandLoadRequest === request) commandLoadRequest = null; });
+  commandLoadRequest = request;
+  return request.promise;
+}
+// Return the first-token command fragment under the caret, or null when the
+// composer is not editing a command word. Only the first line and the first
+// token participate, so a path such as /tmp/file never opens the menu.
+function commandContext(value, caret) {
+  if (typeof value !== "string") return null;
+  const end = Number.isInteger(caret) ? caret : value.length;
+  const first = value.search(/\S/);
+  if (first < 0 || end <= first) return null;
+  if (value.slice(0, first).includes("\n")) return null;
+  const prefix = value[first];
+  if (prefix !== "/" && prefix !== ":") return null;
+  const rest = value.slice(first + 1);
+  const stop = rest.search(/\s/);
+  const tokenEnd = stop < 0 ? value.length : first + 1 + stop;
+  if (end > tokenEnd) return null;
+  const query = value.slice(first + 1, end).toLowerCase();
+  if (query.includes("/") || query.includes("\\") || query.includes(".") || query.includes(":")) return null;
+  if (query.length > 32) return null;
+  return { start: first, end: tokenEnd, prefix, query };
+}
+function commandScore(command, query) {
+  const name = command.name.toLowerCase();
+  if (!query) return 0;
+  if (name.startsWith(query)) return 0;
+  if (query.length < 2) return -1;
+  if (name.includes(query) || name.split("-").some((part) => part.startsWith(query))) return 1;
+  if (query.length >= 3 && command.description.toLowerCase().includes(query)) return 2;
+  return -1;
+}
+function renderCommandMenu(prefix) {
+  const box = $("cmdoptions");
+  box.textContent = "";
+  commandMatches.forEach((command, index) => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "cmdrow";
+    row.id = "cmdopt-" + index;
+    row.setAttribute("role", "option");
+    row.setAttribute("aria-selected", index === commandActive ? "true" : "false");
+    row.setAttribute("data-active", index === commandActive ? "true" : "false");
+    row.onpointerdown = (e) => e.preventDefault();
+    row.onpointerenter = () => setCommandActive(index);
+    row.onclick = () => acceptCommand(command);
+    const name = document.createElement("span");
+    name.className = "cmdname";
+    name.textContent = prefix + command.name;
+    if (command.usage) {
+      const usage = document.createElement("span");
+      usage.className = "cmdusage";
+      usage.textContent = " " + command.usage;
+      name.appendChild(usage);
+    }
+    const desc = document.createElement("span");
+    desc.className = "cmddesc";
+    desc.textContent = command.description;
+    row.appendChild(name);
+    if (command.description) row.appendChild(desc);
+    box.appendChild(row);
+  });
+}
+function setCommandActive(index) {
+  if (!commandMatches.length) { commandActive = -1; return; }
+  commandActive = ((index % commandMatches.length) + commandMatches.length) % commandMatches.length;
+  const options = $("cmdoptions").children;
+  for (let i = 0; i < options.length; i++) {
+    const active = i === commandActive;
+    options[i].setAttribute("aria-selected", active ? "true" : "false");
+    options[i].setAttribute("data-active", active ? "true" : "false");
+  }
+  const active = options[commandActive];
+  if (active) {
+    $("prompt").setAttribute("aria-activedescendant", active.id);
+    active.scrollIntoView?.({ block: "nearest" });
+  }
+}
+function closeCommandMenu() {
+  const menu = $("cmdmenu");
+  if (!menu) return;
+  menu.hidden = true;
+  commandMatches = [];
+  commandActive = -1;
+  $("cmdoptions").textContent = "";
+  $("cmdempty").hidden = true;
+  const prompt = $("prompt");
+  if (prompt) {
+    prompt.removeAttribute("aria-activedescendant");
+    prompt.setAttribute("aria-expanded", "false");
+  }
+}
+function refreshCommandMenu() {
+  const prompt = $("prompt");
+  if (!prompt || promptComposing || document.activeElement !== prompt) { closeCommandMenu(); return; }
+  const context = commandContext(prompt.value, prompt.selectionStart);
+  if (!context) { closeCommandMenu(); return; }
+  const scored = [];
+  commandCatalog.forEach((command, index) => {
+    const score = commandScore(command, context.query);
+    if (score >= 0) scored.push({ command, score, index });
+  });
+  scored.sort((a, b) => a.score - b.score || a.index - b.index);
+  commandMatches = scored.map((item) => item.command);
+  commandActive = commandMatches.length ? 0 : -1;
+  renderCommandMenu(context.prefix);
+  $("cmdempty").hidden = commandMatches.length > 0;
+  $("cmdmenu").hidden = false;
+  prompt.setAttribute("aria-expanded", "true");
+  prompt.setAttribute("aria-controls", "cmdoptions");
+  if (commandMatches.length) setCommandActive(0);
+  else prompt.removeAttribute("aria-activedescendant");
+}
+function acceptCommand(target) {
+  const command = typeof target === "number" ? commandMatches[target] : target;
+  if (!command) return false;
+  const prompt = $("prompt");
+  const context = commandContext(prompt.value, prompt.selectionStart);
+  if (!context) { closeCommandMenu(); return false; }
+  const tail = prompt.value.slice(context.end);
+  const replacement = context.prefix + command.name + (/^\s/.test(tail) ? "" : " ");
+  const value = prompt.value.slice(0, context.start) + replacement + prompt.value.slice(context.end);
+  if (!setPromptValue(value)) return false;
+  const caret = context.start + replacement.length;
+  try { prompt.setSelectionRange(caret, caret); } catch (_) {}
+  closeCommandMenu();
+  growPrompt();
+  persistDraft();
+  return true;
+}
+function commandKeydown(e) {
+  if (promptComposing || e.isComposing || e.keyCode === 229) return false;
+  if ($("cmdmenu").hidden) return false;
+  if (e.key === "Escape") { e.preventDefault(); closeCommandMenu(); return true; }
+  if (!commandMatches.length) return false;
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    const step = e.key === "ArrowDown" ? 1 : -1;
+    setCommandActive(commandActive < 0 ? (step > 0 ? 0 : commandMatches.length - 1) : commandActive + step);
+    return true;
+  }
+  if (e.key === "Tab" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    acceptCommand(commandActive < 0 ? 0 : commandActive);
+    return true;
+  }
+  if (e.key === "Enter" && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+    e.preventDefault();
+    acceptCommand(commandActive < 0 ? 0 : commandActive);
+    return true;
+  }
+  return false;
+}
 async function loadInfo() {
   try {
     const info = await (await api("/info")).json();
@@ -7382,6 +7605,7 @@ async function completeBoot() {
   bootCompleting = true;
   try {
     void loadSkills();
+    void loadCommands();
     await loadSessions();
     if (!sessionId) { bootComplete = true; return; }
     if (historyLoadStates.get(sessionId)?.failure) await retryHistory();
@@ -8607,6 +8831,7 @@ async function send() {
   const text = $("prompt").value;
   if (!text.trim() && !pendingImages.length) return;
   if (!validateSkillInput()) return;
+  closeCommandMenu();
 
   const draftSession = sessionId, sendBase = store.base;
   sendBusy = true;
@@ -9512,6 +9737,7 @@ function wire() {
       }
       scheduleGrow();
       persistDraft();
+      refreshCommandMenu();
     }, 0);
   });
   $("prompt").addEventListener("beforeinput", (e) => promptHistory.beforeInput(e));
@@ -9525,13 +9751,16 @@ function wire() {
     // and a layout change inside the commit task loses the word.
     scheduleGrow();
     persistDraft();
+    refreshCommandMenu();
   });
   $("prompt").addEventListener("paste", handlePromptPaste);
   restoreDraft();
   $("prompt").addEventListener("keydown", (e) => {
-    // Plain Enter inserts a newline (mobile keyboards included); only the
-    // send button — or Ctrl/Cmd+Enter for hardware keyboards — submits.
+    // Plain Enter inserts a newline (mobile keyboards included); the send
+    // button — or Ctrl/Cmd+Enter — submits. While the command menu is open,
+    // commandKeydown accepts the highlighted command instead.
     if (promptComposing || e.isComposing || e.keyCode === 229) return;
+    if (commandKeydown(e)) return;
     const key = e.key.toLowerCase();
     if (!e.altKey && (e.ctrlKey || e.metaKey)
         && (key === "z" || (key === "y" && e.ctrlKey && !e.shiftKey))) {
@@ -9540,6 +9769,19 @@ function wire() {
       return;
     }
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
+  });
+  $("prompt").addEventListener("click", () => refreshCommandMenu());
+  $("prompt").addEventListener("focusout", (e) => {
+    const next = e.relatedTarget;
+    if (next && (next === $("prompt") || $("cmdmenu").contains(next))) return;
+    // Let a tap on an option finish its click before the menu disappears.
+    setTimeout(() => {
+      const active = document.activeElement;
+      if (active !== $("prompt") && !$("cmdmenu").contains(active)) closeCommandMenu();
+    }, 0);
+  });
+  document.addEventListener("pointerdown", (e) => {
+    if (!$("cmdmenu").contains(e.target) && e.target !== $("prompt")) closeCommandMenu();
   });
   const toggleSessions = () => setDrawer(!$("sessions").classList.contains("open"));;
   $("menu").onclick = toggleSessions;
@@ -9642,6 +9884,7 @@ async function boot() {
   }
   await loadInfo();
   loadSkills(); // Optional catalog must not delay history or the composer.
+  loadCommands();
   await loadSessions();
   await loadHistory();
   await loadSessionConfig(); // restore this session's picks from the server

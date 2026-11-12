@@ -55,6 +55,8 @@ pub(in crate::ai) mod ctl;
 #[cfg(feature = "serve")]
 mod checkpoint;
 #[cfg(feature = "serve")]
+mod commands;
+#[cfg(feature = "serve")]
 mod files;
 #[cfg(feature = "serve")]
 mod history;
@@ -78,6 +80,8 @@ mod write_roots;
 
 #[cfg(feature = "serve")]
 pub(crate) use checkpoint::*;
+#[cfg(feature = "serve")]
+pub(crate) use commands::*;
 #[cfg(feature = "serve")]
 pub(crate) use files::*;
 #[cfg(feature = "serve")]
@@ -1772,6 +1776,7 @@ pub(in crate::ai) async fn run_serve(
         )
         .route("/skills", get(list_skills))
         .route("/agents", get(list_agents))
+        .route("/commands", get(list_commands))
         .route("/sessions/{id}/cd", post(post_session_cd))
         .route(
             "/sessions/{id}/cd-candidates",
