@@ -2,8 +2,8 @@
 // Theme contract of the embedded client: three palettes (dark, light, warm)
 // driven by a stored preference that may also be "auto", a header button that
 // cycles the palettes, a picker in the settings panel, and a choice that
-// survives a reload. The light palettes are held below the luminance of white
-// paper on purpose: a near-white panel is what makes a phone screen glare.
+// survives a reload. Desktop light uses white surfaces, one green accent and
+// purple side-note borders; warm keeps its eye-care surface scale.
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -144,7 +144,18 @@ function tokenValues(block) {
 function ruleValues(source, selector) {
   const values = {};
   for (const match of source.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
-    const selectors = match[1].replace(/\/\*[\s\S]*?\*\//g, "").trim().split(",").map((value) => value.trim());
+    const header = match[1].replace(/\/\*[\s\S]*?\*\//g, "").trim();
+    const selectors = [];
+    let start = 0, depth = 0, quote = "";
+    for (let i = 0; i < header.length; i++) {
+      const char = header[i];
+      if (quote) { if (char === quote && header[i - 1] !== "\\") quote = ""; }
+      else if (char === "'" || char === '"') quote = char;
+      else if (char === "(" || char === "[") depth++;
+      else if (char === ")" || char === "]") depth--;
+      else if (char === "," && depth === 0) { selectors.push(header.slice(start, i).trim()); start = i + 1; }
+    }
+    selectors.push(header.slice(start).trim());
     if (!selectors.includes(selector)) continue;
     for (const entry of match[2].split(";")) {
       const colon = entry.indexOf(":");
@@ -154,7 +165,7 @@ function ruleValues(source, selector) {
   return values;
 }
 
-test("desktop Markdown answers keep their original backgrounds and stronger borders in all three themes", () => {
+test("desktop Markdown answers inherit panel backgrounds and retain stronger borders in all three themes", () => {
   const desktop = desktopMediaQueries().map((block) => block.body).join("\n");
   const selector = ".msg.asst.md:not(.pending):not(.err):not(.git-output)";
   const body = ruleValues(desktop, selector);
@@ -163,7 +174,7 @@ test("desktop Markdown answers keep their original backgrounds and stronger bord
   const expected = {
     dark: { page: "#1b1b1b", surface: "#2e2e2e", answer: "#242424", border: "#858585" },
     light: { page: "#f1f1f1", surface: "#e5e5e5", answer: "#f3f3f3", border: "#737373" },
-    warm: { page: "#edeae4", surface: "#e8e5de", answer: "#f5f2ec", border: "#6f6a5b" },
+    warm: { page: "#e9e8e7", surface: "#e0dfde", answer: "#efeeed", border: "#6f6a5b" },
   };
   for (const [name, root] of Object.entries(PALETTES)) {
     const palette = { ...tokenValues(tokenBlock(PALETTES.dark)),
@@ -172,7 +183,7 @@ test("desktop Markdown answers keep their original backgrounds and stronger bord
     // The helper reads exact selectors; resolve the unchanged assistant base
     // background and verify that no answer-specific theme overrides remain.
     const themed = name === "dark" ? {} : ruleValues(desktop, root.replace(/\s*\{$/, "") + " " + selector);
-    assert.deepEqual(themed, {});
+    assert.deepEqual(themed, name === "light" ? { border: "1px solid var(--card-edge)" } : {});
     const background = ruleValues(style, ".msg.asst").background;
     assert.equal(background, "var(--panel)");
     const token = /^var\((--[\w-]+)\)$/.exec(background)?.[1];
@@ -190,7 +201,7 @@ function brightnessColor(hex, factor) {
     .toString(16).padStart(2, "0")).join("");
 }
 
-test("desktop palette overrides use neutral surfaces and keep the shared accent", () => {
+test("desktop palette overrides use low-saturation surfaces and preserve action accents", () => {
   const expected = {
     "dark": {
       "--bg": "#1b1b1b",
@@ -221,55 +232,55 @@ test("desktop palette overrides use neutral surfaces and keep the shared accent"
     },
     "light": {
       "--bg": "#f1f1f1",
-      "--code-bg": "#e8e8e8",
-      "--code-toolbar": "#efefef",
-      "--control-border": "#737373",
-      "--card-edge": "rgba(46,46,46,.12)",
-      "--card-shadow": "0 2px 4px rgba(46,46,46,.03), 0 10px 28px rgba(46,46,46,.05)",
-      "--danger-text": "#9f3029",
-      "--dim": "#3e3e3e",
-      "--edge": "rgba(46,46,46,.18)",
+      "--panel": "#f3f3f3",
+      "--line": "#9a9a9a",
       "--fg": "#242424",
-      "--field": "#f3f3f3",
+      "--dim": "#3e3e3e",
+      "--surface": "#e5e5e5",
+      "--surface-hover": "#d9d9d9",
+      "--surface-2": "#efefef",
+      "--line-2": "#858585",
+      "--control-border": "#737373",
+      "--danger-text": "#9f3029",
       "--fw-meta": "450",
+      "--field": "#f3f3f3",
+      "--code-bg": "#e8e8e8",
+      "--media-bg": "#e0e0e0",
+      "--code-toolbar": "#efefef",
       "--glass": "rgba(243,243,243,.95)",
       "--glass-strong": "rgba(243,243,243,.98)",
-      "--line": "#9a9a9a",
-      "--line-2": "#858585",
-      "--media-bg": "#e0e0e0",
-      "--panel": "#f3f3f3",
-      "--shadow-panel": "0 8px 28px rgba(46,46,46,.10)",
-      "--shadow-sm": "0 2px 8px rgba(46,46,46,.05)",
-      "--surface": "#e5e5e5",
-      "--surface-2": "#efefef",
-      "--surface-hover": "#d9d9d9",
       "--tint": "rgba(46,46,46,.06)",
       "--tint-2": "rgba(46,46,46,.04)",
       "--tint-3": "rgba(46,46,46,.14)",
-      "--tint-4": "rgba(46,46,46,.13)"
-    },
+      "--tint-4": "rgba(46,46,46,.13)",
+      "--edge": "rgba(46,46,46,.18)",
+      "--shadow-sm": "0 2px 8px rgba(46,46,46,.05)",
+      "--shadow-panel": "0 8px 28px rgba(46,46,46,.10)",
+      "--card-edge": "rgba(46,46,46,.12)",
+      "--card-shadow": "0 2px 4px rgba(46,46,46,.03), 0 10px 28px rgba(46,46,46,.05)"
+},
     "warm": {
-      "--bg": "#edeae4",
+      "--bg": "#e9e8e7",
       "--card-edge": "rgba(72,66,52,.12)",
       "--card-shadow": "0 2px 8px rgba(64,60,46,.06)",
-      "--code-bg": "#e9e6df",
-      "--code-toolbar": "#f0ede7",
+      "--code-bg": "#e2e1e0",
+      "--code-toolbar": "#e7e6e5",
       "--control-border": "#6f6a5b",
       "--dim": "#5b5d51",
       "--edge": "rgba(52,54,45,.18)",
       "--fg": "#34362b",
-      "--field": "#f0ede7",
-      "--glass": "rgba(245,242,236,.95)",
-      "--glass-strong": "rgba(245,242,236,.98)",
+      "--field": "#e7e6e5",
+      "--glass": "rgba(239,238,237,.95)",
+      "--glass-strong": "rgba(239,238,237,.98)",
       "--line": "#d9d2c2",
       "--line-2": "#c8c0ae",
-      "--media-bg": "#e6e3db",
-      "--panel": "#f5f2ec",
+      "--media-bg": "#dbdad9",
+      "--panel": "#efeeed",
       "--shadow-panel": "0 8px 28px rgba(64,60,46,.10)",
       "--shadow-sm": "0 2px 8px rgba(64,60,46,.05)",
-      "--surface": "#e8e5de",
-      "--surface-2": "#f0ede7",
-      "--surface-hover": "#e2dfd7",
+      "--surface": "#e0dfde",
+      "--surface-2": "#e7e6e5",
+      "--surface-hover": "#d7d6d5",
       "--tint": "rgba(53,105,93,.10)",
       "--tint-2": "rgba(53,105,93,.06)",
       "--tint-3": "rgba(53,105,93,.13)",
@@ -289,7 +300,81 @@ test("desktop palette overrides use neutral surfaces and keep the shared accent"
   }
 });
 
-test("desktop light text and control boundaries retain contrast on a brighter neutral canvas", () => {
+test("light surfaces keep their page, panel and readable field hierarchy at every width", () => {
+  const shared = style.slice(0, style.indexOf("@media (min-width:701px)"));
+  const expected = {
+    "--bg": "#f2f0ee", "--panel": "#faf9f7", "--line": "#e3dfdb",
+    "--surface": "#f1eeeb", "--surface-2": "#eae6e2",
+    "--field": "#fdfdfc", "--code-bg": "#f0ece8",
+    "--code-toolbar": "#f5f2ef", "--glass": "rgba(250,249,247,.95)",
+    "--glass-strong": "rgba(250,249,247,.98)",
+    "--composer-a": "#faf9f7", "--composer-b": "#f2f0ee"
+  };
+  const base = tokenValues(tokenBlock(PALETTES.light));
+  const desktop = { ...base, ...tokenValues(tokenBlock(PALETTES.light, desktopMediaQueries()[0].body)) };
+  for (const [name, palette] of [["shared", base], ["desktop", desktop]]) {
+    const scale = name === "shared" ? { ...expected, "--surface-hover": "#eae6e2", "--media-bg": "#eae6e2" }
+      : { ...expected, "--bg": "#f1f1f1", "--panel": "#f3f3f3", "--line": "#9a9a9a",
+        "--surface": "#e5e5e5", "--surface-2": "#efefef", "--field": "#f3f3f3",
+        "--code-bg": "#e8e8e8", "--code-toolbar": "#efefef", "--glass": "rgba(243,243,243,.95)",
+        "--glass-strong": "rgba(243,243,243,.98)", "--surface-hover": "#d9d9d9", "--media-bg": "#e0e0e0" };
+    for (const [token, value] of Object.entries(scale)) {
+      assert.equal(palette[token], value, name + " light " + token);
+    }
+    if (name === "desktop") {
+      assert.equal(palette["--field"], palette["--panel"], "white fields and panels share the reading surface");
+      assert.equal(palette["--surface-2"], "#efefef", "user cards restore the baseline neutral fill");
+      const channels = palette["--surface-2"].slice(1).match(/../g).map((channel) => parseInt(channel, 16));
+      const spread = Math.max(...channels) - Math.min(...channels);
+      assert.equal(spread, 0, "user fill has no independent tint");
+      assert.ok(contrast(palette["--fg"], palette["--surface-2"]) >= 4.5, "user text remains readable");
+    } else {
+      assert.ok(relativeLuminance(palette["--field"]) > relativeLuminance(palette["--panel"]));
+      assert.ok(relativeLuminance(palette["--bg"]) > relativeLuminance(palette["--surface-2"]));
+    }
+    assert.ok(relativeLuminance(palette["--panel"]) > relativeLuminance(palette["--bg"]), name + " page/panel hierarchy");
+    for (const surface of ["--bg", "--panel", "--surface", "--surface-hover", "--surface-2", "--field", "--code-bg", "--code-toolbar", "--media-bg"]) {
+      for (const text of ["--fg", "--dim"]) {
+        assert.ok(contrast(palette[text], palette[surface]) >= 4.5, name + " " + text + " on " + surface);
+      }
+    }
+  }
+  assert.deepEqual(ruleValues(shared, ':root[data-theme="light"] .msg.user'), {
+    background: "var(--surface-2)", color: "var(--fg)"
+  });
+  assert.deepEqual(ruleValues(shared, ':root[data-theme="light"] #prompt'), {
+    background: "var(--field)"
+  });
+});
+
+test("desktop light surfaces have low saturation and a distinct canvas from eye-care", () => {
+  const desktop = desktopMediaQueries()[0].body;
+  const light = { ...tokenValues(tokenBlock(PALETTES.light)), ...tokenValues(tokenBlock(PALETTES.light, desktop)) };
+  const warm = { ...tokenValues(tokenBlock(PALETTES.warm)), ...tokenValues(tokenBlock(PALETTES.warm, desktop)) };
+  for (const token of ["--bg", "--panel", "--surface", "--surface-hover", "--surface-2", "--field",
+    "--code-bg", "--code-toolbar", "--media-bg", "--glass", "--glass-strong", "--line", "--line-2",
+    "--tint", "--tint-2", "--tint-3", "--tint-4"]) {
+    const color = light[token].match(/#([a-f0-9]{6})(?![a-f0-9])|rgba\((\d+),(\d+),(\d+),[.\d]+\)/i);
+    assert.ok(color, token + " has no parsable low-saturation color");
+    const [r, g, b] = color[1] ? color[1].match(/../g).map((channel) => parseInt(channel, 16)) : color.slice(2).map(Number);
+    const neutral = ["--panel", "--surface", "--surface-2", "--field", "--code-bg", "--code-toolbar",
+      "--media-bg", "--glass", "--glass-strong", "--success-bg", "--pending-bg", "--error-bg"];
+    const spread = Math.max(r, g, b) - Math.min(r, g, b);
+    assert.ok(spread <= (neutral.includes(token) ? 0 : token === "--bg" ? 6 : 24), token + " exceeds its neutral or accent channel spread");
+  }
+  assert.equal(relativeLuminance(light["--bg"]), relativeLuminance("#f1f1f1"),
+    "the desktop canvas stays near white without reaching paper white");
+  assert.equal(relativeLuminance(light["--bg"]) - relativeLuminance(warm["--bg"]), relativeLuminance("#f1f1f1") - relativeLuminance("#e9e8e7"),
+    "the light canvas must remain visibly brighter than eye-care");
+  assert.equal(relativeLuminance(light["--field"]) - relativeLuminance(warm["--field"]), relativeLuminance("#f3f3f3") - relativeLuminance("#e7e6e5"),
+    "light fields must remain distinct from eye-care fields");
+  for (const selector of ["header", "#sessbar"]) {
+    assert.equal(ruleValues(desktop, ':root[data-theme="light"] ' + selector)["border-bottom-color"], "#d8d8d8",
+      selector + " separator uses a precise low-saturation mint tint");
+  }
+});
+
+test("desktop light text and control boundaries retain contrast on a brighter pastel canvas", () => {
   const desktop = desktopMediaQueries()[0].body;
   const palette = { ...tokenValues(tokenBlock(PALETTES.light)), ...tokenValues(tokenBlock(PALETTES.light, desktop)) };
   for (const token of ["--bg", "--panel", "--surface", "--surface-hover", "--surface-2", "--field", "--code-bg", "--code-toolbar", "--media-bg"]) {
@@ -299,7 +384,7 @@ test("desktop light text and control boundaries retain contrast on a brighter ne
   assert.equal(palette["--bg"], "#f1f1f1");
   assert.equal(palette["--panel"], "#f3f3f3");
   assert.ok(relativeLuminance(palette["--bg"]) > relativeLuminance("#e9e9e9"));
-  assert.ok(relativeLuminance(palette["--panel"]) < 0.9, "reading surface stays below paper white");
+  assert.equal(palette["--panel"], palette["--field"], "reading panel uses the existing white body surface");
   assert.ok(contrast(palette["--line-2"], palette["--bg"]) >= 3, "folded tool boundary");
   for (const token of ["--bg", "--panel", "--field", "--surface-hover"]) {
     assert.ok(contrast(palette["--control-border"], palette[token]) >= 3, "control boundary on " + token);
@@ -318,7 +403,7 @@ test("desktop light chrome keeps metadata weight and retains hover and focus cue
   const desktop = desktopMediaQueries()[0].body;
   const light = ':root[data-theme="light"] ';
   assert.deepEqual(ruleValues(desktop, light + "body"), {
-    "--radius-card": "16px", "--radius-control": "10px"
+    "--radius-card": "16px", "--radius-control": "10px", "font-weight": "400"
   });
   assert.equal(tokenValues(tokenBlock(PALETTES.light, desktop))["--fw-meta"], "450");
   const shared = style.slice(0, style.indexOf("@media (min-width:701px)"));
@@ -344,7 +429,9 @@ test("desktop light chrome keeps metadata weight and retains hover and focus cue
     '.msg.asst:has(> details[data-fold-key^="thinking:"])',
     '.msg.asst:has(> details[data-fold-key$=":thinking"])'
   ]) {
-    assert.deepEqual(ruleValues(desktop, light + selector), { "border-color": "var(--card-edge)", "box-shadow": "none" });
+    assert.deepEqual(ruleValues(desktop, light + selector), {
+      "border-color": "var(--card-edge)", "box-shadow": "none"
+    });
   }
 });
 
@@ -369,7 +456,7 @@ test("desktop dark inline emphasis stands out while prose and headings keep thei
       "dark body copy and headings keep their shared weights"
     );
   }
-  assert.equal(ruleValues(desktop, "#composer")["padding"], "8px 24px 20px");
+  assert.equal(ruleValues(desktop, "#composer")["padding"], "10px 24px 8px");
 });
 
 test("eye-care desktop copy keeps the shared prose weight", () => {
@@ -377,7 +464,7 @@ test("eye-care desktop copy keeps the shared prose weight", () => {
   assert.deepEqual(ruleValues(desktop, warm + ".msg.md"), {}, "warm body copy keeps the shared weight");
   assert.deepEqual(
     ruleValues(desktop, ':root[data-theme="light"] body'),
-    { "--radius-card": "16px", "--radius-control": "10px" },
+    { "--radius-card": "16px", "--radius-control": "10px", "font-weight": "400" },
     "light body only carries the card shape"
   );
 });
@@ -386,7 +473,8 @@ test("desktop sidebar and cards share soft shapes across all three palettes", ()
   const desktop = desktopMediaQueries()[0].body;
   for (const selector of Object.values(PALETTES)) {
     const palette = { ...tokenValues(tokenBlock(selector)), ...tokenValues(tokenBlock(selector, desktop)) };
-    assert.match(palette["--card-edge"], /^rgba\([\d,]+,\.12\)$/);
+    const alpha = "12";
+    assert.match(palette["--card-edge"], new RegExp("^rgba\\([\\d,]+,\\." + alpha + "\\)$"));
     assert.ok(palette["--card-shadow"] && palette["--card-shadow"] !== "none");
   }
   assert.equal(ruleValues(desktop, '.msg.asst:not(.git-output)')["border-color"], "var(--card-edge)");
@@ -415,14 +503,17 @@ test("desktop sidebar and cards share soft shapes across all three palettes", ()
 test("desktop light surfaces soften without losing activity and keyboard focus cues", () => {
   const desktop = desktopMediaQueries()[0].body, light = ':root[data-theme="light"] ';
   assert.deepEqual(ruleValues(desktop, light + '.msg.asst:not(.git-output)'), {
-    "border-color": "var(--card-edge)", "border-radius": "var(--radius-card)", "box-shadow": "var(--card-shadow)"
+    "border-color": "var(--card-edge)", "border-radius": "var(--radius-card)",
+    "box-shadow": "var(--card-shadow)"
   });
   assert.deepEqual(ruleValues(desktop, light + '.msg.asst.tool-activity[data-running="true"]'), {
     "border-color": "var(--acc-line)"
   });
   assert.deepEqual(ruleValues(desktop, light + '#sessions'), { "border-right-color": "var(--card-edge)" });
   for (const selector of ["#promptnav", "#ovrwrap"]) {
-    assert.deepEqual(ruleValues(desktop, light + selector), { "border-top-color": "var(--card-edge)" });
+    assert.deepEqual(ruleValues(desktop, light + selector), selector === "#ovrwrap"
+      ? { "border-top-color": "var(--card-edge)", order: "0", padding: "10px 24px 4px" }
+      : { "border-top-color": "var(--card-edge)" });
   }
   assert.deepEqual(ruleValues(desktop, light + '#prompt'), {
     background: "var(--field)", "border-radius": "12px", "box-shadow": "var(--shadow-sm)"
@@ -450,7 +541,9 @@ test("desktop themes share a lightly inset content width and light top separator
   }
   for (const selector of ["#msgwrap", "#ovrwrap", "#sidequeue", "#composer"]) {
     for (const [theme, root] of Object.entries(PALETTES)) {
-      const expected = theme === "light" && selector === "#ovrwrap" ? { "border-top-color": "var(--card-edge)" } : {};
+      const expected = theme === "light" ? (selector === "#ovrwrap"
+        ? { "border-top-color": "var(--card-edge)", order: "0", padding: "10px 24px 4px" }
+        : selector === "#composer" ? { padding: "8px 24px 20px" } : {}) : {};
       const scope = root.replace(/\s*\{$/, "");
       assert.deepEqual(ruleValues(desktop, scope + " " + selector), expected, theme + " inherits the shared content width");
     }
@@ -475,7 +568,7 @@ test("desktop themes share a lightly inset content width and light top separator
   assert.equal(ruleValues(narrow, "#ovrwrap")["grid-template-columns"], "repeat(3,minmax(0,1fr))", "narrow desktop keeps shrinkable picker columns");
 });
 
-test("desktop dark and light stay neutral while eye-care keeps a bounded warm band", () => {
+test("desktop dark stays neutral, light keeps low-saturation pastel fills and eye-care keeps its warm band", () => {
   const desktop = desktopMediaQueries()[0].body;
   const tokens = ["--bg", "--panel", "--surface", "--surface-hover", "--surface-2", "--field",
     "--code-toolbar", "--code-bg", "--media-bg", "--glass", "--glass-strong", "--tint", "--tint-2",
@@ -502,6 +595,16 @@ test("desktop dark and light stay neutral while eye-care keeps a bounded warm ba
         assert.ok(hue > 25 && hue < 75, name + " " + token + " has a hue " + hue + " outside the warm paper band");
         continue;
       }
+      if (name === "light") {
+        const pastel = ["--bg", "--surface", "--surface-hover", "--surface-2", "--code-bg", "--line", "--line-2"];
+        if (pastel.includes(token)) {
+          assert.ok(chroma <= 24, token + " exceeds the pastel channel spread");
+        } else {
+          assert.ok(chroma <= 8, token + " changed the existing neutral token");
+          assert.ok(r >= g && g >= b, token + " changed the existing neutral direction");
+        }
+        continue;
+      }
       assert.ok(chroma <= 6, name + " " + token + " channel spread " + chroma + " is not neutral");
       assert.ok(hue < 20 || hue > 80, name + " " + token + " has a yellow/orange hue " + hue);
       assert.ok(hue < 140 || hue > 210, name + " " + token + " has a teal hue " + hue);
@@ -523,7 +626,7 @@ test("desktop eye-care surfaces keep only a subtle warm paper tint", () => {
   }
 });
 
-test("desktop text and selected rows stay readable on neutral surfaces", () => {
+test("desktop text and selected rows stay readable on their theme surfaces", () => {
   const desktop = desktopMediaQueries()[0].body;
   for (const [name, selector] of Object.entries(PALETTES)) {
     const palette = { ...tokenValues(tokenBlock(selector)), ...tokenValues(tokenBlock(selector, desktop)) };
@@ -543,10 +646,13 @@ test("desktop text and selected rows stay readable on neutral surfaces", () => {
       assert.ok(contrast(palette["--fg"], background) >= 7, name + " selected text contrast on " + token);
       assert.ok(contrast(palette["--dim"], background) >= 4.5, name + " selected muted text contrast on " + token);
     }
-    if (name !== "dark") {
+    if (name === "light") {
+      assert.equal(palette["--bg"], "#f1f1f1", "the canvas stays below paper white");
+      assert.equal(palette["--panel"], "#f3f3f3", "the panel uses the existing white body surface");
+    } else if (name === "warm") {
       assert.ok(relativeLuminance(palette["--panel"]) <= 0.9, name + " desktop panel is too bright");
     }
-    assert.ok(relativeLuminance(palette["--panel"]) > relativeLuminance(palette["--bg"]), name + " panel hierarchy");
+    assert.ok(relativeLuminance(palette["--panel"]) > relativeLuminance(palette["--bg"]), name + " page/panel hierarchy");
     assert.ok(contrast(palette["--acc"], palette["--panel"]) >= 4.5, name + " link contrast");
     assert.ok(contrast(palette["--on-acc"], palette["--acc"]) >= 4.5, name + " primary button contrast");
   }
@@ -674,12 +780,14 @@ test("desktop rewind opacity and light metadata retain readable foregrounds", ()
   }
 });
 
-// Pin shared and phone CSS, including the compact mobile spacing.
+// Pin shared and phone CSS, including the compact mobile spacing and the
+// user/queued-note footer matching the existing assistant footer declarations.
+// The snapshot includes the shared attachment summary above the composer.
 test("desktop contrast rules preserve the current shared and mobile CSS bytes", () => {
   const phoneApplicable = desktopMediaQueries().reduce((source, block) => source.replace(block.css, ""), style);
   assert.doesNotMatch(phoneApplicable, /--(?:control-border|danger-text)/);
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "c3080c1e449164119b08c4bff12edf3c9641dbe4ceea934fed8b2dec3b32613e",
+    "23363ead97dd9c727383e5c5cb1bb095c3f23832c0f737520a2a59470553496a",
     "desktop contrast changed shared or mobile CSS");
 });
 
@@ -689,8 +797,312 @@ test("desktop overrides leave all phone-applicable CSS byte-identical", () => {
   let phoneApplicable = style;
   for (const block of desktop) phoneApplicable = phoneApplicable.replace(block.css, "");
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "c3080c1e449164119b08c4bff12edf3c9641dbe4ceea934fed8b2dec3b32613e",
+    "23363ead97dd9c727383e5c5cb1bb095c3f23832c0f737520a2a59470553496a",
     "shared or phone CSS changed outside the desktop queries");
+});
+
+// Frozen exact-selector declarations from 37000ed6, with retained command-row
+// fills for the newer completion menu. Shared rules are also protected by the
+// phone/non-light hashes below; no live Git lookup is needed.
+const restoredLightDeclarations = {
+  ".msg.asst": {
+    "align-self": "stretch",
+    "background": "var(--panel)",
+    "border": "1px solid var(--line)",
+    "box-shadow": "none",
+    "border-top-left-radius": "6px"
+  },
+  ".msg.user": {
+    "align-self": "flex-end",
+    "background": "var(--surface-2)",
+    "color": "var(--fg)",
+    "border-bottom-right-radius": "6px",
+    "max-width": "85%",
+    "border": "1px solid var(--line)",
+    "box-shadow": "0 1px 2px rgba(15,23,42,.05)"
+  },
+  ".user-msg-row > .msg.user": {
+    "border-left": "3px solid var(--acc)",
+    "min-width": "0",
+    "align-self": "auto"
+  },
+  ".msg.md blockquote": {
+    "font-weight": "var(--fw-meta)",
+    "margin": "4px 0",
+    "padding": "6px 12px",
+    "border-left": "3px solid var(--line)",
+    "color": "var(--dim)",
+    "border-color": "var(--acc-line)",
+    "background": "var(--tint-2)",
+    "border-radius": "0 10px 10px 0"
+  },
+  ".msg.md code": {
+    "letter-spacing": "normal",
+    "font-family": "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+    "font-size": "14px",
+    "background": "var(--code-bg)",
+    "border": "1px solid var(--line)",
+    "border-radius": "5px",
+    "padding": "0 4px",
+    "overflow-wrap": "anywhere"
+  },
+  ".msg.md pre": {
+    "letter-spacing": "normal",
+    "margin": "6px 0",
+    "padding": "12px",
+    "background": "var(--code-bg)",
+    "border": "1px solid var(--line)",
+    "border-radius": "var(--radius-control)",
+    "overflow-x": "auto"
+  },
+  ".msg.md pre code": {
+    "background": "none",
+    "border": "0",
+    "padding": "0",
+    "white-space": "pre-wrap",
+    "overflow-wrap": "anywhere"
+  },
+  ".msg.md .code-block": {
+    "margin": "6px 0"
+  },
+  ".msg.md .code-block-toolbar": {
+    "display": "flex",
+    "justify-content": "space-between",
+    "align-items": "center",
+    "gap": "8px",
+    "margin-bottom": "8px"
+  },
+  ".msg.md .tablewrap": {
+    "overflow-x": "auto",
+    "margin": "12px 0"
+  },
+  ".msg.md table": {
+    "border-collapse": "collapse",
+    "font-size": "15px"
+  },
+  ".msg.md th": {
+    "border": "0",
+    "padding": "8px 12px",
+    "text-align": "left",
+    "border-bottom": "1px solid var(--card-edge)",
+    "vertical-align": "top",
+    "background": "var(--surface-2)",
+    "color": "var(--fg)",
+    "font-weight": "600",
+    "border-bottom-color": "var(--line)"
+  },
+  ".msg.md td": {
+    "border": "0",
+    "padding": "8px 12px",
+    "text-align": "left",
+    "border-bottom": "1px solid var(--card-edge)",
+    "vertical-align": "top"
+  },
+  ".msg.md table code": {
+    "font-size": "14px",
+    "background": "var(--tint-2)",
+    "border": "0",
+    "border-radius": "3px",
+    "padding": "1px 3px"
+  },
+  ".msg.md .code-preview iframe": {
+    "display": "block",
+    "width": "100%",
+    "max-height": "min(70dvh,720px)",
+    "border": "1px solid var(--line)",
+    "border-radius": "var(--radius-control)",
+    "background": "var(--code-bg)"
+  },
+  ".msg.md .media-image img": {
+    "display": "block",
+    "width": "auto",
+    "max-width": "100%",
+    "max-height": "min(70dvh,720px)",
+    "border": "1px solid var(--line)",
+    "border-radius": "var(--radius-control)",
+    "background": "var(--media-bg)"
+  },
+  ".msg.md .media-video video": {
+    "display": "block",
+    "width": "100%",
+    "max-width": "100%",
+    "max-height": "min(70dvh,720px)",
+    "border": "1px solid var(--line)",
+    "border-radius": "var(--radius-control)",
+    "background": "var(--media-bg)",
+    "aspect-ratio": "16/9"
+  },
+  ".msg.phone-frame img": {
+    "display": "block",
+    "width": "auto",
+    "max-width": "100%",
+    "max-height": "min(30dvh,260px)",
+    "object-fit": "contain",
+    "margin": "0 auto",
+    "border": "1px solid var(--line)",
+    "border-radius": "var(--radius-control)",
+    "background": "var(--media-bg)"
+  },
+  "#sidequeuelist li": {
+    "display": "flex",
+    "align-items": "flex-start",
+    "gap": "6px",
+    "padding": "6px 8px",
+    "border": "1px solid var(--line)",
+    "border-radius": "8px",
+    "background": "var(--tint-2)",
+    "font-size": "12px",
+    "line-height": "1.4"
+  },
+  "#sessions li.cur": {
+    "background": "var(--tint-3)",
+    "box-shadow": "inset 3px 0 0 var(--acc)"
+  },
+  "#sessions li.cur:hover": {
+    "background": "var(--tint-3)",
+    "box-shadow": "inset 3px 0 0 var(--acc)"
+  },
+  "#sessions li:hover": {
+    "background-color": "var(--surface-hover)",
+    "background": "var(--surface-2)"
+  },
+  ".modelrow:hover": {
+    "background": "var(--surface-2)"
+  },
+  ".cmdrow:hover": { "background": "var(--surface-2)" },
+  ".cmdrow[data-active=\"true\"]": {
+    "background": "var(--surface-2)", "box-shadow": "inset 3px 0 0 var(--acc)"
+  },
+  "#promptlist button:hover": {
+    "background": "var(--surface-2)",
+    "border-left-color": "var(--acc)"
+  },
+  "#jumpbottom:hover": {
+    "background": "var(--surface-2)"
+  },
+  "#img:hover:not(:disabled)": {
+    "background": "var(--surface-2)",
+    "color": "var(--fg)"
+  },
+  "#img:focus-visible": {
+    "background": "var(--surface-2)",
+    "color": "var(--fg)"
+  },
+  ".msg.asst > details > summary:hover": {},
+  ".msg.pending": {
+    "font-weight": "var(--fw-meta)",
+    "color": "var(--dim)",
+    "font-style": "italic"
+  },
+  ".msg.err": {
+    "border-color": "var(--err)",
+    "color": "var(--err)"
+  },
+  ".turn .tool-activity[data-running=\"true\"]": {
+    "border-color": "var(--acc-line)"
+  }
+};
+function assertRestoredLightDeclarations(selectors) {
+  const shared = style.slice(0, style.indexOf("@media (min-width:701px)"));
+  const desktop = desktopMediaQueries()[0].body;
+  for (const selector of selectors) {
+    assert.deepEqual({ ...ruleValues(shared, selector), ...ruleValues(desktop, selector) },
+      restoredLightDeclarations[selector], selector + " restores the baseline declarations");
+    assert.deepEqual(ruleValues(desktop, ':root[data-theme="light"] ' + selector),
+      [".msg.md pre", ".msg.md pre code"].includes(selector)
+        ? { "white-space":"pre", "word-break":"normal", "overflow-wrap":"normal" } : {},
+      selector + " retains only its desktop code whitespace protection");
+  }
+}
+
+test("desktop light restores the neutral reading palette and original accent", () => {
+  const palette = { ...tokenValues(tokenBlock(PALETTES.light)), ...tokenValues(tokenBlock(PALETTES.light, desktopMediaQueries()[0].body)) };
+  const expected = { "--bg":"#f1f1f1", "--panel":"#f3f3f3", "--field":"#f3f3f3", "--surface":"#e5e5e5", "--surface-2":"#efefef", "--surface-hover":"#d9d9d9", "--code-bg":"#e8e8e8", "--code-toolbar":"#efefef", "--media-bg":"#e0e0e0", "--acc":"#246b60" };
+  for (const [token, value] of Object.entries(expected)) assert.equal(palette[token], value, token);
+  for (const token of ["--bg", "--panel", "--field", "--surface-2", "--code-bg", "--media-bg"]) {
+    assert.ok(contrast(palette["--fg"], palette[token]) >= 7, "body contrast on " + token);
+    assert.ok(contrast(palette["--acc"], palette[token]) >= 4.5, "link contrast on " + token);
+    assert.ok(contrast(palette["--control-border"], palette[token]) >= 3, "control boundary on " + token);
+  }
+  assertRestoredLightDeclarations([".msg.asst", ".msg.user"]);
+});
+
+test("desktop light notes restore the original panel and queued-note tint", () => {
+  const desktop = desktopMediaQueries()[0].body, light = ':root[data-theme="light"] ';
+  assertRestoredLightDeclarations([".msg.asst", "#sidequeuelist li"]);
+  for (const suffix of ["", " > details", " > details > summary"]) {
+    assert.deepEqual(ruleValues(desktop, light + `.msg.asst[data-canonical-identity^='["internal_note",']` + suffix), {});
+  }
+  assert.deepEqual(ruleValues(desktop, light + "#sidenote.show"), { background:"var(--field)", "border-color":"var(--acc)", color:"var(--acc)" });
+  assert.equal(tokenValues(tokenBlock(PALETTES.light, desktop))["--panel"], "#f3f3f3");
+});
+
+test("desktop light Markdown tables restore intrinsic layout and baseline horizontal rules", () => {
+  assertRestoredLightDeclarations([".msg.md .tablewrap", ".msg.md table", ".msg.md th", ".msg.md td", ".msg.md table code"]);
+  const desktop = desktopMediaQueries()[0].body;
+  assert.equal(ruleValues(desktop, ".msg.md th").display, undefined, "native table columns remain intact");
+  assert.doesNotMatch(desktop, /:root\[data-theme="light"\][^{}]*(?:tbody|tr):nth-child\([^)]*\)\s*\{/);
+});
+
+test("desktop light cards and user accents restore their baseline outlines", () => {
+  const desktop = desktopMediaQueries()[0].body, light = ':root[data-theme="light"] ';
+  assert.deepEqual(ruleValues(desktop, light + ".msg.asst:not(.git-output)"), { "border-color":"var(--card-edge)", "border-radius":"var(--radius-card)", "box-shadow":"var(--card-shadow)" });
+  assertRestoredLightDeclarations([".user-msg-row > .msg.user", ".msg.asst > details > summary:hover"]);
+  for (const selector of ['.msg.asst:has(> details[data-fold-key^="thinking:"])', '.msg.asst:has(> details[data-fold-key$=":thinking"])']) {
+    assert.deepEqual(ruleValues(desktop, light + selector), { "border-color":"var(--card-edge)", "box-shadow":"none" });
+  }
+});
+
+test("desktop light quotations, code and media restore their original surfaces", () => {
+  assertRestoredLightDeclarations([".msg.md blockquote", ".msg.md code", ".msg.md pre", ".msg.md pre code", ".msg.md .code-block", ".msg.md .code-block-toolbar", ".msg.md table code", ".msg.md .code-preview iframe", ".msg.md .media-image img", ".msg.md .media-video video", ".msg.phone-frame img"]);
+});
+
+test("desktop light status and hover visuals restore the existing baseline rules", () => {
+  const desktop = desktopMediaQueries()[0].body, light = ':root[data-theme="light"] ';
+  assert.deepEqual(ruleValues(desktop, light + '.msg.asst.tool-activity[data-running="true"]'), { "border-color":"var(--acc-line)" });
+  for (const selector of ['.msg.asst[data-execution-state="completed"]', '.msg.asst.pending', '.msg.asst[data-execution-state="running"]', '.msg.asst.err', '.msg.asst[data-execution-exception="true"]', '.msg.asst:has(> .task-output > .task-error)']) {
+    assert.deepEqual(ruleValues(desktop, light + selector), {}, selector + " uses its original status surface");
+  }
+  assertRestoredLightDeclarations([".msg.pending", ".msg.err", '.turn .tool-activity[data-running="true"]', ".modelrow:hover", ".cmdrow:hover", '.cmdrow[data-active="true"]', "#promptlist button:hover", "#jumpbottom:hover", "#img:hover:not(:disabled)", "#img:focus-visible"]);
+});
+
+test("desktop light session selection and hover restore neutral fills and readable metadata", () => {
+  assertRestoredLightDeclarations(["#sessions li.cur", "#sessions li.cur:hover", "#sessions li:hover"]);
+  const palette = { ...tokenValues(tokenBlock(PALETTES.light)), ...tokenValues(tokenBlock(PALETTES.light, desktopMediaQueries()[0].body)) };
+  assert.equal(palette["--tint-3"], "rgba(46,46,46,.14)");
+  assert.equal(palette["--surface-2"], "#efefef");
+  for (const color of ["#f3f3f3", "#efefef", "#d7d7d7"]) {
+    assert.ok(contrast(palette["--fg"], color) >= 7, "session title contrast on " + color);
+    assert.ok(contrast(palette["--dim"], color) >= 7, "metadata contrast on " + color);
+  }
+  assert.equal(ruleValues(style, '#sessions li.cur span[role="button"]')["font-weight"], "600");
+});
+
+test("desktop near-white changes preserve dark and warm token blocks byte for byte", () => {
+  const sources = { shared: style.slice(0, style.indexOf("@media (min-width:701px)")), desktop: desktopMediaQueries()[0].body };
+  const hashes = {
+    shared_dark: "12c8183613f4dce5fb703d9de5f6a6274c0ee0049d5db5f323ae239f06cc08ff",
+    shared_warm: "98d6aa190c66db657bf77a71021b2aaeec46da2b2a857fb9fe342f0b8b923a54",
+    desktop_dark: "8c298e38bc187003be269b1394f42f24d1c608a579c3b005c16be2d88c25f592",
+    desktop_warm: "2d255eafaeedb07824714821d8454aa1fc03dce573baccd04ba7f305c765ed84",
+  };
+  for (const [scope, source] of Object.entries(sources)) {
+    for (const name of ["dark", "warm"]) {
+      const start = source.indexOf(PALETTES[name]);
+      assert.ok(start >= 0);
+      const block = source.slice(start, source.indexOf("}", start) + 1);
+      assert.equal(createHash("sha256").update(block).digest("hex"), hashes[scope + "_" + name]);
+    }
+  }
+});
+
+test("desktop pastel changes preserve every non-light rule and declaration", () => {
+  const protectedCss = style.replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/:root\[data-theme="light"\][^{]*\{[^{}]*\}/g, "")
+    .replace(/\s+/g, "");
+  assert.equal(createHash("sha256").update(protectedCss).digest("hex"),
+    "3621030a9bc681af936669f8c54f35184b93a0dce1f2a59a4598ad73ccada60d",
+    "dark or warm CSS changed beyond a desktop light selector");
 });
 
 test("the header carries a theme toggle with one icon per palette", () => {

@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { createHash } = require("node:crypto");
 const { test } = require("node:test");
 
 const html = fs.readFileSync(path.join(__dirname, "app.html"), "utf8");
@@ -131,11 +132,78 @@ for (const width of [390, 700, 701, 1280]) {
   });
 }
 
-function pipeTableHarness(width = 1280) {
+function pipeTableHarness(width = 1280, theme = "light") {
   const h = harness();
   h.context.window.matchMedia = (query) => ({ matches: query === "(min-width:701px)" && width >= 701 });
+  h.context.document.documentElement = { getAttribute: (name) => name === "data-theme" ? theme : null };
   return h;
 }
+
+for (const width of [701, 1280]) test("desktop light GFM tables accept optional outer pipes and alignment at " + width + "px", () => {
+  const { render } = pipeTableHarness(width);
+  for (const source of [
+    "commit | conclusion\n:--- | ---:\n`84acfe1` description | merged into `87b7428`",
+    "| commit | conclusion |\n| :--- | ---: |\n| `84acfe1` description | merged into `87b7428` |",
+    "commit | conclusion |\n| :--- | ---:\n`84acfe1` description | merged into `87b7428` |",
+  ]) {
+    const output = render(source);
+    assert.match(output, /<thead><tr><th style="text-align:left">commit<\/th><th style="text-align:right">conclusion<\/th><\/tr>/);
+    assert.match(output, /<td style="text-align:left"><code>84acfe1<\/code> description<\/td><td style="text-align:right">merged into <code>87b7428<\/code><\/td>/);
+    assert.equal((output.match(/<td\b/g) || []).length, 2);
+    assert.doesNotMatch(output, /class="p"/);
+  }
+  assert.match(render("a | b\n--- | :---:\nc | d"), /<th>a<\/th><th style="text-align:center">b<\/th>/);
+});
+
+test("desktop light GFM table cells protect code, escapes and math and reuse inline rendering", () => {
+  const { render } = pipeTableHarness();
+  const output = render("| value | conclusion |\n| --- | --- |\n| `a|b` | left\\|right |\n| $|x|$ | **bold** and [link](https://example.test) |");
+  assert.equal((output.match(/<td>/g) || []).length, 4);
+  assert.match(output, /<td><code>a\|b<\/code><\/td><td>left\|right<\/td>/);
+  assert.match(output, /<b>bold<\/b> and <a\b[^>]*href="https:\/\/example\.test"/);
+  assert.equal(nodesOf(output).length, 1);
+  assert.match(render("a | b\n--- | ---\n`a\\|b` | <script>alert(1)</script>"), /<code>a\\\|b<\/code>/);
+  assert.doesNotMatch(render("a | b\n--- | ---\n<script>alert(1)</script> | c"), /<script>/);
+});
+
+test("desktop light GFM tables leave fences opaque and bound rows and list continuations", () => {
+  const { render } = pipeTableHarness();
+  const source = "commit | conclusion\n--- | ---\n`84acfe1` | merged";
+  for (const fence of ["```", "~~~"]) {
+    for (const end of ["", "\n" + fence]) assert.doesNotMatch(render(fence + "text\n" + source + end), /<table>/);
+    assert.doesNotMatch(render("- code\n  " + fence + "text\n" + source.replace(/^/gm, "  ") + "\n  " + fence), /<table>/);
+  }
+  const listed = render("- results:\n" + source.replace(/^/gm, "  ") + "\n- next");
+  assert.match(listed, /<table>/);
+  assert.equal((listed.match(/class="li"/g) || []).length, 2);
+  assert.match(render(source + "\n\nfollowing prose"), /<\/table><\/div><div class="p">following prose<\/div>/);
+  assert.doesNotMatch(render("a | b\n--- | text\nc | d"), /<table>/);
+  assert.doesNotMatch(render("a | b\n--- | --- | ---\nc | d"), /<table>/);
+  // GFM pads short rows and discards surplus cells to keep the header's shape.
+  assert.match(render("a | b\n--- | ---\nc |\nd | e | discarded"), /<tr><td>c<\/td><td><\/td><\/tr><tr><td>d<\/td><td>e<\/td><\/tr>/);
+});
+
+test("table fixes preserve protected theme renderer bytes for the regression corpus", () => {
+  const sources = [
+    "commit | conclusion\n--- | ---\n`84acfe1` description | merged into `87b7428`",
+    "| commit | conclusion |\n| :--- | ---: |\n| `a|b` | left\\|right |",
+    "| label | value |\n| c | d |\n| e | f |",
+    "| label | value |\n| --- | --- |\n| c | d |",
+    "```text\n| label | value |\n| --- | --- |\n| c | d |\n```",
+    "- table:\n  commit | conclusion\n  --- | ---\n  `84acfe1` | merged",
+    "| a | b |\n| | |\n| c | d |",
+    "\n \t\nshort\n \t\n",
+  ];
+  for (const width of [390, 700, 701, 1280]) {
+    for (const theme of (width <= 700 ? ["light", "dark", "warm"] : ["dark", "warm"])) {
+      const h = pipeTableHarness(width, theme);
+      const outputs = sources.map(source => h.context.renderMarkdown(source, false));
+      assert.equal(createHash("sha256").update(JSON.stringify(outputs)).digest("hex"), width <= 700
+        ? "1ccbabc2e1e7d8b6d8770bcf521979b2a304d382590eac7154d8f13c70a6865c"
+        : "e91169d2ca21d94f2b2a8cf714d883416ada28aa50393fc67c3d010e3a1a71b3", width + "px " + theme);
+    }
+  }
+});
 
 const missingDelimiterTable = [
   "| 区域 | 原色 → 新色 |",
@@ -683,6 +751,8 @@ test("a failed side note preserves the draft and pending images", async () => {
   const end = script.indexOf("async function stopTurn(", start);
   let apiCalls = 0;
   const notices = [];
+  const errors = [];
+  let scrolls = 0;
   const prompt = { value: "keep this", style: { height: "80px" }, focus() {} };
   const button = { disabled: false };
   const context = vm.createContext({
@@ -694,12 +764,14 @@ test("a failed side note preserves the draft and pending images", async () => {
     api: async () => { apiCalls++; throw new Error("offline"); },
     clearDraft: () => assert.fail("failed notes must not clear drafts"), syncStopButton() {},
     note: (message) => notices.push(message),
+    addMsg: (role, text, cls) => errors.push({ role, text, cls }),
+    scrollToLatest: () => { scrolls++; },
     JSON,
   });
   vm.runInContext(script.slice(start, end), context);
   await context.sendSideNote();
   assert.equal(prompt.value, "keep this");
-  assert.equal(notices.at(-1), "side note failed: offline");
+  assert.deepEqual(errors.at(-1), { role: "err", text: "side note failed: offline", cls: "asst err" });
   const image = { filename: "photo.png", data_base64: "cGhvdG8=" };
   context.pendingImages.push(image);
   await context.sendSideNote();
@@ -707,7 +779,8 @@ test("a failed side note preserves the draft and pending images", async () => {
   assert.equal(prompt.value, "keep this");
   assert.equal(prompt.style.height, "80px");
   assert.deepEqual(Array.from(context.pendingImages), [image]);
-  assert.equal(notices.at(-1), "side note failed: offline");
+  assert.deepEqual(errors.at(-1), { role: "err", text: "side note failed（photo.png）: offline", cls: "asst err" });
+  assert.equal(scrolls, 2, "both rejected notes must reveal their error bubbles");
   assert.equal(context.sideNoteBusy, false);
   assert.equal(button.disabled, false);
 });
@@ -2488,8 +2561,12 @@ function pasteHarness(value = "") {
       this.onload();
     }
   }
+  const feedback = { attachments: { hidden: true }, attachmentcount: { textContent: "" }, attachmentnames: { textContent: "" } };
   const context = vm.createContext({
-    $: (id) => { assert.equal(id, "prompt"); return prompt; },
+    $: (id) => {
+      if (Object.hasOwn(feedback, id)) return feedback[id];
+      assert.equal(id, "prompt"); return prompt;
+    },
     growPrompt: () => calls.push("grow"),
     persistDraft: () => calls.push("draft"),
     promptComposing: false,

@@ -377,6 +377,7 @@ pub(super) struct ServeTurnMetadata {
     session_id: String,
     watermark: Option<i64>,
     committed_answer: Option<String>,
+    input_reported: bool,
 }
 
 impl ServeTurnMetadata {
@@ -388,6 +389,7 @@ impl ServeTurnMetadata {
             session_id,
             watermark,
             committed_answer: None,
+            input_reported: false,
         }
     }
 
@@ -400,6 +402,51 @@ impl ServeTurnMetadata {
                     .and_then(|text| text.as_str())
                     .map(str::to_owned)
             });
+    }
+
+    pub(super) fn decorate_input_event(&mut self, event: &mut ServeSse) {
+        if self.input_reported {
+            return;
+        }
+        // These frames consume typed fields or ignore their payload entirely;
+        // raw tool/subagent text must retain its original wire bytes.
+        if !matches!(
+            event.kind.as_str(),
+            "thinking_start"
+                | "thinking"
+                | "thinking_done"
+                | "delta"
+                | "replace"
+                | "answer_pending"
+        ) {
+            return;
+        }
+        let Some(watermark) = self.watermark else {
+            return;
+        };
+        let Ok(messages) = self.store.read_stored_messages(&self.session_id, watermark) else {
+            return;
+        };
+        let metadata = serve_done_metadata(&messages, None);
+        let Some(input) = metadata.get("user_message") else {
+            return;
+        };
+        let mut payload = if event.data.is_empty() {
+            serde_json::json!({})
+        } else {
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.data) else {
+                return;
+            };
+            payload
+        };
+        let Some(object) = payload.as_object_mut() else {
+            return;
+        };
+        // The first persisted input decorates an existing frame before model
+        // completion; missing storage metadata is retried on a later frame.
+        object.insert("user_message".into(), input.clone());
+        event.data = payload.to_string();
+        self.input_reported = true;
     }
 
     pub(super) fn done_event(&self) -> ServeSse {

@@ -72,23 +72,25 @@
   --edge:rgba(228,237,239,.20);
   --shadow-sm:0 2px 8px rgba(0,0,0,.12); --shadow-panel:0 8px 28px rgba(0,0,0,.22);
   --radius-card:18px; --radius-control:14px;
-  --fw-text:450; --fw-meta:400;
+  --fw-text:450; --fw-meta:450;
 }
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg:#eaf0ef; --panel:#f5f8f7; --line:#d3dfdc; --fg:#202d2b; --dim:#586b66;
+  --bg:#f2f0ee; --panel:#faf9f7; --line:#e3dfdb; --fg:#202d2b; --dim:#586b66;
   --acc:#246b60; --ok:#286b3d; --err:#b53e36; --mark:#9a6b12;
-  --surface:#e3ece9; --surface-hover:#d7e5e0; --surface-2:#edf3f0; --line-2:#b6cbc3;
-  --field:#edf3f0; --code-bg:#e6eeeb; --media-bg:#e0e9e5; --code-toolbar:#edf3f0;
+  --surface:#f1eeeb; --surface-hover:#eae6e2; --surface-2:#eae6e2; --line-2:#858585;
+  --field:#fdfdfc; --code-bg:#f0ece8; --media-bg:#eae6e2; --code-toolbar:#f5f2ef;
   --acc-soft:#246b60; --acc-soft-2:#174e45; --acc-line:#87b4a9; --acc-line-soft:rgba(36,107,96,.38);
   --acc-solid:#246b60; --acc-focus:#246b60; --on-acc:#ffffff; --on-user:#ffffff;
-  --glass:rgba(245,248,247,.95); --glass-strong:rgba(245,248,247,.98);
+  --glass:rgba(250,249,247,.95); --glass-strong:rgba(250,249,247,.98);
   --tint:rgba(36,107,96,.10); --tint-2:rgba(36,107,96,.06); --tint-3:rgba(36,107,96,.13); --tint-4:rgba(36,107,96,.22);
-  --composer-a:#f5f8f7; --composer-b:#edf3f0;
+  --composer-a:#faf9f7; --composer-b:#f2f0ee;
   --focus-ring:rgba(36,107,96,.14); --acc-shadow:rgba(36,107,96,.16); --glow:rgba(36,107,96,.32);
   --edge:rgba(32,45,43,.18);
-  --shadow-sm:0 2px 8px rgba(32,61,52,.05); --shadow-panel:0 8px 28px rgba(32,61,52,.10);
+  --shadow-sm:0 2px 8px rgba(46,46,46,.05); --shadow-panel:0 8px 28px rgba(46,46,46,.10);
 }
+:root[data-theme="light"] .msg.user { background:var(--surface-2); color:var(--fg); }
+:root[data-theme="light"] #prompt { background:var(--field); }
 /* Warm surfaces keep the same teal accent and hierarchy as the other themes. */
 :root[data-theme="warm"] {
   color-scheme: light;
@@ -224,7 +226,7 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #scrim { display:none; }
 /* The override wrapper is transparent by default; the width queries below
    give it a phone summary row or a desktop row with the team entry. */
-#ovrwrap { display:contents; }
+#ovrwrap { display:contents; order:1; }
 #ovrwrap > summary { display:none; }
 html { -webkit-text-size-adjust:100%; }
 select, summary { touch-action:manipulation; }
@@ -622,6 +624,14 @@ select, summary { touch-action:manipulation; }
 }
 #sidequeuelist .text { min-width:0; white-space:pre-wrap; overflow-wrap:anywhere; }
 #composer { display:flex; position:relative; gap:8px; padding:10px 12px calc(10px + env(safe-area-inset-bottom)); background:var(--panel); border-top:1px solid var(--line); }
+#attachments[hidden] { display:none; }
+#attachments {
+  position:absolute; bottom:calc(100% + 4px); left:8px; right:8px; z-index:5;
+  padding:6px 10px; border:1px solid var(--line); border-radius:10px;
+  background:var(--panel); color:var(--dim); box-shadow:var(--shadow-panel); font-size:12px;
+}
+#attachmentcount { cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#attachmentnames { max-height:96px; overflow-y:auto; white-space:pre-wrap; overflow-wrap:anywhere; padding-top:4px; }
 /* Slash-command completion sits above the composer, like the skill picker,
    so opening it never reflows the transcript or the input row. */
 #cmdmenu {
@@ -684,7 +694,8 @@ select, summary { touch-action:manipulation; }
 .msg.md { white-space:normal; }
 .msg.md .answer-actions { display:flex; justify-content:flex-end; align-items:center; gap:8px; margin-top:8px; }
 .message-time { display:block; flex:0 0 auto; color:var(--dim); font-size:11px; font-weight:var(--fw-meta); line-height:1.4; font-variant-numeric:tabular-nums; white-space:nowrap; }
-.msg.user > .message-time { margin-top:4px; color:inherit; opacity:.8; text-align:right; }
+.msg.user > .message-actions, #sidequeuelist .message-actions { display:flex; justify-content:flex-end; align-items:center; gap:8px; margin-top:8px; }
+.message-actions > .message-time { margin-right:auto; }
 .answer-actions > .message-time { margin-right:auto; }
 /* Throughput is a footer inside an assistant card. Phones use their existing
    status card while running, then keep this footer with the completed turn. */
@@ -834,7 +845,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
      the face actually is, which is what makes the text look thick and soft.
      Phones keep the heavier base weight and their platform smoothing. */
   body {
-    font-weight:400;
+    font-weight:450;
     -webkit-font-smoothing:antialiased;
     -moz-osx-font-smoothing:grayscale;
   }
@@ -842,8 +853,8 @@ button:active:not(:disabled) { filter:brightness(.96); }
      inputs shrink to a sliver and the token field cannot be used. */
   #conn.open { flex-wrap:wrap; }
   #conn input { flex:1 1 260px; }
-  /* Gray reading surfaces keep teal on actions and focus indicators. The
-     shared palettes above continue to own every phone colour. */
+  /* Desktop palettes keep teal on actions; light uses neutral resting fills.
+     The shared palettes above continue to own every phone colour. */
   :root {
     --bg:#1b1b1b; --panel:#242424; --line:#3e3e3e; --fg:#e9e9e9; --dim:#c4c4c4;
     --surface:#2e2e2e; --surface-hover:#383838; --surface-2:#292929; --line-2:#5c5c5c;
@@ -916,14 +927,27 @@ button:active:not(:disabled) { filter:brightness(.96); }
   :root[data-theme="light"] #oeffortbtn:focus-visible,
   :root[data-theme="light"] #oskill:focus-visible { border-color:var(--acc-focus); }
   :root[data-theme="light"] #sidenote.show { background:var(--field); border-color:var(--acc); color:var(--acc); }
+  /* Light-theme shell overrides set spacing and visual order without moving DOM nodes.
+     The positioned composer anchors the command completion menu. */
+  :root[data-theme="light"] body { font-weight:400; }
+  :root[data-theme="light"] #ovrwrap { order:0; padding:10px 24px 4px; }
+  :root[data-theme="light"] #composer { padding:8px 24px 20px; }
+  /* Light-theme answer cards use a thin border without changing other themes. */
+  :root[data-theme="light"] .msg.asst.md:not(.pending):not(.err):not(.git-output) {
+    border:1px solid var(--card-edge);
+  }
+  :root[data-theme="light"] .msg.md pre,
+  :root[data-theme="light"] .msg.md pre code {
+    white-space:pre; word-break:normal; overflow-wrap:normal;
+  }
   /* Desktop eye-care uses a low-chroma paper tint instead of saturated cream.
      Surfaces stay below paper white, and accent tints keep their teal hue. */
   :root[data-theme="warm"] {
-    --bg:#edeae4; --panel:#f5f2ec; --line:#d9d2c2; --fg:#34362b; --dim:#5b5d51;
-    --surface:#e8e5de; --surface-hover:#e2dfd7; --surface-2:#f0ede7; --line-2:#c8c0ae;
+    --bg:#e9e8e7; --panel:#efeeed; --line:#d9d2c2; --fg:#34362b; --dim:#5b5d51;
+    --surface:#e0dfde; --surface-hover:#d7d6d5; --surface-2:#e7e6e5; --line-2:#c8c0ae;
     --control-border:#6f6a5b;
-    --field:#f0ede7; --code-bg:#e9e6df; --media-bg:#e6e3db; --code-toolbar:#f0ede7;
-    --glass:rgba(245,242,236,.95); --glass-strong:rgba(245,242,236,.98);
+    --field:#e7e6e5; --code-bg:#e2e1e0; --media-bg:#dbdad9; --code-toolbar:#e7e6e5;
+    --glass:rgba(239,238,237,.95); --glass-strong:rgba(239,238,237,.98);
     --tint:rgba(53,105,93,.10); --tint-2:rgba(53,105,93,.06); --tint-3:rgba(53,105,93,.13); --tint-4:rgba(53,105,93,.18);
     --edge:rgba(52,54,45,.18);
     --card-edge:rgba(72,66,52,.12);
@@ -1115,7 +1139,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #jumpbottom.show { opacity:1; transform:translateY(0) scale(1); pointer-events:auto; }
   #ovrwrap {
     display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:start;
-    position:relative; flex-shrink:0; gap:4px 8px; padding:10px 24px 4px;
+    position:relative; flex-shrink:0; gap:4px 8px; padding:4px 24px 20px;
     border-top:1px solid var(--line); background:transparent; box-shadow:none;
   }
   /* A phone may have closed the disclosure before the viewport widened. */
@@ -1128,7 +1152,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
     grid-column:1; grid-row:1; position:relative; min-width:0; align-items:start; gap:4px 8px; padding:0;
   }
   #ovr select, #omodelbtn, #oagentbtn, #oeffortbtn, #oskill {
-    width:100%; height:32px; min-height:32px; padding:0 10px; font-size:13px; font-weight:400;
+    width:100%; height:32px; min-height:32px; padding:0 10px; font-size:13px; font-weight:450;
     background-color:transparent; border-color:transparent;
   }
   #ovr select { padding-right:30px; }
@@ -1151,7 +1175,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #composer {
     display:grid; grid-template-columns:36px minmax(0,1fr) 36px;
     grid-template-areas:"image prompt send";
-    flex-shrink:0; align-items:end; gap:8px; padding:8px 24px 20px; border-top:0; background:transparent; box-shadow:none;
+    flex-shrink:0; align-items:end; gap:8px; padding:10px 24px 8px; border-top:0; background:transparent; box-shadow:none;
   }
   #composer.side-note-ready {
     grid-template-columns:36px minmax(0,1fr) 58px 36px;
@@ -1218,7 +1242,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
   .rowbtns button { flex:1; min-height:42px; font-size:13px; }
   #sessfilter { padding:10px 8px; }
   /* Override picks collapse into one summary row showing the current picks. */
-  #ovrwrap { display:block; border-top:1px solid var(--line); background:var(--panel); }
+  #ovrwrap { display:block; border-top:1px solid var(--line); background:var(--panel); padding-bottom:env(safe-area-inset-bottom); }
   #ovrwrap > summary { display:flex; align-items:center; gap:8px; min-height:48px; padding:2px 10px; font-size:12px; color:var(--dim); white-space:nowrap; }
   #teamtrigger { min-height:44px; padding:0 12px; gap:6px; background:var(--surface-2); }
   #ovrsummary { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
@@ -1243,6 +1267,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #jumpbottom.show { opacity:1; transform:translateY(0) scale(1); pointer-events:auto; }
   #questionbtn.show { display:grid; }
   .msg { max-width:94%; padding:6px 10px; border-radius:12px; line-height:1.5; scroll-margin-block:8px; }
+  .msg.asst[data-task-raw-tool="true"] > details[open] > .prog { overscroll-behavior-y:auto; }
   .msg details summary { min-height:30px; padding:6px 2px; }
   .execution-group > details > .execution-items { padding:8px; }
   .msg.md .p { margin:4px 0; }
@@ -1267,7 +1292,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #composer {
     display:grid; grid-template-columns:42px minmax(0,1fr) 42px;
     grid-template-areas:"image prompt send";
-    align-items:end; gap:8px; margin:6px 8px; padding:6px 8px calc(6px + env(safe-area-inset-bottom));
+    align-items:end; gap:8px; margin:6px 8px; padding:6px 8px;
     border:1px solid var(--line); border-radius:16px;
     background:linear-gradient(180deg, var(--composer-a) 0%, var(--composer-b) 100%);
     box-shadow:var(--shadow-panel);
@@ -1513,6 +1538,10 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <textarea id="prompt" placeholder="ask…" rows="1"></textarea>
 <button id="sidenote" type="button" aria-label="send as side note" aria-hidden="true" tabindex="-1" title="send as side note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v11H9l-4 3V5Z"/><path d="M9 9h6"/></svg><span>note</span></button>
 <button id="send" class="primary">➤</button>
+<details id="attachments" hidden>
+<summary id="attachmentcount" role="status" aria-live="polite"></summary>
+<div id="attachmentnames"></div>
+</details>
 <div id="cmdmenu" hidden>
 <div id="cmdoptions" role="listbox" aria-label="slash commands"></div>
 <div id="cmdempty" role="status" hidden>No matching commands</div>
@@ -1885,6 +1914,7 @@ const executionModel = (() => {
       const activity = state.activities.get(event.owner.id);
       if (!activity) return;
       if (event.kind === "task") {
+        if (event.advance) activity.slots.delete(event.slot);
         activity.slots.set(event.slot, summaryOf(event.summary));
         // A completed report may advance its logical observation beside the
         // tool that produced it. The renderer uses this same explicit action.
@@ -2130,6 +2160,153 @@ function codeBlock(source, lang) {
     '<button type="button" data-copy-code>copy</button></div>' +
     "<pre" + (lang ? ' data-lang="' + esc(lang) + '"' : "") + "><code>" + esc(source) + "</code></pre></div>";
 }
+// BEGIN desktop light code
+// This is a display tokenizer, not a parser. Every token retains source bytes
+// and reaches the DOM only through textContent or a text node.
+const LIGHT_CODE_LANGUAGES = {
+  javascript: { aliases: ["js", "jsx", "mjs", "cjs"], comments: "slash", template: true,
+    keywords: "async await break case catch class const continue debugger default delete do else export extends false finally for from function get if import in instanceof let new null of return set static super switch this throw true try typeof undefined var void while with yield" },
+  typescript: { aliases: ["ts", "tsx"], comments: "slash", template: true,
+    keywords: "abstract any as async await boolean break case catch class const constructor continue declare default delete do else enum export extends false finally for from function if implements import in infer instanceof interface is keyof let namespace never new null number of private protected public readonly require return satisfies static string super switch symbol this throw true try type typeof undefined unknown var void while yield" },
+  python: { aliases: ["py", "python3"], comments: "hash", triple: true,
+    keywords: "and as assert async await break class continue def del elif else except False finally for from global if import in is lambda None nonlocal not or pass raise return True try while with yield" },
+  rust: { aliases: ["rs"], comments: "slash", rust: true,
+    keywords: "as async await break const continue crate dyn else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while" },
+  json: { aliases: ["jsonc"], comments: "slash", keywords: "true false null" },
+  bash: { aliases: ["sh", "shell", "zsh", "shellscript"], comments: "hash", template: true, shell: true,
+    keywords: "if then else elif fi for while until do done case esac in function select time coproc true false" },
+  yaml: { aliases: ["yml"], comments: "hash", keys: true, keywords: "true false null yes no on off" },
+  html: { aliases: ["htm", "xml", "svg"], comments: "html",
+    keywords: "doctype html head body title meta link style script div span p a img input button form section main header footer nav article ul ol li table thead tbody tr th td pre code h1 h2 h3 br svg path" },
+  css: { aliases: ["scss", "less"], comments: "block", keys: true,
+    keywords: "important inherit initial unset auto none block inline flex grid relative absolute fixed sticky solid transparent" },
+};
+const lightCodeAliases = new Map();
+for (const [language, config] of Object.entries(LIGHT_CODE_LANGUAGES)) {
+  config.keywordSet = new Set(config.keywords.split(" "));
+  for (const alias of [language, ...config.aliases]) lightCodeAliases.set(alias, config);
+}
+const lightCodeSources = new WeakMap();
+let lightCodeWatching = false;
+let lightCodeActive = false;
+function isDesktopLightCode() {
+  return typeof document !== "undefined" && document.documentElement?.getAttribute?.("data-theme") === "light"
+    && typeof window !== "undefined" && window.matchMedia?.("(min-width:701px)").matches === true;
+}
+function tokenizeLightCode(source, language) {
+  const name = String(language || "").trim().toLowerCase().split(/\s+/)[0];
+  const config = lightCodeAliases.get(name);
+  // Bound optional decoration work while keeping long listings readable.
+  if (!config || source.length > 200000) return null;
+  const rules = [];
+  const add = (kind, expression) => rules.push({ kind, expression });
+  if (config.comments === "slash" || config.comments === "block") add("comment", /\/\*[\s\S]*?(?:\*\/|$)/y);
+  if (config.comments === "slash") add("comment", /\/\/[^\n]*/y);
+  if (config.comments === "hash") add("comment", /#[^\n]*/y);
+  if (config.comments === "html") add("comment", /<!--[\s\S]*?(?:-->|$)/y);
+  if (config.triple) add("string", /(?:"""[\s\S]*?(?:"""|$)|'''[\s\S]*?(?:'''|$))/y);
+  if (config.rust) {
+    add("string", /r(#+)?"[\s\S]*?"\1/y);
+    add("plain", /'[A-Za-z_]\w*\b(?!')/y); // Rust lifetimes are not quoted strings.
+  }
+  add("string", /(?:"(?:\\[\s\S]|[^"\\\n])*(?:"|(?=\n|$))|'(?:\\[\s\S]|[^'\\\n])*(?:'|(?=\n|$)))/y);
+  if (config.template) add("string", /`(?:\\[\s\S]|[^`\\])*(?:`|$)/y);
+  add("number", /\b(?:0[xX][\da-fA-F_]+|0[bB][01_]+|(?:\d[\d_]*(?:\.\d[\d_]*)?|\.\d+)(?:[eE][+-]?\d+)?)/y);
+  add("identifier", config.keys || config.comments === "html" ? /[A-Za-z_$][\w$-]*/y : /[A-Za-z_$][\w$]*/y);
+  add("plain", /\s+/y);
+  add("punctuation", /[^\w\s]/uy);
+  const tokens = [];
+  let index = 0;
+  let shellCommandStart = true;
+  while (index < source.length) {
+    let found = false;
+    for (const rule of rules) {
+      rule.expression.lastIndex = index;
+      const match = rule.expression.exec(source);
+      if (!match) continue;
+      const text = match[0];
+      let kind = rule.kind;
+      if (kind === "identifier") {
+        kind = config.keywordSet.has(text) ? "keyword"
+          : /^\s*!?\s*\(/.test(source.slice(index + text.length))
+            || (config.keys && /^\s*:/.test(source.slice(index + text.length)))
+            || (config.shell && shellCommandStart)
+            ? "function" : "plain";
+      }
+      tokens.push({ kind, text });
+      if (config.shell) {
+        if (text.includes("\n") || /^[;|&]$/.test(text) || (kind === "keyword" && /^(then|do|else)$/.test(text))) shellCommandStart = true;
+        else if (!/^\s+$/.test(text) && kind !== "comment") shellCommandStart = false;
+      }
+      index += text.length;
+      found = true;
+      break;
+    }
+    if (!found) tokens.push({ kind: "plain", text: source[index++] });
+  }
+  return tokens;
+}
+function watchDesktopLightCode() {
+  if (lightCodeWatching) return;
+  lightCodeWatching = true;
+  const repaint = () => decorateDesktopLightCode($("msgs"));
+  // Passive listeners also cover a first switch into desktop light. They
+  // leave monochrome DOM untouched until this decoration has been active.
+  const observer = window.MutationObserver && new window.MutationObserver(repaint);
+  observer?.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  window.matchMedia?.("(min-width:701px)").addEventListener?.("change", repaint);
+}
+function decorateDesktopLightCode(root) {
+  const enabled = isDesktopLightCode();
+  if (!root?.querySelectorAll) return;
+  watchDesktopLightCode();
+  if (!enabled && !lightCodeActive) return;
+  lightCodeActive = enabled;
+  const selector = enabled ? ".code-block pre code, .code-preview pre code" : "code.code-highlighted";
+  for (const code of root.querySelectorAll(selector)) {
+    const source = code.textContent;
+    const language = code.parentElement?.dataset.lang || code.closest?.(".code-preview")?.dataset.previewKind || "";
+    const previous = lightCodeSources.get(code);
+    if (!enabled) {
+      if (previous?.highlighted) {
+        code.textContent = source;
+        code.classList.remove("code-highlighted");
+        lightCodeSources.delete(code);
+      }
+      continue;
+    }
+    if (previous?.source === source && previous.language === language) continue;
+    try {
+      const tokens = tokenizeLightCode(source, language);
+      if (!tokens) {
+        if (previous?.highlighted) {
+          code.textContent = source;
+          code.classList.remove("code-highlighted");
+        }
+        lightCodeSources.set(code, { source, language, highlighted: false });
+        continue;
+      }
+      const fragment = document.createDocumentFragment();
+      for (const token of tokens) {
+        if (token.kind === "plain") fragment.appendChild(document.createTextNode(token.text));
+        else {
+          const span = document.createElement("span");
+          span.className = "code-token-" + token.kind;
+          span.textContent = token.text;
+          fragment.appendChild(span);
+        }
+      }
+      code.replaceChildren(fragment);
+      code.classList.add("code-highlighted");
+      lightCodeSources.set(code, { source, language, highlighted: true });
+    } catch (_) {
+      code.textContent = source;
+      code.classList.remove("code-highlighted");
+      lightCodeSources.delete(code);
+    }
+  }
+}
+// END desktop light code
 // Copying uses the async clipboard when the page is served over HTTPS; plain
 // HTTP and older WebViews fall back to a selection copy, which still works
 // because the tap is a user gesture.
@@ -2641,9 +2818,46 @@ function renderMarkdown(src, allowPreviews) {
   const previews = allowPreviews !== false;
   const compactEdges = typeof window !== "undefined" && typeof window.matchMedia === "function"
     && window.matchMedia("(min-width:701px)").matches;
+  const lightTables = compactEdges && typeof document !== "undefined"
+    && document.documentElement?.getAttribute?.("data-theme") === "light";
   const math = protectMath(String(src).replace(/\r\n?/g, "\n"));
   const lines = math.source.split("\n");
   const inline = (s) => math.restore(mdInline(s));
+  // GFM outer pipes are optional. Code spans and escaped pipes belong to a
+  // cell, while math pipes are already opaque in protectMath's source.
+  const pipeCells = (line) => {
+    const source = line.trim(), pipes = [];
+    for (const match of source.matchAll(/`[^`]+`|\\.|\|/g)) {
+      if (match[0] === "|") pipes.push(match.index);
+    }
+    if (!pipes.length) return null;
+    const stops = [-1, ...pipes, source.length];
+    const cells = stops.slice(1).map((end, index) => source.slice(stops[index] + 1, end).trim());
+    if (pipes[0] === 0) cells.shift();
+    if (pipes[pipes.length - 1] === source.length - 1) cells.pop();
+    return cells;
+  };
+  const lightTableAt = (index) => {
+    if (!lightTables || index + 1 >= lines.length) return null;
+    // Keep ambiguous framed blocks intact instead of inferring a new header
+    // partway through one. The existing explicit delimiter branch still owns
+    // its legacy grammar at those positions.
+    if (index > 0 && /^\s*\|.*\|\s*$/.test(lines[index - 1])) return null;
+    const header = pipeCells(lines[index]), delimiter = pipeCells(lines[index + 1]);
+    if (!header?.length || !delimiter || delimiter.length !== header.length
+      || !delimiter.every((cell) => /^:?-{3,}:?$/.test(cell))) return null;
+    const align = delimiter.map((cell) => cell.startsWith(":")
+      ? (cell.endsWith(":") ? "center" : "left") : (cell.endsWith(":") ? "right" : ""));
+    const rows = [];
+    let end = index + 2;
+    for (; end < lines.length; end++) {
+      const row = pipeCells(lines[end]);
+      if (!row || /^\s*(?:`{3,}|~{3,}|>|[-*+]\s|\d{1,3}[.)]\s|#{1,6}\s)/.test(lines[end])) break;
+      // GFM keeps the header's column count for short and overfull body rows.
+      rows.push(Array.from({ length: header.length }, (_, column) => row[column] || ""));
+    }
+    return { header, rows, align, end };
+  };
   // Infer only a complete, consistently shaped pipe block. Short or ragged
   // blocks remain text; a missing delimiter must not make us invent cells.
   const framedRow = (line) => {
@@ -2754,7 +2968,8 @@ function renderMarkdown(src, allowPreviews) {
       out.push("<blockquote>" + quoted.map(inline).join("<br>") + "</blockquote>");
       continue;
     }
-    const inferred = implicitTableAt(i);
+    const table = lightTableAt(i);
+    const inferred = table || implicitTableAt(i);
     if (inferred || (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1]))) {
       flushText();
       let ths, rows;
@@ -2769,9 +2984,11 @@ function renderMarkdown(src, allowPreviews) {
         rows = [];
         for (; i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]); i++) rows.push(cells(lines[i]));
       }
+      const cell = (tag, content, column) => "<" + tag + (table?.align[column]
+        ? ' style="text-align:' + table.align[column] + '"' : "") + ">" + inline(content) + "</" + tag + ">";
       out.push('<div class="tablewrap"><table><thead><tr>' +
-        ths.map((c) => "<th>" + inline(c) + "</th>").join("") + "</tr></thead><tbody>" +
-        rows.map((r) => "<tr>" + r.map((c) => "<td>" + inline(c) + "</td>").join("") + "</tr>").join("") +
+        ths.map((c, column) => cell("th", c, column)).join("") + "</tr></thead><tbody>" +
+        rows.map((r) => "<tr>" + r.map((c, column) => cell("td", c, column)).join("") + "</tr>").join("") +
         "</tbody></table></div>");
       continue;
     }
@@ -2822,7 +3039,7 @@ function renderMarkdown(src, allowPreviews) {
           i = closed ? end : end - 1;
           continue;
         }
-        if (compactEdges && implicitTableAt(i)) break;
+        if (lightTableAt(i) || (compactEdges && implicitTableAt(i))) break;
         run.push(inline(cont[2]));
       }
       flushRun();
@@ -3111,6 +3328,7 @@ function scheduleGrow() {
 function insertPromptText(text) {
   const prompt = $("prompt");
   if (promptComposing) return;
+  if (typeof invalidateDesktopCompletion === "function") invalidateDesktopCompletion();
   const before = promptHistory?.capture();
   const start = Number.isInteger(prompt.selectionStart) ? prompt.selectionStart : prompt.value.length;
   const end = Number.isInteger(prompt.selectionEnd) ? prompt.selectionEnd : start;
@@ -3336,31 +3554,126 @@ function imageMarkerAppend(value, added) {
   return (value && !value.endsWith("\n") ? "\n" : "") +
     added.map((image) => "[[image:" + image.filename + "]]").join("\n");
 }
+const IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+const IMAGE_MAX_EDGE = 2048;
+const IMAGE_JPEG_QUALITY = 0.85;
+const IMAGE_MIME_EXTENSIONS = {
+  "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg",
+  "image/gif": "gif", "image/webp": "webp", "image/bmp": "bmp", "image/x-ms-bmp": "bmp",
+};
+const IMAGE_EXTENSION_MIMES = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+  webp: "image/webp", bmp: "image/bmp", heic: "image/heic", heif: "image/heif",
+  avif: "image/avif", svg: "image/svg+xml", tif: "image/tiff", tiff: "image/tiff", ico: "image/x-icon",
+};
+function imageFileMime(file) {
+  if (!file) return "";
+  const type = String(file.type || "").toLowerCase().trim();
+  return type.startsWith("image/") ? type : IMAGE_EXTENSION_MIMES[String(file.name || "").split(".").pop().toLowerCase()] || "";
+}
+function renderComposerAttachments() {
+  const box = $("attachments");
+  if (!box) return;
+  box.hidden = !pendingImages.length;
+  const names = pendingImages.map((image) => image.filename);
+  $("attachmentcount").textContent = names.length ? "已选 " + names.length + " 张图片 · " + names.join("、") : "";
+  $("attachmentnames").textContent = names.join("\n");
+}
+function readImageDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const value = String(reader.result || "");
+      if (!/^data:[^,]*;base64,[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+        reject(new Error("图片内容为空或无法读取"));
+      } else resolve(value);
+    };
+    reader.onerror = () => reject(reader.error || new Error("无法读取图片"));
+    reader.onabort = () => reject(new Error("图片读取已取消"));
+    reader.readAsDataURL(file);
+  });
+}
+function imageDataBytes(dataUrl) {
+  const data = dataUrl.slice(dataUrl.indexOf(",") + 1);
+  return data.length * 3 / 4 - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0);
+}
+function imageFilenameWithExtension(name, extension) {
+  const stem = String(name || "image").replace(/\.[^.]+$/, "");
+  return stem + "." + extension;
+}
+async function normalizeImageFile(file) {
+  const mime = imageFileMime(file);
+  if (!mime) throw new Error("不支持的图片类型，请选择图片文件");
+  const dataUrl = await readImageDataUrl(file);
+  const type = String(file.type || "").toLowerCase().trim();
+  const extension = IMAGE_MIME_EXTENSIONS[type];
+  if (extension && (file.size === undefined || file.size <= IMAGE_MAX_BYTES) && imageDataBytes(dataUrl) <= IMAGE_MAX_BYTES) {
+    const originalExtension = String(file.name || "").split(".").pop().toLowerCase();
+    const filename = ["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(originalExtension)
+      ? file.name : imageFilenameWithExtension(file.name, extension);
+    return { filename, data_base64: dataUrl.slice(dataUrl.indexOf(",") + 1) };
+  }
+  const image = await new Promise((resolve, reject) => {
+    const decoded = new Image();
+    decoded.onload = () => resolve(decoded);
+    decoded.onerror = () => reject(new Error("无法解码图片（" + mime + "），请改选 JPEG 或 PNG"));
+    // Pickers can omit MIME metadata; give the decoder the extension's image MIME.
+    decoded.src = dataUrl.replace(/^data:[^;]*/, "data:" + mime);
+  });
+  const edge = Math.max(image.naturalWidth, image.naturalHeight);
+  if (!Number.isFinite(edge) || edge <= 0 || !image.naturalWidth || !image.naturalHeight) {
+    throw new Error("无法读取图片尺寸");
+  }
+  const scale = Math.min(1, IMAGE_MAX_EDGE / edge);
+  let width = Math.max(1, Math.round(image.naturalWidth * scale));
+  let height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const canvas = document.createElement("canvas");
+  const context = typeof canvas.getContext === "function" ? canvas.getContext("2d") : null;
+  if (!context || typeof canvas.toBlob !== "function") throw new Error("canvas 图片转换不可用，请改选 JPEG 或 PNG");
+  try {
+    while (true) {
+      canvas.width = width;
+      canvas.height = height;
+      context.fillStyle = "#fff";
+      context.fillRect(0, 0, width, height);
+      context.drawImage(image, 0, 0, width, height);
+      const blob = await new Promise((resolve, reject) => {
+        canvas.toBlob((value) => value && value.size && value.type === "image/jpeg"
+          ? resolve(value) : reject(new Error("canvas 无法编码 JPEG")), "image/jpeg", IMAGE_JPEG_QUALITY);
+      });
+      if (blob.size < IMAGE_MAX_BYTES) {
+        const jpeg = await readImageDataUrl(blob);
+        if (imageDataBytes(jpeg) >= IMAGE_MAX_BYTES) throw new Error("转换后的图片仍超过 10 MiB");
+        return { filename: imageFilenameWithExtension(file.name, "jpg"), data_base64: jpeg.slice(jpeg.indexOf(",") + 1) };
+      }
+      if (width === 1 && height === 1) throw new Error("转换后的图片仍超过 10 MiB");
+      width = Math.max(1, Math.floor(width * 0.75));
+      height = Math.max(1, Math.floor(height * 0.75));
+    }
+  } finally {
+    // Release the canvas backing store after encoding, including failed reads.
+    canvas.width = canvas.height = 0;
+  }
+}
 async function queueImageFiles(files) {
   const targetSession = sessionId;
   const key = draftKey(targetSession);
   const added = [];
   for (const file of files) {
-    const currentImages = sessionId === targetSession ? pendingImages : composerImageDrafts.get(key) || [];
-    if (currentImages.length >= 10) break;
-    if (!file || !String(file.type || "").startsWith("image/")) continue;
     try {
-      const dataUrl = await new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result);
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-      });
-      const data = String(dataUrl).split(",", 2)[1] || "";
-      if (!data) continue;
+      const currentImages = sessionId === targetSession ? pendingImages : composerImageDrafts.get(key) || [];
+      if (currentImages.length >= 10) throw new Error("最多只能附带 10 张图片");
+      const normalized = await normalizeImageFile(file);
       const images = sessionId === targetSession ? pendingImages : composerImageDrafts.get(key) || [];
-      if (images.length >= 10) break;
-      const image = { filename: uniqueImageFilename(file.name, images), data_base64: data };
+      if (images.length >= 10) throw new Error("最多只能附带 10 张图片");
+      const image = { filename: uniqueImageFilename(normalized.filename, images), data_base64: normalized.data_base64 };
       images.push(image);
       composerImageDrafts.set(key, images);
       added.push(image);
     } catch (error) {
-      note("could not attach image: " + (error && error.message ? error.message : error));
+      addMsg("err", "无法附加 " + String(file && file.name || "未命名图片") + "：" +
+        (error && error.message ? error.message : error), "asst err");
+      scrollToLatest();
     }
   }
   if (!added.length) return;
@@ -3370,6 +3683,7 @@ async function queueImageFiles(files) {
     storeDraft(targetSession, value + marker, composerImageDrafts.get(key));
     return;
   }
+  renderComposerAttachments();
   const prompt = $("prompt");
   const marker = imageMarkerAppend(prompt.value, added);
   // A word being composed owns the field: the markers wait for it to end.
@@ -3396,6 +3710,7 @@ if (typeof window !== "undefined") {
       if (pendingImages.length >= 10) { note("最多只能附带 10 张图片"); return false; }
       const filename = uniqueImageFilename(share.filename || "shared-image", pendingImages);
       pendingImages.push({ filename, data_base64: share.data_base64 });
+      renderComposerAttachments();
       text = (text ? text + "\n" : "") + "[[image:" + filename + "]]";
     }
     if (!text) return false;
@@ -3419,11 +3734,11 @@ function handlePromptPaste(event) {
   const clipboard = event.clipboardData;
   if (!clipboard) return;
   const itemImages = Array.from(clipboard.items || [])
-    .filter((item) => item.kind === "file" && String(item.type || "").startsWith("image/"))
+    .filter((item) => item.kind === "file")
     .map((item) => item.getAsFile())
-    .filter(Boolean);
+    .filter((file) => imageFileMime(file));
   const images = itemImages.length ? itemImages : Array.from(clipboard.files || [])
-    .filter((file) => String(file.type || "").startsWith("image/"));
+    .filter((file) => imageFileMime(file));
   if (images.length) {
     event.preventDefault();
     return queueImageFiles(images);
@@ -3706,6 +4021,7 @@ function storeDraft(id, value, images) {
 }
 function persistDraft(id = sessionId) {
   storeDraft(id, $("prompt").value, pendingImages);
+  if (typeof renderComposerAttachments === "function") renderComposerAttachments();
 }
 function restoreDraft(id = sessionId) {
   // A draft is only restored when the composer is free; replacing the value
@@ -3714,12 +4030,14 @@ function restoreDraft(id = sessionId) {
   const value = !isPhoneLayout() && composerDrafts.has(key) ? composerDrafts.get(key) : localStorage.getItem(key) || "";
   if (!setPromptValue(value, false, { resetHistory: true })) return;
   pendingImages = composerImageDrafts.get(key) || [];
+  if (typeof renderComposerAttachments === "function") renderComposerAttachments();
   growPrompt();
 }
 function clearDraft(id) {
   composerDrafts.delete(draftKey(id));
   composerImageDrafts.delete(draftKey(id));
   localStorage.removeItem(draftKey(id));
+  if (typeof renderComposerAttachments === "function") renderComposerAttachments();
 }
 function closeQuestionPanel() {
   const panel = $("questionpanel");
@@ -3748,6 +4066,7 @@ function resetQuestionNavigator() {
 function switchSession(nextId, saveCurrent = true) {
   nextId = nextId || "";
   if (nextId === sessionId) return;
+  if (typeof invalidateDesktopCompletion === "function") invalidateDesktopCompletion();
   if (saveCurrent) {
     persistDraft();
     if (typeof rememberSessionFoldState === "function") rememberSessionFoldState();
@@ -3980,14 +4299,18 @@ function setMessageTimestamp(root, source) {
   const ms = messageTimestampOf(source);
   if (ms === null || !root) return;
   const user = root.dataset.role === "user";
-  const footer = root.querySelector(".answer-actions");
+  let footer = root.querySelector(user ? ".message-actions" : ".answer-actions");
   if (!user && (!footer || root.classList.contains("pending"))) return;
+  if (user && !footer) {
+    footer = document.createElement("div");
+    footer.className = "message-actions";
+    root.appendChild(footer);
+  }
   let label = root.querySelector(".message-time");
   if (!label) {
     label = document.createElement("time");
     label.className = "message-time";
-    if (user) root.appendChild(label);
-    else footer.insertBefore(label, footer.firstChild);
+    footer.insertBefore(label, footer.firstChild);
   }
   label.setAttribute("datetime", new Date(ms).toISOString());
   label.textContent = formatMessageTime(ms);
@@ -4128,6 +4451,7 @@ function previewPathCandidates(path) {
   return cut <= 0 ? [path] : [path, path.slice(cut + 1)];
 }
 function decorateAndLoad(root) {
+  decorateDesktopLightCode(root);
   decorateMath(root);
   decorateMedia(root);
   loadPreviews(root);
@@ -4213,6 +4537,7 @@ function mergeTaskReport(records, report, at) {
   for (const [index, task] of report.tasks.entries()) {
     const id = task.task_id || report.operation + ":" + (task.index ?? index);
     const previous = records.get(id);
+    if (previous && !previous.task.active && task.active) continue;
     // A delivered terminal result cannot be replaced by an older progress snapshot.
     if (previous && typeof previous.task.output === "string"
       && (typeof task.output !== "string" || (task.output_truncated === true && previous.task.output_truncated !== true))) continue;
@@ -4235,7 +4560,9 @@ function projectTaskReport(value, includeOutput = true) {
   const current = Array.isArray(report.currentTaskIndexes) ? new Set(report.currentTaskIndexes) : null;
   const text = (value) => typeof value === "string" ? value : "";
   const number = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
-  const add = (kind, value, taskId = "") => { if (value !== "") rows.push({ kind, text: value, taskId }); };
+  const add = (kind, value, taskId = "", preview) => {
+    if (value !== "") rows.push({ kind, text: value, taskId, ...(preview === undefined ? {} : { preview }) });
+  };
   const active = report.tasks.filter((task) => task.active).length;
   const noun = report.tasks.length === 1 ? " task" : " tasks";
   add("count", "subagents · " + report.tasks.length + noun + " · " + active + " active");
@@ -4252,28 +4579,43 @@ function projectTaskReport(value, includeOutput = true) {
       .filter(Boolean).join(" ");
     add("identity", [identity, text(task.status) + (elapsed === null ? "" : " " + formatSubagentElapsed(Math.floor(elapsed / 1000)))]
       .filter(Boolean).join(" · "), id);
-    if (text(task.description)) add("description", "task: " + task.description, id);
+    if (text(task.description)) {
+      add("description", "task: " + task.description, id);
+      rows.at(-1).preview = "task: " + shortLine(task.description, 240);
+    }
     add("meta", [id ? "task_id: " + id : "", pid === null ? "" : "pid: " + pid].filter(Boolean).join(" · "), id);
     const progress = task.progress;
+    const progressStart = rows.length;
     if (progress && typeof progress === "object") {
-      if (text(progress.phase)) add("progress", "phase: " + progress.phase, id);
-      if (text(progress.latest_activity)) add("progress", "latest: " + progress.latest_activity, id);
-      if (text(progress.checkpoint_summary)) add("progress", "checkpoint: " + progress.checkpoint_summary, id);
+      for (const [field, label] of [["phase", "phase"], ["latest_activity", "latest"], ["checkpoint_summary", "checkpoint"]]) {
+        if (text(progress[field])) {
+          const value = label + ": " + progress[field];
+          add("progress", value, id, task.active ? shortLine(value, 160) : null);
+        }
+      }
       if (text(progress.checkpoint_excerpt)) add("progress", progress.checkpoint_excerpt, id);
+      if (Array.isArray(progress.timeline) && progress.timeline.length) add("progress", JSON.stringify(progress.timeline, null, 2), id);
       const sequence = number(progress.sequence), stale = number(progress.stale_for_ms);
       add("meta", [sequence === null ? "" : "updates " + sequence,
         stale === null ? "" : "last activity " + stale / 1000 + "s ago", progress.checkpoint_due === true ? "checkpoint due" : ""]
         .filter(Boolean).join(" · "), id);
     }
     if (text(task.progress_text)) add("progress", task.progress_text, id);
+    for (const row of rows.slice(progressStart)) if (row.preview === undefined) {
+      row.preview = task.active && row.kind === "meta" ? row.text : null;
+    }
     if (text(task.error)) add("error", "Failure reason: " + task.error, id);
     if (text(task.selection_explanation)) add("meta", task.selection_explanation, id);
     if (text(task.inherit)) add("meta", "inherit: " + task.inherit, id);
     if (includeOutput && typeof task.output === "string") add("output-body", task.output, id);
     if (includeOutput && task.output_truncated === true) add("meta", "[output preview truncated; full output in history]", id);
-    // Keep the complete rows and task state; only desktop subagent cards use
-    // this display choice, so resizing to mobile restores the full projection.
-    for (const row of rows.slice(firstRow)) row.currentTask = !current || task.active || current.has(index);
+    // Preserve the full projection and delivery provenance. The dedicated card
+    // renders compact metadata and puts long evidence in a separate disclosure.
+    for (const row of rows.slice(firstRow)) {
+      row.taskIndex = index;
+      row.currentTask = !current || task.active || current.has(index);
+      if (row.kind === "output-body") row.preview = null;
+    }
   }
   if (text(report.error)) add("error", report.error);
   return { rows, taskStates, busy: active > 0, resetTasks: report.snapshot === true };
@@ -4291,6 +4633,26 @@ function taskReportLabel(report) {
 // sibling of <details>, so updates preserve the reader's disclosure choice.
 function renderTaskToolResult(fold, result) {
   fold.box._taskResult = result;
+  if (fold.box.dataset.subagents === "true" && (fold.rawDetails || (result && fold.body.textContent))) {
+    if (!fold.rawDetails) {
+      const details = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = "Raw subagent progress";
+      details.appendChild(summary);
+      details.dataset.taskDetailsKey = "raw-progress";
+      const outer = fold.box.querySelector("details");
+      outer.appendChild(details);
+      details.appendChild(fold.body);
+      if (outer.dataset.foldKey && typeof foldOpenByKey !== "undefined") {
+        const key = outer.dataset.foldKey + ":raw-progress";
+        details.dataset.foldKey = key;
+        details.open = foldOpenByKey.get(key) === true;
+        details.addEventListener("toggle", () => foldOpenByKey.set(key, details.open));
+      }
+      fold.rawDetails = details;
+    }
+    fold.rawDetails.hidden = !fold.body.textContent;
+  }
   if (!result) {
     if (fold.taskPreview) { fold.taskPreview.remove(); fold.taskPreview = null; }
     delete fold.box.dataset.taskStates;
@@ -4305,18 +4667,61 @@ function renderTaskToolResult(fold, result) {
     fold.box.appendChild(fold.taskPreview);
     fold.box.dataset.taskOutput = "true";
   }
-  const existing = Array.from(fold.taskPreview.children);
-  const reusable = existing.length === result.rows.length && result.rows.every((row, index) =>
-    existing[index].className === "task-" + row.kind && existing[index].dataset.taskId === row.taskId);
-  if (!reusable) fold.taskPreview.textContent = "";
-  for (const [index, row] of result.rows.entries()) {
-    const line = reusable ? existing[index] : document.createElement("div");
-    line.className = "task-" + row.kind;
-    line.dataset.taskId = row.taskId;
-    line.dataset.taskCurrent = String(row.currentTask !== false);
-    if (line.textContent !== row.text) line.textContent = row.text;
-    if (!reusable) fold.taskPreview.appendChild(line);
+  const compact = fold.box.dataset.subagents === "true";
+  const rows = [], evidence = new Map();
+  const occurrences = new Map();
+  for (const row of result.rows) {
+    const identity = (row.taskId || (row.taskIndex ?? "report")) + ":" + row.kind;
+    const occurrence = occurrences.get(identity) || 0;
+    occurrences.set(identity, occurrence + 1);
+    const key = identity + ":" + occurrence;
+    if (!compact || row.preview !== null) rows.push({ ...row, key, text: compact ? row.preview ?? row.text : row.text });
+    if (compact && row.preview !== undefined && row.preview !== row.text) {
+      const taskKey = row.taskId || "index:" + row.taskIndex;
+      if (!evidence.has(taskKey)) evidence.set(taskKey, { key: taskKey, taskId: row.taskId,
+        currentTask: row.currentTask, rows: [] });
+      evidence.get(taskKey).rows.push({ ...row, key });
+    }
   }
+  rows.push(...[...evidence.values()].map((task) => ({ ...task, key: "details:" + task.key, kind: "details" })));
+  const paintRows = (parent, projection) => {
+    const nodes = parent._taskRows || (parent._taskRows = new Map());
+    const retained = new Set();
+    for (const [index, row] of projection.entries()) {
+      let line = nodes.get(row.key);
+      if (!line) {
+        line = document.createElement(row.kind === "details" ? "details" : "div");
+        nodes.set(row.key, line);
+      }
+      retained.add(row.key);
+      line.className = "task-" + row.kind;
+      line.dataset.taskId = row.taskId;
+      line.dataset.taskBatchCurrent = String(row.currentTask !== false);
+      line.dataset.taskCurrent = String(compact || row.currentTask !== false);
+      if (row.kind === "details") {
+        if (!line._taskBody) {
+          const summary = document.createElement("summary");
+          summary.textContent = "Full task details" + (row.taskId ? " · " + row.taskId : "");
+          line.appendChild(summary);
+          line._taskBody = document.createElement("div");
+          line._taskBody.className = "task-detail-body";
+          line.appendChild(line._taskBody);
+          line.dataset.taskDetailsKey = row.key;
+          const outerKey = fold.box.querySelector("details")?.dataset.foldKey;
+          if (outerKey && typeof foldOpenByKey !== "undefined") {
+            const key = outerKey + ":" + row.key;
+            line.dataset.foldKey = key;
+            line.open = foldOpenByKey.get(key) === true;
+            line.addEventListener("toggle", () => foldOpenByKey.set(key, line.open));
+          }
+        }
+        paintRows(line._taskBody, row.rows);
+      } else if (line.textContent !== row.text) line.textContent = row.text;
+      if (parent.children[index] !== line) parent.insertBefore(line, parent.children[index] || null);
+    }
+    for (const [key, line] of nodes) if (!retained.has(key)) { line.remove(); nodes.delete(key); }
+  };
+  paintRows(fold.taskPreview, rows);
   if (result.taskStates.length) fold.box.dataset.taskStates = JSON.stringify(result.taskStates);
   else delete fold.box.dataset.taskStates;
   if (result.busy === null) delete fold.box.dataset.taskBusy;
@@ -4384,6 +4789,10 @@ function bindStoredFold(det, key) {
     const oldest = foldOpenState.keys().next();
     if (foldOpenState.size > 300 && !oldest.done) foldOpenState.delete(oldest.value);
     saveFoldOpenState();
+    // A stored card held outside a group can join once the reader closes it.
+    if (!det.open) for (let owner = det.parentNode; owner; owner = owner.parentNode) {
+      if (owner._executionGroups) { owner._executionGroups.sync(); break; }
+    }
   });
 }
 loadFoldOpenState();
@@ -4733,7 +5142,7 @@ function addFold(title, bodyText, parent, key) {
 function createThinkingFold(parent, before) {
   const groups = executionGroupsFor(parent);
   const ordinal = (parent._thinkingOrdinal = (parent._thinkingOrdinal || 0) + 1);
-  const next = addFold("thinking…", "", parent, "thinking:" + ordinal);
+  const next = addFold("thinking…", "", parent, executionFoldKey(parent, "thinking:" + ordinal));
   next.box.dataset.executionState = next.box._executionState = "running";
   next.box.dataset.thinkingPhase = "true";
   // A recovered turn can hand over a node from an older box; inserting against
@@ -4741,6 +5150,12 @@ function createThinkingFold(parent, before) {
   parent.insertBefore(next.box, before && before.parentNode === parent ? before : null);
   groups.sync();
   return next;
+}
+function executionFoldKey(parent, key, scope = parent._executionFoldScope) {
+  const state = executionState();
+  scope ||= JSON.stringify([state.base, state.sessionId, state.turn]);
+  const split = key.indexOf(":");
+  return (split < 0 ? key + ":" : key.slice(0, split + 1)) + scope + "\n" + (split < 0 ? "" : key.slice(split + 1));
 }
 
 // Group original cards, never copies or history records. Restoring their exact
@@ -4772,7 +5187,7 @@ function executionGroupsFor(parent, stored = false) {
     for (const wrapper of wrappers) wrapper.classList.remove("execution-empty");
     slots = []; wrappers = []; lastPlan = [];
   };
-  const sync = () => {
+  const sync = (latestProgress = null) => {
     const units = [];
     const visit = (owner) => {
       for (const node of Array.from(owner.children)) {
@@ -4802,9 +5217,16 @@ function executionGroupsFor(parent, stored = false) {
     // A trailing rate line is metadata, not the newest record: the run boundary
     // must still be the latest real card, or a fresh record could be swallowed.
     const rates = (node) => node.dataset?.turnRate !== undefined;
+    let progressBefore = null;
+    if (latestProgress && units.includes(latestProgress)) {
+      units.splice(units.indexOf(latestProgress), 1);
+      const last = units.findLastIndex((node) => !node.hidden && !node.classList.contains("pending") && !rates(node));
+      progressBefore = units[last + 1] || null;
+      units.splice(last + 1, 0, latestProgress);
+    } else latestProgress = null;
     const latest = units.findLast((node) => !node.hidden && !node.classList.contains("pending") && !rates(node));
-    // A card the reader has expanded must not move. Records already inside a
-    // group stay there; records outside wait for a collapse before merging.
+    // Expanded completed cards wait for a collapse before joining a group.
+    // Fresh active progress has its explicit display position above.
     const expanded = (node) => {
       for (const details of node.querySelectorAll?.("details") || []) if (details.open) return true;
       return false;
@@ -4835,14 +5257,29 @@ function executionGroupsFor(parent, stored = false) {
     // Prefer the expanded card as the scroll anchor so a merge elsewhere never
     // slides the text the reader is watching.
     const anchor = !following && viewport
-      ? (units.find((node) => expanded(node) && visible(node)) || units.find(visible))
+      ? (units.find((node) => node !== latestProgress && expanded(node) && visible(node))
+        || units.find((node) => node !== latestProgress && visible(node)))
       : null;
     // Measure the same element before and after: a grouped record is represented
     // by its group box on both sides, so compensating cannot add a fixed offset.
     const anchorBox = (node) => node.parentNode?.classList.contains("execution-items")
       ? node.parentNode.parentNode.parentNode : node;
     const anchorTop = anchor ? anchorBox(anchor).getBoundingClientRect?.().top : undefined;
+    const selection = latestProgress ? window.getSelection?.() : null;
+    const inProgress = (node) => {
+      for (; node; node = node.parentNode) if (node === latestProgress) return true;
+      return false;
+    };
+    const selected = selection && (inProgress(selection.anchorNode) || inProgress(selection.focusNode))
+      ? { anchorNode: selection.anchorNode, anchorOffset: selection.anchorOffset,
+        focusNode: selection.focusNode, focusOffset: selection.focusOffset } : null;
     restore();
+    // Restore group slots before moving their former sibling anchor. Otherwise
+    // an old completed run would follow the progress card past newer prose.
+    if (latestProgress) {
+      if (parent.moveBefore && latestProgress.parentNode === parent) parent.moveBefore(latestProgress, progressBefore);
+      else parent.insertBefore(latestProgress, progressBefore);
+    }
     const collectWrappers = (owner) => {
       for (const node of owner.children) if (node.classList.contains("turn") && (!stored || node.dataset.canonicalKey !== undefined)) {
         wrappers.push(node); collectWrappers(node);
@@ -4886,6 +5323,7 @@ function executionGroupsFor(parent, stored = false) {
     folds = used;
     for (const wrapper of wrappers) if (!wrapper.children.length) wrapper.classList.add("execution-empty");
     lastPlan = plan;
+    if (selected) selection.setBaseAndExtent(selected.anchorNode, selected.anchorOffset, selected.focusNode, selected.focusOffset);
     // Compensate a real collapse in the same paint. Repeated progress updates
     // leave the tree and scroll position untouched, including open disclosures.
     if (!mounted) return;
@@ -4960,7 +5398,7 @@ function agedTaskReport(report, records, now) {
   }) };
 }
 function createSubagentClock(fold, owner) {
-  let report = null, records = new Map(), rawText = "", lastTitle = "", lastRawText = null;
+  let report = null, records = new Map(), rawText = "", lastTitle = "", lastRawText = null, lastProgress = "";
   // The fold opens once when a run starts; after that its state belongs to the
   // reader, so streaming progress never re-opens a card the reader collapsed.
   // Completion still tidies away a card nobody touched.
@@ -5004,10 +5442,20 @@ function createSubagentClock(fold, owner) {
         // Older free-form events stay plain text; they carry no clock or state.
         rawText = typeof event?.text === "string" ? event.text : typeof payload === "string" ? payload : "";
       }
+      // Clock-only snapshots are not new activity. Compare the merged producer
+      // fields, excluding elapsed/age counters that also change on every tick.
+      const progress = JSON.stringify(report?.tasks.map(({ elapsed_ms, progress, ...task }) => {
+        if (!progress) return task;
+        const { elapsed_ms: progressElapsed, stale_for_ms, ...activity } = progress;
+        return { ...task, progress: activity };
+      }));
+      const changed = progress !== lastProgress;
+      lastProgress = progress;
       const running = [...records.values()].some((row) => row.task.active);
       const nextOpen = running && !started ? true : !running && autoOpened ? false : details.open;
       if (owner) updateExecutionModel({ kind: "task", owner, slot: "subagents",
-        summary: projectTaskReport(report), after: !nextOpen ? after : null });
+        summary: projectTaskReport(report), advance: changed && !running,
+        after: !running || !nextOpen ? after : null });
       if (running && !started) { started = true; programmatic = true; details.open = true; autoOpened = true; }
       else if (!running && autoOpened) { programmatic = false; details.open = false; autoOpened = false; started = false; }
       render(Date.now());
@@ -5019,6 +5467,7 @@ function createSubagentClock(fold, owner) {
         subagentClocks.delete(fold.box); tickingSubagents.delete(clock);
       }
       syncSubagentTicker();
+      return changed;
     },
     stop() {
       if (autoOpened) { programmatic = false; details.open = false; autoOpened = false; started = false; }
@@ -5033,18 +5482,21 @@ function createSubagentClock(fold, owner) {
 // inferred from stderr. Completion updates its own card, even for parallel tools.
 function createLiveActivity(parent, before, sid = sessionId, base = executionBase()) {
   const owner = updateExecutionModel({ kind: "activity" }, sid, base);
+  const scope = JSON.stringify([base, sid, owner.turn]);
+  if (parent._executionFoldScope !== scope) parent._thinkingOrdinal = 0;
+  parent._executionFoldScope = scope;
   bindDisplayedProducer(parent, owner.source);
   const groups = executionGroupsFor(parent);
   const tools = new Map();
   let phase = "Connecting…";
-  let waiting = false;
+  let waiting = false, closed = false, latestProgress = null;
   let subagents = null, subagentClock = null;
   // Tool/thinking cards insert before the *current* answer bubble. A turn can
   // hold several answer bubbles (prose, then tools, then more prose), so the
   // answer-segment owner moves this anchor whenever it seals a bubble.
   let anchor = before;
   const insert = (title, key) => {
-    const fold = addFold(title, "", parent, key);
+    const fold = addFold(title, "", parent, executionFoldKey(parent, key, scope));
     parent.insertBefore(fold.box, anchor && anchor.parentNode === parent ? anchor : null);
     return fold;
   };
@@ -5056,12 +5508,34 @@ function createLiveActivity(parent, before, sid = sessionId, base = executionBas
       subagents.box.dataset.executionState = subagents.box._executionState = "running";
       subagentClock = createSubagentClock(subagents, owner);
     }
-    subagentClock.set(payload, afterSlot, decoded);
-    // Re-anchoring is invisible only once the card is collapsed; set() above may
-    // close it in this same paint. Moving a card that is still open would scroll
-    // the text the reader is looking at.
+    const changed = subagentClock.set(payload, afterSlot, decoded);
+    // Later producer reports settle earlier active snapshots by task identity.
+    // Their raw fields and DOM nodes remain the original observations.
+    const states = new Map(subagents.box._taskResult?.taskStates || []);
+    for (const tool of tools.values()) {
+      const result = tool.fold.box._taskResult;
+      const active = result?.taskStates.filter(([, busy]) => busy);
+      if (result?.busy === true && active.length && active.every(([id]) => states.get(id) === false)) {
+        tool.fold.box.dataset.executionSettled = tool.fold.box._executionSettled = "true";
+      }
+    }
+    const displayed = displayedExecutionState(), state = executionState(sid, base);
+    const source = owner.source, token = source.sourceToken;
+    let mounted = parent;
+    const root = $("msgs");
+    while (mounted && mounted !== root) mounted = mounted.parentNode;
+    latestProgress = changed && subagentClock.busy() === true && !closed
+      && window.matchMedia?.("(min-width:701px)").matches
+      && sid === sessionId && base === executionBase() && mounted === root
+      && displayed.sessionId === sid && displayed.base === base
+      && owner.turn === state.turn && state.activities.get(owner.id) === source
+      && token?.transcriptToken === displayed.transcriptToken && token?.generation === displayed.generation
+      && displayed.sources.get(token)?.mountToken === source.mountToken
+      ? subagents.box : null;
+    // Other reports retain their original collapsed-card placement policy.
+    // Fresh desktop progress moves through group sync with scroll compensation.
     const cardDetails = subagents.box.querySelector("details");
-    if (!cardDetails?.open && after?.parentNode === parent && after.nextElementSibling !== subagents.box) {
+    if (!latestProgress && !cardDetails?.open && after?.parentNode === parent && after.nextElementSibling !== subagents.box) {
       parent.insertBefore(subagents.box, after.nextElementSibling);
     }
     // Only an explicit busy flag means work is still in flight. A report without
@@ -5102,6 +5576,7 @@ function createLiveActivity(parent, before, sid = sessionId, base = executionBas
     },
     tool(event) {
       if (!event || !event.id || !event.name || !["started", "finished"].includes(event.phase)) return;
+      latestProgress = null;
       let tool = tools.get(event.id);
       if (!tool) {
         tool = { id: event.id, fold: insert(event.name, "tool:" + (event.id || event.name + ":" + tools.size)), name: event.name };
@@ -5120,14 +5595,15 @@ function createLiveActivity(parent, before, sid = sessionId, base = executionBas
       updateExecutionModel({ kind: "task", owner, slot: "tool:" + event.id,
         summary: projectTaskReport(tool.task_report, false) });
       renderTool(tool);
-      groups.sync();
+      groups.sync(latestProgress);
       if (typeof syncStopButton === "function") syncStopButton();
     },
     subagents(payload, decoded = null) {
-      showSubagents(payload, null, null, decoded); groups.sync();
+      showSubagents(payload, null, null, decoded); groups.sync(latestProgress);
       if (typeof syncStopButton === "function") syncStopButton();
     },
     finish(reason, answer = false) {
+      closed = true;
       updateExecutionModel({ kind: "finish", owner, reason, answer });
       if (subagentClock) subagentClock.stop();
       for (const tool of tools.values()) if (tool.running) {
@@ -5137,6 +5613,13 @@ function createLiveActivity(parent, before, sid = sessionId, base = executionBas
         tool.fold.box.dataset.executionException = tool.fold.box._executionException = "true";
         tool.fold.set(callLabel({ function: { name: tool.name, arguments: tool.arguments || "{}" } }) + " · " + reason,
           (tool.arguments || "") + "\n" + (tool.output || ""));
+      }
+      // A final answer settles earlier task snapshots without rewriting their
+      // raw reports; an ended stream without an answer still keeps active work.
+      if (reason === "ended" && answer) for (const tool of tools.values()) {
+        if (tool.fold.box._taskResult?.busy === true) {
+          tool.fold.box.dataset.executionSettled = tool.fold.box._executionSettled = "true";
+        }
       }
       if (reason === "interrupted" || reason === "failed") {
         const folds = [...tools.values()].map((tool) => ({ fold: tool.fold, busy: projectTaskReport(tool.task_report, false)?.busy }));
@@ -5154,7 +5637,7 @@ function createLiveActivity(parent, before, sid = sessionId, base = executionBas
       waiting = false;
       groups.sync();
     },
-    remove() { updateExecutionModel({ kind: "remove", owner }); },
+    remove() { closed = true; updateExecutionModel({ kind: "remove", owner }); },
   };
 }
 
@@ -6299,11 +6782,358 @@ function loadSkills() {
   skillLoadRequest = request;
   return request.promise;
 }
-// Slash-command completion. The catalog comes from `GET /commands` so the
-// page and the server cannot drift; matching and rendering stay local so
-// typing never waits on the network.
+// Slash-command completion. Server commands come from `GET /commands`;
+// desktop model commands belong to the page's persistent session pickers.
+// Matching and rendering stay local so typing never waits on the network.
 let commandCatalog = [], commandMatches = [], commandActive = -1;
 let commandLoadRequest = null, commandLoadEpoch = 0;
+const DESKTOP_PICKER_COMMANDS = ["model", "models"].map((name) => ({
+  name, usage: "[<model>|list|current|help|effort <level>]", description: "查看或切换当前会话模型",
+}));
+function desktopCommandCatalog(catalog, query) {
+  // An empty slash still lists the server catalog; typed model prefixes and
+  // argument contexts also resolve the page-owned setting commands.
+  const local = DESKTOP_PICKER_COMMANDS.filter((command) => query === undefined || (query && command.name.startsWith(query)));
+  return catalog.filter((command) => !local.some((item) => item.name === command.name.toLowerCase())).concat(local);
+}
+// Desktop cycles retain the original UTF-16 range, never the previous insertion.
+const desktopCompletion = { session: null, menu: null, request: null, epoch: 0 };
+function isDesktopCommandCompletion() {
+  try { return typeof window !== "undefined" && window.matchMedia?.("(min-width:701px)").matches === true; }
+  catch (_) { return false; }
+}
+function clearDesktopCompletion() {
+  desktopCompletion.session = null;
+  desktopCompletion.menu = null;
+  desktopCompletion.request = null;
+  desktopCompletion.epoch++;
+}
+function invalidateDesktopCompletion() {
+  if (isDesktopCommandCompletion() || desktopCompletion.menu || desktopCompletion.session || desktopCompletion.request) closeCommandMenu();
+}
+// Each line has its own command word. Selections must stay inside one token;
+// /cd alone owns the rest of its line, because directory names may contain spaces.
+function desktopCommandContext(value, selectionStart, selectionEnd, catalog) {
+  if (typeof value !== "string" || !Number.isInteger(selectionStart) || !Number.isInteger(selectionEnd)
+      || selectionStart < 0 || selectionEnd < selectionStart || selectionEnd > value.length) return null;
+  const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
+  const newline = value.indexOf("\n", selectionStart), lineEnd = newline < 0 ? value.length : newline;
+  if (selectionEnd > lineEnd) return null;
+  const line = value.slice(lineStart, lineEnd), match = /^[^\S\n]*([/:])([a-z0-9-]*)(?=\s|$)/i.exec(line);
+  if (!match) return null;
+  const start = lineStart + match[0].length - match[2].length - 1, end = lineStart + match[0].length;
+  if (selectionStart < start) return null;
+  if (selectionStart <= end) {
+    if (selectionEnd > end || (selectionStart === start && selectionEnd === start)) return null;
+    return { kind: "command", start, end, prefix: match[1], query: value.slice(start + 1, selectionStart).toLowerCase() };
+  }
+  const command = catalog.find((item) => item.name.toLowerCase() === match[2].toLowerCase());
+  if (!command) return null;
+  const argumentStart = end + (value.slice(end, lineEnd).match(/^\s*/)?.[0].length || 0);
+  if (command.name.toLowerCase() === "cd") {
+    const from = Math.min(argumentStart, selectionStart);
+    return { kind: "directory", command, start: from, end: lineEnd, query: value.slice(from, selectionStart), args: [], index: 0 };
+  }
+  const args = [];
+  for (const token of value.slice(end, lineEnd).matchAll(/\S+/g)) {
+    const from = end + token.index, to = from + token[0].length;
+    if (selectionStart > to) { args.push(token[0]); continue; }
+    if (selectionStart < from) {
+      if (selectionEnd !== selectionStart) return null;
+      return { kind: "argument", command, start: selectionStart, end: selectionStart, query: "", args, index: args.length };
+    }
+    if (selectionEnd > to) return null;
+    return { kind: "argument", command, start: from, end: to, query: value.slice(from, selectionStart), args, index: args.length };
+  }
+  if (selectionEnd !== selectionStart) return null;
+  return { kind: "argument", command, start: selectionStart, end: selectionStart, query: "", args, index: args.length };
+}
+// Usage brackets describe optional groups; pipes describe alternatives. A null
+// token is a metavar, which can match prior input but is never offered as a value.
+function desktopUsageAlternatives(source) {
+  const out = [];
+  let depth = 0, start = 0;
+  for (let i = 0; i < source.length; i++) {
+    if (source[i] === "[" || source[i] === "<") depth++;
+    else if (source[i] === "]" || source[i] === ">") depth--;
+    else if (source[i] === "|" && depth === 0) { out.push(source.slice(start, i).trim()); start = i + 1; }
+  }
+  out.push(source.slice(start).trim());
+  return out;
+}
+function desktopStaticArguments(usage, args, index) {
+  const metavar = /^(?:<.*>|[A-Z][A-Z_]*|id|name|dir|target|text|instruction|message|goal|topic|backend|model|session-id|file\.[\w]+|output\.zip|archive\.zip)$/;
+  const patterns = desktopUsageAlternatives(String(usage || "")).flatMap((usageBranch) => {
+    let sequences = [[]];
+    for (const part of usageBranch.match(/\[[^\]]*\]|<[^>]*>|[^\s]+/g) || []) {
+      if (part === "...") continue;
+      const optional = part.startsWith("["), body = optional ? part.slice(1, -1) : part;
+      const alternatives = desktopUsageAlternatives(body).map((branch) => branch.trim().split(/\s+/).filter(Boolean)
+        .map((token) => metavar.test(token) || (optional && !body.includes("|") && !token.startsWith("-")) ? null : token));
+      if (optional) alternatives.push([]);
+      sequences = sequences.flatMap((sequence) => alternatives.map((alternative) => sequence.concat(alternative)));
+    }
+    return sequences;
+  });
+  return [...new Set(patterns.filter((pattern) => pattern.length > index && args.every((arg, i) =>
+    i < pattern.length && (pattern[i] === null || pattern[i].toLowerCase() === arg.toLowerCase())))
+    .map((pattern) => pattern[index]).filter((item) => item !== null))];
+}
+function desktopBackendArguments(context, sources) {
+  if (!/\bbackend\b/.test(context.command.usage)) return context.index === 0 ? sources.models : [];
+  return context.index === 0 ? sources.backends : context.index === 1 && context.args[0] === "traecli" ? sources.workerModels : [];
+}
+function desktopModelArguments(context, sources) {
+  return context.index === 0 ? sources.models
+    : context.index === 1 && context.args[0].toLowerCase() === "effort" ? sources.efforts : [];
+}
+const DESKTOP_ARGUMENT_SOURCES = {
+  skills: (context, sources) => sources.skills.filter((name) => !context.args.includes(name)),
+  agent: (context, sources) => context.index === 0 ? sources.agents : [],
+  use: desktopBackendArguments,
+  subagent: desktopBackendArguments,
+  model: desktopModelArguments,
+  models: desktopModelArguments,
+  effort: (context, sources) => context.index === 0 ? sources.efforts : [],
+  resume: (context, sources) => context.index === 0 ? sources.sessions : [],
+};
+function desktopCommandCandidates(context, catalog, sources) {
+  if (context.kind === "command") return rankCommandMatches(desktopCommandCatalog(catalog, context.query), context.query).map((command) => ({
+    display: context.prefix + command.name, replacement: context.prefix + command.name,
+    usage: command.usage, description: command.description,
+  }));
+  const name = context.command.name.toLowerCase();
+  const registered = Object.hasOwn(DESKTOP_ARGUMENT_SOURCES, name) ? DESKTOP_ARGUMENT_SOURCES[name] : null;
+  const values = desktopStaticArguments(context.command.usage, context.args, context.index)
+    .concat(registered ? registered(context, sources) : []);
+  const seen = new Set(), query = context.query.toLowerCase();
+  return values.map((value) => typeof value === "string" ? { display: value, replacement: value } : value)
+    .filter((candidate) => {
+      if (!candidate || typeof candidate.replacement !== "string" || !candidate.replacement
+          || !candidate.replacement.toLowerCase().startsWith(query) || seen.has(candidate.replacement)) return false;
+      seen.add(candidate.replacement);
+      return true;
+    });
+}
+function desktopReplacementPlan(value, context, candidate) {
+  const tail = value.slice(context.end);
+  const replacement = candidate.replacement + (context.kind !== "directory" && !/^\s/.test(tail) ? " " : "");
+  return { value: value.slice(0, context.start) + replacement + tail, caret: context.start + replacement.length };
+}
+function desktopCycleIndex(index, count) { return count > 0 ? (index + 1) % count : -1; }
+function desktopCommandSources() {
+  const options = (id) => Array.from($(id)?.options || []).filter((option) => option.value)
+    .map((option) => ({ display: option.textContent, replacement: option.value }));
+  return {
+    skills: typeof skillCatalog === "undefined" ? [] : skillCatalog.map((skill) => skill.name),
+    models: options("omodel"), agents: options("oagent"), efforts: options("oeffort"),
+    backends: typeof TEAM_FIELDS === "undefined" ? [] : Object.keys(TEAM_FIELDS.backend),
+    workerModels: [],
+    sessions: typeof lastItems === "undefined" ? [] : lastItems.map((item) => item.id),
+  };
+}
+function desktopModelCommandLine(text, caret) {
+  const start = text.lastIndexOf("\n", caret - 1) + 1;
+  const newline = text.indexOf("\n", caret), end = newline < 0 ? text.length : newline;
+  const match = /^[^\S\n]*[/:](model|models)(?:\s+(.*))?$/i.exec(text.slice(start, end));
+  return match ? { name: match[1].toLowerCase(), args: (match[2] || "").trim().split(/\s+/).filter(Boolean) } : null;
+}
+function runDesktopModelCommand(text, options = {}) {
+  if (!isDesktopCommandCompletion()) return false;
+  // A completed setting line stays in the textarea, including surrounding
+  // prose. Consume it locally on send just as completion does at that caret.
+  const line = options.caret === undefined ? /(?:^|\n)[^\S\n]*[/:](?:model|models)(?=\s|$)/i.exec(text) : null;
+  const caret = options.caret ?? (line ? line.index + line[0].length : 0);
+  const command = desktopModelCommandLine(text, caret);
+  if (!command) return false;
+  const selector = (command.args[0] || "").toLowerCase();
+  if (selector === "effort") {
+    const level = (command.args[1] || "").toLowerCase(), sel = $("oeffort");
+    const reset = /^(auto|clear|default|reset)$/.test(level);
+    const option = [...sel.options].find((item) => item.value.toLowerCase() === level);
+    if (level && (reset || option)) {
+      const value = reset ? "" : option.value;
+      if (sel.value !== value) { sel.value = value; savePick(); }
+    } else if (!options.preview) openPickPop("effort");
+  } else if (!selector || ["list", "ls", "current", "cur", "help", "h"].includes(selector)) {
+    if (!options.preview) {
+      if (selector === "help" || selector === "h") note("/model <模型> 切换当前会话模型；/model list|current；/model effort <级别>");
+      openModelSheet();
+    }
+  } else {
+    const sel = $("omodel"), option = [...sel.options].find((item) => item.value && item.value.toLowerCase() === selector);
+    if (option) {
+      if (sel.value !== option.value) chooseModelOption(option.value);
+    } else if (!options.preview) {
+      openModelSheet();
+      $("modelpicksearch").value = command.args[0];
+      renderModelSheet(command.args[0]);
+      $("modelpicksearch").focus();
+    }
+  }
+  return true;
+}
+function desktopCompletionOwner() { return { base: store.base, sid: typeof sessionId === "undefined" ? "" : sessionId }; }
+function desktopSnapshotCurrent(snapshot) {
+  const prompt = $("prompt"), owner = desktopCompletionOwner();
+  return isDesktopCommandCompletion() && document.activeElement === prompt && owner.base === snapshot.base && owner.sid === snapshot.sid
+    && prompt.value === snapshot.expectedValue && prompt.selectionStart === snapshot.caret && prompt.selectionEnd === snapshot.selectionEnd;
+}
+function desktopCommandSnapshot(context, candidates) {
+  const prompt = $("prompt");
+  return { ...desktopCompletionOwner(), original: prompt.value, context: { ...context }, candidates: candidates.slice(), index: -1,
+    originalStart: prompt.selectionStart, originalEnd: prompt.selectionEnd,
+    expectedValue: prompt.value, caret: prompt.selectionStart, selectionEnd: prompt.selectionEnd };
+}
+function showDesktopCommandMenu(context, candidates) {
+  desktopCompletion.menu = desktopCommandSnapshot(context, candidates);
+  commandMatches = candidates;
+  commandActive = candidates.length ? 0 : -1;
+  renderCommandMenu(context.prefix || "");
+  $("cmdempty").hidden = candidates.length > 0;
+  $("cmdmenu").hidden = false;
+  $("prompt").setAttribute("aria-expanded", "true");
+  $("prompt").setAttribute("aria-controls", "cmdoptions");
+  if (candidates.length) setCommandActive(0);
+  else $("prompt").removeAttribute("aria-activedescendant");
+}
+function desktopRemoteCommandSource(context) {
+  if (context.kind === "directory") {
+    const sid = desktopCompletionOwner().sid;
+    return sid ? "/sessions/" + encodeURIComponent(sid) + "/cd-candidates?frag=" + encodeURIComponent(context.query) : null;
+  }
+  const name = context.command?.name.toLowerCase();
+  return (name === "use" || name === "subagent") && /\bbackend\b/.test(context.command.usage)
+    && context.index === 1 && context.args[0] === "traecli" ? "/subagent-models" : null;
+}
+function desktopRemoteCommandCandidates(context, url) {
+  const prompt = $("prompt"), owner = desktopCompletionOwner();
+  const key = JSON.stringify([owner.base, owner.sid, url, prompt.value, prompt.selectionStart, prompt.selectionEnd]);
+  if (desktopCompletion.request?.key === key) return desktopCompletion.request.candidates;
+  const request = { ...desktopCommandSnapshot(context, []), key, candidates: [], epoch: ++desktopCompletion.epoch };
+  desktopCompletion.request = request;
+  request.promise = (async () => {
+    try {
+      const data = await (await api(url)).json();
+      if (desktopCompletion.request !== request || desktopCompletion.epoch !== request.epoch
+          || promptComposing || !desktopSnapshotCurrent(request)) return;
+      const list = context.kind === "directory" ? data.candidates : data.models;
+      const seen = new Set();
+      request.candidates = (Array.isArray(list) ? list : []).filter((value) => {
+        if (typeof value !== "string" || !value || /[\r\n]/.test(value) || seen.has(value)) return false;
+        if (context.kind !== "directory" && !value.toLowerCase().startsWith(context.query.toLowerCase())) return false;
+        seen.add(value); return true;
+      }).map((value) => ({ display: value, replacement: value }));
+      showDesktopCommandMenu(context, request.candidates);
+    } catch (_) {
+      // Keep the empty result until an edit; a failed optional catalog must not
+      // cause a request loop or block ordinary composer input.
+    }
+  })();
+  return request.candidates;
+}
+function refreshDesktopCommandMenu() {
+  const prompt = $("prompt"), session = desktopCompletion.session;
+  if (session && desktopSnapshotCurrent(session)) return;
+  if (session) clearDesktopCompletion();
+  const context = desktopCommandContext(prompt.value, prompt.selectionStart, prompt.selectionEnd, desktopCommandCatalog(commandCatalog));
+  if (!context) { closeCommandMenu(); return; }
+  const remote = desktopRemoteCommandSource(context);
+  const candidates = remote ? desktopRemoteCommandCandidates(context, remote) : desktopCommandCandidates(context, commandCatalog, desktopCommandSources());
+  showDesktopCommandMenu(context, candidates);
+}
+function applyDesktopCommandCandidate(snapshot, index) {
+  if (promptComposing || !desktopSnapshotCurrent(snapshot) || !snapshot.candidates[index]) return false;
+  const plan = desktopReplacementPlan(snapshot.original, snapshot.context, snapshot.candidates[index]);
+  if (!setPromptValue(plan.value)) return false;
+  snapshot.expectedValue = plan.value;
+  snapshot.caret = snapshot.selectionEnd = plan.caret;
+  snapshot.index = index;
+  try { $("prompt").setSelectionRange(plan.caret, plan.caret); } catch (_) {}
+  growPrompt(); persistDraft();
+  return true;
+}
+function acceptDesktopCommand(target) {
+  const session = desktopCompletion.session, menu = desktopCompletion.menu;
+  if (!menu || !desktopSnapshotCurrent(session || menu)) { closeCommandMenu(); return false; }
+  const prompt = $("prompt"), context = session?.context || desktopCommandContext(prompt.value, prompt.selectionStart, prompt.selectionEnd, desktopCommandCatalog(commandCatalog));
+  if (!context) { closeCommandMenu(); return false; }
+  const candidates = session?.candidates || commandMatches;
+  const index = typeof target === "number" ? target : candidates.indexOf(target);
+  const snapshot = session || menu;
+  if (!applyDesktopCommandCandidate(snapshot, index)) return false;
+  closeCommandMenu();
+  runDesktopModelCommand(snapshot.expectedValue, { caret: snapshot.context.start });
+  return true;
+}
+function desktopCommandKeydown(e) {
+  const session = desktopCompletion.session, menu = desktopCompletion.menu;
+  if (menu && !desktopSnapshotCurrent(session || menu)) {
+    closeCommandMenu(); return false;
+  }
+  if ($("cmdmenu").hidden) return false;
+  if (e.key === "Escape") {
+    e.preventDefault();
+    if (session && setPromptValue(session.original)) {
+      try { $("prompt").setSelectionRange(session.originalStart, session.originalEnd); } catch (_) {}
+      growPrompt(); persistDraft();
+    }
+    closeCommandMenu(); return true;
+  }
+  if (e.key === "Tab" && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && commandMatches.length) {
+    const prompt = $("prompt"), context = session?.context || desktopCommandContext(prompt.value, prompt.selectionStart, prompt.selectionEnd, desktopCommandCatalog(commandCatalog));
+    if (!context) return false;
+    const snapshot = session || menu;
+    if (!snapshot) return false;
+    const index = desktopCycleIndex(snapshot.index, snapshot.candidates.length);
+    if (!applyDesktopCommandCandidate(snapshot, index)) return false;
+    desktopCompletion.session = snapshot;
+    e.preventDefault(); setCommandActive(index);
+    // Tab on an exact setting command opens its picker. Partial words retain
+    // the ordinary alias cycle; model argument cycles commit the selected id.
+    const name = snapshot.candidates[index].replacement.slice(1).toLowerCase();
+    const direct = context.kind === "command" && context.query === name && DESKTOP_PICKER_COMMANDS.some((command) => command.name === name);
+    if (direct) closeCommandMenu();
+    runDesktopModelCommand(snapshot.expectedValue, { caret: snapshot.context.start, preview: !direct });
+    return true;
+  }
+  if (commandMatches.length && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+    e.preventDefault();
+    setCommandActive(commandNavigationTarget(commandActive, e.key === "ArrowDown" ? 1 : -1, commandMatches));
+    return true;
+  }
+  if (commandMatches.length && e.key === "Enter" && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+    if (!acceptDesktopCommand(commandActive < 0 ? 0 : commandActive)) return false;
+    e.preventDefault(); return true;
+  }
+  if (session && !["Tab", "Shift", "Control", "Meta", "Alt"].includes(e.key)) closeCommandMenu();
+  return false;
+}
+function wireDesktopCommandCompletion() {
+  const prompt = $("prompt");
+  const moved = () => {
+    const snapshot = desktopCompletion.session || desktopCompletion.menu || desktopCompletion.request;
+    if (snapshot && !desktopSnapshotCurrent(snapshot)) closeCommandMenu();
+  };
+  for (const event of ["beforeinput", "input", "paste", "click", "blur", "focusout", "compositionstart"]) {
+    prompt.addEventListener(event, invalidateDesktopCompletion);
+  }
+  prompt.addEventListener("select", moved);
+  document.addEventListener("selectionchange", moved);
+  prompt.addEventListener("keyup", (e) => {
+    if (promptComposing || e.isComposing || e.keyCode === 229 || !isDesktopCommandCompletion()) return;
+    if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) { moved(); refreshCommandMenu(); }
+  });
+  const resized = () => {
+    if (!isDesktopCommandCompletion() && (desktopCompletion.menu || desktopCompletion.session || desktopCompletion.request)) closeCommandMenu();
+  };
+  try {
+    const media = window.matchMedia?.("(min-width:701px)");
+    if (media?.addEventListener) media.addEventListener("change", resized);
+    else media?.addListener?.(resized);
+  } catch (_) {}
+  window.addEventListener("resize", resized);
+}
 function normalizeCommands(list) {
   if (!Array.isArray(list)) return [];
   const seen = new Set(), out = [];
@@ -6321,6 +7151,7 @@ function normalizeCommands(list) {
   return out;
 }
 function loadCommands() {
+  invalidateDesktopCompletion();
   const base = store.base;
   if (commandLoadRequest?.base === base) return commandLoadRequest.promise;
   const epoch = ++commandLoadEpoch;
@@ -6395,7 +7226,7 @@ function renderCommandMenu(prefix) {
     row.onclick = () => acceptCommand(command);
     const name = document.createElement("span");
     name.className = "cmdname";
-    name.textContent = prefix + command.name;
+    name.textContent = command.display ?? prefix + command.name;
     if (command.usage) {
       const usage = document.createElement("span");
       usage.className = "cmdusage";
@@ -6426,6 +7257,7 @@ function setCommandActive(index) {
   }
 }
 function closeCommandMenu() {
+  clearDesktopCompletion();
   const menu = $("cmdmenu");
   if (!menu) return;
   menu.hidden = true;
@@ -6442,6 +7274,7 @@ function closeCommandMenu() {
 function refreshCommandMenu() {
   const prompt = $("prompt");
   if (!prompt || promptComposing || document.activeElement !== prompt) { closeCommandMenu(); return; }
+  if (isDesktopCommandCompletion()) { refreshDesktopCommandMenu(); return; }
   const context = commandContext(prompt.value, prompt.selectionStart);
   if (!context) { closeCommandMenu(); return; }
   commandMatches = rankCommandMatches(commandCatalog, context.query);
@@ -6463,6 +7296,8 @@ function commandReplacementPlan(value, context, command) {
   };
 }
 function acceptCommand(target) {
+  if (isDesktopCommandCompletion()) return acceptDesktopCommand(target);
+  if (desktopCompletion.menu || desktopCompletion.session || desktopCompletion.request) { closeCommandMenu(); return false; }
   const command = typeof target === "number" ? commandMatches[target] : target;
   if (!command) return false;
   const prompt = $("prompt");
@@ -6478,6 +7313,8 @@ function acceptCommand(target) {
 }
 function commandKeydown(e) {
   if (promptComposing || e.isComposing || e.keyCode === 229) return false;
+  if (isDesktopCommandCompletion()) return desktopCommandKeydown(e);
+  if (desktopCompletion.menu || desktopCompletion.session || desktopCompletion.request) closeCommandMenu();
   if ($("cmdmenu").hidden) return false;
   if (e.key === "Escape") { e.preventDefault(); closeCommandMenu(); return true; }
   if (!commandMatches.length) return false;
@@ -7295,10 +8132,16 @@ function historyRowsOf(msgs, histTotal, showAll) {
     row.key = JSON.stringify([row.key, row.subagentReport !== null]);
   }
   let settled = false;
+  const laterTasks = new Map();
   for (const row of rows.slice().reverse()) {
-    if (row.message.role === "user") settled = false;
+    if (row.message.role === "user") { settled = false; laterTasks.clear(); }
     else if (row.message.role === "assistant" && !row.message.tool_calls?.length) settled = true;
-    row.executionSettled = settled;
+    const summary = row.message.task_report ? projectTaskReport(row.message.task_report, false) : null;
+    const merged = row.subagentReport ? projectTaskReport(row.subagentReport, false) : null;
+    for (const [id, busy] of merged?.taskStates || []) if (!laterTasks.has(id)) laterTasks.set(id, busy);
+    const active = summary?.taskStates.filter(([, busy]) => busy) || [];
+    row.executionSettled = settled || (active.length > 0 && active.every(([id]) => laterTasks.get(id) === false));
+    for (const [id, busy] of summary?.taskStates || []) if (!laterTasks.has(id)) laterTasks.set(id, busy);
   }
   return { rows, shownCount: shown.length };
 }
@@ -7317,6 +8160,8 @@ function historyExecutionOf(rows) {
   return summaries;
 }
 function renderHistoryRow(row, parent) {
+  // Equal message bodies keep their reconciliation identity but own distinct folds.
+  const foldIdentity = row.identity + ":" + row.historyIndex;
   const executionBoxes = [];
   let source = null;
   const observe = (node, slot, summary) => {
@@ -7352,7 +8197,7 @@ function renderHistoryRow(row, parent) {
       fold.box.dataset.executionState = fold.box._executionState = "completed";
       const summary = fold.box.querySelector("summary");
       const det = fold.box.querySelector("details");
-      if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + snapshot.identity + ":thinking");
+      if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + foldIdentity + ":thinking");
       return summary;
     },
     answer(snapshot, turn) { addMsgMd(snapshot.text, turn.group, textOf(snapshot.message.content), snapshot.message); },
@@ -7380,7 +8225,8 @@ function renderHistoryRow(row, parent) {
       const raw = textOf(m.content);
       const body = policy.toolText(snapshot, raw, taskResult);
       const fold = addFold(snapshot.call ? callLabel(snapshot.call) : FOLD_ROLE_LABELS[m.role] || m.role, body, container);
-      if (m.role === "tool") {
+      if (m.role === "tool" || m.role === "internal_note") {
+        if (m.tool_call_id) fold.box._historyToolCall = { id: m.tool_call_id, sessionId, base: executionBase() };
         executionBoxes.push(fold.box);
         fold.box.dataset.executionState = fold.box._executionState = "completed";
         fold.box.dataset.executionSettled = fold.box._executionSettled = String(snapshot.executionSettled === true);
@@ -7402,7 +8248,12 @@ function renderHistoryRow(row, parent) {
     },
     stored(fold, suffix = "") {
       const det = fold.box.querySelector("details");
-      if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + row.identity + suffix);
+      if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + foldIdentity + suffix);
+      if (fold.taskPreview && typeof bindStoredFold === "function") {
+        for (const details of fold.box.querySelectorAll("details")) if (details.dataset.taskDetailsKey) {
+          bindStoredFold(details, sessionId + "\n" + foldIdentity + suffix + ":" + details.dataset.taskDetailsKey);
+        }
+      }
     },
     subagents(snapshot, container) {
       // History reports are frozen observations. Their elapsed clocks do not run.
@@ -8308,10 +9159,12 @@ function pollSwitchRunningState() {
 // original live DOM, but it restores thinking, tool cards, the partial answer
 // and any pending question after a page reload.
 function recoveredProgressView(sid = sessionId) {
+  const base = executionBase();
   const box = document.createElement("div");
   box.className = "turn recovered";
   let bubble = document.createElement("div");
-  bubble.className = "msg asst";
+  bubble.className = "msg asst md";
+  bubble.dataset.role = "assistant";
   bubble.hidden = true;
   box.appendChild(bubble);
   const phaseBubble = document.createElement("div");
@@ -8347,7 +9200,10 @@ function recoveredProgressView(sid = sessionId) {
       rememberRate("turn", sid, answer, lastOutputRate);
       bubble.dataset.segmentSealed = "1";
       bubble.hidden = false;
-      bubble.textContent = answer;
+      bubble.innerHTML = renderMarkdown(answer, false);
+      decorateAndLoad(bubble);
+      addAnswerCopy(bubble, answer);
+      if (bubble._messageTimeSource) setMessageTimestamp(bubble, bubble._messageTimeSource);
     } else {
       bubble.remove();
       answerBubbles.pop();
@@ -8360,7 +9216,8 @@ function recoveredProgressView(sid = sessionId) {
   const ensureAnswerBubble = () => {
     if (bubble) return;
     bubble = document.createElement("div");
-    bubble.className = "msg asst";
+    bubble.className = "msg asst md";
+    bubble.dataset.role = "assistant";
     bubble.hidden = true;
     box.insertBefore(bubble, phaseBubble);
     answerBubbles.push(bubble);
@@ -8382,13 +9239,20 @@ function recoveredProgressView(sid = sessionId) {
     phaseBubble.textContent = activity.label() + (counts ? " · " + counts : "") + " · " + formatElapsed(Date.now() - clockStart);
     showTurnRate(rate || lastOutputRate);
   };
-  const paintAnswer = () => {
+  const paintAnswer = (timeSource = null) => {
     if (answer && !tokenRate && !lastOutputRate) {
       lastOutputRate = storedRate("turn", sid, answer);
     }
-    // Recovery paints immediately as plain text; history owns the final
-    // Markdown, media, math and copy controls when replay hands the view back.
-    if (bubble) { bubble.hidden = !answer; bubble.textContent = answer; }
+    // Replay uses the live renderer and its escaping policy. Previews and math
+    // decoration wait until the segment is sealed or the reply finishes.
+    if (bubble) {
+      if (timeSource?.created_at != null || timeSource?.timestamp != null) bubble._messageTimeSource = timeSource;
+      bubble.hidden = !answer;
+      bubble.innerHTML = renderMarkdown(answer, false);
+      if (bubble.parentNode?._executionGroups && bubble.parentNode.querySelectorAll("details").length) {
+        bubble.parentNode._executionGroups.sync();
+      }
+    }
     activity.setPhase(answer ? "Responding…" : "Processing…");
     paintPhase();
   };
@@ -8426,8 +9290,8 @@ function recoveredProgressView(sid = sessionId) {
       activity.setPhase("Thinking…");
       paintPhase();
     },
-    delta(text) { endThinking(); ensureAnswerBubble(); answer += text; outputRate.observe(text); paintAnswer(); },
-    replace(text) { endThinking(); ensureAnswerBubble(); answer = text; outputRate.replace(text); paintAnswer(); },
+    delta(text, timeSource = null) { endThinking(); ensureAnswerBubble(); answer += text; outputRate.observe(text); paintAnswer(timeSource); },
+    replace(text, timeSource = null) { endThinking(); ensureAnswerBubble(); answer = text; outputRate.replace(text); paintAnswer(timeSource); },
     rate(value) {
       const valueSample = rateSampleOf(value);
       if (!valueSample) return;
@@ -8439,7 +9303,15 @@ function recoveredProgressView(sid = sessionId) {
       }
       paintPhase();
     },
-    tool(event) { endThinking(); sealAnswerSegment(); activity.setPhase("Processing…"); activity.tool(event); paintPhase(); },
+    tool(event) {
+      endThinking(); sealAnswerSegment(); activity.setPhase("Processing…");
+      const stored = Array.from($("msgs").querySelectorAll(".msg")).some((node) => {
+        const call = node._historyToolCall;
+        return call && call.id === event?.id && call.sessionId === sid && call.base === base;
+      });
+      if (!stored) activity.tool(event);
+      paintPhase();
+    },
     subagents(payload, decoded) { activity.subagents(payload, decoded); },
     phase(text, waiting) { activity.setPhase(text, waiting); paintPhase(); },
     finish(reason = "ended") {
@@ -8450,6 +9322,12 @@ function recoveredProgressView(sid = sessionId) {
       const measured = outputRate.text(true);
       const rate = tokenRate || (measured ? "output " + measured : "") || lastOutputRate;
       rememberRate("turn", sid, answer.trim() ? answer : sealedAnswerText || lastThinkingText, rate);
+      if (bubble && answer.trim()) {
+        bubble.innerHTML = renderMarkdown(answer);
+        decorateAndLoad(bubble);
+        addAnswerCopy(bubble, answer);
+        if (bubble._messageTimeSource) setMessageTimestamp(bubble, bubble._messageTimeSource);
+      }
       const last = answerBubbles.at(-1);
       if (last) {
         setAnswerRate(last, rate);
@@ -8620,6 +9498,7 @@ function dispatchExecutionSnapshot(snapshot, view, source) {
 function dispatchExecutionEvent(kind, payload, view, source) {
   if (!Object.hasOwn(EXECUTION_EVENT_HANDLERS, kind)) return;
   const event = decodeExecutionEvent(kind, payload);
+  if (event.value?.user_message) view.userMessage?.(event.value.user_message);
   // Semantics run synchronously in wire order; only the source view decides
   // when to paint. Terminal frames and transport recovery stay with callers.
   dispatchExecutionProjection(EXECUTION_EVENT_HANDLERS, kind, event, view, source);
@@ -9000,7 +9879,9 @@ async function sendSideNote() {
     note("side note queued — applies at the next model request");
     void refreshSideNotes();
   } catch (e) {
-    note("side note failed: " + e.message);
+    const filenames = images.map((image) => image.filename).join("、");
+    addMsg("err", "side note failed" + (filenames ? "（" + filenames + "）" : "") + ": " + e.message, "asst err");
+    scrollToLatest();
   } finally {
     sideNoteBusy = false;
     $("sidenote").disabled = false;
@@ -9042,8 +9923,15 @@ function renderSideNotes(notes) {
     from.textContent = item.from === "user" ? "你" : (item.from || "agent");
     const text = document.createElement("span");
     text.className = "text";
-    text.textContent = item.content || "";
+    const content = document.createElement("span");
+    content.className = "side-note-text";
+    content.textContent = item.content || "";
+    text.appendChild(content);
     text.title = item.content || "";
+    if (item.from === "user" && typeof item.ts === "number" && item.ts > 0) {
+      text.dataset.role = "user";
+      setMessageTimestamp(text, { created_at: item.ts });
+    }
     li.appendChild(from);
     li.appendChild(text);
     list.appendChild(li);
@@ -9461,6 +10349,8 @@ async function prepareTurnSession(previousId, base) {
 // Bridges own matching and prompt/draft clearing, including cancellation.
 // Consumption here only decides whether the input can reach a model turn.
 const COMPOSER_COMMANDS = [
+  { name: "model", resolveHandler: () => isDesktopCommandCompletion() ? runDesktopModelCommand : undefined,
+    withOwner: false, consumeInput: true, keepAttachments: true },
   { name: "cd", resolveHandler: () => runCdCommand, withOwner: true, consumeInput: true, keepAttachments: true },
   { name: "git", resolveHandler: () => runGitCommand, withOwner: true, consumeInput: true, keepAttachments: true },
   { name: "transfer", resolveHandler: () => typeof runTransferCommand === "function" ? runTransferCommand : undefined,
@@ -9722,6 +10612,9 @@ async function send() {
       // bubble is rebuilt on every paint, so every formula would be typeset
       // again and again. The finished reply is typeset once, at the end.
       answerDirty = false;
+      if (bubble.parentNode?._executionGroups && bubble.parentNode.querySelectorAll("details").length) {
+        bubble.parentNode._executionGroups.sync();
+      }
     }
     // Streaming markdown replaces the answer body. Attach throughput after
     // that write so its footer survives each paint.
@@ -9843,6 +10736,10 @@ async function send() {
   // Live retains the complete bodies and coalesces paints while its POST owns
   // the turn. Replay uses the same interface with immediate recovery paints.
   const liveView = {
+    userMessage(source) {
+      const input = liveEntry.userInput?.row?.querySelector(".msg.user");
+      if (input) setMessageTimestamp(input, source);
+    },
     endThinking(newRound) { closeThinkingPhase(newRound); },
     sealAnswerSegment() { sealAnswerSegment(); },
     phase(text, waiting) { setPhase(text, waiting); },
@@ -10332,6 +11229,7 @@ function wire() {
   $("skillpicker").onfocusout = (e) => { if (!$("skillpicker").contains(e.relatedTarget)) closeSkillMenu(); };
   document.addEventListener("pointerdown", (e) => { if (!$("skillpicker").contains(e.target)) closeSkillMenu(); });
   // END skill picker events
+  wireDesktopCommandCompletion();
   $("prompt").addEventListener("compositionstart", () => {
     promptHistory.beginComposition();
     promptComposing = true;
@@ -10407,7 +11305,11 @@ function wire() {
       promptHistory.replay(key === "y" || e.shiftKey);
       return;
     }
-    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      if (isTurnRunning()) sendSideNote();
+      else send();
+    }
   });
   $("prompt").addEventListener("click", () => refreshCommandMenu());
   $("prompt").addEventListener("focusout", (e) => {
@@ -10517,6 +11419,7 @@ function registerAppServiceWorker() {
 async function boot() {
   registerAppServiceWorker();
   wire();
+  invalidateDesktopCompletion();
   restoreTeamPick();
   try { await api("/healthz"); } catch (e) {
     $("info").textContent = "offline — retrying…";

@@ -2732,6 +2732,12 @@ fn live_done_timestamps_match_persisted_final_answer_and_replay() {
         metadata.done_event().data.is_empty(),
         "no new rows must not borrow the old answer time"
     );
+    let mut early = ServeSse::new("thinking_start", "");
+    metadata.decorate_input_event(&mut early);
+    assert!(
+        early.data.is_empty(),
+        "live input metadata must not borrow an older user timestamp"
+    );
     let path = store.session_history_file("timestamp-live");
     let message = |role: &str, text: &str| crate::ai::history::Message {
         role: role.into(),
@@ -2751,10 +2757,22 @@ fn live_done_timestamps_match_persisted_final_answer_and_replay() {
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute("UPDATE messages SET created_at = 1700000000 + id", [])
         .unwrap();
+    let mut raw = ServeSse::new("subagent_progress", r#"{"text": "raw legacy progress"}"#);
+    metadata.decorate_input_event(&mut raw);
+    assert_eq!(raw.data, r#"{"text": "raw legacy progress"}"#);
     let (tx, mut rx) = mpsc::channel(8);
     let done = AtomicBool::new(false);
     let timing = super::TurnSendTiming::default();
     let t0 = std::time::Instant::now();
+    super::forward_live_event(
+        ServeLiveEvent::ThinkingStart,
+        &done,
+        &tx,
+        &timing,
+        t0,
+        None,
+        Some(&mut metadata),
+    );
     super::forward_live_event(
         ServeLiveEvent::Replace("assistant says hi".into()),
         &done,
@@ -2781,6 +2799,12 @@ fn live_done_timestamps_match_persisted_final_answer_and_replay() {
         t0,
         None,
         Some(&mut metadata),
+    );
+    let input = rx.try_recv().unwrap().unwrap();
+    assert_eq!(input.kind, "thinking_start");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&input.data).unwrap(),
+        serde_json::json!({"user_message": {"message_id": 3, "created_at": 1700000003}})
     );
     let replacement = rx.try_recv().unwrap().unwrap();
     assert_eq!(replacement.kind, "replace");

@@ -307,6 +307,8 @@ function imageHarness(source, phone = false) {
   const c = fixtures.makeContext({
     DRAFT_PREFIX: "draft:", sessionId: "old", pendingAppend: "",
     isPhoneLayout: () => phone, note: (text) => trace.push(["note", text]),
+    addMsg: (role, text, cls) => trace.push(["message", role, text, cls]),
+    scrollToLatest: () => trace.push(["scroll"]),
     FileReader: class {
       readAsDataURL(file) { readers.push(this); trace.push(["read", file.name, file.type]); }
     },
@@ -376,12 +378,18 @@ async function attachmentCompositionAndFailures(source) {
   const failed = imageHarness(source); failed.c.prompt.value = "unchanged";
   const badBatch = failed.c.queueImageFiles([null, { name: "text", type: "text/plain" },
     { name: "bad.png", type: "image/png" }, { name: "empty.png", type: "image/png" }]);
-  failed.readers[0].onerror(new Error("read failed")); await settle();
+  await settle();
+  failed.readers[0].error = new Error("read failed");
+  failed.readers[0].onerror(); await settle();
   await finishImage(failed, 1, "data:image/png;base64,"); await badBatch;
   assert.equal(failed.c.pendingImages.length, 0);
   assert.equal(failed.c.prompt.value, "unchanged");
-  assert.deepEqual(failed.trace, [["read", "bad.png", "image/png"], ["note", "could not attach image: read failed"],
-    ["read", "empty.png", "image/png"]]);
+  assert.deepEqual(failed.trace, [
+    ["message", "err", "无法附加 未命名图片：不支持的图片类型，请选择图片文件", "asst err"], ["scroll"],
+    ["message", "err", "无法附加 text：不支持的图片类型，请选择图片文件", "asst err"], ["scroll"],
+    ["read", "bad.png", "image/png"], ["message", "err", "无法附加 bad.png：read failed", "asst err"], ["scroll"],
+    ["read", "empty.png", "image/png"], ["message", "err", "无法附加 empty.png：图片内容为空或无法读取", "asst err"], ["scroll"],
+  ]);
   snapshots.push(failed.snapshot());
   const capped = imageHarness(source); capped.c.prompt.value = "full";
   for (let i = 0; i < 9; i++) capped.c.pendingImages.push({ filename: i + ".png", data_base64: "QQ==" });
@@ -391,6 +399,10 @@ async function attachmentCompositionAndFailures(source) {
   assert.equal(capped.readers.length, 1, "capacity is checked again after the read");
   assert.equal(capped.c.pendingImages.length, 10);
   assert.equal(capped.c.prompt.value, "full");
+  assert.deepEqual(capped.trace.slice(-4), [
+    ["message", "err", "无法附加 late.png：最多只能附带 10 张图片", "asst err"], ["scroll"],
+    ["message", "err", "无法附加 next.png：最多只能附带 10 张图片", "asst err"], ["scroll"],
+  ]);
   snapshots.push(capped.snapshot());
   return snapshots;
 }

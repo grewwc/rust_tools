@@ -23,7 +23,7 @@ function bodyRules() {
 
 test("the default reading weight is a token, and it outranks the font shorthand", () => {
   assert.match(style, /--fw-text:\s*450/, "the reading weight token is missing");
-  assert.match(style, /--fw-meta:\s*400/, "the secondary weight token is missing");
+  assert.match(style, /--fw-meta:\s*450/, "the secondary weight token is missing");
 
   const rules = bodyRules();
   const shorthand = rules.find((r) => /font:/.test(r.body));

@@ -407,13 +407,50 @@ test("timezone-qualified wire timestamps align with canonical Unix seconds", () 
   assert.equal(c.formatMessageTime(ms, ms), String(new Date(ms).getHours()).padStart(2, "0") + ":05");
 });
 
-test("timestamp styles use secondary text in normal flow on both layouts", () => {
+test("user and side-note timestamps share the assistant footer geometry on both layouts", () => {
   assert.match(html, /\.message-time \{[^}]*color:var\(--dim\);[^}]*font-size:11px;[^}]*font-variant-numeric:tabular-nums/);
-  assert.match(html, /\.msg\.user > \.message-time \{[^}]*margin-top:4px;[^}]*color:inherit/);
+  const assistant = html.match(/\.msg\.md \.answer-actions \{([^}]*)\}/)[1];
+  const user = html.match(/\.msg\.user > \.message-actions, #sidequeuelist \.message-actions \{([^}]*)\}/);
+  assert.ok(user, "user and queued side-note time use the shared footer layout");
+  assert.equal(user[1], assistant, "footer geometry must match the assistant without changing its CSS");
+  assert.doesNotMatch(html, /\.msg\.user > \.message-time/);
+  assert.match(html, /\.message-actions > \.message-time \{ margin-right:auto;/);
   assert.match(html, /\.answer-actions > \.message-time \{ margin-right:auto;/);
   const phone = html.slice(html.indexOf("@media (max-width:700px)"));
   assert.match(phone, /\.message-time \{ font-size:12px;/);
   assert.doesNotMatch(html.match(/\.message-time \{([^}]*)\}/)[1], /(?:^|;)\s*(?:position|height):/);
+});
+
+for (const phone of [false, true]) test(`live user timestamp is visible before the answer completes (phone=${phone})`, () => {
+  const h = streamHarness({ phone });
+  const row = h.document.createElement("div");
+  h.msgs.appendChild(row);
+  const user = h.context.addMsg("user", "live input", "user", row);
+  h.context.liveEntry.userInput = { row };
+  h.emit("delta", { delta: "working", user_message: { message_id: 13, created_at: 1700000003 } });
+  const time = user.querySelector(".message-time");
+  assert.ok(time, "persisted input metadata must appear while the model is still running");
+  assert.equal(time.getAttribute("datetime"), "2023-11-14T22:13:23.000Z");
+  assert.equal(time.parentNode.className, "message-actions");
+  assert.equal(user.dataset.question, "live input");
+  assert.equal(h.box.querySelectorAll(".message-time").length, 0, "the partial answer still has no timestamp");
+  h.emit("done", { user_message: { message_id: 13, created_at: 1700000003 } });
+  assert.equal(user.querySelectorAll(".message-time").length, 1);
+});
+
+for (const phone of [false, true]) test(`queued side-note time comes from durable queue seconds (phone=${phone})`, () => {
+  const h = harness({ phone });
+  const elements = Object.fromEntries(["sidequeue", "sidequeuelist", "sidequeuecount"].map((id) => [id, h.document.createElement("div")]));
+  Object.assign(h.context, { $: (id) => elements[id], watchSideNotes() {} });
+  vm.runInContext(between("function renderSideNotes(", "// The queue is server-side"), h.context);
+  h.context.renderSideNotes([{ from: "user", content: "steer left", ts: 1700000003 }, { from: "user", content: "legacy" }]);
+  const first = elements.sidequeuelist.children[0];
+  const time = first.querySelector(".message-time");
+  assert.ok(time, "queued user guidance must display its stored enqueue time");
+  assert.equal(time.getAttribute("datetime"), "2023-11-14T22:13:23.000Z");
+  assert.equal(time.parentNode.className, "message-actions");
+  assert.equal(first.querySelector(".side-note-text").textContent, "steer left");
+  assert.equal(elements.sidequeuelist.children[1].querySelector(".message-time"), null, "missing queue metadata cannot use render time");
 });
 
 test("partial and pending answers expose no copy control until the stream finishes", async () => {
@@ -455,6 +492,97 @@ test("recovered partial answers do not expose a copy control", () => {
   view.replace("仍在输出");
   assert.equal(view.box.querySelectorAll("[data-copy-answer]").length, 0);
 });
+
+function replayHarness(options) {
+  const h = harness(options), renders = [], decorations = [];
+  const render = h.context.renderMarkdown;
+  h.context.renderMarkdown = (text, previews) => {
+    renders.push({ text, previews });
+    return render(text, previews);
+  };
+  h.context.decorateAndLoad = (node) => decorations.push(node);
+  vm.runInContext(between("function recoveredProgressView(", "function handleReplayEvent("), h.context);
+  return { ...h, renders, decorations, view: h.context.recoveredProgressView() };
+}
+
+test("replay streams real Markdown and replaces unfinished fences without exposing unsafe HTML", () => {
+  const h = replayHarness(), view = h.view, answer = view.box.children[0];
+  view.delta("## Heading\n\n**bold** and `code`\n\n<script>alert(1)</script>\n\n```js\nconst x = 1;");
+  assert.match(answer.innerHTML, /<div class="h lv2">Heading<\/div>/);
+  assert.match(answer.innerHTML, /<b>bold<\/b> and <code>code<\/code>/);
+  assert.match(answer.innerHTML, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.doesNotMatch(answer.innerHTML, /<script\b/);
+  assert.match(answer.innerHTML, /<pre data-lang="js"><code>const x = 1;/);
+  view.delta("\n```\n\n- trailing item");
+  assert.match(answer.innerHTML, /class="li"/);
+  view.replace("## Replacement\n\n**final** [unsafe](javascript:alert)");
+  assert.equal(view.box.children[0], answer, "replacement preserves the answer node and its position");
+  assert.match(answer.innerHTML, /<div class="h lv2">Replacement<\/div>/);
+  assert.match(answer.innerHTML, /<b>final<\/b>/);
+  assert.doesNotMatch(answer.innerHTML, /Heading|const x|href="javascript:/);
+  assert.ok(answer.classList.contains("msg") && answer.classList.contains("asst") && answer.classList.contains("md"));
+  assert.equal(answer.dataset.role, "assistant");
+  assert.equal(answer.hidden, false);
+  assert.equal(view.box.className, "turn recovered");
+  assert.deepEqual(h.renders.map((call) => call.previews), [false, false, false]);
+  assert.equal(h.decorations.length, 0, "streaming does not reload previews or typeset math");
+  assert.equal(answer.querySelector("[data-copy-answer]"), null);
+});
+
+test("replay seals separate Markdown rounds with raw copy text and stored timestamps", async () => {
+  const copied = [], h = replayHarness({ clipboard: { writeText: async (text) => copied.push(text) } });
+  const firstRaw = "## First\n\n**before tool**\n", secondRaw = "`after tool`\n";
+  const first = h.view.box.children[0];
+  h.view.delta(firstRaw, { created_at: 1700000000 });
+  h.view.tool({ id: "read", name: "read_file", phase: "started" });
+  assert.equal(first.dataset.segmentSealed, "1");
+  assert.match(first.querySelector(".answer-body")?.innerHTML || "", /<b>before tool<\/b>/);
+  assert.equal(first.querySelectorAll("[data-copy-answer]").length, 1);
+  assert.equal(first.querySelector(".message-time")?.getAttribute("datetime"), "2023-11-14T22:13:20.000Z");
+  assert.equal(await h.tap(first.querySelector("[data-copy-answer]")), true);
+  h.view.delta(secondRaw);
+  const second = h.view.box.children.find((row) => row !== first && row.classList.contains("md"));
+  assert.ok(second && second !== first);
+  assert.equal(second.querySelector("[data-copy-answer]"), null, "the next round remains partial");
+  h.view.finish();
+  assert.equal(h.view.box.children[0], first, "sealing and completion preserve round order");
+  assert.equal(h.view.box.querySelectorAll("[data-copy-answer]").length, 2);
+  assert.equal(second.querySelector(".message-time"), null, "missing metadata cannot invent a timestamp");
+  assert.equal(await h.tap(second.querySelector("[data-copy-answer]")), true);
+  assert.deepEqual(copied, [firstRaw, secondRaw]);
+  assert.deepEqual(h.renders.map((call) => call.previews), [false, false, false, undefined]);
+  assert.deepEqual(h.decorations, [first, second]);
+});
+
+for (const reason of ["ended", "interrupted"]) {
+  test("replay " + reason + " finalizes sanitized previews and preserves copy, time and throughput", async () => {
+    const copied = [], h = replayHarness({ clipboard: { writeText: async (text) => copied.push(text) } });
+    const raw = '## Final\n\n**bold** and `code`\n\n```html\n<div onclick="bad()">preview<script>bad()</script></div>\n```';
+    h.view.delta(raw, { timestamp: 1700000000123 });
+    const answer = h.view.box.children[0];
+    assert.doesNotMatch(answer.innerHTML, /class="code-preview/);
+    h.view.rate({ phase: "output", tokens: 40, elapsed_ms: 2000 });
+    h.view.finish(reason);
+    assert.match(answer.querySelector(".answer-body")?.innerHTML || "", /class="code-preview/);
+    assert.match(answer.innerHTML, /<iframe sandbox referrerpolicy="no-referrer"/);
+    const srcdoc = answer.innerHTML.match(/srcdoc="([^"]*)"/)[1]
+      .replace(/&(amp|lt|gt|quot);/g, (_, key) => ({ amp: "&", lt: "<", gt: ">", quot: '"' })[key]);
+    assert.doesNotMatch(srcdoc, /<script\b/);
+    assert.match(srcdoc, /script-src 'none'/);
+    assert.doesNotMatch(answer.innerHTML, /<script\b|<div onclick=/);
+    assert.equal(answer.querySelectorAll("[data-copy-answer]").length, 1);
+    assert.equal(answer.querySelectorAll(".message-time").length, 1);
+    assert.equal(answer.querySelector(".message-time").getAttribute("datetime"), "2023-11-14T22:13:20.123Z");
+    assert.equal(answer.querySelector(".turn-rate").textContent, "↳ speed · output 40 tok @ 20 tok/s");
+    assert.equal(h.view.box.querySelectorAll(".turn-rate").length, 1);
+    assert.equal(h.view.box.querySelector(".pending"), null);
+    assert.equal(h.view.box.className, "turn recovered");
+    assert.equal(await h.tap(answer.querySelector("[data-copy-answer]")), true);
+    assert.deepEqual(copied, [raw]);
+    assert.deepEqual(h.renders.map((call) => call.previews), [false, undefined]);
+    assert.deepEqual(h.decorations, [answer]);
+  });
+}
 
 for (const phone of [true, false]) {
   test((phone ? "phone" : "desktop") + " final rendering keeps throughput outside copied answer text", async () => {

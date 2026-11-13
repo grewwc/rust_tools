@@ -820,6 +820,11 @@ function phase4NavigationObservation(html, spec) {
     closeSkillMenu() { h.record("close-skill"); },
     chooseSkill(name) { h.record("choose-skill", name); },
   });
+  // Load the completion dependencies as well as the navigation slice. A VM
+  // without matchMedia still exercises the original navigation observations.
+  if (command && script.includes("const desktopCompletion =")) {
+    vm.runInContext(phase4Section(script, "const desktopCompletion =", "function normalizeCommands("), c);
+  }
   vm.runInContext(phase4Section(script, command ? "function setCommandActive(" : "function setSkillActive(",
     command ? "async function loadInfo()" : "function validateSkillInput()"), c);
   const setter = command ? "setCommandActive" : "setSkillActive", original = c[setter];

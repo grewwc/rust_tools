@@ -433,11 +433,14 @@ test("first send creates a session and waits for config success before the actua
   assert.equal(h.consumed.length, 1);
 });
 
-for (const state of ["replay", "server", "stale", "live"]) test(`button and keyboard sends share the running guard (${state})`, async () => {
+for (const state of ["replay", "server", "stale", "live"]) test(`the button stops and keyboard routes running drafts to side notes (${state})`, async () => {
   const h = harness(), c = h.context;
-  let aborted = 0, stopped = 0;
+  let aborted = 0, stopped = 0, sent = 0;
+  const send = c.send, sideNotes = [];
+  c.send = () => { sent++; return send(); };
   Object.assign(c, { eventAbort: { abort() { aborted++; } }, recoveredView: null,
     stopTurn() { stopped++; },
+    sendSideNote() { sideNotes.push({ sessionId: c.sessionId, text: h.elements.prompt.value, images: c.pendingImages }); },
   });
   vm.runInContext(existingFunction("function abortEvents()", "async function pollConfirm()"), c);
   if (state === "replay") Object.assign(c, { eventActive: true, eventSession: "alpha", staleDone: true });
@@ -459,6 +462,8 @@ for (const state of ["replay", "server", "stale", "live"]) test(`button and keyb
     await settle();
     assert.equal(prevented, true);
   }
+  assert.equal(sent, 1, "running keyboard submission must bypass ordinary send");
+  assert.deepEqual(sideNotes, ["ctrlKey", "metaKey"].map(() => ({ sessionId: "alpha", text: draft, images })));
   assert.equal(h.turns().length, 0);
   assert.equal(aborted, 0, "blocked submission must preserve the active event feed");
   assert.equal(h.elements.prompt.value, draft);
@@ -467,6 +472,8 @@ for (const state of ["replay", "server", "stale", "live"]) test(`button and keyb
   Object.assign(c, { eventActive: false, eventSession: "", staleSession: "", eventStreamEnded: true });
   keydown({ key: "Enter", ctrlKey: true, preventDefault() {} });
   await settle();
+  assert.equal(sent, 2, "idle keyboard submission uses ordinary send");
+  assert.equal(sideNotes.length, 2, "idle submission must not queue another note");
   assert.equal(h.turns().length, 1, "keyboard submission unlocks after true completion");
 });
 
@@ -1170,7 +1177,7 @@ test("the layout hosts the team entry and the accessible sheet uses the existing
   assert.match(desktop, /#ovrsummaryline #teamcontrols \{ flex:0 0 auto; padding:0; margin-left:auto; \}/);
   const desktopRow = /@media \(min-width:701px\) \{([\s\S]*?)\n\}/.exec(desktop);
   assert.ok(desktopRow);
-  assert.match(desktopRow[1], /#ovrwrap \{[^}]*display:grid; grid-template-columns:minmax\(0,1fr\) auto;[^}]*gap:4px 8px; padding:10px 24px 4px;/);
+  assert.match(desktopRow[1], /#ovrwrap \{[^}]*display:grid; grid-template-columns:minmax\(0,1fr\) auto;[^}]*gap:4px 8px; padding:4px 24px 20px;/);
   assert.match(desktopRow[1], /#ovrwrap > summary \{ display:flex; align-items:center; grid-column:2; grid-row:1; padding:0; list-style:none; \}/);
   assert.match(desktopRow[1], /#ovrsummary \{ display:none; \}/);
   assert.match(desktopRow[1], /#ovr \{[^}]*display:grid;[^}]*grid-column:1; grid-row:1;[^}]*min-width:0;/);

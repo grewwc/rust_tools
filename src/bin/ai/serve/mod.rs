@@ -1203,7 +1203,7 @@ fn forward_live_event(
     // slot is filled before the send: an answer can only arrive after a client
     // saw the event, and a client that lost the stream instead of receiving it
     // reads the slot through `GET .../confirm`.
-    let sse = match event {
+    let mut sse = match event {
         ServeLiveEvent::ConfirmRequest(payload) => {
             let Some((id, prompt)) = parse_confirm_request(&payload) else {
                 // A fragment of a split payload names no question; dropping it
@@ -1277,10 +1277,11 @@ fn forward_live_event(
             None => return,
         },
     };
-    if let Some(metadata) = metadata
-        && sse.kind == "replace"
-    {
-        metadata.record_committed_answer(&sse.data);
+    if let Some(metadata) = metadata {
+        if sse.kind == "replace" {
+            metadata.record_committed_answer(&sse.data);
+        }
+        metadata.decorate_input_event(&mut sse);
     }
     let _ = tx.blocking_send(Ok(sse));
 }

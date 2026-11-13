@@ -210,7 +210,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
     showConfirm() {}, hideConfirm() {}, confirmShown: null, stopStaleFollow() {},
     addMsgMd() { const item = node(); item.className = "msg asst md"; box.appendChild(item); return item; },
     addFold(title, text, parent = box, key) { return fixtureFold(node, title, text, parent, key); },
-    window: { addEventListener: listen },
+    window: { addEventListener: listen, matchMedia: () => ({ matches: !phone }) },
     MutationObserver: class { constructor(fn) { observers.push(fn); } observe() {} },
     ...(activityOnly ? {
       Date: { now: () => clock.now }, document,
@@ -312,18 +312,24 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
 function replayHarness(options) {
   const live = streamHarness(options), { context, storage } = live;
   function node() {
-    let text = "";
+    let text = "", markup = "";
     const item = {
       children: [], dataset: {}, hidden: false, scrollTop: 0, className: "", classList: {
         add(name) { if (!this.contains(name)) item.className = (item.className + " " + name).trim(); },
         remove(name) { item.className = item.className.split(/\s+/).filter((part) => part !== name).join(" "); },
         contains(name) { return item.className.split(/\s+/).includes(name); },
       },
-      get textContent() { return text + this.children.map((child) => child.textContent).join(""); },
+      get textContent() { return text + markup + this.children.map((child) => child.textContent).join(""); },
       set textContent(value) {
         text = String(value);
+        markup = "";
         this.children.forEach((child) => { child.parentNode = null; });
         this.children = [];
+      },
+      get innerHTML() { return markup; },
+      set innerHTML(value) {
+        this.textContent = "";
+        markup = String(value);
       },
       get lastElementChild() { return this.children.at(-1) || null; },
       get nextElementSibling() { return this.parentNode?.children[this.parentNode.children.indexOf(this) + 1] || null; },
@@ -375,7 +381,7 @@ function replayHarness(options) {
       }
     },
     status: () => view.box.children.at(-1).textContent,
-    reply: () => view.box.children.filter((item) => !item.summary && item.className === "msg asst" && !item.hidden).at(-1)?.textContent || "",
+    reply: () => view.box.children.filter((item) => !item.summary && item.matches(".msg.asst.md") && !item.hidden).at(-1)?.textContent || "",
     mainRate: () => rateNodes(view.box)[0]?.textContent || "",
     titles: () => executionRecords(view.box).map((item) => item.summary.textContent),
   };
@@ -600,6 +606,291 @@ function retainedHistoryHarness(messages, options = {}) {
     },
   };
 }
+
+function progressPositionHarness(replay, width = 1280) {
+  const h = replay ? replayHarness({ realThinking: true, phone: width <= 700 })
+    : streamHarness({ realThinking: true, phone: width <= 700 });
+  h.context.window.matchMedia = (query) => ({ matches: query === "(min-width:701px)" && width > 700 });
+  h.context.commitExecutionView();
+  const box = replay ? h.view.box : h.box;
+  const worker = structuredTask("position-worker", 5000);
+  h.emit("tool", { id: "position-spawn", name: "task_spawn", phase: "finished", ok: true,
+    output: "Spawn bytes", task_report: { ...structuredSubagents([worker]).task_report, operation: "task_spawn", snapshot: false } });
+  const card = executionRecords(box).find((item) => item.dataset.subagents === "true");
+  for (const [index, text] of ["Body A", "Body B"].entries()) {
+    h.emit("delta", { delta: text });
+    h.emit("tool", { id: "position-command-" + index, name: "execute_command", phase: "started" });
+    h.emit("tool", { id: "position-command-" + index, name: "execute_command", phase: "finished", ok: true, output: "Command " + index });
+  }
+  const progress = (sequence = 2, overrides = {}) => h.emit("subagent_progress",
+    structuredSubagents([{ ...worker, ...overrides, progress: { ...worker.progress, sequence, latest_activity: "Latest progress " + sequence } }]));
+  const records = () => {
+    const visit = (parent) => parent.children.flatMap((item) => item.classList?.contains("execution-group")
+      ? visit(item.querySelector(".execution-items")) : [item]);
+    return visit(box).filter((item) => !item.hidden && !item.classList?.contains("pending") && !item.dataset.turnRate);
+  };
+  return { ...h, box, card, worker, progress, records };
+}
+
+for (const replay of [false, true]) for (const width of [700, 701, 1280]) {
+  test(`desktop latest subagent progress follows prose and completed tools (${replay ? "replay" : "live"}, ${width}px)`, () => {
+    const h = progressPositionHarness(replay, width), { card, context } = h;
+    const details = card.querySelector("details"), key = details.dataset.foldKey;
+    const previous = h.records(), source = [...context.executionState().activities.values()].at(-1);
+    const slots = [...source.slots.keys()], body = card.body;
+    assert.notEqual(previous.at(-1), card, "spawn is initially above both prose rounds");
+    assert.equal(details.open, true);
+    h.progress();
+    assert.equal(h.records().at(-1) === card, width > 700, "the latest busy desktop progress must be the last real card");
+    assert.equal(card.body, body); assert.equal(card.querySelector("details"), details);
+    assert.equal(details.open, true); assert.equal(details.dataset.foldKey, key);
+    assert.equal(executionRecords(h.box).filter((item) => item.dataset.subagents === "true").length, 1);
+    assert.deepEqual([...source.slots.keys()], slots, "display movement cannot reorder producer observations");
+    assert.deepEqual(h.records().filter((item) => item !== card), previous.filter((item) => item !== card), "prose and original execution records keep their order");
+    details.open = false;
+    h.emit("delta", { delta: "Body C" });
+    const beforeRepeat = h.records();
+    h.progress();
+    assert.deepEqual(h.records(), beforeRepeat, "repeated progress must not re-anchor a card");
+    h.emit("subagent_progress", structuredSubagents([{ ...h.worker, elapsed_ms: 6000,
+      progress: { ...h.worker.progress, sequence: 2, latest_activity: "Latest progress 2", elapsed_ms: 6000, stale_for_ms: 1000 } }]));
+    assert.deepEqual(h.records(), beforeRepeat, "elapsed/age-only snapshots are not new progress");
+    h.progress(3);
+    assert.equal(details.open, false, "new progress preserves the reader's collapse choice");
+    assert.equal(h.records().at(-1) === card, width > 700);
+    assert.equal(h.records().find((item) => item.textContent === "Body A").textContent, "Body A");
+  });
+}
+
+for (const replay of [false, true]) {
+  test(`desktop latest subagent progress leaves completed history in place (${replay ? "replay" : "live"})`, () => {
+    const h = progressPositionHarness(replay);
+    h.progress(2, { active: false, status: "completed", output: "Original delivered bytes\n" });
+    h.emit("delta", { delta: "Later answer" });
+    const before = h.records();
+    h.progress(3, { active: true, status: "running" });
+    assert.deepEqual(h.records(), before, "late active snapshots cannot advance a delivered completion");
+    assert.equal(h.card._taskResult.busy, false);
+    assert.ok(h.card.textContent.includes("Original delivered bytes\n"));
+  });
+  for (const boundary of ["turn", "session", "server", "displayed", "generation", "mount", "unmount", "removed", "interrupted"]) {
+    test(`desktop latest subagent progress rejects an obsolete ${boundary} owner (${replay ? "replay" : "live"})`, () => {
+      const h = progressPositionHarness(replay), c = h.context;
+      const source = [...c.executionState().activities.values()].at(-1);
+      if (boundary === "turn") c.updateExecutionModel({ kind: "begin" });
+      if (boundary === "session") c.sessionId = "other-session";
+      if (boundary === "server") c.store = { base: "other-server" };
+      if (boundary === "displayed") c.commitExecutionView("other-session");
+      if (boundary === "generation") c.clearDisplayedSources();
+      if (boundary === "mount") c.mountDisplayedSource(source.sourceToken, {}, source.origin, [...source.slots.values()]);
+      if (boundary === "unmount") c.unmountDisplayedSource(source.sourceToken, source.mountToken);
+      if (boundary === "removed" || boundary === "interrupted") {
+        if (replay) boundary === "removed" ? h.view.remove() : h.view.finish("interrupted");
+        else vm.runInContext(boundary === "removed" ? "activity.remove()" : 'activity.finish("interrupted")', c);
+      }
+      const before = h.records();
+      // Invoke the retained view directly, including the replay callback whose
+      // outer dispatcher would normally reject a different selected session.
+      const payload = JSON.stringify(structuredSubagents([structuredTask("position-worker", 6000,
+        { progress: { sequence: 9, phase: "working", latest_activity: "Late progress" } })]));
+      if (replay) h.view.subagents(payload);
+      else { c.lateProgressPayload = payload; vm.runInContext("activity.subagents(lateProgressPayload)", c); }
+      assert.deepEqual(h.records(), before, "an obsolete producer cannot move transcript nodes");
+    });
+  }
+  test(`desktop latest subagent progress advances a new batch without moving completed turns (${replay ? "replay" : "live"})`, () => {
+    const h = progressPositionHarness(replay);
+    h.progress(2, { active: false, status: "completed", output: "First batch bytes" });
+    h.emit("delta", { delta: "Batch boundary answer" });
+    const before = h.records().filter((item) => item !== h.card);
+    h.emit("tool", { id: "position-next-spawn", name: "task_spawn", phase: "finished", ok: true, output: "Next spawn bytes",
+      task_report: { ...structuredSubagents([structuredTask("next-worker", 1000)]).task_report, operation: "task_spawn", snapshot: false } });
+    assert.equal(h.records().at(-1), h.card);
+    assert.equal(h.card._taskResult.busy, true);
+    assert.ok(h.card.textContent.includes("First batch bytes"), "the prior delivered result remains intact in the same card");
+    assert.deepEqual(h.records().filter((item) => before.includes(item)), before, "earlier records keep their order");
+  });
+  for (const nativeMove of [false, true]) {
+    test(`desktop latest subagent progress preserves a backward selection (${replay ? "replay" : "live"}, ${nativeMove ? "moveBefore" : "insertBefore"})`, () => {
+      const h = progressPositionHarness(replay);
+      h.progress(); h.emit("delta", { delta: "Text after first progress" });
+      const selectedBody = h.card.body, details = h.card.querySelector("details");
+      const selection = { anchorNode: selectedBody, anchorOffset: 1, focusNode: selectedBody, focusOffset: 0,
+        setBaseAndExtent(anchorNode, anchorOffset, focusNode, focusOffset) {
+          Object.assign(this, { anchorNode, anchorOffset, focusNode, focusOffset });
+        } };
+      h.context.window.getSelection = () => selection;
+      let moves = 0;
+      const insert = h.box.insertBefore.bind(h.box);
+      const move = (node, before) => {
+        if (node === h.card) {
+          moves++;
+          if (!nativeMove) Object.assign(selection, { anchorNode: h.box, anchorOffset: 0, focusNode: h.box, focusOffset: 0 });
+        }
+        return insert(node, before);
+      };
+      if (nativeMove) h.box.moveBefore = move;
+      else h.box.insertBefore = move;
+      const raw = selectedBody.textContent;
+      h.progress(3);
+      assert.equal(moves, 1);
+      assert.equal(h.card.body, selectedBody); assert.equal(selectedBody.textContent, raw);
+      assert.equal(selection.anchorNode, selectedBody); assert.equal(selection.anchorOffset, 1);
+      assert.equal(selection.focusNode, selectedBody); assert.equal(selection.focusOffset, 0);
+      assert.equal(h.card.querySelector("details"), details); assert.equal(details.open, true);
+    });
+  }
+  test(`desktop latest subagent progress preserves reading position and existing bottom following (${replay ? "replay" : "live"})`, () => {
+    const h = progressPositionHarness(replay), root = replay ? h.msgs : h.box;
+    if (!h.box.classList) h.box.classList = { contains: () => false };
+    const answer = h.records().find((item) => item.classList?.contains("md") && item.textContent.startsWith("Body B")), frames = [];
+    root.scrollTop = h.records().indexOf(answer) * 40 - 20; root.scrollHeight = 999;
+    const readingTop = root.scrollTop;
+    root.getBoundingClientRect = () => ({ top: 0, bottom: 120 });
+    answer.getBoundingClientRect = () => {
+      const top = h.records().indexOf(answer) * 40 - root.scrollTop;
+      return { top, bottom: top + 40 };
+    };
+    h.context.shouldFollowOutput = () => false;
+    h.context.followOutput = (follow, target = root) => { if (follow) frames.push(() => { target.scrollTop = target.scrollHeight; }); };
+    const top = answer.getBoundingClientRect().top;
+    h.progress();
+    assert.equal(answer.getBoundingClientRect().top, top, "the same old prose stays at the same viewport position");
+    assert.equal(root.scrollTop, readingTop - 40, "removing 40px above the reading anchor is compensated");
+    assert.equal(frames.length, 0, "reading old output does not request a bottom jump");
+    h.context.shouldFollowOutput = () => true;
+    h.emit("delta", { delta: "Text at the live edge" });
+    h.progress(3);
+    assert.equal(root.scrollTop, readingTop - 40, "following stays in the existing scheduled paint");
+    assert.ok(frames.length > 0);
+    frames[0]();
+    assert.equal(root.scrollTop, 999, "the existing follow callback can still reach the latest progress");
+  });
+}
+
+for (const replay of [false, true]) for (const phone of [false, true]) for (const event of ["delta", "replace"]) {
+  test(`execution merge regression: ${event} answer paint merges completed tools (${replay ? "replay" : "live"}, ${phone ? "phone" : "desktop"})`, () => {
+    const h = replay ? replayHarness({ realThinking: true, phone }) : streamHarness({ realThinking: true, phone });
+    const root = replay ? h.view.box : h.box;
+    const output = " \nOriginal output\n \n", answer = " \nVisible answer\n\nSecond paragraph\n ";
+    h.emit("tool", { id: "paint-first", name: "read_file", phase: "finished", ok: true, output });
+    const original = executionRecords(root)[0];
+    assert.equal(root.querySelectorAll(".execution-group")[0], undefined, "latest execution remains visible before an answer");
+    h.emit(event, event === "delta" ? { delta: answer } : { text: answer });
+    const group = root.querySelectorAll(".execution-group")[0];
+    assert.ok(group, "the answer paint immediately advances the merge boundary");
+    assert.equal(group.querySelector("summary").textContent, "Completed execution · 1");
+    assert.equal(original.parentNode, group.querySelector(".execution-items"));
+    assert.equal(original.body.textContent, output, "merging preserves exact tool output bytes");
+    assert.equal(h.reply(), answer, "answer paint preserves raw whitespace and line breaks");
+    h.context.executionGroupsFor(root).sync();
+    assert.equal(root.querySelectorAll(".execution-group")[0], group, "an unchanged sync reuses the same group");
+  });
+}
+
+for (const phone of [false, true]) test(`execution merge regression: final delta and done share one paint (${phone ? "phone" : "desktop"})`, () => {
+  const h = streamHarness({ realThinking: true, phone });
+  h.emit("tool", { id: "paint-tail", name: "read_file", phase: "finished", ok: true, output: "Original output" });
+  const original = executionRecords(h.box)[0];
+  h.emit("delta", { delta: "Final answer" }, { paint: false });
+  h.emit("done", {});
+  assert.equal(h.reply(), "Final answer", "the done tail paint flushes the final answer without another event");
+  const group = h.box.querySelectorAll(".execution-group")[0];
+  assert.ok(group, "the final paint merges tools after finish ran with a hidden answer");
+  assert.equal(group.querySelector("summary").textContent, "Completed execution · 1");
+  assert.equal(original.parentNode, group.querySelector(".execution-items"));
+});
+
+for (const replay of [false, true]) test("execution merge regression: final answer settles an earlier busy task_wait card (replay=" + replay + ")", () => {
+  const h = replay ? replayHarness({ realThinking: true }) : streamHarness({ realThinking: true });
+  const box = replay ? h.view.box : h.box;
+  const worker = structuredTask("merge-worker", 5000);
+  const report = (task) => ({ ...structuredSubagents([task]).task_report, operation: "task_wait", snapshot: false });
+  h.emit("tool", { id: "wait-early", name: "task_wait", phase: "finished", ok: true,
+    output: "Early wait raw bytes", task_report: report(worker) });
+  const early = executionRecords(box).find((card) => card.summary.textContent.includes("task_wait"));
+  assert.equal(early._taskResult.busy, true);
+  assert.equal(early.parentNode, box, "a running worker keeps its raw card independent");
+  h.emit("tool", { id: "wait-final", name: "task_wait", phase: "finished", ok: true,
+    output: "Final wait raw bytes", task_report: report({ ...worker, active: false, status: "completed", output: "Worker result" }) });
+  assert.equal(executionRecords(box).find((card) => card.dataset.subagents === "true")._taskResult.busy, false);
+  h.emit("delta", { delta: "Final answer" });
+  // The earlier report is an immutable active snapshot. A terminal answer must
+  // settle its fold even though only the shared subagent card saw completion.
+  if (replay) h.view.finish(); else h.emit("done", {});
+  assert.equal(early.parentNode.classList?.contains("execution-items") === true, true,
+    "the earlier busy raw card joins completed execution after the final answer");
+  assert.equal(early.body.textContent, "Early wait raw bytes", "settlement preserves the original raw result");
+  for (const group of box.querySelectorAll(".execution-group")) {
+    assert.equal(group.querySelector("summary").textContent,
+      "Completed execution · " + group.querySelector(".execution-items").children.length);
+  }
+  const answer = descendants(box).find((card) => card.classList?.contains("md") && card.textContent.startsWith("Final answer"));
+  assert.equal(answer.parentNode, box, "the latest answer stays outside the execution group");
+});
+
+for (const replay of [false, true]) test("execution merge regression: ending without an answer keeps an active task_wait independent (replay=" + replay + ")", () => {
+  const h = replay ? replayHarness({ realThinking: true }) : streamHarness({ realThinking: true });
+  const box = replay ? h.view.box : h.box;
+  h.emit("tool", { id: "wait-active", name: "task_wait", phase: "finished", ok: true,
+    output: "Active wait", task_report: { ...structuredSubagents([structuredTask("active-worker", 5000)]).task_report,
+      operation: "task_wait", snapshot: false } });
+  const raw = executionRecords(box).find((card) => card.summary.textContent.includes("task_wait"));
+  if (replay) h.view.finish(); else h.emit("done", {});
+  assert.equal(raw._taskResult.busy, true);
+  assert.equal(raw.parentNode, box, "a terminal marker without a final answer cannot settle active work");
+});
+
+for (const task of [false, true]) test("execution merge regression: recovered tool replay skips a result already grouped in history (task=" + task + ")", async () => {
+  const output = "Persisted tool result", name = task ? "task_wait" : "read_file";
+  const report = task ? { ...structuredSubagents([structuredTask("finished-worker", 5000,
+    { active: false, status: "completed", output: "Delivered worker result" })]).task_report, operation: name, snapshot: false } : undefined;
+  const messages = [
+    { role: "user", content: "Read the result" },
+    { role: "assistant", content: "", reasoning_content: "Read the result", tool_calls: [
+      { id: "history-tool", function: { name, arguments: "{}" } },
+    ] },
+    { role: "tool", tool_call_id: "history-tool", content: output, task_report: report },
+    { role: "assistant", content: "Historical answer" },
+  ];
+  const h = retainedHistoryHarness(messages), c = h.c;
+  await c.loadHistory();
+  const original = executionRecords(h.root).find((card) => card.body.textContent === output);
+  assert.ok(original.parentNode.classList.contains("execution-items"));
+  const pending = c.attachEvents();
+  await h.settle();
+  try {
+    for (const phase of ["started", "finished"]) {
+      await h.frame("event: tool\ndata: " + JSON.stringify({ id: "history-tool", name, phase, ok: true, output, task_report: report }) + "\n\n");
+      assert.equal(c.recoveredView.box.querySelectorAll(".tool-activity").length, 0,
+        "a persisted tool_call_id cannot create a duplicate recovered card before done");
+      assert.equal(executionRecords(h.root).filter((card) => card.body.textContent === output).length, 1);
+    }
+    await h.frame("event: tool\ndata: " + JSON.stringify({ id: "new-tool", name, phase: "finished", ok: true, output }) + "\n\n");
+    const newCards = c.recoveredView.box.querySelectorAll(".tool-activity");
+    assert.equal(newCards.length, 1, "a different call ID with equal text still renders");
+    assert.equal(newCards[0].body.textContent, output);
+  } finally {
+    await h.frame("event: done\ndata: {}\n\n");
+    await pending;
+  }
+  assert.ok(executionRecords(h.root).includes(original), "replay leaves the original historical result mounted");
+});
+
+for (const otherServer of [false, true]) test("execution merge regression: a historical call ID from another " + (otherServer ? "server" : "session") + " still renders in recovery", async () => {
+  const h = retainedHistoryHarness([
+    { role: "tool", tool_call_id: "shared-id", content: "Other owner's result" },
+  ]), c = h.c;
+  await c.loadHistory();
+  if (otherServer) c.store.base = "https://other-server";
+  const view = c.recoveredProgressView(otherServer ? "s" : "other-session");
+  try {
+    view.tool({ id: "shared-id", name: "read_file", phase: "finished", ok: true, output: "Current result" });
+    const cards = view.box.querySelectorAll(".tool-activity");
+    assert.equal(cards.length, 1, "history owned by another session or server cannot suppress a current result");
+    assert.equal(cards[0].body.textContent, "Current result");
+  } finally { view.remove(); }
+});
 
 for (const reasoning of ["", "saved thought"]) {
   test("retained canonical history gains replay " + (reasoning ? "thinking and output rates" : "output rate") + " without remounting", async () => {
@@ -2465,7 +2756,7 @@ test("retained canonical task history moves merged details when a later wait is 
   ];
   const h = retainedHistoryHarness(messages);
   await h.c.loadHistory();
-  assert.equal(h.root.querySelectorAll(".task-output").length, 2);
+  assert.equal(h.root.querySelectorAll(".task-output").filter((panel) => panel.parentNode.classList.contains("msg")).length, 2);
   const done = { ...spawned, status: "completed", active: false, output: "  delivered exact bytes\n" };
   messages.push(
     { role: "assistant", content: "", tool_calls: [{ id: "wait", function: { name: "task_wait", arguments: "{}" } }] },
@@ -2476,9 +2767,14 @@ test("retained canonical task history moves merged details when a later wait is 
   assert.equal(cards.length, 1);
   assert.equal(h.root.children.length, 2, "task display must retain one root child per canonical display row");
   assert.equal(h.root.children[0].children.filter((child) => child.dataset.subagents === "true").length, 0);
-  const waitRow = h.root.children[1], [waitFold, subagents] = executionRecords(waitRow);
+  const waitRow = h.root.children[1];
+  const waitFold = executionRecords(h.root).find((card) => card.body.textContent === "raw wait\n");
+  const subagents = executionRecords(waitRow).find((card) => card.dataset.subagents === "true");
   assert.equal(waitFold.body.textContent, "raw wait\n");
-  assert.equal(waitFold.parentNode.parentNode.parentNode.nextElementSibling, subagents);
+  const execution = waitFold.parentNode.parentNode.parentNode;
+  assert.equal(execution.querySelector("summary").textContent, "Completed execution · 2");
+  assert.equal(execution.parentNode.nextElementSibling, waitRow);
+  assert.equal(waitRow.children[0], subagents, "the shared card follows the completed run across canonical wrappers");
   assert.equal(subagents.dataset.subagents, "true");
   assert.equal(subagents.querySelectorAll(".task-output-body")[0].textContent, done.output);
   assert.equal(h.root.children[0].dataset.canonicalIndex, "1");

@@ -180,7 +180,7 @@ function displayFold(node) {
 }
 function assertTask(panel, expected) {
   assert.ok(panel, "a task result alone must create the dedicated subagent detail card");
-  const rows = panel.children.filter((row) => row.dataset.taskId === expected.task_id);
+  const rows = panel.querySelectorAll("div").filter((row) => row.dataset.taskId === expected.task_id);
   const all = rows.map((row) => row.textContent).join("\n");
   for (const value of [expected.task_id, expected.description, expected.agent, expected.model, expected.status]) {
     assert.ok(all.includes(value), "missing explicit task field: " + value);
@@ -206,7 +206,8 @@ for (const phone of [false, true]) for (const mode of ["live", "replay", "histor
     const panel = taskCard(h), details = panel.parentNode.querySelector("details");
     const rawDetails = h.root.querySelector("details");
     const body = panel.querySelector(".task-output-body");
-    assert.equal(body.closest("details"), null, "the delivered output is outside the disclosure");
+    assert.equal(body.closest("details"), panel.querySelector("details"), "delivered output has a separate nested disclosure");
+    assert.equal(body.closest("details").open, false, "opening subagents does not expose delivered output");
     assert.equal(details.parentNode, panel.parentNode, "the disclosure and task rows share one owner");
     rawDetails.open = true; rawDetails.fire("toggle");
     details.open = true; details.fire("toggle");
@@ -226,7 +227,7 @@ for (const phone of [false, true]) for (const mode of ["live", "replay", "histor
     details.fire("toggle");
     assert.equal(rawDetails.open, true, "the separate tool disclosure must stay open");
     if (mode === "live" || mode === "replay") {
-      assert.equal(vm.runInContext('foldOpenByKey.get("subagents")', h.context), false);
+      assert.equal(vm.runInContext("foldOpenByKey.get(taskDetailsKey)", Object.assign(h.context, { taskDetailsKey: details.dataset.foldKey })), false);
     } else {
       const cold = harness({ phone, width, storage: new Map(h.storage) });
       cold.emit("cold", "raw task result", "task_wait", { task_report: report([expected]) });
@@ -310,7 +311,10 @@ for (const phone of [false, true]) for (const mode of ["live", "replay", "histor
     h.emit(mode, terminalPayload + "\n" + body, "task_wait", { task_report: report([expected]) });
     const panel = taskCard(h); assertTask(panel, expected);
     assert.deepEqual(JSON.parse(panel.parentNode.dataset.taskStates), [["task_real", false]]);
-    assert.ok(!panel.querySelectorAll(".task-progress").some((row) => row.textContent.includes("forged")));
+    const progressRows = panel.querySelectorAll(".task-progress");
+    assert.ok(progressRows.length > 0, "structured progress must be present, including nested details");
+    assert.ok(!progressRows.some((row) => row.textContent.includes("forged")),
+      "metadata-looking output must not enter any descendant progress row, including closed details");
     assert.equal(panel.querySelectorAll(".task-error").length, 0);
     assert.equal(panel.querySelectorAll("img").length, 0);
     assert.equal(h.root.querySelector(".prog").textContent, terminalPayload + "\n" + body);
@@ -402,7 +406,7 @@ test("structured repeat completions replace their own tool rows and preserve ope
   h.emit("live", "raw two", "task_wait", { task_report: report([second]) });
   h.emit("live", "raw two", "task_wait", { task_report: report([second]) });
   assert.equal(details.open, true);
-  assert.equal(h.root.querySelectorAll(".task-output").length, 2);
+  assert.equal(h.root.querySelectorAll(".task-output").filter((panel) => panel.parentNode.classList.contains("msg")).length, 2);
   assertTask(taskCard(h), second);
 });
 
@@ -517,7 +521,7 @@ for (const mode of ["live", "replay", "history", "cold"]) {
     for (const expected of [...earlier, ...recent, active]) assertTask(panel, expected);
     for (const expected of earlier) {
       assert.ok(panel.children.filter((row) => row.dataset.taskId === expected.task_id)
-        .every((row) => row.dataset.taskCurrent === "false"), "older completed work must be outside the current display");
+        .every((row) => row.dataset.taskBatchCurrent === "false"), "older completed work retains its delivery provenance");
       assert.ok(h.root.querySelectorAll(".prog").some((body) => body.textContent === expected.output),
         "the original tool fold must retain the exact historical output");
     }
@@ -541,7 +545,7 @@ for (const mode of ["live", "replay", "history", "cold"]) {
     h.emit(mode, "first completes last", "task_wait", { id: "wait-first", task_report: report([{ ...first, active: false, output: "first exact\n" }]) });
     const panel = taskCard(h);
     assert.ok(panel.children.filter((row) => row.dataset.taskId === first.task_id).every((row) => row.dataset.taskCurrent === "true"));
-    assert.ok(panel.children.filter((row) => row.dataset.taskId === second.task_id).every((row) => row.dataset.taskCurrent === "false"));
+    assert.ok(panel.children.filter((row) => row.dataset.taskId === second.task_id).every((row) => row.dataset.taskBatchCurrent === "false"));
     assert.equal(panel.querySelector(".task-count").textContent, "subagents · 2 tasks · 0 active");
   });
 
@@ -557,7 +561,7 @@ for (const mode of ["live", "replay", "history", "cold"]) {
     ]) });
     const panel = taskCard(h);
     assertTask(panel, earlier); assertTask(panel, latest);
-    assert.ok(panel.children.filter((row) => row.dataset.taskId === earlier.task_id).every((row) => row.dataset.taskCurrent === "false"));
+    assert.ok(panel.children.filter((row) => row.dataset.taskId === earlier.task_id).every((row) => row.dataset.taskBatchCurrent === "false"));
     assert.ok(panel.children.filter((row) => row.dataset.taskId === latest.task_id).every((row) => row.dataset.taskCurrent === "true"));
     assert.equal(panel.parentNode.dataset.taskBusy, "false");
   });
@@ -570,8 +574,8 @@ test("current task display provenance supports results without task IDs", () => 
   h.emit("live", "anonymous raw", "task_wait", { task_report: report([first, second]) });
   h.emit("live", "first anonymous redelivery", "task_wait", { task_report: report([first]) });
   const descriptions = taskCard(h).querySelectorAll(".task-description");
-  assert.equal(descriptions.find((row) => row.textContent.includes(first.description)).dataset.taskCurrent, "true");
-  assert.equal(descriptions.find((row) => row.textContent.includes(second.description)).dataset.taskCurrent, "false");
+  assert.equal(descriptions.find((row) => row.textContent.includes(first.description)).dataset.taskBatchCurrent, "true");
+  assert.equal(descriptions.find((row) => row.textContent.includes(second.description)).dataset.taskBatchCurrent, "false");
 });
 
 test("a current terminal error without output stays in the subagent display", () => {
@@ -582,7 +586,7 @@ test("a current terminal error without output stays in the subagent display", ()
   const panel = taskCard(h);
   assertTask(panel, failed);
   assert.equal(panel.querySelector(".task-error").dataset.taskCurrent, "true");
-  assert.ok(panel.children.filter((row) => row.dataset.taskId === earlier.task_id).every((row) => row.dataset.taskCurrent === "false"));
+  assert.ok(panel.children.filter((row) => row.dataset.taskId === earlier.task_id).every((row) => row.dataset.taskBatchCurrent === "false"));
 });
 
 test("raw task tools keep every byte while the duplicate preview and payload stay secondary", () => {
@@ -624,6 +628,34 @@ test("raw task tools keep every byte while the duplicate preview and payload sta
   assert.match(historyRaw.querySelector("summary").textContent, / · raw$/);
 });
 
+test("phone raw task output permits vertical scroll chaining without changing its native scrollport", () => {
+  const selector = '.msg.asst[data-task-raw-tool="true"] > details[open] > .prog';
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const rule = new RegExp(escaped + "\\s*\\{([^}]*)\\}", "g");
+  const phoneStart = css.indexOf("@media (max-width:700px)");
+  const phoneEnd = css.indexOf("@media (prefers-reduced-motion:reduce)", phoneStart);
+  assert.ok(phoneStart >= 0 && phoneEnd > phoneStart, "the phone override must stay in its media query");
+  const phone = css.slice(phoneStart, phoneEnd);
+  const declarations = [...phone.matchAll(rule)].map((match) => match[1].trim());
+  assert.deepEqual(declarations, ["overscroll-behavior-y:auto;"],
+    "only vertical boundary chaining changes on phones; horizontal containment and native overflow stay inherited");
+  assert.equal([...css.matchAll(rule)].length, 2, "the raw scrollport has one shared rule and one phone override");
+  assert.match(css.slice(0, css.indexOf("@media (min-width:701px)")),
+    new RegExp(escaped + "\\s*\\{\\s*max-height:44vh; max-height:min\\(44vh, 380px\\); overflow:auto; overscroll-behavior:contain;\\s*\\}"));
+
+  for (const width of [375, 390, 700, 701]) for (const mode of ["live", "replay", "history", "cold"]) {
+    const h = harness({ phone: width <= 700, width });
+    const expected = reportedTask("task_scroll_boundary");
+    h.emit(mode, "raw output\n" + expected.output, "task_wait", { id: "wait-scroll", task_report: report([expected]) });
+    const card = h.root.querySelectorAll(".msg.asst").find((row) => row.dataset.taskRawTool === "true");
+    assert.ok(card, mode + " marks the raw card at " + width + "px");
+    const details = card.querySelector("details"), prog = card.querySelector(".prog");
+    details.open = true;
+    assert.equal(details.parentNode, card, "the disclosure directly belongs to the marked raw card");
+    assert.equal(prog.parentNode, details, "the raw output matches the direct-child scrollport selector");
+  }
+});
+
 test("subagent history display is gated to desktop while raw tool folds and mobile stay complete", () => {
   const selector = '.msg.asst[data-subagents="true"] > .task-output > [data-task-current="false"]';
   const desktopStart = css.indexOf("@media (min-width:701px)"), desktopEnd = css.indexOf("/* Keep narrow desktop", desktopStart);
@@ -635,3 +667,194 @@ test("subagent history display is gated to desktop while raw tool folds and mobi
   assert.match(css, /\.msg details:not\(\[open\]\) ~ \.task-output\s*\{\s*display:none;\s*\}/,
     "the owning disclosure must continue to collapse its sibling task rows");
 });
+
+
+function renderCanonical(h, messages) {
+  h.context.addMsgMd = (text, parent) => {
+    const node = h.context.document.createElement("div");
+    node.className = "msg asst md"; node.textContent = text; parent.appendChild(node);
+  };
+  h.context.addUserBubble = (text, index, parent) => {
+    const node = h.context.document.createElement("div");
+    node.className = "msg user"; node.textContent = text; parent.appendChild(node);
+  };
+  const rows = h.context.historyRowsOf(messages, messages.length, true).rows;
+  for (const row of rows) h.context.renderHistoryRow(row, h.root);
+  h.context.executionGroupsFor(h.root, true).sync();
+  return rows;
+}
+
+for (const phone of [false, true]) {
+  const viewport = phone ? "phone" : "desktop";
+  test("grouping closure: history internal notes join one continuous execution, " + viewport, () => {
+    const h = harness({ phone });
+    const messages = [
+      { role: "tool", content: "tool A", tool_call_id: "A" },
+      { role: "internal_note", content: "saved internal note" },
+      { role: "tool", content: "tool B", tool_call_id: "B" },
+      { role: "tool", content: "latest tool", tool_call_id: "latest" },
+    ];
+    renderCanonical(h, messages);
+    const groups = h.root.querySelectorAll(".execution-group");
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0].querySelector("summary").textContent, "Completed execution · 3");
+    assert.deepEqual(groups[0].querySelector(".execution-items").children.map((node) => node.querySelector(".prog").textContent),
+      ["tool A", "saved internal note", "tool B"]);
+    assert.equal(h.root.lastElementChild.querySelector(".prog").textContent, "latest tool");
+  });
+  for (const mode of ["live", "replay", "history"]) {
+    test("grouping closure: later wait/integrate settles raw snapshots before an answer, " + mode + " " + viewport, () => {
+      const h = harness({ phone });
+      const active = reportedTask("closure-worker", { active: true, status: "running", output: undefined });
+      h.emit(mode, "early active raw", "task_spawn", { id: "closure-spawn", task_report: report([active]) });
+      h.emit(mode, "active wait raw", "task_wait", { id: "closure-wait", task_report: report([active]) });
+      h.emit(mode, "completion raw", "task_integrate", { id: "closure-integrate", task_report: report([{ ...active, active: false, status: "completed", output: "Exact completion\n" }]) });
+      if (mode === "history") h.context.executionGroupsFor(h.root, true).sync();
+      const groups = h.root.querySelectorAll(".execution-group");
+      assert.equal(groups.length, 1);
+      assert.equal(groups[0].querySelector("summary").textContent, "Completed execution · 3");
+      const raw = h.root.querySelectorAll(".prog").find((body) => body.textContent === "early active raw");
+      assert.equal(raw.closest(".msg.asst")._taskResult.busy, true, "the raw observation stays immutable");
+      assert.equal(raw.closest(".msg.asst").parentNode, groups[0].querySelector(".execution-items"));
+      assert.equal(taskCard(h).parentNode.parentNode.classList.contains("execution-items"), false, "latest actual card remains separate");
+    });
+  }
+  for (const mode of ["live", "replay", "history", "cold"]) {
+    test("subagent overload: completed metadata is concise with separate full details, " + mode + " " + viewport, () => {
+      const h = harness({ phone }), done = reportedTask("compact-done", { output: "EXACT OUTPUT\n".repeat(100),
+        progress: { phase: "completed phase", latest_activity: "LONG ACTIVITY\n".repeat(100), checkpoint_summary: "LONG CHECKPOINT\n".repeat(100),
+          checkpoint_excerpt: "EXACT CHECKPOINT\n".repeat(100) } });
+      h.emit(mode, "raw wait", "task_wait", { task_report: report([done]) });
+      const panel = taskCard(h), details = panel.querySelector("details");
+      assert.ok(details, "full output and progress have their own disclosure");
+      assert.equal(details.open, false);
+      const visible = panel.children.filter((row) => row.tagName !== "DETAILS").map((row) => row.textContent).join("\n");
+      for (const metadata of [done.task_id, done.status, done.description]) assert.ok(visible.includes(metadata));
+      for (const body of [done.output, done.progress.latest_activity, done.progress.checkpoint_excerpt]) assert.ok(!visible.includes(body));
+      assert.equal(details.querySelector(".task-output-body").textContent, done.output);
+      assert.ok(details.textContent.includes(done.progress.checkpoint_excerpt));
+      details.open = true; details.fire("toggle");
+      assert.equal(details.querySelector(".task-output-body").textContent, done.output);
+    });
+    test("subagent overload: multiple active tasks retain only short progress, " + mode + " " + viewport, () => {
+      const h = harness({ phone });
+      const tasks = ["active-a", "active-b"].map((id) => reportedTask(id, { active: true, status: "running", output: undefined,
+        progress: { phase: "working", latest_activity: "reading files\n" + "long activity ".repeat(100),
+          checkpoint_summary: "saved progress\n" + "long summary ".repeat(100), checkpoint_excerpt: "full checkpoint ".repeat(100) } }));
+      h.emit(mode, "active raw", "task_wait", { task_report: report(tasks) });
+      const panel = taskCard(h);
+      const visible = panel.children.filter((row) => row.tagName !== "DETAILS").map((row) => row.textContent).join("\n");
+      for (const task of tasks) {
+        assert.ok(visible.includes(task.task_id)); assert.ok(visible.includes("reading files"));
+        assert.ok(!visible.includes(task.progress.latest_activity)); assert.ok(!visible.includes(task.progress.checkpoint_excerpt));
+      }
+      assert.equal(panel.parentNode.dataset.taskBusy, "true");
+      assert.equal(panel.querySelectorAll("details").length, 2);
+    });
+  }
+  for (const mode of ["live", "replay"]) {
+    test("grouping closure: terminal progress advances past an older busy wait, " + mode + " " + viewport, () => {
+      const h = harness({ phone }), active = reportedTask("terminal-worker", { active: true, status: "running", output: undefined });
+      h.emit(mode, "spawn raw", "task_spawn", { id: "terminal-spawn", task_report: report([active]) });
+      h.emit(mode, "old busy wait", "task_wait", { id: "terminal-wait", task_report: report([active]) });
+      const activity = mode === "live" ? h.context.activity : h.context.view;
+      const details = taskCard(h).parentNode.querySelector("details");
+      details.open = false; details.fire("toggle"); details.open = true; details.fire("toggle");
+      activity.subagents({ task_report: report([{ ...active, active: false, status: "completed" }], { snapshot: true }) });
+      const state = h.context.executionState();
+      assert.equal(state.taskBusy, false);
+      assert.equal(state.taskStates.get(active.task_id), false);
+      const slots = [...[...state.activities.values()].at(-1).slots.keys()];
+      assert.equal(slots.at(-1), "subagents", "terminal observation order is independent of disclosure state");
+      assert.equal(details.open, true, "completion keeps a reader-opened disclosure open");
+    });
+    test("grouping closure: partial completion cannot settle a multi-task active snapshot, " + mode + " " + viewport, () => {
+      const h = harness({ phone });
+      const tasks = ["partial-a", "partial-b"].map((id) => reportedTask(id, { active: true, status: "running", output: undefined }));
+      h.emit(mode, "both active", "task_spawn", { id: "partial-spawn", task_report: report(tasks) });
+      h.emit(mode, "one complete", "task_wait", { id: "partial-wait", task_report: report([{ ...tasks[0], active: false, status: "completed" }]) });
+      const early = h.root.querySelectorAll(".prog").find((body) => body.textContent === "both active").closest(".msg.asst");
+      assert.equal(early.parentNode.classList.contains("execution-items"), false);
+      assert.equal(taskCard(h).parentNode.dataset.taskBusy, "true");
+      assert.equal(h.context.executionState().taskStates.get("partial-b"), true);
+    });
+  }
+  test("grouping closure: live fold expansion is isolated by turn session and server, " + viewport, () => {
+    const h = harness({ phone }), c = h.context;
+    c.activity = c.createLiveActivity(h.root, null);
+    const first = c.createThinkingFold(h.root, null), firstDetails = first.box.querySelector("details");
+    c.activity.tool({ id: "same-call", name: "read_file", phase: "finished", ok: true, output: "first raw" });
+    const firstTool = h.root.querySelectorAll(".prog").find((node) => node.textContent === "first raw").closest(".msg.asst").querySelector("details");
+    firstDetails.open = true; firstDetails.fire("toggle"); firstTool.open = true; firstTool.fire("toggle");
+    const keys = new Set([firstDetails.dataset.foldKey, firstTool.dataset.foldKey]);
+    for (const boundary of ["turn", "session", "server"]) {
+      if (boundary === "turn") c.updateExecutionModel({ kind: "begin" });
+      if (boundary === "session") c.sessionId = "another-session";
+      if (boundary === "server") c.store = { base: "another-server" };
+      c.activity = c.createLiveActivity(h.root, null);
+      const thinking = c.createThinkingFold(h.root, null).box.querySelector("details");
+      c.activity.tool({ id: "same-call", name: "read_file", phase: "finished", ok: true, output: boundary + " raw" });
+      const tool = h.root.querySelectorAll(".prog").find((node) => node.textContent === boundary + " raw").closest(".msg.asst").querySelector("details");
+      for (const details of [thinking, tool]) {
+        assert.equal(details.open, false, boundary + " cannot inherit another fold's expansion");
+        assert.ok(!keys.has(details.dataset.foldKey)); keys.add(details.dataset.foldKey);
+      }
+      assert.ok(thinking.dataset.foldKey.startsWith("thinking:"), "theme prefix stays intact");
+    }
+    assert.equal(firstDetails.open, true); assert.equal(firstTool.open, true);
+  });
+}
+
+
+for (const phone of [false, true]) for (const mode of ["live", "replay", "history", "cold"]) {
+  test("grouping closure: terminal evidence without output survives a late active snapshot, " + mode + " phone=" + phone, () => {
+    const h = harness({ phone }), active = reportedTask("no-output-worker", { active: true, status: "running", output: undefined });
+    h.emit(mode, "early active snapshot", "task_spawn", { id: "no-output-spawn", task_report: report([active]) });
+    h.emit(mode, "terminal metadata", "task_wait", { id: "no-output-done", task_report: report([{ ...active, active: false, status: "completed" }]) });
+    h.emit(mode, "late active snapshot", "task_status", { id: "no-output-late", task_report: report([active], { snapshot: true }) });
+    assert.equal(taskCard(h).parentNode.dataset.taskBusy, "false");
+    assert.ok(taskCard(h).querySelector(".task-identity").textContent.includes("completed"));
+    if (mode === "history" || mode === "cold") h.context.executionGroupsFor(h.root, true).sync();
+    const early = h.root.querySelectorAll(".prog").find((node) => node.textContent === "early active snapshot").closest(".msg.asst");
+    assert.equal(early._taskResult.busy, true);
+    assert.equal(early.parentNode.classList.contains("execution-items"), true, "late raw activity cannot undo terminal grouping evidence");
+  });
+  test("subagent overload: full details retain nodes and expansion across updates or cold reload, " + mode + " phone=" + phone, () => {
+    const h = harness({ phone }), done = reportedTask("retained-detail");
+    h.emit(mode, "retained raw", "task_wait", { task_report: report([done]) });
+    const panel = taskCard(h), details = panel.querySelector("details"), output = details.querySelector(".task-output-body");
+    assert.ok(details);
+    details.open = true; details.fire("toggle");
+    if (mode === "live" || mode === "replay") {
+      h.emit(mode, "retained raw", "task_wait", { task_report: report([done]) });
+      assert.equal(taskCard(h), panel); assert.equal(panel.querySelector("details"), details);
+      assert.equal(details.querySelector(".task-output-body"), output);
+      assert.equal(details.open, true);
+    } else {
+      const cold = harness({ phone, storage: new Map(h.storage) });
+      cold.emit("cold", "retained raw", "task_wait", { task_report: report([done]) });
+      assert.equal(taskCard(cold).querySelector("details").open, true);
+      assert.equal(taskCard(cold).querySelector(".task-output-body").textContent, done.output);
+    }
+  });
+}
+
+
+for (const phone of [false, true]) for (const mode of ["live", "replay"]) {
+  test("subagent overload: raw wire progress has a separate disclosure, " + mode + " phone=" + phone, () => {
+    const h = harness({ phone }), done = reportedTask("raw-progress-worker");
+    h.emit(mode, "task raw", "task_wait", { task_report: report([done]) });
+    const activity = mode === "live" ? h.context.activity : h.context.view;
+    const card = taskCard(h).parentNode, outer = card.querySelector("details"), body = card.querySelector(".prog");
+    const raw = "EXACT RAW PROGRESS\n".repeat(200);
+    activity.subagents({ text: raw, task_report: report([done], { snapshot: true }) });
+    const rawDetails = body.closest("details");
+    assert.notEqual(rawDetails, outer, "opening subagents must not expose the long wire log");
+    assert.equal(rawDetails.open, false); assert.equal(rawDetails.parentNode, outer);
+    assert.equal(body.textContent, raw);
+    rawDetails.open = true; rawDetails.fire("toggle");
+    activity.subagents({ text: raw, task_report: report([done], { snapshot: true }) });
+    assert.equal(card.querySelector(".prog"), body); assert.equal(body.closest("details"), rawDetails);
+    assert.equal(rawDetails.open, true); assert.equal(body.textContent, raw);
+  });
+}

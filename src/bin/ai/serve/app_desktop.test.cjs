@@ -192,7 +192,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     store: { base: "https://serve.test", token: "test-token" },
     sessionId: sid, lastItems: plain(serverItems), pendingNew: null, pendingCwd: "", lastMsgCount: 5, PAGE_ID: "test-page",
     localStorage: { getItem: (key) => stored.get(key) ?? null, setItem: (key, value) => stored.set(key, value), removeItem: (key) => stored.delete(key) },
-    Date: { now: () => now }, TextDecoder,
+    Date: class extends Date { static now() { return now; } }, TextDecoder,
     setTimeout: (fn, ms) => { const id = nextTimer++; timers.set(id, { fn, at: now + ms }); return id; },
     clearTimeout: (id) => timers.delete(id), setInterval: () => 1, clearInterval() {},
     fetch: async (url, options = {}) => {
@@ -856,7 +856,7 @@ test("phone Markdown tables retain compact cells and the original code capsules"
   assert.deepEqual(responsiveRule(".msg.md table code", true), {});
 });
 
-test("desktop user bubbles stay neutral but carry a border and accent rule", () => {
+test("desktop user bubbles use theme fills and retain a border and accent rule", () => {
   const desktopBubble = responsiveRule(".msg.user");
   assert.equal(desktopBubble.background, "var(--surface-2)");
   assert.equal(desktopBubble.color, "var(--fg)");
@@ -865,10 +865,12 @@ test("desktop user bubbles stay neutral but carry a border and accent rule", () 
   for (const [selector, background] of [
     [":root", "#2e2e2e"],
     [':root[data-theme="light"]', "#e5e5e5"],
-    [':root[data-theme="warm"]', "#e8e5de"],
+    [':root[data-theme="warm"]', "#e0dfde"],
   ]) {
-    assert.equal(responsiveRule(selector)["--surface"], background, selector + " user bubble fill");
+    assert.equal(responsiveRule(selector)["--surface"], background, selector + " precise theme control fill");
   }
+  assert.equal(responsiveRule(':root[data-theme="light"]')["--surface-2"], "#efefef", "light user bubble fill");
+  assert.equal(responsiveRule(':root[data-theme="light"]')["--panel"], "#f3f3f3", "light internal notes inherit the baseline panel");
   assert.equal(responsiveRule("#sessions li.cur")["box-shadow"], "inset 3px 0 0 var(--acc)");
   assert.equal(responsiveRule("#sessions li.cur").background, "var(--tint-3)");
   assert.equal(responsiveRule('#sessions li.cur span[role="button"]')["font-weight"], "600");
@@ -1168,6 +1170,41 @@ test("completed execution groups add vertical breathing room without changing th
     "base and desktop spacing stay intact while the phone uses a compact gap");
 });
 
+test("desktop light restores baseline composer order while other themes and phone retain input-first order", () => {
+  for (const id of ["ovrwrap", "sidequeue", "composer"]) {
+    assert.equal(shellPathTo(id).at(-2).id, "chat", id + " remains a direct child of the chat column");
+  }
+  assert.ok(html.indexOf('<details id="ovrwrap"') < html.indexOf('<div id="composer">'),
+    "source and keyboard Tab order stay unchanged");
+  const narrowCss = css.slice(css.indexOf("/* Keep narrow desktop"), phoneStart);
+  for (const width of [390, 700, 701, 1024, 1148, 1280]) {
+    const phone = width <= 700;
+    for (const theme of ["light", "dark", "warm"]) {
+    const restored = !phone && theme === "light";
+    const rule = (selector) => ({ ...responsiveRule(selector, phone),
+      ...(restored ? cssRule(desktopCss, ':root[data-theme="light"] ' + selector) : {}),
+      ...(!phone && width <= 1100 ? cssRule(narrowCss, selector) : {}) });
+    assert.equal(rule("#chat").display, "flex");
+    assert.equal(rule("#chat")["flex-direction"], "column");
+    assert.equal(rule("#ovrwrap").display, phone ? "block" : "grid",
+      "override controls form a flex item at " + width + "px");
+    assert.equal(rule("#ovrwrap").order, restored ? "0" : "1", theme + " override order at " + width + "px");
+    const sourceOrder = ["ovrwrap", "sidequeue", "composer"];
+    const visualOrder = [...sourceOrder].sort((a, b) => Number(rule("#" + a).order || 0) - Number(rule("#" + b).order || 0));
+    assert.deepEqual(visualOrder, restored ? ["ovrwrap", "sidequeue", "composer"] : ["sidequeue", "composer", "ovrwrap"],
+      "pending notes remain above the input at " + width + "px");
+    if (phone) {
+      assert.equal(rule("#composer").padding, "6px 8px");
+      assert.equal(rule("#ovrwrap")["padding-bottom"], "env(safe-area-inset-bottom)",
+        "the lower controls reserve the phone safe area");
+    } else {
+      assert.equal(rule("#composer").padding, restored ? "8px 24px 20px" : "10px 24px 8px");
+      assert.equal(rule("#ovrwrap").padding, restored ? "10px 24px 4px" : "4px 24px 20px");
+    }
+  }
+  }
+});
+
 test("phone chrome and card spacing stay compact with readable text and full touch targets", () => {
   assert.equal(cssRule(phoneCss, "header").padding, "4px 8px");
   assert.equal(cssRule(phoneCss, "header")["padding-top"], "calc(4px + env(safe-area-inset-top))");
@@ -1195,7 +1232,8 @@ test("phone chrome and card spacing stay compact with readable text and full tou
   assert.equal(cssRule(phoneCss, ".msg.md .h").margin, "8px 0 4px");
   assert.equal(cssRule(phoneCss, "#ovrwrap > summary").padding, "2px 10px");
   assert.equal(cssRule(phoneCss, "#composer").margin, "6px 8px");
-  assert.equal(cssRule(phoneCss, "#composer").padding, "6px 8px calc(6px + env(safe-area-inset-bottom))");
+  assert.equal(cssRule(phoneCss, "#composer").padding, "6px 8px");
+  assert.equal(cssRule(phoneCss, "#ovrwrap")["padding-bottom"], "env(safe-area-inset-bottom)");
   assert.equal(cssRule(phoneCss, "#composer")["border-radius"], "16px");
 });
 
@@ -1513,6 +1551,76 @@ for (const width of [390, 1280]) {
     assert.equal(detail.open, true);
   });
 }
+
+for (const width of [390, 1280]) test(`execution merge regression: closing a stored card merges it immediately at ${width}px`, async () => {
+  const h = sessionFoldHarness(width), c = h.context, root = h.elements.msgs;
+  const messages = [
+    { role: "user", content: "Request\n\nSecond line" },
+    { role: "tool", content: " \nFirst output\n " },
+    { role: "tool", content: "Second output" },
+    { role: "assistant", content: "Answer" },
+  ];
+  for (const row of c.historyRowsOf(messages, messages.length, true).rows) c.renderHistoryRow(row, root);
+  const original = Array.from(root.children), first = original[1], details = first.querySelector("details");
+  await h.activateSummary(details); h.flushToggles();
+  const groups = c.executionGroupsFor(root, true);
+  groups.sync();
+  assert.equal(first.parentNode, root, "an independently expanded stored card stays outside");
+  assert.equal(root.querySelector(".execution-group").querySelector("summary").textContent, "Completed execution · 1");
+  const content = first.querySelector(".prog").textContent;
+  await h.activateSummary(details); h.flushToggles();
+  const group = root.querySelector(".execution-group");
+  assert.equal(group.querySelector("summary").textContent, "Completed execution · 2");
+  assert.deepEqual(group.querySelector(".execution-items").children, original.slice(1, 3), "merge keeps original cards in canonical order");
+  assert.equal(details.open, false);
+  assert.equal(first.querySelector(".prog").textContent, content, "collapse retains the rendered output");
+  assert.equal(original[0].parentNode, root, "the user remains a turn boundary");
+  assert.equal(original[3].parentNode, root, "the assistant body remains a boundary");
+  groups.restore();
+  assert.deepEqual(root.children, original, "restore retains all original row identities and positions");
+});
+
+for (const width of [701, 1280]) test("execution merge regression: repeated historical reasoning keeps separate turn groups at " + width + "px", async () => {
+  const h = sessionFoldHarness(width), root = h.elements.msgs;
+  const messages = [1, 2].flatMap((turn) => [
+    { role: "user", content: "Request " + turn },
+    { role: "assistant", content: "", reasoning_content: "Identical reasoning", tool_calls: [
+      { id: "read-" + turn, function: { name: "read_file", arguments: "{}" } },
+    ] },
+    { role: "tool", tool_call_id: "read-" + turn, content: "Output " + turn },
+    { role: "assistant", content: "Answer " + turn },
+  ]);
+  const fetch = h.context.fetch;
+  h.context.fetch = async (url, options) => new URL(url).pathname.endsWith("/history")
+    ? response(plain(messages), 200, { "x-history-total": String(messages.length) }) : fetch(url, options);
+  await h.context.loadHistory();
+  // Before the fix, sync's key map retains only the later identical reasoning
+  // group; another history paint moves both turns into it and leaves an empty fold.
+  messages.push({ role: "user", content: "Next request" });
+  await h.context.loadHistory();
+  const groups = root.querySelectorAll(".execution-group");
+  assert.deepEqual(groups.map((group) => group.querySelector(".execution-items").children.length), [2, 2],
+    "each turn keeps its own two original cards without an empty bubble");
+  assert.deepEqual(groups.map((group) => group.querySelector("summary").textContent),
+    ["Completed execution · 2", "Completed execution · 2"]);
+  groups.forEach((group, index) => {
+    assert.ok(group.textContent.includes("Output " + (index + 1)));
+    assert.ok(!group.textContent.includes("Output " + (2 - index)));
+  });
+  const thinkingKeys = groups.map((group) => group.querySelector(".execution-items").children[0]
+    .querySelector("details").dataset.foldKey);
+  assert.notEqual(thinkingKeys[0], thinkingKeys[1]);
+  const rows = h.context.historyRowsOf(messages, messages.length, true).rows;
+  const tail = h.context.historyRowsOf(messages.slice(4), messages.length, true).rows;
+  assert.equal(rows[5].historyIndex, tail[1].historyIndex, "paging preserves the canonical row index");
+  const tailParent = h.document.createElement("div");
+  h.context.renderHistoryRow(tail[1], tailParent);
+  assert.equal(tailParent.querySelector("details").dataset.foldKey, thinkingKeys[1],
+    "the same canonical message keeps its fold identity in a smaller history window");
+  const original = groups.slice();
+  await h.context.loadHistory();
+  assert.deepEqual(root.querySelectorAll(".execution-group"), original, "an unchanged paint keeps the original fold nodes");
+});
 
 function sessionScrollHarness(width, withTasks) {
   const h = sessionFoldHarness(width), root = h.elements.msgs;
@@ -2026,23 +2134,23 @@ for (const width of [390, 700, 701, 1280]) {
     const h = sessionFoldHarness(width);
     await h.context.loadHistory();
     const original = h.folds();
-    assert.equal(original.length, 5, "history must render thinking, tool, raw task, subagent and control folds");
-    assert.deepEqual(original.map((details) => details.open), [false, false, false, false, false]);
+    assert.equal(original.length, 6, "history must render thinking, tool, raw task, subagent, full task details and control folds");
+    assert.deepEqual(original.map((details) => details.open), [false, false, false, false, false, false]);
     for (const details of original) await h.activateSummary(details);
     h.flushToggles();
     for (const details of original.slice(0, -1)) await h.activateSummary(details);
-    assert.deepEqual(original.map((details) => details.open), [false, false, false, false, true],
+    assert.deepEqual(original.map((details) => details.open), [false, false, false, false, false, true],
       "A is collapsed before the sidebar switch, with one explicitly expanded control");
     if (!queued) h.flushToggles();
     await h.selectHistory("target-session");
-    assert.deepEqual(h.folds().map((details) => details.open), [false, false, false, false, false],
+    assert.deepEqual(h.folds().map((details) => details.open), [false, false, false, false, false, false],
       "B must not inherit A's fold state even with identical message identities");
     await h.activateSummary(h.folds()[0]);
     await h.selectHistory("open-session");
     const returned = h.folds();
     assert.notEqual(returned[0], original[0], "returning to A must rebuild its canonical rows");
     assert.deepEqual(returned.map((details) => details.dataset.foldKey), original.map((details) => details.dataset.foldKey));
-    const expected = queued && width <= 700 ? [true, true, true, true, true] : [false, false, false, false, true];
+    const expected = queued && width <= 700 ? [true, true, true, true, true, true] : [false, false, false, false, false, true];
     assert.deepEqual(returned.map((details) => details.open), expected,
       "desktop must preserve the collapsed DOM state; mobile keeps its existing queued-toggle behavior");
     assert.equal(returned.at(-1).open, true, "the explicitly expanded control must remain expanded");
@@ -2064,7 +2172,7 @@ for (const width of [390, 700, 701, 1280]) {
     assert.equal(control.open, true, "keyboard activation expands A's control before navigation");
     await h.selectHistory("target-session");
     await h.selectHistory("open-session");
-    assert.deepEqual(h.folds().map((details) => details.open), [false, false, false, false, width >= 701],
+    assert.deepEqual(h.folds().map((details) => details.open), [false, false, false, false, false, width >= 701],
       "desktop captures a pending expansion; mobile retains its prior restoration timing");
   });
 }
@@ -2077,10 +2185,10 @@ for (const width of [701, 1280]) test("session A to B to A rejects a detached to
   await h.selectHistory("target-session");
   await h.selectHistory("open-session");
   const current = h.folds();
-  assert.deepEqual(current.map((details) => details.open), [true, true, true, true, true]);
+  assert.deepEqual(current.map((details) => details.open), [true, true, true, true, true, true]);
   assert.notEqual(current[0], obsolete[0], "returning to A creates new fold owners");
   for (const details of current) await h.activateSummary(details);
-  assert.deepEqual(current.map((details) => details.open), [false, false, false, false, false]);
+  assert.deepEqual(current.map((details) => details.open), [false, false, false, false, false, false]);
   await h.selectHistory("target-session");
   const collapsedStorage = h.stored.get("serve.foldopen");
   assert.equal(collapsedStorage, "[]", "navigation snapshots A's newer collapsed choices");
@@ -2091,7 +2199,7 @@ for (const width of [701, 1280]) test("session A to B to A rejects a detached to
   }
   const afterObsoleteToggle = h.stored.get("serve.foldopen");
   await h.selectHistory("open-session");
-  assert.deepEqual(h.folds().map((details) => details.open), [false, false, false, false, false],
+  assert.deepEqual(h.folds().map((details) => details.open), [false, false, false, false, false, false],
     "obsolete expanded events must not reopen any of A's newly collapsed folds");
   assert.equal(afterObsoleteToggle, collapsedStorage, "obsolete fold events must not write storage");
 });
@@ -2153,7 +2261,7 @@ test("desktop historical tool folds use canonical roles and preserve report surf
   assert.equal(note.dataset.canonicalIdentity, rows[1].identity);
   for (const [index, card] of [tool, note].entries()) {
     const key = card.querySelector("details").dataset.foldKey;
-    assert.equal(key, h.context.sessionId + "\n" + rows[index].identity);
+    assert.equal(key, h.context.sessionId + "\n" + rows[index].identity + ":" + rows[index].historyIndex);
     assert.ok(key.includes('\n["tool",'), "the key substring alone cannot prove a tool role");
   }
   assert.ok(tool.dataset.canonicalIdentity.startsWith('["tool",'));
@@ -2267,6 +2375,389 @@ test("desktop side-note clicks queue the composer text without interrupting the 
   assert.equal(h.notes.at(-1), "side note queued — applies at the next model request");
 });
 
+function loadComposerImages(h, width) {
+  h.context.window.innerWidth = width;
+  h.context.window.matchMedia = (query) => ({
+    matches: /max-width/.test(query) ? width <= 700 : width >= 701,
+  });
+  const fileInput = h.elements.file = h.document.createElement("input");
+  let pickerClicks = 0;
+  fileInput.click = () => { pickerClicks++; };
+  h.elements.viewer = h.document.createElement("div");
+  // Mirror the new feedback markup only when it exists in the page source.
+  if (/<details id="attachments"/.test(html)) {
+    for (const [id, tag] of [["attachments", "details"], ["attachmentcount", "summary"], ["attachmentnames", "div"]]) {
+      h.elements[id] = h.document.createElement(tag);
+    }
+    h.elements.attachments.hidden = true;
+    h.elements.attachments.appendChild(h.elements.attachmentcount);
+    h.elements.attachments.appendChild(h.elements.attachmentnames);
+    h.elements.composer.appendChild(h.elements.attachments);
+  }
+  h.context.FileReader = class {
+    readAsDataURL(file) {
+      this.result = "data:" + file.type + ";base64," + file.data_base64;
+      this.onload();
+    }
+  };
+  vm.runInContext(between("function uniqueImageFilename(", "// Entry point for the Android share target."), h.context);
+  vm.runInContext(between("function handlePromptPaste(", "function textOf("), h.context);
+  vm.runInContext(between('$("img").onclick =', "function registerAppServiceWorker()").replace(/\n}\s*$/, ""), h.context);
+  vm.runInContext('$("prompt").addEventListener("paste", handlePromptPaste);', h.context);
+  return () => pickerClicks;
+}
+
+// FileReader, image decoding, and JPEG encoding are simulated. These tests
+// exercise the page's selection, normalization, and POST logic, not a codec.
+function mockImageCodec(h, { width = 4032, height = 3024, encodedBytes = () => 4096, decodeError = false, canvasAvailable = true } = {}) {
+  const encodes = [], reads = [];
+  h.context.FileReader = class {
+    readAsDataURL(file) {
+      reads.push(file);
+      if (file.readError) { this.error = new Error(file.readError); this.onerror(); return; }
+      this.result = "data:" + (file.type || "application/octet-stream") + ";base64," + file.data_base64;
+      this.onload();
+    }
+  };
+  h.context.Image = class {
+    naturalWidth = width;
+    naturalHeight = height;
+    set src(value) { this.source = value; if (decodeError) this.onerror(); else this.onload(); }
+  };
+  const create = h.document.createElement;
+  h.document.createElement = (tag) => {
+    if (tag !== "canvas") return create(tag);
+    const canvas = {
+      getContext: () => canvasAvailable ? { fillRect() {}, drawImage() {} } : null,
+      toBlob(callback, type, quality) {
+        const dimensions = { width: canvas.width, height: canvas.height, type, quality };
+        encodes.push(dimensions);
+        const size = encodedBytes(dimensions);
+        callback({ type, size, data_base64: Buffer.alloc(size, 7).toString("base64") });
+      },
+    };
+    return canvas;
+  };
+  return { encodes, reads };
+}
+
+test("390px side-note 400 exposes the filename and reason and retains its draft attachments", async () => {
+  const h = harness({ phone: true });
+  loadChat(h);
+  loadComposerImages(h, 390);
+  h.context.turns.set("open-session", {});
+  h.context.syncStopButton();
+  h.elements.file.files = [{ name: "phone.jpg", type: "image/jpeg", size: 4, data_base64: "cGhvdG8=" }];
+  await h.dispatch(h.elements.file, "change").done;
+  const draft = h.elements.prompt.value, image = h.context.pendingImages[0];
+  h.context.fetch = async (_url, options) => {
+    assert.equal(options.method, "POST");
+    return response({ error: 'image "phone.jpg" is rejected' }, 400);
+  };
+  await h.dispatch(h.elements.sidenote, "click").done;
+  const error = h.elements.msgs.querySelector(".err");
+  assert.ok(error && !error.hidden, "a rejected note needs a visible error bubble");
+  assert.match(error.textContent, /side note failed.*phone\.jpg.*400.*rejected/);
+  assert.equal(h.elements.prompt.value, draft);
+  assert.equal(h.context.pendingImages[0], image);
+  assert.equal(h.elements.sidenote.disabled, false);
+  assert.equal(h.context.turns.has("open-session"), true);
+});
+
+for (const type of ["image/heic", "image/heif", "", "application/octet-stream"]) {
+  test(`390px ${type || "empty MIME"} photo becomes a bounded JPEG in the side-note payload`, async () => {
+    const h = harness({ phone: true });
+    loadChat(h);
+    loadComposerImages(h, 390);
+    const codec = mockImageCodec(h);
+    h.elements.file.files = [{ name: "camera.heic", type, size: 5, data_base64: "cGhvdG8=" }];
+    await h.dispatch(h.elements.file, "change").done;
+    assert.equal(codec.encodes.length, 1, "unsupported MIME must be re-encoded");
+    assert.deepEqual(codec.encodes[0], { width: 2048, height: 1536, type: "image/jpeg", quality: 0.85 });
+    const image = h.context.pendingImages[0];
+    assert.equal(image.filename, "camera.jpg");
+    assert.equal(Buffer.from(image.data_base64, "base64").length, 4096);
+    await h.context.sendSideNote();
+    const submitted = h.requests.find(({ method, path }) => method === "POST" && path.endsWith("/side-notes"));
+    assert.deepEqual(submitted.body.images, [plain(image)]);
+    assert.match(submitted.body.text, /\[\[image:camera\.jpg\]\]/);
+  });
+}
+
+test("390px a synthetic image above 10 MiB is repeatedly downsampled until its JPEG fits", async () => {
+  const h = harness({ phone: true });
+  loadChat(h);
+  loadComposerImages(h, 390);
+  const codec = mockImageCodec(h, { width: 8000, height: 6000,
+    encodedBytes: ({ width, height }) => width * height * 4 });
+  const data = Buffer.alloc(10 * 1024 * 1024 + 1, 9);
+  h.elements.file.files = [{ name: "large.png", type: "image/png", size: data.length, data_base64: data.toString("base64") }];
+  await h.dispatch(h.elements.file, "change").done;
+  assert.ok(codec.encodes.length > 1, "an oversized first JPEG must trigger another smaller encoding");
+  for (let i = 0; i < codec.encodes.length; i++) {
+    const encoded = codec.encodes[i];
+    assert.ok(Math.max(encoded.width, encoded.height) <= 2048);
+    assert.equal(encoded.type, "image/jpeg");
+    assert.equal(encoded.quality, 0.85);
+    if (i) assert.ok(encoded.width < codec.encodes[i - 1].width && encoded.height < codec.encodes[i - 1].height);
+  }
+  const image = h.context.pendingImages[0];
+  assert.equal(image.filename, "large.jpg");
+  assert.ok(Buffer.from(image.data_base64, "base64").length <= 10 * 1024 * 1024);
+  await h.context.sendSideNote();
+  assert.deepEqual(h.requests.find(({ method }) => method === "POST").body.images, [plain(image)]);
+});
+
+for (const width of [390, 1280]) {
+  test(`${width}px compliant JPEG and PNG keep their bytes and expose filenames in the composer`, async () => {
+    const h = harness({ phone: width <= 700 });
+    loadChat(h);
+    loadComposerImages(h, width);
+    const codec = mockImageCodec(h);
+    const files = [{ name: "same.jpg", type: "image/jpeg", data_base64: "AQIDBA==", size: 4 },
+      { name: "same.png", type: "image/png", data_base64: "BQYHCA==", size: 4 }];
+    h.elements.file.files = files;
+    await h.dispatch(h.elements.file, "change").done;
+    assert.deepEqual(codec.encodes, [], "compliant images must avoid canvas");
+    assert.deepEqual(plain(h.context.pendingImages), files.map(({ name, data_base64 }) => ({ filename: name, data_base64 })));
+    assert.ok(h.elements.attachments && !h.elements.attachments.hidden, "selected attachments need visible composer feedback");
+    assert.match(h.elements.attachmentcount.textContent, /2.*same\.jpg.*same\.png/);
+    assert.match(h.elements.attachmentnames.textContent, /same\.jpg/);
+    assert.match(h.elements.attachmentnames.textContent, /same\.png/);
+    assert.equal(shellPathTo("attachments").at(-2).id, "composer");
+    assert.equal(responsiveRule("#attachments", width <= 700).position, "absolute", "feedback must leave the existing composer grid intact");
+    await h.context.sendSideNote();
+    assert.deepEqual(h.requests.find(({ method }) => method === "POST").body.images,
+      files.map(({ name, data_base64 }) => ({ filename: name, data_base64 })));
+    assert.equal(h.elements.attachments.hidden, true, "successful sends must clear attachment feedback");
+  });
+}
+
+for (const failure of ["read", "decode", "canvas", "type", "empty", "limit"]) {
+  test(`390px ${failure} attachment failure is visible with its filename and keeps earlier images`, async () => {
+    const h = harness({ phone: true });
+    loadChat(h);
+    loadComposerImages(h, 390);
+    mockImageCodec(h, { decodeError: failure === "decode", canvasAvailable: failure !== "canvas" });
+    const count = failure === "limit" ? 10 : 1;
+    const earlier = Array.from({ length: count }, (_, i) => ({ filename: `old-${i}.png`, data_base64: "b2xk" }));
+    h.context.pendingImages = earlier.slice();
+    h.elements.file.files = [{ name: failure === "type" ? "bad.txt" : "bad.heic",
+      type: failure === "type" ? "text/plain" : "image/heic", size: 4,
+      data_base64: failure === "empty" ? "" : "AQIDBA==", readError: failure === "read" ? "file read denied" : "" }];
+    await h.dispatch(h.elements.file, "change").done;
+    const error = h.elements.msgs.querySelector(".err");
+    assert.ok(error && !error.hidden, `${failure} must create a visible error bubble`);
+    assert.match(error.textContent, /bad\.(heic|txt)/);
+    assert.match(error.textContent, /denied|解码|canvas|图片类型|内容|10/);
+    assert.deepEqual(plain(h.context.pendingImages), earlier);
+  });
+}
+
+for (const width of [390, 700, 1280]) {
+  test(`${width}px image selection and paste travel with a side-note without stopping the turn`, async () => {
+    const h = harness({ phone: width <= 700 });
+    loadChat(h);
+    const pickerClicks = loadComposerImages(h, width);
+    h.context.turns.set("open-session", {});
+    h.context.syncStopButton();
+    h.elements.prompt.value = "look at these";
+    assert.equal(h.elements.sidenote.classList.contains("show"), true);
+    assert.equal(h.elements.img.disabled, false);
+    assert.equal(responsiveRule("#img", width <= 700)["grid-area"], "image");
+    assert.equal(responsiveRule("#img::before", width <= 700).content, '"+"');
+    assert.match(html, /<input id="file" type="file" accept="image\/\*" multiple hidden>/);
+    await h.dispatch(h.elements.img, "click").done;
+    assert.equal(pickerClicks(), 1);
+    h.elements.file.files = [
+      { name: "image.png", type: "image/png", data_base64: "Zmlyc3Q=" },
+      { name: "second.jpg", type: "image/jpeg", data_base64: "c2Vjb25k" },
+    ];
+    await h.dispatch(h.elements.file, "change").done;
+    assert.equal(h.elements.file.value, "");
+    assert.equal(h.context.pendingImages.length, 2);
+    assert.equal(h.elements.prompt.value, "look at these\n[[image:image.png]]\n[[image:second.jpg]]");
+    const pasted = { name: "image.png", type: "image/png", data_base64: "cGFzdGU=" };
+    const paste = h.dispatch(h.elements.prompt, "paste", {
+      clipboardData: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => pasted }],
+        files: [pasted], getData: () => "",
+      },
+    });
+    await paste.done;
+    assert.equal(paste.event.prevented, true);
+    const images = [
+      { filename: "image.png", data_base64: "Zmlyc3Q=" },
+      { filename: "second.jpg", data_base64: "c2Vjb25k" },
+      { filename: "image-2.png", data_base64: "cGFzdGU=" },
+    ];
+    assert.deepEqual(plain(h.context.pendingImages), images);
+    assert.equal(h.requests.length, 0, "adding images must not send or stop a turn");
+    const text = "look at these\n[[image:image.png]]\n[[image:second.jpg]]\n[[image:image-2.png]]";
+    assert.equal(h.elements.prompt.value, text);
+    await h.dispatch(h.elements.sidenote, "click").done;
+    assert.deepEqual(h.requests, [
+      { path: "/sessions/open-session/side-notes", method: "POST", body: { text, images } },
+      { path: "/sessions/open-session/side-notes", method: "GET", body: null },
+    ]);
+    assert.equal(h.context.turns.has("open-session"), true);
+    assert.equal(h.elements.send.textContent, "⏹");
+    assert.equal(h.elements.prompt.value, "");
+    assert.equal(h.context.pendingImages.length, 0);
+    assert.equal(h.drafts.has(h.context.draftKey("open-session")), false);
+  });
+}
+
+test("desktop image selection retains the main composer send payload", async () => {
+  const h = harness();
+  loadComposerImages(h, 1280);
+  h.elements.prompt.value = "look at this";
+  h.elements.file.files = [{ name: "shot.png", type: "image/png", data_base64: "c2hvdA==" }];
+  await h.dispatch(h.elements.file, "change").done;
+  await h.context.send();
+  const submitted = h.requests.find(({ path }) => path.endsWith("/turns/stream"));
+  assert.deepEqual(submitted.body, {
+    prompt: "look at this\n[[image:shot.png]]", confirm: true,
+    images: [{ filename: "shot.png", data_base64: "c2hvdA==" }],
+  });
+  assert.equal(h.elements.prompt.value, "");
+  assert.equal(h.context.pendingImages.length, 0);
+});
+
+function loadComposerShortcuts(h) {
+  Object.assign(h.context, { sideNoteBusy: false, holdLayout: (_, apply) => apply() });
+  for (const [start, end] of [
+    ["function syncStopButton(", "// Transient note through"],
+    ["async function sendSideNote(", "async function stopTurn("],
+    ['$("prompt").addEventListener("keydown"', '$("prompt").addEventListener("click"'],
+  ]) vm.runInContext(between(start, end), h.context);
+  const submissions = [];
+  for (const name of ["send", "sendSideNote", "stopTurn", "abortEvents"]) {
+    const submit = h.context[name];
+    h.context[name] = () => {
+      const done = submit();
+      submissions.push({ name, done });
+      return done;
+    };
+  }
+  return {
+    submissions,
+    async press(extra) {
+      const press = h.dispatch(h.elements.prompt, "keydown", { key: "Enter", ...extra });
+      await Promise.all(submissions.map(({ done }) => done));
+      return press.event;
+    },
+  };
+}
+
+for (const modifier of ["metaKey", "ctrlKey"]) {
+  test(`idle desktop ${modifier}+Enter uses ordinary send and preserves payload bytes`, async () => {
+    const h = harness(), keys = loadComposerShortcuts(h);
+    const draft = "  send this\nwith whitespace  ";
+    h.elements.prompt.value = draft;
+    h.context.persistDraft();
+    const press = await keys.press({ [modifier]: true });
+    assert.equal(press.prevented, true);
+    assert.deepEqual(keys.submissions.map(({ name }) => name), ["send", "abortEvents"]);
+    const turns = h.requests.filter(({ path }) => path.endsWith("/turns/stream"));
+    assert.equal(turns.length, 1);
+    assert.equal(turns[0].path, "/sessions/open-session/turns/stream");
+    assert.equal(turns[0].method, "POST");
+    assert.equal(turns[0].body.prompt, draft);
+    assert.equal(h.requests.some(({ path }) => path.endsWith("/side-notes")), false);
+    assert.equal(h.elements.prompt.value, "");
+    assert.equal(h.drafts.has(h.context.draftKey("open-session")), false);
+  });
+
+  for (const state of ["live", "replay", "recovering", "server", "remote", "task"]) {
+    test(`running desktop ${modifier}+Enter queues a side note (${state})`, async () => {
+      const h = harness(), keys = loadComposerShortcuts(h);
+      if (state === "live") h.context.turns.set("open-session", {});
+      if (state === "replay") Object.assign(h.context, { eventActive: true, eventSession: "open-session" });
+      if (state === "recovering") Object.assign(h.context, { staleSession: "open-session", staleDone: true });
+      if (state === "server") Object.assign(h.context, { turnRunning: true, turnRunningAt: 1000 });
+      if (state === "remote") Object.assign(h.context, { remoteTurnPid: "123", remoteTurnAt: 1000, REMOTE_RUNNING_TTL_MS: 30000 });
+      if (state === "task") {
+        const owner = h.context.updateExecutionModel({ kind: "activity" });
+        h.context.updateExecutionModel({ kind: "task", owner, slot: "worker", summary: { taskStates: [["worker", true]], busy: null } });
+      }
+      const before = h.context.executionState();
+      assert.equal(h.context.isTurnRunning(), true);
+      h.context.syncStopButton();
+      assert.equal(h.elements.sidenote.getAttribute("aria-hidden"), "false");
+      h.elements.prompt.value = "  steer left  ";
+      h.context.persistDraft();
+      const press = await keys.press({ [modifier]: true });
+      assert.equal(press.prevented, true);
+      assert.deepEqual(keys.submissions.map(({ name }) => name), ["sendSideNote"]);
+      assert.deepEqual(h.requests, [
+        { path: "/sessions/open-session/side-notes", method: "POST", body: { text: "steer left" } },
+        { path: "/sessions/open-session/side-notes", method: "GET", body: null },
+      ]);
+      assert.deepEqual(h.context.executionState(), before, "queuing a note must preserve the active turn");
+      assert.equal(h.context.isTurnRunning(), true);
+      assert.equal(h.elements.send.textContent, "⏹");
+      assert.equal(h.elements.prompt.value, "");
+      assert.equal(h.elements.sidenote.disabled, false);
+      assert.equal(h.drafts.has(h.context.draftKey("open-session")), false);
+      assert.equal(h.notes.at(-1), "side note queued — applies at the next model request");
+    });
+  }
+
+  for (const running of [false, true]) for (const draft of ["", " \t\n "]) {
+    test(`desktop ${modifier}+Enter rejects ${JSON.stringify(draft)} while ${running ? "running" : "idle"}`, async () => {
+      const h = harness(), keys = loadComposerShortcuts(h);
+      if (running) h.context.turns.set("open-session", {});
+      h.elements.prompt.value = draft;
+      h.context.persistDraft();
+      const press = await keys.press({ [modifier]: true });
+      assert.equal(press.prevented, true);
+      assert.deepEqual(keys.submissions.map(({ name }) => name), [running ? "sendSideNote" : "send"]);
+      assert.deepEqual(h.requests, []);
+      assert.equal(h.elements.prompt.value, draft);
+      assert.equal(h.drafts.get(h.context.draftKey("open-session")), draft);
+      assert.equal(h.context.sideNoteBusy, false);
+      assert.equal(h.elements.sidenote.disabled, false);
+      assert.equal(h.context.isTurnRunning(), running);
+    });
+  }
+
+  test(`running desktop ${modifier}+Enter leaves a busy side-note channel untouched`, async () => {
+    const h = harness(), keys = loadComposerShortcuts(h);
+    h.context.turns.set("open-session", {});
+    h.context.sideNoteBusy = true;
+    h.context.syncStopButton();
+    const images = h.context.pendingImages = [{ filename: "draft.png", data_base64: "image" }];
+    h.elements.prompt.value = "keep this draft";
+    h.context.persistDraft();
+    const before = h.context.executionState();
+    const press = await keys.press({ [modifier]: true });
+    assert.equal(press.prevented, true);
+    assert.deepEqual(keys.submissions.map(({ name }) => name), ["sendSideNote"]);
+    assert.deepEqual(h.requests, []);
+    assert.deepEqual(h.notes, []);
+    assert.deepEqual(h.context.executionState(), before);
+    assert.equal(h.elements.prompt.value, "keep this draft");
+    assert.equal(h.drafts.get(h.context.draftKey("open-session")), "keep this draft");
+    assert.equal(h.context.pendingImages, images);
+    assert.equal(h.elements.sidenote.disabled, true);
+  });
+}
+
+for (const extra of [
+  {}, { shiftKey: true }, { key: "Escape" },
+  { metaKey: true, isComposing: true }, { ctrlKey: true, keyCode: 229 },
+]) for (const running of [false, true]) test(`desktop other keys retain their behavior while ${running ? "running" : "idle"}: ${JSON.stringify(extra)}`, async () => {
+  const h = harness(), keys = loadComposerShortcuts(h);
+  if (running) h.context.turns.set("open-session", {});
+  h.elements.prompt.value = "keep this draft";
+  const press = await keys.press(extra);
+  assert.equal(press.prevented, false);
+  assert.deepEqual(keys.submissions, []);
+  assert.deepEqual(h.requests, []);
+  assert.equal(h.elements.prompt.value, "keep this draft");
+});
+
 test("desktop side-note queue lists waiting notes and clears after drain", async () => {
   const h = harness();
   loadChat(h);
@@ -2278,7 +2769,8 @@ test("desktop side-note queue lists waiting notes and clears after drain", async
   const rows = h.elements.sidequeuelist.children;
   assert.equal(rows.length, 2);
   assert.equal(rows[0].children[0].textContent, "你");
-  assert.equal(rows[0].children[1].textContent, "steer left");
+  assert.equal(rows[0].querySelector(".side-note-text").textContent, "steer left");
+  assert.equal(rows[0].querySelector(".message-time").getAttribute("datetime"), "1970-01-01T00:00:01.000Z");
   assert.equal(rows[1].children[0].textContent, "lead");
   assert.equal(rows[1].children[1].textContent, "check tests");
   // The turn child drained the queue: the next sample hides the panel instead
