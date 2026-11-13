@@ -782,12 +782,13 @@ test("desktop rewind opacity and light metadata retain readable foregrounds", ()
 
 // Pin shared and phone CSS, including the compact mobile spacing and the
 // user/queued-note footer matching the existing assistant footer declarations.
-// The snapshot includes the shared attachment summary above the composer.
+// The snapshot includes the shared attachment summary and the intentional
+// paragraph-sized KaTeX rule with automatic overflow on both axes.
 test("desktop contrast rules preserve the current shared and mobile CSS bytes", () => {
   const phoneApplicable = desktopMediaQueries().reduce((source, block) => source.replace(block.css, ""), style);
   assert.doesNotMatch(phoneApplicable, /--(?:control-border|danger-text)/);
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "23363ead97dd9c727383e5c5cb1bb095c3f23832c0f737520a2a59470553496a",
+    "efa7f0eaec3840231c5461d88a04ad5d369bb046d12180203f6d20eaac22539f",
     "desktop contrast changed shared or mobile CSS");
 });
 
@@ -797,7 +798,7 @@ test("desktop overrides leave all phone-applicable CSS byte-identical", () => {
   let phoneApplicable = style;
   for (const block of desktop) phoneApplicable = phoneApplicable.replace(block.css, "");
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "23363ead97dd9c727383e5c5cb1bb095c3f23832c0f737520a2a59470553496a",
+    "efa7f0eaec3840231c5461d88a04ad5d369bb046d12180203f6d20eaac22539f",
     "shared or phone CSS changed outside the desktop queries");
 });
 
@@ -1096,12 +1097,12 @@ test("desktop near-white changes preserve dark and warm token blocks byte for by
   }
 });
 
-test("desktop pastel changes preserve every non-light rule and declaration", () => {
+test("desktop pastel and paragraph-sized math pin every non-light rule and declaration", () => {
   const protectedCss = style.replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/:root\[data-theme="light"\][^{]*\{[^{}]*\}/g, "")
     .replace(/\s+/g, "");
   assert.equal(createHash("sha256").update(protectedCss).digest("hex"),
-    "3621030a9bc681af936669f8c54f35184b93a0dce1f2a59a4598ad73ccada60d",
+    "dbba0871f546814abe26f9876cfde65df49f2a04f2111a3601c960c2684877ce",
     "dark or warm CSS changed beyond a desktop light selector");
 });
 

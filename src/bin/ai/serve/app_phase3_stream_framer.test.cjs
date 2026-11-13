@@ -356,8 +356,12 @@ for (const source of ["live", "replay"]) for (const scenario of framingCases) {
     if (scenario.payloads) assert.deepEqual(result.final.parsed.map((block) => block.payload), scenario.payloads);
     if (scenario.id) assert.equal(result.final.parsed[0].id, scenario.id);
     const terminal = scenario.ended;
-    assert.equal(result.final.state.eventStreamEnded, source === "live" && !terminal ? true : terminal);
-    if (terminal) assert.equal(result.final.state.eventStreamFailed, Boolean(scenario.failed));
+    assert.equal(result.final.state.eventStreamEnded, terminal);
+    assert.equal(result.final.state.eventStreamFailed, Boolean(scenario.failed));
+    if (source === "live" && !terminal) {
+      assert.equal(result.final.state.recovering, true, "EOF without a terminal event keeps the turn in recovery");
+      assert.equal(result.final.state.canStop, true, "transport EOF must not enable another send");
+    }
     if (scenario.answer) assert.ok(result.answers.some((answer) => answer.includes(scenario.answer)), "real view renders the framed answer");
     if (scenario.noAnswer) assert.ok(result.answers.every((answer) => !answer.includes(scenario.noAnswer)), "ignored bytes never reach the real view");
     if (scenario.emptyAfter) for (const checkpoint of result.checkpoints.slice(2, 2 + scenario.emptyAfter)) assert.deepEqual(checkpoint.snapshot.parsed, []);

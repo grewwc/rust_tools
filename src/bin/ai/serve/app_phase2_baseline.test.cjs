@@ -433,8 +433,8 @@ function sse(kind, value) {
   return (kind ? "event: " + kind + "\n" : "") + "data: " + payload + "\n\n";
 }
 
-function sendHarness() {
-  const h = desktop.harness(), c = h.context, timers = new Map(), replays = [], requests = [];
+function sendHarness(options = {}) {
+  const h = desktop.harness(options), c = h.context, timers = new Map(), replays = [], requests = [];
   let timerId = 0, now = 1000;
   const headers = deferred(), requested = deferred(), reader = controlledReader();
   const create = h.document.createElement;
@@ -572,22 +572,22 @@ test("real send: done followed by EOF preserves the new composer draft, settles 
   await h.dispose();
 });
 
-for (const scenario of [
+for (const phone of [false, true]) for (const scenario of [
   { name: "EOF without done", active: true, end: (h) => h.reader.eof(),
     error: "stream ended before completion — checking server history" },
   { name: "reader rejection immediately after acceptance", active: false, end: (h) => h.reader.reject("reader rejected"),
     error: "connection lost: reader rejected — the turn keeps running on the server (following history)" },
   { name: "transport loss after a partial answer and active task snapshot", active: true, end: (h) => h.reader.reject("transport lost"),
     error: "connection lost: transport lost — the turn keeps running on the server (following history)" },
-]) test("quirk: real send " + scenario.name + " reconnects but clears recovery ownership and exposes send while replay is attached", async () => {
-  const h = sendHarness(); await h.start(); await h.accept();
+]) test("real send recovery: " + scenario.name + " keeps stop while replay is attached (phone=" + phone + ")", async () => {
+  const h = sendHarness({ phone }); await h.start(); await h.accept();
   if (scenario.active) await activeTurn(h);
   await h.finish(() => scenario.end(h));
-  // Quirk: goStale calls fail, whose real stopStaleFollow clears the owner just set.
-  // The failed execution flag then outranks the newly attached replay in the gates.
-  assert.deepEqual(h.snapshot(), { ...cleanState, failed: true, attached: true, sideNote: true,
-    errors: [scenario.error], timeouts: [25000, 300000], intervals: [1000, 2000] });
-  assert.equal(h.c.staleSession, ""); assert.equal(h.c.staleTimer, null);
+  assert.equal(h.snapshot().send, "⏹", "transport loss must keep the running turn stoppable");
+  assert.deepEqual(h.snapshot(), { ...cleanState, canSend: false, canStop: true, send: "⏹", title: "stop this turn",
+    stopClass: true, ended: false, recovering: true, attached: true, sideNote: true,
+    errors: [scenario.error], timeouts: [25000, 300000], intervals: [1000, 1500, 2000] });
+  assert.equal(h.c.staleSession, h.c.sessionId); assert.notEqual(h.c.staleTimer, null);
   assert.equal(h.liveBox().parentNode, null, "the recorded error belongs to the retired live box");
   assert.equal(h.replays.length, 1);
   assert.equal(records(h.elements.msgs).filter((node) => node.classList.contains("err")).length, 0,
@@ -597,6 +597,61 @@ for (const scenario of [
     assert.equal(interrupted.dataset.executionState, "completed");
     assert.equal(interrupted.dataset.executionException, "true");
   }
+  h.replays[0].frame(sse("thinking", { text: "Still working after reconnect." }));
+  await settle();
+  assert.equal(h.snapshot().send, "⏹");
+  assert.equal(h.snapshot().canStop, true);
+  assert.equal(h.snapshot().failed, false);
+  h.c.turnRunning = false; h.c.turnRunningAt = 0;
+  h.replays[0].eof();
+  await settle();
+  assert.equal(h.snapshot().attached, false);
+  assert.equal(h.snapshot().recovering, true);
+  assert.equal(h.snapshot().send, "⏹", "unresolved recovery survives another lost stream without a running sample");
+  await h.dispose();
+});
+
+for (const phone of [false, true]) test("real send recovery: only a confirmed replay failure returns to send (phone=" + phone + ")", async () => {
+  const h = sendHarness({ phone }); await h.start(); await h.accept();
+  await h.frame("thinking", { text: "Working before transport loss." });
+  await h.finish(() => h.reader.reject("network changed"));
+  assert.equal(h.snapshot().send, "⏹");
+  h.replays[0].frame(sse("thinking", { text: "Working after transport recovery." }));
+  await settle();
+  assert.equal(h.snapshot().send, "⏹");
+  h.replays[0].frame(sse("error", { error: "confirmed turn failure after reconnect" }));
+  await settle();
+  assert.equal(h.snapshot().failed, true);
+  assert.equal(h.snapshot().ended, true);
+  assert.equal(h.snapshot().recovering, false);
+  assert.equal(h.snapshot().attached, false);
+  assert.equal(h.snapshot().send, "➤");
+  assert.equal(h.snapshot().title, "send");
+  assert.equal(h.snapshot().canSend, true);
+  assert.equal(h.snapshot().canStop, false);
+  assert.match(h.elements.msgs.textContent, /confirmed turn failure after reconnect/);
+  assert.deepEqual(h.snapshot().timeouts, []);
+  await h.dispose();
+});
+
+test("real send recovery: the phone stop button still posts an interrupt for the running turn", async () => {
+  const h = sendHarness({ phone: true }); await h.start(); await h.accept();
+  await h.finish(() => h.reader.eof());
+  assert.equal(h.snapshot().send, "⏹");
+  runSlice(h.c, "async function stopTurn()", "// Parse one SSE block");
+  const interruptions = [];
+  h.c.api = async (pathname, options) => {
+    interruptions.push({ pathname, method: options.method });
+    return { json: async () => ({ interrupted: true }) };
+  };
+  h.elements.send.onclick();
+  await settle();
+  assert.deepEqual(interruptions, [{ pathname: "/sessions/" + h.c.sessionId + "/interrupt", method: "POST" }]);
+  assert.equal(h.snapshot().send, "⏹", "the turn stays stoppable until the server confirms termination");
+  h.replays[0].frame(sse("error", { error: "turn interrupted" }));
+  await settle();
+  assert.equal(h.snapshot().send, "➤");
+  assert.equal(h.snapshot().canStop, false);
   await h.dispose();
 });
 
@@ -622,10 +677,17 @@ for (const outcome of ["HTTP failure", "fetch rejection"]) test("real send: " + 
   await h.dispose();
 });
 
-test("quirk: real send recoverEnded cancels its reader and retires the error box without arming history follow", async () => {
+test("real send recovery: a server-confirmed end follows history without reattaching", async () => {
   const h = sendHarness(); await h.start(); await h.accept(); await activeTurn(h);
+  const api = h.c.api;
+  Object.assign(h.c, {
+    pollConfirm: async () => false,
+    api: (pathname, ...args) => pathname.includes("/history?")
+      ? Promise.resolve({ headers: { get: () => "0" }, json: async () => [] }) : api(pathname, ...args),
+    histKey: (messages) => JSON.stringify(messages), staleKey: "", historyLoadStates: new Map(),
+  });
   await h.finish(() => h.entry().recover("server says the turn ended", true));
-  assert.deepEqual(h.snapshot(), { ...cleanState, failed: true,
+  assert.deepEqual(h.snapshot(), { ...cleanState, ended: false,
     errors: ["server says the turn ended — checking server history"] });
   assert.equal(h.reader.cancellations(), 1);
   assert.equal(h.replays.length, 0, "recoverEnded suppresses retained-event reattachment");

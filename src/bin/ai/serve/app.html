@@ -754,9 +754,13 @@ select, summary { touch-action:manipulation; }
 .msg.md .tablewrap { overflow-x:auto; margin:6px 0; }
 /* Keep wide equations scrollable inside the bubble, including flex list items. */
 .msg.md .li > span:last-child { min-width:0; }
-.msg.md .math { max-width:100%; overflow-x:auto; overflow-y:hidden; word-break:normal; }
+.msg.md .math { max-width:100%; overflow-x:auto; word-break:normal; }
 .msg.md .math.display { display:block; margin:8px 0; padding:4px 0; }
 .msg.md .math.inline { display:inline-block; vertical-align:middle; }
+/* Match paragraph metrics instead of KaTeX's default 1.21em enlargement. */
+.msg.md .math .katex { font-size:1em; line-height:inherit; }
+/* KaTeX vertical lists extend glyphs beyond their measured strut height. */
+.msg.md .math.display:has(.vlist) { padding-block:.5em; }
 .msg.md .math .katex-display { margin:0; text-align:left; }
 .msg.md .math .katex-display > .katex { text-align:left; }
 .msg.md table { border-collapse:collapse; font-size:13px; }
@@ -5640,9 +5644,9 @@ function createLiveActivity(parent, before, sid = sessionId, base = executionBas
       showSubagents(payload, null, null, decoded); groups.sync(latestProgress);
       if (typeof syncStopButton === "function") syncStopButton();
     },
-    finish(reason, answer = false) {
+    finish(reason, answer = false, terminal = true) {
       closed = true;
-      updateExecutionModel({ kind: "finish", owner, reason, answer });
+      if (terminal) updateExecutionModel({ kind: "finish", owner, reason, answer });
       if (subagentClock) subagentClock.stop();
       for (const tool of tools.values()) if (tool.running) {
         tool.running = false;
@@ -10758,17 +10762,17 @@ async function send() {
     mutation();
     if (sid === sessionId) followOutput(follow);
   };
-  const fail = (msg) => {
+  const fail = (msg, terminal = true) => {
     closeThinkingPhase();
     if (paintTimer !== null) { clearTimeout(paintTimer); paintTimer = null; }
-    if (sid === sessionId && sendBase === executionBase()) {
+    if (terminal && sid === sessionId && sendBase === executionBase()) {
       confirmPollSeq++;
       eventStreamEnded = true;
       endedTurnPid = turnRunningPid;
       eventStreamFailed = true;
       stopStaleFollow();
     }
-    activity.finish("interrupted");
+    activity.finish("interrupted", false, terminal);
     activityDirty = false;
     const measured = outputRate.text(true);
     lastOutputRate = tokenRate || (measured ? "output " + measured : "") || lastOutputRate;
@@ -10908,7 +10912,8 @@ async function send() {
     // Until the first fetch below, staleDone still describes the transcript
     // from before this turn and would end the follow on its first tick.
     staleDone = false;
-    fail(msg);
+    // Transport loss retires this view without ending the server's turn.
+    fail(msg, false);
     startStaleFollow();
     wentStale = true;
   };
