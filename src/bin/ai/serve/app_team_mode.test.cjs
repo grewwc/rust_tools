@@ -439,6 +439,7 @@ for (const state of ["replay", "server", "stale", "live"]) test(`the button stop
   const send = c.send, sideNotes = [];
   c.send = () => { sent++; return send(); };
   Object.assign(c, { eventAbort: { abort() { aborted++; } }, recoveredView: null,
+    clearEventWarnings() {},
     stopTurn() { stopped++; },
     sendSideNote() { sideNotes.push({ sessionId: c.sessionId, text: h.elements.prompt.value, images: c.pendingImages }); },
   });

@@ -165,6 +165,50 @@ function ruleValues(source, selector) {
   return values;
 }
 
+test("mobile warm user timestamps meet 4.5:1 and stay softer than body text without changing bubble or footer styles", () => {
+  const media = "@media (max-width:700px) {";
+  const start = style.indexOf(media);
+  assert.ok(start >= 0, "missing phone media query");
+  const open = start + media.length;
+  let depth = 1, end = open;
+  while (end < style.length && depth) {
+    if (style[end] === "{") depth++;
+    if (style[end] === "}") depth--;
+    end++;
+  }
+  assert.equal(depth, 0, "unclosed phone media query");
+  const phone = style.slice(open, end - 1);
+  const outsidePhone = style.slice(0, start) + style.slice(end);
+  const shared = style.slice(0, style.indexOf("@media (min-width:701px)"));
+  const selector = ':root[data-theme="warm"] .msg.user > .message-actions > .message-time';
+  const palette = { ...tokenValues(tokenBlock(PALETTES.warm)),
+    ...ruleValues(phone, ':root[data-theme="warm"]') };
+  const bubble = ruleValues(shared, ".msg.user");
+  const timestamp = { ...ruleValues(shared, ".message-time"),
+    ...ruleValues(phone, ".message-time"), ...ruleValues(phone, selector) };
+  const resolve = (value) => palette[/^var\((--[\w-]+)\)$/.exec(value)?.[1]];
+  const ratio = contrast(resolve(timestamp.color), resolve(bubble.background));
+  assert.ok(ratio >= 4.5, "mobile warm user timestamp contrast " + ratio.toFixed(2) + " is too low");
+  const bodyRatio = contrast(resolve(bubble.color), resolve(bubble.background));
+  assert.ok(ratio <= bodyRatio * 0.9, "timestamp contrast must be at least 10% softer than body text");
+  assert.equal(palette["--on-user-dim"], "#e5e1d7", "phone warm timestamp keeps its dedicated secondary color");
+  assert.equal(resolve(bubble.color), "#fffaf1", "user body foreground stays unchanged");
+  assert.equal(resolve(bubble.background), "#35695d", "user bubble background stays unchanged");
+  assert.equal(bubble.background, "var(--acc-solid)");
+  assert.equal(bubble.color, "var(--on-user)", "user body text keeps its original color");
+  assert.deepEqual(ruleValues(phone, selector), { color: "var(--on-user-dim)" },
+    "only the user's footer timestamp color is overridden");
+  assert.deepEqual(ruleValues(outsidePhone, selector), {}, "desktop keeps its existing timestamp color");
+  assert.doesNotMatch(outsidePhone, /--on-user-dim/, "the secondary user foreground is scoped to phones");
+  assert.equal(ruleValues(shared, ".message-time").color, "var(--dim)",
+    "assistant and queued-note timestamps keep the shared secondary color");
+  assert.deepEqual(ruleValues(phone, ".message-time"), { "font-size": "12px", "scroll-margin-block": "8px" });
+  for (const theme of ["dark", "light"]) {
+    assert.deepEqual(ruleValues(phone, selector.replace('"warm"', '"' + theme + '"')), {},
+      theme + " keeps its existing timestamp color");
+  }
+});
+
 test("desktop Markdown answers inherit panel backgrounds and retain stronger borders in all three themes", () => {
   const desktop = desktopMediaQueries().map((block) => block.body).join("\n");
   const selector = ".msg.asst.md:not(.pending):not(.err):not(.git-output)";
@@ -783,12 +827,13 @@ test("desktop rewind opacity and light metadata retain readable foregrounds", ()
 // Pin shared and phone CSS, including the compact mobile spacing and the
 // user/queued-note footer matching the existing assistant footer declarations.
 // The snapshot includes the shared attachment summary and the intentional
-// paragraph-sized KaTeX rule with automatic overflow on both axes.
+// paragraph-sized KaTeX rule with automatic overflow on both axes, plus the
+// mobile warm user timestamp color protected by its contrast test above.
 test("desktop contrast rules preserve the current shared and mobile CSS bytes", () => {
   const phoneApplicable = desktopMediaQueries().reduce((source, block) => source.replace(block.css, ""), style);
   assert.doesNotMatch(phoneApplicable, /--(?:control-border|danger-text)/);
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "efa7f0eaec3840231c5461d88a04ad5d369bb046d12180203f6d20eaac22539f",
+    "dc3656b0519d34d224c5c3119805973e96ccd47a7c043d68414f9f9ec69eb461",
     "desktop contrast changed shared or mobile CSS");
 });
 
@@ -798,7 +843,7 @@ test("desktop overrides leave all phone-applicable CSS byte-identical", () => {
   let phoneApplicable = style;
   for (const block of desktop) phoneApplicable = phoneApplicable.replace(block.css, "");
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "efa7f0eaec3840231c5461d88a04ad5d369bb046d12180203f6d20eaac22539f",
+    "dc3656b0519d34d224c5c3119805973e96ccd47a7c043d68414f9f9ec69eb461",
     "shared or phone CSS changed outside the desktop queries");
 });
 
@@ -1097,13 +1142,13 @@ test("desktop near-white changes preserve dark and warm token blocks byte for by
   }
 });
 
-test("desktop pastel and paragraph-sized math pin every non-light rule and declaration", () => {
+test("desktop pastel, paragraph-sized math and mobile warm timestamps pin every non-light rule and declaration", () => {
   const protectedCss = style.replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/:root\[data-theme="light"\][^{]*\{[^{}]*\}/g, "")
     .replace(/\s+/g, "");
   assert.equal(createHash("sha256").update(protectedCss).digest("hex"),
-    "dbba0871f546814abe26f9876cfde65df49f2a04f2111a3601c960c2684877ce",
-    "dark or warm CSS changed beyond a desktop light selector");
+    "9059b25e1238a7915ad19e6449b2ffa5014e91a7e2f6f966ce477a36b0a28ba1",
+    "dark or warm CSS changed beyond the pinned baseline");
 });
 
 test("the header carries a theme toggle with one icon per palette", () => {

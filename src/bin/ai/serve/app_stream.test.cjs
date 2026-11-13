@@ -454,6 +454,11 @@ function runningComposer(c) {
   return elements;
 }
 
+function loadAttachmentPoll(c) {
+  Object.assign(c, { confirmBusy: false, confirmPollSeq: 0, armHistoryFollow() {} });
+  vm.runInContext(script.slice(script.indexOf("async function pollConfirm()"), script.indexOf("function isTurnRunning()")), c);
+}
+
 function historyRateHarness(storage, content, reasoning = "", phone = false) {
   const h = replayHarness({ storage, phone });
   h.view.remove();
@@ -1317,6 +1322,74 @@ test("replay transport failures fall back to history after a bounded retry budge
   assert.ok(h.polls() > 0);
 });
 
+for (const phone of [false, true]) test(`network failures retry automatically and clear the latest warning (phone=${phone})`, async () => {
+  const h = attachmentHarness(false, { phone }), c = h.c, fetch = c.fetch;
+  const root = c.$("msgs");
+  let attempts = 0;
+  c.fetch = (url, options) => {
+    attempts++;
+    if (attempts <= 2) return Promise.reject(new Error(attempts === 1 ? "network error" : "Failed to fetch"));
+    return fetch(url, options);
+  };
+  await c.attachEvents();
+  const warning = root.querySelectorAll(".err")[0];
+  assert.match(warning.textContent, /network error/);
+  h.fire(2000); await h.settle();
+  assert.equal(attempts, 2);
+  assert.equal(root.querySelectorAll(".err").length, 1);
+  assert.equal(root.querySelectorAll(".err")[0], warning);
+  assert.equal(warning.textContent, "live progress unavailable: Failed to fetch (2 failures)");
+  h.fire(2000); await h.settle();
+  assert.equal(attempts, 3);
+  assert.equal(warning.parentNode, null);
+  assert.equal(c.eventFailures, 0);
+  await h.frame('event: done\ndata: {}\n\n');
+  assert.equal(root.querySelectorAll(".err").length, 0);
+  assert.equal(h.timers.size, 0);
+});
+
+test("a successful running poll reopens the exhausted event retry budget", async () => {
+  const h = attachmentHarness(), c = h.c, fetch = c.fetch, root = c.$("msgs");
+  loadAttachmentPoll(c);
+  let attempts = 0;
+  c.fetch = (url, options) => ++attempts === 1
+    ? Promise.reject(new Error("Failed to fetch")) : fetch(url, options);
+  c.eventFailures = 4;
+  await c.attachEvents();
+  assert.equal(c.eventFailures, 5);
+  const warning = root.querySelectorAll(".err")[0];
+  await c.attachEvents();
+  assert.equal(attempts, 1, "the automatic burst stays bounded");
+  c.api = async () => ({ json: async () => ({ running: true, turn: 17, pending: null }) });
+  assert.equal(await c.pollConfirm(), true);
+  await h.settle();
+  assert.equal(attempts, 2, "a reachable server permits recovery without refreshing the page");
+  assert.equal(warning.parentNode, null);
+  assert.equal(c.eventFailures, 0);
+  await h.frame('event: done\ndata: {}\n\n');
+  await c.attachEvents();
+  assert.equal(attempts, 2, "a terminal turn cannot be replayed by an obsolete retry");
+});
+
+test("an idle poll clears a failed attachment and suppresses its queued retry", async () => {
+  const h = attachmentHarness(), c = h.c, root = c.$("msgs");
+  loadAttachmentPoll(c);
+  let attempts = 0;
+  c.fetch = async () => { attempts++; throw new Error("network error"); };
+  await c.attachEvents();
+  const warning = root.querySelectorAll(".err")[0];
+  const loads = h.loads();
+  c.api = async () => ({ json: async () => ({ running: false, turn: 0, pending: null }) });
+  assert.equal(await c.pollConfirm(), false);
+  assert.equal(warning.parentNode, null);
+  assert.equal(c.eventFailures, 0);
+  assert.equal(h.loads(), loads + 1, "the completed turn refreshes its canonical history");
+  h.fire(2000); await h.settle();
+  assert.equal(attempts, 1);
+  assert.equal(root.querySelectorAll(".err").length, 0);
+  assert.equal(h.timers.size, 0);
+});
+
 for (const phone of [false, true]) test(`event attach conflicts reuse one warning and clear it on recovery (phone=${phone})`, async () => {
   const h = attachmentHarness(false, { phone }), c = h.c, fetch = c.fetch;
   const root = c.$("msgs"), warnings = () => root.querySelectorAll(".err");
@@ -1343,7 +1416,7 @@ for (const phone of [false, true]) test(`event attach conflicts reuse one warnin
   assert.equal(h.timers.size, 0);
 });
 
-test("event attach warnings distinguish sessions, epochs and error kinds", async () => {
+test("event attach warnings distinguish sessions and epochs while updating error kinds", async () => {
   const h = attachmentHarness(), c = h.c, root = c.$("msgs");
   c.fetch = async () => ({ ok: false, status: 409 });
   await c.attachEvents();
@@ -1356,18 +1429,19 @@ test("event attach warnings distinguish sessions, epochs and error kinds", async
   c.fetch = async () => { throw new Error("event stream 409: lease expired"); };
   await c.attachEvents();
   const rows = root.querySelectorAll(".live-progress-warning");
-  assert.equal(rows.length, 2, "only the selected session's warnings remain mounted");
+  assert.equal(rows.length, 1, "only one warning for the selected session and epoch remains mounted");
   assert.ok(previousRows.every((row) => row.parentNode === null));
-  assert.equal(new Set([...previousRows, ...rows].map((row) => row.dataset.eventWarningKey)).size, 4);
-  assert.ok(rows.every((row) => row.dataset.eventWarningFailures === "1"));
-  assert.equal(rows.at(-1).textContent, "live progress unavailable: event stream 409: lease expired");
+  assert.equal(new Set([...previousRows, ...rows].map((row) => row.dataset.eventWarningKey)).size, 3);
+  assert.ok(previousRows.every((row) => row.dataset.eventWarningFailures === "1"));
+  assert.equal(rows[0].dataset.eventWarningFailures, "2");
+  assert.equal(rows[0].textContent, "live progress unavailable: event stream 409: lease expired (2 failures)");
   c.fetch = async () => ({ ok: true, body: { getReader: () => ({ read: async () => ({ done: true }) }) } });
   await c.attachEvents();
   assert.deepEqual(root.querySelectorAll(".live-progress-warning"), [],
     "recovery clears only warnings belonging to the attached session and epoch");
 });
 
-test("event attach errors other than conflicts keep separate warning rows", async () => {
+test("event attach conflicts and server failures share one recoverable warning", async () => {
   const h = attachmentHarness(), c = h.c, root = c.$("msgs");
   let status = 409;
   c.fetch = async () => ({ ok: false, status });
@@ -1376,11 +1450,9 @@ test("event attach errors other than conflicts keep separate warning rows", asyn
   await c.attachEvents();
   await c.attachEvents();
   const rows = root.querySelectorAll(".err");
-  assert.equal(rows.length, 3);
+  assert.equal(rows.length, 1);
   assert.deepEqual(rows.map((row) => row.textContent), [
-    "live progress unavailable: event stream 409",
-    "live progress unavailable: event stream 500",
-    "live progress unavailable: event stream 500",
+    "live progress unavailable: event stream 500 (3 failures)",
   ]);
   assert.equal(root.querySelectorAll(".live-progress-warning").length, 1);
 });

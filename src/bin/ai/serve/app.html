@@ -1277,6 +1277,8 @@ button:active:not(:disabled) { filter:brightness(.96); }
   .msg.md .p { margin:4px 0; }
   .msg.md .h { margin:8px 0 4px; }
   .message-time { font-size:12px; scroll-margin-block:8px; }
+  :root[data-theme="warm"] { --on-user-dim:#e5e1d7; }
+  :root[data-theme="warm"] .msg.user > .message-actions > .message-time { color:var(--on-user-dim); }
   .user-msg-row {
     display:flex; align-items:center; align-self:flex-end; justify-content:flex-end;
     max-width:94%; gap:7px;
@@ -1342,6 +1344,8 @@ button:active:not(:disabled) { filter:brightness(.96); }
 .mediaprev img { display:block; max-width:100%; max-height:52vh; border-radius:var(--radius-control); }
 .mediaprev audio { display:block; width:100%; }
 .mediaprev .mediacap { display:block; margin-top:4px; font-size:11px; color:var(--dim); word-break:break-all; }
+.mediaprev.failed { display:block; margin:6px 0; font-size:12px; color:var(--dim); word-break:break-all; }
+.mediaprev.failed .mediaretry { margin-left:6px; padding:2px 8px; font:inherit; color:inherit; background:var(--surface-2); border:1px solid var(--line); border-radius:var(--radius-control); }
 #viewer { display:none; position:fixed; inset:0; z-index:60; background:rgba(0,0,0,.92); align-items:center; justify-content:center; }
 #viewer.on { display:flex; }
 #viewer img { max-width:100vw; max-height:100vh; }
@@ -4384,26 +4388,46 @@ function addMsgMd(text, parent, copyText = text, timeSource = null) {
 const previewUrls = new Map(); // slot -> Object URL; ownership follows the DOM
 const MEDIA_TOKEN_G = /[\w.@~+\/-]*[\w@~+\/-]\.(?:png|jpe?g|gif|webp|svg|avif|bmp|mp3|wav|m4a|aac|ogg|flac|opus)\b/gi;
 const MAX_PREVIEWS_PER_MSG = 4;
+// Phone replies carry more dead path tokens than live ones (stale uploads,
+// paths outside the served roots). Extra attempts keep a later live image
+// inside the per-message render cap, which counts only successful loads.
+const MAX_PREVIEW_ATTEMPTS_PHONE = 8;
+const MAX_PREVIEW_TOKEN_CHARS = 200;
+const MAX_PREVIEW_TOKEN_CHARS_PHONE = 260;
+function previewAttemptCap() {
+  return previewPhoneLayout() ? MAX_PREVIEW_ATTEMPTS_PHONE : MAX_PREVIEWS_PER_MSG;
+}
 // Standalone path tokens only: a run of path characters that keeps its
 // directory prefixes (`out/chart.svg`, `rust_tools/chart.svg`, bare
 // `chart.svg`) and ends in an image extension; `xchart.svg` and `chart.svgz`
-// do not. A leading `/` is deliberately excluded, so `/tmp/chart.svg` stays
-// plain text: the route serves workspace-relative paths only, and a path that
-// 404s is then retried once as its basename (loadPreviews), which needs the
-// prefixed token to survive intact without a root ambiguity.
+// do not. The server serves absolute paths too, as long as they resolve inside
+// the workspace or this session's assets dir. The desktop transcript leaves
+// them as text; a phone rewrites this session's assets path to its
+// assets-relative form (shorter and root-free) and sends any other absolute
+// path unchanged for the server's own containment check.
+function previewToken(raw) {
+  if (!previewPhoneLayout() || !raw.startsWith("/")) return raw;
+  const marker = "/" + sessionId + ".assets/";
+  const cut = marker.length > 1 ? raw.indexOf(marker) : -1;
+  return cut < 0 ? raw : raw.slice(cut + marker.length);
+}
 function mediaTokensIn(text) {
   const found = [];
+  const phone = previewPhoneLayout();
+  const limit = phone ? MAX_PREVIEW_TOKEN_CHARS_PHONE : MAX_PREVIEW_TOKEN_CHARS;
   MEDIA_TOKEN_G.lastIndex = 0;
   let m;
   while ((m = MEDIA_TOKEN_G.exec(text))) {
-    const token = m[0];
-    if (token.length > 200) continue;
-    if (token.startsWith("/")) continue; // absolute paths: never workspace-relative
+    const raw = m[0];
+    if (raw.startsWith("//")) continue; // protocol-relative URL, not a path
+    const token = previewToken(raw);
+    if (raw.startsWith("/") && !phone) continue;
+    if (token.length > limit) continue;
     const before = m.index ? text[m.index - 1] : "";
-    const after = text[m.index + token.length] || "";
+    const after = text[m.index + raw.length] || "";
     if (before && !/[\s`'"(\[（【:]/.test(before)) continue;
     if (after && !/[\s`'")，。、\]】）:]/.test(after)) continue;
-    found.push({ at: m.index, token: token });
+    found.push({ at: m.index, token, raw });
   }
   return found;
 }
@@ -4412,11 +4436,23 @@ function decorateMedia(root) {
   const nodes = [];
   while (tw.nextNode()) nodes.push(tw.currentNode);
   let budget = MAX_PREVIEWS_PER_MSG;
+  let capped = false;
+  const seen = new Set();
   for (const node of nodes) {
     if (node.parentElement.closest(".math")) continue;
     const text = node.nodeValue || "";
     if (!budget || text.indexOf(".") === -1) continue;
-    const hits = mediaTokensIn(text).filter(() => budget-- > 0);
+    // Resolved lazily so a harness that loads this function alone still runs.
+    if (!capped) {
+      capped = true;
+      budget = typeof previewAttemptCap === "function" ? previewAttemptCap() : MAX_PREVIEWS_PER_MSG;
+    }
+    const hits = mediaTokensIn(text).filter((hit) => {
+      if (!budget || seen.has(hit.token)) return false;
+      seen.add(hit.token);
+      budget--;
+      return true;
+    });
     if (!hits.length) continue;
     const frag = document.createDocumentFragment();
     let last = 0;
@@ -4426,7 +4462,7 @@ function decorateMedia(root) {
       slot.className = "mediaprev";
       slot.dataset.path = hit.token;
       frag.appendChild(slot);
-      last = hit.at + hit.token.length;
+      last = hit.at + hit.raw.length;
     }
     frag.appendChild(document.createTextNode(text.slice(last)));
     node.parentNode.replaceChild(frag, node);
@@ -4435,54 +4471,123 @@ function decorateMedia(root) {
 async function loadPreviews(root) {
   if (!root.querySelectorAll) return;
   const forSession = sessionId;
+  const state = { shown: 0 };
   for (const slot of root.querySelectorAll("span.mediaprev:not([data-held])")) {
     if (slot.dataset.retired) continue;
-    slot.dataset.held = "1"; // one fetch per slot, however often the view repaints
-    const path = slot.dataset.path;
-    // Assistants print both workspace-relative paths and bare names, and the
-    // printed prefix need not match the served root; a path that fails is
-    // retried once as a basename before the token falls back to plain text.
-    const attempt = async (p) => {
-      if (slot.dataset.retired) throw new Error("preview retired");
-      const res = await api("/sessions/" + forSession + "/file?path=" + encodeURIComponent(p));
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      return URL.createObjectURL(await res.blob());
-    };
-    try {
-      let url;
-      try {
-        url = await attempt(path);
-      } catch (e) {
-        const candidates = previewPathCandidates(path);
-        if (candidates.length < 2) throw e;
-        url = await attempt(candidates[1]);
-      }
-      // A history refresh or session switch may retire this slot during fetch.
-      if (slot.dataset.retired) {
-        URL.revokeObjectURL(url);
-        continue;
-      }
-      previewUrls.set(slot, url);
-      const isAudio = /\.(?:mp3|wav|m4a|aac|ogg|flac|opus)$/i.test(path);
-      const media = document.createElement(isAudio ? "audio" : "img");
-      media.src = url;
-      if (isAudio) {
-        media.controls = true;
-        media.preload = "none";
-      } else {
-        media.alt = path;
-        media.loading = "lazy";
-        media.onclick = () => showViewer(url);
-      }
-      const cap = document.createElement("span");
-      cap.className = "mediacap";
-      cap.textContent = path;
-      slot.append(media, cap);
-      slot.classList.add("loaded");
-    } catch (e) {
-      if (!slot.dataset.retired) slot.replaceWith(document.createTextNode(path));
-    }
+    slot.dataset.held = "1"; // one load per slot, however often the view repaints
+    const job = () => loadPreviewSlot(slot, forSession, state);
+    if (previewPhoneLayout()) whenPreviewVisible(slot, job);
+    else await job();
   }
+}
+// Defined after loadPreviews so a harness that loads that slice still sees it;
+// function declarations hoist, so the earlier media helpers may call it too.
+function previewPhoneLayout() {
+  return typeof isPhoneLayout === "function" && isPhoneLayout();
+}
+const PREVIEW_RENDER_CAP = typeof MAX_PREVIEWS_PER_MSG === "number" ? MAX_PREVIEWS_PER_MSG : 4;
+let previewObserver = null;
+// A phone scrolls a long transcript: fetch near the viewport instead of every
+// preview slot the repaint touches. Without an observer, load immediately.
+function whenPreviewVisible(slot, job) {
+  if (typeof IntersectionObserver !== "function") {
+    job();
+    return;
+  }
+  if (!previewObserver) {
+    previewObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const run = entry.target._previewStart;
+        entry.target._previewStart = null;
+        previewObserver.unobserve(entry.target);
+        if (run) run();
+      }
+    }, { rootMargin: "600px 0px" });
+  }
+  slot._previewStart = job;
+  previewObserver.observe(slot);
+}
+async function loadPreviewSlot(slot, forSession, state) {
+  if (slot.dataset.retired) return;
+  const path = slot.dataset.path;
+  // A message that already filled its render cap spends no further fetch.
+  if (state.shown >= PREVIEW_RENDER_CAP) {
+    slot.replaceWith(document.createTextNode(path));
+    return;
+  }
+  // Assistants print both workspace-relative paths and bare names, and the
+  // printed prefix need not match the served root; a path that fails is
+  // retried once as a basename before the token falls back to plain text.
+  const attempt = async (p) => {
+    if (slot.dataset.retired) throw new Error("preview retired");
+    const res = await api("/sessions/" + forSession + "/file?path=" + encodeURIComponent(p));
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return URL.createObjectURL(await res.blob());
+  };
+  try {
+    let url;
+    try {
+      url = await attempt(path);
+    } catch (e) {
+      if (!path) throw e;
+      const candidates = previewPathCandidates(path);
+      if (candidates.length < 2) throw e;
+      url = await attempt(candidates[1]);
+    }
+    // A history refresh or session switch may retire this slot during fetch.
+    if (slot.dataset.retired) {
+      URL.revokeObjectURL(url);
+      return;
+    }
+    if (state.shown >= PREVIEW_RENDER_CAP) {
+      URL.revokeObjectURL(url);
+      slot.replaceWith(document.createTextNode(path));
+      return;
+    }
+    state.shown++;
+    previewUrls.set(slot, url);
+    const isAudio = /\.(?:mp3|wav|m4a|aac|ogg|flac|opus)$/i.test(path);
+    const media = document.createElement(isAudio ? "audio" : "img");
+    media.src = url;
+    if (isAudio) {
+      media.controls = true;
+      media.preload = "none";
+    } else {
+      media.alt = path;
+      media.loading = "lazy";
+      media.onclick = () => showViewer(url);
+    }
+    const cap = document.createElement("span");
+    cap.className = "mediacap";
+    cap.textContent = path;
+    slot.append(media, cap);
+    slot.classList.add("loaded");
+  } catch (e) {
+    if (!slot.dataset.retired) previewFailed(slot, path, forSession, state);
+  }
+}
+// Desktop keeps the plain-text fallback; a phone keeps the path visible with a
+// tap target so a transient failure (offline, moved file) can be retried.
+function previewFailed(slot, path, forSession, state) {
+  if (!previewPhoneLayout()) {
+    slot.replaceWith(document.createTextNode(path));
+    return;
+  }
+  slot.classList.add("failed");
+  slot.replaceChildren(document.createTextNode(String(path)));
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.className = "mediaretry";
+  retry.textContent = "未加载，点按重试";
+  retry.onclick = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    slot.classList.remove("failed");
+    slot.replaceChildren();
+    loadPreviewSlot(slot, forSession, state);
+  };
+  slot.append(retry);
 }
 function previewPathCandidates(path) {
   const cut = path.lastIndexOf("/");
@@ -4500,7 +4605,10 @@ function showViewer(url) {
 }
 function revokePreviews(root = $("msgs")) {
   // Retire pending fetches as well as URLs already attached to this subtree.
-  for (const slot of root.querySelectorAll("span.mediaprev")) slot.dataset.retired = "1";
+  for (const slot of root.querySelectorAll("span.mediaprev")) {
+    slot.dataset.retired = "1";
+    if (previewObserver) previewObserver.unobserve(slot);
+  }
   for (const [slot, url] of previewUrls) {
     if (!root.contains(slot)) continue;
     URL.revokeObjectURL(url);
@@ -9560,7 +9668,9 @@ function dispatchExecutionEvent(kind, payload, view, source) {
 // END execution event dispatcher
 
 function showEventWarning(sid, epoch, kind) {
-  const key = JSON.stringify([sid, epoch, kind]);
+  // Transport failures describe one connection, not persisted turn history.
+  // Keep its place while retries update the latest cause and failure count.
+  const key = JSON.stringify([sid, epoch]);
   const warnings = $("msgs").querySelectorAll(".live-progress-warning");
   let row = Array.from(warnings).find((warning) => warning.dataset.eventWarningKey === key);
   const failures = Number(row?.dataset.eventWarningFailures || 0) + 1;
@@ -9583,7 +9693,7 @@ function clearEventWarnings(sid, epoch) {
 // path after a reload: it replays progress and delivers a pending native or
 // confirmation request without waiting for a poll interval.
 async function attachEvents() {
-  if (!sessionId || eventActive || turns.has(sessionId) || eventFailures >= 5) return;
+  if (!sessionId || eventActive || eventStreamEnded || turns.has(sessionId) || eventFailures >= 5) return;
   const sid = sessionId;
   const base = executionBase();
   const epoch = runEpoch;
@@ -9638,6 +9748,7 @@ async function attachEvents() {
     });
     if (!res.ok || !res.body) throw new Error("event stream " + res.status);
     if (!ownsStream() || controller.signal.aborted) return;
+    eventFailures = 0;
     clearEventWarnings(sid, epoch);
     armSilence();
     const reader = res.body.getReader();
@@ -9680,8 +9791,7 @@ async function attachEvents() {
   } catch (error) {
     if (!controller.signal.aborted && ownsStream() && !String(error.message).includes("404")) {
       const kind = String(error.message);
-      if (/^event stream 409\b/.test(kind)) showEventWarning(sid, epoch, kind);
-      else addMsg("err", "live progress unavailable: " + kind, "asst err");
+      showEventWarning(sid, epoch, kind);
     }
   } finally {
     clearTimeout(silenceTimer);
@@ -9696,7 +9806,7 @@ async function attachEvents() {
     if (!finished && fresh && !turns.has(sid) && eventFailures < 5 && (timedOut || !controller.signal.aborted)) {
       ensureConfirmPoll(); // fallback while the event stream is down
       setTimeout(() => {
-        if (sid === sessionId && epoch === runEpoch) void attachEvents();
+        if (sid === sessionId && base === executionBase() && epoch === runEpoch && turnRunning) void attachEvents();
       }, 2000);
     } else if (!turns.has(sid) && (timedOut || !controller.signal.aborted)) {
       await loadHistory();
@@ -9705,6 +9815,7 @@ async function attachEvents() {
 }
 
 function abortEvents() {
+  clearEventWarnings(eventSession || sessionId, runEpoch);
   eventFailures = 0;
   if (eventAbort) { eventAbort.abort(); eventAbort = null; }
   eventActive = false;
@@ -9749,6 +9860,9 @@ async function pollConfirm() {
   if (turnRunning) {
     turnRunningPid = pid;
     turnRunningAt = Date.now();
+    // A successful server sample can reopen a retry budget exhausted offline.
+    // Keep the existing bounded burst while allowing recovery without reload.
+    if (eventFailures >= 5) eventFailures = 0;
     if (!wasRunning && !eventStreamEnded) { eventFailures = 0; eventStreamFailed = false; }
     armHistoryFollow();
     ensureConfirmPoll();
@@ -9782,7 +9896,7 @@ async function pollConfirm() {
   }
   else {
     eventStreamEnded = false;
-    if (eventActive && eventSession === sid) {
+    if ((eventActive && eventSession === sid) || eventFailures > 0) {
       abortEvents();
       await loadHistory();
       if (sid !== sessionId || base !== executionBase() || epoch !== runEpoch || seq !== confirmPollSeq) return null;

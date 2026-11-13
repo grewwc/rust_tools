@@ -23,7 +23,7 @@ function nodeList(nodes) {
   };
 }
 
-function harness({ realApi = false } = {}) {
+function harness({ realApi = false, phone = false } = {}) {
   function element() {
     let text = "", markup = "";
     const node = {
@@ -81,7 +81,7 @@ function harness({ realApi = false } = {}) {
   ];
   const context = vm.createContext({
     document: { createElement: element, visibilityState: "visible" },
-    window: { matchMedia: () => ({ matches: false }) },
+    window: { matchMedia: () => ({ matches: !phone }) },
     navigator: { onLine: true },
     console: { error: (...args) => renderErrors.push(args) },
     $: (id) => {
@@ -315,33 +315,34 @@ for (const outcome of ["success", "missing total", "invalid total", "API error",
   });
 }
 
-// app_stream covers transient 409 warnings that are deduplicated and cleared on
-// reconnect. Ordinary attachment errors remain separate conversation rows.
-test("two consecutive live-progress request failures preserve distinct error rows", async () => {
+test("consecutive live-progress request failures update one transient row", async () => {
   const h = harness();
   await h.failLive("network error");
   const row = h.liveRows()[0];
   assert.equal(h.liveRows().length, 1);
   await h.failLive("Failed to fetch");
   const rows = h.liveRows();
-  assert.equal(rows.length, 2);
-  assert.equal(rows[0], row, "preserve the first failure's DOM node");
-  assert.notEqual(rows[1], row, "the next failure gets its own error row");
-  assert.equal(row.textContent, "live progress unavailable: network error");
-  assert.equal(rows[1].textContent, "live progress unavailable: Failed to fetch");
-  assert.ok(rows.every((error) => !error.classList.contains("live-progress-warning")));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0], row, "update the mounted warning without moving it");
+  assert.equal(row.textContent, "live progress unavailable: Failed to fetch (2 failures)");
+  assert.ok(row.classList.contains("live-progress-warning"));
 });
 
-test("a successful live-progress reconnect preserves its ordinary error row", async () => {
-  const h = harness();
-  await h.failLive("network error");
+for (const phone of [false, true]) for (const failure of ["throw", "500"]) test(`live-progress reconnect clears the failed request warning (phone=${phone}, failure=${failure})`, async () => {
+  const h = harness({ phone });
+  if (failure === "throw") await h.failLive("network error");
+  else {
+    h.context.fetch = async () => ({ ok: false, status: 500 });
+    await h.context.attachEvents();
+  }
+  assert.equal(h.liveRows().length, 1, "the failed request visibly reports its cause");
   const row = h.liveRows()[0];
+  assert.match(row.textContent, failure === "throw" ? /network error/ : /event stream 500/);
   const connection = await h.connectLive();
   try {
-    assert.equal(h.liveRows().length, 1, "reconnecting clears warnings, not ordinary errors");
-    assert.equal(h.liveRows()[0], row);
-    assert.equal(row.textContent, "live progress unavailable: network error");
-    assert.equal(row.parentNode, h.root);
+    assert.equal(h.liveRows().length, 0, "successful response headers clear the warning while the turn still runs");
+    assert.equal(row.parentNode, null);
+    assert.equal(h.context.eventFailures, 0, "a recovered connection starts a new failure budget");
   } finally { await connection.close(); }
 });
 
@@ -377,20 +378,36 @@ test("live recovery preserves history errors and real conversation nodes", async
   const h = harness();
   await h.recoverHistory();
   const content = h.root.children.slice();
-  const realError = h.context.addMsg("err", "history failed: a recorded conversation error", "asst err");
+  const realError = h.context.addMsg("err", "live progress unavailable: a recorded conversation error", "asst err");
   await h.failHistory("Failed to fetch");
   const historyError = h.historyRows().find((row) => row !== realError);
   await h.failLive("network error");
-  const liveError = h.liveRows()[0];
+  // The recorded error deliberately has the same prefix as the transient row.
+  const warning = h.liveRows().find((row) => row !== realError);
+  h.root.scrollTop = 45;
   const connection = await h.connectLive();
   try {
     assert.equal(h.liveRows().length, 1);
-    assert.equal(h.liveRows()[0], liveError, "the ordinary live error remains on reconnect");
-    assert.equal(liveError.textContent, "live progress unavailable: network error");
-    assert.deepEqual(h.historyRows(), [realError, historyError]);
+    assert.equal(h.liveRows()[0], realError, "a recorded error with identical wording is still history");
+    assert.equal(warning.parentNode, null);
+    assert.deepEqual(h.historyRows(), [historyError]);
     assert.equal(historyError.textContent, "history failed: Failed to fetch");
     assert.deepEqual(h.root.children.slice(0, content.length), content);
+    assert.equal(h.root.children[content.length], realError);
+    assert.equal(h.root.scrollTop, 45, "warning cleanup does not reset the reader's position");
   } finally { await connection.close(); }
+});
+
+test("ending recovery removes the warning without removing canonical rows", async () => {
+  const h = harness();
+  await h.recoverHistory();
+  const content = h.root.children.slice();
+  await h.failLive("Failed to fetch");
+  const warning = h.liveRows()[0];
+  h.context.abortEvents();
+  assert.equal(h.liveRows().length, 0);
+  assert.equal(warning.parentNode, null);
+  assert.deepEqual(h.root.children, content);
 });
 
 for (const rendered of [false, true]) test(`history recovery ${rendered ? "preserves" : "replaces"} the live error (history already rendered=${rendered})`, async () => {
