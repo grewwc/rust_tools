@@ -72,6 +72,23 @@ const listed = [
   { id: "unicode-id", summary: "中文 [literal] École" },
 ];
 
+test("empty star-filter pages expose older sessions and keep filtering appended results", async () => {
+  const h = harness();
+  setPager(h, { total: 3, offset: 2, hasMore: true });
+  h.dispatch(h.elements.sessmarked, "click");
+  assert.deepEqual(rendered(h).tail, ["暂无星标会话（已加载范围内）", "加载更多会话"]);
+  const calls = installResponse(h, [{ id: "older-star", summary: "Older star", marked: true }], {
+    "x-sessions-total": "3", "x-sessions-page-size": "1",
+  });
+  const more = h.elements.sesslist.querySelector("button");
+  await h.dispatch(more, "click").done;
+  assert.deepEqual(calls, ["/sessions?newest=true&limit=12&offset=2"]);
+  assert.deepEqual(rendered(h).titles, ["Older star"]);
+  assert.deepEqual(rendered(h).tail, []);
+  assert.equal(rendered(h).count, "3 sessions · showing 1");
+  assert.equal(h.context.sessionId, "open-session");
+});
+
 test("blank and whitespace session filters preserve input order and title fallback rules", () => {
   for (const query of ["", " \t\n "]) {
     const h = harness();

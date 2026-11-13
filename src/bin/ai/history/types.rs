@@ -208,6 +208,16 @@ pub(in crate::ai) struct Message {
     pub(in crate::ai) reasoning_content: Option<String>,
 }
 
+/// Display metadata read from the same canonical SQLite row as the message.
+/// Keep it outside `Message`, which also travels to model providers and context caches.
+#[derive(Debug, Clone)]
+pub(in crate::ai) struct StoredMessage {
+    pub(in crate::ai) message: Message,
+    pub(in crate::ai) message_id: i64,
+    /// Unix seconds recorded when the canonical message was persisted.
+    pub(in crate::ai) created_at: Option<i64>,
+}
+
 /// Replace the payload of inline `data:` image URLs inside a message content
 /// array with a short placeholder. Structured image blocks
 /// (`{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}` or

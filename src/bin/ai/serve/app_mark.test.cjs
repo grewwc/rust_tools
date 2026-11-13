@@ -185,6 +185,8 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
     context.switchSession = (...args) => { switches.push(args[0]); return switchSession(...args); };
     context.loadHistory = (...args) => { historyLoads += 1; return loadHistory(...args); };
   }
+  elements.sessall = node("button");
+  elements.sessmarked = node("button");
   vm.runInContext(between('$("sessfilter").oninput =', '$("connbtn").onclick ='), context);
   context.wireSessionActions();
   context.renderSessionList(context.lastItems);

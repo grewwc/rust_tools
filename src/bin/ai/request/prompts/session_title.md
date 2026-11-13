@@ -4,7 +4,7 @@ Rules:
 1. Use the conversation's dominant language.
 2. Concrete, not abstract: keep domain words, file/feature names, or the broken behavior. Someone who wasn't there should still recognize the topic.
 3. Bug fixes start with 修复 / Fix.
-4. Noun or verb phrase, at most 30 characters, no trailing punctuation.
+4. Noun or verb phrase, at most 60 characters, no trailing punctuation.
 
 Examples:
 

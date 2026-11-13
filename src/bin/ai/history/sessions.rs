@@ -28,7 +28,7 @@ use super::{
         remove_session_write_root_sqlite, with_session_state_lock, write_session_archived_sqlite,
         write_session_mark_sqlite, write_session_serve_config_sqlite, write_session_title_sqlite,
     },
-    types::Message,
+    types::{Message, StoredMessage},
 };
 
 const MAX_SESSION_ID_BYTES: usize = 128;
@@ -337,10 +337,11 @@ impl SessionStore {
                 .map(|time| time.with_timezone(&Local))
                 .or_else(|| file_modified.map(DateTime::<Local>::from));
             // Prefer the LLM-generated title (stored in the meta table),
-            // falling back to the first message's summary.
+            // falling back to the first message's summary. Stored titles need
+            // only a display cap; do not clean user-chosen wording again.
             let summary = generated_title
                 .as_deref()
-                .map(normalize_generated_session_title)
+                .map(|title| truncate_summary(title, MAX_SESSION_TITLE_CHARS))
                 .filter(|title| !title.is_empty())
                 .or_else(|| {
                     first_user_prompt
@@ -446,7 +447,7 @@ impl SessionStore {
             .or_else(|| file_modified.map(DateTime::<Local>::from));
         let summary = generated_title
             .as_deref()
-            .map(normalize_generated_session_title)
+            .map(|title| truncate_summary(title, MAX_SESSION_TITLE_CHARS))
             .filter(|title| !title.is_empty())
             .or_else(|| {
                 first_user_prompt
@@ -1323,6 +1324,25 @@ impl SessionStore {
         read_all_messages_sqlite(&path)
     }
 
+    /// Read canonical rows with their persisted display metadata, without creating a session.
+    pub(in crate::ai) fn read_stored_messages(
+        &self,
+        session_id: &str,
+        after_message_id: i64,
+    ) -> io::Result<Vec<StoredMessage>> {
+        Self::validate_session_id(session_id)?;
+        let path = self.session_history_file(session_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        super::sqlite::read_stored_messages_sqlite(&path, after_message_id)
+    }
+
+    pub(in crate::ai) fn read_message_watermark(&self, session_id: &str) -> io::Result<i64> {
+        Self::validate_session_id(session_id)?;
+        super::sqlite::read_message_watermark_sqlite(&self.session_history_file(session_id))
+    }
+
     /// Count canonical messages without decoding their payloads or modifying the session.
     pub(in crate::ai) fn read_message_count(&self, session_id: &str) -> io::Result<usize> {
         Self::validate_session_id(session_id)?;
@@ -1972,7 +1992,7 @@ pub(in crate::ai) fn generate_session_summary(first_prompt: &str) -> String {
     let combined = all_text_parts.join(" ");
     // Strip common filler prefixes so the title is more concise
     let cleaned = strip_filler_prefixes(&combined);
-    truncate_summary(&cleaned, 40)
+    truncate_summary(&cleaned, MAX_SESSION_TITLE_CHARS)
 }
 
 /// Extract text parts and the image flag from a JSON array.
@@ -1998,6 +2018,8 @@ fn extract_from_json_array(arr: &[serde_json::Value]) -> (Vec<String>, bool) {
     }
     (parts, has_image)
 }
+
+const MAX_SESSION_TITLE_CHARS: usize = 60;
 
 /// Truncate a summary to the given length, appending an ellipsis.
 fn truncate_summary(s: &str, max_len: usize) -> String {
@@ -2123,7 +2145,7 @@ pub(in crate::ai) fn normalize_generated_session_title(title: &str) -> String {
     }
     let without_agent = strip_agent_prefix(first_line);
     let without_request = strip_request_filler_prefixes(without_agent).0;
-    truncate_summary(without_request.trim(), 30)
+    truncate_summary(without_request.trim(), MAX_SESSION_TITLE_CHARS)
 }
 
 /// Remove the startup-resume prompt echo (`[resume] 当前 terminal 有 N 个挂起
@@ -2378,8 +2400,18 @@ mod tests {
         assert!(is_low_quality_session_title(bad_title));
         assert_eq!(
             normalize_generated_session_title(bad_title),
-            "a.rs这个agent的system prompt加一个限制…"
+            "a.rs这个agent的system prompt加一个限制吧"
         );
+
+        let title = "会🦀é".repeat(20);
+        assert_eq!(title.chars().count(), 60);
+        assert_eq!(normalize_generated_session_title(&title), title);
+        assert_eq!(generate_session_summary(&title), title);
+        let overlong = format!("{title}尾🦀é");
+        let truncated = format!("{title}…");
+        assert_eq!(normalize_generated_session_title(&overlong), truncated);
+        assert_eq!(generate_session_summary(&overlong), truncated);
+        assert_eq!(normalize_generated_session_title(&truncated), truncated);
 
         assert!(!is_low_quality_session_title("session title 问题排查"));
     }
@@ -2600,6 +2632,39 @@ mod tests {
                 origin: SessionTitleOrigin::Model,
             })
         );
+
+        let title = format!("请问{}题", "会🦀é".repeat(19));
+        assert_eq!(title.chars().count(), 60);
+        for origin in [SessionTitleOrigin::Model, SessionTitleOrigin::User] {
+            store
+                .write_session_title_with_origin(session_id, &title, origin)
+                .unwrap();
+            assert_eq!(
+                store.read_session_title_with_origin(session_id).unwrap(),
+                Some(super::SessionTitle {
+                    text: title.clone(),
+                    origin,
+                })
+            );
+            assert_eq!(
+                store.read_session_preview(session_id).unwrap().unwrap().0,
+                Some(title.clone())
+            );
+            assert_eq!(
+                store.list_sessions().unwrap()[0].summary,
+                Some(title.clone())
+            );
+        }
+        let overlong = format!("{title}尾🦀é");
+        store
+            .write_session_title_with_origin(session_id, &overlong, SessionTitleOrigin::User)
+            .unwrap();
+        let truncated = format!("{title}…");
+        assert_eq!(
+            store.read_session_preview(session_id).unwrap().unwrap().0,
+            Some(truncated.clone())
+        );
+        assert_eq!(store.list_sessions().unwrap()[0].summary, Some(truncated));
 
         let _ = fs::remove_dir_all(store.sessions_root());
     }

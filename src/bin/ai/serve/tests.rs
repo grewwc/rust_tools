@@ -2661,6 +2661,175 @@ async fn history_total_header_reports_precut_count() {
 }
 
 #[tokio::test]
+async fn history_timestamps_follow_canonical_rows_in_all_views() {
+    let state = lifecycle_test_state();
+    seed_rewind_session(
+        &state,
+        "timestamp-history",
+        &["user", "assistant", "tool", "user", "assistant"],
+    );
+    let store = SessionStore::new(&state.history_file);
+    let path = store.session_history_file("timestamp-history");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("DELETE FROM messages WHERE id = 3", [])
+        .unwrap();
+    conn.execute("UPDATE messages SET created_at = 1700000100 - id", [])
+        .unwrap();
+    for (limit, role, count, conclusion, user_conclusion, expected_ids) in [
+        (None, None, None, None, None, vec![1, 2, 4, 5]),
+        (Some(2), None, None, None, None, vec![4, 5]),
+        (None, Some("user"), Some(1), None, None, vec![4]),
+        (None, Some("assistant"), None, None, None, vec![2, 5]),
+        (None, None, None, Some(1), None, vec![5]),
+        (None, None, None, None, Some(1), vec![2]),
+        (None, None, None, None, Some(2), vec![5]),
+    ] {
+        let response = super::read_history(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("timestamp-history".to_string()),
+            Query(HistoryQuery {
+                limit,
+                meta: None,
+                role: role.map(str::to_string),
+                count,
+                conclusion,
+                user_conclusion,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["message_id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        for row in rows {
+            let id = row["message_id"].as_i64().unwrap();
+            assert_eq!(row["created_at"], 1700000100 - id);
+            if role == Some("user") {
+                assert_eq!(row["user_ordinal"], 2);
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(state.history_file.parent().unwrap());
+}
+
+#[test]
+fn live_done_timestamps_match_persisted_final_answer_and_replay() {
+    let state = lifecycle_test_state();
+    seed_rewind_session(&state, "timestamp-live", &["user", "assistant"]);
+    let store = SessionStore::new(&state.history_file);
+    let mut metadata =
+        super::history::ServeTurnMetadata::new(store.clone(), "timestamp-live".into());
+    assert!(
+        metadata.done_event().data.is_empty(),
+        "no new rows must not borrow the old answer time"
+    );
+    let path = store.session_history_file("timestamp-live");
+    let message = |role: &str, text: &str| crate::ai::history::Message {
+        role: role.into(),
+        content: serde_json::json!(text),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    };
+    crate::ai::history::append_history_messages(
+        &path,
+        &[
+            message("user", "user says hi"),
+            message("assistant", "assistant says hi"),
+        ],
+    )
+    .unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("UPDATE messages SET created_at = 1700000000 + id", [])
+        .unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    let done = AtomicBool::new(false);
+    let timing = super::TurnSendTiming::default();
+    let t0 = std::time::Instant::now();
+    super::forward_live_event(
+        ServeLiveEvent::Replace("assistant says hi".into()),
+        &done,
+        &tx,
+        &timing,
+        t0,
+        None,
+        Some(&mut metadata),
+    );
+    super::forward_live_event(
+        ServeLiveEvent::OutputComplete,
+        &done,
+        &tx,
+        &timing,
+        t0,
+        None,
+        Some(&mut metadata),
+    );
+    super::forward_live_event(
+        ServeLiveEvent::OutputComplete,
+        &done,
+        &tx,
+        &timing,
+        t0,
+        None,
+        Some(&mut metadata),
+    );
+    let replacement = rx.try_recv().unwrap().unwrap();
+    assert_eq!(replacement.kind, "replace");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&replacement.data).unwrap(),
+        serde_json::json!({"text": "assistant says hi"})
+    );
+    let terminal = rx.try_recv().unwrap().unwrap();
+    assert_eq!(terminal.kind, "done");
+    let payload: serde_json::Value = serde_json::from_str(&terminal.data).unwrap();
+    assert_eq!(
+        payload,
+        serde_json::json!({"message_id": 4, "created_at": 1700000004, "user_message": {"message_id": 3, "created_at": 1700000003}})
+    );
+    assert!(rx.try_recv().is_err(), "OutputComplete remains idempotent");
+    let log = state.events.begin("timestamp-live");
+    log.publish(&terminal.kind, &terminal.data);
+    let (events, _, _) = state.events.snapshot("timestamp-live", 0).unwrap();
+    assert_eq!(events[0].data, terminal.data);
+    metadata.record_committed_answer(r#"{"text":"unpersisted answer"}"#);
+    let unmatched: serde_json::Value = serde_json::from_str(&metadata.done_event().data).unwrap();
+    assert!(unmatched.get("created_at").is_none());
+    crate::ai::history::append_history_messages(&path, &[message("user", "unanswered")]).unwrap();
+    metadata.record_committed_answer(r#"{"text":"assistant says hi"}"#);
+    let unanswered: serde_json::Value = serde_json::from_str(&metadata.done_event().data).unwrap();
+    assert!(
+        unanswered.get("created_at").is_none(),
+        "a later unanswered input cannot reuse a prior conclusion"
+    );
+    let missing = crate::ai::history::StoredMessage {
+        message: message("assistant", "answer"),
+        message_id: 9,
+        created_at: None,
+    };
+    assert!(
+        super::history::serve_stored_history_message(&missing)
+            .unwrap()
+            .get("created_at")
+            .is_none()
+    );
+    assert!(
+        super::history::serve_done_metadata(&[missing], Some("answer"))
+            .get("created_at")
+            .is_none()
+    );
+    let _ = std::fs::remove_dir_all(state.history_file.parent().unwrap());
+}
+
+#[tokio::test]
 async fn history_redacts_inline_image_payloads() {
     use crate::ai::history::{Message, append_history_messages};
     use axum::{
@@ -3811,6 +3980,7 @@ fn live_fifo_pump_forwards_frames_and_ends_turn_early() {
             &tx,
             super::TurnSendTiming::default(),
             std::time::Instant::now(),
+            None,
             None,
         )
     });

@@ -200,7 +200,7 @@ function assertTask(panel, expected) {
 
 for (const phone of [false, true]) for (const mode of ["live", "replay", "history", "cold"]) {
   const label = mode + " " + (phone ? "phone" : "desktop");
-  for (const width of phone ? [390, 700] : [701, 1280]) test("structured subagent row double tap respects the desktop breakpoint, " + label + " " + width + "px", () => {
+  for (const width of phone ? [390, 700] : [701, 1280]) test("structured subagent row double tap collapses its own card at every width, " + label + " " + width + "px", () => {
     const h = harness({ phone, width }), expected = reportedTask("task_collapse");
     h.emit(mode, "raw task result", "task_wait", { task_report: report([expected]) });
     const panel = taskCard(h), details = panel.parentNode.querySelector("details");
@@ -222,16 +222,16 @@ for (const phone of [false, true]) for (const mode of ["live", "replay", "histor
     assert.equal(details.open, true, "a single click leaves the report open");
     h.clock.now += 100;
     assert.equal(click(body, 2).defaultPrevented, false, "task text retains native selection events");
-    assert.equal(details.open, phone, "only desktop closes the sibling disclosure; mobile retains its open state");
-    if (!phone) details.fire("toggle");
+    assert.equal(details.open, false, "the sibling disclosure closes at every width");
+    details.fire("toggle");
     assert.equal(rawDetails.open, true, "the separate tool disclosure must stay open");
     if (mode === "live" || mode === "replay") {
-      assert.equal(vm.runInContext('foldOpenByKey.get("subagents")', h.context), phone);
+      assert.equal(vm.runInContext('foldOpenByKey.get("subagents")', h.context), false);
     } else {
       const cold = harness({ phone, width, storage: new Map(h.storage) });
       cold.emit("cold", "raw task result", "task_wait", { task_report: report([expected]) });
-      assert.equal(taskCard(cold).parentNode.querySelector("details").open, phone,
-        "canonical reconstruction must retain the desktop collapse or the untouched mobile expansion");
+      assert.equal(taskCard(cold).parentNode.querySelector("details").open, false,
+        "canonical reconstruction must retain the collapse at every width");
     }
   });
   test("structured task placement: distinct spawn and wait put one detail card after wait, " + label, () => {

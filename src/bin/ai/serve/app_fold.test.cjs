@@ -136,7 +136,7 @@ viewportTest("an expanded task card collapses on a double tap in its report rows
   const row = node("DIV");
   row.parentNode = fold.card;
   doubleTap(h, row);
-  assert.equal(fold.details.open, width <= 700, "desktop closes the card; phones keep it open");
+  assert.equal(fold.details.open, false, "the card closes at every width");
 });
 
 viewportTest("subagent summary single clicks and keyboard activation retain native toggles", (width) => {
@@ -216,13 +216,13 @@ viewportTest("the innermost open fold collapses first", (width) => {
   assert.equal(outer.details.open, false);
 });
 
-viewportTest("subagent sibling rows keep the old ancestor collapse owner on mobile", (width) => {
+viewportTest("subagent sibling rows collapse their own card at every width", (width) => {
   const h = harness({ width }), outer = makeFold(true), inner = makeFold(true, true), row = node("DIV");
   inner.card.parentNode = outer.body;
   row.parentNode = inner.card;
   doubleTap(h, row);
-  assert.equal(inner.details.open, width <= 700);
-  assert.equal(outer.details.open, width >= 701, "mobile must retain the pre-existing ancestor search");
+  assert.equal(inner.details.open, false);
+  assert.equal(outer.details.open, true, "the outer fold stays open at every width");
 });
 
 test("subagent summary double-click collapses on both sides of the phone breakpoint", () => {

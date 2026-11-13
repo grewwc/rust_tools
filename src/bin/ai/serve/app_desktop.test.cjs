@@ -148,7 +148,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
   document.createElement = node;
   const elements = {};
   for (const [id, tag] of [
-    ["sesslist", "ul"], ["sesscount", "div"], ["sesstitle", "div"], ["sesscwd", "span"], ["sessmeta", "div"],
+    ["sesslist", "ul"], ["sesscount", "div"], ["sessall", "button"], ["sessmarked", "button"], ["sesstitle", "div"], ["sesscwd", "span"], ["sessmeta", "div"],
     ["prompt", "textarea"], ["msgs", "div"], ["promptlist", "ol"], ["promptcount", "span"], ["newbtn", "button"], ["fork", "button"],
     ["refresh", "button"], ["del", "button"], ["omodel", "select"], ["oagent", "select"], ["oeffort", "select"],
     ["composer", "div"], ["img", "button"], ["sidenote", "button"], ["send", "button"], ["turnstatus", "div"],
@@ -287,6 +287,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
   vm.runInContext(marked("composer send"), context);
   vm.runInContext(between('$("newbtn").onclick =', '$("img").onclick ='), context);
   context.wireSessionActions();
+  context.wireSessionMarkedFilter();
   context.renderSessionList(context.lastItems);
   context.renderSessionBar();
   const drafts = vm.runInContext("composerDrafts", context);
@@ -384,6 +385,65 @@ test("desktop single row body click selects the session", async () => {
   assert.equal(h.configLoads(), 1);
   assert.deepEqual(h.drawers, []);
   assert.deepEqual(h.requests, []);
+});
+
+test("desktop star filter keeps the active session, scroll and filter state across refreshes", async () => {
+  const h = harness({ marked: true, sid: "target-session" });
+  h.elements.sesslist.scrollTop = 64;
+  h.dispatch(h.elements.sessmarked, "click");
+  assert.equal(h.elements.sesslist.children.length, 1);
+  assert.equal(h.row().classList.contains("cur"), true);
+  assert.equal(h.title().getAttribute("aria-current"), "true");
+  assert.equal(h.context.sessionId, "target-session");
+  assert.equal(h.elements.sesslist.scrollTop, 64);
+  assert.equal(h.elements.sesscount.textContent, "2 sessions · showing 1");
+  assert.equal(h.elements.sessmarked.getAttribute("aria-pressed"), "true");
+  assert.equal(h.elements.sessall.getAttribute("aria-pressed"), "false");
+  await h.context.loadSessions();
+  assert.equal(h.elements.sesslist.children.length, 1);
+  assert.equal(h.context.sessionId, "target-session");
+  h.dispatch(h.elements.sessall, "click");
+  assert.equal(h.elements.sesslist.children.length, 2);
+  assert.equal(h.elements.sesscount.textContent, "2 sessions");
+});
+
+test("star filters combine with title search and stay inactive on phones", () => {
+  const h = harness({ marked: true });
+  vm.runInContext('sessFilter = "open"', h.context);
+  h.dispatch(h.elements.sessmarked, "click");
+  assert.equal(h.elements.sesslist.children[0].textContent, "没有匹配的星标会话");
+  assert.equal(h.context.sessionId, "open-session");
+  h.media.matches = true;
+  h.media.listeners.forEach((listener) => listener());
+  assert.equal(h.elements.sesslist.children.length, 1);
+  assert.equal(h.row("open-session").classList.contains("cur"), true);
+  h.media.matches = false;
+  h.media.listeners.forEach((listener) => listener());
+  assert.equal(h.elements.sesslist.children[0].textContent, "没有匹配的星标会话");
+  assert.equal(h.elements.sessmarked.getAttribute("aria-pressed"), "true");
+});
+
+test("unmarking a filtered session updates the empty state without changing selection", async () => {
+  const h = harness({ marked: true, sid: "target-session" });
+  h.dispatch(h.elements.sessmarked, "click");
+  await h.dispatch(h.row().querySelector(".mk"), "click").done;
+  assert.equal(h.elements.sesslist.children[0].textContent, "暂无星标会话");
+  assert.equal(h.elements.sesscount.textContent, "2 sessions · showing 0");
+  assert.equal(h.context.sessionId, "target-session");
+  h.dispatch(h.elements.sessall, "click");
+  assert.equal(h.row().classList.contains("cur"), true);
+  assert.equal(h.row().querySelector(".mk").getAttribute("aria-pressed"), "false");
+});
+
+test("star filter chrome belongs to desktop and keeps the count beside compact buttons", () => {
+  assert.equal(cssRule(baseCss, "#sessmarkfilter").display, "none");
+  assert.equal(cssRule(desktopCss, "#sessmarkfilter").display, "flex");
+  assert.equal(cssRule(desktopCss, "#sessfilterrow")["flex-wrap"], "wrap");
+  assert.equal(cssRule(desktopCss, "#sessfilterrow > #sesscount").padding, "0");
+  assert.deepEqual(cssRule(phoneCss, "#sessmarkfilter"), {});
+  assert.match(html, /id="sessmarkfilter" role="group" aria-label="会话星标筛选"/);
+  assert.match(html, /id="sessall" type="button" aria-pressed="true">全部/);
+  assert.match(html, /id="sessmarked" type="button" aria-pressed="false">仅星标/);
 });
 
 for (const key of ["Enter", " "]) test("desktop focused title " + JSON.stringify(key) + " opens the session without marking", async () => {
@@ -709,20 +769,23 @@ for (const phone of [true, false]) test((phone ? "phone" : "desktop") + " sessio
     assert.equal(bar.display, "grid");
     assert.equal(bar["grid-template-columns"], "minmax(0,1fr) auto");
     assert.equal(bar["flex-shrink"], "0");
-    assert.equal(title["grid-column"], "1 / -1");
+    assert.equal(title["grid-column"], "1");
+    assert.equal(title["grid-row"], "1");
     assert.equal(title["min-width"], "0");
     assert.equal(title["white-space"], "normal");
     assert.equal(title["overflow-wrap"], "anywhere");
     assert.equal(title.display, "-webkit-box");
     assert.equal(title["-webkit-box-orient"], "vertical");
     assert.equal(title["-webkit-line-clamp"], "2");
-    assert.equal(title["line-height"], "1.4");
-    assert.equal(title["max-height"], "2.8em");
-    assert.equal(cwd["grid-column"], "1 / -1");
+    assert.equal(title["line-height"], "1.3");
+    assert.equal(title["max-height"], "2.6em");
+    assert.equal(cwd["grid-column"], "1");
+    assert.equal(cwd["grid-row"], "2");
     assert.equal(cwd["max-width"], "none");
-    assert.equal(meta["min-width"], "0");
-    assert.equal(meta.overflow, "hidden");
-    assert.equal(meta["text-overflow"], "ellipsis");
+    assert.deepEqual(cssRule(phoneCss, "#sessmeta"), { display: "none" });
+    assert.equal(meta.display, "none");
+    assert.equal(responsiveRule("#questionbtn", true)["grid-column"], "2");
+    assert.equal(responsiveRule("#questionbtn", true)["grid-row"], "1 / 3");
     assert.equal(responsiveRule("#questionbtn.show", true).display, "grid");
   } else {
     assert.equal(bar.display, "flex");
@@ -894,6 +957,108 @@ function loadChat(h) {
   ]) vm.runInContext(between(start, end), h.context);
 }
 
+test("prompt navigation uses user text and excludes the timestamp label", () => {
+  const h = harness(), row = h.document.createElement("div"), bubble = h.document.createElement("div");
+  vm.runInContext(between("function promptNavHasOlder(", 'if ($("promptlist") && typeof $("promptlist").addEventListener'), h.context);
+  row.className = "user-msg-row";
+  bubble.className = "msg user";
+  bubble.dataset.question = "问题\n原文";
+  bubble.dataset.historyIndex = "0";
+  bubble.textContent = "问题\n原文";
+  const time = h.document.createElement("time");
+  time.className = "message-time";
+  time.textContent = "09:05";
+  bubble.appendChild(time);
+  row.appendChild(bubble);
+  row.querySelector = (selector) => selector === ".msg.user" ? bubble : null;
+  h.elements.msgs.appendChild(row);
+  h.context.syncPromptNav();
+  const entry = h.elements.promptlist.children[0];
+  assert.equal(entry.querySelector(".pnt").textContent, "问题 原文");
+  assert.equal(entry.querySelector("button").title, "问题 原文");
+  assert.equal(entry.dataset.historyIndex, "0");
+});
+
+const answerCardSelector = ".msg.asst.md:not(.pending):not(.err):not(.git-output)";
+const warmAnswerCardSelector = ':root[data-theme="warm"] ' + answerCardSelector;
+
+// Match only the compound class selector under test, without pretending that
+// the DOM fixture or the CSS property reader implements the browser cascade.
+function matchesAnswerCard(element) {
+  const excluded = [...answerCardSelector.matchAll(/:not\(\.([\w-]+)\)/g)].map((match) => match[1]);
+  const required = [...answerCardSelector.replace(/:not\([^)]*\)/g, "").matchAll(/\.([\w-]+)/g)].map((match) => match[1]);
+  return required.every((name) => element.classList.contains(name)) &&
+    excluded.every((name) => !element.classList.contains(name));
+}
+
+test("desktop completed Markdown answers have stronger card borders in history and live send", async () => {
+  assert.deepEqual(cssRule(desktopCss, answerCardSelector), {
+    border: "2px solid var(--control-border)",
+    padding: "8px 12px", "border-radius": "var(--radius-card)",
+  });
+  assert.equal(responsiveRule(".msg.asst").background, "var(--panel)");
+  assert.deepEqual(cssRule(desktopCss, warmAnswerCardSelector), {});
+  for (const selector of [".msg.asst:not(.git-output)", ':root[data-theme="light"] .msg.asst:not(.git-output)']) {
+    assert.ok(desktopCss.indexOf(answerCardSelector + " {") > desktopCss.indexOf(selector + " {"),
+      "the answer border follows the passive card edge rules");
+  }
+  for (const width of [701, 1280]) {
+    const h = harness();
+    const matchMedia = h.context.window.matchMedia;
+    h.context.window.matchMedia = (query) => query === "(min-width:701px)"
+      ? { matches: width >= 701 } : matchMedia(query);
+    loadChat(h);
+    vm.runInContext(between("function addMsgMd(", "// --- server-side media"), h.context);
+    h.context.addAnswerCopy = () => {};
+    const text = "Rendered Markdown answer";
+    const messages = [{ role: "assistant", content: text }];
+    for (const row of h.context.historyRowsOf(messages, messages.length, true).rows) {
+      h.context.renderHistoryRow(row, h.elements.msgs);
+    }
+    const historical = h.elements.msgs.querySelector(".md");
+    assert.equal(historical.textContent, text, "history executes the real Markdown builder at " + width);
+    assert.equal(matchesAnswerCard(historical), true);
+    const fetch = h.context.fetch;
+    h.context.fetch = async (url, options) => {
+      if (!new URL(url).pathname.endsWith("/turns/stream")) return fetch(url, options);
+      let read = false;
+      return { ...response({}), body: { getReader: () => ({
+        read: async () => read ? { done: true } : (read = true, {
+          done: false, value: Buffer.from('event: delta\ndata: {"delta":"Live Markdown answer"}\n\nevent: done\ndata: \n\n'),
+        }), cancel() {},
+      }) } };
+    };
+    h.elements.prompt.value = "show answer";
+    await h.context.send();
+    const live = h.elements.msgs.querySelectorAll(".md").find((node) => node !== historical && !node.hidden);
+    assert.ok(live, "send leaves a visible Markdown answer at " + width);
+    assert.equal(live.innerHTML, "Live Markdown answer", "the reply retains its rendered body alongside its rate footer");
+    assert.equal(matchesAnswerCard(live), true);
+  }
+});
+
+test("desktop answer cards exclude pending errors folds git output and recovered progress", () => {
+  assert.ok(Object.keys(cssRule(desktopCss, answerCardSelector)).length > 0);
+  const h = harness();
+  for (const className of [
+    "msg asst md pending", "msg asst md err", "msg asst", "msg asst execution-group",
+    "msg asst tool-activity git-output", "msg asst md git-output", "prog", "task-output",
+  ]) {
+    const node = h.document.createElement("div");
+    node.className = className;
+    assert.equal(matchesAnswerCard(node), false, className + " keeps its existing appearance");
+  }
+  assert.equal(matchesAnswerCard(h.document.createElement("details")), false);
+});
+
+for (const width of [390, 700]) test("phone Markdown answer cards gain no CSS override at " + width + "px", () => {
+  for (const selector of [answerCardSelector, warmAnswerCardSelector]) {
+    assert.deepEqual(cssRule(baseCss, selector), {});
+    assert.deepEqual(cssRule(phoneCss, selector), {});
+  }
+  assert.equal(responsiveRule(".msg.asst", true).background, "var(--panel)");
+});
+
 function sessionFoldHarness(width) {
   const h = harness({ phone: width <= 700 }), pendingToggles = new Set(), historyLoads = [];
   const createElement = h.document.createElement;
@@ -990,7 +1155,7 @@ function sessionFoldHarness(width) {
 test("completed execution groups add vertical breathing room without changing the shared gutter on both layouts", () => {
   for (const phone of [false, true]) {
     const items = responsiveRule(".execution-group > details > .execution-items", phone);
-    assert.equal(items.padding, "16px", "the same inset applies on every side");
+    assert.equal(items.padding, phone ? "8px" : "16px", "each layout uses the same inset on every side");
     assert.deepEqual([items.background, items.border, items["border-radius"]], [undefined, undefined, undefined],
       "the merged rows keep the shared card surface instead of a nested well");
     const summary = responsiveRule(".msg.asst.execution-group > details > summary", phone);
@@ -999,8 +1164,39 @@ test("completed execution groups add vertical breathing room without changing th
   // The stylesheet has multiple media blocks, so enumerate every gap rule
   // rather than relying on the fixture's slices around the first media block.
   const turnRules = [...css.matchAll(/(?:^|\n)\s*\.turn\s*\{[^}]*\}/g)];
-  assert.deepEqual(turnRules.map(([rule]) => cssRule(rule, ".turn").gap), ["8px", "12px", "8px"],
-    "base, shared visual and phone card spacing declarations stay unchanged");
+  assert.deepEqual(turnRules.map(([rule]) => cssRule(rule, ".turn").gap), ["8px", "12px", "8px", "4px"],
+    "base and desktop spacing stay intact while the phone uses a compact gap");
+});
+
+test("phone chrome and card spacing stay compact with readable text and full touch targets", () => {
+  assert.equal(cssRule(phoneCss, "header").padding, "4px 8px");
+  assert.equal(cssRule(phoneCss, "header")["padding-top"], "calc(4px + env(safe-area-inset-top))");
+  assert.equal(cssRule(phoneCss, "header")["flex-shrink"], "0");
+  assert.equal(cssRule(phoneCss, "header").gap, "5px");
+  assert.equal(cssRule(phoneCss, "header b")["font-size"], "18px");
+  assert.equal(cssRule(phoneCss, "#info")["font-size"], "11px");
+  assert.equal(responsiveRule("header button", true)["min-height"], "44px");
+  assert.equal(cssRule(phoneCss, "#sessbar").padding, "4px 10px");
+  assert.equal(cssRule(phoneCss, "#sessbar")["row-gap"], "2px");
+  assert.equal(cssRule(phoneCss, "#sesstitle")["font-size"], "12px");
+  assert.equal(cssRule(phoneCss, "#sesscwd")["font-size"], "11px");
+  assert.equal(cssRule(phoneCss, "#sesscwd")["line-height"], "1.3");
+  assert.equal(cssRule(phoneCss, "#sessmeta").display, "none");
+  assert.deepEqual(cssRule(phoneCss, "#msgs"), { padding: "8px", gap: "6px", "scroll-padding-block": "8px" });
+  assert.equal(cssRule(phoneCss, "#chat")["min-height"], "0");
+  assert.equal(cssRule(phoneCss, ".turn").gap, "4px");
+  assert.equal(cssRule(phoneCss, ".msg").padding, "6px 10px");
+  assert.equal(cssRule(phoneCss, ".msg")["line-height"], "1.5");
+  assert.equal(cssRule(phoneCss, ".msg")["border-radius"], "12px");
+  assert.equal(cssRule(phoneCss, ".msg")["scroll-margin-block"], "8px");
+  assert.deepEqual(cssRule(phoneCss, ".msg details summary"), { "min-height": "30px", padding: "6px 2px" });
+  assert.deepEqual(cssRule(phoneCss, ".message-time"), { "font-size": "12px", "scroll-margin-block": "8px" });
+  assert.equal(cssRule(phoneCss, ".msg.md .p").margin, "4px 0");
+  assert.equal(cssRule(phoneCss, ".msg.md .h").margin, "8px 0 4px");
+  assert.equal(cssRule(phoneCss, "#ovrwrap > summary").padding, "2px 10px");
+  assert.equal(cssRule(phoneCss, "#composer").margin, "6px 8px");
+  assert.equal(cssRule(phoneCss, "#composer").padding, "6px 8px calc(6px + env(safe-area-inset-bottom))");
+  assert.equal(cssRule(phoneCss, "#composer")["border-radius"], "16px");
 });
 
 for (const width of [390, 1280]) {

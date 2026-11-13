@@ -512,6 +512,8 @@ async fn post_turn_sse(
             title_seed.clone(),
         );
         let event_log = bus.begin(&bus_session);
+        let turn_metadata =
+            history::ServeTurnMetadata::new(SessionStore::new(&history_file), bus_session.clone());
         tokio::spawn(async move {
             let mut client_alive = true;
             while let Some(item) = raw_rx.recv().await {
@@ -542,6 +544,7 @@ async fn post_turn_sse(
                 session_cwd,
                 term_cols,
                 child_title_seed,
+                turn_metadata,
             )
         })
         .await;
@@ -580,6 +583,7 @@ fn stream_child_turn(
     session_cwd: std::path::PathBuf,
     term_cols: Option<u16>,
     title_seed: SessionTitleSeed,
+    turn_metadata: history::ServeTurnMetadata,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -697,6 +701,7 @@ fn stream_child_turn(
                     pump_timing,
                     t0,
                     pump_confirm,
+                    Some(turn_metadata),
                 )
             })
         });
@@ -1182,12 +1187,14 @@ fn forward_live_event(
     timing: &TurnSendTiming,
     t0: std::time::Instant,
     confirm: Option<&std::sync::Mutex<ConfirmSlot>>,
+    metadata: Option<&mut history::ServeTurnMetadata>,
 ) {
     timing.stamp_first(t0);
     if matches!(event, ServeLiveEvent::OutputComplete) {
         if !turn_done.swap(true, std::sync::atomic::Ordering::SeqCst) {
             timing.stamp_done(t0);
-            let _ = tx.blocking_send(Ok(done_event()));
+            let done = metadata.map_or_else(done_event, |metadata| metadata.done_event());
+            let _ = tx.blocking_send(Ok(done));
         }
         return;
     }
@@ -1270,6 +1277,11 @@ fn forward_live_event(
             None => return,
         },
     };
+    if let Some(metadata) = metadata
+        && sse.kind == "replace"
+    {
+        metadata.record_committed_answer(&sse.data);
+    }
     let _ = tx.blocking_send(Ok(sse));
 }
 
@@ -1288,6 +1300,7 @@ fn pump_live_fifo(
     timing: TurnSendTiming,
     t0: std::time::Instant,
     confirm: Option<Arc<std::sync::Mutex<ConfirmSlot>>>,
+    mut metadata: Option<history::ServeTurnMetadata>,
 ) {
     use std::os::fd::AsRawFd;
     let fd = reader.as_raw_fd();
@@ -1322,7 +1335,15 @@ fn pump_live_fifo(
         if n == 0 {
             if child_done.load(std::sync::atomic::Ordering::SeqCst) {
                 for event in decoder.finish() {
-                    forward_live_event(event, turn_done, tx, &timing, t0, confirm.as_deref());
+                    forward_live_event(
+                        event,
+                        turn_done,
+                        tx,
+                        &timing,
+                        t0,
+                        confirm.as_deref(),
+                        metadata.as_mut(),
+                    );
                 }
                 break;
             }
@@ -1331,7 +1352,15 @@ fn pump_live_fifo(
             continue;
         }
         for event in decoder.push(&buf[..n as usize]) {
-            forward_live_event(event, turn_done, tx, &timing, t0, confirm.as_deref());
+            forward_live_event(
+                event,
+                turn_done,
+                tx,
+                &timing,
+                t0,
+                confirm.as_deref(),
+                metadata.as_mut(),
+            );
         }
     }
 }

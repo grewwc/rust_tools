@@ -86,6 +86,92 @@ fn msg(role: &str, text: &str) -> Message {
     }
 }
 
+#[test]
+fn stored_message_timestamps_follow_canonical_ids() {
+    let dir = std::env::temp_dir().join(format!("stored-timestamps-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    assert_eq!(read_message_watermark_sqlite(&path).unwrap(), 0);
+    assert!(!path.exists());
+    append_history_sqlite(
+        &path,
+        vec![
+            msg("user", "repeat"),
+            msg("tool", "removed"),
+            msg("user", "repeat"),
+            msg("assistant", "answer"),
+        ],
+    )
+    .unwrap();
+    let conn = open_history_db(&path).unwrap();
+    conn.execute("DELETE FROM messages WHERE id = 2", [])
+        .unwrap();
+    conn.execute("UPDATE messages SET created_at = 1700000100 - id", [])
+        .unwrap();
+    let stored = read_stored_messages_sqlite(&path, 0).unwrap();
+    assert_eq!(
+        stored
+            .iter()
+            .map(|row| (row.message_id, row.created_at))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, Some(1700000099)),
+            (3, Some(1700000097)),
+            (4, Some(1700000096))
+        ]
+    );
+    assert_eq!(stored[0].message, stored[1].message);
+    assert_eq!(
+        stored
+            .iter()
+            .map(|row| row.message.clone())
+            .collect::<Vec<_>>(),
+        read_all_messages_sqlite(&path).unwrap()
+    );
+    assert_eq!(read_message_watermark_sqlite(&path).unwrap(), 4);
+    assert_eq!(
+        read_stored_messages_sqlite(&path, 1)
+            .unwrap()
+            .iter()
+            .map(|row| row.message_id)
+            .collect::<Vec<_>>(),
+        vec![3, 4]
+    );
+    assert!(read_stored_messages_sqlite(&path, 4).unwrap().is_empty());
+    assert!(
+        serde_json::to_value(&stored[0].message)
+            .unwrap()
+            .get("created_at")
+            .is_none()
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn stored_message_missing_timestamps_stay_absent() {
+    let dir = std::env::temp_dir().join(format!("stored-no-timestamps-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE messages (id INTEGER PRIMARY KEY, role TEXT, content TEXT, tool_calls TEXT, tool_call_id TEXT, reasoning_content TEXT, created_at INTEGER); INSERT INTO messages(id, role, content) VALUES(7, 'user', '\"legacy\"');").unwrap();
+    let stored = read_stored_messages_sqlite(&path, 0).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].message_id, 7);
+    assert_eq!(stored[0].created_at, None);
+    conn.execute("UPDATE messages SET created_at = 'unknown'", [])
+        .unwrap();
+    assert_eq!(
+        read_stored_messages_sqlite(&path, 0).unwrap()[0].created_at,
+        None
+    );
+    conn.execute("ALTER TABLE messages DROP COLUMN created_at", [])
+        .unwrap();
+    let missing_column = read_stored_messages_sqlite(&path, 0).unwrap();
+    assert_eq!(missing_column[0].created_at, None);
+    assert_eq!(missing_column[0].message, stored[0].message);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn tool_msg(id: &str, text: &str) -> Message {
     let mut message = msg("tool", text);
     message.tool_call_id = Some(id.to_string());

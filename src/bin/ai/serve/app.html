@@ -219,6 +219,8 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessdelconfirm { color:var(--err); border-color:var(--err); }
 #sessfilter { margin:8px 8px 0; padding:6px 8px; font-size:13px; width:calc(100% - 16px); box-sizing:border-box; }
 #sesscount { padding:4px 12px 0; color:var(--dim); font-size:12px; }
+#sessfilterrow { display:contents; }
+#sessmarkfilter { display:none; }
 #scrim { display:none; }
 /* The override wrapper is transparent by default; the width queries below
    give it a phone summary row or a desktop row with the team entry. */
@@ -681,6 +683,9 @@ select, summary { touch-action:manipulation; }
    pre-wrap source view the other bubbles keep. */
 .msg.md { white-space:normal; }
 .msg.md .answer-actions { display:flex; justify-content:flex-end; align-items:center; gap:8px; margin-top:8px; }
+.message-time { display:block; flex:0 0 auto; color:var(--dim); font-size:11px; font-weight:var(--fw-meta); line-height:1.4; font-variant-numeric:tabular-nums; white-space:nowrap; }
+.msg.user > .message-time { margin-top:4px; color:inherit; opacity:.8; text-align:right; }
+.answer-actions > .message-time { margin-right:auto; }
 /* Throughput is a footer inside an assistant card. Phones use their existing
    status card while running, then keep this footer with the completed turn. */
 .turn-rate { flex:0 0 auto; max-width:100%; margin-top:8px; color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums; white-space:normal; overflow-wrap:anywhere; }
@@ -954,6 +959,10 @@ button:active:not(:disabled) { filter:brightness(.96); }
   .msg.asst:not(.git-output) {
     border-color:var(--card-edge); border-radius:var(--radius-card); box-shadow:var(--card-shadow);
   }
+  .msg.asst.md:not(.pending):not(.err):not(.git-output) {
+    border:2px solid var(--control-border);
+    padding:8px 12px; border-radius:var(--radius-card);
+  }
   .msg.asst.tool-activity[data-running="true"] { border-color:var(--acc-line); }
   .execution-group > details > summary:focus-visible {
     outline:2px solid var(--acc-focus); outline-offset:2px;
@@ -984,6 +993,13 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #skillhint { display:none; }
   .modelrowcheck { border-color:var(--control-border); }
   #sesscount { padding-left:16px; }
+  #sessfilterrow { display:flex; flex-wrap:wrap; align-items:center; gap:6px; padding:6px 12px; }
+  #sessfilterrow > #sesscount { flex:1 1 auto; padding:0; }
+  #sessmarkfilter { display:flex; flex:0 0 auto; gap:2px; padding:2px; border:1px solid var(--line); border-radius:8px; }
+  #sessmarkfilter button { min-height:26px; padding:2px 7px; border:0; border-radius:6px; background:transparent; color:var(--dim); font-size:11px; }
+  #sessmarkfilter button[aria-pressed="true"] { background:var(--tint-3); color:var(--fg); }
+  #sessions li.session-empty { color:var(--dim); font-size:12px; }
+  #sessions li.session-more button { width:100%; padding:6px; color:var(--dim); font-size:12px; }
   #sessions .rowbtns { flex-shrink:0; }
   #sessions .rowbtns button:hover:not(:disabled),
   #sessions .rowbtns button:focus-visible { background:var(--surface-hover); }
@@ -1169,19 +1185,20 @@ button:active:not(:disabled) { filter:brightness(.96); }
 @media (max-width:700px) {
   #pickpopmenu { bottom:calc(84px + env(safe-area-inset-bottom)); width:calc(100vw - 20px); }
   .pickrow { min-height:46px; }
-  header { padding-left:10px; padding-right:10px; gap:6px; }
+  header { flex-shrink:0; padding:4px 8px; padding-top:calc(4px + env(safe-area-inset-top)); gap:5px; }
+  header b { font-size:18px; }
+  #info { font-size:11px; }
   header button { min-width:44px; min-height:44px; padding:0 10px; }
-  /* Keep session metadata from consuming the title's reading width. */
-  #sessbar { display:grid; grid-template-columns:minmax(0,1fr) auto; row-gap:4px; flex-shrink:0; }
+  /* Keep the title and path beside the question button without a metadata row. */
+  #sessbar { display:grid; grid-template-columns:minmax(0,1fr) auto; row-gap:2px; flex-shrink:0; padding:4px 10px; }
   #sesstitle {
-    grid-column:1 / -1; min-width:0; white-space:normal; overflow-wrap:anywhere;
+    grid-column:1; grid-row:1; min-width:0; white-space:normal; overflow-wrap:anywhere;
     display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2;
-    line-height:1.4; max-height:2.8em;
+    font-size:12px; line-height:1.3; max-height:2.6em;
   }
-  /* A path is one unbroken token on the phone; give it its own row instead of
-     letting it squeeze the metadata or the question button. */
-  #sesscwd { grid-column:1 / -1; max-width:none; }
-  #sessmeta { min-width:0; overflow:hidden; text-overflow:ellipsis; }
+  #sesscwd { grid-column:1; grid-row:2; max-width:none; font-size:11px; line-height:1.3; }
+  #sessmeta { display:none; }
+  #questionbtn { grid-column:2; grid-row:1 / 3; align-self:center; width:44px; min-width:44px; height:44px; }
   #apkdownload {
     display:grid; flex:0 0 44px; width:44px; height:44px; place-items:center;
     border:1px solid var(--line); border-radius:14px; background:var(--surface);
@@ -1202,7 +1219,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #sessfilter { padding:10px 8px; }
   /* Override picks collapse into one summary row showing the current picks. */
   #ovrwrap { display:block; border-top:1px solid var(--line); background:var(--panel); }
-  #ovrwrap > summary { display:flex; align-items:center; gap:8px; min-height:48px; padding:6px 12px; font-size:12px; color:var(--dim); white-space:nowrap; }
+  #ovrwrap > summary { display:flex; align-items:center; gap:8px; min-height:48px; padding:2px 10px; font-size:12px; color:var(--dim); white-space:nowrap; }
   #teamtrigger { min-height:44px; padding:0 12px; gap:6px; background:var(--surface-2); }
   #ovrsummary { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
   #ovr { flex-direction:column; align-items:stretch; gap:10px; padding:4px 12px 12px; }
@@ -1214,14 +1231,23 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #ovrsummaryline #teamcontrols { display:flex; }
   .modelrow { min-height:56px; }
   #oskill { min-height:46px; padding:10px 12px; font-size:15px; }
-  #msgs { padding:14px 12px; gap:14px; }
+  /* Reveal targets inside the transcript's own scrollport below the fixed
+     chrome, with room for message timestamps and focus outlines. */
+  #chat { min-height:0; }
+  #msgs { padding:8px; gap:6px; scroll-padding-block:8px; }
+  .turn { gap:4px; }
   #modelpickclose, #questionclose { width:44px; height:44px; min-width:44px; min-height:44px; }
   #modelpicksearchclear { width:44px; height:44px; right:5px; }
   #modelpicksearch { padding-right:52px; }
   #jumpbottom { display:grid; }
   #jumpbottom.show { opacity:1; transform:translateY(0) scale(1); pointer-events:auto; }
   #questionbtn.show { display:grid; }
-  .msg { max-width:94%; }
+  .msg { max-width:94%; padding:6px 10px; border-radius:12px; line-height:1.5; scroll-margin-block:8px; }
+  .msg details summary { min-height:30px; padding:6px 2px; }
+  .execution-group > details > .execution-items { padding:8px; }
+  .msg.md .p { margin:4px 0; }
+  .msg.md .h { margin:8px 0 4px; }
+  .message-time { font-size:12px; scroll-margin-block:8px; }
   .user-msg-row {
     display:flex; align-items:center; align-self:flex-end; justify-content:flex-end;
     max-width:94%; gap:7px;
@@ -1241,8 +1267,8 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #composer {
     display:grid; grid-template-columns:42px minmax(0,1fr) 42px;
     grid-template-areas:"image prompt send";
-    align-items:end; gap:8px; margin:8px 10px; padding:10px 8px calc(10px + env(safe-area-inset-bottom));
-    border:1px solid var(--line); border-radius:20px;
+    align-items:end; gap:8px; margin:6px 8px; padding:6px 8px calc(6px + env(safe-area-inset-bottom));
+    border:1px solid var(--line); border-radius:16px;
     background:linear-gradient(180deg, var(--composer-a) 0%, var(--composer-b) 100%);
     box-shadow:var(--shadow-panel);
   }
@@ -1342,7 +1368,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <div id="views">
 <div id="scrim"></div>
 <nav id="sessions"><input id="sessfilter" placeholder="filter sessions…" autocomplete="off">
-<div id="sesscount"></div><ul id="sesslist"></ul>
+<div id="sessfilterrow"><div id="sesscount"></div><div id="sessmarkfilter" role="group" aria-label="会话星标筛选"><button id="sessall" type="button" aria-pressed="true">全部</button><button id="sessmarked" type="button" aria-pressed="false">仅星标</button></div></div><ul id="sesslist"></ul>
 <details id="promptnav">
 <summary><span class="pnlabel">会话提问</span><span id="promptcount" class="pncount"></span></summary>
 <ol id="promptlist"></ol>
@@ -2265,9 +2291,6 @@ function collapseFoldForTap(event) {
   if (!event.detail) return;
   const target = event.target;
   if (!target || !target.closest || target.closest("button, a, input, select, textarea")) return;
-  // Structured subagent rows own the ancestor collapse only on desktop; ordinary
-  // folds do not.
-  const desktop = !!(window.matchMedia && window.matchMedia("(min-width:701px)").matches);
   const summary = target.closest("summary");
   if (summary) {
     // A subagent summary is the only fold whose double-click must collapse it on
@@ -2288,10 +2311,9 @@ function collapseFoldForTap(event) {
   lastFoldTap = double ? { at: 0, x: 0, y: 0 } : { at: now, x: event.clientX, y: event.clientY };
   if (!double) return;
   for (let node = target; node; node = node.parentNode) {
-    // Structured subagent rows are siblings of <details> in their owning card.
-    // Structured rows (subagents, task reports) are siblings of <details> in
-    // their owning card, so the card itself has to stand in for the fold.
-    const structured = desktop && (node.dataset?.subagents === "true" || node.dataset?.taskOutput === "true");
+    // Structured rows are siblings of <details>, so their owning card stands
+    // in for the nearest fold at every viewport width.
+    const structured = node.dataset?.subagents === "true" || node.dataset?.taskOutput === "true";
     const details = node.tagName === "DETAILS" ? node : structured ? node.querySelector("details") : null;
     if (details?.open) { details.open = false; break; }
   }
@@ -3914,13 +3936,62 @@ async function renderQuestionPage(panel, list, want) {
 // `parent` mounts the node inside a live turn's own container instead of the
 // transcript: a turn whose session the user has left must keep rendering into
 // its own box, not into whatever the transcript happens to show now.
-function addMsg(role, text, cls, parent) {
+function addMsg(role, text, cls, parent, timeSource = null) {
   const root = parent || $("msgs");
   const follow = !parent && shouldFollowOutput(root);
   const d = createPlainMessageNode(role, text, cls);
+  if (timeSource && role === "user") setMessageTimestamp(d, timeSource);
   root.appendChild(d);
   if (!parent) { followOutput(follow, root); updateQuestionButton(); }
   return d;
+}
+// Storage timestamps are Unix seconds; explicit wire timestamps are milliseconds
+// or timezone-qualified ISO strings. Missing metadata never uses arrival time.
+function messageTimestampOf(source) {
+  if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+  for (const [key, scale] of [["created_at", 1000], ["timestamp", 1]]) {
+    const value = source[key];
+    let ms = null;
+    if (typeof value === "number" && Number.isFinite(value)) ms = value * scale;
+    else if (typeof value === "string") {
+      const iso = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.exec(value);
+      if (iso) {
+        const [year, month, day, hour, minute, second] = iso.slice(1).map(Number);
+        const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+        const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        if (month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1]
+          && hour < 24 && minute < 60 && second < 60) ms = Date.parse(value);
+      }
+    }
+    if (ms !== null && Number.isFinite(ms) && Number.isFinite(new Date(ms).getTime())) return ms;
+  }
+  return null;
+}
+function formatMessageTime(ms, now = Date.now()) {
+  if (typeof ms !== "number" || !Number.isFinite(ms)) return "";
+  const date = new Date(ms), today = new Date(now);
+  if (!Number.isFinite(date.getTime()) || !Number.isFinite(today.getTime())) return "";
+  const clock = String(date.getHours()).padStart(2, "0") + ":" + String(date.getMinutes()).padStart(2, "0");
+  const sameYear = date.getFullYear() === today.getFullYear();
+  if (sameYear && date.getMonth() === today.getMonth() && date.getDate() === today.getDate()) return clock;
+  return (sameYear ? "" : date.getFullYear() + "/") + (date.getMonth() + 1) + "/" + date.getDate() + " " + clock;
+}
+function setMessageTimestamp(root, source) {
+  const ms = messageTimestampOf(source);
+  if (ms === null || !root) return;
+  const user = root.dataset.role === "user";
+  const footer = root.querySelector(".answer-actions");
+  if (!user && (!footer || root.classList.contains("pending"))) return;
+  let label = root.querySelector(".message-time");
+  if (!label) {
+    label = document.createElement("time");
+    label.className = "message-time";
+    if (user) root.appendChild(label);
+    else footer.insertBefore(label, footer.firstChild);
+  }
+  label.setAttribute("datetime", new Date(ms).toISOString());
+  label.textContent = formatMessageTime(ms);
+  label.title = new Date(ms).toLocaleString();
 }
 // Construction owns only the detached node; callers own mounting and effects.
 function createPlainMessageNode(role, text, cls) {
@@ -3933,13 +4004,14 @@ function createPlainMessageNode(role, text, cls) {
 }
 // Assistant replies render as markdown; addMsg stays the plain (escaped,
 // pre-wrap) path for user text, progress traces, errors and notices.
-function addMsgMd(text, parent, copyText = text) {
+function addMsgMd(text, parent, copyText = text, timeSource = null) {
   const follow = !parent && shouldFollowOutput();
   const d = addMsg("assistant", "", "asst md", parent);
   d.innerHTML = text ? renderMarkdown(text) : "";
   if (!parent) followOutput(follow);
   decorateAndLoad(d);
   if (text) addAnswerCopy(d, copyText);
+  if (timeSource) setMessageTimestamp(d, timeSource);
   return d;
 }
 // --- server-side media ----------------------------------------------------
@@ -6676,21 +6748,35 @@ async function deleteSession(targetId, confirmed = false) {
 // Render the drawer from cached or fresh items: the filter narrows by title
 // or id, the count line proves no session is hidden, and an optional error
 // row keeps a failed refresh visible without wiping the last good list.
-function sessionListProjection(items, sessFilter) {
+let sessMarkedOnly = false;
+function setSessionMarkedFilter(markedOnly) {
+  sessMarkedOnly = !!markedOnly;
+  renderSessionList(lastItems);
+}
+function wireSessionMarkedFilter() {
+  $("sessall").onclick = () => setSessionMarkedFilter(false);
+  $("sessmarked").onclick = () => setSessionMarkedFilter(true);
+  window.matchMedia?.("(max-width:700px)").addEventListener?.("change", () => renderSessionList(lastItems));
+}
+function sessionListProjection(items, sessFilter, markedOnly = false) {
   const q = sessFilter.trim().toLowerCase();
-  const shown = q ? items.filter((s) => (sessionTitle(s) + " " + s.id).toLowerCase().includes(q)) : items;
+  const matching = q ? items.filter((s) => (sessionTitle(s) + " " + s.id).toLowerCase().includes(q)) : items;
+  const shown = markedOnly ? matching.filter((s) => s.marked) : matching;
   return { q, shown };
 }
 function sessionListTotal(items, sessionsTotal) {
   return typeof sessionsTotal === "number" ? sessionsTotal : items.length;
 }
-function sessionListCountText(q, shown, items, total) {
-  return q
+function sessionListCountText(q, shown, items, total, markedOnly = false) {
+  return q || markedOnly
     ? total + " sessions · showing " + shown.length + (items.length < total ? " loaded" : "")
     : total + " sessions";
 }
 function renderSessionList(items, errText, { preserveScroll = true, followNewest = false } = {}) {
-  const { q, shown } = sessionListProjection(items, sessFilter);
+  const markedOnly = sessMarkedOnly && !isPhoneLayout();
+  const { q, shown } = sessionListProjection(items, sessFilter, markedOnly);
+  $("sessall")?.setAttribute("aria-pressed", String(!sessMarkedOnly));
+  $("sessmarked")?.setAttribute("aria-pressed", String(sessMarkedOnly));
   const ul = $("sesslist");
   const scrollTop = preserveScroll && ul.children.length ? ul.scrollTop : 0;
   ul.textContent = "";
@@ -6791,13 +6877,33 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
     };
     ul.appendChild(li);
   }
+  if (markedOnly && !shown.length) {
+    const empty = document.createElement("li");
+    empty.className = "session-empty";
+    empty.textContent = q ? "没有匹配的星标会话" : "暂无星标会话";
+    if (sessionsHasMore) empty.textContent += "（已加载范围内）";
+    ul.appendChild(empty);
+  }
+  if (markedOnly && sessionsHasMore) {
+    const more = document.createElement("li"), button = document.createElement("button");
+    more.className = "session-more";
+    button.type = "button";
+    button.textContent = "加载更多会话";
+    button.onclick = async () => {
+      button.disabled = true;
+      try { await loadOlderSessions(); }
+      finally { button.disabled = false; }
+    };
+    more.appendChild(button);
+    ul.appendChild(more);
+  }
   if (errText) {
     const li = document.createElement("li");
     li.textContent = errText;
     ul.appendChild(li);
   }
   const total = sessionListTotal(items, sessionsTotal);
-  $("sesscount").textContent = sessionListCountText(q, shown, items, total);
+  $("sesscount").textContent = sessionListCountText(q, shown, items, total, markedOnly);
   if (followNewest) ul.scrollTop = 0;
   else ul.scrollTop = scrollTop;
 }
@@ -6898,7 +7004,7 @@ async function loadOlderSessions() {
     if (older.length) {
       lastItems = mergeSessionPageItems(lastItems, older);
       renderSessionList(lastItems);
-    }
+    } else if (sessMarkedOnly && !isPhoneLayout()) renderSessionList(lastItems);
   } catch (e) {
     if (loadId === sessionsLoadSeq && forSession === sessionId && base === store.base) {
       renderSessionList(lastItems, "sessions refresh failed: " + e.message);
@@ -7040,7 +7146,7 @@ function syncPromptNav() {
   const entries = [];
   for (const row of rows) {
     const bubble = row.querySelector(".msg.user");
-    const text = (bubble ? bubble.textContent : "").trim().replace(/\s+/g, " ");
+    const text = (bubble ? bubble.dataset.question ?? bubble.textContent : "").trim().replace(/\s+/g, " ");
     if (text) entries.push({ row, text });
   }
   const shown = entries.length;
@@ -7163,7 +7269,8 @@ function historyRowsOf(msgs, histTotal, showAll) {
       reasoning,
       historyIndex: histBase + i,
       call: message.tool_call_id ? calls.get(message.tool_call_id) : null,
-      key: JSON.stringify([histBase + i, ...identity]),
+      key: JSON.stringify([histBase + i, ...identity, ...(message.created_at != null || message.timestamp != null
+        ? [{ created_at: message.created_at, timestamp: message.timestamp }] : [])]),
       identity: JSON.stringify(identity),
     });
   }
@@ -7221,7 +7328,7 @@ function renderHistoryRow(row, parent) {
   // The canonical row is a complete observation, not a stream lifecycle. This
   // adapter owns only its DOM slots, stored disclosures and displayed producer.
   const historyView = {
-    user(snapshot) { addUserBubble(snapshot.text, snapshot.historyIndex, parent); },
+    user(snapshot) { addUserBubble(snapshot.text, snapshot.historyIndex, parent, snapshot.message); },
     assistant(snapshot) {
       const m = snapshot.message;
       // Reconciliation counts canonical messages. Keep the reasoning, answer and
@@ -7248,7 +7355,7 @@ function renderHistoryRow(row, parent) {
       if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + snapshot.identity + ":thinking");
       return summary;
     },
-    answer(snapshot, turn) { addMsgMd(snapshot.text, turn.group, textOf(snapshot.message.content)); },
+    answer(snapshot, turn) { addMsgMd(snapshot.text, turn.group, textOf(snapshot.message.content), snapshot.message); },
     rates(snapshot, turn) {
       const { group, rateSession, showTurnRate, thinkingCount, thinkingSummary } = turn;
       // Replay may fill the rate cache after this canonical row was mounted.
@@ -7845,8 +7952,8 @@ function attachUserRewind(d, text, activate) {
   // selectable and copyable, and the button beside it is the sole trigger.
   return d;
 }
-function addUserBubble(text, index, parent) {
-  const d = addMsg("user", text, "user rewindable", parent);
+function addUserBubble(text, index, parent, timeSource = null) {
+  const d = addMsg("user", text, "user rewindable", parent, timeSource);
   d.dataset.historyIndex = String(index);
   return attachUserRewind(d, text, () => rewindTo(index, text));
 }
@@ -8389,18 +8496,22 @@ function withParsedExecutionEvent(event, update) {
 }
 
 function dispatchAnswerEvent(event, view, policy, field, method) {
+  const deliver = (text, source) => {
+    if (source?.created_at != null || source?.timestamp != null) view[method](text, source);
+    else view[method](text);
+  };
   // Live historically preserves malformed answer bytes; replay ignores them
   // because canonical history will replace its provisional answer. A decoded
   // null also retains the original field-access failure behavior of each path.
   if (!policy.rawAnswerFallback) {
-    withParsedExecutionEvent(event, (value) => view[method](value[field] || ""));
+    withParsedExecutionEvent(event, (value) => deliver(value[field] || "", value));
     return;
   }
   let text = event.payload;
   if (event.parsed) {
     try { text = event.value[field] || ""; } catch (_) {}
   }
-  view[method](text);
+  deliver(text, event.value);
 }
 
 function dispatchRequestDone(event, view, policy) {
@@ -9736,17 +9847,19 @@ async function send() {
     sealAnswerSegment() { sealAnswerSegment(); },
     phase(text, waiting) { setPhase(text, waiting); },
     showsRequests() { return sid === sessionId; },
-    delta(text) {
+    delta(text, timeSource = null) {
       closeThinkingPhase();
       ensureAnswerBubble();
+      if (timeSource && !bubble._messageTimeSource) bubble._messageTimeSource = timeSource;
       raw += text;
       outputRate.observe(text);
       answerDirty = true;
       setPhase("Responding…");
     },
-    replace(text) {
+    replace(text, timeSource = null) {
       closeThinkingPhase();
       ensureAnswerBubble();
+      if (timeSource) bubble._messageTimeSource = timeSource;
       raw = text;
       outputRate.replace(raw);
       answerDirty = true;
@@ -9885,6 +9998,14 @@ async function send() {
         armStall();
         if (kind !== "" || payload) armProgress();
         if (kind === "done") {
+          if (payload) {
+            try {
+              const source = JSON.parse(payload);
+              if (bubble && (source?.created_at != null || source?.timestamp != null)) bubble._messageTimeSource = source;
+              const input = liveEntry.userInput?.row?.querySelector(".msg.user");
+              if (input && source?.user_message) setMessageTimestamp(input, source.user_message);
+            } catch (_) {}
+          }
           closeThinkingPhase();
           activity.finish("ended", Boolean(bubble && raw.trim()));
           activityDirty = false;
@@ -9924,7 +10045,10 @@ async function send() {
     finishFollow = sid === sessionId && shouldFollowOutput();
     if (bubble && raw.trim()) bubble.innerHTML = renderMarkdown(raw); // previews belong to the finished reply
     if (bubble) decorateAndLoad(bubble); // reply paths become previews only once it is final
-    if (finished && bubble && raw.trim()) addAnswerCopy(bubble, raw);
+    if (finished && bubble && raw.trim()) {
+      addAnswerCopy(bubble, raw);
+      if (bubble._messageTimeSource) setMessageTimestamp(bubble, bubble._messageTimeSource);
+    }
     if (finished) showTurnRate(mainRate());
     if (!finished && !turnError) {
       // Only the session on screen can be followed from history here; a stalled
@@ -10302,6 +10426,7 @@ function wire() {
   $("menu").onclick = toggleSessions;
   $("sessbar").onclick = toggleSessions;
   $("sessfilter").oninput = (e) => { sessFilter = e.target.value; renderSessionList(lastItems, undefined, { preserveScroll: false }); };
+  wireSessionMarkedFilter();
   $("connbtn").onclick = () => $("conn").classList.toggle("open");
   // The floating capture button needs a system permission that is granted
   // once; the entry only shows up in shells that know how to open it.

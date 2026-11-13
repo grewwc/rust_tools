@@ -8,7 +8,8 @@ use crate::ai::types::ToolCall;
 
 use super::super::compress::{COMPRESSED_TOOL_EVIDENCE_MARKER, value_to_string};
 use super::super::types::{
-    Message, ROLE_INTERNAL_NOTE, WAKE_NOTE_DEDUP_SCAN, parse_still_waiting_wake_identity,
+    Message, ROLE_INTERNAL_NOTE, StoredMessage, WAKE_NOTE_DEDUP_SCAN,
+    parse_still_waiting_wake_identity,
 };
 use super::{
     connection::open_history_db,
@@ -470,6 +471,66 @@ pub(super) fn decode_tool_calls(tool_calls: Option<&str>) -> Option<Vec<ToolCall
 pub(in crate::ai) fn read_all_messages_sqlite(path: &Path) -> io::Result<Vec<Message>> {
     let conn = open_history_db(path)?;
     read_canonical_messages(&conn)
+}
+
+/// Read canonical content and display metadata in one query, ordered by message ID.
+/// The watermark excludes prior turns without relying on timestamps or row counts.
+pub(in crate::ai) fn read_stored_messages_sqlite(
+    path: &Path,
+    after_message_id: i64,
+) -> io::Result<Vec<StoredMessage>> {
+    let conn = super::connection::open_history_db_read_only(path)?;
+    // Legacy schemas can have content without timestamp metadata. Project a
+    // missing column as NULL instead of migrating it to a fabricated current time.
+    let timestamp_column = if conn
+        .prepare("SELECT * FROM messages LIMIT 0")
+        .map_err(|e| io::Error::other(e.to_string()))?
+        .column_names()
+        .contains(&"created_at")
+    {
+        "created_at"
+    } else {
+        "NULL"
+    };
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT role, content, tool_calls, tool_call_id, reasoning_content, id, {timestamp_column}
+             FROM messages WHERE id > ?1 ORDER BY id ASC"
+        ))
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let rows = stmt
+        .query_map([after_message_id], |row| {
+            let content: String = row.get(1)?;
+            let tool_calls: Option<String> = row.get(2)?;
+            Ok(StoredMessage {
+                message: Message {
+                    role: row.get(0)?,
+                    content: decode_message_content(&content),
+                    tool_calls: decode_tool_calls(tool_calls.as_deref()),
+                    tool_call_id: row.get(3)?,
+                    reasoning_content: row.get(4)?,
+                },
+                message_id: row.get(5)?,
+                created_at: match row.get_ref(6)? {
+                    rusqlite::types::ValueRef::Integer(value) => Some(value),
+                    _ => None,
+                },
+            })
+        })
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| io::Error::other(e.to_string()))
+}
+
+pub(in crate::ai) fn read_message_watermark_sqlite(path: &Path) -> io::Result<i64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let conn = super::connection::open_history_db_read_only(path)?;
+    conn.query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| {
+        row.get(0)
+    })
+    .map_err(|e| io::Error::other(e.to_string()))
 }
 
 /// Read a source session without creating it, migrating it, or changing its journal mode.

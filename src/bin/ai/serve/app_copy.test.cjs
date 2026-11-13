@@ -59,6 +59,15 @@ function harness({ clipboard, fallback = true, phone = false } = {}) {
       child.parentNode = null;
       return child;
     }
+    replaceChild(next, current) {
+      const index = this.children.indexOf(current);
+      assert.ok(index >= 0, "the replaced node is a child");
+      next.remove();
+      this.children[index] = next;
+      current.parentNode = null;
+      next.parentNode = this;
+      return current;
+    }
     remove() { if (this.parentNode) this.parentNode.removeChild(this); }
     setAttribute(name, value) { this.attributes[name] = String(value); }
     getAttribute(name) { return this.attributes[name] ?? null; }
@@ -274,6 +283,137 @@ test("history answers copy the original message including surrounding line break
   assert.equal(await h.tap(answer.querySelector("[data-copy-answer]")), true);
   assert.deepEqual(copied, [raw]);
   assert.equal(answer.dataset.canonicalIndex, "2", "history indexing remains on the answer wrapper");
+});
+
+test("timestamp parsing uses storage seconds or explicit wire times and never invents missing values", () => {
+  const h = harness(), c = h.context;
+  const instant = new Date(2026, 10, 13, 9, 5).getTime();
+  assert.equal(c.messageTimestampOf({ created_at: instant / 1000, timestamp: instant + 60000 }), instant);
+  assert.equal(c.messageTimestampOf({ timestamp: instant }), instant);
+  assert.equal(c.messageTimestampOf({ timestamp: new Date(instant).toISOString() }), instant);
+  for (const source of [null, {}, [], { timestamp: "" }, { timestamp: false }, { timestamp: "09:05" },
+    { timestamp: "2026-11-13T09:05:00" }, { timestamp: "2026-02-30T09:05:00Z" },
+    { created_at: Infinity }, { timestamp: NaN }, { timestamp: 1e20 }]) {
+    assert.equal(c.messageTimestampOf(source), null);
+  }
+  assert.equal(c.messageTimestampOf({ created_at: "bad", timestamp: instant }), instant);
+  assert.equal(c.formatMessageTime(instant, new Date(2026, 10, 13, 23, 59).getTime()), "09:05");
+  assert.equal(c.formatMessageTime(instant, new Date(2026, 10, 14).getTime()), "11/13 09:05");
+  assert.equal(c.formatMessageTime(instant, new Date(2027, 0, 1).getTime()), "2026/11/13 09:05");
+  assert.equal(c.formatMessageTime(null, instant), "");
+});
+
+for (const phone of [false, true]) test(`history user and answer timestamps stay outside body and copy text (phone=${phone})`, async () => {
+  const copied = [], h = harness({ phone, clipboard: { writeText: async (text) => { copied.push(text); } } });
+  const instant = new Date(2026, 10, 13, 9, 5).getTime();
+  h.context.textOf = (content) => content;
+  vm.runInContext(between("// BEGIN execution event dispatcher", "// END execution event dispatcher"), h.context);
+  vm.runInContext(between("function attachUserRewind(", "function findUserHistoryIndex("), h.context);
+  vm.runInContext(between("function renderHistoryRow(", "// A session the server reports"), h.context);
+  const user = { role: "user", content: "问题\n原文", created_at: instant / 1000 };
+  const answer = { role: "assistant", content: "\n# 最终结论\n", timestamp: instant + 60000 };
+  for (const [index, message] of [user, answer].entries()) {
+    h.context.renderHistoryRow({ message, text: message.content.trim(), historyIndex: index }, h.msgs);
+  }
+  const userBubble = h.msgs.querySelector(".msg.user"), answerBubble = h.msgs.querySelector(".msg.md");
+  assert.equal(userBubble.dataset.question, user.content);
+  assert.equal(userBubble.dataset.historyIndex, "0");
+  assert.equal(userBubble.querySelectorAll(".message-time").length, 1);
+  assert.equal(userBubble.querySelector(".message-time").getAttribute("datetime"), new Date(instant).toISOString());
+  assert.equal(answerBubble.querySelectorAll(".message-time").length, 1);
+  assert.equal(answerBubble.querySelector(".message-time").parentNode, answerBubble.querySelector(".answer-actions"));
+  assert.equal(answerBubble.querySelector(".answer-body").querySelector(".message-time"), null);
+  h.context.setMessageTimestamp(answerBubble, { timestamp: instant + 120000 });
+  assert.equal(answerBubble.querySelectorAll(".message-time").length, 1, "metadata updates cannot duplicate the label");
+  assert.equal(answerBubble.querySelectorAll("[data-copy-answer]").length, 1);
+  assert.equal(await h.tap(answerBubble.querySelector("[data-copy-answer]")), true);
+  assert.deepEqual(copied, [answer.content]);
+  h.context.answerBubble = answerBubble;
+  vm.runInContext("answerCopyTexts.delete(answerBubble)", h.context);
+  await h.tap(answerBubble.querySelector("[data-copy-answer]"));
+  assert.deepEqual(copied, [answer.content, answerBubble.querySelector(".answer-body").innerText]);
+});
+
+test("missing message metadata leaves existing user and assistant layouts unchanged", () => {
+  const h = harness();
+  const user = h.context.addMsg("user", "问题", "user", h.msgs, {});
+  const answer = h.context.addMsgMd("回答", h.msgs, "回答", {});
+  const tool = h.context.addMsg("tool", "结果", "asst", h.msgs, { timestamp: Date.now() });
+  const pending = h.context.addMsgMd("", h.msgs, "", { timestamp: Date.now() });
+  assert.equal(h.msgs.querySelectorAll(".message-time").length, 0);
+  assert.equal(user.innerHTML, "问题");
+  assert.equal(answer.children.length, 2);
+  assert.equal(tool.querySelector(".message-time"), null);
+  assert.equal(pending.querySelector(".answer-actions"), null);
+});
+
+test("timestamp metadata refreshes history render keys without changing fold or message identity", () => {
+  const h = harness();
+  h.context.textOf = (content) => content;
+  h.context.isRuntimeSyntheticUser = () => false;
+  vm.runInContext(between("function historyRowsOf(", "function historyExecutionOf("), h.context);
+  const before = { role: "assistant", content: "最终回答" };
+  const after = { ...before, created_at: 1700000000 };
+  const first = h.context.historyRowsOf([before], 1, true).rows[0];
+  const second = h.context.historyRowsOf([after], 1, true).rows[0];
+  assert.notEqual(first.key, second.key, "new metadata cannot be lost by retaining the old DOM row");
+  assert.equal(first.identity, second.identity, "timestamps must not change stored disclosure identities");
+  assert.equal(first.historyIndex, second.historyIndex);
+  assert.equal(first.text, second.text);
+});
+
+test("live timestamp metadata appears once only on the finished answer and resets between segments", async () => {
+  const copied = [], h = streamHarness({ clipboard: { writeText: async (text) => { copied.push(text); } } });
+  const instant = new Date(2026, 10, 13, 9, 5).getTime();
+  h.emit("delta", { delta: "前序正文", timestamp: instant });
+  assert.equal(h.box.querySelectorAll(".message-time").length, 0);
+  h.seal();
+  h.emit("delta", { delta: "最终", timestamp: instant + 60000 });
+  h.emit("replace", { text: "最终回答", timestamp: instant + 120000 });
+  assert.equal(h.box.querySelectorAll(".message-time").length, 0);
+  h.emit("done", { timestamp: instant + 180000 });
+  const final = h.box.querySelectorAll(".msg.md").at(-1);
+  assert.equal(h.box.querySelectorAll(".message-time").length, 1);
+  assert.equal(final.querySelector(".message-time").getAttribute("datetime"), new Date(instant + 180000).toISOString());
+  await h.tap(final.querySelector("[data-copy-answer]"));
+  assert.deepEqual(copied, ["最终回答"]);
+});
+
+for (const phone of [false, true]) test(`canonical done metadata timestamps the matching live input and final answer (phone=${phone})`, async () => {
+  const copied = [], h = streamHarness({ phone, clipboard: { writeText: async (text) => { copied.push(text); } } });
+  const row = h.document.createElement("div");
+  h.msgs.appendChild(row);
+  const user = h.context.addMsg("user", "同一个问题", "user", row);
+  h.context.liveEntry.userInput = { row };
+  h.emit("delta", { delta: "最终回答" });
+  h.emit("replace", { text: "最终回答" });
+  assert.equal(h.msgs.querySelectorAll(".message-time").length, 0);
+  h.emit("done", { message_id: 14, created_at: 1700000004, user_message: { message_id: 13, created_at: 1700000003 } });
+  const answer = h.box.querySelectorAll(".msg.md").at(-1);
+  assert.equal(user.querySelectorAll(".message-time").length, 1);
+  assert.equal(answer.querySelectorAll(".message-time").length, 1);
+  assert.equal(user.querySelector(".message-time").getAttribute("datetime"), "2023-11-14T22:13:23.000Z");
+  assert.equal(answer.querySelector(".message-time").getAttribute("datetime"), "2023-11-14T22:13:24.000Z");
+  await h.tap(answer.querySelector("[data-copy-answer]"));
+  assert.deepEqual(copied, ["最终回答"]);
+});
+
+test("timezone-qualified wire timestamps align with canonical Unix seconds", () => {
+  const h = harness();
+  const c = h.context;
+  const ms = Date.parse("2026-11-13T01:05:00Z");
+  assert.equal(c.messageTimestampOf({ timestamp: "2026-11-13T09:05:00+08:00" }), ms);
+  assert.equal(c.messageTimestampOf({ created_at: ms / 1000 }), ms);
+  assert.equal(c.formatMessageTime(ms, ms), String(new Date(ms).getHours()).padStart(2, "0") + ":05");
+});
+
+test("timestamp styles use secondary text in normal flow on both layouts", () => {
+  assert.match(html, /\.message-time \{[^}]*color:var\(--dim\);[^}]*font-size:11px;[^}]*font-variant-numeric:tabular-nums/);
+  assert.match(html, /\.msg\.user > \.message-time \{[^}]*margin-top:4px;[^}]*color:inherit/);
+  assert.match(html, /\.answer-actions > \.message-time \{ margin-right:auto;/);
+  const phone = html.slice(html.indexOf("@media (max-width:700px)"));
+  assert.match(phone, /\.message-time \{ font-size:12px;/);
+  assert.doesNotMatch(html.match(/\.message-time \{([^}]*)\}/)[1], /(?:^|;)\s*(?:position|height):/);
 });
 
 test("partial and pending answers expose no copy control until the stream finishes", async () => {

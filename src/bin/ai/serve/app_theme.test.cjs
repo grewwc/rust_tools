@@ -154,6 +154,37 @@ function ruleValues(source, selector) {
   return values;
 }
 
+test("desktop Markdown answers keep their original backgrounds and stronger borders in all three themes", () => {
+  const desktop = desktopMediaQueries().map((block) => block.body).join("\n");
+  const selector = ".msg.asst.md:not(.pending):not(.err):not(.git-output)";
+  const body = ruleValues(desktop, selector);
+  assert.equal(body.background, undefined);
+  assert.equal(body.border, "2px solid var(--control-border)");
+  const expected = {
+    dark: { page: "#1b1b1b", surface: "#2e2e2e", answer: "#242424", border: "#858585" },
+    light: { page: "#f1f1f1", surface: "#e5e5e5", answer: "#f3f3f3", border: "#737373" },
+    warm: { page: "#edeae4", surface: "#e8e5de", answer: "#f5f2ec", border: "#6f6a5b" },
+  };
+  for (const [name, root] of Object.entries(PALETTES)) {
+    const palette = { ...tokenValues(tokenBlock(PALETTES.dark)),
+      ...tokenValues(tokenBlock(root)), ...tokenValues(tokenBlock(PALETTES.dark, desktop)),
+      ...tokenValues(tokenBlock(root, desktop)) };
+    // The helper reads exact selectors; resolve the unchanged assistant base
+    // background and verify that no answer-specific theme overrides remain.
+    const themed = name === "dark" ? {} : ruleValues(desktop, root.replace(/\s*\{$/, "") + " " + selector);
+    assert.deepEqual(themed, {});
+    const background = ruleValues(style, ".msg.asst").background;
+    assert.equal(background, "var(--panel)");
+    const token = /^var\((--[\w-]+)\)$/.exec(background)?.[1];
+    assert.ok(token, name + " answer uses a theme token");
+    assert.deepEqual({ page: palette["--bg"], surface: palette["--surface"],
+      answer: palette[token], border: palette["--control-border"] }, expected[name]);
+    assert.equal(palette[token], palette["--panel"], name + " answer keeps its original background");
+    assert.ok(contrast(palette["--control-border"], palette[token]) >= 3,
+      name + " answer boundary contrast is at least 3:1");
+  }
+});
+
 function brightnessColor(hex, factor) {
   return "#" + hex.slice(1).match(/../g).map((channel) => Math.round(parseInt(channel, 16) * factor)
     .toString(16).padStart(2, "0")).join("");
@@ -643,12 +674,12 @@ test("desktop rewind opacity and light metadata retain readable foregrounds", ()
   }
 });
 
-// Pin shared and phone CSS including the command menu styles from 4722cb07.
+// Pin shared and phone CSS, including the compact mobile spacing.
 test("desktop contrast rules preserve the current shared and mobile CSS bytes", () => {
   const phoneApplicable = desktopMediaQueries().reduce((source, block) => source.replace(block.css, ""), style);
   assert.doesNotMatch(phoneApplicable, /--(?:control-border|danger-text)/);
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "e9ddcc9675b0887b8946cfd7976bd1204e7cdce9ab8026d115e733e34864aca8",
+    "c3080c1e449164119b08c4bff12edf3c9641dbe4ceea934fed8b2dec3b32613e",
     "desktop contrast changed shared or mobile CSS");
 });
 
@@ -658,7 +689,7 @@ test("desktop overrides leave all phone-applicable CSS byte-identical", () => {
   let phoneApplicable = style;
   for (const block of desktop) phoneApplicable = phoneApplicable.replace(block.css, "");
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "e9ddcc9675b0887b8946cfd7976bd1204e7cdce9ab8026d115e733e34864aca8",
+    "c3080c1e449164119b08c4bff12edf3c9641dbe4ceea934fed8b2dec3b32613e",
     "shared or phone CSS changed outside the desktop queries");
 });
 

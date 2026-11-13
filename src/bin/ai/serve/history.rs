@@ -1,7 +1,7 @@
 //! History routes: rewind and read.
 
 use super::*;
-use crate::ai::history::Message;
+use crate::ai::history::{Message, StoredMessage};
 
 /// Server-side cap for the serve-chat `?count` view param. The client clamps
 /// to its own max (20) before sending, so this only guards against a
@@ -136,7 +136,7 @@ pub(crate) async fn read_history(
         return bad_request(format!("invalid session id: {id}")).into_response();
     }
     let store = SessionStore::new(state.history_file.as_path());
-    let mut messages = match store.read_all_messages(&id) {
+    let mut messages = match store.read_stored_messages(&id, 0) {
         Ok(v) => v,
         Err(err) => {
             return (
@@ -155,7 +155,8 @@ pub(crate) async fn read_history(
     if q.meta.as_deref() == Some("roles") {
         let roles: Vec<String> = messages
             .iter()
-            .map(|message| {
+            .map(|stored| {
+                let message = &stored.message;
                 if is_runtime_synthetic_user_message(message) {
                     "runtime_synthetic_user".to_string()
                 } else {
@@ -185,9 +186,9 @@ pub(crate) async fn read_history(
             .into_response();
         }
         let mut seen = 0usize;
-        let mut found: Option<&Message> = None;
+        let mut found: Option<&StoredMessage> = None;
         for message in messages.iter().rev() {
-            if !is_serve_assistant_conclusion(message) {
+            if !is_serve_assistant_conclusion(&message.message) {
                 continue;
             }
             seen += 1;
@@ -205,8 +206,15 @@ pub(crate) async fn read_history(
             return bad_request(detail).into_response();
         };
         let mut message = message.clone();
-        redact_inline_image_data(&mut message.content);
-        return (StatusCode::OK, Json(vec![message])).into_response();
+        redact_inline_image_data(&mut message.message.content);
+        return (
+            StatusCode::OK,
+            Json(vec![
+                serve_stored_history_message(&message)
+                    .expect("serializing canonical history cannot fail"),
+            ]),
+        )
+            .into_response();
     }
     // `?user_conclusion=N`: the final assistant conclusion after user row uN
     // and before the next user row. User ordinals match the `user_ordinal`
@@ -217,8 +225,9 @@ pub(crate) async fn read_history(
         }
         let mut user_ordinal = 0usize;
         let mut target_found = false;
-        let mut found: Option<&Message> = None;
-        for message in &messages {
+        let mut found: Option<&StoredMessage> = None;
+        for stored in &messages {
+            let message = &stored.message;
             if message.role == "user" && !is_runtime_synthetic_user_message(message) {
                 if target_found {
                     break;
@@ -228,7 +237,7 @@ pub(crate) async fn read_history(
                 continue;
             }
             if target_found && is_serve_assistant_conclusion(message) {
-                found = Some(message);
+                found = Some(stored);
             }
         }
         let Some(message) = found else {
@@ -242,8 +251,15 @@ pub(crate) async fn read_history(
             return bad_request(detail).into_response();
         };
         let mut message = message.clone();
-        redact_inline_image_data(&mut message.content);
-        return (StatusCode::OK, Json(vec![message])).into_response();
+        redact_inline_image_data(&mut message.message.content);
+        return (
+            StatusCode::OK,
+            Json(vec![
+                serve_stored_history_message(&message)
+                    .expect("serializing canonical history cannot fail"),
+            ]),
+        )
+            .into_response();
     }
     // serve-chat preview views are bounded tails, so `?role` + `?count`
     // filter and tail-cut here and only the subset travels. Each user row
@@ -254,7 +270,8 @@ pub(crate) async fn read_history(
     if q.role.is_some() || q.count.is_some() {
         let mut rows: Vec<serde_json::Value> = Vec::new();
         let mut user_ordinal = 0usize;
-        for message in &messages {
+        for stored in &messages {
+            let message = &stored.message;
             let is_real_user =
                 message.role == "user" && !is_runtime_synthetic_user_message(message);
             if is_real_user {
@@ -275,7 +292,7 @@ pub(crate) async fn read_history(
             if !role_matches {
                 continue;
             }
-            let mut value = match serve_history_message(message) {
+            let mut value = match serve_stored_history_message(stored) {
                 Ok(v) => v,
                 Err(err) => {
                     return (
@@ -315,7 +332,7 @@ pub(crate) async fn read_history(
     // media type, and every message index/role, so rewind anchors and role
     // filters stay valid) before the response is serialized.
     for message in &mut messages {
-        redact_inline_image_data(&mut message.content);
+        redact_inline_image_data(&mut message.message.content);
     }
     // Total before the tail cut: the mobile client maps a tapped user bubble
     // back to its canonical index as `total - shown.length + bubble_index`
@@ -329,7 +346,7 @@ pub(crate) async fn read_history(
     }
     let rows = messages
         .iter()
-        .map(serve_history_message)
+        .map(serve_stored_history_message)
         .collect::<Result<Vec<_>, _>>();
     let mut resp = (
         StatusCode::OK,
@@ -342,6 +359,113 @@ pub(crate) async fn read_history(
             .unwrap_or(axum::http::HeaderValue::from_static("0")),
     );
     resp
+}
+
+pub(super) fn serve_stored_history_message(
+    message: &StoredMessage,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut value = serve_history_message(&message.message)?;
+    value["message_id"] = serde_json::json!(message.message_id);
+    if let Some(created_at) = message.created_at {
+        value["created_at"] = serde_json::json!(created_at);
+    }
+    Ok(value)
+}
+
+pub(super) struct ServeTurnMetadata {
+    store: SessionStore,
+    session_id: String,
+    watermark: Option<i64>,
+    committed_answer: Option<String>,
+}
+
+impl ServeTurnMetadata {
+    pub(super) fn new(store: SessionStore, session_id: String) -> Self {
+        // The caller holds the session turn lock and has not spawned its child.
+        let watermark = store.read_message_watermark(&session_id).ok();
+        Self {
+            store,
+            session_id,
+            watermark,
+            committed_answer: None,
+        }
+    }
+
+    pub(super) fn record_committed_answer(&mut self, payload: &str) {
+        self.committed_answer = serde_json::from_str::<serde_json::Value>(payload)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("text")
+                    .and_then(|text| text.as_str())
+                    .map(str::to_owned)
+            });
+    }
+
+    pub(super) fn done_event(&self) -> ServeSse {
+        // Read on OutputComplete while this child still owns its turn, before
+        // enqueueing the event. Deferred event fanout cannot race the next turn.
+        let Some(watermark) = self.watermark else {
+            return super::done_event();
+        };
+        let Ok(messages) = self.store.read_stored_messages(&self.session_id, watermark) else {
+            return super::done_event();
+        };
+        let metadata = serve_done_metadata(&messages, self.committed_answer.as_deref());
+        if metadata
+            .as_object()
+            .is_some_and(|object| !object.is_empty())
+        {
+            ServeSse::new("done", metadata.to_string())
+        } else {
+            super::done_event()
+        }
+    }
+}
+
+/// Only timestamps from this turn's canonical rows may decorate its live output.
+/// A committed body must match the display projection of the latest conclusion.
+pub(super) fn serve_done_metadata(
+    messages: &[StoredMessage],
+    committed_answer: Option<&str>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({});
+    let real_user = |stored: &&StoredMessage| {
+        stored.message.role == "user" && !is_runtime_synthetic_user_message(&stored.message)
+    };
+    if let Some(user) = messages.iter().find(real_user)
+        && let Some(created_at) = user.created_at
+    {
+        value["user_message"] = serde_json::json!({
+            "message_id": user.message_id,
+            "created_at": created_at,
+        });
+    }
+    let conclusion = messages
+        .iter()
+        .rev()
+        .take_while(|stored| !real_user(stored))
+        .find(|stored| is_serve_assistant_conclusion(&stored.message));
+    if let (Some(message), Some(committed_answer)) = (conclusion, committed_answer)
+        && let Some(created_at) = message.created_at
+        && let Some(content) = message.message.content.as_str()
+    {
+        let base = content
+            .split_once("\n\n[Runtime warning]")
+            .map_or(content, |(body, _)| body);
+        let base = crate::ai::stream::hide_audit_report(base);
+        let base = crate::ai::request::strip_digest_blocks(base.trim());
+        if !base.is_empty()
+            && (committed_answer == base
+                || committed_answer
+                    .strip_prefix(&base)
+                    .is_some_and(|suffix| suffix.starts_with("\n\n")))
+        {
+            value["message_id"] = serde_json::json!(message.message_id);
+            value["created_at"] = serde_json::json!(created_at);
+        }
+    }
+    value
 }
 
 /// Canonical tool content stays verbatim; its runtime sidecar becomes an explicit UI field.

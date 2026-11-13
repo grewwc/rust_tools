@@ -901,7 +901,7 @@ mod session_title_tests {
     }
 }
 
-/// Generate a short summarizing title (<= 20 chars) for the conversation with the LLM.
+/// Generate a short summarizing title for the conversation with the LLM.
 /// Feeds the session list and the prompt's top line.
 pub(crate) async fn generate_session_title_via_model(
     app: &App,
@@ -1041,12 +1041,8 @@ pub(crate) async fn generate_session_title_with_context(
         return None;
     }
 
-    // Cap at 30 characters (a CJK glyph counts as one char).
-    let result: String = if cleaned.chars().count() > 30 {
-        cleaned.chars().take(30).collect()
-    } else {
-        cleaned
-    };
+    // Share the Unicode character cap and ellipsis with persisted title previews.
+    let result = crate::ai::history::normalize_generated_session_title(&cleaned);
 
     Some(result)
 }

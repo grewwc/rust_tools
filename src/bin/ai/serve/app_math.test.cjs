@@ -992,7 +992,7 @@ test("standalone display formulas do not inherit paragraph blank-line gaps", () 
 });
 
 test("phone display formula spacing stays compact", () => {
-  assert.match(html, /@media \(max-width:700px\) \{[\s\S]*?\.msg \{ max-width:94%; \}/);
+  assert.match(html, /@media \(max-width:700px\) \{[\s\S]*?\.msg \{ max-width:94%; padding:6px 10px; border-radius:12px; line-height:1\.5; scroll-margin-block:8px; \}/);
   assert.match(html, /@media \(max-width:700px\) \{[\s\S]*?\.msg\.md \.math\.display \{ margin:4px 0; padding:0; \}/);
 });
 
@@ -1458,7 +1458,7 @@ test("delta blocks defer layout work to the coalesced paint", () => {
   const handlers = script.slice(script.indexOf("const EXECUTION_EVENT_HANDLERS ="), script.indexOf("function dispatchExecutionEvent("));
   assert.ok(start >= 0 && end > start);
   assert.doesNotMatch(blockDispatch, /shouldFollowOutput|followOutput/);
-  assert.match(liveView, /delta\(text\)[\s\S]*?answerDirty = true;[\s\S]*?setPhase\("Responding…"\)/);
+  assert.match(liveView, /delta\(text, timeSource = null\)[\s\S]*?answerDirty = true;[\s\S]*?setPhase\("Responding…"\)/);
   assert.match(handlers, /thinking_start\(event, view\)[\s\S]*?view.endThinking\(true\)/);
   assert.match(handlers + liveView, /thinking\(event, view\)[\s\S]*?if \(text\)[\s\S]*?createThinkingFold\(box, phaseBubble\)[\s\S]*?thinkingDirty = true;[\s\S]*?schedulePaint\(\)/);
   assert.doesNotMatch(blockDispatch, /kind !== "thinking_start" && kind !== "thinking" && kind !== "thinking_done"/);
