@@ -36,6 +36,7 @@ function harness({ windowSession = "s", shown = 200, total = 900, loading = 0, p
     Math,
     Number,
   });
+  vm.runInContext(page.slice(page.indexOf("function executionBase()"), page.indexOf("function executionState(")), context);
   vm.runInContext(page.slice(start, end), context);
   root._histWinSession = windowSession;
   root._histWin = shown;

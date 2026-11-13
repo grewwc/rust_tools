@@ -6,7 +6,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const { test } = require("node:test");
 
-const script = fs.readFileSync(path.join(__dirname, "app.html"), "utf8")
+const script = fs.readFileSync(process.env.ASERVE_TEST_APP_HTML || path.join(__dirname, "app.html"), "utf8")
   .match(/<script>([\s\S]*?)<\/script>/)[1];
 function source(start, end) {
   const first = script.indexOf(start), last = script.indexOf(end, first);
@@ -120,6 +120,9 @@ function harness({ realApi = false } = {}) {
     ["// BEGIN history retry", "// Historical user inputs"],
     ["function handleReplayEvent(", "async function pollConfirm("],
   ]) vm.runInContext(source(start, end), context);
+  if (script.includes("function createSseFramer()")) {
+    vm.runInContext(source("function createSseFramer()", "// `/cd` changes"), context);
+  }
   if (realApi) vm.runInContext(source("async function api(", "const esc ="), context);
   Object.assign(context, {
     renderMarkdown: vm.runInContext("esc", context),

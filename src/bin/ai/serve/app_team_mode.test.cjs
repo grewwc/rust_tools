@@ -45,7 +45,10 @@ function nodeList(nodes = []) {
 }
 
 function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, configGet, createSession, skills = [], subagentModels, turnPost } = {}) {
-  const document = { activeElement: null, querySelectorAll: () => nodeList() };
+  const document = {
+    activeElement: null, querySelectorAll: () => nodeList(),
+    addEventListener(type, listener) { this["on" + type] = listener; },
+  };
   function node(tag = "div") {
     let text = "";
     const classes = new Set();
@@ -56,7 +59,9 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
       set textContent(value) { text = String(value); el.children = []; },
       get textContent() { return text; },
       setAttribute(key, value) { el.attrs[key] = String(value); },
+      removeAttribute(key) { delete el.attrs[key]; },
       getAttribute(key) { return el.attrs[key] ?? null; },
+      addEventListener(type, listener) { el["on" + type] = listener; },
       appendChild(child) { child.parentNode = el; el.children.push(child); return child; },
       remove() { if (el.parentNode) el.parentNode.children = el.parentNode.children.filter((n) => n !== el); },
       focus(options) { if (!el.disabled) { document.activeElement = el; el.focusOptions = options; } },
@@ -114,6 +119,10 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
   elements.prompt = node("textarea");
   elements.prompt.value = "一起完成这个任务";
   elements.msgs = node();
+  for (const id of ["cmdmenu", "cmdoptions", "cmdempty"]) elements[id] = node();
+  elements.cmdmenu.hidden = true;
+  elements.cmdempty.hidden = true;
+  attach("cmdmenu", "cmdoptions", "cmdempty");
   const requests = [], notes = [], messages = [], consumed = [], stored = new Map(), listeners = new Map();
   const configs = new Map([[sid || "fresh", plain(cfg)]]);
   const media = { matches: phone, addEventListener: (_, fn) => { media.change = fn; } };
@@ -178,6 +187,7 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
   });
   vm.runInContext(marked("execution model"), context);
   vm.runInContext(existingFunction("async function api(", "const esc ="), context);
+  vm.runInContext(existingFunction("// Slash-command completion.", "async function loadInfo()"), context);
   vm.runInContext(marked("mobile team mode"), context);
   vm.runInContext(marked("session config hydration"), context);
   vm.runInContext(existingFunction("async function persistPicks()", "// A changed pick belongs"), context);
@@ -188,6 +198,9 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
   vm.runInContext(existingFunction("function isRemoteTurn()", "// The one send/stop button"), context);
   vm.runInContext(existingFunction("const RATE_STORAGE =", "function addFold("), context);
   vm.runInContext(existingFunction("function setAnswerRate(", "// Only completed answer bubbles"), context);
+  if (script.includes("function createSseFramer()")) {
+    vm.runInContext(existingFunction("function createSseFramer()", "// `/cd` changes"), context);
+  }
   vm.runInContext(marked("composer send"), context);
   context.wireTeamMode();
   return {
@@ -422,7 +435,7 @@ test("first send creates a session and waits for config success before the actua
 
 for (const state of ["replay", "server", "stale", "live"]) test(`button and keyboard sends share the running guard (${state})`, async () => {
   const h = harness(), c = h.context;
-  let aborted = 0, stopped = 0, keydown;
+  let aborted = 0, stopped = 0;
   Object.assign(c, { eventAbort: { abort() { aborted++; } }, recoveredView: null,
     stopTurn() { stopped++; },
   });
@@ -434,9 +447,9 @@ for (const state of ["replay", "server", "stale", "live"]) test(`button and keyb
   const images = c.pendingImages = [{ filename: "draft.png", data_base64: "image" }];
   const draft = h.elements.prompt.value;
   h.elements.send = {};
-  h.elements.prompt.addEventListener = (_, listener) => { keydown = listener; };
   vm.runInContext(existingFunction('$("send").onclick =', '$("sidenote").onclick ='), c);
   vm.runInContext(existingFunction('$("prompt").addEventListener("keydown"', "const toggleSessions ="), c);
+  const keydown = h.elements.prompt.onkeydown;
   h.elements.send.onclick();
   assert.equal(stopped, 1, "the button must stop the active turn");
   await c.send();

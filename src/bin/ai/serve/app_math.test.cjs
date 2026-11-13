@@ -41,6 +41,7 @@ vm.createContext = (sandbox = {}) => {
   ...sandbox,
   });
   vm.runInContext(script.slice(script.indexOf("// BEGIN execution model"), script.indexOf("// END execution model")), context);
+  vm.runInContext(script.slice(script.indexOf("// BEGIN execution event dispatcher"), script.indexOf("// END execution event dispatcher")), context);
   return context;
 };
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
@@ -1318,6 +1319,12 @@ test("a math slot cannot manufacture a link or inject markup into href", () => {
   }
 });
 
+function mountPaintFeed(context) {
+  const liveEntry = {}, base = context.executionBase(), sid = context.sessionId;
+  context.owner = { base, sid, turn: context.executionState(sid, base).turn, liveEntry };
+  context.updateExecutionModel({ kind: "live", entry: liveEntry }, sid, base);
+}
+
 test("the real streaming paint leaves the formulas for the final render", async () => {
   const h = harness();
   const bubble = {
@@ -1333,6 +1340,7 @@ test("the real streaming paint leaves the formulas for the final render", async 
     mainRate: () => "",
     shouldFollowOutput: () => true, followOutput() {},
   });
+  mountPaintFeed(h.context);
   const paint = script.match(/const paint = \(\) => \{([\s\S]*?)\n  \};/)[1];
   const runPaint = () => vm.runInContext("(() => {" + paint + "})()", h.context);
   runPaint();
@@ -1388,6 +1396,7 @@ test("stream paint batches answer, thinking and progress into one follow pass", 
     shouldFollowOutput: () => { followChecks++; return true; },
     followOutput: (follow) => { follows++; assert.equal(follow, true); },
   });
+  mountPaintFeed(h.context);
   const paint = script.match(/const paint = \(\) => \{([\s\S]*?)\n  \};/)[1];
   const runPaint = () => vm.runInContext("(() => {" + paint + "})()", h.context);
   runPaint();
@@ -1445,34 +1454,40 @@ test("delta blocks defer layout work to the coalesced paint", () => {
   const start = script.indexOf('const { kind, payload } = parseBlock');
   const end = script.indexOf("if (finished) break;", start);
   const blockDispatch = script.slice(start, end);
+  const liveView = script.slice(script.indexOf("  // BEGIN live event view"), script.indexOf("  // END live event view"));
+  const handlers = script.slice(script.indexOf("const EXECUTION_EVENT_HANDLERS ="), script.indexOf("function dispatchExecutionEvent("));
   assert.ok(start >= 0 && end > start);
   assert.doesNotMatch(blockDispatch, /shouldFollowOutput|followOutput/);
-  assert.match(blockDispatch, /kind === "delta"[\s\S]*?answerDirty = true;[\s\S]*?schedulePaint\(\)/);
-  assert.match(blockDispatch, /kind === "thinking_start"[\s\S]*?closeThinkingPhase\(\)/);
-  assert.match(blockDispatch, /kind === "thinking"[\s\S]*?if \(text\)[\s\S]*?createThinkingFold\(box, phaseBubble\)[\s\S]*?thinkingDirty = true;[\s\S]*?schedulePaint\(\)/);
+  assert.match(liveView, /delta\(text\)[\s\S]*?answerDirty = true;[\s\S]*?setPhase\("Responding…"\)/);
+  assert.match(handlers, /thinking_start\(event, view\)[\s\S]*?view.endThinking\(true\)/);
+  assert.match(handlers + liveView, /thinking\(event, view\)[\s\S]*?if \(text\)[\s\S]*?createThinkingFold\(box, phaseBubble\)[\s\S]*?thinkingDirty = true;[\s\S]*?schedulePaint\(\)/);
   assert.doesNotMatch(blockDispatch, /kind !== "thinking_start" && kind !== "thinking" && kind !== "thinking_done"/);
   assert.match(blockDispatch, /kind === "done"[\s\S]*?closeThinkingPhase\(\)/);
-  assert.match(blockDispatch, /kind === "subagent_progress"[\s\S]*?activity.subagents\(payload\)/);
+  assert.match(liveView, /subagents\(payload, decoded\)[\s\S]*?activity.subagents\(payload, decoded\)/);
+  assert.match(blockDispatch, /dispatchExecutionEvent\(kind, payload, liveView, "live"\)/);
+  assert.match(script, /const setPhase = [\s\S]*?activityDirty = true;[\s\S]*?schedulePaint\(\)/);
+  assert.match(liveView, /endThinking\(newRound\) \{ closeThinkingPhase\(newRound\); \}/);
 });
 
 test("progress cannot split an active thinking phase", () => {
   const start = script.indexOf('const { kind, payload } = parseBlock');
   const end = script.indexOf("if (finished) break;", start);
   const blockDispatch = script.slice(start, end);
+  const liveView = script.slice(script.indexOf("  // BEGIN live event view"), script.indexOf("  // END live event view"));
   // Payload-derived speed was removed because the structured `rate` event now
   // carries the display sample.
-  const rateBranch = blockDispatch.match(/else if \(kind === "rate"\) \{([\s\S]*?)\n        \}/);
-  const subagentBranch = blockDispatch.match(/else if \(kind === "subagent_progress"\) \{([\s\S]*?)\n        \}/);
+  const rateBranch = liveView.match(/rate\(value\) \{([\s\S]*?)\n    \},/);
+  const subagentBranch = liveView.match(/subagents\(payload, decoded\) \{([\s\S]*?)\n    \},/);
   assert.ok(rateBranch);
   assert.ok(subagentBranch);
-  assert.match(rateBranch[1], /rateSampleOf\(JSON\.parse\(payload\)\)/);
+  assert.match(rateBranch[1], /rateSampleOf\(value\)/);
   assert.match(rateBranch[1], /thinkingRates\.speed\(sample\)/);
   assert.match(rateBranch[1], /setTokenRate\(sample\)/);
   assert.doesNotMatch(blockDispatch, /else if \(payload\)/);
   assert.doesNotMatch(rateBranch[1], /closeThinkingPhase/);
   assert.doesNotMatch(subagentBranch[1], /closeThinkingPhase/);
   assert.doesNotMatch(rateBranch[1], /ensureProgressPhase\(\)|progLines\.push/);
-  assert.match(subagentBranch[1], /activity.subagents\(payload\)/);
+  assert.match(subagentBranch[1], /activity.subagents\(payload, decoded\)/);
   assert.doesNotMatch(blockDispatch, /closeProgressPhase/);
   assert.doesNotMatch(script, /finalizing response/);
 });

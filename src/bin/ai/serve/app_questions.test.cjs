@@ -115,6 +115,7 @@ function harness({ messages, phone = true, requestHook } = {}) {
   vm.runInContext(between("function closeQuestionPanel(", "// BEGIN session switch"), context);
   context.updateQuestionButton = (count) => { if (count !== undefined) elements.questioncount.textContent = String(count); };
   vm.runInContext(between("function questionRowsOf(", "// Assistant replies render"), context);
+  vm.runInContext(between("// BEGIN execution event dispatcher", "// END execution event dispatcher"), context);
   vm.runInContext(between("function historyRowsOf(", "// A session the server reports as running"), context);
   vm.runInContext(between("// BEGIN history retry", "const HISTORY_RETRY_DELAYS_MS"), context);
   vm.runInContext(between("async function loadHistory(", "// Scrolling to the top of the transcript"), context);

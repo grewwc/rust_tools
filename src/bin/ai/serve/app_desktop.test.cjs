@@ -102,6 +102,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
       },
       addEventListener(type, listener) { el["on" + type] = listener; },
       setAttribute(key, value) { el.attrs[key] = String(value); },
+      removeAttribute(key) { delete el.attrs[key]; },
       getAttribute(key) { return el.attrs[key] ?? null; },
       appendChild(child) { child.remove(); child.parentNode = el; el.children.push(child); return child; },
       insertBefore(child, before) {
@@ -152,8 +153,14 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     ["refresh", "button"], ["del", "button"], ["omodel", "select"], ["oagent", "select"], ["oeffort", "select"],
     ["composer", "div"], ["img", "button"], ["sidenote", "button"], ["send", "button"], ["turnstatus", "div"],
     ["sidequeue", "div"], ["sidequeuecount", "span"], ["sidequeuelist", "ul"],
+    ["cmdmenu", "div"], ["cmdoptions", "div"], ["cmdempty", "div"],
   ]) elements[id] = node(tag);
   for (const id of ["img", "prompt", "sidenote", "send"]) elements.composer.appendChild(elements[id]);
+  elements.cmdmenu.hidden = true;
+  elements.cmdempty.hidden = true;
+  elements.cmdmenu.appendChild(elements.cmdoptions);
+  elements.cmdmenu.appendChild(elements.cmdempty);
+  elements.composer.appendChild(elements.cmdmenu);
   elements.prompt.value = "draft in A";
   for (const match of html.matchAll(/<(div|section|button)[^>]*id="(sessionaction[^"]*)"[^>]*>([^<]*)/g)) {
     const el = elements[match[2]] = node(match[1]);
@@ -260,6 +267,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
   });
   vm.runInContext(marked("execution model"), context);
   vm.runInContext(between("function headers(", "const esc ="), context);
+  vm.runInContext(between("// Slash-command completion.", "async function loadInfo()"), context);
   vm.runInContext(between("function sessionTitle(s)", "// Phone drawer floats"), context);
   vm.runInContext(between("function setPromptValue(", "// True while the composer"), context);
   vm.runInContext(between("const DRAFT_PREFIX =", "let questionCache ="), context);
@@ -275,6 +283,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
   vm.runInContext(between("function parseBlock(raw)", "// \u0060/cd\u0060 changes"), context);
   vm.runInContext(between("const RATE_STORAGE =", "function addFold("), context);
   vm.runInContext(between("function setAnswerRate(", "// Only completed answer bubbles"), context);
+  vm.runInContext(between("function handleReplayEvent(", "function showEventWarning("), context);
   vm.runInContext(marked("composer send"), context);
   vm.runInContext(between('$("newbtn").onclick =', '$("img").onclick ='), context);
   context.wireSessionActions();

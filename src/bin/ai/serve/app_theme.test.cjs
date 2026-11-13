@@ -643,11 +643,12 @@ test("desktop rewind opacity and light metadata retain readable foregrounds", ()
   }
 });
 
+// Pin shared and phone CSS including the command menu styles from 4722cb07.
 test("desktop contrast rules preserve the current shared and mobile CSS bytes", () => {
   const phoneApplicable = desktopMediaQueries().reduce((source, block) => source.replace(block.css, ""), style);
   assert.doesNotMatch(phoneApplicable, /--(?:control-border|danger-text)/);
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "53fc93f51d7dada2ed866072de3e2131009a261540b31a84b4a4e5abc111cf5e",
+    "e9ddcc9675b0887b8946cfd7976bd1204e7cdce9ab8026d115e733e34864aca8",
     "desktop contrast changed shared or mobile CSS");
 });
 
@@ -657,7 +658,7 @@ test("desktop overrides leave all phone-applicable CSS byte-identical", () => {
   let phoneApplicable = style;
   for (const block of desktop) phoneApplicable = phoneApplicable.replace(block.css, "");
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "53fc93f51d7dada2ed866072de3e2131009a261540b31a84b4a4e5abc111cf5e",
+    "e9ddcc9675b0887b8946cfd7976bd1204e7cdce9ab8026d115e733e34864aca8",
     "shared or phone CSS changed outside the desktop queries");
 });
 

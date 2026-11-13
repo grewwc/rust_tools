@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const crypto = require("node:crypto");
 
 function loadFixtures(file, names) {
   const filename = path.join(__dirname, file);
@@ -13,7 +14,7 @@ function loadFixtures(file, names) {
     "\n;({" + names.join(",") + "});", { filename }).runInNewContext({
     require: (name) => name === "node:test" ? { test() {} } : require(name),
     __dirname, __filename: filename, console, Buffer,
-    process: { env: { ...process.env, ASERVE_TEST_APP_HTML: path.join(__dirname, "app.html") } },
+    process: { env: { ...process.env, ASERVE_TEST_APP_HTML: process.env.ASERVE_TEST_APP_HTML || path.join(__dirname, "app.html") } },
     TextEncoder, TextDecoder, AbortController, URL, URLSearchParams,
     setTimeout, clearTimeout, setInterval, clearInterval, setImmediate,
   });
@@ -25,6 +26,19 @@ const stream = loadFixtures("app_stream.test.cjs", [
 ]);
 const desktop = loadFixtures("app_desktop.test.cjs", ["harness", "loadChat"]);
 const errors = loadFixtures("app_error_rows.test.cjs", ["harness"]);
+const team = loadFixtures("app_team_mode.test.cjs", ["harness", "NORMAL", "TRAECLI", "response"]);
+
+test("owner regression: adoptComposerSession preserves the exact HEAD function contract", () => {
+  const start = stream.script.indexOf("function adoptComposerSession(");
+  const end = stream.script.indexOf("\n}", start) + 2;
+  assert.ok(start >= 0 && end > start);
+  const source = stream.script.slice(start, end), body = source.slice(source.indexOf("{"));
+  // HEAD 18e9fbc3, measured by the independent contracts.cjs checker.
+  assert.equal(source.slice(0, source.indexOf("{")), "function adoptComposerSession(newId, previousId, base) ");
+  assert.equal(Buffer.byteLength(body), 425);
+  assert.equal(crypto.createHash("sha256").update(body).digest("hex"),
+    "b17cffd76ff46aa23f5e3675485a4e06d445c6812bef9580fcece60abb76f006");
+});
 
 function pageSlice(start, end) {
   const from = stream.script.indexOf(start), to = stream.script.indexOf(end, from);
@@ -173,8 +187,8 @@ test("three paths: history omits Arguments and replay caps thinking while live r
   assert.equal(thinkingBody(replay.view.box).length, 6001);
 });
 
-function renderingHarness() {
-  const h = desktop.harness();
+function renderingHarness(options) {
+  const h = desktop.harness(options);
   desktop.loadChat(h);
   runSlice(h.context, "function toolArgsOf(", "// Which stored folds");
   runSlice(h.context, "function formatSubagentElapsed(", "function createSubagentClock(");
@@ -213,6 +227,128 @@ test("history task tools preserve raw bytes beyond the ordinary output limit wit
       { role: "tool", content: raw, tool_call_id: call.id, task_report: report }]);
     assert.equal(foldParts(toolNode(h.elements.msgs, "task_wait")).body.textContent, raw);
   }
+});
+
+test("snapshot history routes canonical rows through the shared projection without stream events or live activity", async () => {
+  const messages = [{ role: "user", content: "question" }, ...historyMessages,
+    { role: "internal_note", content: "stored note" }];
+  const h = stream.retainedHistoryHarness(messages), c = h.c;
+  assert.equal(typeof c.dispatchExecutionSnapshot, "function", "history must expose its materialized snapshot projection");
+  assert.equal(typeof c.dispatchExecutionProjection, "function", "events and snapshots must share the projection entry point");
+  const table = vm.runInContext("EXECUTION_SNAPSHOT_HANDLERS", c);
+  const snapshots = [], projected = [], updates = [];
+  const snapshot = c.dispatchExecutionSnapshot, project = c.dispatchExecutionProjection, update = c.updateExecutionModel;
+  c.dispatchExecutionSnapshot = (row, view, source) => {
+    snapshots.push({ row, source });
+    return snapshot(row, view, source);
+  };
+  c.dispatchExecutionProjection = (handlers, kind, value, view, source) => {
+    projected.push({ handlers, kind, value, source });
+    return project(handlers, kind, value, view, source);
+  };
+  c.updateExecutionModel = (event, ...args) => { updates.push(event); return update(event, ...args); };
+  c.decodeExecutionEvent = () => assert.fail("materialized history must not decode a fabricated wire event");
+  c.dispatchExecutionEvent = () => assert.fail("materialized history must not dispatch started/delta/done events");
+  c.createLiveActivity = () => assert.fail("materialized history must not acquire live activity ownership");
+  await c.loadHistory();
+  assert.equal(snapshots.length, messages.length);
+  assert.deepEqual(projected.map((item) => item.kind), ["user", "assistant", "assistant", "fold", "fold", "fold", "assistant", "fold"]);
+  for (const [index, item] of snapshots.entries()) {
+    assert.equal(item.source, "history");
+    assert.equal(item.row.message, messages[index], "the canonical message remains the snapshot source");
+    assert.equal(item.row.historyIndex, index);
+    assert.equal(projected[index].handlers, table);
+    assert.equal(projected[index].value, item.row, "projection retains canonical identity and merged task fields");
+    assert.equal(projected[index].source, "history");
+  }
+  assert.deepEqual(updates.map((event) => event.kind), ["history", "display"]);
+  assert.deepEqual(JSON.parse(JSON.stringify(updates[0].summaries)),
+    JSON.parse(JSON.stringify(c.historyExecutionOf(snapshots.map((item) => item.row)))));
+  const nodes = [h.root, ...stream.descendants(h.root)];
+  await c.loadHistory();
+  assert.equal(snapshots.length, messages.length, "unchanged canonical rows refresh without another materialization");
+  assert.deepEqual([h.root, ...stream.descendants(h.root)], nodes);
+  assert.deepEqual(updates.map((event) => event.kind), ["history", "display", "history", "display"], "each load commits canonical summaries once");
+  assert.equal(c.canonicalHistoryTotal, messages.length);
+
+  for (const source of ["live", "replay"]) {
+    const live = source === "live" ? stream.streamHarness() : stream.replayHarness();
+    const context = live.context, calls = [], dispatch = context.dispatchExecutionProjection;
+    const events = vm.runInContext("EXECUTION_EVENT_HANDLERS", context);
+    context.dispatchExecutionProjection = (...args) => { calls.push(args); return dispatch(...args); };
+    live.emit("delta", { delta: "wire answer" });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][0], events);
+    assert.equal(calls[0][1], "delta");
+    assert.equal(calls[0][2].parsed, true);
+    assert.equal(calls[0][4], source);
+    const root = live.box || live.view.box, before = projection(root), original = Array.from(stream.descendants(root));
+    live.emit("snapshot", { role: "assistant", text: "not a wire event" });
+    assert.equal(calls.length, 1, "snapshot projection does not add a server event kind");
+    assert.deepEqual(projection(root), before);
+    assert.deepEqual(Array.from(stream.descendants(root)), original);
+  }
+});
+
+for (const phone of [false, true]) test("snapshot history preserves " + (phone ? "phone" : "desktop") + " source text, reasoning, rates and frozen task observations", () => {
+  const h = renderingHarness({ phone }), c = h.context;
+  assert.equal(typeof c.dispatchExecutionSnapshot, "function", "history must use the snapshot projection");
+  c.Date = { now() { assert.fail("history must not age a materialized task or reasoning observation"); } };
+  c.setInterval = () => assert.fail("history must not start an elapsed clock");
+  c.setTimeout = () => assert.fail("history snapshots must not schedule live paint");
+  c.createLiveActivity = () => assert.fail("history snapshots must not create activity slots");
+  const prefix = "\u001eaios:reasoning-encrypted-replay:v1\u001f";
+  const typed = "typed one\n\ntyped two", plain = "ordinary reasoning";
+  const ordinary = "\n  " + "o".repeat(2100) + "ORDINARY TAIL\r\n ";
+  const taskRaw = "\n  " + "t".repeat(2100) + "TASK TAIL\r\n\n";
+  const taskOutput = "\n  retained task output\r\n\n";
+  const report = { ...stream.structuredSubagents([{ ...stream.structuredTask("snapshot-worker", 5000),
+    output: taskOutput, output_truncated: true }]).task_report, operation: "task_wait" };
+  const messages = [
+    { role: "assistant", content: "", tool_calls: calls },
+    { role: "assistant", content: "", tool_calls: calls, reasoning_content: prefix + JSON.stringify({ items: [
+      { type: "reasoning", encrypted_content: "ENCRYPTED BYTES", summary: [
+        { type: "summary_text", text: "  typed one \n" }, { type: "text", text: "untyped secret" },
+        { type: "summary_text", text: "\n typed two  " },
+      ] }, { type: "message", summary: [{ type: "summary_text", text: "wrong item" }] },
+    ] }) },
+    { role: "assistant", content: "visible metadata holder", tool_calls: calls, reasoning_content: " runtime-origin:internal metadata " },
+    { role: "assistant", content: "", tool_calls: calls, reasoning_content: "\n  " + plain + " \r\n" },
+    { role: "assistant", content: "", reasoning_content: prefix + "{broken" },
+    { role: "tool", content: ordinary, tool_call_id: calls[0].id },
+    { role: "tool", content: taskRaw, tool_call_id: calls[2].id, task_report: report },
+    { role: "assistant", content: "\n final snapshot answer\n\n" },
+  ];
+  c.storedRate = (kind, sid, text) => {
+    assert.equal(sid, "open-session");
+    return kind === "thinking" && text === typed ? "~12 tok @ 6 tok/s"
+      : kind === "turn" && text === "final snapshot answer" ? "output 20 tok @ 10 tok/s" : "";
+  };
+  const rows = c.historyRowsOf(messages, 50, true).rows;
+  for (const row of rows) c.renderHistoryRow(row, h.elements.msgs);
+  assert.deepEqual(Array.from(rows, (row) => row.historyIndex), [43, 44, 45, 47, 48, 49]);
+  assert.deepEqual(Array.from(rows, (row) => row.reasoning), [typed, "", plain, "", "", ""]);
+  assert.equal(rows[3].call, calls[0], "the filtered call message still supplies the canonical lookup");
+  assert.equal(foldParts(toolNode(h.elements.msgs, "read_file")).body.textContent, ordinary.trim().slice(0, 2000));
+  assert.equal(foldParts(toolNode(h.elements.msgs, "task_wait")).body.textContent, taskRaw);
+  assert.doesNotMatch(h.elements.msgs.textContent, /Arguments\n|ENCRYPTED BYTES|untyped secret|wrong item|ORDINARY TAIL|runtime-origin:/);
+  const thoughts = records(h.elements.msgs).filter((node) => foldParts(node).summary?.textContent.startsWith("thinking"));
+  assert.deepEqual(thoughts.map((node) => foldParts(node).body.textContent), [typed, plain]);
+  assert.equal(foldParts(thoughts[0]).summary.textContent, "thinking · ~12 tok @ 6 tok/s");
+  assert.equal(foldParts(thoughts[1]).summary.textContent, "thinking · ~" + c.estimateTextTokens(plain) + " tok");
+  const card = records(h.elements.msgs).find((node) => node.dataset.subagents === "true");
+  assert.equal(card.dataset.executionState, "completed", "a busy history report is still a frozen card");
+  assert.equal(card.dataset.taskBusy, "true");
+  assert.equal(card.dataset.executionSettled, "true");
+  assert.equal(card.querySelector(".task-output-body").textContent, taskOutput);
+  assert.match(card.textContent, /5s|output preview truncated; full output in history/);
+  assert.match(card.textContent, /\[output preview truncated; full output in history\]/);
+  const terminal = h.elements.msgs.lastElementChild;
+  assert.equal(terminal.dataset.taskReset, "true");
+  assert.equal(terminal.dataset.canonicalIndex, "49");
+  assert.equal(terminal.dataset.canonicalKey, rows.at(-1).key);
+  assert.equal(terminal.dataset.canonicalIdentity, rows.at(-1).identity);
+  assert.match(terminal.textContent, /output 20 tok @ 10 tok\/s/);
 });
 
 for (const kind of ["delta", "replace"]) test("malformed " + kind + " JSON: live falls back to raw payload and replay ignores it", () => {
@@ -328,16 +464,20 @@ function sendHarness() {
     STALE_FOLLOW_TRIES: Number(/const STALE_FOLLOW_TRIES = (\d+)/.exec(stream.script)[1]),
     REMOTE_RUNNING_TTL_MS: 30000, confirmPollTimer: null, confirmPollTick: 0,
     eventAbort: null, recoveredView: null, eventFailures: 0, confirmShown: null,
+    NATIVE_PREFIX: JSON.parse(/const NATIVE_PREFIX = ("[^"\n]*");/.exec(stream.script)[1]),
     addAnswerCopy() {},
   });
   desktop.loadChat(h);
   runSlice(c, "function toolArgsOf(", "// Which stored folds");
   runSlice(c, "function createThinkingFold(", "// The three override picks");
   runSlice(c, "function addUserBubble(", "function askRewind(");
+  runSlice(c, "function attachLiveBox(", "// A turn the user has left");
+  runSlice(c, "function dropBackgroundTurn(", "// BEGIN history retry");
   runSlice(c, "function isRemoteTurn()", "// Transient note through");
   runSlice(c, "async function reloadStale()", "// --- turn confirmation");
   runSlice(c, "function ensureConfirmPoll()", "// A pick is the moment");
-  runSlice(c, "function recoveredProgressView(", "async function pollConfirm(");
+  runSlice(c, "function recoveredProgressView(", "function handleReplayEvent(");
+  runSlice(c, "function showEventWarning(", "async function pollConfirm(");
   const fetch = c.fetch;
   c.fetch = async (url, options = {}) => {
     const pathname = new URL(url).pathname;
@@ -543,3 +683,569 @@ for (const stage of ["history body", "HTTP failure body"]) for (const navigation
       : ["/sessions/s/history", "/sessions/session-b/history", "/sessions/s/history"]);
   });
 }
+
+function installOwnershipNavigation(c) {
+  Object.assign(c, {
+    persistDraft() {}, restoreDraft() {}, resetQuestionNavigator() {}, restoreSkillPick() {}, restoreTeamPick() {},
+    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+  });
+  runSlice(c, "// BEGIN session switch", "// END session switch");
+}
+
+function installServerSave(c) {
+  const originalQuery = c.$, originalBase = c.store.base, storage = new Map([["serve.base", originalBase]]);
+  const nodes = {
+    save: {}, base: { value: originalBase }, token: { value: "" },
+    conn: { classList: { remove() {} } }, connstat: { classList: { add() {} } },
+  };
+  c.$ = (id) => nodes[id] || originalQuery(id);
+  c.localStorage = { getItem: (key) => storage.get(key) || null,
+    setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) };
+  Object.defineProperty(c.store, "base", { configurable: true, get: () => storage.get("serve.base") || originalBase });
+  Object.assign(c, { URL, location: { origin: originalBase }, showStored() {}, boot: async () => {} });
+  runSlice(c, "function normalizeServeBase(", "const store =");
+  runSlice(c, '  $("save").onclick = async () => {', '  $("newbtn").onclick =');
+  return async (base) => { nodes.base.value = base; await nodes.save.onclick(); };
+}
+
+// HEAD 18e9fbc3 snapshots include every transcript identity and DOM metadata field.
+const HEAD_LATE_HISTORY_VIEWS = {
+  "body": {
+    "text": "Obsolete response.",
+    "selected": "s",
+    "mounted": "s",
+    "keys": [
+      "[998,\"assistant\",\"Obsolete response.\",\"\",\"\",null]"
+    ],
+    "sequence": 1,
+    "total": 999,
+    "count": 1,
+    "window": 1,
+    "windowSession": "s",
+    "nodes": [
+      {
+        "text": "Obsolete response.",
+        "className": "",
+        "dataset": {}
+      },
+      {
+        "text": "Obsolete response.",
+        "className": "turn",
+        "dataset": {
+          "taskReset": "true",
+          "canonicalIndex": "998",
+          "canonicalKey": "[998,\"assistant\",\"Obsolete response.\",\"\",\"\",null]",
+          "canonicalIdentity": "[\"assistant\",\"Obsolete response.\",\"\",\"\",null]"
+        }
+      },
+      {
+        "text": "Obsolete response.",
+        "className": "msg asst md",
+        "dataset": {
+          "role": "assistant"
+        }
+      }
+    ]
+  },
+  "error body": {
+    "text": "Retained transcript.history failed: 503 obsolete error",
+    "selected": "s",
+    "mounted": "",
+    "keys": [],
+    "sequence": 1,
+    "total": 0,
+    "count": null,
+    "nodes": [
+      {
+        "text": "Retained transcript.history failed: 503 obsolete error",
+        "className": "",
+        "dataset": {}
+      },
+      {
+        "text": "history failed: 503 obsolete error",
+        "className": "msg asst err",
+        "dataset": {
+          "role": "err"
+        }
+      }
+    ]
+  }
+};
+
+for (const outcome of ["body", "error body"]) for (const navigation of ["session ABA", "server ABA"]) {
+  test("HEAD parity: a late history " + outcome + " after " + navigation + " commits without a replacement load", async () => {
+    const h = errors.harness({ realApi: true }), c = h.context, body = deferred(), reading = deferred();
+    installOwnershipNavigation(c);
+    const saveServer = installServerSave(c), originalBase = c.store.base;
+    h.root.textContent = "Retained transcript.";
+    c.fetch = async () => ({ ok: outcome === "body", status: 503, statusText: "Unavailable",
+      headers: { get: () => "999" }, json() { reading.resolve(); return body.promise; } });
+    const pending = c.loadHistory(); await reading.promise;
+    if (navigation === "session ABA") { c.switchSession("session-b", false); c.switchSession("s", false); }
+    else { await saveServer("https://other.test"); await saveServer(originalBase); }
+    const before = viewSnapshot(h);
+    body.resolve(outcome === "body" ? [{ role: "assistant", content: "Obsolete response." }] : { error: "obsolete error" });
+    await pending;
+    assert.notEqual(viewSnapshot(h), before);
+    assert.deepEqual(JSON.parse(viewSnapshot(h)), HEAD_LATE_HISTORY_VIEWS[outcome]);
+    if (outcome === "body") {
+      assert.equal(h.root.textContent, "Obsolete response.");
+      assert.equal(c.historySession, "s");
+      assert.equal(c.canonicalHistoryTotal, 999);
+      assert.equal(c.lastMsgCount, 1);
+      assert.equal(h.root._histWinSession, "s");
+      assert.equal(h.root._histWin, 1);
+      assert.equal(c.historyLoadState("s").failure, null);
+      assert.equal(h.timers.size, 0);
+    } else {
+      assert.equal(h.root.textContent, "Retained transcript.history failed: 503 obsolete error");
+      assert.equal(c.historySession, "");
+      assert.equal(c.canonicalHistoryTotal, 0);
+      const failure = c.historyLoadState("s").failure;
+      assert.equal(failure.row, h.root.children.at(-1));
+      assert.equal(failure.retries, 0);
+      assert.deepEqual([...h.timers.values()].map((timer) => timer.delay), [1000]);
+    }
+  });
+}
+
+test("HEAD parity: failures for the same sid share HEAD retry state across servers", async () => {
+  const h = errors.harness(), c = h.context;
+  installOwnershipNavigation(c);
+  const saveServer = installServerSave(c), originalBase = c.store.base;
+  await h.failHistory("server A is unavailable");
+  const originalState = c.historyLoadState("s");
+  assert.ok(originalState.failure);
+  await saveServer("https://other.test");
+  assert.equal(c.historyLoadState("s"), originalState);
+  assert.equal(c.historyLoadState("s").failure, originalState.failure);
+  assert.equal(c.historyLoadState("s", originalBase), originalState);
+  assert.equal(h.historyRows().length, 1);
+});
+
+for (const navigation of ["session ABA", "server ABA"]) {
+  const title = navigation === "session ABA"
+    ? "HEAD parity: a late confirm poll after session ABA still samples the turn and shows its question"
+    : "HEAD parity: a late confirm poll after server ABA still samples the turn and shows its question";
+  test(title, async () => {
+    for (const running of [false, true]) {
+      const h = errors.harness(), c = h.context, response = deferred(), shown = [];
+      let attached = 0;
+      installOwnershipNavigation(c);
+      const saveServer = installServerSave(c), originalBase = c.store.base;
+      runSlice(c, "async function pollConfirm()", "// Live streams, replay streams");
+      Object.assign(c, { confirmBusy: false, turnRunning: false, isRemoteTurn: () => false,
+        attachEvents() { attached++; }, refreshSideNotes() {},
+        showConfirm(...args) { shown.push(args); },
+        api: async () => ({ json: () => response.promise }) });
+      const pending = c.pollConfirm(); await settle();
+      const epoch = c.runEpoch, seq = c.confirmPollSeq;
+      if (navigation === "session ABA") {
+        c.switchSession("session-b", false); c.switchSession("s", false);
+        assert.equal(c.runEpoch, epoch); assert.equal(c.confirmPollSeq, seq);
+      } else { await saveServer("https://other.test"); await saveServer(originalBase); }
+      const before = JSON.stringify(c.executionState());
+      response.resolve({ running, turn: 42,
+        pending: { id: 7, prompt: "Confirm navigation question", token: "navigation-question", input: false } });
+      {
+        assert.equal(await pending, running);
+        if (!running) assert.equal(JSON.stringify(c.executionState()), before);
+        else assert.equal(c.turnRunningPid, 42);
+        assert.equal(c.turnRunning, running);
+        assert.equal(attached, Number(running));
+        assert.deepEqual(shown, [[7, "Confirm navigation question", "navigation-question", false]]);
+      }
+    }
+  });
+}
+
+test("HEAD parity: a queued cancelled history retry can restart after session ABA", async () => {
+  const h = errors.harness(), c = h.context;
+  installOwnershipNavigation(c);
+  await h.failHistory("temporary history failure");
+  const retry = [...h.timers.values()].find((timer) => timer.delay === 1000);
+  assert.ok(retry);
+  c.switchSession("session-b", false); c.switchSession("s", false);
+  let calls = 0;
+  c.api = async () => { calls++; return historyResponse(h.messages, 2); };
+  retry.callback(); await settle();
+  assert.equal(calls, 1, "HEAD checks the current sid and failure identity when a queued callback runs");
+  assert.equal(h.root.textContent, "promptreply");
+  assert.equal(h.timers.size, 0);
+});
+
+test("owner regression: a late history finally leaves the replacement load lock intact", async () => {
+  const h = errors.harness(), c = h.context, first = deferred(), second = deferred();
+  installOwnershipNavigation(c);
+  let calls = 0;
+  c.api = async () => ({ headers: { get: () => "2" }, json: () => (++calls === 1 ? first.promise : second.promise) });
+  const old = c.loadHistory(); await settle();
+  c.switchSession("session-b", false); c.switchSession("s", false);
+  const replacement = c.loadHistory(); await settle();
+  const state = c.historyLoadState("s"), lock = state.loading;
+  first.resolve([{ role: "assistant", content: "Old answer." }]); await old;
+  assert.equal(state.loading, lock);
+  assert.ok(state.loading);
+  assert.equal(h.root.textContent, "");
+  second.resolve(h.messages); await replacement;
+  assert.equal(state.loading, 0);
+  assert.equal(h.root.textContent, "promptreply");
+  assert.equal(h.timers.size, 0);
+});
+
+test("HEAD parity: a superseded pager skips desktop scrolling but clears the shared paging flag", async () => {
+  const h = errors.harness(), c = h.context, first = deferred(), second = deferred();
+  installOwnershipNavigation(c);
+  Object.assign(c, { lastMsgCount: 2, canonicalHistoryTotal: 20 });
+  let scrollOwner = {};
+  Object.assign(c, { isDesktopTranscriptScroll: () => true, ownedTranscriptScroll: () => scrollOwner });
+  Object.assign(h.root, { _histWinSession: "s", _histWin: 2 });
+  let calls = 0;
+  c.loadHistory = () => ++calls === 1 ? first.promise : second.promise;
+  const old = c.loadOlderHistory(); await settle();
+  c.switchSession("session-b", false);
+  scrollOwner = {};
+  h.root._histWinSession = "session-b";
+  h.root._histOlder = false; // The replacement transcript starts its own pager.
+  h.root.scrollTop = 77;
+  const replacement = c.loadOlderHistory(); await settle();
+  h.root.scrollHeight = 350;
+  first.resolve(); await old;
+  assert.equal(h.root._histOlder, false, "HEAD finally releases the shared flag even during the replacement request");
+  assert.equal(h.root.scrollTop, 77);
+  second.resolve(); await replacement;
+  assert.equal(h.root._histOlder, false);
+  assert.equal(h.root.scrollTop, 227);
+});
+
+for (const kind of ["confirm_request", "confirm_done", "input_request", "input_done", "native input", "delta"]) {
+  test("HEAD parity: a live " + kind + " from the same sid on another server still affects this page", async () => {
+    const h = sendHarness(); await h.start(); await h.accept();
+    const c = h.c, originalBase = c.store.base, calls = [];
+    c.store.base = "https://other.test";
+    Object.assign(c, { showConfirm() { calls.push("show"); }, hideConfirm() { calls.push("hide"); },
+      handleNativeRequest() { calls.push("native"); }, shouldFollowOutput: () => true,
+      followOutput() { calls.push("follow"); }, confirmShown: { id: 7, token: "current-server" } });
+    const event = { id: 7, token: "old-server", prompt: kind === "native input" ? "\x1enative:action" : "Old question." };
+    if (kind === "native input") event.prompt = vm.runInContext("NATIVE_PREFIX", c) + "action";
+    await h.frame(kind === "native input" ? "input_request" : kind, kind === "delta" ? { delta: "Background answer." } : event);
+    const notification = kind === "delta" ? [] : [kind === "native input" ? "native"
+      : kind.endsWith("_done") ? "hide" : "show"];
+    assert.deepEqual(calls, [...notification, "follow"]);
+    if (kind === "delta") assert.match(h.liveBox().textContent, /Background answer\./);
+    assert.equal(c.executionState(c.sessionId, originalBase).liveEntry, h.entry());
+    c.store.base = originalBase;
+    await h.finish(() => h.reader.frame(sse("done", {})));
+    await h.dispose();
+  });
+}
+
+test("owner regression: valid background live feeds update their own box and model across session ABA", async () => {
+  const h = sendHarness(); await h.start(); await h.accept();
+  const c = h.c, sid = c.sessionId, base = c.store.base, entry = h.entry(), calls = [];
+  c.switchSession("session-b", false); entry.box.remove();
+  Object.assign(c, { showConfirm() { calls.push("show"); }, shouldFollowOutput: () => true,
+    followOutput() { calls.push("follow"); } });
+  await h.frame("delta", { delta: "While A was hidden." });
+  await h.frame("subagent_progress", stream.structuredSubagents([stream.structuredTask("background-worker", 5000)]));
+  await h.frame("confirm_request", { id: 7, token: "A-question", prompt: "Continue A?" });
+  assert.deepEqual(calls, []);
+  assert.match(entry.box.textContent, /While A was hidden/);
+  assert.equal(c.executionState(sid, base).liveEntry, entry);
+  assert.deepEqual(Array.from(c.executionState(sid, base).taskStates, ([id, active]) => [id, active]), [["background-worker", true]]);
+  c.switchSession(sid, false); c.attachLiveBox();
+  assert.equal(entry.box.parentNode, h.elements.msgs);
+  calls.length = 0;
+  await h.frame("confirm_request", { id: 7, token: "A-question", prompt: "Continue A?" });
+  assert.ok(calls.includes("show"), "the feed remains valid after its original view generation expired");
+  await h.frame("delta", { delta: " Back on A." });
+  assert.match(entry.box.textContent, /While A was hidden\. Back on A\./);
+  await h.finish(() => h.reader.frame(sse("done", {})));
+  assert.equal(c.executionState(sid, base).live, false);
+  assert.equal(c.canSend(), true);
+  await h.dispose();
+});
+
+for (const newerTurn of [false, true]) {
+  test("HEAD parity: old live cleanup deletes a replacement feed" + (newerTurn ? " in a newer turn" : " in the same turn"), async () => {
+    const h = sendHarness(); await h.start(); await h.accept();
+    const c = h.c, sid = c.sessionId, base = c.store.base;
+    if (newerTurn) c.updateExecutionModel({ kind: "begin" }, sid, base);
+    const replacement = { box: c.document.createElement("div"), lastEventAt: 2000 };
+    c.updateExecutionModel({ kind: "live", entry: replacement }, sid, base);
+    c.turnRunning = true;
+    const pageEffects = [];
+    Object.assign(c, { loadInfo() { pageEffects.push("info"); }, loadSessions() { pageEffects.push("sessions"); },
+      loadSessionConfig() { pageEffects.push("config"); }, followOutput() { pageEffects.push("follow"); } });
+    await h.finish(() => h.reader.frame(sse("done", {})));
+    assert.equal(c.executionState(sid, base).liveEntry, undefined);
+    assert.equal(c.executionState(sid, base).running, false);
+    assert.equal(c.executionState(sid, base).ended, true);
+    assert.equal(c.executionState(sid, base).failed, false);
+    assert.deepEqual(pageEffects, ["follow", "follow", "follow", "info", "sessions", "config"]);
+    assert.equal(c.canStop(), false);
+    assert.equal(c.canSend(), true);
+    c.updateExecutionModel({ kind: "live", entry: null }, sid, base);
+    await h.dispose();
+  });
+}
+
+test("owner regression: old replay finally preserves the replacement controller and view", async () => {
+  const h = errors.harness(), c = h.context, headers = [deferred(), deferred()];
+  let calls = 0;
+  c.fetch = () => headers[calls++].promise;
+  const old = c.attachEvents();
+  const oldController = c.eventAbort;
+  c.abortEvents();
+  const replacement = c.attachEvents(), controller = c.eventAbort, view = c.recoveredView;
+  assert.notEqual(controller, oldController);
+  headers[0].resolve({ ok: true, body: {} }); await old;
+  assert.equal(c.eventAbort, controller);
+  assert.equal(c.recoveredView, view);
+  assert.equal(c.eventActive, true);
+  assert.equal(view.box.parentNode, h.root);
+  c.abortEvents(); headers[1].resolve({ ok: true, body: {} }); await replacement;
+  assert.equal(h.timers.size, 0);
+});
+
+test("HEAD parity: a queued replay retry can attach after session ABA", async () => {
+  const h = errors.harness(), c = h.context;
+  installOwnershipNavigation(c);
+  let calls = 0;
+  c.fetch = async () => { calls++; throw new Error("wire unavailable"); };
+  await c.attachEvents();
+  const retry = [...h.timers.values()].find((timer) => timer.delay === 2000);
+  assert.ok(retry);
+  c.switchSession("session-b", false); c.switchSession("s", false);
+  c.turnRunning = true; c.turnRunningAt = Date.now();
+  retry.callback(); await settle();
+  assert.equal(calls, 2);
+  assert.equal(c.eventActive, false);
+  assert.equal(c.recoveredView, null);
+  assert.deepEqual([...h.timers.values()].map((timer) => timer.delay), [2000, 2000]);
+});
+
+test("HEAD parity: composer preparation adopts a late created session after session ABA", async () => {
+  const h = desktop.harness({ sid: "" }), c = h.context, created = deferred();
+  c.api = async () => ({ json: () => created.promise });
+  const pending = c.prepareTurnSession("", c.store.base); await settle();
+  c.switchSession("session-b", false); c.switchSession("", false);
+  created.resolve({ id: "obsolete-created-session", cwd: "/old" });
+  assert.equal(await pending, "obsolete-created-session");
+  assert.equal(c.sessionId, "obsolete-created-session");
+  assert.equal(c.pendingNew, "obsolete-created-session");
+  assert.equal(c.pendingCwd, "/old");
+});
+
+test("HEAD parity: composer config waits resume after session or server ABA", async () => {
+  for (const navigation of ["session ABA", "server ABA"]) {
+    const h = desktop.harness(), c = h.context, config = deferred(), sid = c.sessionId;
+    const saveServer = installServerSave(c), originalBase = c.store.base;
+    c.ensureTeamConfig = () => config.promise;
+    const pending = c.prepareTurnSession(sid, c.store.base); await settle();
+    if (navigation === "session ABA") { c.switchSession("session-b", false); c.switchSession(sid, false); }
+    else { await saveServer("https://other.test"); await saveServer(originalBase); }
+    config.resolve(true);
+    assert.equal(await pending, sid);
+    assert.equal(c.sessionId, sid); assert.equal(c.store.base, originalBase);
+  }
+});
+
+test("HEAD parity: an active composer preparation adopts the created session", async () => {
+  const h = desktop.harness({ sid: "" }), c = h.context, config = deferred();
+  c.api = async () => ({ json: async () => ({ id: "fresh-owned-session", cwd: "/fresh" }) });
+  c.ensureTeamConfig = (sid, base) => {
+    assert.equal(sid, "fresh-owned-session"); assert.equal(base, c.store.base); return config.promise;
+  };
+  const pending = c.prepareTurnSession("", c.store.base); await settle();
+  assert.equal(c.sessionId, "fresh-owned-session");
+  assert.equal(c.pendingNew, "fresh-owned-session");
+  config.resolve(true);
+  assert.equal(await pending, "fresh-owned-session");
+  assert.equal(c.pendingCwd, "/fresh");
+});
+
+for (const navigation of ["session ABA", "server ABA"]) {
+  test("HEAD parity: a late session-list page after " + navigation + " commits list and pager state", async () => {
+    const h = desktop.harness(), c = h.context, body = deferred(), sid = c.sessionId;
+    const saveServer = installServerSave(c), originalBase = c.store.base;
+    c.fetch = async () => ({ ok: true, headers: { get: (name) => name === "x-sessions-total" ? "71" : "1" },
+      json: () => body.promise });
+    const pending = c.loadSessions(); await settle();
+    if (navigation === "session ABA") { c.switchSession("session-b", false); c.switchSession(sid, false); }
+    else { await saveServer("https://other.test"); await saveServer(originalBase); }
+    const snapshot = () => vm.runInContext("JSON.stringify([lastItems,sessionsTotal,sessionsPageOffset,sessionsHasMore])", c);
+    const before = snapshot();
+    body.resolve([{ id: sid, summary: "Obsolete session list.", size_bytes: 1 }]); await pending;
+    assert.notEqual(snapshot(), before);
+    assert.equal(snapshot(), JSON.stringify([[{ id: sid, summary: "Obsolete session list.", size_bytes: 1 }], 71, 1, true]));
+  });
+}
+
+test("HEAD parity: an obsolete legacy session page issues its fallback request on the current server", async () => {
+  const h = desktop.harness(), c = h.context, body = deferred(), requests = [];
+  const saveServer = installServerSave(c);
+  c.fetch = async (url) => {
+    requests.push(url);
+    return { ok: true, headers: { get: () => null }, json: () => body.promise };
+  };
+  const pending = c.loadSessions(); await settle();
+  await saveServer("https://other.test");
+  body.resolve([{ id: c.sessionId, summary: "Old server." }]); await pending;
+  assert.equal(requests.length, 2);
+  assert.match(requests[0], /^https:\/\/serve\.test\/sessions\?/);
+  assert.equal(requests[1], "https://other.test/sessions");
+});
+
+for (const teamOnly of [false, true]) {
+  test("HEAD parity: a late " + (teamOnly ? "team-only" : "full") + " config read restores the current equal sid/base", async () => {
+    const body = deferred(), h = team.harness({ cfg: team.NORMAL, configGet: () => body.promise }), c = h.context;
+    const pending = c.loadSessionConfig({ teamOnly }); await settle();
+    c.switchSession("beta"); c.switchSession("alpha");
+    const before = JSON.stringify(h.state()), label = h.elements.teamlabel.textContent;
+    body.resolve(team.response(team.TRAECLI)); await pending;
+    assert.notEqual(JSON.stringify(h.state()), before);
+    assert.deepEqual(JSON.parse(JSON.stringify(h.state())), {
+      choice: { mode: "team", backend: "traecli", model: "worker-model" },
+      confirmed: { mode: "team", backend: "traecli", model: "worker-model" },
+      pending: false, saving: null, error: "", errorSource: "", revision: 0,
+      configRetryTimer: null, configRetries: 0, loadEpoch: 1,
+      fullLoadEpoch: teamOnly ? 0 : 1, appliedTeamLoadEpoch: 1,
+    });
+    assert.equal(h.elements.teamlabel.textContent, "subagent");
+  });
+}
+
+test("owner regression: valid background completion preserves the page's info and session-list refresh", async () => {
+  const h = sendHarness(); await h.start(); await h.accept();
+  const calls = [], c = h.c;
+  c.switchSession("session-b", false);
+  Object.assign(c, { loadInfo() { calls.push("info"); }, loadSessions() { calls.push("sessions"); },
+    loadSessionConfig() { calls.push("config"); } });
+  await h.finish(() => h.reader.frame(sse("done", {})));
+  assert.deepEqual(calls, ["info", "sessions"]);
+  assert.equal(h.entry().userInput.settled, true);
+  assert.equal(h.liveBox().parentNode, null);
+  await h.dispose();
+});
+
+test("HEAD parity: a stale live feed from another server publishes page notifications and refreshes", async () => {
+  const h = sendHarness(); await h.start(); await h.accept();
+  const c = h.c, originalBase = c.store.base, sid = c.sessionId, calls = [];
+  c.store.base = "https://other.test";
+  Object.assign(c, { note() { calls.push("note"); }, loadInfo() { calls.push("info"); },
+    loadSessions() { calls.push("sessions"); }, loadSessionConfig() { calls.push("config"); },
+    followOutput() { calls.push("follow"); } });
+  await h.finish(() => h.reader.eof());
+  assert.deepEqual(calls, ["note", "follow", "info", "sessions"]);
+  assert.equal(c.executionState(sid, originalBase).live, false);
+  assert.equal(c.executionState(sid).recovering, false);
+  assert.equal(h.liveBox().parentNode, null);
+  await h.dispose();
+});
+
+test("dispatcher decode retains wire bytes, decoded values and parse success independently", () => {
+  const h = stream.streamHarness(), decode = h.context.decodeExecutionEvent;
+  const payload = ' {"delta":"same"} ';
+  const valid = decode("delta", payload), malformed = decode("replace", '{"text":'), empty = decode("delta", "null");
+  assert.equal(valid.kind, "delta");
+  assert.equal(valid.payload, payload);
+  assert.deepEqual(JSON.parse(JSON.stringify(valid.value)), { delta: "same" });
+  assert.equal(valid.parsed, true);
+  assert.equal(malformed.payload, '{"text":');
+  assert.equal(malformed.value, null);
+  assert.equal(malformed.parsed, false);
+  assert.equal(empty.value, null);
+  assert.equal(empty.parsed, true, "decoded null remains distinct from malformed JSON");
+});
+
+test("dispatcher live deltas and replace update synchronously without advancing their debounce paint", () => {
+  const h = stream.streamHarness(), c = h.context;
+  let renders = 0, follows = 0;
+  const render = c.renderMarkdown;
+  c.renderMarkdown = (...args) => { renders++; return render(...args); };
+  c.shouldFollowOutput = () => true;
+  c.followOutput = () => { follows++; };
+  h.emit("delta", { delta: "draft " }, { paint: false });
+  h.emit("delta", { delta: "tail" }, { paint: false });
+  assert.equal(vm.runInContext("raw", c), "draft tail");
+  assert.equal(h.reply(), "");
+  assert.equal(renders, 0);
+  assert.equal(follows, 0);
+  assert.equal(h.timers.filter((delay) => delay === 50).length, 1);
+  h.emit("replace", { text: "canonical" }, { paint: false });
+  assert.equal(vm.runInContext("raw", c), "canonical");
+  assert.equal(h.reply(), "");
+  h.flush();
+  assert.equal(h.reply(), "canonical");
+  assert.equal(renders, 1);
+  assert.equal(follows, 1);
+  h.emit("replace", { text: "" }, { paint: false });
+  assert.equal(vm.runInContext("raw", c), "");
+  assert.equal(h.reply(), "canonical", "empty replacement waits for the same source paint boundary");
+  h.flush();
+  assert.equal(h.reply(), "");
+  assert.equal(vm.runInContext("bubble.hidden", c), true);
+});
+
+test("dispatcher live prose seals before a tool and the next delta opens a separate unpainted segment", () => {
+  const h = stream.streamHarness(), c = h.context;
+  h.emit("delta", { delta: "before tool" }, { paint: false });
+  h.emit("tool", { id: "ordered", name: "read_file", phase: "started", arguments: calls[0].function.arguments }, { paint: false });
+  assert.deepEqual(projection(h.box), [
+    { role: "assistant", text: "before tool" },
+    { role: "tool", label: "read_file README.md", text: "", state: "running", error: false },
+  ]);
+  assert.equal(vm.runInContext("bubble", c), null);
+  assert.equal(vm.runInContext("answerBubbles[0].dataset.segmentSealed", c), "1");
+  h.emit("delta", { delta: "after tool" }, { paint: false });
+  assert.equal(vm.runInContext("raw", c), "after tool");
+  assert.equal(vm.runInContext("answerBubbles.length", c), 2);
+  assert.equal(vm.runInContext("bubble.hidden", c), true);
+  h.flush();
+  assert.deepEqual(projection(h.box).map((row) => row.role), ["assistant", "tool", "assistant"]);
+  assert.equal(h.reply(), "after tool");
+});
+
+for (const source of ["live", "replay"]) {
+  test("dispatcher " + source + " decodes subagent payload once through the real clock and preserves raw legacy text", () => {
+    const h = source === "live" ? stream.streamHarness({ phaseClock: true }) : stream.replayHarness({ phaseClock: true });
+    const c = h.context, root = h.box || h.view.box;
+    const payload = JSON.stringify(stream.structuredSubagents([stream.structuredTask("decoded-worker", 5000)], "producer text"));
+    let reads = 0;
+    c.JSON = { ...JSON, parse(text, ...args) { if (text === payload) reads++; return JSON.parse(text, ...args); }, stringify: JSON.stringify };
+    h.emit("subagent_progress", payload);
+    assert.equal(reads, 1);
+    const card = records(root).find((node) => node.dataset.subagents === "true");
+    assert.ok(card);
+    assert.equal(foldParts(card).body.textContent, "producer text");
+    assert.deepEqual(Array.from(c.executionState().taskStates, ([id, active]) => [id, active]), [["decoded-worker", true]]);
+    h.emit("subagent_progress", payload);
+    assert.equal(reads, 2, "each event is interpreted even when its wire text repeats");
+    assert.equal(records(root).find((node) => node.dataset.subagents === "true"), card);
+    for (const raw of ['"legacy string"', '{"untyped":"legacy object"}', '{"broken":']) {
+      h.emit("subagent_progress", raw);
+      assert.equal(foldParts(card).body.textContent, raw);
+      assert.deepEqual(Array.from(c.executionState().taskStates), []);
+    }
+  });
+}
+
+test("dispatcher preserves source request-done ordering and malformed input phase behavior", () => {
+  for (const source of ["live", "replay"]) {
+    const h = source === "live" ? stream.streamHarness() : stream.replayHarness(), c = h.context, events = [];
+    c.recordPhase = (text) => events.push(text);
+    if (source === "live") vm.runInContext('const originalPhase = activity.setPhase; activity.setPhase = (...args) => { recordPhase(args[0]); return originalPhase(...args); };', c);
+    else {
+      const phase = h.view.phase;
+      h.view.phase = (...args) => { events.push(args[0]); return phase(...args); };
+    }
+    c.confirmShown = { id: 7 };
+    c.hideConfirm = () => events.push("hide");
+    h.emit("confirm_done", { id: 7 });
+    assert.deepEqual(events, source === "live" ? ["Processing…", "hide"] : ["hide", "Processing…"]);
+    events.length = 0;
+    h.emit("input_request", '{"prompt":');
+    assert.deepEqual(events, source === "live" ? ["Waiting for your input…"] : []);
+  }
+});

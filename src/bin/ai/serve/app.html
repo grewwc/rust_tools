@@ -1720,7 +1720,9 @@ const executionModel = (() => {
   const requests = { sendBusy: false, stopBusy: false, sideNoteBusy: false };
   // Selection can move before its history arrives. The task-ledger gate follows
   // the transcript that has actually committed, not the selection in flight.
-  const displayed = { base: "", sessionId: "", taskStates: new Map(), taskBusy: null };
+  const displayed = { transcriptToken: null, generation: 0, base: "", sessionId: "",
+    sources: new Map(), taskStates: new Map(), taskBusy: null };
+  let nextSource = 0;
   // The page owns one recovery timer and one replay controller. Their address
   // prevents a feed from becoming the running source of another server.
   const recovery = { base: "", sessionId: "" };
@@ -1747,16 +1749,17 @@ const executionModel = (() => {
     if (!state && create) { state = freshSession(); server.sessions.set(sid, state); }
     return state || emptySession;
   };
-  const summarize = (state) => {
+  const foldSummaries = (state, summaries) => {
     state.taskStates.clear(); state.taskBusy = null;
-    const apply = (summary) => {
-      if (!summary) return;
+    for (const summary of summaries) {
+      if (!summary) continue;
       if (summary.resetTasks) { state.taskStates.clear(); state.taskBusy = null; }
       for (const [id, active] of summary.taskStates) state.taskStates.set(id, active);
       if (summary.busy !== null) state.taskBusy = summary.busy;
-    };
-    state.history.forEach(apply);
-    for (const activity of state.activities.values()) for (const summary of activity.slots.values()) apply(summary);
+    }
+  };
+  const summarize = (state) => {
+    foldSummaries(state, [...state.history, ...[...state.activities.values()].flatMap((activity) => [...activity.slots.values()])]);
   };
   const summaryOf = (value) => value ? {
     taskStates: value.taskStates.map(([id, active]) => [id, active]),
@@ -1779,14 +1782,47 @@ const executionModel = (() => {
       liveCount: [...servers.values()].reduce((count, owner) => count + owner.liveTurns.size, 0),
       ...requests };
   };
+  const clearDisplayedSources = () => {
+    displayed.sources.clear(); displayed.generation++;
+  };
+  const bindDisplayedTranscript = (transcriptToken) => {
+    if (transcriptToken && transcriptToken !== displayed.transcriptToken) {
+      clearDisplayedSources(); displayed.transcriptToken = transcriptToken;
+    }
+    return { transcriptToken: displayed.transcriptToken, generation: displayed.generation };
+  };
+  const createDisplayedProducer = (origin) => {
+    const source = { identity: { id: ++nextSource },
+      origin: { ...origin, order: origin.order || [1, nextSource] },
+      slots: new Map(), sourceToken: null, mountToken: null };
+    return source;
+  };
+  const mountDisplayedSource = (sourceToken, mountToken, origin, orderedSummaries) => {
+    if (sourceToken.transcriptToken !== displayed.transcriptToken || sourceToken.generation !== displayed.generation) return;
+    displayed.sources.set(sourceToken, { mountToken, origin: { ...origin, order: [...origin.order] },
+      summaries: orderedSummaries.map(summaryOf) });
+  };
+  const updateDisplayedSource = (sourceToken, orderedSummaries) => {
+    const source = displayed.sources.get(sourceToken);
+    if (!source) return;
+    source.summaries = orderedSummaries.map(summaryOf);
+  };
+  const unmountDisplayedSource = (sourceToken, mountToken) => {
+    if (displayed.sources.get(sourceToken)?.mountToken !== mountToken) return;
+    displayed.sources.delete(sourceToken);
+  };
   const snapshotDisplayed = (state) => {
     displayed.taskStates = new Map(state.taskStates);
     displayed.taskBusy = state.taskBusy;
   };
   const readDisplayed = () => ({ ...read(displayed.sessionId, displayed.base),
+    transcriptToken: displayed.transcriptToken, generation: displayed.generation, sources: new Map(displayed.sources),
     taskStates: new Map(displayed.taskStates), taskBusy: displayed.taskBusy });
   const update = (event, sid, base) => {
     const server = serverFor(base, true), state = sessionFor(server, sid, true);
+    if (event.kind === "remove" && event.owner?.source) {
+      unmountDisplayedSource(event.owner.source.sourceToken, event.owner.source.mountToken);
+    }
     if (event.kind === "field") {
       if (event.name in requests) requests[event.name] = event.value;
       else if (event.name === "staleSession") { recovery.base = base; recovery.sessionId = event.value; }
@@ -1816,8 +1852,9 @@ const executionModel = (() => {
       state.history = event.summaries.map(summaryOf); summarize(state);
     } else if (event.kind === "activity") {
       const id = ++state.nextActivity;
-      state.activities.set(id, { slots: new Map() });
-      return { sessionId: sid, base, turn: state.turn, id };
+      const source = createDisplayedProducer({ kind: "activity", sessionId: sid, base });
+      state.activities.set(id, source);
+      return { sessionId: sid, base, turn: state.turn, id, source };
     } else if (event.owner?.turn === state.turn) {
       const activity = state.activities.get(event.owner.id);
       if (!activity) return;
@@ -1841,13 +1878,15 @@ const executionModel = (() => {
         state.ended = true;
         state.endedPid = state.pid;
       } else if (event.kind === "remove") state.activities.delete(event.owner.id);
+      if (event.kind === "task" || event.kind === "finish") updateDisplayedSource(activity.sourceToken, [...activity.slots.values()]);
       summarize(state);
       if (displayed.base === base && displayed.sessionId === sid) snapshotDisplayed(state);
     }
     return read(sid, base);
   };
   return { fields: [...Object.keys(sessionFields), ...Object.keys(serverFields), ...Object.keys(requests), ...feedFields],
-    value, read, readDisplayed, update };
+    value, read, readDisplayed, update, createDisplayedProducer, bindDisplayedTranscript,
+    mountDisplayedSource, updateDisplayedSource, unmountDisplayedSource, clearDisplayedSources };
 })();
 function executionBase() { return typeof store === "undefined" ? "" : store.base; }
 function executionState(sid = typeof sessionId === "undefined" ? "" : sessionId, base = executionBase()) {
@@ -1862,7 +1901,56 @@ function commitExecutionView(sid = typeof sessionId === "undefined" ? "" : sessi
   return updateExecutionModel({ kind: "display" }, sid, base);
 }
 function clearExecutionView(base = executionBase()) {
+  clearDisplayedSources();
   return updateExecutionModel({ kind: "display", empty: true }, "", base);
+}
+function mountDisplayedSource(sourceToken, mountToken, origin, orderedSummaries) {
+  executionModel.mountDisplayedSource(sourceToken, mountToken, origin, orderedSummaries);
+}
+function updateDisplayedSource(sourceToken, orderedSummaries) {
+  executionModel.updateDisplayedSource(sourceToken, orderedSummaries);
+}
+function unmountDisplayedSource(sourceToken, mountToken) {
+  executionModel.unmountDisplayedSource(sourceToken, mountToken);
+}
+function clearDisplayedSources() { executionModel.clearDisplayedSources(); }
+const displayedProducerNodes = new WeakMap();
+function mountDisplayedProducer(node, source) {
+  const root = typeof $ === "function" ? $("msgs") : null;
+  if (!root) return;
+  let owner = node;
+  while (owner && owner !== root) owner = owner.parentNode;
+  if (!owner) return;
+  const transcript = executionModel.bindDisplayedTranscript(root);
+  // A transcript rebuild starts a generation; each reattachment owns a mount.
+  if (source.sourceToken?.transcriptToken !== transcript.transcriptToken || source.sourceToken?.generation !== transcript.generation) {
+    source.sourceToken = { ...transcript, producer: source.identity };
+  }
+  if (!source.mountToken || displayedExecutionState().sources.get(source.sourceToken)?.mountToken !== source.mountToken) {
+    source.mountToken = {};
+  }
+  mountDisplayedSource(source.sourceToken, source.mountToken, source.origin, [...source.slots.values()]);
+}
+function bindDisplayedProducer(node, source) {
+  let sources = displayedProducerNodes.get(node);
+  if (!sources) { sources = new Set(); displayedProducerNodes.set(node, sources); }
+  sources.add(source);
+  mountDisplayedProducer(node, source);
+}
+function restoreDisplayedSources(node) {
+  for (const source of displayedProducerNodes.get(node) || []) mountDisplayedProducer(node, source);
+  for (const child of node.children || []) restoreDisplayedSources(child);
+}
+function unmountDisplayedSources(node) {
+  for (const source of displayedProducerNodes.get(node) || []) {
+    unmountDisplayedSource(source.sourceToken, source.mountToken);
+    source.mountToken = null;
+  }
+  for (const child of node.children || []) unmountDisplayedSources(child);
+}
+function removeDisplayedNode(node) {
+  unmountDisplayedSources(node);
+  node.remove();
 }
 function bindExecutionModel() {
   const seed = executionModel.fields.map((name) => [name, globalThis[name]]);
@@ -3222,6 +3310,10 @@ function uniqueImageFilename(name, images) {
   for (let n = 2; taken(candidate); n++) candidate = stem + "-" + n + ext;
   return candidate;
 }
+function imageMarkerAppend(value, added) {
+  return (value && !value.endsWith("\n") ? "\n" : "") +
+    added.map((image) => "[[image:" + image.filename + "]]").join("\n");
+}
 async function queueImageFiles(files) {
   const targetSession = sessionId;
   const key = draftKey(targetSession);
@@ -3252,14 +3344,12 @@ async function queueImageFiles(files) {
   if (!added.length) return;
   if (sessionId !== targetSession) {
     const value = composerDrafts.get(key) || localStorage.getItem(key) || "";
-    const marker = (value && !value.endsWith("\n") ? "\n" : "") +
-      added.map((image) => "[[image:" + image.filename + "]]").join("\n");
+    const marker = imageMarkerAppend(value, added);
     storeDraft(targetSession, value + marker, composerImageDrafts.get(key));
     return;
   }
   const prompt = $("prompt");
-  const marker = (prompt.value && !prompt.value.endsWith("\n") ? "\n" : "") +
-    added.map((image) => "[[image:" + image.filename + "]]").join("\n");
+  const marker = imageMarkerAppend(prompt.value, added);
   // A word being composed owns the field: the markers wait for it to end.
   if (!setPromptValue(prompt.value + marker)) {
     pendingAppend = marker;
@@ -3827,13 +3917,18 @@ async function renderQuestionPage(panel, list, want) {
 function addMsg(role, text, cls, parent) {
   const root = parent || $("msgs");
   const follow = !parent && shouldFollowOutput(root);
+  const d = createPlainMessageNode(role, text, cls);
+  root.appendChild(d);
+  if (!parent) { followOutput(follow, root); updateQuestionButton(); }
+  return d;
+}
+// Construction owns only the detached node; callers own mounting and effects.
+function createPlainMessageNode(role, text, cls) {
   const d = document.createElement("div");
   d.className = "msg " + cls;
   d.dataset.role = role;
   if (role === "user") d.dataset.question = text;
   d.innerHTML = esc(text) || "<span style='color:var(--dim)'>(empty)</span>";
-  root.appendChild(d);
-  if (!parent) { followOutput(follow, root); updateQuestionButton(); }
   return d;
 }
 // Assistant replies render as markdown; addMsg stays the plain (escaped,
@@ -3925,9 +4020,9 @@ async function loadPreviews(root) {
       try {
         url = await attempt(path);
       } catch (e) {
-        const cut = path.lastIndexOf("/");
-        if (cut <= 0) throw e;
-        url = await attempt(path.slice(cut + 1));
+        const candidates = previewPathCandidates(path);
+        if (candidates.length < 2) throw e;
+        url = await attempt(candidates[1]);
       }
       // A history refresh or session switch may retire this slot during fetch.
       if (slot.dataset.retired) {
@@ -3955,6 +4050,10 @@ async function loadPreviews(root) {
       if (!slot.dataset.retired) slot.replaceWith(document.createTextNode(path));
     }
   }
+}
+function previewPathCandidates(path) {
+  const cut = path.lastIndexOf("/");
+  return cut <= 0 ? [path] : [path, path.slice(cut + 1)];
 }
 function decorateAndLoad(root) {
   decorateMath(root);
@@ -4270,6 +4369,16 @@ function rateTextFromSample(value, displayTokens = null) {
   const precision = rate >= 100 ? 0 : rate >= 10 ? 1 : 2;
   const shown = Number(rate.toFixed(precision)).toString();
   return (sample.approximate ? "~" : "") + shownTokens + " tok @ " + shown + " tok/s";
+}
+function mergeTokenRateSample(rates, sample) {
+  const next = new Map(rates);
+  if (sample.phase === "generation") next.clear();
+  else next.delete("generation");
+  next.set(sample.phase, sample.phase + " " + rateTextFromSample(sample));
+  return {
+    rates: next,
+    text: ["reasoning", "output", "generation"].flatMap((phase) => next.get(phase) || []).join(" · "),
+  };
 }
 // Older thinking payloads may omit a rate. Arrival estimates carry a "~";
 // history rendering restores recorded values instead of timing message bodies.
@@ -4769,6 +4878,15 @@ function formatSubagentElapsed(seconds) {
   const hours = Math.floor(seconds / 3600), minutes = Math.floor(seconds / 60) % 60;
   return (hours ? hours + "h" : "") + (hours || minutes ? minutes + "m" : "") + seconds % 60 + "s";
 }
+function agedTaskReport(report, records, now) {
+  return report && { ...report, tasks: [...records.values()].map(({ task, at }) => {
+    if (!task.active) return task;
+    const elapsed = Math.max(0, now - at);
+    const age = (value) => typeof value === "number" && Number.isFinite(value) ? value + elapsed : value;
+    return { ...task, elapsed_ms: age(task.elapsed_ms),
+      progress: task.progress && { ...task.progress, stale_for_ms: age(task.progress.stale_for_ms) } };
+  }) };
+}
 function createSubagentClock(fold, owner) {
   let report = null, records = new Map(), rawText = "", lastTitle = "", lastRawText = null;
   // The fold opens once when a run starts; after that its state belongs to the
@@ -4784,13 +4902,7 @@ function createSubagentClock(fold, owner) {
     });
   }
   const render = (now) => {
-    const value = report && { ...report, tasks: [...records.values()].map(({ task, at }) => {
-      if (!task.active) return task;
-      const elapsed = Math.max(0, now - at);
-      const age = (value) => typeof value === "number" && Number.isFinite(value) ? value + elapsed : value;
-      return { ...task, elapsed_ms: age(task.elapsed_ms),
-        progress: task.progress && { ...task.progress, stale_for_ms: age(task.progress.stale_for_ms) } };
-    }) };
+    const value = agedTaskReport(report, records, now);
     const title = value ? taskReportLabel(value) : "subagents";
     if (title !== lastTitle || rawText !== lastRawText) {
       fold.set(title, rawText); lastTitle = title; lastRawText = rawText;
@@ -4803,9 +4915,12 @@ function createSubagentClock(fold, owner) {
     box: fold.box,
     busy() { return report ? [...records.values()].some((row) => row.task.active) : null; },
     paint(now) { render(now); },
-    set(payload, after = null) {
+    set(payload, after = null, decoded = null) {
       let event = payload;
-      if (typeof payload === "string") {
+      // Stream dispatch supplies its decode while retaining the wire text for
+      // legacy display. Direct activity callers still accept objects or text.
+      if (decoded) event = decoded.value;
+      else if (typeof payload === "string") {
         try { event = JSON.parse(payload); } catch (_) { event = null; }
       }
       const next = taskReportOf(event?.task_report || event);
@@ -4846,6 +4961,7 @@ function createSubagentClock(fold, owner) {
 // inferred from stderr. Completion updates its own card, even for parallel tools.
 function createLiveActivity(parent, before, sid = sessionId, base = executionBase()) {
   const owner = updateExecutionModel({ kind: "activity" }, sid, base);
+  bindDisplayedProducer(parent, owner.source);
   const groups = executionGroupsFor(parent);
   const tools = new Map();
   let phase = "Connecting…";
@@ -4860,7 +4976,7 @@ function createLiveActivity(parent, before, sid = sessionId, base = executionBas
     parent.insertBefore(fold.box, anchor && anchor.parentNode === parent ? anchor : null);
     return fold;
   };
-  const showSubagents = (payload, after = null, afterSlot = null) => {
+  const showSubagents = (payload, after = null, afterSlot = null, decoded = null) => {
     if (!subagents && !payload) return;
     if (!subagents) {
       subagents = insert("subagents", "subagents");
@@ -4868,7 +4984,7 @@ function createLiveActivity(parent, before, sid = sessionId, base = executionBas
       subagents.box.dataset.executionState = subagents.box._executionState = "running";
       subagentClock = createSubagentClock(subagents, owner);
     }
-    subagentClock.set(payload, afterSlot);
+    subagentClock.set(payload, afterSlot, decoded);
     // Re-anchoring is invisible only once the card is collapsed; set() above may
     // close it in this same paint. Moving a card that is still open would scroll
     // the text the reader is looking at.
@@ -4935,8 +5051,8 @@ function createLiveActivity(parent, before, sid = sessionId, base = executionBas
       groups.sync();
       if (typeof syncStopButton === "function") syncStopButton();
     },
-    subagents(payload) {
-      showSubagents(payload); groups.sync();
+    subagents(payload, decoded = null) {
+      showSubagents(payload, null, null, decoded); groups.sync();
       if (typeof syncStopButton === "function") syncStopButton();
     },
     finish(reason, answer = false) {
@@ -5045,13 +5161,17 @@ function scheduleConfigRetry(team, sid, base) {
     void loadSessionConfig({ teamOnly: true });
   }, delay);
 }
+function teamChipValues(state, sid) {
+  const unknown = sid && !state.confirmed && !state.pending;
+  const label = unknown ? "对话模式" : teamChoiceLabel(state.choice);
+  const detail = state.choice.mode === "team" ? " · " + teamBackendLabel(state.choice) : "";
+  const status = state.saving ? "保存中" : state.error ? "重试" : state.pending ? "待保存" : unknown ? "未同步" : "";
+  return { unknown, label, detail, status };
+}
 function syncTeamTrigger() {
   // Keep the capsule's label on one line and defer updates around the IME.
   holdLayout("teamMode", () => {
-    const state = teamPickState(), unknown = sessionId && !state.confirmed && !state.pending;
-    const label = unknown ? "对话模式" : teamChoiceLabel(state.choice);
-    const detail = state.choice.mode === "team" ? " · " + teamBackendLabel(state.choice) : "";
-    const status = state.saving ? "保存中" : state.error ? "重试" : state.pending ? "待保存" : unknown ? "未同步" : "";
+    const state = teamPickState(), { unknown, label, detail, status } = teamChipValues(state, sessionId);
     const button = $("teamtrigger");
     $("teamlabel").textContent = label;
     $("teamstatus").textContent = status;
@@ -5263,6 +5383,15 @@ function loadWorkerModels(force = false) {
   workerModelsRequest = request;
   return request.promise;
 }
+function workerListBottom(panelBottom, wrapBottom) {
+  return Math.round(Math.max(6, panelBottom - wrapBottom + 10));
+}
+function workerListHeights(wrapBottom, panelTop, view) {
+  const space = Math.max(0, Math.floor(wrapBottom - panelTop - 16));
+  const cap = Math.round(view * .96);
+  const height = Math.max(240, Math.min(space, cap));
+  return { height, optionsHeight: Math.max(0, height - 64) };
+}
 // Anchor the list to the trigger and let it grow up to the panel top. Its
 // containing block is the panel, so the scrolling body does not clip it.
 function placeWorkerList() {
@@ -5278,15 +5407,13 @@ function placeWorkerList() {
   // The open list covers the trigger and its hint: the picked model already
   // shows as the checked row inside the list, so the collapsed label is not
   // needed while choosing. Its bottom edge lands on the card's bottom edge.
-  list.style.bottom = Math.round(Math.max(6, panelRect.bottom - wrapRect.bottom + 10)) + "px";
+  list.style.bottom = workerListBottom(panelRect.bottom, wrapRect.bottom) + "px";
   // The panel does not clip the absolute list, so it may rise past the panel's
   // top edge while open; it stops just inside the panel's top edge so the list
   // gets the full sheet height without leaving the sheet.
-  const space = Math.max(0, Math.floor(wrapRect.bottom - panelRect.top - 16));
-  const cap = Math.round(view * .96);
-  const height = Math.max(240, Math.min(space, cap));
+  const { height, optionsHeight } = workerListHeights(wrapRect.bottom, panelRect.top, view);
   list.style.maxHeight = height + "px";
-  $("teamworkeroptions").style.maxHeight = Math.max(0, height - 64) + "px";
+  $("teamworkeroptions").style.maxHeight = optionsHeight + "px";
 }
 function setWorkerListOpen(open) {
   const draft = teamDraft;
@@ -5963,18 +6090,21 @@ function skillMatchRank(skill, query) {
   if (score !== null) return Math.min(255, Math.max(1, 255 - score));
   return String(skill.description || "").toLowerCase().includes(query) ? 256 : -1;
 }
-function renderSkillMenu() {
-  if ($("oskill").disabled || $("skillmenu").hidden) return;
-  const box = $("skilloptions"), query = $("skillsearch").value.trim().toLowerCase();
-  const names = readSkillPick()?.names || [], activeName = skillMatches[skillActive]?.name;
+function rankSkillMatches(catalog, query) {
   const ranked = [];
-  skillCatalog.forEach((skill, order) => {
+  catalog.forEach((skill, order) => {
     const rank = skillMatchRank(skill, query);
     if (rank >= 0) ranked.push({ skill, rank, order });
   });
   // A name hit outranks a description-only hit; equal ranks keep catalog order.
   ranked.sort((a, b) => a.rank - b.rank || a.order - b.order);
-  skillMatches = ranked.map((entry) => entry.skill);
+  return ranked.map((entry) => entry.skill);
+}
+function renderSkillMenu() {
+  if ($("oskill").disabled || $("skillmenu").hidden) return;
+  const box = $("skilloptions"), query = $("skillsearch").value.trim().toLowerCase();
+  const names = readSkillPick()?.names || [], activeName = skillMatches[skillActive]?.name;
+  skillMatches = rankSkillMatches(skillCatalog, query);
   skillActive = activeName ? skillMatches.findIndex((s) => s.name === activeName) : -1;
   // Use DOM text nodes: catalog descriptions are untrusted plain text.
   box.textContent = "";
@@ -6027,15 +6157,18 @@ function skillKeydown(e) {
   if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
     e.preventDefault();
     if (!skillMatches.length) return;
-    const next = e.key === "Home" ? 0 : e.key === "End" ? skillMatches.length - 1
-      : skillActive < 0 ? (e.key === "ArrowDown" ? 0 : skillMatches.length - 1)
-      : (skillActive + (e.key === "ArrowDown" ? 1 : -1) + skillMatches.length) % skillMatches.length;
+    const next = skillNavigationTarget(e, skillActive, skillMatches);
     setSkillActive(next);
   } else if (e.key === "Enter") {
     e.preventDefault(); // Select only; never submit a chat message from this field.
     const match = skillMatches[skillActive < 0 ? 0 : skillActive];
     if (match) chooseSkill(match.name);
   }
+}
+function skillNavigationTarget(input, active, matches) {
+  return input.key === "Home" ? 0 : input.key === "End" ? matches.length - 1
+    : active < 0 ? (input.key === "ArrowDown" ? 0 : matches.length - 1)
+    : (active + (input.key === "ArrowDown" ? 1 : -1) + matches.length) % matches.length;
 }
 function validateSkillInput() {
   if ($("oskill").disabled || !skillComposing) return true;
@@ -6165,6 +6298,15 @@ function commandScore(command, query) {
   if (query.length >= 3 && command.description.toLowerCase().includes(query)) return 2;
   return -1;
 }
+function rankCommandMatches(catalog, query) {
+  const scored = [];
+  catalog.forEach((command, index) => {
+    const score = commandScore(command, query);
+    if (score >= 0) scored.push({ command, score, index });
+  });
+  scored.sort((a, b) => a.score - b.score || a.index - b.index);
+  return scored.map((item) => item.command);
+}
 function renderCommandMenu(prefix) {
   const box = $("cmdoptions");
   box.textContent = "";
@@ -6230,13 +6372,7 @@ function refreshCommandMenu() {
   if (!prompt || promptComposing || document.activeElement !== prompt) { closeCommandMenu(); return; }
   const context = commandContext(prompt.value, prompt.selectionStart);
   if (!context) { closeCommandMenu(); return; }
-  const scored = [];
-  commandCatalog.forEach((command, index) => {
-    const score = commandScore(command, context.query);
-    if (score >= 0) scored.push({ command, score, index });
-  });
-  scored.sort((a, b) => a.score - b.score || a.index - b.index);
-  commandMatches = scored.map((item) => item.command);
+  commandMatches = rankCommandMatches(commandCatalog, context.query);
   commandActive = commandMatches.length ? 0 : -1;
   renderCommandMenu(context.prefix);
   $("cmdempty").hidden = commandMatches.length > 0;
@@ -6246,17 +6382,22 @@ function refreshCommandMenu() {
   if (commandMatches.length) setCommandActive(0);
   else prompt.removeAttribute("aria-activedescendant");
 }
+function commandReplacementPlan(value, context, command) {
+  const tail = value.slice(context.end);
+  const replacement = context.prefix + command.name + (/^\s/.test(tail) ? "" : " ");
+  return {
+    value: value.slice(0, context.start) + replacement + value.slice(context.end),
+    caret: context.start + replacement.length,
+  };
+}
 function acceptCommand(target) {
   const command = typeof target === "number" ? commandMatches[target] : target;
   if (!command) return false;
   const prompt = $("prompt");
   const context = commandContext(prompt.value, prompt.selectionStart);
   if (!context) { closeCommandMenu(); return false; }
-  const tail = prompt.value.slice(context.end);
-  const replacement = context.prefix + command.name + (/^\s/.test(tail) ? "" : " ");
-  const value = prompt.value.slice(0, context.start) + replacement + prompt.value.slice(context.end);
+  const { value, caret } = commandReplacementPlan(prompt.value, context, command);
   if (!setPromptValue(value)) return false;
-  const caret = context.start + replacement.length;
   try { prompt.setSelectionRange(caret, caret); } catch (_) {}
   closeCommandMenu();
   growPrompt();
@@ -6271,7 +6412,7 @@ function commandKeydown(e) {
   if (e.key === "ArrowDown" || e.key === "ArrowUp") {
     e.preventDefault();
     const step = e.key === "ArrowDown" ? 1 : -1;
-    setCommandActive(commandActive < 0 ? (step > 0 ? 0 : commandMatches.length - 1) : commandActive + step);
+    setCommandActive(commandNavigationTarget(commandActive, step, commandMatches));
     return true;
   }
   if (e.key === "Tab" && !e.ctrlKey && !e.metaKey && !e.altKey) {
@@ -6285,6 +6426,10 @@ function commandKeydown(e) {
     return true;
   }
   return false;
+}
+// Keep the raw target: setCommandActive owns command-menu wraparound.
+function commandNavigationTarget(active, step, matches) {
+  return active < 0 ? (step > 0 ? 0 : matches.length - 1) : active + step;
 }
 async function loadInfo() {
   try {
@@ -6531,9 +6676,21 @@ async function deleteSession(targetId, confirmed = false) {
 // Render the drawer from cached or fresh items: the filter narrows by title
 // or id, the count line proves no session is hidden, and an optional error
 // row keeps a failed refresh visible without wiping the last good list.
-function renderSessionList(items, errText, { preserveScroll = true, followNewest = false } = {}) {
+function sessionListProjection(items, sessFilter) {
   const q = sessFilter.trim().toLowerCase();
   const shown = q ? items.filter((s) => (sessionTitle(s) + " " + s.id).toLowerCase().includes(q)) : items;
+  return { q, shown };
+}
+function sessionListTotal(items, sessionsTotal) {
+  return typeof sessionsTotal === "number" ? sessionsTotal : items.length;
+}
+function sessionListCountText(q, shown, items, total) {
+  return q
+    ? total + " sessions · showing " + shown.length + (items.length < total ? " loaded" : "")
+    : total + " sessions";
+}
+function renderSessionList(items, errText, { preserveScroll = true, followNewest = false } = {}) {
+  const { q, shown } = sessionListProjection(items, sessFilter);
   const ul = $("sesslist");
   const scrollTop = preserveScroll && ul.children.length ? ul.scrollTop : 0;
   ul.textContent = "";
@@ -6639,10 +6796,8 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
     li.textContent = errText;
     ul.appendChild(li);
   }
-  const total = typeof sessionsTotal === "number" ? sessionsTotal : items.length;
-  $("sesscount").textContent = q
-    ? total + " sessions · showing " + shown.length + (items.length < total ? " loaded" : "")
-    : total + " sessions";
+  const total = sessionListTotal(items, sessionsTotal);
+  $("sesscount").textContent = sessionListCountText(q, shown, items, total);
   if (followNewest) ul.scrollTop = 0;
   else ul.scrollTop = scrollTop;
 }
@@ -6685,16 +6840,10 @@ let sessionsTotal = null;
 let sessionsPageOffset = 0;
 let sessionsHasMore = false;
 let sessionsLoadingMore = false;
-async function fetchSessionPage(offset, limit, includeSelected = false) {
-  let path = "/sessions?newest=true&limit=" + limit + "&offset=" + offset;
-  if (includeSelected && sessionId) path += "&include=" + encodeURIComponent(sessionId);
-  const response = await api(path);
-  const value = await response.json();
-  const items = Array.isArray(value) ? value : [];
-  const header = (name) => response.headers && typeof response.headers.get === "function"
-    ? response.headers.get(name) : null;
-  const totalHeader = header("x-sessions-total");
-  const pageHeader = header("x-sessions-page-size");
+function sessionPageItems(value) {
+  return Array.isArray(value) ? value : [];
+}
+function sessionPageProjection(items, totalHeader, pageHeader, limit) {
   const totalValue = totalHeader === null ? NaN : Number(totalHeader);
   const pageValue = pageHeader === null ? NaN : Number(pageHeader);
   return {
@@ -6702,6 +6851,38 @@ async function fetchSessionPage(offset, limit, includeSelected = false) {
     total: Number.isFinite(totalValue) ? totalValue : null,
     pageSize: Number.isFinite(pageValue) ? pageValue : Math.min(items.length, limit),
   };
+}
+function legacySessionItems(legacy) {
+  return Array.isArray(legacy) ? legacy : [];
+}
+function sessionPageOlderItems(lastItems, page) {
+  const known = new Set(lastItems.map((item) => item.id));
+  return page.items.filter((item) => !known.has(item.id));
+}
+function mergeSessionPageItems(lastItems, older) {
+  return lastItems.concat(older);
+}
+function sessionRefreshLimit(sessionsPageOffset, pageSize) {
+  return Math.max(pageSize, sessionsPageOffset || 0);
+}
+function sessionPageNextOffset(offset, pageSize) {
+  return offset + pageSize;
+}
+function sessionPageHasMore(sessionsPageOffset, sessionsTotal, page, pageSize) {
+  return typeof sessionsTotal === "number"
+    ? sessionsPageOffset < sessionsTotal : page.pageSize === pageSize;
+}
+async function fetchSessionPage(offset, limit, includeSelected = false) {
+  let path = "/sessions?newest=true&limit=" + limit + "&offset=" + offset;
+  if (includeSelected && sessionId) path += "&include=" + encodeURIComponent(sessionId);
+  const response = await api(path);
+  const value = await response.json();
+  const items = sessionPageItems(value);
+  const header = (name) => response.headers && typeof response.headers.get === "function"
+    ? response.headers.get(name) : null;
+  const totalHeader = header("x-sessions-total");
+  const pageHeader = header("x-sessions-page-size");
+  return sessionPageProjection(items, totalHeader, pageHeader, limit);
 }
 async function loadOlderSessions() {
   if (sessionsLoadingMore || !sessionsHasMore) return;
@@ -6711,13 +6892,11 @@ async function loadOlderSessions() {
     const page = await fetchSessionPage(sessionsPageOffset, SESSION_PAGE_SIZE);
     if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base) return;
     if (typeof page.total === "number") sessionsTotal = page.total;
-    sessionsPageOffset += page.pageSize;
-    sessionsHasMore = typeof sessionsTotal === "number"
-      ? sessionsPageOffset < sessionsTotal : page.pageSize === SESSION_PAGE_SIZE;
-    const known = new Set(lastItems.map((item) => item.id));
-    const older = page.items.filter((item) => !known.has(item.id));
+    sessionsPageOffset = sessionPageNextOffset(sessionsPageOffset, page.pageSize);
+    sessionsHasMore = sessionPageHasMore(sessionsPageOffset, sessionsTotal, page, SESSION_PAGE_SIZE);
+    const older = sessionPageOlderItems(lastItems, page);
     if (older.length) {
-      lastItems = lastItems.concat(older);
+      lastItems = mergeSessionPageItems(lastItems, older);
       renderSessionList(lastItems);
     }
   } catch (e) {
@@ -6743,14 +6922,15 @@ async function loadSessions() {
   const loadId = ++sessionsLoadSeq, forSession = sessionId, base = store.base;
   let items;
   try {
-    const requested = Math.max(SESSION_PAGE_SIZE, sessionsPageOffset || 0);
+    const requested = sessionRefreshLimit(sessionsPageOffset, SESSION_PAGE_SIZE);
     const page = await fetchSessionPage(0, requested, true);
     if (typeof page.total !== "number") {
       // A running daemon from before paged ordering has no total/order headers.
       // Preserve its legacy full-list behavior until that daemon is restarted;
       // otherwise its oldest first page would be mistaken for the newest one.
       const legacy = await (await api("/sessions")).json();
-      items = Array.isArray(legacy) ? legacy.reverse() : [];
+      items = legacySessionItems(legacy);
+      if (items === legacy) items = legacy.reverse();
       sessionsTotal = items.length;
       sessionsPageOffset = items.length;
       sessionsHasMore = false;
@@ -7030,87 +7210,108 @@ function historyExecutionOf(rows) {
   return summaries;
 }
 function renderHistoryRow(row, parent) {
-  const m = row.message;
   const executionBoxes = [];
-  if (m.role === "user") addUserBubble(row.text, row.historyIndex, parent);
-  else if (m.role === "assistant") {
-    // Reconciliation counts canonical messages. Keep the reasoning, answer and
-    // rate in one row so a later refresh cannot trim the rate as an extra row.
-    const group = document.createElement("div");
-    group.className = "turn";
-    // A persisted assistant message without tool calls is the terminal answer
-    // for the preceding task sequence. Old or truncated running task cards
-    // before it must not keep the composer in stop mode after a reload.
-    if (!Array.isArray(m.tool_calls) || m.tool_calls.length === 0) group.dataset.taskReset = "true";
-    parent.appendChild(group);
-    const rateSession = sessionId;
-    const showTurnRate = createTurnRateLine(group);
-    const thinkingCount = row.reasoning ? "~" + estimateTextTokens(row.reasoning) + " tok" : "";
-    let thinkingSummary = null;
-    if (row.reasoning) {
-      const fold = addFold("thinking", row.reasoning, group);
+  let source = null;
+  const observe = (node, slot, summary) => {
+    if (!source) source = executionModel.createDisplayedProducer({ kind: "history", sessionId, base: executionBase(),
+      order: [0, row.historyIndex ?? 0] });
+    source.slots.set(slot, summary);
+    bindDisplayedProducer(node, source);
+  };
+  // The canonical row is a complete observation, not a stream lifecycle. This
+  // adapter owns only its DOM slots, stored disclosures and displayed producer.
+  const historyView = {
+    user(snapshot) { addUserBubble(snapshot.text, snapshot.historyIndex, parent); },
+    assistant(snapshot) {
+      const m = snapshot.message;
+      // Reconciliation counts canonical messages. Keep the reasoning, answer and
+      // rate in one row so a later refresh cannot trim the rate as an extra row.
+      const group = document.createElement("div");
+      group.className = "turn";
+      // A persisted assistant message without tool calls is the terminal answer
+      // for the preceding task sequence. Old or truncated running task cards
+      // before it must not keep the composer in stop mode after a reload.
+      if (!Array.isArray(m.tool_calls) || m.tool_calls.length === 0) group.dataset.taskReset = "true";
+      parent.appendChild(group);
+      if (!Array.isArray(m.tool_calls) || m.tool_calls.length === 0) observe(group, "answer",
+        { taskStates: [], busy: null, resetTasks: true });
+      const rateSession = sessionId;
+      const showTurnRate = createTurnRateLine(group);
+      const thinkingCount = snapshot.reasoning ? "~" + estimateTextTokens(snapshot.reasoning) + " tok" : "";
+      return { group, rateSession, showTurnRate, thinkingCount, thinkingSummary: null };
+    },
+    thinking(snapshot, turn) {
+      const fold = addFold("thinking", snapshot.reasoning, turn.group);
       fold.box.dataset.executionState = fold.box._executionState = "completed";
-      thinkingSummary = fold.box.querySelector("summary");
+      const summary = fold.box.querySelector("summary");
       const det = fold.box.querySelector("details");
-      if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + row.identity + ":thinking");
-    }
-    if (row.text) {
-      addMsgMd(row.text, group, textOf(m.content));
-    }
-    // Replay may fill the rate cache after this canonical row was mounted.
-    // Refresh its metadata without rebuilding answer bodies or open folds.
-    group._aserveRefreshRates = () => {
-      if (thinkingSummary) {
-        const rate = (typeof storedRate === "function" ? storedRate("thinking", rateSession, row.reasoning) : "") || thinkingCount;
-        thinkingSummary.textContent = "thinking · " + rate;
+      if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + snapshot.identity + ":thinking");
+      return summary;
+    },
+    answer(snapshot, turn) { addMsgMd(snapshot.text, turn.group, textOf(snapshot.message.content)); },
+    rates(snapshot, turn) {
+      const { group, rateSession, showTurnRate, thinkingCount, thinkingSummary } = turn;
+      // Replay may fill the rate cache after this canonical row was mounted.
+      // Refresh its metadata without rebuilding answer bodies or open folds.
+      group._aserveRefreshRates = () => {
+        if (thinkingSummary) {
+          const rate = (typeof storedRate === "function" ? storedRate("thinking", rateSession, snapshot.reasoning) : "") || thinkingCount;
+          thinkingSummary.textContent = "thinking · " + rate;
+        }
+        const rate = typeof storedRate === "function" ? storedRate("turn", rateSession, snapshot.text) || storedRate("turn", rateSession, snapshot.reasoning) : "";
+        showTurnRate(rate);
+      };
+      group._aserveRefreshRates();
+    },
+    fold(snapshot, taskResult, policy) {
+      const m = snapshot.message;
+      let container = parent;
+      if (taskResult) {
+        container = document.createElement("div"); container.className = "turn";
+        parent.appendChild(container);
       }
-      const rate = typeof storedRate === "function" ? storedRate("turn", rateSession, row.text) || storedRate("turn", rateSession, row.reasoning) : "";
-      showTurnRate(rate);
-    };
-    group._aserveRefreshRates();
-  }
-  else {
-    const taskResult = m.task_report ? projectTaskReport(m.task_report, false) : null;
-    let container = parent;
-    if (taskResult) {
-      container = document.createElement("div"); container.className = "turn";
-      parent.appendChild(container);
-    }
-    const raw = textOf(m.content);
-    const fallback = taskResult ? raw : row.call ? legacyTaskToolText(row.call, raw) : null;
-    const fold = addFold(row.call ? callLabel(row.call) : FOLD_ROLE_LABELS[m.role] || m.role,
-      fallback === null ? row.text.slice(0, 2000) : fallback, container);
-    if (m.role === "tool") {
-      executionBoxes.push(fold.box);
-      fold.box.dataset.executionState = fold.box._executionState = "completed";
-      fold.box.dataset.executionSettled = fold.box._executionSettled = String(row.executionSettled === true);
-      const taskReport = taskReportOf(m.task_report);
-      fold.box.dataset.executionException = fold.box._executionException = String(Boolean(taskReport?.error) || Boolean(taskReport?.tasks.some((task) => task.error)));
-    }
-    if (taskResult) {
+      const raw = textOf(m.content);
+      const body = policy.toolText(snapshot, raw, taskResult);
+      const fold = addFold(snapshot.call ? callLabel(snapshot.call) : FOLD_ROLE_LABELS[m.role] || m.role, body, container);
+      if (m.role === "tool") {
+        executionBoxes.push(fold.box);
+        fold.box.dataset.executionState = fold.box._executionState = "completed";
+        fold.box.dataset.executionSettled = fold.box._executionSettled = String(snapshot.executionSettled === true);
+        const taskReport = taskReportOf(m.task_report);
+        fold.box.dataset.executionException = fold.box._executionException = String(Boolean(taskReport?.error) || Boolean(taskReport?.tasks.some((task) => task.error)));
+      }
+      return { container, fold };
+    },
+    task(snapshot, tool, taskResult) {
+      const { container, fold } = tool;
+      observe(container, "raw", taskResult);
       fold.box.dataset.taskRawTool = "true";
       // Only a tool row whose report also owns the dedicated card may hide its
       // preview; an earlier report without that card must stay fully visible.
-      if (row.subagentReport) fold.box.dataset.taskMerged = "true";
+      if (snapshot.subagentReport) fold.box.dataset.taskMerged = "true";
       renderTaskToolResult(fold, taskResult);
       const summary = fold.box.querySelector("summary");
       if (summary) summary.textContent += " · raw";
-    }
-    const det = fold.box.querySelector("details");
-    if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + row.identity);
-    if (row.subagentReport) {
+    },
+    stored(fold, suffix = "") {
+      const det = fold.box.querySelector("details");
+      if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + row.identity + suffix);
+    },
+    subagents(snapshot, container) {
       // History reports are frozen observations. Their elapsed clocks do not run.
-      const subagents = addFold(taskReportLabel(row.subagentReport), "", container);
+      const subagents = addFold(taskReportLabel(snapshot.subagentReport), "", container);
+      const summary = projectTaskReport(snapshot.subagentReport);
+      observe(container, "subagents", summary);
       executionBoxes.push(subagents.box);
       subagents.box.dataset.subagents = "true";
       subagents.box.dataset.executionState = subagents.box._executionState = "completed";
-      subagents.box.dataset.executionSettled = subagents.box._executionSettled = String(row.executionSettled === true);
-      subagents.box.dataset.executionException = subagents.box._executionException = String(Boolean(row.subagentReport.error) || Boolean(row.subagentReport.tasks.some((task) => task.error)));
-      renderTaskToolResult(subagents, projectTaskReport(row.subagentReport));
-      const details = subagents.box.querySelector("details");
-      if (details && typeof bindStoredFold === "function") bindStoredFold(details, sessionId + "\n" + row.identity + ":subagents");
-    }
-  }
+      subagents.box.dataset.executionSettled = subagents.box._executionSettled = String(snapshot.executionSettled === true);
+      subagents.box.dataset.executionException = subagents.box._executionException = String(Boolean(snapshot.subagentReport.error) || Boolean(snapshot.subagentReport.tasks.some((task) => task.error)));
+      renderTaskToolResult(subagents, summary);
+      return subagents;
+    },
+  };
+  dispatchExecutionSnapshot(row, historyView, "history");
   const last = parent?.lastElementChild;
   const node = last && last.dataset && last.dataset.turnRate ? last.previousElementSibling : last;
   if (node?.dataset) {
@@ -7122,6 +7323,10 @@ function renderHistoryRow(row, parent) {
     // state without rebuilding its original disclosure or attachment nodes.
     node._aserveRefreshExecution = (next) => {
       for (const box of executionBoxes) box.dataset.executionSettled = box._executionSettled = String(next.executionSettled === true);
+      if (source) {
+        source.origin.order = [0, next.historyIndex ?? 0];
+        mountDisplayedProducer(node, source);
+      }
     };
   }
 }
@@ -7153,12 +7358,13 @@ function attachLiveBox() {
   // finish before send() removes this map entry, so do not re-attach its
   // retired live box beside the newly rendered reply.
   if (box === staleBox) return;
-  root.appendChild(box);
   const displayed = displayedExecutionState();
-  if (displayed.sessionId !== sessionId || displayed.base !== executionBase()) {
-    commitExecutionView();
-    syncStopButton();
-  }
+  root.appendChild(box);
+  restoreDisplayedSources(box);
+  const next = displayedExecutionState();
+  if (displayed.sessionId !== sessionId || displayed.base !== executionBase()
+      || displayed.taskBusy !== next.taskBusy || displayed.taskStates.size !== next.taskStates.size
+      || [...displayed.taskStates].some(([id, active]) => next.taskStates.get(id) !== active)) syncStopButton();
   followOutput(follow, root);
 }
 function attachPendingInputs(root) {
@@ -7285,6 +7491,7 @@ async function loadHistory(prefetched, canCommit = () => true) {
     updateExecutionModel({ kind: "history", summaries: [] });
     revokePreviews();
     $("msgs").textContent = "";
+    clearDisplayedSources();
     historySession = "";
     historyKeys = [];
     canonicalHistoryTotal = 0;
@@ -7454,7 +7661,7 @@ async function loadHistory(prefetched, canCommit = () => true) {
           && root.children.length >= historyKeys.length;
         const removeRow = (node) => {
           if (!protectedRows.has(node)) revokePreviews(node);
-          node.remove();
+          removeDisplayedNode(node);
         };
         if (appendOnly) {
           for (let i = 0; i < start; i++) removeRow(root.children[0]);
@@ -7470,6 +7677,7 @@ async function loadHistory(prefetched, canCommit = () => true) {
           // A still-running box is reattached below; its previews remain owned by it.
           revokePreviews(root);
           root.textContent = "";
+          clearDisplayedSources();
           for (const row of history.rows) renderHistoryRow(row, root);
         }
       }
@@ -7505,6 +7713,7 @@ async function loadHistory(prefetched, canCommit = () => true) {
       if (clearedTranscript) {
         revokePreviews(root);
         root.textContent = "";
+        clearDisplayedSources();
       }
       historySession = "";
       historyKeys = [];
@@ -8012,12 +8221,11 @@ function recoveredProgressView(sid = sessionId) {
   let thinking = "";
   let answer = "";
   let tokenRate = "", closed = false;
-  const tokenRates = new Map();
+  let tokenRates = new Map();
   const setTokenRate = (sample) => {
-    if (sample.phase === "generation") tokenRates.clear();
-    else tokenRates.delete("generation");
-    tokenRates.set(sample.phase, sample.phase + " " + rateTextFromSample(sample));
-    tokenRate = ["reasoning", "output", "generation"].flatMap((phase) => tokenRates.get(phase) || []).join(" · ");
+    const merged = mergeTokenRateSample(tokenRates, sample);
+    tokenRates = merged.rates;
+    tokenRate = merged.text;
   };
   let sealedAnswerText = "", lastThinkingText = "", lastOutputRate = "", thinkRate = "", thinkRecordedRate = "";
   let thinkRecordedTimed = false;
@@ -8055,6 +8263,8 @@ function recoveredProgressView(sid = sessionId) {
     if (closed) return;
     if (think) {
       thinkRate = thinkingRateText(sid, thinking, thinkRecordedRate, thinkTokens, thinkStartedAt, thinkingRates.key, thinkRecordedTimed);
+      // Replay is a compact recovery view; canonical history will render the
+      // complete reasoning body after this temporary view is removed.
       think.set(thinkRate ? "thinking · " + thinkRate : "thinking", thinking.length > 6000 ? "…" + thinking.slice(-6000) : thinking);
       thinkingRates.observe(think, thinking, thinkRate, thinkStartedAt, Boolean(thinkRecordedRate), thinkRecordedTimed);
     }
@@ -8069,6 +8279,8 @@ function recoveredProgressView(sid = sessionId) {
     if (answer && !tokenRate && !lastOutputRate) {
       lastOutputRate = storedRate("turn", sid, answer);
     }
+    // Recovery paints immediately as plain text; history owns the final
+    // Markdown, media, math and copy controls when replay hands the view back.
     if (bubble) { bubble.hidden = !answer; bubble.textContent = answer; }
     activity.setPhase(answer ? "Responding…" : "Processing…");
     paintPhase();
@@ -8121,7 +8333,7 @@ function recoveredProgressView(sid = sessionId) {
       paintPhase();
     },
     tool(event) { endThinking(); sealAnswerSegment(); activity.setPhase("Processing…"); activity.tool(event); paintPhase(); },
-    subagents(text) { activity.subagents(text); },
+    subagents(payload, decoded) { activity.subagents(payload, decoded); },
     phase(text, waiting) { activity.setPhase(text, waiting); paintPhase(); },
     finish(reason = "ended") {
       closed = true;
@@ -8139,64 +8351,169 @@ function recoveredProgressView(sid = sessionId) {
       phaseBubble.remove();
       showTurnRate(rate);
     },
-    remove() { closed = true; clearInterval(phaseTimer); endThinking(); activity.remove?.(); box.remove(); },
+    remove() { closed = true; clearInterval(phaseTimer); endThinking(); activity.remove?.(); removeDisplayedNode(box); },
   };
 }
 
 function handleReplayEvent(sid, kind, payload, view) {
   if (sid !== sessionId) return;
-  if (kind === "thinking_start") {
+  dispatchExecutionEvent(kind, payload, view, "replay");
+}
+
+// BEGIN execution event dispatcher
+function decodeExecutionEvent(kind, payload) {
+  try { return { kind, payload, value: JSON.parse(payload), parsed: true }; }
+  catch (_) { return { kind, payload, value: null, parsed: false }; }
+}
+
+// Live owns a possibly parked turn; replay only writes the selected recovery
+// view. History projects complete canonical rows with its own text policy.
+const EXECUTION_EVENT_POLICIES = Object.freeze({
+  live: Object.freeze({ rawAnswerFallback: true, waitOnMalformedInput: true, phaseBeforeRequestDone: true,
+    showsRequests: (view) => view.showsRequests() }),
+  replay: Object.freeze({ rawAnswerFallback: false, waitOnMalformedInput: false, phaseBeforeRequestDone: false,
+    showsRequests: () => true }),
+  history: Object.freeze({
+    // History omits Arguments, trims/caps ordinary text, and preserves the raw
+    // task-tool body. Typed task previews keep their existing truncation hints.
+    toolText(row, raw, taskResult) {
+      const fallback = taskResult ? raw : row.call ? legacyTaskToolText(row.call, raw) : null;
+      return fallback === null ? row.text.slice(0, 2000) : fallback;
+    },
+  }),
+});
+
+function withParsedExecutionEvent(event, update) {
+  if (!event.parsed) return;
+  try { update(event.value); } catch (_) {}
+}
+
+function dispatchAnswerEvent(event, view, policy, field, method) {
+  // Live historically preserves malformed answer bytes; replay ignores them
+  // because canonical history will replace its provisional answer. A decoded
+  // null also retains the original field-access failure behavior of each path.
+  if (!policy.rawAnswerFallback) {
+    withParsedExecutionEvent(event, (value) => view[method](value[field] || ""));
+    return;
+  }
+  let text = event.payload;
+  if (event.parsed) {
+    try { text = event.value[field] || ""; } catch (_) {}
+  }
+  view[method](text);
+}
+
+function dispatchRequestDone(event, view, policy) {
+  // Live schedules the phase before hiding a dialog; replay hides it before
+  // its immediate phase paint. Preserve that order as well as question ids.
+  if (policy.phaseBeforeRequestDone) view.phase("Processing…");
+  let cid = null;
+  if (event.parsed) {
+    try { cid = event.value.id; } catch (_) {}
+  }
+  if (policy.showsRequests(view) && (cid === null || (confirmShown && confirmShown.id === cid))) hideConfirm();
+  if (!policy.phaseBeforeRequestDone) view.phase("Processing…");
+}
+
+const EXECUTION_EVENT_HANDLERS = Object.freeze({
+  thinking_start(event, view) {
     view.endThinking(true);
     view.sealAnswerSegment();
     view.phase("Waiting for model…");
-  } else if (kind === "thinking") {
-    try {
-      const event = JSON.parse(payload);
-      const text = event.text || "";
-      if (text) view.thinkingText(text, event.rate);
-    } catch (_) {}
-  } else if (kind === "thinking_done") {
+  },
+  thinking(event, view) {
+    withParsedExecutionEvent(event, (value) => {
+      const text = value.text || "";
+      if (text) view.thinkingText(text, value.rate);
+    });
+  },
+  thinking_done(event, view) {
     view.endThinking();
     view.phase("Processing…");
-  } else if (kind === "rate") {
-    try { view.rate(JSON.parse(payload)); } catch (_) {}
-  } else if (kind === "tool") {
-    try { view.tool(JSON.parse(payload)); } catch (_) {}
-  } else if (kind === "subagent_progress") {
-    view.subagents(payload);
-  } else if (kind === "compression_start") {
+  },
+  rate(event, view) { withParsedExecutionEvent(event, (value) => view.rate(value)); },
+  tool(event, view) { withParsedExecutionEvent(event, (value) => view.tool(value)); },
+  // Raw legacy text and the parsed report travel together. The activity keeps
+  // its existing source owner, tool slots and task-id reconciliation rules.
+  subagent_progress(event, view) { view.subagents(event.payload, event); },
+  compression_start(event, view) {
     view.phase("Compressing history…");
-  } else if (kind === "compression_done") {
+  },
+  compression_done(event, view) {
     view.phase("Processing…");
-  } else if (kind === "delta") {
-    try { view.delta(JSON.parse(payload).delta || ""); } catch (_) {}
-  } else if (kind === "replace") {
-    try { view.replace(JSON.parse(payload).text || ""); } catch (_) {}
-  } else if (kind === "answer_pending") {
+  },
+  delta(event, view, policy) { dispatchAnswerEvent(event, view, policy, "delta", "delta"); },
+  replace(event, view, policy) { dispatchAnswerEvent(event, view, policy, "text", "replace"); },
+  answer_pending(event, view) {
+    // Buffered prose may precede more tool calls; it is not a final reply.
     view.phase("Processing response…");
-  } else if (kind === "confirm_request") {
+  },
+  confirm_request(event, view, policy) {
     view.phase("Waiting for confirmation…", true);
-    try {
-      const c = JSON.parse(payload);
-      showConfirm(c.id, c.prompt, c.token, c.input);
-    } catch (_) {}
-  } else if (kind === "input_request") {
-    let c = null;
-    try { c = JSON.parse(payload); } catch (_) {}
+    withParsedExecutionEvent(event, (c) => {
+      // showConfirm uses textContent and answers into the selected session.
+      // A parked live turn leaves its request pending for pollConfirm to show.
+      if (policy.showsRequests(view)) showConfirm(c.id, c.prompt, c.token, c.input);
+    });
+  },
+  input_request(event, view, policy) {
+    const c = event.value;
     if (c && typeof c.prompt === "string" && c.prompt.startsWith(NATIVE_PREFIX)) {
-      view.phase("正在手机上执行…", true);
-      void handleNativeRequest(c.id, c.token, c.prompt);
-    } else if (c) {
+      // Native work belongs to the selected page; a parked live turn must not
+      // launch it or change its phase until that session is shown again.
+      if (policy.showsRequests(view)) {
+        view.phase("正在手机上执行…", true);
+        void handleNativeRequest(c.id, c.token, c.prompt);
+      }
+    } else if (c || policy.waitOnMalformedInput) {
+      // Live still enters its waiting phase on malformed input; replay needs a
+      // decoded request to reconstruct a waiting view.
       view.phase("Waiting for your input…", true);
-      showConfirm(c.id, c.prompt, c.token, true);
+      if (c && policy.showsRequests(view)) showConfirm(c.id, c.prompt, c.token, true);
     }
-  } else if (kind === "confirm_done" || kind === "input_done") {
-    let cid = null;
-    try { cid = JSON.parse(payload).id; } catch (_) {}
-    if (cid === null || (confirmShown && confirmShown.id === cid)) hideConfirm();
-    view.phase("Processing…");
-  }
+  },
+  confirm_done: dispatchRequestDone,
+  input_done: dispatchRequestDone,
+});
+
+// Snapshots have no started/delta/done lifecycle. Their canonical rows already
+// carry reasoning filtering, call lookup, task merging and stable identities.
+const EXECUTION_SNAPSHOT_HANDLERS = Object.freeze({
+  user(snapshot, view) { view.user(snapshot); },
+  assistant(snapshot, view) {
+    const turn = view.assistant(snapshot);
+    if (snapshot.reasoning) turn.thinkingSummary = view.thinking(snapshot, turn);
+    if (snapshot.text) view.answer(snapshot, turn);
+    view.rates(snapshot, turn);
+  },
+  fold(snapshot, view, policy) {
+    const m = snapshot.message;
+    const taskResult = m.task_report ? projectTaskReport(m.task_report, false) : null;
+    const tool = view.fold(snapshot, taskResult, policy);
+    if (taskResult) view.task(snapshot, tool, taskResult);
+    view.stored(tool.fold);
+    if (snapshot.subagentReport) view.stored(view.subagents(snapshot, tool.container), ":subagents");
+  },
+});
+
+function dispatchExecutionProjection(handlers, kind, value, view, source) {
+  handlers[kind](value, view, EXECUTION_EVENT_POLICIES[source]);
 }
+
+function dispatchExecutionSnapshot(snapshot, view, source) {
+  const role = snapshot.message.role;
+  const kind = Object.hasOwn(EXECUTION_SNAPSHOT_HANDLERS, role) ? role : "fold";
+  dispatchExecutionProjection(EXECUTION_SNAPSHOT_HANDLERS, kind, snapshot, view, source);
+}
+
+function dispatchExecutionEvent(kind, payload, view, source) {
+  if (!Object.hasOwn(EXECUTION_EVENT_HANDLERS, kind)) return;
+  const event = decodeExecutionEvent(kind, payload);
+  // Semantics run synchronously in wire order; only the source view decides
+  // when to paint. Terminal frames and transport recovery stay with callers.
+  dispatchExecutionProjection(EXECUTION_EVENT_HANDLERS, kind, event, view, source);
+}
+// END execution event dispatcher
 
 function showEventWarning(sid, epoch, kind) {
   const key = JSON.stringify([sid, epoch, kind]);
@@ -8241,7 +8558,6 @@ async function attachEvents() {
   }
   syncStopButton();
   view.phase("Reconnecting…");
-  let buf = "";
   let finished = false;
   let timedOut = false, waiting = false;
   let silenceTimer = null, progressTimer = null;
@@ -8285,16 +8601,15 @@ async function attachEvents() {
     clearEventWarnings(sid, epoch);
     armSilence();
     const reader = res.body.getReader();
-    const dec = new TextDecoder();
+    const framer = createSseFramer();
     for (;;) {
       const { done, value } = await reader.read();
       if (!ownsStream() || controller.signal.aborted) return;
       if (value && value.length) armSilence();
-      if (value) buf += dec.decode(value, { stream: true });
-      let idx;
-      while ((idx = buf.indexOf("\n\n")) >= 0) {
-        const block = parseBlock(buf.slice(0, idx));
-        buf = buf.slice(idx + 2);
+      if (value) framer.push(value);
+      let rawBlock;
+      while ((rawBlock = framer.next()) !== null) {
+        const block = parseBlock(rawBlock);
         if (block.kind === "done") {
           view.finish();
           endedTurnPid = turnRunningPid;
@@ -8688,6 +9003,23 @@ function parseBlock(raw) {
   return { id, kind, payload: data.join("\n") };
 }
 
+// Keep decoding state per response and return one complete block at a time.
+// Callers discard an unfinished tail at EOF without flushing the decoder.
+function createSseFramer() {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  return {
+    push(value) { buffer += decoder.decode(value, { stream: true }); },
+    next() {
+      const boundary = buffer.indexOf("\n\n");
+      if (boundary < 0) return null;
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      return block;
+    },
+  };
+}
+
 // `/cd` changes the session's working directory on the server, not the turn
 // child's: a child that ran it exits and takes the change with it, so the next
 // turn is back in the old directory. Mobile answers the command locally
@@ -9015,6 +9347,29 @@ async function prepareTurnSession(previousId, base) {
 }
 // END turn session preparation
 // BEGIN composer send
+// Bridges own matching and prompt/draft clearing, including cancellation.
+// Consumption here only decides whether the input can reach a model turn.
+const COMPOSER_COMMANDS = [
+  { name: "cd", resolveHandler: () => runCdCommand, withOwner: true, consumeInput: true, keepAttachments: true },
+  { name: "git", resolveHandler: () => runGitCommand, withOwner: true, consumeInput: true, keepAttachments: true },
+  { name: "transfer", resolveHandler: () => typeof runTransferCommand === "function" ? runTransferCommand : undefined,
+    withOwner: false, consumeInput: true, keepAttachments: true },
+];
+function* dispatchComposerCommands() {
+  // Resolve one bridge at a time, after the previous await. Yield its original
+  // promise without another async wrapper on the current command policies.
+  for (const command of COMPOSER_COMMANDS) {
+    const handler = command.resolveHandler();
+    const invoke = typeof handler === "function" && (!command.consumeInput || !command.keepAttachments)
+      ? (...args) => handler(...args).then((handled) => {
+        if (!handled) return false;
+        if (!command.keepAttachments) pendingImages = [];
+        return command.consumeInput;
+      })
+      : handler;
+    yield { handler: invoke, withOwner: command.withOwner };
+  }
+}
 function pendingInputAnchor(root) {
   if (typeof executionGroupsFor === "function") executionGroupsFor(root, true).restore();
   const previous = Array.from(root.children).findLast((node) => node.dataset?.canonicalIdentity);
@@ -9046,9 +9401,16 @@ async function send() {
   let sid;
   try {
     // Session commands use their own endpoints before preparing a model turn.
-    if (await runCdCommand(text)) return;
-    if (await runGitCommand(text)) return;
-    if (typeof runTransferCommand === "function" && await runTransferCommand(text)) return;
+    for (const command of dispatchComposerCommands()) {
+      if (command.withOwner) {
+        // Resolve the command bridge through the ordered dispatcher.
+        const runCdCommand = command.handler;
+        if (await runCdCommand(text)) return;
+      } else {
+        const runTransferCommand = command.handler;
+        if (typeof runTransferCommand === "function" && await runTransferCommand(text)) return;
+      }
+    }
     sid = await prepareTurnSession(draftSession, sendBase);
     if (!sid) return;
   } finally { sendBusy = false; } // the stream below owns itself: other sessions may send now
@@ -9143,12 +9505,11 @@ async function send() {
     if (executionState(sid, sendBase).liveEntry === liveEntry) refreshThinkingRate();
   });
   let tokenRate = "", sealedAnswerText = "", lastThinkingText = "", lastOutputRate = "";
-  const tokenRates = new Map();
+  let tokenRates = new Map();
   const setTokenRate = (sample) => {
-    if (sample.phase === "generation") tokenRates.clear();
-    else tokenRates.delete("generation");
-    tokenRates.set(sample.phase, sample.phase + " " + rateTextFromSample(sample));
-    tokenRate = ["reasoning", "output", "generation"].flatMap((phase) => tokenRates.get(phase) || []).join(" · ");
+    const merged = mergeTokenRateSample(tokenRates, sample);
+    tokenRates = merged.rates;
+    tokenRate = merged.text;
   };
   const mainRate = () => tokenRate || (outputRate.text() ? "output " + outputRate.text() : "") || lastOutputRate;
   const phaseLine = () => {
@@ -9367,6 +9728,86 @@ async function send() {
       if (identity) rememberRate("turn", sid, identity, lastOutputRate);
     }
   };
+  // BEGIN live event view
+  // Live retains the complete bodies and coalesces paints while its POST owns
+  // the turn. Replay uses the same interface with immediate recovery paints.
+  const liveView = {
+    endThinking(newRound) { closeThinkingPhase(newRound); },
+    sealAnswerSegment() { sealAnswerSegment(); },
+    phase(text, waiting) { setPhase(text, waiting); },
+    showsRequests() { return sid === sessionId; },
+    delta(text) {
+      closeThinkingPhase();
+      ensureAnswerBubble();
+      raw += text;
+      outputRate.observe(text);
+      answerDirty = true;
+      setPhase("Responding…");
+    },
+    replace(text) {
+      closeThinkingPhase();
+      ensureAnswerBubble();
+      raw = text;
+      outputRate.replace(raw);
+      answerDirty = true;
+      setPhase(raw ? "Responding…" : "Processing…");
+    },
+    thinkingText(text, rate) {
+      setPhase("Thinking…");
+      sealAnswerSegment();
+      if (!think) mutateTranscript(() => {
+        think = createThinkingFold(box, phaseBubble);
+        thinkingFolds.push(think);
+      });
+      // Unlike the compact replay tail, this fold is the live reasoning body.
+      // Its full text remains available through every debounce and phase seal.
+      thinkRaw += text;
+      if (thinkStartedAt === null) thinkStartedAt = Date.now();
+      thinkTokens += estimateTextTokens(text);
+      const sample = rateSampleOf(rate);
+      const recorded = rateTextFromSample(sample);
+      if (recorded) {
+        thinkRecordedRate = recorded;
+        thinkRecordedTimed = sample.elapsed_ms !== null;
+      }
+      thinkRate = thinkingRateText(sid, thinkRaw, thinkRecordedRate, thinkTokens, thinkStartedAt, thinkingRates.key, thinkRecordedTimed);
+      thinkingRates.observe(think, thinkRaw, thinkRate, thinkStartedAt, Boolean(thinkRecordedRate), thinkRecordedTimed);
+      thinkingDirty = true;
+      schedulePaint();
+    },
+    rate(value) {
+      const sample = rateSampleOf(value);
+      if (!sample) return;
+      if (sample.phase === "reasoning" || sample.phase === "generation") {
+        const measured = thinkingRates.speed(sample);
+        if (think && measured) {
+          thinkRecordedRate = measured;
+          thinkRecordedTimed = sample.elapsed_ms !== null;
+          thinkRate = measured;
+          thinkingDirty = true;
+        }
+      }
+      // Rate windows and prose seals belong to this view's existing counters.
+      setTokenRate(sample);
+      activityDirty = true;
+      schedulePaint();
+    },
+    tool(event) {
+      closeThinkingPhase();
+      sealAnswerSegment();
+      mutateTranscript(() => activity.tool(event));
+      activityDirty = true;
+      schedulePaint();
+    },
+    subagents(payload, decoded) {
+      // This activity retains the captured server/session owner even while
+      // parked; replay's activity belongs to its selected recovery view.
+      mutateTranscript(() => activity.subagents(payload, decoded));
+      activityDirty = true;
+      schedulePaint();
+    },
+  };
+  // END live event view
   // The POST is accepted before its first byte arrives, and the server keeps the
   // turn running even if this page goes away: only a server-sent `error` event is
   // a real turn failure, while a dead stream leaves a stale view (startStaleFollow).
@@ -9424,8 +9865,7 @@ async function send() {
     // END turn HTTP acceptance
     turnStarted = true;
     reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
+    const framer = createSseFramer();
     armStall(); // the first block must arrive within LIVE_STALL_MS
     armProgress(); // and the turn must produce something within STREAM_SILENCE_MS
     let finished = false;
@@ -9434,13 +9874,12 @@ async function send() {
       const { done, value } = await reader.read();
       if (value) {
         liveEntry.lastEventAt = Date.now();
-        buf += dec.decode(value, { stream: true });
+        framer.push(value);
       }
       // Consume complete blocks; the tail may hold a partial block.
-      let idx;
-      while ((idx = buf.indexOf("\n\n")) >= 0) {
-        const { kind, payload } = parseBlock(buf.slice(0, idx));
-        buf = buf.slice(idx + 2);
+      let rawBlock;
+      while ((rawBlock = framer.next()) !== null) {
+        const { kind, payload } = parseBlock(rawBlock);
         // Any block at all, a keep-alive comment included, proves that the
         // connection is still there. Only a real event counts as progress.
         armStall();
@@ -9472,142 +9911,7 @@ async function send() {
           break;
         }
         else if (kind === "error") { turnError = true; throw new Error(JSON.parse(payload).error || "turn failed"); }
-        else if (kind === "delta") {
-          closeThinkingPhase();
-          ensureAnswerBubble();
-          let delta = "";
-          try { delta = JSON.parse(payload).delta || ""; }
-          catch (_) { delta = payload; }
-          raw += delta;
-          outputRate.observe(delta);
-          answerDirty = true;
-          setPhase("Responding…");
-        }
-        else if (kind === "replace") {
-          closeThinkingPhase();
-          ensureAnswerBubble();
-          try { raw = JSON.parse(payload).text || ""; }
-          catch (_) { raw = payload; }
-          outputRate.replace(raw);
-          answerDirty = true;
-          setPhase(raw ? "Responding…" : "Processing…");
-        }
-        else if (kind === "answer_pending") {
-          // Buffered prose may precede more tool calls; it is not a final reply.
-          setPhase("Processing response…");
-        }
-        else if (kind === "thinking_start") {
-          closeThinkingPhase(true);
-          sealAnswerSegment();
-          setPhase("Waiting for model…");
-        }
-        else if (kind === "thinking") {
-          try {
-            const event = JSON.parse(payload);
-            const text = event.text || "";
-            if (text) {
-              setPhase("Thinking…");
-              sealAnswerSegment();
-              if (!think) mutateTranscript(() => {
-                think = createThinkingFold(box, phaseBubble);
-                thinkingFolds.push(think);
-              });
-              thinkRaw += text;
-              if (thinkStartedAt === null) thinkStartedAt = Date.now();
-              thinkTokens += estimateTextTokens(text);
-              const sample = rateSampleOf(event.rate);
-              const recorded = rateTextFromSample(sample);
-              if (recorded) {
-                thinkRecordedRate = recorded;
-                thinkRecordedTimed = sample.elapsed_ms !== null;
-              }
-              thinkRate = thinkingRateText(sid, thinkRaw, thinkRecordedRate, thinkTokens, thinkStartedAt, thinkingRates.key, thinkRecordedTimed);
-              thinkingRates.observe(think, thinkRaw, thinkRate, thinkStartedAt, Boolean(thinkRecordedRate), thinkRecordedTimed);
-              thinkingDirty = true;
-              schedulePaint();
-            }
-          } catch (_) {}
-        }
-        else if (kind === "thinking_done") {
-          closeThinkingPhase();
-          setPhase("Processing…");
-        }
-        else if (kind === "rate") {
-          try {
-            const sample = rateSampleOf(JSON.parse(payload));
-            if (!sample) continue;
-            if (sample.phase === "reasoning" || sample.phase === "generation") {
-              const measured = thinkingRates.speed(sample);
-              if (think && measured) {
-                thinkRecordedRate = measured;
-                thinkRecordedTimed = sample.elapsed_ms !== null;
-                thinkRate = measured;
-                thinkingDirty = true;
-              }
-            }
-            setTokenRate(sample);
-            activityDirty = true;
-            schedulePaint();
-          } catch (_) {}
-        }
-        else if (kind === "tool") {
-          try {
-            const event = JSON.parse(payload);
-            closeThinkingPhase();
-            sealAnswerSegment();
-            mutateTranscript(() => activity.tool(event));
-            activityDirty = true;
-            schedulePaint();
-          } catch (_) {}
-        }
-        else if (kind === "subagent_progress") {
-          mutateTranscript(() => activity.subagents(payload));
-          activityDirty = true;
-          schedulePaint();
-        }
-        else if (kind === "compression_start") {
-          setPhase("Compressing history…");
-        }
-        else if (kind === "compression_done") {
-          setPhase("Processing…");
-        }
-        else if (kind === "confirm_request") {
-          setPhase("Waiting for confirmation…", true);
-          // Server text: showConfirm renders the prompt through textContent.
-          // Only the session on screen can answer: the dialog answers into
-          // `sessionId`, so a question from a turn in another session is left
-          // pending on the server (the dialog shows when that session is
-          // opened, because pollConfirm rebuilds it from /confirm).
-          try { const c = JSON.parse(payload); if (sid === sessionId) showConfirm(c.id, c.prompt, c.token, c.input); } catch (_) {}
-        }
-        else if (kind === "confirm_done") {
-          setPhase("Processing…");
-          // Only the question this event closes goes away; a newer request can
-          // only follow it, and an id-less event hides whatever is on screen.
-          let cid = null;
-          try { cid = JSON.parse(payload).id; } catch (_) {}
-          if (sid === sessionId && (cid === null || (confirmShown && confirmShown.id === cid))) hideConfirm();
-        }
-        else if (kind === "input_request") {
-          let c = null;
-          try { c = JSON.parse(payload); } catch (_) {}
-          if (c && typeof c.prompt === "string" && c.prompt.startsWith(NATIVE_PREFIX)) {
-            // A phone action is executed by the app, not typed into a dialog.
-            if (sid === sessionId) {
-              setPhase("正在手机上执行…", true);
-              void handleNativeRequest(c.id, c.token, c.prompt);
-            }
-          } else {
-            setPhase("Waiting for your input…", true);
-            if (c && sid === sessionId) showConfirm(c.id, c.prompt, c.token, true);
-          }
-        }
-        else if (kind === "input_done") {
-          setPhase("Processing…");
-          let cid = null;
-          try { cid = JSON.parse(payload).id; } catch (_) {}
-          if (sid === sessionId && (cid === null || (confirmShown && confirmShown.id === cid))) hideConfirm();
-        }
+        else dispatchExecutionEvent(kind, payload, liveView, "live");
         // Plain child stdout is tool chatter, not transcript content. Structured
         // `rate` and `tool` events carry the display data used by this page.
       }
@@ -10061,6 +10365,7 @@ function wire() {
       // loadHistory, which would 404 and print a scary red error, and let
       // loadSessions refresh only the drawer/bar around the pending id.
       $("msgs").textContent = "";
+      clearDisplayedSources();
       addMsg("asst", "new session — type below to start.", "asst");
       commitExecutionView(newId, executionBase());
       syncStopButton();

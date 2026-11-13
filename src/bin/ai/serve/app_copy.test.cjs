@@ -153,6 +153,7 @@ function streamHarness(options) {
     turnRunningPid: 0, endedTurnPid: 0,
     finished: false, turnError: false, finishFollow: false, confirmPollSeq: 0, stopStaleFollow() {},
   });
+  vm.runInContext(between("function handleReplayEvent(", "function showEventWarning("), h.context);
   vm.runInContext(between('  let bubble = addMsgMd("", box);', "  let turnStarted = false;"), h.context);
   const dispatch = between('        if (kind === "done") {', '      if (finished) break;').replace(/\s*}\s*$/, "");
   const completion = between("    flushPaint(); // flush the tail before final decoration or stale recovery", "    if (!finished && !turnError) {");
@@ -264,6 +265,7 @@ test("history answers copy the original message including surrounding line break
   const copied = [];
   const h = harness({ clipboard: { writeText: async (text) => { copied.push(text); } } });
   h.context.textOf = (content) => content;
+  vm.runInContext(between("// BEGIN execution event dispatcher", "// END execution event dispatcher"), h.context);
   vm.runInContext(between("function renderHistoryRow(", "// A session the server reports"), h.context);
   const raw = "\n# 结论\n\n完整的回答\n\n";
   h.context.renderHistoryRow({ message: { role: "assistant", content: raw }, text: raw.trim(), historyIndex: 2 }, h.msgs);

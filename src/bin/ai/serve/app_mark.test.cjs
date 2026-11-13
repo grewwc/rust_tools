@@ -159,6 +159,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
   vm.runInContext(between("function headers(", "const esc ="), context);
   vm.runInContext(between("function sessionTitle(s)", "// Phone drawer floats"), context);
   vm.runInContext(between("function renderSessionBar()", "// History is append-only"), context);
+  if (!realNavigation) vm.runInContext(between("function executionBase()", "function executionState("), context);
   vm.runInContext(between("let switchPollTimer = null;", "// Rebuild a compact progress card"), context);
   if (realNavigation) {
     Object.assign(context, {
@@ -177,6 +178,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
       createTurnRateLine: () => () => {}, estimateTextTokens: () => 0,
     });
     vm.runInContext(between("// BEGIN execution model", "// END execution model"), context);
+    vm.runInContext(between("// BEGIN execution event dispatcher", "// END execution event dispatcher"), context);
     vm.runInContext(between("// BEGIN session switch", "// END session switch"), context);
     vm.runInContext(between("// History is append-only", "// Historical user inputs"), context);
     const switchSession = context.switchSession, loadHistory = context.loadHistory;

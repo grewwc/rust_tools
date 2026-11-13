@@ -29,7 +29,7 @@ function harness({ sid = "s1", images = [], respond } = {}) {
   function node(tag = "div") {
     const classes = new Set();
     const el = {
-      tagName: tag, children: [], parentNode: null, dataset: {}, style: {},
+      tagName: tag, children: [], parentNode: null, attrs: {}, dataset: {}, style: {},
       hidden: false, disabled: false, value: "", textContent: "",
       classList: {
         add: (...names) => names.forEach((name) => classes.add(name)),
@@ -49,15 +49,21 @@ function harness({ sid = "s1", images = [], respond } = {}) {
       },
       focus() { document.activeElement = el; },
       addEventListener(type, listener) { el["on" + type] = listener; },
+      setAttribute(name, value) { el.attrs[name] = String(value); },
+      removeAttribute(name) { delete el.attrs[name]; },
     };
     return el;
   }
   document.createElement = node;
   const elements = {};
-  for (const id of ["prompt", "msgs", "omodel", "oagent", "oeffort", "gitconfirmwrap", "gitconfirmpanel", "gitconfirmtext", "gitcancel", "gitaccept"]) {
+  for (const id of ["prompt", "msgs", "omodel", "oagent", "oeffort", "gitconfirmwrap", "gitconfirmpanel", "gitconfirmtext", "gitcancel", "gitaccept", "cmdmenu", "cmdoptions", "cmdempty"]) {
     elements[id] = node();
   }
   elements.gitconfirmwrap.hidden = true;
+  elements.cmdmenu.hidden = true;
+  elements.cmdempty.hidden = true;
+  elements.cmdmenu.appendChild(elements.cmdoptions);
+  elements.cmdmenu.appendChild(elements.cmdempty);
   elements.gitconfirmwrap.appendChild(elements.gitconfirmpanel);
   for (const id of ["gitconfirmtext", "gitcancel", "gitaccept"]) elements.gitconfirmpanel.appendChild(elements[id]);
   elements.prompt.focus();
@@ -111,6 +117,7 @@ function harness({ sid = "s1", images = [], respond } = {}) {
     between("// BEGIN execution model", "// END execution model"),
     between("function canSend()", "// The one send/stop button"),
     between("function headers(", "const esc ="),
+    between("// Slash-command completion.", "async function loadInfo()"),
     marked("composer cd command"), marked("composer git command"), marked("turn session preparation"),
     between("function parseBlock(raw)", "// `/cd` changes"),
     between("const RATE_STORAGE =", "function addFold("),

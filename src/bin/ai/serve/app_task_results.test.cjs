@@ -128,10 +128,9 @@ function harness({ phone = false, width = phone ? 390 : 1280, storage = new Map(
     ["function recoveredProgressView(", "function showEventWarning("],
   ]) vm.runInContext(source(first, last), context);
 
-  const send = script.slice(script.indexOf("async function send()"));
-  const liveBranch = /else if \(kind === "tool"\) \{([\s\S]*?)\n        \}\n        else if \(kind === "subagent_progress"\)/.exec(send);
-  assert.ok(liveBranch, "missing live SSE tool dispatch");
-  vm.runInContext("function liveTool(payload) {" + liveBranch[1] + "\n}", context);
+  const liveView = source("  // BEGIN live event view", "  // END live event view");
+  assert.match(liveView, /tool\(event\)/, "missing live SSE tool adapter");
+  vm.runInContext(liveView + '\nfunction liveTool(payload) { dispatchExecutionEvent("tool", payload, liveView, "live"); }', context);
   const historyMessages = [];
   const emit = (mode, output, name = "task_wait", extra = {}) => {
     const event = { id: "wait", name, phase: "finished", ok: true, output, ...extra };

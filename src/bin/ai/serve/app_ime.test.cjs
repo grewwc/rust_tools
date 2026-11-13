@@ -43,6 +43,11 @@ const inputHandlerSrc = script.slice(
   script.indexOf('$("prompt").addEventListener("input"'),
   script.indexOf('$("prompt").addEventListener("paste"'),
 );
+// Include the real command helpers invoked by input and composition-end events.
+const commandsSrc = script.slice(
+  script.indexOf("// Slash-command completion."),
+  script.indexOf("async function loadInfo()"),
+);
 const compositionEndSrc = script.slice(
   script.indexOf('$("prompt").addEventListener("compositionend"'),
   script.indexOf('$("prompt").addEventListener("input"'),
@@ -58,7 +63,18 @@ const noteSrc = script.slice(
 
 function makeContext(extra) {
   const listeners = new Map();
-  const prompt = {
+  function node(tag = "div") {
+    let text = "";
+    return {
+      tagName: tag, attrs: {}, children: [], hidden: false,
+      setAttribute(name, value) { this.attrs[name] = String(value); },
+      removeAttribute(name) { delete this.attrs[name]; },
+      appendChild(child) { this.children.push(child); return child; },
+      get textContent() { return text + this.children.map((child) => child.textContent).join(""); },
+      set textContent(value) { text = String(value); this.children = []; },
+    };
+  }
+  const prompt = Object.assign(node("textarea"), {
     value: "",
     style: { height: "44px" },
     scrollHeight: 120,
@@ -80,8 +96,13 @@ function makeContext(extra) {
       for (const handler of listeners.get(type) || []) handler(event || {});
     },
     getBoundingClientRect() { return { top: 0, left: 0, width: 320, height: 44 }; },
-  };
-  const document = { activeElement: null };
+  });
+  const elements = { prompt, cmdmenu: node(), cmdoptions: node(), cmdempty: node() };
+  elements.cmdmenu.hidden = true;
+  elements.cmdempty.hidden = true;
+  elements.cmdmenu.appendChild(elements.cmdoptions);
+  elements.cmdmenu.appendChild(elements.cmdempty);
+  const document = { activeElement: null, createElement: node };
   const context = vm.createContext(Object.assign({
     document,
     sessionId: "",
@@ -94,7 +115,7 @@ function makeContext(extra) {
       setItem(k, v) { this.store.set(k, v); },
       removeItem(k) { this.store.delete(k); },
     },
-    $: (id) => (id === "prompt" ? prompt : null),
+    $: (id) => elements[id] || null,
     draftKey: (id) => "draft:" + id,
     composerDrafts: new Map(),
     composerImageDrafts: new Map(),
@@ -106,6 +127,7 @@ function makeContext(extra) {
   context.prompt = prompt;
   context.marks = [];
   vm.runInContext(imeSrc, context);
+  vm.runInContext(commandsSrc, context);
   // Mirror wire() before any composition or input handler is registered.
   vm.runInContext("promptHistory = createPromptHistory(prompt);", context);
   return context;
@@ -221,6 +243,7 @@ test("an automatic session switch does not replace the composer's text", async (
     loadSessionConfig: async () => {},
     resetPicks: () => {},
   });
+  vm.runInContext(script.slice(script.indexOf("function executionBase()"), script.indexOf("function executionState(")), context);
   vm.runInContext(loadSessionsSrc, context);
   vm.runInContext("let lastItems = []; let pendingNew = ''; let sessionId = 'gone'; let turnRunning = false; let sessFilter = '';", context);
 
@@ -259,6 +282,7 @@ test("desktop session loading fetches only the bounded newest page", async () =>
     loadSessionConfig: async () => {},
     resetPicks: () => {},
   });
+  vm.runInContext(script.slice(script.indexOf("function executionBase()"), script.indexOf("function executionState(")), context);
   vm.runInContext(loadSessionsSrc, context);
   vm.runInContext("let lastItems = []; let pendingNew = ''; let sessionId = 's-51'; let turnRunning = false; let sessFilter = '';", context);
 
@@ -291,6 +315,7 @@ test("desktop session loading falls back when an older daemon ignores offset", a
     loadSessionConfig: async () => {},
     resetPicks: () => {},
   });
+  vm.runInContext(script.slice(script.indexOf("function executionBase()"), script.indexOf("function executionState(")), context);
   vm.runInContext(loadSessionsSrc, context);
   vm.runInContext("let lastItems = []; let pendingNew = ''; let sessionId = 's-51'; let turnRunning = false; let sessFilter = '';", context);
 
