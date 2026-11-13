@@ -49,6 +49,7 @@ function harness({ sid = "s1", images = [], respond } = {}) {
       },
       focus() { document.activeElement = el; },
       addEventListener(type, listener) { el["on" + type] = listener; },
+      querySelectorAll() { return []; },
       setAttribute(name, value) { el.attrs[name] = String(value); },
       removeAttribute(name) { delete el.attrs[name]; },
     };

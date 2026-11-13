@@ -1687,7 +1687,8 @@ let canonicalHistoryTotal = 0; // full canonical count, including rows outside t
 let historySession = ""; // session whose canonical rows back historyKeys
 let historyKeys = []; // visible canonical rows currently mounted, excluding live turn UI
 let historyLoadSeq = 0;
-const pendingUserInputs = new Map(); // local rows survive until canonical history acknowledges them
+// `pendingUserInputs` is the execution model's server-scoped session registry;
+// local rows survive until their own server's canonical history acknowledges them.
 // Live turns, one entry per session that is streaming right now: the page can
 // hold a turn in one session, switch to another, and start a second turn there.
 // Each entry owns the container its stream writes into, so concurrent streams
@@ -1788,8 +1789,8 @@ const executionModel = (() => {
     endedTurnPid: "endedPid", remoteTurnPid: "remotePid", remoteTurnAt: "remoteAt",
     eventStreamEnded: "ended", eventStreamFailed: "failed",
   };
-  const serverFields = { turns: "liveTurns" };
-  const freshServer = () => ({ sessions: new Map(), liveTurns: new Map() });
+  const serverFields = { turns: "liveTurns", pendingUserInputs: "pendingInputs" };
+  const freshServer = () => ({ sessions: new Map(), liveTurns: new Map(), pendingInputs: new Map() });
   const freshSession = () => ({ turn: 0, pid: 0, endedPid: 0, running: false, runningAt: 0,
     remotePid: "", remoteAt: 0, ended: false, failed: false, history: [], activities: new Map(),
     nextActivity: 0, taskStates: new Map(), taskBusy: null });
@@ -1825,7 +1826,7 @@ const executionModel = (() => {
     if (name === "staleSession") return recovery.base === base ? recovery.sessionId : "";
     if (name === "eventActive") return replay.base === base && replay.active;
     if (name === "eventSession") return replay.base === base ? replay.sessionId : "";
-    const server = serverFor(base);
+    const server = serverFor(base, name in serverFields);
     return name in serverFields ? server[serverFields[name]] : sessionFor(server, sid)[sessionFields[name]];
   };
   const read = (sid, base) => {
@@ -1970,6 +1971,35 @@ function unmountDisplayedSource(sourceToken, mountToken) {
   executionModel.unmountDisplayedSource(sourceToken, mountToken);
 }
 function clearDisplayedSources() { executionModel.clearDisplayedSources(); }
+// The reused transcript root owns one server/session and one DOM generation.
+// Restore grouped records before discarding their tree, then retire the cache so
+// a queued disclosure callback cannot reinsert nodes into a later transcript.
+function resetTranscript(sid = sessionId, base = executionBase(), root = $("msgs")) {
+  const owner = root._transcriptOwner || displayedExecutionState();
+  root._executionGroups?.restore();
+  delete root._executionGroups;
+  root._transcriptGeneration = (root._transcriptGeneration || 0) + 1;
+  root.textContent = "";
+  root._transcriptOwner = { sessionId: sid, base };
+  clearDisplayedSources();
+  if (owner.sessionId !== sid || owner.base !== base) {
+    updateExecutionModel({ kind: "display", empty: true }, sid, base);
+  }
+}
+function ensureTranscriptOwner(sid = sessionId, base = executionBase(), root = $("msgs")) {
+  const owner = root._transcriptOwner || displayedExecutionState();
+  if (owner.sessionId !== sid || owner.base !== base) {
+    historyLoadSeq++;
+    resetTranscript(sid, base, root);
+    historySession = "";
+    historyKeys = [];
+    canonicalHistoryTotal = 0;
+    lastMsgCount = null;
+  } else root._transcriptOwner = { sessionId: sid, base };
+}
+function removeTranscriptPlaceholder(root = $("msgs")) {
+  for (const row of root.querySelectorAll(".transcript-placeholder")) row.remove();
+}
 const displayedProducerNodes = new WeakMap();
 function mountDisplayedProducer(node, source) {
   const root = typeof $ === "function" ? $("msgs") : null;
@@ -3890,6 +3920,7 @@ function savedTranscriptPosition(id) {
 }
 function rememberTranscriptPosition(root = $("msgs"), owner = ownedTranscriptScroll(root)) {
   if (!sessionId || isDesktopTranscriptScroll() && (!owner || ownedTranscriptScroll(root) !== owner)) return;
+  if (root._transcriptOwner && !root.children.length) return;
   const id = isDesktopTranscriptScroll() ? owner.sessionId : sessionId;
   const atBottom = isNearBottom(root) || !!(owner?.following && !outputFollowSuspended);
   try {
@@ -3901,10 +3932,12 @@ let scrollPositionTimer = null;
 function scheduleRememberTranscriptPosition() {
   if (scrollPositionTimer !== null) return;
   const root = $("msgs"), desktop = isDesktopTranscriptScroll(), owner = ownedTranscriptScroll(root);
+  const sid = sessionId, generation = root._transcriptGeneration;
   if (desktop && !owner) return;
   const timer = setTimeout(() => {
     if (scrollPositionTimer !== timer) return;
     scrollPositionTimer = null;
+    if (sid !== sessionId || generation !== root._transcriptGeneration) return;
     if (desktop && (!isDesktopTranscriptScroll() || ownedTranscriptScroll(root) !== owner)) return;
     rememberTranscriptPosition(root, desktop ? owner : null);
   }, 200);
@@ -4083,6 +4116,7 @@ function switchSession(nextId, saveCurrent = true) {
   eventStreamFailed = false;
   sessionId = nextId;
   updateExecutionModel({ kind: "select" });
+  ensureTranscriptOwner(nextId);
   if (sessionId) localStorage.setItem("serve.session", sessionId);
   else localStorage.removeItem("serve.session");
   // The server running sample belongs to the session that was on screen.
@@ -5161,9 +5195,12 @@ function executionFoldKey(parent, key, scope = parent._executionFoldScope) {
 // Group original cards, never copies or history records. Restoring their exact
 // slots keeps canonical row reconciliation and live insertion anchors intact.
 function executionGroupsFor(parent, stored = false) {
-  if (parent._executionGroups) return parent._executionGroups;
+  const generation = parent._transcriptGeneration || 0;
+  if (parent._executionGroups?.generation === generation) return parent._executionGroups;
   let slots = [], wrappers = [], folds = new Map(), lastPlan = [];
+  const current = () => generation === (parent._transcriptGeneration || 0);
   const restore = () => {
+    if (!current()) return;
     if (stored && folds.size && typeof foldOpenState !== "undefined") {
       for (const [key, fold] of folds) {
         if (fold.box.querySelector("details").open) foldOpenState.set(key, true);
@@ -5188,6 +5225,7 @@ function executionGroupsFor(parent, stored = false) {
     slots = []; wrappers = []; lastPlan = [];
   };
   const sync = (latestProgress = null) => {
+    if (!current()) return;
     const units = [];
     const visit = (owner) => {
       for (const node of Array.from(owner.children)) {
@@ -5332,7 +5370,7 @@ function executionGroupsFor(parent, stored = false) {
       root.scrollTop = top + (anchorBox(anchor).getBoundingClientRect?.().top ?? anchorTop) - anchorTop;
     } else root.scrollTop = top;
   };
-  return parent._executionGroups = { restore, sync };
+  return parent._executionGroups = { restore, sync, generation };
 }
 function completeExecution(fold, parent) {
   fold.box.dataset.executionState = fold.box._executionState = "completed";
@@ -8307,6 +8345,7 @@ function armHistoryFollow() {
 // it; a session with nothing to attach follows the turn from history instead.
 function attachLiveBox() {
   const root = $("msgs");
+  ensureTranscriptOwner(sessionId, executionBase(), root);
   const follow = shouldFollowOutput(root);
   attachPendingInputs(root);
   if (typeof executionGroupsFor === "function") executionGroupsFor(root, true).sync();
@@ -8317,6 +8356,7 @@ function attachLiveBox() {
   // retired live box beside the newly rendered reply.
   if (box === staleBox) return;
   const displayed = displayedExecutionState();
+  removeTranscriptPlaceholder(root);
   root.appendChild(box);
   restoreDisplayedSources(box);
   const next = displayedExecutionState();
@@ -8328,6 +8368,7 @@ function attachLiveBox() {
 function attachPendingInputs(root) {
   const pending = pendingUserInputs.get(sessionId) || [];
   if (!pending.length) return;
+  removeTranscriptPlaceholder(root);
   if (typeof executionGroupsFor === "function") executionGroupsFor(root, true).restore();
   // Each refresh resolves the owning turn before the DOM rows are reconciled.
   const rows = new Map(Array.from(root.children).map((node) => [node.dataset?.canonicalKey, node]));
@@ -8441,6 +8482,7 @@ async function loadHistory(prefetched, canCommit = () => true) {
   const forSession = prefetched?.sessionId ?? sessionId;
   const base = executionBase();
   if (forSession !== sessionId || !canCommit()) return;
+  ensureTranscriptOwner(forSession, base);
   if (typeof beginTranscriptScroll === "function" && isDesktopTranscriptScroll()
       && (!transcriptScrollState || transcriptScrollState.sessionId !== forSession)) beginTranscriptScroll(forSession);
   const loadId = ++historyLoadSeq;
@@ -8448,8 +8490,7 @@ async function loadHistory(prefetched, canCommit = () => true) {
   if (!sessionId) {
     updateExecutionModel({ kind: "history", summaries: [] });
     revokePreviews();
-    $("msgs").textContent = "";
-    clearDisplayedSources();
+    resetTranscript("", base);
     historySession = "";
     historyKeys = [];
     canonicalHistoryTotal = 0;
@@ -8634,8 +8675,7 @@ async function loadHistory(prefetched, canCommit = () => true) {
           // as one frame instead of exposing an empty transcript during network I/O.
           // A still-running box is reattached below; its previews remain owned by it.
           revokePreviews(root);
-          root.textContent = "";
-          clearDisplayedSources();
+          resetTranscript(forSession, base, root);
           for (const row of history.rows) renderHistoryRow(row, root);
         }
       }
@@ -8670,8 +8710,7 @@ async function loadHistory(prefetched, canCommit = () => true) {
       const clearedTranscript = historySession !== forSession;
       if (clearedTranscript) {
         revokePreviews(root);
-        root.textContent = "";
-        clearDisplayedSources();
+        resetTranscript(forSession, base, root);
       }
       historySession = "";
       historyKeys = [];
@@ -8887,22 +8926,29 @@ function askRewind(short) {
   });
 }
 async function rewindTo(index, preview, targetSession = sessionId) {
+  const targetBase = executionBase(), targetInputs = pendingUserInputs;
   const short = preview.length > 80 ? preview.slice(0, 79) + "…" : preview;
   if (!(await askRewind(short))) return;
+  if (targetBase !== executionBase()) return;
   try {
     const res = await (await api("/sessions/" + targetSession + "/rewind", {
       method: "POST", body: JSON.stringify({ message_index: index }),
     })).json();
-    for (const input of pendingUserInputs.get(targetSession) || []) {
+    for (const input of targetInputs.get(targetSession) || []) {
       input.row.remove();
       revokePreviews(input.row);
     }
-    pendingUserInputs.delete(targetSession);
+    targetInputs.delete(targetSession);
+    if (targetBase !== executionBase()) return;
     await loadSessions();
     if (sessionId !== targetSession) { note("rewound the background session"); return; }
     await loadHistory();
-    addMsg("ok", "rewound: removed " + res.removed + " message(s).", "asst");
-  } catch (e) { addMsg("err", "rewind failed: " + e.message, "asst err"); }
+    if (sessionId === targetSession && targetBase === executionBase()) {
+      addMsg("ok", "rewound: removed " + res.removed + " message(s).", "asst");
+    }
+  } catch (e) {
+    if (sessionId === targetSession && targetBase === executionBase()) addMsg("err", "rewind failed: " + e.message, "asst err");
+  }
 }
 
 // The reply to a turn whose live feed died still lands in history, so the page
@@ -9170,7 +9216,11 @@ function recoveredProgressView(sid = sessionId) {
   const phaseBubble = document.createElement("div");
   phaseBubble.className = "msg asst pending";
   box.appendChild(phaseBubble);
-  $("msgs").appendChild(box);
+  if (sid === sessionId) {
+    ensureTranscriptOwner(sid, base);
+    removeTranscriptPlaceholder();
+    $("msgs").appendChild(box);
+  }
   const activity = createLiveActivity(box, bubble, sid);
   const answerBubbles = [bubble];
   const outputRate = createOutputRateCounter();
@@ -9533,7 +9583,6 @@ async function attachEvents() {
   const sid = sessionId;
   const base = executionBase();
   const epoch = runEpoch;
-  const mountedView = displayedExecutionState();
   const controller = new AbortController();
   eventAbort = controller;
   eventActive = true;
@@ -9541,11 +9590,8 @@ async function attachEvents() {
   ensureConfirmPoll();
   const view = recoveredProgressView(sid);
   recoveredView = view;
-  // Replay is appended to the mounted transcript. It may be the first view for
-  // this session, but it must not claim a different session's retained rows.
-  if (!mountedView.sessionId || (mountedView.base === base && mountedView.sessionId === sid)) {
-    commitExecutionView(sid, base);
-  }
+  // recoveredProgressView mounts only after the transcript owner is selected.
+  commitExecutionView(sid, base);
   syncStopButton();
   view.phase("Reconnecting…");
   let finished = false;
@@ -9860,6 +9906,8 @@ async function sendSideNote() {
   // The queue accepts notes even between turns. Do not gate delivery on a
   // running-state poll, or let that wait change the target session or text.
   const targetSession = sessionId;
+  const targetBase = executionBase();
+  const stillSelected = () => sessionId === targetSession && executionBase() === targetBase;
   sideNoteBusy = true;
   $("sidenote").disabled = true;
   note("sending side note…");
@@ -9869,16 +9917,19 @@ async function sendSideNote() {
     });
     // Do not erase another session's draft or text/images changed in flight.
     // Clear the submitted attachments only with their unchanged draft.
-    if (sessionId === targetSession && input.value === draft &&
+    if (stillSelected() && input.value === draft &&
         pendingImages.length === images.length && pendingImages.every((image, i) => image === images[i])) {
       setPromptValue("", true);
       input.style.height = "auto";
       pendingImages = [];
       clearDraft(targetSession);
     }
-    note("side note queued — applies at the next model request");
-    void refreshSideNotes();
+    if (stillSelected()) {
+      note("side note queued — applies at the next model request");
+      void refreshSideNotes();
+    }
   } catch (e) {
+    if (!stillSelected()) return;
     const filenames = images.map((image) => image.filename).join("、");
     addMsg("err", "side note failed" + (filenames ? "（" + filenames + "）" : "") + ": " + e.message, "asst err");
     scrollToLatest();
@@ -9939,15 +9990,15 @@ function renderSideNotes(notes) {
   watchSideNotes(notes.length > 0);
 }
 // The queue is server-side and a turn child can drain it between any two
-// polls. A sequence guard keeps a slow response for an old session from
-// repainting the queue after the user switches sessions.
+// polls. The owner and sequence guards prevent a slow response for an old
+// server/session from repainting the selected queue.
 async function refreshSideNotes() {
   if (!sessionId) { renderSideNotes([]); return; }
-  const sid = sessionId, seq = ++sideNotesSeq;
+  const sid = sessionId, base = executionBase(), seq = ++sideNotesSeq;
   let body;
   try { body = await (await api("/sessions/" + sid + "/side-notes")).json(); }
   catch (_) { return; }
-  if (sid !== sessionId || seq !== sideNotesSeq) return;
+  if (sid !== sessionId || base !== executionBase() || seq !== sideNotesSeq) return;
   renderSideNotes(Array.isArray(body.notes) ? body.notes : []);
 }
 async function stopTurn() {
@@ -10443,6 +10494,8 @@ async function send() {
   questionCache = null;
   document.querySelectorAll("#msgs .turn-interrupted").forEach((node) => node.remove());
   lastHistoryEndsUnanswered = false;
+  ensureTranscriptOwner(sid, sendBase);
+  removeTranscriptPlaceholder();
   const userBubble = addLiveUserBubble(text.trim() ? text : "(images only)", prompt, sid, rewindFloor);
   const pendingInputs = pendingUserInputs.get(sid) || [];
   // `settled` flips once the turn's POST is accepted: from then on this input
@@ -11357,6 +11410,7 @@ function wire() {
   } catch (e) {}
   applyTheme(themePref(), false);
   $("save").onclick = async () => {
+    const previousBase = executionBase();
     const b = normalizeServeBase($("base").value);
     $("base").value = b;
     // Phones love appending a trailing space via autocomplete; that single
@@ -11373,6 +11427,12 @@ function wire() {
       el.textContent = "save failed: " + (e && e.message ? e.message : e);
       el.classList.add("show");
       return;
+    }
+    if (previousBase !== executionBase()) {
+      abortEvents();
+      pauseHistoryRetry(sessionId);
+      ensureTranscriptOwner();
+      if (typeof renderSideNotes === "function") renderSideNotes([]);
     }
     showStored();
     $("conn").classList.remove("open");
@@ -11391,9 +11451,9 @@ function wire() {
       // The id is lazy (no history yet): show it optimistically instead of
       // loadHistory, which would 404 and print a scary red error, and let
       // loadSessions refresh only the drawer/bar around the pending id.
-      $("msgs").textContent = "";
-      clearDisplayedSources();
-      addMsg("asst", "new session — type below to start.", "asst");
+      resetTranscript(newId);
+      const placeholder = addMsg("asst", "new session — type below to start.", "asst transcript-placeholder");
+      placeholder.dataset.transcriptPlaceholder = "new-session";
       commitExecutionView(newId, executionBase());
       syncStopButton();
       await loadSessions();

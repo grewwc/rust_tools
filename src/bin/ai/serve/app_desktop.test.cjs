@@ -248,7 +248,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     runCdCommand: async () => false, validateSkillInput: () => true,
     captureSkillPick: () => ({ skills: [] }), consumeSkillPick() {},
     sendBusy: false, pendingImages: [], turns: new Map(), MAX_LIVE_TURNS: 4,
-    historySession: sid, canonicalHistoryTotal: 0, pendingUserInputs: new Map(),
+    historySession: sid, historyLoadSeq: 0, canonicalHistoryTotal: 0, pendingUserInputs: new Map(),
     questionCache: null, runEpoch: 0, turnRunning: false, confirmPollSeq: 0,
     turnRunningAt: 0, RUNNING_SAMPLE_TTL_MS: 60000,
     turnRunningPid: 0, endedTurnPid: 0,
@@ -1885,15 +1885,16 @@ for (const width of [390, 700, 701, 1280]) {
     await openOtherTranscriptAtBottom(h, width);
     const release = h.deferHistory("open-session"), selecting = h.selectHistory("open-session");
     assert.equal(h.context.sessionId, "open-session");
-    assert.equal(h.context.historySession, "target-session", "B stays mounted while A is fetching");
+    assert.equal(h.context.historySession, "", "B is retired while A is fetching");
+    assert.equal(h.root.children.length, 0, "the selected transcript cannot retain another session's rows");
     const before = h.root.scrollTop;
     h.resizeViewport(h.root.clientHeight + 80);
     h.flushScroll();
-    assert.equal(h.root.scrollTop, before - 80, "the outgoing layout really clamps and dispatches a scroll");
+    assert.equal(h.root.scrollTop, before, "an empty transcript has no outgoing content to clamp");
     release(); await selecting; h.settleLayout();
     assert.equal(h.root.querySelectorAll(".task-output").length, 2);
-    assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : 0,
-      "desktop ignores the outgoing clamp; mobile retains its existing suspension");
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
+      "the selected transcript follows its own bottom without an outgoing clamp");
   });
   test("desktop transcript ownership invalidates pending position saves on navigation" + suffix, async () => {
     const h = sessionScrollHarness(width, true);
@@ -1908,10 +1909,10 @@ for (const width of [390, 700, 701, 1280]) {
     const release = h.deferHistory("open-session"), selecting = h.selectHistory("open-session");
     h.advance(200);
     if (desktop) pendingSave(); // A callback already queued before cancellation must also be harmless.
-    assert.equal(h.stored.get("serve.scroll.open-session"), desktop ? savedA : JSON.stringify({ top: 120, atBottom: false }),
-      "only desktop rejects B's pending offset under A's storage key");
+    assert.equal(h.stored.get("serve.scroll.open-session"), savedA,
+      "every layout rejects B's pending offset under A's storage key");
     release(); await selecting; h.settleLayout();
-    assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : 120);
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
     assert.deepEqual(JSON.parse(h.stored.get("serve.scroll.target-session")), { top: 120, atBottom: false },
       "navigation still saves B's intentional reading position under B");
   });
@@ -2012,13 +2013,15 @@ for (const width of [390, 700, 701, 1280]) {
     h.context.switchSession("open-session");
     await h.context.loadHistory(); h.settleLayout();
     if (desktop) pendingSave();
-    assert.equal(h.root.children[0], firstRow, "the retained A transcript can acquire a new scroll generation");
+    const restoredRow = h.root.children[0];
+    assert.notEqual(restoredRow, firstRow, "A's new transcript generation remounts canonical history");
+    assert.equal(restoredRow.dataset.canonicalKey, firstRow.dataset.canonicalKey);
     assert.equal(h.root.scrollTop, 120);
-    assert.equal(h.stored.get("serve.scroll.target-session"), desktop ? undefined : JSON.stringify({ top: 120, atBottom: false }),
-      "desktop never saves A's mounted DOM under the unmounted B session");
+    assert.equal(h.stored.get("serve.scroll.target-session"), undefined,
+      "no layout saves A's mounted DOM under the unmounted B session");
     release(); await obsoleteLoad; h.settleLayout();
     assert.equal(h.context.historySession, "open-session");
-    assert.equal(h.root.children[0], firstRow, "B's superseded response cannot replace A");
+    assert.equal(h.root.children[0], restoredRow, "B's superseded response cannot replace A");
     assert.deepEqual(JSON.parse(h.stored.get("serve.scroll.open-session")), { top: 120, atBottom: false });
   });
   test("desktop transcript ownership carries lazy session adoption into following" + suffix, async () => {

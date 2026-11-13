@@ -34,6 +34,7 @@ vm.createContext = (sandbox = {}) => {
   const context = createContext({
   executionGroupsFor: () => ({ sync() {}, restore() {} }),
   pendingImages: [],
+  historyLoadSeq: 0,
   window: { matchMedia: () => ({ matches: false }), addEventListener() {}, removeEventListener() {} },
   createTurnRateLine: () => () => {},
   // Rate decoration is display-only; app_desktop covers its real rendering.
@@ -2096,6 +2097,7 @@ test("a stale live box is not reattached beside canonical history", () => {
 test("unmatched pending user rows precede trailing canonical answers", () => {
   const root = {
     children: [], scrollTop: 0, scrollHeight: 10,
+    querySelectorAll() { return []; },
     get lastElementChild() { return this.children[this.children.length - 1] || null; },
     insertBefore(node, anchor) {
       const oldIndex = this.children.indexOf(node);
@@ -2227,8 +2229,9 @@ test("prefetched history from another session cannot replace or cancel the selec
   const sequenceAfterPrefetch = h.context.historyLoadSeq, rowsAfterPrefetch = renderedNodes(h.root);
   h.resolveResponse();
   await loading;
-  assert.equal(sequenceAfterPrefetch, 1, "reject stale cached rows before invalidating B's pending response");
-  assert.deepEqual(rowsAfterPrefetch, [old]);
+  assert.equal(sequenceAfterPrefetch, 2, "owner replacement and B's load retire earlier responses");
+  assert.deepEqual(rowsAfterPrefetch, [], "A's transcript is retired before B's response arrives");
+  assert.equal(rowsAfterPrefetch.includes(old), false);
   assert.equal(h.context.historySession, "B");
   assert.deepEqual(renderedKeys(h.root), ["B transcript"]);
   assert.equal(h.apiCalls(), 1);

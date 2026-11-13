@@ -141,7 +141,7 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
     restoreDraft() { elements.prompt.value = stored.get("draft." + context.sessionId) || ""; },
     restoreSkillPick() {}, carrySkillPick() {}, resetQuestionNavigator() {},
     sendBusy: false, promptComposing: false, pendingImages: [],
-    turns: new Map(), MAX_LIVE_TURNS: 4, historySession: sid, canonicalHistoryTotal: 0,
+    turns: new Map(), MAX_LIVE_TURNS: 4, historySession: sid, historyLoadSeq: 0, canonicalHistoryTotal: 0,
     pendingUserInputs: new Map(), questionCache: null, runEpoch: 0, turnRunning: false,
     turnRunningAt: 0, turnRunningPid: 0, endedTurnPid: 0, RUNNING_SAMPLE_TTL_MS: 60000,
     remoteTurnPid: "", remoteTurnAt: 0, REMOTE_RUNNING_TTL_MS: 30000,

@@ -708,72 +708,8 @@ function installServerSave(c) {
   return async (base) => { nodes.base.value = base; await nodes.save.onclick(); };
 }
 
-// HEAD 18e9fbc3 snapshots include every transcript identity and DOM metadata field.
-const HEAD_LATE_HISTORY_VIEWS = {
-  "body": {
-    "text": "Obsolete response.",
-    "selected": "s",
-    "mounted": "s",
-    "keys": [
-      "[998,\"assistant\",\"Obsolete response.\",\"\",\"\",null]"
-    ],
-    "sequence": 1,
-    "total": 999,
-    "count": 1,
-    "window": 1,
-    "windowSession": "s",
-    "nodes": [
-      {
-        "text": "Obsolete response.",
-        "className": "",
-        "dataset": {}
-      },
-      {
-        "text": "Obsolete response.",
-        "className": "turn",
-        "dataset": {
-          "taskReset": "true",
-          "canonicalIndex": "998",
-          "canonicalKey": "[998,\"assistant\",\"Obsolete response.\",\"\",\"\",null]",
-          "canonicalIdentity": "[\"assistant\",\"Obsolete response.\",\"\",\"\",null]"
-        }
-      },
-      {
-        "text": "Obsolete response.",
-        "className": "msg asst md",
-        "dataset": {
-          "role": "assistant"
-        }
-      }
-    ]
-  },
-  "error body": {
-    "text": "Retained transcript.history failed: 503 obsolete error",
-    "selected": "s",
-    "mounted": "",
-    "keys": [],
-    "sequence": 1,
-    "total": 0,
-    "count": null,
-    "nodes": [
-      {
-        "text": "Retained transcript.history failed: 503 obsolete error",
-        "className": "",
-        "dataset": {}
-      },
-      {
-        "text": "history failed: 503 obsolete error",
-        "className": "msg asst err",
-        "dataset": {
-          "role": "err"
-        }
-      }
-    ]
-  }
-};
-
 for (const outcome of ["body", "error body"]) for (const navigation of ["session ABA", "server ABA"]) {
-  test("HEAD parity: a late history " + outcome + " after " + navigation + " commits without a replacement load", async () => {
+  test("a late history " + outcome + " after " + navigation + " cannot commit without a replacement load", async () => {
     const h = errors.harness({ realApi: true }), c = h.context, body = deferred(), reading = deferred();
     installOwnershipNavigation(c);
     const saveServer = installServerSave(c), originalBase = c.store.base;
@@ -786,30 +722,22 @@ for (const outcome of ["body", "error body"]) for (const navigation of ["session
     const before = viewSnapshot(h);
     body.resolve(outcome === "body" ? [{ role: "assistant", content: "Obsolete response." }] : { error: "obsolete error" });
     await pending;
-    assert.notEqual(viewSnapshot(h), before);
-    assert.deepEqual(JSON.parse(viewSnapshot(h)), HEAD_LATE_HISTORY_VIEWS[outcome]);
-    if (outcome === "body") {
-      assert.equal(h.root.textContent, "Obsolete response.");
-      assert.equal(c.historySession, "s");
-      assert.equal(c.canonicalHistoryTotal, 999);
-      assert.equal(c.lastMsgCount, 1);
-      assert.equal(h.root._histWinSession, "s");
-      assert.equal(h.root._histWin, 1);
-      assert.equal(c.historyLoadState("s").failure, null);
-      assert.equal(h.timers.size, 0);
-    } else {
-      assert.equal(h.root.textContent, "Retained transcript.history failed: 503 obsolete error");
-      assert.equal(c.historySession, "");
-      assert.equal(c.canonicalHistoryTotal, 0);
-      const failure = c.historyLoadState("s").failure;
-      assert.equal(failure.row, h.root.children.at(-1));
-      assert.equal(failure.retries, 0);
-      assert.deepEqual([...h.timers.values()].map((timer) => timer.delay), [1000]);
-    }
+    assert.equal(viewSnapshot(h), before, "the complete selected view remains unchanged by an obsolete result");
+    assert.equal(h.root.textContent, "");
+    assert.equal(c.historySession, "");
+    assert.equal(JSON.stringify(c.historyKeys), "[]");
+    assert.equal(c.historyLoadSeq, 3);
+    assert.equal(c.canonicalHistoryTotal, 0);
+    assert.equal(c.lastMsgCount, null);
+    assert.equal(h.root._histWinSession, undefined);
+    assert.equal(h.root._histWin, undefined);
+    assert.equal(c.historyLoadState("s").failure, null);
+    assert.equal(c.historyLoadState("s").loading, 0);
+    assert.equal(h.timers.size, 0);
   });
 }
 
-test("HEAD parity: failures for the same sid share HEAD retry state across servers", async () => {
+test("a retained retry state cannot display its failure row after a server switch", async () => {
   const h = errors.harness(), c = h.context;
   installOwnershipNavigation(c);
   const saveServer = installServerSave(c), originalBase = c.store.base;
@@ -820,7 +748,9 @@ test("HEAD parity: failures for the same sid share HEAD retry state across serve
   assert.equal(c.historyLoadState("s"), originalState);
   assert.equal(c.historyLoadState("s").failure, originalState.failure);
   assert.equal(c.historyLoadState("s", originalBase), originalState);
-  assert.equal(h.historyRows().length, 1);
+  assert.equal(h.historyRows().length, 0);
+  assert.equal(originalState.failure.row.parentNode, null);
+  assert.equal(originalState.failure.timer, null);
 });
 
 for (const navigation of ["session ABA", "server ABA"]) {
@@ -906,6 +836,7 @@ test("HEAD parity: a superseded pager skips desktop scrolling but clears the sha
   c.switchSession("session-b", false);
   scrollOwner = {};
   h.root._histWinSession = "session-b";
+  Object.assign(c, { lastMsgCount: 2, canonicalHistoryTotal: 20 });
   h.root._histOlder = false; // The replacement transcript starts its own pager.
   h.root.scrollTop = 77;
   const replacement = c.loadOlderHistory(); await settle();

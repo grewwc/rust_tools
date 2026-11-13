@@ -213,7 +213,7 @@ test("a late session A history body leaves session B transcript and mounted stat
   assert.doesNotMatch(h.root.textContent, /Late answer from A/);
 });
 
-test("session navigation keeps the mounted transcript gate until replacement history commits", async () => {
+test("session navigation retires the previous transcript gate before replacement history commits", async () => {
   const report = stream.structuredSubagents([stream.structuredTask("worker-a", 5000)]).task_report;
   const h = stream.retainedHistoryHarness([
     { role: "user", content: "Start worker A." },
@@ -240,9 +240,10 @@ test("session navigation keeps the mounted transcript gate until replacement his
   await Promise.resolve();
   await Promise.resolve();
   assert.equal(c.sessionId, "session-b");
-  assert.equal(c.displayedExecutionState().sessionId, "s");
-  assert.equal(c.isTurnRunning(), true);
-  assert.equal(composer.send.title, "stop this turn");
+  assert.equal(c.displayedExecutionState().sessionId, "session-b");
+  assert.equal(c.isTurnRunning(), false);
+  assert.equal(composer.send.title, "send");
+  assert.equal(h.root.children.length, 0, "A's rows cannot remain visible during B's fetch");
 
   body.resolve([{ role: "assistant", content: "Visible B answer." }]);
   await pending;
@@ -250,7 +251,7 @@ test("session navigation keeps the mounted transcript gate until replacement his
   assert.equal(c.isTurnRunning(), false);
   assert.equal(composer.send.title, "send");
 
-  // A background turn can finish while its original transcript is retained.
+  // A background turn can finish while its original transcript is detached.
   // Its removal must refresh the composer without waiting for drawer requests.
   const live = phase2.sendHarness();
   await live.start(); await live.accept();
@@ -287,16 +288,16 @@ test("displayed sources: an ended parked task without a live entry becomes idle 
   await c.loadHistory();
   c.stopStaleFollow();
   c.syncStopButton();
-  assert.equal(box.parentNode, h.root, "unchanged history retains the parked producer");
+  assert.equal(box.parentNode, null, "navigation retires an unregistered parked producer from the transcript");
   assert.equal(box.querySelectorAll(".task-output").length, 1);
-  assert.equal(c.executionState().activities.size, 0, "selection retired the session activity without unmounting it");
+  assert.equal(c.executionState().activities.size, 0, "selection retired the session activity and its mount");
   // HEAD 18e9fbc3: arbitrate.cjs minimal head exits 0 with send/true/false.
   // The original baseline exits 1 on HEAD at this title assertion (actual send).
   // Evidence: /tmp/app-phase2-aba-fix-mea4vtqy/before/arbitration-runs.json.
   assert.equal(composer.send.title, "send");
   assert.equal(c.canSend(), true);
   assert.equal(c.canStop(), false);
-  assert.equal(c.displayedExecutionState().sources.size, 2, "the canonical reset and parked activity are still mounted");
+  assert.equal(c.displayedExecutionState().sources.size, 1, "only the selected canonical history is mounted");
   assert.equal(JSON.stringify([...c.displayedExecutionState().taskStates]), JSON.stringify([]));
   activity.subagents(stream.structuredSubagents([stream.structuredTask("parked-a", 5000)]));
   // HEAD ignores task/finish observations once select removed the activity.
@@ -304,9 +305,9 @@ test("displayed sources: an ended parked task without a live entry becomes idle 
   assert.equal(c.canStop(), false, "a same-turn report cannot reactivate an activity absent from the registry");
   assert.equal(composer.send.title, "send");
   activity.subagents(stream.structuredSubagents([stream.structuredTask("parked-a", 5000, { status: "completed", active: false })]));
-  assert.equal(c.canSend(), true, "rendering the mounted card does not restore its retired model observation");
+  assert.equal(c.canSend(), true, "rendering the detached card does not restore its retired model observation");
   activity.remove(); box.remove();
-  assert.equal(c.displayedExecutionState().sources.size, 1, "actual removal unregisters the retired activity independently");
+  assert.equal(c.displayedExecutionState().sources.size, 1, "removing the detached activity cannot unregister canonical history");
 });
 
 for (const live of [false, true]) test("displayed sources: ABA retires parked observations only when live entry is absent (live=" + live + ")", async () => {
@@ -321,15 +322,18 @@ for (const live of [false, true]) test("displayed sources: ABA retires parked ob
   activity.finish("ended");
   if (live) c.turns.set("s", { box });
   c.switchSession("session-b", false); c.switchSession("s", false);
-  assert.equal(composer.send.title, "stop this turn", "selection keeps the mounted gate until history commits");
+  assert.equal(composer.send.title, live ? "stop this turn" : "send", "the selected live owner alone retains its running gate");
   await c.loadHistory(); c.turns.delete("s"); c.stopStaleFollow(); c.syncStopButton();
   assert.equal(composer.send.title, live ? "stop this turn" : "send");
   assert.equal(c.canSend(), !live);
   assert.equal(c.canStop(), live);
-  assert.equal(box.parentNode, h.root);
+  assert.equal(box.parentNode, live ? h.root : null);
   assert.equal(box.querySelectorAll(".task-output").length, 1);
   assert.equal(h.historyCalls.length, 2);
-  canonical.forEach((node, index) => assert.equal(h.root.children[index], node));
+  canonical.forEach((node, index) => {
+    assert.notEqual(h.root.children[index], node, "navigation rebuilds the selected canonical rows");
+    assert.equal(h.root.children[index].textContent, node.textContent);
+  });
   activity.remove(); box.remove();
 });
 
@@ -388,14 +392,14 @@ for (const kind of ["task", "finish"]) test("displayed sources: retired same-tur
   assert.equal(composer.send.textContent, "➤");
   assert.equal(c.canSend(), true);
   assert.equal(c.canStop(), false);
-  assert.equal(box.parentNode, h.root);
+  assert.equal(box.parentNode, null, "a retired producer remains detached across navigation");
   const card = Array.from(stream.descendants(box)).find((node) => node.dataset?.subagents === "true");
   assert.ok(card, "the existing card still renders");
   if (kind === "task") assert.equal(card.dataset.taskStates, JSON.stringify([["after-retirement", true]]));
   else assert.equal(card.dataset.taskBusy, "false");
   const sourceCount = c.displayedExecutionState().sources.size;
   activity.remove(); box.remove();
-  assert.equal(c.displayedExecutionState().sources.size, sourceCount - 1, "remove still unregisters its mounted source");
+  assert.equal(c.displayedExecutionState().sources.size, sourceCount, "removing a detached source preserves the selected transcript");
 });
 
 test("displayed sources: a late running report from an older turn keeps the completed current turn idle", async () => {
@@ -462,7 +466,7 @@ test("HEAD parity: a same-session rebuild failure retains the displayed active t
   assert.equal(JSON.stringify([...c.displayedExecutionState().taskStates]), JSON.stringify([["old-active", true]]));
 });
 
-test("HEAD parity: navigation permits an ABA replay retry and preserves mounted B tasks", async () => {
+test("navigation permits an ABA replay retry only in A's own transcript", async () => {
   const h = stream.retainedHistoryHarness([]), c = h.c;
   const composer = stream.runningComposer(c);
   loadSessionSwitch(c);
@@ -499,7 +503,8 @@ test("HEAD parity: navigation permits an ABA replay retry and preserves mounted 
   const currentReplay = retryAttachment;
   assert.ok(currentReplay);
   const retryBox = c.recoveredView.box;
-  assert.equal(retryBox.parentNode, h.root, "A's current replay appends beside B's retained canonical rows");
+  assert.equal(retryBox.parentNode, h.root, "A's current replay mounts in A's selected transcript");
+  for (const row of canonicalB) assert.equal(row.parentNode, null, "B's rows are detached before A's history completes");
   body.reject(new Error("controlled A history failure"));
   await pendingHistory;
   assert.equal(retryBox.parentNode, h.root, "the history failure reattaches A's replay box");
@@ -513,15 +518,15 @@ test("HEAD parity: navigation permits an ABA replay retry and preserves mounted 
   assert.equal(c.eventActive, false);
   assert.equal(c.recoveredView, null);
   assert.equal(retryBox.parentNode, null);
-  for (const row of canonicalB) assert.ok(stream.descendants(h.root).includes(row));
-  assert.equal(h.root.querySelectorAll(".task-output").length, 2, "B's raw and merged task observations stay mounted");
+  for (const row of canonicalB) assert.equal(stream.descendants(h.root).includes(row), false);
+  assert.equal(h.root.querySelectorAll(".task-output").length, 0, "B's task observations cannot remain in A's transcript");
   c.syncStopButton();
-  assert.equal(composer.send.title, "stop this turn");
-  assert.equal(c.canSend(), false);
-  assert.equal(c.canStop(), true);
-  assert.equal(c.displayedExecutionState().sessionId, "session-b", "reattachment preserves the canonical transcript owner");
-  assert.equal(c.displayedExecutionState().sources.size, 1, "the old replay removes only its own source");
-  assert.equal(JSON.stringify([...c.displayedExecutionState().taskStates]), JSON.stringify([["mounted-b", true]]));
+  assert.equal(composer.send.title, "send");
+  assert.equal(c.canSend(), true);
+  assert.equal(c.canStop(), false);
+  assert.equal(c.displayedExecutionState().sessionId, "s", "reattachment keeps the selected transcript owner");
+  assert.equal(c.displayedExecutionState().sources.size, 0, "the replay removes only its own source");
+  assert.equal(JSON.stringify([...c.displayedExecutionState().taskStates]), JSON.stringify([]));
 });
 
 test("quirk: a successful session-list refresh detaches the active rename editor", async () => {

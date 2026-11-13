@@ -187,6 +187,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
   const document = { hidden: false, body: box, addEventListener: listen, createElement: () => node() };
   const context = vm.createContext({
     box, sid: "s", sessionId: "s", sendBase: "", finished: false, turnError: false, document, $: () => box,
+    historyLoadSeq: 0,
     turns: new Map(), liveEntry: {},
     Date: { now: () => clock.now }, isPhoneLayout: () => phone,
     localStorage: {
@@ -421,6 +422,7 @@ function attachmentHarness(headersOnly = false, options) {
     },
   });
   c.commitExecutionView(c.sessionId, c.executionBase());
+  c.$("msgs")._transcriptOwner = { sessionId: c.sessionId, base: c.executionBase() };
   vm.runInContext(script.slice(script.indexOf("function parseBlock("), script.indexOf("async function send()")), c);
   vm.runInContext(script.slice(script.indexOf("function stopStaleFollow()"), script.indexOf("function startStaleFollow()")), c);
   const settle = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
@@ -605,6 +607,191 @@ function retainedHistoryHarness(messages, options = {}) {
       return found;
     },
   };
+}
+
+function sessionIsolationHarness(messages, phone) {
+  const h = retainedHistoryHarness(messages, { phone }), c = h.c;
+  const newButton = {}, prompt = { value: "", style: {}, focus() {} }, lookup = c.$;
+  Object.assign(c, {
+    $: (id) => id === "newbtn" ? newButton : id === "prompt" ? prompt : lookup(id),
+    persistDraft() {}, restoreDraft() {}, resetQuestionNavigator() {}, restoreSkillPick() {}, restoreTeamPick() {},
+    clearDraft() {}, loadSessions: async () => {}, loadSessionConfig() {},
+    outputFollowSuspended: false, jumpingToBottom: false,
+    addMsg(role, text, cls, parent = h.root) {
+      const row = c.document.createElement("div"); row.className = "msg " + cls; row.textContent = text;
+      return parent.appendChild(row);
+    },
+  });
+  c.localStorage.removeItem = (key) => h.storage.delete(key);
+  for (const [start, end] of [["// BEGIN session switch", "// END session switch"],
+    ['  $("newbtn").onclick =', '  $("refresh").onclick =']]) {
+    vm.runInContext(script.slice(script.indexOf(start), script.indexOf(end, script.indexOf(start))), c);
+  }
+  return { ...h, newButton, prompt };
+}
+
+for (const phone of [false, true]) {
+  test(`session isolation regression: folded nodes cannot revive in a new transcript (phone=${phone})`, async () => {
+    const h = sessionIsolationHarness([{ role: "tool", content: "A tool" }, { role: "assistant", content: "A answer" }], phone), c = h.c;
+    await c.loadHistory();
+    assert.equal(h.root.querySelectorAll(".execution-group").length, 1, "the reproduction must retain real grouped nodes");
+    const oldGroups = h.root._executionGroups;
+    c.api = async () => ({ json: async () => ({ id: "b" }) });
+    await h.newButton.onclick();
+    c.addMsg("user", "B user", "user");
+    c.pendingInputAnchor(h.root);
+    assert.doesNotMatch(h.root.textContent, /A tool|A answer/, "send must not resurrect the previous session's cached nodes");
+    oldGroups.restore(); oldGroups.sync();
+    assert.doesNotMatch(h.root.textContent, /A tool|A answer/, "an obsolete group callback must remain inert");
+  });
+
+  test(`session isolation regression: first input removes the new-session placeholder (phone=${phone})`, async () => {
+    const h = sessionIsolationHarness([], phone), c = h.c;
+    c.api = async () => ({ json: async () => ({ id: "b" }) });
+    await h.newButton.onclick();
+    assert.match(h.root.textContent, /new session — type below to start\./);
+    Object.assign(c, {
+      canSend: () => true, validateSkillInput: () => true, closeCommandMenu() {},
+      dispatchComposerCommands: function* () {}, prepareTurnSession: async () => "b",
+      captureSkillPick: () => ({ skills: [] }), setPromptValue: (value) => { h.prompt.value = value; },
+      addLiveUserBubble(text) { const row = c.addMsg("user", text, "user"); return { parentNode: row }; },
+      pendingImages: [], promptComposing: false, lastHistoryEndsUnanswered: false,
+    });
+    const lookup = c.$;
+    c.$ = (id) => ["omodel", "oagent", "oeffort"].includes(id) ? { value: "" } : lookup(id);
+    c.document.querySelectorAll = () => [];
+    h.prompt.value = "B question";
+    const start = script.indexOf("async function send()"), end = script.indexOf("  stopStaleFollow(); // this turn", start);
+    vm.runInContext(script.slice(start, end) + "\n}", c);
+    await c.send();
+    assert.match(h.root.textContent, /B question/);
+    assert.doesNotMatch(h.root.textContent, /new session — type below to start\./, "the first submitted input replaces the empty state");
+    const view = c.recoveredProgressView("b");
+    try {
+      c.handleReplayEvent("b", "thinking", JSON.stringify({ text: "B thought" }), view);
+      assert.match(h.root.textContent, /B thought/);
+      assert.doesNotMatch(h.root.textContent, /new session — type below to start\./);
+    } finally { view.remove(); }
+  });
+
+  test(`session isolation regression: navigation and failed history never mix replay with old rows (phone=${phone})`, async () => {
+    const h = sessionIsolationHarness([{ role: "assistant", content: "A answer" }], phone), c = h.c;
+    await c.loadHistory();
+    c.switchSession("b", false);
+    assert.doesNotMatch(h.root.textContent, /A answer/, "selection must immediately leave the old transcript");
+    let rejectHistory;
+    c.api = () => new Promise((_, reject) => { rejectHistory = reject; });
+    const history = c.loadHistory(), events = c.attachEvents();
+    await h.settle();
+    try {
+      await h.frame('event: thinking\ndata: {"text":"B thought"}\n\n');
+      assert.match(h.root.textContent, /B thought/);
+      assert.doesNotMatch(h.root.textContent, /A answer/);
+      rejectHistory(new Error("B history unavailable"));
+      await history;
+      assert.match(h.root.textContent, /history failed: B history unavailable/);
+      assert.doesNotMatch(h.root.textContent, /A answer/, "history failure must retain only the selected owner's replay");
+      assert.equal(c.recoveredView.box.parentNode, h.root);
+    } finally {
+      c.pauseHistoryRetry("b"); c.abortEvents(); await events;
+    }
+  });
+
+  test(`session isolation regression: same sid on another server has independent history and pending input (phone=${phone})`, async () => {
+    const h = sessionIsolationHarness([{ role: "assistant", content: "A answer" }], phone), c = h.c;
+    await c.loadHistory();
+    const row = c.addMsg("user", "A pending", "user"), inputsA = c.pendingUserInputs;
+    inputsA.set("s", [{ row, prompt: "A pending", minIndex: 1 }]);
+    c.store.base = "https://server-b";
+    await c.loadHistory({ sessionId: "s", messages: [{ role: "assistant", content: "B answer" }], histTotal: 1 });
+    assert.match(h.root.textContent, /B answer/);
+    assert.doesNotMatch(h.root.textContent, /A answer|A pending/, "another server cannot carry pending rows for an equal sid");
+    assert.equal(inputsA.get("s")[0].row, row, "the original server keeps its unacknowledged input");
+    c.store.base = "https://server";
+    await c.loadHistory({ sessionId: "s", messages: [{ role: "assistant", content: "A answer" }], histTotal: 1 });
+    assert.match(h.root.textContent, /A pending/);
+    assert.doesNotMatch(h.root.textContent, /B answer/);
+  });
+
+  for (const outcome of ["failed", "accepted"]) test(`session isolation regression: side-note ${outcome} result cannot touch another owner (phone=${phone})`, async () => {
+    const h = sessionIsolationHarness([], phone), c = h.c, button = { disabled: false }, lookup = c.$;
+    let finish;
+    const errors = [], cleared = [];
+    Object.assign(c, {
+      $: (id) => id === "sidenote" ? button : lookup(id), pendingImages: [],
+      note() {}, scrollToLatest() {}, clearDraft: (sid) => cleared.push(sid),
+      setPromptValue: (value) => { h.prompt.value = value; },
+      api: () => new Promise((resolve, reject) => { finish = outcome === "failed" ? reject : resolve; }),
+      addMsg: (...args) => errors.push(args),
+    });
+    const start = script.indexOf("async function sendSideNote(");
+    vm.runInContext(script.slice(start, script.indexOf("async function stopTurn(", start)), c);
+    h.prompt.value = "A side note";
+    const sending = c.sendSideNote();
+    c.store.base = "https://server-b";
+    finish(outcome === "failed" ? new Error("A transport failed") : undefined);
+    await sending;
+    assert.equal(errors.length, 0, "a late failure must not append an error to another server's transcript");
+    assert.equal(h.prompt.value, "A side note", "an acknowledgment for the previous server must not erase the shown draft");
+    assert.deepEqual(cleared, []);
+    assert.equal(button.disabled, false);
+  });
+
+  test(`session isolation regression: side-note queue response belongs to its server and sid (phone=${phone})`, async () => {
+    const h = sessionIsolationHarness([], phone), c = h.c;
+    let finish;
+    const rendered = [];
+    c.api = () => new Promise((resolve) => { finish = (notes) => resolve({ json: async () => ({ notes }) }); });
+    const start = script.indexOf("let sideNotesSeq = 0;");
+    vm.runInContext(script.slice(start, script.indexOf("async function stopTurn(", start)), c);
+    c.renderSideNotes = (notes) => rendered.push(notes);
+    const queue = c.refreshSideNotes();
+    c.store.base = "https://server-b";
+    finish([{ content: "A queued note" }]);
+    await queue;
+    assert.equal(rendered.length, 0, "the old server's queue must not render for an equal sid");
+    const current = c.refreshSideNotes();
+    finish([{ content: "B queued note" }]);
+    await current;
+    assert.equal(rendered.length, 1);
+    assert.equal(rendered[0][0].content, "B queued note");
+  });
+
+  test(`session isolation regression: history response stays retired after server ABA (phone=${phone})`, async () => {
+    const h = sessionIsolationHarness([], phone), c = h.c;
+    let finish;
+    c.api = () => new Promise((resolve) => { finish = () => resolve({ headers: { get: () => "1" },
+      json: async () => [{ role: "assistant", content: "obsolete A body" }] }); });
+    const loading = c.loadHistory();
+    c.store.base = "https://server-b"; c.ensureTranscriptOwner();
+    c.store.base = "https://server"; c.ensureTranscriptOwner();
+    finish(); await loading;
+    assert.doesNotMatch(h.root.textContent, /obsolete A body/, "returning to the server must not revive a retired request");
+    assert.equal(c.historySession, "");
+    assert.equal(c.canonicalHistoryTotal, 0);
+  });
+
+  test(`session isolation regression: rewind response clears pending inputs only on its server (phone=${phone})`, async () => {
+    const h = sessionIsolationHarness([], phone), c = h.c;
+    let finish;
+    const errors = [];
+    c.askRewind = async () => true;
+    c.loadHistory = async () => {};
+    c.api = () => new Promise((resolve) => { finish = () => resolve({ json: async () => ({ removed: 1 }) }); });
+    c.addMsg = (...args) => errors.push(args);
+    const rowA = c.document.createElement("div"), inputsA = c.pendingUserInputs;
+    inputsA.set("s", [{ row: rowA }]);
+    const start = script.indexOf("async function rewindTo(");
+    vm.runInContext(script.slice(start, script.indexOf("// The reply to a turn", start)), c);
+    const rewinding = c.rewindTo(0, "A prompt"); await h.settle();
+    c.store.base = "https://server-b"; c.ensureTranscriptOwner();
+    const rowB = c.document.createElement("div"), inputsB = c.pendingUserInputs;
+    inputsB.set("s", [{ row: rowB }]);
+    finish(); await rewinding;
+    assert.equal(inputsB.get("s")?.[0].row, rowB, "A's response cannot remove B's pending input");
+    assert.equal(inputsA.has("s"), false, "A's accepted rewind retires A's pending input");
+    assert.deepEqual(errors, [], "A's response cannot append a notice to B's transcript");
+  });
 }
 
 function progressPositionHarness(replay, width = 1280) {
@@ -1162,18 +1349,21 @@ test("event attach warnings distinguish sessions, epochs and error kinds", async
   await c.attachEvents();
   c.runEpoch++;
   await c.attachEvents();
+  const previousRows = root.querySelectorAll(".live-progress-warning");
+  assert.equal(previousRows.length, 2);
   c.sessionId = "other";
   await c.attachEvents();
   c.fetch = async () => { throw new Error("event stream 409: lease expired"); };
   await c.attachEvents();
   const rows = root.querySelectorAll(".live-progress-warning");
-  assert.equal(rows.length, 4);
-  assert.equal(new Set(rows.map((row) => row.dataset.eventWarningKey)).size, 4);
+  assert.equal(rows.length, 2, "only the selected session's warnings remain mounted");
+  assert.ok(previousRows.every((row) => row.parentNode === null));
+  assert.equal(new Set([...previousRows, ...rows].map((row) => row.dataset.eventWarningKey)).size, 4);
   assert.ok(rows.every((row) => row.dataset.eventWarningFailures === "1"));
   assert.equal(rows.at(-1).textContent, "live progress unavailable: event stream 409: lease expired");
   c.fetch = async () => ({ ok: true, body: { getReader: () => ({ read: async () => ({ done: true }) }) } });
   await c.attachEvents();
-  assert.deepEqual(root.querySelectorAll(".live-progress-warning"), rows.slice(0, 2),
+  assert.deepEqual(root.querySelectorAll(".live-progress-warning"), [],
     "recovery clears only warnings belonging to the attached session and epoch");
 });
 

@@ -110,6 +110,7 @@ function harness({ width = 701, catalog = commands, media = "known", respond } =
     send() { effects.push(["send"]); }, sendSideNote() { effects.push(["side-note"]); },
     pauseHistoryRetry() {}, abortEvents() {}, updateExecutionModel() {}, syncStopButton() {},
     resetQuestionNavigator() {}, restoreSkillPick() {}, restoreTeamPick() {},
+    historyLoadSeq: 0, ensureTranscriptOwner() {},
     syncPickTrigger() {}, syncOvrSummary() {}, note(text) { effects.push(["note", text]); },
     openPickPop(kind) { effects.push(["picker", kind]); },
     localStorage: { setItem() {}, removeItem() {} },
