@@ -1728,8 +1728,13 @@ function sessionScrollHarness(width, withTasks) {
     for (const observer of mutationObservers) {
       if (!observer.children || observer.children.length === root.children.length &&
           observer.children.every((child, index) => child === root.children[index])) continue;
+      const previous = observer.children;
       observer.children = root.children.slice();
-      observer.callback([{ target: root }]);
+      observer.callback([{
+        target: root,
+        addedNodes: root.children.filter((child) => !previous.includes(child)),
+        removedNodes: previous.filter((child) => !root.children.includes(child)),
+      }]);
     }
   };
   const flushResizes = () => {
@@ -1931,6 +1936,18 @@ for (const width of [390, 700, 701, 1280]) {
     h.context.rememberTranscriptPosition();
     assert.equal(JSON.parse(h.stored.get("serve.scroll.open-session")).atBottom, desktop,
       "late layout does not turn a desktop bottom goal into a saved reading offset");
+  });
+  test("desktop transcript ownership ignores a running-elsewhere status notice" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    h.root.scrollTop = 0; // A restored reading position, no scroll gesture.
+    const note = h.document.createElement("div");
+    note.className = "msg asst pending remote-turn-note";
+    note.textContent = "正在另一个进程中运行（pid 33011）";
+    h.root.appendChild(note);
+    h.flushFrame();
+    assert.equal(h.root.scrollTop, 0,
+      "the notice is status, not output: appending it must not follow the live edge");
   });
   test("desktop transcript ownership follows a viewport shrink after landing" + suffix, async () => {
     const h = sessionScrollHarness(width, true);

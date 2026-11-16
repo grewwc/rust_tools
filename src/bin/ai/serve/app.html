@@ -175,6 +175,7 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessions.open { display:flex; }
 #sessions ul { list-style:none; margin:0; padding:8px; overflow-y:auto; flex:1; }
 #sessions li { padding:8px; border-radius:8px; font-size:14px; transition:background-color .15s ease, box-shadow .15s ease; }
+#sessions li.session-running { background:var(--tint-2); box-shadow:inset 2px 0 0 var(--acc-line); }
 #sessions li.cur { background:var(--tint-3); box-shadow:inset 3px 0 0 var(--acc); }
 #sessions li.cur span[role="button"] { font-weight:600; }
 /* The prompt index is a desktop aid for long transcripts; the phone drawer
@@ -183,10 +184,18 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #msgs .user-msg-row.flash .msg.user { box-shadow:0 0 0 2px var(--acc); }
 #sessions li.holding { background:var(--tint-4); }
 #sessions li small { color:var(--dim); display:block; font-size:12px; }
-#sessions li .session-running-dot { display:inline-block; width:6px; height:6px; margin-left:7px; vertical-align:1px; border-radius:50%; background:var(--acc); visibility:hidden; opacity:.72; }
-#sessions li .session-running-dot.running { visibility:visible; animation:session-running-pulse 2.8s ease-in-out infinite; }
+#sessions li.session-running .session-title { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#sessions li.session-running .session-meta { display:flex; align-items:center; gap:8px; min-width:0; container:session-meta / inline-size; }
+#sessions li.session-running .session-hash { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#sessions li .session-running-badge { display:inline-flex; align-items:center; gap:5px; flex:0 0 auto; padding:1px 6px; border-radius:999px; background:var(--panel); color:var(--acc); font-size:11px; line-height:16px; font-weight:var(--fw-meta); white-space:nowrap; }
+#sessions li .session-running-label { letter-spacing:.04em; }
+#sessions li .session-running-dot { display:inline-block; flex:0 0 6px; width:6px; height:6px; border-radius:50%; background:currentColor; opacity:.86; animation:session-running-pulse 2.8s ease-in-out infinite; }
 @keyframes session-running-pulse { 0%, 100% { opacity:.58; transform:scale(.88); } 50% { opacity:.86; transform:scale(1); } }
-@media (prefers-reduced-motion:reduce) { #sessions li .session-running-dot.running { animation:none; } }
+@container session-meta (max-width:72px) {
+  #sessions li .session-running-label { display:none; }
+  #sessions li .session-running-badge { gap:0; }
+}
+@media (prefers-reduced-motion:reduce) { #sessions li .session-running-dot { animation:none; } }
 #sessions li .rn, #sessions li .mk { float:right; background:none; border:none; color:var(--dim); font-size:14px; padding:4px 10px; cursor:pointer; }
 #sessions li .mk { font-size:18px; }
 #sessions li .mk[aria-pressed="true"] { color:var(--mark); }
@@ -1788,11 +1797,10 @@ let runEpoch = 0; // bumped every time this page starts a stream: a poll sent
 // terminal marker.
 // `turnRunningPid` and `endedTurnPid` belong to the selected execution record.
 const RUNNING_SAMPLE_TTL_MS = 60000; // a running sample older than this is stale
-// A turn owned by another process (a terminal or a `/bg` session) has no local
+// A turn owned by another process has no local
 // event stream. `/confirm` reports its owner pid; the page can only show that
 // it is running and follow persisted history until the round lands.
 // `remoteTurnPid` and `remoteTurnAt` project the selected remote owner sample.
-const REMOTE_RUNNING_TTL_MS = 30000; // idle /confirm samples arrive every 10s
 // `stopBusy` and `sideNoteBusy` are execution model request locks.
 let noteTimer = null; // pending auto-clear of the transient #connstat note
 let infoRetryTimer = null; // retries GET /info after a transient failure
@@ -1860,7 +1868,7 @@ const executionModel = (() => {
   const serverFields = { turns: "liveTurns", pendingUserInputs: "pendingInputs" };
   const freshServer = () => ({ sessions: new Map(), liveTurns: new Map(), pendingInputs: new Map() });
   const freshSession = () => ({ turn: 0, pid: 0, endedPid: 0, running: false, runningAt: 0,
-    remotePid: "", remoteAt: 0, ended: false, failed: false, history: [], activities: new Map(),
+    remoteActive: false, remotePid: "", remoteAt: 0, ended: false, failed: false, history: [], activities: new Map(),
     nextActivity: 0, taskStates: new Map(), taskBusy: null });
   const emptyServer = freshServer(), emptySession = freshSession();
   const serverFor = (base, create = false) => {
@@ -1889,6 +1897,9 @@ const executionModel = (() => {
     taskStates: value.taskStates.map(([id, active]) => [id, active]),
     busy: value.busy, resetTasks: value.resetTasks === true,
   } : null;
+  const clearRemote = (state) => {
+    state.remoteActive = false; state.remotePid = ""; state.remoteAt = 0;
+  };
   const value = (name, sid, base) => {
     if (name in requests) return requests[name];
     if (name === "staleSession") return recovery.base === base ? recovery.sessionId : "";
@@ -1953,7 +1964,10 @@ const executionModel = (() => {
       else if (event.name === "eventActive") { if (event.value) replay.base = base; replay.active = event.value; }
       else if (event.name === "eventSession") { replay.base = base; replay.sessionId = event.value; }
       else if (event.name in serverFields) server[serverFields[event.name]] = event.value;
-      else if (event.name in sessionFields) state[sessionFields[event.name]] = event.value;
+      else if (event.name in sessionFields) {
+        state[sessionFields[event.name]] = event.value;
+        if (event.name === "turnRunning" && event.value === true) clearRemote(state);
+      }
     } else if (event.kind === "display") {
       displayed.base = base; displayed.sessionId = sid;
       if (event.empty) {
@@ -1961,13 +1975,18 @@ const executionModel = (() => {
       } else snapshotDisplayed(state);
     } else if (event.kind === "begin") {
       state.turn++; state.running = false; state.ended = false; state.failed = false;
+      clearRemote(state);
       state.activities.clear(); summarize(state);
     } else if (event.kind === "live") {
-      if (event.entry) server.liveTurns.set(sid, event.entry);
+      if (event.entry) { clearRemote(state); server.liveTurns.set(sid, event.entry); }
       else server.liveTurns.delete(sid);
+    } else if (event.kind === "remote") {
+      if (event.active && !state.running && !server.liveTurns.has(sid)) {
+        state.remoteActive = true; state.remotePid = event.pid || ""; state.remoteAt = event.at;
+      } else clearRemote(state);
     } else if (event.kind === "select") {
       state.running = false; state.pid = 0; state.endedPid = 0;
-      state.remotePid = ""; state.remoteAt = 0; state.ended = false; state.failed = false;
+      clearRemote(state); state.ended = false; state.failed = false;
       if (!server.liveTurns.has(sid)) state.activities.clear();
       summarize(state);
     } else if (event.kind === "history") {
@@ -2017,10 +2036,15 @@ function executionBase() { return typeof store === "undefined" ? "" : store.base
 function executionState(sid = typeof sessionId === "undefined" ? "" : sessionId, base = executionBase()) {
   return executionModel.read(sid, base);
 }
+function remoteTurnIsFresh(state) {
+  return !!state.sessionId && !state.live && !state.running && !state.attached
+    && !!(state.remoteActive || state.remotePid) && Date.now() - state.remoteAt < REMOTE_RUNNING_TTL_MS;
+}
 // Every execution write, including the legacy identifier accessors, enters here.
 function updateExecutionModel(event, sid = event.owner?.sessionId ?? (typeof sessionId === "undefined" ? "" : sessionId), base = event.owner?.base ?? executionBase()) {
   const result = executionModel.update(event, sid, base);
   if (typeof observeSessionActivityExecution === "function") observeSessionActivityExecution(event, sid, base);
+  if (typeof observeRemoteTurnNoteExecution === "function") observeRemoteTurnNoteExecution(event, sid, base);
   return result;
 }
 function displayedExecutionState() { return executionModel.readDisplayed(); }
@@ -3930,13 +3954,22 @@ function composerOffsetHeight() {
   const composer = $("composer");
   return composer && typeof composer.offsetHeight === "number" ? composer.offsetHeight : null;
 }
+function isRemoteTurnNote(node) {
+  return node?.nodeType === 1 && node.classList.contains("remote-turn-note");
+}
 function syncTranscriptScrollChildren(state) {
   const children = new Set(state.root.children);
   for (const child of state.children) if (!children.has(child)) state.resizeObserver.unobserve(child);
-  for (const child of children) if (!state.children.has(child)) state.resizeObserver.observe(child);
+  for (const child of children) {
+    // A status note is not output: observing its height would make the follow
+    // logic scroll the reader to reveal a banner that only says a turn runs
+    // elsewhere.
+    if (!state.children.has(child) && !isRemoteTurnNote(child)) state.resizeObserver.observe(child);
+  }
   state.children = children;
 }
-function queueTranscriptScrollResize(state) {
+function queueTranscriptScrollResize(state, entries) {
+  if (entries?.length && entries.every((entry) => isRemoteTurnNote(entry.target))) return;
   if (!isDesktopTranscriptScroll()) { clearTranscriptScrollGoal(state); return; }
   if (ownedTranscriptScroll(state.root) !== state || !state.following || outputFollowSuspended || jumpingToBottom) return;
   // A taller composer (a pasted image adds a marker line, a pending side note
@@ -3951,16 +3984,20 @@ function queueTranscriptScrollResize(state) {
 }
 function watchTranscriptScroll(state) {
   if (state.resizeObserver || typeof ResizeObserver !== "function") return;
-  state.resizeObserver = new ResizeObserver(() => queueTranscriptScrollResize(state));
+  state.resizeObserver = new ResizeObserver((entries) => queueTranscriptScrollResize(state, entries));
   // The fixed scrollport reports viewport changes; its direct children report
   // growth inside the transcript, including media and expanded task cards.
   state.resizeObserver.observe(state.root);
   syncTranscriptScrollChildren(state);
   if (typeof MutationObserver === "function") {
-    state.mutationObserver = new MutationObserver(() => {
+    state.mutationObserver = new MutationObserver((records) => {
       if (ownedTranscriptScroll(state.root) !== state || !state.following) return;
       syncTranscriptScrollChildren(state);
-      queueTranscriptScrollResize(state);
+      const onlyNotes = records.length > 0 && records.every((record) => {
+        const nodes = [...(record.addedNodes || []), ...(record.removedNodes || [])];
+        return nodes.length > 0 && nodes.every(isRemoteTurnNote);
+      });
+      if (!onlyNotes) queueTranscriptScrollResize(state);
     });
     state.mutationObserver.observe(state.root, { childList: true });
   }
@@ -8238,6 +8275,9 @@ function sessionListCountText(q, shown, items, total, markedOnly = false) {
 // BEGIN session activity
 const SESSION_ACTIVITY_POLL_MS = 2500;
 const SESSION_ACTIVITY_MAX_AGE_MS = 7500;
+// `var`, not `const`: the execution model binds before this block is
+// evaluated, and its first update reads this TTL through remoteTurnIsFresh.
+var REMOTE_RUNNING_TTL_MS = SESSION_ACTIVITY_MAX_AGE_MS;
 const SESSION_ACTIVITY_BATCH_SIZE = 256;
 const sessionActivitySamples = new Map();
 const sessionActivityRows = new Map();
@@ -8252,12 +8292,33 @@ function normalizeSessionActivity(value) {
   return value === "running" || value === "idle" ? value : "unknown";
 }
 function paintSessionActivity(id) {
-  const dot = sessionActivityRows.get(id);
-  if (!dot) return;
+  const row = sessionActivityRows.get(id);
+  if (!row) return;
   const sample = sessionActivitySamples.get(id);
   const running = sample?.activity === "running" && Date.now() - sample.at < SESSION_ACTIVITY_MAX_AGE_MS;
-  dot.className = "session-running-dot" + (running ? " running" : "");
-  dot.setAttribute("aria-hidden", String(!running));
+  const badge = row.querySelector(".session-running-badge");
+  if (!running) {
+    row.classList.remove("session-running");
+    badge?.remove();
+    return;
+  }
+  row.classList.add("session-running");
+  if (badge) return;
+  const indicator = document.createElement("span");
+  indicator.className = "session-running-badge";
+  indicator.title = "RUNNING";
+  indicator.setAttribute("role", "img");
+  indicator.setAttribute("aria-label", "RUNNING");
+  const dot = document.createElement("span");
+  dot.className = "session-running-dot";
+  dot.setAttribute("aria-hidden", "true");
+  const label = document.createElement("span");
+  label.className = "session-running-label";
+  label.textContent = "RUNNING";
+  label.setAttribute("aria-hidden", "true");
+  indicator.appendChild(dot);
+  indicator.appendChild(label);
+  row.querySelector(".session-meta").appendChild(indicator);
 }
 function sessionActivityScope() {
   const base = executionBase();
@@ -8271,6 +8332,7 @@ function sessionActivityScope() {
     sessionActivityRevisions.clear();
     for (const id of sessionActivityRows.keys()) paintSessionActivity(id);
     sessionActivityRows.clear();
+    if (typeof syncRemoteTurnNote === "function") syncRemoteTurnNote();
   }
   return base;
 }
@@ -8303,17 +8365,24 @@ function mergeSessionActivities(items, { base = executionBase(), revisions = nul
     const revision = sessionActivityRevisions.get(item.id) || 0;
     // A request made before a newer observation or an unload/reload cannot undo it.
     if (revisions && revision !== (revisions.get(item.id) || 0)) continue;
-    sessionActivitySamples.set(item.id, { activity: normalizeSessionActivity(item.activity), at: Date.now() });
+    const activity = normalizeSessionActivity(item.activity);
+    sessionActivitySamples.set(item.id, { activity, at: Date.now() });
     sessionActivityRevisions.set(item.id, ++nextSessionActivityRevision);
     paintSessionActivity(item.id);
+    if (activity !== "running" && typeof executionState === "function") {
+      const state = executionState(item.id, base);
+      if (state.remoteActive || state.remotePid) updateExecutionModel({ kind: "remote", active: false }, item.id, base);
+    }
   }
 }
 function expireSessionActivities() {
   for (const [id, sample] of sessionActivitySamples) {
     if (Date.now() - sample.at < SESSION_ACTIVITY_MAX_AGE_MS) continue;
     sessionActivitySamples.set(id, { activity: "unknown", at: Date.now() });
+    sessionActivityRevisions.set(id, ++nextSessionActivityRevision);
     paintSessionActivity(id);
   }
+  if (typeof syncRemoteTurnNote === "function") syncRemoteTurnNote();
 }
 async function pollSessionActivity() {
   const base = sessionActivityScope();
@@ -8470,19 +8539,17 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
       finally { mk.disabled = false; }
     };
     const sm = document.createElement("small");
-    sm.textContent = s.id.slice(0, 8);
-    const dot = document.createElement("span");
-    dot.className = "session-running-dot";
-    dot.title = "running";
-    dot.setAttribute("role", "img");
-    dot.setAttribute("aria-label", "running");
-    sm.appendChild(dot);
-    sessionActivityRows.set(s.id, dot);
-    paintSessionActivity(s.id);
+    sm.className = "session-meta";
+    const hash = document.createElement("span");
+    hash.className = "session-hash";
+    hash.textContent = s.id.slice(0, 8);
+    sm.appendChild(hash);
     li.appendChild(rn);
     li.appendChild(mk);
     li.appendChild(t);
     li.appendChild(sm);
+    sessionActivityRows.set(s.id, li);
+    paintSessionActivity(s.id);
     bindSessionLongPress(li, s);
     // Desktop right-click opens the same mark/fork/delete sheet as a double
     // click, so the actions stay one gesture away without switching sessions.
@@ -9962,8 +10029,7 @@ function ensureConfirmPoll() {
     const sid = sessionId, epoch = runEpoch;
     const running = await pollConfirm();
     if (sid !== sessionId || epoch !== runEpoch) return;
-    // Keep the slow idle cadence for remote turns; it returns early while the
-    // page is hidden, so an open tab costs one sample per 10s.
+    // Active remote turns use the same fast cadence; idle tabs sample every 10s.
     if (!sessionId) stopConfirmPoll();
   }, 2000); // fallback only; the reattached event stream is the primary path
 }
@@ -10515,6 +10581,8 @@ async function pollConfirm() {
   const sid = sessionId;
   const base = executionBase();
   const epoch = runEpoch;
+  const startedAt = Date.now();
+  const activityRevisions = typeof snapshotSessionActivityRevisions === "function" ? snapshotSessionActivityRevisions() : null;
   let body;
   try { body = await (await api("/sessions/" + sid + "/confirm")).json(); }
   catch (_) { return null; } // transient (hidden mid-flight, server restarting): retry next tick
@@ -10525,17 +10593,19 @@ async function pollConfirm() {
   // The same poll reports a live turn for this session: the server is the only
   // source that survives this page losing the stream. A missing field means an
   // older server, treated as "not running".
-  const wasRunning = turnRunning;
+  const remote = body.remote === true || (typeof body.remote === "string" && !!body.remote.trim());
+  // Delivery cannot renew ownership evidence captured before a slow request.
+  if (remote && Date.now() - startedAt >= REMOTE_RUNNING_TTL_MS) return null;
+  // An activity observation received after this request takes precedence over
+  // its older remote owner, even when no stream has changed the run epoch.
+  if (remote && activityRevisions && activityRevisions.get(sid) !== snapshotSessionActivityRevisions().get(sid)) return null;
+  const wasRunning = turnRunning, wasRemote = isRemoteTurn();
   turnRunning = body.running === true;
   const pid = Number(body.turn) || 0;
-  const remote = typeof body.remote === "string" ? body.remote : "";
-  const wasRemote = isRemoteTurn();
-  if (remote && !turnRunning) {
-    remoteTurnPid = remote;
-    remoteTurnAt = Date.now();
-  } else if (!remote) {
-    remoteTurnPid = "";
-    remoteTurnAt = 0;
+  const remotePid = typeof body.remote === "string" && /^[1-9]\d*$/.test(body.remote.trim()) ? body.remote.trim() : "";
+  const previous = executionState();
+  if ((remote && !turnRunning) || previous.remoteActive || previous.remotePid) {
+    updateExecutionModel({ kind: "remote", active: remote && !turnRunning, pid: remotePid, at: startedAt }, sid, base);
   }
   if (turnRunning) {
     turnRunningPid = pid;
@@ -10564,13 +10634,7 @@ async function pollConfirm() {
     // Another process owns this turn: there is no local event log to attach
     // and no interrupt endpoint that can reach it. Show that it is running and
     // follow persisted history so the round appears when it lands.
-    if (!wasRemote && !$("msgs").querySelector(".remote-turn-note")) {
-      addMsg(
-        "asst pending",
-        "正在终端中运行（pid " + remote + "）；本轮结束后结果会自动出现在这里。",
-        "asst pending remote-turn-note"
-      );
-    }
+    if (typeof syncRemoteTurnNote === "function") syncRemoteTurnNote({ create: true });
     armHistoryFollow();
     ensureConfirmPoll();
   }
@@ -10609,8 +10673,7 @@ async function pollConfirm() {
 // cover different running states. History can end in provisional assistant
 // text, so only a terminal event or an idle server poll resolves recovery.
 function isRemoteTurn() {
-  const state = executionState();
-  return !!state.remotePid && Date.now() - state.remoteAt < REMOTE_RUNNING_TTL_MS;
+  return remoteTurnIsFresh(executionState());
 }
 function isTurnRunning() {
   const state = executionState();
@@ -10618,7 +10681,7 @@ function isTurnRunning() {
   if (!state.sessionId) return false;
   // Another process's turn has no local stream and no `turnRunning` sample,
   // but it must still block a second send and keep history follow alive.
-  if (state.remotePid && Date.now() - state.remoteAt < REMOTE_RUNNING_TTL_MS) return true;
+  if (remoteTurnIsFresh(state)) return true;
   if (state.live) return true;
   if (state.failed) return false;
   // A parked foreground turn can close its model-output stream while a
@@ -10636,6 +10699,7 @@ function canStop() { return isTurnRunning(); }
 // The one send/stop button reflects that predicate: stop glyph plus the stop
 // class while a turn runs, the plain send look otherwise.
 function syncStopButton() {
+  if (typeof syncRemoteTurnNote === "function") syncRemoteTurnNote();
   const state = executionState();
   const b = $("send");
   const running = isTurnRunning();
@@ -10643,7 +10707,7 @@ function syncStopButton() {
   b.classList.toggle("stop", running);
   const remote = typeof isRemoteTurn === "function" && isRemoteTurn();
   const label = remote
-    ? "running in a terminal — stop it there"
+    ? "running in another process"
     : running ? "stop this turn" : "send";
   b.setAttribute("aria-label", label);
   b.title = label;
@@ -10803,13 +10867,7 @@ async function stopTurn() {
   const state = executionState();
   if (state.stopBusy || !state.sessionId) return;
   if (typeof isRemoteTurn === "function" && isRemoteTurn()) {
-    if (!$("msgs").querySelector(".remote-turn-note")) {
-      addMsg(
-        "err",
-        "这一轮在终端里运行（pid " + remoteTurnPid + "）；请在那里停止（Esc 或 Ctrl+C）。",
-        "asst err remote-turn-note"
-      );
-    }
+    if (typeof syncRemoteTurnNote === "function") syncRemoteTurnNote();
     return;
   }
   stopBusy = true;
@@ -11228,13 +11286,7 @@ function pendingInputAnchor(root) {
 }
 async function send() {
   if (typeof isRemoteTurn === "function" && isRemoteTurn()) {
-    if (!$("msgs").querySelector(".remote-turn-note")) {
-      addMsg(
-        "err",
-        "这个会话正在终端里运行（pid " + remoteTurnPid + "）；请等它结束或在终端里停止。",
-        "asst err remote-turn-note"
-      );
-    }
+    if (typeof syncRemoteTurnNote === "function") syncRemoteTurnNote();
     return;
   }
   if (!canSend()) return;
@@ -11880,6 +11932,46 @@ async function send() {
   if (sid === sessionId && sendBase === store.base) void loadSessionConfig({ teamOnly: true });
 }
 // END composer send
+
+// BEGIN remote turn note
+// `var` for the same boot-order reason: the first bind reaches
+// syncRemoteTurnNote while this block is still being defined.
+var remoteTurnNoteTimer = null;
+function syncRemoteTurnNote({ create = false } = {}) {
+  if (remoteTurnNoteTimer !== null) { clearTimeout(remoteTurnNoteTimer); remoteTurnNoteTimer = null; }
+  const root = $("msgs");
+  if (!root) return;
+  const notes = [...root.querySelectorAll(".remote-turn-note")];
+  if (!notes.length && !create) return;
+  const state = executionState(), owner = root._transcriptOwner;
+  const visible = remoteTurnIsFresh(state) && (!owner || (owner.sessionId === state.sessionId && owner.base === state.base));
+  if (!visible) { notes.forEach((node) => node.remove()); return; }
+  let node = notes.shift();
+  notes.forEach((duplicate) => duplicate.remove());
+  // Only a current /confirm response may create this transient status. History
+  // and replay can reconcile an existing node, but cannot recreate a cleared one.
+  if (!node && create) {
+    node = document.createElement("div");
+    node.className = "msg asst pending remote-turn-note";
+    node.setAttribute("role", "note");
+    node.setAttribute("aria-label", "其他进程中的运行状态");
+    node.setAttribute("aria-live", "off");
+    root.appendChild(node);
+  }
+  if (!node) return;
+  const text = "正在另一个进程中运行" + (state.remotePid ? "（pid " + state.remotePid + "）" : "")
+    + "；本轮结束后结果会自动出现在这里。";
+  if (node.textContent !== text) node.textContent = text;
+  remoteTurnNoteTimer = setTimeout(() => {
+    remoteTurnNoteTimer = null;
+    syncRemoteTurnNote();
+  }, REMOTE_RUNNING_TTL_MS - (Date.now() - state.remoteAt));
+}
+function observeRemoteTurnNoteExecution(event, sid, base) {
+  if (sid !== sessionId || base !== executionBase()) return;
+  if (["remote", "begin", "live", "select", "field", "finish", "display"].includes(event.kind)) syncRemoteTurnNote();
+}
+// END remote turn note
 
 // Length only, never the secret: separates "nothing stored" (0 chars, save
 // never landed) from "stored but wrong" without leaking the token on screen.

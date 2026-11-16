@@ -18,8 +18,9 @@ const plain = (value) => JSON.parse(JSON.stringify(value));
 const run = (h, source) => vm.runInContext(source, h.context);
 const listed = (activity = "idle") => sessions().map((item) => ({ ...item, activity }));
 const row = (h, id) => h.elements.sesslist.children.find((node) => node.dataset.sessionId === id);
+const badge = (h, id) => row(h, id)?.querySelector(".session-running-badge");
 const dot = (h, id) => row(h, id)?.querySelector(".session-running-dot");
-const running = (h, id) => dot(h, id)?.classList.contains("running");
+const running = (h, id) => Boolean(badge(h, id));
 const samples = (h) => plain(run(h, "[...sessionActivitySamples].map(([id, sample]) => [id, sample.activity])"));
 const activityRequests = (h) => h.requests.filter((request) => request.path === "/session-activity");
 function sameRows(h, before) {
@@ -37,9 +38,9 @@ const { sendHarness } = new vm.Script(
   setTimeout, clearTimeout, setInterval, clearInterval, setImmediate,
 });
 
-for (const phone of [false, true]) test("first paint uses quiet, accessible dots keyed by full IDs (phone=" + phone + ")", () => {
+for (const phone of [false, true]) test("first paint shows a labeled running row keyed by full IDs (phone=" + phone + ")", () => {
   const items = [
-    { id: "samehead-alpha", summary: "First", marked: true, activity: "running" },
+    { id: "samehead-alpha", summary: "这是一个很长的中文会话标题，用来确认运行标签不会改变完整标题内容", marked: true, activity: "running" },
     { id: "samehead-beta", summary: "Second", activity: "idle" },
     { id: "unknown", summary: "Unknown", activity: "unknown" },
     { id: "legacy", summary: "Legacy" },
@@ -47,14 +48,22 @@ for (const phone of [false, true]) test("first paint uses quiet, accessible dots
   const h = harness({ phone, items, sid: items[0].id });
   assert.equal(running(h, items[0].id), true);
   for (const item of items) {
-    const indicator = dot(h, item.id);
-    assert.ok(indicator, "every row reserves the same dot space");
-    assert.equal(indicator.textContent, "");
-    assert.equal(indicator.title, "running");
-    assert.equal(indicator.getAttribute("aria-label"), "running");
-    assert.equal(indicator.getAttribute("role"), "img");
-    assert.equal(indicator.getAttribute("aria-hidden"), String(item.activity !== "running"));
-    assert.equal(row(h, item.id).querySelector("small").textContent, item.id.slice(0, 8));
+    const active = item.activity === "running", element = row(h, item.id), indicator = badge(h, item.id);
+    assert.equal(element.classList.contains("session-running"), active);
+    assert.equal(element.querySelectorAll(".session-running-badge").length, active ? 1 : 0);
+    assert.equal(element.querySelector(".session-hash").textContent, item.id.slice(0, 8));
+    if (active) {
+      assert.equal(indicator.textContent, "RUNNING");
+      assert.equal(indicator.title, "RUNNING");
+      assert.equal(indicator.getAttribute("aria-label"), "RUNNING");
+      assert.equal(indicator.getAttribute("role"), "img");
+      assert.equal(dot(h, item.id).getAttribute("aria-hidden"), "true");
+      assert.equal(element.classList.contains("cur"), true, "running composes with selection");
+    } else {
+      assert.equal(indicator, null);
+      assert.equal(dot(h, item.id), null);
+      assert.equal(element.querySelector("small").textContent, item.id.slice(0, 8));
+    }
     assert.equal(row(h, item.id).querySelector("span").textContent, item.summary);
   }
   assert.equal(running(h, items[1].id), false, "equal short IDs must not share status");
@@ -62,6 +71,47 @@ for (const phone of [false, true]) test("first paint uses quiet, accessible dots
   assert.equal(running(h, "legacy"), false);
   assert.equal(h.elements.sesscount.textContent, "4 sessions");
   assert.deepEqual(plain(h.requests), []);
+});
+
+for (const phone of [false, true]) test("running badges are added once and removed on idle or unknown after repaint (phone=" + phone + ")", () => {
+  const h = harness({ phone, items: listed() }), id = "target-session";
+  const before = [...h.elements.sesslist.children], target = row(h, id);
+  const controls = [target.querySelector(".rn"), target.querySelector(".mk")];
+  assert.equal(badge(h, id), null);
+  let indicator;
+  for (let i = 0; i < 3; i++) {
+    h.context.mergeSessionActivities([{ id, activity: "running" }]);
+    run(h, "paintSessionActivity('target-session');");
+    indicator ??= badge(h, id);
+    assert.equal(badge(h, id), indicator, "repeated observations reuse the badge");
+    assert.equal(target.querySelectorAll(".session-running-badge").length, 1);
+    assert.equal(target.querySelectorAll(".session-running-dot").length, 1);
+    assert.equal(target.classList.contains("session-running"), true);
+    assert.equal(target.classList.contains("cur"), false, "running does not select the row");
+  }
+  sameRows(h, before);
+  assert.deepEqual([target.querySelector(".rn"), target.querySelector(".mk")], controls);
+  h.context.mergeSessionActivities([{ id, activity: "idle" }]);
+  run(h, "paintSessionActivity('target-session');");
+  assert.equal(badge(h, id), null);
+  assert.equal(dot(h, id), null);
+  assert.equal(target.classList.contains("session-running"), false);
+  assert.equal(target.querySelector("small").textContent, id.slice(0, 8));
+  run(h, "lastItems[1].activity = 'running'; renderSessionList(lastItems);");
+  assert.equal(badge(h, id), null, "a stale list cannot restore a finished session's badge");
+  assert.equal(row(h, id).classList.contains("session-running"), false);
+
+  h.context.mergeSessionActivities([{ id, activity: "running" }]);
+  for (let i = 0; i < 3; i++) {
+    h.context.renderSessionList(h.context.lastItems);
+    run(h, "paintSessionActivity('target-session');");
+    assert.equal(row(h, id).querySelectorAll(".session-running-badge").length, 1);
+    assert.equal(badge(h, id).textContent, "RUNNING");
+  }
+  h.context.mergeSessionActivities([{ id, activity: "unknown" }]);
+  h.context.renderSessionList(h.context.lastItems);
+  assert.equal(badge(h, id), null);
+  assert.equal(row(h, id).classList.contains("session-running"), false);
 });
 
 test("activity merges preserve row identity, scroll, selection, filters and the rename editor", () => {
@@ -316,10 +366,28 @@ test("expired samples become unknown and an older daemon leaves status unclaimed
   assert.deepEqual(samples(legacy), [["open-session", "unknown"], ["target-session", "unknown"]]);
 });
 
-test("dot styling reserves six pixels, uses theme accent and respects reduced motion", () => {
-  assert.match(css, /#sessions li \.session-running-dot \{[^}]*display:inline-block; width:6px; height:6px;[^}]*background:var\(--acc\); visibility:hidden;/);
+test("running rail and compact label use theme tokens without overriding selection", () => {
+  const rail = "#sessions li.session-running {";
+  assert.match(css, /#sessions li\.session-running \{ background:var\(--tint-2\); box-shadow:inset 2px 0 0 var\(--acc-line\); \}/);
+  assert.ok(css.indexOf(rail) < css.indexOf("#sessions li.cur {"), "selection keeps its stronger rail and wash");
+  assert.match(css, /#sessions li\.cur \{ background:var\(--tint-3\); box-shadow:inset 3px 0 0 var\(--acc\); \}/);
+  assert.match(css, /#sessions li \.session-running-badge \{[^}]*flex:0 0 auto;[^}]*border-radius:999px; background:var\(--panel\); color:var\(--acc\); font-size:11px;[^}]*white-space:nowrap;/);
+  assert.match(css, /#sessions li \.session-running-label \{ letter-spacing:\.04em; \}/);
+});
+
+test("running titles ellipsize beside controls and only constrained metadata hides the label", () => {
+  assert.match(css, /#sessions li\.session-running \.session-title \{ display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; \}/);
+  assert.match(css, /#sessions li\.session-running \.session-meta \{ display:flex; align-items:center; gap:8px; min-width:0; container:session-meta \/ inline-size; \}/);
+  assert.match(css, /#sessions li\.session-running \.session-hash \{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; \}/);
+  assert.match(css, /@container session-meta \(max-width:72px\) \{\s*#sessions li \.session-running-label \{ display:none; \}/);
+  assert.doesNotMatch(css, /@media[^{}]*\{[^}]*\.session-running-label/);
+});
+
+test("only the six-pixel dot breathes and reduced motion disables its animation", () => {
+  assert.match(css, /#sessions li \.session-running-dot \{[^}]*flex:0 0 6px; width:6px; height:6px;[^}]*background:currentColor;[^}]*animation:session-running-pulse 2\.8s ease-in-out infinite;/);
+  assert.doesNotMatch(css, /#sessions li \.session-running-badge \{[^}]*animation:/);
   assert.match(css, /@keyframes session-running-pulse/);
-  assert.match(css, /@media \(prefers-reduced-motion:reduce\) \{ #sessions li \.session-running-dot\.running \{ animation:none; \} \}/);
+  assert.match(css, /@media \(prefers-reduced-motion:reduce\) \{ #sessions li \.session-running-dot \{ animation:none; \} \}/);
 });
 
 test("pending and accepted local submissions cannot synthesize a running dot", async () => {
@@ -356,8 +424,8 @@ test("real submission and acceptance sample activity without promoting an idle s
     });
     return fetch(url, options);
   };
-  const isRunning = () => h.elements.sesslist.children.find((item) => item.dataset.sessionId === c.sessionId)
-    .querySelector(".session-running-dot").classList.contains("running");
+  const isRunning = () => Boolean(h.elements.sesslist.children.find((item) => item.dataset.sessionId === c.sessionId)
+    .querySelector(".session-running-badge"));
   await h.start();
   assert.equal(h.requests.length, 1, "the actual turn POST was submitted");
   assert.ok(reads >= 1, "submission immediately requests authoritative activity");

@@ -165,6 +165,62 @@ function ruleValues(source, selector) {
   return values;
 }
 
+test("RUNNING labels meet 4.5:1 after compositing every theme and selected row", (t) => {
+  const shared = style.slice(0, style.indexOf("@media (min-width:701px)"));
+  const desktop = desktopMediaQueries().map((block) => block.body).join("\n");
+  function color(value, palette) {
+    const token = /^var\((--[\w-]+)\)$/.exec(value)?.[1];
+    if (token) return color(palette[token], palette);
+    if (value === undefined || value === "transparent") return [0, 0, 0, 0];
+    const hex = /^#([0-9a-f]{6})$/i.exec(value);
+    if (hex) return [...hex[1].match(/../g).map((channel) => parseInt(channel, 16)), 1];
+    const rgba = /^rgba\((\d+),(\d+),(\d+),([\d.]+)\)$/.exec(value);
+    assert.ok(rgba, "unsupported contrast color: " + value);
+    return rgba.slice(1).map(Number);
+  }
+  function composite(front, back) {
+    const alpha = front[3] + back[3] * (1 - front[3]);
+    return [...front.slice(0, 3).map((channel, index) =>
+      (channel * front[3] + back[index] * back[3] * (1 - front[3])) / alpha), alpha];
+  }
+  function luminance(rgb) {
+    const linear = rgb.slice(0, 3).map((channel) => {
+      const value = channel / 255;
+      return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+    });
+    return linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722;
+  }
+  const hex = (rgb) => "#" + rgb.slice(0, 3).map((channel) => Math.round(channel).toString(16).padStart(2, "0")).join("");
+  const rows = [];
+  for (const layout of ["phone", "desktop"]) for (const [theme, root] of Object.entries(PALETTES)) {
+    const overrides = layout === "desktop" ? desktop : "";
+    const rootSelector = root.replace(/\s*\{$/, "");
+    const palette = { ...tokenValues(tokenBlock(PALETTES.dark, shared)), ...tokenValues(tokenBlock(root, shared)),
+      ...ruleValues(overrides, ":root"), ...ruleValues(overrides, rootSelector) };
+    const values = (selector) => ({ ...ruleValues(shared, selector), ...ruleValues(shared, rootSelector + " " + selector),
+      ...ruleValues(overrides, selector), ...ruleValues(overrides, rootSelector + " " + selector) });
+    const page = color(palette["--bg"], palette);
+    const panel = composite(color(values("#sessions").background, palette), page);
+    const badge = values("#sessions li .session-running-badge");
+    for (const selected of [false, true]) {
+      const row = { ...values("#sessions li"), ...values("#sessions li.session-running"),
+        ...(selected ? values("#sessions li.cur") : {}) };
+      const rowBackground = composite(color(row.background, palette), panel);
+      const background = composite(color(badge.background, palette), rowBackground);
+      const foreground = composite(color(badge.color, palette), background);
+      const high = Math.max(luminance(foreground), luminance(background));
+      const low = Math.min(luminance(foreground), luminance(background));
+      rows.push({ layout, theme, selected, foreground: hex(foreground), background: hex(background), ratio: (high + 0.05) / (low + 0.05) });
+      assert.equal(badge["font-size"], "11px", "the badge keeps its normal-text size");
+    }
+  }
+  assert.equal(rows.length, 12);
+  t.diagnostic(rows.map((row) => [row.layout, row.theme, row.selected ? "selected+running" : "running",
+    row.foreground, row.background, row.ratio.toFixed(2) + ":1"].join(" | ")).join("\n"));
+  for (const row of rows) assert.ok(row.ratio >= 4.5,
+    row.layout + " " + row.theme + " selected=" + row.selected + " RUNNING contrast " + row.ratio.toFixed(2) + " is below 4.5:1");
+});
+
 test("mobile warm user timestamps meet 4.5:1 and stay softer than body text without changing bubble or footer styles", () => {
   const media = "@media (max-width:700px) {";
   const start = style.indexOf(media);
@@ -828,12 +884,13 @@ test("desktop rewind opacity and light metadata retain readable foregrounds", ()
 // user/queued-note footer matching the existing assistant footer declarations.
 // The snapshot includes the shared attachment summary and the intentional
 // paragraph-sized KaTeX rule with automatic overflow on both axes, plus the
-// mobile warm user timestamp color and the token-based plan/task cards.
+// mobile warm user timestamp color, token-based plan/task cards, and the
+// opaque sidebar running badges and rails.
 test("desktop contrast rules preserve the current shared and mobile CSS bytes", () => {
   const phoneApplicable = desktopMediaQueries().reduce((source, block) => source.replace(block.css, ""), style);
   assert.doesNotMatch(phoneApplicable, /--(?:control-border|danger-text)/);
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "ae68799280f2f0072cb67b5e5155091cda3d871dc9028bdf5c5a01370ec9dae8",
+    "483a75b42f7a7c81afbb9ada5dbb7f895ecc0ed0736e6a130bdb25de4397a8d0",
     "desktop contrast changed shared or mobile CSS");
 });
 
@@ -843,7 +900,7 @@ test("desktop overrides leave all phone-applicable CSS byte-identical", () => {
   let phoneApplicable = style;
   for (const block of desktop) phoneApplicable = phoneApplicable.replace(block.css, "");
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "ae68799280f2f0072cb67b5e5155091cda3d871dc9028bdf5c5a01370ec9dae8",
+    "483a75b42f7a7c81afbb9ada5dbb7f895ecc0ed0736e6a130bdb25de4397a8d0",
     "shared or phone CSS changed outside the desktop queries");
 });
 
@@ -1147,7 +1204,7 @@ test("desktop pastel, math, plan/task cards and mobile warm timestamps pin every
     .replace(/:root\[data-theme="light"\][^{]*\{[^{}]*\}/g, "")
     .replace(/\s+/g, "");
   assert.equal(createHash("sha256").update(protectedCss).digest("hex"),
-    "5eb35bd077d5eba798c65153ff885e8beb914028bfee93d0fae73afa33a15a2f",
+    "3ad80e426f27c942f31fc8823bea1decda8c3b25356e55e482ed20b863b4a760",
     "dark or warm CSS changed beyond the pinned baseline");
 });
 
