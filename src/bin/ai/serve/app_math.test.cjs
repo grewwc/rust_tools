@@ -1835,6 +1835,34 @@ test("a settled input whose recorded floor drifted is reconciled, not duplicated
   assert.equal(h.retired.includes(row), true, "the acknowledged local row is dropped");
 });
 
+test("a /skills command's question acknowledges the command-prefixed input", async () => {
+  // `/skills <name>...` is a runtime command: the turn stores only the question
+  // that follows it, with its tokens rejoined by single spaces. The raw
+  // composer text never equals that message, so the local row used to stay
+  // above the canonical one for good.
+  const row = { key: "pending-user", remove() {} };
+  const h = historyHarness({ messages: [
+    { role: "user", content: "仔细review这个MR： https://example.test/mr/79" },
+  ] });
+  h.context.pendingUserInputs.set("s", [{
+    row,
+    prompt: "/skills mr-review-verdict bytedcli\n仔细review这个MR： https://example.test/mr/79",
+    minIndex: 0,
+    settled: true,
+  }]);
+  await h.context.loadHistory();
+  assert.equal(h.context.pendingUserInputs.has("s"), false, "the stored question acknowledges the command input");
+  assert.equal(h.retired.includes(row), true, "the local command row is dropped");
+});
+
+test("a plain multi-line prompt is not acknowledged by its suffix", async () => {
+  const row = { key: "pending-user", remove() {} };
+  const h = historyHarness({ messages: [{ role: "user", content: "后半句" }] });
+  h.context.pendingUserInputs.set("s", [{ row, prompt: "前半句\n后半句", minIndex: 0, settled: false }]);
+  await h.context.loadHistory();
+  assert.equal(h.context.pendingUserInputs.has("s"), true, "only a skill command may match its trailing question");
+});
+
 test("an in-flight input never claims an older identical message", async () => {
   // Until the turn's POST returns, an equal text in history can only be an
   // earlier input: dropping the local row there is the "my message vanished"

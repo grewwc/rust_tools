@@ -4064,6 +4064,15 @@ function storeDraft(id, value, images) {
   if (value) localStorage.setItem(draftKey(id), value);
   else localStorage.removeItem(draftKey(id));
 }
+// An attachment lives in the composer only through its `[[image:name]]` marker.
+// Deleting the marker (or the line carrying it) detaches the upload, so the
+// status row must follow the text instead of keeping the image until send.
+function prunePendingImages() {
+  if (!pendingImages.length) return;
+  const text = $("prompt").value;
+  const kept = pendingImages.filter((image) => text.includes("[[image:" + image.filename + "]]"));
+  if (kept.length !== pendingImages.length) pendingImages = kept;
+}
 function persistDraft(id = sessionId) {
   storeDraft(id, $("prompt").value, pendingImages);
   if (typeof renderComposerAttachments === "function") renderComposerAttachments();
@@ -8493,6 +8502,16 @@ function attachPendingInputs(root) {
     root.insertBefore(input.row, anchor || null);
   }
 }
+// `/skills <name>...` (also `:skills`, `/skill`) in the composer is a runtime
+// command, not part of the question: the turn persists only the tokens after
+// the command and its skill names, rejoined with single spaces. Comparing the
+// raw composer text would never acknowledge that input, leaving its local row
+// above the canonical one for good.
+const SKILL_COMMAND_HEAD_RE = /^[:/]skills?\s/i;
+function skillCommandText(prompt) {
+  const text = String(prompt || "").replace(/\[\[image:[\s\S]*?\]\]/g, "").replace(/\s+/g, " ").trim();
+  return SKILL_COMMAND_HEAD_RE.test(text) ? text : "";
+}
 function pendingHistoryFloor(input, history, msgs, baseIndex, total) {
   const identity = input.afterInput?.historyIdentity || input.afterHistoryKey;
   if (!identity) return input.afterInput ? input.afterInput.minIndex : input.minIndex;
@@ -8697,11 +8716,17 @@ async function loadHistory(prefetched, canCommit = () => true) {
         // Image tokens become reference parts, or OCR is appended for non-vision models.
         const expected = input.prompt.replace(/\[\[image:[\s\S]*?\]\]/g, "").trim();
         const hadImages = expected !== input.prompt.trim();
+        const commandText = skillCommandText(input.prompt);
         const matches = (message) => {
           if (message.role !== "user" || isRuntimeSyntheticUser(message)) return false;
           const actual = textOf(message.content).trim();
-          return actual === expected || (hadImages && actual.startsWith(expected)
-            && /^\s*\[Attached Image Content via [^\]\r\n]+\]\n/.test(actual.slice(expected.length)));
+          if (actual === expected) return true;
+          if (hadImages && actual.startsWith(expected)
+            && /^\s*\[Attached Image Content via [^\]\r\n]+\]\n/.test(actual.slice(expected.length))) return true;
+          // The question after a skill command is the stored message; a command
+          // line the reader never sees in history must not keep the local row.
+          const question = actual.replace(/\s+/g, " ");
+          return !!commandText && !!question && commandText.endsWith(" " + question);
         };
         let found = msgs.findIndex((message, index) => baseIndex + index >= floor && matches(message));
         if (found < 0 && input.settled) {
@@ -11442,6 +11467,7 @@ function wire() {
         }
       }
       scheduleGrow();
+      if (typeof prunePendingImages === "function") prunePendingImages();
       persistDraft();
       refreshCommandMenu();
     }, 0);
@@ -11453,6 +11479,7 @@ function wire() {
       return;
     }
     promptHistory.recordInput(e);
+    if (typeof prunePendingImages === "function") prunePendingImages();
     // The resize waits for a frame: an IME word arrives as an input event,
     // and a layout change inside the commit task loses the word.
     scheduleGrow();

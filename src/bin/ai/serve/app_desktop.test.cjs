@@ -2553,6 +2553,27 @@ for (const width of [390, 1280]) {
   });
 }
 
+test("deleting an image marker detaches the upload and its composer status", async () => {
+  const h = harness();
+  loadChat(h);
+  loadComposerImages(h, 1280);
+  mockImageCodec(h);
+  h.elements.file.files = [{ name: "one.png", type: "image/png", data_base64: "AQIDBA==", size: 4 },
+    { name: "two.png", type: "image/png", data_base64: "BQYHCA==", size: 4 }];
+  await h.dispatch(h.elements.file, "change").done;
+  assert.match(h.elements.attachmentcount.textContent, /2.*one\.png.*two\.png/);
+  // Only the marker keeps an image attached, so deleting that line is a delete
+  // gesture the status row and the stored draft must follow.
+  h.elements.prompt.value = h.elements.prompt.value.replace("[[image:two.png]]", "").trimEnd();
+  // The prompt's input listener runs these two in this order; the harness has
+  // no prompt-history recorder, so the delete gesture is applied directly.
+  h.context.prunePendingImages();
+  h.context.persistDraft();
+  assert.deepEqual(plain(h.context.pendingImages).map(({ filename }) => filename), ["one.png"]);
+  assert.match(h.elements.attachmentcount.textContent, /^已选 1 张图片 · one\.png$/);
+  assert.doesNotMatch(h.elements.attachmentnames.textContent, /two\.png/);
+});
+
 for (const failure of ["read", "decode", "canvas", "type", "empty", "limit"]) {
   test(`390px ${failure} attachment failure is visible with its filename and keeps earlier images`, async () => {
     const h = harness({ phone: true });
