@@ -214,6 +214,13 @@ pub(crate) fn subagent_status_snapshots(session_id: &str) -> Vec<SubagentStatusS
     snapshots
 }
 
+/// Session that owns a registered task, for callers holding only the task id.
+pub(crate) fn task_session_id(task_id: &str) -> Option<String> {
+    lock_task_registry()
+        .get(&task_id.to_string())
+        .map(|entry| entry.session_id.clone())
+}
+
 pub(crate) fn subagent_terminal_statuses(
     os: &mut dyn Kernel,
     snapshots: Vec<SubagentStatusSnapshot>,

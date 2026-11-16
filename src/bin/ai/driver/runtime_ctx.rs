@@ -530,7 +530,7 @@ pub(crate) fn publish_subagent_phase_to_slot(slot: &SubagentPhaseSlot, phase: &s
         _ => None,
     };
     if let Some(snapshot) = snapshot {
-        publish_progress_update(&snapshot, SubagentProgressEventKind::Phase);
+        publish_progress_update(slot, &snapshot, SubagentProgressEventKind::Phase);
     }
 }
 
@@ -567,7 +567,7 @@ pub(crate) fn publish_subagent_activity_to_slot(
         Err(_) => None,
     };
     if let Some(snapshot) = snapshot {
-        publish_progress_update(&snapshot, SubagentProgressEventKind::Activity);
+        publish_progress_update(slot, &snapshot, SubagentProgressEventKind::Activity);
     }
 }
 
@@ -605,15 +605,28 @@ pub(crate) fn publish_subagent_checkpoint_to_slot(
         Err(_) => None,
     };
     if let Some(snapshot) = snapshot {
-        publish_progress_update(&snapshot, SubagentProgressEventKind::Checkpoint);
+        publish_progress_update(slot, &snapshot, SubagentProgressEventKind::Checkpoint);
     }
 }
 
-fn publish_progress_update(snapshot: &SubagentProgressSnapshot, kind: SubagentProgressEventKind) {
-    let Ok(task_id) = SUBAGENT_TASK_ID.try_with(Clone::clone) else {
+/// Record one progress event and deliver it to a serve client immediately. The
+/// scheduling loop only refreshes between turns, so a turn blocked in a model
+/// call would otherwise keep serving the snapshot it published before the call.
+fn publish_progress_update(
+    slot: &SubagentPhaseSlot,
+    snapshot: &SubagentProgressSnapshot,
+    kind: SubagentProgressEventKind,
+) {
+    // In-process subagents carry the task-local id. External runner threads do
+    // not, and reach their task through the slot they were handed.
+    if let Ok(task_id) = SUBAGENT_TASK_ID.try_with(Clone::clone) {
+        crate::ai::tools::task_tools::record_subagent_progress_update(&task_id, snapshot, kind);
+        crate::ai::driver::background_dispatch::publish_subagent_progress_now(&task_id);
         return;
-    };
-    crate::ai::tools::task_tools::record_subagent_progress_update(&task_id, snapshot, kind);
+    }
+    if let Some(task_id) = crate::ai::tools::task_tools::task_id_for_progress_slot(slot) {
+        crate::ai::driver::background_dispatch::publish_subagent_progress_now(&task_id);
+    }
 }
 
 pub(crate) fn new_subagent_progress_slot() -> SubagentPhaseSlot {

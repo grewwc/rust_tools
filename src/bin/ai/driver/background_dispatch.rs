@@ -349,6 +349,85 @@ impl SubagentStatusLine {
     }
 }
 
+/// Floor between two event-driven subagent frames, so a burst of progress
+/// events cannot publish a burst of frames.
+const PROGRESS_FRAME_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+#[derive(Default)]
+struct ProgressFrameState {
+    key: Option<Vec<serde_json::Value>>,
+    at: Option<std::time::Instant>,
+}
+
+/// Last status published from a progress event, so a repeated status stays
+/// silent exactly like the scheduling loop's own dedupe.
+static PROGRESS_FRAME_STATE: std::sync::LazyLock<std::sync::Mutex<ProgressFrameState>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::default());
+
+/// Publish the current subagent status as soon as a progress event lands.
+///
+/// The scheduling loop refreshes the line between turns, so a turn blocked in a
+/// model call would otherwise keep serving the snapshot published before that
+/// call started: the client then shows a phase the subagent already left. The
+/// content, rendering, and report match the loop's refresh; only the delivery
+/// trigger differs. A caller already holding the kernel lock is mid-operation,
+/// and the loop's next refresh carries the same status, so that case skips
+/// instead of blocking.
+pub(crate) fn publish_subagent_progress_now(task_id: &str) {
+    if !crate::ai::background::serve_live_streaming() {
+        return;
+    }
+    let Some(session_id) = crate::ai::tools::task_tools::task_session_id(task_id) else {
+        return;
+    };
+    let snapshots = crate::ai::tools::task_tools::subagent_status_snapshots(&session_id);
+    if snapshots.is_empty() {
+        return;
+    }
+    let Some(kernel) = crate::ai::tools::os_tools::GLOBAL_OS
+        .lock()
+        .ok()
+        .and_then(|globals| globals.clone())
+    else {
+        return;
+    };
+    let Ok(mut os) = kernel.try_lock() else {
+        return;
+    };
+    let statuses = crate::ai::tools::task_tools::subagent_terminal_statuses(&mut **os, snapshots);
+    drop(os);
+    if statuses.is_empty() {
+        return;
+    }
+    let key = agent_team_subagent_status_semantic_key(&statuses);
+    {
+        let mut last = PROGRESS_FRAME_STATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if last.key.as_ref() == Some(&key) {
+            return;
+        }
+        if last
+            .at
+            .is_some_and(|at| at.elapsed() < PROGRESS_FRAME_MIN_INTERVAL)
+        {
+            return;
+        }
+        last.key = Some(key);
+        last.at = Some(std::time::Instant::now());
+    }
+    let status_line = render_subagent_status_line(&statuses);
+    let report = crate::ai::tools::task_tools::TaskReport::from_statuses(&statuses);
+    if let Some(payload) =
+        crate::ai::background::serve_subagent_progress_payload(&status_line, &report)
+    {
+        crate::ai::background::publish_serve_json_frame(
+            crate::ai::background::ServeLiveKind::SubagentProgress,
+            &payload,
+        );
+    }
+}
+
 fn subagent_status_semantic_key(
     statuses: &[crate::ai::tools::task_tools::SubagentTerminalStatus],
 ) -> Vec<serde_json::Value> {
@@ -593,7 +672,7 @@ fn render_status_line_with_prefix(prefix: &str, content: &str, width: usize) -> 
     format!("{prefix}{content}")
 }
 
-fn render_subagent_status_line(
+pub(crate) fn render_subagent_status_line(
     statuses: &[crate::ai::tools::task_tools::SubagentTerminalStatus],
 ) -> String {
     render_subagent_status_line_at_width(statuses, crate::ai::stream::raw_terminal_cols())
