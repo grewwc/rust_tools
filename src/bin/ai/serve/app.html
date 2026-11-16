@@ -183,6 +183,10 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #msgs .user-msg-row.flash .msg.user { box-shadow:0 0 0 2px var(--acc); }
 #sessions li.holding { background:var(--tint-4); }
 #sessions li small { color:var(--dim); display:block; font-size:12px; }
+#sessions li .session-running-dot { display:inline-block; width:6px; height:6px; margin-left:7px; vertical-align:1px; border-radius:50%; background:var(--acc); visibility:hidden; opacity:.72; }
+#sessions li .session-running-dot.running { visibility:visible; animation:session-running-pulse 2.8s ease-in-out infinite; }
+@keyframes session-running-pulse { 0%, 100% { opacity:.58; transform:scale(.88); } 50% { opacity:.86; transform:scale(1); } }
+@media (prefers-reduced-motion:reduce) { #sessions li .session-running-dot.running { animation:none; } }
 #sessions li .rn, #sessions li .mk { float:right; background:none; border:none; color:var(--dim); font-size:14px; padding:4px 10px; cursor:pointer; }
 #sessions li .mk { font-size:18px; }
 #sessions li .mk[aria-pressed="true"] { color:var(--mark); }
@@ -1959,7 +1963,9 @@ function executionState(sid = typeof sessionId === "undefined" ? "" : sessionId,
 }
 // Every execution write, including the legacy identifier accessors, enters here.
 function updateExecutionModel(event, sid = event.owner?.sessionId ?? (typeof sessionId === "undefined" ? "" : sessionId), base = event.owner?.base ?? executionBase()) {
-  return executionModel.update(event, sid, base);
+  const result = executionModel.update(event, sid, base);
+  if (typeof observeSessionActivityExecution === "function") observeSessionActivityExecution(event, sid, base);
+  return result;
 }
 function displayedExecutionState() { return executionModel.readDisplayed(); }
 function commitExecutionView(sid = typeof sessionId === "undefined" ? "" : sessionId, base = executionBase()) {
@@ -6808,6 +6814,16 @@ function skillMatchRank(skill, query) {
   if (score !== null) return Math.min(255, Math.max(1, 255 - score));
   return String(skill.description || "").toLowerCase().includes(query) ? 256 : -1;
 }
+// Argument-name completion mirrors `name_token_match_rank`: an exact prefix
+// ranks 0, fuzzy subsequence matches rank 1..=255, and names never match on
+// descriptions. Ranked names let `/skills sync` reach `wwc_skill_sync`.
+function argumentNameMatchRank(query, candidate) {
+  const name = String(candidate || "");
+  if (!query) return 0;
+  if (name.toLowerCase().startsWith(query)) return 0;
+  const score = skillFuzzyScore(query, name);
+  return score === null ? -1 : Math.min(255, Math.max(1, 255 - score));
+}
 function rankSkillMatches(catalog, query) {
   const ranked = [];
   catalog.forEach((skill, order) => {
@@ -7050,9 +7066,33 @@ function desktopModelArguments(context, sources) {
   return context.index === 0 ? sources.models
     : context.index === 1 && context.args[0].toLowerCase() === "effort" ? sources.efforts : [];
 }
+// `/skills` subcommand literals, mirroring `skills_subcommands` in
+// `prompt/completion.rs`. Skill names join them at the first argument only.
+const DESKTOP_SKILL_SUBCOMMANDS = ["list", "current", "use", "help"];
+// Name-valued arguments use prefix + fuzzy ranking (terminal parity) and skip
+// names already consumed on the line, case-insensitively.
+function desktopNameCandidates(context, values) {
+  const query = context.query.toLowerCase(), picked = new Set(context.args.map((arg) => arg.toLowerCase()));
+  const seen = new Set(), out = [];
+  values.map((value) => typeof value === "string" ? { display: value, replacement: value } : value)
+    .forEach((candidate) => {
+      if (!candidate || typeof candidate.replacement !== "string" || !candidate.replacement) return;
+      const key = candidate.replacement.toLowerCase();
+      if (picked.has(key) || seen.has(key)) return;
+      const rank = argumentNameMatchRank(query, candidate.replacement);
+      if (rank < 0) return;
+      seen.add(key);
+      out.push({ ...candidate, rank });
+    });
+  return out;
+}
 const DESKTOP_ARGUMENT_SOURCES = {
-  skills: (context, sources) => sources.skills.filter((name) => !context.args.includes(name)),
-  agent: (context, sources) => context.index === 0 ? sources.agents : [],
+  skills: (context, sources) => {
+    const names = desktopNameCandidates(context, sources.skills);
+    if (context.index !== 0) return names;
+    return DESKTOP_SKILL_SUBCOMMANDS.map((name) => ({ display: name + " · subcommand", replacement: name })).concat(names);
+  },
+  agent: (context, sources) => desktopNameCandidates(context, context.index === 0 ? sources.agents : []),
   use: desktopBackendArguments,
   subagent: desktopBackendArguments,
   model: desktopModelArguments,
@@ -7069,14 +7109,21 @@ function desktopCommandCandidates(context, catalog, sources) {
   const registered = Object.hasOwn(DESKTOP_ARGUMENT_SOURCES, name) ? DESKTOP_ARGUMENT_SOURCES[name] : null;
   const values = desktopStaticArguments(context.command.usage, context.args, context.index)
     .concat(registered ? registered(context, sources) : []);
-  const seen = new Set(), query = context.query.toLowerCase();
-  return values.map((value) => typeof value === "string" ? { display: value, replacement: value } : value)
-    .filter((candidate) => {
-      if (!candidate || typeof candidate.replacement !== "string" || !candidate.replacement
-          || !candidate.replacement.toLowerCase().startsWith(query) || seen.has(candidate.replacement)) return false;
-      seen.add(candidate.replacement);
-      return true;
+  const query = context.query.toLowerCase(), seen = new Set(), ranked = [];
+  values.map((value) => typeof value === "string" ? { display: value, replacement: value } : value)
+    .forEach((candidate) => {
+      if (!candidate || typeof candidate.replacement !== "string" || !candidate.replacement) return;
+      const key = candidate.replacement.toLowerCase();
+      if (seen.has(key)) return;
+      // Registered name sources carry a fuzzy rank; literals stay prefix-only.
+      const rank = typeof candidate.rank === "number" ? candidate.rank
+        : key.startsWith(query) ? 0 : -1;
+      if (rank < 0) return;
+      seen.add(key);
+      ranked.push({ candidate, rank, order: ranked.length });
     });
+  ranked.sort((a, b) => a.rank - b.rank || a.order - b.order);
+  return ranked.map((entry) => entry.candidate);
 }
 function desktopReplacementPlan(value, context, candidate) {
   const tail = value.slice(context.end);
@@ -7772,6 +7819,172 @@ function sessionListCountText(q, shown, items, total, markedOnly = false) {
     ? total + " sessions · showing " + shown.length + (items.length < total ? " loaded" : "")
     : total + " sessions";
 }
+// BEGIN session activity
+const SESSION_ACTIVITY_POLL_MS = 2500;
+const SESSION_ACTIVITY_MAX_AGE_MS = 7500;
+const SESSION_ACTIVITY_BATCH_SIZE = 256;
+const sessionActivitySamples = new Map();
+const sessionActivityRows = new Map();
+const sessionActivityRevisions = new Map();
+let sessionActivityBase = null;
+let sessionActivityItemsBase = null;
+let sessionActivitySupported = false;
+let sessionActivityTimer = null;
+let sessionActivityFlight = null;
+let nextSessionActivityRevision = 0;
+function normalizeSessionActivity(value) {
+  return value === "running" || value === "idle" ? value : "unknown";
+}
+function paintSessionActivity(id) {
+  const dot = sessionActivityRows.get(id);
+  if (!dot) return;
+  const sample = sessionActivitySamples.get(id);
+  const running = sample?.activity === "running" && Date.now() - sample.at < SESSION_ACTIVITY_MAX_AGE_MS;
+  dot.className = "session-running-dot" + (running ? " running" : "");
+  dot.setAttribute("aria-hidden", String(!running));
+}
+function sessionActivityScope() {
+  const base = executionBase();
+  if (base !== sessionActivityBase) {
+    if (sessionActivityBase === null) sessionActivityItemsBase = base;
+    sessionActivityBase = base;
+    sessionActivitySupported = false;
+    sessionActivityFlight?.controller.abort();
+    sessionActivityFlight = null;
+    sessionActivitySamples.clear();
+    sessionActivityRevisions.clear();
+    for (const id of sessionActivityRows.keys()) paintSessionActivity(id);
+    sessionActivityRows.clear();
+  }
+  return base;
+}
+function syncSessionActivityItems(items = lastItems) {
+  sessionActivityScope();
+  const loaded = new Set(items.map((item) => item.id));
+  if (sessionActivityItemsBase === sessionActivityBase) {
+    sessionActivitySupported = items.some((item) => ["idle", "running", "unknown"].includes(item.activity));
+  }
+  for (const map of [sessionActivitySamples, sessionActivityRevisions, sessionActivityRows]) {
+    for (const id of map.keys()) if (!loaded.has(id)) map.delete(id);
+  }
+  for (const item of items) if (!sessionActivitySamples.has(item.id)) {
+    sessionActivitySamples.set(item.id, {
+      activity: normalizeSessionActivity(sessionActivityItemsBase === sessionActivityBase ? item.activity : "unknown"), at: Date.now(),
+    });
+    sessionActivityRevisions.set(item.id, ++nextSessionActivityRevision);
+  }
+  return loaded;
+}
+function snapshotSessionActivityRevisions() {
+  sessionActivityScope();
+  return new Map(sessionActivityRevisions);
+}
+function mergeSessionActivities(items, { base = executionBase(), revisions = null } = {}) {
+  if (base !== executionBase()) return;
+  const loaded = syncSessionActivityItems();
+  for (const item of items) {
+    if (!loaded.has(item.id)) continue;
+    const revision = sessionActivityRevisions.get(item.id) || 0;
+    // A request made before a newer observation or an unload/reload cannot undo it.
+    if (revisions && revision !== (revisions.get(item.id) || 0)) continue;
+    sessionActivitySamples.set(item.id, { activity: normalizeSessionActivity(item.activity), at: Date.now() });
+    sessionActivityRevisions.set(item.id, ++nextSessionActivityRevision);
+    paintSessionActivity(item.id);
+  }
+}
+function expireSessionActivities() {
+  for (const [id, sample] of sessionActivitySamples) {
+    if (Date.now() - sample.at < SESSION_ACTIVITY_MAX_AGE_MS) continue;
+    sessionActivitySamples.set(id, { activity: "unknown", at: Date.now() });
+    paintSessionActivity(id);
+  }
+}
+async function pollSessionActivity() {
+  const base = sessionActivityScope();
+  const ids = [...syncSessionActivityItems()];
+  expireSessionActivities();
+  if (document.visibilityState !== "visible" || !ids.length || !sessionActivitySupported) return;
+  if (sessionActivityFlight) {
+    sessionActivityFlight.again = true;
+    return sessionActivityFlight.promise;
+  }
+  const flight = { base, controller: new AbortController(), again: false, promise: null };
+  const revisions = snapshotSessionActivityRevisions();
+  sessionActivityFlight = flight;
+  flight.promise = (async () => {
+    const deadline = setTimeout(() => flight.controller.abort(), 5000);
+    try {
+      for (let offset = 0; offset < ids.length; offset += SESSION_ACTIVITY_BATCH_SIZE) {
+        if (base !== executionBase() || document.visibilityState !== "visible") break;
+        const loaded = syncSessionActivityItems();
+        const batch = ids.slice(offset, offset + SESSION_ACTIVITY_BATCH_SIZE).filter((id) => loaded.has(id));
+        if (!batch.length) continue;
+        let samples;
+        try {
+          if (flight.controller.signal.aborted) throw new Error("activity sample timed out");
+          const response = await api("/session-activity", {
+            method: "POST", body: JSON.stringify({ ids: batch }), signal: flight.controller.signal,
+          });
+          const body = await response.json();
+          if (flight.controller.signal.aborted) throw new Error("activity sample timed out");
+          const values = new Map((Array.isArray(body) ? body : []).map((item) => [item?.id, item?.activity]));
+          samples = batch.map((id) => ({ id, activity: values.get(id) }));
+        } catch (_) {
+          samples = batch.map((id) => ({ id, activity: "unknown" }));
+        }
+        if (base !== executionBase() || document.visibilityState !== "visible") break;
+        mergeSessionActivities(samples, { base, revisions });
+      }
+    } finally {
+      clearTimeout(deadline);
+      if (sessionActivityFlight === flight) {
+        sessionActivityFlight = null;
+        if (flight.again && document.visibilityState === "visible") void pollSessionActivity();
+      }
+    }
+  })();
+  return flight.promise;
+}
+function scheduleSessionActivityPoll() {
+  if (sessionActivityTimer !== null || document.visibilityState !== "visible") return;
+  sessionActivityTimer = setTimeout(() => {
+    sessionActivityTimer = null;
+    void pollSessionActivity();
+    scheduleSessionActivityPoll();
+  }, SESSION_ACTIVITY_POLL_MS);
+}
+function wireSessionActivityPoll() {
+  const resume = () => {
+    if (sessionActivityTimer !== null) clearTimeout(sessionActivityTimer);
+    sessionActivityTimer = null;
+    if (document.visibilityState !== "visible") {
+      sessionActivityFlight?.controller.abort();
+      mergeSessionActivities([...sessionActivitySamples.keys()].map((id) => ({ id, activity: "unknown" })));
+      return;
+    }
+    expireSessionActivities();
+    void pollSessionActivity();
+    scheduleSessionActivityPoll();
+  };
+  document.addEventListener("visibilitychange", resume);
+  window.addEventListener("pageshow", resume);
+  window.addEventListener("online", resume);
+  resume();
+}
+function observeSessionActivityExecution(event, sid, base) {
+  if (!sid || base !== executionBase() || event.kind !== "finish") return;
+  const state = executionState(sid, base);
+  if (event.owner?.turn !== state.turn) return;
+  refreshSessionActivity(sid, base);
+}
+function refreshSessionActivity(sid, base = executionBase()) {
+  if (base !== executionBase()) return;
+  if (syncSessionActivityItems().has(sid)) sessionActivityRevisions.set(sid, ++nextSessionActivityRevision);
+  // Submission and output completion request fresh evidence; neither proves
+  // that a child has started or has been reaped.
+  void pollSessionActivity();
+}
+// END session activity
 function renderSessionList(items, errText, { preserveScroll = true, followNewest = false } = {}) {
   const markedOnly = sessMarkedOnly && !isPhoneLayout();
   const { q, shown } = sessionListProjection(items, sessFilter, markedOnly);
@@ -7779,11 +7992,15 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
   $("sessmarked")?.setAttribute("aria-pressed", String(sessMarkedOnly));
   const ul = $("sesslist");
   const scrollTop = preserveScroll && ul.children.length ? ul.scrollTop : 0;
+  syncSessionActivityItems(items);
+  sessionActivityRows.clear();
   ul.textContent = "";
   for (const s of shown) {
     const li = document.createElement("li");
+    li.dataset.sessionId = s.id;
     if (s.id === sessionId) li.className = "cur";
     const t = document.createElement("span");
+    t.className = "session-title";
     t.textContent = sessionTitle(s);
     t.setAttribute("role", "button");
     t.setAttribute("tabindex", "0");
@@ -7838,6 +8055,14 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
     };
     const sm = document.createElement("small");
     sm.textContent = s.id.slice(0, 8);
+    const dot = document.createElement("span");
+    dot.className = "session-running-dot";
+    dot.title = "running";
+    dot.setAttribute("role", "img");
+    dot.setAttribute("aria-label", "running");
+    sm.appendChild(dot);
+    sessionActivityRows.set(s.id, dot);
+    paintSessionActivity(s.id);
     li.appendChild(rn);
     li.appendChild(mk);
     li.appendChild(t);
@@ -7911,12 +8136,14 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
 // POST /sessions/{id}/title, Esc cancels. A failed commit keeps the old
 // title and surfaces as a tail row instead of silently sticking.
 function startRename(li, s) {
+  const title = li.querySelector(".session-title");
+  if (!title) return;
   const old = sessionTitle(s);
   const inp = document.createElement("input");
   inp.className = "rnm";
   inp.value = old;
   inp.maxLength = 200;
-  li.replaceChild(inp, li.querySelector("span"));
+  li.replaceChild(inp, title);
   inp.focus();
   inp.select();
   let done = false;
@@ -7994,6 +8221,7 @@ async function loadOlderSessions() {
   if (sessionsLoadingMore || !sessionsHasMore) return;
   sessionsLoadingMore = true;
   const loadId = sessionsLoadSeq, forSession = sessionId, base = store.base;
+  const activityRevisions = snapshotSessionActivityRevisions();
   try {
     const page = await fetchSessionPage(sessionsPageOffset, SESSION_PAGE_SIZE);
     if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base) return;
@@ -8003,8 +8231,13 @@ async function loadOlderSessions() {
     const older = sessionPageOlderItems(lastItems, page);
     if (older.length) {
       lastItems = mergeSessionPageItems(lastItems, older);
+      mergeSessionActivities(page.items, { base, revisions: activityRevisions });
       renderSessionList(lastItems);
-    } else if (sessMarkedOnly && !isPhoneLayout()) renderSessionList(lastItems);
+    } else {
+      mergeSessionActivities(page.items, { base, revisions: activityRevisions });
+      if (sessMarkedOnly && !isPhoneLayout()) renderSessionList(lastItems);
+    }
+    void pollSessionActivity();
   } catch (e) {
     if (loadId === sessionsLoadSeq && forSession === sessionId && base === store.base) {
       renderSessionList(lastItems, "sessions refresh failed: " + e.message);
@@ -8026,6 +8259,7 @@ if ($("sesslist") && typeof $("sesslist").addEventListener === "function") {
 }
 async function loadSessions() {
   const loadId = ++sessionsLoadSeq, forSession = sessionId, base = store.base;
+  const activityRevisions = snapshotSessionActivityRevisions();
   let items;
   try {
     const requested = sessionRefreshLimit(sessionsPageOffset, SESSION_PAGE_SIZE);
@@ -8079,10 +8313,13 @@ async function loadSessions() {
     }
   }
   lastItems = items;
+  sessionActivityItemsBase = base;
+  mergeSessionActivities(items, { base, revisions: activityRevisions });
   renderSessionList(items, undefined, {
     followNewest: !sessionId || items[0]?.id === sessionId,
   });
   renderSessionBar();
+  void pollSessionActivity();
   if (hydrate) {
     const selectedId = sessionId;
     await loadHistory();
@@ -11057,15 +11294,18 @@ async function send() {
   flushPaint();
   // BEGIN turn HTTP acceptance
   try {
-    const res = await fetch(sendBase + "/sessions/" + sid + "/turns/stream", {
+    const response = fetch(sendBase + "/sessions/" + sid + "/turns/stream", {
       method: "POST", headers: headers(true), body: JSON.stringify(body),
     });
+    if (typeof refreshSessionActivity === "function") refreshSessionActivity(sid, sendBase);
+    const res = await response;
     if (!res.ok) {
       let detail = res.statusText;
       try { detail = (await res.json()).error || detail; } catch (_) {}
       throw new Error(res.status + " " + detail);
     }
     consumeSkillPick(skillSelection); // Accepted by the server, not model completion.
+    if (typeof refreshSessionActivity === "function") refreshSessionActivity(sid, sendBase);
     // END turn HTTP acceptance
     turnStarted = true;
     reader = res.body.getReader();
@@ -11399,6 +11639,7 @@ function wire() {
   window.addEventListener("popstate", () => { if (!$("modelpick").hidden) closeModelSheet(true); });
   wireTeamMode();
   wireSessionActions();
+  wireSessionActivityPoll();
   // BEGIN skill picker events
   $("ovrwrap").ontoggle = () => { if ($("ovrwrap").open && !skillCatalog.length) return loadSkills(); };
   $("oskill").onclick = () => { if ($("skillmenu").hidden) openSkillMenu(); else closeSkillMenu(true); };

@@ -2,114 +2,194 @@
 
 ## Scope
 
-Standalone stdio JSON-RPC **MCP server** for browser automation (navigate/click/type/extract/screenshot). Not a library — spawned as MCP subprocess via `mcp_stdio::run()`.
+Standalone stdio JSON-RPC MCP server for browser automation. Shared transport,
+text delivery, error wording, and timeout contracts live in
+[the mcp_stdio guide](../mcp_stdio/AGENTS.md).
 
-**Two drivers, one tool surface:** AppleScript drives the user's Chrome via
-`osascript`; CDP uses `chromiumoxide` to attach or launch. Driver selection and
-environment settings are owned by the symbols in **Environment variables**.
+**Isolation is the default.** `DriverMode::from_env`, `headless_from_env`, and
+`BrowserSession::launch` (`src/browser.rs`) select a self-launched headless CDP
+browser with a dedicated temporary profile on every platform. Model activity
+must not change the user's ordinary browser tabs, focus, profile, or cookies.
+The capability preflight checks the executable without opening a window or tab;
+a default headless configuration requires no GUI login session.
 
 ## Layout
 
 ```text
-src/main.rs      # #[tokio::main(multi_thread)]; BrowserServer { mode, session } + impl McpServer; gc_stale_profiles() + mcp_stdio::run()
-src/browser.rs   # BrowserSession + launch()/ensure_session()/shutdown() + Session enum + DriverMode::from_env()
-src/applescript.rs # AppleScript driver: ApplescriptSession + osascript runner + tools
-src/tools.rs     # initialize/tools_list schemas + handle_tools_call dispatch + tools
+src/main.rs        # BrowserServer, capability gating, shared call deadline, shutdown
+src/browser.rs     # driver/config parsing, preflight, launch, profile GC, owned tabs
+src/attach.rs      # AttachGuard: ownership enforcement before CDP reaches an external browser
+src/tools.rs       # MCP schemas, CDP dispatch, shared human-action detector
+src/contract.rs    # argument validation, JSON encoding, wait/extraction scripts
+src/snapshot.rs    # native accessibility tree, stable DOM refs, trusted CDP actions
+src/applescript.rs # explicit AppleScript mode, stable tab ids, synthetic actions
 ```
-
-Shared transport, text delivery, error wording, and timeout contracts live in
-[the mcp_stdio guide](../mcp_stdio/AGENTS.md).
 
 ## Build / Test
 
-Capability-gating and AppleScript error-translation helpers have focused tests
-that run without Chrome. Protocol/schema dispatch changes require this binary
-smoke:
+Follow the root verification ladder and scope Cargo commands to this crate.
+Pure validation, configuration, encoding, ownership, and tab-id tests run without
+Chrome. Protocol/schema changes additionally require the binary smoke:
 
 ```bash
+cargo check -p mcp_browser
+cargo test -p mcp_browser browser_fixes_
 cargo build -p mcp_browser
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | ./target/debug/mcp_browser
 ```
 
-Changes to launch/connect, tab ownership, AppleScript execution, DOM interaction
-or extraction, human-action detection, or screenshots additionally require a
-round-trip through the affected driver in real Chrome. Add `tools/call navigate`
-and the affected operation; CDP may use headless mode where applicable. For
-AppleScript, enable JS-from-Apple-Events and verify that only the session tab
-opens/closes.
+Changes to launch/connect, ownership, DOM interaction, human-action inspection,
+extraction, or screenshots also require real Chrome round-trips through the
+affected driver. Test CDP with an isolated headless instance. An attach smoke
+must use a separate debugging browser and verify that existing targets survive
+session cleanup. AppleScript verification requires JS-from-Apple-Events; inspect
+its capability before running mutations in the user's Chrome. Keep automated
+unit tests independent of browser availability. Unicode insertion, URL waits,
+action verdicts, and requestSubmit behavior are fully verified only by live
+CDP/AppleScript round-trips; pure tests establish their command and verdict
+contracts without claiming site behavior.
 
-## Invariants (do not break)
+## Invariants
 
-1. **Browser timeout policy.** Operations share `op_timeout_ms`
-   (`src/browser.rs`), which clamps environment overrides to the ceiling defined
-   in code; do not introduce per-tool cap overrides. Shared ordering is defined
-   by **Per-op timeout < host timeout** in `crates/mcp_stdio/AGENTS.md`.
-2. **Error translation.** `translate_err` (`src/applescript.rs`) and CDP error
-   construction obey **Error wording** in `crates/mcp_stdio/AGENTS.md`.
-3. **Screenshot results.** Save captures to disk and return the path, never
-   inline image bytes; shared delivery is defined by **Text delivery** in
-   `crates/mcp_stdio/AGENTS.md`.
-4. **Sequential + Handler polling.** `main` owns one `Session` (`Option<Session>`) by `&mut`; host serializes requests so one reused `Page` keeps cookies. CDP `Handler` must be continuously polled, else all CDP hangs.
-5. **launch vs connect.** `Browser::launch` = new controlled Chrome (throwaway profile). `Browser::connect` (when `MCP_BROWSER_WS_URL` set) = attach existing `--remote-debugging` instance. Default is launch. `owns_browser` records which one happened: shutdown closes the whole browser only when this process launched it, an attached browser only ever loses its session tab.
-6. **Per-pid profile dir + startup GC.** Controlled launches use per-pid profiles;
-   `gc_stale_profiles` (`src/browser.rs`) reclaims dead owners' directories, never
-   explicit user profiles. Keep the startup deadline and failed-page cleanup in
-   `BrowserSession::launch` (`src/browser.rs`), which runs outside the tool wrapper.
-7. **Human-required detection + `wait_for_human`.**
-   - **Detect** captcha/slider/sms_otp/twofa/login_required/payment_verify/
-     identity_verify in `get_text`/`get_html` and after every mutating call
-     (`navigate`/`click`/`type_text`/`press_key`/`scroll`/`wait_for`/`screenshot`/
-     `wait_for_human`); one `evaluate_expression` pass per call, and a JS error
-     means "no signal".
-   - **Signals must be visibility-gated** — hidden inputs/iframes never count, and
-     **no raw `innerHTML` substring matching** (SPA script text false-positives);
-     text clues come from visibility-safe `body.innerText` plus a visible input.
-     Both drivers share the same keyword rules.
-   - **Tag** `[USER_ACTION_REQUIRED: <category>]` **after** `cap_text` (never
-     truncated), from `user_action_tag()` — one copy per driver (`src/tools.rs`,
-     `src/applescript.rs`), kept byte-identical; cap the body once
-     and append the tag afterwards — a second cap over the summary cuts the tag
-     off on long pages. Captcha counts only while present *and* unsolved: the
-     solved state is read from the **host** document
-     (`textarea[name="g-recaptcha-response"]`), never from the widget iframe
-     (cross-origin → `contentDocument` is null). `pending_human` is set on a
-     hit and cleared on a miss (`detect_and_mark` in both drivers), so mutating
-     tools prepend `[HUMAN_ACTION_PENDING: <category>]` exactly while a blocker
-     is still on the page.
-   - **`wait_for_human`** waits in bounded segments under the host timeout and returns `status=still_waiting` — a normal result, not an error:
-     the model ends the turn and asks the user. Headless reports
-     `status=unavailable`. Detector internals live in `src/tools.rs` (CDP) and
-     `src/applescript.rs` (AppleScript).
+1. **One call deadline.** `op_timeout_ms` (`src/browser.rs`) owns defaults and
+   clamps positive overrides below the host default deadline. `BrowserServer`
+   (`src/main.rs`) includes lazy CDP startup and the operation in one deadline.
+   Human waits use `human_wait_budget_ms`, bounded polls, and reserved return
+   time; shorter host deadlines require an appropriately shorter server cap.
+2. **Ownership controls cleanup.** Self-launch shutdown closes the controlled
+   browser. Attach shutdown closes only targets explicitly created by the
+   session. `AttachGuard` (`src/attach.rs`) also blocks chromiumoxide's automatic
+   `Target.closeTarget` on foreign targets after initialization failures and
+   rejects whole-browser closure. Keep the guard on every live attach path.
+3. **Profile protection.** Only auto-generated temporary profiles may have
+   singleton files removed or directories reclaimed. An explicit
+   `MCP_BROWSER_USER_DATA_DIR` retains its singleton files and contents; log
+   preservation instead of changing a user profile's lock state. Startup GC
+   checks that the temporary profile owner is dead.
+4. **Sequential session, continuously polled handler.** `BrowserServer` owns a
+   mutable `Session`; the CDP `Handler` must keep being polled for calls to make
+   progress. `switch_tab` changes the automation target without activating a
+   window. Shutdown ownership must be independent of the selected target.
+5. **Strict tool arguments.** `parse_call` (`src/contract.rs`) validates the
+   published schema before any browser mutation. Wrong optional types, nulls,
+   empty selectors, negative coordinates/offsets, and meaningless zero limits
+   are invalid parameters. Supply exactly one of `selector` or `ref` for click
+   and typing. Empty `text` intentionally clears an editable field.
+6. **Evidence after actions.** Navigate reports final URL and observed load
+   outcome. Click, typing, keys, and scroll report current URL, readyState, and
+   scroll coordinates. Click and typing include applied/not_applied/unknown
+   verdicts backed by click target state/focus or exact value read-back. Disabled
+   targets and mismatched/sanitized values must not claim application. Inspection
+   failures explicitly report unknown evidence; password read-back is redacted.
+7. **Bounded results.** Extraction slices Unicode characters in the page with
+   `max_chars` and `offset`, then reports `total_chars` and `next_offset`.
+   Snapshots page nodes with `offset`/`limit` and preserve valid bounded JSON.
+   Oversized fields carry explicit truncation markers. Continuation must advance
+   when more nodes remain; an oversized identity errors instead of stalling.
+   Append human-action markers after the bounded body. Screenshots return an
+   absolute file path rather than image bytes.
+8. **Human-action correctness.** Both drivers use `DETECT_USER_ACTION_JS`
+   (`src/tools.rs`), with visible DOM evidence and host-document captcha
+   response tokens. Hidden inputs/iframes and script contents are not blockers.
+   Successful empty inspections clear `pending_human`; failed inspections keep
+   it and report unknown. `wait_for_human` resolves only after consecutive
+   successful clean polls, returns `still_waiting` for a continuing blocker,
+   `unknown` with the inspection reason, and `unavailable` for self-launched
+   headless mode. A pending/unknown result asks the model to return control to
+   the user.
+9. **Error wording.** CDP construction and `translate_err`
+   (`src/applescript.rs`) follow the shared error wording contract.
 
-## AppleScript driver specifics
+## Tool contracts
 
-Same tools/args as CDP; `wait_for_human` never `unavailable`. Dedicated invariants:
+Existing names remain available: navigate, click, type_text, press_key, scroll,
+wait_for, evaluate_js, get_text, get_html, wait_for_human, screenshot, list_tabs,
+close_browser. Additional names are switch_tab, close_tab, and snapshot.
 
-1. **Never steal focus.** No `activate`; `open_tab` records the frontmost app before creating the tab and restores it afterwards (skip when already in Chrome). Ops address `window id W` + `whose id is "T"` (int window id + quoted tab id; a stale reference fails with the -1728 `can't get` error that the server maps to a rebuild hint) → stray events fail dry instead of mutating foreign tabs. Chrome self-activates on a new tab — hence the restore.
-2. **Allow JavaScript from Apple Events** (View > Developer). Chrome reads this preference **at startup only**: enabling it in a running browser (or editing the profile on disk) changes nothing, so the error must name the required full Chrome restart, not just the menu path. The wording lives in one shared constant (`JS_APPLE_EVENTS_HINT` in `src/applescript.rs`) used by both error paths, so they cannot drift.
-3. **JS embeds as one AppleScript string literal** — escape `\`/`"`/newlines via `esc_applescript`; the whole script goes over `osascript -` stdin, no temp files. Multi-line JS (detect/wait polling) is fine.
-4. **One session tab, reused.** `navigate` re-sets `URL of` tab unless vanished (then fresh tab in session window; first session uses front window). Tab becomes active tab *of its window* (for `screencapture -l`) but window stays background.
-5. **Synthetic events only.** JS `click()`, native-setter `value`+`input`/`change`, `KeyboardEvent` dispatch (Enter also `form.requestSubmit()`). No OS key chords / drag&drop. `full_page` degrades to a window screenshot.
-6. **Screenshot TCC preflight.** `screenshot` probes Screen Recording permission first: without it the window capture fails while the region/full-screen fallbacks still exit 0 with a wallpaper-only image that looks like success — so the server must error out with authorization instructions instead of returning a useless frame. The probe and fallback chain live in `src/applescript.rs`; the grant applies only after fully quitting and restarting the host app.
-7. **AppleScript timeout wrapper.** `handle_tools_call` (`src/applescript.rs`)
-   wraps operations with `with_timeout` using the shared browser cap; CDP-only
-   environment options do not apply.
-8. **Results are decoded, not escaped.** `get_text`/`get_html` parse the `JSON.stringify` envelope, so the model sees real newlines and real HTML instead of `\n` and `\"`.
+- `type_text` replaces the complete input/textarea value on both drivers,
+  including clearing with empty text. Both drivers support Unicode (Chinese,
+  emoji, and other text): CDP uses native select-all/deletion and Input.insertText;
+  AppleScript uses the native value setter plus input/change events. Read back
+  the field before submission and compare it with the requested value. With
+  submit=true, CDP dispatches Enter and AppleScript uses requestSubmit() after
+  confirming the replacement. AppleScript reports the observed submit event;
+  missing forms, validation failures, and submit exceptions produce errors.
+- `evaluate_js` returns JSON text on both drivers: strings stay quoted,
+  objects/arrays are serialized, and undefined becomes null. Runtime and
+  serialization exceptions produce errors. Multi-line code retains its lines.
+- `list_tabs` reports stable ids plus readable indices and URLs. CDP ids are
+  target ids; AppleScript ids combine window and tab ids and survive tab
+  reordering. `switch_tab(id)` selects the automation target. `close_tab(id)`
+  protects foreign tabs in attached CDP and AppleScript modes. Closing the
+  current CDP tab selects another controlled tab or creates a blank replacement;
+  AppleScript clears its target when no owned tab remains and navigate rebuilds.
+- `wait_for` takes exactly one of selector or url. Selector conditions are
+  present (default), visible, and absent. The url parameter waits for exact
+  string equality to location.href, including query and fragment; condition
+  applies only to selectors, and URL-plus-selector/ref arguments are invalid.
+  Its own timeout_ms deadline is subordinate to the call cap; both drivers
+  report actual elapsed time and the observed current URL.
+- `snapshot(offset, limit)` uses Chrome's Accessibility domain for native
+  roles, accessible names/labels, descriptions, and stable refs accepted by
+  click/type_text. Refs are scoped to their target and remain usable while the
+  DOM node exists; navigation or node replacement may invalidate them. Snapshot
+  explicitly returns an unsupported-mode error under AppleScript. Oversized
+  fields include [truncated] markers and truncated_fields metadata; paging
+  advances even when one source node would exceed the output budget.
 
-## Environment variables
+## Environment and isolation trade-offs
 
-Driver selection and CDP launch/attach settings belong to `DriverMode::from_env`
-and `BrowserSession::launch` (`src/browser.rs`). Timeout defaults and clamps
-belong to `op_timeout_ms` there; screenshot path settings belong to
-`resolve_screenshot_path` (`src/tools.rs`). Keep option values/defaults in those
-symbols rather than copying them into this guide.
+Configuration parsing belongs to `DriverMode::from_env`, `BrowserSession::launch`,
+`headless_from_env`, and `op_timeout_ms` (`src/browser.rs`); keep numeric tuning
+values in code. Screenshot paths belong to `resolve_screenshot_path`
+(`src/tools.rs`).
+
+- No overrides: isolated CDP self-launch, headless, throwaway profile.
+- `MCP_BROWSER_CHROME`: explicit Chrome/Chromium executable; otherwise detect it.
+- `MCP_BROWSER_HEADLESS=0`: explicitly open a visible controlled browser. Its
+  profile remains separate, but a new window can affect desktop focus.
+- `MCP_BROWSER_USER_DATA_DIR`: explicitly persist a dedicated automation profile.
+  Do not point it at the user's ordinary profile or share it across running
+  processes. Locked profiles fail normally; their locks are never removed.
+- `MCP_BROWSER_WS_URL`: explicitly attach an existing debugging browser; it takes
+  precedence over driver selection. This shares that browser's profile and
+  cookies, and CDP initialization or operations can affect its tabs/settings.
+  Use a dedicated debugging instance to preserve isolation. The attach guard
+  protects foreign targets from closure, including automatic failure cleanup.
+- `MCP_BROWSER_DRIVER=applescript`: explicitly drive the user's Chrome on macOS.
+  It shares their cookies/profile and can change the active tab when creating
+  a session tab or capturing its window. Focus restoration is best effort;
+  this mode cannot provide the default CDP isolation guarantee.
+- `MCP_BROWSER_OP_TIMEOUT_MS`: positive override, clamped by the server ceiling;
+  invalid/zero values use the default. Configure below a shorter host deadline.
+- `MCP_BROWSER_SCREENSHOT_DIR`: default directory for screenshots.
+
+## AppleScript specifics
+
+No `activate` calls or OS keyboard chords. Scripts target stable window/tab ids,
+escape JS as one AppleScript string literal, and travel through osascript stdin.
+Only tabs created by this session are closed, even after switching to a foreign
+one. Synthetic clicks, native setter input/change events, and KeyboardEvents
+have site limitations; `full_page` degrades to a window screenshot.
+
+Chrome requires View > Developer > Allow JavaScript from Apple Events and a full
+Chrome restart after changing that preference. `JS_APPLE_EVENTS_HINT` and
+`translate_err` (`src/applescript.rs`) own actionable error translation. Window
+screenshots require Screen Recording permission and its preflight must run before
+capture; denied permission produces an error instead of a misleading desktop
+image. `switch_tab` does not select the visible Chrome tab.
 
 ## Keyboard focus
 
-Keyboard/typing must go through **`Element`**; `Page` has no `press_key`. `Element::press_key` sends a page-level `Input.dispatchKeyEvent`, so the key lands on the **focused** element — never focus `body` first, that would move focus off the input the model just typed into. Focus `body` only when nothing else is focused. The element/screenshot API details live in `src/tools.rs`.
+CDP keyboard input must keep the intended element focused. Element keyboard
+methods send page-level input events; fetching a body handle does not mean body
+should be focused. `replace_text` (`src/snapshot.rs`) and `tool_press_key`
+(`src/tools.rs`) own these focus rules.
 
 ## Host registration
 
 Host tool family: `mcp_browser_*`. Shared configuration is described in
-**Host registration** in `crates/mcp_stdio/AGENTS.md`.
+**Host registration** in the mcp_stdio guide. Tool additions require the client
+to refresh tools/list; no client-side changes are part of this crate.

@@ -390,6 +390,27 @@ pub(crate) struct SessionItem {
     /// directory when the session never switched. The web UI shows it in the
     /// session bar so a new session's default directory is visible.
     pub(crate) cwd: String,
+    /// Live turn ownership sampled independently of persisted history.
+    pub(crate) activity: SessionActivity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SessionActivity {
+    Idle,
+    Running,
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SessionActivityReq {
+    pub(crate) ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SessionActivityItem {
+    pub(crate) id: String,
+    pub(crate) activity: SessionActivity,
 }
 
 #[derive(Debug, Deserialize)]

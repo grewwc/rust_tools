@@ -6,17 +6,15 @@
 //!   reused from `mcp_stdio::run`; this file only supplies the `McpServer`
 //!   implementation: the three tool-related sections plus a `shutdown` override
 //!   for graceful session close.
-//! - Dual driver modes: the default `applescript` drives the user's already-open
-//!   Chrome (new tab, keeps cookies, never quits the user's browser);
-//!   `MCP_BROWSER_DRIVER=cdp` (or setting MCP_BROWSER_WS_URL) uses the original
-//!   controlled-instance path. BrowserServer holds an Option<Session> enum and
-//!   dispatches by mode.
-//! - Every operation is bounded by `with_timeout` (default 90s < host
-//!   `request_timeout_ms` 120s); on timeout it returns a clean JSON-RPC error
-//!   free of transport trigger words so the host does not kill the process.
+//! - CDP self-launch with a dedicated headless profile is the default. AppleScript
+//!   and external CDP attachment are explicit opt-ins with shared-user trade-offs.
+//! - Tool calls, including lazy startup, share a cap below the host default.
 
 mod applescript;
+mod attach;
 mod browser;
+mod contract;
+mod snapshot;
 mod tools;
 
 use browser::{DriverMode, Session};
@@ -70,7 +68,7 @@ impl McpServer for BrowserServer {
             ));
         }
         if self.mode.is_applescript() {
-            // Reuse the 13 tool definitions/parameter names from tools.rs; the
+            // Reuse the shared tool definitions/parameter names from tools.rs; the
             // implementation runs on the applescript driver.
             let s = match &mut self.session {
                 Some(Session::AppleScript(a)) => a,
@@ -93,7 +91,20 @@ impl McpServer for BrowserServer {
                     None
                 }
             };
-            let r = tools::handle_tools_call(&mut cdp, params).await;
+            let cap = browser::op_timeout_ms();
+            let r = match tokio::time::timeout(
+                std::time::Duration::from_millis(cap),
+                tools::handle_tools_call(&mut cdp, params),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(JsonRpcErr::new(
+                    -32001,
+                    &format!("operation reached the {cap} ms server cap"),
+                    None,
+                )),
+            };
             if let Some(c) = cdp {
                 self.session = Some(Session::Cdp(c));
             }

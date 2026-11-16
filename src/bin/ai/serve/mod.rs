@@ -136,8 +136,14 @@ fn apply_title_seed_env(
 }
 
 #[cfg(feature = "serve")]
+fn apply_session_history_env(cmd: &mut std::process::Command, history_file: &std::path::Path) {
+    cmd.env(super::persona::SERVE_SESSION_HISTORY_ENV, history_file);
+}
+
+#[cfg(feature = "serve")]
 fn run_one_shot_turn(
     session_id: &str,
+    history_file: &std::path::Path,
     prompt: &str,
     overrides: &TurnOverrides,
     cwd: &std::path::Path,
@@ -151,6 +157,7 @@ fn run_one_shot_turn(
     // pipe, so the client's width travels through the environment.
     apply_term_cols_env(&mut cmd, term_cols);
     apply_title_seed_env(&mut cmd, session_id, title_seed);
+    apply_session_history_env(&mut cmd, history_file);
     let out = cmd
         // The turn runs in the session's virtual cwd, so relative paths in
         // every tool resolve per session rather than against the daemon's.
@@ -235,9 +242,11 @@ async fn post_turn(
     );
     let session_id = id.clone();
     let child_title_seed = title_seed.clone();
+    let child_history_file = state.history_file.clone();
     let output = tokio::task::spawn_blocking(move || {
         run_one_shot_turn(
             &session_id,
+            &child_history_file,
             &prompt,
             &overrides,
             &session_cwd,
@@ -530,9 +539,11 @@ async fn post_turn_sse(
             let _ = raw_tx.send(Ok(ServeSse::new("", warning))).await;
         }
         let child_title_seed = title_seed.clone();
+        let child_history_file = history_file.clone();
         let _ = tokio::task::spawn_blocking(move || {
             stream_child_turn(
                 session_id,
+                child_history_file,
                 prompt,
                 overrides,
                 raw_tx,
@@ -572,6 +583,7 @@ async fn post_turn_sse(
 #[cfg(feature = "serve")]
 fn stream_child_turn(
     session_id: String,
+    history_file: PathBuf,
     prompt: String,
     overrides: TurnOverrides,
     tx: mpsc::Sender<Result<ServeSse, std::convert::Infallible>>,
@@ -614,6 +626,7 @@ fn stream_child_turn(
     let mut cmd = std::process::Command::new(&exe);
     push_turn_args(&mut cmd, &session_id, &prompt, &overrides);
     apply_title_seed_env(&mut cmd, &session_id, &title_seed);
+    apply_session_history_env(&mut cmd, &history_file);
     // Run in the session's virtual cwd (see `serve/session_cwd.rs`), so
     // tools, MCP children and the prompt all see that session's directory.
     cmd.current_dir(&session_cwd);
@@ -651,9 +664,13 @@ fn stream_child_turn(
         }
     };
     // Registered for as long as the child runs, so an interrupt reaches
-    // exactly this turn; the guard clears the entry when the child is reaped,
+    // exactly this turn; the guard clears the entry after reaping and draining,
     // on every exit path below.
-    let _active_turn = ActiveTurnGuard::register(&active_turns, &session_id, child.id());
+    let mut active_turn = Some(ActiveTurnGuard::register(
+        &active_turns,
+        &session_id,
+        child.id(),
+    ));
     // Registered before the FIFO pump starts so an early question is never
     // dropped; the child's stdin moves into the slot, where the `/confirm`
     // endpoint writes the answer. A child without the pipe (spawn did not give
@@ -716,14 +733,15 @@ fn stream_child_turn(
             send(ServeSse::new("", clean_sse_line(&line)));
         }
     }
-    let status = child.wait();
-    child_done.store(true, Ordering::SeqCst);
-    if let Some(handle) = fifo_handle {
-        let _ = handle.join();
-    }
-    let stderr_tail = stderr_handle
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
+    let (status, stderr_tail) = reap_and_drain_turn_child(&mut child, &mut active_turn, || {
+        child_done.store(true, Ordering::SeqCst);
+        if let Some(handle) = fifo_handle {
+            let _ = handle.join();
+        }
+        stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default()
+    });
     // The pump may have ended the turn early via OutputComplete; only the
     // first `done` wins. A late failure still surfaces its detail as an
     // error event (harmless if the client already left on `done`).
@@ -754,6 +772,18 @@ fn stream_child_turn(
         t0.elapsed().as_millis(),
         already_done,
     );
+}
+
+#[cfg(feature = "serve")]
+fn reap_and_drain_turn_child<T>(
+    child: &mut std::process::Child,
+    active_turn: &mut Option<ActiveTurnGuard>,
+    drain: impl FnOnce() -> T,
+) -> (std::io::Result<std::process::ExitStatus>, T) {
+    let status = child.wait();
+    let drained = drain();
+    drop(active_turn.take());
+    (status, drained)
 }
 
 /// Per-turn live-chunk FIFO: created by the SSE endpoint before spawning the
@@ -1663,13 +1693,30 @@ pub(in crate::ai) fn run_serve_tls_init(
 }
 
 #[cfg(feature = "serve")]
+fn resolve_serve_history_file(
+    base_history_file: &std::path::Path,
+    persona_id: &str,
+) -> std::io::Result<PathBuf> {
+    // Anchor the root before any turn child changes to its session cwd.
+    let absolute = if base_history_file.is_absolute() {
+        base_history_file.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(base_history_file)
+    };
+    Ok(super::persona::session_client_history_file(&absolute, persona_id, None))
+}
+
+#[cfg(feature = "serve")]
 pub(in crate::ai) async fn run_serve(
     cli: super::cli::ParsedCli,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Reuse the same config resolution as the CLI so serve sees the same
     // history file, models, and sandbox settings.
     let app_config = super::config::load_config()?;
-    let history_file = app_config.history_file.clone();
+    let persona = super::persona::PersonaStore::new()
+        .active_persona()
+        .unwrap_or_else(|_| super::persona::default_persona());
+    let history_file = resolve_serve_history_file(&app_config.base_history_file, &persona.id)?;
     let cfg = configw::get_all_config();
     let from_cfg = cfg.get_opt(AiConfig::SERVE_BIND).unwrap_or_default();
     let bind = resolve_serve_bind(&cli.serve_bind, &from_cfg);
@@ -1760,6 +1807,11 @@ pub(in crate::ai) async fn run_serve(
         .route("/info", get(server_info))
         .route("/subagent-models", get(subagent_models))
         .route("/sessions", get(list_sessions).post(create_session))
+        .route(
+            "/session-activity",
+            post(list_session_activity)
+                .layer(DefaultBodyLimit::max(MAX_SESSION_ACTIVITY_REQUEST_BYTES)),
+        )
         .route(
             "/sessions/import",
             post(import_session).layer(DefaultBodyLimit::max(MAX_IMPORT_REQUEST_BYTES)),

@@ -223,10 +223,15 @@ where
             .map_err(|error| format!("invalid --session id: {error}"))?;
     }
 
+    let serve_history_file = crate::ai::background::is_serve_child()
+        .then(|| std::env::var_os(crate::ai::persona::SERVE_SESSION_HISTORY_ENV))
+        .flatten()
+        .map(PathBuf::from);
     let mut choice = StartupSessionChoice {
-        history_file: crate::ai::persona::history_file_for_persona(
+        history_file: crate::ai::persona::session_client_history_file(
             config.base_history_file.as_path(),
             &active_persona.id,
+            serve_history_file.as_deref(),
         ),
         active_persona,
         session_id: cli

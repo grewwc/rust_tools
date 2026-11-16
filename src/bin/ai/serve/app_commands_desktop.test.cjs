@@ -92,7 +92,7 @@ function harness({ width = 701, catalog = commands, media = "known", respond } =
   const context = vm.createContext({
     $, document, window, promptComposing: false, composingText: "", sessionId: "s-one",
     store: { base: "http://server-one", token: "" },
-    skillCatalog: [{ name: "review" }, { name: "release" }, { name: "中文🚀" }],
+    skillCatalog: [{ name: "review" }, { name: "release" }, { name: "中文🚀" }, { name: "wwc_skill_sync" }],
     lastItems: [{ id: "s-one" }, { id: "s-two" }],
     TEAM_FIELDS: { backend: { kernel: "teamkernel", traecli: "teamtraecli" } },
     workerModels: null, workerModelsBase: "", workerModelsState: "idle",
@@ -118,6 +118,7 @@ function harness({ width = 701, catalog = commands, media = "known", respond } =
   function $(id) { return elements[id] || null; }
   vm.runInContext(between("async function persistPicks()", "function fillSelect("), context);
   vm.runInContext(between("let modelSheetReturnFocus", "// Skills are pending next-turn choices"), context);
+  vm.runInContext(between("function skillCharBoundary(", "function rankSkillMatches("), context);
   vm.runInContext(between("// Slash-command completion.", "async function loadInfo()"), context);
   if (typeof context.wireDesktopCommandCompletion === "function") context.wireDesktopCommandCompletion();
   vm.runInContext(between("function insertPromptText(", "// --- native phone actions"), context);
@@ -190,6 +191,22 @@ test("skills parameters cycle names and preserve completed parameters", async ()
   assert.match(values(h)[0], /review/); h.key("Tab"); assert.equal(h.prompt.value, "/skills review ");
   h.key("Tab"); assert.equal(h.prompt.value, "/skills release ");
   h.type("/skills review re"); h.key("Tab"); assert.equal(h.prompt.value, "/skills review release ");
+});
+test("skills parameters fuzzy-match names like terminal completion", async () => {
+  const h = await ready(); h.type("/skills sync");
+  assert.match(values(h)[0], /wwc_skill_sync/);
+  assert.equal(h.key("Tab").prevented, true);
+  assert.equal(h.prompt.value, "/skills wwc_skill_sync ");
+});
+test("skills offers subcommand literals at the first argument position", async () => {
+  const h = await ready(); h.type("/skills us");
+  assert.match(values(h)[0], /^use/);
+  h.key("Tab"); assert.equal(h.prompt.value, "/skills use ");
+});
+test("agent parameters fuzzy-match names", async () => {
+  const h = await ready(); h.type("/agent eview");
+  assert.match(values(h)[0], /review/);
+  h.key("Tab"); assert.equal(h.prompt.value, "/agent review ");
 });
 test("agent parameters come from info select values", async () => {
   const h = await ready(); h.type("/agent r"); h.key("Tab");
@@ -288,8 +305,8 @@ test("multiline commands preserve leading text and middle-caret suffix", async (
 test("noncollapsed parameter selection replaces only its token with correct UTF-16 caret", async () => {
   const h = await ready(); const start = "中文🚀\n/skills ".length;
   h.type("中文🚀\n/skills 中文🚀 tail", start, start + "中文🚀".length); h.key("Tab");
-  assert.equal(h.prompt.value, "中文🚀\n/skills review tail");
-  assert.equal(h.prompt.selectionStart, start + "review".length);
+  assert.equal(h.prompt.value, "中文🚀\n/skills list tail");
+  assert.equal(h.prompt.selectionStart, start + "list".length);
   h.key("Escape"); assert.equal(h.prompt.selectionEnd, start + "中文🚀".length);
 });
 test("a selection spanning tokens or lines and ordinary paths preserve native Tab", async () => {

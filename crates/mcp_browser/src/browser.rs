@@ -20,23 +20,25 @@ use tokio::task::JoinHandle;
 /// Shared by GC and launch to avoid naming drift.
 const TEMP_PROFILE_PREFIX: &str = "mcp_browser-profile-";
 
-/// Per-operation timeout (milliseconds), hard-clamped to 90_000.
-///
-/// This server cannot observe the host's configured `request_timeout_ms`, so 90s is
-/// the only safe ceiling that stays strictly below every allowed host timeout
-/// (host default 30s; recommended 120s — crates/mcp_stdio/AGENTS.md invariant 5).
-/// Without the clamp, a large `MCP_BROWSER_OP_TIMEOUT_MS` would let a per-op wait
-/// outlast the host timeout, and the host would kill+restart the subprocess (losing
-/// the whole session) instead of the server returning its clean timeout error.
-/// Unset or non-numeric values fall back to the ceiling; parsed values above it are
-/// clamped down, so no per-op wait can ever exceed 90s.
-pub(crate) fn op_timeout_ms() -> u64 {
-    const HARD_CAP_MS: u64 = 90_000;
-    std::env::var("MCP_BROWSER_OP_TIMEOUT_MS")
-        .ok()
+/// Server cap stays below the host's default request deadline. Overrides can
+/// reduce it; callers with a shorter host deadline must configure both sides.
+const HARD_CAP_MS: u64 = 25_000;
+
+pub(crate) fn parse_timeout(value: Option<&str>) -> u64 {
+    value
         .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
         .map(|v| v.min(HARD_CAP_MS))
         .unwrap_or(HARD_CAP_MS)
+}
+
+pub(crate) fn op_timeout_ms() -> u64 {
+    parse_timeout(std::env::var("MCP_BROWSER_OP_TIMEOUT_MS").ok().as_deref())
+}
+
+/// Reserve time for returning the final human-wait result, even with small caps.
+pub(crate) fn human_wait_budget_ms(cap: u64) -> u64 {
+    cap.saturating_sub(1_000).min(20_000)
 }
 
 /// Startup garbage collection: remove leftover temp profile dirs belonging to **dead
@@ -94,7 +96,14 @@ fn process_alive(pid: u32) -> bool {
 /// killed the subprocess on timeout), the locks linger and the next launch aborts with
 /// `Failed to create ... SingletonLock: File exists (17)`. They are symlinks, and
 /// `remove_file` removes the link itself without following it.
-fn purge_singleton_locks(dir: &Path) {
+fn purge_singleton_locks(dir: &Path, owned: bool) {
+    if !owned {
+        eprintln!(
+            "mcp_browser: preserving singleton locks in user profile {}",
+            dir.display()
+        );
+        return;
+    }
     for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
         let _ = std::fs::remove_file(dir.join(name));
     }
@@ -105,6 +114,12 @@ pub struct BrowserSession {
     pub browser: Browser,
     pub page: Page,
     handler_task: JoinHandle<()>,
+    attach_guard: Option<crate::attach::AttachGuard>,
+    pub(crate) owned_pages: Vec<String>,
+    pub(crate) snapshot_refs: Vec<(
+        String,
+        chromiumoxide::cdp::browser_protocol::dom::BackendNodeId,
+    )>,
     /// Whether this process launched the browser itself (a controlled instance) or
     /// attached to an existing one via MCP_BROWSER_WS_URL. A self-launched browser
     /// is closed whole on shutdown; an attached browser only ever has its session
@@ -127,11 +142,8 @@ pub enum Session {
     AppleScript(crate::applescript::ApplescriptSession),
 }
 
-/// Driver mode selection, decided by the `MCP_BROWSER_DRIVER` environment variable.
-///
-/// - Default `applescript`: reuse the user's already-open Chrome (new tab, never quits the user's browser).
-/// - `cdp`: launch a new controlled Chrome instance (historical behavior).
-/// - When `MCP_BROWSER_WS_URL` is set, always `cdp` (explicitly attach an existing debugging-port instance).
+/// CDP self-launch is the isolated default on every platform. AppleScript and
+/// external WebSocket attachment require explicit configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverMode {
     AppleScript,
@@ -140,15 +152,20 @@ pub enum DriverMode {
 
 impl DriverMode {
     pub fn from_env() -> Self {
-        if std::env::var("MCP_BROWSER_WS_URL").ok().is_some() {
-            return DriverMode::Cdp;
+        Self::parse(
+            std::env::var("MCP_BROWSER_DRIVER").ok().as_deref(),
+            std::env::var("MCP_BROWSER_WS_URL").ok().as_deref(),
+        )
+    }
+
+    fn parse(driver: Option<&str>, ws: Option<&str>) -> Self {
+        if ws.is_some() {
+            return Self::Cdp;
         }
-        match std::env::var("MCP_BROWSER_DRIVER").ok().as_deref() {
-            Some("cdp") | Some("CDP") => DriverMode::Cdp,
-            _ if cfg!(target_os = "macos") => DriverMode::AppleScript,
-            // Non-macOS platforms have no osascript, so default to a controlled instance
-            // (combined with MCP_BROWSER_WS_URL it can attach a user-started debugging-port instance).
-            _ => DriverMode::Cdp,
+        if driver.is_some_and(|v| v.eq_ignore_ascii_case("applescript")) {
+            Self::AppleScript
+        } else {
+            Self::Cdp
         }
     }
 
@@ -255,10 +272,12 @@ fn headed_cdp_capability_preflight() -> Result<(), String> {
     }
 }
 
-fn headless_from_env() -> bool {
-    std::env::var("MCP_BROWSER_HEADLESS")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+pub(crate) fn headless_from_env() -> bool {
+    parse_headless(std::env::var("MCP_BROWSER_HEADLESS").ok().as_deref())
+}
+
+fn parse_headless(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
 }
 
 async fn remote_cdp_capability_preflight(configured_url: &str) -> Result<(), String> {
@@ -310,7 +329,9 @@ fn current_user_has_gui_session() -> bool {
 
 #[cfg(target_os = "macos")]
 async fn find_applescript_chrome() -> Option<PathBuf> {
-    let mut candidates = vec![PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")];
+    let mut candidates = vec![PathBuf::from(
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    )];
     if let Some(home) = std::env::var_os("HOME") {
         candidates.push(
             PathBuf::from(home).join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
@@ -366,7 +387,7 @@ impl BrowserSession {
     /// Environment variables:
     /// - `MCP_BROWSER_WS_URL`: if set, attach an existing instance instead (`Browser::connect`).
     /// - `MCP_BROWSER_CHROME`: explicit Chrome executable path (otherwise auto-detected per OS).
-    /// - `MCP_BROWSER_HEADLESS`: `0` (default) headed, good for login/interaction; `1` headless.
+    /// - `MCP_BROWSER_HEADLESS`: `1` (default) headless; `0` explicitly opens a visible window.
     /// - `MCP_BROWSER_USER_DATA_DIR`: explicit profile dir (persists login state); not
     ///   cleaned up, and sharing it across processes causes conflicts. When unset, each
     ///   process gets a unique temp dir that is removed on exit.
@@ -393,15 +414,22 @@ impl BrowserSession {
 
     /// The actual launch work, bounded by [`launch`]'s per-operation cap.
     async fn launch_inner() -> Result<Self, String> {
-        let (mut browser, mut handler, owns_browser, temp_profile_dir) =
+        let (mut browser, mut handler, owns_browser, temp_profile_dir, attach_guard) =
             if let Ok(ws) = std::env::var("MCP_BROWSER_WS_URL") {
                 let ws = resolve_ws_url(&ws)
                     .await
                     .map_err(|e| format!("failed to resolve MCP_BROWSER_WS_URL ({ws}): {e}"))?;
-                let (browser, handler) = Browser::connect(ws).await.map_err(|e| {
-                    format!("failed to connect to browser at MCP_BROWSER_WS_URL: {e}")
-                })?;
-                (browser, handler, false, None)
+                let guard = crate::attach::AttachGuard::connect(&ws).await?;
+                let (browser, handler) = Browser::connect_with_config(
+                    guard.url.clone(),
+                    chromiumoxide::handler::HandlerConfig {
+                        request_timeout: std::time::Duration::from_millis(op_timeout_ms()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| format!("failed to connect to browser at MCP_BROWSER_WS_URL: {e}"))?;
+                (browser, handler, false, None, Some(guard))
             } else {
                 let chrome = configured_chrome_executable()?;
                 let headless = headless_from_env();
@@ -418,13 +446,15 @@ impl BrowserSession {
                         (dir.clone(), Some(dir))
                     }
                 };
-                // Whether the dir is new or old, clear any leftover singleton locks before launching.
-                let _ = std::fs::create_dir_all(&data_dir);
-                purge_singleton_locks(&data_dir);
+                // Explicit profiles belong to the user; their Chrome locks are never removed.
+                std::fs::create_dir_all(&data_dir)
+                    .map_err(|e| format!("cannot create browser profile: {e}"))?;
+                purge_singleton_locks(&data_dir, temp.is_some());
 
                 let mut builder = BrowserConfig::builder()
                     .chrome_executable(&chrome)
-                    .user_data_dir(&data_dir);
+                    .user_data_dir(&data_dir)
+                    .request_timeout(std::time::Duration::from_millis(op_timeout_ms()));
                 builder = if headless {
                     builder.new_headless_mode()
                 } else {
@@ -436,7 +466,7 @@ impl BrowserSession {
                 let (browser, handler) = Browser::launch(config).await.map_err(|e| {
                     format!("failed to launch Chrome at '{}': {e}", chrome.display())
                 })?;
-                (browser, handler, true, temp)
+                (browser, handler, true, temp, None)
             };
 
         // The Handler must be polled continuously, otherwise CDP calls make no progress.
@@ -459,13 +489,20 @@ impl BrowserSession {
         };
 
         Ok(BrowserSession {
+            owned_pages: vec![page.target_id().as_ref().to_string()],
+            snapshot_refs: Vec::new(),
             browser,
             page,
             handler_task,
+            attach_guard,
             owns_browser,
             temp_profile_dir,
             pending_human: None,
         })
+    }
+
+    pub(crate) fn may_close_tab(&self, id: &str) -> bool {
+        self.owns_browser || self.owned_pages.iter().any(|owned| owned == id)
     }
 
     /// Close the session and stop the Handler polling task. Best-effort.
@@ -483,9 +520,20 @@ impl BrowserSession {
         } else {
             // Attach mode: never close the whole browser (that would quit the
             // user's Chrome); only close the session tab we created.
-            let _ = self.page.close().await;
+            for id in &self.owned_pages {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    self.browser.execute(
+                        chromiumoxide::cdp::browser_protocol::target::CloseTargetParams::new(
+                            id.clone(),
+                        ),
+                    ),
+                )
+                .await;
+            }
         }
         self.handler_task.abort();
+        self.attach_guard.take();
         // Only clean up the auto-generated temp profile; dirs the user explicitly set are kept (persisted login state).
         if let Some(dir) = self.temp_profile_dir.take() {
             let _ = std::fs::remove_dir_all(&dir);
@@ -578,4 +626,50 @@ pub async fn ensure_session(
         *session = Some(BrowserSession::launch().await?);
     }
     Ok(session.as_mut().expect("session just initialized"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_fixes_mode_and_timeout_defaults() {
+        assert_eq!(DriverMode::parse(None, None), DriverMode::Cdp);
+        assert_eq!(DriverMode::parse(Some("unknown"), None), DriverMode::Cdp);
+        assert_eq!(
+            DriverMode::parse(Some("AppleScript"), None),
+            DriverMode::AppleScript
+        );
+        assert_eq!(
+            DriverMode::parse(Some("applescript"), Some("ws://example")),
+            DriverMode::Cdp
+        );
+        assert!(parse_headless(None));
+        assert!(!parse_headless(Some("0")));
+        assert!(!parse_headless(Some("FALSE")));
+        for value in [None, Some("0"), Some("-1"), Some("junk"), Some("90000")] {
+            assert_eq!(parse_timeout(value), 25_000);
+        }
+        assert_eq!(parse_timeout(Some("1000")), 1000);
+        for cap in [1, 500, 1000, 5000, 25_000] {
+            assert!(human_wait_budget_ms(cap) < cap);
+        }
+    }
+
+    #[test]
+    fn browser_fixes_preserves_user_singleton_files() {
+        let dir =
+            std::env::temp_dir().join(format!("mcp-browser-lock-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+            std::fs::write(dir.join(name), "user lock").unwrap();
+        }
+        purge_singleton_locks(&dir, false);
+        assert!(dir.join("SingletonLock").exists());
+        assert!(dir.join("SingletonSocket").exists());
+        assert!(dir.join("SingletonCookie").exists());
+        purge_singleton_locks(&dir, true);
+        assert!(!dir.join("SingletonLock").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -35,8 +35,13 @@ const longSessions = () => [sessions()[0], ...Array.from({ length: 100 }, (_, in
   id: "older-session-" + index, summary: "Older session " + index, marked: false, size_bytes: 1024,
 })), sessions()[1]];
 
-function harness({ phone = false, sid = "open-session", items = sessions(), cachedItems = items, markError = "", confirmDelete = true, beforeMark, sessionsGet, historyGet, configGet, realNavigation = false } = {}) {
-  const document = { activeElement: null };
+function harness({ phone = false, sid = "open-session", items = sessions(), cachedItems = items, markError = "", confirmDelete = true, beforeMark, sessionsGet, activityGet, historyGet, configGet, realNavigation = false } = {}) {
+  const documentListeners = new Map(), windowListeners = new Map();
+  const listen = (listeners, name, fn) => {
+    if (!listeners.has(name)) listeners.set(name, []);
+    listeners.get(name).push(fn);
+  };
+  const document = { activeElement: null, visibilityState: "hidden", addEventListener: (name, fn) => listen(documentListeners, name, fn) };
   function node(tag = "div") {
     let text = "";
     const classes = new Set();
@@ -56,6 +61,12 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
       getAttribute(key) { return el.attrs[key] ?? null; },
       get lastElementChild() { return el.children.at(-1) || null; },
       appendChild(child) { child.remove(); child.parentNode = el; el.children.push(child); return child; },
+      replaceChild(child, old) {
+        const index = el.children.indexOf(old);
+        assert.ok(index >= 0, "replace an existing child");
+        child.remove(); old.parentNode = null; child.parentNode = el;
+        el.children[index] = child; return old;
+      },
       remove() {
         if (el.parentNode) el.parentNode.children = el.parentNode.children.filter((child) => child !== el);
         el.parentNode = null;
@@ -78,6 +89,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
       },
       querySelector(selector) { return el.querySelectorAll(selector)[0] || null; },
       focus() { if (!el.disabled) document.activeElement = el; },
+      select() { el.selectionStart = 0; el.selectionEnd = el.value?.length || 0; },
     };
     return el;
   }
@@ -104,7 +116,8 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
   const timers = new Map();
   let now = 1000, nextTimer = 1, historyLoads = 0, configLoads = 0;
   const context = vm.createContext({
-    document, $: (id) => elements[id], window: { matchMedia: () => media },
+    document, $: (id) => elements[id], AbortController,
+    window: { matchMedia: () => media, addEventListener: (name, fn) => listen(windowListeners, name, fn) },
     store: { base: "https://serve.test", token: "test-token" },
     lastItems: plain(cachedItems), sessionId: sid, pendingNew: null, lastMsgCount: 5, turnRunning: true, PAGE_ID: "test-page",
     localStorage: { getItem: (key) => stored.get(key) || null, setItem: (key, value) => stored.set(key, value), removeItem: (key) => stored.delete(key) },
@@ -115,6 +128,10 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
       const parsed = new URL(url);
       const request = { url, path: parsed.pathname, searchParams: parsed.searchParams, method: options.method || "GET", headers: plain(options.headers), body: options.body ? JSON.parse(options.body) : null };
       requests.push(request);
+      if (request.path === "/session-activity") {
+        if (activityGet) return activityGet(request);
+        return response(request.body.ids.map((id) => ({ id, activity: serverItems.find((item) => item.id === id)?.activity ?? "unknown" })));
+      }
       if (request.path.endsWith("/history")) return historyGet ? historyGet(request) : response([]);
       if (request.path.endsWith("/config")) return configGet ? configGet(request) : response({});
       if (request.path.endsWith("/mark")) {
@@ -211,7 +228,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
   }
   const touch = (extra = {}) => ({ pointerType: "touch", isPrimary: true, button: 0, clientX: 10, clientY: 20, ...extra });
   function hold(id) { const li = row(id); dispatch(li, "pointerdown", touch()); advance(650); dispatch(li, "pointerup", touch()); return li; }
-  return { context, document, elements, requests, switches, confirmations, draftsCleared, messages, drawerChanges, stored, media, timers, row, advance, touch, hold, dispatch, historyLoads: () => historyLoads, configLoads: () => configLoads };
+  return { context, document, documentListeners, windowListeners, elements, requests, switches, confirmations, draftsCleared, messages, drawerChanges, stored, media, timers, row, advance, touch, hold, dispatch, historyLoads: () => historyLoads, configLoads: () => configLoads };
 }
 
 test("sidebar stars reflect marked state and expose the matching accessible action", () => {

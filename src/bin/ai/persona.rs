@@ -14,6 +14,7 @@ use crate::commonw::{
 };
 
 pub(in crate::ai) const DEFAULT_PERSONA_ID: &str = "default";
+pub(in crate::ai) const SERVE_SESSION_HISTORY_ENV: &str = "A_SERVE_SESSION_HISTORY_FILE";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(in crate::ai) struct PersonaProfile {
@@ -89,6 +90,18 @@ pub(in crate::ai) fn history_file_for_persona(
         base_history_file,
         &format!(".persona-{}", sanitize_path_fragment(persona_id)),
     )
+}
+
+/// A serve child keeps the daemon's resolved root for its addressed session.
+/// A later persona or base-history change must not redirect that turn's lease.
+pub(in crate::ai) fn session_client_history_file(
+    base_history_file: &Path,
+    persona_id: &str,
+    serve_history_file: Option<&Path>,
+) -> PathBuf {
+    serve_history_file
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| history_file_for_persona(base_history_file, persona_id))
 }
 
 pub(in crate::ai) fn memory_file_for_persona(persona_id: &str) -> PathBuf {

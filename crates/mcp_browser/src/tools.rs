@@ -1,6 +1,6 @@
 //! Tool schema declarations + `tools/call` dispatch and per-tool logic.
 //!
-//! All 13 tools return text via `content[0].text` (the host reads only this slot).
+//! All tools return text via `content[0].text` (the host reads only this slot).
 //! Every CDP operation is wrapped in `with_timeout`; a timeout returns a clean error free of transport trigger words.
 
 use std::path::PathBuf;
@@ -10,6 +10,7 @@ use chromiumoxide::page::{Page, ScreenshotParams};
 use serde_json::{Value, json};
 
 use crate::browser::{BrowserSession, ensure_session};
+use crate::contract::{opt_str, require_str};
 use mcp_stdio::{JsonRpcErr, cap_text, text_content, with_timeout};
 
 /// Per-operation timeout, defined in `browser.rs` (the session layer) so the
@@ -26,9 +27,9 @@ pub fn initialize_result() -> Value {
     })
 }
 
-/// Result of tools/list: schemas for the 13 browser automation tools.
+/// Result of tools/list: schemas for browser automation tools.
 pub fn tools_list_result() -> Value {
-    json!({
+    let mut registry = json!({
         "tools": [
             {
                 "name": "navigate",
@@ -44,7 +45,7 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "click",
-                "description": "Click the first element matching a CSS selector (scrolled into view first). If the response starts with [HUMAN_ACTION_PENDING: <category>], a human verification is still pending on the page - stop and call wait_for_human (or return control to the user) before continuing.",
+                "description": "Click an element by selector or snapshot ref (scrolled into view first). Returns applied/not_applied/unknown based on the observed click event, target state/focus, or URL; disabled targets are not clicked. If the response starts with [HUMAN_ACTION_PENDING: <category>], a human verification is still pending on the page - stop and call wait_for_human (or return control to the user) before continuing.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -55,13 +56,13 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "type_text",
-                "description": "Focus an input matching the selector and type text. Optionally press Enter to submit. If the response starts with [HUMAN_ACTION_PENDING: <category>], a human verification is still pending - stop and call wait_for_human (or return control to the user) before continuing.",
+                "description": "Replace the entire current value of an input/textarea with Unicode text, including Chinese and emoji, on both drivers (empty text clears it). Use selector or a snapshot ref. Returns applied/not_applied/unknown with value read-back evidence. With submit=true, CDP dispatches Enter and AppleScript uses requestSubmit(); submission errors are surfaced. If the response starts with [HUMAN_ACTION_PENDING: <category>], a human verification is still pending - stop and call wait_for_human (or return control to the user) before continuing.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "selector": { "type": "string", "description": "CSS selector of the input/textarea" },
                         "text": { "type": "string", "description": "Text to type" },
-                        "submit": { "type": "boolean", "description": "Press Enter after typing (default false)", "default": false }
+                        "submit": { "type": "boolean", "description": "Submit after confirmed replacement: CDP dispatches Enter; AppleScript uses requestSubmit() and reports its submit event (default false)", "default": false }
                     },
                     "required": ["selector", "text"]
                 }
@@ -92,7 +93,7 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "wait_for",
-                "description": "Poll until a CSS selector appears in the DOM, up to timeout_ms.",
+                "description": "Wait for exactly one target: selector with present (default), visible, or absent condition; or url with exact-string equality to location.href, including query and fragment. Returns observed current_url. condition applies only to selector waits. Bounded by timeout_ms and the server operation cap.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -104,7 +105,7 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "evaluate_js",
-                "description": "Evaluate a JavaScript expression in the page and return its JSON value.",
+                "description": "Evaluate JavaScript and return JSON text identically on both drivers: strings are quoted, arrays/objects serialized, undefined becomes null; runtime exceptions are errors.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -146,7 +147,7 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "wait_for_human",
-                "description": "BLOCK and wait for the user to manually complete an action in the visible (headed) browser window - captcha, slider, SMS/OTP code, 2FA, login, payment or identity verification. Call this when a page shows [USER_ACTION_REQUIRED] or otherwise needs a human. It polls the page and returns AS SOON AS the blocking signal is gone (status=resolved). Each call waits at most 60s (always kept safely under the host request timeout); if the user has not finished yet it returns status=still_waiting WITHOUT error - END YOUR TURN and ask the user to complete the action in the browser window; when they reply, call wait_for_human again to verify and continue. In headless mode it returns status=unavailable immediately (no visible window, so the user cannot act).",
+                "description": "BLOCK and wait for the user to manually complete an action in the visible (headed) browser window - captcha, slider, SMS/OTP code, 2FA, login, payment or identity verification. Call this when a page shows [USER_ACTION_REQUIRED] or otherwise needs a human. It polls the page and returns AS SOON AS the blocking signal is gone (status=resolved). Each call waits within the server operation cap (below the default host deadline); if the user has not finished yet it returns status=still_waiting WITHOUT error - END YOUR TURN and ask the user to complete the action in the browser window; when they reply, call wait_for_human again to verify and continue. In headless mode it returns status=unavailable immediately (no visible window, so the user cannot act).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -157,16 +158,57 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "list_tabs",
-                "description": "List open tabs (index and URL) in the current browser session.",
+                "description": "List open tabs with readable index, stable id, URL, and current automation target. Pass id to switch_tab/close_tab; indices are informational.",
                 "inputSchema": { "type": "object", "properties": {} }
             },
             {
                 "name": "close_browser",
-                "description": "Close the browser session: CDP mode quits the controlled Chrome; AppleScript mode closes only the session tab and never quits your own Chrome.",
+                "description": "Close the browser session: CDP self-launch quits the controlled Chrome; attached CDP and AppleScript close only owned tabs and never quit your own Chrome.",
                 "inputSchema": { "type": "object", "properties": {} }
             }
         ]
-    })
+    });
+    for tool in registry["tools"].as_array_mut().unwrap() {
+        let name = tool["name"].as_str().unwrap().to_string();
+        let schema = &mut tool["inputSchema"];
+        schema["additionalProperties"] = json!(false);
+        if matches!(name.as_str(), "click" | "type_text") {
+            schema["properties"]["ref"] = json!({"type":"string", "description":"Stable element ref from snapshot (CDP only), instead of selector"});
+            schema["required"] = if name == "type_text" {
+                json!(["text"])
+            } else {
+                json!([])
+            };
+            schema["oneOf"] = json!([{"required":["selector"]},{"required":["ref"]}]);
+        }
+        if name == "wait_for" {
+            schema["properties"]["url"] = json!({"type":"string","description":"Exact current URL to wait for, including query and fragment; mutually exclusive with selector"});
+            schema["required"] = json!([]);
+            schema["oneOf"] = json!([{"required":["selector"]},{"required":["url"]}]);
+            schema["properties"]["condition"] =
+                json!({"type":"string","enum":["present","visible","absent"],"default":"present"});
+            schema["properties"]["timeout_ms"]["minimum"] = json!(1);
+        }
+        if matches!(name.as_str(), "get_text" | "get_html") {
+            schema["properties"]["max_chars"] = json!({"type":"integer","minimum":1,"maximum":20000,"default":12000,"description":"Maximum Unicode characters to return; result includes next_offset for paging"});
+            schema["properties"]["offset"] = json!({"type":"integer","minimum":0,"default":0,"description":"Unicode character offset into the extracted content"});
+        }
+        for (key, spec) in schema["properties"].as_object_mut().unwrap() {
+            if spec["type"] == "string" && key != "text" {
+                spec["minLength"] = json!(1);
+            }
+            if spec["type"] == "integer" && spec.get("minimum").is_none() {
+                spec["minimum"] = json!(0);
+                spec["maximum"] = json!(9_007_199_254_740_991u64);
+            }
+        }
+    }
+    registry["tools"].as_array_mut().unwrap().extend([
+        json!({"name":"switch_tab","description":"Select the tab used by subsequent tools by stable id from list_tabs. CDP does not activate a user window; AppleScript changes the automation target without selecting its visible tab.","inputSchema":{"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"],"additionalProperties":false}}),
+        json!({"name":"close_tab","description":"Close a tab by stable id from list_tabs. Attached CDP and AppleScript sessions may close only tabs they created. Closing the current tab selects another owned tab or creates a blank replacement in CDP; AppleScript navigate opens a fresh tab if none remains.","inputSchema":{"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"],"additionalProperties":false}}),
+        json!({"name":"snapshot","description":"CDP accessibility snapshot: structured roles, accessible names/labels, descriptions, and stable DOM refs accepted by click/type_text. Refs remain valid while their node exists in that tab. Uses offset/limit paging. Not supported in AppleScript mode.","inputSchema":{"type":"object","properties":{"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":100}},"additionalProperties":false}}),
+    ]);
+    registry
 }
 
 /// tools/call dispatch.
@@ -174,16 +216,7 @@ pub async fn handle_tools_call(
     session: &mut Option<BrowserSession>,
     params: Option<Value>,
 ) -> Result<Value, JsonRpcErr> {
-    let params = params.unwrap_or_else(|| json!({}));
-    let name = params
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let args = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let (name, args) = crate::contract::parse_call(params)?;
 
     match name.as_str() {
         "navigate" => tool_navigate(session, &args).await,
@@ -198,6 +231,9 @@ pub async fn handle_tools_call(
         "wait_for_human" => tool_wait_for_human(session, &args).await,
         "screenshot" => tool_screenshot(session, &args).await,
         "list_tabs" => tool_list_tabs(session).await,
+        "switch_tab" => tool_switch_tab(session, &args).await,
+        "close_tab" => tool_close_tab(session, &args).await,
+        "snapshot" => tool_snapshot(session, &args).await,
         "close_browser" => tool_close_browser(session).await,
         _ => Err(JsonRpcErr::new(
             -32601,
@@ -207,28 +243,11 @@ pub async fn handle_tools_call(
     }
 }
 
-// ---- Parameter helpers ----
-
-fn require_str(args: &Value, key: &str) -> Result<String, JsonRpcErr> {
-    args.get(key)
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .ok_or_else(|| JsonRpcErr::new(-32602, &format!("missing or empty '{key}'"), None))
-}
-
-fn opt_str(args: &Value, key: &str) -> Option<String> {
-    args.get(key)
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-}
-
 /// Scans the page for actions that require manual completion by the user.
 ///
 /// Covers 7 categories: captcha, slider, sms_otp, twofa, login_required,
 /// payment_verify, identity_verify. Returns the category tag on a hit, None otherwise.
-/// Detection failures (e.g. JS exceptions) silently return None and do not affect the normal flow.
+/// Inspection failures remain errors; callers must not infer resolution from them.
 ///
 /// Detection is conservative: DOM structure signals (iframe/class/id, dedicated input fields) come first and are most trusted;
 /// plain body keyword matching easily false-positives (e.g. an article explaining 2FA/OTP), so text-only signals are ranked after
@@ -236,10 +255,26 @@ fn opt_str(args: &Value, key: &str) -> Option<String> {
 /// All structure signals are visibility-gated (`anyVisible`): hidden inputs/iframes
 /// (display:none / visibility:hidden / zero-size: unopened modals, templates, invisible
 /// captchas) never count as blockers.
-async fn detect_user_action_required(page: &chromiumoxide::page::Page) -> Option<String> {
+async fn detect_user_action_required(
+    page: &chromiumoxide::page::Page,
+) -> Result<Option<String>, String> {
     let result = page
-        .evaluate_expression(r#"(function(){
-          // body 可能为 null（极早期/纯 frameset 页），用 try 兜底避免整表达式 reject。
+        .evaluate_expression(DETECT_USER_ACTION_JS)
+        .await
+        .map_err(|e| format!("human-action inspection failed: {e}"))?;
+    parse_detection(result.value().unwrap_or(&Value::Null))
+}
+
+pub(crate) fn parse_detection(value: &Value) -> Result<Option<String>, String> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(cat) if !cat.is_empty() => Ok(Some(cat.clone())),
+        _ => Err("human-action inspection returned an invalid result".into()),
+    }
+}
+
+pub(crate) const DETECT_USER_ACTION_JS: &str = r#"(function(){
+          // body can be null on early or frameset documents.
           var t = "";
           try { t = ((document.body && document.body.innerText) || "").toLowerCase(); } catch(e) { t = ""; }
           function has(sel){ try { return !!document.querySelector(sel); } catch(e){ return false; } }
@@ -254,39 +289,34 @@ async fn detect_user_action_required(page: &chromiumoxide::page::Page) -> Option
             } catch(e){}
             return false;
           }
-          // reCAPTCHA / hCaptcha 已解决：隐藏的 response textarea 被填入 token。
-          // 注意：验证码 iframe 在解决后仍常驻 DOM（打勾/徽标），所以「存在」≠「阻塞」，
-          // 必须用「存在 && 未解决」判定，否则 wait_for_human 将永远等不到 resolved。
+          // Solved captcha responses live in a hidden host-document textarea.
+          // Captcha iframes remain after solving; presence alone is not a blocker.
+          // Only an unsolved visible widget requires human action.
           function recaptchaSolved(){
             var ta = document.querySelector('textarea[name="g-recaptcha-response"], textarea[name="h-captcha-response"]');
             return !!(ta && ta.value && ta.value.length > 0);
           }
-          // 1) captcha：验证码 iframe（reCAPTCHA / hCaptcha / 腾讯等）或可见的 captcha
-          //    类元素，且「未解决」。隐藏的页脚徽标/已关闭的弹层不算阻塞。
+          // 1) Visible captcha iframe or class, gated on the unsolved state.
+          // Hidden badges and dismissed dialogs do not count.
           if (anyVisible('iframe[src*="recaptcha/api2/anchor"]') && !recaptchaSolved()) return 'captcha';
           if (anyVisible('iframe[src*="hcaptcha"]') && !has('iframe[src*="badge"]') && !recaptchaSolved()) return 'captcha';
           if (anyVisible('iframe[src*="captcha"]') && !has('iframe[src*="recaptcha/api2/bframe"]') && !has('iframe[src*="badge"]') && !recaptchaSolved()) return 'captcha';
           if ((has('[class*="captcha"]') || has('[id*="captcha"]')) && anyVisible('[class*="captcha"], [id*="captcha"]') && !recaptchaSolved()) return 'captcha';
-          // 2) slider：需要滑块 DOM 结构，纯文案不足以判定。
+          // 2) Sliders require DOM evidence, not just text.
           if (anyVisible('.geetest_slider_button, .geetest_slider, [class*="slider_track"], [class*="slider-btn"]') || (anyVisible('[class*="slider"]') && /滑动|拖动|slide|滑块/.test(t))) return 'slider';
-          // 3) sms_otp：优先专用输入框；纯文本需同时存在可输入的验证码框，降低误报。
+          // 3) OTP requires a dedicated input or visible input plus matching text.
           if (anyVisible('input[autocomplete="one-time-code"]')) return 'sms_otp';
           if (anyVisible('input[type="tel"], input[type="text"], input[type="number"]') && /短信验证码|短信动态码|sms.{0,5}code|one-time.{0,5}code|verification code|动态验证码/.test(t)) return 'sms_otp';
-          // 4) twofa：要求「关键词 + 可输入框」同时命中，避免误伤科普文。
+          // 4) Two-factor verification requires text and a visible input.
           if (anyVisible('input[type="tel"], input[type="text"], input[type="number"]') && /two-factor|双因素|二次验证|authenticator/.test(t)) return 'twofa';
-          // 5) login_required：登录提示 + 页面存在密码/登录框。
+          // 5) Login requires a prompt and a visible login/password field.
           if (anyVisible('input[type="password"], input[name*="login"], input[id*="login"]') && /请登录|请先登录|登录后查看|sign in to continue|please sign in|log in to continue/.test(t)) return 'login_required';
-          // 6) payment_verify：支付/银行验证，要求存在输入框。
+          // 6) Payment verification requires a visible input.
           if (anyVisible('input[type="password"], input[type="tel"]') && /支付密码|payment password|银行短信|bank verification/.test(t)) return 'payment_verify';
-          // 7) identity_verify：实名认证。
+          // 7) Identity verification requires a visible input or form.
           if (/实名认证|identity verification|verify your identity/.test(t) && (anyVisible('input') || anyVisible('form'))) return 'identity_verify';
           return null;
-        })()"#)
-        .await
-        .ok()?;
-    let v = result.value().and_then(|v| v.as_str())?.to_string();
-    if v.is_empty() { None } else { Some(v) }
-}
+        })()"#;
 
 /// Builds the "user action required" tag appended to tool output (single source of truth, avoids duplication).
 fn user_action_tag(cat: &str) -> String {
@@ -300,12 +330,16 @@ fn user_action_tag(cat: &str) -> String {
 /// Reused by navigate / get_text / get_html / click / type_text / press_key,
 /// keeping the session flag consistent with the actual page state.
 async fn detect_and_mark(s: &mut BrowserSession) -> String {
-    if let Some(cat) = detect_user_action_required(&s.page).await {
-        s.pending_human = Some(cat.clone());
-        user_action_tag(&cat)
-    } else {
-        s.pending_human = None;
-        String::new()
+    match detect_user_action_required(&s.page).await {
+        Ok(Some(cat)) => {
+            s.pending_human = Some(cat.clone());
+            user_action_tag(&cat)
+        }
+        Ok(None) => {
+            s.pending_human = None;
+            String::new()
+        }
+        Err(reason) => format!("\n[HUMAN_ACTION_UNKNOWN] {reason}"),
     }
 }
 
@@ -356,20 +390,25 @@ async fn tool_navigate(
             .goto(url.clone())
             .await
             .map_err(|e| format!("navigation failed: {e}"))?;
-        s.page
-            .wait_for_navigation()
-            .await
-            .map_err(|e| format!("wait_for_navigation failed: {e}"))?;
         if let Some(sel) = &wait_selector {
-            wait_for_selector(&s.page, sel, 30_000).await.map_err(|e| {
-                format!("navigate 等待元素超时：{e}（可忽略后继续，用 wait_for 重试）")
-            })?;
+            wait_for_selector(&s.page, sel, ms.saturating_sub(1_000))
+                .await
+                .map_err(|e| {
+                    format!("navigate 等待元素超时：{e}（可忽略后继续，用 wait_for 重试）")
+                })?;
         }
         let title = s.page.get_title().await.ok().flatten().unwrap_or_default();
         let final_url = s.page.url().await.ok().flatten().unwrap_or(url.clone());
         // New page = new state: clear the stale human-action flag, then re-detect on the new page.
         s.pending_human = None;
-        let mut summary = format!("Navigated to {final_url}\nTitle: {title}");
+        let state = post_action_state(s).await;
+        let outcome = if state.contains("\"readyState\":\"complete\"") {
+            "complete"
+        } else {
+            "incomplete"
+        };
+        let mut summary =
+            format!("Navigated to {final_url}\nTitle: {title}\nload_outcome={outcome}\n{state}");
         summary.push_str(&detect_and_mark(s).await);
         Ok(summary)
     })
@@ -382,80 +421,53 @@ async fn tool_click(
     session: &mut Option<BrowserSession>,
     args: &Value,
 ) -> Result<Value, JsonRpcErr> {
-    let selector = require_str(args, "selector")?;
-    let ms = op_timeout_ms();
+    let target = args["selector"]
+        .as_str()
+        .or_else(|| args["ref"].as_str())
+        .unwrap();
     let s = ensure_session(session)
         .await
         .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
-
-    // While a human action is still pending, prompt the model to stop first (see pending_warning).
     let pending = pending_warning(s);
-    let tag = with_timeout(ms, async {
-        let el = s
-            .page
-            .find_element(selector.clone())
-            .await
-            .map_err(|e| format!("element '{selector}' not found: {e}"))?;
-        el.scroll_into_view()
-            .await
-            .map_err(|e| format!("scroll_into_view failed: {e}"))?;
-        el.click().await.map_err(|e| format!("click failed: {e}"))?;
-        // Clicks often trigger captchas/login walls: detect and flag immediately after the action so the model knows right away.
-        Ok(detect_and_mark(s).await)
+    let summary = with_timeout(op_timeout_ms(), async {
+        let object = crate::snapshot::resolve_target(s, args).await?;
+        let verdict = crate::snapshot::click(s, &object).await?;
+        let state = post_action_state(s).await;
+        let tag = detect_and_mark(s).await;
+        Ok(format!(
+            "{pending}click target={target}\n{verdict}\n{state}{tag}"
+        ))
     })
     .await?;
-
-    Ok(text_content(format!("{pending}Clicked {selector}{tag}")))
+    Ok(text_content(summary))
 }
 
 async fn tool_type_text(
     session: &mut Option<BrowserSession>,
     args: &Value,
 ) -> Result<Value, JsonRpcErr> {
-    let selector = require_str(args, "selector")?;
-    // The AppleScript driver rejects an empty 'text' (require_str), so enforce the
-    // same contract here: an empty string is not a meaningful type operation and
-    // silently typing 0 chars only confuses the model.
-    let text = require_str(args, "text")?;
-    let submit = args
-        .get("submit")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let char_count = text.chars().count();
-    let ms = op_timeout_ms();
+    let target = args["selector"]
+        .as_str()
+        .or_else(|| args["ref"].as_str())
+        .unwrap();
+    let text = args["text"].as_str().unwrap();
+    let submit = args["submit"].as_bool().unwrap_or(false);
     let s = ensure_session(session)
         .await
         .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
-
-    // While a human action is still pending, prompt the model to stop first (see pending_warning).
     let pending = pending_warning(s);
-    let tag = with_timeout(ms, async {
-        let el = s
-            .page
-            .find_element(selector.clone())
-            .await
-            .map_err(|e| format!("element '{selector}' not found: {e}"))?;
-        el.scroll_into_view()
-            .await
-            .map_err(|e| format!("scroll_into_view failed: {e}"))?;
-        el.focus().await.map_err(|e| format!("focus failed: {e}"))?;
-        el.type_str(&text)
-            .await
-            .map_err(|e| format!("type failed: {e}"))?;
-        if submit {
-            el.press_key("Enter")
-                .await
-                .map_err(|e| format!("submit (Enter) failed: {e}"))?;
-        }
-        // Submits often trigger captchas/login walls: detect and flag immediately after the action so the model knows right away.
-        Ok(detect_and_mark(s).await)
+    let summary = with_timeout(op_timeout_ms(), async {
+        let object = crate::snapshot::resolve_target(s, args).await?;
+        let verdict = crate::snapshot::replace_text(s, &object, text, submit).await?;
+        let state = post_action_state(s).await;
+        let tag = detect_and_mark(s).await;
+        Ok(format!(
+            "{pending}type_text target={target} requested_chars={} (submit={submit})\n{verdict}\n{state}{tag}",
+            text.chars().count()
+        ))
     })
     .await?;
-
-    let suffix = if submit { " and pressed Enter" } else { "" };
-    Ok(text_content(format!(
-        "{pending}Typed {char_count} chars into {selector}{suffix}{tag}"
-    )))
+    Ok(text_content(summary))
 }
 
 async fn tool_press_key(
@@ -503,7 +515,11 @@ async fn tool_press_key(
             .await
             .map_err(|e| format!("press_key '{key}' failed: {e}"))?;
         // Enter submissions often trigger captchas/login walls: detect and flag immediately after the action so the model knows right away.
-        Ok(detect_and_mark(s).await)
+        Ok(format!(
+            "\n{}{}",
+            post_action_state(s).await,
+            detect_and_mark(s).await
+        ))
     })
     .await?;
 
@@ -515,15 +531,15 @@ async fn tool_scroll(
     args: &Value,
 ) -> Result<Value, JsonRpcErr> {
     let selector = opt_str(args, "selector");
-    let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
-    let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+    let x = args.get("x").and_then(|v| v.as_u64()).unwrap_or(0);
+    let y = args.get("y").and_then(|v| v.as_u64()).unwrap_or(0);
     let ms = op_timeout_ms();
     let s = ensure_session(session)
         .await
         .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
 
     let summary = with_timeout(ms, async {
-        if let Some(sel) = &selector {
+        let action = if let Some(sel) = &selector {
             let el = s
                 .page
                 .find_element(sel.clone())
@@ -532,14 +548,21 @@ async fn tool_scroll(
             el.scroll_into_view()
                 .await
                 .map_err(|e| format!("scroll_into_view failed: {e}"))?;
-            Ok(format!("Scrolled {sel} into view"))
+            format!("Scrolled {sel} into view")
         } else {
             s.page
                 .evaluate_expression(format!("window.scrollTo({x}, {y})"))
                 .await
                 .map_err(|e| format!("window scroll failed: {e}"))?;
-            Ok(format!("Scrolled window to ({x}, {y})"))
-        }
+            format!("Scrolled window to ({x}, {y})")
+        };
+        Ok(format!(
+            "{}{}\n{}{}",
+            pending_warning(s),
+            action,
+            post_action_state(s).await,
+            detect_and_mark(s).await
+        ))
     })
     .await?;
 
@@ -550,37 +573,44 @@ async fn tool_wait_for(
     session: &mut Option<BrowserSession>,
     args: &Value,
 ) -> Result<Value, JsonRpcErr> {
-    let selector = require_str(args, "selector")?;
-    let timeout_ms = args
-        .get("timeout_ms")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(15_000);
-    // The outer with_timeout keeps ONLY the operation cap (op_timeout_ms, <= 90s).
-    // The user's timeout_ms belongs to the loop's own deadline below: squeezing the
-    // outer cap to it used to make with_timeout fire at the same instant, returning
-    // the misleading "server cap" wording and leaving the not-found branch dead.
-    let cap = op_timeout_ms();
+    let target = crate::contract::parse_wait_target(args)?;
+    let timeout_ms = args["timeout_ms"]
+        .as_u64()
+        .unwrap_or(15_000)
+        .min(op_timeout_ms().saturating_sub(1_000));
     let s = ensure_session(session)
         .await
         .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
-
-    let summary = with_timeout(cap, async {
+    let summary = with_timeout(op_timeout_ms(), async {
         let start = std::time::Instant::now();
         loop {
-            if s.page.find_element(selector.clone()).await.is_ok() {
-                let ms = start.elapsed().as_millis();
-                return Ok(format!("Found {selector} after {ms} ms"));
+            let result = s
+                .page
+                .evaluate_expression(target.script())
+                .await
+                .map_err(|e| format!("wait_for inspection failed: {e}"))?;
+            let observation = result.value().ok_or("wait_for observation missing")?;
+            let url = observation["current_url"]
+                .as_str()
+                .ok_or("wait_for URL observation missing")?;
+            if observation["matched"] == true {
+                let tag = detect_and_mark(s).await;
+                return Ok(format!(
+                    "Wait met: {} after {} ms\ncurrent_url: {url}{tag}",
+                    target.description(),
+                    start.elapsed().as_millis()
+                ));
             }
-            if start.elapsed().as_millis() as u64 >= timeout_ms {
+            if start.elapsed().as_millis() >= timeout_ms as u128 {
                 return Err(format!(
-                    "selector '{selector}' not found within {timeout_ms} ms"
+                    "{} not met within {timeout_ms} ms; observed current_url: {url}",
+                    target.description()
                 ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     })
     .await?;
-
     Ok(text_content(summary))
 }
 
@@ -597,11 +627,14 @@ async fn tool_evaluate_js(
     let value = with_timeout(ms, async {
         let result = s
             .page
-            .evaluate_expression(expression.clone())
+            .evaluate_expression(crate::contract::evaluation_script(&expression))
             .await
             .map_err(|e| format!("evaluate failed: {e}"))?;
-        let json_val = result.value().cloned().unwrap_or(Value::Null);
-        Ok(serde_json::to_string_pretty(&json_val).unwrap_or_else(|_| json_val.to_string()))
+        let raw = result
+            .value()
+            .and_then(Value::as_str)
+            .ok_or("missing JavaScript envelope")?;
+        crate::contract::decode_evaluation(raw)
     })
     .await?;
 
@@ -612,174 +645,108 @@ async fn tool_get_text(
     session: &mut Option<BrowserSession>,
     args: &Value,
 ) -> Result<Value, JsonRpcErr> {
-    let selector = opt_str(args, "selector").unwrap_or_else(|| "body".to_string());
-    let ms = op_timeout_ms();
-    let s = ensure_session(session)
-        .await
-        .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
-
-    let text = with_timeout(ms, async {
-        let el = s
-            .page
-            .find_element(selector.clone())
-            .await
-            .map_err(|e| format!("element '{selector}' not found: {e}"))?;
-        let inner = el
-            .inner_text()
-            .await
-            .map_err(|e| format!("inner_text failed: {e}"))?
-            .unwrap_or_default();
-        // The detection is returned separately from the body so the tag is not swallowed by cap_text truncation (the body may be ≥ 24K).
-        let tag = detect_and_mark(s).await;
-        Ok((inner, tag))
-    })
-    .await?;
-
-    let (inner, tag) = text;
-    let mut out = cap_text(&inner);
-    out.push_str(&tag);
-    Ok(text_content(out))
+    tool_extract(session, args, false).await
 }
 
 async fn tool_get_html(
     session: &mut Option<BrowserSession>,
     args: &Value,
 ) -> Result<Value, JsonRpcErr> {
-    let selector = opt_str(args, "selector");
-    let ms = op_timeout_ms();
+    tool_extract(session, args, true).await
+}
+
+async fn tool_extract(
+    session: &mut Option<BrowserSession>,
+    args: &Value,
+    html: bool,
+) -> Result<Value, JsonRpcErr> {
     let s = ensure_session(session)
         .await
         .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
-
-    let html = with_timeout(ms, async {
-        let content = match &selector {
-            Some(sel) => {
-                let el = s
-                    .page
-                    .find_element(sel.clone())
-                    .await
-                    .map_err(|e| format!("element '{sel}' not found: {e}"))?;
-                Ok(el
-                    .outer_html()
-                    .await
-                    .map_err(|e| format!("outer_html failed: {e}"))?
-                    .unwrap_or_default())
-            }
-            None => s
-                .page
-                .content()
-                .await
-                .map_err(|e| format!("content failed: {e}")),
-        }?;
-        // The detection is returned separately from the body so the tag is not swallowed by cap_text truncation (HTML easily exceeds 24K).
+    let summary = with_timeout(op_timeout_ms(), async {
+        let result = s
+            .page
+            .evaluate_expression(crate::contract::extraction_script(args, html))
+            .await
+            .map_err(|e| format!("extraction failed: {e}"))?;
+        let raw = result
+            .value()
+            .and_then(Value::as_str)
+            .ok_or("missing extraction envelope")?;
+        let body = crate::contract::decode_extraction(raw)?;
         let tag = detect_and_mark(s).await;
-        Ok((content, tag))
+        Ok(format!("{body}{tag}"))
     })
     .await?;
-
-    let (content, tag) = html;
-    let mut out = cap_text(&content);
-    out.push_str(&tag);
-    Ok(text_content(out))
+    Ok(text_content(summary))
 }
 
-/// Blocks waiting for the user to manually complete a verification step in the visible window (captcha / slider / SMS code / 2FA / login ...).
-///
-/// # Why renewable bounded segments instead of waiting indefinitely
-/// The host enforces a single `request_timeout_ms` per MCP server (default 120s). Once any
-/// tools/call exceeds it, the host **kills and restarts the subprocess, destroying the whole browser session**
-/// (see AGENTS.md invariant #2). Human completion of a captcha often takes minutes; if this tool blocked to the end,
-/// it would inevitably time out → window killed → the user's half-finished work lost.
-///
-/// Therefore this tool **blocks for at most one bounded budget per call** (fixed 60s max, hard-clamped to be well below
-/// the server op cap), polling `detect_user_action_required` every 2s meanwhile:
-/// - 2 consecutive polls with no blocking signal → return `status=resolved` (human finished; automation may continue);
-///   consecutive confirmation avoids false "resolved" reports from re-renders or transient detection jitter.
-/// - Each poll has its own 5s timeout: a hung poll is treated as "still blocked", never misreported as resolved.
-/// - Budget exhausted and still unfinished → return **normally** (not an error) `status=still_waiting`, telling the model
-///   **to end the turn and hand the action to the user**, then call this tool again after the user replies. It never returns a -32001
-///   timeout error, so the model never misreads it as failure; headless mode (no visible window) returns unavailable immediately.
-///
-/// This is both **a real block** (completion inside the window is detected and returned immediately) and never triggers the host's
-/// kill+restart, letting the user complete arbitrarily long manual work across multiple calls.
+/// Wait in a bounded segment; only successful clean inspections can resolve it.
 async fn tool_wait_for_human(
     session: &mut Option<BrowserSession>,
     args: &Value,
 ) -> Result<Value, JsonRpcErr> {
-    let expect = opt_str(args, "expect");
-    let relay = opt_str(args, "message");
-
-    // Blocking budget per call: fixed 60s max (return as soon as the human finishes; otherwise wait at most 1 minute).
-    // Still hard-clamped to [2s, op_timeout - 15s], leaving enough headroom for the final poll + return,
-    // ensuring it never approaches the host request_timeout.
-    let op_cap = op_timeout_ms();
-    let ceiling = op_cap.saturating_sub(15_000).max(5_000);
-    let budget_ms = 60_000u64.min(ceiling);
-
-    // In headless mode the user cannot see or operate the window at all — return immediately instead of idling (also avoids launching a browser).
-    let headless = std::env::var("MCP_BROWSER_HEADLESS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if headless {
+    if crate::browser::headless_from_env() && std::env::var_os("MCP_BROWSER_WS_URL").is_none() {
         return Ok(text_content(
-            "status=unavailable\nBrowser is HEADLESS - the user has no visible window to act in. Relaunch with MCP_BROWSER_HEADLESS=0 (headed) so the user can complete the action, then call wait_for_human again.",
+            "status=unavailable\nBrowser is headless. Relaunch with MCP_BROWSER_HEADLESS=0 for a visible dedicated window.",
         ));
     }
-
     let s = ensure_session(session)
         .await
         .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
-
-    let poll_interval = std::time::Duration::from_millis(2_000);
-    let poll_timeout = std::time::Duration::from_secs(5);
+    let budget_ms = crate::browser::human_wait_budget_ms(op_timeout_ms());
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
-
-    // Polling loop within a segment. Note: this loop is itself bounded by budget_ms; no with_timeout wrapper.
-    let mut last_seen: Option<String> = None;
-    let mut clean_polls = 0u32;
+    let mut last_seen = s.pending_human.clone();
+    let mut clean_polls = 0;
     loop {
-        match tokio::time::timeout(poll_timeout, detect_user_action_required(&s.page)).await {
-            Ok(Some(cat)) => {
-                // Blocking signal still present: record the category and keep waiting.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(
+            remaining.min(std::time::Duration::from_secs(5)),
+            detect_user_action_required(&s.page),
+        )
+        .await
+        {
+            Ok(Ok(Some(cat))) => {
+                s.pending_human = Some(cat.clone());
                 last_seen = Some(cat);
                 clean_polls = 0;
             }
-            Ok(None) => {
-                // Blocking signal gone: confirm completion only after 2 consecutive clean polls (guards against re-render jitter).
+            Ok(Ok(None)) => {
                 clean_polls += 1;
                 if clean_polls >= 2 {
-                    let url = s.page.url().await.ok().flatten().unwrap_or_default();
-                    let note = match &last_seen {
-                        Some(c) => format!("resolved: '{c}' cleared"),
-                        None => "resolved: no blocking signal detected".to_string(),
-                    };
                     s.pending_human = None;
                     return Ok(text_content(format!(
-                        "status=resolved\n{note}\ncurrent_url: {url}\nYou may continue browser automation now."
+                        "status=resolved\n{}\nYou may continue browser automation.",
+                        post_action_state(s).await
                     )));
                 }
             }
+            Ok(Err(reason)) => {
+                return Ok(text_content(format!(
+                    "status=unknown\nHuman action remains pending: inspection failed: {reason}"
+                )));
+            }
             Err(_) => {
-                // A single poll timed out (CDP hung): treat as "still blocked" and keep waiting without accumulating clean_polls.
+                return Ok(text_content(
+                    "status=unknown\nHuman action remains pending: inspection exceeded its polling deadline.",
+                ));
             }
         }
-
-        if std::time::Instant::now() + poll_interval >= deadline {
-            break;
-        }
-        tokio::time::sleep(poll_interval).await;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        tokio::time::sleep(remaining.min(std::time::Duration::from_secs(2))).await;
     }
-
-    // Budget exhausted and still unfinished: return still_waiting normally (not an error), guiding the model to hand control back to the user.
-    let cat = last_seen
-        .or(expect)
-        .unwrap_or_else(|| "unknown".to_string());
-    s.pending_human = Some(cat.clone());
-    let hint = relay
+    let category = last_seen
+        .or_else(|| opt_str(args, "expect"))
+        .unwrap_or_else(|| "unknown".into());
+    s.pending_human = Some(category.clone());
+    let relay = opt_str(args, "message")
         .map(|m| format!("\nInstruction for the user: {m}"))
         .unwrap_or_default();
     Ok(text_content(format!(
-        "status=still_waiting\nStill waiting for the user to complete '{cat}' in the visible browser window after {budget_ms} ms.{hint}\nEnd your turn now and ask the user to complete it in the browser window; when they reply, call wait_for_human again to verify and continue."
+        "status=still_waiting\nWaiting for '{category}' after {budget_ms} ms.{relay}\nEnd your turn and ask the user to complete it; call wait_for_human after they reply."
     )))
 }
 
@@ -798,7 +765,7 @@ async fn tool_screenshot(
         .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
 
     let saved = out_path.clone();
-    with_timeout(ms, async {
+    let tag = with_timeout(ms, async {
         let params = ScreenshotParams::builder()
             .format(CaptureScreenshotFormat::Png)
             .full_page(full_page)
@@ -807,12 +774,12 @@ async fn tool_screenshot(
             .save_screenshot(params, &saved)
             .await
             .map_err(|e| format!("screenshot failed: {e}"))?;
-        Ok(())
+        Ok(detect_and_mark(s).await)
     })
     .await?;
 
     Ok(text_content(format!(
-        "Saved screenshot to {} (full_page={full_page})",
+        "Saved screenshot to {} (full_page={full_page}){tag}",
         out_path.display()
     )))
 }
@@ -855,7 +822,18 @@ async fn tool_list_tabs(session: &mut Option<BrowserSession>) -> Result<Value, J
         let mut lines = Vec::with_capacity(pages.len());
         for (i, p) in pages.iter().enumerate() {
             let url = p.url().await.ok().flatten().unwrap_or_default();
-            lines.push(format!("#{i}: {url}"));
+            let id = p.target_id().as_ref();
+            let current = if id == s.page.target_id().as_ref() {
+                " [current]"
+            } else {
+                ""
+            };
+            let owned = if s.owned_pages.iter().any(|known| known == id) {
+                " [owned]"
+            } else {
+                ""
+            };
+            lines.push(format!("#{i} id={id}: {url}{current}{owned}"));
         }
         if lines.is_empty() {
             Ok("(no open tabs)".to_string())
@@ -876,4 +854,120 @@ async fn tool_close_browser(session: &mut Option<BrowserSession>) -> Result<Valu
         }
         None => Ok(text_content("No active browser session")),
     }
+}
+
+async fn post_action_state(s: &BrowserSession) -> String {
+    match s
+        .page
+        .evaluate_expression(crate::contract::STATE_SCRIPT)
+        .await
+    {
+        Ok(result) => result
+            .value()
+            .and_then(Value::as_str)
+            .unwrap_or("post_action_state=unknown")
+            .to_string(),
+        Err(e) => format!("post_action_state=unknown: {e}"),
+    }
+}
+
+async fn tool_snapshot(
+    session: &mut Option<BrowserSession>,
+    args: &Value,
+) -> Result<Value, JsonRpcErr> {
+    let s = ensure_session(session)
+        .await
+        .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
+    let output = with_timeout(
+        op_timeout_ms(),
+        crate::snapshot::snapshot(
+            s,
+            args["offset"].as_u64().unwrap_or(0) as usize,
+            args["limit"].as_u64().unwrap_or(100) as usize,
+        ),
+    )
+    .await?;
+    crate::snapshot::validate_payload(&output)
+        .map_err(|reason| JsonRpcErr::new(-32000, &reason, None))?;
+    Ok(text_content(output))
+}
+
+async fn tool_switch_tab(
+    session: &mut Option<BrowserSession>,
+    args: &Value,
+) -> Result<Value, JsonRpcErr> {
+    let id = require_str(args, "id")?;
+    let s = ensure_session(session)
+        .await
+        .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
+    let output = with_timeout(op_timeout_ms(), async {
+        let page = s
+            .browser
+            .get_page(id.clone().into())
+            .await
+            .map_err(|e| format!("unknown tab id '{id}': {e}"))?;
+        s.page = page;
+        s.pending_human = None;
+        Ok(format!(
+            "Selected tab {id}\n{}{}",
+            post_action_state(s).await,
+            detect_and_mark(s).await
+        ))
+    })
+    .await?;
+    Ok(text_content(output))
+}
+
+async fn tool_close_tab(
+    session: &mut Option<BrowserSession>,
+    args: &Value,
+) -> Result<Value, JsonRpcErr> {
+    let id = require_str(args, "id")?;
+    let s = ensure_session(session)
+        .await
+        .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
+    let output = with_timeout(op_timeout_ms(), async {
+        if !s.may_close_tab(&id) {
+            return Err("cannot close a tab this session did not create".into());
+        }
+        let current = id == s.page.target_id().as_ref();
+        // Create a replacement before closing the last active page, so every
+        // subsequent tool still has a valid target without touching foreign tabs.
+        if current {
+            let replacement = s
+                .browser
+                .pages()
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|page| {
+                    page.target_id().as_ref() != id && s.may_close_tab(page.target_id().as_ref())
+                });
+            s.page = match replacement {
+                Some(page) => page,
+                None => {
+                    let page = s
+                        .browser
+                        .new_page("about:blank")
+                        .await
+                        .map_err(|e| format!("replacement tab failed: {e}"))?;
+                    s.owned_pages.push(page.target_id().as_ref().to_string());
+                    page
+                }
+            };
+            s.pending_human = None;
+        }
+        s.browser
+            .execute(
+                chromiumoxide::cdp::browser_protocol::target::CloseTargetParams::new(id.clone()),
+            )
+            .await
+            .map_err(|e| format!("close tab failed: {e}"))?;
+        s.owned_pages.retain(|known| known != &id);
+        s.snapshot_refs
+            .retain(|(reference, _)| !reference.starts_with(&format!("{id}:")));
+        Ok(format!("Closed tab {id}\n{}", post_action_state(s).await))
+    })
+    .await?;
+    Ok(text_content(output))
 }

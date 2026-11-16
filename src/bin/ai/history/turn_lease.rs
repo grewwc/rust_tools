@@ -76,10 +76,7 @@ impl TurnLease {
     /// session id was sanitized on its way to disk. A lease held by another
     /// live process returns `io::ErrorKind::WouldBlock` with the owner pid when
     /// the owner marker can be read.
-    pub(in crate::ai) fn acquire(
-        history_file: &Path,
-        session_id: &str,
-    ) -> io::Result<Self> {
+    pub(in crate::ai) fn acquire(history_file: &Path, session_id: &str) -> io::Result<Self> {
         FileLease::acquire(
             history_file,
             "turn.lock",
@@ -121,10 +118,7 @@ impl SessionOpenLease {
     /// database. A lease held by another live process returns
     /// `io::ErrorKind::WouldBlock` with the owner pid when the owner marker can
     /// be read.
-    pub(in crate::ai) fn acquire(
-        history_file: &Path,
-        session_id: &str,
-    ) -> io::Result<Self> {
+    pub(in crate::ai) fn acquire(history_file: &Path, session_id: &str) -> io::Result<Self> {
         FileLease::acquire(
             history_file,
             "open.lock",
@@ -202,6 +196,34 @@ fn read_owner(path: &Path) -> Option<String> {
         .filter(|owner| !owner.is_empty())
 }
 
+/// Only an inconclusive open or lock probe leaves ownership unknown.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::ai) enum TurnLeaseProbe {
+    Free,
+    Held,
+    Unknown,
+}
+
+/// Sample turn ownership without creating files or reading session history.
+/// A stale PID marker alone is never evidence of a running turn.
+pub(in crate::ai) fn probe_turn_lease(history_file: &Path) -> TurnLeaseProbe {
+    if !crate::ai::history::is_sqlite_path(history_file) {
+        return TurnLeaseProbe::Free;
+    }
+    let path = history_file.with_extension("turn.lock");
+    let file = match open_existing_lock_file(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return TurnLeaseProbe::Free,
+        Err(_) => return TurnLeaseProbe::Unknown,
+    };
+    match try_lock_exclusive(&file) {
+        Ok(()) => TurnLeaseProbe::Free,
+        // The flock proves ownership even before or without a successful PID write.
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => TurnLeaseProbe::Held,
+        Err(_) => TurnLeaseProbe::Unknown,
+    }
+}
+
 /// Read-only probe for a turn lease held by another live process.
 ///
 /// The serve daemon uses this to notice a turn started by a terminal or a
@@ -248,10 +270,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "a-turn-lease-{}-{nanos}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("a-turn-lease-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&root).expect("create temp root");
         root
     }
@@ -273,8 +293,8 @@ mod tests {
     #[test]
     fn different_sessions_do_not_block_each_other() {
         let root = temp_root();
-        let first = TurnLease::acquire(&root.join("session-a.sqlite"), "session-a")
-            .expect("first lease");
+        let first =
+            TurnLease::acquire(&root.join("session-a.sqlite"), "session-a").expect("first lease");
         let second = TurnLease::acquire(&root.join("session-b.sqlite"), "session-b")
             .expect("second session lease");
         drop(first);
@@ -327,5 +347,37 @@ mod tests {
         drop(lease);
         assert_eq!(turn_lease_owner(&history), None);
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn session_activity_probe_distinguishes_free_held_and_unknown() {
+        let root = temp_root();
+        let history = root.join("session-a.sqlite");
+        let lock = history.with_extension("turn.lock");
+        assert_eq!(probe_turn_lease(&history), TurnLeaseProbe::Free);
+        assert!(!lock.exists(), "probing must not create a missing lock");
+
+        let lease = TurnLease::acquire(&history, "session-a").expect("lease");
+        let owner = fs::read(&lock).expect("owner");
+        assert_eq!(probe_turn_lease(&history), TurnLeaseProbe::Held);
+        assert_eq!(fs::read(&lock).expect("unmodified owner"), owner);
+        for marker in ["", "not-a-pid", "0"] {
+            fs::write(&lock, marker).expect("unreadable owner marker");
+            assert_eq!(probe_turn_lease(&history), TurnLeaseProbe::Held);
+            assert_eq!(
+                TurnLease::acquire(&history, "session-a")
+                    .expect_err("probe must not release the live lease")
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        fs::write(&lock, owner).expect("restore owner");
+        drop(lease);
+        assert_eq!(probe_turn_lease(&history), TurnLeaseProbe::Free);
+
+        fs::remove_file(&lock).expect("remove free lock");
+        fs::create_dir(&lock).expect("make lock unprobeable");
+        assert_eq!(probe_turn_lease(&history), TurnLeaseProbe::Unknown);
+        fs::remove_dir_all(&root).expect("remove test root");
     }
 }

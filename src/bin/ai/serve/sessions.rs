@@ -8,6 +8,67 @@ use crate::ai::driver::commands::use_backend::{
 use crate::ai::history::{MarkMessageUpdate, with_sessions_lifecycle_lock};
 use crate::ai::tools::task_tools::BackendId;
 
+pub(super) const MAX_SESSION_ACTIVITY_IDS: usize = 256;
+pub(super) const MAX_SESSION_ACTIVITY_REQUEST_BYTES: usize = 64 * 1024;
+
+pub(super) fn session_activity(
+    state: &ServeState,
+    store: &SessionStore,
+    id: &str,
+) -> SessionActivity {
+    use crate::ai::history::turn_lease::{TurnLeaseProbe, probe_turn_lease};
+
+    let local = state
+        .active_turns
+        .lock()
+        .map(|turns| turns.contains_key(id));
+    if matches!(local, Ok(true)) {
+        return SessionActivity::Running;
+    }
+    match probe_turn_lease(&store.session_history_file(id)) {
+        TurnLeaseProbe::Held => SessionActivity::Running,
+        TurnLeaseProbe::Free if local.is_ok() => SessionActivity::Idle,
+        _ => SessionActivity::Unknown,
+    }
+}
+
+/// Bulk, uncached turn samples for loaded IDs. This route deliberately does
+/// not enumerate SQLite files, read metadata, or compute session totals.
+pub(crate) async fn list_session_activity(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Json(req): Json<SessionActivityReq>,
+) -> Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if req.ids.len() > MAX_SESSION_ACTIVITY_IDS {
+        return bad_request(format!(
+            "at most {MAX_SESSION_ACTIVITY_IDS} session ids are allowed"
+        ))
+        .into_response();
+    }
+    for id in &req.ids {
+        if SessionStore::validate_session_id(id).is_err() {
+            return bad_request(format!("invalid session id: {id}")).into_response();
+        }
+    }
+    let store = SessionStore::new(state.history_file.as_path());
+    let items: Vec<SessionActivityItem> = req
+        .ids
+        .into_iter()
+        .map(|id| SessionActivityItem {
+            activity: session_activity(&state, &store, &id),
+            id,
+        })
+        .collect();
+    let mut response = Json(items).into_response();
+    response
+        .headers_mut()
+        .insert("cache-control", HeaderValue::from_static("no-store"));
+    response
+}
+
 /// Render the config response. `subagent_backend` carries an explicitly stored
 /// canonical choice verbatim. Without one, an agent-team session reports the
 /// TraeCLI default its picker uses (and that the runtime applies), while an
@@ -128,6 +189,7 @@ pub(crate) async fn list_sessions(
                 marked: s.marked,
                 archived: s.archived,
                 cwd,
+                activity: SessionActivity::Unknown,
             }
         })
         .collect();
@@ -154,7 +216,14 @@ pub(crate) async fn list_sessions(
     {
         all.push(item);
     }
+    // Probe only the returned page, including an explicitly selected older ID.
+    for item in &mut all {
+        item.activity = session_activity(&state, &store, &item.id);
+    }
     let mut response = (StatusCode::OK, Json(serde_json::json!(all))).into_response();
+    response
+        .headers_mut()
+        .insert("cache-control", HeaderValue::from_static("no-store"));
     response.headers_mut().insert(
         "x-sessions-total",
         axum::http::HeaderValue::from_str(&total.to_string()).unwrap(),

@@ -23,6 +23,9 @@ const restoreSrc = script.slice(
   script.indexOf("function clearDraft("),
 );
 const loadSessionsSrc = script.slice(
+  script.indexOf("// BEGIN session activity"),
+  script.indexOf("// END session activity"),
+) + script.slice(
   script.indexOf("let sessionsLoadSeq = 0;"),
   script.indexOf("// History is append-only"),
 );

@@ -1,4 +1,4 @@
-//! AppleScript driver mode: drives the **user's already-open Chrome** directly (the default driver).
+//! AppleScript driver mode: drives the **user's already-open Chrome** directly (explicit opt-in).
 //!
 //! Why it exists: CDP can only attach to a "specially launched" Chrome, and Chrome 136+
 //! refuses to enable `--remote-debugging-port` on the default profile, so a browser the
@@ -38,6 +38,7 @@ use mcp_stdio::{JsonRpcErr, cap_text, text_content, with_timeout};
 use serde_json::{Value, json};
 use tokio::process::Command;
 
+use crate::contract::{opt_str, require_str};
 use crate::tools::{op_timeout_ms, resolve_screenshot_path};
 
 /// Non-blocking probe of macOS Screen Recording permission (TCC). Returns false
@@ -166,108 +167,10 @@ pub fn pending_warning(session: &ApplescriptSession) -> String {
     }
 }
 
-/// Human-verification detection with the same semantics as tools.rs: captcha/slider/
-/// sms_otp/twofa/login_required/payment_verify/identity_verify. captcha means "present
-/// and unsolved" (a dismissed popup does not count); text-only clues require a
-/// keyword + input field to avoid false positives. All signals are visibility-gated:
-/// hidden inputs/iframes (display:none / visibility:hidden / zero-size, e.g. unopened
-/// modals, hidden templates, invisible captchas) never count as blockers. No raw
-/// `body.innerHTML` substring matching is done - SPA bundles/inline config routinely
-/// embed words like "otp" or "factor" in script text, which produced false sms_otp /
-/// login_required reports on internal pages. Text clues instead use visibility-safe
-/// `body.innerText` + a visible input (same keyword rules as the CDP driver). The JS
-/// result is JSON.stringify'd.
-pub const DETECT_USER_ACTION_JS: &str = r#"(function(){
-  var vis = function(el){
-    if (!el) return false;
-    var r = el.getBoundingClientRect();
-    if (!(r.width > 0 && r.height > 0)) return false;
-    try {
-      var st = getComputedStyle(el);
-      if (st.display === 'none' || st.visibility === 'hidden') return false;
-    } catch (e) {}
-    return true;
-  };
-  var out = null;
-  try {
-    // jo: hash-only route signal (e.g. SPA '#/twofa'). Never match body.innerHTML -
-    // inline script/config text containing "otp"/"factor"/"登录后" is not a blocker.
-    var jo = function(p){ return location.hash.indexOf(p) >= 0; };
-    if (jo('sms_otp') || jo('twofa') || jo('two_fa') || jo('factor') || jo('otp')) out = out || 'sms_otp';
-    if (jo('login_required') || jo('login-required') || jo('please login') || jo('请登录') || jo('登录后')) out = out || 'login_required';
-    if (jo('payment_verify') || jo('payment-verify') || jo('verify payment') || jo('验证支付')) out = out || 'payment_verify';
-    if (jo('identity_verify') || jo('identity-verify') || jo('verify identity') || jo('实名') || jo('身份验证')) out = out || 'identity_verify';
-    // The solved state must be read from the HOST document: reCAPTCHA/hCaptcha
-    // store their response token in a textarea on the host page, and the widget
-    // iframe itself is cross-origin, so its contentDocument is null here and
-    // can never be read. A visible captcha iframe/class only counts as a blocker
-    // while unsolved - after solving, the anchor iframe stays in the DOM with a
-    // checkmark, so "present" alone is not "blocked".
-    var solved = (function(){
-      var ta = document.querySelector('textarea[name="g-recaptcha-response"], textarea[name="h-captcha-response"]');
-      return !!(ta && ta.value && ta.value.length > 0);
-    })();
-    if (!solved) {
-      var ifr = document.querySelectorAll('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="captcha"]');
-      for (var i = 0; i < ifr.length; i++) {
-        if (vis(ifr[i])) { out = out || 'captcha'; break; }
-      }
-    }
-    if (!out && !solved) {
-      var caps = document.querySelectorAll('[class*="captcha"], [id*="captcha"], [class*="Captcha"], [id*="Captcha"]');
-      for (var j = 0; j < caps.length; j++) {
-        var el = caps[j];
-        if (!vis(el) || el.tagName === 'SCRIPT') continue;
-        var txt = (el.innerText || '').toLowerCase();
-        if (txt.indexOf('correct') >= 0 || txt.indexOf('solved') >= 0 || txt.indexOf('success') >= 0) continue;
-        out = 'captcha'; break;
-      }
-    }
-    if (!out) {
-      var inputs = document.querySelectorAll('input[type="text"], input:not([type]), input[type="password"], textarea');
-      var hits = {
-        captcha: /captcha|验证码|图形验证|人机验证|点击.?验证/,
-        slider: /slider|drag|滑动|滑块|拖动/,
-        sms_otp: /sms|otp|verification code|验证码|短信/,
-        twofa: /two.?factor|2fa|authenticator|双重验证|二次验证/,
-        login_required: /login|sign.?in|登录|登入/,
-        payment_verify: /payment|支付|verif/,
-        identity_verify: /identity|real.?name|实名|身份/
-      };
-      var cats = ['captcha','slider','sms_otp','twofa','login_required','payment_verify','identity_verify'];
-      for (var k = 0; k < inputs.length; k++) {
-        var inp = inputs[k];
-        if (!vis(inp)) continue;
-        var ph = ((inp.placeholder || '') + ' ' + (inp.getAttribute('aria-label') || '') + ' ' + (inp.name || '')).toLowerCase();
-        for (var c = 0; c < cats.length; c++) {
-          if (hits[cats[c]].test(ph)) { out = out || cats[c]; }
-        }
-      }
-    }
-    // Text + visible input pass, mirroring the CDP driver (tools.rs): body.innerText
-    // is visibility-safe (excludes display:none and <script> content), so keyword
-    // matching here cannot fire on bundle/config text - the original false positive.
-    if (!out) {
-      var t = "";
-      try { t = ((document.body && document.body.innerText) || '').toLowerCase(); } catch (e) {}
-      var anyVis = function(sels){
-        var els = document.querySelectorAll(sels);
-        for (var m = 0; m < els.length; m++) { if (vis(els[m])) return true; }
-        return false;
-      };
-      if (anyVis('input[type="tel"], input[type="text"], input[type="number"]') && /短信验证码|短信动态码|sms.{0,5}code|one-time.{0,5}code|verification code|动态验证码/.test(t)) out = out || 'sms_otp';
-      if (anyVis('input[type="tel"], input[type="text"], input[type="number"]') && /two-factor|双因素|二次验证|authenticator/.test(t)) out = out || 'twofa';
-      if (anyVis('input[type="password"], input[name*="login"], input[id*="login"]') && /请登录|请先登录|登录后查看|sign in to continue|please sign in|log in to continue/.test(t)) out = out || 'login_required';
-      if (anyVis('input[type="password"], input[type="tel"]') && /支付密码|payment password|银行短信|bank verification/.test(t)) out = out || 'payment_verify';
-      if (/实名认证|identity verification|verify your identity/.test(t) && (anyVis('input') || anyVis('form'))) out = out || 'identity_verify';
-    }
-  } catch (e) {}
-  return out ? out : null;
-})()"#;
-
 /// Run a block of osascript (passed via stdin); returns the last stdout line (trimmed).
 async fn run_osascript(script: &str) -> Result<String, String> {
     let mut child = Command::new("/usr/bin/osascript")
+        .kill_on_drop(true)
         .arg("-") // Read the script from stdin to avoid command-line escaping hell.
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -322,6 +225,7 @@ pub struct ApplescriptSession {
     pub window_id: Option<String>,
     pub tab_id: Option<String>,
     pub pending_human: Option<String>,
+    owned_tabs: Vec<(String, String)>,
 }
 
 impl ApplescriptSession {
@@ -399,9 +303,11 @@ impl ApplescriptSession {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
         if let Some(sel) = wait_selector {
-            self.wait_for_selector(sel, 30_000).await.map_err(|e| {
-                format!("navigate 等待元素超时：{e}（可忽略后继续，用 wait_for 重试）")
-            })?;
+            self.wait_for_selector(sel, "present", op_timeout_ms().saturating_sub(1_000))
+                .await
+                .map_err(|e| {
+                    format!("navigate 等待元素超时：{e}（可忽略后继续，用 wait_for 重试）")
+                })?;
         }
         Ok(())
     }
@@ -447,6 +353,7 @@ end tell"#,
             (Some(w), Some(t)) if !w.is_empty() && !t.is_empty() => {
                 self.window_id = Some(w.to_string());
                 self.tab_id = Some(t.to_string());
+                self.owned_tabs.push((w.to_string(), t.to_string()));
                 restore_focus(prev.as_ref());
                 Ok((w.to_string(), t.to_string()))
             }
@@ -470,116 +377,138 @@ end tell"#,
             .unwrap_or(false)
     }
 
-    /// List the tabs in the session window (#idx: url [active]).
+    /// Stable window/tab ids survive reordering; the index is only for reading.
     pub async fn list_tabs(&self) -> Result<String, String> {
-        let wid = match &self.window_id {
-            Some(w) => w.clone(),
-            None => return Ok("(no session window)".to_string()),
-        };
-        let script = format!(
-            r#"tell application "Google Chrome"
-  set ws to URL of every tab of window id {}
-  set ais to active tab index of window id {}
+        if self.window_id.is_none() {
+            return Ok("(no session window)".into());
+        }
+        let script = r##"tell application "Google Chrome"
   set out to ""
-  repeat with i from 1 to (count of ws)
-    set u to item i of ws
-    if i is ais then
-      set out to out & (i as text) & ": " & u & " [active]" & linefeed
-    else
-      set out to out & (i as text) & ": " & u & linefeed
-    end if
+  set i to 0
+  repeat with w in windows
+    repeat with t in tabs of w
+      set out to out & "#" & (i as text) & " id=" & (id of w as text) & ":" & (id of t as text) & ": " & (URL of t) & linefeed
+      set i to i + 1
+    end repeat
   end repeat
   return out
-end tell"#,
-            wid, wid
-        );
-        let out = run_osascript(&script).await?;
-        Ok(out.trim().to_string())
+end tell"##;
+        let mut out = run_osascript(script).await?;
+        if let (Some(w), Some(t)) = (&self.window_id, &self.tab_id) {
+            out.push_str(&format!("\ncurrent_id={w}:{t}"));
+        }
+        Ok(out)
     }
 
-    /// Close the session tab (does not quit Chrome or touch other windows/tabs).
-    pub async fn close_session_tab(&mut self) -> Result<(), String> {
-        if let (Some(w), Some(t)) = (&self.window_id.clone(), &self.tab_id.clone()) {
-            let script = format!(
-                "tell application \"Google Chrome\"\n  close (first tab of window id {} whose id is \"{}\")\nend tell",
-                w, t
-            );
-            if run_osascript(&script).await.is_ok() {
-                self.window_id = None;
-                self.tab_id = None;
-                self.pending_human = None;
-                return Ok(());
-            }
+    pub async fn switch_tab(&mut self, id: &str) -> Result<String, String> {
+        let (window, tab) = parse_tab_id(id)?;
+        let script = format!(
+            "tell application \"Google Chrome\"\n exists (first tab of window id {window} whose id is \"{tab}\")\nend tell"
+        );
+        if run_osascript(&script).await? != "true" {
+            return Err(format!("unknown tab id '{id}'"));
         }
-        // The tab is already gone (closed by the user) -- treat it as "closed" and just clear the state.
+        // Change only the automation target; selecting a visible Chrome tab
+        // would disrupt the user's current page.
+        self.window_id = Some(window.to_string());
+        self.tab_id = Some(tab.to_string());
+        self.pending_human = None;
+        Ok(format!("Selected tab {id}"))
+    }
+
+    pub async fn close_tab(&mut self, id: &str) -> Result<String, String> {
+        let (window, tab) = parse_tab_id(id)?;
+        if !self.owned_tabs.iter().any(|(w, t)| w == window && t == tab) {
+            return Err("cannot close a tab this session did not create".into());
+        }
+        let script = format!(
+            "tell application \"Google Chrome\"\n close (first tab of window id {window} whose id is \"{tab}\")\nend tell"
+        );
+        run_osascript(&script).await?;
+        self.owned_tabs.retain(|(w, t)| w != window || t != tab);
+        if self.window_id.as_deref() == Some(window) && self.tab_id.as_deref() == Some(tab) {
+            let replacement = self.owned_tabs.first().cloned();
+            self.window_id = replacement.as_ref().map(|(w, _)| w.clone());
+            self.tab_id = replacement.map(|(_, t)| t);
+            self.pending_human = None;
+        }
+        Ok(format!("Closed tab {id}"))
+    }
+
+    /// Shutdown closes owned tabs, including after selecting a foreign tab.
+    pub async fn close_session_tab(&mut self) -> Result<(), String> {
+        let tabs = self.owned_tabs.clone();
+        for (w, t) in tabs {
+            let _ = self.close_tab(&format!("{w}:{t}")).await;
+        }
+        self.owned_tabs.clear();
         self.window_id = None;
         self.tab_id = None;
         self.pending_human = None;
         Ok(())
     }
 
-    /// Extract page text (selector optional, defaults to body); append the detection tag after capping.
-    pub async fn get_text_sel(&self, selector: Option<&str>) -> Result<String, String> {
-        let js = match selector {
-            Some(sel) => format!(
-                "JSON.stringify(document.querySelector({}) ? document.querySelector({}).innerText : null)",
-                json!(sel),
-                json!(sel)
-            ),
-            None => "JSON.stringify(document.body ? document.body.innerText : '')".to_string(),
-        };
-        let raw = self.exec_js(&js).await?;
-        let inner = unquote(&raw);
-        if inner == "null" {
-            return Err(format!("未找到选择器 {}", selector.unwrap_or("(body)")));
+    async fn post_action_state(&self) -> String {
+        match self.exec_js(crate::contract::STATE_SCRIPT).await {
+            Ok(state) => state,
+            Err(e) => format!("post_action_state=unknown: {e}"),
         }
-        Ok(cap_text(&inner))
     }
 
-    /// Extract page HTML (selector optional, defaults to documentElement); append the detection tag after capping.
-    pub async fn get_html_sel(&self, selector: Option<&str>) -> Result<String, String> {
-        let js = match selector {
-            Some(sel) => format!(
-                "JSON.stringify(document.querySelector({}) ? document.querySelector({}).outerHTML : null)",
-                json!(sel),
-                json!(sel)
-            ),
-            None => "JSON.stringify(document.documentElement.outerHTML)".to_string(),
-        };
-        let raw = self.exec_js(&js).await?;
-        let inner = unquote(&raw);
-        if inner == "null" {
-            return Err(format!("未找到选择器 {}", selector.unwrap_or("(document)")));
-        }
-        Ok(cap_text(&inner))
+    /// Extract only the requested Unicode character slice in the page.
+    pub async fn extract(&self, args: &Value, html: bool) -> Result<String, String> {
+        let raw = self
+            .exec_js(&crate::contract::extraction_script(args, html))
+            .await?;
+        crate::contract::decode_extraction(&raw)
     }
 
-    /// Execute an arbitrary JS expression in the page (result returned after JSON.stringify).
+    /// Preserve the same JSON serialization and exception contract as CDP.
     pub async fn evaluate_js(&self, expr: &str) -> Result<String, String> {
-        let js = format!(
-            "JSON.stringify((() => {{ try {{ return ({}); }} catch(e) {{ return 'JS_ERROR: ' + e; }} }})())",
-            expr
-        );
-        // User expressions may contain newlines (multi-line expressions are legal); join the lines into a single line.
-        let js = js.lines().collect::<Vec<_>>().join(" ");
-        let raw = self.exec_js(&js).await?;
-        Ok(unquote(&raw))
+        let raw = self
+            .exec_js(&crate::contract::evaluation_script(expr))
+            .await?;
+        crate::contract::decode_evaluation(&raw)
     }
 
-    /// Wait for an element to appear (polling); returns the number of milliseconds waited.
-    pub async fn wait_for_selector(&self, selector: &str, timeout_ms: u64) -> Result<u64, String> {
-        let sel = selector.to_string();
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    /// Navigation's selector wait shares the exact same observation path.
+    pub async fn wait_for_selector(
+        &self,
+        selector: &str,
+        condition: &str,
+        timeout_ms: u64,
+    ) -> Result<u64, String> {
+        let target = crate::contract::WaitTarget::Selector {
+            selector: selector.into(),
+            condition: condition.into(),
+        };
+        self.wait_for_target(&target, timeout_ms)
+            .await
+            .map(|(elapsed, _)| elapsed)
+    }
+
+    /// Wait for a selector condition or an exact URL, reporting the observed URL.
+    async fn wait_for_target(
+        &self,
+        target: &crate::contract::WaitTarget,
+        timeout_ms: u64,
+    ) -> Result<(u64, String), String> {
+        let start = Instant::now();
+        let timeout_ms = timeout_ms.min(op_timeout_ms().saturating_sub(1_000));
         loop {
-            let js = format!("JSON.stringify(!!document.querySelector({}))", json!(&sel));
-            let raw = self.exec_js(&js).await?;
-            if unquote(&raw) == "true" {
-                return Ok(deadline.elapsed().as_millis() as u64);
+            let raw = self.evaluate_js(&target.script()).await?;
+            let observation: Value = serde_json::from_str(&raw)
+                .map_err(|e| format!("wait_for observation invalid: {e}"))?;
+            let url = observation["current_url"]
+                .as_str()
+                .ok_or("wait_for URL observation missing")?;
+            if observation["matched"] == true {
+                return Ok((start.elapsed().as_millis() as u64, url.to_string()));
             }
-            if Instant::now() >= deadline {
+            if start.elapsed().as_millis() >= timeout_ms as u128 {
                 return Err(format!(
-                    "等待超时：{}ms 内未找到选择器 '{}'",
-                    timeout_ms, selector
+                    "{} not met within {timeout_ms} ms; observed current_url: {url}",
+                    target.description()
                 ));
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -612,60 +541,74 @@ end tell"#,
         Ok(())
     }
 
-    /// Click (synthetic click event + native setter input); returns the output text.
+    /// Report a synthetic click's observed event and resulting target state.
     pub async fn click(&self, selector: &str) -> Result<String, String> {
-        let sel = selector.to_string();
-        let js = format!(
-            "(() => {{ const el = document.querySelector({}); if (!el) return JSON.stringify({{ok:false,error:'not found'}}); \
-              el.scrollIntoView({{block:'center'}}); \
-              el.dispatchEvent(new MouseEvent('mousedown', {{bubbles:true, cancelable:true}})); \
-              el.dispatchEvent(new MouseEvent('mouseup', {{bubbles:true, cancelable:true}})); \
-              el.click(); return JSON.stringify({{ok:true}}); }})()",
-            json!(&sel)
-        );
-        let raw = self.exec_js(&js).await?;
-        if unquote(&raw).contains("\"ok\":false") {
-            return Err(format!("未找到可点击元素 {}", selector));
-        }
-        Ok(format!("Clicked {}", selector))
+        let raw = self
+            .evaluate_js(&crate::contract::click_script(selector))
+            .await?;
+        let observed: Value =
+            serde_json::from_str(&raw).map_err(|e| format!("click observation invalid: {e}"))?;
+        Ok(format!(
+            "click target={selector}\n{}",
+            crate::contract::click_verdict(&observed)
+        ))
     }
 
-    /// Type text (native setter + input/change events; can submit the form).
+    /// Replace through the native Unicode setter, then read back before submit.
     pub async fn type_text(
         &self,
         selector: &str,
         text: &str,
         submit: bool,
     ) -> Result<String, String> {
-        let sel = selector.to_string();
-        let text_json = json!(text).to_string();
-        let submit_js = if submit {
-            " if (el.form) { try { el.form.requestSubmit(); } catch(e) {} }"
-        } else {
-            ""
-        };
-        let js = format!(
-            "(() => {{ const el = document.querySelector({}); if (!el) return JSON.stringify({{ok:false}}); \
-              el.scrollIntoView({{block:'center'}}); el.focus(); \
-              const proto = (el.tagName === 'TEXTAREA') ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype; \
-              const setter = Object.getOwnPropertyDescriptor(proto, 'value').set; \
-              setter.call(el, {}); \
-              el.dispatchEvent(new Event('input', {{bubbles:true}})); \
-              el.dispatchEvent(new Event('change', {{bubbles:true}}));{} \
-              return JSON.stringify({{ok:true}}); }})()",
-            json!(&sel),
-            text_json,
-            submit_js
+        let script = format!(
+            r#"(() => {{
+            const el = document.querySelector({selector});
+            if(!el) throw Error('input target not found');
+            const observe = {observe};
+            let observation = observe.call(el);
+            if(!observation.connected || !observation.editable || observation.disabled || observation.read_only)
+                return {{observation}};
+            el.scrollIntoView({{block:'center'}});
+            el.focus();
+            const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            Object.getOwnPropertyDescriptor(proto,'value').set.call(el,{text});
+            el.dispatchEvent(new Event('input',{{bubbles:true}}));
+            el.dispatchEvent(new Event('change',{{bubbles:true}}));
+            observation = observe.call(el);
+            let submission = null;
+            if({submit} && observation.connected && observation.editable && !observation.disabled && !observation.read_only && observation.value === {text}) {{
+                if(!el.form) throw Error('submit requested but input has no form');
+                const form = el.form;
+                let event = null;
+                const mark = e => {{ event = e; }};
+                form.addEventListener('submit',mark,{{once:true}});
+                try {{ form.requestSubmit(); }} finally {{ form.removeEventListener('submit',mark); }}
+                if(!event) throw Error('requestSubmit did not produce a submit event; form validation may have prevented submission');
+                submission = {{method:'requestSubmit',submit_event:true,default_prevented:event.defaultPrevented}};
+            }}
+            return {{observation,submission}};
+        }})()"#,
+            selector = json!(selector),
+            text = json!(text),
+            submit = submit,
+            observe = crate::contract::TYPE_OBSERVATION_FUNCTION
         );
-        let raw = self.exec_js(&js).await?;
-        if unquote(&raw).contains("\"ok\":false") {
-            return Err(format!("未找到输入框 {}", selector));
-        }
+        let raw = self.evaluate_js(&script).await?;
+        let result: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("type_text observation invalid: {e}"))?;
+        let mut verdict = crate::contract::type_verdict(text, &result["observation"]);
+        let submission = if submit && verdict["status"] == "applied" {
+            crate::contract::submission_summary(&result["submission"])?
+        } else if submit {
+            "skipped because the requested value was not confirmed".into()
+        } else {
+            "not requested".into()
+        };
+        verdict["submission"] = json!(submission);
         Ok(format!(
-            "Typed {} chars into {}{}",
-            text.chars().count(),
-            selector,
-            if submit { " and pressed Enter" } else { "" }
+            "type_text target={selector} requested_chars={}\n{verdict}",
+            text.chars().count()
         ))
     }
 
@@ -673,7 +616,7 @@ end tell"#,
     pub async fn press_key(&self, key: &str, selector: Option<&str>) -> Result<String, String> {
         let focus_js = match selector {
             Some(sel) => format!(
-                "const el = document.querySelector({}) || document.activeElement; if (el) {{ el.focus(); el.scrollIntoView({{block:'center'}}); }}",
+                "const el = document.querySelector({}); if (!el) throw Error('focus selector not found'); if (el) {{ el.focus(); el.scrollIntoView({{block:'center'}}); }}",
                 json!(sel)
             ),
             None => "const el = document.activeElement;".to_string(),
@@ -703,108 +646,76 @@ end tell"#,
         Ok(format!("Pressed {}", key))
     }
 
-    /// Human-verification detection (JS with the same semantics); returns the category or None.
-    pub async fn detect_user_action_required(&self) -> Option<String> {
-        let js = format!("JSON.stringify({})", DETECT_USER_ACTION_JS);
-        let raw = self.exec_js(&js).await.ok()?;
-        let v = unquote(&raw);
-        if v.is_empty() || v == "null" || v.starts_with("JS_ERROR") {
-            None
-        } else {
-            Some(v)
-        }
+    /// An inspection error is unknown, never proof that a blocker disappeared.
+    pub async fn detect_user_action_required(&self) -> Result<Option<String>, String> {
+        let raw = self
+            .exec_js(&format!(
+                "JSON.stringify({})",
+                crate::tools::DETECT_USER_ACTION_JS
+            ))
+            .await?;
+        let value: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("human-action inspection failed: {e}"))?;
+        crate::tools::parse_detection(&value)
     }
 
-    /// Detect human verification and record the result in the session
-    /// (`pending_human` flag): on a hit, stores the category and returns the tag
-    /// to append; on a miss, clears the flag and returns an empty string.
-    /// Mirrors `detect_and_mark` in tools.rs (CDP driver) so the
-    /// [HUMAN_ACTION_PENDING: ...] prefix on mutating tools reflects the actual
-    /// page state: present while a blocker is detected, gone once it clears.
     async fn detect_and_mark(&mut self) -> String {
-        if let Some(cat) = self.detect_user_action_required().await {
-            self.pending_human = Some(cat.clone());
-            user_action_tag(&cat)
-        } else {
-            self.pending_human = None;
-            String::new()
+        match self.detect_user_action_required().await {
+            Ok(Some(cat)) => {
+                self.pending_human = Some(cat.clone());
+                user_action_tag(&cat)
+            }
+            Ok(None) => {
+                self.pending_human = None;
+                String::new()
+            }
+            Err(reason) => format!("\n[HUMAN_ACTION_UNKNOWN] {reason}"),
         }
     }
 
-    /// Wait for the user to handle it manually (same contract: status=resolved /
-    /// still_waiting; 60s budget, resolved only after 2 consecutive clean polls).
-    /// `message` (the tool's `message` argument) is relayed verbatim to the user
-    /// in the still_waiting output, mirroring the CDP driver.
     pub async fn wait_for_human_tool(
         &mut self,
         expect: Option<&str>,
         message: Option<&str>,
     ) -> String {
-        let op_cap = op_timeout_ms();
-        let ceiling = op_cap.saturating_sub(15_000).max(5_000);
-        let budget_ms = 60_000u64.min(ceiling);
+        let budget_ms = crate::browser::human_wait_budget_ms(op_timeout_ms());
         let deadline = Instant::now() + Duration::from_millis(budget_ms);
-        let mut clean_streak: u32 = 0;
-        let mut note = String::new();
-        let mut last_cat: Option<String> = None;
-        let cat = expect
-            .map(|e| e.trim().to_string())
-            .filter(|e| !e.is_empty());
+        let mut clean_polls = 0;
+        let mut last_cat = self.pending_human.clone();
         loop {
-            // Each poll has its own timeout: a hung poll counts as "still blocked".
-            let poll = self.detect_user_action_required_guarded().await;
-            match poll {
-                None => {
-                    clean_streak += 1;
-                    if clean_streak >= 2 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining.min(Duration::from_secs(5)), self.detect_user_action_required()).await {
+                Ok(Ok(Some(cat))) => { self.pending_human = Some(cat.clone()); last_cat = Some(cat); clean_polls = 0; }
+                Ok(Ok(None)) => {
+                    clean_polls += 1;
+                    if clean_polls >= 2 {
                         self.pending_human = None;
-                        return format!(
-                            "status=resolved\nYou may now continue browser automation.\n{}",
-                            note.trim()
-                        );
+                        return format!("status=resolved\n{}\nYou may continue browser automation.", self.post_action_state().await);
                     }
                 }
-                Some(c) if c != "poll_timeout" => {
-                    clean_streak = 0;
-                    last_cat = Some(c.clone());
-                    note = format!("current blocker: [USER_ACTION_REQUIRED: {}]", c);
-                }
-                Some(_) => {
-                    // A hung poll is "still blocked" but carries no real category;
-                    // do not record the internal poll_timeout marker as a blocker.
-                    clean_streak = 0;
-                }
+                Ok(Err(reason)) => return format!("status=unknown\nHuman action remains pending: inspection failed: {reason}"),
+                Err(_) => return "status=unknown\nHuman action remains pending: inspection exceeded its polling deadline.".into(),
             }
-            if Instant::now() >= deadline {
-                let cat = last_cat
-                    .clone()
-                    .or_else(|| cat.clone())
-                    .unwrap_or_else(|| "unknown".to_string());
-                self.pending_human = Some(cat.clone());
-                let relay = message
-                    .map(|m| format!("\nInstruction for the user: {m}"))
-                    .unwrap_or_default();
-                return format!(
-                    "status=still_waiting\nStill waiting for the user to complete '{}' in the visible browser window after {} ms.{}",
-                    cat, budget_ms, relay
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(2000)).await;
+            tokio::time::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(2)),
+            )
+            .await;
         }
-    }
-
-    /// Detection with a 5s poll timeout: a hung poll is treated as "still blocked"
-    /// (anything other than None is not judged resolved).
-    async fn detect_user_action_required_guarded(&self) -> Option<String> {
-        match with_timeout(5000, async {
-            Ok::<_, String>(self.detect_user_action_required().await)
-        })
-        .await
-        {
-            Ok(Some(c)) => Some(c),
-            Ok(None) => None,
-            Err(_) => Some("poll_timeout".to_string()),
-        }
+        let cat = last_cat
+            .or_else(|| expect.map(str::to_string))
+            .unwrap_or_else(|| "unknown".into());
+        self.pending_human = Some(cat.clone());
+        let relay = message
+            .map(|m| format!("\nInstruction for the user: {m}"))
+            .unwrap_or_default();
+        format!(
+            "status=still_waiting\nWaiting for '{cat}' after {budget_ms} ms.{relay}\nEnd your turn and ask the user to complete it; call wait_for_human after they reply."
+        )
     }
 
     /// Query the Chrome window bounds: returns (x, y, w, h), or None on failure (e.g. window closed).
@@ -953,7 +864,7 @@ Chrome 未开启“Apple 事件中的 JavaScript”（Allow JavaScript from Appl
 
 /// Detect Chrome's "executing JavaScript through AppleScript is turned off" error.
 ///
-/// The wording is locale-dependent ("通过 AppleScript 执行 JavaScript 的功能已关闭" in
+/// The wording differs between Chinese and English Chrome builds (the gate is
 /// zh-CN, "Executing JavaScript through AppleScript is turned off" in en), but every
 /// variant names AppleScript and JavaScript and links
 /// `https://support.google.com/chrome/?p=applescript`, so those two lowercase
@@ -1022,21 +933,21 @@ fn esc_js_key(k: &str) -> String {
         .replace('"', "\\\"")
 }
 
-fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
-    args.get(key).and_then(Value::as_str)
-}
-
-fn require_str(args: &Value, key: &str) -> Result<String, JsonRpcErr> {
-    str_arg(args, key)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| JsonRpcErr::new(-32602, &format!("missing or empty '{key}'"), None))
-}
-
-fn opt_str(args: &Value, key: &str) -> Option<String> {
-    str_arg(args, key)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+fn parse_tab_id(id: &str) -> Result<(&str, &str), String> {
+    let (window, tab) = id
+        .split_once(':')
+        .ok_or("tab id must be window_id:tab_id from list_tabs")?;
+    for part in [window, tab] {
+        if !part.chars().all(|c| c.is_ascii_digit())
+            || part
+                .parse::<u64>()
+                .ok()
+                .is_none_or(|n| n == 0 || n > i64::MAX as u64)
+        {
+            return Err("invalid stable tab id; use an id from list_tabs".into());
+        }
+    }
+    Ok((window, tab))
 }
 
 impl ApplescriptSession {
@@ -1048,25 +959,17 @@ impl ApplescriptSession {
     }
 }
 
-/// The 13 tools with the same names and argument keys as in tools.rs; results go only
+/// The tools with the same names and argument keys as in tools.rs; results go only
 /// into content[0].text (capped at 24K), using the same `[...]` markers as CDP mode to
 /// remind the model.
 pub async fn handle_tools_call(
     session: &mut ApplescriptSession,
     params: Option<Value>,
 ) -> Result<Value, JsonRpcErr> {
-    let params = params.unwrap_or_else(|| json!({}));
-    let cmd = params
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| JsonRpcErr::new(-32602, "missing 'name'", None))?;
-    let args = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let (cmd, args) = crate::contract::parse_call(params)?;
     let ms = op_timeout_ms();
 
-    match cmd {
+    match cmd.as_str() {
         "navigate" => {
             let url = require_str(&args, "url")?;
             let wait_selector = opt_str(&args, "wait_selector");
@@ -1075,35 +978,65 @@ pub async fn handle_tools_call(
                 session.navigate(&url, wait_selector.as_deref()).await?;
                 let (u, t) = session.url_title().await?;
                 let tag = session.detect_and_mark().await;
-                Ok(format!("{pend}Navigated to {u}\nTitle: {t}{tag}"))
+                let state = session.post_action_state().await;
+                let outcome = if state.contains("\"readyState\":\"complete\"") {
+                    "complete"
+                } else {
+                    "incomplete"
+                };
+                Ok(format!(
+                    "{pend}Navigated to {u}\nTitle: {t}\nload_outcome={outcome}\n{state}{tag}"
+                ))
             })
             .await?;
             Ok(text_content(&summary))
         }
+        "snapshot" => Err(JsonRpcErr::new(
+            -32000,
+            "snapshot is not supported in AppleScript mode; use the isolated CDP driver",
+            None,
+        )),
         "click" => {
+            if args.get("ref").is_some() {
+                return Err(JsonRpcErr::new(
+                    -32000,
+                    "snapshot refs are not supported in AppleScript mode; use selector",
+                    None,
+                ));
+            }
             let sel = require_str(&args, "selector")?;
             let pend = pending_warning(session);
             let summary = with_timeout(ms, async {
-                session.click(&sel).await?;
+                let message = session.click(&sel).await?;
                 let tag = session.detect_and_mark().await;
-                Ok(format!("{pend}Clicked {sel}{tag}"))
+                Ok(format!(
+                    "{pend}{message}\n{}{tag}",
+                    session.post_action_state().await
+                ))
             })
             .await?;
             Ok(text_content(&summary))
         }
         "type_text" => {
+            if args.get("ref").is_some() {
+                return Err(JsonRpcErr::new(
+                    -32000,
+                    "snapshot refs are not supported in AppleScript mode; use selector",
+                    None,
+                ));
+            }
             let sel = require_str(&args, "selector")?;
-            let text = require_str(&args, "text")?;
+            let text = args["text"].as_str().unwrap().to_string();
             let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(false);
             let pend = pending_warning(session);
             let summary = with_timeout(ms, async {
-                // type_text already returns the complete summary
-                // ("Typed N chars into <sel> [and pressed Enter]"); use it
-                // verbatim instead of re-formatting it as if it were a char
-                // count (that duplicated the message and the suffix).
+                // Keep the value verdict and submit evidence returned by the driver.
                 let msg = session.type_text(&sel, &text, submit).await?;
                 let tag = session.detect_and_mark().await;
-                Ok(format!("{pend}{msg}{tag}"))
+                Ok(format!(
+                    "{pend}{msg}\n{}{tag}",
+                    session.post_action_state().await
+                ))
             })
             .await?;
             Ok(text_content(&summary))
@@ -1115,46 +1048,48 @@ pub async fn handle_tools_call(
             let summary = with_timeout(ms, async {
                 session.press_key(&key, sel.as_deref()).await?;
                 let tag = session.detect_and_mark().await;
-                Ok(format!("{pend}Pressed {key}{tag}"))
+                Ok(format!(
+                    "{pend}Pressed {key}\n{}{tag}",
+                    session.post_action_state().await
+                ))
             })
             .await?;
             Ok(text_content(&summary))
         }
         "scroll" => {
             let sel = opt_str(&args, "selector");
-            let x = args.get("x").and_then(Value::as_f64);
-            let y = args.get("y").and_then(Value::as_f64);
+            let x = args.get("x").and_then(Value::as_i64);
+            let y = args.get("y").and_then(Value::as_i64);
             let pend = pending_warning(session);
             let summary = with_timeout(ms, async {
-                session
-                    .scroll(x.map(|v| v as i64), y.map(|v| v as i64), sel.as_deref())
-                    .await?;
+                session.scroll(x, y, sel.as_deref()).await?;
                 let tag = session.detect_and_mark().await;
-                Ok(match &sel {
+                let action = match &sel {
                     Some(s) => format!("{pend}Scrolled {s} into view{tag}"),
                     None => format!(
                         "{pend}Scrolled window to ({}, {}){tag}",
-                        x.map(|v| v as i64).unwrap_or(0),
-                        y.map(|v| v as i64).unwrap_or(0)
+                        x.unwrap_or(0),
+                        y.unwrap_or(0)
                     ),
-                })
+                };
+                Ok(format!("{action}\n{}", session.post_action_state().await))
             })
             .await?;
             Ok(text_content(&summary))
         }
         "wait_for" => {
-            let sel = require_str(&args, "selector")?;
-            let timeout_ms = args
-                .get("timeout_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(15_000);
+            let target = crate::contract::parse_wait_target(&args)?;
+            let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(15_000);
             let summary = with_timeout(ms, async {
-                let waited = session.wait_for_selector(&sel, timeout_ms).await?;
+                let (elapsed, url) = session.wait_for_target(&target, timeout_ms).await?;
                 let tag = session.detect_and_mark().await;
-                Ok(format!("Found {sel} after {waited} ms{tag}"))
+                Ok(format!(
+                    "Wait met: {} after {elapsed} ms\ncurrent_url: {url}{tag}",
+                    target.description()
+                ))
             })
             .await?;
-            Ok(text_content(&summary))
+            Ok(text_content(summary))
         }
         "evaluate_js" => {
             let expr = require_str(&args, "expression")?;
@@ -1162,33 +1097,29 @@ pub async fn handle_tools_call(
             Ok(text_content(&cap_text(&out)))
         }
         "get_text" => {
-            let sel = opt_str(&args, "selector");
             let pend = pending_warning(session);
             let summary = with_timeout(ms, async {
-                let t = session.get_text_sel(sel.as_deref()).await?;
+                let t = session.extract(&args, false).await?;
                 let tag = session.detect_and_mark().await;
                 Ok((t, tag))
             })
             .await?;
             let (t, tag) = summary;
-            // Cap the body BEFORE appending the tag: cap_text must never swallow
-            // the [USER_ACTION_REQUIRED] marker (the body alone can sit at the
-            // 24K cap, so capping the whole summary afterwards would cut the tag).
-            let mut out = cap_text(&t);
+            // Extraction is bounded in the page; append detection after paging metadata.
+            let mut out = t;
             out.push_str(&tag);
             Ok(text_content(format!("{pend}{out}")))
         }
         "get_html" => {
-            let sel = opt_str(&args, "selector");
             let pend = pending_warning(session);
             let summary = with_timeout(ms, async {
-                let t = session.get_html_sel(sel.as_deref()).await?;
+                let t = session.extract(&args, true).await?;
                 let tag = session.detect_and_mark().await;
                 Ok((t, tag))
             })
             .await?;
             let (t, tag) = summary;
-            let mut out = cap_text(&t);
+            let mut out = t;
             out.push_str(&tag);
             Ok(text_content(format!("{pend}{out}")))
         }
@@ -1225,6 +1156,16 @@ pub async fn handle_tools_call(
             .await?;
             Ok(text_content(&summary))
         }
+        "switch_tab" => {
+            let id = require_str(&args, "id")?;
+            let r = with_timeout(ms, async { session.switch_tab(&id).await }).await?;
+            Ok(text_content(r))
+        }
+        "close_tab" => {
+            let id = require_str(&args, "id")?;
+            let r = with_timeout(ms, async { session.close_tab(&id).await }).await?;
+            Ok(text_content(r))
+        }
         "list_tabs" => {
             let r = with_timeout(ms, async { session.list_tabs().await }).await?;
             Ok(text_content(&cap_text(&r)))
@@ -1254,6 +1195,29 @@ pub async fn handle_tools_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_fixes_stable_apple_tab_ids() {
+        assert_eq!(parse_tab_id("12:34").unwrap(), ("12", "34"));
+        for id in [
+            "",
+            "0:1",
+            "1:0",
+            "1:2:3",
+            "1:bad",
+            "-1:2",
+            "1:2\"",
+            "999999999999999999999:1",
+        ] {
+            assert!(parse_tab_id(id).is_err(), "{id}");
+        }
+        assert_eq!(crate::tools::parse_detection(&Value::Null).unwrap(), None);
+        assert_eq!(
+            crate::tools::parse_detection(&json!("captcha")).unwrap(),
+            Some("captcha".into())
+        );
+        assert!(crate::tools::parse_detection(&json!({"error":"boom"})).is_err());
+    }
 
     #[test]
     fn unquote_decodes_json_stringify_output() {
@@ -1340,7 +1304,7 @@ mod tests {
         let inner = js_apple_events_message(CHROME_JS_GATE_ERROR);
         assert!(is_gate_closed_message(&inner));
         let wrapped = format!(
-            "执行 JS 失败(超过 90000ms 上限或 osascript 出错): {}",
+            "执行 JS 失败(超过 25000ms 上限或 osascript 出错): {}",
             inner
         );
         assert!(is_gate_closed_message(&wrapped));
@@ -1349,7 +1313,7 @@ mod tests {
             "execution error: 不能获得“window id 999999”。 (-1728)"
         ));
         assert!(!is_gate_closed_message(
-            "operation reached the 90000 ms server cap"
+            "operation reached the 25000 ms server cap"
         ));
     }
 }

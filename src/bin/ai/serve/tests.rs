@@ -751,6 +751,356 @@ async fn confirm_reports_a_remote_turn_owner_from_the_turn_lease() {
     assert_eq!(view["remote"], serde_json::Value::Null);
 }
 
+#[cfg(unix)]
+#[test]
+fn session_activity_mapping_prefers_active_turns_and_preserves_unknown() {
+    use super::sessions::session_activity;
+    use crate::ai::history::turn_lease::TurnLease;
+
+    let state = lifecycle_test_state();
+    let store = SessionStore::new(state.history_file.as_path());
+    let history = store.session_history_file("samehead-a");
+    let lock = history.with_extension("turn.lock");
+    assert_eq!(
+        session_activity(&state, &store, "samehead-a"),
+        SessionActivity::Idle
+    );
+    let lease = TurnLease::acquire(&history, "samehead-a").expect("remote lease");
+    assert_eq!(
+        session_activity(&state, &store, "samehead-a"),
+        SessionActivity::Running
+    );
+    assert_eq!(
+        session_activity(&state, &store, "samehead-b"),
+        SessionActivity::Idle
+    );
+    std::fs::write(&lock, "").expect("clear held owner");
+    assert_eq!(
+        session_activity(&state, &store, "samehead-a"),
+        SessionActivity::Running
+    );
+    state
+        .active_turns
+        .lock()
+        .unwrap()
+        .insert("samehead-a".into(), 123);
+    assert_eq!(
+        session_activity(&state, &store, "samehead-a"),
+        SessionActivity::Running
+    );
+    state.active_turns.lock().unwrap().clear();
+    assert_eq!(
+        session_activity(&state, &store, "samehead-a"),
+        SessionActivity::Running
+    );
+    drop(lease);
+    assert_eq!(
+        session_activity(&state, &store, "samehead-a"),
+        SessionActivity::Idle
+    );
+    std::fs::remove_file(&lock).expect("remove free lock");
+    std::fs::create_dir(&lock).expect("unprobeable lock");
+    assert_eq!(
+        session_activity(&state, &store, "samehead-a"),
+        SessionActivity::Unknown
+    );
+    std::fs::remove_dir_all(state.history_file.parent().unwrap()).expect("remove test root");
+}
+
+#[tokio::test]
+async fn session_activity_endpoint_bounds_validates_and_avoids_history_reads() {
+    let state = lifecycle_test_state();
+    let store = SessionStore::new(state.history_file.as_path());
+    store.ensure_root_dir().expect("session root");
+    let history = store.session_history_file("activity");
+    std::fs::write(&history, b"deliberately not a SQLite database").expect("invalid history");
+    state
+        .active_turns
+        .lock()
+        .unwrap()
+        .insert("samehead-a".into(), 123);
+    let mut authed = state.clone();
+    authed.token = "activity-test".into();
+    let app = Router::new()
+        .route(
+            "/session-activity",
+            post(list_session_activity)
+                .layer(DefaultBodyLimit::max(MAX_SESSION_ACTIVITY_REQUEST_BYTES)),
+        )
+        .route("/sessions/{id}/confirm", get(get_confirm))
+        .with_state(authed);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listen");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+    let client = reqwest::Client::new();
+
+    let denied = client
+        .post(format!("{base}/session-activity"))
+        .json(&serde_json::json!({"ids": ["activity"]}))
+        .send()
+        .await
+        .expect("unauthenticated request");
+    assert_eq!(denied.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let valid = client
+        .post(format!("{base}/session-activity"))
+        .bearer_auth("activity-test")
+        .json(&serde_json::json!({"ids": ["samehead-a", "samehead-b", "activity"]}))
+        .send()
+        .await
+        .expect("valid activity request");
+    assert_eq!(valid.status(), reqwest::StatusCode::OK);
+    assert_eq!(valid.headers()["cache-control"], "no-store");
+    assert_eq!(
+        valid
+            .json::<serde_json::Value>()
+            .await
+            .expect("activity json"),
+        serde_json::json!([
+            {"id": "samehead-a", "activity": "running"},
+            {"id": "samehead-b", "activity": "idle"},
+            {"id": "activity", "activity": "idle"},
+        ])
+    );
+    for ids in [
+        vec!["".to_string()],
+        vec!["../activity".to_string()],
+        vec!["a".repeat(129)],
+        vec!["activity".to_string(); MAX_SESSION_ACTIVITY_IDS + 1],
+    ] {
+        let bad = client
+            .post(format!("{base}/session-activity"))
+            .bearer_auth("activity-test")
+            .json(&serde_json::json!({"ids": ids}))
+            .send()
+            .await
+            .expect("invalid activity request");
+        assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+    let empty = client
+        .post(format!("{base}/session-activity"))
+        .bearer_auth("activity-test")
+        .json(&serde_json::json!({"ids": []}))
+        .send()
+        .await
+        .expect("empty batch");
+    assert_eq!(
+        empty.json::<serde_json::Value>().await.expect("empty json"),
+        serde_json::json!([])
+    );
+    let oversized = client
+        .post(format!("{base}/session-activity"))
+        .bearer_auth("activity-test")
+        .header("content-type", "application/json")
+        .body(" ".repeat(MAX_SESSION_ACTIVITY_REQUEST_BYTES + 1))
+        .send()
+        .await
+        .expect("oversized activity request");
+    assert_eq!(oversized.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    let confirm = client
+        .get(format!("{base}/sessions/activity/confirm"))
+        .bearer_auth("activity-test")
+        .send()
+        .await
+        .expect("session named activity still routes");
+    assert_eq!(confirm.status(), reqwest::StatusCode::OK);
+    assert!(
+        !store.session_history_file("samehead-b").exists(),
+        "status sampling must not materialize sessions"
+    );
+    server.abort();
+    std::fs::remove_dir_all(state.history_file.parent().unwrap()).expect("remove test root");
+}
+
+#[cfg(unix)]
+#[test]
+fn session_activity_daemon_and_driver_resolve_the_same_persona_lock_root() {
+    use crate::ai::history::turn_lease::TurnLease;
+    use crate::ai::persona::{history_file_for_persona, session_client_history_file};
+    let mut state = lifecycle_test_state();
+    let base = state.history_file.clone();
+    let driver_history = history_file_for_persona(&base, "persona-a");
+    let driver_store = SessionStore::new(&driver_history);
+    let history = driver_store.session_history_file("persona-session");
+    let lease = TurnLease::acquire(&history, "persona-session").expect("driver persona lease");
+    state.history_file = resolve_serve_history_file(&base, "persona-a").expect("serve history root");
+    let daemon_store = SessionStore::new(&state.history_file);
+    assert_eq!(
+        super::sessions::session_activity(&state, &daemon_store, "persona-session"),
+        SessionActivity::Running,
+        "the daemon must probe the lock the driver acquired in the persona root"
+    );
+    assert_eq!(
+        daemon_store.session_history_file("persona-session"),
+        history
+    );
+    let mut cmd = std::process::Command::new("a");
+    apply_session_history_env(&mut cmd, &state.history_file);
+    let forwarded = cmd
+        .get_envs()
+        .find_map(|(key, value)| {
+            (key == crate::ai::persona::SERVE_SESSION_HISTORY_ENV)
+                .then(|| value.map(PathBuf::from))
+                .flatten()
+        })
+        .expect("forwarded history root");
+    let child_history = session_client_history_file(
+        &base.with_file_name("changed-history.sqlite"),
+        "persona-b",
+        Some(&forwarded),
+    );
+    assert_eq!(
+        SessionStore::new(&child_history).session_history_file("persona-session"),
+        history,
+        "a serve child must retain its daemon's resolved root after configuration changes"
+    );
+    drop(lease);
+    std::fs::remove_dir_all(base.parent().unwrap()).expect("remove test root");
+}
+
+#[test]
+fn session_activity_relative_history_root_stays_fixed_across_child_cwds() {
+    use crate::ai::persona::{
+        DEFAULT_PERSONA_ID, history_file_for_persona, session_client_history_file,
+    };
+
+    let daemon_cwd = std::env::current_dir().expect("daemon cwd");
+    let child_cwd = daemon_cwd.join("different-session-cwd");
+    let relative = std::path::Path::new("data/history.sqlite");
+    for persona in [DEFAULT_PERSONA_ID, "persona-a"] {
+        let resolved = resolve_serve_history_file(relative, persona).expect("relative serve root");
+        assert!(
+            resolved.is_absolute(),
+            "serve must anchor the relative root before forwarding it: {resolved:?}"
+        );
+        assert_eq!(
+            resolved,
+            history_file_for_persona(&daemon_cwd.join(relative), persona)
+        );
+        let mut cmd = std::process::Command::new("a");
+        cmd.current_dir(&child_cwd);
+        apply_session_history_env(&mut cmd, &resolved);
+        assert_eq!(cmd.get_current_dir(), Some(child_cwd.as_path()));
+        let forwarded = cmd
+            .get_envs()
+            .find_map(|(key, value)| {
+                (key == crate::ai::persona::SERVE_SESSION_HISTORY_ENV)
+                    .then(|| value.map(PathBuf::from))
+                    .flatten()
+            })
+            .expect("forwarded history root");
+        let child_history = session_client_history_file(relative, persona, Some(&forwarded));
+        let parent_lock = SessionStore::new(&resolved)
+            .session_history_file("relative-session")
+            .with_extension("turn.lock");
+        let child_lock = child_cwd
+            .join(SessionStore::new(&child_history).session_history_file("relative-session"))
+            .with_extension("turn.lock");
+        assert_eq!(
+            parent_lock, child_lock,
+            "a different session cwd must not redirect the turn lease"
+        );
+        let absolute = daemon_cwd.join("absolute/history.sqlite");
+        assert_eq!(
+            resolve_serve_history_file(&absolute, persona).expect("absolute serve root"),
+            history_file_for_persona(&absolute, persona)
+        );
+        assert!(session_client_history_file(relative, persona, None).is_relative());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn session_activity_reaping_and_draining_releases_registration_before_cleanup() {
+    let state = lifecycle_test_state();
+    let store = SessionStore::new(&state.history_file);
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("synthetic child");
+    let mut active = Some(ActiveTurnGuard::register(
+        &state.active_turns,
+        "drained",
+        child.id(),
+    ));
+    let (status, ()) = reap_and_drain_turn_child(&mut child, &mut active, || {
+        assert_eq!(
+            super::sessions::session_activity(&state, &store, "drained"),
+            SessionActivity::Running,
+            "registration must survive until output draining completes"
+        );
+    });
+    assert!(status.expect("reap child").success());
+    assert_eq!(
+        super::sessions::session_activity(&state, &store, "drained"),
+        SessionActivity::Idle,
+        "silent cleanup must not keep a reaped and drained child registered"
+    );
+    assert!(active.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_activity_list_reports_first_paint_for_the_returned_page() {
+    let state = lifecycle_test_state();
+    let store = SessionStore::new(state.history_file.as_path());
+    for id in ["local", "remote", "unknown", "idle"] {
+        store
+            .write_session_title_with_origin(id, id, SessionTitleOrigin::User)
+            .expect("persist session");
+    }
+    state
+        .active_turns
+        .lock()
+        .unwrap()
+        .insert("local".into(), 123);
+    let remote = crate::ai::history::turn_lease::TurnLease::acquire(
+        &store.session_history_file("remote"),
+        "remote",
+    )
+    .expect("remote lease");
+    let unknown_history = store.session_history_file("unknown");
+    let unknown = crate::ai::history::turn_lease::TurnLease::acquire(&unknown_history, "unknown")
+        .expect("unknown lease");
+    std::fs::write(unknown_history.with_extension("turn.lock"), "").expect("clear owner");
+    let response = list_sessions(
+        State(state.clone()),
+        HeaderMap::new(),
+        Query(SessionsQuery {
+            limit: None,
+            offset: None,
+            newest: false,
+            include: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.headers()["x-sessions-total"], "4");
+    assert_eq!(response.headers()["x-sessions-page-size"], "4");
+    let body = axum::body::to_bytes(response.into_body(), 16384)
+        .await
+        .expect("list body");
+    let items: serde_json::Value = serde_json::from_slice(&body).expect("list json");
+    for (id, expected) in [
+        ("local", "running"),
+        ("remote", "running"),
+        ("unknown", "running"),
+        ("idle", "idle"),
+    ] {
+        let item = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == id)
+            .expect("listed id");
+        assert_eq!(item["activity"], expected);
+    }
+    drop(remote);
+    drop(unknown);
+    std::fs::remove_dir_all(state.history_file.parent().unwrap()).expect("remove test root");
+}
+
 /// The `/confirm` route pair: the pending question is readable, an answer
 /// reaches the turn child's stdin exactly once, and answering the same
 /// question again is refused instead of writing a second line.
