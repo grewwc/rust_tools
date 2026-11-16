@@ -1,17 +1,19 @@
-//! Static Agent Graph 与动态 Graph-of-Agents 编排器。
+//! Static Agent Graph and dynamic Graph-of-Agents orchestration.
 //!
-//! 两种图都只负责拓扑、状态机、checkpoint 与 prompt 组装；真正执行仍由父模块的
-//! `task_*` / AIOS kernel 完成，因此取消、evidence、owner/session 隔离保持一致。
+//! Both modes own only topology, state transitions, checkpoints, and prompt assembly.
+//! Execution reuses the parent `task_*` / AIOS kernel protocols for cancellation,
+//! evidence, and owner/session isolation.
 
 use super::{
-    MAX_PROMPT_CHARS, MemberStatus, TeamBudget, TeamLifecycle, TeamMember, TeamState, TeamTask,
-    TeamTaskState, active_identity, atomic_write_json, checkpoint_base_dir, clip_text,
-    integrate_graph_task, now_ms, recover_orphaned_team_tasks, validate_identifier,
+    MAX_PROMPT_CHARS, MemberStatus, StatusViewOptions, TeamBudget, TeamLifecycle, TeamMember,
+    TeamState, TeamTask, TeamTaskState, active_identity, atomic_write_json, checkpoint_base_dir,
+    clip_text, integrate_graph_task, now_ms, recover_orphaned_team_tasks, validate_identifier,
 };
 use crate::ai::tools::registry::common::{
     ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
     ToolRegistration, ToolSpec,
 };
+use rust_tools::commonw::FastMap;
 use rust_tools::cw::graph::DirectedGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
@@ -60,6 +62,10 @@ enum GraphLifecycle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentGraphCheckpoint {
     version: u32,
+    #[serde(default, skip_serializing_if = "super::revision_is_zero")]
+    revision: u64,
+    #[serde(default, skip_serializing_if = "FastMap::is_empty")]
+    node_revisions: FastMap<String, u64>,
     graph_id: String,
     session_id: String,
     owner_pid: u64,
@@ -72,6 +78,16 @@ struct AgentGraphCheckpoint {
     final_result: Option<String>,
     created_at_unix_ms: u64,
     updated_at_unix_ms: u64,
+}
+
+impl AgentGraphCheckpoint {
+    fn configure_revision_tracking(&mut self, enabled: bool) {
+        self.team.configure_revision_tracking(enabled);
+        if !enabled {
+            self.revision = 0;
+            self.node_revisions.clear();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,7 +117,7 @@ impl NodeStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct StaticNodeSpec {
     id: String,
     description: String,
@@ -146,7 +162,7 @@ enum EdgeCondition {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum Reducer {
     #[default]
@@ -156,7 +172,7 @@ enum Reducer {
     Concat,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct StaticNodeRuntime {
     spec: StaticNodeSpec,
     status: NodeStatus,
@@ -174,7 +190,7 @@ struct StaticGraphRun {
     state: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct DynamicCandidateSpec {
     id: String,
     role: String,
@@ -246,7 +262,7 @@ struct DynamicEdge {
     score: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct DynamicCandidateRuntime {
     spec: DynamicCandidateSpec,
     task_id: Option<String>,
@@ -336,19 +352,25 @@ fn default_graph_state() -> Value {
 
 pub(super) fn execute_run_agent_graph(args: &Value) -> Result<String, String> {
     super::super::ensure_top_level_task_orchestration("run_agent_graph")?;
+    let optimizations = crate::ai::config::agent_team_optimizations();
+    let optimizations_enabled = optimizations.optimizations_enabled();
     let input: GraphToolInput = serde_json::from_value(args.clone())
         .map_err(|error| format!("invalid run_agent_graph arguments: {error}"))?;
     match input.action.as_str() {
-        "start" => start_graph(input),
-        "advance" => mutate_graph(input.graph_id.as_deref(), |graph| {
+        "start" => start_graph(input, optimizations_enabled),
+        "advance" => mutate_graph(input.graph_id.as_deref(), optimizations_enabled, |graph| {
             advance_graph(graph)?;
             Ok(graph_view(graph))
         }),
         "status" => {
-            let graph = load_graph(required_graph_id(input.graph_id.as_deref())?)?;
-            render_json(&graph_view(&graph))
+            let options = StatusViewOptions::for_optimizations(args, optimizations_enabled)?;
+            let graph = load_graph(
+                required_graph_id(input.graph_id.as_deref())?,
+                optimizations_enabled,
+            )?;
+            render_json(&graph_view_with_options(&graph, options))
         }
-        "cancel" => mutate_graph(input.graph_id.as_deref(), |graph| {
+        "cancel" => mutate_graph(input.graph_id.as_deref(), optimizations_enabled, |graph| {
             cancel_graph(graph)?;
             Ok(graph_view(graph))
         }),
@@ -358,7 +380,7 @@ pub(super) fn execute_run_agent_graph(args: &Value) -> Result<String, String> {
     }
 }
 
-fn start_graph(input: GraphToolInput) -> Result<String, String> {
+fn start_graph(input: GraphToolInput, optimizations_enabled: bool) -> Result<String, String> {
     let (session_id, owner_pid) = active_identity()?;
     let name = input.name.unwrap_or_else(|| "agent-graph".to_string());
     let question = required_non_empty(input.question.as_deref(), "question")?.to_string();
@@ -384,6 +406,8 @@ fn start_graph(input: GraphToolInput) -> Result<String, String> {
     let team_id = Uuid::new_v4().to_string();
     let team = TeamState {
         version: super::TEAM_STATE_VERSION,
+        revision: u64::from(optimizations_enabled),
+        revision_tracking_enabled: optimizations_enabled,
         id: team_id,
         session_id: session_id.clone(),
         owner_pid,
@@ -406,6 +430,8 @@ fn start_graph(input: GraphToolInput) -> Result<String, String> {
     };
     let mut checkpoint = AgentGraphCheckpoint {
         version: GRAPH_STATE_VERSION,
+        revision: 0,
+        node_revisions: FastMap::default(),
         graph_id,
         session_id,
         owner_pid,
@@ -419,7 +445,9 @@ fn start_graph(input: GraphToolInput) -> Result<String, String> {
         created_at_unix_ms: now,
         updated_at_unix_ms: now,
     };
+    let previous = GraphRevisionSnapshot::Initial;
     advance_graph(&mut checkpoint)?;
+    record_graph_revision(&mut checkpoint, &previous);
     save_graph(&checkpoint)?;
     render_json(&graph_view(&checkpoint))
 }
@@ -607,12 +635,13 @@ fn advance_graph(graph: &mut AgentGraphCheckpoint) -> Result<(), String> {
         graph.team.lifecycle = TeamLifecycle::Completed;
     } else if graph.lifecycle == GraphLifecycle::Failed {
         graph.team.lifecycle = TeamLifecycle::Failed;
-        // 图进入 Failed 终态：预算耗尽/启动失败会遗留 Running 节点或在途候选的
-        // runtime 任务（进程/channel 未回收），统一取消内核进程并清理引用，避免泄漏。
+        // Budget exhaustion or spawn failure can leave runtime tasks in flight.
+        // Cancel kernel processes and clear references when entering the failed state.
         cancel_active_runtime_tasks(graph, "agent graph failed");
     }
     graph.updated_at_unix_ms = now_ms();
     graph.team.updated_at_unix_ms = graph.updated_at_unix_ms;
+    graph.team.bump_revision();
     Ok(())
 }
 
@@ -632,10 +661,9 @@ fn advance_static(
         match poll_owned_task_result(&task_id) {
             Ok(OwnedTaskPoll::Pending { .. }) => {}
             Err(error) => {
-                // 轮次中途错误绝不冒泡：poll 失败（任务丢失/所有权变更）时把节点
-                // 就地标记为失败并清掉 task 引用。若 `?` 冒泡，checkpoint 不会保存，
-                // 磁盘上节点仍带 runtime_task_id，下次 advance 对同一丢失任务重复
-                // poll，永久卡死。错误以 Failed 终态呈现，下游条件边按失败跳过。
+                // Settle poll failures in place and clear the task reference. Propagating
+                // the error would skip the checkpoint and repeatedly poll a lost task.
+                // Downstream conditional edges observe the failed terminal state.
                 let Some(node_id) = run.nodes.iter().find_map(|(id, node)| {
                     (node.runtime_task_id.as_deref() == Some(task_id.as_str())).then(|| id.clone())
                 }) else {
@@ -679,17 +707,16 @@ fn advance_static(
                     node.status = NodeStatus::Completed;
                     node.output = Some(result.output.clone());
                     node.error = None;
-                    // 归约失败是配置性错误：节点已真实完成，但输出未能并入图状态，
-                    // 按失败处理以免下游读到缺失的状态键。绝不冒泡——poll 已消费
-                    // TASK_REGISTRY 条目，若在这里 `?` 传播，checkpoint 不会保存，
-                    // 磁盘上节点仍为 Running，下次 advance 会永久卡死。
+                    // A reduction error leaves required shared state missing, so mark
+                    // the node failed. Poll already consumed the registry entry; an
+                    // early return would leave a running checkpoint that cannot resume.
                     if let Err(error) =
                         reduce_static_output(&mut run.state, &node.spec, &result.output)
                     {
                         node.status = NodeStatus::Failed;
                         node.error = Some(format!("static reduce failed: {error}"));
                     }
-                    // 历史集成尽力而为：证据已由 poll 持久化，失败仅追加诊断。
+                    // Poll persisted the evidence; integration failures only add diagnostics.
                     if let Err(error) = integrate_graph_task(
                         &task_id,
                         "accepted",
@@ -770,9 +797,9 @@ fn advance_static(
                     let Some((task_id, team_task_id)) = (match spawned {
                         Ok(pair) => pair,
                         Err(error) => {
-                            // spawn 失败（如 member busy）不可恢复：就地标记节点失败
-                            // 并终止本轮。错误冒泡会使 checkpoint 不保存，磁盘上节点
-                            // 仍为 Pending，下次 advance 反复重试并再次报错，永久卡死。
+                            // Settle unrecoverable spawn failures in place. Propagation
+                            // would skip the checkpoint and retry the same pending node
+                            // indefinitely on subsequent advances.
                             let node = run.nodes.get_mut(&node_id).unwrap();
                             node.status = NodeStatus::Failed;
                             node.error = Some(format!("spawn failed: {error}"));
@@ -780,9 +807,8 @@ fn advance_static(
                             break;
                         }
                     }) else {
-                        // 预算耗尽：无法再启动任何节点。把尚未结束的节点标记为失败，
-                        // 让图以 Failed 正常终止——错误若冒泡会使 checkpoint 永不
-                        // 保存，导致永久卡死。
+                        // Exhausted attempts prevent further launches. Fail unfinished
+                        // nodes so the graph terminates and its checkpoint is saved.
                         for node in run.nodes.values_mut() {
                             if !node.status.is_terminal() {
                                 node.status = NodeStatus::Failed;
@@ -801,8 +827,8 @@ fn advance_static(
                     break;
                 }
                 Err(error) => {
-                    // decision 失败（配置性）：就地标记节点失败并终止本轮，
-                    // 绝不冒泡——否则 checkpoint 不保存，节点永久 Pending 卡死。
+                    // Settle decision errors in place so the failed node is checkpointed
+                    // rather than left pending for the next advance.
                     let node = run.nodes.get_mut(&node_id).unwrap();
                     node.status = NodeStatus::Failed;
                     node.error = Some(format!("static node decision failed: {error}"));
@@ -981,7 +1007,7 @@ fn advance_dynamic(
 ) -> Result<(), String> {
     collect_dynamic_tasks(team, run)?;
     if run.error.is_some() {
-        // 预算已耗尽：不再启动新任务，等待 advance_graph 将图标记为 Failed。
+        // Stop launching after an error; advance_graph will mark the graph failed.
         return Ok(());
     }
     loop {
@@ -1047,10 +1073,9 @@ fn collect_dynamic_tasks(team: &mut TeamState, run: &mut DynamicGraphRun) -> Res
         let OwnedTaskPoll::Terminal { result, .. } = (match poll {
             Ok(poll) => poll,
             Err(error) => {
-                // 轮次中途错误绝不冒泡：poll 失败时清掉 task 引用并复位成员，
-                // 下一轮 advance 重新 spawn 该候选；反复失败最终由预算耗尽终止。
-                // 冒泡会使 checkpoint 不保存，磁盘残留 task_id，下次对同一丢失
-                // 任务重复 poll，永久卡死。
+                // Clear failed task references and reset the member for a later retry.
+                // Repeated failures terminate through the attempt budget. Propagating
+                // here would skip the checkpoint and repeatedly poll the same lost task.
                 let team_task_id = run.candidates[&candidate_id].team_task_id.clone();
                 settle_graph_team_task(
                     team,
@@ -1114,10 +1139,9 @@ fn collect_dynamic_tasks(team: &mut TeamState, run: &mut DynamicGraphRun) -> Res
             }
             _ => {}
         }
-        // 集成失败不能冒泡：poll 已消费 TASK_REGISTRY 条目并持久化证据，若在此
-        // `?` 传播，checkpoint 不会保存，磁盘上候选仍带 runtime_task_id，下次
-        // advance 会因任务已不在 registry 而永久卡死。候选状态已就地更新，
-        // 集成失败仅影响父级可见的证据回执，忽略即可。
+        // Poll consumed the registry entry and persisted evidence. Keep the updated
+        // candidate checkpoint even if integration fails; only the parent's evidence
+        // receipt is affected, and retrying the consumed task would stall the graph.
         let _ = integrate_graph_task(
             &task_id,
             if result.status == "completed" {
@@ -1152,7 +1176,7 @@ fn collect_dynamic_tasks(team: &mut TeamState, run: &mut DynamicGraphRun) -> Res
                         )
                     })
                 });
-                // 同候选分支：pooling 状态已就地提交，集成失败仅丢失父级回执，忽略。
+                // Preserve the settled pooling state if the evidence receipt fails.
                 let _ = integrate_graph_task(
                     &task_id,
                     if result.status == "completed" {
@@ -1164,8 +1188,7 @@ fn collect_dynamic_tasks(team: &mut TeamState, run: &mut DynamicGraphRun) -> Res
                 );
             }
             Err(error) => {
-                // pool 任务丢失：清掉引用并复位成员，用最优候选输出兜底完成图，
-                // 绝不冒泡。
+                // Settle a lost pool task in place and finish using the best candidate.
                 let team_task_id = run.pool_team_task_id.clone();
                 settle_graph_team_task(
                     team,
@@ -1225,7 +1248,7 @@ fn launch_dynamic_phase(
         let prompt = match dynamic_prompt(question, run, &id) {
             Ok(prompt) => prompt,
             Err(error) => {
-                // 不可恢复的配置错误：让图以 Failed 终止，绝不冒泡。
+                // Record unrecoverable prompt errors so the graph terminates as failed.
                 run.error = Some(format!("dynamic prompt failed: {error}"));
                 break;
             }
@@ -1236,13 +1259,13 @@ fn launch_dynamic_phase(
         let Some((task_id, team_task_id)) = (match spawned {
             Ok(pair) => pair,
             Err(error) => {
-                // spawn 失败（如 member busy）：让图以 Failed 终止，绝不冒泡。
+                // Record spawn errors so the graph terminates as failed.
                 run.error = Some(format!("spawn failed: {error}"));
                 break;
             }
         }) else {
-            // 预算耗尽：无法再启动任何候选，记录失败并停止启动，由
-            // advance_dynamic 的 error 早退 + advance_graph 将图标记为 Failed。
+            // Exhausted attempts stop candidate launches. advance_dynamic returns
+            // early and advance_graph marks the graph failed.
             run.error = Some("graph team exhausted max_total_attempts".to_string());
             break;
         };
@@ -1355,9 +1378,8 @@ fn launch_pool_task(
         return Ok(());
     }
     let Some(member_id) = ranked_selected_ids(run).into_iter().next() else {
-        // 无 selected 候选（如 min_selected=0 且阈值过高）：配置性错误，就地标记
-        // Failed 落盘。`?` 冒泡会使 checkpoint 不保存，图永久卡在 Running，
-        // 每次 mutate 都报同样错误，只能靠 cancel 脱困。
+        // No selected candidate is a configuration error. Persist the failed state;
+        // propagating would skip the checkpoint and leave the graph running forever.
         run.error = Some("dynamic graph has no selected candidate for pooling".to_string());
         return Ok(());
     };
@@ -1400,12 +1422,12 @@ fn launch_pool_task(
     let Some((task_id, team_task_id)) = (match spawned {
         Ok(pair) => pair,
         Err(error) => {
-            // spawn 失败（如 member busy）：不可恢复，让图以 Failed 终止，绝不冒泡。
+            // Record unrecoverable pooling spawn errors so the graph terminates.
             run.error = Some(format!("pooling spawn failed: {error}"));
             return Ok(());
         }
     }) else {
-        // 预算耗尽：无法启动 pooling 任务，记录失败并让图以 Failed 终止。
+        // Record exhausted attempts so the graph fails without launching a pool task.
         run.error = Some("graph team exhausted max_total_attempts".to_string());
         return Ok(());
     };
@@ -1662,9 +1684,8 @@ fn spawn_graph_member_task(
     response_schema: Option<Value>,
 ) -> Result<Option<(String, String)>, String> {
     if team.budget.attempts_used >= team.budget.max_total_attempts {
-        // 预算耗尽不是错误而是终止条件：返回 Ok(None)，由调用方把未完成的工作
-        // 标记为失败并让图正常终止。若此处返回 Err，advance 会把错误冒泡且不
-        // 保存 checkpoint，导致图永久卡死。
+        // Exhausted attempts are a termination condition. Returning None lets callers
+        // fail unfinished work and save the checkpoint rather than leaving it running.
         return Ok(None);
     }
     let member = team
@@ -1692,11 +1713,13 @@ fn spawn_graph_member_task(
     let prepared = prepare_subagent_task(&args)?;
     let spawned = spawn_subagent_kernel_task(&prepared)?;
     let now = now_ms();
+    let revision = team.bump_revision();
     let team_task_id = format!("g-{}-{}", &graph_id[..8], Uuid::new_v4().simple());
     team.tasks.insert(
         team_task_id.clone(),
         TeamTask {
             id: team_task_id.clone(),
+            revision,
             title: description.to_string(),
             prompt: clip_text(prompt, MAX_PROMPT_CHARS),
             assignee: Some(member_id.to_string()),
@@ -1729,6 +1752,10 @@ fn settle_graph_team_task(
     let Some(team_task_id) = team_task_id else {
         return;
     };
+    if !team.tasks.contains_key(team_task_id) {
+        return;
+    }
+    let revision = team.bump_revision();
     let Some(task) = team.tasks.get_mut(team_task_id) else {
         return;
     };
@@ -1744,6 +1771,7 @@ fn settle_graph_team_task(
     task.output = (!output.is_empty()).then(|| output.to_string());
     task.error = error.map(str::to_string);
     task.updated_at_unix_ms = now_ms();
+    task.revision = revision;
     if let Some(member_id) = task.assignee.clone()
         && let Some(member) = team.members.get_mut(&member_id)
     {
@@ -1779,10 +1807,12 @@ fn cancel_graph(graph: &mut AgentGraphCheckpoint) -> Result<(), String> {
             }
         }
     }
+    let revision = graph.team.bump_revision();
     for task in graph.team.tasks.values_mut() {
         if task.state == TeamTaskState::Running {
             task.state = TeamTaskState::Cancelled;
             task.runtime_task_id = None;
+            task.revision = revision;
         }
     }
     for member in graph.team.members.values_mut() {
@@ -1811,10 +1841,9 @@ fn active_graph_task_ids(graph: &AgentGraphCheckpoint) -> Vec<String> {
     }
 }
 
-/// 图进入 Failed 终态时的在途任务回收：预算耗尽/启动失败会遗留 Running 节点或
-/// 动态候选的 runtime 任务（内核进程/channel 未回收），统一走 execute_task_cancel
-/// 取消进程并清理引用。best-effort：取消失败不阻塞 Failed 终态标记，会话 teardown
-/// 的进程组回收仍是最兜底防线。
+/// Cancel runtime tasks left in flight by budget exhaustion or spawn failure.
+/// Cancellation uses the shared task protocol and clears references even on failure;
+/// session teardown remains responsible for any surviving process groups.
 fn cancel_active_runtime_tasks(graph: &mut AgentGraphCheckpoint, reason: &str) {
     let task_ids = active_graph_task_ids(graph);
     if !task_ids.is_empty() {
@@ -1841,10 +1870,12 @@ fn cancel_active_runtime_tasks(graph: &mut AgentGraphCheckpoint, reason: &str) {
             run.pool_team_task_id = None;
         }
     }
+    let revision = graph.team.bump_revision();
     for task in graph.team.tasks.values_mut() {
         if task.state == TeamTaskState::Running {
             task.state = TeamTaskState::Cancelled;
             task.runtime_task_id = None;
+            task.revision = revision;
         }
     }
     for member in graph.team.members.values_mut() {
@@ -1881,6 +1912,75 @@ fn validate_static_graph(
     Ok(())
 }
 
+enum GraphRevisionSnapshot {
+    Initial,
+    Static(FxHashMap<String, StaticNodeRuntime>),
+    Dynamic {
+        phase: DynamicPhase,
+        lifecycle: GraphLifecycle,
+        candidates: FxHashMap<String, DynamicCandidateRuntime>,
+    },
+}
+
+impl GraphRevisionSnapshot {
+    fn capture(graph: &AgentGraphCheckpoint) -> Self {
+        if !graph.team.revision_tracking_enabled {
+            return Self::Initial;
+        }
+        match &graph.run {
+            GraphRun::Static(run) => Self::Static(run.nodes.clone()),
+            GraphRun::Dynamic(run) => Self::Dynamic {
+                phase: run.phase.clone(),
+                lifecycle: graph.lifecycle.clone(),
+                candidates: run.candidates.clone(),
+            },
+        }
+    }
+}
+
+fn record_graph_revision(graph: &mut AgentGraphCheckpoint, previous: &GraphRevisionSnapshot) {
+    if !graph.team.revision_tracking_enabled {
+        return;
+    }
+    // Each committed orchestration transaction advances the cursor. Compare complete
+    // node data, including outputs beyond the displayed preview and dynamic phases.
+    graph.revision = graph.revision.saturating_add(1);
+    match &graph.run {
+        GraphRun::Static(run) => {
+            let previous_nodes = match previous {
+                GraphRevisionSnapshot::Static(nodes) => Some(nodes),
+                _ => None,
+            };
+            for (id, node) in &run.nodes {
+                if previous_nodes.and_then(|nodes| nodes.get(id)) != Some(node) {
+                    graph.node_revisions.insert(id.clone(), graph.revision);
+                }
+            }
+        }
+        GraphRun::Dynamic(run) => {
+            let (previous_candidates, phase_changed) = match previous {
+                GraphRevisionSnapshot::Dynamic {
+                    phase,
+                    lifecycle,
+                    candidates,
+                } => (
+                    Some(candidates),
+                    phase != &run.phase || lifecycle != &graph.lifecycle,
+                ),
+                _ => (None, true),
+            };
+            for (id, candidate) in &run.candidates {
+                if phase_changed
+                    || previous_candidates.and_then(|candidates| candidates.get(id))
+                        != Some(candidate)
+                {
+                    graph.node_revisions.insert(id.clone(), graph.revision);
+                }
+            }
+        }
+    }
+}
+
 fn graph_checkpoint_path(graph_id: &str) -> Result<PathBuf, String> {
     Uuid::parse_str(graph_id)
         .map_err(|_| format!("invalid graph_id {graph_id:?}: expected UUID"))?;
@@ -1894,7 +1994,7 @@ fn save_graph(graph: &AgentGraphCheckpoint) -> Result<(), String> {
     atomic_write_json(&path, graph)
 }
 
-fn load_graph(graph_id: &str) -> Result<AgentGraphCheckpoint, String> {
+fn load_graph(graph_id: &str, optimizations_enabled: bool) -> Result<AgentGraphCheckpoint, String> {
     let path = graph_checkpoint_path(graph_id)?;
     let bytes = fs::read(&path)
         .map_err(|error| format!("failed to read agent graph {}: {error}", path.display()))?;
@@ -1906,15 +2006,18 @@ fn load_graph(graph_id: &str) -> Result<AgentGraphCheckpoint, String> {
             graph.version
         ));
     }
+    graph.configure_revision_tracking(optimizations_enabled);
     let (session_id, owner_pid) = active_identity()?;
     if graph.session_id != session_id {
         return Err("agent graph belongs to another session".to_string());
     }
     if graph.owner_pid != owner_pid {
+        let previous = GraphRevisionSnapshot::capture(&graph);
         graph.owner_pid = owner_pid;
         graph.team.owner_pid = owner_pid;
         recover_orphaned_team_tasks(&mut graph.team);
         recover_orphaned_graph(&mut graph);
+        record_graph_revision(&mut graph, &previous);
         save_graph(&graph)?;
     }
     Ok(graph)
@@ -1949,12 +2052,15 @@ fn recover_orphaned_graph(graph: &mut AgentGraphCheckpoint) {
 
 fn mutate_graph(
     graph_id: Option<&str>,
+    optimizations_enabled: bool,
     operation: impl FnOnce(&mut AgentGraphCheckpoint) -> Result<Value, String>,
 ) -> Result<String, String> {
     let graph_id = required_graph_id(graph_id)?;
-    let mut graph = load_graph(graph_id)?;
+    let mut graph = load_graph(graph_id, optimizations_enabled)?;
+    let previous = GraphRevisionSnapshot::capture(&graph);
     let value = operation(&mut graph)?;
     graph.updated_at_unix_ms = now_ms();
+    record_graph_revision(&mut graph, &previous);
     save_graph(&graph)?;
     render_json(&value)
 }
@@ -2032,6 +2138,160 @@ fn graph_view(graph: &AgentGraphCheckpoint) -> Value {
     })
 }
 
+fn dynamic_candidate_status(
+    candidate: &DynamicCandidateRuntime,
+    phase: &DynamicPhase,
+    lifecycle: &GraphLifecycle,
+) -> NodeStatus {
+    if lifecycle == &GraphLifecycle::Cancelled {
+        return NodeStatus::Cancelled;
+    }
+    if candidate.task_id.is_some() {
+        return NodeStatus::Running;
+    }
+    if !candidate.selected
+        && matches!(
+            phase,
+            DynamicPhase::Forward
+                | DynamicPhase::Reverse
+                | DynamicPhase::Pooling
+                | DynamicPhase::Completed
+        )
+    {
+        return NodeStatus::Skipped;
+    }
+    let done = match phase {
+        DynamicPhase::Initial => candidate.initial.is_some(),
+        DynamicPhase::Scoring => candidate.score_complete,
+        DynamicPhase::Forward => candidate.forward.is_some(),
+        DynamicPhase::Reverse => candidate.reverse.is_some(),
+        DynamicPhase::Pooling | DynamicPhase::Completed => true,
+    };
+    if done {
+        NodeStatus::Completed
+    } else if lifecycle == &GraphLifecycle::Failed {
+        NodeStatus::Failed
+    } else {
+        NodeStatus::Pending
+    }
+}
+
+fn graph_view_with_options(graph: &AgentGraphCheckpoint, options: StatusViewOptions) -> Value {
+    if options.is_default() {
+        return graph_view(graph);
+    }
+    let includes =
+        |id: &String| options.includes(graph.node_revisions.get(id).copied().unwrap_or_default());
+    let run = match &graph.run {
+        GraphRun::Static(run) => {
+            let mut nodes = run
+                .nodes
+                .iter()
+                .filter(|(id, _)| includes(id))
+                .map(|(id, node)| {
+                    if options.summary {
+                        json!({
+                            "id": id,
+                            "state": node.status,
+                            "attempts": node.attempts,
+                            "has_error": node.error.is_some(),
+                        })
+                    } else {
+                        json!({
+                            "id": id,
+                            "status": node.status,
+                            "attempts": node.attempts,
+                            "runtime_task_id": node.runtime_task_id,
+                            "output": node.output.as_deref().map(|text| clip_text(text, 4_000)),
+                            "error": node.error,
+                        })
+                    }
+                })
+                .collect::<Vec<_>>();
+            nodes.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+            let mut view = json!({
+                "mode": "static",
+                "node_count": run.nodes.len(),
+                "returned_node_count": nodes.len(),
+                "edge_count": run.edges.len(),
+                "nodes": nodes,
+            });
+            if !options.summary {
+                view["state"] = run.state.clone();
+            }
+            view
+        }
+        GraphRun::Dynamic(run) => {
+            let mut candidates = run
+                .candidates
+                .iter()
+                .filter(|(id, _)| includes(id))
+                .map(|(id, candidate)| {
+                    if options.summary {
+                        json!({
+                            "id": id,
+                            "state": dynamic_candidate_status(candidate, &run.phase, &graph.lifecycle),
+                            "attempts": candidate.attempts,
+                            "has_error": candidate.error.is_some(),
+                        })
+                    } else {
+                        json!({
+                            "id": id,
+                            "selected": candidate.selected,
+                            "relevance": candidate.relevance,
+                            "active_task_id": candidate.task_id,
+                            "has_initial": candidate.initial.is_some(),
+                            "has_forward": candidate.forward.is_some(),
+                            "has_reverse": candidate.reverse.is_some(),
+                            "error": candidate.error,
+                        })
+                    }
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+            let mut view = json!({
+                "mode": "dynamic",
+                "phase": run.phase,
+                "candidate_count": run.candidates.len(),
+                "returned_candidate_count": candidates.len(),
+                "edge_count": run.edges.len(),
+                "candidates": candidates,
+            });
+            if options.summary {
+                view["has_result"] = json!(run.result.is_some());
+            } else {
+                view["edges"] = json!(run.edges);
+                view["pool_task_id"] = json!(run.pool_task_id);
+                view["result"] = json!(run.result.as_deref().map(|text| clip_text(text, 12_000)));
+            }
+            view
+        }
+    };
+    let mut view = json!({
+        "graph_id": graph.graph_id,
+        "name": graph.name,
+        "lifecycle": graph.lifecycle,
+        "max_parallel": graph.max_parallel,
+        "revision": graph.revision,
+        "summary": options.summary,
+        "since": options.since,
+        "has_final_result": graph.final_result.is_some(),
+        "run": run,
+        "next_action": if graph.lifecycle == GraphLifecycle::Running { "call run_agent_graph action=advance after tasks make progress" } else { "terminal" },
+        "updated_at_unix_ms": graph.updated_at_unix_ms,
+    });
+    if !options.summary {
+        view["question"] = json!(graph.question);
+        view["final_result"] = json!(
+            graph
+                .final_result
+                .as_deref()
+                .map(|text| clip_text(text, 12_000))
+        );
+    }
+    view
+}
+
 fn render_json(value: &Value) -> Result<String, String> {
     serde_json::to_string_pretty(value)
         .map_err(|error| format!("failed to render graph state: {error}"))
@@ -2074,6 +2334,376 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn status_test_graph(dynamic: bool) -> AgentGraphCheckpoint {
+        let mut team = super::super::tests::sample_team();
+        let evidence = "graph evidence".repeat(2_000);
+        let run = if dynamic {
+            let (mut run, members) = build_dynamic_run(
+                serde_json::from_value(json!({"candidates": [
+                    {"id": "z", "role": "worker"},
+                    {"id": "a", "role": "worker"},
+                ]}))
+                .unwrap(),
+            )
+            .unwrap();
+            team.members = members;
+            let GraphRun::Dynamic(dynamic) = &mut run else {
+                unreachable!()
+            };
+            dynamic.candidates.get_mut("a").unwrap().initial = Some(evidence.clone());
+            dynamic.result = Some(evidence.clone());
+            run
+        } else {
+            let mut nodes = runtime_nodes(&["z", "a"]);
+            let node = nodes.get_mut("a").unwrap();
+            node.status = NodeStatus::Completed;
+            node.attempts = 2;
+            node.output = Some(evidence.clone());
+            node.error = Some("integration diagnostic".to_string());
+            GraphRun::Static(StaticGraphRun {
+                nodes,
+                edges: Vec::new(),
+                state: json!({"evidence": evidence}),
+            })
+        };
+        let mut graph = AgentGraphCheckpoint {
+            version: GRAPH_STATE_VERSION,
+            revision: 0,
+            node_revisions: FastMap::default(),
+            graph_id: Uuid::new_v4().to_string(),
+            session_id: team.session_id.clone(),
+            owner_pid: team.owner_pid,
+            name: "graph".to_string(),
+            question: "question".to_string(),
+            lifecycle: GraphLifecycle::Running,
+            max_parallel: 4,
+            team,
+            run,
+            final_result: Some(evidence),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        record_graph_revision(&mut graph, &GraphRevisionSnapshot::Initial);
+        graph
+    }
+
+    fn status_options(summary: bool, since: Option<u64>) -> StatusViewOptions {
+        StatusViewOptions { summary, since }
+    }
+
+    #[test]
+    fn graph_master_off_ignores_status_options_and_omits_revision_checkpoint() {
+        super::super::tests::with_status_test_context_with_config("", || {
+            assert!(!crate::ai::config::agent_team_optimizations().optimizations_enabled());
+            for dynamic in [false, true] {
+                let mut graph = status_test_graph(dynamic);
+                (graph.session_id, graph.owner_pid) = active_identity().unwrap();
+                graph.team.session_id = graph.session_id.clone();
+                graph.team.owner_pid = graph.owner_pid;
+                assert!(graph.revision > 0);
+                save_graph(&graph).unwrap();
+                let expected = render_json(&graph_view(&graph)).unwrap();
+                for options in [
+                    json!({"summary": true, "since": u64::MAX}),
+                    json!({"summary": "invalid", "since": -1}),
+                ] {
+                    let mut args = options;
+                    args["action"] = json!("status");
+                    args["graph_id"] = json!(graph.graph_id);
+                    assert_eq!(execute_run_agent_graph(&args).unwrap(), expected);
+                }
+                execute_run_agent_graph(&json!({"action": "cancel", "graph_id": graph.graph_id}))
+                    .unwrap();
+                let bytes = fs::read(graph_checkpoint_path(&graph.graph_id).unwrap()).unwrap();
+                let saved: Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(saved.get("revision").is_none());
+                assert!(saved.get("node_revisions").is_none());
+                assert!(saved["team"].get("revision").is_none());
+                let mut loaded = load_graph(&graph.graph_id, false).unwrap();
+                let previous = GraphRevisionSnapshot::capture(&loaded);
+                assert!(matches!(previous, GraphRevisionSnapshot::Initial));
+                record_graph_revision(&mut loaded, &previous);
+                assert_eq!(loaded.revision, 0);
+                assert!(loaded.node_revisions.is_empty());
+                assert_eq!(loaded.team.revision, 0);
+            }
+        });
+    }
+
+    #[test]
+    fn graph_status_summary_and_default_preserve_full_evidence() {
+        super::super::tests::with_status_test_context(|| {
+            for dynamic in [false, true] {
+                let mut graph = status_test_graph(dynamic);
+                (graph.session_id, graph.owner_pid) = active_identity().unwrap();
+                graph.team.session_id = graph.session_id.clone();
+                graph.team.owner_pid = graph.owner_pid;
+                if let GraphRun::Dynamic(run) = &mut graph.run {
+                    run.phase = DynamicPhase::Forward;
+                    let candidate = run.candidates.get_mut("a").unwrap();
+                    candidate.selected = true;
+                    candidate.task_id = Some("active-runtime".to_string());
+                    candidate.attempts = 2;
+                    candidate.error = Some("integration diagnostic".to_string());
+                }
+                save_graph(&graph).unwrap();
+                let args = json!({"action": "status", "graph_id": graph.graph_id});
+                let expected = render_json(&graph_view(&graph)).unwrap();
+                assert_eq!(execute_run_agent_graph(&args).unwrap(), expected);
+                let full: Value = serde_json::from_str(&expected).unwrap();
+                assert!(full.get("revision").is_none());
+                assert_eq!(
+                    full["final_result"],
+                    clip_text(&"graph evidence".repeat(2_000), 12_000)
+                );
+                if !dynamic {
+                    assert_eq!(
+                        full["run"]["nodes"][0]["output"],
+                        clip_text(&"graph evidence".repeat(2_000), 4_000)
+                    );
+                    assert!(full["run"]["state"]["evidence"].as_str().unwrap().len() > 12_000);
+                }
+                let summary: Value = serde_json::from_str(
+                    &execute_run_agent_graph(&json!({
+                        "action": "status", "graph_id": graph.graph_id, "summary": true,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(summary["revision"], graph.revision);
+                assert_eq!(summary["has_final_result"], true);
+                assert!(summary.get("final_result").is_none());
+                assert!(summary["run"].get("state").is_none());
+                assert!(summary["run"].get("result").is_none());
+                assert!(!summary.to_string().contains("graph evidence"));
+                let key = if dynamic { "candidates" } else { "nodes" };
+                let rows = summary["run"][key].as_array().unwrap();
+                assert_eq!(rows.len(), 2);
+                assert!(rows.iter().all(|row| row.as_object().unwrap().len() == 4));
+                assert_eq!(rows[0]["id"], "a");
+                assert_eq!(rows[0]["attempts"], 2);
+                assert_eq!(rows[0]["has_error"], true);
+                assert_eq!(
+                    rows[0]["state"],
+                    if dynamic { "running" } else { "completed" }
+                );
+                assert_eq!(
+                    rows[1]["state"],
+                    if dynamic { "skipped" } else { "pending" }
+                );
+                assert_eq!(
+                    execute_run_agent_graph(&json!({
+                        "action": "status", "graph_id": graph.graph_id, "summary": false,
+                    }))
+                    .unwrap(),
+                    expected
+                );
+                assert_eq!(execute_run_agent_graph(&args).unwrap(), expected);
+                assert!(
+                    execute_run_agent_graph(&json!({
+                        "action": "status", "graph_id": graph.graph_id, "since": -1,
+                    }))
+                    .is_err()
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn graph_status_since_tracks_full_static_data_and_persisted_cursor() {
+        let mut graph = status_test_graph(false);
+        let baseline = graph.revision;
+        let previous = GraphRevisionSnapshot::capture(&graph);
+        let GraphRun::Static(run) = &mut graph.run else {
+            unreachable!()
+        };
+        let node = run.nodes.get_mut("z").unwrap();
+        node.status = NodeStatus::Running;
+        node.attempts = 1;
+        node.runtime_task_id = Some("runtime-z".to_string());
+        record_graph_revision(&mut graph, &previous);
+        let delta = graph_view_with_options(&graph, status_options(false, Some(baseline)));
+        assert_eq!(delta["run"]["node_count"], 2);
+        assert_eq!(delta["run"]["returned_node_count"], 1);
+        assert_eq!(delta["run"]["nodes"][0]["id"], "z");
+        assert!(graph.revision > baseline);
+
+        let saved_revision = graph.revision;
+        graph = serde_json::from_slice(&serde_json::to_vec(&graph).unwrap()).unwrap();
+        graph.configure_revision_tracking(true);
+        assert_eq!(graph.revision, saved_revision);
+        assert_eq!(graph.node_revisions["z"], saved_revision);
+        let visible_before = graph_view(&graph);
+        let previous = GraphRevisionSnapshot::capture(&graph);
+        let GraphRun::Static(run) = &mut graph.run else {
+            unreachable!()
+        };
+        run.nodes
+            .get_mut("a")
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .push_str("changed beyond the preview");
+        record_graph_revision(&mut graph, &previous);
+        assert_eq!(graph_view(&graph), visible_before);
+        let delta = graph_view_with_options(&graph, status_options(true, Some(saved_revision)));
+        assert_eq!(delta["run"]["returned_node_count"], 1);
+        assert_eq!(delta["run"]["nodes"][0]["id"], "a");
+        assert!(graph.revision > saved_revision);
+
+        let cursor = graph.revision;
+        let unchanged = graph_view_with_options(&graph, status_options(false, Some(cursor)));
+        assert_eq!(unchanged["run"]["nodes"], json!([]));
+        assert_eq!(unchanged["revision"], cursor);
+        assert_eq!(graph.revision, cursor);
+        let previous = GraphRevisionSnapshot::capture(&graph);
+        graph.final_result = Some("new final evidence".to_string());
+        record_graph_revision(&mut graph, &previous);
+        let metadata_only = graph_view_with_options(&graph, status_options(false, Some(cursor)));
+        assert_eq!(metadata_only["run"]["nodes"], json!([]));
+        assert_eq!(metadata_only["final_result"], "new final evidence");
+        assert!(metadata_only["revision"].as_u64().unwrap() > cursor);
+    }
+
+    #[test]
+    fn graph_status_since_tracks_dynamic_phase_and_candidate_changes() {
+        let mut graph = status_test_graph(true);
+        let baseline = graph.revision;
+        let previous = GraphRevisionSnapshot::capture(&graph);
+        let GraphRun::Dynamic(run) = &mut graph.run else {
+            unreachable!()
+        };
+        let candidate = run.candidates.get_mut("z").unwrap();
+        candidate.task_id = Some("runtime-z".to_string());
+        candidate.attempts = 1;
+        record_graph_revision(&mut graph, &previous);
+        let delta = graph_view_with_options(&graph, status_options(true, Some(baseline)));
+        assert_eq!(delta["run"]["returned_candidate_count"], 1);
+        assert_eq!(delta["run"]["candidates"][0]["id"], "z");
+        assert_eq!(delta["run"]["candidates"][0]["state"], "running");
+
+        let cursor = graph.revision;
+        let previous = GraphRevisionSnapshot::capture(&graph);
+        let GraphRun::Dynamic(run) = &mut graph.run else {
+            unreachable!()
+        };
+        run.candidates.get_mut("z").unwrap().task_id = None;
+        run.phase = DynamicPhase::Scoring;
+        record_graph_revision(&mut graph, &previous);
+        let phase_delta = graph_view_with_options(&graph, status_options(true, Some(cursor)));
+        assert_eq!(phase_delta["run"]["phase"], "scoring");
+        assert_eq!(phase_delta["run"]["returned_candidate_count"], 2);
+        assert_eq!(phase_delta["run"]["candidates"][0]["state"], "pending");
+
+        let cursor = graph.revision;
+        let previous = GraphRevisionSnapshot::capture(&graph);
+        let visible_before = graph_view(&graph);
+        let GraphRun::Dynamic(run) = &mut graph.run else {
+            unreachable!()
+        };
+        let candidate = run.candidates.get_mut("a").unwrap();
+        candidate.score_complete = true;
+        candidate.scores.insert("z".to_string(), 0.9);
+        record_graph_revision(&mut graph, &previous);
+        assert_eq!(graph_view(&graph), visible_before);
+        graph = serde_json::from_slice(&serde_json::to_vec(&graph).unwrap()).unwrap();
+        graph.configure_revision_tracking(true);
+        let score_delta = graph_view_with_options(&graph, status_options(true, Some(cursor)));
+        assert_eq!(score_delta["run"]["returned_candidate_count"], 1);
+        assert_eq!(score_delta["run"]["candidates"][0]["id"], "a");
+        assert_eq!(score_delta["run"]["candidates"][0]["state"], "completed");
+
+        let cursor = graph.revision;
+        let previous = GraphRevisionSnapshot::capture(&graph);
+        cancel_graph(&mut graph).unwrap();
+        record_graph_revision(&mut graph, &previous);
+        let cancelled = graph_view_with_options(&graph, status_options(true, Some(cursor)));
+        assert_eq!(cancelled["run"]["returned_candidate_count"], 2);
+        assert!(
+            cancelled["run"]["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["state"] == "cancelled")
+        );
+    }
+
+    #[test]
+    fn graph_checkpoint_without_revision_loads_and_recovers() {
+        super::super::tests::with_status_test_context(|| {
+            let mut graph = status_test_graph(false);
+            (graph.session_id, graph.owner_pid) = active_identity().unwrap();
+            graph.team.session_id = graph.session_id.clone();
+            graph.team.owner_pid = graph.owner_pid;
+            let GraphRun::Static(run) = &mut graph.run else {
+                unreachable!()
+            };
+            let node = run.nodes.get_mut("a").unwrap();
+            node.status = NodeStatus::Running;
+            node.runtime_task_id = Some("orphaned-runtime".to_string());
+            node.spec.max_retries = node.attempts;
+            super::super::add_team_task(
+                &mut graph.team,
+                super::super::TeamTaskInput {
+                    id: Some("first".to_string()),
+                    title: "first".to_string(),
+                    prompt: "first".to_string(),
+                    assignee: None,
+                    depends_on: Vec::new(),
+                },
+            )
+            .unwrap();
+            graph.team.tasks.get_mut("first").unwrap().state = TeamTaskState::Running;
+            let mut legacy = serde_json::to_value(&graph).unwrap();
+            legacy.as_object_mut().unwrap().remove("revision");
+            legacy.as_object_mut().unwrap().remove("node_revisions");
+            legacy["team"].as_object_mut().unwrap().remove("revision");
+            for task in legacy["team"]["tasks"]
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+            {
+                task.as_object_mut().unwrap().remove("revision");
+            }
+            let decoded: AgentGraphCheckpoint = serde_json::from_value(legacy.clone()).unwrap();
+            assert_eq!(decoded.revision, 0);
+            assert!(decoded.node_revisions.is_empty());
+            assert_eq!(decoded.team.revision, 0);
+            assert_eq!(decoded.team.tasks["first"].revision, 0);
+
+            legacy["owner_pid"] = json!(graph.owner_pid + 1);
+            atomic_write_json(&graph_checkpoint_path(&graph.graph_id).unwrap(), &legacy).unwrap();
+            let recovered: Value = serde_json::from_str(
+                &execute_run_agent_graph(&json!({
+                    "action": "status", "graph_id": graph.graph_id, "summary": true, "since": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(recovered["revision"], 1);
+            assert_eq!(recovered["run"]["returned_node_count"], 1);
+            assert_eq!(recovered["run"]["nodes"][0]["id"], "a");
+            assert_eq!(recovered["run"]["nodes"][0]["state"], "pending");
+            let saved = load_graph(&graph.graph_id, true).unwrap();
+            assert_eq!(saved.revision, 1);
+            assert_eq!(saved.node_revisions["a"], 1);
+            assert_eq!(
+                saved.node_revisions.get("z").copied().unwrap_or_default(),
+                0
+            );
+            assert_eq!(saved.team.revision, 1);
+            assert_eq!(saved.team.tasks["first"].revision, 1);
+            let GraphRun::Static(run) = saved.run else {
+                unreachable!()
+            };
+            assert_eq!(
+                run.nodes["a"].output.as_deref(),
+                Some("graph evidence".repeat(2_000).as_str())
+            );
+        });
     }
 
     #[test]

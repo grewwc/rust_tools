@@ -637,6 +637,11 @@ fn append_native_tools(tools: Vec<ToolDef>) -> Vec<ToolDef> {
 
 fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option<Vec<ToolDef>> {
     let mut defs: Vec<ToolDef> = Vec::new();
+    let optimizations = crate::ai::config::agent_team_optimizations();
+    let defer_lifecycle = super::super::tools::enable_tools::task_lifecycle_schemas_deferred(
+        optimizations.auto_mount_lifecycle_tools(),
+    );
+    let mut deferred_group_schema = false;
     // Case-insensitive dedup so a tool named both via a group and by an
     // explicit `tools:` entry rides along only once.
     let mut names_seen: Vec<String> = Vec::new();
@@ -661,6 +666,17 @@ fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option
         // write_file are never marked hidden, so editing capability is
         // unaffected.
         for tool in super::super::tools::tool_definitions_for_groups(&groups) {
+            if super::super::tools::registry::common::tool_has_lazy_group_schema(
+                &tool.function.name,
+                optimizations.lazy_group_schemas(),
+            ) || (defer_lifecycle
+                && super::super::tools::registry::common::is_task_lifecycle_tool(
+                    &tool.function.name,
+                ))
+            {
+                deferred_group_schema = true;
+                continue;
+            }
             if !super::super::tools::tool_defers_eager_load(&tool.function.name) {
                 names_seen.push(tool.function.name.clone());
                 defs.push(tool);
@@ -689,10 +705,9 @@ fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option
         }
     }
     if defs.is_empty() {
-        // Pinning only driver-injected control tools is still a declared set:
-        // returning None would make the caller fall back to the default
-        // groups, widening the manifest's narrow pin to the whole Core set.
-        if pinned_control_tool {
+        // A control-only pin or a schema-deferred group is still a declared
+        // set. Returning None would widen it to the default Core group.
+        if pinned_control_tool || deferred_group_schema {
             return Some(ensure_required_baseline_tools(Vec::new()));
         }
         return None;
@@ -1050,19 +1065,60 @@ fn build_hidden_task_tool_catalog(available_tools: &Box<SkipSet<String>>) -> Opt
         "manage_team",
         "run_agent_graph",
     ];
+    let optimizations = crate::ai::config::agent_team_optimizations();
+    let lazy_groups = optimizations.lazy_group_schemas();
+    let defer_lifecycle = super::super::tools::enable_tools::task_lifecycle_schemas_deferred(
+        optimizations.auto_mount_lifecycle_tools(),
+    );
     let hidden: Vec<&str> = TASK_FAMILY
         .iter()
         .copied()
         .filter(|name| !available_tools.contains_str(name))
+        .filter(|name| {
+            !super::super::tools::registry::common::tool_has_lazy_group_schema(name, lazy_groups)
+                && !(defer_lifecycle
+                    && super::super::tools::registry::common::is_task_lifecycle_tool(name))
+        })
         .collect();
 
-    render_hidden_tool_catalog(
+    let mut catalogs = Vec::new();
+    if let Some(catalog) = render_hidden_tool_catalog(
         "Subagent orchestration tools are available but not loaded in this turn.\n\
          When the task splits into multiple independent branches that would benefit from \
          subagent parallelism (broad discovery, cross-module mapping, independent verification, \
          or concurrent research), enable the needed tools via `enable_tools`.",
         &hidden,
-    )
+    ) {
+        catalogs.push(catalog);
+    }
+    if lazy_groups {
+        let names = super::super::tools::tool_summaries_for_groups(&[ToolGroup::AgentTeam])
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| !available_tools.contains_str(name))
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+            catalogs.push(format!(
+                "Agent-team orchestration tools load on demand via `enable_tools` (group `agent_team` or individual tool names).\nAvailable: {}.",
+                format_tool_names(&names),
+            ));
+        }
+    }
+    if defer_lifecycle {
+        let names = super::super::tools::registry::common::task_lifecycle_tool_names()
+            .into_iter()
+            .filter(|name| !available_tools.contains_str(name))
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+            catalogs.push(format!(
+                "Task lifecycle tools are auto-mounted after `task_spawn` succeeds. For existing tasks or delivered evidence, enable individual tool names via `enable_tools`.\nAvailable after spawn: {}.",
+                format_tool_names(&names),
+            ));
+        }
+    }
+    (!catalogs.is_empty()).then(|| catalogs.join("\n\n"))
 }
 
 /// Render names in caller-supplied order: MCP and execution catalogs sort and
@@ -1112,6 +1168,43 @@ fn escape_xml_attr(s: &str) -> String {
 // Keep project and skill precedence declarations aligned on the protected rules.
 const NON_OVERRIDABLE_PROMPT_CONSTRAINTS: &str =
     "correctness guardrails (including git-safety rules), intellectual honesty, safety redlines";
+
+const BASE_TASK_SPAWN_GUIDANCE: &str = "Use `task_spawn` for every delegation, including a single focused subtask whose result you need back. Spawn first, continue any independent parent-side work, then collect with `task_wait`; never block before spawning.";
+const BASE_SUBAGENT_RESULT_CONTRACT: &str = "Give each subagent an explicit result contract: return a concise conclusion, the key evidence paths/lines or commands, remaining uncertainty, and suggested verification; do not return raw logs, exhaustive search output, or large source excerpts unless requested.";
+
+/// Dedupe only against the reviewed authored contract. A same-named user
+/// override or extra system prompt cannot silently remove base guarantees.
+fn should_dedupe_agent_team_base_prompt(skills: &[&SkillManifest]) -> bool {
+    if !crate::ai::config::agent_team_optimizations().dedupe_base_prompt() {
+        return false;
+    }
+    let Some((_, authored_prompt)) =
+        include_str!("../builtin_skills/agent-team.skill").split_once("\n---\n")
+    else {
+        return false;
+    };
+    let authored_prompt = authored_prompt.trim();
+    // Preserve the base lines if a future skill revision drops their covering
+    // contracts, even when that revision still uses the same skill name.
+    const COVERING_CONTRACTS: &[&str] = &[
+        "Use `task_spawn` with a `tasks` array for every delegation, including a single worker. Never block the parent before spawning.",
+        "When blocked on results and no\n  parent-side decision remains, go straight to `task_wait`",
+        "the expected result format: concise conclusion, exact artifact/version",
+        "assumptions, remaining uncertainty and what it does not cover",
+        "Keep detailed logs and large excerpts in artifacts for selective recovery.",
+    ];
+    COVERING_CONTRACTS
+        .iter()
+        .all(|contract| authored_prompt.contains(contract))
+        && skills.iter().any(|skill| {
+            skill.name.eq_ignore_ascii_case("agent-team")
+                && skill.prompt.trim() == authored_prompt
+                && skill
+                    .system_prompt
+                    .as_deref()
+                    .is_none_or(|prompt| prompt.trim().is_empty())
+        })
+}
 
 fn build_project_instruction_prompt() -> Option<String> {
     let docs = load_project_instruction_docs();
@@ -1388,6 +1481,7 @@ fn build_system_prompt(
     ctx: &PromptContext,
 ) -> SystemPromptBuilder {
     let mut b = SystemPromptBuilder::new();
+    let dedupe_agent_team_base = should_dedupe_agent_team_base_prompt(skills);
 
     // Identity section: merge the generic identity with agent / skill enforcement, avoiding 4 copies of
     // repeated "you must follow ..." flooding the prompt cache.
@@ -1721,11 +1815,15 @@ fn build_system_prompt(
         // gates check outstanding tasks and unintegrated evidence with bounded retries.
         let mut lines = Vec::new();
         if has_tool(available_tools, "task_spawn") {
-            lines.push("Use `task_spawn` for every delegation, including a single focused subtask whose result you need back. Spawn first, continue any independent parent-side work, then collect with `task_wait`; never block before spawning.".to_string());
+            if !dedupe_agent_team_base {
+                lines.push(BASE_TASK_SPAWN_GUIDANCE.to_string());
+            }
             lines.push("When no active skill requires delegation, qualify a subtask when it has a distinct, bounded goal and its expected latency or context-isolation benefit outweighs handoff overhead — a serial step qualifies too when it keeps substantial intermediate reads, searches, logs, or experiments out of the parent context while returning a concise result; parallel branches are not required.".to_string());
             lines.push("Keep pre-division shared discovery sequential; never run dependent steps concurrently, do not delegate merely to create parallelism, and keep work in the parent when net benefit is marginal or uncertain — unless an active skill requires delegation.".to_string());
             lines.push("Prefer delegating broad read-only discovery, cross-module caller or consumer mapping, noisy log or dependency research, and independent adversarial verification. Keep final decisions and end-to-end synthesis in the parent; when an active skill requires delegation, hand a tightly coupled edit to exactly one worker instead of doing it in the parent. Iteration limits, tool failures, and recovery steps are not delegation benefits.".to_string());
-            lines.push("Give each subagent an explicit result contract: return a concise conclusion, the key evidence paths/lines or commands, remaining uncertainty, and suggested verification; do not return raw logs, exhaustive search output, or large source excerpts unless requested.".to_string());
+            if !dedupe_agent_team_base {
+                lines.push(BASE_SUBAGENT_RESULT_CONTRACT.to_string());
+            }
             lines.push("Once you identify multiple qualifying subtasks with no data dependency, spawn ALL of them in one `task_spawn` call (1-8 tasks) so preflight, dispatch, and returned task ids preserve input order; continue every independent parent-side step while they run — never spawn-wait-spawn-wait serially.".to_string());
         }
         if has_tool(available_tools, "task_status") {
@@ -1963,8 +2061,11 @@ fn build_skill_turn_guard(
     if !pure_mode
         && super::runtime_ctx::is_resume_turn()
         && !quiet_task_wait_resume
-        && let Some(guidance) =
-            super::process_context::wakeup_task_guidance(|name| has_tool(&available_tools, name))
+        && let Some(guidance) = super::process_context::wakeup_task_guidance(
+            question,
+            app.config.agent_team_optimizations().merge_ready_results(),
+            |name| has_tool(&available_tools, name),
+        )
     {
         builder.push_labeled(ContextKind::Behavior, "scheduler_wakeup", guidance);
     }
@@ -2638,6 +2739,326 @@ mod pure_prompt_tests {
             stable_hash(without_environment_block(&prompt).as_bytes()),
             DEFAULT_PROFILE_PROMPT_HASH,
             "the default profile's prompt bytes drifted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod agent_team_optimization_tests {
+    use super::*;
+    use crate::ai::driver::runtime_ctx::{SUBAGENT_DEPTH, TURN_IDENTITY};
+    use crate::ai::tools::enable_tools::{self, with_agent_team_optimizations_for_test};
+    use sha2::{Digest, Sha256};
+
+    const GROUPS: &[&str] = &["core", "task", "agent_team"];
+    const MASTER: &str = "ai.agent_team.optimizations_enabled = true\n";
+
+    fn team_skill() -> SkillManifest {
+        crate::ai::skills::parse_skill_front_matter(include_str!(
+            "../builtin_skills/agent-team.skill"
+        ))
+        .expect("valid authored agent-team skill")
+    }
+
+    fn all_tools() -> Box<SkipSet<String>> {
+        available_tool_names(
+            &crate::ai::tools::tool_definitions_for_groups(&[
+                ToolGroup::Core,
+                ToolGroup::Task,
+                ToolGroup::AgentTeam,
+            ]),
+            &[],
+        )
+    }
+
+    fn group_tools(pins: &[&str]) -> Vec<ToolDef> {
+        manifest_tool_definitions(
+            &GROUPS
+                .iter()
+                .map(|group| (*group).to_string())
+                .collect::<Vec<_>>(),
+            &pins
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .expect("declared tool set")
+    }
+
+    fn async_section(builder: &SystemPromptBuilder) -> &str {
+        &builder
+            .sections
+            .iter()
+            .find(|(_, label, _)| label.as_deref() == Some("async_subagent_orchestration"))
+            .expect("task guidance section")
+            .2
+    }
+
+    fn assert_legacy_async_bytes(builder: &SystemPromptBuilder) {
+        let section = async_section(builder);
+        assert_eq!(section.len(), 2204);
+        let hash = Sha256::digest(section.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        // Captured from the authored section before adding prompt deduplication.
+        assert_eq!(
+            hash,
+            "57dde939faa78f8c04ac8f81a117326e105a5b7187c1c3b148bba583d5da768d"
+        );
+    }
+
+    #[test]
+    fn agent_team_dedupe_default_off_preserves_prompt_bytes() {
+        let skill = team_skill();
+        let available = all_tools();
+        let ctx = PromptContext::default();
+        let baseline = with_agent_team_optimizations_for_test("", || {
+            build_system_prompt(None, &[&skill], &available, &ctx)
+        });
+        assert_legacy_async_bytes(&baseline);
+        let master_off = with_agent_team_optimizations_for_test(
+            "ai.agent_team.optimizations_enabled = false\nai.agent_team.dedupe_base_prompt = true\nai.agent_team.lazy_group_schemas = true\nai.agent_team.auto_mount_lifecycle_tools = true\n",
+            || build_system_prompt(None, &[&skill], &available, &ctx),
+        );
+        assert_legacy_async_bytes(&master_off);
+        assert_eq!(
+            master_off.render_system_prompt().as_bytes(),
+            baseline.render_system_prompt().as_bytes(),
+        );
+    }
+
+    #[test]
+    fn agent_team_dedupe_removes_only_reviewed_overlaps() {
+        let skill = team_skill();
+        let available = all_tools();
+        let ctx = PromptContext::default();
+        let mut expected = with_agent_team_optimizations_for_test("", || {
+            build_system_prompt(None, &[&skill], &available, &ctx)
+        });
+        assert_legacy_async_bytes(&expected);
+        let retained = async_section(&expected)
+            .lines()
+            .filter(|line| {
+                *line != format!("- {BASE_TASK_SPAWN_GUIDANCE}")
+                    && *line != format!("- {BASE_SUBAGENT_RESULT_CONTRACT}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(retained.lines().count(), 5);
+        expected.replace_labeled(
+            ContextKind::Behavior,
+            "async_subagent_orchestration",
+            retained,
+        );
+        let enabled = with_agent_team_optimizations_for_test(
+            &format!("{MASTER}ai.agent_team.dedupe_base_prompt = true\n"),
+            || {
+                assert!(should_dedupe_agent_team_base_prompt(&[&skill]));
+                build_system_prompt(None, &[&skill], &available, &ctx)
+            },
+        );
+        let rendered = enabled.render_system_prompt();
+        assert_eq!(
+            rendered.as_bytes(),
+            expected.render_system_prompt().as_bytes()
+        );
+        for block in [
+            include_str!("system_prompts/trust_boundary.md"),
+            include_str!("system_prompts/correctness_guardrails.md"),
+            include_str!("system_prompts/safety_redlines.md"),
+            include_str!("system_prompts/intellectual_honesty.md"),
+        ] {
+            assert!(rendered.contains(block.trim()));
+        }
+        assert!(rendered.contains(skill.prompt.trim()));
+        assert!(async_section(&enabled).contains("returned task ids preserve input order"));
+        assert!(
+            async_section(&enabled)
+                .contains("runtime final-response gates provide bounded recovery")
+        );
+    }
+
+    #[test]
+    fn agent_team_dedupe_keeps_same_named_override_guarantees() {
+        let original = team_skill();
+        let mut renamed = original.clone();
+        renamed.name = "another-skill".to_string();
+        let mut rewritten = original.clone();
+        rewritten.prompt = "Delegate when useful.".to_string();
+        let mut extended = original.clone();
+        extended.system_prompt = Some("Additional custom instructions.".to_string());
+        with_agent_team_optimizations_for_test(
+            &format!("{MASTER}ai.agent_team.dedupe_base_prompt = true\n"),
+            || {
+                for skill in [&renamed, &rewritten, &extended] {
+                    assert!(!should_dedupe_agent_team_base_prompt(&[skill]));
+                    assert_legacy_async_bytes(&build_system_prompt(
+                        None,
+                        &[skill],
+                        &all_tools(),
+                        &PromptContext::default(),
+                    ));
+                }
+                assert!(!should_dedupe_agent_team_base_prompt(&[]));
+                assert!(should_dedupe_agent_team_base_prompt(&[&renamed, &original]));
+            },
+        );
+    }
+
+    #[test]
+    fn agent_team_lazy_schemas_preserve_default_and_narrow_groups() {
+        let baseline = with_agent_team_optimizations_for_test(MASTER, || group_tools(&[]));
+        with_agent_team_optimizations_for_test(
+            &format!("{MASTER}ai.agent_team.lazy_group_schemas = true\n"),
+            || {
+                let lazy = group_tools(&[]);
+                let expected = baseline
+                    .iter()
+                    .filter(|tool| {
+                        !["manage_team", "run_agent_graph"].contains(&tool.function.name.as_str())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    serde_json::to_value(&lazy).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+                let narrow = manifest_tool_definitions(&["agent_team".to_string()], &[])
+                    .expect("a lazy-only declaration remains a declared tool set");
+                assert_eq!(narrow.len(), required_baseline_tool_names().len());
+                assert!(
+                    narrow
+                        .iter()
+                        .all(|tool| required_baseline_tool_names().contains(&tool.function.name))
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn agent_team_lifecycle_tools_mount_after_spawn_and_survive_turns() {
+        let baseline = with_agent_team_optimizations_for_test(MASTER, || group_tools(&[]));
+        with_agent_team_optimizations_for_test(
+            &format!("{MASTER}ai.agent_team.auto_mount_lifecycle_tools = true\n"),
+            || {
+                let session = format!("lifecycle-{}", uuid::Uuid::new_v4().simple());
+                TURN_IDENTITY.sync_scope((session.clone(), 1), || {
+                    let _guard = enable_tools::EnableTurnStateGuard::enter();
+                    assert!(!enable_tools::task_lifecycle_tools_mounted());
+                    let before = group_tools(&[]);
+                    let expected = baseline
+                        .iter()
+                        .filter(|tool| {
+                            !crate::ai::tools::registry::common::is_task_lifecycle_tool(
+                                &tool.function.name,
+                            )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        serde_json::to_value(&before).unwrap(),
+                        serde_json::to_value(expected).unwrap()
+                    );
+                    assert!(before.iter().any(|tool| tool.function.name == "task_spawn"));
+                    enable_tools::set_active_tool_names(
+                        before
+                            .iter()
+                            .map(|tool| tool.function.name.clone())
+                            .collect(),
+                    );
+                    enable_tools::record_successful_task_spawn();
+                    assert!(enable_tools::task_lifecycle_tools_mounted());
+                    let queued = enable_tools::drain_pending_enable();
+                    assert_eq!(
+                        queued.len(),
+                        crate::ai::tools::registry::common::task_lifecycle_tool_names().len()
+                    );
+                    assert_eq!(
+                        serde_json::to_value(group_tools(&[])).unwrap(),
+                        serde_json::to_value(&baseline).unwrap()
+                    );
+                });
+                TURN_IDENTITY.sync_scope((session.clone(), 2), || {
+                    assert!(enable_tools::task_lifecycle_tools_mounted());
+                    assert_eq!(
+                        serde_json::to_value(group_tools(&[])).unwrap(),
+                        serde_json::to_value(&baseline).unwrap()
+                    );
+                    let merged = merge_with_runtime_enabled_tools(
+                        crate::ai::tools::tool_definitions_for_groups(&[ToolGroup::Core]),
+                        Vec::new(),
+                        &[],
+                    );
+                    for name in crate::ai::tools::registry::common::task_lifecycle_tool_names() {
+                        assert!(merged.iter().any(|tool| tool.function.name == name));
+                    }
+                    enable_tools::clear_task_family_explicitly_enabled_tools(&session);
+                    assert!(!enable_tools::task_lifecycle_tools_mounted());
+                    enable_tools::clear_explicitly_enabled_tools(&session);
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn agent_team_schema_deferral_preserves_pins_and_subagent_depth() {
+        with_agent_team_optimizations_for_test(
+            &format!(
+                "{MASTER}ai.agent_team.lazy_group_schemas = true\nai.agent_team.auto_mount_lifecycle_tools = true\n"
+            ),
+            || {
+                let pins = ["manage_team", "task_wait"];
+                let tools = group_tools(&pins);
+                for name in pins {
+                    assert!(tools.iter().any(|tool| tool.function.name == name));
+                }
+                assert!(
+                    !tools
+                        .iter()
+                        .any(|tool| tool.function.name == "run_agent_graph")
+                );
+                assert!(
+                    !tools
+                        .iter()
+                        .any(|tool| tool.function.name == "task_integrate")
+                );
+                assert!(tools.iter().any(|tool| tool.function.name == "task_spawn"));
+                SUBAGENT_DEPTH.sync_scope(1, || {
+                    let skill = team_skill();
+                    let tools = builtin_tools_for_skill(&[&skill], None);
+                    assert!(tools.iter().all(|tool| {
+                        !crate::ai::tools::is_subagent_orchestration_tool_name(&tool.function.name)
+                    }));
+                    assert!(
+                        tools
+                            .iter()
+                            .any(|tool| tool.function.name == "send_side_note")
+                    );
+                    assert!(build_hidden_task_tool_catalog(&all_tools()).is_none());
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn agent_team_catalog_names_lazy_groups_and_spawn_lifecycle_tools() {
+        with_agent_team_optimizations_for_test(
+            &format!(
+                "{MASTER}ai.agent_team.lazy_group_schemas = true\nai.agent_team.auto_mount_lifecycle_tools = true\n"
+            ),
+            || {
+                let catalog =
+                    build_hidden_task_tool_catalog(&available_tool_names(&group_tools(&[]), &[]))
+                        .expect("deferred schemas need a catalog");
+                assert!(catalog.contains("group `agent_team` or individual tool names"));
+                assert!(catalog.contains("`manage_team` and `run_agent_graph`"));
+                assert!(catalog.contains("auto-mounted after `task_spawn` succeeds"));
+                assert!(catalog.contains("existing tasks or delivered evidence"));
+                for name in crate::ai::tools::registry::common::task_lifecycle_tool_names() {
+                    assert!(catalog.contains(&format!("`{name}`")), "{name}: {catalog}");
+                }
+            },
         );
     }
 }

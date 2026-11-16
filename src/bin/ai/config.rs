@@ -103,6 +103,69 @@ fn parse_switch(raw: Option<&str>) -> Option<bool> {
     }
 }
 
+/// A snapshot of the opt-in agent-team optimization switches. Raw switches
+/// stay private so every optimization accessor enforces the master switch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct AgentTeamOptimizations {
+    optimizations_enabled: bool,
+    dedupe_base_prompt: bool,
+    lazy_group_schemas: bool,
+    persist_status_cursor: bool,
+    merge_ready_results: bool,
+    auto_mount_lifecycle_tools: bool,
+}
+
+impl AgentTeamOptimizations {
+    /// Unset or invalid values default to off, using the existing switch parser.
+    pub(super) fn from_config(cfg: &configw::ConfigW) -> Self {
+        let enabled = |key| parse_switch(cfg.get_opt(key).as_deref()).unwrap_or(false);
+        Self {
+            optimizations_enabled: enabled(AiConfig::AGENT_TEAM_OPTIMIZATIONS_ENABLED),
+            dedupe_base_prompt: enabled(AiConfig::AGENT_TEAM_DEDUPE_BASE_PROMPT),
+            lazy_group_schemas: enabled(AiConfig::AGENT_TEAM_LAZY_GROUP_SCHEMAS),
+            persist_status_cursor: enabled(AiConfig::AGENT_TEAM_PERSIST_STATUS_CURSOR),
+            merge_ready_results: enabled(AiConfig::AGENT_TEAM_MERGE_READY_RESULTS),
+            auto_mount_lifecycle_tools: enabled(AiConfig::AGENT_TEAM_AUTO_MOUNT_LIFECYCLE_TOOLS),
+        }
+    }
+
+    pub(super) fn optimizations_enabled(&self) -> bool {
+        self.optimizations_enabled
+    }
+
+    pub(super) fn dedupe_base_prompt(&self) -> bool {
+        self.optimizations_enabled && self.dedupe_base_prompt
+    }
+
+    pub(super) fn lazy_group_schemas(&self) -> bool {
+        self.optimizations_enabled && self.lazy_group_schemas
+    }
+
+    pub(super) fn persist_status_cursor(&self) -> bool {
+        self.optimizations_enabled && self.persist_status_cursor
+    }
+
+    pub(super) fn merge_ready_results(&self) -> bool {
+        self.optimizations_enabled && self.merge_ready_results
+    }
+
+    pub(super) fn auto_mount_lifecycle_tools(&self) -> bool {
+        self.optimizations_enabled && self.auto_mount_lifecycle_tools
+    }
+}
+
+/// Read one consistent snapshot from the current process's cached configuration.
+pub(super) fn agent_team_optimizations() -> AgentTeamOptimizations {
+    AgentTeamOptimizations::from_config(&configw::get_all_config())
+}
+
+impl AppConfig {
+    /// Read the current persisted switches, including changes after a config refresh.
+    pub(super) fn agent_team_optimizations(&self) -> AgentTeamOptimizations {
+        agent_team_optimizations()
+    }
+}
+
 /// Whether the `ai.prompt.pure_mode` configuration key requests the pure
 /// agent as the startup default. Unset or invalid config means off, so a
 /// missing configuration can never silently strip the normal system prompt.

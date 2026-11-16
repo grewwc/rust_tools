@@ -130,15 +130,26 @@ pub(super) fn format_wakeup_prompt(pid: u64, goal: &str, messages: &[String]) ->
 }
 
 /// Render task wake-up instructions from the schema actually sent to the model.
-pub(super) fn wakeup_task_guidance(has_tool: impl Fn(&str) -> bool) -> Option<String> {
+pub(super) fn wakeup_task_guidance(
+    question: &str,
+    merge_ready_results: bool,
+    has_tool: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let results_delivered = merge_ready_results && question.contains("[TASK_RESULTS_READY]");
     let mut lines = Vec::new();
     if has_tool("task_wait") {
-        lines.push(
-            "- If the mailbox indicates event wake-up after a parked task wait, immediately re-call `task_wait` with the same task_ids and wait_policy to collect results from task result channels. Its timeout_secs is a per-call wait budget, not a stall signal.",
-        );
+        lines.push(if results_delivered {
+            "- Call `task_wait` only for tasks that are still running."
+        } else {
+            "- If the mailbox indicates event wake-up after a parked task wait, immediately re-call `task_wait` with the same task_ids and wait_policy to collect results from task result channels. Its timeout_secs is a per-call wait budget, not a stall signal."
+        });
     }
     if has_tool("task_status") {
-        lines.push("- Use `task_status` for a non-blocking snapshot and to collect ready results.");
+        lines.push(if results_delivered {
+            "- Use `task_status` only for tasks that are still running."
+        } else {
+            "- Use `task_status` for a non-blocking snapshot and to collect ready results."
+        });
     }
     if has_tool("task_integrate") {
         lines.push(
@@ -147,6 +158,12 @@ pub(super) fn wakeup_task_guidance(has_tool: impl Fn(&str) -> bool) -> Option<St
     }
     if lines.is_empty() {
         return None;
+    }
+    if results_delivered {
+        lines.insert(
+            0,
+            "- Task results in this wake-up have already been delivered. First integrate the delivered tasks.",
+        );
     }
     lines.push("- Cancellation alone does not collect a terminal result.");
     Some(lines.join("\n"))
@@ -252,15 +269,59 @@ mod tests {
                     .enumerate()
                     .any(|(index, tool)| *tool == name && mask & (1 << index) != 0)
             };
-            let guidance = wakeup_task_guidance(has_tool);
-            assert_eq!(guidance.is_none(), mask == 0);
-            let guidance = guidance.unwrap_or_default();
-            for tool in tool_names {
-                assert_eq!(guidance.contains(&format!("`{tool}`")), has_tool(tool));
+            for merge_ready_results in [false, true] {
+                for question in ["[EVENT_WAKE]", "[EVENT_WAKE]\n[TASK_RESULTS_READY]"] {
+                    let guidance = wakeup_task_guidance(question, merge_ready_results, has_tool);
+                    assert_eq!(guidance.is_none(), mask == 0);
+                    let guidance = guidance.unwrap_or_default();
+                    for tool in tool_names {
+                        assert_eq!(guidance.contains(&format!("`{tool}`")), has_tool(tool));
+                    }
+                    assert!(!guidance.contains("`task_spawn`"));
+                    assert!(!guidance.contains("`task_cancel`"));
+                }
             }
-            assert!(!guidance.contains("`task_spawn`"));
-            assert!(!guidance.contains("`task_cancel`"));
         }
+    }
+
+    #[test]
+    fn merge_ready_results_flag_off_preserves_wakeup_guidance_bytes() {
+        let original = concat!(
+            "- If the mailbox indicates event wake-up after a parked task wait, immediately re-call `task_wait` with the same task_ids and wait_policy to collect results from task result channels. Its timeout_secs is a per-call wait budget, not a stall signal.\n",
+            "- Use `task_status` for a non-blocking snapshot and to collect ready results.\n",
+            "- After a task result is delivered, call `task_integrate` with the task_id, disposition, and parent conclusion; delivery alone does not close the evidence lifecycle.\n",
+            "- Cancellation alone does not collect a terminal result."
+        );
+        for (question, enabled) in [
+            ("[EVENT_WAKE]", false),
+            (
+                "[EVENT_WAKE]\n[TASK_RESULTS_READY]\nalready collected",
+                false,
+            ),
+            ("[EVENT_WAKE]", true),
+            ("[Task result collection warning]", true),
+        ] {
+            let unchanged = wakeup_task_guidance(question, enabled, |_| true).unwrap();
+            assert_eq!(unchanged.as_bytes(), original.as_bytes());
+        }
+    }
+
+    #[test]
+    fn merge_ready_results_wakeup_guidance_integrates_delivery_before_waiting() {
+        let guidance = wakeup_task_guidance(
+            "[EVENT_WAKE]\n[TASK_RESULTS_READY]\nAlready collected task_ids: [ready]",
+            true,
+            |_| true,
+        )
+        .unwrap();
+        assert!(guidance.starts_with(
+            "- Task results in this wake-up have already been delivered. First integrate the delivered tasks.\n"
+        ));
+        assert!(guidance.contains("- Call `task_wait` only for tasks that are still running."));
+        assert!(guidance.contains("- Use `task_status` only for tasks that are still running."));
+        assert!(guidance.contains("delivery alone does not close the evidence lifecycle."));
+        assert!(!guidance.contains("immediately re-call"));
+        assert!(!guidance.contains("to collect ready results"));
     }
 
     #[test]

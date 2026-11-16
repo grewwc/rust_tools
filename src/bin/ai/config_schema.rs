@@ -87,6 +87,22 @@ impl AiConfig {
     // ── Agents ─────────────────────────────────────────────
     pub const AGENTS_DIR: &str = "ai.agents.dir";
 
+    // ── Agent-team optimizations ───────────────────────────
+    /// Master switch for agent-team optimizations. Default false; each
+    /// optimization also requires its own switch to be enabled.
+    pub const AGENT_TEAM_OPTIMIZATIONS_ENABLED: &str = "ai.agent_team.optimizations_enabled";
+    /// Deduplicate the base prompt in agent-team mode. Default false.
+    pub const AGENT_TEAM_DEDUPE_BASE_PROMPT: &str = "ai.agent_team.dedupe_base_prompt";
+    /// Load agent-team group schemas on demand. Default false.
+    pub const AGENT_TEAM_LAZY_GROUP_SCHEMAS: &str = "ai.agent_team.lazy_group_schemas";
+    /// Persist the status cursor across session resumes. Default false.
+    pub const AGENT_TEAM_PERSIST_STATUS_CURSOR: &str = "ai.agent_team.persist_status_cursor";
+    /// Merge ready results into the wake-up turn. Default false.
+    pub const AGENT_TEAM_MERGE_READY_RESULTS: &str = "ai.agent_team.merge_ready_results";
+    /// Mount lifecycle tools after the first spawn. Default false.
+    pub const AGENT_TEAM_AUTO_MOUNT_LIFECYCLE_TOOLS: &str =
+        "ai.agent_team.auto_mount_lifecycle_tools";
+
     // ── TraeCLI subagent backend ─────────────────────────────
     /// Default model for `backend: "traecli"` subagent runs (a TraeCLI model
     /// slug, see `traecli models`). A per-call `backend_model` wins over this

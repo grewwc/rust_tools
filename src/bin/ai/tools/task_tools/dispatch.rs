@@ -1,6 +1,13 @@
 use super::*;
 use crate::ai::tools::common::{ToolParallelPolicy, ToolParallelPolicyRegistration};
 
+#[path = "task_evidence.rs"]
+mod task_evidence;
+pub(in crate::ai) use task_evidence::initial_agent_team_task_status_cursor;
+pub(super) use task_evidence::{
+    EvidenceReadOptions, StatusCursor, merge_status_cursor, read_status_cursor, write_status_cursor,
+};
+
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_retry",
@@ -206,6 +213,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
 
 pub(crate) fn execute_task_evidence_read(args: &Value) -> Result<String, String> {
     ensure_top_level_task_orchestration("task_evidence_read")?;
+    let optimizations = crate::ai::config::agent_team_optimizations();
     let source = match args.get("source") {
         None => "progress",
         Some(Value::String(source)) if matches!(source.as_str(), "progress" | "delivered") => {
@@ -237,6 +245,8 @@ pub(crate) fn execute_task_evidence_read(args: &Value) -> Result<String, String>
             "Task {task_id} is owned by another process/session"
         ));
     }
+    let options =
+        EvidenceReadOptions::for_optimizations(args, optimizations.optimizations_enabled())?;
 
     if source == "delivered" {
         let context = crate::ai::driver::runtime_ctx::try_current()
@@ -250,13 +260,21 @@ pub(crate) fn execute_task_evidence_read(args: &Value) -> Result<String, String>
             task_id,
         ).map_err(|error| format!("Failed to read delivered evidence for task {task_id}: {error}"))?
             .ok_or_else(|| format!("No delivered evidence for task {task_id} in this session; use task_audit to list recorded IDs"))?;
-        return serde_json::to_string_pretty(&serde_json::json!({
+        let evidence = serde_json::json!({
             "task_id": task_id,
             "source": "delivered",
             "status": status,
             "payload": payload,
-        }))
-        .map_err(|error| format!("Failed to render delivered evidence: {error}"));
+        });
+        let full = serde_json::to_string_pretty(&evidence)
+            .map_err(|error| format!("Failed to render delivered evidence: {error}"))?;
+        return options.render_delivered(
+            task_id,
+            full,
+            evidence,
+            context.app_proto.config.history_file.as_path(),
+            &context.app_proto.session_id,
+        );
     }
 
     if let Some(slot) = task_progress_slot(task_id)
@@ -269,7 +287,7 @@ pub(crate) fn execute_task_evidence_read(args: &Value) -> Result<String, String>
     }
     let path = task_progress_file_path(task_id)?;
     match fs::read_to_string(&path) {
-        Ok(content) => Ok(content),
+        Ok(content) => options.render_progress(task_id, content),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
             "No persisted progress evidence for task {task_id}; the task may not have emitted a phase transition or checkpoint yet"
         )),
@@ -732,9 +750,22 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
     Ok(msg)
 }
 
-pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
+fn task_status_filter(args: &Value, enabled: bool) -> Result<Option<&str>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+    Ok(match args.get("task_id") {
+        None => None,
+        Some(Value::String(task_id)) if !task_id.trim().is_empty() => Some(task_id.trim()),
+        Some(_) => return Err("task_status requires non-empty string 'task_id'".to_string()),
+    })
+}
+
+pub(crate) fn execute_task_status(args: &Value) -> Result<String, String> {
     start_task_report(false);
     ensure_top_level_task_orchestration("task_status")?;
+    let optimizations = crate::ai::config::agent_team_optimizations();
+    let task_id = task_status_filter(args, optimizations.optimizations_enabled())?;
     let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
     let current_owner_pid = current_task_owner_pid()?;
     let tracked = {
@@ -742,14 +773,23 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
         registry
             .iter()
             .filter(|(_, entry)| task_entry_owned_by(entry, &current_session_id, current_owner_pid))
+            .filter(|(tid, _)| task_id.is_none_or(|task_id| tid.as_str() == task_id))
             .map(|(tid, entry)| (tid.clone(), entry.clone()))
             .collect::<Vec<_>>()
     };
-    if is_agent_team_mode() {
-        super::quiet::execute_agent_team_task_status(&tracked)
+    let result = if is_agent_team_mode() {
+        match task_id {
+            None => super::quiet::execute_agent_team_task_status(&tracked),
+            Some(_) => super::quiet::execute_agent_team_task_status_filtered(&tracked, task_id),
+        }
     } else {
         execute_full_task_status(tracked)
+    };
+    if task_id.is_some() {
+        // A filtered sample must not remove unrelated tasks from the display's live snapshot.
+        start_task_report(false);
     }
+    result
 }
 
 pub(super) fn execute_full_task_status(
@@ -840,4 +880,150 @@ pub(super) fn execute_full_task_status(
 
     start_task_report(true);
     Ok(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod optimization_gate_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn task_evidence_master_gate_controls_runtime_projection() {
+        for (config, enabled) in [
+            ("", false),
+            (
+                "ai.agent_team.optimizations_enabled = false\nai.agent_team.persist_status_cursor = true\n",
+                false,
+            ),
+            ("ai.agent_team.optimizations_enabled = true\n", true),
+        ] {
+            super::super::agent_team::tests::with_status_test_context_with_config(config, || {
+                let task_id = "gate-evidence";
+                let path = task_progress_file_path(task_id).unwrap();
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let original = " {\"phase\":\"read\",\"checkpoint_excerpt\":\"α界🙂z\"} \n";
+                fs::write(&path, original).unwrap();
+                let full = execute_task_evidence_read(&json!({"task_id": task_id})).unwrap();
+                assert_eq!(full.as_bytes(), original.as_bytes());
+                let selected = execute_task_evidence_read(
+                    &json!({"task_id": task_id, "fields": ["checkpoint_excerpt"]}),
+                )
+                .unwrap();
+                let bounded =
+                    execute_task_evidence_read(&json!({"task_id": task_id, "max_chars": 0}))
+                        .unwrap();
+                let invalid = execute_task_evidence_read(
+                    &json!({"task_id": task_id, "fields": [], "max_chars": -1}),
+                );
+                if enabled {
+                    let selected: Value = serde_json::from_str(&selected).unwrap();
+                    assert_eq!(selected["payload"], json!({"checkpoint_excerpt": "α界🙂z"}));
+                    let bounded: Value = serde_json::from_str(&bounded).unwrap();
+                    assert_eq!(bounded["payload"], "");
+                    assert_eq!(bounded["truncated"], true);
+                    assert!(invalid.is_err());
+                } else {
+                    assert_eq!(selected.as_bytes(), original.as_bytes());
+                    assert_eq!(bounded.as_bytes(), original.as_bytes());
+                    assert_eq!(invalid.unwrap().as_bytes(), original.as_bytes());
+                }
+            });
+        }
+    }
+
+    struct RegisteredTasks(Vec<String>);
+
+    impl Drop for RegisteredTasks {
+        fn drop(&mut self) {
+            for task_id in &self.0 {
+                remove_task_entry(task_id);
+            }
+        }
+    }
+
+    fn register_pending_tasks() -> RegisteredTasks {
+        let session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
+        let owner_pid = current_task_owner_pid().unwrap();
+        let mut tasks = RegisteredTasks(Vec::new());
+        for _ in 0..2 {
+            let task_id = uuid::Uuid::new_v4().to_string();
+            let (pid, channel, futex) = with_os_kernel(|os| {
+                let pid = os.spawn(
+                    Some(owner_pid),
+                    "worker".to_string(),
+                    "pending gate test".to_string(),
+                    20,
+                    4,
+                    None,
+                    None,
+                )?;
+                let channel = os.channel_create(Some(pid), 1, "gate-result".to_string());
+                let futex = os.futex_create(0, "gate-complete".to_string());
+                Ok((pid, channel.raw(), futex))
+            })
+            .unwrap();
+            insert_task_entry_for_test(
+                task_id.clone(),
+                AsyncTaskEntry {
+                    session_id: session_id.clone(),
+                    evidence_history_file: None,
+                    owner_pid,
+                    pid,
+                    result_channel_id: channel,
+                    completion_futex_addr: futex,
+                    description: "pending gate test".to_string(),
+                    agent_name: "worker".to_string(),
+                    backend: None,
+                    model: "test-model".to_string(),
+                    is_model_auto_selected: false,
+                    auto_model_fallback: None,
+                    selection_explanation: "gate fixture".to_string(),
+                    inherit: InheritOptions::default(),
+                    abort_handle: None,
+                    cancel_stream: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    started_at: Instant::now(),
+                    last_progress_notification_at: None,
+                    last_progress_persisted_at: None,
+                },
+            );
+            tasks.0.push(task_id);
+        }
+        tasks
+    }
+
+    #[test]
+    fn task_status_master_gate_controls_filtering_and_validation() {
+        for (config, enabled) in [
+            ("", false),
+            (
+                "ai.agent_team.optimizations_enabled = false\nai.agent_team.persist_status_cursor = true\n",
+                false,
+            ),
+            ("ai.agent_team.optimizations_enabled = true\n", true),
+        ] {
+            super::super::agent_team::tests::with_status_test_context_with_config(config, || {
+                let tasks = register_pending_tasks();
+                let filtered =
+                    execute_task_status(&json!({"task_id": format!(" {} ", tasks.0[0])})).unwrap();
+                assert!(filtered.contains(&tasks.0[0]));
+                assert_eq!(filtered.contains(&tasks.0[1]), !enabled);
+                for invalid in [
+                    json!({"task_id": " "}),
+                    json!({"task_id": null}),
+                    json!({"task_id": 7}),
+                ] {
+                    let result = execute_task_status(&invalid);
+                    if enabled {
+                        assert!(result.unwrap_err().contains("non-empty string 'task_id'"));
+                    } else {
+                        let output = result.unwrap();
+                        assert!(output.contains(&tasks.0[0]));
+                        assert!(output.contains(&tasks.0[1]));
+                    }
+                }
+                assert!(with_task_entry(&tasks.0[0], |_| ()).is_some());
+                assert!(with_task_entry(&tasks.0[1], |_| ()).is_some());
+            });
+        }
+    }
 }

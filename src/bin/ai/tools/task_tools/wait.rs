@@ -4,6 +4,125 @@ use super::*;
 pub(super) static TASK_WAIT_STATES: LazyLock<Mutex<FxHashMap<TaskWaitKey, TaskWaitState>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
+pub(crate) struct TaskWakeupResults {
+    pub(crate) collected_task_ids: Vec<String>,
+    pub(crate) rendered: String,
+}
+
+fn render_ready_task_results(
+    ready: &[String],
+    pending_ids: &[String],
+    reason: TaskWaitReturnReason,
+    waited: Duration,
+) -> Option<String> {
+    if ready.is_empty() {
+        return None;
+    }
+    let mut parts = vec![ready.join("\n\n---\n\n")];
+    if !pending_ids.is_empty() {
+        parts.push(super::quiet::format_agent_team_task_wait(
+            pending_ids,
+            reason,
+            waited,
+        ));
+    }
+    Some(parts.join("\n\n---\n\n"))
+}
+
+/// Deliver ready results from this foreground's recorded waits. Completion mail remains
+/// kernel-owned; the driver opts into this non-blocking collection before its resumed turn.
+pub(crate) fn collect_task_wait_wakeup_results(
+    session_id: &str,
+    owner_pid: u64,
+) -> Result<Option<TaskWakeupResults>, String> {
+    let waits = lock_unpoisoned(&TASK_WAIT_STATES)
+        .iter()
+        .filter(|(key, _)| key.session_id == session_id && key.owner_pid == owner_pid)
+        .map(|(key, state)| (key.clone(), *state))
+        .collect::<Vec<_>>();
+    if waits.is_empty() {
+        return Ok(None);
+    }
+    let mut task_ids = waits
+        .iter()
+        .flat_map(|(key, _)| key.task_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    task_ids.sort();
+    task_ids.dedup();
+    let tracked = {
+        let registry = lock_task_registry();
+        task_ids
+            .iter()
+            .filter_map(|task_id| {
+                registry
+                    .get_ref(task_id)
+                    .filter(|entry| task_entry_owned_by(entry, session_id, owner_pid))
+                    .map(|entry| (task_id.clone(), entry.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
+    if tracked.is_empty() {
+        return Ok(None);
+    }
+    let batch = collect_ready_task_batch(owner_pid, &tracked)?;
+    if batch.rendered.is_empty() {
+        return if batch.collection_errors.is_empty() {
+            Ok(None)
+        } else {
+            Err(batch.collection_errors.join("\n"))
+        };
+    }
+
+    let now = Instant::now();
+    let budget_elapsed = waits
+        .iter()
+        .any(|(_, state)| state.expired || now >= state.deadline);
+    let waited = waits
+        .iter()
+        .map(|(_, state)| {
+            Duration::from_secs(state.timeout_secs)
+                .saturating_sub(state.deadline.saturating_duration_since(now))
+                .saturating_add(now.saturating_duration_since(state.deadline))
+        })
+        .max()
+        .unwrap_or_default();
+    let reason = if budget_elapsed {
+        TaskWaitReturnReason::BudgetElapsed
+    } else {
+        TaskWaitReturnReason::ResultsReady
+    };
+    let mut rendered =
+        render_ready_task_results(&batch.rendered, &batch.pending_ids, reason, waited)
+            .expect("a ready batch always renders its full results");
+    if !batch.collection_errors.is_empty() {
+        rendered.push_str("\n\n---\n\n[Task result collection warning]\n");
+        rendered.push_str(&batch.collection_errors.join("\n"));
+        rendered.push_str("\nRetry collection of these task ids with `task_wait` or `task_status`; their available evidence has been retained.");
+    }
+
+    let finished = batch.finished_ids.iter().collect::<FxHashSet<_>>();
+    let pending = batch.pending_ids.iter().collect::<FxHashSet<_>>();
+    for (key, state) in &waits {
+        if key
+            .task_ids
+            .iter()
+            .any(|task_id| finished.contains(task_id))
+            && (state.agent_team_mode
+                || key.wait_policy == TaskWaitPolicyKey::Any
+                || state.expired
+                || now >= state.deadline
+                || !key.task_ids.iter().any(|task_id| pending.contains(task_id)))
+        {
+            clear_task_wait_state(key);
+            reset_task_wait_noop_count(key);
+        }
+    }
+    Ok(Some(TaskWakeupResults {
+        collected_task_ids: batch.finished_ids,
+        rendered,
+    }))
+}
+
 /// Consecutive `task_wait` calls that found every referenced task already delivered (the
 /// "all completed" no-op path). Once results are delivered, waiting is over: PARKED /
 /// BUDGET-ELAPSED legitimately ask the model to re-call `task_wait` to keep waiting, and a stuck
@@ -553,34 +672,25 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     if agent_team_mode && !ready.is_empty() {
         // Deliver terminal evidence immediately, including partial `all` waits. The quiet
         // deadline must never postpone a result or an error already collected from the channel.
-        let mut parts = vec![ready.join("\n\n---\n\n")];
-        record_report_wait(
-            if wait_budget_elapsed && !pending.is_empty() {
-                TaskWaitReturnReason::BudgetElapsed
-            } else {
-                TaskWaitReturnReason::ResultsReady
-            },
-            wait_started_at.elapsed(),
-            timeout_secs,
-        );
-        if !pending.is_empty() {
-            let pending_ids = pending
-                .iter()
-                .map(|(tid, _)| tid.clone())
-                .collect::<Vec<_>>();
-            let reason = if wait_budget_elapsed {
-                TaskWaitReturnReason::BudgetElapsed
-            } else {
-                TaskWaitReturnReason::ResultsReady
-            };
-            parts.push(super::quiet::format_agent_team_task_wait(
-                &pending_ids,
-                reason,
-                Instant::now().saturating_duration_since(wait_started_at),
-            ));
-        }
+        let reason = if wait_budget_elapsed && !pending.is_empty() {
+            TaskWaitReturnReason::BudgetElapsed
+        } else {
+            TaskWaitReturnReason::ResultsReady
+        };
+        record_report_wait(reason, wait_started_at.elapsed(), timeout_secs);
+        let pending_ids = pending
+            .iter()
+            .map(|(tid, _)| tid.clone())
+            .collect::<Vec<_>>();
+        let rendered = render_ready_task_results(
+            &ready,
+            &pending_ids,
+            reason,
+            Instant::now().saturating_duration_since(wait_started_at),
+        )
+        .expect("a ready wait always renders its full results");
         clear_task_wait_state(&wait_key);
-        return Ok(parts.join("\n\n---\n\n"));
+        return Ok(rendered);
     }
     // `any` exists to return the first finisher without blocking on the rest. Once the wait
     // budget has already elapsed, the owner was woken for the timeout, so returning ready
@@ -889,6 +999,489 @@ mod tests {
     use aios_kernel::kernel::{KernelInternal, Syscall};
     use aios_kernel::local::LocalOS;
     use aios_kernel::primitives::{FutexOps, IpcOps};
+
+    struct ReadyWakeFixture {
+        context: Arc<crate::ai::driver::runtime_ctx::DriverContext>,
+        owner_pid: u64,
+        root: PathBuf,
+        task_ids: Vec<String>,
+    }
+
+    impl ReadyWakeFixture {
+        fn new(agent_team_mode: bool) -> Self {
+            let mut app = super::super::tests::test_app_with_model("test-model".to_string());
+            app.session_id = format!("merge-ready-results-{}", Uuid::new_v4().simple());
+            let root = std::env::temp_dir().join(&app.session_id);
+            app.config.history_file = root.join("history.sqlite");
+            app.session_history_file = app.config.history_file.clone();
+            let owner_pid = app.os.lock().unwrap().begin_foreground(
+                "parent".into(),
+                "original goal".into(),
+                10,
+                8,
+                None,
+            );
+            let context = crate::ai::driver::runtime_ctx::DriverContext::new(
+                app,
+                Arc::new(Mutex::new(crate::ai::mcp::McpClient::new())),
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+            );
+            if agent_team_mode {
+                context
+                    .active_skill_names
+                    .write()
+                    .unwrap()
+                    .push("agent-team".into());
+            }
+            Self {
+                context,
+                owner_pid,
+                root,
+                task_ids: Vec::new(),
+            }
+        }
+
+        fn spawn(&mut self) -> String {
+            let task_id = format!(
+                "task-{:02}-{}",
+                self.task_ids.len(),
+                Uuid::new_v4().simple()
+            );
+            let (pid, channel, futex) = {
+                let mut os = self.context.app_proto.os.lock().unwrap();
+                let pid = os
+                    .spawn(
+                        Some(self.owner_pid),
+                        "child".into(),
+                        "goal".into(),
+                        20,
+                        4,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                let channel = os.channel_create_tagged_with_holders(
+                    Some(self.owner_pid),
+                    1,
+                    "wake-result".into(),
+                    ChannelOwnerTag::TaskResult,
+                    vec!["task_result.producer".into(), "task_result.consumer".into()],
+                );
+                let futex = os.futex_create(0, "wake-complete".into());
+                (pid, channel.raw(), futex)
+            };
+            insert_task_entry_for_test(
+                task_id.clone(),
+                AsyncTaskEntry {
+                    session_id: self.context.app_proto.session_id.clone(),
+                    evidence_history_file: Some(self.context.app_proto.config.history_file.clone()),
+                    owner_pid: self.owner_pid,
+                    pid,
+                    result_channel_id: channel,
+                    completion_futex_addr: futex,
+                    description: "wake result test".into(),
+                    agent_name: "build".into(),
+                    backend: None,
+                    model: "test-model".into(),
+                    is_model_auto_selected: false,
+                    auto_model_fallback: None,
+                    selection_explanation: "explicit test model".into(),
+                    inherit: InheritOptions::default(),
+                    abort_handle: None,
+                    cancel_stream: Arc::new(AtomicBool::new(false)),
+                    started_at: Instant::now(),
+                    last_progress_notification_at: None,
+                    last_progress_persisted_at: None,
+                },
+            );
+            self.task_ids.push(task_id.clone());
+            task_id
+        }
+
+        fn scope<T>(&self, action: impl FnOnce() -> T) -> T {
+            use crate::ai::driver::runtime_ctx;
+            self.context
+                .app_proto
+                .os
+                .lock()
+                .unwrap()
+                .set_current_pid(Some(self.owner_pid));
+            runtime_ctx::TURN_IDENTITY
+                .sync_scope((self.context.app_proto.session_id.clone(), 0), || {
+                    runtime_ctx::DRIVER_CTX.sync_scope(self.context.clone(), action)
+                })
+        }
+
+        fn park(&self, task_ids: &[String], policy: WaitPolicy) -> TaskWaitKey {
+            let args = serde_json::json!({
+                "task_ids": task_ids,
+                "wait_policy": if policy == WaitPolicy::All { "all" } else { "any" },
+                "timeout_secs": 60,
+            });
+            let parked = self.scope(|| execute_task_wait(&args)).unwrap();
+            assert!(
+                parked.contains("PARKED") || parked.contains("reason=parked"),
+                "{parked}"
+            );
+            task_wait_key(
+                &self.context.app_proto.session_id,
+                self.owner_pid,
+                &policy,
+                task_ids,
+            )
+        }
+
+        fn publish(&self, task_id: &str, result: StoredTaskResult) {
+            let entry = with_task_entry(task_id, Clone::clone).unwrap();
+            self.context
+                .app_proto
+                .os
+                .lock()
+                .unwrap()
+                .channel_send(
+                    Some(entry.pid),
+                    ChannelId(entry.result_channel_id),
+                    serde_json::json!({
+                        "status": result.status,
+                        "output": result.output,
+                        "error": result.error,
+                        "progress": result.progress,
+                        "backend_session": result.backend_session,
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+        }
+
+        fn collect(&self) -> Result<Option<TaskWakeupResults>, String> {
+            self.scope(|| {
+                collect_task_wait_wakeup_results(&self.context.app_proto.session_id, self.owner_pid)
+            })
+        }
+    }
+
+    impl Drop for ReadyWakeFixture {
+        fn drop(&mut self) {
+            for task_id in &self.task_ids {
+                remove_task_entry(task_id);
+                lock_unpoisoned(&TASK_PROGRESS_REGISTRY).remove(task_id);
+            }
+            lock_unpoisoned(&TASK_WAIT_STATES).retain(|key, _| {
+                key.session_id != self.context.app_proto.session_id
+                    && !key
+                        .task_ids
+                        .iter()
+                        .any(|task_id| self.task_ids.contains(task_id))
+            });
+            lock_unpoisoned(&TASK_WAIT_NOOP_COUNTS).retain(|key, _| {
+                key.session_id != self.context.app_proto.session_id
+                    && !key
+                        .task_ids
+                        .iter()
+                        .any(|task_id| self.task_ids.contains(task_id))
+            });
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn ready_result(status: TaskTerminalStatus, output: String) -> StoredTaskResult {
+        StoredTaskResult {
+            status: status.as_str().into(),
+            output,
+            error: None,
+            progress: None,
+            backend_session: None,
+        }
+    }
+
+    #[test]
+    fn merge_ready_results_render_reuses_wait_compact_format() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let mut fixture = ReadyWakeFixture::new(true);
+        let pending = fixture.spawn();
+        let ready = vec![
+            "[task_id=a]\nfirst result\nfull detail".into(),
+            "[task_id=b]\nsecond result".into(),
+        ];
+        let rendered = fixture
+            .scope(|| {
+                render_ready_task_results(
+                    &ready,
+                    &[pending.clone()],
+                    TaskWaitReturnReason::ResultsReady,
+                    Duration::from_secs(17),
+                )
+            })
+            .unwrap();
+        assert!(rendered.starts_with("[task_id=a]\nfirst result\nfull detail\n\n---\n\n[task_id=b]\nsecond result\n\n---\n\n[task-wait] still running: reason=results_ready waited=17s "));
+        assert!(rendered.contains(&format!("{pending}(idle=")));
+        assert!(rendered.ends_with("phase=-)"));
+        assert_eq!(
+            render_ready_task_results(
+                &ready,
+                &[],
+                TaskWaitReturnReason::ResultsReady,
+                Duration::ZERO
+            )
+            .unwrap(),
+            ready.join("\n\n---\n\n")
+        );
+        assert!(
+            render_ready_task_results(
+                &[],
+                &[pending],
+                TaskWaitReturnReason::ResultsReady,
+                Duration::ZERO
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn merge_ready_results_delivers_full_terminal_failures() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let mut fixture = ReadyWakeFixture::new(true);
+        let statuses = [
+            TaskTerminalStatus::Failed,
+            TaskTerminalStatus::Cancelled,
+            TaskTerminalStatus::Timeout,
+            TaskTerminalStatus::Blocked,
+        ];
+        let task_ids = statuses.iter().map(|_| fixture.spawn()).collect::<Vec<_>>();
+        let output = format!(
+            "partial-start\n{}\npartial-end",
+            "full-output-detail\n".repeat(1000)
+        );
+        let error = format!(
+            "failure-start\n{}\nfailure-end",
+            "full-failure-detail\n".repeat(1000)
+        );
+        let progress = format!(
+            "progress-start\n{}\nprogress-end",
+            "full-progress-detail\n".repeat(600)
+        );
+        let key = fixture.park(&task_ids, WaitPolicy::All);
+        for (task_id, status) in task_ids.iter().zip(statuses) {
+            fixture.publish(
+                task_id,
+                StoredTaskResult {
+                    status: status.as_str().into(),
+                    output: output.clone(),
+                    error: Some(error.clone()),
+                    progress: Some(progress.clone()),
+                    backend_session: None,
+                },
+            );
+        }
+        assert!(
+            fixture
+                .context
+                .app_proto
+                .os
+                .lock()
+                .unwrap()
+                .get_process(fixture.owner_pid)
+                .unwrap()
+                .mailbox
+                .iter()
+                .any(|message| message.starts_with("[EVENT_WAKE]"))
+        );
+        let merged = fixture.collect().unwrap().unwrap();
+        assert_eq!(merged.collected_task_ids, task_ids);
+        assert_eq!(merged.rendered.matches(&output).count(), statuses.len());
+        assert_eq!(merged.rendered.matches(&error).count(), statuses.len());
+        assert_eq!(merged.rendered.matches(&progress).count(), statuses.len());
+        assert!(merged.rendered.contains(SUBAGENT_BLOCKED_PARENT_GUIDANCE));
+        assert!(!lock_unpoisoned(&TASK_WAIT_STATES).contains_key(&key));
+        for (task_id, status) in task_ids.iter().zip(statuses) {
+            let evidence = crate::ai::history::read_task_evidence_status_payload(
+                &fixture.context.app_proto.config.history_file,
+                &fixture.context.app_proto.session_id,
+                task_id,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(evidence.0, status.as_str());
+            assert!(evidence.1.contains(&output));
+            assert!(evidence.1.contains(&error));
+            assert!(evidence.1.contains(&progress));
+            assert!(evidence.1.contains(&format!("task_id=\"{task_id}\"")));
+            assert!(with_task_entry(task_id, Clone::clone).is_none());
+        }
+        assert!(
+            crate::ai::history::read_integrated_task_ids(
+                &fixture.context.app_proto.config.history_file,
+                &fixture.context.app_proto.session_id
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn merge_ready_results_limits_collection_to_owned_waits_and_preserves_all_budget() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let mut fixture = ReadyWakeFixture::new(false);
+        let ready = fixture.spawn();
+        let pending = fixture.spawn();
+        let unrelated = fixture.spawn();
+        let foreign_session = fixture.spawn();
+        let foreign_owner = fixture.spawn();
+        let key = fixture.park(&[ready.clone(), pending.clone()], WaitPolicy::All);
+        let original_deadline = lock_unpoisoned(&TASK_WAIT_STATES)[&key].deadline;
+        for (task_id, foreign) in [(&foreign_session, true), (&foreign_owner, false)] {
+            let mut entry = with_task_entry(task_id, Clone::clone).unwrap();
+            if foreign {
+                entry.session_id.push_str("-foreign");
+            } else {
+                entry.owner_pid += 1000;
+            }
+            insert_task_entry_for_test(task_id.clone(), entry.clone());
+            let foreign_key = task_wait_key(
+                &entry.session_id,
+                entry.owner_pid,
+                &WaitPolicy::Any,
+                &[task_id.clone()],
+            );
+            let original_state = lock_unpoisoned(&TASK_WAIT_STATES)[&key];
+            lock_unpoisoned(&TASK_WAIT_STATES).insert(foreign_key, original_state);
+        }
+        for task_id in [&ready, &unrelated, &foreign_session, &foreign_owner] {
+            fixture.publish(
+                task_id,
+                ready_result(
+                    TaskTerminalStatus::Completed,
+                    format!("result for {task_id}"),
+                ),
+            );
+        }
+        let merged = fixture.collect().unwrap().unwrap();
+        assert_eq!(merged.collected_task_ids, vec![ready.clone()]);
+        assert!(merged.rendered.contains(&format!("result for {ready}")));
+        assert!(merged.rendered.contains("reason=results_ready"));
+        assert!(merged.rendered.contains(&pending));
+        assert_eq!(
+            lock_unpoisoned(&TASK_WAIT_STATES)[&key].deadline,
+            original_deadline
+        );
+        for task_id in [&pending, &unrelated, &foreign_session, &foreign_owner] {
+            let entry = with_task_entry(task_id, Clone::clone).unwrap();
+            let os = fixture.context.app_proto.os.lock().unwrap();
+            assert!(
+                os.channel_meta(ChannelId(entry.result_channel_id))
+                    .is_some()
+            );
+            assert!(os.futex_event_id(entry.completion_futex_addr).is_some());
+            assert!(!entry.cancel_stream.load(Ordering::Acquire));
+            assert!(!merged.rendered.contains(&format!("result for {task_id}")));
+        }
+    }
+
+    #[test]
+    fn merge_ready_results_no_ready_preserves_wait_and_ipc() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let mut fixture = ReadyWakeFixture::new(true);
+        let pending = fixture.spawn();
+        let key = fixture.park(&[pending.clone()], WaitPolicy::Any);
+        let entry = with_task_entry(&pending, Clone::clone).unwrap();
+        let original_deadline = lock_unpoisoned(&TASK_WAIT_STATES)[&key].deadline;
+        let original_state = fixture
+            .context
+            .app_proto
+            .os
+            .lock()
+            .unwrap()
+            .get_process(fixture.owner_pid)
+            .unwrap()
+            .state
+            .clone();
+        assert!(fixture.collect().unwrap().is_none());
+        assert_eq!(
+            lock_unpoisoned(&TASK_WAIT_STATES)[&key].deadline,
+            original_deadline
+        );
+        assert!(with_task_entry(&pending, Clone::clone).is_some());
+        let os = fixture.context.app_proto.os.lock().unwrap();
+        assert_eq!(
+            os.get_process(fixture.owner_pid).unwrap().state,
+            original_state
+        );
+        assert!(
+            os.channel_meta(ChannelId(entry.result_channel_id))
+                .is_some()
+        );
+        assert!(os.futex_event_id(entry.completion_futex_addr).is_some());
+        assert!(!entry.cancel_stream.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn merge_ready_results_collection_failure_retains_unconsumed_evidence() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let mut fixture = ReadyWakeFixture::new(true);
+        let first = fixture.spawn();
+        let failed = fixture.spawn();
+        let last = fixture.spawn();
+        let task_ids = vec![first.clone(), failed.clone(), last.clone()];
+        fixture.park(&task_ids, WaitPolicy::All);
+        fs::create_dir_all(&fixture.root).unwrap();
+        let blocked_path = fixture.root.join("file-instead-of-directory");
+        fs::write(&blocked_path, "test persistence failure").unwrap();
+        let mut failed_entry = with_task_entry(&failed, Clone::clone).unwrap();
+        failed_entry.evidence_history_file = Some(blocked_path.join("history.sqlite"));
+        insert_task_entry_for_test(failed.clone(), failed_entry.clone());
+        fixture.publish(
+            &first,
+            ready_result(TaskTerminalStatus::Completed, "first full result".into()),
+        );
+        let failure_output = "failed output must remain readable";
+        fixture.publish(
+            &failed,
+            StoredTaskResult {
+                status: "failed".into(),
+                output: failure_output.into(),
+                error: Some("original failure reason".into()),
+                progress: None,
+                backend_session: None,
+            },
+        );
+        fixture.publish(
+            &last,
+            ready_result(TaskTerminalStatus::Completed, "last full result".into()),
+        );
+        let merged = fixture.collect().unwrap().unwrap();
+        assert_eq!(merged.collected_task_ids, vec![first, last]);
+        assert!(merged.rendered.contains("first full result"));
+        assert!(merged.rendered.contains("last full result"));
+        assert!(merged.rendered.contains("[Task result collection warning]"));
+        assert!(merged.rendered.contains(&format!("task_id={failed}")));
+        assert!(merged.rendered.contains("failed to persist task evidence"));
+        assert!(with_task_entry(&failed, Clone::clone).is_some());
+        let preserved = fixture
+            .scope(|| {
+                with_os_kernel(|os| read_task_result(os, failed_entry.result_channel_id, false))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.output, failure_output);
+        assert_eq!(preserved.error.as_deref(), Some("original failure reason"));
+        assert!(
+            !crate::ai::history::task_evidence_exists(
+                &fixture.context.app_proto.config.history_file,
+                &fixture.context.app_proto.session_id,
+                &failed
+            )
+            .unwrap()
+        );
+        failed_entry.evidence_history_file =
+            Some(fixture.context.app_proto.config.history_file.clone());
+        insert_task_entry_for_test(failed.clone(), failed_entry);
+        let recovered = fixture
+            .scope(|| execute_task_wait(&serde_json::json!({"task_ids": [failed]})))
+            .unwrap();
+        assert!(recovered.contains(failure_output));
+        assert!(recovered.contains("original failure reason"));
+    }
 
     struct NormalProgressTestGuard {
         session_id: String,

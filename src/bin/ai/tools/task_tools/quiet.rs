@@ -1,11 +1,9 @@
 use super::*;
 use crate::ai::driver::runtime_ctx::{self, SubagentProgressSnapshot};
-use rust_tools::commonw::FastMap;
 
 const TASK_WAIT_LINE_MAX_CHARS: usize = 300;
 const CHECKPOINT_SUMMARY_MAX_CHARS: usize = 160;
 const TASK_WAIT_DEADLINE_PREFIX: &str = "[task-wait] still running:";
-type StatusCursor = FastMap<String, (String, String, u64, u64)>;
 
 #[derive(Clone, Copy)]
 pub(super) enum TaskWaitReturnReason {
@@ -125,6 +123,14 @@ fn compact_line(text: &str, max_chars: usize) -> String {
 }
 
 fn format_status_digest(tasks: &[TaskDigest], cursor: &mut StatusCursor) -> String {
+    format_status_digest_filtered(tasks, cursor, None)
+}
+
+fn format_status_digest_filtered(
+    tasks: &[TaskDigest],
+    cursor: &mut StatusCursor,
+    task_id: Option<&str>,
+) -> String {
     let mut running = 0;
     let mut done = 0;
     let mut failed = 0;
@@ -138,7 +144,9 @@ fn format_status_digest(tasks: &[TaskDigest], cursor: &mut StatusCursor) -> Stri
     let mut lines = vec![format!(
         "[task-status] running={running} done={done} failed={failed}"
     )];
-    cursor.retain(|task_id, _| tasks.iter().any(|task| &task.task_id == task_id));
+    if task_id.is_none() {
+        cursor.retain(|task_id, _| tasks.iter().any(|task| &task.task_id == task_id));
+    }
     for task in tasks {
         let revision = (
             task.status.clone(),
@@ -146,7 +154,8 @@ fn format_status_digest(tasks: &[TaskDigest], cursor: &mut StatusCursor) -> Stri
             task.revision,
             task.sequence,
         );
-        if cursor.get(&task.task_id) != Some(&revision) {
+        // Explicit lookup always includes its progress summary, even when its revision is quiet.
+        if task_id.is_some() || cursor.get(&task.task_id) != Some(&revision) {
             lines.push(task.status_line());
         }
         cursor.insert(task.task_id.clone(), revision);
@@ -157,7 +166,23 @@ fn format_status_digest(tasks: &[TaskDigest], cursor: &mut StatusCursor) -> Stri
 pub(super) fn execute_agent_team_task_status(
     tracked: &[(String, AsyncTaskEntry)],
 ) -> Result<String, String> {
+    execute_agent_team_task_status_filtered(tracked, None)
+}
+
+pub(super) fn execute_agent_team_task_status_filtered(
+    tracked: &[(String, AsyncTaskEntry)],
+    task_id: Option<&str>,
+) -> Result<String, String> {
     start_task_report(false);
+    let persistence_owner = runtime_ctx::try_current()
+        .filter(|context| {
+            context
+                .app_proto
+                .config
+                .agent_team_optimizations()
+                .persist_status_cursor()
+        })
+        .and_then(|_| current_task_owner_pid_opt());
     let mut tasks = Vec::new();
     let mut completed_outputs = Vec::new();
     let mut finished_ids = Vec::new();
@@ -202,19 +227,49 @@ pub(super) fn execute_agent_team_task_status(
 
     // Advance the cursor only after every fallible collection succeeds. Terminal result bodies
     // always bypass the digest/cursor and retain the existing durable collection format.
+    let mut persistence_warnings = Vec::new();
     let mut output = if let Some(context) = runtime_ctx::try_current() {
-        format_status_digest(
-            &tasks,
-            &mut lock_unpoisoned(&context.agent_team_task_status_cursor),
-        )
+        let mut cursor = lock_unpoisoned(&context.agent_team_task_status_cursor);
+        if let Some(owner_pid) = persistence_owner {
+            match read_status_cursor(
+                &context.app_proto.config.history_file, &context.app_proto.session_id, owner_pid,
+            ) {
+                Ok(stored) => merge_status_cursor(&mut cursor, &stored),
+                Err(error) => persistence_warnings.push(format!(
+                    "[task-status cursor warning] Failed to restore the status cursor: {error}. Status summaries may repeat after resume."
+                )),
+            }
+        }
+        let output = if task_id.is_some() {
+            format_status_digest_filtered(&tasks, &mut cursor, task_id)
+        } else {
+            format_status_digest(&tasks, &mut cursor)
+        };
+        if let Some(owner_pid) = persistence_owner
+            && let Err(error) = write_status_cursor(
+                &context.app_proto.config.history_file,
+                &context.app_proto.session_id,
+                owner_pid,
+                &cursor,
+            )
+        {
+            persistence_warnings.push(format!(
+                "[task-status cursor warning] Failed to persist the status cursor: {error}. The sampled status and collected terminal results are retained; resume may repeat status summaries."
+            ));
+        }
+        output
     } else {
-        format_status_digest(&tasks, &mut StatusCursor::default())
+        format_status_digest_filtered(&tasks, &mut StatusCursor::default(), task_id)
     };
     if !completed_outputs.is_empty() {
         output.push_str("\n\n");
         output.push_str(&completed_outputs.join("\n\n---\n\n"));
     }
-    start_task_report(true);
+    if !persistence_warnings.is_empty() {
+        output.push('\n');
+        output.push_str(&persistence_warnings.join("\n"));
+    }
+    start_task_report(task_id.is_none());
     Ok(output)
 }
 
@@ -1456,5 +1511,401 @@ mod tests {
                 .1,
             ledger.1
         );
+    }
+
+    struct StatusConfigGuard {
+        path: PathBuf,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl StatusConfigGuard {
+        fn new(contents: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("status-config-{}.configw", Uuid::new_v4().simple()));
+            let previous = std::env::var_os("CONFIGW_PATH");
+            fs::write(&path, contents).unwrap();
+            unsafe { std::env::set_var("CONFIGW_PATH", &path) };
+            crate::commonw::configw::refresh();
+            Self { path, previous }
+        }
+
+        fn set(&self, contents: &str) {
+            fs::write(&self.path, contents).unwrap();
+            crate::commonw::configw::refresh();
+        }
+    }
+
+    impl Drop for StatusConfigGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(previous) => unsafe { std::env::set_var("CONFIGW_PATH", previous) },
+                None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+            }
+            crate::commonw::configw::refresh();
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    impl RuntimeFixture {
+        fn rebuilt_context(&self) -> Arc<runtime_ctx::DriverContext> {
+            let context = runtime_ctx::DriverContext::from_app_snapshot(
+                &self.context.app_proto,
+                self.context.mcp_client.clone(),
+                self.context.skill_manifests.clone(),
+                self.context.agent_manifests.clone(),
+            );
+            *context.active_skill_names.write().unwrap() =
+                self.context.active_skill_names.read().unwrap().clone();
+            context
+        }
+
+        fn create_cursor_session(&self) -> PathBuf {
+            let store =
+                crate::ai::history::SessionStore::new(&self.context.app_proto.config.history_file);
+            fs::create_dir_all(store.sessions_root()).unwrap();
+            let path = store.session_history_file(&self.context.app_proto.session_id);
+            fs::write(&path, b"").unwrap();
+            path
+        }
+    }
+
+    #[test]
+    fn task_evidence_selective_reads_preserve_delivery_and_integration() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let _config = StatusConfigGuard::new("ai.agent_team.optimizations_enabled = true\n");
+        let mut fixture = RuntimeFixture::new();
+        let task_id = fixture.spawn();
+        let slot = task_progress_slot(&task_id).unwrap();
+        runtime_ctx::publish_subagent_checkpoint_to_slot(
+            &slot,
+            "saved conclusion",
+            "full checkpoint body",
+        );
+        let progress = fixture
+            .scope(|| {
+                execute_task_evidence_read(&serde_json::json!({
+                    "task_id": task_id, "fields": ["phase", "checkpoint_summary"],
+                }))
+            })
+            .unwrap();
+        let progress: Value = serde_json::from_str(&progress).unwrap();
+        assert_eq!(
+            progress["payload"]["checkpoint_summary"],
+            "saved conclusion"
+        );
+        assert!(progress["payload"]["phase"].is_string());
+        assert!(progress["payload"].get("checkpoint_excerpt").is_none());
+        assert!(with_task_entry(&task_id, |_| ()).is_some());
+
+        let body = serde_json::json!({
+            "conclusion": "implemented without weakening the gate",
+            "evidence_paths": ["src/example.rs"], "details": "界 α🙂",
+        })
+        .to_string();
+        fixture.publish(&task_id, "completed", &body, None);
+        let error = fixture
+            .scope(|| {
+                execute_task_evidence_read(&serde_json::json!({
+                    "task_id": task_id, "source": "delivered", "fields": ["conclusion"],
+                }))
+            })
+            .unwrap_err();
+        assert!(error.contains("No delivered evidence"));
+        assert!(with_task_entry(&task_id, |_| ()).is_some());
+        fixture
+            .scope(|| execute_task_status(&serde_json::json!({})))
+            .unwrap();
+
+        let full_args = serde_json::json!({"task_id": task_id, "source": "delivered"});
+        let full = fixture
+            .scope(|| execute_task_evidence_read(&full_args))
+            .unwrap();
+        let canonical: Value = serde_json::from_str(&full).unwrap();
+        let ledger_before = crate::ai::history::render_unintegrated_task_evidence(
+            &fixture.context.app_proto.config.history_file,
+            &fixture.context.app_proto.session_id,
+        )
+        .unwrap();
+        let selected = fixture.scope(|| execute_task_evidence_read(&serde_json::json!({
+            "task_id": task_id, "source": "delivered", "fields": ["conclusion", "evidence_paths"],
+        }))).unwrap();
+        let selected: Value = serde_json::from_str(&selected).unwrap();
+        assert_eq!(
+            selected["payload"],
+            serde_json::json!({
+                "conclusion": "implemented without weakening the gate", "evidence_paths": ["src/example.rs"],
+            })
+        );
+        assert_eq!(selected["status"], "completed");
+        let bounded = fixture
+            .scope(|| {
+                execute_task_evidence_read(&serde_json::json!({
+                    "task_id": task_id, "source": "delivered", "max_chars": 2,
+                }))
+            })
+            .unwrap();
+        let bounded: Value = serde_json::from_str(&bounded).unwrap();
+        assert_eq!(
+            bounded["payload"],
+            canonical["payload"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .take(2)
+                .collect::<String>()
+        );
+        assert_eq!(bounded["shown_chars"], 2);
+        assert_eq!(bounded["truncated"], true);
+        assert_eq!(
+            fixture
+                .scope(|| execute_task_evidence_read(&full_args))
+                .unwrap(),
+            full
+        );
+        assert_eq!(
+            crate::ai::history::render_unintegrated_task_evidence(
+                &fixture.context.app_proto.config.history_file,
+                &fixture.context.app_proto.session_id,
+            )
+            .unwrap(),
+            ledger_before
+        );
+    }
+
+    #[test]
+    fn task_status_filtered_queries_preserve_sibling_cursor_and_snapshot() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let _config = StatusConfigGuard::new("ai.agent_team.optimizations_enabled = true\n");
+        for quiet in [true, false] {
+            let mut fixture = RuntimeFixture::new();
+            if !quiet {
+                fixture.context.active_skill_names.write().unwrap().clear();
+            }
+            let first = fixture.spawn();
+            let second = fixture.spawn();
+            fixture
+                .scope(|| execute_task_status(&serde_json::json!({})))
+                .unwrap();
+            let sibling_before = lock_unpoisoned(&fixture.context.agent_team_task_status_cursor)
+                .get(&second)
+                .cloned();
+            let slot = task_progress_slot(&first).unwrap();
+            runtime_ctx::publish_subagent_checkpoint_to_slot(
+                &slot,
+                "first checkpoint",
+                "original checkpoint",
+            );
+            let (output, report) = fixture.scope(|| {
+                capture_task_report("task_status", || {
+                    execute_task_status(&serde_json::json!({"task_id": first}))
+                })
+            });
+            let output = output.unwrap();
+            let report = report.unwrap();
+            assert!(!report.snapshot);
+            assert_eq!(report.tasks.len(), 1);
+            assert_eq!(report.tasks[0].task_id.as_deref(), Some(first.as_str()));
+            assert_eq!(
+                report.tasks[0]
+                    .progress
+                    .as_ref()
+                    .unwrap()
+                    .checkpoint_summary
+                    .as_deref(),
+                Some("first checkpoint")
+            );
+            assert!(output.contains(&first));
+            assert!(!output.contains(&second));
+            assert!(output.contains("first checkpoint"));
+            assert_eq!(
+                lock_unpoisoned(&fixture.context.agent_team_task_status_cursor)
+                    .get(&second)
+                    .cloned(),
+                sibling_before
+            );
+            let repeated = fixture
+                .scope(|| execute_task_status(&serde_json::json!({"task_id": first})))
+                .unwrap();
+            assert!(repeated.contains(&first));
+            assert!(repeated.contains("first checkpoint"));
+            let all = fixture
+                .scope(|| execute_task_status(&serde_json::json!({})))
+                .unwrap();
+            if quiet {
+                assert_eq!(all, "[task-status] running=2 done=0 failed=0");
+            }
+
+            let unknown = fixture
+                .scope(|| execute_task_status(&serde_json::json!({"task_id": "unknown"})))
+                .unwrap();
+            assert!(!unknown.contains(&first) && !unknown.contains(&second));
+            if quiet {
+                assert_eq!(
+                    lock_unpoisoned(&fixture.context.agent_team_task_status_cursor).len(),
+                    2
+                );
+            }
+            assert!(
+                fixture
+                    .scope(|| execute_task_status(&serde_json::json!({"task_id": " "})))
+                    .unwrap_err()
+                    .contains("task_id")
+            );
+
+            let body = format!("selected terminal body\n{}", "界".repeat(1000));
+            let error = format!("selected failure reason {}", "x".repeat(1000));
+            fixture.publish(&first, "failed", &body, Some(&error));
+            fixture.publish(&second, "completed", "sibling terminal body", None);
+            let selected = fixture
+                .scope(|| execute_task_status(&serde_json::json!({"task_id": first})))
+                .unwrap();
+            assert_eq!(selected.matches(&body).count(), 1);
+            assert_eq!(selected.matches(&error).count(), 1);
+            assert!(!selected.contains("sibling terminal body"));
+            assert!(with_task_entry(&first, |_| ()).is_none());
+            assert!(with_task_entry(&second, |_| ()).is_some());
+            let (all, report) = fixture.scope(|| {
+                capture_task_report("task_status", || {
+                    execute_task_status(&serde_json::json!({}))
+                })
+            });
+            assert!(all.unwrap().contains("sibling terminal body"));
+            assert!(report.unwrap().snapshot);
+        }
+    }
+
+    #[test]
+    fn task_status_cursor_defaults_off_and_resumes_with_merge() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let config = StatusConfigGuard::new("");
+        let mut fixture = RuntimeFixture::new();
+        fixture.create_cursor_session();
+        let first = fixture.spawn();
+        fixture
+            .scope(|| execute_task_status(&serde_json::json!({})))
+            .unwrap();
+        let seen = lock_unpoisoned(&fixture.context.agent_team_task_status_cursor).clone();
+        write_status_cursor(
+            &fixture.context.app_proto.config.history_file,
+            &fixture.context.app_proto.session_id,
+            fixture.owner_pid,
+            &seen,
+        )
+        .unwrap();
+
+        for flags in [
+            "",
+            "ai.agent_team.persist_status_cursor = true\n",
+            "ai.agent_team.optimizations_enabled = true\n",
+            "ai.agent_team.optimizations_enabled = false\nai.agent_team.persist_status_cursor = true\n",
+        ] {
+            config.set(flags);
+            fixture.context = fixture.rebuilt_context();
+            assert!(lock_unpoisoned(&fixture.context.agent_team_task_status_cursor).is_empty());
+            assert!(
+                fixture
+                    .scope(|| execute_task_status(&serde_json::json!({})))
+                    .unwrap()
+                    .contains(&first)
+            );
+            assert_eq!(
+                read_status_cursor(
+                    &fixture.context.app_proto.config.history_file,
+                    &fixture.context.app_proto.session_id,
+                    fixture.owner_pid
+                )
+                .unwrap(),
+                seen
+            );
+        }
+        config.set("ai.agent_team.optimizations_enabled = true\nai.agent_team.persist_status_cursor = true\n");
+        let early_context = fixture.rebuilt_context();
+        fixture.context = fixture.rebuilt_context();
+        assert_eq!(
+            *lock_unpoisoned(&fixture.context.agent_team_task_status_cursor),
+            seen
+        );
+        assert_eq!(
+            fixture
+                .scope(|| execute_task_status(&serde_json::json!({})))
+                .unwrap(),
+            "[task-status] running=1 done=0 failed=0"
+        );
+        let second = fixture.spawn();
+        fixture
+            .scope(|| execute_task_status(&serde_json::json!({"task_id": second})))
+            .unwrap();
+        fixture.context = early_context;
+        fixture
+            .scope(|| execute_task_status(&serde_json::json!({"task_id": first})))
+            .unwrap();
+        fixture.context = fixture.rebuilt_context();
+        assert_eq!(
+            lock_unpoisoned(&fixture.context.agent_team_task_status_cursor).len(),
+            2
+        );
+        assert_eq!(
+            fixture
+                .scope(|| execute_task_status(&serde_json::json!({})))
+                .unwrap(),
+            "[task-status] running=2 done=0 failed=0"
+        );
+        let third = fixture.spawn();
+        let only_new = fixture
+            .scope(|| execute_task_status(&serde_json::json!({})))
+            .unwrap();
+        assert!(only_new.contains(&third));
+        assert!(!only_new.contains(&first) && !only_new.contains(&second));
+        let slot = task_progress_slot(&second).unwrap();
+        runtime_ctx::publish_subagent_checkpoint_to_slot(
+            &slot,
+            "new saved evidence",
+            "full new checkpoint",
+        );
+        let changed = fixture
+            .scope(|| execute_task_status(&serde_json::json!({})))
+            .unwrap();
+        assert!(changed.contains(&second));
+        assert!(changed.contains("new saved evidence"));
+        assert!(!changed.contains(&first) && !changed.contains(&third));
+    }
+
+    #[test]
+    fn task_status_cursor_persistence_errors_keep_terminal_payloads() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let _config = StatusConfigGuard::new(
+            "ai.agent_team.optimizations_enabled = true\nai.agent_team.persist_status_cursor = true\n",
+        );
+        let mut fixture = RuntimeFixture::new();
+        let session_file = fixture.create_cursor_session();
+        let first = fixture.spawn();
+        let second = fixture.spawn();
+        fixture
+            .scope(|| execute_task_status(&serde_json::json!({})))
+            .unwrap();
+        fixture.context = fixture.rebuilt_context();
+        fs::remove_file(session_file).unwrap();
+        let body = format!(
+            "terminal body survives cursor failure\n{}",
+            "界".repeat(1000)
+        );
+        let error = format!("complete failure reason {}", "x".repeat(1000));
+        fixture.publish(&first, "failed", &body, Some(&error));
+        let selected = fixture
+            .scope(|| execute_task_status(&serde_json::json!({"task_id": first})))
+            .unwrap();
+        assert_eq!(selected.matches(&body).count(), 1);
+        assert_eq!(selected.matches(&error).count(), 1);
+        assert!(selected.contains("[task-status cursor warning] Failed to persist"));
+        assert!(with_task_entry(&first, |_| ()).is_none());
+        assert!(with_task_entry(&second, |_| ()).is_some());
+        let ledger = fixture
+            .scope(|| {
+                read_persisted_task_evidence_status(&fixture.context.app_proto.session_id, &first)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.0, "failed");
+        assert!(ledger.1.contains(&body) && ledger.1.contains(&error));
     }
 }

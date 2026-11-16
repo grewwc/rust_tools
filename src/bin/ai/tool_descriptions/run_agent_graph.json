@@ -265,6 +265,17 @@
       }
     }
   },
+  "agent_team_optimization_properties": {
+    "summary": {
+      "type": "boolean",
+      "description": "For status only, return compact node/candidate rows (id, state, attempts, has_error) and counts, without shared state or result bodies. Default false. Opt-in summary/since status responses include a persistent revision. Available when ai.agent_team.optimizations_enabled is true."
+    },
+    "since": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "For status only, include nodes/candidates changed strictly after this persistent revision. Read summary=true without since for a baseline, then reuse the returned revision for later polls. Dynamic phase changes update affected candidate views. Can be combined with summary. Omit to include all nodes/candidates. Available when ai.agent_team.optimizations_enabled is true."
+    }
+  },
   "groups": [
     "builtin",
     "agent_team"

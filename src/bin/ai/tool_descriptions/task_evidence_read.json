@@ -19,6 +19,22 @@
       "task_id"
     ]
   },
+  "agent_team_optimization_properties": {
+    "fields": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Optional non-empty list of top-level evidence field names. Unavailable names return an error listing available fields. Omit for no field selection; omitting both fields and max_chars preserves the original output. Available when ai.agent_team.optimizations_enabled is true."
+    },
+    "max_chars": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Optional payload limit counted in Unicode scalar values, not bytes; response metadata is outside this limit. Truncation reports shown_chars, total_chars, truncated, and a full-read recovery hint. 0 returns an empty payload. Omit for no character limit; omitting both fields and max_chars preserves the original output. Available when ai.agent_team.optimizations_enabled is true."
+    }
+  },
   "groups": [
     "builtin",
     "task"

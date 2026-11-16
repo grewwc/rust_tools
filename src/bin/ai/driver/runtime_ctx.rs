@@ -303,7 +303,8 @@ pub(crate) struct DriverContext {
     /// turn guard is (re)built. External subagents scope their skill overlay
     /// to this set instead of inheriting the whole manifest catalog.
     pub(crate) active_skill_names: Arc<std::sync::RwLock<Vec<String>>>,
-    /// Status delivery cursor scoped to this parent turn, including parallel tool workers.
+    /// Status delivery cursor shared by this parent turn's parallel tool workers.
+    /// Opt-in persistence restores previously observed revisions for the same session and owner.
     pub(crate) agent_team_task_status_cursor:
         std::sync::Mutex<FastMap<String, (String, String, u64, u64)>>,
 }
@@ -321,7 +322,9 @@ impl DriverContext {
             skill_manifests,
             agent_manifests,
             active_skill_names: Arc::new(std::sync::RwLock::new(Vec::new())),
-            agent_team_task_status_cursor: std::sync::Mutex::new(FastMap::default()),
+            agent_team_task_status_cursor: std::sync::Mutex::new(
+                crate::ai::tools::task_tools::initial_agent_team_task_status_cursor(app),
+            ),
         })
     }
 

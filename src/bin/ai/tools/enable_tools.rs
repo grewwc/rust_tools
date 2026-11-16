@@ -30,6 +30,9 @@ struct TurnEnableState {
 struct ExplicitEnableState {
     tool_names: Vec<String>,
     tool_age: FastMap<String, u32>,
+    /// A committed spawn keeps lifecycle schemas available across turn
+    /// rebuilds and scheduler wakeups, until the session's task tools reset.
+    task_spawn_succeeded: bool,
 }
 
 /// active/catalog/pending 都是 turn 级状态，避免并发 Agent 覆盖或偷取消费。
@@ -81,13 +84,13 @@ fn subagent_may_enable_tool(name: &str) -> bool {
         || !super::is_subagent_orchestration_tool_name(name)
 }
 
-/// On-demand enablement only exposes generic `builtin` tools. Skill-specific
-/// driver control tools and manually activated agent-team tools are injected by
-/// the driver during an active-skill turn and cannot be obtained through
-/// `enable_tools` in a normal turn.
+/// Driver control tools remain injected by the driver. Agent-team tools can
+/// be loaded dynamically only when their independent lazy-schema policy is on.
 fn registration_may_be_dynamically_enabled(reg: &ToolRegistration) -> bool {
     let groups = crate::ai::tools::registry::tool_metadata::tool_groups(reg.spec.name);
-    groups.contains(&ToolGroup::Builtin) && !groups.contains(&ToolGroup::AgentTeam)
+    groups.contains(&ToolGroup::Builtin)
+        && (!groups.contains(&ToolGroup::AgentTeam)
+            || crate::ai::config::agent_team_optimizations().lazy_group_schemas())
 }
 
 /// Record whether the current turn's active agent/skills declare a group that
@@ -129,7 +132,9 @@ fn agent_may_enable_tool(name: &str) -> bool {
 /// core members — so the catalog never advertises a system-level family the
 /// agent cannot meaningfully load.
 fn group_visible_to_agent(group: ToolGroup) -> bool {
-    group != ToolGroup::AgentTeam
+    (group != ToolGroup::AgentTeam
+        || (crate::ai::config::agent_team_optimizations().lazy_group_schemas()
+            && crate::ai::driver::runtime_ctx::current_subagent_depth() == 0))
         && (!super::group_gates_hidden_tools(group) || hidden_group_declared())
 }
 
@@ -169,6 +174,57 @@ pub(crate) fn explicit_enabled_tool_names() -> Vec<String> {
         .unwrap_or_default()
 }
 
+pub(crate) fn task_lifecycle_tools_mounted() -> bool {
+    let turn = current_turn_identity();
+    let owner = current_enable_owner(&turn);
+    STATE
+        .read()
+        .ok()
+        .and_then(|s| {
+            s.explicit
+                .get(&owner)
+                .map(|state| state.task_spawn_succeeded)
+        })
+        .unwrap_or(false)
+}
+
+/// Publish only a committed spawn. Queuing schemas through the normal enable
+/// path also handles iterations that reuse their existing skill-turn guard.
+/// Record the fact while the flag is off so turning it on cannot hide tools
+/// for tasks that this owner already spawned.
+pub(crate) fn record_successful_task_spawn() {
+    if crate::ai::driver::runtime_ctx::current_subagent_depth() != 0 {
+        return;
+    }
+    let auto_mount = crate::ai::config::agent_team_optimizations().auto_mount_lifecycle_tools();
+    let names = auto_mount
+        .then(super::registry::common::task_lifecycle_tool_names)
+        .unwrap_or_default();
+    let turn = current_turn_identity();
+    let owner = current_enable_owner(&turn);
+    if let Ok(mut s) = STATE.write() {
+        s.explicit
+            .entry(owner.clone())
+            .or_default()
+            .task_spawn_succeeded = true;
+        if auto_mount {
+            let state = s.turns.entry(turn).or_default();
+            for name in &names {
+                if !state.active_tool_names.contains(name) && !state.pending_enable.contains(name) {
+                    state.pending_enable.push(name.clone());
+                }
+            }
+            mark_explicitly_enabled_tools(&mut s, owner, &names);
+        }
+    }
+}
+
+pub(crate) fn task_lifecycle_schemas_deferred(auto_mount_lifecycle_tools: bool) -> bool {
+    auto_mount_lifecycle_tools
+        && crate::ai::driver::runtime_ctx::current_subagent_depth() == 0
+        && !task_lifecycle_tools_mounted()
+}
+
 /// 清空 explicit-enabled tool 列表。
 /// 由 session 切换 / clear-history 等流程调用，避免上一 session 启用过的 tool
 /// 永久焊接到后续所有 session 的请求 tools 数组（每个 schema 几百~上千 token，
@@ -198,6 +254,7 @@ pub(crate) fn clear_task_family_explicitly_enabled_tools(session_id: &str) {
         explicit
             .tool_age
             .retain(|name, _| !family.iter().any(|family_name| family_name == name));
+        explicit.task_spawn_succeeded = false;
     }
 }
 
@@ -270,6 +327,44 @@ pub(crate) fn set_explicit_enabled_tool_names(names: Vec<String>) {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn with_agent_team_optimizations_for_test<R>(
+    config: &str,
+    run: impl FnOnce() -> R,
+) -> R {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    struct RestoreConfig {
+        old_path: Option<std::ffi::OsString>,
+        path: std::path::PathBuf,
+    }
+    impl Drop for RestoreConfig {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old_path {
+                    Some(path) => std::env::set_var("CONFIGW_PATH", path),
+                    None => std::env::remove_var("CONFIGW_PATH"),
+                }
+            }
+            crate::commonw::configw::refresh();
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+    let path = std::env::temp_dir().join(format!(
+        "agent-team-optimizations-{}.configw",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&path, config).expect("write isolated optimization config");
+    let _restore = RestoreConfig {
+        old_path: std::env::var_os("CONFIGW_PATH"),
+        path: path.clone(),
+    };
+    unsafe { std::env::set_var("CONFIGW_PATH", &path) };
+    crate::commonw::configw::refresh();
+    run()
+}
+
 pub(crate) fn drain_pending_mcp_names() -> Vec<String> {
     let turn = current_turn_identity();
     STATE
@@ -297,6 +392,7 @@ pub(crate) fn drain_pending_enable() -> Vec<ToolDefinition> {
     if names.is_empty() {
         return Vec::new();
     }
+    let optimizations = crate::ai::config::agent_team_optimizations();
     let mut defs = Vec::new();
     for reg in inventory::iter::<ToolRegistration> {
         if registration_may_be_dynamically_enabled(reg) && names.iter().any(|n| n == reg.spec.name)
@@ -309,8 +405,9 @@ pub(crate) fn drain_pending_enable() -> Vec<ToolDefinition> {
                         reg.spec.name,
                         reg.spec.description,
                     ),
-                    parameters: crate::ai::tools::registry::tool_metadata::tool_parameters(
+                    parameters: super::registry::common::tool_parameters_with_optimizations(
                         reg.spec.name,
+                        optimizations.optimizations_enabled(),
                     ),
                 },
             });
@@ -383,6 +480,16 @@ fn group_members(group: ToolGroup) -> Vec<String> {
     members
 }
 
+fn group_members_for_enable(group: ToolGroup) -> Vec<String> {
+    let mut members = group_members(group);
+    if task_lifecycle_schemas_deferred(
+        crate::ai::config::agent_team_optimizations().auto_mount_lifecycle_tools(),
+    ) {
+        members.retain(|name| !super::registry::common::is_task_lifecycle_tool(name));
+    }
+    members
+}
+
 /// Whether a registered tool carries this exact name.
 ///
 /// A name can be both a tool and a group shortcut; callers use this to notice
@@ -406,13 +513,27 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
             }
             let mut lines = Vec::with_capacity(available.len() + 1);
             lines.push(format!("{} additional tools available:", available.len()));
+            let optimizations = crate::ai::config::agent_team_optimizations();
+            let defer_lifecycle =
+                task_lifecycle_schemas_deferred(optimizations.auto_mount_lifecycle_tools());
             for (name, desc) in available {
                 let short = if desc.chars().count() > 80 {
                     desc.chars().take(80).collect::<String>()
                 } else {
                     desc.to_string()
                 };
-                lines.push(format!("  - {}: {}", name, short));
+                let loading = if super::registry::common::tool_has_lazy_group_schema(
+                    &name,
+                    optimizations.lazy_group_schemas(),
+                ) {
+                    " [load via enable_tools: agent_team or this tool name]"
+                } else if defer_lifecycle && super::registry::common::is_task_lifecycle_tool(&name)
+                {
+                    " [auto-mounted after task_spawn succeeds; enable this name for existing task evidence]"
+                } else {
+                    ""
+                };
+                lines.push(format!("  - {}: {}{}", name, short, loading));
             }
             // One-line group catalog: the model can load a whole tool family
             // by passing the group name to 'enable' instead of listing every
@@ -423,7 +544,11 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                 if registration_may_be_dynamically_enabled(reg) {
                     for tag in crate::ai::tools::registry::tool_metadata::tool_groups(reg.spec.name)
                     {
-                        if !tag.is_enable_ability_flag() && group_visible_to_agent(*tag) {
+                        if !tag.is_enable_ability_flag()
+                            && group_visible_to_agent(*tag)
+                            && !(defer_lifecycle
+                                && super::registry::common::is_task_lifecycle_tool(reg.spec.name))
+                        {
                             *group_counts.entry(tag.as_str()).or_insert(0) += 1;
                         }
                     }
@@ -494,7 +619,7 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                     .filter(|group| {
                         !group.is_enable_ability_flag() && group_visible_to_agent(*group)
                     })
-                    .map(group_members)
+                    .map(group_members_for_enable)
                     .unwrap_or_default();
                 if is_tool {
                     resolved_names.push(entry.clone());
@@ -681,6 +806,204 @@ mod tests {
                 parameters: json!({"type": "object"}),
             },
         }
+    }
+
+    #[test]
+    fn agent_team_lazy_enable_catalog_and_depth_guards() {
+        with_agent_team_optimizations_for_test(
+            "ai.agent_team.optimizations_enabled = true\nai.agent_team.lazy_group_schemas = true\n",
+            || {
+                let session = format!("lazy-team-{}", uuid::Uuid::new_v4().simple());
+                crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+                    (session.clone(), 1),
+                    || {
+                        let _guard = EnableTurnStateGuard::enter();
+                        set_active_tool_names(vec!["enable_tools".to_string()]);
+                        let listed = execute_enable_tools(&json!({"operation": "list"})).unwrap();
+                        assert!(listed.contains("agent_team(2)"), "{listed}");
+                        for name in ["manage_team", "run_agent_graph"] {
+                            let row = listed
+                                .lines()
+                                .find(|line| line.starts_with(&format!("  - {name}:")))
+                                .unwrap();
+                            assert!(
+                                row.contains("load via enable_tools: agent_team or this tool name"),
+                                "{row}"
+                            );
+                            assert!(!super::super::tool_defers_eager_load(name));
+                        }
+                        assert!(!super::super::group_gates_hidden_tools(
+                            ToolGroup::AgentTeam
+                        ));
+                        assert!(!listed.contains("executor("));
+                        let enabled = execute_enable_tools(
+                            &json!({"operation": "enable", "tools": ["agent_team"]}),
+                        )
+                        .unwrap();
+                        assert!(enabled.contains("Enabled 2 tool(s)"), "{enabled}");
+                        let defs = drain_pending_enable();
+                        assert_eq!(defs.len(), 2);
+                        let registered = super::super::get_tool_definitions_by_names(&[
+                            "manage_team".to_string(),
+                            "run_agent_graph".to_string(),
+                        ]);
+                        for def in &defs {
+                            let original = registered
+                                .iter()
+                                .find(|tool| tool.function.name == def.function.name)
+                                .unwrap();
+                            assert_eq!(
+                                serde_json::to_value(def).unwrap(),
+                                serde_json::to_value(original).unwrap()
+                            );
+                        }
+                    },
+                );
+                crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+                    (session.clone(), 2),
+                    || {
+                        assert_eq!(explicit_enabled_tool_names().len(), 2);
+                        let _guard = EnableTurnStateGuard::enter();
+                        set_active_tool_names(vec!["enable_tools".to_string()]);
+                        let enabled = execute_enable_tools(
+                            &json!({"operation": "enable", "tools": ["manage_team"]}),
+                        )
+                        .unwrap();
+                        assert!(
+                            enabled.contains("Enabled 1 tool(s): manage_team"),
+                            "{enabled}"
+                        );
+                        assert_eq!(drain_pending_enable().len(), 1);
+                        clear_explicitly_enabled_tools(&session);
+                    },
+                );
+                crate::ai::driver::runtime_ctx::SUBAGENT_DEPTH.sync_scope(1, || {
+                    crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope((session, 3), || {
+                        let _guard = EnableTurnStateGuard::enter();
+                        set_active_tool_names(vec!["enable_tools".to_string()]);
+                        let listed = execute_enable_tools(&json!({"operation": "list"})).unwrap();
+                        assert!(!listed.contains("agent_team("), "{listed}");
+                        assert!(!listed.contains("  - manage_team:"), "{listed}");
+                        let enabled = execute_enable_tools(&json!({"operation": "enable", "tools": ["agent_team", "manage_team", "run_agent_graph"]})).unwrap();
+                        assert!(enabled.contains("Unavailable in subagent context"), "{enabled}");
+                        assert!(drain_pending_enable().is_empty());
+                        assert!(explicit_enabled_tool_names().is_empty());
+                    });
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn task_lifecycle_auto_mount_keeps_explicit_evidence_loading() {
+        with_agent_team_optimizations_for_test(
+            "ai.agent_team.optimizations_enabled = true\nai.agent_team.auto_mount_lifecycle_tools = true\n",
+            || {
+                let session = format!("auto-mount-{}", uuid::Uuid::new_v4().simple());
+                crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+                    (session.clone(), 1),
+                    || {
+                        let _guard = EnableTurnStateGuard::enter();
+                        set_active_tool_names(vec!["enable_tools".to_string()]);
+                        let listed = execute_enable_tools(&json!({"operation": "list"})).unwrap();
+                        assert!(listed.contains("task(1)"), "{listed}");
+                        for name in super::super::registry::common::task_lifecycle_tool_names() {
+                            let row = listed
+                                .lines()
+                                .find(|line| line.starts_with(&format!("  - {name}:")))
+                                .unwrap();
+                            assert!(
+                                row.contains("auto-mounted after task_spawn succeeds"),
+                                "{row}"
+                            );
+                            assert!(
+                                row.contains("enable this name for existing task evidence"),
+                                "{row}"
+                            );
+                        }
+                        let enabled = execute_enable_tools(
+                            &json!({"operation": "enable", "tools": ["task"]}),
+                        )
+                        .unwrap();
+                        assert!(
+                            enabled.contains("Expanded group shortcut(s): task (1 tools)"),
+                            "{enabled}"
+                        );
+                        let defs = drain_pending_enable();
+                        assert_eq!(defs.len(), 1);
+                        assert_eq!(defs[0].function.name, "task_spawn");
+                        let enabled = execute_enable_tools(
+                            &json!({"operation": "enable", "tools": ["task_evidence_read"]}),
+                        )
+                        .unwrap();
+                        assert!(
+                            enabled.contains("Enabled 1 tool(s): task_evidence_read"),
+                            "{enabled}"
+                        );
+                        assert_eq!(
+                            drain_pending_enable()[0].function.name,
+                            "task_evidence_read"
+                        );
+                        assert!(!task_lifecycle_tools_mounted());
+                        record_successful_task_spawn();
+                        assert!(task_lifecycle_tools_mounted());
+                        let defs = drain_pending_enable();
+                        assert_eq!(
+                            defs.len(),
+                            super::super::registry::common::task_lifecycle_tool_names().len() - 1
+                        );
+                        assert!(
+                            defs.iter()
+                                .any(|tool| tool.function.name == "task_integrate")
+                        );
+                        assert!(
+                            execute_enable_tools(&json!({"operation": "list"}))
+                                .unwrap()
+                                .contains("task(9)")
+                        );
+                        clear_explicitly_enabled_tools(&session);
+                    },
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn task_lifecycle_mount_marker_is_owner_scoped_and_resettable() {
+        with_agent_team_optimizations_for_test(
+            "ai.agent_team.optimizations_enabled = true\nai.agent_team.auto_mount_lifecycle_tools = true\n",
+            || {
+                let owner = format!("mounted-owner-{}", uuid::Uuid::new_v4().simple());
+                let other = format!("other-owner-{}", uuid::Uuid::new_v4().simple());
+                crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+                    (owner.clone(), 1),
+                    || {
+                        let _guard = EnableTurnStateGuard::enter();
+                        set_explicit_enabled_tool_names(vec!["knowledge_search".to_string()]);
+                        record_successful_task_spawn();
+                        assert!(task_lifecycle_tools_mounted());
+                    },
+                );
+                crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope((other, 1), || {
+                    assert!(!task_lifecycle_tools_mounted());
+                    assert!(drain_pending_enable().is_empty());
+                    assert!(explicit_enabled_tool_names().is_empty());
+                });
+                crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+                    (owner.clone(), 2),
+                    || {
+                        assert!(task_lifecycle_tools_mounted());
+                        clear_task_family_explicitly_enabled_tools(&owner);
+                        assert!(!task_lifecycle_tools_mounted());
+                        assert_eq!(
+                            explicit_enabled_tool_names(),
+                            vec!["knowledge_search".to_string()]
+                        );
+                        clear_explicitly_enabled_tools(&owner);
+                    },
+                );
+            },
+        );
     }
 
     #[test]

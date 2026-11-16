@@ -738,6 +738,7 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
     }) {
         record_report_task(task);
     }
+    crate::ai::tools::enable_tools::record_successful_task_spawn();
     Ok(SpawnedSubagentTask {
         task_id,
         pid,
@@ -838,4 +839,104 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
         "next": "Use task_status for non-blocking progress (phase, updates, last activity). Do not duplicate a running branch; use task_wait only when blocked on a result, then task_integrate."
     }))
     .expect("serializing task_spawn result cannot fail"))
+}
+
+#[cfg(test)]
+mod lifecycle_mount_tests {
+    use super::*;
+    use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext, TURN_IDENTITY};
+    use crate::ai::tools::enable_tools::{self, with_agent_team_optimizations_for_test};
+
+    #[test]
+    fn task_lifecycle_signal_follows_committed_spawn_and_preserves_errors() {
+        for auto_mount in [false, true] {
+            with_agent_team_optimizations_for_test(
+                &format!(
+                    "ai.agent_team.optimizations_enabled = true\nai.agent_team.auto_mount_lifecycle_tools = {auto_mount}\n"
+                ),
+                || {
+                    let mut app = super::super::tests::test_app_with_model(String::new());
+                    app.session_id = format!("spawn-mount-{}", Uuid::new_v4().simple());
+                    app.config.history_file = std::env::temp_dir()
+                        .join(format!("spawn-mount-{}", Uuid::new_v4().simple()))
+                        .join("history.sqlite");
+                    let context = DriverContext::from_app_snapshot(
+                        &app,
+                        Arc::new(Mutex::new(crate::ai::mcp::McpClient::new())),
+                        Arc::new(Vec::new()),
+                        Arc::new(Vec::new()),
+                    );
+                    TURN_IDENTITY.sync_scope((app.session_id.clone(), 1), || {
+                        let _guard = enable_tools::EnableTurnStateGuard::enter();
+                        enable_tools::set_active_tool_names(vec!["task_spawn".to_string()]);
+                        DRIVER_CTX.sync_scope(context, || {
+                            assert_eq!(
+                                execute_task_spawn(&serde_json::json!({"tasks": []})).unwrap_err(),
+                                "task_spawn requires at least one task",
+                            );
+                            assert!(!enable_tools::task_lifecycle_tools_mounted());
+                            assert!(enable_tools::drain_pending_enable().is_empty());
+                            let prepared = PreparedSubagentTask {
+                                description: "mount fixture".to_string(),
+                                prompt: "No backend execution is performed.".to_string(),
+                                response_schema: None,
+                                agent_name: "build".to_string(),
+                                model: String::new(),
+                                reasoning_effort: None,
+                                is_model_auto_selected: false,
+                                auto_model_fallback: None,
+                                selection_explanation: "fixture".to_string(),
+                                inherit: InheritOptions::default(),
+                                backend: SubagentBackend::Kernel,
+                                show_backend_launch_tag: false,
+                                backend_model: None,
+                                backend_continue_from: None,
+                                image_files: Vec::new(),
+                            };
+                            let error = match spawn_subagent_kernel_task(&prepared) {
+                                Ok(_) => panic!("spawning without a foreground must fail"),
+                                Err(error) => error,
+                            };
+                            assert_eq!(
+                                error,
+                                "subagent task requires an active AIOS process context."
+                            );
+                            assert!(!enable_tools::task_lifecycle_tools_mounted());
+                            assert!(enable_tools::drain_pending_enable().is_empty());
+                            app.os.lock().unwrap().begin_foreground(
+                                "parent".to_string(),
+                                "goal".to_string(),
+                                10,
+                                8,
+                                None,
+                            );
+                            let first = spawn_subagent_kernel_task(&prepared).unwrap();
+                            let second = spawn_subagent_kernel_task(&prepared).unwrap();
+                            assert_ne!(first.task_id, second.task_id);
+                            assert!(with_task_entry(&first.task_id, |_| ()).is_some());
+                            assert!(enable_tools::task_lifecycle_tools_mounted());
+                            let mut queued = enable_tools::drain_pending_enable()
+                                .into_iter()
+                                .map(|tool| tool.function.name)
+                                .collect::<Vec<_>>();
+                            queued.sort_unstable();
+                            if auto_mount {
+                                assert_eq!(
+                                    queued,
+                                    crate::ai::tools::registry::common::task_lifecycle_tool_names()
+                                );
+                                assert!(!queued.iter().any(|name| name == "task_spawn"));
+                            } else {
+                                assert!(queued.is_empty());
+                                assert!(enable_tools::explicit_enabled_tool_names().is_empty());
+                            }
+                            assert!(enable_tools::drain_pending_enable().is_empty());
+                            discard_tasks_for_session(&app.session_id);
+                            enable_tools::clear_explicitly_enabled_tools(&app.session_id);
+                        });
+                    });
+                },
+            );
+        }
+    }
 }

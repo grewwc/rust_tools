@@ -225,6 +225,62 @@ pub(super) struct DrainedTaskResult {
     pub(super) rendered: String,
 }
 
+pub(super) struct ReadyTaskBatch {
+    pub(super) rendered: Vec<String>,
+    pub(super) finished_ids: Vec<String>,
+    pub(super) pending_ids: Vec<String>,
+    pub(super) collection_errors: Vec<String>,
+}
+
+/// Collect a validated wait snapshot without parking. Each task uses the normal durable
+/// collection path; a later collection error must not hide results already delivered.
+pub(super) fn collect_ready_task_batch(
+    owner_pid: u64,
+    tracked: &[(String, AsyncTaskEntry)],
+) -> Result<ReadyTaskBatch, String> {
+    let mut batch = ReadyTaskBatch {
+        rendered: Vec::new(),
+        finished_ids: Vec::new(),
+        pending_ids: Vec::new(),
+        collection_errors: Vec::new(),
+    };
+    with_os_kernel(|os| {
+        if !os
+            .get_process(owner_pid)
+            .is_some_and(|process| process.state != ProcessState::Terminated)
+        {
+            return Ok(());
+        }
+        for (task_id, entry) in tracked {
+            match drain_task_result(
+                os,
+                task_id,
+                entry,
+                "subagent result collected during wake-up",
+            ) {
+                Ok(Some(collected)) => {
+                    batch.rendered.push(collected.rendered);
+                    batch.finished_ids.push(task_id.clone());
+                }
+                Ok(None) => batch.pending_ids.push(task_id.clone()),
+                Err(error) => {
+                    batch.pending_ids.push(task_id.clone());
+                    batch
+                        .collection_errors
+                        .push(format!("task_id={task_id}: {error}"));
+                }
+            }
+        }
+        Ok(())
+    })?;
+    // Never hold registry -> kernel locks. Only successfully collected entries are removed;
+    // failed collections keep their channel or durable payload available for a later retry.
+    for task_id in &batch.finished_ids {
+        remove_task_entry(task_id);
+    }
+    Ok(batch)
+}
+
 /// Drain a terminal result: persist evidence first, consume the channel, then release the IPC
 /// resources and terminate the kernel process. Returns `Ok(None)` while the task is still running.
 ///

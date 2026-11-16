@@ -5,6 +5,13 @@
     "type": "object",
     "properties": {}
   },
+  "agent_team_optimization_properties": {
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional non-empty task_id, with surrounding whitespace trimmed, to show and collect ready results only for that task in the current process/session. Omit to query all tracked tasks, preserving the original behavior. Available when ai.agent_team.optimizations_enabled is true."
+    }
+  },
   "groups": [
     "builtin",
     "task"

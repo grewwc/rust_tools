@@ -129,6 +129,8 @@ pub(super) struct TaskLease {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct TeamTask {
     pub(super) id: String,
+    #[serde(default, skip_serializing_if = "revision_is_zero")]
+    pub(super) revision: u64,
     pub(super) title: String,
     pub(super) prompt: String,
     pub(super) assignee: Option<String>,
@@ -156,6 +158,10 @@ pub(super) struct TeamMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct TeamState {
     pub(super) version: u32,
+    #[serde(default, skip_serializing_if = "revision_is_zero")]
+    pub(super) revision: u64,
+    #[serde(skip)]
+    pub(super) revision_tracking_enabled: bool,
     pub(super) id: String,
     pub(super) session_id: String,
     pub(super) owner_pid: u64,
@@ -169,6 +175,59 @@ pub(super) struct TeamState {
     pub(super) next_message_seq: u64,
     pub(super) created_at_unix_ms: u64,
     pub(super) updated_at_unix_ms: u64,
+}
+
+impl TeamState {
+    pub(super) fn configure_revision_tracking(&mut self, enabled: bool) {
+        self.revision_tracking_enabled = enabled;
+        if !enabled {
+            self.revision = 0;
+            for task in self.tasks.values_mut() {
+                task.revision = 0;
+            }
+        }
+    }
+
+    fn bump_revision(&mut self) -> u64 {
+        if self.revision_tracking_enabled {
+            self.revision = self.revision.saturating_add(1);
+        }
+        self.revision
+    }
+}
+
+pub(super) fn revision_is_zero(revision: &u64) -> bool {
+    *revision == 0
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+struct StatusViewOptions {
+    #[serde(default)]
+    summary: bool,
+    #[serde(default)]
+    since: Option<u64>,
+}
+
+impl StatusViewOptions {
+    fn for_optimizations(args: &Value, enabled: bool) -> Result<Self, String> {
+        if !enabled {
+            return Ok(Self::default());
+        }
+        Self::from_args(args)
+    }
+
+    fn from_args(args: &Value) -> Result<Self, String> {
+        serde_json::from_value(args.clone())
+            .map_err(|error| format!("invalid status view options: {error}"))
+    }
+
+    fn is_default(self) -> bool {
+        !self.summary && self.since.is_none()
+    }
+
+    fn includes(self, revision: u64) -> bool {
+        self.since.is_none_or(|since| revision > since)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -332,6 +391,7 @@ pub(super) fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<
 }
 
 pub(super) fn recover_orphaned_team_tasks(team: &mut TeamState) {
+    let revision = team.bump_revision();
     for task in team.tasks.values_mut() {
         if task.state == TeamTaskState::Running {
             task.runtime_task_id = None;
@@ -344,6 +404,7 @@ pub(super) fn recover_orphaned_team_tasks(team: &mut TeamState) {
                 TeamTaskState::Failed
             };
             task.updated_at_unix_ms = now_unix_ms();
+            task.revision = revision;
         }
     }
     for member in team.members.values_mut() {
@@ -443,7 +504,7 @@ fn member_from_input(input: TeamMemberInput) -> Result<TeamMember, String> {
     })
 }
 
-fn create_team(args: &Value) -> Result<String, String> {
+fn create_team(args: &Value, optimizations_enabled: bool) -> Result<String, String> {
     let name = args
         .get("name")
         .and_then(Value::as_str)
@@ -483,6 +544,8 @@ fn create_team(args: &Value) -> Result<String, String> {
     let now = now_unix_ms();
     let team = TeamState {
         version: TEAM_STATE_VERSION,
+        revision: u64::from(optimizations_enabled),
+        revision_tracking_enabled: optimizations_enabled,
         id: Uuid::new_v4().to_string(),
         session_id: active_session_id()?,
         owner_pid: active_owner_pid()?,
@@ -520,7 +583,7 @@ fn recover_team_owner(team: &mut TeamState) -> Result<(), String> {
     Ok(())
 }
 
-fn load_team(id: &str) -> Result<TeamState, String> {
+fn load_team(id: &str, optimizations_enabled: bool) -> Result<TeamState, String> {
     let mut team: TeamState = load_checkpoint("teams", id)?;
     if team.version != TEAM_STATE_VERSION {
         return Err(format!(
@@ -528,6 +591,7 @@ fn load_team(id: &str) -> Result<TeamState, String> {
             team.version
         ));
     }
+    team.configure_revision_tracking(optimizations_enabled);
     recover_team_owner(&mut team)?;
     Ok(team)
 }
@@ -570,10 +634,12 @@ fn add_team_task(team: &mut TeamState, input: TeamTaskInput) -> Result<String, S
         }
     }
     let now = now_unix_ms();
+    let revision = team.bump_revision();
     team.tasks.insert(
         id.clone(),
         TeamTask {
             id: id.clone(),
+            revision,
             title: input.title.trim().to_string(),
             prompt: input.prompt.trim().to_string(),
             assignee: input.assignee,
@@ -634,6 +700,7 @@ fn propagate_failed_dependencies(team: &mut TeamState) {
         }
         blocked.sort_by(|left, right| left.0.cmp(&right.0));
         let now = now_unix_ms();
+        let revision = team.bump_revision();
         for (task_id, dependencies) in blocked {
             let task = team.tasks.get_mut(&task_id).expect("blocked task exists");
             task.state = TeamTaskState::Failed;
@@ -644,6 +711,7 @@ fn propagate_failed_dependencies(team: &mut TeamState) {
                 dependencies.join(", ")
             ));
             task.updated_at_unix_ms = now;
+            task.revision = revision;
         }
         for member in team.members.values_mut() {
             if member.active_task_id.as_deref().is_some_and(|task_id| {
@@ -672,6 +740,11 @@ fn expire_leases(team: &mut TeamState, now: u64) {
             .then_some(id.clone())
         })
         .collect::<Vec<_>>();
+    let revision = if expired.is_empty() {
+        team.revision
+    } else {
+        team.bump_revision()
+    };
     for task_id in expired {
         let member_id = team
             .tasks
@@ -682,6 +755,7 @@ fn expire_leases(team: &mut TeamState, now: u64) {
             task.state = TeamTaskState::Pending;
             task.lease = None;
             task.updated_at_unix_ms = now;
+            task.revision = revision;
         }
         if let Some(member_id) = member_id
             && let Some(member) = team.members.get_mut(&member_id)
@@ -748,6 +822,7 @@ fn claim_team_task(
             .ok_or_else(|| format!("no ready task is available for member {member_id}"))?
     };
     let expires_at_unix_ms = now.saturating_add(lease_secs.saturating_mul(1_000));
+    let revision = team.bump_revision();
     let task = team.tasks.get_mut(&task_id).expect("validated task");
     task.state = TeamTaskState::Claimed;
     task.lease = Some(TaskLease {
@@ -755,6 +830,7 @@ fn claim_team_task(
         expires_at_unix_ms,
     });
     task.updated_at_unix_ms = now;
+    task.revision = revision;
     let member = team.members.get_mut(member_id).expect("validated member");
     member.status = MemberStatus::Busy;
     member.active_task_id = Some(task_id.clone());
@@ -906,6 +982,7 @@ fn dispatch_ready_team_tasks_with(
             "inherit": member_snapshot.inherit,
         }))?;
         let now = now_unix_ms();
+        let revision = team.bump_revision();
         let task = team.tasks.get_mut(&task_id).expect("ready task");
         task.state = TeamTaskState::Running;
         task.lease = None;
@@ -914,6 +991,7 @@ fn dispatch_ready_team_tasks_with(
         task.runtime_state = Some("ready".to_string());
         task.attempts += 1;
         task.updated_at_unix_ms = now;
+        task.revision = revision;
         let member = team.members.get_mut(&member_id).expect("chosen member");
         member.status = MemberStatus::Busy;
         member.active_task_id = Some(task_id.clone());
@@ -1004,9 +1082,7 @@ pub(super) fn collect_team_results(team: &mut TeamState) -> Result<Vec<String>, 
     for (task_id, runtime_task_id) in running {
         match poll_owned_task_result(&runtime_task_id) {
             Ok(OwnedTaskPoll::Pending { state }) => {
-                if let Some(task) = team.tasks.get_mut(&task_id) {
-                    task.runtime_state = Some(state);
-                }
+                update_team_runtime_state(team, &task_id, state);
             }
             Ok(OwnedTaskPoll::Terminal { result, rendered }) => {
                 let now = now_unix_ms();
@@ -1037,6 +1113,7 @@ pub(super) fn collect_team_results(team: &mut TeamState) -> Result<Vec<String>, 
                         "task {task_id} evidence integration failed: {error}"
                     ));
                 }
+                let revision = team.bump_revision();
                 if let Some(task) = team.tasks.get_mut(&task_id) {
                     task.state = if result.status == "completed" {
                         TeamTaskState::Completed
@@ -1049,6 +1126,7 @@ pub(super) fn collect_team_results(team: &mut TeamState) -> Result<Vec<String>, 
                     task.error = result.error;
                     task.runtime_state = Some(result.status.clone());
                     task.updated_at_unix_ms = now;
+                    task.revision = revision;
                 }
                 if let Some(member_id) = member_id
                     && let Some(member) = team.members.get_mut(&member_id)
@@ -1071,12 +1149,14 @@ pub(super) fn collect_team_results(team: &mut TeamState) -> Result<Vec<String>, 
                     .tasks
                     .get(&task_id)
                     .and_then(|task| task.assignee.clone());
+                let revision = team.bump_revision();
                 if let Some(task) = team.tasks.get_mut(&task_id) {
                     task.state = TeamTaskState::Failed;
                     task.runtime_task_id = None;
                     task.runtime_state = Some("failed".to_string());
                     task.error = Some(format!("lost team task {task_id}: {error}"));
                     task.updated_at_unix_ms = now;
+                    task.revision = revision;
                 }
                 if let Some(member_id) = member_id
                     && let Some(member) = team.members.get_mut(&member_id)
@@ -1091,6 +1171,20 @@ pub(super) fn collect_team_results(team: &mut TeamState) -> Result<Vec<String>, 
     }
     refresh_team_lifecycle(team);
     Ok(collected)
+}
+
+fn update_team_runtime_state(team: &mut TeamState, task_id: &str, state: String) {
+    if team
+        .tasks
+        .get(task_id)
+        .is_some_and(|task| task.runtime_state.as_deref() != Some(state.as_str()))
+    {
+        let revision = team.bump_revision();
+        if let Some(task) = team.tasks.get_mut(task_id) {
+            task.runtime_state = Some(state);
+            task.revision = revision;
+        }
+    }
 }
 
 fn refresh_team_lifecycle(team: &mut TeamState) {
@@ -1108,6 +1202,7 @@ fn refresh_team_lifecycle(team: &mut TeamState) {
         } else {
             TeamLifecycle::Failed
         };
+        team.bump_revision();
     }
 }
 
@@ -1139,6 +1234,7 @@ fn complete_team_task(
         );
     }
     let now = now_unix_ms();
+    let revision = team.bump_revision();
     let task = team.tasks.get_mut(task_id).expect("validated task");
     task.state = match status {
         "completed" => TeamTaskState::Completed,
@@ -1149,6 +1245,7 @@ fn complete_team_task(
     task.error = error;
     task.lease = None;
     task.updated_at_unix_ms = now;
+    task.revision = revision;
     let member = team.members.get_mut(member_id).expect("validated member");
     member.status = MemberStatus::Idle;
     member.active_task_id = None;
@@ -1186,6 +1283,7 @@ fn send_team_message(
         created_at_unix_ms: now,
     });
     team.updated_at_unix_ms = now;
+    team.bump_revision();
     Ok(seq)
 }
 
@@ -1203,11 +1301,13 @@ fn cancel_team(team: &mut TeamState, reason: &str) -> Result<Vec<String>, String
         }))?);
         notes.extend(collect_team_results(team)?);
     }
+    let revision = team.bump_revision();
     for task in team.tasks.values_mut() {
         if !task.state.is_terminal() {
             task.state = TeamTaskState::Cancelled;
             task.error = Some(reason.to_string());
             task.updated_at_unix_ms = now_unix_ms();
+            task.revision = revision;
         }
     }
     for member in team.members.values_mut() {
@@ -1256,6 +1356,78 @@ fn render_team_status(team: &TeamState, event: &str) -> String {
     .unwrap_or_else(|error| format!("failed to render team status: {error}"))
 }
 
+fn render_team_status_with_options(
+    team: &TeamState,
+    event: &str,
+    options: StatusViewOptions,
+) -> String {
+    if options.is_default() {
+        return render_team_status(team, event);
+    }
+    let mut tasks = team
+        .tasks
+        .values()
+        .filter(|task| options.includes(task.revision))
+        .collect::<Vec<_>>();
+    tasks.sort_by(|left, right| left.id.cmp(&right.id));
+    let task_views = tasks
+        .into_iter()
+        .map(|task| {
+            if options.summary {
+                json!({
+                    "id": task.id,
+                    "state": task.state,
+                    "attempts": task.attempts,
+                    "has_error": task.error.is_some(),
+                })
+            } else {
+                json!({
+                    "id": task.id,
+                    "title": task.title,
+                    "assignee": task.assignee,
+                    "depends_on": task.depends_on,
+                    "state": task.state,
+                    "runtime_task_id": task.runtime_task_id,
+                    "runtime_state": task.runtime_state,
+                    "attempts": task.attempts,
+                    "output_preview": task.output.as_deref().map(|value| clip_chars(value, 2_000)),
+                    "error": task.error,
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut view = json!({
+        "event": event,
+        "team_id": team.id,
+        "name": team.name,
+        "lifecycle": team.lifecycle,
+        "budget": team.budget,
+        "revision": team.revision,
+        "summary": options.summary,
+        "since": options.since,
+        "task_count": team.tasks.len(),
+        "returned_task_count": task_views.len(),
+        "tasks": task_views,
+    });
+    if options.summary {
+        view["member_count"] = json!(team.members.len());
+        view["message_count"] = json!(team.messages.len());
+    } else {
+        let mut members = team.members.values().collect::<Vec<_>>();
+        members.sort_by(|left, right| left.id.cmp(&right.id));
+        view["goal"] = json!(team.goal);
+        view["members"] = json!(members);
+        view["messages"] = json!(team.messages.iter().rev().take(20).collect::<Vec<_>>());
+        view["checkpoint"] = json!(
+            checkpoint_dir("teams")
+                .ok()
+                .map(|dir| { dir.join(format!("{}.json", team.id)) })
+        );
+    }
+    serde_json::to_string_pretty(&view)
+        .unwrap_or_else(|error| format!("failed to render team status: {error}"))
+}
+
 fn required_str<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
     args.get(name)
         .and_then(Value::as_str)
@@ -1266,12 +1438,19 @@ fn required_str<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
 
 fn execute_manage_team(args: &Value) -> Result<String, String> {
     super::ensure_top_level_task_orchestration("manage_team")?;
+    let optimizations = crate::ai::config::agent_team_optimizations();
+    let optimizations_enabled = optimizations.optimizations_enabled();
     let action = required_str(args, "action")?;
     if action == "create" {
-        return create_team(args);
+        return create_team(args, optimizations_enabled);
     }
+    let status_options = if action == "status" {
+        StatusViewOptions::for_optimizations(args, optimizations_enabled)?
+    } else {
+        StatusViewOptions::default()
+    };
     let team_id = required_str(args, "team_id")?;
-    let mut team = load_team(team_id)?;
+    let mut team = load_team(team_id, optimizations_enabled)?;
     let mut event = action.to_string();
     let mut notes = Vec::new();
     match action {
@@ -1360,7 +1539,7 @@ fn execute_manage_team(args: &Value) -> Result<String, String> {
         }
     }
     save_checkpoint("teams", &team.id, &team)?;
-    let mut rendered = render_team_status(&team, &event);
+    let mut rendered = render_team_status_with_options(&team, &event, status_options);
     if !notes.is_empty() {
         rendered.push_str("\n\nRuntime results:\n");
         rendered.push_str(&notes.join("\n\n---\n\n"));
@@ -1369,13 +1548,15 @@ fn execute_manage_team(args: &Value) -> Result<String, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    fn sample_team() -> TeamState {
+    pub(super) fn sample_team() -> TeamState {
         let now = now_unix_ms();
         TeamState {
             version: TEAM_STATE_VERSION,
+            revision: 1,
+            revision_tracking_enabled: true,
             id: Uuid::new_v4().to_string(),
             session_id: "session".to_string(),
             owner_pid: 1,
@@ -1403,6 +1584,367 @@ mod tests {
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
         }
+    }
+
+    pub(super) fn with_status_test_context<T>(operation: impl FnOnce() -> T) -> T {
+        with_status_test_context_with_config(
+            "ai.agent_team.optimizations_enabled = true\n",
+            operation,
+        )
+    }
+
+    pub(in crate::ai::tools::task_tools) fn with_status_test_context_with_config<T>(
+        config: &str,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext, TURN_IDENTITY};
+        use std::sync::Arc;
+
+        crate::ai::tools::enable_tools::with_agent_team_optimizations_for_test(config, || {
+            struct TestDirectory(PathBuf);
+            impl Drop for TestDirectory {
+                fn drop(&mut self) {
+                    let _ = fs::remove_dir_all(&self.0);
+                }
+            }
+            let directory = TestDirectory(
+                std::env::temp_dir().join(format!("agent-status-test-{}", Uuid::new_v4().simple())),
+            );
+            let mut app = super::super::tests::test_app_with_model(String::new());
+            app.session_id = format!("status-test-{}", Uuid::new_v4().simple());
+            app.config.history_file = directory.0.join("history.sqlite");
+            app.os.lock().unwrap().begin_foreground(
+                "parent".to_string(),
+                "inspect status".to_string(),
+                10,
+                8,
+                None,
+            );
+            let session_id = app.session_id.clone();
+            let context = DriverContext::new(
+                app,
+                Arc::new(Mutex::new(crate::ai::mcp::McpClient::new())),
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+            );
+            TURN_IDENTITY.sync_scope((session_id, 0), || {
+                DRIVER_CTX.sync_scope(context, operation)
+            })
+        })
+    }
+
+    fn add_status_test_task(team: &mut TeamState, id: &str) {
+        add_team_task(
+            team,
+            TeamTaskInput {
+                id: Some(id.to_string()),
+                title: id.to_string(),
+                prompt: format!("complete {id}"),
+                assignee: None,
+                depends_on: Vec::new(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn status_value(team_id: &str, options: Value) -> Value {
+        let mut args = options;
+        args["action"] = json!("status");
+        args["team_id"] = json!(team_id);
+        serde_json::from_str(&execute_manage_team(&args).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn team_master_off_ignores_status_options_and_omits_revision_checkpoint() {
+        with_status_test_context_with_config("", || {
+            assert!(!crate::ai::config::agent_team_optimizations().optimizations_enabled());
+            let mut team = sample_team();
+            (team.session_id, team.owner_pid) = active_identity().unwrap();
+            add_status_test_task(&mut team, "first");
+            team.tasks.get_mut("first").unwrap().output = Some("full evidence".to_string());
+            send_team_message(&mut team, "parent", "*", "mailbox evidence").unwrap();
+            assert!(team.revision > 1);
+            save_checkpoint("teams", &team.id, &team).unwrap();
+            let expected = render_team_status(&team, "status");
+            for options in [
+                json!({"summary": true, "since": u64::MAX}),
+                json!({"summary": "invalid", "since": -1}),
+            ] {
+                let mut args = options;
+                args["action"] = json!("status");
+                args["team_id"] = json!(team.id);
+                assert_eq!(execute_manage_team(&args).unwrap(), expected);
+            }
+            execute_manage_team(&json!({
+                "action": "claim", "team_id": team.id, "member_id": "worker", "task_id": "first",
+            }))
+            .unwrap();
+            let saved: Value = load_checkpoint("teams", &team.id).unwrap();
+            assert!(saved.get("revision").is_none());
+            assert!(saved.get("revision_tracking_enabled").is_none());
+            assert!(saved["tasks"]["first"].get("revision").is_none());
+            let mut loaded = load_team(&team.id, false).unwrap();
+            assert_eq!(loaded.revision, 0);
+            loaded.tasks.get_mut("first").unwrap().state = TeamTaskState::Running;
+            recover_orphaned_team_tasks(&mut loaded);
+            update_team_runtime_state(&mut loaded, "first", "pending".to_string());
+            send_team_message(&mut loaded, "parent", "*", "next message").unwrap();
+            assert_eq!(loaded.revision, 0);
+            assert!(loaded.tasks.values().all(|task| task.revision == 0));
+            save_checkpoint("teams", &loaded.id, &loaded).unwrap();
+            let saved: Value = load_checkpoint("teams", &loaded.id).unwrap();
+            assert!(saved.get("revision").is_none());
+            assert!(saved["tasks"]["first"].get("revision").is_none());
+
+            let created: Value = serde_json::from_str(
+                &execute_manage_team(&json!({
+                    "action": "create", "name": "legacy", "goal": "retain legacy checkpoint shape",
+                    "members": [{"id": "worker", "role": "worker"}],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let saved: Value =
+                load_checkpoint("teams", created["team_id"].as_str().unwrap()).unwrap();
+            assert!(saved.get("revision").is_none());
+        });
+    }
+
+    #[test]
+    fn team_status_summary_and_default_preserve_full_evidence() {
+        with_status_test_context(|| {
+            let mut team = sample_team();
+            (team.session_id, team.owner_pid) = active_identity().unwrap();
+            for id in ["z", "a"] {
+                add_status_test_task(&mut team, id);
+            }
+            let task = team.tasks.get_mut("a").unwrap();
+            task.state = TeamTaskState::Completed;
+            task.attempts = 2;
+            task.output = Some("evidence".repeat(1_000));
+            task.error = Some("integration diagnostic".to_string());
+            for _ in 0..21 {
+                send_team_message(&mut team, "parent", "*", "mailbox evidence").unwrap();
+            }
+            save_checkpoint("teams", &team.id, &team).unwrap();
+
+            let args = json!({"action": "status", "team_id": team.id});
+            let expected = render_team_status(&team, "status");
+            assert_eq!(execute_manage_team(&args).unwrap(), expected);
+            let full: Value = serde_json::from_str(&expected).unwrap();
+            assert_eq!(full["messages"].as_array().unwrap().len(), 20);
+            assert_eq!(
+                full["tasks"][0]["output_preview"],
+                clip_chars(&"evidence".repeat(1_000), 2_000)
+            );
+            assert_eq!(full["tasks"][0]["error"], "integration diagnostic");
+            assert!(full.get("revision").is_none());
+
+            let summary = status_value(&team.id, json!({"summary": true}));
+            assert_eq!(summary["revision"], team.revision);
+            assert_eq!(summary["task_count"], 2);
+            assert_eq!(summary["returned_task_count"], 2);
+            assert_eq!(summary["message_count"], 21);
+            assert_eq!(
+                summary["tasks"],
+                json!([
+                    {"id": "a", "state": "completed", "attempts": 2, "has_error": true},
+                    {"id": "z", "state": "pending", "attempts": 0, "has_error": false},
+                ])
+            );
+            assert!(summary.get("messages").is_none());
+            assert!(!summary.to_string().contains("evidence"));
+            assert_eq!(
+                execute_manage_team(
+                    &json!({"action": "status", "team_id": team.id, "summary": false})
+                )
+                .unwrap(),
+                expected
+            );
+            assert_eq!(execute_manage_team(&args).unwrap(), expected);
+            assert!(StatusViewOptions::from_args(&json!({"summary": "true"})).is_err());
+            assert!(StatusViewOptions::from_args(&json!({"since": -1})).is_err());
+        });
+    }
+
+    #[test]
+    fn team_status_since_tracks_transitions_without_repeating_unchanged_tasks() {
+        with_status_test_context(|| {
+            let mut team = sample_team();
+            (team.session_id, team.owner_pid) = active_identity().unwrap();
+            for id in ["first", "second"] {
+                add_status_test_task(&mut team, id);
+            }
+            save_checkpoint("teams", &team.id, &team).unwrap();
+            let baseline = status_value(&team.id, json!({"summary": true}))["revision"]
+                .as_u64()
+                .unwrap();
+            execute_manage_team(&json!({
+                "action": "claim", "team_id": team.id, "member_id": "worker", "task_id": "first",
+            }))
+            .unwrap();
+            let claimed = status_value(&team.id, json!({"summary": true, "since": baseline}));
+            assert!(claimed["revision"].as_u64().unwrap() > baseline);
+            assert_eq!(
+                claimed["tasks"],
+                json!([
+                    {"id": "first", "state": "claimed", "attempts": 0, "has_error": false},
+                ])
+            );
+
+            let mut checkpoint = load_team(&team.id, true).unwrap();
+            checkpoint
+                .tasks
+                .get_mut("first")
+                .unwrap()
+                .lease
+                .as_mut()
+                .unwrap()
+                .expires_at_unix_ms = 0;
+            save_checkpoint("teams", &team.id, &checkpoint).unwrap();
+            let expired = status_value(
+                &team.id,
+                json!({"summary": true, "since": claimed["revision"]}),
+            );
+            assert_eq!(expired["tasks"][0]["state"], "pending");
+            assert_eq!(expired["returned_task_count"], 1);
+            assert!(expired["revision"].as_u64().unwrap() > claimed["revision"].as_u64().unwrap());
+
+            execute_manage_team(&json!({
+                "action": "claim", "team_id": team.id, "member_id": "worker", "task_id": "first",
+            }))
+            .unwrap();
+            execute_manage_team(&json!({
+                "action": "complete", "team_id": team.id, "member_id": "worker", "task_id": "first",
+                "status": "completed", "output": "retained result",
+            }))
+            .unwrap();
+            let completed = status_value(&team.id, json!({"since": expired["revision"]}));
+            assert_eq!(completed["returned_task_count"], 1);
+            assert_eq!(completed["tasks"][0]["id"], "first");
+            assert_eq!(completed["tasks"][0]["output_preview"], "retained result");
+
+            execute_manage_team(&json!({
+                "action": "send_message", "team_id": team.id, "from": "parent", "to": "*", "body": "new message",
+            })).unwrap();
+            let message_only = status_value(
+                &team.id,
+                json!({"summary": true, "since": completed["revision"]}),
+            );
+            assert!(
+                message_only["revision"].as_u64().unwrap()
+                    > completed["revision"].as_u64().unwrap()
+            );
+            assert_eq!(message_only["tasks"], json!([]));
+            assert_eq!(message_only["task_count"], 2);
+            assert_eq!(message_only["returned_task_count"], 0);
+            let repeated = status_value(
+                &team.id,
+                json!({"summary": true, "since": message_only["revision"]}),
+            );
+            assert_eq!(repeated["revision"], message_only["revision"]);
+            assert_eq!(repeated["tasks"], json!([]));
+        });
+    }
+
+    #[test]
+    fn team_revision_is_persisted_before_partial_dispatch_returns() {
+        let mut team = sample_team();
+        let mut member = team.members["worker"].clone();
+        member.id = "worker-2".to_string();
+        team.members.insert(member.id.clone(), member);
+        for id in ["first", "second"] {
+            add_status_test_task(&mut team, id);
+        }
+        let baseline = team.revision;
+        let mut launches = 0;
+        let mut committed = Vec::new();
+        assert!(
+            dispatch_ready_team_tasks_with(
+                &mut team,
+                |_| {
+                    launches += 1;
+                    if launches == 1 {
+                        Ok("runtime-first".to_string())
+                    } else {
+                        Err("launch failed".to_string())
+                    }
+                },
+                |team| {
+                    committed.push(serde_json::to_vec(team).unwrap());
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        let saved: TeamState = serde_json::from_slice(&committed[0]).unwrap();
+        assert!(saved.revision > baseline);
+        assert_eq!(saved.tasks["first"].revision, saved.revision);
+        assert_eq!(
+            saved.tasks["first"].runtime_task_id.as_deref(),
+            Some("runtime-first")
+        );
+        assert!(saved.tasks["second"].revision <= baseline);
+        update_team_runtime_state(&mut team, "first", "running".to_string());
+        let progressed = team.revision;
+        assert!(progressed > saved.revision);
+        update_team_runtime_state(&mut team, "first", "running".to_string());
+        assert_eq!(team.revision, progressed);
+        let delta: Value = serde_json::from_str(&render_team_status_with_options(
+            &team,
+            "status",
+            StatusViewOptions {
+                summary: false,
+                since: Some(saved.revision),
+            },
+        ))
+        .unwrap();
+        assert_eq!(delta["returned_task_count"], 1);
+        assert_eq!(delta["tasks"][0]["runtime_state"], "running");
+    }
+
+    #[test]
+    fn team_checkpoint_without_revision_loads_and_recovers() {
+        with_status_test_context(|| {
+            let mut team = sample_team();
+            (team.session_id, team.owner_pid) = active_identity().unwrap();
+            for id in ["first", "second"] {
+                add_status_test_task(&mut team, id);
+            }
+            let task = team.tasks.get_mut("first").unwrap();
+            task.state = TeamTaskState::Running;
+            task.runtime_task_id = Some("orphaned-runtime".to_string());
+            task.output = Some("previous evidence".to_string());
+            let mut legacy = serde_json::to_value(&team).unwrap();
+            legacy.as_object_mut().unwrap().remove("revision");
+            for task in legacy["tasks"].as_object_mut().unwrap().values_mut() {
+                task.as_object_mut().unwrap().remove("revision");
+            }
+            save_checkpoint("teams", &team.id, &legacy).unwrap();
+            let decoded = load_team(&team.id, true).unwrap();
+            assert_eq!(decoded.revision, 0);
+            assert!(decoded.tasks.values().all(|task| task.revision == 0));
+            assert_eq!(
+                decoded.tasks["first"].output.as_deref(),
+                Some("previous evidence")
+            );
+
+            legacy["owner_pid"] = json!(team.owner_pid + 1);
+            save_checkpoint("teams", &team.id, &legacy).unwrap();
+            let recovered = status_value(&team.id, json!({"summary": true, "since": 0}));
+            assert_eq!(recovered["revision"], 1);
+            assert_eq!(recovered["returned_task_count"], 1);
+            assert_eq!(recovered["tasks"][0]["id"], "first");
+            assert_eq!(recovered["tasks"][0]["state"], "pending");
+            let saved: TeamState = load_checkpoint("teams", &team.id).unwrap();
+            assert_eq!(saved.revision, 1);
+            assert_eq!(saved.tasks["first"].revision, 1);
+            assert_eq!(saved.tasks["second"].revision, 0);
+            assert_eq!(
+                saved.tasks["first"].output.as_deref(),
+                Some("previous evidence")
+            );
+        });
     }
 
     #[test]

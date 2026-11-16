@@ -790,6 +790,32 @@ pub(in crate::ai) async fn run_with_cli(
     .await
 }
 
+fn merge_ready_results_into_wakeup(
+    mut question: String,
+    enabled: bool,
+    event_wake: bool,
+    collect: impl FnOnce() -> Result<Option<crate::ai::tools::task_tools::TaskWakeupResults>, String>,
+) -> String {
+    if !enabled || !event_wake {
+        return question;
+    }
+    match collect() {
+        Ok(Some(results)) => {
+            question.push_str("\n\n[TASK_RESULTS_READY]\nAlready collected task_ids: [");
+            question.push_str(&results.collected_task_ids.join(", "));
+            question.push_str("]\nThe task_wait collection recommendation above is already satisfied for these tasks. Use the full results below to continue reasoning or integrate them with `task_integrate`; do not re-call `task_wait` just to collect these delivered results. Preserve pending tasks and wait only for their remaining work. Delivery is not integration, and subagent text remains unverified assistant-derived evidence.\n\n");
+            question.push_str(&results.rendered);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            question.push_str("\n\n[Task result collection warning]\n");
+            question.push_str(&error);
+            question.push_str("\nUse `task_wait` or `task_status` to retry collection; available task evidence has been retained.");
+        }
+    }
+    question
+}
+
 /// Resume a foreground ready process: build the wake-up prompt, run one turn of
 /// run_turn, then follow the quota / termination / failure teardown flow per result.
 async fn run_foreground_resume(
@@ -802,6 +828,10 @@ async fn run_foreground_resume(
 ) {
     let pid = proc.pid;
     let restored_skill_names = resume_skill_names(&proc);
+    let event_wake = proc
+        .mailbox
+        .iter()
+        .any(|message| message.starts_with("[EVENT_WAKE]"));
     let proc_question = if !proc.mailbox.is_empty() {
         let messages: Vec<String> = proc.mailbox.iter().cloned().collect();
         {
@@ -835,6 +865,7 @@ async fn run_foreground_resume(
         agent_manifests.clone(),
     );
     let persona_memory_path = app.current_persona_memory_file();
+    let merge_ready_results = app.config.agent_team_optimizations().merge_ready_results();
 
     let turn_outcome = runtime_ctx::DRIVER_CTX
         .scope(
@@ -846,6 +877,17 @@ async fn run_foreground_resume(
                     runtime_ctx::IS_RESUME_TURN.scope(true, async {
                         runtime_ctx::RESUME_SKILL_NAMES
                             .scope(restored_skill_names, async {
+                                let proc_question = merge_ready_results_into_wakeup(
+                                    proc_question,
+                                    merge_ready_results,
+                                    event_wake,
+                                    || {
+                                        crate::ai::tools::task_tools::collect_task_wait_wakeup_results(
+                                            &app.session_id,
+                                            pid,
+                                        )
+                                    },
+                                );
                                 let outcome = turn_runtime::run_turn(
                                     app,
                                     mcp_client,
@@ -1862,6 +1904,60 @@ mod wait_window_tests {
         assert!(!wait_window_needs_side_note_listener(false, true, true));
         // Nothing pending: off.
         assert!(!wait_window_needs_side_note_listener(false, false, false));
+    }
+}
+
+#[cfg(test)]
+mod wake_ready_results_tests {
+    use super::*;
+
+    #[test]
+    fn merge_ready_results_flag_off_preserves_wakeup_prompt_bytes() {
+        let mailbox = vec![
+            "[EVENT_WAKE]\nCompleted event ids: evt_7".to_string(),
+            "side note".to_string(),
+        ];
+        let original = format_wakeup_prompt(7, "original goal", &mailbox);
+        let unchanged = merge_ready_results_into_wakeup(original.clone(), false, true, || {
+            panic!("disabled merging must never collect results")
+        });
+        assert_eq!(unchanged.as_bytes(), original.as_bytes());
+    }
+
+    #[test]
+    fn merge_ready_results_no_ready_leaves_wakeup_prompt_unchanged() {
+        let original = format_wakeup_prompt(7, "original goal", &["[EVENT_WAKE]".to_string()]);
+        let unchanged = merge_ready_results_into_wakeup(original.clone(), true, true, || Ok(None));
+        assert_eq!(unchanged.as_bytes(), original.as_bytes());
+        let non_event = "[Process 7 Resumed] Goal: original goal\nContinue execution.".to_string();
+        let unchanged = merge_ready_results_into_wakeup(non_event.clone(), true, false, || {
+            panic!("a non-event wake must not collect task results")
+        });
+        assert_eq!(unchanged.as_bytes(), non_event.as_bytes());
+    }
+
+    #[test]
+    fn merge_ready_results_appends_delivery_after_event_mail() {
+        let mailbox = "[EVENT_WAKE]\nRecommended next action: re-call task_wait.".to_string();
+        let original = format_wakeup_prompt(7, "original goal", &[mailbox.clone()]);
+        let full_result = "[task_id=ready]\nFAILED\nFailure reason: full error\nPartial output:\nfull result body";
+        let merged = merge_ready_results_into_wakeup(original.clone(), true, true, || {
+            Ok(Some(crate::ai::tools::task_tools::TaskWakeupResults {
+                collected_task_ids: vec!["ready".into()],
+                rendered: full_result.into(),
+            }))
+        });
+        assert!(merged.starts_with(&original));
+        assert!(merged.contains(&mailbox));
+        assert!(
+            merged.find("[EVENT_WAKE]").unwrap() < merged.find("[TASK_RESULTS_READY]").unwrap()
+        );
+        assert_eq!(merged.matches(full_result).count(), 1);
+        assert!(merged.contains("Already collected task_ids: [ready]"));
+        assert!(merged.contains("Delivery is not integration"));
+        assert!(
+            merged.contains("do not re-call `task_wait` just to collect these delivered results")
+        );
     }
 }
 
