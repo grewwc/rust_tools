@@ -1985,6 +1985,23 @@ for (const width of [390, 700, 701, 1280]) {
     assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : resumedTop,
       "the explicit jump resumes desktop following while mobile keeps its current jump behavior");
   });
+  test("a reader's scroll-up during growth is not discarded" + suffix, async () => {
+    if (!desktop) return;
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    const bottom = h.root.scrollTop;
+    // The reader scrolls up in the same frame that rows arrive below, so the
+    // scroll event observes a changed scrollHeight.
+    h.growLayout(180);
+    h.root.scrollTop = bottom - 40;
+    h.flushScroll();
+    const readingTop = h.root.scrollTop;
+    h.settleLayout();
+    assert.equal(h.root.scrollTop, readingTop, "the growth that preceded the gesture does not outrank it");
+    assert.equal(h.context.shouldFollowOutput(), false, "the reader left the live edge");
+    h.growLayout(120); h.settleLayout();
+    assert.equal(h.root.scrollTop, readingTop, "later growth leaves an active reader alone");
+  });
   test("desktop transcript ownership observes new children and rejects obsolete resize callbacks" + suffix, async () => {
     const h = sessionScrollHarness(width, true);
     await h.openHistory();

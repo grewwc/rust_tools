@@ -3860,7 +3860,7 @@ function beginTranscriptScroll(id, root = $("msgs")) {
   resetTranscriptScroll();
   transcriptScrollState = {
     sessionId: id, generation: ++transcriptScrollGeneration, root,
-    landing: true, following: false, children: new Set(), resizeObserver: null, mutationObserver: null,
+    following: false, children: new Set(), resizeObserver: null, mutationObserver: null,
     composerHeight: composerOffsetHeight(),
   };
 }
@@ -3908,7 +3908,6 @@ function mountTranscriptScroll(id, follow, root = $("msgs")) {
   if (!transcriptScrollState || transcriptScrollState.sessionId !== id || transcriptScrollState.root !== root) beginTranscriptScroll(id, root);
   const state = transcriptScrollState;
   root._transcriptScrollOwner = state;
-  state.landing = follow;
   state.following = follow && !outputFollowSuspended;
   if (state.following) watchTranscriptScroll(state);
   else clearTranscriptScrollGoal(state);
@@ -3959,10 +3958,16 @@ function shouldFollowOutput(root = $("msgs")) {
   if (state && root._transcriptScrollOwner !== state) return false;
   return !outputFollowSuspended && (!!state?.following || isNearBottom(root));
 }
-function noteTranscriptScroll(previousTop, root = $("msgs"), layoutChanged = false, dragging = false) {
+function noteTranscriptScroll(previousTop, root = $("msgs"), dragging = false) {
   if (root.scrollTop >= previousTop) return false;
   const state = ownedTranscriptScroll(root, false);
-  if (state && !dragging && (root._transcriptScrollOwner !== state || state.landing || state.following && layoutChanged)) return false;
+  // A decrease is the reader's gesture unless the browser clamped it at the
+  // new bottom. Growth in the same frame must not discard it: the follow
+  // callback for that growth would pull the view back down while the reader
+  // is above the live edge.
+  const maxTop = root.scrollHeight - root.clientHeight;
+  const clamped = previousTop > maxTop && root.scrollTop >= maxTop - FOLLOW_BOTTOM_GAP;
+  if (state && !dragging && (root._transcriptScrollOwner !== state || clamped)) return false;
   if (isDesktopTranscriptScroll()) clearTranscriptScrollGoal();
   outputFollowSuspended = true;
   return true;
@@ -4022,7 +4027,6 @@ function followOutput(wasFollowing, root = $("msgs")) {
         || request.generation !== transcriptScrollGeneration || request.owner && ownedTranscriptScroll(target) !== request.owner)) return;
     // A wheel/touch gesture can arrive after a paint requested following but
     // before this frame. Never pull the reader back down after that gesture.
-    if (request.owner) request.owner.landing = false;
     if (!target || outputFollowSuspended) { updateJumpButton(); return; }
     target.scrollTop = target.scrollHeight;
     if (request.desktop) target._resetScrollTracking?.(false);
@@ -4034,7 +4038,7 @@ function scrollToLatest(smooth = true) {
   outputFollowSuspended = false;
   jumpingToBottom = smooth;
   const state = ownedTranscriptScroll(root);
-  if (state) { state.following = true; state.landing = smooth; watchTranscriptScroll(state); }
+  if (state) { state.following = true; watchTranscriptScroll(state); }
   updateJumpButton();
   if (smooth && root.scrollTo) root.scrollTo({ top: root.scrollHeight, behavior: "smooth" });
   else root.scrollTop = root.scrollHeight;
@@ -4042,7 +4046,7 @@ function scrollToLatest(smooth = true) {
   setTimeout(() => {
     if (state && ownedTranscriptScroll(root) !== state) return;
     jumpingToBottom = false;
-    if (state) { state.landing = false; queueTranscriptScrollResize(state); }
+    if (state) queueTranscriptScrollResize(state);
     updateJumpButton();
   }, 450);
 }
@@ -8877,14 +8881,10 @@ if ($("msgs") && typeof $("msgs").addEventListener === "function") {
   // live edge must not trigger a fetch, and a transcript shorter than its viewport
   // has no older rows to reveal.
   let previousTop = $("msgs").scrollTop;
-  let previousHeight = $("msgs").scrollHeight;
-  let previousViewport = $("msgs").clientHeight;
   let previousTouchY = null;
   let pointerDown = false;
   $("msgs")._resetScrollTracking = (resetInput = true) => {
     previousTop = $("msgs").scrollTop;
-    previousHeight = $("msgs").scrollHeight;
-    previousViewport = $("msgs").clientHeight;
     if (resetInput) { previousTouchY = null; pointerDown = false; }
   };
   $("msgs").addEventListener("pointerdown", (event) => { pointerDown = event.target === $("msgs"); }, { passive: true });
@@ -8912,11 +8912,8 @@ if ($("msgs") && typeof $("msgs").addEventListener === "function") {
   }, { passive: true });
   $("msgs").addEventListener("scroll", () => {
     const root = $("msgs");
-    const layoutChanged = root.scrollHeight !== previousHeight || root.clientHeight !== previousViewport;
-    const movedUp = noteTranscriptScroll(previousTop, root, layoutChanged, pointerDown);
+    const movedUp = noteTranscriptScroll(previousTop, root, pointerDown);
     previousTop = root.scrollTop;
-    previousHeight = root.scrollHeight;
-    previousViewport = root.clientHeight;
     if (!movedUp || root.scrollTop > 0) return;
     if (root.scrollHeight <= root.clientHeight + 8) return;
     loadOlderHistory();
