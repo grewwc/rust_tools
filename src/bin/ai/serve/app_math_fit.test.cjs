@@ -250,7 +250,7 @@ test("formula overflow and paragraph typography apply across every theme", () =>
 
 test("CSS snapshot pins paragraph-sized math, plan/task cards and mobile and desktop themes", () => {
   const css = html.match(/<style>([\s\S]*?)<\/style>/)[1];
-  assert.equal(Buffer.byteLength(css), 96061);
+  assert.equal(Buffer.byteLength(css), 96914);
   assert.equal(createHash("sha256").update(css).digest("hex"),
-    "654e7fd68e5ee7251b0d67e7b486e7afd2941888b70fb9f9fd1d60c2f848548d");
+    "a29be3a1f88905a65fbd2f28a83c1b55b15697faafc7d64793927470d8217ca2");
 });

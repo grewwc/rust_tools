@@ -387,6 +387,21 @@ test("desktop single row body click selects the session", async () => {
   assert.deepEqual(h.requests, []);
 });
 
+for (const phone of [false, true]) test((phone ? "phone" : "desktop") + " session pick moves the caret into the composer", async () => {
+  const h = harness({ phone });
+  await h.select();
+  assert.equal(h.context.sessionId, "target-session");
+  assert.equal(h.document.activeElement, h.elements.prompt, "the picked session is ready for typing");
+  if (phone) assert.equal(h.drawers.at(-1), false, "the phone drawer still closes over the chat");
+});
+
+test("a new session starts with the caret in the composer", async () => {
+  const h = harness();
+  await h.elements.newbtn.onclick();
+  assert.equal(h.context.sessionId, "fresh-session");
+  assert.equal(h.document.activeElement, h.elements.prompt);
+});
+
 test("desktop star filter keeps the active session, scroll and filter state across refreshes", async () => {
   const h = harness({ marked: true, sid: "target-session" });
   h.elements.sesslist.scrollTop = 64;

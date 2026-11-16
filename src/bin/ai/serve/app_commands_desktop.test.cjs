@@ -220,6 +220,19 @@ test("use completes registered backends and remote worker models", async () => {
   h.key("Tab"); assert.equal(h.prompt.value, "/use traecli worker-two ");
   assert.equal(h.calls.filter(([url]) => url === "/subagent-models").length, 1);
 });
+test("use traecli model parameters fuzzy-match a middle substring", async () => {
+  const h = await ready({ respond: () => ({ models: ["beam-free-opencode", "model-two"] }) });
+  h.type("/use traecli free"); await settle();
+  assert.deepEqual(values(h), ["beam-free-opencode"]);
+  h.key("Tab"); assert.equal(h.prompt.value, "/use traecli beam-free-opencode ");
+});
+test("subagent traecli model parameters fuzzy-match a middle substring", async () => {
+  const catalog = [{ name: "subagent", usage: "[backend] [model]", description: "Set the subagent backend and model" }];
+  const h = await ready({ catalog, respond: () => ({ models: ["beam-free-opencode", "model-two"] }) });
+  h.type("/subagent traecli fre"); await settle();
+  assert.deepEqual(values(h), ["beam-free-opencode"]);
+  h.key("Tab"); assert.equal(h.prompt.value, "/subagent traecli beam-free-opencode ");
+});
 test("a name-only model command usage uses info model values", async () => {
   const h = await ready({ catalog: [{ name: "use", usage: "[name]" }] });
   h.type("/use model-"); h.key("Tab"); assert.equal(h.prompt.value, "/use model-one ");
@@ -445,6 +458,17 @@ for (const alias of ["model", "models"]) {
     h.type("/" + alias + " effort xhigh "); assert.equal(h.elements.cmdoptions.children.length, 0);
   });
 }
+for (const alias of ["model", "models"]) for (const key of ["Tab", "Enter"]) test("desktop /" + alias + " matches a model by a middle substring via " + key, async () => {
+  const h = await ready({ catalog: modelCatalog });
+  h.elements.omodel.options[1] = { value: "beam-free-opencode", textContent: "beam-free-opencode" };
+  h.elements.omodel.options[2] = { value: "model-two", textContent: "model-two" };
+  h.type("/" + alias + " free");
+  assert.deepEqual(values(h), ["beam-free-opencode"]);
+  assert.equal(h.key(key).prevented, true);
+  const expected = "/" + alias + " beam-free-opencode ";
+  assertModelPrompt(h, expected, expected.length, key === "Enter");
+  assert.equal(h.elements.omodel.value, "beam-free-opencode");
+});
 test("desktop /mod cycles model aliases before Enter opens the picker", async () => {
   const h = await ready({ catalog: modelCatalog }); h.type("/mod");
   h.key("Tab"); assertModelPrompt(h, "/model ", 7, false);
@@ -517,9 +541,37 @@ test("desktop send dispatcher consumes model commands before preparing a chat tu
   h.context.closeModelSheet(); h.prompt.focus();
   const multiline = "中文🚀\n/models model-one tail🚀\nnext";
   h.type(multiline); await h.context.send();
-  assert.equal(h.elements.omodel.value, "model-one");
-  assertModelPrompt(h, multiline, multiline.length, true);
+  assert.equal(h.elements.omodel.value, "model-two", "a command line inside a message must not switch the model");
+  assert.equal(configWrites(h).length, 1);
+  assert.equal(h.effects.filter(([kind]) => kind === "prepare-turn").length, 1, "prose around a command line must reach the turn path");
+  assert.equal(h.prompt.value, multiline);
+  h.type("\n/models model-one\n"); await h.context.send();
+  assert.equal(h.elements.omodel.value, "model-one", "blank lines do not turn a lone command into prose");
   assert.equal(configWrites(h).length, 2);
+  assert.equal(h.effects.filter(([kind]) => kind === "prepare-turn").length, 1, "a lone command is still consumed locally");
+  assert.equal(h.context.desktopModelSendCommand("说明🚀\n/models model-one"), null, "a later command line is prose");
+  assert.deepEqual(h.context.desktopModelSendCommand("  /models model-one  \n说明🚀\n第二行").rest, "说明🚀\n第二行");
+  assert.deepEqual(h.context.desktopModelSendCommand("/models model-one\n\n  缩进🚀\n").rest, "\n  缩进🚀\n",
+    "only the command line is removed; the question keeps the typed bytes");
+  assert.equal(h.context.desktopModelSendCommand("/models model-one\n  \n").rest, "", "a blank rest leaves only the command");
+  assert.equal(h.context.desktopModelSendCommand("  \n/models model-one\n说明🚀").rest, "说明🚀", "leading blank lines still find the command");
+  // A leading command keeps its question: the setting applies here and the rest
+  // of the message still starts the turn.
+  h.type("/models model-two\n说明🚀\n第二行"); await h.context.send(); await settle();
+  assert.equal(h.elements.omodel.value, "model-two", "the leading command applies the model locally");
+  assert.equal(configWrites(h).length, 3);
+  assert.equal(h.effects.filter(([kind]) => kind === "prepare-turn").length, 2, "the question after a command reaches the turn path");
+  h.type("/models nope\n说明🚀"); await h.context.send(); await settle();
+  assert.equal(h.elements.modelpick.hidden, false);
+  assert.equal(configWrites(h).length, 3);
+  assert.equal(h.effects.filter(([kind]) => kind === "prepare-turn").length, 2, "an unresolved selector keeps the message in the box");
+});
+test("send() posts only the lines after a leading model command", () => {
+  const apply = script.indexOf('if (typeof handled === "string") input = handled;');
+  const prompt = script.indexOf("let prompt = input;");
+  const body = script.indexOf("const body = { prompt, confirm: true };");
+  assert.ok(apply > 0 && prompt > apply, "the bridge remainder must become the turn prompt");
+  assert.ok(body > prompt, "the turn body is built from that remainder");
 });
 for (const width of [320, 700]) test(width + "px send dispatcher keeps the original model-text path", async () => {
   const h = await ready({ width, catalog: modelCatalog });
