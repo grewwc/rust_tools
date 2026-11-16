@@ -1,0 +1,8 @@
+{
+  "dev": {
+    "apiBase": "http://10.37.248.120:8000"
+  },
+  "prod": {
+    "apiBase": "https://aeolus-conciliator.byted.org"
+  }
+}

@@ -23,6 +23,9 @@ const restoreSrc = script.slice(
   script.indexOf("function clearDraft("),
 );
 const loadSessionsSrc = script.slice(
+  script.indexOf("let sessMarkedOnly = false;"),
+  script.indexOf("function setSessionMarkedFilter("),
+) + script.slice(
   script.indexOf("// BEGIN session activity"),
   script.indexOf("// END session activity"),
 ) + script.slice(
@@ -110,6 +113,7 @@ function makeContext(extra) {
     document,
     sessionId: "",
     window: { matchMedia: () => ({ matches: false }), innerHeight: 800 },
+    isPhoneLayout: () => false,
     requestAnimationFrame: (fn) => { context.frames.push(fn); return context.frames.length; },
     setTimeout: (fn) => { context.timers.push(fn); return context.timers.length; },
     localStorage: {

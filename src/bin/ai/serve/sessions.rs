@@ -174,8 +174,30 @@ pub(crate) async fn list_sessions(
                 .into_response();
         }
     };
+    let query = q.query.as_deref().unwrap_or_default().trim().to_lowercase();
+    let keywords: Vec<&str> = query.split_whitespace().collect();
     let mut all: Vec<SessionItem> = items
         .into_iter()
+        .filter(|s| !q.marked || s.marked)
+        .filter(|s| {
+            if keywords.is_empty() {
+                return true;
+            }
+            // Keep the same title precedence and placeholder as the WebUI.
+            let title = s
+                .summary
+                .as_deref()
+                .filter(|title| !title.is_empty())
+                .or_else(|| {
+                    s.first_user_prompt
+                        .as_deref()
+                        .filter(|prompt| !prompt.is_empty())
+                })
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("new session · {}", &s.id[..s.id.len().min(8)]));
+            let text = format!("{title} {}", s.id).to_lowercase();
+            keywords.iter().all(|keyword| text.contains(keyword))
+        })
         .map(|s| {
             // Resolve before moving `s.id`: the value is the session's live
             // `/cd` entry, falling back to the daemon cwd exactly like the
@@ -193,6 +215,7 @@ pub(crate) async fn list_sessions(
             }
         })
         .collect();
+    // The total describes the complete matching set, before paging or include.
     let total = all.len();
     if q.newest {
         all.reverse();

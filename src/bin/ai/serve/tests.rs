@@ -924,7 +924,8 @@ fn session_activity_daemon_and_driver_resolve_the_same_persona_lock_root() {
     let driver_store = SessionStore::new(&driver_history);
     let history = driver_store.session_history_file("persona-session");
     let lease = TurnLease::acquire(&history, "persona-session").expect("driver persona lease");
-    state.history_file = resolve_serve_history_file(&base, "persona-a").expect("serve history root");
+    state.history_file =
+        resolve_serve_history_file(&base, "persona-a").expect("serve history root");
     let daemon_store = SessionStore::new(&state.history_file);
     assert_eq!(
         super::sessions::session_activity(&state, &daemon_store, "persona-session"),
@@ -1070,6 +1071,8 @@ async fn session_activity_list_reports_first_paint_for_the_returned_page() {
         Query(SessionsQuery {
             limit: None,
             offset: None,
+            query: None,
+            marked: false,
             newest: false,
             include: None,
         }),
@@ -2021,6 +2024,277 @@ async fn session_list_offset_matches_the_legacy_full_response() {
     );
     assert_eq!(page, vec![all[1].clone()]);
     assert_eq!(newest, vec![all[2].clone(), all[1].clone(), all[0].clone()]);
+    server.abort();
+    let _ = server.await;
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[tokio::test]
+async fn session_search_filters_all_metadata_before_pagination() {
+    use crate::ai::history::MarkMessageUpdate;
+
+    async fn fetch(
+        client: &reqwest::Client,
+        base: &str,
+        params: &[(&str, &str)],
+        total: &str,
+        page_size: &str,
+    ) -> Vec<serde_json::Value> {
+        let response = client
+            .get(format!("{base}/sessions"))
+            .query(params)
+            .bearer_auth("t")
+            .send()
+            .await
+            .expect("session search request");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-sessions-total"], total);
+        assert_eq!(response.headers()["x-sessions-page-size"], page_size);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        response.json().await.expect("session search json")
+    }
+
+    let mut state = lifecycle_test_state();
+    state.token = "t".into();
+    let root = state
+        .history_file
+        .parent()
+        .expect("test root")
+        .to_path_buf();
+    let store = SessionStore::new(state.history_file.as_path());
+    for (id, title) in [
+        ("match-old", "ÄLPHA debugging BETA"),
+        ("match-other", "beta another Älpha"),
+        ("plain", "Unrelated"),
+    ] {
+        store
+            .write_session_title_with_origin(id, title, SessionTitleOrigin::User)
+            .expect("persist search fixture");
+    }
+    let app = Router::new()
+        .route("/sessions", get(list_sessions))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listen");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let client = reqwest::Client::new();
+    let all = fetch(&client, &base, &[], "3", "3").await;
+    let first_loaded = fetch(
+        &client,
+        &base,
+        &[("newest", "true"), ("limit", "1")],
+        "3",
+        "1",
+    )
+    .await;
+    let expected: Vec<_> = all
+        .iter()
+        .rev()
+        .filter(|item| item["id"].as_str().unwrap().starts_with("match-"))
+        .cloned()
+        .collect();
+    let outside_first_page = expected
+        .iter()
+        .find(|item| item["id"] != first_loaded[0]["id"])
+        .expect("a matching fixture beyond the initially loaded page");
+
+    // Keywords can occur in either order, separated by Unicode whitespace.
+    let query = "  BETA\t\u{2003}älpha  ";
+    let matches = fetch(
+        &client,
+        &base,
+        &[("query", query), ("newest", "true")],
+        "2",
+        "2",
+    )
+    .await;
+    assert_eq!(matches, expected);
+    assert!(matches.contains(outside_first_page));
+    let legacy_order = fetch(&client, &base, &[("query", query)], "2", "2").await;
+    assert_eq!(
+        legacy_order,
+        expected.iter().rev().cloned().collect::<Vec<_>>()
+    );
+
+    // Offset and totals apply to matches, and a nonmatching include stays out.
+    for (offset, index) in [("0", 0), ("1", 1)] {
+        let page = fetch(
+            &client,
+            &base,
+            &[
+                ("query", query),
+                ("newest", "true"),
+                ("offset", offset),
+                ("limit", "1"),
+                ("include", "plain"),
+            ],
+            "2",
+            "1",
+        )
+        .await;
+        assert_eq!(page, vec![expected[index].clone()]);
+    }
+    let included = fetch(
+        &client,
+        &base,
+        &[
+            ("query", query),
+            ("newest", "true"),
+            ("limit", "1"),
+            ("include", expected[1]["id"].as_str().unwrap()),
+        ],
+        "2",
+        "1",
+    )
+    .await;
+    assert_eq!(included, expected);
+    let id_match = fetch(&client, &base, &[("query", "OTHER ÄLPHA")], "1", "1").await;
+    assert_eq!(id_match[0]["id"], "match-other");
+    assert!(
+        fetch(&client, &base, &[("query", "Unrelated Älpha")], "0", "0")
+            .await
+            .is_empty()
+    );
+    for empty in ["", " \t\u{2003}\n "] {
+        assert_eq!(
+            fetch(&client, &base, &[("query", empty)], "3", "3").await,
+            all
+        );
+    }
+
+    // A star outside the unfiltered first page must be on the first matching
+    // page, with totals and inclusion restricted by both constraints.
+    let starred_match_id = outside_first_page["id"].as_str().unwrap();
+    for id in [starred_match_id, "plain"] {
+        store
+            .write_session_mark(id, true, MarkMessageUpdate::Keep)
+            .expect("persist starred search fixture");
+    }
+    let updated = fetch(&client, &base, &[], "3", "3").await;
+    assert_eq!(
+        fetch(&client, &base, &[("marked", "false")], "3", "3").await,
+        updated
+    );
+    assert_eq!(
+        fetch(
+            &client,
+            &base,
+            &[("query", query), ("marked", "false"), ("newest", "true")],
+            "2",
+            "2",
+        )
+        .await,
+        updated
+            .iter()
+            .rev()
+            .filter(|item| item["id"] != "plain")
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    let unmarked_match_id = expected
+        .iter()
+        .find(|item| item["id"] != starred_match_id)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    for include in ["plain", unmarked_match_id] {
+        let starred_query = fetch(
+            &client,
+            &base,
+            &[
+                ("query", query),
+                ("marked", "true"),
+                ("newest", "true"),
+                ("limit", "1"),
+                ("include", include),
+            ],
+            "1",
+            "1",
+        )
+        .await;
+        assert_eq!(starred_query.len(), 1);
+        assert_eq!(starred_query[0]["id"], starred_match_id);
+        assert_eq!(starred_query[0]["marked"], true);
+    }
+    let starred: Vec<_> = updated
+        .iter()
+        .rev()
+        .filter(|item| item["marked"] == true)
+        .cloned()
+        .collect();
+    for empty in [None, Some(" \t\u{2003}\n ")] {
+        let mut params = vec![("marked", "true"), ("newest", "true")];
+        if let Some(query) = empty {
+            params.push(("query", query));
+        }
+        assert_eq!(fetch(&client, &base, &params, "2", "2").await, starred);
+    }
+    for (offset, index) in [("0", 0), ("1", 1)] {
+        let page = fetch(
+            &client,
+            &base,
+            &[
+                ("marked", "true"),
+                ("newest", "true"),
+                ("offset", offset),
+                ("limit", "1"),
+                ("include", unmarked_match_id),
+            ],
+            "2",
+            "1",
+        )
+        .await;
+        assert_eq!(page, vec![starred[index].clone()]);
+    }
+    assert_eq!(
+        fetch(
+            &client,
+            &base,
+            &[
+                ("marked", "true"),
+                ("newest", "true"),
+                ("limit", "1"),
+                ("include", starred[1]["id"].as_str().unwrap()),
+            ],
+            "2",
+            "1",
+        )
+        .await,
+        starred
+    );
+    assert!(
+        fetch(
+            &client,
+            &base,
+            &[("marked", "true"), ("query", query), ("offset", "1")],
+            "1",
+            "0",
+        )
+        .await
+        .is_empty()
+    );
+    for invalid in ["", "1", "TRUE", "invalid"] {
+        let response = client
+            .get(format!("{base}/sessions"))
+            .query(&[("marked", invalid)])
+            .bearer_auth("t")
+            .send()
+            .await
+            .expect("invalid starred filter request");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{invalid:?}");
+    }
+    let unauthorized = client
+        .get(format!("{base}/sessions"))
+        .query(&[("query", query), ("marked", "true")])
+        .send()
+        .await
+        .expect("unauthorized search request");
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
     server.abort();
     let _ = server.await;
     std::fs::remove_dir_all(root).expect("remove test root");

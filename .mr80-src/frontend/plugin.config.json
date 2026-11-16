@@ -1,0 +1,13 @@
+{
+  "siteDomain": "https://meego.larkoffice.com",
+  "pluginId": "MII_6AAF4159C3C0CCDB",
+  "pluginSecret": "83e1df621447e6945a772df9589c33c43b620a471a6baa049eb6461d1f038e29cca3858ba778a5f85de8dc57e8f1c76d",
+  "resources": [
+    {
+      "id": "ai_node_web_aeolus_card",
+      "entry": "./src/features/ai_node_web_aeolus_card/index.tsx"
+    }
+  ],
+  "app_type": "ai_node",
+  "source_type": "remote"
+}

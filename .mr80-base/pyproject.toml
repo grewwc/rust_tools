@@ -1,0 +1,98 @@
+[project]
+name = "conciliator"
+version = "0.1.0"
+description = "Auto resolve MR conflicts via Coco Agent, with per-block approval flow"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "httpx>=0.27.0",
+    "sqlalchemy>=2.0.36",
+    "alembic>=1.14.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "structlog>=24.4.0",
+    "GitPython>=3.1.43",
+    "lark-oapi>=1.4.0",
+    "tenacity>=9.0.0",
+    "packaging>=24.0",
+    # bytedmysql 0.4.x 要求 pymysql<=0.9.3；本地/CI/生产统一版本。
+    "pymysql==0.9.3",
+    # byteddps 0.1.3 要求 urllib3<2。
+    "urllib3==1.26.18",
+]
+
+# 字节内部 SDK(bytedmysql/bytedance.metrics/bytedkmsv2/byteddps/
+# bytedztijwthelper)不在 pyproject 里:
+#   - 它们只在字节内网可达,放进 pyproject 会让 uv lock 失败
+#   - 生产构建时 Atum 单独 `uv pip install` 这些包(见 atum.yaml)
+#   - 代码里用 try/except 延迟 import,本地无 byted* 也能跑大部分逻辑
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "respx>=0.21.1",
+    "testcontainers[mysql]>=4.8.0",
+    "freezegun>=1.5.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+]
+
+# 字节内部 pip 镜像(参考 https://python.byted.org/setup/)。
+# 镜像同时代理开源包；设为默认索引，保证本地锁文件与 TCE 构建来源一致。
+[[tool.uv.index]]
+name = "byted"
+url = "https://bytedpypi.byted.org/simple/"
+default = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/conciliator"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Cross-component tests exercise the standalone worker without a server runtime dependency.
+pythonpath = ["deployment-worker/src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.11"
+# 不开 strict(77 个类型注解缺失,后续逐步补)
+# 只开核心检查:语法错误、明显类型错误、missing return
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = false
+# byted* SDK 暂无 stub,关闭缺失 import 检查
+[[tool.mypy.overrides]]
+module = [
+    "bytedmysql.*",
+    "bytedance.*",
+    "kmsv2.*",
+    "byteddps",
+    "ztijwthelper",
+    "bytecloud_cloud_sdk.*",
+    "bytedlogger",
+    "backgrounds",
+]
+ignore_missing_imports = true
+
+# The Lark SDK does not ship stubs or a py.typed marker.
+[[tool.mypy.overrides]]
+module = ["lark_oapi.*"]
+ignore_missing_imports = true

@@ -1,0 +1,29 @@
+{
+  "Action": "edited",
+  "Sender": {
+    "Id": "792763146702616",
+    "Username": "aeolus_conciliator_test",
+    "Email": "aeolus_conciliator_test@bytedance.com"
+  },
+  "Repository": {
+    "Id": "1106267",
+    "Path": "xiahaitao/Conciliator",
+    "URL": "https://code.byted.org/xiahaitao/Conciliator",
+    "CloneURL": "https://code.byted.org/xiahaitao/Conciliator.git"
+  },
+  "MergeRequest": {
+    "Id": "793125163377574",
+    "Number": 9,
+    "SourceRepoId": "1106267",
+    "TargetRepoId": "1106267",
+    "SourceBranchName": "verify/nextcode-20260826-1313-test1",
+    "TargetBranchName": "verify/nextcode-20260826-1313-test2",
+    "Title": "[verification] NextCode contract 20260826-1313"
+  },
+  "Diffs": {
+    "Description": {
+      "Before": "before",
+      "After": "after"
+    }
+  }
+}

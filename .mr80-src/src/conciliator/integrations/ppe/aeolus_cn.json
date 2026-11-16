@@ -1,0 +1,262 @@
+{
+  "schema_version": 1,
+  "repository": "dp/aeolus",
+  "psm": "data.aeolus.api_v3",
+  "scm_repo_id": 572600,
+  "scm_repo_name": "data/dp/aeolus_ppe",
+  "standard_env": "online_cn",
+  "environment_type": "ppe",
+  "reference_environment": "ppe_aeolus_huaguojin_test",
+  "reference_environment_id": "382028319",
+  "idc": "LF",
+  "operator": "huaguojin",
+  "baseline_artifact": {
+    "version": "1.0.0.1541",
+    "version_id": "168188114",
+    "commit_sha": "5c8985612bf78e62404968293b144981fe8ecfef",
+    "build_type": "test"
+  },
+  "bits_scm": {
+    "pipeline_id": "1251261261058",
+    "space_id": "284273157378"
+  },
+  "meta": {
+    "app_path": "toutiao/app/data/aeolus/dlv_control/bootstrap.sh",
+    "base_image": "debian.bookworm.python310:latest",
+    "dependency_mode": "default",
+    "enable_sidecar": true,
+    "is_runtime": false,
+    "new_ports": [
+      {
+        "intent": "primary",
+        "is_primary": true,
+        "port": 12356,
+        "type": "tcp"
+      },
+      {
+        "intent": "other",
+        "is_primary": false,
+        "port": 32470,
+        "type": "tcp"
+      },
+      {
+        "intent": "other",
+        "is_primary": false,
+        "port": 32471,
+        "type": "tcp"
+      },
+      {
+        "intent": "other",
+        "is_primary": false,
+        "port": 6793,
+        "type": "tcp"
+      },
+      {
+        "intent": "other",
+        "is_primary": false,
+        "port": 36793,
+        "type": "tcp"
+      },
+      {
+        "intent": "other",
+        "is_primary": false,
+        "port": 32346,
+        "type": "tcp"
+      }
+    ],
+    "health_check_path": " /opt/tiger/tce/tce_tools/bin/health_check.sh && curl -m 5 http://127.0.0.1:$PORT0/aeolus/api/v3/misc/healthz | grep \"Hello Aeolus!\";",
+    "language": "go",
+    "enable_forbidden_pyc": false,
+    "scm_repos": [
+      {
+        "version": "1.0.0.1541",
+        "path": "toutiao/app/data/aeolus",
+        "remote_id": 572600,
+        "main_repo": true,
+        "type": "scm",
+        "sub_path": "",
+        "name": "data/dp/aeolus_ppe"
+      },
+      {
+        "version": "1.0.2.628",
+        "path": "toutiao/load",
+        "remote_id": 667,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": "",
+        "name": "toutiao/load"
+      },
+      {
+        "version": "1.0.1.877",
+        "path": "toutiao/runtime",
+        "remote_id": 631,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": "",
+        "name": "toutiao/runtime"
+      },
+      {
+        "version": "1.0.0.1833",
+        "path": "ss_conf",
+        "remote_id": 756,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": "",
+        "name": "ss_conf"
+      },
+      {
+        "version": "1.0.0.19",
+        "path": "databuspy",
+        "remote_id": 56171,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": "",
+        "name": "security/tq/databuspy"
+      },
+      {
+        "version": "1.0.0.3133",
+        "path": "hive_deploy",
+        "remote_id": 17547,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": "",
+        "name": "dp/hive_deploy"
+      },
+      {
+        "version": "1.0.0.4",
+        "path": "pyutil",
+        "remote_id": 198558,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": "",
+        "name": "data/byteair_sec/pyutil"
+      },
+      {
+        "version": "1.0.0.550",
+        "path": "toutiao/app/data/aeolus/dlv_control",
+        "remote_id": 219528,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": "",
+        "name": "debug/snapshot/agent"
+      },
+      {
+        "version": "1.0.0.14",
+        "path": "aeolus_expr_parse",
+        "remote_id": 520839,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": "",
+        "name": "data/dp/aeolus_expr_parse_py310"
+      },
+      {
+        "version": "1.0.0.18",
+        "path": "dp_druid_client_py",
+        "remote_id": 9865,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": "",
+        "name": "dp/olap/dp_druid_client_py"
+      },
+      {
+        "version": "1.0.0.331",
+        "path": "pytqs",
+        "remote_id": 3088,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": "",
+        "name": "data/olap/pytqs"
+      }
+    ],
+    "clusters": [
+      {
+        "name": "online",
+        "zone": "China-North-LF",
+        "virtual_cluster": "PPE/ipv6",
+        "dc_infos": [
+          {
+            "count": 1,
+            "idc": "LF"
+          }
+        ],
+        "cpu": 8,
+        "mem": 32,
+        "host_type": "docker",
+        "network_mode": "autohost",
+        "update_mode": "delete_first",
+        "enable_sidecar_percent": 100,
+        "sidecar_ingress_enable": false,
+        "sidecar_egress_enable": true,
+        "sidecar_http_ingress_enable": false,
+        "sidecar_http_egress_enable": true,
+        "server_identity_enable": false,
+        "base_cluster_id": 219404613,
+        "ipv6only_enable": "true"
+      },
+      {
+        "name": "query_online_mirror",
+        "zone": "China-North-LF",
+        "virtual_cluster": "PPE/ipv6",
+        "dc_infos": [
+          {
+            "count": 1,
+            "idc": "LF"
+          }
+        ],
+        "cpu": 8,
+        "mem": 32,
+        "host_type": "docker",
+        "network_mode": "autohost",
+        "update_mode": "delete_first",
+        "enable_sidecar_percent": 100,
+        "sidecar_ingress_enable": false,
+        "sidecar_egress_enable": false,
+        "sidecar_http_ingress_enable": false,
+        "sidecar_http_egress_enable": false,
+        "server_identity_enable": false,
+        "base_cluster_id": 219404612,
+        "ipv6only_enable": "true"
+      }
+    ],
+    "name": "data.aeolus.api_v3",
+    "psm": "data.aeolus.api_v3",
+    "scm_replace": true
+  },
+  "verified_for_write": false,
+  "image_recipe": {
+    "psm": "data.aeolus.api_v3",
+    "base_image": "debian.bookworm.python310:latest",
+    "load_path": "toutiao/app/data/aeolus/dlv_control/bootstrap.sh",
+    "app_root_path": "/opt/tiger",
+    "runtime": 0,
+    "enable_sidecar": true,
+    "region": [
+      "China-North-LF"
+    ],
+    "arch_map": {
+      "China-North-LF": [
+        "x86_64"
+      ]
+    },
+    "galaxy_node_id": 188669,
+    "reuse": false,
+    "idc_list": [
+      "ppe"
+    ],
+    "user_tags": [
+      "ppe"
+    ],
+    "packages": [
+      {
+        "package_type": "apt-get",
+        "name": "build-essential\ngcc\npython-dev-is-python3\nlibxmlsec1-dev\nlibxml2-dev\ng++\ngit\nnano\nlibsnappy-dev\nlibmagic-dev"
+      },
+      {
+        "package_type": "pip3",
+        "name": "six==1.16.0\nFlask==2.0.3\ngunicorn==20.1.0\nFlask-CAS==1.0.0\nFlask-Cors==3.0.10\npytest==7.2.0\nflake8==3.3.0\narrow==1.2.3\nflask_restful==0.3.9\npydash==7.0.4\n\nopenpyxl==3.0.10\npython-dateutil==2.8.2\npyasn1==0.5.1\nantlr4-python3-runtime==4.9.3\ngreenlet==2.0.2\ngevent-websocket==0.10.1\ngevent==22.10.2\nFlask-SocketIO==4.3.1\npython-socketio==4.6.0\nfunc-timeout==4.3.5\npandas==1.5.3\nnumpy==1.24.3\nSQLAlchemy==1.4.48\nxlrd==1.2.0\nPyJWT==2.6.0\ncryptography==39.0.1\ncelery==5.2.7\nbytedlogid==0.0.3\nbytedservicediscovery==0.17.4 --index-url=https://bytedpypi.byted.org/simple/\nwerkzeug==2.0.3 --index-url=https://bytedpypi.byted.org/simple/\ntornado==6.5.4\nfuture==0.18.3\npypinyin==0.38.1\nmock==3.0.5\nbytedunicorn==0.9.4\nbytedlogger==0.14.6\nPyYAML==6.0\njsonpickle==1.4.2\npython-engineio==3.13.2\nbytedkafka==0.0.17\nxmltodict==0.12.0\npathos==0.2.7\nbytedeuler==0.33.0 --index-url=https://bytedpypi.byted.org/simple/\npillow==9.4.0\nbytedredis==1.1.1\nsqlparse==0.4.3\nredis-py-cluster==2.1.3\nprotobuf==3.20.3\nthrift==0.16.0\nAPScheduler==3.11.2\nFlask-APScheduler==1.12.4\nCerberus==1.3.4\njsonpath==0.82\nDBUtils==3.0.2\nbyteddps==0.1.3\nlz4==4.0.0\nmultiprocess==0.70.14\ninfluxdb==5.3.1\nbytedes-ad==1.0.17.20\nbytedes==1.0.29\nPyMySQL==0.9.3\nbytedmysql==0.4.4 --index-url=https://bytedpypi.byted.org/simple/\nimpyla==0.18.0 --index-url=https://bytedpypi.byted.org/simple/\nthrift_sasl==0.4.3\ngoogle-auth==2.18.1\nmock==3.0.5\ntomd==0.1.3\nrequests-mock==1.8.0\nvolcengine==1.0.15\npycrypto==2.6.1\npython-snappy==0.6.0\nrequests-oauthlib==1.3.1\nrequests-toolbelt==1.0.0\nkubernetes==24.2.0\nurllib3==1.26.18\nppft==1.6.6.4\ncoverage==7.13.3\nbytedpypolaris==3.0.45\nbytedurllibsec==0.4.1\npresto-python-client==0.7.0\nPyPDF2==3.0.0\nswagger-spec-validator==2.4.3\n\nbytedztijwthelper==0.0.24 -i https://bytedpypi.byted.org/simple --trusted-host=bytedpypi.byted.org\nbytedztijwt==0.2.26 -i https://bytedpypi.byted.org/simple --trusted-host=bytedpypi.byted.org\nbytedtqs==0.0.57 --index-url=https://bytedpypi.byted.org/simple/\nsimplejson==3.19.2\nbitarray==2.8.3\nthriftpy2==0.4.17\nbytedstarling==0.2.17 --index-url=https://bytedpypi.byted.org/simple/\npsutil==6.0.0\nbytedance.metrics==0.5.1 --index-url=https://bytedpypi.byted.org/simple/\nbytedkmsv2==0.10.55 --index-url=https://bytedpypi.byted.org/simple/\nujson==5.7.0\nbyted_mario_collector==2.0.12 --index-url=https://bytedpypi.byted.org/simple/\nbytedtos==2.0.7 --index-url=https://bytedpypi.byted.org/simple\npython-magic==0.4.18\npyarrow==6.0.1\n"
+      }
+    ],
+    "image_id": 217258,
+    "reference_version": "1.0.1.7372"
+  }
+}

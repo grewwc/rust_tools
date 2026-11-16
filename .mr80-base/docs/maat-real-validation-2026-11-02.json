@@ -1,0 +1,232 @@
+{
+  "previous_application_operator_attempt": {
+    "started_at": "2026-11-02T13:16:21.077703+00:00",
+    "cleanup": "TODO",
+    "resources": [
+      {
+        "name": "hua-ai-cb71e8479934-g1",
+        "repository": "dp/aeolus",
+        "host": "10.37.248.120",
+        "port": 20817,
+        "probe_marker_sha256": "002885b26599f50b0b8e3b7d99709765534fc7d9ba14b71b23ceb63da839e8fe",
+        "state": "proxy_create_rejected",
+        "probe_server_running": false
+      }
+    ],
+    "http_operations": [
+      {
+        "stage": "preflight",
+        "path": "/api/open/devEnv/list",
+        "http_status": 200,
+        "log_id": "2026110221162192E8136CC93D7BF8C3D0",
+        "business_code": 0,
+        "error_categories": []
+      },
+      {
+        "stage": "preflight",
+        "path": "/api/open/devConfig/get",
+        "http_status": 200,
+        "log_id": "2026110221162192E8136CC93D7BF8C3DA",
+        "business_code": 0,
+        "error_categories": []
+      },
+      {
+        "stage": "name_preflight",
+        "path": "/api/open/devEnv/list",
+        "http_status": 200,
+        "log_id": "2026110221162192E8136CC93D7BF8C3DE",
+        "business_code": 0,
+        "error_categories": []
+      },
+      {
+        "stage": "proxy_create",
+        "path": "/api/open/devApi/create",
+        "http_status": 200,
+        "log_id": "2026110221162192E8136CC93D7BF8C3E7",
+        "business_code": 10000,
+        "error_categories": [
+          "permission"
+        ]
+      }
+    ],
+    "baseline_revision": "1bb71c40cf1ba286e5d7090b53376f2ee598cd9db6f3902ed2b83fc4d6167fa7",
+    "operator_source": "application_identity",
+    "result": "stopped",
+    "failed_stage": "proxy_create",
+    "error_type": "MaatError",
+    "finished_at": "2026-11-02T13:16:22.455274+00:00"
+  },
+  "started_at": "2026-11-02T13:17:28.840452+00:00",
+  "cleanup": "TODO",
+  "resources": [
+    {
+      "name": "hua-ai-00973b919219-g1",
+      "repository": "dp/aeolus",
+      "host": "10.37.248.120",
+      "port": 14035,
+      "probe_marker_sha256": "ef868e58d7537c8259f2f5c2667f961c8a293d58b89bcc49ac8f37d499ec2706",
+      "state": "validated",
+      "probe_server_running": false,
+      "api_id": "6ae88d69dff95302c8e87b9e",
+      "create_body_sha256": "62f20eb95d0219d2c0fdab856c8b8a645c7095188fe4a49a0352ee706ff9dff1",
+      "env_id": "6ae88d69dff95302c8e87ba3",
+      "proxy_rules_match": true,
+      "maat_url": "https://hua-ai-00973b919219-g1.maat.bytedance.net",
+      "environment_status": "deploying_file",
+      "probe_http_status": 200,
+      "probe_reached_new_port": true,
+      "final_environment_status": "deploy_file_ok",
+      "final_identity_matches": true,
+      "static_resources_match_reference": true,
+      "frontend_http_status": 302,
+      "frontend_content_type": "text/html; charset=utf-8",
+      "frontend_redirect_host": "do.bytedance.net"
+    },
+    {
+      "name": "hua-ai-d7fed8775b4a-g1",
+      "repository": "dp/VizQueryService",
+      "host": "10.37.248.120",
+      "port": 15963,
+      "probe_marker_sha256": "ffaf4b600679263ab1d6dc7be1764ba085e64a318de20a2fbed4b1a8c36135b0",
+      "state": "validated",
+      "probe_server_running": false,
+      "api_id": "6ae88d6cdff95302c8e87c5b",
+      "create_body_sha256": "d33ce1e88f42dbe442b92bae7c930954e5dff0fea15c5fefc3ba5e177e877347",
+      "env_id": "6ae88d6cdff95302c8e87c60",
+      "proxy_rules_match": true,
+      "maat_url": "https://hua-ai-d7fed8775b4a-g1.maat.bytedance.net",
+      "environment_status": "deploying_file",
+      "probe_http_status": 200,
+      "probe_reached_new_port": true,
+      "final_environment_status": "deploying_file",
+      "final_identity_matches": true,
+      "static_resources_match_reference": true,
+      "frontend_http_status": 302,
+      "frontend_content_type": "text/html; charset=utf-8",
+      "frontend_redirect_host": "do.bytedance.net"
+    }
+  ],
+  "http_operations": [
+    {
+      "stage": "preflight",
+      "path": "/api/open/devEnv/list",
+      "http_status": 200,
+      "log_id": "2026110221172975B7EF17810DF2D322EA",
+      "business_code": 0,
+      "error_categories": []
+    },
+    {
+      "stage": "preflight",
+      "path": "/api/open/devConfig/get",
+      "http_status": 200,
+      "log_id": "2026110221172975B7EF17810DF2D322FA",
+      "business_code": 0,
+      "error_categories": []
+    },
+    {
+      "stage": "name_preflight",
+      "path": "/api/open/devEnv/list",
+      "http_status": 200,
+      "log_id": "2026110221172975B7EF17810DF2D322FC",
+      "business_code": 0,
+      "error_categories": []
+    },
+    {
+      "stage": "proxy_create",
+      "path": "/api/open/devApi/create",
+      "http_status": 200,
+      "log_id": "2026110221172975B7EF17810DF2D32301",
+      "business_code": 0,
+      "error_categories": []
+    },
+    {
+      "stage": "environment_create",
+      "path": "/api/open/devEnv/create",
+      "http_status": 200,
+      "log_id": "2026110221172975B7EF17810DF2D32302",
+      "business_code": 0,
+      "error_categories": []
+    },
+    {
+      "stage": "configuration_apply",
+      "path": "/api/open/devEnv/list",
+      "http_status": 200,
+      "log_id": "2026110221173075B7EF17810DF2D32318",
+      "business_code": 0,
+      "error_categories": []
+    },
+    {
+      "stage": "configuration_apply",
+      "path": "/api/open/devEnv/update",
+      "http_status": 200,
+      "log_id": "2026110221173175B7EF17810DF2D32322",
+      "business_code": 0,
+      "error_categories": []
+    },
+    {
+      "stage": "configuration_readback",
+      "path": "/api/open/devEnv/list",
+      "http_status": 200,
+      "log_id": "2026110221173175B7EF17810DF2D32334",
+      "business_code": 0,
+      "error_categories": []
+    },
+    {
+      "stage": "name_preflight",
+      "path": "/api/open/devEnv/list",
+      "http_status": 200,
+      "log_id": "2026110221173175B7EF17810DF2D3233B",
+      "business_code": 0,
+      "error_categories": []
+    },
+    {
+      "stage": "proxy_create",
+      "path": "/api/open/devApi/create",
+      "http_status": 200,
+      "log_id": "2026110221173275B7EF17810DF2D3233D",
+      "business_code": 0,
+      "error_categories": []
+    },
+    {
+      "stage": "environment_create",
+      "path": "/api/open/devEnv/create",
+      "http_status": 200,
+      "log_id": "2026110221173275B7EF17810DF2D3233F",
+      "business_code": 0,
+      "error_categories": []
+    },
+    {
+      "stage": "configuration_apply",
+      "path": "/api/open/devEnv/list",
+      "http_status": 200,
+      "log_id": "2026110221173275B7EF17810DF2D32353",
+      "business_code": 0,
+      "error_categories": []
+    },
+    {
+      "stage": "configuration_apply",
+      "path": "/api/open/devEnv/update",
+      "http_status": 200,
+      "log_id": "2026110221173375B7EF17810DF2D32356",
+      "business_code": 0,
+      "error_categories": []
+    },
+    {
+      "stage": "configuration_readback",
+      "path": "/api/open/devEnv/list",
+      "http_status": 200,
+      "log_id": "2026110221173475B7EF17810DF2D32375",
+      "business_code": 0,
+      "error_categories": []
+    }
+  ],
+  "baseline_revision": "1bb71c40cf1ba286e5d7090b53376f2ee598cd9db6f3902ed2b83fc4d6167fa7",
+  "operator_source": "user_provided_x_action_user",
+  "result": "complete",
+  "finished_at": "2026-11-02T13:17:34.808869+00:00",
+  "reference_environment_unchanged": true,
+  "final_readback_at": "2026-11-02T13:24:25.593154+00:00",
+  "validation_scope": "MAAT create/update/configuration readback and forwarding to temporary probe services",
+  "created_dev_api_count": 2,
+  "created_dev_env_count": 2
+}

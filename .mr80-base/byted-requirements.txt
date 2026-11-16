@@ -1,0 +1,24 @@
+# 字节内部 SDK 清单(只在内网可达,不进 pyproject.toml)
+# 生产构建时由 Atum 单独安装(见 atum.yaml)
+#
+# 包名参考 https://python.byted.org/library/index.html
+# 固定已验证的内部 SDK 版本，避免 TCE 重建时依赖漂移。
+bytedmysql==0.4.4
+bytedance.metrics==0.5.2
+bytedkmsv2==0.10.55
+byteddps==0.1.3
+bytedztijwthelper==0.0.23
+bytedance.cloud-sdk-python==0.1.14
+
+# Argos StreamLog（华北）。bytedlogger 只发布 sdist，镜像构建阶段需要 C 编译器；
+# 0.16.0 已被上游 yank，固定到最新的稳定版本。bytedbackgrounds 提供 bytedlogger
+# 运行时 import 的 backgrounds 模块（未声明依赖）。
+bytedlogger==0.15.2
+bytedbackgrounds==0.0.6
+
+# 内部 SDK 的兼容约束：
+# - bytedmysql 0.4.4 要求 pymysql<=0.9.3（由 pyproject.toml 固定）
+# - bytedkmsv2 0.10.55 要求 cryptography<50、protobuf<4
+# - byteddps 0.1.3 要求 urllib3<2（由 pyproject.toml 固定）
+cryptography==39.0.1
+protobuf==3.20.3

@@ -1,0 +1,295 @@
+{
+  "schema_version": 1,
+  "repository": "dp/VizQueryService",
+  "psm": "data.vqs.api",
+  "scm_repo_id": 53349,
+  "scm_repo_name": "data/dp/vqs",
+  "environment_prefix": "ppe_ai_vqs_",
+  "standard_env": "online_cn",
+  "environment_type": "ppe",
+  "reference_environment": "ppe_liwenshuai_test",
+  "reference_environment_id": "320411492",
+  "idc": "LF",
+  "operator": "huaguojin",
+  "required_env_vars": {
+    "AEOLUS_SERVICE_DISCOVERY": "0"
+  },
+  "baseline_artifact": {
+    "version": "1.0.0.6079",
+    "version_id": "172012752",
+    "commit_sha": "dd854438c71627b76419aabca52ade725437eb60",
+    "build_type": "online"
+  },
+  "bits_scm": {
+    "pipeline_id": "1251819549442",
+    "space_id": "284273157378"
+  },
+  "health_probe": {
+    "path": "/healthz",
+    "json": {
+      "code": "aeolus/ok"
+    }
+  },
+  "meta": {
+    "name": "data.vqs.api",
+    "psm": "data.vqs.api",
+    "app_path": "toutiao/app/data/vqs/run/prod_run.sh",
+    "base_image": "toutiao.debian.python3:latest",
+    "dependency_mode": "default",
+    "scm_replace": true,
+    "enable_sidecar": true,
+    "is_runtime": false,
+    "new_ports": [
+      {
+        "intent": "primary",
+        "is_primary": true,
+        "port": 12355,
+        "type": "tcp"
+      },
+      {
+        "intent": "other",
+        "is_primary": false,
+        "port": 32470,
+        "type": "tcp"
+      },
+      {
+        "intent": "other",
+        "is_primary": false,
+        "port": 32471,
+        "type": "tcp"
+      }
+    ],
+    "health_check_path": " /opt/tiger/tce/tce_tools/bin/health_check.sh && curl -fsS -m 5 http://127.0.0.1:$PORT0/healthz | grep 'aeolus/ok';",
+    "language": "go",
+    "scm_repos": [
+      {
+        "name": "data/dp/vqs",
+        "path": "toutiao/app/data/vqs",
+        "version": "1.0.0.6079",
+        "remote_id": 53349,
+        "main_repo": true,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "toutiao/load",
+        "path": "toutiao/load",
+        "version": "1.0.2.628",
+        "remote_id": 667,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "toutiao/runtime",
+        "path": "toutiao/runtime",
+        "version": "1.0.1.592",
+        "remote_id": 631,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "ss_conf",
+        "path": "ss_conf",
+        "version": "1.0.0.1797",
+        "remote_id": 756,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "pyutil",
+        "path": "pyutil",
+        "version": "1.0.0.469",
+        "remote_id": 757,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "toutiao/conf",
+        "path": "toutiao/conf",
+        "version": "1.0.1.2375",
+        "remote_id": 637,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "service_rpc/py/service_rpc",
+        "path": "toutiao/lib/service_rpc",
+        "version": "2.1.0.199",
+        "remote_id": 639,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "service_rpc/tool",
+        "path": "toutiao/tools/tool",
+        "version": "1.0.0.28",
+        "remote_id": 638,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "service_rpc/idl",
+        "path": "toutiao/lib/idl",
+        "version": "10.0.2.1727",
+        "remote_id": 640,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "toutiao/lib/toutiao",
+        "path": "toutiao/lib/toutiao",
+        "version": "1.0.0.30",
+        "remote_id": 634,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "data/dp/aeolus_fe",
+        "path": "toutiao/app/data/aeolus_fe",
+        "version": "1.1.0.3205",
+        "remote_id": 4808,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "dp/olap/dp_druid_client_py",
+        "path": "dp_druid_client_py",
+        "version": "1.0.0.18",
+        "remote_id": 9865,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "data/inf/bytesnake",
+        "path": "bytesnake",
+        "version": "1.0.0.56",
+        "remote_id": 11736,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "data/olap/pytqs",
+        "path": "pytqs",
+        "version": "1.0.0.123",
+        "remote_id": 3088,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "inf/infsec/dps_python_sdk",
+        "path": "inf/infsecs_python",
+        "version": "1.0.0.9",
+        "remote_id": 14287,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "toutiao/storage/pytos",
+        "path": "pytos",
+        "version": "1.2.11.1333",
+        "remote_id": 2390,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "toutiao/lib/pyredis",
+        "path": "pyredis",
+        "version": "1.0.0.81",
+        "remote_id": 1010,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      },
+      {
+        "name": "data/dp/aeolus_expr_parse_py3",
+        "path": "aeolus_expr_parse",
+        "version": "1.0.0.95",
+        "remote_id": 256862,
+        "main_repo": false,
+        "type": "scm",
+        "sub_path": ""
+      }
+    ],
+    "clusters": [
+      {
+        "name": "default",
+        "zone": "China-North-LF",
+        "virtual_cluster": "PPE/ipv6",
+        "dc_infos": [
+          {
+            "count": 1,
+            "idc": "LF"
+          }
+        ],
+        "cpu": 16,
+        "mem": 32,
+        "base_cluster_id": 217131828,
+        "ipv6only_enable": "true",
+        "host_type": "docker",
+        "network_mode": "autohost",
+        "update_mode": "delete_first",
+        "enable_sidecar_percent": 100,
+        "sidecar_ingress_enable": false,
+        "sidecar_egress_enable": true,
+        "sidecar_http_ingress_enable": false,
+        "sidecar_http_egress_enable": true,
+        "server_identity_enable": false
+      }
+    ]
+  },
+  "image_recipe": {
+    "psm": "data.vqs.api",
+    "base_image": "toutiao.debian.python3:latest",
+    "load_path": "toutiao/app/data/vqs/run/prod_run.sh",
+    "app_root_path": "/opt/tiger",
+    "runtime": 0,
+    "enable_sidecar": true,
+    "region": [
+      "China-North-LF"
+    ],
+    "arch_map": {
+      "China-North-LF": [
+        "x86_64"
+      ]
+    },
+    "galaxy_node_id": 133365,
+    "reuse": false,
+    "idc_list": [
+      "ppe"
+    ],
+    "user_tags": [
+      "ppe"
+    ],
+    "packages": [
+      {
+        "package_type": "apt-get",
+        "name": "gcc\npython3-dev\nlibsnappy-dev"
+      },
+      {
+        "package_type": "pip",
+        "name": "pip==20.2.4\nsetuptools==50.3.2"
+      },
+      {
+        "package_type": "pip",
+        "name": "bytedmysql==0.4.0\nbytedbasicuserdata==0.0.2\nbytedtos==0.1.0\nbytedservicediscovery==0.13.0\nFlask==1.1.1\nFlask-CAS==1.0.0\nFlask-Cors==3.0.8\ngunicorn==20.0.4\nFlask-RESTful==0.3.7\npydash==4.7.5\nrequests==2.22.0\nPyMySQL==0.9.3\nDBUtils==1.3\nopenpyxl==3.0.0\npython-dateutil==2.8.0\nantlr4-python3-runtime==4.7.2\ngevent==20.9.0\ngreenlet==0.4.17\nFlask-SocketIO==4.2.1\npython-socketio==4.3.1\npandas==1.1.1\nnumpy==1.17.3\nfunc-timeout==4.3.5\nSQLAlchemy==1.3.10\nxlrd==1.2.0\nPyJWT==1.7.1\ncryptography==2.2.1\nmsgpack==0.6.2\nthrift==0.11.0\nprotobuf==3.13.0\nujson==1.35\npycrypto==2.6.1\nmatplotlib==3.1.1\npyhumps==1.3.1\nsimplejson==3.17.0\npypinyin==0.39.0\nbytedlogger==0.10.1\nmock==3.0.5\nmeinheld==1.0.1\nbytedunicorn==0.8.4\nbytedtcc==1.4.2\nbyteddatabus==0.0.2\ndeepdiff==5.0.2\npython-engineio==3.13.2\nbytedkafka==0.0.15\nbytedredis==1.0.4\nFlask-SQLAlchemy==2.4.4\njsonpickle==1.4.1\narrow==0.16.0\nxlsxwriter==3.0.1\nitsdangerous==2.0.1\nJinja2==3.0.2\nWerkzeug==2.0.3\nbytedmetrics==0.9.1\nimpyla==0.18.0\npsutil==5.9.5\nbitarray==3.7.2\nchdb==0.9.0\npyarrow==12.0.1\nrequests-toolbelt==1.0.0"
+      }
+    ],
+    "image_id": 191197,
+    "reference_version": "1.0.0.2118"
+  }
+}

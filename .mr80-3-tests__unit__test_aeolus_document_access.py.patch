@@ -1,0 +1,132 @@
+@@ -4,6 +4,12 @@ from unittest.mock import AsyncMock, Mock
+ import pytest
+ 
+ from conciliator.domain.aeolus_task import AeolusState
++from conciliator.integrations.coco.aeolus import (
++    build_coding_prompt,
++    build_evaluation_prompt,
++    build_evaluation_retry_prompt,
++    build_feedback_prompt,
++)
+ from conciliator.integrations.lark.client import LarkError
+ from conciliator.services.aeolus_document_access import (
+     DOCUMENT_CAPABILITY_HEADER,
+@@ -104,6 +110,36 @@ def test_instructions_contain_only_scoped_capability():
+     assert "curl -fsS" not in instructions
+     assert "$(jq" not in instructions
+     assert "| jq" not in instructions
++    assert "主需求文档由后端读取，不支持通过此工具重复下载" in instructions
++    assert "仅当需要核对下面列出的引用文档时" in instructions
++    assert "不要尝试登录\n`lark-cli`" in instructions
++    assert "不要输出、解释或记录能力凭证" in instructions
++    assert (
++        "若命令提示需要飞书授权，停止重试，在当前阶段的结构化结果中明确要求用户授权；\n"
++        "不要自行获取凭据或改用其他账号，所有文档读取必须通过此代理。"
++    ) in instructions
++    assert "不要读取列表外的文档" in instructions
++    assert "lark-cli 身份回退" not in instructions
++    assert "skill" not in instructions
++    for builder in (build_evaluation_prompt, build_evaluation_retry_prompt):
++        prompt = builder(_task().requirement_text, document_access_instructions=instructions)
++        assert instructions in prompt
++        assert "不要尝试登录\n`lark-cli`" in prompt
++        assert "所有文档读取必须通过此代理" in prompt
++        assert "lark-cli docs +fetch" not in prompt
++        assert "--as bot" not in prompt and "--as user" not in prompt
++
++
++def test_coding_instructions_keep_reference_failures_non_blocking():
++    service, _, _ = _service()
++
++    evaluation = service.instructions(_task())
++    coding = service.instructions(_task(), include_requirement_document=True)
++
++    assert "停止重试" in evaluation and "明确要求用户授权" in evaluation
++    assert "继续实现" in coding
++    assert "unresolved_items" in coding
++    assert "明确要求用户授权" not in coding
+ 
+ 
+ @pytest.mark.asyncio
+@@ -131,6 +167,68 @@ async def test_cite_reference_is_exposed_and_allowed():
+     assert tokens.lookups == []
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize("state", [AeolusState.CODING, AeolusState.RECODING])
++async def test_coding_instructions_allow_primary_document(state):
++    task = _task(
++        state=state,
++        requirement_url="https://bytedance.larkoffice.com/docx/MainDoc",
++    )
++    service, tokens, _ = _service(task)
++
++    instructions = service.instructions(task, include_requirement_document=True)
++    markdown = await service.read_markdown(
++        task_id=task.task_id,
++        capability=service.issue(task),
++        url=task.requirement_url,
++    )
++
++    assert "MainDoc" in instructions
++    assert "DocToken2" in instructions
++    assert "主需求文档和下列引用文档" in instructions
++    assert "需要核对原文时可以使用此工具" in instructions
++    assert "不要输出、解释或记录能力凭证" in instructions
++    assert "不要通过代理自行获取凭据" in instructions
++    assert "代理不可用或权限不足时" in instructions
++    assert "把该文档和受影响的核对项写入 `unresolved_items`" in instructions
++    assert "不要读取列表外的文档" in instructions
++
++    if state == AeolusState.RECODING:
++        prompt = build_feedback_prompt("请补测试", instructions)
++    else:
++        prompt = build_coding_prompt(
++            requirement_url=task.requirement_url,
++            evaluation_summary="信息充分",
++            branch="aeolus/ai-node/task-1",
++            document_access_instructions=instructions,
++        )
++    assert instructions in prompt
++    assert "## 飞书文档（读取时机）" in prompt
++    assert "按需读取相关文档或章节" in prompt
++    assert "无需在任务开始时自动读取主需求文档或遍历引用链接" in prompt
++    assert "skill" not in prompt
++    assert "不要为了确认权限而预读文档" in prompt
++    assert "lark_authorization_required" in prompt
++    for forbidden in (
++        "不要尝试登录", "所有文档读取必须通过此代理", "必读", "编码前必须读",
++        "lark-cli docs +fetch", "--as bot", "--as user", "131006", "3380004", "99991672",
++    ):
++        assert forbidden not in instructions
++        assert forbidden not in prompt
++    assert markdown == "# Exported Markdown\n\nBody"
++    assert tokens.lookups == []
++
++
++def test_coding_instructions_include_primary_document_without_references():
++    task = _task(state=AeolusState.CODING, requirement_text="无外部引用")
++    service, _, _ = _service(task)
++
++    instructions = service.instructions(task, include_requirement_document=True)
++
++    assert "WikiToken1" in instructions
++    assert "主需求文档和下列引用文档" in instructions
++
++
+ @pytest.mark.parametrize("text", [
+     "",
+     "# 需求\n实现既定需求，无外部引用。",
+@@ -235,9 +333,10 @@ async def test_readers_resolve_wiki_node_before_markdown_export(via_proxy):
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_backend_reader_requires_authorization_only_after_app_acl_denial():
++@pytest.mark.parametrize("code", [131006, 3380004])
++async def test_backend_reader_requires_authorization_only_after_app_acl_denial(code):
+     service, tokens, lark = _service(user_token=None)
+-    lark._request = AsyncMock(side_effect=LarkError("app cannot read", code=131006))
++    lark._request = AsyncMock(side_effect=LarkError("app cannot read", code=code))
+     with pytest.raises(LarkAuthorizationRequired):
+         await service.read_for_user(_task().requirement_url, "user-2")
+     assert tokens.lookups == ["user-2"]

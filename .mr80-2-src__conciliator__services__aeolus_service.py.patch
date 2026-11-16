@@ -1,0 +1,68 @@
+@@ -190,7 +190,12 @@ class CodeHost(Protocol):
+ 
+ 
+ class DocumentAccess(Protocol):
+-    def instructions(self, task: AeolusTask) -> str: ...
++    def instructions(
++        self,
++        task: AeolusTask,
++        *,
++        include_requirement_document: bool = False,
++    ) -> str: ...
+ 
+ 
+ class NextCodeAeolusHost:
+@@ -303,10 +308,17 @@ class AeolusService:
+         self._background: set[asyncio.Task[None]] = set()
+         self._recovery_worker: asyncio.Task[None] | None = None
+ 
+-    def _document_instructions(self, task: AeolusTask) -> str:
++    def _document_instructions(
++        self,
++        task: AeolusTask,
++        *,
++        include_requirement_document: bool = False,
++    ) -> str:
+         if self._document_access is None:
+             return ""
+-        return self._document_access.instructions(task)
++        return self._document_access.instructions(
++            task, include_requirement_document=include_requirement_document
++        )
+ 
+     async def _precheck_reference_documents(
+         self, task: AeolusTask
+@@ -1212,6 +1224,11 @@ class AeolusService:
+                     "应用和当前用户均无法读取该文档，"
+                     "请为应用添加阅读权限或为当前用户申请文档访问权限后重试"
+                 )
++            elif isinstance(exc, LarkError) and exc.code == 3380004:
++                missing_item = (
++                    "应用无该文档权限，"
++                    "请将应用添加为文档协作者或为当前用户申请文档访问权限后重试"
++                )
+             log.warning(
+                 "aeolus_document_read_failed",
+                 task_id=task_id,
+@@ -1584,7 +1601,9 @@ class AeolusService:
+         try:
+             document_kwargs = {}
+             if self._document_access is not None:
+-                document_kwargs["document_access_instructions"] = self._document_instructions(task)
++                document_kwargs["document_access_instructions"] = self._document_instructions(
++                    task, include_requirement_document=True
++                )
+             run = await self._coco.recode(
+                 session_id=task.coco_session_id,
+                 feedback=feedback,
+@@ -1728,7 +1747,9 @@ class AeolusService:
+         task = await self.registry.get(task_id)
+         document_kwargs = {}
+         if self._document_access is not None:
+-            document_kwargs["document_access_instructions"] = self._document_instructions(task)
++            document_kwargs["document_access_instructions"] = self._document_instructions(
++                task, include_requirement_document=True
++            )
+         return await self._coco.code(
+             repo_id=repo_id,
+             repository=_task_code_context(task).repository,

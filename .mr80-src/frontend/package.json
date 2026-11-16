@@ -1,0 +1,37 @@
+{
+  "name": "aeolus",
+  "scripts": {
+    "dev": "node scripts/lpm.cjs dev start",
+    "build": "node scripts/lpm.cjs prod build",
+    "build:dev": "node scripts/lpm.cjs dev build",
+    "build:prod": "node scripts/lpm.cjs prod build",
+    "pack": "node scripts/lpm.cjs prod pack",
+    "pack:dev": "node scripts/lpm.cjs dev pack",
+    "test": "node --test tests/*.test.cjs"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "dependencies": {
+    "@lark-project/js-sdk": "^2.0.5",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}

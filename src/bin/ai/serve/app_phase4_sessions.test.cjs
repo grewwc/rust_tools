@@ -72,20 +72,25 @@ const listed = [
   { id: "unicode-id", summary: "中文 [literal] École" },
 ];
 
-test("empty star-filter pages expose older sessions and keep filtering appended results", async () => {
+test("star toggles reset paging and append only server-filtered older stars", async () => {
   const h = harness();
   setPager(h, { total: 3, offset: 2, hasMore: true });
-  h.dispatch(h.elements.sessmarked, "click");
-  assert.deepEqual(rendered(h).tail, ["暂无星标会话（已加载范围内）", "加载更多会话"]);
-  const calls = installResponse(h, [{ id: "older-star", summary: "Older star", marked: true }], {
-    "x-sessions-total": "3", "x-sessions-page-size": "1",
+  const firstCalls = installResponse(h, [{ id: "first-star", summary: "First star", marked: true }], {
+    "x-sessions-total": "2", "x-sessions-page-size": "1",
   });
-  const more = h.elements.sesslist.querySelector("button");
+  await h.dispatch(h.elements.sessmarked, "click").done;
+  assert.deepEqual(firstCalls, ["/sessions?newest=true&limit=12&offset=0&marked=true"]);
+  assert.deepEqual(rendered(h).titles, ["First star"]);
+  assert.deepEqual(rendered(h).tail, ["加载更多会话"]);
+  const calls = installResponse(h, [{ id: "older-star", summary: "Older star", marked: true }], {
+    "x-sessions-total": "2", "x-sessions-page-size": "1",
+  });
+  const more = h.elements.sesslist.querySelector(".session-more").querySelector("button");
   await h.dispatch(more, "click").done;
-  assert.deepEqual(calls, ["/sessions?newest=true&limit=12&offset=2"]);
-  assert.deepEqual(rendered(h).titles, ["Older star"]);
+  assert.deepEqual(calls, ["/sessions?newest=true&limit=12&offset=1&marked=true"]);
+  assert.deepEqual(rendered(h).titles, ["First star", "Older star"]);
   assert.deepEqual(rendered(h).tail, []);
-  assert.equal(rendered(h).count, "3 sessions · showing 1");
+  assert.equal(rendered(h).count, "2 sessions · showing 2");
   assert.equal(h.context.sessionId, "open-session");
 });
 
@@ -100,9 +105,10 @@ test("blank and whitespace session filters preserve input order and title fallba
   }
 });
 
-test("session filters trim and fold case across displayed titles and complete IDs", () => {
+test("session filters match all reordered keywords across displayed titles and complete IDs", () => {
   for (const [query, expected] of [
     [" first SUMMARY ", ["FIRST Summary"]], ["ALPHA-id", ["FIRST Summary"]],
+    ["SUMMARY \t FIRST", ["FIRST Summary"]], ["id first", ["FIRST Summary"]], ["first missing", []],
     ["second prompt", ["Second Prompt"]], ["fallback-123", ["new session · fallback"]],
     ["new session", ["new session · fallback"]], ["中文", ["中文 [literal] École"]],
     ["[literal]", ["中文 [literal] École"]], ["éCOLE", ["中文 [literal] École"]],

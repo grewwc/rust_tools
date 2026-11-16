@@ -1,0 +1,57 @@
+{
+  "aiNode": {
+    "key": "ai_node_aeolus",
+    "url": "http://10.37.248.120:8000/hooks/meegle/ai-node",
+    "token": "69d4bb9c-13f3-4ffe-87e9-b33979d934a9",
+    "properties": [
+      {
+        "key": "design_doc",
+        "name": {
+          "zh": "需求文档"
+        },
+        "description": {
+          "zh": "用于校验并驱动编码的需求设计文档"
+        },
+        "data_type": [
+          "field"
+        ],
+        "input_field_types": [
+          "text",
+          "multi-text",
+          "select",
+          "radio",
+          "multi-select",
+          "date",
+          "schedule",
+          "user",
+          "multi-user",
+          "vote-boolean",
+          "vote-option-multi",
+          "vote-option",
+          "tree-select",
+          "tree-multi-select",
+          "workitem_related_select",
+          "workitem_related_multi_select",
+          "bool",
+          "link",
+          "link_cloud_doc",
+          "compound_field",
+          "multi_user_compound_field",
+          "telephone",
+          "email",
+          "number",
+          "multi-file",
+          "signal",
+          "multi-signal"
+        ],
+        "max_field_count": 1
+      }
+    ],
+    "needCustomCard": true,
+    "platform": {
+      "web": {
+        "resource": "ai_node_web_aeolus_card"
+      }
+    }
+  }
+}

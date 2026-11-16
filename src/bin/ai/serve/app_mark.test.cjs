@@ -46,7 +46,8 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
     let text = "";
     const classes = new Set();
     const el = {
-      tagName: tag, children: [], parentNode: null, attrs: {}, dataset: {}, hidden: false, disabled: false, title: "", scrollTop: 0,
+      tagName: tag, children: [], parentNode: null, attrs: {}, dataset: {}, hidden: false, disabled: false, title: "", scrollTop: 0, eventListeners: new Map(),
+      addEventListener(name, fn) { listen(el.eventListeners, name, fn); },
       get className() { return [...classes].join(" "); },
       set className(value) { classes.clear(); for (const name of value.split(/\s+/).filter(Boolean)) classes.add(name); },
       classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name), contains: (name) => classes.has(name) },
@@ -94,7 +95,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
     return el;
   }
   document.createElement = node;
-  const elements = { sesslist: node("ul"), sessfilter: node("input"), sesscount: node(), sesstitle: node(), sessmeta: node(), msgs: node(), prompt: node("textarea") };
+  const elements = { sesslist: node("ul"), sessfilter: node("input"), sesscount: node(), sesstitle: node(), sessmeta: node(), sesscwd: node(), msgs: node(), prompt: node("textarea") };
   elements.prompt.value = "draft in A";
   for (const match of html.matchAll(/<(div|section|button)[^>]*id="(sessionaction[^"]*)"[^>]*>([^<]*)/g)) {
     const el = elements[match[2]] = node(match[1]);
@@ -150,13 +151,16 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
       }
       assert.equal(request.path, "/sessions");
       if (sessionsGet) return sessionsGet(request);
-      const ordered = request.searchParams.get("newest") === "true" ? serverItems.slice().reverse() : serverItems.slice();
+      const keywords = (request.searchParams.get("query") || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const matching = serverItems.filter((item) => (request.searchParams.get("marked") !== "true" || item.marked) && keywords.every((keyword) =>
+        ((item.summary || item.first_user_prompt || "") + " " + item.id).toLowerCase().includes(keyword)));
+      const ordered = request.searchParams.get("newest") === "true" ? matching.slice().reverse() : matching.slice();
       const offset = Number(request.searchParams.get("offset") || 0);
       const limit = Number(request.searchParams.get("limit") || ordered.length);
       const page = ordered.slice(offset, offset + limit);
       const include = request.searchParams.get("include");
       const selected = include && ordered.find((item) => item.id === include);
-      if (selected && !page.some((item) => item.id === include)) page.push(selected);
+      if (offset === 0 && selected && !page.some((item) => item.id === include)) page.push(selected);
       return response(page, 200, {
         "x-sessions-total": String(ordered.length),
         "x-sessions-page-size": String(Math.min(limit, Math.max(0, ordered.length - offset))),
@@ -204,7 +208,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
   }
   elements.sessall = node("button");
   elements.sessmarked = node("button");
-  vm.runInContext(between('$("sessfilter").oninput =', '$("connbtn").onclick ='), context);
+  vm.runInContext(between('  wireSessionSearch();', '$("connbtn").onclick ='), context);
   context.wireSessionActions();
   context.renderSessionList(context.lastItems);
   context.renderSessionBar();
@@ -216,12 +220,16 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
       for (let current = target; current; current = current.parentNode) {
         const result = current["on" + type]?.(event);
         if (result && typeof result.then === "function") pending.push(result);
+        for (const listener of current.eventListeners.get(type) || []) {
+          const result = listener(event);
+          if (result && typeof result.then === "function") pending.push(result);
+        }
         if (event.stopped) break;
       }
     }
     return { event, done: Promise.all(pending) };
   }
-  const row = (id = "target-session") => elements.sesslist.children.find((li) => li.querySelector("small")?.textContent === id.slice(0, 8));
+  const row = (id = "target-session") => elements.sesslist.children.find((li) => li.dataset.sessionId === id);
   function advance(ms) {
     now += ms;
     for (const [id, timer] of [...timers]) if (timer.at <= now) { timers.delete(id); timer.fn(); }
@@ -300,6 +308,31 @@ test("unmarking the current session refreshes the existing session-bar star", as
   assert.equal(h.elements.sesstitle.textContent, "Open session");
   assert.equal(h.row("open-session").querySelector(".mk").getAttribute("aria-pressed"), "false");
   assert.deepEqual(h.switches, []);
+});
+
+test("unmarking the selected star refreshes the filtered total while preserving its chat and metadata", async () => {
+  const items = sessions();
+  items[0].marked = true;
+  items[0].cwd = "/tmp/selected-project";
+  const h = harness({ items });
+  await h.dispatch(h.elements.sessmarked, "click").done;
+  assert.equal(h.elements.sesscount.textContent, "1 sessions · showing 1");
+  assert.equal(h.elements.sesstitle.textContent, "★ Open session");
+  await h.dispatch(h.row("open-session").querySelector(".mk"), "click").done;
+  assert.equal(h.elements.sesscount.textContent, "0 sessions · showing 0");
+  assert.equal(h.elements.sesslist.textContent, "暂无星标会话");
+  assert.equal(h.elements.sesstitle.textContent, "Open session");
+  assert.equal(h.elements.sesscwd.textContent, "📁 /tmp/selected-project");
+  assert.equal(h.context.sessionListItem("open-session").marked, false);
+  assert.equal(h.context.sessionId, "open-session");
+  assert.equal(h.context.turnRunning, true);
+  assert.equal(h.context.lastMsgCount, 5);
+  assert.equal(h.elements.prompt.value, "draft in A");
+  assert.deepEqual(h.switches, []);
+  assert.equal(h.historyLoads(), 0);
+  assert.equal(h.configLoads(), 0);
+  assert.ok(h.requests.filter((request) => request.path === "/sessions")
+    .every((request) => request.searchParams.get("marked") === "true" && !request.searchParams.has("include")));
 });
 
 for (const marked of [false, true]) test("a failed " + (marked ? "unmark" : "mark") + " keeps the prior state and displays a sidebar error", async () => {
@@ -533,30 +566,37 @@ test("filter input resets the session rail while normal re-renders preserve scro
   rail.scrollTop = 1600;
   filter.value = "Older session";
   await h.dispatch(filter, "input").done;
+  assert.equal(h.requests.length, 0, "search is debounced");
+  h.advance(250);
+  await settle();
   assert.equal(rail.scrollTop, 0);
-  assert.equal(rail.children.length, 100);
-  assert.equal(h.elements.sesscount.textContent, "102 sessions · showing 100");
+  assert.equal(rail.children.length, 13);
+  assert.equal(h.elements.sesscount.textContent, "100 matches · showing 12 loaded");
   assert.equal(h.row(), undefined);
 
   rail.scrollTop = 800;
   h.context.renderSessionList(h.context.lastItems);
   assert.equal(rail.scrollTop, 800, "a normal refresh must preserve scroll even with an active filter");
-  assert.equal(rail.children.length, 100);
+  assert.equal(rail.children.length, 13);
 
   filter.value = "target";
   await h.dispatch(filter, "input").done;
+  h.advance(250);
+  await settle();
   assert.equal(rail.scrollTop, 0);
   assert.equal(rail.children.length, 1);
   assert.ok(h.row());
-  assert.equal(h.elements.sesscount.textContent, "102 sessions · showing 1");
+  assert.equal(h.elements.sesscount.textContent, "1 matches · showing 1");
 
   filter.value = "";
   await h.dispatch(filter, "input").done;
+  h.advance(250);
+  await settle();
   assert.equal(rail.scrollTop, 0);
-  assert.equal(rail.children.length, 102);
+  assert.equal(rail.children.length, 13, "normal list includes the selected session outside the first page");
   assert.equal(h.elements.sesscount.textContent, "102 sessions");
   assert.equal(h.context.sessionId, "open-session");
-  assert.deepEqual(h.requests, []);
+  assert.deepEqual(h.requests.filter((request) => request.path === "/sessions").map((request) => request.searchParams.get("query")), ["Older session", "target", null]);
 });
 
 test("a fresh session-list render starts at the top", () => {

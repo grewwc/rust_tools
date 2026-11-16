@@ -1,0 +1,31 @@
+
+/**
+ * Plugin main entry point
+ * This file is loaded by the plugin runtime and its `main` function is invoked. DO NOT DELETE.
+ */
+import React, { lazy, Suspense } from 'react';
+import ReactDOM from 'react-dom';
+import { createRoot } from 'react-dom/client';
+
+const App = lazy(() => import('./App'));
+
+export default async function main() {
+  await window.JSSDK.shared.setSharedModules({
+    React,
+    ReactDOM,
+  });
+
+  const container = document.createElement('div');
+  container.id = 'app';
+  container.tabIndex = 0;
+  container.setAttribute('role', 'region');
+  container.setAttribute('aria-label', 'Coding 卡片滚动区域');
+  document.body.appendChild(container);
+  const root = createRoot(container);
+
+  root.render(
+    <Suspense fallback={<div>loading...</div>}>
+      <App />
+    </Suspense>
+  );
+}

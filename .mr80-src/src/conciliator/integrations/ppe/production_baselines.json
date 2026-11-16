@@ -1,0 +1,63 @@
+{
+  "dp/aeolus": {
+    "psm": "data.aeolus.api_v3",
+    "source": {
+      "environment": "prod",
+      "service_id": "65853",
+      "clusters": {"online": "4175518", "query_online_mirror": "1869290"}
+    },
+    "image_id": "217258",
+    "image_version_id": "176877628",
+    "image_version": "1.0.2.107",
+    "image_digest": "sha256:ea90ab217c587eef893d4bb436f1aec7f99112ac2dd1bc6bfea52409ea4dd33f",
+    "scm_repo_id": 4863,
+    "scm_repo_name": "data/dp/aeolus",
+    "version": "1.0.11.8884",
+    "version_id": "172012735",
+    "commit_sha": "9de29907307a62714e3c5a8cc3ad80912be1ae8c",
+    "build_type": "online",
+    "app_path": "/opt/tiger/toutiao/app/data/aeolus/bootstrap.sh",
+    "resolved_base_image": "hub.byted.org/base/debian.bookworm.python310:be5a0b970ff7095f45c122995ee97191",
+    "scm_repos": []
+  },
+  "dp/VizQueryService": {
+    "psm": "data.vqs.api",
+    "source": {
+      "environment": "prod",
+      "service_id": "52876",
+      "clusters": {"default": "4184535"}
+    },
+    "image_id": "191197",
+    "image_version_id": "176877640",
+    "image_version": "1.0.0.2118",
+    "image_digest": "sha256:986c2091872cf2b4f8024be487f12cf7139307c26f5c590f864939455d051420",
+    "scm_repo_id": 53349,
+    "scm_repo_name": "data/dp/vqs",
+    "version": "1.0.0.6079",
+    "version_id": "172012752",
+    "commit_sha": "dd854438c71627b76419aabca52ade725437eb60",
+    "build_type": "online",
+    "app_path": "/opt/tiger/toutiao/app/data/vqs/run/prod_run.sh",
+    "resolved_base_image": "hub.byted.org/base/toutiao.debian.python3:b41ad11303866d67d7aa62e057d7b265",
+    "scm_repos": [
+      {"remote_id": 53349, "name": "data/dp/vqs", "path": "toutiao/app/data/vqs", "version": "1.0.0.6079"},
+      {"remote_id": 667, "name": "toutiao/load", "path": "toutiao/load", "version": "1.0.2.628"},
+      {"remote_id": 631, "name": "toutiao/runtime", "path": "toutiao/runtime", "version": "1.0.1.592"},
+      {"remote_id": 756, "name": "ss_conf", "path": "ss_conf", "version": "1.0.0.1797"},
+      {"remote_id": 757, "name": "pyutil", "path": "pyutil", "version": "1.0.0.469"},
+      {"remote_id": 637, "name": "toutiao/conf", "path": "toutiao/conf", "version": "1.0.1.2375"},
+      {"remote_id": 639, "name": "service_rpc/py/service_rpc", "path": "toutiao/lib/service_rpc", "version": "2.1.0.199"},
+      {"remote_id": 638, "name": "service_rpc/tool", "path": "toutiao/tools/tool", "version": "1.0.0.28"},
+      {"remote_id": 640, "name": "service_rpc/idl", "path": "toutiao/lib/idl", "version": "10.0.2.1727"},
+      {"remote_id": 634, "name": "toutiao/lib/toutiao", "path": "toutiao/lib/toutiao", "version": "1.0.0.30"},
+      {"remote_id": 4808, "name": "data/dp/aeolus_fe", "path": "toutiao/app/data/aeolus_fe", "version": "1.1.0.3205"},
+      {"remote_id": 9865, "name": "dp/olap/dp_druid_client_py", "path": "dp_druid_client_py", "version": "1.0.0.18"},
+      {"remote_id": 11736, "name": "data/inf/bytesnake", "path": "bytesnake", "version": "1.0.0.56"},
+      {"remote_id": 3088, "name": "data/olap/pytqs", "path": "pytqs", "version": "1.0.0.123"},
+      {"remote_id": 14287, "name": "inf/infsec/dps_python_sdk", "path": "inf/infsecs_python", "version": "1.0.0.9"},
+      {"remote_id": 2390, "name": "toutiao/storage/pytos", "path": "pytos", "version": "1.2.11.1333"},
+      {"remote_id": 1010, "name": "toutiao/lib/pyredis", "path": "pyredis", "version": "1.0.0.81"},
+      {"remote_id": 256862, "name": "data/dp/aeolus_expr_parse_py3", "path": "aeolus_expr_parse", "version": "1.0.0.95"}
+    ]
+  }
+}

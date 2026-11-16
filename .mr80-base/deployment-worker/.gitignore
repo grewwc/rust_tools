@@ -1,0 +1,10 @@
+.venv/
+.deployment-worker/
+dist/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+*.log
+*.pid

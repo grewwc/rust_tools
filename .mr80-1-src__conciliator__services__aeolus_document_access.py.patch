@@ -1,0 +1,131 @@
+@@ -27,6 +27,7 @@ _LARK_URL_RE = re.compile(
+ )
+ _DOCUMENT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+ _ACTIVE_STATES = {AeolusState.EVALUATING, AeolusState.CODING, AeolusState.RECODING}
++_CODING_STATES = {AeolusState.CODING, AeolusState.RECODING}
+ 
+ 
+ class _CiteReferenceParser(HTMLParser):
+@@ -107,8 +108,15 @@ def _cite_document_urls(task: AeolusTask) -> list[str]:
+     return [f"{origin}/{kind}/{token}" for kind, token in parser.references]
+ 
+ 
+-def _allowed_documents(task: AeolusTask) -> dict[str, str]:
++def _allowed_documents(
++    task: AeolusTask, *, include_requirement_document: bool = False
++) -> dict[str, str]:
+     allowed: dict[str, str] = {}
++    if include_requirement_document:
++        with suppress(ValueError):
++            allowed[_document_key(task.requirement_url)] = _canonical_document_url(
++                task.requirement_url
++            )
+     document_urls = [
+         *_LARK_URL_RE.findall(task.requirement_text),
+         *_cite_document_urls(task),
+@@ -118,9 +126,11 @@ def _allowed_documents(task: AeolusTask) -> dict[str, str]:
+             allowed.setdefault(_document_key(url), _canonical_document_url(url))
+         except ValueError:
+             continue
+-    # The backend supplies the primary document; even self-links are not tool inputs.
+-    with suppress(ValueError):
+-        allowed.pop(_document_key(task.requirement_url), None)
++    # Evaluation treats the backend snapshot as the source of truth. Coding may
++    # re-read the primary document through the same operator-scoped proxy.
++    if not include_requirement_document:
++        with suppress(ValueError):
++            allowed.pop(_document_key(task.requirement_url), None)
+     return allowed
+ 
+ 
+@@ -151,8 +161,13 @@ class AeolusDocumentAccessService:
+         self._ttl_seconds = ttl_seconds
+         self._clock = clock
+ 
+-    def instructions(self, task: AeolusTask) -> str:
+-        allowed = _allowed_documents(task)
++    def instructions(
++        self,
++        task: AeolusTask,
++        *,
++        include_requirement_document: bool = False,
++    ) -> str:
++        allowed = _allowed_documents(task, include_requirement_document=include_requirement_document)
+         if not allowed:
+             return ""
+         capability = self.issue(task)
+@@ -161,14 +176,35 @@ class AeolusDocumentAccessService:
+             f"{quote(task.task_id, safe='')}/lark-document"
+         )
+         allowed_lines = "\n".join(f"- {url}" for url in allowed.values())
++        if include_requirement_document:
++            heading = "## 飞书文档读取工具"
++            scope = (
++                "主需求文档和下列引用文档可以通过 Conciliator 的只读代理读取。"
++                "需要核对原文时可以使用此工具；使用代理时不要输出、解释或记录能力凭证。"
++            )
++            list_heading = "允许读取的文档："
++            failure_instruction = (
++                "不要通过代理自行获取凭据。代理不可用或权限不足时，"
++                "把该文档和受影响的核对项写入 `unresolved_items`，继续实现。"
++            )
++        else:
++            heading = "## 飞书引用文档读取工具"
++            scope = (
++                "主需求文档由后端读取，不支持通过此工具重复下载。\n"
++                "仅当需要核对下面列出的引用文档时，使用 Conciliator 的只读代理。不要尝试登录\n"
++                "`lark-cli`，也不要输出、解释或记录能力凭证。"
++            )
++            list_heading = "允许读取的引用文档："
++            failure_instruction = (
++                "若命令提示需要飞书授权，停止重试，在当前阶段的结构化结果中明确要求用户授权；\n"
++                "不要自行获取凭据或改用其他账号，所有文档读取必须通过此代理。"
++            )
+         return f"""
+-## 飞书引用文档读取工具
++{heading}
+ 
+-主需求文档由后端读取，不支持通过此工具重复下载。
+-仅当需要核对下面列出的引用文档时，使用 Conciliator 的只读代理。不要尝试登录
+-`lark-cli`，也不要输出、解释或记录能力凭证。
++{scope}
+ 
+-允许读取的引用文档：
++{list_heading}
+ {allowed_lines}
+ 
+ 调用方法（把 `$DOC_URL` 设置为上面某个完整 URL；沙箱内没有 `jq`/`rg`，请只用
+@@ -186,8 +222,7 @@ curl -sS -X POST '{endpoint}' \\
+ - 其它错误把 `detail` 原文一并列出，不要猜测文档内容。
+ 
+ 后端会先尝试应用身份，失败后再尝试当前操作者身份；任一身份可读即可返回正文。
+-若命令提示需要飞书授权，停止重试，在当前阶段的结构化结果中明确要求用户授权；
+-不要自行获取凭据或改用其他账号，所有文档读取必须通过此代理。
++{failure_instruction}
+ 
+ 代理只返回 Markdown，凭证绑定当前任务和操作者，且会自动过期。不要读取列表外的文档。
+ """.strip()
+@@ -204,7 +239,10 @@ curl -sS -X POST '{endpoint}' \\
+             key = _document_key(url)
+         except ValueError as exc:
+             raise DocumentNotAllowed("document is not allowed for this task") from exc
+-        if key not in _allowed_documents(task):
++        include_requirement_document = task.state in _CODING_STATES
++        if key not in _allowed_documents(
++            task, include_requirement_document=include_requirement_document
++        ):
+             raise DocumentNotAllowed("document is not allowed for this task")
+ 
+         return await self.read_for_user(url, task.user_key)
+@@ -218,8 +256,9 @@ curl -sS -X POST '{endpoint}' \\
+             access_token = await self._user_tokens.user_access_token(user_key)
+             if not access_token:
+                 # An absent user token cannot repair an app scope/configuration
+-                # error or an outage. Only document ACL denial calls for OAuth.
+-                if isinstance(app_error, LarkError) and app_error.code == 131006:
++                # error or an outage. A document ACL denial calls for OAuth:
++                # 131006 for a wiki node, 3380004 for a docx document.
++                if isinstance(app_error, LarkError) and app_error.code in {131006, 3380004}:
+                     raise LarkAuthorizationRequired(
+                         self._user_tokens.authorize_url(user_key)
+                     ) from app_error

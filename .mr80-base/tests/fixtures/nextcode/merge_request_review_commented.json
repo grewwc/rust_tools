@@ -1,0 +1,34 @@
+{
+  "Action": "commented",
+  "Sender": {
+    "Id": "verification-user",
+    "Username": "verification-user",
+    "Email": "verification-user@example.com"
+  },
+  "Repository": {
+    "Id": "1106267",
+    "Path": "xiahaitao/Conciliator",
+    "URL": "https://code.byted.org/xiahaitao/Conciliator",
+    "CloneURL": "https://code.byted.org/xiahaitao/Conciliator.git"
+  },
+  "Review": {
+    "Id": "verification-review",
+    "MergeRequestId": "793125163377574",
+    "Status": "commented",
+    "Content": "/resolve status",
+    "CreatedBy": {
+      "Id": "verification-user",
+      "Username": "verification-user",
+      "Email": "verification-user@example.com"
+    }
+  },
+  "MergeRequest": {
+    "Id": "793125163377574",
+    "Number": 9,
+    "SourceRepoId": "1106267",
+    "TargetRepoId": "1106267",
+    "SourceBranchName": "verify/nextcode-20260826-1313-test1",
+    "TargetBranchName": "verify/nextcode-20260826-1313-test2",
+    "Title": "[verification] NextCode contract 20260826-1313"
+  }
+}

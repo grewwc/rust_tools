@@ -1,0 +1,28 @@
+@@ -222,7 +222,7 @@ async def test_oauth_reader_requires_authorization_when_app_denied_and_user_miss
+         runtime.raw_reader.assert_not_awaited()
+ 
+ 
+-async def test_oauth_reader_keeps_document_acl_denial_out_of_the_oauth_flow(
++async def test_oauth_reader_requires_authorization_for_document_acl_denial(
+     reader_runtime,
+ ):
+     async with reader_runtime() as runtime:
+@@ -231,11 +231,15 @@ async def test_oauth_reader_keeps_document_acl_denial_out_of_the_oauth_flow(
+             "app access forbidden", code=3380004,
+         )
+ 
+-        with pytest.raises(LarkError) as exc:
++        with pytest.raises(LarkAuthorizationRequired) as exc:
+             await runtime.reader(DOCX_URL, USER_KEY)
+ 
+-        assert exc.value.code == 3380004
+-        runtime.tokens.authorize_url.assert_not_called()
++        assert exc.value.authorization_url == "https://auth.example.test/authorize"
++        runtime.tokens.user_access_token.assert_awaited_once_with(USER_KEY)
++        runtime.tokens.authorize_url.assert_called_once_with(USER_KEY)
++        runtime.lark._request.assert_awaited_once()
++        assert runtime.lark._request.call_args.kwargs["access_token"] is None
++        runtime.raw_reader.assert_not_awaited()
+ 
+ 
+ @pytest.mark.parametrize(

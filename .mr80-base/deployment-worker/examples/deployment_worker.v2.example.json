@@ -1,0 +1,32 @@
+{
+  "protocol_version": 2,
+  "api_base": "https://aeolus-conciliator.byted.org",
+  "worker_id": "my-devbox",
+  "advertised_host": "devbox.example.internal",
+  "services": {
+    "aeolus": {
+      "runtime_profiles": {
+        "py310": {
+          "python_path": "/opt/runtimes/aeolus-py310/bin/python",
+          "python_version": "3.10",
+          "dependency_paths": {
+            "aeolus_expr_parse": "/opt/tiger/aeolus_lib_py3/aeolus_expr_parse"
+          },
+          "extra_paths": ["/opt/tiger/pyutil", "/opt/tiger/aeolus_lib_py3"]
+        }
+      }
+    },
+    "vqs": {
+      "runtime_profiles": {
+        "py37": {
+          "python_path": "/opt/runtimes/vqs-py37/bin/python",
+          "python_version": "3.7",
+          "dependency_paths": {
+            "aeolus_expr_parse": "/opt/runtimes/vqs-py37/aeolus_expr_parse"
+          },
+          "extra_paths": ["/opt/tiger/pyutil"]
+        }
+      }
+    }
+  }
+}

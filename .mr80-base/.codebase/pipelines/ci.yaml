@@ -1,0 +1,95 @@
+# Codebase CI pipeline — push 时跑单元测试 + schema 静态检查
+#
+# 写法参考 VizQueryService/.codebase/pipelines/ci.yaml:
+#   - 直接用 pip install 装依赖(不走 uv,避免 PATH/lock 兼容问题)
+#   - 同一 step 内 export + install(export 跨命令在同 shell 生效)
+#   - step.commands 是 list
+#
+# 集成测试需要 MySQL,本地跑;CI 只跑单元测试
+# schema 检查走纯静态分析(scripts/check_schema.py),不连 MySQL
+
+name: CI
+trigger: [change]
+jobs:
+  unit-test:
+    name: Unit Test + Lint
+    image: python:3.11-slim
+    steps:
+      - uses: actions/checkout
+        inputs:
+          depth: 1
+      - name: install
+        # pip 走字节内部源,避免 pypi.org 慢
+        commands:
+          - export PIP_INDEX_URL=https://bytedpypi.byted.org/simple/
+          - export PIP_DISABLE_PIP_VERSION_CHECK=1
+          - python -m pip install --upgrade pip
+          - pip install -e ".[dev]"
+      - name: lint
+        commands:
+          - ruff check src/ tests/
+      - name: type-check
+        commands:
+          - mypy src/
+      - name: unit-test
+        # 生成 coverage.xml(后续配好 codecov token 再上传)
+        commands:
+          - pytest tests/unit/ -v --cov-report xml --cov=src/conciliator --durations=0
+
+  schema-check:
+    name: DB Schema Static Check
+    image: python:3.11-slim
+    steps:
+      - uses: actions/checkout
+        inputs:
+          depth: 1
+      - name: install
+        commands:
+          - export PIP_INDEX_URL=https://bytedpypi.byted.org/simple/
+          - export PIP_DISABLE_PIP_VERSION_CHECK=1
+          - python -m pip install --upgrade pip
+          - pip install -e .
+      - name: schema-static-check
+        # 纯静态检查,不连 MySQL:
+        #   1. migrations/*.py 能解析
+        #   2. revision id 唯一
+        #   3. 依赖链完整
+        #   4. ddl/*.sql 与 migrations/*.py 对应
+        #   5. ddl/*.sql 含 alembic_version 推进语句
+        #   6. models.py 能 import
+        commands:
+          - python scripts/check_schema.py
+
+  deployment-worker:
+    name: Standalone Deployment Worker
+    image: python:3.11-slim
+    steps:
+      - uses: actions/checkout
+        inputs:
+          depth: 1
+      - name: install
+        commands:
+          - export PIP_INDEX_URL=https://bytedpypi.byted.org/simple/
+          - pip install -e './deployment-worker[dev]'
+      - name: check
+        commands:
+          - ruff check deployment-worker/src/ deployment-worker/tests/
+          - pytest -c deployment-worker/pyproject.toml deployment-worker/tests/ -v
+          - conciliator-deployment-worker --help
+      - name: package
+        commands:
+          - pip wheel ./deployment-worker --no-deps --wheel-dir deployment-worker/dist
+
+  frontend:
+    name: Frontend Tests
+    image: node:20
+    steps:
+      - uses: actions/checkout
+        inputs:
+          depth: 1
+      - name: install
+        commands:
+          - npm ci --prefix frontend
+      - name: test
+        commands:
+          - npm test --prefix frontend

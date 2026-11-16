@@ -1469,7 +1469,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <textarea id="inputtrace" hidden readonly rows="5" aria-label="input diagnostics (no typed text)" style="flex-shrink:0;margin:6px 12px;font-size:12px"></textarea>
 <div id="views">
 <div id="scrim"></div>
-<nav id="sessions"><input id="sessfilter" placeholder="filter sessions…" autocomplete="off">
+<nav id="sessions"><input id="sessfilter" placeholder="search all sessions…" aria-label="Search all sessions by title or ID" title="Match all keywords in any order" autocomplete="off">
 <div id="sessfilterrow"><div id="sesscount"></div><div id="sessmarkfilter" role="group" aria-label="会话星标筛选"><button id="sessall" type="button" aria-pressed="true">全部</button><button id="sessmarked" type="button" aria-pressed="false">仅星标</button></div></div><ul id="sesslist"></ul>
 <details id="promptnav">
 <summary><span class="pnlabel">会话提问</span><span id="promptcount" class="pncount"></span></summary>
@@ -8078,7 +8078,8 @@ async function loadInfo() {
 // into a persistent bar under the header: title plus short id, disk size,
 // fork marker, and (when history was loaded) message count.
 function renderSessionBar() {
-  const s = lastItems.find((x) => x.id === sessionId);
+  const s = sessionListItem(sessionId);
+  if (s) { selectedSessionMetadata = s; selectedSessionMetadataBase = store.base; }
   const cwd = s ? (s.cwd || "") : (sessionId && sessionId === pendingNew ? (pendingCwd || "") : "");
   const cwdEl = $("sesscwd");
   if (cwdEl) {
@@ -8096,15 +8097,20 @@ function renderSessionBar() {
   if (lastMsgCount != null) meta += " · " + lastMsgCount + " msgs";
   $("sessmeta").textContent = meta + " · " + PAGE_ID;
 }
+function sessionListItem(id) {
+  return lastItems.find((item) => item.id === id)
+    || (selectedSessionMetadataBase === store.base && selectedSessionMetadata?.id === id ? selectedSessionMetadata : null);
+}
 async function toggleSessionMark(s) {
   try {
     const { marked } = await (await api("/sessions/" + s.id + "/mark", { method: "POST", body: JSON.stringify({ marked: !s.marked }) })).json();
-    // Update the cached entry in place and re-render without refetching /sessions,
-    // preserving the rail's current order and scroll position.
-    const item = lastItems.find((x) => x.id === s.id);
+    // Update ordinary lists in place to preserve their order and scroll.
+    // Starred lists also refresh their server total and refill the page.
+    const item = sessionListItem(s.id);
     if (item) item.marked = marked;
     renderSessionList(lastItems);
     renderSessionBar();
+    if (sessionMarkedFilter()) await loadSessions({ preserveSelection: true });
   } catch (e) {
     renderSessionList(lastItems, "mark failed: " + e.message);
   }
@@ -8131,7 +8137,7 @@ let sessionDeleteTarget = null;
 let sessionDeleteReturnFocus = null;
 function openSessionDelete(targetId) {
   wireSessionDelete();
-  const target = lastItems.find((x) => x.id === targetId);
+  const target = sessionListItem(targetId);
   sessionDeleteTarget = targetId;
   sessionDeleteReturnFocus = document.activeElement;
   $("sessdeltext").textContent = "「" + (target ? sessionTitle(target) : targetId) + "」将被永久删除，此操作无法撤销。";
@@ -8278,29 +8284,46 @@ async function deleteSession(targetId, confirmed = false) {
     await loadHistory();
   } catch (e) { addMsg("err", "delete failed: " + e.message, "asst err"); }
 }
-// Render the drawer from cached or fresh items: the filter narrows by title
-// or id, the count line proves no session is hidden, and an optional error
-// row keeps a failed refresh visible without wiping the last good list.
+// Search pages come from the server; the projection also keeps cached rows
+// consistent after local edits. Both constraints filter the full server list.
 let sessMarkedOnly = false;
+function sessionMarkedFilter() {
+  return sessMarkedOnly && !isPhoneLayout();
+}
 function setSessionMarkedFilter(markedOnly) {
+  if (sessMarkedOnly === !!markedOnly) return;
   sessMarkedOnly = !!markedOnly;
-  renderSessionList(lastItems);
+  if (sessionsSearchTimer !== null) clearTimeout(sessionsSearchTimer);
+  sessionsSearchTimer = null;
+  sessionsSearchPending = false;
+  resetSessionSearch();
+  return loadSessions({ preserveSelection: true });
 }
 function wireSessionMarkedFilter() {
   $("sessall").onclick = () => setSessionMarkedFilter(false);
   $("sessmarked").onclick = () => setSessionMarkedFilter(true);
-  window.matchMedia?.("(max-width:700px)").addEventListener?.("change", () => renderSessionList(lastItems));
+  window.matchMedia?.("(max-width:700px)").addEventListener?.("change", () => {
+    if (sessMarkedOnly) {
+      resetSessionSearch();
+      void loadSessions({ preserveSelection: true });
+    } else renderSessionList(lastItems);
+  });
 }
 function sessionListProjection(items, sessFilter, markedOnly = false) {
   const q = sessFilter.trim().toLowerCase();
-  const matching = q ? items.filter((s) => (sessionTitle(s) + " " + s.id).toLowerCase().includes(q)) : items;
+  const keywords = q.split(/\s+/);
+  const matching = q ? items.filter((s) => {
+    const text = (sessionTitle(s) + " " + s.id).toLowerCase();
+    return keywords.every((keyword) => text.includes(keyword));
+  }) : items;
   const shown = markedOnly ? matching.filter((s) => s.marked) : matching;
   return { q, shown };
 }
 function sessionListTotal(items, sessionsTotal) {
   return typeof sessionsTotal === "number" ? sessionsTotal : items.length;
 }
-function sessionListCountText(q, shown, items, total, markedOnly = false) {
+function sessionListCountText(q, shown, items, total, markedOnly = false, searchResults = false) {
+  if (q && searchResults) return total + " matches · showing " + shown.length + (items.length < total ? " loaded" : "");
   return q || markedOnly
     ? total + " sessions · showing " + shown.length + (items.length < total ? " loaded" : "")
     : total + " sessions";
@@ -8504,8 +8527,9 @@ function refreshSessionActivity(sid, base = executionBase()) {
 }
 // END session activity
 function renderSessionList(items, errText, { preserveScroll = true, followNewest = false } = {}) {
-  const markedOnly = sessMarkedOnly && !isPhoneLayout();
+  const markedOnly = sessionMarkedFilter();
   const { q, shown } = sessionListProjection(items, sessFilter, markedOnly);
+  const searchResults = !!q && sessionsResultQuery === sessFilter.trim() && sessionsResultMarkedOnly === markedOnly;
   $("sessall")?.setAttribute("aria-pressed", String(!sessMarkedOnly));
   $("sessmarked")?.setAttribute("aria-pressed", String(sessMarkedOnly));
   const ul = $("sesslist");
@@ -8621,18 +8645,24 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
     };
     ul.appendChild(li);
   }
+  if (searchResults && !shown.length && !markedOnly) {
+    const empty = document.createElement("li");
+    empty.className = "session-empty";
+    empty.textContent = sessionsSearching ? "搜索中…" : "没有匹配的会话";
+    ul.appendChild(empty);
+  }
   if (markedOnly && !shown.length) {
     const empty = document.createElement("li");
     empty.className = "session-empty";
-    empty.textContent = q ? "没有匹配的星标会话" : "暂无星标会话";
+    empty.textContent = sessionsSearching ? "搜索中…" : q ? "没有匹配的星标会话" : "暂无星标会话";
     if (sessionsHasMore) empty.textContent += "（已加载范围内）";
     ul.appendChild(empty);
   }
-  if (markedOnly && sessionsHasMore) {
+  if ((searchResults || markedOnly) && sessionsHasMore) {
     const more = document.createElement("li"), button = document.createElement("button");
     more.className = "session-more";
     button.type = "button";
-    button.textContent = "加载更多会话";
+    button.textContent = q ? "加载更多搜索结果" : "加载更多会话";
     button.onclick = async () => {
       button.disabled = true;
       try { await loadOlderSessions(); }
@@ -8647,7 +8677,8 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
     ul.appendChild(li);
   }
   const total = sessionListTotal(items, sessionsTotal);
-  $("sesscount").textContent = sessionListCountText(q, shown, items, total, markedOnly);
+  $("sesscount").textContent = (searchResults || markedOnly) && sessionsSearching && sessionsTotal === null
+    ? "searching sessions…" : sessionListCountText(q, shown, items, total, markedOnly, searchResults);
   if (followNewest) ul.scrollTop = 0;
   else ul.scrollTop = scrollTop;
 }
@@ -8688,10 +8719,63 @@ function startRename(li, s) {
 }
 let sessionsLoadSeq = 0;
 const SESSION_PAGE_SIZE = 12;
+const SESSION_SEARCH_DELAY_MS = 250;
+let selectedSessionMetadata = null;
+let selectedSessionMetadataBase = null;
+let sessionsSearchTimer = null;
+let sessionsSearchPending = false;
+let sessionsFilterComposing = false;
+let sessionsSearching = false;
+let sessionsResultQuery = null;
+let sessionsResultMarkedOnly = null;
 let sessionsTotal = null;
 let sessionsPageOffset = 0;
 let sessionsHasMore = false;
 let sessionsLoadingMore = false;
+function resetSessionSearch() {
+  // Invalidate requests immediately and cache the active metadata before clearing.
+  ++sessionsLoadSeq;
+  sessionsLoadingMore = false;
+  sessionsTotal = null;
+  sessionsPageOffset = 0;
+  sessionsHasMore = false;
+  sessionsSearching = !!sessFilter.trim() || sessionMarkedFilter();
+  sessionsResultQuery = sessFilter.trim();
+  sessionsResultMarkedOnly = sessionMarkedFilter();
+  renderSessionBar();
+  lastItems = [];
+  renderSessionList(lastItems, undefined, { preserveScroll: false });
+}
+function setSessionSearch(value) {
+  const previousQuery = sessFilter.trim();
+  sessFilter = value;
+  const query = sessFilter.trim();
+  const changed = query !== previousQuery;
+  if (!changed && !sessionsSearchPending) return;
+  if (sessionsSearchTimer !== null) clearTimeout(sessionsSearchTimer);
+  if (changed) resetSessionSearch();
+  sessionsSearchPending = true;
+  const base = store.base, markedOnly = sessionMarkedFilter();
+  sessionsSearchTimer = setTimeout(() => {
+    sessionsSearchTimer = null;
+    sessionsSearchPending = false;
+    if (base === store.base && query === sessFilter.trim() && markedOnly === sessionMarkedFilter()) void loadSessions({ preserveSelection: true });
+  }, SESSION_SEARCH_DELAY_MS);
+}
+function wireSessionSearch() {
+  $("sessfilter").oncompositionstart = () => {
+    sessionsFilterComposing = true;
+    if (sessionsSearchTimer !== null) { clearTimeout(sessionsSearchTimer); sessionsSearchTimer = null; }
+  };
+  $("sessfilter").oncompositionend = (event) => {
+    sessionsFilterComposing = false;
+    setSessionSearch(event.target.value);
+  };
+  $("sessfilter").oninput = (event) => {
+    if (sessionsFilterComposing || event.isComposing) return;
+    setSessionSearch(event.target.value);
+  };
+}
 function sessionPageItems(value) {
   return Array.isArray(value) ? value : [];
 }
@@ -8724,9 +8808,11 @@ function sessionPageHasMore(sessionsPageOffset, sessionsTotal, page, pageSize) {
   return typeof sessionsTotal === "number"
     ? sessionsPageOffset < sessionsTotal : page.pageSize === pageSize;
 }
-async function fetchSessionPage(offset, limit, includeSelected = false) {
+async function fetchSessionPage(offset, limit, includeSelected = false, query = sessFilter.trim(), markedOnly = sessionMarkedFilter()) {
   let path = "/sessions?newest=true&limit=" + limit + "&offset=" + offset;
-  if (includeSelected && sessionId) path += "&include=" + encodeURIComponent(sessionId);
+  if (query) path += "&query=" + encodeURIComponent(query);
+  else if (!markedOnly && includeSelected && sessionId) path += "&include=" + encodeURIComponent(sessionId);
+  if (markedOnly) path += "&marked=true";
   const response = await api(path);
   const value = await response.json();
   const items = sessionPageItems(value);
@@ -8739,11 +8825,11 @@ async function fetchSessionPage(offset, limit, includeSelected = false) {
 async function loadOlderSessions() {
   if (sessionsLoadingMore || !sessionsHasMore) return;
   sessionsLoadingMore = true;
-  const loadId = sessionsLoadSeq, forSession = sessionId, base = store.base;
+  const loadId = sessionsLoadSeq, forSession = sessionId, base = store.base, query = sessFilter.trim(), markedOnly = sessionMarkedFilter();
   const activityRevisions = snapshotSessionActivityRevisions();
   try {
-    const page = await fetchSessionPage(sessionsPageOffset, SESSION_PAGE_SIZE);
-    if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base) return;
+    const page = await fetchSessionPage(sessionsPageOffset, SESSION_PAGE_SIZE, false, query, markedOnly);
+    if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base || query !== sessFilter.trim() || markedOnly !== sessionMarkedFilter()) return;
     if (typeof page.total === "number") sessionsTotal = page.total;
     sessionsPageOffset = sessionPageNextOffset(sessionsPageOffset, page.pageSize);
     sessionsHasMore = sessionPageHasMore(sessionsPageOffset, sessionsTotal, page, SESSION_PAGE_SIZE);
@@ -8754,15 +8840,15 @@ async function loadOlderSessions() {
       renderSessionList(lastItems);
     } else {
       mergeSessionActivities(page.items, { base, revisions: activityRevisions });
-      if (sessMarkedOnly && !isPhoneLayout()) renderSessionList(lastItems);
+      if (query || markedOnly) renderSessionList(lastItems);
     }
     void pollSessionActivity();
   } catch (e) {
-    if (loadId === sessionsLoadSeq && forSession === sessionId && base === store.base) {
+    if (loadId === sessionsLoadSeq && forSession === sessionId && base === store.base && query === sessFilter.trim() && markedOnly === sessionMarkedFilter()) {
       renderSessionList(lastItems, "sessions refresh failed: " + e.message);
     }
   } finally {
-    sessionsLoadingMore = false;
+    if (loadId === sessionsLoadSeq) sessionsLoadingMore = false;
   }
 }
 if ($("sesslist") && typeof $("sesslist").addEventListener === "function") {
@@ -8776,39 +8862,51 @@ if ($("sesslist") && typeof $("sesslist").addEventListener === "function") {
     if (event.deltaY > 0 && list.scrollTop + list.clientHeight >= list.scrollHeight) loadOlderSessions();
   }, { passive: true });
 }
-async function loadSessions() {
-  const loadId = ++sessionsLoadSeq, forSession = sessionId, base = store.base;
+async function loadSessions({ preserveSelection = false } = {}) {
+  const loadId = ++sessionsLoadSeq, forSession = sessionId, base = store.base, query = sessFilter.trim(), markedOnly = sessionMarkedFilter();
+  sessionsLoadingMore = false;
   const activityRevisions = snapshotSessionActivityRevisions();
-  let items;
+  let items, total, offset, hasMore;
   try {
     const requested = sessionRefreshLimit(sessionsPageOffset, SESSION_PAGE_SIZE);
-    const page = await fetchSessionPage(0, requested, true);
-    if (typeof page.total !== "number") {
+    const page = await fetchSessionPage(0, requested, !query && !markedOnly, query, markedOnly);
+    if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base || query !== sessFilter.trim() || markedOnly !== sessionMarkedFilter()) return;
+    if (!query && !markedOnly && typeof page.total !== "number") {
       // A running daemon from before paged ordering has no total/order headers.
       // Preserve its legacy full-list behavior until that daemon is restarted;
       // otherwise its oldest first page would be mistaken for the newest one.
       const legacy = await (await api("/sessions")).json();
       items = legacySessionItems(legacy);
       if (items === legacy) items = legacy.reverse();
-      sessionsTotal = items.length;
-      sessionsPageOffset = items.length;
-      sessionsHasMore = false;
+      total = items.length;
+      offset = items.length;
+      hasMore = false;
     } else {
-      sessionsTotal = page.total;
-      sessionsPageOffset = page.pageSize;
-      sessionsHasMore = sessionsPageOffset < sessionsTotal;
+      total = page.total;
+      offset = page.pageSize;
+      hasMore = sessionPageHasMore(offset, total, page, requested);
       items = page.items;
     }
   } catch (e) {
-    if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base) return;
+    if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base || query !== sessFilter.trim() || markedOnly !== sessionMarkedFilter()) return;
     // Keep the last good list so one failed refresh (e.g. a token hiccup)
     // cannot hide every session; the error stays as a tail row instead.
+    sessionsSearching = false;
     renderSessionList(lastItems, "sessions refresh failed: " + e.message);
     return;
   }
-  if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base) return;
+  if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base || query !== sessFilter.trim() || markedOnly !== sessionMarkedFilter()) return;
+  sessionsTotal = total;
+  sessionsPageOffset = offset;
+  sessionsHasMore = hasMore;
+  sessionsSearching = false;
+  sessionsResultQuery = query;
+  sessionsResultMarkedOnly = markedOnly;
   let hydrate = false;
-  if (items.some((s) => s.id === sessionId)) { pendingNew = null; }
+  if (query || markedOnly || preserveSelection) {
+    // Search membership has no authority over the current session's lifecycle.
+  }
+  else if (items.some((s) => s.id === sessionId)) { pendingNew = null; }
   else if (sessionId === pendingNew && sessionId) {
     // Fresh id, not yet materialized: stay on it; the first turn persists
     // it and the following loadSessions picks it up normally.
@@ -8835,7 +8933,7 @@ async function loadSessions() {
   sessionActivityItemsBase = base;
   mergeSessionActivities(items, { base, revisions: activityRevisions });
   renderSessionList(items, undefined, {
-    followNewest: !sessionId || items[0]?.id === sessionId,
+    followNewest: !query && !markedOnly && (!sessionId || items[0]?.id === sessionId),
   });
   renderSessionBar();
   void pollSessionActivity();
@@ -10977,7 +11075,7 @@ function cdCommandLine(text) {
 // /sessions refresh.
 function applySessionCwd(sid, cwd) {
   if (!sid || typeof cwd !== "string" || !cwd) return;
-  const item = lastItems.find((x) => x.id === sid);
+  const item = sessionListItem(sid);
   if (item) item.cwd = cwd;
   if (sid === sessionId) {
     if (sid === pendingNew) pendingCwd = cwd;
@@ -12319,7 +12417,7 @@ function wire() {
   const toggleSessions = () => setDrawer(!$("sessions").classList.contains("open"));;
   $("menu").onclick = toggleSessions;
   $("sessbar").onclick = toggleSessions;
-  $("sessfilter").oninput = (e) => { sessFilter = e.target.value; renderSessionList(lastItems, undefined, { preserveScroll: false }); };
+  wireSessionSearch();
   wireSessionMarkedFilter();
   $("connbtn").onclick = () => $("conn").classList.toggle("open");
   // The floating capture button needs a system permission that is granted

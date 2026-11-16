@@ -1,0 +1,190 @@
+@@ -82,6 +82,8 @@ class FakeRunner:
+         self.evaluation = evaluation
+         self.feedbacks: list[str] = []
+         self.code_inputs: list[str] = []
++        self.code_document_instructions: list[str] = []
++        self.recode_document_instructions: list[str] = []
+         self.evaluation_inputs: list[tuple[str, str]] = []
+         self.session_contexts = []
+ 
+@@ -100,6 +102,9 @@ class FakeRunner:
+     async def code(self, **kwargs) -> CocoCodingRun:
+         self.code_inputs.append(kwargs["requirement_url"])
+         self.session_contexts.append(kwargs["session_context"])
++        self.code_document_instructions.append(
++            kwargs.get("document_access_instructions", "")
++        )
+         on_started = kwargs.get("on_started")
+         if on_started:
+             await on_started("session-1", "run-1", "event-1")
+@@ -113,10 +118,16 @@ class FakeRunner:
+         )
+ 
+     async def recode(
+-        self, *, session_id: str, feedback: str, on_started=None
++        self,
++        *,
++        session_id: str,
++        feedback: str,
++        document_access_instructions: str = "",
++        on_started=None,
+     ) -> CocoCodingRun:
+         assert session_id == "session-1"
+         self.feedbacks.append(feedback)
++        self.recode_document_instructions.append(document_access_instructions)
+         if on_started:
+             await on_started("session-1", "run-2", "event-11")
+         return CocoCodingRun(
+@@ -370,8 +381,9 @@ async def test_legacy_task_without_type_skips_item_query():
+     ("no_reference_access", AeolusState.VALIDATION_FAILED, True),
+     ("both_acl_denied", AeolusState.VALIDATION_FAILED, False),
+ ])
++@pytest.mark.parametrize("code", [131006, 3380004])
+ async def test_evaluation_uses_either_identity_before_requesting_oauth(
+-    scenario, expected_state, needs_oauth,
++    scenario, expected_state, needs_oauth, code,
+ ):
+     from conciliator.services.aeolus_document_access import AeolusDocumentAccessService
+ 
+@@ -391,7 +403,7 @@ async def test_evaluation_uses_either_identity_before_requesting_oauth(
+         else:
+             allowed = scenario in {"user_only", "mixed"}
+         if not allowed:
+-            raise LarkError("no document permission", code=131006)
++            raise LarkError("no document permission", code=code)
+         return {"document": {"content": document if main_document else "引用正文"}}
+ 
+     service, registry, runner, _, _ = _service(EvaluationResult(True, "通过", (), ()))
+@@ -427,7 +439,7 @@ async def test_evaluation_uses_either_identity_before_requesting_oauth(
+ ])
+ async def test_evaluation_always_receives_full_backend_snapshot(proxy_enabled, document):
+     class DocumentAccess:
+-        def instructions(self, task):
++        def instructions(self, task, *, include_requirement_document=False):
+             assert task.requirement_url == "https://example.feishu.cn/docx/doccnABC"
+             assert task.requirement_text == document
+             return "DOC_PROXY_INSTRUCTIONS"
+@@ -457,7 +469,7 @@ async def test_evaluation_always_receives_full_backend_snapshot(proxy_enabled, d
+ async def test_reference_precheck_reports_all_permission_failures_before_evaluation():
+     service, _, runner, _, _ = _service(
+         EvaluationResult(True, "通过", (), ()),
+-        document_access=SimpleNamespace(instructions=lambda task: ""),
++        document_access=SimpleNamespace(instructions=lambda task, **_: ""),
+     )
+     references = [f"https://example.feishu.cn/docx/Reference{i}" for i in range(10)]
+     document = "\n".join(f"[引用 {i}]({url})" for i, url in enumerate(references))
+@@ -500,7 +512,7 @@ async def test_reference_precheck_classifies_document_acl_codes(
+ ):
+     service, _, runner, _, _ = _service(
+         EvaluationResult(True, "通过", (), ()),
+-        document_access=SimpleNamespace(instructions=lambda task: ""),
++        document_access=SimpleNamespace(instructions=lambda task, **_: ""),
+     )
+     reference = "https://example.feishu.cn/docx/Reference"
+     document = f"[引用]({reference})"
+@@ -529,7 +541,7 @@ async def test_reference_precheck_classifies_document_acl_codes(
+ async def test_reference_precheck_reports_expired_oauth_without_acl_failures():
+     service, _, runner, _, _ = _service(
+         EvaluationResult(True, "通过", (), ()),
+-        document_access=SimpleNamespace(instructions=lambda task: ""),
++        document_access=SimpleNamespace(instructions=lambda task, **_: ""),
+     )
+     reference = "https://example.feishu.cn/docx/Reference"
+ 
+@@ -560,7 +572,7 @@ async def test_reference_precheck_reports_expired_oauth_without_acl_failures():
+     ValueError("document has no readable content"),
+ ])
+ async def test_invalid_reference_is_structured_only_with_operator_access(proxy_enabled, error):
+-    access = SimpleNamespace(instructions=lambda task: "") if proxy_enabled else None
++    access = SimpleNamespace(instructions=lambda task, **_: "") if proxy_enabled else None
+     service, _, runner, _, _ = _service(
+         EvaluationResult(True, "通过", (), ()), document_access=access,
+     )
+@@ -1672,6 +1684,30 @@ async def test_unshared_document_requires_document_access_not_user_authorization
+     assert host.reviews == 0
+ 
+ 
++@pytest.mark.asyncio
++async def test_app_document_acl_denial_reports_document_permission():
++    service, registry, _, host, _ = _service(
++        EvaluationResult(True, "信息充分", (), ())
++    )
++
++    async def fail_to_read_document(url: str, user_key: str) -> str:
++        raise LarkError("app access forbidden", http_status=403, code=3380004)
++
++    service._read_document = fail_to_read_document
++    await service.accept_event(_event())
++    await service.wait_for_idle()
++
++    task = await registry.get("idem-1")
++    assert task.state == AeolusState.VALIDATION_FAILED
++    assert task.evaluation["missing_items"] == [
++        "应用无该文档权限，"
++        "请将应用添加为文档协作者或为当前用户申请文档访问权限后重试"
++    ]
++    assert task.evaluation["document_read_error_code"] == 3380004
++    assert task.evaluation["document_authorization_required"] is False
++    assert host.reviews == 0
++
++
+ @pytest.mark.asyncio
+ async def test_successful_coding_creates_one_review_and_records_round():
+     contract = "# 需求共识\n只更新 README，验证 diff"
+@@ -1705,13 +1741,46 @@ async def test_successful_coding_creates_one_review_and_records_round():
+     assert host.review_targets == [("repo-1", "master")]
+ 
+ 
++@pytest.mark.asyncio
++async def test_coding_receives_primary_document_proxy_instructions():
++    class DocumentAccess:
++        def __init__(self):
++            self.include_requirement_document = []
++
++        def instructions(self, task, *, include_requirement_document=False):
++            self.include_requirement_document.append(include_requirement_document)
++            return "MAIN_AND_REFERENCES" if include_requirement_document else "REFERENCES_ONLY"
++
++    access = DocumentAccess()
++    service, _, runner, _, _ = _service(
++        EvaluationResult(True, "信息充分", (), ()), document_access=access
++    )
++
++    await service.accept_event(_event())
++    await service.wait_for_idle()
++    assert access.include_requirement_document and not any(access.include_requirement_document)
++    assert runner.evaluation_inputs[-1][1] == "REFERENCES_ONLY"
++
++    await service.confirm_evaluation("idem-1", "evaluation-confirm")
++    await service.wait_for_idle()
++
++    assert access.include_requirement_document[-1] is True
++    assert runner.code_document_instructions[-1] == "MAIN_AND_REFERENCES"
++
++    await service.submit_feedback("idem-1", "补充测试", "feedback-1")
++    await service.wait_for_idle()
++
++    assert access.include_requirement_document[-1] is True
++    assert runner.recode_document_instructions[-1] == "MAIN_AND_REFERENCES"
++
++
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize("proxy_enabled", [False, True])
+ async def test_evaluation_feedback_rereads_document_and_preserves_history(
+     proxy_enabled,
+ ):
+     class DocumentAccess:
+-        def instructions(self, task):
++        def instructions(self, task, *, include_requirement_document=False):
+             return "DOC_PROXY_INSTRUCTIONS"
+ 
+     service, registry, runner, host, _ = _service(
+@@ -1776,7 +1845,7 @@ async def test_evaluation_feedback_rereads_document_and_preserves_history(
+ async def test_missing_user_authorization_blocks_evaluation_until_retry(legacy_snapshot):
+     service, registry, runner, host, _ = _service(
+         EvaluationResult(True, "通过", (), ()),
+-        document_access=SimpleNamespace(instructions=lambda task: "DOC_PROXY_INSTRUCTIONS"),
++        document_access=SimpleNamespace(instructions=lambda task, **_: "DOC_PROXY_INSTRUCTIONS"),
+     )
+     service._read_document = AsyncMock(side_effect=[
+         LarkAuthorizationRequired("https://auth.example/authorize?state=private"),

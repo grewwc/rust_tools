@@ -1,0 +1,21 @@
+{
+  "Sender": {
+    "Id": "792763146702616",
+    "Username": "aeolus_conciliator_test",
+    "Email": "aeolus_conciliator_test@bytedance.com"
+  },
+  "Repository": {
+    "Id": "1106267",
+    "Path": "xiahaitao/Conciliator",
+    "URL": "https://code.byted.org/xiahaitao/Conciliator",
+    "CloneURL": "https://code.byted.org/xiahaitao/Conciliator.git"
+  },
+  "Ref": "refs/heads/verify/nextcode-20260826-1313-test2",
+  "Before": "4a48b21c55056958270afa4ca206da0034ffd27e",
+  "After": "80c631cbec6985bf052d7826ee1599f871d4e702",
+  "Commits": [],
+  "TotalCommitsCount": 1,
+  "Created": false,
+  "Deleted": false,
+  "Forced": false
+}

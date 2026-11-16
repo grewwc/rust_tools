@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>任务明细 · Conciliator</title>
+    <link rel="stylesheet" href="/trace/assets/trace.css" />
+    <script src="/trace/assets/trace.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="/trace"
+        ><span class="logo">C</span> Conciliator <span class="divider">/</span>
+        <span>任务明细</span></a
+      >
+      <div class="header-right">
+        <span class="dot"></span> 只读视图 <span id="updated"></span>
+      </div>
+    </header>
+    <main>
+      <div class="intro">
+        <div>
+          <p class="eyebrow">TASK ACTIVITY</p>
+          <h1>每一步，都有记录</h1>
+          <p class="muted">
+            查询新任务的完整处理过程，追踪状态、外部调用与应用日志。
+          </p>
+        </div>
+        <button id="refresh" class="primary">刷新记录</button>
+      </div>
+      <div id="health" class="notice" role="status">正在检查采集状态…</div>
+      <section class="workspace">
+        <nav class="tabs" aria-label="查询视图">
+          <button id="events-tab" class="active">全部明细</button
+          ><button id="tasks-tab">任务列表</button
+          ><span class="tab-note">仅收录采集启用后创建的任务</span>
+        </nav>
+        <form id="filters">
+          <div class="filter-grid">
+            <label
+              >任务 ID<input
+                name="task_id"
+                placeholder="例如 123"
+                inputmode="numeric"
+                pattern="[0-9]+"
+            /></label>
+            <label
+              >当前状态<select name="current_status">
+                <option value="">全部状态</option>
+              </select></label
+            >
+            <label
+              >外部系统<select name="provider">
+                <option value="">全部系统</option>
+                <option value="nextcode">NextCode</option>
+                <option value="coco">Coco</option>
+                <option value="lark">Lark</option>
+              </select></label
+            >
+            <label
+              >事件类型<select name="event_type">
+                <option value="">全部类型</option>
+              </select></label
+            >
+            <label
+              >仓库 ID<input name="repo_id" placeholder="精确匹配仓库 ID"
+            /></label>
+            <div class="filter-actions">
+              <button type="submit" class="primary">查询</button
+              ><button type="button" id="reset">重置</button>
+            </div>
+          </div>
+          <details class="advanced">
+            <summary>更多筛选</summary>
+            <div class="filter-grid">
+              <label
+                >记录时状态<select name="task_status">
+                  <option value="">全部状态</option>
+                </select></label
+              >
+              <label
+                >原 MR 编号<input
+                  name="original_mr_id"
+                  inputmode="numeric"
+                  pattern="[0-9]+"
+              /></label>
+              <label
+                >新 MR 编号<input
+                  name="new_mr_id"
+                  inputmode="numeric"
+                  pattern="[0-9]+"
+              /></label>
+              <label
+                >原 MR 链接<input
+                  name="original_mr_url"
+                  type="url"
+                  placeholder="https://code.byted.org/…"
+              /></label>
+              <label
+                >操作名称<input
+                  name="operation"
+                  placeholder="例如 CreateComment"
+              /></label>
+              <label
+                >调用结果<select name="outcome">
+                  <option value="">全部结果</option>
+                  <option value="SUCCESS">成功</option>
+                  <option value="HTTP_ERROR">HTTP 错误</option>
+                  <option value="BUSINESS_ERROR">业务错误</option>
+                  <option value="UNKNOWN">结果未知</option>
+                </select></label
+              >
+              <label
+                >开始时间（本机时区）<input
+                  name="start"
+                  type="datetime-local"
+                  step="1"
+              /></label>
+              <label
+                >结束时间（本机时区）<input
+                  name="end"
+                  type="datetime-local"
+                  step="1"
+              /></label>
+              <label>调用 ID<input name="call_id" /></label>
+              <label
+                >时间顺序<select name="order">
+                  <option value="desc">最新在前</option>
+                  <option value="asc">最早在前</option>
+                </select></label
+              >
+            </div>
+          </details>
+        </form>
+        <div class="result-bar">
+          <div>
+            <strong id="result-title">全部明细</strong
+            ><span id="result-count"></span
+            ><button id="clear-task" hidden>返回全部明细</button>
+          </div>
+          <label class="auto"
+            ><input id="auto" type="checkbox" />每 15 秒刷新首页</label
+          >
+        </div>
+        <p id="error" class="error" role="alert" hidden></p>
+        <div id="table-wrap" class="table-wrap" aria-live="polite">
+          <table>
+            <thead id="thead"></thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+        <div id="empty" class="empty" hidden>
+          <span class="empty-icon">≡</span>
+          <h2>暂无新任务明细</h2>
+          <p>创建新任务后，状态和调用记录会出现在这里。也可以调整筛选条件。</p>
+        </div>
+        <footer>
+          <span id="page-note">时间以 Asia/Shanghai 显示 · 正文按需加载</span>
+          <div>
+            <button id="prev" disabled>上一页</button
+            ><span id="page-number">第 1 页</span
+            ><button id="next" disabled>下一页</button>
+          </div>
+        </footer>
+      </section>
+      <p class="footnote">
+        Coco 输入输出请在对应 Session
+        查看。请求记录表示一次调用尝试；没有响应时，不能据此认定对方未执行。刷新可查询迟到记录。
+      </p>
+    </main>
+    <dialog id="detail">
+      <div class="drawer-head">
+        <div>
+          <p class="eyebrow">EVENT DETAIL</p>
+          <h2 id="detail-title">明细</h2>
+        </div>
+        <button id="close-detail" aria-label="关闭明细">✕</button>
+      </div>
+      <div class="drawer-content">
+        <div id="detail-meta"></div>
+        <div id="body-tabs"></div>
+        <p id="body-status" class="muted"></p>
+        <label class="search-body"
+          >正文内查找<input
+            id="body-search"
+            placeholder="输入关键词，按 Enter 查找下一处" /></label
+        ><textarea
+          id="body-content"
+          readonly
+          spellcheck="false"
+          aria-label="脱敏正文"
+        ></textarea
+        ><button id="more-body" hidden>加载下一段</button>
+      </div>
+    </dialog>
+  </body>
+</html>

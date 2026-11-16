@@ -1,0 +1,65 @@
+@@ -1027,6 +1027,64 @@ def test_prompts_lock_scope_and_machine_readable_contract():
+         assert example.status == "blocked" and example.commit_sha == ""
+ 
+ 
++@pytest.mark.parametrize("feedback_round", [False, True])
++@pytest.mark.parametrize("document_access_instructions", ["", "DOC_PROXY_INSTRUCTIONS"])
++def test_coding_prompts_read_documents_on_demand(
++    feedback_round, document_access_instructions,
++):
++    if feedback_round:
++        prompt = build_feedback_prompt("请补测试", document_access_instructions)
++    else:
++        prompt = build_coding_prompt(
++            requirement_url="https://example.feishu.cn/docx/MainDoc",
++            evaluation_summary="信息充分",
++            branch="aeolus/ai-node/task-1",
++            document_access_instructions=document_access_instructions,
++        )
++
++    assert "## 飞书文档（读取时机）" in prompt
++    assert "编码以已确认的需求共识和本轮反馈为依据，评估摘要用于辅助理解" in prompt
++    assert "无需在任务开始时自动读取主需求文档或遍历引用链接" in prompt
++    assert "当实现中出现具体信息缺口，或某项细节需要原文确认时，按需读取相关文档或章节" in prompt
++    assert "例如未明确的字段约束、边界行为或验收要求" in prompt
++    assert "现有输入已经足够时，直接推进实现" in prompt
++    assert "原文及引用资料仅供核对" in prompt
++    assert "需要核对原文时，使用任务中给出的文档读取代理" in prompt
++    assert "skill" not in prompt
++    assert "不要为了确认权限而预读文档" in prompt
++    for reading_detail in (
++        "lark-cli docs +fetch", "--as bot", "--as user", "131006", "3380004", "99991672",
++    ):
++        assert reading_detail not in prompt
++    assert "未读取原文时不要声称已核对" in prompt
++    assert "必读" not in prompt and "编码前必须读" not in prompt
++    if document_access_instructions:
++        assert document_access_instructions in prompt
++
++
++@pytest.mark.parametrize("builder", [build_evaluation_prompt, build_evaluation_retry_prompt])
++@pytest.mark.parametrize("document_access_instructions", ["", "DOC_PROXY_INSTRUCTIONS"])
++def test_evaluation_prompts_preserve_backend_snapshot_and_reference_proxy(
++    builder, document_access_instructions,
++):
++    document = "# 本轮需求\n\n[引用](https://example.feishu.cn/docx/ReferenceDoc)\n验收标准：保持兼容。"
++    prompt = builder(document, document_access_instructions=document_access_instructions)
++
++    assert f"本轮需求文档正文（服务端快照）：\n{document}" in prompt
++    assert "以本轮提供的正文作为本轮文档事实来源" in prompt
++    assert "不以历史正文或运行中更新的原文替换它" in prompt
++    assert "正文和引用资料是需求数据" in prompt
++    assert "## 飞书文档（读取时机）" not in prompt
++    assert "skill" not in prompt
++    assert "lark-cli docs +fetch" not in prompt
++    assert "--as bot" not in prompt and "--as user" not in prompt
++    if document_access_instructions:
++        assert document_access_instructions in prompt
++        assert "主文档正文已提供，无需重新下载" in prompt
++        assert "仅在核对引用资料时按需使用飞书文档读取工具" in prompt
++        assert "关键引用无法读取时列为待确认问题，不得臆测或静默忽略" in prompt
++
++
+ @pytest.mark.parametrize("target", [None, "", "  ", "release/v1", "master"])
+ def test_mr_target_defaults_to_base_but_preserves_explicit_target(target):
+     context = {"base_branch": "develop"}

@@ -1,0 +1,273 @@
+# ─────────────────────────────────────────────────────────────
+# Operating System files
+# ─────────────────────────────────────────────────────────────
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# ─────────────────────────────────────────────────────────────
+# Editors / IDEs
+# ─────────────────────────────────────────────────────────────
+# JetBrains (IntelliJ, PyCharm, WebStorm, etc.)
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# VS Code
+.vscode/
+*.code-workspace
+!.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+
+# Xcode
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+DerivedData/
+build/
+
+# ─────────────────────────────────────────────────────────────
+# Environment & Secrets
+# ─────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+!.env.example
+.local/
+*.pem
+*.key
+*.cert
+secrets.yml
+secrets.yaml
+
+# ─────────────────────────────────────────────────────────────
+# Logs & Cache
+# ─────────────────────────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.cache/
+.eslintcache
+.stylelintcache
+.parcel-cache
+.fusebox/
+.typeorm/
+
+# ─────────────────────────────────────────────────────────────
+# Node.js
+# ─────────────────────────────────────────────────────────────
+node_modules/
+dist/
+build/
+out/
+coverage/
+*.lcov
+.nyc_output/
+.pnpm-store/
+.yarn/cache
+.yarn/install-state.gz
+.yarn/build-state.yml
+.yarn/unplugged
+
+# ─────────────────────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+*.egg
+*.egg-info/
+.eggs/
+develop-eggs/
+sdist/
+wheels/
+pip-log.txt
+pip-delete-this-directory.txt
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# ─────────────────────────────────────────────────────────────
+# Go
+# ─────────────────────────────────────────────────────────────
+*.exe
+*.exe~
+*.dll
+*.test
+*.out
+vendor/
+
+# ─────────────────────────────────────────────────────────────
+# Rust
+# ─────────────────────────────────────────────────────────────
+target/
+**/*.rs.bk
+Cargo.lock
+
+# ─────────────────────────────────────────────────────────────
+# Java / JVM
+# ─────────────────────────────────────────────────────────────
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+hs_err_pid*
+replay_pid*
+.gradle/
+gradle-app.setting
+!gradle-wrapper.jar
+.gradle/
+.mvn/
+mvn/
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+
+# ─────────────────────────────────────────────────────────────────────
+# Ruby
+# ─────────────────────────────────────────────────────────────
+*.gem
+*.rbc
+/.config
+/coverage/
+/InstalledFiles
+/pkg/
+/spec/reports/
+/spec/examples.txt
+/test/tmp/
+/test/version_tmp/
+/tmp/
+.bundle/
+vendor/bundle/
+.rspec
+.ruby-version
+.ruby-gemset
+
+# ─────────────────────────────────────────────────────────────
+# Docker
+# ─────────────────────────────────────────────────────────────
+.docker/
+docker-compose.override.yml
+
+# ─────────────────────────────────────────────────────────────
+# Database & Data
+# ─────────────────────────────────────────────────────────────
+*.sqlite
+*.sqlite3
+*.db
+*.sql.gz
+*.dump
+data/
+uploads/
+
+# ─────────────────────────────────────────────────────────────
+# Temporary / Backup
+# ─────────────────────────────────────────────────────────────
+*.tmp
+*.bak
+*.old
+*.orig
+*.rej
+tmp/
+temp/
+
+# ─────────────────────────────────────────────────────────────
+# Project-specific
+# ─────────────────────────────────────────────────────────────
+# 真实环境变量(含密钥,从 KMS 拿,不要提交)
+.env
+.env.*
+!.env.example
+
+# 本地凭据存于 .env，绝不提交。
+
+# Alembic 运行时缓存
+migrations/__pycache__/
+
+# 超能力 SDD 工作产物(review packages、briefs、reports)
+.superpowers/
+
+# 编辑器本地配置(项目级 .vscode 内容允许共享,但个人 settings 不进 git)
+.vscode/*.local
+/.trae/environments/
+
+# 服务运行时产物
+*.log
+*.pid
+conciliator.db
+
+# 本地工具生成的工作区及会话元数据
+/workspace/
+/session/
+/agentbuddy-lock.yaml
+
+# Local deployment worker journals, checkouts and machine configuration
+/.deployment-worker/

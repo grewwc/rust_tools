@@ -1,0 +1,88 @@
+# Atum manifest for Conciliator
+#
+# 文档:https://bytedance.larkoffice.com/wiki/wikcn90DilLa7eGT7VijZbpc3Sd
+# 字段详解:https://bytedance.feishu.cn/wiki/wikcnsXQ1gBaOBeTOYQK8yWqaub
+#
+# TODO(部署前替换):
+#   1. psm:替换为你在 TCE 注册的实际 PSM(如 conciliator.service.psm)
+#   2. image_namespace:TCE 用 'tce',faas 用 'faas'
+#   3. NextCode webhook URL 用 PSM 直连：http://<psm>/hooks/codebase
+
+# ── 服务标识 ────────────────────────────────────────────────────────
+name: conciliator
+psm: data.aeolus.conciliator
+
+# ── 镜像构建配置(TCE 镜像模式必填) ─────────────────────────────────
+image_namespace: tce           # TCE 服务填 tce,faas 填 faas
+build_regions:
+  - China-North-LF             # 国内,其他区域参考 Atum 字段详解文档
+arches:
+  - x86_64                     # 一般 x86_64,arm 机器才加 aarch64
+
+image_config:
+  enable_sidecar: true         # 启用 mesh(服务治理、重试、熔断),不填 mesh 会启动失败
+
+# ── 构建阶段 ────────────────────────────────────────────────────────
+stages:
+  # Python 项目无编译产物,只需一个 run stage 打包文件 + 装依赖
+  - name: run
+    type: run
+
+    # 高版本 Python 基础镜像(文档推荐)
+    # 其他可用版本参考 https://bytedance.feishu.cn/docs/Wt3VwN7FzijnBWkn02GczxQdn9f
+    base_image: hub.byted.org/base/debian.bookworm.python311:latest
+
+    # work_dir 必须以 /opt/tiger 开头(ICM 约定)
+    work_dir: /opt/tiger/conciliator
+
+    # 环境变量(运行时 + 启动时)
+    envs:
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      LANG: en_US.UTF-8
+      TZ: Asia/Shanghai
+      # 让 src layout 的 conciliator 包可直接 import
+      PYTHONPATH: /opt/tiger/conciliator/src
+      # 默认 prod,本地通过 Atum shell 调试时可覆盖
+      ENV: prod
+
+    # 依赖安装:从 uv.lock 导出开源依赖,与内部 SDK 一次性装进系统 Python。
+    # 不混用 uv 默认 .venv 与 system site-packages,避免启动时找不到依赖。
+    dependencies:
+      # bytedlogger 只发布 sdist，setup.py 里声明了 proto/protov3 两个 C 扩展；
+      # 基础镜像有 Python 头文件但不带编译器，直接安装会在 "Failed building
+      # wheel for bytedlogger" 处失败。libc 头文件同样缺失，因此装 build-essential
+      # 而不只是 gcc。
+      - type: shell
+        name: install C toolchain for bytedlogger
+        command: |
+          apt-get update && \
+          apt-get install -y --no-install-recommends build-essential && \
+          rm -rf /var/lib/apt/lists/*
+      - type: shell
+        name: install uv
+        command: |
+          pip install --index-url=https://bytedpypi.byted.org/simple/ "uv==0.12.5"
+      - type: shell
+        name: install runtime dependencies
+        command: |
+          cd /opt/tiger/conciliator && \
+          uv export --frozen --no-dev --no-hashes --no-emit-project \
+            --output-file /tmp/conciliator-open-source.txt && \
+          uv pip install --system \
+            --index-url=https://bytedpypi.byted.org/simple/ \
+            -r /tmp/conciliator-open-source.txt \
+            -r byted-requirements.txt
+
+    # 打包文件:把整个项目拷到 work_dir
+    inputs:
+      - type: local
+        source: .
+        target: /opt/tiger/conciliator
+
+    # 启动命令:FastAPI/ASGI 统一使用 Uvicorn + PORT0 绑定
+    # 数据库迁移需在发布前独立完成，不在容器启动时执行。
+    run_command: bash /opt/tiger/conciliator/run/prod_run.sh
+
+    # 本地开发配置(atum shell 用)
+    development: {}

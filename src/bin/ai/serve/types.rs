@@ -417,11 +417,18 @@ pub(crate) struct SessionActivityItem {
 pub(crate) struct SessionsQuery {
     pub(crate) limit: Option<usize>,
     pub(crate) offset: Option<usize>,
+    /// Case-insensitive whitespace-separated keywords; all must match the
+    /// displayed title or full ID. Filtering precedes paging and inclusion.
+    pub(crate) query: Option<String>,
+    /// Restrict the full metadata set to starred sessions before search/paging.
+    #[serde(default)]
+    pub(crate) marked: bool,
     /// Explicit ordering for paged UI clients; omitted keeps the legacy API.
     #[serde(default)]
     pub(crate) newest: bool,
     /// Keep the selected session addressable when it falls outside the newest
-    /// page. It is appended without contributing to the page offset.
+    /// page. It is appended without contributing to the page offset, provided
+    /// it also matches the active query and starred constraint.
     pub(crate) include: Option<String>,
 }
 

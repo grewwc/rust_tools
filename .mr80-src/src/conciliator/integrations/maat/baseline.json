@@ -1,0 +1,280 @@
+{
+  "environment": {
+    "_id": "6a3ca61923f092028ab6cf2d",
+    "status": "deploy_static_ok",
+    "watchUserList": [
+      "huaguojin"
+    ],
+    "larkGroupList": [],
+    "isDeleted": false,
+    "scmList": [
+      {
+        "resourceType": "scm",
+        "redirect": false,
+        "scmVersion": "1.0.16.6958",
+        "scmName": "data/dp/aeolus_fe_maat",
+        "scmId": "31336"
+      }
+    ],
+    "name": "xiaorui-aeolus-hua",
+    "projectId": "636c75edd14b09030bf8fbfc",
+    "projectName": "aeolus",
+    "region": "CN",
+    "desc": "xiaorui\u73af\u5883\uff0c51431, 51432, 51433\n\u7528\u4e8ehuaguojin\u6d4b\u8bd5\u9a8c\u8bc1",
+    "resourceType": "scm",
+    "apiProxyList": [
+      {
+        "_id": "6a67585fc126da0295ebc606",
+        "pathname": "aeolus-developers",
+        "pathMatchType": "regexp",
+        "apiId": "639bbe6441871c031b8a8c05",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc607",
+        "pathname": "api/v3/misc",
+        "pathMatchType": "regexp",
+        "apiId": "639bbd6c41871c031b8a8821",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc608",
+        "pathname": "auth/larkAuth",
+        "pathMatchType": "regexp",
+        "apiId": "639bbd7241871c031b8a884e",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc609",
+        "pathname": "/aeolus/notification",
+        "pathMatchType": "regexp",
+        "apiId": "639bbd6c41871c031b8a8821",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc60a",
+        "pathname": "aeolus/api/v3",
+        "pathMatchType": "regexp",
+        "apiId": "639bbd6c41871c031b8a8821",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc60b",
+        "pathname": "aeolus/vqs",
+        "pathMatchType": "regexp",
+        "apiId": "639bbd6c41871c031b8a8821",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc60c",
+        "pathname": "aeolus/api/v1",
+        "pathMatchType": "regexp",
+        "apiId": "639bbd6c41871c031b8a8821",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc60d",
+        "pathname": "aeolus/prep",
+        "pathMatchType": "regexp",
+        "apiId": "639bbd6c41871c031b8a8821",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc60e",
+        "pathname": "aeolus/intellia",
+        "pathMatchType": "regexp",
+        "apiId": "639bbe5f41871c031b8a8bf6",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc60f",
+        "pathname": "aeolus/openApi",
+        "pathMatchType": "regexp",
+        "apiId": "639bbd6c41871c031b8a8821",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc610",
+        "pathname": "aeolus/glue/api",
+        "pathMatchType": "regexp",
+        "apiId": "64affd718c101602382033d9",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc611",
+        "pathname": "aeolus/sdkApi",
+        "pathMatchType": "regexp",
+        "apiId": "639bbd6c41871c031b8a8821",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc612",
+        "pathname": "/qe/v2/api",
+        "pathMatchType": "regexp",
+        "apiId": "639bbe629a37c60317ab5bf2",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc613",
+        "pathname": "/tqs_api/cn",
+        "pathMatchType": "regexp",
+        "apiId": "639bbe079a37c60317ab5a75",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc614",
+        "pathname": "qe_api/hive",
+        "pathMatchType": "regexp",
+        "apiId": "639bbe079a37c60317ab5a75",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc615",
+        "pathname": "qe_api/qe-china",
+        "pathMatchType": "regexp",
+        "apiId": "639bbe629a37c60317ab5bf2",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc616",
+        "pathname": "qe_open_api",
+        "pathMatchType": "regexp",
+        "apiId": "639bbe629a37c60317ab5bec",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc617",
+        "pathname": "/jupyter-warden/aeolus",
+        "pathMatchType": "regexp",
+        "apiId": "639bbe079a37c60317ab5a75",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc618",
+        "pathname": "qe_api/qe-i18n",
+        "pathMatchType": "regexp",
+        "apiId": "639bbe5b9a37c60317ab5bc2",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc619",
+        "pathname": "/socket.io",
+        "pathMatchType": "regexp",
+        "apiId": "639bbb7df0b0ea031e148aa9",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc61a",
+        "pathname": "common_service_api",
+        "pathMatchType": "regexp",
+        "apiId": "639bbe0be462780314b9b6b6",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc61b",
+        "pathname": "socket-open",
+        "pathMatchType": "regexp",
+        "apiId": "639bbb7df0b0ea031e148aa9",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc61c",
+        "pathname": "jupyter",
+        "pathMatchType": "regexp",
+        "apiId": "639bbe079a37c60317ab5a75",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc61d",
+        "pathname": "socket-lsp",
+        "pathMatchType": "regexp",
+        "apiId": "639bbe06e462780314b9b695",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc61e",
+        "pathname": "/aeolus/resource",
+        "pathMatchType": "regexp",
+        "apiId": "639bbdcdf0b0ea031e149376",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc61f",
+        "pathname": "/polyglot",
+        "pathMatchType": "regexp",
+        "apiId": "639bbe079a37c60317ab5a75",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc620",
+        "pathname": "aeolus/find",
+        "pathMatchType": "regexp",
+        "apiId": "6523f8c7a859320306d4ebb3",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc621",
+        "pathname": "/obj/data.aeolus.qe-result",
+        "pathMatchType": "regexp",
+        "apiId": "639bbe079a37c60317ab5a75",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc622",
+        "pathname": "/nuwav2/api",
+        "pathMatchType": "regexp",
+        "apiId": "639bbe6ce462780314b9b893",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc623",
+        "pathname": "api",
+        "pathMatchType": "regexp",
+        "apiId": "639bbb7df0b0ea031e148aa9",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc624",
+        "pathname": "/aeolus/graphql",
+        "pathMatchType": "regexp",
+        "apiId": "639bbdf6f0b0ea031e149433",
+        "customDirectiveList": []
+      },
+      {
+        "_id": "6a67585fc126da0295ebc625",
+        "pathname": "/prep/manifest/",
+        "pathMatchType": "regexp",
+        "apiId": "639bbe53f0b0ea031e14958c",
+        "customDirectiveList": [
+          {
+            "_id": "6a67585fc126da0295ebc626",
+            "name": "rewrite",
+            "value": "/prep/manifest(.*) $1 break;"
+          }
+        ]
+      },
+      {
+        "_id": "6a67585fc126da0295ebc627",
+        "pathname": "/subscription/api",
+        "pathMatchType": "regexp",
+        "apiId": "639bbd6c41871c031b8a8821",
+        "customDirectiveList": []
+      }
+    ],
+    "maatV1Id": "91",
+    "updateUser": "huaguojin",
+    "devChildList": [],
+    "hasIgnoreManifestLogin": true,
+    "packages": [],
+    "templateConfig": "// \u6a21\u677f\u521d\u59cb\u503c\u6765\u81ea\u751f\u4ea7\u73af\u5883 \n /**\n* \u5185\u7f6e\u53d8\u91cf\uff1a\n* 1. VERSION -> \u5f53\u524d\u53d1\u5e03\u7248\u672c\n* 2. PUBLISH_REGION -> \u5f53\u524d\u53d1\u5e03\u533a\u57df\n* 3. CDN_BASE_PATH -> \u53d1\u5e03\u8d44\u6e90\u5728cdn\u4e0a\u7684\u5730\u5740\uff0c\u5305\u542b\u4e86\u4e1a\u52a1\u81ea\u5b9a\u4e49\u8def\u5f84\uff0c\u60f3\u8981\u81ea\u5df1\u5207\u6362cdn\u57df\u540d\u65f6\u53ef\u4ee5\u7528\u7528\u4e0b\u9762\u7684list\n* 4. CDN_BASE_LIST -> cdn\u5217\u8868\uff0c\u5305\u542bbucket\u8def\u5f84\uff0c\u4e0d\u5305\u542b\u4e1a\u52a1\u81ea\u5b9a\u4e49\u8def\u5f84\n* 5. CDN_UPLOAD_PREFIX -> cdn\u4e0a\u4f20\u524d\u7f00\uff0c\u4e1a\u52a1\u81ea\u5b9a\u4e49\u8def\u5f84\n* 6. MANIFEST -> \u5982\u679c\u662fkura\u5fae\u524d\u7aef\u9879\u76ee\uff0c\u63d0\u4f9bmanifest.json\u5185\u5bb9\n*/\n\nlet targetData = {\n   enableBrowserHistory: true\n   // enableBrowserHistoryInIframe: true\n}\n\ntargetData.version=VERSION;\n\n// \u56e0\u4e3a\u8fd9\u4e0d\u662f\u4e00\u4e2a\u51fd\u6570\uff0c\u6240\u4ee5\u6700\u7ec8\u6570\u636e\u8981\u6253\u5370\u4e00\u4e0b\n// \u5c31\u50cf\u5728 devTool \u7684 console\u5199\u4ee3\u7801\u4e00\u6837\ntargetData;\n",
+    "createUser": "huaguojin",
+    "createdAt": "2026-06-25T03:52:57.810Z",
+    "updatedAt": "2026-10-13T02:40:59.534Z",
+    "__v": 5,
+    "kuraPackagesPrefetch": {},
+    "scmVersion": "1.0.16.6958"
+  },
+  "project_config": {
+    "domainType": "generic"
+  }
+}
