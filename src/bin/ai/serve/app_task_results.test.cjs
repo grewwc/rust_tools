@@ -387,6 +387,30 @@ test("live result and structured progress share one card; clocks use numeric ela
   assertTask(panel, done);
 });
 
+test("a live card states its snapshot age instead of presenting a frozen phase as current", () => {
+  // The turn publishes a frame as each progress event lands, so the age note
+  // only marks silence: it must not appear for a recent snapshot, and must
+  // state how old a silent one is instead of asserting its phase is current.
+  const h = harness();
+  const running = reportedTask("task_age", { status: "working", active: true, output: undefined });
+  h.emit("live", "raw", "task_wait", { task_report: report([running]) });
+  const card = taskCard(h).parentNode, summary = card.querySelector("summary");
+  const clock = vm.runInContext("subagentClocks.get(card)", Object.assign(h.context, { card }));
+  clock.paint(2000);
+  assert.ok(!summary.textContent.includes("snapshot"), "a recent snapshot needs no age note");
+  assert.ok(summary.textContent.includes(running.progress.latest_activity));
+  clock.paint(9000);
+  assert.match(summary.textContent, /snapshot [6-9]s old/);
+  // A newer frame clears the note and shows the later phase.
+  h.context.Date.now = () => 30000;
+  h.context.activity.subagents(JSON.stringify({ text: "raw", task_report: report([
+    { ...running, progress: { ...running.progress, latest_activity: "running tests", sequence: running.progress.sequence + 1 } },
+  ], { snapshot: true }) }));
+  clock.paint(31000);
+  assert.ok(!summary.textContent.includes("snapshot"), "a fresh frame clears the age note");
+  assert.ok(summary.textContent.includes("running tests"));
+});
+
 test("a late progress snapshot cannot overwrite a delivered result or reopen its clock", () => {
   const h = harness(), done = reportedTask("task_done");
   h.emit("live", "terminal", "task_wait", { task_report: report([done]) });

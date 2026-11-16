@@ -4779,6 +4779,16 @@ function projectTaskReport(value, includeOutput = true) {
   if (text(report.error)) add("error", report.error);
   return { rows, taskStates, busy: active > 0, resetTasks: report.snapshot === true };
 }
+// A live card paints from the last snapshot it received. The turn publishes a
+// frame as each progress event lands, so silence this long means the subagent
+// produced nothing new; the card then says how old its snapshot is instead of
+// presenting a frozen phase as current. The next frame clears the note.
+const SUBAGENT_SNAPSHOT_STALE_MS = 6000;
+function subagentSnapshotAgeNote(report, age) {
+  if (!(age >= SUBAGENT_SNAPSHOT_STALE_MS)) return "";
+  if (!report?.tasks?.some((task) => task.active)) return "";
+  return " · snapshot " + Math.floor(age / 1000) + "s old";
+}
 function taskReportLabel(report) {
   const active = report.tasks.filter((task) => task.active);
   const latest = active.slice().reverse().find((task) => task.progress?.latest_activity || task.progress?.checkpoint_summary || task.progress?.phase);
@@ -5576,7 +5586,12 @@ function createSubagentClock(fold, owner) {
   }
   const render = (now) => {
     const value = agedTaskReport(report, records, now);
-    const title = value ? taskReportLabel(value) : "subagents";
+    // Receipt age is what this page knows for certain: the producer stops
+    // publishing subagent frames while the turn is inside a model call.
+    const receivedAt = Math.max(0, ...[...records.values()].map((row) => row.at || 0));
+    const title = value
+      ? taskReportLabel(value) + subagentSnapshotAgeNote(value, receivedAt ? Math.max(0, now - receivedAt) : 0)
+      : "subagents";
     if (title !== lastTitle || rawText !== lastRawText) {
       fold.set(title, rawText); lastTitle = title; lastRawText = rawText;
     }

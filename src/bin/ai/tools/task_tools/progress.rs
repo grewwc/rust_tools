@@ -16,6 +16,17 @@ pub(crate) fn task_progress_slot(
         .cloned()
 }
 
+/// Task that owns a progress slot. External runner threads carry no task-local
+/// id, so the slot they update is the only handle back to its task.
+pub(crate) fn task_id_for_progress_slot(
+    slot: &crate::ai::driver::runtime_ctx::SubagentPhaseSlot,
+) -> Option<String> {
+    lock_unpoisoned(&TASK_PROGRESS_REGISTRY)
+        .iter()
+        .find(|(_, candidate)| std::sync::Arc::ptr_eq(candidate, slot))
+        .map(|(task_id, _)| task_id.clone())
+}
+
 pub(super) fn current_task_progress(task_id: &str) -> Option<String> {
     let progress = task_progress_slot(task_id)
         .and_then(|slot| crate::ai::driver::runtime_ctx::subagent_progress_snapshot(&slot))
