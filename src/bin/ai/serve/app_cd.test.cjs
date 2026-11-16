@@ -126,7 +126,7 @@ test("a rejected cd shows the server error and no activity card", async () => {
 });
 
 test("send() consults the cd bridge before opening a turn stream", () => {
-  const call = script.indexOf("if (await runCdCommand(text)) return;");
+  const call = script.indexOf("if (await runCdCommand(input)) return;");
   assert.ok(call > 0, "send() must call the bridge");
   assert.ok(call < script.indexOf('"/turns/stream"'), "the bridge runs before the turn request");
 });

@@ -4216,6 +4216,18 @@ function resetQuestionNavigator() {
   updateQuestionButton(0);
 }
 // BEGIN session switch
+// A session the user just picked is ready for typing, so a desktop layout hands
+// the caret to its composer. A phone layout keeps focus where it is: focusing
+// the field there raises the soft keyboard and scrolls the view away from the
+// list the user is still tapping through. An active IME or a field that already
+// holds the caret keeps focus either way.
+function focusComposer() {
+  const prompt = $("prompt");
+  if (!prompt) return;
+  if (window.matchMedia && window.matchMedia("(max-width:700px)").matches) return;
+  if ((typeof promptComposing !== "undefined" && promptComposing) || document.activeElement === prompt) return;
+  try { prompt.focus({ preventScroll: true }); } catch (_) { prompt.focus(); }
+}
 function switchSession(nextId, saveCurrent = true) {
   nextId = nextId || "";
   if (nextId === sessionId) return;
@@ -7516,7 +7528,7 @@ function desktopBackendArguments(context, sources) {
   return context.index === 0 ? sources.backends : context.index === 1 && context.args[0] === "traecli" ? sources.workerModels : [];
 }
 function desktopModelArguments(context, sources) {
-  return context.index === 0 ? sources.models
+  return context.index === 0 ? desktopNameCandidates(context, sources.models)
     : context.index === 1 && context.args[0].toLowerCase() === "effort" ? sources.efforts : [];
 }
 // `/skills` subcommand literals, mirroring `skills_subcommands` in
@@ -7601,14 +7613,30 @@ function desktopModelCommandLine(text, caret) {
   const match = /^[^\S\n]*[/:](model|models)(?:\s+(.*))?$/i.exec(text.slice(start, end));
   return match ? { name: match[1].toLowerCase(), args: (match[2] || "").trim().split(/\s+/).filter(Boolean) } : null;
 }
+// A send treats its first non-blank line as the command and the text after that
+// line as the question, matching `/model <selector> [<question>]` in the
+// terminal. The question keeps the bytes the user typed; only the command line
+// is removed. A command-shaped line below the first one stays prose.
+function desktopModelSendCommand(text) {
+  const start = text.length - text.trimStart().length;
+  if (start === text.length) return null;
+  const newline = text.indexOf("\n", start);
+  const lineEnd = newline < 0 ? text.length : newline;
+  const command = desktopModelCommandLine(text.slice(start, lineEnd), lineEnd - start);
+  if (!command) return null;
+  const rest = newline < 0 ? "" : text.slice(newline + 1);
+  // Blank lines below the command keep it a lone setting line, not a question.
+  return { command, rest: rest.trim() ? rest : "" };
+}
 function runDesktopModelCommand(text, options = {}) {
   if (!isDesktopCommandCompletion()) return false;
-  // A completed setting line stays in the textarea, including surrounding
-  // prose. Consume it locally on send just as completion does at that caret.
-  const line = options.caret === undefined ? /(?:^|\n)[^\S\n]*[/:](?:model|models)(?=\s|$)/i.exec(text) : null;
-  const caret = options.caret ?? (line ? line.index + line[0].length : 0);
-  const command = desktopModelCommandLine(text, caret);
+  // Completion applies the setting line under the caret and leaves the text
+  // alone. A send applies a leading setting line and keeps going with the rest
+  // of the message, so the command cannot swallow the question.
+  const sent = options.caret === undefined ? desktopModelSendCommand(text) : null;
+  const command = sent ? sent.command : desktopModelCommandLine(text, options.caret);
   if (!command) return false;
+  let applied = false;
   const selector = (command.args[0] || "").toLowerCase();
   if (selector === "effort") {
     const level = (command.args[1] || "").toLowerCase(), sel = $("oeffort");
@@ -7616,6 +7644,7 @@ function runDesktopModelCommand(text, options = {}) {
     const option = [...sel.options].find((item) => item.value.toLowerCase() === level);
     if (level && (reset || option)) {
       const value = reset ? "" : option.value;
+      applied = true;
       if (sel.value !== value) { sel.value = value; savePick(); }
     } else if (!options.preview) openPickPop("effort");
   } else if (!selector || ["list", "ls", "current", "cur", "help", "h"].includes(selector)) {
@@ -7626,6 +7655,7 @@ function runDesktopModelCommand(text, options = {}) {
   } else {
     const sel = $("omodel"), option = [...sel.options].find((item) => item.value && item.value.toLowerCase() === selector);
     if (option) {
+      applied = true;
       if (sel.value !== option.value) chooseModelOption(option.value);
     } else if (!options.preview) {
       openModelSheet();
@@ -7634,7 +7664,9 @@ function runDesktopModelCommand(text, options = {}) {
       $("modelpicksearch").focus();
     }
   }
-  return true;
+  // An applied setting returns the message that follows it; an unresolved
+  // selector only opens the picker, so the text waits in the box for a choice.
+  return applied && sent && sent.rest ? sent.rest : true;
 }
 function desktopCompletionOwner() { return { base: store.base, sid: typeof sessionId === "undefined" ? "" : sessionId }; }
 function desktopSnapshotCurrent(snapshot) {
@@ -7684,7 +7716,8 @@ function desktopRemoteCommandCandidates(context, url) {
       const seen = new Set();
       request.candidates = (Array.isArray(list) ? list : []).filter((value) => {
         if (typeof value !== "string" || !value || /[\r\n]/.test(value) || seen.has(value)) return false;
-        if (context.kind !== "directory" && !value.toLowerCase().startsWith(context.query.toLowerCase())) return false;
+        if (context.kind === "directory") { seen.add(value); return true; }
+        if (argumentNameMatchRank(context.query, value) < 0) return false;
         seen.add(value); return true;
       }).map((value) => ({ display: value, replacement: value }));
       showDesktopCommandMenu(context, request.candidates);
@@ -8582,6 +8615,9 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
       pollSwitchRunningState();
       Promise.resolve(loadHistory()).catch(() => {});
       loadSessionConfig();
+      // The picked session is the one the user types into next, so the caret
+      // leaves the row this gesture focused (the drawer is already closed).
+      if (typeof focusComposer === "function") focusComposer();
     };
     ul.appendChild(li);
   }
@@ -11292,7 +11328,8 @@ async function send() {
   if (!canSend()) return;
   // Send the textarea bytes as typed: the server stores them unchanged, so a
   // client-side trim would make the transcript differ from the input. The
-  // trimmed view only decides whether there is anything to send.
+  // trimmed view only decides whether there is anything to send. A leading
+  // setting line is local and leaves the message after it as the prompt.
   const text = $("prompt").value;
   if (!text.trim() && !pendingImages.length) return;
   if (!validateSkillInput()) return;
@@ -11300,17 +11337,22 @@ async function send() {
 
   const draftSession = sessionId, sendBase = store.base;
   sendBusy = true;
-  let sid;
+  let sid, input = text;
   try {
     // Session commands use their own endpoints before preparing a model turn.
     for (const command of dispatchComposerCommands()) {
       if (command.withOwner) {
         // Resolve the command bridge through the ordered dispatcher.
         const runCdCommand = command.handler;
-        if (await runCdCommand(text)) return;
+        if (await runCdCommand(input)) return;
       } else {
         const runTransferCommand = command.handler;
-        if (typeof runTransferCommand === "function" && await runTransferCommand(text)) return;
+        if (typeof runTransferCommand !== "function") continue;
+        const handled = await runTransferCommand(input);
+        // A model command applies its setting and hands back the rest of the
+        // message, which is this turn's prompt.
+        if (typeof handled === "string") input = handled;
+        else if (handled) return;
       }
     }
     sid = await prepareTurnSession(draftSession, sendBase);
@@ -11322,7 +11364,7 @@ async function send() {
   if (typeof abortEvents === "function") abortEvents();
   const rewindFloor = historySession === sid ? canonicalHistoryTotal : 0;
   void retryHistory();
-  let prompt = text;
+  let prompt = input;
   const images = pendingImages;
   pendingImages = [];
   // The file picker previews these same placeholders in the textarea, so
@@ -12341,6 +12383,8 @@ function wire() {
       const newId = created.id;
       if (!isPhoneLayout()) clearDraft(newId);
       switchSession(newId);
+      // A fresh session starts with the caret in its composer.
+      if (typeof focusComposer === "function") focusComposer();
       pendingNew = newId;
       pendingCwd = created.cwd || "";
       lastMsgCount = null;
