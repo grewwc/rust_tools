@@ -40,9 +40,13 @@ pub(crate) const SUBAGENT_BLOCKED_PARENT_GUIDANCE: &str = "Parent action require
 /// with the parent agent's own work instead of suspending the parent for minutes right after
 /// task_spawn.
 pub(super) const DEFAULT_TASK_WAIT_TIMEOUT_SECS: u64 = 30;
-/// Hard upper bound for ordinary `task_wait.timeout_secs`, so the model cannot block the driver
-/// indefinitely before re-evaluating its foreground work.
-pub(super) const MAX_TASK_WAIT_TIMEOUT_SECS: u64 = 60;
+/// Hard upper bound for ordinary `task_wait.timeout_secs`, matching the maximum advertised by the
+/// tool schema. A long-running subagent must not wake the parent at a short deadline solely to
+/// re-issue the identical wait, which burns a model round trip each time. Completion, failure,
+/// cancellation, and side notes wake the parent immediately through independent paths, so a long
+/// quiet budget never delays an actionable event. The foreground is still re-evaluated at this
+/// budget and whenever any such event arrives.
+pub(super) const MAX_TASK_WAIT_TIMEOUT_SECS: u64 = 5 * 60;
 /// Agent-team mode delegates all substantive work before waiting. A five-minute budget lets that
 /// work stay event-driven instead of repeatedly waking the parent model solely to renew a short
 /// wait; task completion, interruption, cancellation, and side notes still wake the parent early.

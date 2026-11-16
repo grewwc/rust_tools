@@ -195,7 +195,9 @@ fn task_wait_defaults_are_short_and_resume_on_first_result() {
 
     assert_eq!(timeout_secs, 30);
     assert_eq!(wait_policy, WaitPolicy::Any);
-    assert_eq!(ordinary_timeout_secs, 60);
+    // Ordinary waits honor a model-requested timeout up to the same ceiling as agent-team mode,
+    // so a long-running subagent does not wake the parent repeatedly to re-issue the same wait.
+    assert_eq!(ordinary_timeout_secs, 300);
     assert_eq!(agent_team_timeout_secs, 300);
 }
 
