@@ -38,8 +38,8 @@ function structuredTask(task_id, elapsed_ms, overrides = {}) {
     elapsed_ms, progress: { phase: "working", latest_activity: "reading files", stale_for_ms: 0, sequence: 1 }, ...overrides };
 }
 function structuredIdentityRows(h) {
-  return h.box.children.flatMap((card) => card.children || []).flatMap((panel) => panel.children || [])
-    .filter((row) => row.className === "task-identity").map((row) => row.textContent);
+  return h.box.children.flatMap((card) => [...card.querySelectorAll(".task-block")]
+    .map((block) => block.querySelector(".task-identity").textContent + " · " + block.querySelector(".task-status").textContent));
 }
 
 // Most fixtures predate the typed rate frame. Translate only their fixture
@@ -278,7 +278,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
     timers,
     connect() {
       const begin = script.indexOf("  let turnStarted = false;", start);
-      const end = script.indexOf("  try {\n    const res = await fetch", begin);
+      const end = script.indexOf("  // BEGIN turn HTTP acceptance", begin);
       assert.ok(end > begin);
       vm.runInContext(
         script.slice(begin, end)
@@ -2740,7 +2740,7 @@ test("subagent elapsed ticker advances explicit numeric fields and reanchors to 
   let identities = structuredIdentityRows(h);
   assert.ok(identities.some((text) => text.includes("alpha") && text.includes("running 1m0s")));
   assert.ok(identities.some((text) => text.includes("beta") && text.includes("running 2m0s")));
-  assert.ok(identities.some((text) => text.includes("gamma") && text.includes("completed 7m3s")));
+  assert.ok(identities.some((text) => text.includes("gamma") && text.includes("done 7m3s")));
   assert.equal(h.bodies()[0], snapshot.text, "raw backend text is never rewritten by the clock");
   assert.equal(h.intervals.size, 1); assert.equal([...h.intervals.values()][0].delay, 1000);
   assert.equal(h.box.children[0], card); assert.equal(card.dataset.subagents, "true");

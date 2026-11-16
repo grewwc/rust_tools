@@ -197,6 +197,79 @@ function assertTask(panel, expected) {
     assert.equal(body.textContent, expected.output, "delivered output was altered");
   }
 }
+function visibleTaskText(panel) {
+  const walk = (node) => node.tagName === "DETAILS" ? "" : node.children.length ? node.children.map(walk).join("\n") : node.textContent;
+  return walk(panel);
+}
+
+for (const phone of [false, true]) for (const mode of ["live", "replay", "history", "cold"]) {
+  test("subagent goals have labeled titles, subordinate identity and separate task blocks, " + mode + " phone=" + phone, () => {
+    const h = harness({ phone }), goal = "核对计划渲染和子任务进度并保留完整证据".repeat(60) + "\n<img src=x><script>throw 1</script>";
+    const running = reportedTask("goal-running", { description: goal, status: "running", active: true, elapsed_ms: 109000, output: undefined });
+    const done = reportedTask("goal-done", { description: "Write the review" });
+    h.emit(mode, "raw goals", "task_wait", { task_report: report([running, done]) });
+    const panel = taskCard(h), blocks = panel.querySelectorAll(".task-block");
+    assert.equal(blocks.length, 2);
+    assert.ok(blocks.every((block) => block.parentNode === panel), "one wrapper separates each task");
+    const block = blocks.find((item) => item.dataset.taskId === running.task_id), header = block.querySelector(".task-header");
+    assert.equal(header.querySelector(".task-label").textContent, "TASK");
+    assert.equal(header.querySelector(".task-goal-title").textContent, goal);
+    assert.equal(header.querySelector(".task-goal-title").title, goal);
+    assert.equal(header.querySelector(".task-status").textContent, "running 1m49s");
+    assert.equal(block.dataset.state, "running"); assert.equal(header.querySelector(".task-status").dataset.state, "running");
+    assert.equal(block.querySelector(".task-identity").textContent, "[backend=traecli] build (Vendor GPT 6.1 Sol Premium) (effort: max)");
+    assert.ok(!block.querySelector(".task-identity").textContent.includes("running"));
+    const details = block.querySelector("details");
+    assert.equal(details.open, false); assert.equal(details.querySelector(".task-description").textContent, goal);
+    assert.equal(blocks[1].querySelector(".task-status").textContent, "done 29s");
+    assert.ok(blocks[1].querySelector("details").textContent.includes("completed"), "canonical status remains available in full details");
+    assert.equal(panel.querySelectorAll("img, script").length, 0);
+  });
+  test("subagent status capsules preserve arbitrary strings and use explicit active and error fields, " + mode + " phone=" + phone, () => {
+    const h = harness({ phone }), tasks = [
+      reportedTask("goal-arbitrary", { status: "Waiting for backend response", active: true, output: undefined }),
+      reportedTask("goal-cancelled", { status: "cancelled", active: false, output: undefined }),
+      reportedTask("goal-error", { status: "custom timeout", error: "Backend timeout", output: undefined }),
+      reportedTask("goal-terminal", { status: "running", active: false, output: "Delivered" }),
+    ];
+    h.emit(mode, "raw statuses", "task_status", { task_report: report(tasks) });
+    const blocks = taskCard(h).querySelectorAll(".task-block");
+    assert.deepEqual(blocks.map((block) => block.dataset.state), ["running", "neutral", "failed", "neutral"]);
+    assert.deepEqual(blocks.map((block) => block.querySelector(".task-status").dataset.state), ["running", "neutral", "failed", "neutral"]);
+    assert.ok(blocks[0].querySelector(".task-status").textContent.startsWith(tasks[0].status));
+    assert.equal(blocks[1].querySelector(".task-status").textContent, "cancelled 29s");
+    assert.equal(blocks[2].querySelector(".task-error").textContent, "Failure reason: Backend timeout");
+    assert.equal(blocks[3].querySelector(".task-status").textContent, "running 29s");
+  });
+}
+for (const phone of [false, true]) for (const mode of ["live", "replay"]) {
+  test("subagent task wrappers and goal/status nodes survive updates and elapsed clock paints, " + mode + " phone=" + phone, () => {
+    const h = harness({ phone }), running = reportedTask("goal-retained", { status: "running", active: true, output: undefined, elapsed_ms: 109000 });
+    h.emit(mode, "raw start", "task_wait", { task_report: report([running]) });
+    const panel = taskCard(h), block = panel.querySelector(".task-block"), title = block.querySelector(".task-goal-title"),
+      status = block.querySelector(".task-status"), identity = block.querySelector(".task-identity"), details = block.querySelector("details");
+    details.open = true; details.fire("toggle");
+    const clock = vm.runInContext("subagentClocks.get(retainedCard)", Object.assign(h.context, { retainedCard: panel.parentNode }));
+    clock.paint(3000);
+    assert.equal(status.textContent, "running 1m51s");
+    h.emit(mode, "raw completion", "task_wait", { task_report: report([{ ...running, status: "completed", active: false, elapsed_ms: 115000, output: "Full result" }]) });
+    assert.equal(taskCard(h), panel); assert.equal(panel.querySelector(".task-block"), block);
+    assert.equal(block.querySelector(".task-goal-title"), title); assert.equal(block.querySelector(".task-status"), status);
+    assert.equal(block.querySelector(".task-identity"), identity); assert.equal(block.querySelector("details"), details);
+    assert.equal(details.open, true); assert.equal(status.textContent, "done 1m55s"); assert.equal(block.dataset.state, "done");
+  });
+}
+test("subagent goal styles wrap CJK, clamp only the title and keep mobile/status layout bounded", () => {
+  assert.match(css, /\.task-block\s*\{[^}]*border:1px solid var\(--line\)[^}]*border-radius:11px[^}]*padding:10px 11px/);
+  assert.match(css, /\.task-block\[data-state="running"\]\s*\{[^}]*border-inline-start:2px solid var\(--acc\)/);
+  assert.match(css, /\.task-block\[data-state="failed"\]\s*\{[^}]*var\(--err\)/);
+  assert.match(css, /\.task-label\s*\{[^}]*font-size:10px[^}]*letter-spacing:\.12em[^}]*color:var\(--acc\)/);
+  assert.match(css, /\.task-goal-title\s*\{[^}]*font-size:14px[^}]*font-weight:600[^}]*white-space:normal[^}]*overflow-wrap:anywhere[^}]*-webkit-line-clamp:2/);
+  assert.match(css, /\.task-header\s*\{[^}]*flex-wrap:wrap[^}]*min-width:0/);
+  assert.match(css, /\.work-status\s*\{[^}]*max-width:100%[^}]*overflow-wrap:anywhere/);
+  const phoneStart = css.indexOf("@media (max-width:700px)");
+  assert.match(css.slice(phoneStart), /\.task-goal\s*\{\s*flex-basis:100%/);
+});
 
 for (const phone of [false, true]) for (const mode of ["live", "replay", "history", "cold"]) {
   const label = mode + " " + (phone ? "phone" : "desktop");
@@ -379,8 +452,8 @@ test("live result and structured progress share one card; clocks use numeric ela
   assert.ok(card.querySelector("summary").textContent.includes("read_file Cargo.toml"));
   const clock = vm.runInContext("subagentClocks.get(activityCard)", Object.assign(h.context, { activityCard: card }));
   clock.paint(6000);
-  assert.ok(panel.querySelector(".task-identity").textContent.includes("14s"));
-  assert.ok(!panel.querySelector(".task-identity").textContent.includes("999s"));
+  assert.ok(panel.querySelector(".task-status").textContent.includes("14s"));
+  assert.ok(!panel.querySelector(".task-status").textContent.includes("999s"));
   const done = { ...progress, active: false, status: "running", output: "exact completed bytes\n" };
   h.emit("live", "raw completion", "task_wait", { task_report: report([done]) });
   assert.equal(details.open, false, "active=false is authoritative even when status text says running");
@@ -488,7 +561,7 @@ test("a painted-open progress fold is not remembered as a reader expansion", () 
     "a reader expansion must survive");
 });
 
-test("truncated unrelated tools keep their existing notices and task CSS stays unchanged", () => {
+test("truncated unrelated tools keep their existing notices and task text retains raw wrapping", () => {
   const h = harness();
   assert.equal(h.emit("live", terminalPayload, "read_file", { arguments: "{", arguments_truncated: true, output_truncated: true, ok: false }), null);
   assert.ok(h.root.querySelector(".prog").textContent.includes(terminalPayload));
@@ -522,8 +595,8 @@ test("later progress and replay previews preserve a complete delivered result an
 test("unknown task timing stays absent instead of inventing an elapsed counter", () => {
   const h = harness(), expected = reportedTask("task_unknown_time", { active: true, output: undefined, elapsed_ms: undefined });
   h.emit("live", "raw", "task_wait", { task_report: report([expected]) });
-  const identity = taskCard(h).querySelector(".task-identity").textContent;
-  assert.ok(identity.endsWith("completed"));
+  const status = taskCard(h).querySelector(".task-status").textContent;
+  assert.equal(status, "done");
 });
 
 for (const mode of ["live", "replay", "history", "cold"]) {
@@ -626,7 +699,7 @@ test("raw task tools keep every byte while the duplicate preview and payload sta
   assert.equal(panel.querySelector(".task-count").textContent, "subagents · 1 task · 0 active");
   assert.equal(panel.querySelector(".task-wait").textContent, "wait · parked · waited 0s");
   assert.ok(panel.querySelector(".task-meta").textContent.includes("task_id: task_raw_payload"));
-  assert.ok(panel.querySelector(".task-identity").textContent.includes("completed"));
+  assert.ok(panel.querySelector(".task-status").textContent.includes("done"));
   assert.match(panel.parentNode.querySelector("summary").textContent, /subagents · 1 task · complete/);
 
   const rawCard = h.root.querySelectorAll(".msg.asst").find((card) => card.dataset.taskRawTool === "true");
@@ -634,7 +707,8 @@ test("raw task tools keep every byte while the duplicate preview and payload sta
   assert.equal(rawCard.dataset.taskMerged, "true", "a live report always owns the dedicated card");
   assert.equal(rawCard.querySelector(".prog").textContent, raw, "raw output must stay verbatim");
   assert.ok(rawCard.querySelector(".task-output"), "the duplicate structured preview stays in the DOM for readers");
-  assert.match(css, /\.msg \.task-output \.task-identity\s*\{[^}]*border-top/);
+  assert.match(css, /\.msg \.task-output \.task-block\s*\{[^}]*border:1px solid var\(--line\)/);
+  assert.match(css, /\.msg \.task-output \.task-identity\s*\{[^}]*color:var\(--dim\)[^}]*font-size:12px/);
   assert.match(css, /\.msg \.task-output \.task-meta\s*\{[^}]*font-size:\s*12px/);
   assert.match(css, /\[data-task-raw-tool="true"\]\[data-task-merged="true"\]:has\(\+ \.msg\.asst\[data-subagents="true"\]\) > \.task-output\s*\{\s*display:none;\s*\}/);
   assert.match(css, /\.execution-items > \.msg\.asst\[data-task-raw-tool="true"\]\[data-task-merged="true"\]:has\(~ \.msg\.asst\[data-subagents="true"\]\) > \.task-output\s*\{\s*display:none;\s*\}/);
@@ -752,8 +826,8 @@ for (const phone of [false, true]) {
       const panel = taskCard(h), details = panel.querySelector("details");
       assert.ok(details, "full output and progress have their own disclosure");
       assert.equal(details.open, false);
-      const visible = panel.children.filter((row) => row.tagName !== "DETAILS").map((row) => row.textContent).join("\n");
-      for (const metadata of [done.task_id, done.status, done.description]) assert.ok(visible.includes(metadata));
+      const visible = visibleTaskText(panel);
+      for (const metadata of [done.task_id, "done", done.description]) assert.ok(visible.includes(metadata));
       for (const body of [done.output, done.progress.latest_activity, done.progress.checkpoint_excerpt]) assert.ok(!visible.includes(body));
       assert.equal(details.querySelector(".task-output-body").textContent, done.output);
       assert.ok(details.textContent.includes(done.progress.checkpoint_excerpt));
@@ -767,7 +841,7 @@ for (const phone of [false, true]) {
           checkpoint_summary: "saved progress\n" + "long summary ".repeat(100), checkpoint_excerpt: "full checkpoint ".repeat(100) } }));
       h.emit(mode, "active raw", "task_wait", { task_report: report(tasks) });
       const panel = taskCard(h);
-      const visible = panel.children.filter((row) => row.tagName !== "DETAILS").map((row) => row.textContent).join("\n");
+      const visible = visibleTaskText(panel);
       for (const task of tasks) {
         assert.ok(visible.includes(task.task_id)); assert.ok(visible.includes("reading files"));
         assert.ok(!visible.includes(task.progress.latest_activity)); assert.ok(!visible.includes(task.progress.checkpoint_excerpt));
@@ -837,7 +911,7 @@ for (const phone of [false, true]) for (const mode of ["live", "replay", "histor
     h.emit(mode, "terminal metadata", "task_wait", { id: "no-output-done", task_report: report([{ ...active, active: false, status: "completed" }]) });
     h.emit(mode, "late active snapshot", "task_status", { id: "no-output-late", task_report: report([active], { snapshot: true }) });
     assert.equal(taskCard(h).parentNode.dataset.taskBusy, "false");
-    assert.ok(taskCard(h).querySelector(".task-identity").textContent.includes("completed"));
+    assert.ok(taskCard(h).querySelector(".task-status").textContent.includes("done"));
     if (mode === "history" || mode === "cold") h.context.executionGroupsFor(h.root, true).sync();
     const early = h.root.querySelectorAll(".prog").find((node) => node.textContent === "early active snapshot").closest(".msg.asst");
     assert.equal(early._taskResult.busy, true);

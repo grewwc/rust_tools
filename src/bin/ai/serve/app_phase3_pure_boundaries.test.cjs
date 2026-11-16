@@ -968,7 +968,7 @@ async function taskHistoryDoesNotAge(source) {
     const task = h.reportedTask("frozen", { active: true, output: undefined, elapsed_ms: 5000, progress: { stale_for_ms: 1000 } });
     h.emit(mode, "history raw 999s", "task_status", { task_report: h.report([task], { snapshot: true, operation: "task_status" }) });
     const panel = h.taskCard(h);
-    assert.match(panel.querySelector(".task-identity").textContent, /5s/);
+    assert.match(panel.querySelector(".task-status").textContent, /5s/);
     assert.match(panel.querySelector(".task-meta").nextElementSibling?.textContent || panel.textContent, /1s ago/);
     assert.equal(vm.runInContext("tickingSubagents.size", h.context), 0);
     assert.ok(observed.records && Array.from(observed.records.values()).every((row) => row.at === 0));

@@ -2043,6 +2043,7 @@ test("user image references stay visible as placeholders; assistant media stays 
 test("image reread followups stay internal without losing real prompts or canonical indices", () => {
   const h = harness(), rendered = [];
   const chunks = [
+    ["const PLAN_RESULT_TOOLS", "const TASK_RESULT_TOOLS"],
     ["function textOf(", "const PHONE_LAYOUT_QUERY"],
     ["function historyRowsOf(", "function attachLiveBox("],
     ["function questionRowsOf(", "async function openQuestionPanel("],

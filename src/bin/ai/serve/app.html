@@ -316,20 +316,72 @@ select, summary { touch-action:manipulation; }
 #sidenote { display:none; }
 .msg .prog { font-size:13px; color:var(--dim); }
 .msg.git-output .prog { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:var(--fg); }
+/* Plan cards share the tool disclosure; raw arguments and output stay nested. */
+.msg .plan-card { min-width:0; padding:8px 0 4px; color:var(--fg); font-size:13px; line-height:1.5; white-space:normal; }
+.msg .plan-header { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px 12px; min-width:0; }
+.msg .plan-title { border-inline-start:2px solid var(--acc); padding-inline-start:9px; font-size:14px; font-weight:600; }
+.msg .plan-header-status { display:flex; align-items:center; flex-wrap:wrap; gap:8px; min-width:0; }
+.msg .plan-count { color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums; }
+.msg .plan-summary { margin:9px 0; color:var(--fg); overflow-wrap:anywhere; white-space:pre-wrap; }
+.msg .work-status { display:inline-flex; align-items:center; gap:5px; max-width:100%; padding:2px 7px; border:1px solid var(--line);
+  border-radius:999px; color:var(--dim); font-size:11px; line-height:1.4; font-weight:500; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
+.msg .work-status[data-state="running"] { color:var(--acc); border-color:var(--acc-line-soft); background:var(--tint-2); }
+.msg .work-status[data-state="running"]::before { content:""; flex:0 0 auto; width:5px; height:5px; border-radius:50%; background:var(--acc); animation:work-pulse 2s ease-in-out infinite; }
+.msg .work-status[data-state="done"] { color:var(--acc); }
+.msg .work-status[data-state="failed"] { color:var(--err); }
+.msg .work-status[data-state="attention"] { color:var(--mark); }
+.msg .plan-progress { display:flex; height:4px; border-radius:999px; overflow:hidden; background:var(--surface-2); margin:10px 0 5px; }
+.msg .plan-progress-segment { flex:0 0 auto; min-width:0; height:100%; }
+.msg .plan-progress-segment[data-state="done"] { background:var(--acc); }
+.msg .plan-progress-segment[data-state="running"] { background:var(--acc-soft-2); opacity:.55; animation:work-pulse 2s ease-in-out infinite; }
+.msg .plan-progress-segment[data-state="failed"] { background:var(--err); }
+.msg .plan-progress-segment[data-state="skipped"] { background:var(--line-2); }
+.msg .plan-counts, .msg .plan-hint, .msg .plan-message { color:var(--dim); font-size:11px; margin:5px 0 9px; overflow-wrap:anywhere; }
+.msg .plan-message[data-state="failed"] { color:var(--err); }
+.msg .plan-group { margin-top:10px; min-width:0; }
+.msg .plan-group-title { font-size:11px; color:var(--dim); font-weight:500; margin-bottom:4px; }
+.msg .plan-group[data-state="failed"] > .plan-group-title { color:var(--err); }
+.msg .plan-step { display:grid; grid-template-columns:12px 3ch minmax(0,1fr); gap:7px; min-width:0; padding:8px 9px;
+  border-inline-start:2px solid transparent; border-radius:7px; margin:3px 0; }
+.msg .plan-step.plan-hero { background:var(--surface-2); margin-top:10px; }
+.msg .plan-step[data-state="running"] { background:var(--tint-2); background:color-mix(in srgb, var(--acc) 9%, transparent); border-inline-start-color:var(--acc); }
+.msg .plan-step[data-state="failed"] { border-inline-start-color:var(--err); }
+.msg .plan-step-glyph, .msg .plan-step-number { color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums; line-height:1.65; }
+.msg .plan-step-glyph[data-state="running"], .msg .plan-step-glyph[data-state="done"] { color:var(--acc); }
+.msg .plan-step-glyph[data-state="failed"] { color:var(--err); }
+.msg .plan-step-content { min-width:0; }
+.msg .plan-step-heading { display:flex; flex-wrap:wrap; align-items:center; gap:5px; margin-bottom:3px; min-width:0; }
+.msg .plan-tool { display:inline-block; max-width:100%; border:1px solid var(--line); border-radius:4px; padding:0 5px;
+  color:var(--dim); font-size:10px; line-height:1.6; overflow-wrap:anywhere; }
+.msg .plan-step-action { color:var(--dim); white-space:pre-wrap; overflow-wrap:anywhere; }
+.msg .plan-step[data-state="running"] .plan-step-action, .msg .plan-hero .plan-step-action { color:var(--fg); font-weight:600; }
+.msg .plan-step-note, .msg .plan-step-reason { margin-top:4px; color:var(--dim); font-size:11px; white-space:pre-wrap; overflow-wrap:anywhere; }
+.msg .plan-warning { margin:8px 0; border-inline-start:2px solid var(--mark); padding-inline-start:8px; color:var(--mark); font-size:12px; white-space:pre-wrap; overflow-wrap:anywhere; }
+.msg .plan-raw { margin-top:9px; border-top:1px solid var(--line); }
+.msg .plan-raw > summary { font-size:11px; padding:5px 0; }
+.msg .plan-raw > .prog { max-height:44vh; overflow:auto; overscroll-behavior:contain; white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; }
+@keyframes work-pulse { 0%,100% { opacity:.55; } 50% { opacity:1; } }
 /* Task reports keep every row but read as one compact report: a summary
-   header, then each task's identity, description and progress, with debug
+   header, then each task's goal, status and progress, with identity and debug
    metadata demoted below. Raw tool payloads stay in their own disclosure. */
-.msg .task-output { display:flex; flex-direction:column; gap:3px; min-width:0; margin-top:4px;
+.msg .task-output { display:flex; flex-direction:column; gap:8px; min-width:0; margin-top:4px;
   font-size:13px; color:var(--dim); white-space:pre-wrap; overflow-wrap:anywhere; }
 .msg .task-output .task-count { color:var(--fg); font-weight:600; margin-bottom:2px; }
 .msg .task-output .task-wait { color:var(--fg); }
-.msg .task-output .task-identity {
-  color:var(--fg); font-weight:600; margin-top:8px; padding-top:7px;
-  border-top:1px solid var(--line);
-}
+.msg .task-output .task-block { min-width:0; border:1px solid var(--line); border-radius:11px; padding:10px 11px; background:transparent; }
+.msg .task-output .task-block[data-state="running"] { border-inline-start:2px solid var(--acc); background:var(--tint-2); }
+.msg .task-output .task-block[data-state="failed"] { border-inline-start:2px solid var(--err); }
+.msg .task-output .task-header { display:flex; align-items:flex-start; justify-content:space-between; flex-wrap:wrap; gap:7px 10px; min-width:0; white-space:normal; }
+.msg .task-output .task-goal { flex:1 1 220px; min-width:0; }
+.msg .task-output .task-label { font-size:10px; letter-spacing:.12em; line-height:1.5; color:var(--acc); margin-bottom:3px; }
 .msg .task-output .task-description { color:var(--fg); }
+.msg .task-output .task-goal-title { font-size:14px; font-weight:600; line-height:1.5; white-space:normal; overflow-wrap:anywhere;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.msg .task-output .task-status { flex:0 1 auto; margin-inline-start:auto; white-space:normal; }
+.msg .task-output .task-content { display:flex; flex-direction:column; gap:3px; min-width:0; margin-top:7px; }
+.msg .task-output .task-identity { color:var(--dim); font-size:12px; font-weight:450; }
 .msg .task-output .task-progress {
-  padding-inline-start:10px; border-inline-start:2px solid var(--acc-line-soft);
+  font-size:12px; padding-inline-start:8px; border-inline-start:1px solid var(--acc-line-soft);
 }
 .msg .task-output .task-meta { font-size:12px; }
 .msg .task-output .task-output-body {
@@ -1276,6 +1328,9 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #questionbtn.show { display:grid; }
   .msg { max-width:94%; padding:6px 10px; border-radius:12px; line-height:1.5; scroll-margin-block:8px; }
   .msg.asst[data-task-raw-tool="true"] > details[open] > .prog { overscroll-behavior-y:auto; }
+  .msg .plan-step { grid-template-columns:10px 2.5ch minmax(0,1fr); gap:5px; padding:7px 6px; }
+  .msg .task-output .task-block { padding:9px 10px; }
+  .msg .task-output .task-goal { flex-basis:100%; }
   .msg details summary { min-height:30px; padding:6px 2px; }
   .execution-group > details > .execution-items { padding:8px; }
   .msg.md .p { margin:4px 0; }
@@ -1341,6 +1396,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 @media (prefers-reduced-motion:reduce) { #skillmenu { animation:none; } }
 @media (prefers-reduced-motion:reduce) { #cmdmenu { animation:none; } }
 @media (prefers-reduced-motion:reduce) { #teampickpanel, #teampickscrim { animation:none; } }
+@media (prefers-reduced-motion:reduce) { .msg .work-status[data-state="running"]::before, .msg .plan-progress-segment[data-state="running"] { animation:none; } }
 /* Server-side images in a reply: the path text stays, the fetched picture
    sits under it (see decorateMedia in the script below). */
 .mediaprev { display:block; margin:6px 0; }
@@ -4682,6 +4738,312 @@ function callLabel(call) {
   if (other) return name + " " + shortLine(other, 64);
   return name;
 }
+const PLAN_RESULT_TOOLS = new Set(["plan", "plan_update"]);
+const PLAN_STEP_STATES = ["pending", "running", "done", "failed", "skipped"];
+function planSuffixOf(status, note) {
+  const value = typeof note === "string" ? note.trim() : "";
+  if (status === "pending") return value ? " (" + value + ")" : "";
+  return " (" + status + (value ? ", note: " + value : "") + ")";
+}
+function planSuffixState(suffix) {
+  if (!suffix) return { status: "pending", note: "" };
+  const status = /^ \((running|done|failed|skipped)(?:, note: ([\s\S]*))?\)$/.exec(suffix);
+  if (status) return { status: status[1], note: status[2] || "" };
+  const pending = /^ \(([\s\S]*)\)$/.exec(suffix);
+  return pending ? { status: "pending", note: pending[1] } : null;
+}
+function planProgressOf(line) {
+  const match = /^Progress: (\d+)\/(\d+) steps done((?:, \d+ (?:running|failed|skipped))*)\.$/.exec(line);
+  if (!match) return null;
+  const counts = { done: Number(match[1]), total: Number(match[2]), running: 0, failed: 0, skipped: 0, pending: null };
+  const seen = new Set();
+  for (const item of match[3].matchAll(/, (\d+) (running|failed|skipped)/g)) {
+    if (seen.has(item[2])) return null;
+    seen.add(item[2]); counts[item[2]] = Number(item[1]);
+  }
+  return Object.values(counts).every((value) => value === null || Number.isSafeInteger(value))
+    && counts.total > 0 && counts.done + counts.running + counts.failed + counts.skipped <= counts.total ? counts : null;
+}
+function planCountsMatch(rows, counts) {
+  return ["done", "running", "failed", "skipped"].every((status) => rows.filter((row) => row.status === status).length === counts[status]);
+}
+function planStepInputOf(args) {
+  if (!Array.isArray(args.steps) || !args.steps.length || args.steps.length > 20) return null;
+  if (args.steps.some((step) => !step || !Number.isSafeInteger(step.step) || step.step < 0 || typeof step.action !== "string"
+    || (step.tool !== undefined && typeof step.tool !== "string") || (step.reason !== undefined && typeof step.reason !== "string"))) return null;
+  return args.steps.map((step) => ({ ...step, tool: step.tool ?? "unspecified", reason: step.reason || "" }));
+}
+// Exact argument prose establishes boundaries even when actions and reasons
+// contain newlines, parentheses or strings that look like result fields.
+function exactPlanStepsOf(body, steps) {
+  const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const headline = (step) => "Step " + step.step + ". [" + step.tool + "]" + (step.delegate ? " [delegate]" : "") + " " + step.action;
+  const tailOf = (tail, step) => {
+    let suffix = tail.trimEnd();
+    if (step.reason) {
+      const reason = new RegExp("\\n[ \\t]*Reason: " + escape(step.reason) + "[ \\t\\r\\n]*$").exec(tail);
+      if (!reason) return null;
+      suffix = tail.slice(0, reason.index).trimEnd();
+    }
+    return planSuffixState(suffix);
+  };
+  const rows = [];
+  let cursor = 0;
+  for (const [index, step] of steps.entries()) {
+    const prefix = new RegExp("^[ \\t\\r\\n]*(?:\\|\\|[ \\t]*)?" + escape(headline(step))).exec(body.slice(cursor));
+    if (!prefix) return null;
+    cursor += prefix[0].length;
+    let end = body.length, state;
+    if (index + 1 < steps.length) {
+      const next = new RegExp("^[ \\t]*(?:\\|\\|[ \\t]*)?" + escape(headline(steps[index + 1])), "gm");
+      const candidates = [];
+      next.lastIndex = cursor;
+      for (let match; (match = next.exec(body));) {
+        const candidate = tailOf(body.slice(cursor, match.index), step);
+        if (candidate) candidates.push({ end: match.index, state: candidate });
+      }
+      if (candidates.length !== 1) return null;
+      ({ end, state } = candidates[0]);
+    } else state = tailOf(body.slice(cursor), step);
+    if (!state) return null;
+    rows.push({ step: step.step, tool: step.tool, action: step.action, reason: step.reason, ...state });
+    cursor = end;
+  }
+  return rows;
+}
+// Without exact step prose, accept only unambiguous headline/reason blocks.
+// Multiline action boundaries cannot be recovered reliably from free text.
+function loosePlanStepsOf(body, args = {}) {
+  const token = "\u0000plan-note\u0000";
+  if (body.includes(token)) return null;
+  const note = typeof args.note === "string" ? args.note.trim() : "";
+  const knownSuffix = PLAN_STEP_STATES.includes(args.status) ? planSuffixOf(args.status, note) : "";
+  if (note && knownSuffix) body = body.split(knownSuffix).join(planSuffixOf(args.status, token));
+  const rows = [];
+  let current = null;
+  for (const line of body.split("\n")) {
+    if (!line.trim()) continue;
+    const head = /^[ \t]*(?:\|\|[ \t]*)?Step (\d+)\. \[([^\]\n]*)\](?: \[delegate\])? (.*)$/.exec(line);
+    if (head) {
+      const step = Number(head[1]);
+      if (!Number.isSafeInteger(step)) return null;
+      let action = head[3], state;
+      const suffix = / \((running|done|failed|skipped)(?:, note: (.*))?\)$/.exec(action);
+      // Reject unfinished annotations before their continuations can become
+      // reason fields. Exact argument-backed notes were protected above.
+      if (!suffix && / \((?:running|done|failed|skipped)(?:, note:.*)?$/.test(action)) return null;
+      if (step === args.step && PLAN_STEP_STATES.includes(args.status) && typeof args.note === "string") {
+        const suffix = planSuffixOf(args.status, note ? token : "");
+        if (suffix && !action.endsWith(suffix)) return null;
+        if (suffix) action = action.slice(0, -suffix.length);
+        state = { status: args.status, note };
+      } else {
+        state = suffix ? { status: suffix[1], note: suffix[2] === token ? note : suffix[2] || "" } : { status: "pending", note: "" };
+        if (suffix) action = action.slice(0, suffix.index);
+      }
+      current = { step, tool: head[2], action, reason: "", ...state };
+      rows.push(current);
+    } else {
+      // The producer indents reason fields by exactly two spaces.
+      const reason = /^  Reason: (.*)$/.exec(line);
+      if (!reason || !current || current.reason) return null;
+      // A status annotation on a continuation may belong to a multiline
+      // action or note, so the row's boundary cannot be recovered safely.
+      if (/ \((?:running|done|failed|skipped)(?:, note:.*)?\)?$/.test(reason[1])) return null;
+      current.reason = reason[1];
+    }
+  }
+  return rows;
+}
+function projectPlanTool(call, output, options = {}) {
+  const name = call?.function?.name;
+  if (!PLAN_RESULT_TOOLS.has(name)) return null;
+  const args = toolArgsOf(call), input = planStepInputOf(args);
+  const raw = typeof output === "string" ? output : "";
+  const truncated = options.outputTruncated === true || options.argumentsTruncated === true || options.historyCapped === true;
+  const result = { title: name === "plan" ? "Plan" : "Plan update", summary: "", state: "attention", counts: null,
+    steps: [], failed: [], remaining: [], hero: null, warnings: [], message: "", truncated, fallback: false };
+  const fallback = (message, state = "attention") => ({ ...result, state, counts: null, steps: [], failed: [], remaining: [], hero: null,
+    noneRemaining: false, fallback: true, message });
+  if (options.interrupted) return fallback("Plan tool " + options.interrupted + ".");
+  if (options.started) {
+    result.state = "preparing";
+    result.summary = typeof args.summary === "string" ? args.summary : "";
+    if (name === "plan" && input) {
+      result.steps = input.map((step) => ({ ...step, status: "pending", note: "" }));
+      if (!truncated) result.counts = { total: input.length, done: 0, running: 0, failed: 0, skipped: 0, pending: input.length };
+    } else result.message = Number.isSafeInteger(args.step) ? "Updating step " + args.step + " · waiting for the result." : "Waiting for the plan result.";
+    return result;
+  }
+  if (/^(?:Error:|Step \d+ not found in the active plan\.|No active plan in this session)/.test(raw.trimStart()) || options.ok === false) {
+    return fallback(shortLine(raw, 260) || "Plan tool failed.", "failed");
+  }
+  try {
+    let body = raw.trim();
+    while (body.startsWith("Warning:")) {
+      const end = body.indexOf("\n");
+      if (end < 0) return fallback(body);
+      result.warnings.push(body.slice(0, end)); body = body.slice(end + 1).trimStart();
+    }
+    if (name === "plan" && input && typeof args.summary === "string" && args.summary) {
+      const prefix = "Plan: " + args.summary + "\n";
+      if (!body.startsWith(prefix)) return fallback("Plan prose could not be matched to its arguments.");
+      result.summary = args.summary; body = body.slice(prefix.length).trimStart();
+    } else if (body.startsWith("Plan: ")) {
+      const end = /\n(?=(?:[ \t]*(?:\|\|[ \t]*)?Step \d+\.|Progress:))/.exec(body);
+      if (!end) return fallback("Plan details are available in Raw.");
+      result.summary = body.slice(6, end.index); body = body.slice(end.index + 1);
+    }
+    if (name === "plan") {
+      const footer = [...body.matchAll(/(?:^|\n)---\n(\d+) step\(s\) planned\./g)].at(-1);
+      if (!footer) return fallback("Plan details are available in Raw.");
+      const total = Number(footer[1]);
+      const trailing = body.slice(footer.index);
+      result.warnings.push(...trailing.split("\n").filter((line) => line.startsWith("Warning:")));
+      body = body.slice(0, footer.index);
+      if (body.startsWith("Progress:")) {
+        const end = body.indexOf("\n");
+        result.counts = planProgressOf(body.slice(0, end < 0 ? undefined : end));
+        if (!result.counts) return fallback("Plan progress could not be read reliably.");
+        body = end < 0 ? "" : body.slice(end + 1);
+      }
+      const rows = input && !options.argumentsTruncated ? exactPlanStepsOf(body, input) : loosePlanStepsOf(body);
+      if (!rows || !Number.isSafeInteger(total) || total < 1 || rows.length !== total || (input && !options.argumentsTruncated && input.length !== total)) {
+        return fallback("Plan step boundaries could not be read reliably.");
+      }
+      result.steps = rows;
+      if (!result.counts) {
+        if (rows.some((row) => row.status !== "pending")) return fallback("Plan progress could not be read reliably.");
+        result.counts = { total, done: 0, running: 0, failed: 0, skipped: 0, pending: total };
+      } else if (result.counts.total !== total || !planCountsMatch(rows, result.counts)) return fallback("Plan counts do not match the listed steps.");
+      result.counts.pending = rows.filter((row) => row.status === "pending").length;
+    } else {
+      // Protect an exact update note before locating structural group markers.
+      const token = "\u0000update-note\u0000";
+      if (body.includes(token)) return fallback("Plan details are available in Raw.");
+      const note = typeof args.note === "string" ? args.note.trim() : "";
+      const suffix = note && PLAN_STEP_STATES.includes(args.status) ? planSuffixOf(args.status, note) : "";
+      if (suffix) body = body.split(suffix).join(planSuffixOf(args.status, token));
+      const progress = [...body.matchAll(/^Progress: [^\n]*$/gm)];
+      if (progress.length !== 1 || !(result.counts = planProgressOf(progress[0][0]))) return fallback("Plan progress could not be read reliably.");
+      const before = body.slice(0, progress[0].index);
+      const after = body.slice(progress[0].index + progress[0][0].length).trim();
+      const markers = [...after.matchAll(/^(Failed steps:|Remaining steps:|Remaining steps: none\.)$/gm)];
+      if (!markers.length || markers.at(-1)[1] === "Failed steps:" || markers.filter((match) => match[1].startsWith("Remaining")).length !== 1
+        || markers.filter((match) => match[1] === "Failed steps:").length > 1 || after.slice(0, markers[0].index).trim()) {
+        return fallback("Plan groups could not be read reliably.");
+      }
+      const parse = (text) => loosePlanStepsOf(text.split(token).join(note), args);
+      const changed = parse(before);
+      if (!changed || changed.length > 1 || changed.some((row) => !["done", "skipped"].includes(row.status) || !result.counts[row.status])) {
+        return fallback("Plan update details are available in Raw.");
+      }
+      for (const [index, marker] of markers.entries()) {
+        const text = after.slice(marker.index + marker[0].length, markers[index + 1]?.index ?? after.length);
+        const rows = parse(text);
+        if (!rows || (marker[1] === "Remaining steps: none." ? rows.length : !rows.length)) return fallback("Plan step boundaries could not be read reliably.");
+        if (marker[1] === "Failed steps:") result.failed = rows;
+        else { result.remaining = rows; result.noneRemaining = marker[1] === "Remaining steps: none."; }
+      }
+      if (result.failed.some((row) => row.status !== "failed") || result.remaining.some((row) => !["pending", "running"].includes(row.status))
+        || result.failed.length !== result.counts.failed || result.remaining.filter((row) => row.status === "running").length !== result.counts.running
+        || result.remaining.length !== result.counts.total - result.counts.done - result.counts.failed - result.counts.skipped) {
+        return fallback("Plan counts do not match the listed steps.");
+      }
+      const rows = [...changed, ...result.failed, ...result.remaining];
+      if (Number.isSafeInteger(args.step) && PLAN_STEP_STATES.includes(args.status)) {
+        const matches = rows.filter((row) => row.step === args.step);
+        if (matches.length !== 1 || matches[0].status !== args.status) return fallback("The changed step could not be identified reliably.");
+        result.hero = matches[0];
+      } else result.hero = changed[0] || null;
+      result.failed = result.failed.filter((row) => row !== result.hero);
+      result.remaining = result.remaining.filter((row) => row !== result.hero);
+    }
+    const counts = result.counts;
+    result.state = counts.failed ? "failed" : counts.running ? "running" : result.warnings.length ? "attention"
+      : counts.done + counts.skipped === counts.total ? "done" : "pending";
+    if (truncated) { result.counts = null; if (result.state !== "failed") result.state = "attention"; }
+    return result;
+  } catch (_) { return fallback("Plan details are available in Raw."); }
+}
+function planRawText(call, output, options = {}) {
+  const rawArgs = call?.function?.arguments;
+  const args = typeof rawArgs === "string" ? rawArgs : rawArgs && typeof rawArgs === "object" ? JSON.stringify(rawArgs, null, 2) : "";
+  return (args ? "Arguments\n" + args + (options.argumentsTruncated ? "\n[preview truncated]" : "") + "\n\n" : "")
+    + output + (options.outputTruncated ? "\n[preview truncated; full output in history]" : "");
+}
+function renderPlanToolResult(fold, result) {
+  if (!result) return;
+  const node = (tag, className, text, parent) => {
+    const el = document.createElement(tag); el.className = className;
+    if (text !== undefined) el.textContent = text;
+    if (parent) parent.appendChild(el);
+    return el;
+  };
+  if (!fold.planCard) {
+    const outer = fold.box.querySelector("details");
+    fold.planCard = node("div", "plan-card", undefined, outer);
+    fold.planRaw = node("details", "plan-raw", undefined, outer);
+    node("summary", "", "Raw", fold.planRaw);
+    fold.planRaw.appendChild(fold.body);
+    if (outer.dataset.foldKey && typeof foldOpenByKey !== "undefined") {
+      const key = outer.dataset.foldKey + ":plan-raw";
+      fold.planRaw.dataset.foldKey = key;
+      fold.planRaw.open = foldOpenByKey.get(key) === true;
+      fold.planRaw.addEventListener("toggle", () => foldOpenByKey.set(key, fold.planRaw.open));
+    }
+  }
+  const card = fold.planCard;
+  card.textContent = ""; card.dataset.state = result.state;
+  const header = node("div", "plan-header", undefined, card);
+  node("div", "plan-title", result.title, header);
+  const status = node("div", "plan-header-status", undefined, header);
+  const badge = node("span", "plan-state work-status", result.state, status); badge.dataset.state = result.state;
+  if (result.counts) node("span", "plan-count", result.counts.done + "/" + result.counts.total, status);
+  if (result.summary) node("div", "plan-summary", result.summary, card);
+  if (result.truncated) node("div", "plan-hint", "truncated · partial preview", card);
+  if (result.counts) {
+    const counts = result.counts;
+    const bar = node("div", "plan-progress", undefined, card);
+    bar.title = counts.done + "/" + counts.total + " done";
+    const labels = [];
+    for (const state of ["done", "running", "failed", "skipped"]) if (counts[state]) {
+      const segment = node("div", "plan-progress-segment", undefined, bar);
+      segment.dataset.state = state; segment.style.width = counts[state] / counts.total * 100 + "%";
+      labels.push(counts[state] + " " + state);
+    }
+    if (counts.pending !== null && counts.pending) labels.push(counts.pending + " pending");
+    node("div", "plan-counts", labels.join(" · ") || "0 done", card);
+  }
+  const step = (row, parent, hero = false) => {
+    const line = node("div", "plan-step" + (hero ? " plan-hero" : ""), undefined, parent);
+    line.dataset.state = row.status; line.dataset.step = String(row.step);
+    const glyph = node("span", "plan-step-glyph", { pending: "○", running: "●", done: "✓", failed: "×", skipped: "–" }[row.status] || "·", line);
+    glyph.dataset.state = row.status;
+    node("span", "plan-step-number", String(row.step), line);
+    const content = node("div", "plan-step-content", undefined, line);
+    const heading = node("div", "plan-step-heading", undefined, content);
+    if (row.tool) node("span", "plan-tool", row.tool, heading);
+    if (hero || row.status === "running" || row.status === "failed") {
+      const state = node("span", "work-status", row.status, heading); state.dataset.state = row.status;
+    }
+    node("div", "plan-step-action", row.action, content);
+    if (row.note) node("div", "plan-step-note", row.note, content);
+    if (row.reason && ["running", "failed"].includes(row.status)) node("div", "plan-step-reason", "Reason: " + row.reason, content);
+  };
+  if (result.hero) step(result.hero, card, true);
+  for (const warning of result.warnings) node("div", "plan-warning", warning, card);
+  for (const row of result.steps) step(row, card);
+  for (const [title, rows, state] of [["Failed steps", result.failed, "failed"], ["Remaining steps", result.remaining, "pending"]]) if (rows.length) {
+    const group = node("div", "plan-group", undefined, card); group.dataset.state = state;
+    node("div", "plan-group-title", title, group);
+    for (const row of rows) step(row, group);
+  }
+  if (result.noneRemaining) node("div", "plan-message", result.state === "failed" ? "No remaining steps · failed steps need attention." : "No remaining steps.", card);
+  if (result.message) { const message = node("div", "plan-message", result.message, card); message.dataset.state = result.state; }
+  if (result.fallback && !fold._planFallback) fold.planRaw.open = true;
+  fold._planFallback = result.fallback;
+}
 const TASK_RESULT_TOOLS = new Set(["task_spawn", "task_wait", "task_status"]);
 // Historical prose has no authoritative task fields. Keep it as plain text.
 function legacyTaskToolText(call, output) {
@@ -4742,12 +5104,12 @@ function projectTaskReport(value, includeOutput = true) {
     const identity = [task.backend ? "[backend=" + text(task.backend) + "]" : "", text(task.agent),
       task.model ? "(" + text(task.model) + ")" : "", task.reasoning_effort ? "(effort: " + text(task.reasoning_effort) + ")" : ""]
       .filter(Boolean).join(" ");
-    add("identity", [identity, text(task.status) + (elapsed === null ? "" : " " + formatSubagentElapsed(Math.floor(elapsed / 1000)))]
-      .filter(Boolean).join(" · "), id);
-    if (text(task.description)) {
-      add("description", "task: " + task.description, id);
-      rows.at(-1).preview = "task: " + shortLine(task.description, 240);
-    }
+    const status = text(task.status), timing = elapsed === null ? "" : " " + formatSubagentElapsed(Math.floor(elapsed / 1000));
+    const taskState = task.error || ["failed", "error"].includes(status) ? "failed" : task.active ? "running"
+      : ["completed", "done"].includes(status) ? "done" : "neutral";
+    add("description", text(task.description) || "Task", id);
+    add("status", status + timing, id, (status === "completed" ? "done" : status) + timing);
+    add("identity", identity, id);
     add("meta", [id ? "task_id: " + id : "", pid === null ? "" : "pid: " + pid].filter(Boolean).join(" · "), id);
     const progress = task.progress;
     const progressStart = rows.length;
@@ -4779,6 +5141,7 @@ function projectTaskReport(value, includeOutput = true) {
     for (const row of rows.slice(firstRow)) {
       row.taskIndex = index;
       row.currentTask = !current || task.active || current.has(index);
+      row.taskState = taskState;
       if (row.kind === "output-body") row.preview = null;
     }
   }
@@ -4851,15 +5214,25 @@ function renderTaskToolResult(fold, result) {
     occurrences.set(identity, occurrence + 1);
     const key = identity + ":" + occurrence;
     if (!compact || row.preview !== null) rows.push({ ...row, key, text: compact ? row.preview ?? row.text : row.text });
-    if (compact && row.preview !== undefined && row.preview !== row.text) {
+    if (compact && ((row.preview !== undefined && row.preview !== row.text) || row.kind === "description")) {
       const taskKey = row.taskId || "index:" + row.taskIndex;
       if (!evidence.has(taskKey)) evidence.set(taskKey, { key: taskKey, taskId: row.taskId,
-        currentTask: row.currentTask, rows: [] });
+        taskIndex: row.taskIndex, taskState: row.taskState, currentTask: row.currentTask, rows: [] });
       evidence.get(taskKey).rows.push({ ...row, key });
     }
   }
   rows.push(...[...evidence.values()].map((task) => ({ ...task, key: "details:" + task.key, kind: "details" })));
-  const paintRows = (parent, projection) => {
+  const blocks = new Map(), grouped = [];
+  for (const row of rows) {
+    if (row.taskIndex === undefined) { grouped.push(row); continue; }
+    const key = "block:" + (row.taskId || "index:" + row.taskIndex);
+    if (!blocks.has(key)) {
+      const block = { ...row, key, kind: "block", rows: [] };
+      blocks.set(key, block); grouped.push(block);
+    }
+    blocks.get(key).rows.push(row);
+  }
+  const paintRows = (parent, projection, header = false) => {
     const nodes = parent._taskRows || (parent._taskRows = new Map());
     const retained = new Set();
     for (const [index, row] of projection.entries()) {
@@ -4873,7 +5246,31 @@ function renderTaskToolResult(fold, result) {
       line.dataset.taskId = row.taskId;
       line.dataset.taskBatchCurrent = String(row.currentTask !== false);
       line.dataset.taskCurrent = String(compact || row.currentTask !== false);
-      if (row.kind === "details") {
+      if (row.kind === "block") {
+        line.dataset.state = row.taskState;
+        if (!line._taskHeader) {
+          line._taskHeader = document.createElement("div"); line._taskHeader.className = "task-header";
+          line._taskContent = document.createElement("div"); line._taskContent.className = "task-content";
+          line.appendChild(line._taskHeader); line.appendChild(line._taskContent);
+        }
+        paintRows(line._taskHeader, row.rows.filter((item) => ["description", "status"].includes(item.kind)), true);
+        paintRows(line._taskContent, row.rows.filter((item) => !["description", "status"].includes(item.kind)));
+      } else if (header && row.kind === "description") {
+        line.className = "task-goal";
+        if (!line._taskTitle) {
+          const label = document.createElement("div"); label.className = "task-label"; label.textContent = "TASK";
+          line._taskTitle = document.createElement("div"); line._taskTitle.className = "task-description task-goal-title";
+          line.appendChild(label); line.appendChild(line._taskTitle);
+        }
+        line._taskTitle.dataset.taskId = row.taskId;
+        line._taskTitle.dataset.taskBatchCurrent = line.dataset.taskBatchCurrent;
+        line._taskTitle.dataset.taskCurrent = line.dataset.taskCurrent;
+        line._taskTitle.title = row.text;
+        if (line._taskTitle.textContent !== row.text) line._taskTitle.textContent = row.text;
+      } else if (header && row.kind === "status") {
+        line.className = "task-status work-status"; line.dataset.state = row.taskState;
+        if (line.textContent !== row.text) line.textContent = row.text;
+      } else if (row.kind === "details") {
         if (!line._taskBody) {
           const summary = document.createElement("summary");
           summary.textContent = "Full task details" + (row.taskId ? " · " + row.taskId : "");
@@ -4896,7 +5293,7 @@ function renderTaskToolResult(fold, result) {
     }
     for (const [key, line] of nodes) if (!retained.has(key)) { line.remove(); nodes.delete(key); }
   };
-  paintRows(fold.taskPreview, rows);
+  paintRows(fold.taskPreview, grouped);
   if (result.taskStates.length) fold.box.dataset.taskStates = JSON.stringify(result.taskStates);
   else delete fold.box.dataset.taskStates;
   if (result.busy === null) delete fold.box.dataset.taskBusy;
@@ -5739,6 +6136,8 @@ function createLiveActivity(parent, before, sid = sessionId, base = executionBas
     const args = tool.arguments ? "Arguments\n" + tool.arguments + (tool.arguments_truncated ? "\n[preview truncated]" : "") + "\n\n" : "";
     tool.fold.set(title, args + (tool.output || "")
       + (tool.output_truncated ? "\n[preview truncated; full output in history]" : ""));
+    renderPlanToolResult(tool.fold, projectPlanTool(call, tool.output, { started: tool.running, ok: tool.ok,
+      argumentsTruncated: tool.arguments_truncated, outputTruncated: tool.output_truncated }));
     if (taskResult) {
       tool.fold.box.dataset.taskRawTool = "true";
       tool.fold.box.dataset.taskMerged = "true";
@@ -5797,6 +6196,8 @@ function createLiveActivity(parent, before, sid = sessionId, base = executionBas
         tool.fold.box.dataset.executionException = tool.fold.box._executionException = "true";
         tool.fold.set(callLabel({ function: { name: tool.name, arguments: tool.arguments || "{}" } }) + " · " + reason,
           (tool.arguments || "") + "\n" + (tool.output || ""));
+        renderPlanToolResult(tool.fold, projectPlanTool({ function: { name: tool.name, arguments: tool.arguments || "{}" } }, tool.output,
+          { interrupted: reason, argumentsTruncated: tool.arguments_truncated, outputTruncated: tool.output_truncated }));
       }
       // A final answer settles earlier task snapshots without rewriting their
       // raw reports; an ended stream without an answer still keeps active work.
@@ -8638,8 +9039,12 @@ function renderHistoryRow(row, parent) {
         parent.appendChild(container);
       }
       const raw = textOf(m.content);
-      const body = policy.toolText(snapshot, raw, taskResult);
+      const planOptions = { ok: m.ok, outputTruncated: m.output_truncated,
+        argumentsTruncated: m.arguments_truncated || snapshot.call?.arguments_truncated || snapshot.call?.function?.arguments_truncated };
+      const planResult = projectPlanTool(snapshot.call, raw, planOptions);
+      const body = planResult ? planRawText(snapshot.call, raw, planOptions) : policy.toolText(snapshot, raw, taskResult);
       const fold = addFold(snapshot.call ? callLabel(snapshot.call) : FOLD_ROLE_LABELS[m.role] || m.role, body, container);
+      renderPlanToolResult(fold, planResult);
       if (m.role === "tool" || m.role === "internal_note") {
         if (m.tool_call_id) fold.box._historyToolCall = { id: m.tool_call_id, sessionId, base: executionBase() };
         executionBoxes.push(fold.box);
@@ -8664,6 +9069,7 @@ function renderHistoryRow(row, parent) {
     stored(fold, suffix = "") {
       const det = fold.box.querySelector("details");
       if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + foldIdentity + suffix);
+      if (fold.planRaw && typeof bindStoredFold === "function") bindStoredFold(fold.planRaw, sessionId + "\n" + foldIdentity + suffix + ":plan-raw");
       if (fold.taskPreview && typeof bindStoredFold === "function") {
         for (const details of fold.box.querySelectorAll("details")) if (details.dataset.taskDetailsKey) {
           bindStoredFold(details, sessionId + "\n" + foldIdentity + suffix + ":" + details.dataset.taskDetailsKey);

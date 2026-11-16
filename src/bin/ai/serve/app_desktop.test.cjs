@@ -2267,6 +2267,7 @@ test("desktop historical tool folds use canonical roles and preserve report surf
   // Opaque session IDs and payload text must not supply the canonical role.
   const h = harness({ sid: 'session\n["tool",prefix' });
   loadChat(h);
+  vm.runInContext(between("const PLAN_RESULT_TOOLS", "const TASK_RESULT_TOOLS"), h.context);
   vm.runInContext(between("function taskReportOf(", "function mergeTaskReport("), h.context);
   vm.runInContext(between("const FOLD_ROLE_LABELS", "// Live rates are display-only"), h.context);
   const messages = [

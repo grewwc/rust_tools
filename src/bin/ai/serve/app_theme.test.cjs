@@ -828,12 +828,12 @@ test("desktop rewind opacity and light metadata retain readable foregrounds", ()
 // user/queued-note footer matching the existing assistant footer declarations.
 // The snapshot includes the shared attachment summary and the intentional
 // paragraph-sized KaTeX rule with automatic overflow on both axes, plus the
-// mobile warm user timestamp color protected by its contrast test above.
+// mobile warm user timestamp color and the token-based plan/task cards.
 test("desktop contrast rules preserve the current shared and mobile CSS bytes", () => {
   const phoneApplicable = desktopMediaQueries().reduce((source, block) => source.replace(block.css, ""), style);
   assert.doesNotMatch(phoneApplicable, /--(?:control-border|danger-text)/);
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "dc3656b0519d34d224c5c3119805973e96ccd47a7c043d68414f9f9ec69eb461",
+    "ae68799280f2f0072cb67b5e5155091cda3d871dc9028bdf5c5a01370ec9dae8",
     "desktop contrast changed shared or mobile CSS");
 });
 
@@ -843,7 +843,7 @@ test("desktop overrides leave all phone-applicable CSS byte-identical", () => {
   let phoneApplicable = style;
   for (const block of desktop) phoneApplicable = phoneApplicable.replace(block.css, "");
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "dc3656b0519d34d224c5c3119805973e96ccd47a7c043d68414f9f9ec69eb461",
+    "ae68799280f2f0072cb67b5e5155091cda3d871dc9028bdf5c5a01370ec9dae8",
     "shared or phone CSS changed outside the desktop queries");
 });
 
@@ -1142,12 +1142,12 @@ test("desktop near-white changes preserve dark and warm token blocks byte for by
   }
 });
 
-test("desktop pastel, paragraph-sized math and mobile warm timestamps pin every non-light rule and declaration", () => {
+test("desktop pastel, math, plan/task cards and mobile warm timestamps pin every non-light rule and declaration", () => {
   const protectedCss = style.replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/:root\[data-theme="light"\][^{]*\{[^{}]*\}/g, "")
     .replace(/\s+/g, "");
   assert.equal(createHash("sha256").update(protectedCss).digest("hex"),
-    "9059b25e1238a7915ad19e6449b2ffa5014e91a7e2f6f966ce477a36b0a28ba1",
+    "5eb35bd077d5eba798c65153ff885e8beb914028bfee93d0fae73afa33a15a2f",
     "dark or warm CSS changed beyond the pinned baseline");
 });
 

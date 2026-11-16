@@ -248,9 +248,9 @@ test("formula overflow and paragraph typography apply across every theme", () =>
   assert.doesNotMatch(script, /fitDisplayMath|queueMathLayout|watchMathLayout|math-scroll-hint/);
 });
 
-test("CSS snapshot pins paragraph-sized math and the existing mobile and desktop themes", () => {
+test("CSS snapshot pins paragraph-sized math, plan/task cards and mobile and desktop themes", () => {
   const css = html.match(/<style>([\s\S]*?)<\/style>/)[1];
-  assert.equal(Buffer.byteLength(css), 89411);
+  assert.equal(Buffer.byteLength(css), 96061);
   assert.equal(createHash("sha256").update(css).digest("hex"),
-    "4513025a70f727f0550515052eb627608073ffb3a4f79c38c26b152758b3b2ad");
+    "654e7fd68e5ee7251b0d67e7b486e7afd2941888b70fb9f9fd1d60c2f848548d");
 });
