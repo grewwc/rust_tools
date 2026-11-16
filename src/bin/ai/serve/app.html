@@ -4216,11 +4216,15 @@ function resetQuestionNavigator() {
   updateQuestionButton(0);
 }
 // BEGIN session switch
-// A session the user just picked is ready for typing, so its composer takes the
-// caret. An active IME or a field that already holds it keeps focus.
+// A session the user just picked is ready for typing, so a desktop layout hands
+// the caret to its composer. A phone layout keeps focus where it is: focusing
+// the field there raises the soft keyboard and scrolls the view away from the
+// list the user is still tapping through. An active IME or a field that already
+// holds the caret keeps focus either way.
 function focusComposer() {
   const prompt = $("prompt");
   if (!prompt) return;
+  if (window.matchMedia && window.matchMedia("(max-width:700px)").matches) return;
   if ((typeof promptComposing !== "undefined" && promptComposing) || document.activeElement === prompt) return;
   try { prompt.focus({ preventScroll: true }); } catch (_) { prompt.focus(); }
 }
