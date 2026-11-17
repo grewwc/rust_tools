@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { test } = require("node:test");
+const { loadReplyReferenceHelpers } = require("./app_reply_reference_fixture.cjs");
 
 const html = fs.readFileSync(process.env.SERVE_QUESTIONS_APP || path.join(__dirname, "app.html"), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
@@ -110,6 +111,7 @@ function harness({ messages, phone = true, requestHook } = {}) {
     recordHistoryFailure: (...args) => failures.push(args),
     createTurnRateLine: () => () => {},
   });
+  loadReplyReferenceHelpers(context, script);
   vm.runInContext(between("// BEGIN execution model", "// END execution model"), context);
   vm.runInContext(between("function textOf(", "const PHONE_LAYOUT_QUERY"), context);
   vm.runInContext(between("function closeQuestionPanel(", "// BEGIN session switch"), context);

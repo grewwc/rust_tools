@@ -1439,6 +1439,8 @@ button:active:not(:disabled) { filter:brightness(.96); }
   }
   .rewind-confirm-cancel:focus-visible, .rewind-confirm-ok:focus-visible { outline:2px solid var(--acc); outline-offset:2px; }
 }
+  .reply-reference { margin-top:8px; padding:8px 12px; border-left:3px solid var(--dim); font-size:12px; color:var(--dim); }
+  .reply-reference pre { white-space:pre-wrap; max-height:240px; overflow:auto; }
 </style>
 </head>
 <body id="serve-app">
@@ -2469,7 +2471,47 @@ function copyCodeText(text) {
   } catch (_) {}
   return Promise.resolve(fallback());
 }
+let replyReferenceVersion = 0;
 const answerCopyTexts = new WeakMap();
+function setMessageIdentity(root, source) {
+  if (!root || !source || typeof source !== "object") return;
+  const id = source.message_id;
+  if (!Number.isSafeInteger(id) || id <= 0 || source.tool_calls?.length) return;
+  root.dataset.messageId = String(id);
+  root.dataset.messageSession = source.source_session_id || sessionId;
+  updateAnswerReference(root);
+}
+function updateAnswerReference(root) {
+  if (!root) return;
+  const actions = root.querySelector(".answer-actions");
+  const enabled = replyReferenceVersion === 1 && actions && root.dataset.role === "assistant"
+    && !root.classList.contains("pending") && root.dataset.messageId
+    && root.dataset.messageSession === sessionId;
+  const existing = root.querySelector("[data-reference-answer]");
+  if (!enabled) { if (existing) existing.remove(); return; }
+  if (existing) return;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "answer-copy";
+  button.setAttribute("data-reference-answer", "");
+  button.setAttribute("aria-label", "引用");
+  button.textContent = "引用";
+  actions.appendChild(button);
+}
+function referenceNearbyAnswer(button) {
+  const root = button.closest(".msg.md");
+  if (!root || button.disabled || root.classList.contains("pending") || replyReferenceVersion !== 1
+    || !root.dataset.messageId || root.dataset.messageSession !== sessionId) return;
+  const prompt = $("prompt");
+  if (!prompt || promptComposing) return;
+  const start = Number.isInteger(prompt.selectionStart) ? prompt.selectionStart : prompt.value.length;
+  const end = Number.isInteger(prompt.selectionEnd) ? prompt.selectionEnd : start;
+  const left = prompt.value.slice(0, start), right = prompt.value.slice(end);
+  const token = (left && !/\p{White_Space}$/u.test(left) ? " " : "") + "@reply:m" + root.dataset.messageId
+    + (right && /^\p{White_Space}/u.test(right) ? "" : " ");
+  insertPromptText(token);
+  prompt.focus();
+}
 function setAnswerRate(root, text) {
   if (!root || !text) return;
   root.dataset.tokenRate = text;
@@ -2483,7 +2525,7 @@ function addAnswerCopy(root, text) {
     if (!value.trim()) return;
     answerCopyTexts.set(root, value);
   }
-  if (root.querySelector(".answer-actions")) return;
+  if (root.querySelector(".answer-actions")) { updateAnswerReference(root); return; }
   const body = document.createElement("div");
   body.className = "answer-body";
   while (root.firstChild) body.appendChild(root.firstChild);
@@ -2503,6 +2545,7 @@ function addAnswerCopy(root, text) {
   actions.appendChild(button);
   root.appendChild(body);
   root.appendChild(actions);
+  updateAnswerReference(root);
 }
 function copyNearbyAnswer(button) {
   const host = button.closest(".msg.md");
@@ -2580,6 +2623,8 @@ function handlePreviewClick(event) {
   const button = target.closest("[data-preview-view]");
   const preview = button && button.closest(".code-preview");
   if (preview) { setPreviewView(preview, button.dataset.previewView); return; }
+  const referenceButton = target.closest("[data-reference-answer]");
+  if (referenceButton) return referenceNearbyAnswer(referenceButton);
   const answerButton = target.closest("[data-copy-answer]");
   if (answerButton) return copyNearbyAnswer(answerButton);
 }
@@ -3877,6 +3922,7 @@ function textOf(content, imagePlaceholders = false) {
   if (Array.isArray(content)) {
     return content.map((b) => {
       if (typeof b === "string") return b;
+      if (b?.type === "reference" && b.kind === "message") return "";
       if (imagePlaceholders && b && (b.kind === "image" || b.type === "image_url" || b.type === "image" || b.type === "input_image")) {
         return "\n[image" + (b.name ? ": " + b.name : "") + "]\n";
       }
@@ -3886,6 +3932,66 @@ function textOf(content, imagePlaceholders = false) {
   }
   if (content && typeof content === "object") return content.text || "";
   return "";
+}
+// Token boundaries and trimming use Unicode White_Space, matching Rust char::is_whitespace.
+// U+0085 separates tokens; U+FEFF remains literal text.
+function replyQuestionText(text) {
+  const whitespace = /\p{White_Space}/u;
+  let out = "", index = 0, code = null, changed = false;
+  while (index < text.length) {
+    const char = text[index];
+    if (char === "\\" && code === null && index + 1 < text.length) {
+      out += text.slice(index, index + 2); index += 2; continue;
+    }
+    if (char === "`" || char === "~") {
+      let end = index;
+      while (text[end] === char) end++;
+      const count = end - index, line = text.slice(0, index).split("\n").at(-1);
+      const fenced = count >= 3 && /^ {0,3}$/.test(line);
+      const tail = text.slice(end).split("\n")[0];
+      // Match Markdown whitespace, including the CR retained from CRLF.
+      const closingFence = fenced && /^[ \t\r]*$/.test(tail);
+      if (code && code.char === char && (code.fenced ? closingFence && count >= code.count : code.count === count)) code = null;
+      else if (!code && (char === "`" || fenced)) code = { char, count, fenced };
+      out += text.slice(index, end); index = end; continue;
+    }
+    if (!code && (index === 0 || whitespace.test(text[index - 1])) && text.startsWith("@reply:", index)) {
+      let end = index;
+      while (end < text.length && !whitespace.test(text[end])) end++;
+      const token = text.slice(index, end);
+      if (/^@reply:(last|[mu][0-9]+)$/.test(token) && !/^@reply:[mu]0+$/.test(token)) {
+        index += token.length; changed = true; continue;
+      }
+    }
+    out += char; index++;
+  }
+  return changed ? out.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "") : out;
+}
+function decorateReplyReferences(root, content) {
+  if (!Array.isArray(content)) return;
+  for (const part of content) {
+    if (part?.type !== "reference" || part.kind !== "message") continue;
+    const details = document.createElement("details");
+    details.className = "reply-reference";
+    const summary = document.createElement("summary");
+    summary.textContent = "Referenced assistant reply: " + (Number.isSafeInteger(part.source_message_id) ? "m" + part.source_message_id : "unavailable");
+    const body = document.createElement("pre");
+    body.textContent = typeof part.text === "string" && part.text.trim() ? part.text : "Referenced assistant reply snapshot unavailable";
+    details.appendChild(summary); details.appendChild(body); root.appendChild(details);
+  }
+}
+function recoverRejectedReplyInput(error, input, targetSession, targetBase, draft, images) {
+  if (!/reply reference|Message m[0-9]+ is not an assistant conclusion/i.test(error)) return false;
+  input.referenceRejected = true;
+  input.settled = false;
+  const remaining = (pendingUserInputs.get(targetSession) || []).filter((item) => item !== input);
+  if (remaining.length) pendingUserInputs.set(targetSession, remaining); else pendingUserInputs.delete(targetSession);
+  if (targetSession === sessionId && targetBase === executionBase() && !$("prompt").value && !promptComposing) {
+    setPromptValue(draft, true);
+    pendingImages = images;
+    renderComposerAttachments(); growPrompt(); persistDraft();
+  }
+  return true;
 }
 // Persisted runtime origin sidecar, shared with history/types.rs. Content may
 // repeat a real prompt (image rereads), so never infer origin from its text.
@@ -4425,7 +4531,10 @@ function addMsg(role, text, cls, parent, timeSource = null) {
   const root = parent || $("msgs");
   const follow = !parent && shouldFollowOutput(root);
   const d = createPlainMessageNode(role, text, cls);
-  if (timeSource && role === "user") setMessageTimestamp(d, timeSource);
+  if (timeSource && role === "user") {
+    decorateReplyReferences(d, timeSource.content);
+    setMessageTimestamp(d, timeSource);
+  }
   root.appendChild(d);
   if (!parent) { followOutput(follow, root); updateQuestionButton(); }
   return d;
@@ -4462,6 +4571,7 @@ function formatMessageTime(ms, now = Date.now()) {
   return (sameYear ? "" : date.getFullYear() + "/") + (date.getMonth() + 1) + "/" + date.getDate() + " " + clock;
 }
 function setMessageTimestamp(root, source) {
+  setMessageIdentity(root, source);
   const ms = messageTimestampOf(source);
   if (ms === null || !root) return;
   const user = root.dataset.role === "user";
@@ -8039,6 +8149,8 @@ function commandNavigationTarget(active, step, matches) {
 async function loadInfo() {
   try {
     const info = await (await api("/info")).json();
+    replyReferenceVersion = info.reply_reference_version === 1 ? 1 : 0;
+    $("msgs").querySelectorAll(".msg.md").forEach(updateAnswerReference);
     const parts = [info.model_label || info.model, info.agent, info.reasoning_effort].filter(Boolean);
     $("info").textContent = parts.join(" · ") + " (remote)";
     fillSelect($("omodel"), (info.models || []).map((m) => [m.id, m.label || m.id]), info.model_label || info.model, "model");
@@ -9117,6 +9229,8 @@ function historyRowsOf(msgs, histTotal, showAll) {
       message.tool_call_id ? calls.get(message.tool_call_id) : null,
     ];
     if (message.task_report) identity.push(message.task_report);
+    if (Array.isArray(message.content)) identity.push(message.content.filter((part) => part?.type === "reference" && part.kind === "message"));
+    if (Number.isSafeInteger(message.message_id)) identity.push(message.message_id);
     rows.push({
       message,
       text,
@@ -9573,7 +9687,7 @@ async function loadHistory(prefetched, canCommit = () => true) {
       for (const input of pendingUserInputs.get(forSession) || []) {
         const floor = Math.max(pendingHistoryFloor(input, history, msgs, baseIndex, canonicalHistoryTotal), acknowledgedThrough);
         // Image tokens become reference parts, or OCR is appended for non-vision models.
-        const expected = input.prompt.replace(/\[\[image:[\s\S]*?\]\]/g, "").trim();
+        const expected = replyQuestionText(input.prompt.replace(/\[\[image:[\s\S]*?\]\]/g, "")).trim();
         const hadImages = expected !== input.prompt.trim();
         const commandText = skillCommandText(input.prompt);
         const matches = (message) => {
@@ -9841,7 +9955,7 @@ function addUserBubble(text, index, parent, timeSource = null) {
   return attachUserRewind(d, text, () => rewindTo(index, text));
 }
 function findUserHistoryIndex(messages, histTotal, prompt, minIndex) {
-  const expected = prompt.trim();
+  const expected = replyQuestionText(prompt).trim();
   const base = Math.max(0, (histTotal || messages.length) - messages.length);
   for (let i = messages.length - 1; i >= 0; i--) {
     const index = base + i;
@@ -10288,7 +10402,7 @@ function recoveredProgressView(sid = sessionId) {
     // Replay uses the live renderer and its escaping policy. Previews and math
     // decoration wait until the segment is sealed or the reply finishes.
     if (bubble) {
-      if (timeSource?.created_at != null || timeSource?.timestamp != null) bubble._messageTimeSource = timeSource;
+      if (timeSource && typeof timeSource === "object") bubble._messageTimeSource = { ...timeSource, source_session_id: sid };
       bubble.hidden = !answer;
       bubble.innerHTML = renderMarkdown(answer, false);
       if (bubble.parentNode?._executionGroups && bubble.parentNode.querySelectorAll("details").length) {
@@ -10356,7 +10470,8 @@ function recoveredProgressView(sid = sessionId) {
     },
     subagents(payload, decoded) { activity.subagents(payload, decoded); },
     phase(text, waiting) { activity.setPhase(text, waiting); paintPhase(); },
-    finish(reason = "ended") {
+    finish(reason = "ended", source = null) {
+      if (bubble && source) bubble._messageTimeSource = { ...source, source_session_id: sid };
       closed = true;
       clearInterval(phaseTimer);
       endThinking();
@@ -10642,7 +10757,9 @@ async function attachEvents() {
       while ((rawBlock = framer.next()) !== null) {
         const block = parseBlock(rawBlock);
         if (block.kind === "done") {
-          view.finish();
+          let source = null;
+          try { source = JSON.parse(block.payload); } catch (_) {}
+          view.finish("ended", source);
           endedTurnPid = turnRunningPid;
           finished = true; eventStreamEnded = true; eventFailures = 0; confirmPollSeq++;
           stopStaleFollow();
@@ -11945,7 +12062,7 @@ async function send() {
           if (payload) {
             try {
               const source = JSON.parse(payload);
-              if (bubble && (source?.created_at != null || source?.timestamp != null)) bubble._messageTimeSource = source;
+              if (bubble && source && typeof source === "object") bubble._messageTimeSource = { ...source, source_session_id: sid };
               const input = liveEntry.userInput?.row?.querySelector(".msg.user");
               if (input && source?.user_message) setMessageTimestamp(input, source.user_message);
             } catch (_) {}
@@ -12024,7 +12141,10 @@ async function send() {
       // unheard, and that session follows it from history when it comes back.
       if (sid === sessionId && sendBase === executionBase()) goStale("connection lost: " + e.message + " — the turn keeps running on the server (following history)");
       else dropBackgroundTurn(box, "connection lost");
-    } else fail("turn failed: " + e.message);
+    } else {
+      fail("turn failed: " + e.message);
+      recoverRejectedReplyInput(e.message, userInput, sid, sendBase, text, images);
+    }
   }
   // This turn is over, so its session may send again: the entry goes away
   // whether or not the box stays on screen.
@@ -12034,7 +12154,7 @@ async function send() {
   if (wentStale || sid !== sessionId || sendBase !== executionBase()) activity.remove?.();
   // The server persisted this input before it ran the turn, so history keeps
   // it even if the page's message count drifted.
-  if (turnStarted) userInput.settled = true;
+  if (turnStarted && !userInput.referenceRejected) userInput.settled = true;
   if (wentStale && sid === sessionId && sendBase === executionBase()) {
     // The live feed died but its turn is still running on the server, and the
     // server kept that turn's event stream: reattach to it so the reply keeps

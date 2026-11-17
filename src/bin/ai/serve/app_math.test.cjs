@@ -6,6 +6,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const { createHash } = require("node:crypto");
 const { test } = require("node:test");
+const { loadReplyReferenceHelpers } = require("./app_reply_reference_fixture.cjs");
 
 const html = fs.readFileSync(path.join(__dirname, "app.html"), "utf8");
 // Assistant and tool rows render inside a per-turn wrapper, so ordered
@@ -42,6 +43,7 @@ vm.createContext = (sandbox = {}) => {
   historyExecutionOf: () => [],
   ...sandbox,
   });
+  loadReplyReferenceHelpers(context, script);
   vm.runInContext(script.slice(script.indexOf("// BEGIN execution model"), script.indexOf("// END execution model")), context);
   vm.runInContext(script.slice(script.indexOf("// BEGIN execution event dispatcher"), script.indexOf("// END execution event dispatcher")), context);
   return context;

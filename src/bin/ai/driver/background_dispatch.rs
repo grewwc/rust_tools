@@ -2344,6 +2344,7 @@ pub(super) fn dispatch_background_batch(
                                             usize::MAX,
                                             prompt,
                                             String::new(),
+                                            Vec::new(),
                                             next_model,
                                             None,
                                             None,

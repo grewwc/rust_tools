@@ -45,6 +45,67 @@ fn push_summary_text(out: &mut String, text: &str, max_chars: usize) -> bool {
     text_chars <= remaining
 }
 
+fn is_reply_reference(part: &Value) -> bool {
+    part.get("type").and_then(Value::as_str) == Some("reference")
+        && part.get("kind").and_then(Value::as_str) == Some("message")
+}
+
+fn has_reply_references(message: &Message) -> bool {
+    message
+        .content
+        .as_array()
+        .is_some_and(|parts| parts.iter().any(is_reply_reference))
+}
+
+/// Reserve the question and every delimiter before allocating bounded previews.
+/// Refuse the fragment if even the complete structural content cannot fit.
+fn render_reply_summary(message: &Message, parts: &[Value], max_chars: usize) -> String {
+    const MAX_PREVIEW_CHARS: usize = 600;
+    let question = parts
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let references: Vec<_> = parts
+        .iter()
+        .filter(|part| is_reply_reference(part))
+        .collect();
+    let mut out = format!(
+        "### {}\n\nUser question:\n{question}\n",
+        message.role.to_uppercase()
+    );
+    let other_parts: Vec<_> = parts
+        .iter()
+        .filter(|part| {
+            !is_reply_reference(part) && part.get("type").and_then(Value::as_str) != Some("text")
+        })
+        .collect();
+    if !other_parts.is_empty() {
+        out.push_str("[Other attachments omitted from summary preview]\n");
+    }
+    let skeleton_chars: usize = references
+        .iter()
+        .map(|part| {
+            crate::ai::history::reply_reference::summary_preview(part, 0)
+                .chars()
+                .count()
+        })
+        .sum();
+    let fixed = out.chars().count() + skeleton_chars;
+    if fixed > max_chars {
+        return String::new();
+    }
+    let body_budget = ((max_chars - fixed) / references.len().max(1)).min(MAX_PREVIEW_CHARS);
+    for part in references {
+        out.push_str(&crate::ai::history::reply_reference::summary_preview(
+            part,
+            body_budget,
+        ));
+    }
+    out
+}
+
 pub(in crate::ai) fn render_summary_message(message: &Message, max_chars: usize) -> String {
     if is_side_note_message(message) {
         let rendered = format!(
@@ -56,6 +117,11 @@ pub(in crate::ai) fn render_summary_message(message: &Message, max_chars: usize)
         } else {
             String::new()
         };
+    }
+    if let Value::Array(parts) = &message.content
+        && parts.iter().any(is_reply_reference)
+    {
+        return render_reply_summary(message, parts, max_chars);
     }
     let mut out = String::with_capacity(max_chars.min(6_000));
     push_summary_text(
@@ -174,7 +240,11 @@ pub(in crate::ai) fn build_summary_history_input(messages: &[Message], max_chars
                 if side_note {
                     max_chars
                 } else {
-                    SUMMARY_MESSAGE_MAX_CHARS
+                    if has_reply_references(message) {
+                        max_chars.min(SUMMARY_MESSAGE_MAX_CHARS)
+                    } else {
+                        SUMMARY_MESSAGE_MAX_CHARS
+                    }
                 },
             );
             let lower = raw.to_ascii_lowercase();
@@ -213,7 +283,7 @@ pub(in crate::ai) fn build_summary_history_input(messages: &[Message], max_chars
             (
                 index,
                 score,
-                if side_note {
+                if side_note || has_reply_references(message) {
                     raw
                 } else {
                     truncate_summary_fragment(&raw, per_message_cap)
@@ -223,6 +293,11 @@ pub(in crate::ai) fn build_summary_history_input(messages: &[Message], max_chars
         })
         .collect();
 
+    if candidates.iter().any(|(index, _, fragment, _)| {
+        has_reply_references(&messages[*index]) && fragment.is_empty()
+    }) {
+        return String::new();
+    }
     candidates.sort_by(|a, b| {
         b.3.cmp(&a.3)
             .then_with(|| b.1.cmp(&a.1))
@@ -265,4 +340,79 @@ pub(in crate::ai) fn build_summary_history_input(messages: &[Message], max_chars
         previous_index = Some(index);
     }
     out
+}
+
+#[cfg(test)]
+mod reply_reference_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn referenced_question(count: i64) -> Message {
+        let mut parts: Vec<_> = (0..count)
+            .map(|index| {
+                json!({
+                    "type":"reference", "kind":"message", "source_message_id":42 + index,
+                    "text":"长引用正文".repeat(1000),
+                })
+            })
+            .collect();
+        parts.push(json!({"type":"text", "text":"Explain the assumptions in every quoted reply."}));
+        Message {
+            role: "user".into(),
+            content: Value::Array(parts),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn reply_reference_summary_long_body_preserves_question_and_end_boundary() {
+        let message = referenced_question(1);
+        let original = message.content.clone();
+        let summary = render_summary_message(&message, 1000);
+        assert!(summary.contains("Explain the assumptions in every quoted reply."));
+        assert!(summary.contains("[Referenced assistant reply: m42]"));
+        assert!(summary.contains("[Referenced assistant reply truncated for summary preview]"));
+        assert!(summary.ends_with("[End referenced assistant reply]\n"));
+        assert!(summary.chars().count() <= 1000);
+        assert_eq!(message.content, original);
+    }
+
+    #[test]
+    fn reply_reference_summary_multiple_long_bodies_keep_all_boundaries_in_order() {
+        let message = referenced_question(4);
+        let original = message.content.clone();
+        for summary in [
+            render_summary_message(&message, 1000),
+            build_summary_history_input(&[message.clone()], 1000),
+        ] {
+            assert!(summary.contains("Explain the assumptions in every quoted reply."));
+            let positions: Vec<_> = (42..46)
+                .map(|id| {
+                    summary
+                        .find(&format!("[Referenced assistant reply: m{id}]"))
+                        .expect("all sources survive")
+                })
+                .collect();
+            assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+            assert_eq!(
+                summary.matches("[End referenced assistant reply]").count(),
+                4
+            );
+            assert_eq!(
+                summary
+                    .matches("[Referenced assistant reply truncated for summary preview]")
+                    .count(),
+                4
+            );
+            assert!(summary.chars().count() <= 1000);
+        }
+        assert_eq!(message.content, original);
+        assert!(
+            render_summary_message(&message, 20).is_empty(),
+            "refuse a budget that cannot fit complete boundaries"
+        );
+        assert!(build_summary_history_input(&[message], 20).is_empty());
+    }
 }

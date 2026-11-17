@@ -87,11 +87,11 @@ fn should_open_popup_on_first_tab(ctx: &PendingTabCompletion) -> bool {
         || matches!(trimmed, "/resume")
         || trimmed.starts_with("/resume "))
         || is_skill_reference_trigger(trimmed)
+        || crate::ai::history::reply_reference::completion_prefix(&ctx.line[..ctx.col]).is_some()
 }
 
-/// `@ski`/`@skill`/`@skills`（含 `:<filter>` 与无冒号 `@skillhum` 等写法）与 `/model`
-/// 一样，第一次 Tab 就直接弹出候选面板，而不是走"第一次静默、第二次弹出"的歧义流程。
-/// 直接复用 `completion::skill_token_filters` 的解析规则，保证触发判断与候选生成一致。
+/// Skill references open the first-Tab panel using the candidate parser
+/// so popup triggers stay consistent with supported skill token syntax.
 fn is_skill_reference_trigger(trimmed: &str) -> bool {
     let last_token = trimmed.split_whitespace().next_back().unwrap_or("");
     let Some(rest) = last_token.strip_prefix('@') else {
@@ -204,7 +204,9 @@ pub(in crate::ai::prompt::multiline) fn apply_multiline_completion(
         return Some("没有匹配的命令补全".to_string());
     }
 
-    if ctx.candidates.len() == 1 {
+    if ctx.candidates.len() == 1
+        && crate::ai::history::reply_reference::completion_prefix(&ctx.line[..ctx.col]).is_none()
+    {
         replace_current_line_range(
             textarea,
             ctx.row,
@@ -519,5 +521,45 @@ mod tests {
                 .iter()
                 .any(|item| item.replacement == format!("@{}", other.display()))
         );
+    }
+}
+
+#[cfg(test)]
+mod reply_reference_tests {
+    use super::*;
+    use tui_textarea::CursorMove;
+    #[test]
+    fn reply_reference_first_tab_opens_preview_for_single_and_multiple_candidates() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for candidates in [
+            vec![(42, "first reply preview".into())],
+            vec![
+                (42, "first reply preview".into()),
+                (43, "second reply preview".into()),
+            ],
+        ] {
+            let count = candidates.len();
+            CommandCompleter::set_reply_candidates(candidates);
+            let mut textarea = TextArea::new(vec!["Explain @reply:".into()]);
+            textarea.move_cursor(CursorMove::End);
+            let mut pending = None;
+            let mut panel = None;
+            assert!(
+                apply_multiline_completion(&mut textarea, &mut pending, &mut panel)
+                    .unwrap()
+                    .contains("发现")
+            );
+            assert_eq!(textarea.lines(), ["Explain @reply:"]);
+            let preview = panel.as_ref().expect("the first Tab displays a panel");
+            assert_eq!(preview.items.len(), count);
+            assert!(preview.items[0].display.contains("first reply preview"));
+            assert_eq!(preview.items[0].replacement, "@reply:m42");
+            let result = confirm_completion_selection(&mut textarea, &mut pending, &mut panel);
+            assert_eq!(textarea.lines(), ["Explain @reply:m42"]);
+            assert!(result.submit.is_none());
+        }
+        CommandCompleter::set_reply_candidates(Vec::new());
     }
 }

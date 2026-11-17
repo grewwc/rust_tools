@@ -283,6 +283,7 @@ pub(crate) struct ServerInfo {
     models: Vec<ServerModelOption>,
     agents: Vec<String>,
     efforts: Vec<&'static str>,
+    reply_reference_version: u8,
 }
 
 pub(crate) async fn server_info(
@@ -331,6 +332,7 @@ pub(crate) async fn server_info(
             models,
             agents,
             efforts: SERVE_EFFORT_LEVELS.to_vec(),
+            reply_reference_version: 1,
         }),
     )
         .into_response()

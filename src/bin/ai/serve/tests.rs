@@ -4910,3 +4910,36 @@ fn chat_page_handles_history_compression_progress() {
     assert!(page.matches(r#"kind === "compression_done""#).count() >= 2);
     assert!(page.contains("Compressing history…"));
 }
+
+#[test]
+fn reply_reference_serve_identity_survives_missing_timestamp_and_requires_committed_body() {
+    let message = |role: &str, body: &str, id: i64| crate::ai::history::StoredMessage {
+        message: crate::ai::history::Message {
+            role: role.into(),
+            content: serde_json::json!(body),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        message_id: id,
+        created_at: None,
+    };
+    let messages = vec![
+        message("user", "question", 7),
+        message("assistant", "committed answer", 9),
+    ];
+    let history = super::history::serve_stored_history_message(&messages[1]).unwrap();
+    assert_eq!(history["message_id"], 9);
+    assert!(history.get("created_at").is_none());
+    let done = super::history::serve_done_metadata(&messages, Some("committed answer"));
+    assert_eq!(done["message_id"], 9);
+    assert_eq!(done["user_message"]["message_id"], 7);
+    assert!(done.get("created_at").is_none());
+    for body in [None, Some("uncommitted stream preview")] {
+        assert!(
+            super::history::serve_done_metadata(&messages, body)
+                .get("message_id")
+                .is_none()
+        );
+    }
+}

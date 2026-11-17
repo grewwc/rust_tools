@@ -1179,8 +1179,9 @@ pub(in crate::ai::driver) async fn run_turn(
     history_count: usize,
     mut question: String,
     attachments_text: String,
+    reply_selectors: Vec<history::reply_reference::ReplySelector>,
     next_model: String,
-    precomputed_ocr: Option<crate::ai::driver::model::OcrExtraction>,
+    mut precomputed_ocr: Option<crate::ai::driver::model::OcrExtraction>,
     parked_foreground_wait_guard: Option<crate::ai::driver::signal::ParkedForegroundWaitGuard>,
     one_shot_mode: bool,
     should_quit: bool,
@@ -1198,6 +1199,32 @@ pub(in crate::ai::driver) async fn run_turn(
     } else {
         None
     };
+    let frozen_replies = history::reply_reference::freeze(
+        &app.session_history_file,
+        &app.session_id,
+        &reply_selectors,
+    )?;
+    let allow_commands = crate::ai::driver::commands::command_routing_allowed(&reply_selectors)
+        && crate::ai::driver::runtime_ctx::current_subagent_depth() == 0;
+    if !reply_selectors.is_empty() {
+        // Reference validation precedes auxiliary model calls as well.
+        if !one_shot_mode {
+            super::maybe_generate_session_title_for_input(app, &question).await;
+        }
+        if precomputed_ocr.is_none()
+            && !app.attached_image_files.is_empty()
+            && !crate::ai::models::is_vl_model(&next_model)
+        {
+            precomputed_ocr = crate::ai::driver::model::parse_attached_images_via_subagent(
+                mcp_client,
+                &app.config.vl_default_model,
+                &app.attached_image_files,
+            )
+            .await
+            .ok()
+            .flatten();
+        }
+    }
     // Hot-reload config + theme at the turn boundary so `ai.theme` /
     // `ai.theme.file` edits (or edits to a custom theme JSON) apply on the
     // next user message without restarting the long-lived agent process.
@@ -1222,7 +1249,7 @@ pub(in crate::ai::driver) async fn run_turn(
     let result = (async {
         // Default audits retain the single foreground runner; only --deep enters planning.
         let (self_generated_audit, pending_audit) =
-            if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0 {
+            if allow_commands {
                 match crate::ai::driver::commands::audit::parse_audit_command(&question) {
                     Some(crate::ai::driver::commands::audit::AuditCommand::SelfGenerated {
                         fast, deep: false,
@@ -1279,7 +1306,7 @@ pub(in crate::ai::driver) async fn run_turn(
         }
         crate::ai::driver::runtime_ctx::TURN_IDENTITY
             .scope((session_id, turn_id), async {
-                if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0
+                if allow_commands
                     && (crate::ai::driver::commands::compact::try_handle_compact_command(app, &question).await?
                         || crate::ai::driver::commands::distill_session::try_handle_distill_session_command(app, &question).await)
                 {
@@ -1336,6 +1363,7 @@ pub(in crate::ai::driver) async fn run_turn(
                             turn_index,
                             question,
                             attachments_text.clone(),
+                            frozen_replies.clone(),
                             next_model.clone(),
                             precomputed_ocr,
                             one_shot_mode,
@@ -1367,7 +1395,7 @@ pub(in crate::ai::driver) async fn run_turn(
                                             let fix_question = crate::ai::driver::commands::audit::build_audit_round_followup(instruction, &report, 1);
                                             return run_turn_body(
                                                 app, mcp_client, skill_manifests, history_count, turn_index,
-                                                fix_question, attachments_text, next_model, None,
+                                                fix_question, attachments_text, frozen_replies, next_model, None,
                                                 one_shot_mode, None, pending.next_round(), should_quit,
                                                 DelegationAdvisoryState::default(), LlmSummaryBudget::default(),
                                             ).await;
@@ -2381,6 +2409,7 @@ async fn run_turn_body(
     turn_index: usize,
     mut question: String,
     attachments_text: String,
+    frozen_replies: Vec<serde_json::Value>,
     next_model: String,
     mut precomputed_ocr: Option<crate::ai::driver::model::OcrExtraction>,
     one_shot_mode: bool,
@@ -2399,6 +2428,7 @@ async fn run_turn_body(
             turn_index,
             question,
             attachments_text.clone(),
+            frozen_replies.clone(),
             next_model.clone(),
             precomputed_ocr.take(),
             one_shot_mode,
@@ -2435,6 +2465,7 @@ async fn run_turn_body_round(
     turn_index: usize,
     question: String,
     attachments_text: String,
+    frozen_replies: Vec<serde_json::Value>,
     next_model: String,
     precomputed_ocr: Option<crate::ai::driver::model::OcrExtraction>,
     one_shot_mode: bool,
@@ -2472,6 +2503,7 @@ async fn run_turn_body_round(
         turn_index,
         &question,
         &attachments_text,
+        &frozen_replies,
         &next_model,
         precomputed_ocr,
     )

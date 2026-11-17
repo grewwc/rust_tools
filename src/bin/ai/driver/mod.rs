@@ -895,6 +895,7 @@ async fn run_foreground_resume(
                                     usize::MAX,
                                     proc_question,
                                     String::new(),
+                                    Vec::new(),
                                     next_model,
                                     None,
                                     parked_foreground_wait_guard,
@@ -1198,6 +1199,8 @@ async fn run_loop(
         let history_count;
         let mut question;
         let attachments_text;
+        let mut reply_selectors = Vec::new();
+        let mut reply_draft = None;
 
         dispatch_background_batch(
             app,
@@ -1483,6 +1486,8 @@ async fn run_loop(
                     continue;
                 }
                 question = ctx.question;
+                reply_selectors = ctx.reply_selectors;
+                reply_draft = ctx.input_draft;
                 attachments_text = ctx.attachments_text;
                 history_count = ctx.history_count;
             }
@@ -1495,7 +1500,8 @@ async fn run_loop(
         // scan — bringing read-only commands like `a /usage` from ~1s down to ~0.1s.
         // Commands like /goal that inject a forced_question and continue the
         // conversation still need the manifests loaded.
-        if try_handle_local_command(app, &question)? {
+        let allow_commands = commands::command_routing_allowed(&reply_selectors);
+        if allow_commands && try_handle_local_command(app, &question)? {
             if let Some(rest) = app.forced_question.take() {
                 question = rest;
             } else {
@@ -1552,7 +1558,9 @@ async fn run_loop(
             *skill_manifests = updated;
         }
 
-        if try_handle_interactive_command(app, &question, agent_manifests, skill_manifests)? {
+        if allow_commands
+            && try_handle_interactive_command(app, &question, agent_manifests, skill_manifests)?
+        {
             // For /skills <name> <rest>, the parsed rest replaces the question and the
             // conversation continues.
             if let Some(rest) = app.forced_question.take() {
@@ -1567,12 +1575,12 @@ async fn run_loop(
 
         // The /memo command needs to call the model asynchronously to organize content,
         // so it is handled separately here.
-        if commands::memo::try_handle_memo_command(app, &question).await? {
+        if allow_commands && commands::memo::try_handle_memo_command(app, &question).await? {
             should_quit = false;
             continue;
         }
 
-        if !one_shot_mode {
+        if !one_shot_mode && reply_selectors.is_empty() {
             // The title depends only on the input the user already submitted, so it
             // should not wait for the first model response. Dispatch the background
             // generation task here immediately, before MCP init, image preprocessing,
@@ -1593,11 +1601,22 @@ async fn run_loop(
         }
 
         if note_search::note_search_interactive_mode(&app.cli) {
-            match note_search::handle_note_search_interactive_turn(app, &question, history_count)
-                .await
+            match note_search::handle_note_search_interactive_turn(
+                app,
+                &question,
+                history_count,
+                &reply_selectors,
+            )
+            .await
             {
                 Ok(()) => {}
                 Err(err) => {
+                    if let Some(draft) = reply_draft.as_ref()
+                        && let Some(editor) = app.prompt_editor.as_mut()
+                    {
+                        editor.set_prefill(draft.clone());
+                        editor.set_status_message(err.to_string());
+                    }
                     crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
                         "[Error] 当前轮 notebook 检索失败：{err}"
                     ));
@@ -1630,7 +1649,8 @@ async fn run_loop(
         )
         .await;
 
-        let precomputed_ocr = if !app.attached_image_files.is_empty()
+        let precomputed_ocr = if reply_selectors.is_empty()
+            && !app.attached_image_files.is_empty()
             && !crate::ai::models::is_vl_model(&app.current_model)
         {
             // When a non-VL model receives attached images, the main agent no longer
@@ -1716,6 +1736,7 @@ async fn run_loop(
                             history_count,
                             question,
                             attachments_text,
+                            reply_selectors,
                             next_model,
                             precomputed_ocr,
                             None,
@@ -1777,6 +1798,11 @@ async fn run_loop(
                 outcome
             }
             Err(err) => {
+                if let Some(draft) = reply_draft {
+                    if let Some(editor) = app.prompt_editor.as_mut() {
+                        editor.set_prefill(draft);
+                    }
+                }
                 let result = format!("Failed: {}", err);
                 let dead_pid = fg_pid.or_else(|| app.os.lock().unwrap().current_process_id());
                 if let Some(pid) = dead_pid {

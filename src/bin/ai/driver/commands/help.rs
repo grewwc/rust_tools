@@ -162,6 +162,9 @@ fn print_shortcuts_help() {
 
 fn print_help_notes() {
     println!("  Notes:");
+    println!("    @reply:m42 / @reply:u2 / @reply:last  quote assistant replies in this session");
+    println!("    Example: @reply:m42 @reply:u2 Why do these answers differ?");
+    println!("    Tab after @reply: previews recent committed replies; limits apply per turn.");
     println!("    - Commands support both / and : prefix (e.g., /help or :help)");
     println!("    - Use `/personas` for persona management");
     println!("    - To create a persona: start `a`, then run `/personas create`");

@@ -126,7 +126,7 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
         return Ok(None);
     }
 
-    let question = loop {
+    let ctx = loop {
         match prompt_user(app) {
             Ok(v) => {
                 app.ignore_next_prompt_interrupt = false;
@@ -136,7 +136,17 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
                 if handle_local_command(app, &input)? {
                     continue;
                 }
-                break Some(input);
+                match finalize_question(app, input.clone(), 0) {
+                    Ok(ctx) => break Some(ctx),
+                    Err(err) => {
+                        if let Some(editor) = app.prompt_editor.as_mut() {
+                            editor.set_prefill(input);
+                            editor.set_status_message(err.to_string());
+                        }
+                        eprintln!("[Error] {err}");
+                        continue;
+                    }
+                }
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {
                 if app.ignore_next_prompt_interrupt {
@@ -154,12 +164,11 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
             Err(err) => return Err(err.into()),
         }
     };
-    let Some(question) = question else {
+    let Some(ctx) = ctx else {
         app.ignore_next_prompt_interrupt = false;
         crate::ai::driver::signal::request_shutdown(app.shutdown.as_ref());
         return Ok(None);
     };
-    let ctx = finalize_question(app, question, 0)?;
     Ok(Some(ctx))
 }
 
@@ -216,6 +225,8 @@ struct HistoryPreviewOptions {
 struct HistoryPreviewItem {
     message: history::Message,
     user_ordinal: Option<usize>,
+    message_id: Option<i64>,
+    archive_only: bool,
     /// The model that produced this message, persisted as `source_model`
     /// provenance in sqlite history; `None` for legacy blob history or messages
     /// written before the column existed.
@@ -708,12 +719,26 @@ fn render_history_preview(
                 grep.as_deref(),
             )
         };
-        let marker = item
-            .user_ordinal
-            .map(|ordinal| format!(" (u{ordinal})"))
-            .unwrap_or_default();
+        let marker =
+            if item.archive_only && matches!(item.message.role.as_str(), "user" | "assistant") {
+                " (archive-only; unavailable for reply references)".to_string()
+            } else {
+                item.user_ordinal
+                    .map(|ordinal| format!(" (u{ordinal})"))
+                    .unwrap_or_default()
+            };
         // Attribute assistant content to the model that produced it; user and
         // tool rows carry the then-active model too, which would be misleading.
+        let marker = if history::reply_reference::assistant_body(&item.message).is_some() {
+            format!(
+                "{marker}{}",
+                item.message_id
+                    .map(|id| format!(" (m{id})"))
+                    .unwrap_or_default()
+            )
+        } else {
+            marker
+        };
         let model_tag = if item.message.role == "assistant" {
             item.source_model
                 .as_deref()
@@ -760,10 +785,7 @@ pub(crate) fn assistant_conclusion_text_at(
         if has_tool_calls {
             return None;
         }
-        let text = searchable_history_content(&message.content);
-        if text.trim().is_empty() {
-            return None;
-        }
+        let text = history::reply_reference::assistant_body(message)?;
         seen += 1;
         (seen == nth_back).then_some((text, source_model.clone()))
     }))
@@ -784,7 +806,7 @@ fn history_user_reply_at_path(
     history_file: &Path,
     target_ordinal: usize,
 ) -> Result<HistoryUserReplyLookup, Box<dyn Error>> {
-    let messages = history::build_message_arr_for_history_view(history_file)?;
+    let messages = history::build_message_arr_with_models(history_file)?;
     let mut user_ordinal = 0usize;
     let mut target_found = false;
     let mut reply = None;
@@ -808,8 +830,7 @@ fn history_user_reply_at_path(
         {
             continue;
         }
-        let text = searchable_history_content(&message.content);
-        if !text.trim().is_empty() {
+        if let Some(text) = history::reply_reference::assistant_body(&message) {
             reply = Some((text, source_model));
         }
     }
@@ -824,6 +845,11 @@ fn history_user_reply_at_path(
 /// `/history last [N]`: replay the Nth most recent assistant conclusion
 /// message (1 = latest), rendered through the terminal markdown renderer.
 fn render_history_message_at(app: &App, nth_back: usize) -> Result<(), Box<dyn Error>> {
+    if let Ok(Some(id)) =
+        history::reply_reference::conclusion_at(&active_history_path(app), None, nth_back)
+    {
+        println!("[history] Assistant reply (m{id})");
+    }
     match assistant_conclusion_text_at(app, nth_back)? {
         Some((text, source_model)) => {
             // Label the replay with the model that produced it (display-only;
@@ -851,6 +877,11 @@ fn render_history_message_at(app: &App, nth_back: usize) -> Result<(), Box<dyn E
 /// number. Tool-call steps and empty assistant messages are not conclusions.
 fn render_history_user_reply(app: &App, user_ordinal: usize) -> Result<(), Box<dyn Error>> {
     let history_file = active_history_path(app);
+    if let Ok(Some(id)) =
+        history::reply_reference::conclusion_at(&history_file, Some(user_ordinal), 1)
+    {
+        println!("[history] Assistant reply (m{id})");
+    }
     match history_user_reply_at_path(&history_file, user_ordinal)? {
         HistoryUserReplyLookup::Found(text, source_model) => {
             match source_model {
@@ -880,6 +911,9 @@ fn render_other_session_message_at(
     history_file: &Path,
     nth_back: usize,
 ) -> Result<(), Box<dyn Error>> {
+    if let Ok(Some(id)) = history::reply_reference::conclusion_at(history_file, None, nth_back) {
+        println!("[history] Assistant reply (m{id})");
+    }
     match assistant_conclusion_text_at_path(history_file, nth_back)? {
         Some((text, source_model)) => {
             match source_model {
@@ -965,10 +999,24 @@ fn render_history_preview_for_path(
                 grep.as_deref(),
             )
         };
-        let marker = item
-            .user_ordinal
-            .map(|ordinal| format!(" (u{ordinal})"))
-            .unwrap_or_default();
+        let marker =
+            if item.archive_only && matches!(item.message.role.as_str(), "user" | "assistant") {
+                " (archive-only; unavailable for reply references)".to_string()
+            } else {
+                item.user_ordinal
+                    .map(|ordinal| format!(" (u{ordinal})"))
+                    .unwrap_or_default()
+            };
+        let marker = if history::reply_reference::assistant_body(&item.message).is_some() {
+            format!(
+                "{marker}{}",
+                item.message_id
+                    .map(|id| format!(" (m{id})"))
+                    .unwrap_or_default()
+            )
+        } else {
+            marker
+        };
         let model_tag = if item.message.role == "assistant" {
             item.source_model
                 .as_deref()
@@ -1007,10 +1055,7 @@ fn assistant_conclusion_text_at_path(
         if has_tool_calls {
             return None;
         }
-        let text = searchable_history_content(&message.content);
-        if text.trim().is_empty() {
-            return None;
-        }
+        let text = history::reply_reference::assistant_body(message)?;
         seen += 1;
         (seen == nth_back).then_some((text, source_model.clone()))
     }))
@@ -1036,13 +1081,14 @@ fn collect_history_messages_for_path(
     history_file: &Path,
     options: HistoryPreviewOptions,
 ) -> Result<Vec<HistoryPreviewItem>, Box<dyn Error>> {
-    let messages = history::build_message_arr_for_history_view(history_file)?;
+    let messages = history::reply_reference::history_view(history_file)?;
     let mut user_ordinal = 0usize;
     let filtered = messages
         .into_iter()
-        .filter_map(|(message, source_model)| {
+        .filter_map(|(message, source_model, message_id)| {
             let is_real_user = is_real_history_user(&message);
-            let ordinal = if is_real_user {
+            let archive_only = history::is_sqlite_path(history_file) && message_id.is_none();
+            let ordinal = if is_real_user && !archive_only {
                 user_ordinal += 1;
                 Some(user_ordinal)
             } else {
@@ -1058,6 +1104,8 @@ fn collect_history_messages_for_path(
             role_matches.then_some(HistoryPreviewItem {
                 message,
                 user_ordinal: ordinal,
+                message_id,
+                archive_only,
                 source_model,
             })
         })
@@ -1082,13 +1130,14 @@ fn collect_history_messages(
     options: HistoryPreviewOptions,
 ) -> Result<Vec<HistoryPreviewItem>, Box<dyn Error>> {
     let history_file = active_history_path(app);
-    let messages = history::build_message_arr_for_history_view(&history_file)?;
+    let messages = history::reply_reference::history_view(&history_file)?;
     let mut user_ordinal = 0usize;
     let filtered = messages
         .into_iter()
-        .filter_map(|(message, source_model)| {
+        .filter_map(|(message, source_model, message_id)| {
             let is_real_user = is_real_history_user(&message);
-            let ordinal = if is_real_user {
+            let archive_only = history::is_sqlite_path(&history_file) && message_id.is_none();
+            let ordinal = if is_real_user && !archive_only {
                 user_ordinal += 1;
                 Some(user_ordinal)
             } else {
@@ -1104,6 +1153,8 @@ fn collect_history_messages(
             role_matches.then_some(HistoryPreviewItem {
                 message,
                 user_ordinal: ordinal,
+                message_id,
+                archive_only,
                 source_model,
             })
         })
@@ -1284,6 +1335,13 @@ fn summarize_history_content(
 fn searchable_history_content(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts)
+            if parts.iter().any(|part| {
+                part.get("kind").and_then(serde_json::Value::as_str) == Some("message")
+            }) =>
+        {
+            history::value_to_string(value)
+        }
         other => {
             let mut redacted = other.clone();
             history::redact_inline_image_data(&mut redacted);
@@ -1723,9 +1781,10 @@ fn finalize_question(
     mut question: String,
     history_count: usize,
 ) -> Result<QuestionContext, Box<dyn Error>> {
-    // 先提取 `@skills:<name>`（用户经补全显式选择、仅本轮强制注入的 skill 列表，
-    // 可写多个：`@skills:a @skills:b`），再做普通 `@file` 引用提取，
-    // 避免 skill 引用被误当作文件路径处理。
+    let input_draft = question.clone();
+    let reply_selectors = history::reply_reference::extract_selectors(&mut question)?;
+    let input_draft = (!reply_selectors.is_empty()).then_some(input_draft);
+    // Explicit skill and reply selectors must be removed before file parsing.
     let forced_skills = extract_forced_skill_references(&mut question);
     if !forced_skills.is_empty() {
         app.forced_skills = forced_skills;
@@ -1752,9 +1811,7 @@ fn finalize_question(
         }
         handle_binary_files(&mut attachments_text, parsed.binary_files)?;
     }
-    // 图片是 per-turn 状态：每个 turn 重置，避免上一轮图片被无声地拼到
-    // 后续 turn 的 user message（重复 token + 重复 OCR + 把 model 锁在 VL）。
-    // 内联图片占位符仅存文件名，这里回挂到 session assets 目录解析出真实路径。
+    // Images belong to this turn only; resolve placeholders in session assets.
     let assets_dir = {
         use crate::ai::history::SessionStore;
         let store = SessionStore::new(app.config.history_file.as_path());
@@ -1769,6 +1826,8 @@ fn finalize_question(
     Ok(QuestionContext {
         question,
         attachments_text,
+        reply_selectors,
+        input_draft,
         history_count,
     })
 }
@@ -2015,6 +2074,22 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
         }
+    }
+
+    #[test]
+    fn reply_reference_finalize_keeps_question_pure_and_draft_intact() {
+        let mut app = test_app();
+        let raw = "@reply:m42 @skills:review Explain the answer";
+        let ctx = finalize_question(&mut app, raw.to_string(), 0).unwrap();
+        assert_eq!(ctx.question.trim(), "Explain the answer");
+        assert_eq!(ctx.input_draft.as_deref(), Some(raw));
+        assert_eq!(
+            ctx.reply_selectors,
+            vec![history::reply_reference::ReplySelector::Message(42)]
+        );
+        assert!(ctx.attachments_text.is_empty());
+        assert_eq!(app.forced_skills, vec!["review"]);
+        assert!(app.pending_files.is_none());
     }
 
     #[test]
@@ -2711,9 +2786,13 @@ mod tests {
         .unwrap();
 
         assert!(rendered.contains("Showing 3 recent user message(s)"));
-        assert!(rendered.contains("first archived user input (u1)"));
-        assert!(rendered.contains("second archived user input (u2)"));
-        assert!(rendered.contains("current inline user input (u3)"));
+        assert!(rendered.contains(
+            "first archived user input (archive-only; unavailable for reply references)"
+        ));
+        assert!(rendered.contains(
+            "second archived user input (archive-only; unavailable for reply references)"
+        ));
+        assert!(rendered.contains("current inline user input (u1)"));
         assert_eq!(rendered.matches("first archived user input").count(), 1);
 
         let _ = std::fs::remove_dir_all(root);
@@ -2840,6 +2919,75 @@ mod tests {
         assert_eq!(assistant_conclusion_text_at(&app, 4).unwrap(), None);
 
         let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn reply_reference_history_ordinals_match_canonical_after_archive_expansion() {
+        let root = std::env::temp_dir().join(format!("reply-reference-history-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("history.sqlite");
+        let archive = root.join("overflow-history.md");
+        std::fs::write(
+            &archive,
+            "## User\n\narchived question\n\n## Assistant\n\narchived reply\n",
+        )
+        .unwrap();
+        append_history_messages(
+            &path,
+            &[
+                test_message(
+                    "internal_note",
+                    &format!(
+                        "[archive-pointer-v2]\narchive_file_path: {}",
+                        archive.display()
+                    ),
+                ),
+                test_message("user", "canonical question"),
+                test_message("assistant", "canonical reply"),
+            ],
+        )
+        .unwrap();
+        let frozen = history::reply_reference::freeze(
+            &path,
+            "s",
+            &[history::reply_reference::ReplySelector::User(1)],
+        )
+        .unwrap();
+        let id = frozen[0]["source_message_id"].as_i64().unwrap();
+        assert_eq!(
+            history_user_reply_at_path(&path, 1).unwrap(),
+            HistoryUserReplyLookup::Found("canonical reply".into(), None)
+        );
+        assert_eq!(
+            history::reply_reference::conclusion_at(&path, Some(1), 1).unwrap(),
+            Some(id)
+        );
+        let rendered = super::render_history_preview_for_path(
+            None,
+            &path,
+            HistoryPreviewOptions {
+                count: 20,
+                role_filter: HistoryRoleFilter::All,
+                full: true,
+                grep: None,
+            },
+        )
+        .unwrap();
+        assert!(rendered.contains("canonical question (u1)"));
+        assert!(rendered.contains(&format!("canonical reply (m{id})")));
+        for row in rendered
+            .lines()
+            .filter(|row| row.contains("archived question") || row.contains("archived reply"))
+        {
+            assert!(row.contains("archive-only; unavailable for reply references"));
+            assert!(!row.contains("(m"));
+            assert!(!row.contains("(u"));
+        }
+        assert_eq!(
+            history_user_reply_at_path(&path, 2).unwrap(),
+            HistoryUserReplyLookup::UserNotFound
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3874,6 +4022,9 @@ fn room_badge_for_input(history_file: &Path) -> Option<String> {
 }
 
 fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
+    crate::ai::prompt::completion::CommandCompleter::set_reply_candidates(
+        history::reply_reference::recent_previews(&active_history_path(app)).unwrap_or_default(),
+    );
     let model_label = crate::ai::models::model_display_label(&app.current_model);
     let reasoning_effort_label =
         crate::ai::request::reasoning_effort_display_label(app, &app.current_model);

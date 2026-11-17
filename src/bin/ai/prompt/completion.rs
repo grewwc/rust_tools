@@ -22,6 +22,9 @@ use crate::{
 
 pub(super) type LineEditor = Editor<CommandCompleter, DefaultHistory>;
 
+static REPLY_CANDIDATES: LazyLock<RwLock<Vec<(i64, String)>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+
 static CURRENT_MODEL_HINT: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new(String::new()));
 /// Written by the driver after loading manifests. Completion sits on the hot path and must not rescan the disk on every Tab.
 /// `None` means not yet initialized, kept as the compatibility fallback for unit tests and non-interactive calls.
@@ -217,6 +220,12 @@ pub(in crate::ai) struct CompletionCandidate {
 pub(in crate::ai) struct CommandCompleter;
 
 impl CommandCompleter {
+    pub(in crate::ai) fn set_reply_candidates(candidates: Vec<(i64, String)>) {
+        if let Ok(mut guard) = REPLY_CANDIDATES.write() {
+            *guard = candidates;
+        }
+    }
+
     pub(in crate::ai) fn set_current_model_hint(model: &str) {
         if let Ok(mut guard) = CURRENT_MODEL_HINT.write() {
             *guard = model.trim().to_string();
@@ -1290,6 +1299,24 @@ impl CommandCompleter {
         let before = &line[..pos];
         if let Some(completion) = Self::complete_distill_session(line, pos) {
             return completion;
+        }
+        if let Some((start, prefix)) =
+            crate::ai::history::reply_reference::completion_prefix(before)
+        {
+            let candidates = REPLY_CANDIDATES
+                .read()
+                .map(|guard| {
+                    guard
+                        .iter()
+                        .filter(|(id, _)| format!("m{id}").starts_with(prefix))
+                        .map(|(id, preview)| CompletionCandidate {
+                            display: format!("m{id} · {preview}"),
+                            replacement: format!("@reply:m{id}"),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            return (start, candidates);
         }
         // `@skills` / `@skill[:prefix]` trigger skill completion and must be handled before plain `@file` completion,
         // otherwise `complete_file_reference` would treat `@skills` as a file-path fragment.
@@ -4748,5 +4775,27 @@ mod tests {
         let candidates = complete_path_fragment("./", None);
 
         assert!(candidates.iter().any(|candidate| candidate == "@./."));
+    }
+}
+
+#[cfg(test)]
+mod reply_reference_tests {
+    use super::*;
+    #[test]
+    fn reply_reference_completion_inserts_canonical_token_and_preview() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        CommandCompleter::set_reply_candidates(vec![
+            (42, "recent conclusion preview".into()),
+            (7, "earlier conclusion".into()),
+        ]);
+        let (start, candidates) =
+            CommandCompleter::complete_for_line("Explain @reply:m4", "Explain @reply:m4".len());
+        assert_eq!(start, 8);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "@reply:m42");
+        assert!(candidates[0].display.contains("recent conclusion preview"));
+        CommandCompleter::set_reply_candidates(Vec::new());
     }
 }

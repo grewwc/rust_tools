@@ -62,6 +62,14 @@ pub(super) fn publish_checkpoint_names(store: &crate::ai::history::CheckpointSto
     checkpoint::publish_checkpoint_names(store);
 }
 
+/// Selector removal can expose a leading slash or colon in ordinary user text.
+/// Every command entry point must use this decision before parsing that text.
+pub(in crate::ai::driver) fn command_routing_allowed(
+    reply_selectors: &[crate::ai::history::reply_reference::ReplySelector],
+) -> bool {
+    reply_selectors.is_empty()
+}
+
 /// True when `token` begins a local slash command (e.g. `/sessions`, `:bg`).
 ///
 /// The one-shot CLI (`cli.rs::protect_slash_command_args`) uses this to detect
@@ -750,6 +758,28 @@ pub(crate) fn apply_embedded_skills(app: &mut App, names: &[String], same_turn: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reply_reference_command_routing_preserves_plain_commands() {
+        use crate::ai::history::reply_reference::{ReplySelector, extract_selectors};
+
+        for prefix in ["/", ":"] {
+            for command in ["compact", "distill-session", "audit", "audit --deep"] {
+                let plain = format!("{prefix}{command}");
+                let mut quoted = format!("@reply:last {plain}");
+                let selectors = extract_selectors(&mut quoted).unwrap();
+                assert_eq!(quoted, plain);
+                assert_eq!(selectors, [ReplySelector::Last]);
+                assert!(!super::command_routing_allowed(&selectors));
+                assert!(super::command_routing_allowed(&[]));
+                assert!(match command {
+                    "compact" => super::compact::compact_command_args(&plain).is_some(),
+                    "distill-session" => super::distill_session::command_args(&plain).is_some(),
+                    _ => super::audit::parse_audit_command(&plain).is_some(),
+                });
+            }
+        }
+    }
+
     use super::looks_like_slash_command;
 
     #[test]

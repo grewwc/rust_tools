@@ -670,7 +670,7 @@ pub(super) struct StreamResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct QuestionContext {
-    /// The user's pure prompt input (excluding @file-injected content).
+    /// The user's pure prompt input (excluding selectors and attached content).
     /// Used for routing / intent detection / skill matching scenarios that need to
     /// see "user intent".
     pub(super) question: String,
@@ -678,6 +678,10 @@ pub(super) struct QuestionContext {
     /// Only concatenated into the final user_message sent to the LLM; not used for
     /// routing/feature extraction.
     pub(super) attachments_text: String,
+    /// Original input retained for retry if reference validation rejects the turn.
+    pub(super) input_draft: Option<String>,
+    /// Explicit current-turn selectors, frozen only after acquiring the turn lease.
+    pub(super) reply_selectors: Vec<crate::ai::history::reply_reference::ReplySelector>,
     pub(super) history_count: usize,
 }
 

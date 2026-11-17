@@ -548,11 +548,28 @@ fn persist_note_search_turn(app: &App, question: &str, answer: &str) {
     }
 }
 
+fn validate_note_search_references(
+    question: &str,
+    selectors: &[crate::ai::history::reply_reference::ReplySelector],
+) -> std::io::Result<()> {
+    let mut question = question.to_string();
+    let inline = crate::ai::history::reply_reference::extract_selectors(&mut question)?;
+    if !selectors.is_empty() || !inline.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Reply references are not supported in note-search mode; use a regular session turn",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn handle_note_search_interactive_turn(
     app: &App,
     question: &str,
     history_count: usize,
+    reply_selectors: &[crate::ai::history::reply_reference::ReplySelector],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    validate_note_search_references(question, reply_selectors)?;
     clear_stream_cancel(app);
     crate::ai::tools::registry::common::clear_tool_cancel();
     let _guard = ForegroundTurnGuard::enter();
@@ -567,6 +584,7 @@ pub(super) async fn handle_note_search_interactive_turn(
 /// than dumping the raw entries directly).
 pub(super) async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     let query = app.cli.args.join(" ");
+    validate_note_search_references(&query, &[])?;
     let answer = answer_memo_search(app, &query, 0).await?;
     crate::ai::stream::render_markdown_block(&answer).ok();
     Ok(())
@@ -1649,5 +1667,92 @@ mod tests {
         assert!(new_entries[0].note.contains("合并后的 memo"));
         assert!(new_entries[0].note.contains("memo_a 内容"));
         assert!(new_entries[0].note.contains("memo_b 内容"));
+    }
+}
+
+#[cfg(test)]
+mod reply_reference_tests {
+    use super::*;
+    use crate::ai::history::reply_reference::ReplySelector;
+
+    #[tokio::test]
+    async fn reply_reference_note_search_rejects_before_retrieval_and_persistence() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut app = crate::ai::driver::tests::test_app("build");
+        app.cli =
+            crate::ai::cli::parse_cli_args(["a", "-ns", "-i"].into_iter().map(str::to_string));
+        assert!(note_search_interactive_mode(&app.cli));
+        let dir = std::env::temp_dir().join(format!(
+            "reply-reference-note-search-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.session_history_file = dir.join("history.sqlite");
+        let message = |role: &str, text: &str| crate::ai::history::Message {
+            role: role.into(),
+            content: serde_json::json!(text),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        crate::ai::history::append_history_messages(
+            &app.session_history_file,
+            &[
+                message("user", "prior question"),
+                message("assistant", "committed reply"),
+            ],
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        app.config.endpoint = format!("http://{}", listener.local_addr().unwrap());
+        for selector in [
+            ReplySelector::Message(2),
+            ReplySelector::Message(999),
+            ReplySelector::Last,
+        ] {
+            let error =
+                handle_note_search_interactive_turn(&app, "Explain the reply", 0, &[selector])
+                    .await
+                    .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("not supported in note-search mode")
+            );
+        }
+        for prompt in [
+            "@reply:m2 Explain",
+            "@reply:m999 Explain",
+            "@reply:m0 Explain",
+        ] {
+            app.cli = crate::ai::cli::parse_cli_args(
+                ["a", "-ns", prompt].into_iter().map(str::to_string),
+            );
+            assert!(app.cli.note_search);
+            assert!(!note_search_interactive_mode(&app.cli));
+            let original = app.cli.args.clone();
+            let error = handle_memo_search(&app).await.unwrap_err();
+            assert!(
+                error.to_string().contains("reply reference")
+                    || error.to_string().contains("Reply references")
+            );
+            assert_eq!(app.cli.args, original);
+        }
+        let conn = rusqlite::Connection::open(&app.session_history_file).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(validate_note_search_references("`@reply:m2` literal search", &[]).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { loadReplyReferenceHelpers } = require("./app_reply_reference_fixture.cjs");
 const html = fs.readFileSync(process.env.ASERVE_TEST_APP_HTML || path.join(__dirname, "app.html"), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 
@@ -219,6 +220,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
       clearInterval(id) { intervals.delete(id); },
     } : {}),
   });
+  loadReplyReferenceHelpers(context, script);
   vm.runInContext(script.slice(script.indexOf("// BEGIN execution model"), script.indexOf("// END execution model")), context);
   context.turns.set("s", context.liveEntry);
   vm.runInContext(script.slice(script.indexOf("function toolArgsOf("), script.indexOf("const FOLD_ROLE_LABELS")), context);
@@ -421,6 +423,7 @@ function attachmentHarness(headersOnly = false, options) {
       }) }) } };
     },
   });
+  vm.runInContext(script.slice(script.indexOf("function messageTimestampOf("), script.indexOf("function createPlainMessageNode(")), c);
   c.commitExecutionView(c.sessionId, c.executionBase());
   c.$("msgs")._transcriptOwner = { sessionId: c.sessionId, base: c.executionBase() };
   vm.runInContext(script.slice(script.indexOf("function parseBlock("), script.indexOf("async function send()")), c);
@@ -541,6 +544,7 @@ function coldHistoryHarness(savedRates, { phone = true } = {}) {
     esc: (text) => String(text), textOf: (text) => String(text), isRuntimeSyntheticUser: () => false,
     renderMarkdown: (text) => text, decorateAndLoad() {}, addAnswerCopy() {}, attachUserRewind: (bubble) => bubble,
   });
+  loadReplyReferenceHelpers(context, script);
   for (const [start, end] of [
     ["// BEGIN execution model", "function bindExecutionModel()"],
     ["const RATE_STORAGE =", "function addFold("],
@@ -576,7 +580,7 @@ function retainedHistoryHarness(messages, options = {}) {
     canonicalHistoryTotal: 0, pendingUserInputs: new Map(),
     staleSession: "", staleDone: false, staleTries: 0,
     isRuntimeSyntheticUser: () => false, isTurnRunning: () => false,
-    textOf: (text) => text, FOLD_ROLE_LABELS: { tool: "tool" },
+    FOLD_ROLE_LABELS: { tool: "tool" },
     histKey: (rows) => JSON.stringify(rows), histEndsTurn: () => true, historyEndsUnanswered: () => false,
     revokePreviews() {}, renderSessionBar() {}, updateQuestionButton() {}, startStaleFollow() {},
     addUserBubble(text, index, parent) {
@@ -2859,7 +2863,12 @@ test("a finished event stream is not re-attached on every poll, but a new turn i
 });
 
 test("the terminal marker ends the reattach loop instead of rescheduling it", () => {
-  assert.match(script, /if \(block\.kind === "done"\) \{\s+view\.finish\(\);\s+endedTurnPid = turnRunningPid;\s+finished = true; eventStreamEnded = true; eventFailures = 0; confirmPollSeq\+\+;\s+stopStaleFollow\(\);\s+break;\s+\}/);
+  const start = script.indexOf('if (block.kind === "done") {');
+  const end = script.indexOf('if (block.kind === "error") {', start);
+  const terminal = script.slice(start, end);
+  assert.match(terminal, /source = JSON.parse\(block.payload\)/);
+  assert.match(terminal, /view\.finish\("ended", source\);\s+endedTurnPid = turnRunningPid;\s+finished = true; eventStreamEnded = true; eventFailures = 0; confirmPollSeq\+\+;\s+stopStaleFollow\(\);\s+break;\s+\}/);
+  assert.doesNotMatch(terminal, /attachEvents\(/);
   assert.match(script, /if \(!eventStreamEnded\) void attachEvents\(\);/);
 });
 

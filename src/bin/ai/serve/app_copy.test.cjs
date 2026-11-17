@@ -131,9 +131,13 @@ function harness({ clipboard, fallback = true, phone = false } = {}) {
   };
   const msgs = document.createElement("div");
   document.body.appendChild(msgs);
+  const prompt = new Element("textarea");
+  prompt.value = "";
+  document.body.appendChild(prompt);
   const rates = new Map();
   const context = vm.createContext({
-    document, window: {}, $: () => msgs,
+    document, window: {}, $: (id) => id === "prompt" ? prompt : msgs,
+    promptComposing: false, promptHistory: null, traceMark() {}, growPrompt() {}, persistDraft() {},
     sessionId: "s", isPhoneLayout: () => phone,
     localStorage: { getItem: (key) => rates.get(key) || null, setItem: (key, value) => rates.set(key, value) },
     shouldFollowOutput: () => false, followOutput() {}, updateQuestionButton() {}, decorateAndLoad() {},
@@ -144,10 +148,12 @@ function harness({ clipboard, fallback = true, phone = false } = {}) {
   });
   vm.runInContext(between("// BEGIN execution model", "// END execution model"), context);
   vm.runInContext(between("const esc =", "function sessionTitle("), context);
+  vm.runInContext(between("function textOf(", "// Persisted runtime origin sidecar"), context);
+  vm.runInContext(between("function insertPromptText(", "// --- native phone actions"), context);
   vm.runInContext(between("function addMsg(", "// --- server-side media"), context);
   vm.runInContext(between("const RATE_STORAGE =", "function addFold("), context);
   return {
-    context, document, msgs, copied, areas, focusCalls,
+    context, document, msgs, prompt, copied, areas, focusCalls,
     answer: (text, parent = msgs) => context.addMsgMd(text, parent),
     tap: (target) => context.handlePreviewClick({ target }),
   };
@@ -611,3 +617,147 @@ for (const phone of [true, false]) {
     assert.deepEqual(copied, [raw, raw], "rendered-text copy included throughput");
   });
 }
+
+
+test("reply_reference_button_inserts_at_cursor_preserves_draft_and_focus", () => {
+  const h = harness();
+  vm.runInContext("replyReferenceVersion = 1", h.context);
+  const answer = h.answer("committed body");
+  h.context.setMessageTimestamp(answer, { message_id: 42 });
+  const button = answer.querySelector("[data-reference-answer]");
+  assert.ok(button, "identity alone is enough without a timestamp");
+  h.prompt.value = "Explain this";
+  h.prompt.setSelectionRange(7, 7);
+  h.tap(button);
+  assert.equal(h.prompt.value, "Explain @reply:m42 this");
+  assert.equal(h.document.activeElement, h.prompt);
+  assert.equal(h.prompt.selectionStart, "Explain @reply:m42".length);
+  assert.equal(answer.querySelectorAll("[data-reference-answer]").length, 1);
+});
+
+test("reply_reference_buttons_require_capability_identity_session_and_completion", () => {
+  const h = harness();
+  const answer = h.answer("body");
+  h.context.setMessageTimestamp(answer, { message_id: 4 });
+  assert.equal(answer.querySelector("[data-reference-answer]"), null, "old server has no capability");
+  vm.runInContext("replyReferenceVersion = 1", h.context);
+  h.context.updateAnswerReference(answer);
+  assert.ok(answer.querySelector("[data-reference-answer]"));
+  const missing = h.answer("missing ID"), pending = h.answer("pending"), tool = h.answer("tool narration");
+  pending.classList.add("pending");
+  h.context.setMessageTimestamp(pending, { message_id: 5 });
+  h.context.setMessageTimestamp(tool, { message_id: 6, tool_calls: [{ id: "call" }] });
+  assert.equal(pending.querySelector("[data-reference-answer]"), null);
+  assert.equal(missing.querySelector("[data-reference-answer]"), null);
+  assert.equal(tool.querySelector("[data-reference-answer]"), null);
+  h.context.sessionId = "another-session";
+  h.context.updateAnswerReference(answer);
+  assert.equal(answer.querySelector("[data-reference-answer]"), null);
+});
+
+test("reply_reference_done_binds_committed_identity_without_timestamp", () => {
+  const h = streamHarness();
+  vm.runInContext("replyReferenceVersion = 1", h.context);
+  h.emit("delta", { delta: "committed body" });
+  assert.equal(h.box.querySelector("[data-reference-answer]"), null);
+  h.emit("done", { message_id: 42 });
+  const button = h.box.querySelector("[data-reference-answer]");
+  assert.ok(button);
+  assert.equal(button.closest(".msg.md").dataset.messageId, "42");
+});
+
+test("reply_reference_frozen_history_has_boundary_and_pending_matches_pure_question", () => {
+  const h = harness();
+  const content = [
+    { type: "reference", kind: "message", source_message_id: 42, text: "assistant snapshot with <script>" },
+    { type: "text", text: "Explain this" },
+  ];
+  assert.equal(h.context.textOf(content), "Explain this");
+  assert.equal(h.context.replyQuestionText("@reply:m42 Explain this"), "Explain this");
+  for (const literal of ["\\@reply:m42", "`@reply:m42`", "```\n@reply:m42\n```", "email@reply:m42"]) {
+    assert.equal(h.context.replyQuestionText(literal), literal);
+  }
+  const row = h.context.addMsg("user", h.context.textOf(content), "user", h.msgs, { message_id: 43, content });
+  assert.equal(row.dataset.question, "Explain this");
+  const reference = row.querySelector(".reply-reference");
+  assert.ok(reference);
+  assert.equal(reference.querySelector("summary").textContent, "Referenced assistant reply: m42");
+  assert.equal(reference.querySelector("pre").textContent, "assistant snapshot with <script>");
+});
+
+
+test("reply_reference_replay_completion_binds_identity_without_timestamp", () => {
+  const h = replayHarness();
+  vm.runInContext("replyReferenceVersion = 1", h.context);
+  h.view.delta("committed body");
+  h.view.finish("ended", { message_id: 48 });
+  assert.equal(h.view.box.querySelector("[data-reference-answer]").closest(".msg.md").dataset.messageId, "48");
+});
+
+test("reply_reference_rejection_restores_draft_and_clears_pending_input", () => {
+  const h = harness();
+  const input = { prompt: "@reply:m42 Explain", settled: true };
+  h.context.pendingUserInputs = new Map([["s", [input]]]);
+  h.context.executionBase = () => "";
+  h.context.setPromptValue = (text) => { h.prompt.value = text; return true; };
+  h.context.renderComposerAttachments = () => {};
+  h.context.pendingImages = [];
+  assert.equal(h.context.recoverRejectedReplyInput("Reply reference Message(42) is unavailable", input, "s", "", input.prompt, []), true);
+  assert.equal(h.prompt.value, input.prompt);
+  assert.equal(input.settled, false);
+  assert.equal(input.referenceRejected, true);
+  assert.equal(h.context.pendingUserInputs.has("s"), false);
+  h.prompt.value = "a new draft";
+  h.context.recoverRejectedReplyInput("Invalid reply reference @reply:m0", input, "s", "", "@reply:m0 question", []);
+  assert.equal(h.prompt.value, "a new draft");
+});
+
+test("reply_reference_normal_server_error_keeps_input_eligible_for_settlement", () => {
+  const h = harness();
+  const input = { prompt: "Explain", settled: true };
+  h.context.pendingUserInputs = new Map([["s", [input]]]);
+  assert.equal(h.context.recoverRejectedReplyInput("server rejected the turn", input, "s", "", input.prompt, []), false);
+  assert.equal(input.settled, true);
+  assert.equal(input.referenceRejected, undefined);
+  assert.equal(h.context.pendingUserInputs.get("s")[0], input);
+});
+
+
+test("reply_reference_fence_closers_require_whitespace_tail_and_matching_length", () => {
+  const h = harness();
+  for (const literal of [
+    "```text\n```not-a-closing-fence\n@reply:m42\n```",
+    "~~~text\n~~~not-a-closing-fence\n@reply:m42\n~~~~ \t",
+    "````\n```\n@reply:m42\n`````",
+    "~~~\n```\n@reply:m42\n~~~",
+    "```\n```\u0085\n@reply:m42\n```",
+    "```\n```\ufeff\n@reply:m42\n```",
+    "`@reply:m42`",
+  ]) {
+    assert.equal(h.context.replyQuestionText(literal + "\n@reply:m7"), literal.trimEnd());
+  }
+  assert.equal(h.context.replyQuestionText("```\n@reply:m42\n``` \t\n@reply:last"), "```\n@reply:m42\n```");
+});
+
+
+test("reply_reference_token_whitespace_follows_unicode_white_space", () => {
+  const h = harness();
+  for (const space of [" ", "\t", "\n", "\r", "\u0085", "\u00a0", "\u3000"]) {
+    assert.equal(h.context.replyQuestionText(space + "@reply:m42" + space + "Explain" + space), "Explain");
+  }
+  for (const literal of ["\ufeff@reply:m42 Explain", "@reply:m42\ufeff Explain"]) {
+    assert.equal(h.context.replyQuestionText(literal), literal);
+  }
+  assert.equal(h.context.replyQuestionText("@reply:m42 \ufeffExplain\ufeff"), "\ufeffExplain\ufeff");
+});
+
+test("reply_reference_button_uses_unicode_token_boundaries", () => {
+  const h = harness();
+  vm.runInContext("replyReferenceVersion = 1", h.context);
+  const answer = h.answer("committed body");
+  h.context.setMessageTimestamp(answer, { message_id: 42 });
+  h.prompt.value = "left\ufeffright";
+  h.prompt.setSelectionRange(5, 5);
+  h.tap(answer.querySelector("[data-reference-answer]"));
+  assert.equal(h.prompt.value, "left\ufeff @reply:m42 right");
+});

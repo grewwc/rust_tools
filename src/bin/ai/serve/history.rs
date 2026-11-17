@@ -8,9 +8,9 @@ use crate::ai::history::{Message, StoredMessage};
 /// malformed or oversized request turning a preview into a full dump.
 const SERVE_HISTORY_VIEW_COUNT_CAP: usize = 100;
 
-/// Same searchable-text rule as the serve-chat client (`String` verbatim,
-/// anything else as compact JSON), used by the `/history last` conclusion
-/// emptiness check so both sides agree on what counts as content.
+/// Searchable history content: strings stay verbatim and structured content
+/// stays compact JSON for route filtering. Conclusion eligibility uses the
+/// shared assistant-body selector.
 fn serve_searchable_text(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(text) => text.clone(),
@@ -21,12 +21,7 @@ fn serve_searchable_text(content: &serde_json::Value) -> String {
 }
 
 fn is_serve_assistant_conclusion(message: &Message) -> bool {
-    message.role == "assistant"
-        && message
-            .tool_calls
-            .as_ref()
-            .is_none_or(|calls| calls.is_empty())
-        && !serve_searchable_text(&message.content).trim().is_empty()
+    crate::ai::history::reply_reference::assistant_body(message).is_some()
 }
 
 /// Request body for `POST /sessions/{id}/rewind`: the canonical (0-based)
@@ -480,13 +475,13 @@ pub(super) fn serve_done_metadata(
     let real_user = |stored: &&StoredMessage| {
         stored.message.role == "user" && !is_runtime_synthetic_user_message(&stored.message)
     };
-    if let Some(user) = messages.iter().find(real_user)
-        && let Some(created_at) = user.created_at
-    {
+    if let Some(user) = messages.iter().find(real_user) {
         value["user_message"] = serde_json::json!({
             "message_id": user.message_id,
-            "created_at": created_at,
         });
+        if let Some(created_at) = user.created_at {
+            value["user_message"]["created_at"] = serde_json::json!(created_at);
+        }
     }
     let conclusion = messages
         .iter()
@@ -494,7 +489,6 @@ pub(super) fn serve_done_metadata(
         .take_while(|stored| !real_user(stored))
         .find(|stored| is_serve_assistant_conclusion(&stored.message));
     if let (Some(message), Some(committed_answer)) = (conclusion, committed_answer)
-        && let Some(created_at) = message.created_at
         && let Some(content) = message.message.content.as_str()
     {
         let base = content
@@ -509,7 +503,9 @@ pub(super) fn serve_done_metadata(
                     .is_some_and(|suffix| suffix.starts_with("\n\n")))
         {
             value["message_id"] = serde_json::json!(message.message_id);
-            value["created_at"] = serde_json::json!(created_at);
+            if let Some(created_at) = message.created_at {
+                value["created_at"] = serde_json::json!(created_at);
+            }
         }
     }
     value

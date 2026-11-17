@@ -55,7 +55,7 @@ mod tests;
 // rustls-no-provider, see root Cargo.toml) panics at Client::build() when no
 // crypto provider is installed. #[ctor] runs before the test harness starts.
 #[cfg(test)]
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn install_rustls_provider_for_tests() {
     rust_tools::ensure_rustls_provider();
 }

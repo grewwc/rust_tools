@@ -85,7 +85,8 @@ pub(in crate::ai) use wire_parse::{
 // External re-exports (build_content is called from several places in the driver)
 #[allow(unused_imports)]
 pub(crate) use builder::{
-    build_content, build_reference_content, clamp_max_tokens_for_prompt, materialize_references,
+    build_content, build_reference_content, clamp_max_tokens_for_prompt,
+    materialize_attachment_references, materialize_references,
 };
 
 // Transport layer: HTTP request sending, retry, timeout, auth

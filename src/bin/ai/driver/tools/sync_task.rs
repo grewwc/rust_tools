@@ -514,6 +514,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
                                     usize::MAX,
                                     prompt,
                                     String::new(),
+                                    Vec::new(),
                                     model,
                                     None,
                                     None,

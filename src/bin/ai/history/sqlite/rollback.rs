@@ -394,7 +394,11 @@ pub(in crate::ai) fn backup_sqlite(source: &Path, target: &Path) -> io::Result<(
         let source_conn = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| io::Error::other(e.to_string()))?;
         source_conn
-            .backup(rusqlite::MAIN_DB, &temporary, None)
+            .backup(
+                rusqlite::MAIN_DB,
+                &temporary,
+                None::<fn(rusqlite::backup::Progress)>,
+            )
             .map_err(|e| io::Error::other(e.to_string()))?;
         drop(source_conn);
 

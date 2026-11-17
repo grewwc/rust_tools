@@ -6,6 +6,7 @@ mod markdown;
 #[cfg(test)]
 #[path = "compress/prefix_cert_integration_tests.rs"]
 mod prefix_cert_integration_tests;
+pub(in crate::ai) mod reply_reference;
 mod sessions;
 mod sqlite;
 mod suspended;
@@ -835,7 +836,8 @@ fn context_projection_fingerprint(
     // instead of materialized inline images, so cross-turn digest fingerprints
     // still match on snapshot-covered loads. Snapshots built under v24 (or
     // earlier) may carry baked base64 image data and must be rebuilt.
-    const PROJECTION_VERSION: u8 = 25;
+    // Rebuild snapshots whose mid-turn summaries consumed flattened reply bodies.
+    const PROJECTION_VERSION: u8 = 28;
     projection_cache_key(
         PROJECTION_VERSION,
         history_max_chars,

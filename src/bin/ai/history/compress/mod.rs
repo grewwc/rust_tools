@@ -409,6 +409,9 @@ pub(in crate::ai) fn value_to_string(v: &Value) -> String {
                         let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("file");
                         text_parts.push(format!("[Attached file: {name}]"));
                     }
+                    "reference" if obj.get("kind").and_then(|k| k.as_str()) == Some("message") => {
+                        text_parts.push(crate::ai::history::reply_reference::marker(item));
+                    }
                     // Any other/future reference kind renders as a marker so
                     // summaries never leak raw JSON and new kinds are not
                     // silently dropped from /history or summary text.

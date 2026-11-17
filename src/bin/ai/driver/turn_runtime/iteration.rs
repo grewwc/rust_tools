@@ -3126,6 +3126,179 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ReplySummaryRecorder {
+        inputs: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::ai::history::HistoryMessageSummarizer for ReplySummaryRecorder {
+        fn summarize_history_messages<'a>(
+            &'a self,
+            messages: &'a [Message],
+            _max_chars: usize,
+        ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
+            Box::pin(async move {
+                // Record the exact transcript renderer used by the auxiliary request.
+                self.inputs.lock().unwrap().push(
+                    crate::ai::history::compress::summary_input::build_summary_history_input(
+                        messages,
+                        crate::ai::history::compress::summary_input::SUMMARY_TRANSCRIPT_MAX_CHARS,
+                    ),
+                );
+                None
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn reply_reference_production_summary_preserves_question_and_boundaries() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for persistent in [true, false] {
+            let root = std::env::temp_dir().join(format!("reply-summary-{}", uuid::Uuid::new_v4()));
+            let mut app = crate::ai::driver::tests::test_app("build");
+            app.config.history_file = root.join("history.sqlite");
+            app.session_history_file = root.join("history.sqlite");
+            app.session_id = format!("reply-summary-{}", uuid::Uuid::new_v4());
+            app.current_model = "reply-summary-test-model".to_string();
+            app.config.history_max_chars = 1_000_000;
+            app.config.history_keep_last = 8;
+            let question = "Compare both quoted replies and explain their remaining disagreement.";
+            let references: Vec<_> = (0..2).map(|index| serde_json::json!({
+                "type": "reference", "kind": "message", "version": 1,
+                "source_message_id": 42 + index, "source_session_id": app.session_id,
+                "role": "assistant", "text": if index == 0 { "A" } else { "B" }.repeat(16_000),
+            })).collect();
+            let mut referenced_user = summary_message("user", question);
+            crate::ai::history::reply_reference::append_frozen(
+                &mut referenced_user.content,
+                &references,
+            );
+            let mut history = vec![
+                referenced_user,
+                summary_message("assistant", "The replies disagree."),
+            ];
+            for turn in 1..4 {
+                history.push(summary_message("user", format!("Later request {turn}")));
+                history.push(summary_message("assistant", format!("Later answer {turn}")));
+            }
+            crate::ai::history::append_history_messages(&app.session_history_file, &history)
+                .unwrap();
+            let model = app.current_model.clone();
+            let mcp = Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+            let mut prepared = super::super::prepare::prepare_turn(
+                &mut app,
+                &mcp,
+                &[],
+                usize::MAX,
+                1,
+                "Continue the task.",
+                "",
+                &references,
+                &model,
+                None,
+            )
+            .await
+            .unwrap();
+            let projected = prepared
+                .messages
+                .iter()
+                .find(|message| {
+                    message.role == "user"
+                        && message
+                            .content
+                            .as_array()
+                            .is_some_and(|parts| parts.iter().any(|part| part["text"] == question))
+                })
+                .expect("production preparation must retain the old referenced question");
+            assert_eq!(projected.content.as_array().unwrap()[0]["kind"], "message");
+            let sent = request::normalize_messages_for_request_for_test(&[projected.clone()]);
+            let sent_user = sent.iter().find(|message| message.role == "user").unwrap();
+            let full_text = crate::ai::history::value_to_string(&sent_user.content);
+            assert!(full_text.contains(&"A".repeat(16_000)));
+            assert!(full_text.contains(&"B".repeat(16_000)));
+            assert!(full_text.contains(question));
+            assert_eq!(
+                full_text
+                    .matches("[End referenced assistant reply]")
+                    .count(),
+                2
+            );
+            // Untrimmable instructions force the real budget gate to invoke the summarizer.
+            prepared.messages.insert(
+                0,
+                summary_message("system", "fixed instruction ".repeat(40_000)),
+            );
+            if !persistent {
+                prepared.persistable_context = None;
+            }
+            let recorder = ReplySummaryRecorder::default();
+            let before =
+                request::preview_request_budget(&app, &model, &prepared.messages, true, false)
+                    .await;
+            assert!(before.exceeds_input_allowance());
+            super::apply_request_budget(
+                &app,
+                &model,
+                &mut prepared.messages,
+                &mut prepared.persistable_context,
+                &mut LlmSummaryBudget::default(),
+                &recorder,
+                false,
+                1,
+                &mut super::CompressionReport::default(),
+                before,
+            )
+            .await;
+            let inputs = recorder.inputs.lock().unwrap();
+            assert_eq!(inputs.len(), 1, "persistent={persistent}");
+            let transcript = &inputs[0];
+            assert!(
+                transcript.contains(question),
+                "persistent={persistent}: {transcript}"
+            );
+            for id in [42, 43] {
+                assert!(
+                    transcript.contains(&format!("[Referenced assistant reply: m{id}]")),
+                    "{transcript}"
+                );
+            }
+            assert_eq!(
+                transcript
+                    .matches("[End referenced assistant reply]")
+                    .count(),
+                2,
+                "{transcript}"
+            );
+            assert_eq!(
+                transcript
+                    .matches("[Referenced assistant reply truncated for summary preview]")
+                    .count(),
+                2
+            );
+            assert!(!transcript.contains(&"A".repeat(601)));
+            assert!(!transcript.contains(&"B".repeat(601)));
+            let logs = crate::ai::driver::decision_log::get_decision_log_store()
+                .by_type(&crate::ai::driver::decision_log::DecisionType::ContextProjection);
+            let expected_trigger = if persistent {
+                "persistable_context"
+            } else {
+                "pre_request_fallback"
+            };
+            assert!(
+                logs.iter()
+                    .filter(|log| log.session_id == app.session_id)
+                    .any(|log| {
+                        let body: Value = serde_json::from_str(&log.context).unwrap();
+                        body["trigger"] == expected_trigger && body["model_called"] == true
+                    })
+            );
+            prepared.skill_turn.restore_agent_context(&mut app);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn llm_summary_budget_caps_model_calls_across_tool_rounds() {
         // Exercise both production trigger paths, including a failed response

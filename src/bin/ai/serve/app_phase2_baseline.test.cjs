@@ -503,8 +503,8 @@ function sendHarness(options = {}) {
   let pending, entry;
   return {
     ...h, c, timers, reader, replays, requests,
-    async start() {
-      h.elements.prompt.value = "run characterization";
+    async start(prompt = "run characterization") {
+      h.elements.prompt.value = prompt;
       pending = c.send(); await requested.promise; await flush();
       entry = c.executionState().liveEntry;
       assert.ok(entry, "real send registers its live turn before headers arrive");
@@ -662,6 +662,17 @@ test("real send: a server error block interrupts task state and retains one erro
   assert.equal(h.liveBox().parentNode, h.elements.msgs);
   assert.equal(h.replays.length, 0);
   assert.equal(records(h.liveBox()).filter((node) => node.classList.contains("err")).length, 1);
+  await h.dispose();
+});
+
+test("reply_reference_real_send_rejection_keeps_input_unsettled_and_preserves_new_draft", async () => {
+  const h = sendHarness(); await h.start("@reply:m42 Explain"); await h.accept();
+  await h.finish(() => h.reader.frame(sse("error", { error: "Reply reference Message(42) is unavailable" })));
+  assert.deepEqual(h.snapshot(), { ...cleanState, failed: true, settled: false,
+    errors: ["turn failed: Reply reference Message(42) is unavailable"] });
+  assert.equal(h.entry().userInput.referenceRejected, true);
+  assert.equal(h.c.pendingUserInputs.has(h.c.sessionId), false);
+  assert.equal(h.replays.length, 0);
   await h.dispose();
 });
 

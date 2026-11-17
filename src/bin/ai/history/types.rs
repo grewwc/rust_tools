@@ -56,7 +56,7 @@ pub(in crate::ai) struct SkillActivationEvent {
 /// of request normalization, and must never reach the provider payload.
 /// Do not switch to a content prefix: real users can type arbitrary text, and
 /// recognizing by content would forge turn boundaries.
-const RUNTIME_SYNTHETIC_USER_ORIGIN: &str = "runtime-origin:synthetic-user:v1";
+pub(super) const RUNTIME_SYNTHETIC_USER_ORIGIN: &str = "runtime-origin:synthetic-user:v1";
 
 /// Runtime-authored fold provenance; persisted but never sent to a provider.
 pub(super) const FOLDED_TOOL_ORIGIN: &str = "runtime-origin:folded-tool-evidence:v1:";

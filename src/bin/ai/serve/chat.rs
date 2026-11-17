@@ -1303,7 +1303,11 @@ struct RemoteHistoryMessage {
     /// falls back to counting locally then.
     #[serde(default)]
     user_ordinal: Option<usize>,
+    #[serde(default)]
+    message_id: Option<i64>,
 }
+
+const SERVE_REPLY_REFERENCE_HELP: &str = "@reply:m42 / @reply:u2 / @reply:last - quote committed replies in this session; separate multiple tokens with spaces.\nRemote CLI: type reply tokens manually (no reply Tab preview); note-search does not support reply references.";
 
 const SERVE_HISTORY_DEFAULT_COUNT: usize = 6;
 const SERVE_HISTORY_FULL_COUNT: usize = 20;
@@ -1465,6 +1469,13 @@ fn fetch_serve_history_selected_conclusion(
 fn serve_history_searchable_text(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(parts)
+            if parts
+                .iter()
+                .any(|part| part["type"] == "reference" && part["kind"] == "message") =>
+        {
+            crate::ai::history::value_to_string(content)
+        }
         other => {
             serde_json::to_string(other).unwrap_or_else(|_| "<non-string content>".to_string())
         }
@@ -1705,7 +1716,17 @@ fn render_serve_history(messages: &[RemoteHistoryMessage], view: &ServeHistoryVi
                 SERVE_HISTORY_MAX_CHARS,
             )
         };
-        let marker = ordinal.map(|n| format!(" (u{n})")).unwrap_or_default();
+        let mut marker = ordinal.map(|n| format!(" (u{n})")).unwrap_or_default();
+        if message.role == "assistant"
+            && message
+                .tool_calls
+                .as_ref()
+                .is_none_or(|calls| calls.is_empty())
+        {
+            if let Some(id) = message.message_id.filter(|id| *id > 0) {
+                marker.push_str(&format!(" (m{id})"));
+            }
+        }
         out.push_str(&format!(
             "{}. [{}] {}{}\n",
             row + 1,
@@ -1796,7 +1817,11 @@ fn print_serve_history_selected_rendered(
     header: String,
 ) -> Result<(), String> {
     let body = serve_history_searchable_text(&messages[0].content);
-    let rendered = format!("{header}\n{body}");
+    let identity = messages[0]
+        .message_id
+        .map(|id| format!(" (m{id})"))
+        .unwrap_or_default();
+    let rendered = format!("{header}{identity}\n{body}");
     let (header, body) = rendered.split_once('\n').unwrap_or((rendered.as_str(), ""));
     println!("{header}");
     let body = super::super::driver::turn_runtime::postprocess_terminal_text(body.to_string());
@@ -2279,6 +2304,7 @@ fn print_serve_history_help() {
         "/history usage (remote session):\n  /history [N]           Show last N messages (default: {})\n  /history full          Show full messages\n  /history user/assistant/tool/system\n                         Filter by role\n  /history u<N>          Replay the assistant reply to user message u<N>\n  /history grep <keyword>  Search messages\n  /history last [N]      Replay the Nth recent assistant conclusion (full text)\n  /history replay        Replay the last assistant conclusion (text only)\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history help          Show this help\n\n`/history copy`/`/history export` and other-session views are local-only: print the view here and save or copy it locally; `/export-md [path]` runs on the server. Assistant rows carry no model tag; the history route serves bare messages.",
         SERVE_HISTORY_DEFAULT_COUNT
     );
+    println!("{SERVE_REPLY_REFERENCE_HELP}");
 }
 
 #[cfg(test)]
@@ -2294,6 +2320,7 @@ mod serve_history_tests {
             tool_calls: None,
             reasoning_content: None,
             user_ordinal: None,
+            message_id: None,
         }
     }
 
@@ -2397,6 +2424,7 @@ mod serve_history_tests {
                 tool_calls: None,
                 reasoning_content: synthetic.reasoning_content,
                 user_ordinal: None,
+                message_id: None,
             },
             test_message("assistant", "answer"),
             test_message("user", "second"),
@@ -2426,6 +2454,7 @@ mod serve_history_tests {
                 tool_calls: None,
                 reasoning_content: synthetic.reasoning_content,
                 user_ordinal: None,
+                message_id: None,
             },
             test_message("user", "second cache target"),
         ];
@@ -2590,6 +2619,7 @@ mod serve_history_tests {
             tool_calls: Some(vec![json!({"id": "1"})]),
             reasoning_content: None,
             user_ordinal: None,
+            message_id: None,
         });
         messages.push(test_message("assistant", "   "));
         let first = render_serve_history_last(&messages, 1).expect("last");
@@ -5170,6 +5200,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                 println!(
                     "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first, archived hidden); /sessions all - include archived; /sessions archive - list archived; /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|u<N>|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/export, /import - session ZIP commands available in the local REPL (same as /ss export/import)\n/export-md [path] - export the latest server-side assistant conclusion to a markdown file on the server (relative to the remote cwd; default: _summary.md)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n{use_usage} - show or switch the remote session's default subagent backend (also :use); a task on a new line runs immediately\n/reset - restore the default subagent backend and clear sticky agent-team\n/audit [-f|--fast] [instruction] - run the audit subagent on the server, then verify and fix findings\n/task [N] <goal> - run a multi-worker task room on the server (/task status [room] shows progress; /task help for details)\n/discuss [N] <topic> - run a multi-member discussion on the server (/discuss status [room] shows progress; /discuss help for details)\n/distill-session [session-id|archive.zip] [--dry-run] [--limit N] - distill a session into knowledge on the server (paths resolve on the server)\n/title [text] - set or show the current server-side session title (bare /title shows it)\n/mark [<id>|current|last] [message] - mark a server-side session as important (default: current; leading `--` makes the rest a literal message for current)\n/unmark [<id>|current|last|--] - remove a server-side important mark (default: current; `--` forces current)\n/archive [<id>|current|last] - toggle the server-side formal archive flag (default: current)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
                 );
+                println!("{SERVE_REPLY_REFERENCE_HELP}");
                 continue;
             }
             "/new" => match create_session(&client, &base, &token) {
@@ -8267,6 +8298,45 @@ mod tests {
             routed_prompt_text(&ServeInputRoute::ServerCommand, typed, trimmed),
             "fn main() {}",
             "a command line keeps its trimmed grammar form"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reply_reference_tests {
+    use super::*;
+    #[test]
+    fn reply_reference_remote_history_preserves_committed_message_id() {
+        let messages: Vec<RemoteHistoryMessage> = serde_json::from_value(serde_json::json!([
+            {"role":"assistant", "content":"same", "message_id":42},
+            {"role":"assistant", "content":"same", "message_id":43}
+        ]))
+        .unwrap();
+        let (view, _) = parse_serve_history_view(&[]).unwrap();
+        let rendered = render_serve_history(&messages, &view);
+        assert!(rendered.contains("(m42)"));
+        assert!(rendered.contains("(m43)"));
+    }
+    #[test]
+    fn reply_reference_remote_help_covers_selectors_and_mode_limits() {
+        for text in [
+            "@reply:m42",
+            "@reply:u2",
+            "@reply:last",
+            "multiple tokens",
+            "manually",
+            "no reply Tab preview",
+            "note-search does not support",
+        ] {
+            assert!(SERVE_REPLY_REFERENCE_HELP.contains(text));
+        }
+        let source = include_str!("chat.rs");
+        assert_eq!(
+            source
+                .matches("println!(\"{SERVE_REPLY_REFERENCE_HELP}\");")
+                .count(),
+            2,
+            "both independent help entry points include the reference usage"
         );
     }
 }

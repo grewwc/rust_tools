@@ -25,12 +25,27 @@ const OVERFLOW_HISTORY_FILENAME: &str = "overflow-history.md";
 pub(super) fn expand_overflow_archives(
     messages: Vec<(Message, Option<String>)>,
 ) -> Vec<(Message, Option<String>)> {
+    expand_overflow_archives_with_ids(
+        messages
+            .into_iter()
+            .map(|(message, model)| (message, model, None))
+            .collect(),
+    )
+    .into_iter()
+    .map(|(message, model, _)| (message, model))
+    .collect()
+}
+
+/// Preserve canonical identity on original rows; archive expansions have no ID.
+pub(super) fn expand_overflow_archives_with_ids(
+    messages: Vec<(Message, Option<String>, Option<i64>)>,
+) -> Vec<(Message, Option<String>, Option<i64>)> {
     let mut expanded = Vec::with_capacity(messages.len());
     let mut loaded_paths = Vec::<PathBuf>::new();
 
-    for (message, source_model) in messages {
+    for (message, source_model, message_id) in messages {
         let Some(path) = overflow_archive_path(&message) else {
-            expanded.push((message, source_model));
+            expanded.push((message, source_model, message_id));
             continue;
         };
         if loaded_paths.iter().any(|loaded| loaded == &path) {
@@ -42,14 +57,14 @@ pub(super) fn expand_overflow_archives(
             .map(|markdown| parse_overflow_history(&markdown))
             .unwrap_or_default();
         if archived.is_empty() {
-            expanded.push((message, source_model));
+            expanded.push((message, source_model, message_id));
             continue;
         }
 
         loaded_paths.push(path);
         // Archived messages have no per-message model (see the doc comment);
         // report unknown rather than inheriting the stub's model.
-        expanded.extend(archived.into_iter().map(|m| (m, None)));
+        expanded.extend(archived.into_iter().map(|m| (m, None, None)));
     }
     expanded
 }
@@ -395,5 +410,51 @@ mod tests {
         assert_eq!(expanded[1].1, None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod reply_reference_tests {
+    use super::*;
+    #[test]
+    fn reply_reference_archive_expansion_keeps_identity_only_on_canonical_rows() {
+        let dir =
+            std::env::temp_dir().join(format!("reply-reference-archive-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("overflow-history.md");
+        std::fs::write(&path, "## 助手\n\narchived reply\n").unwrap();
+        let message = |role: &str, content: String| Message {
+            role: role.into(),
+            content: Value::String(content),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let pointer = message(
+            "internal_note",
+            format!(
+                "[archive-pointer-v2]\narchive_file_path: {}",
+                path.display()
+            ),
+        );
+        let rows = expand_overflow_archives_with_ids(vec![
+            (pointer.clone(), Some("stub model".into()), Some(1)),
+            (pointer, None, Some(2)),
+            (
+                message("assistant", "canonical reply".into()),
+                Some("source model".into()),
+                Some(7),
+            ),
+        ]);
+        assert_eq!(
+            rows.len(),
+            2,
+            "duplicate archive paths still expand only once"
+        );
+        assert_eq!(rows[0].0.content.as_str(), Some("archived reply"));
+        assert_eq!(rows[0].1, None);
+        assert_eq!(rows[0].2, None);
+        assert_eq!(rows[1].2, Some(7));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

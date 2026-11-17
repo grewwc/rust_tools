@@ -386,13 +386,16 @@ impl TurnFixture {
     }
 
     async fn run(&mut self, question: &str) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
+        let mut question = question.to_string();
+        let selectors = crate::ai::history::reply_reference::extract_selectors(&mut question)?;
         let future = run_turn(
             &mut self.app,
             &self.mcp,
             &[],
             0,
-            question.to_string(),
+            question,
             String::new(),
+            selectors,
             self.model.clone(),
             None,
             None,
@@ -401,6 +404,29 @@ impl TurnFixture {
         );
         crate::ai::driver::runtime_ctx::SUPPRESS_TERMINAL_OUTPUT
             .scope(true, future)
+            .await
+    }
+
+    async fn run_loop(&mut self, question: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.app.cli.args = vec![question.to_string()];
+        self.app.cli.model = Some(self.model.clone());
+        self.app.cli.no_skills = true;
+        self.app.shutdown.store(false, Ordering::Relaxed);
+        let mut skills = Arc::new(Vec::new());
+        let mut agents = Arc::new(Vec::new());
+        let probe = crate::ai::driver::mcp_init::McpConfigProbe {
+            config_path: self.root.path().join("mcp.json").display().to_string(),
+            exists: false,
+            server_count: 0,
+        };
+        let future =
+            crate::ai::driver::run_loop(&mut self.app, &self.mcp, probe, &mut skills, &mut agents);
+        crate::ai::driver::runtime_ctx::SUPPRESS_TERMINAL_OUTPUT
+            .scope(
+                true,
+                crate::ai::driver::runtime_ctx::SUBAGENT_MEMORY_PATH
+                    .scope(self.root.path().join("memory.jsonl"), future),
+            )
             .await
     }
 
@@ -731,5 +757,340 @@ async fn cross_turn_requests_extend_the_previous_request_prefix() {
         shared[2],
         messages[2].len(),
         "the tool-round request must extend the turn's first request: shared {shared:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_reference_request_keeps_user_boundary_and_replays_frozen_snapshot() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let source_text = "REPLY_REFERENCE_SOURCE: the committed answer is forty two.";
+    let mut fixture = TurnFixture::new(vec![
+        ScriptedTurn::final_text(source_text),
+        ScriptedTurn::final_text("The referenced answer can be explained directly."),
+        ScriptedTurn::final_text(
+            "The quoted content remains available from the earlier user turn.",
+        ),
+    ]);
+    fixture.run("What is the answer?").await.unwrap();
+    let store = SessionStore::new(fixture.app.config.history_file.as_path());
+    let stored = store
+        .read_stored_messages(&fixture.app.session_id, 0)
+        .unwrap();
+    let source = stored
+        .iter()
+        .find(|row| {
+            row.message.role == "assistant" && row.message.content.as_str() == Some(source_text)
+        })
+        .unwrap();
+    let source_id = source.message_id;
+    fixture
+        .run(&format!(
+            "@reply:m{source_id} @reply:last Explain this answer."
+        ))
+        .await
+        .unwrap();
+    fixture.run("Continue with the explanation.").await.unwrap();
+    let requests = fixture.server.requests();
+    assert_eq!(requests.len(), 3);
+    let text = |value: &Value| crate::ai::history::value_to_string(value);
+    let second = request_messages(&requests[1]);
+    for message in second.iter().filter(|message| message["role"] == "system") {
+        assert!(!text(&message["content"]).contains(source_text));
+    }
+    let prior_assistant = second
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .unwrap();
+    assert_eq!(prior_assistant["content"], source_text);
+    let current_user = second
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .unwrap();
+    let quoted = text(&current_user["content"]);
+    assert!(quoted.contains(source_text), "{quoted}");
+    assert!(quoted.contains(&format!("[Referenced assistant reply: m{source_id}]")));
+    assert!(quoted.contains("Explain this answer."));
+    assert!(!current_user.to_string().contains("\"type\":\"reference\""));
+    let history = store
+        .read_stored_messages(&fixture.app.session_id, 0)
+        .unwrap();
+    let referenced_user = history
+        .iter()
+        .find(|row| {
+            row.message
+                .content
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|part| part["kind"] == "message"))
+        })
+        .unwrap();
+    let parts = referenced_user.message.content.as_array().unwrap();
+    let references = parts
+        .iter()
+        .filter(|part| part["type"] == "reference" && part["kind"] == "message")
+        .collect::<Vec<_>>();
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0]["text"], source_text);
+    assert_eq!(references[0]["source_message_id"], source_id);
+    assert_eq!(parts.last().unwrap()["text"], "Explain this answer.");
+    let replayed = request_messages(&requests[2])
+        .iter()
+        .find(|message| {
+            message["role"] == "user"
+                && text(&message["content"]).contains("[Referenced assistant reply:")
+        })
+        .unwrap();
+    assert_eq!(replayed["content"], current_user["content"]);
+    assert_eq!(
+        history
+            .iter()
+            .find(|row| row.message_id == source_id)
+            .unwrap()
+            .message
+            .content,
+        json!(source_text)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_reference_deleted_identity_rejects_before_model_or_user_commit() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut fixture = TurnFixture::new(vec![ScriptedTurn::final_text("source reply")]);
+    fixture.run("first question").await.unwrap();
+    let conn = rusqlite::Connection::open(&fixture.app.session_history_file).unwrap();
+    let id: i64 = conn
+        .query_row(
+            "SELECT id FROM messages WHERE role = 'assistant' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute("DELETE FROM messages WHERE id = ?1", [id])
+        .unwrap();
+    let before = fixture.history().len();
+    let error = fixture
+        .run(&format!("@reply:m{id} Explain it"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unavailable"));
+    assert_eq!(fixture.server.requests().len(), 1);
+    assert_eq!(fixture.history().len(), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_reference_command_text_is_persisted_without_dispatch() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let commands = [
+        "compact",
+        "distill-session",
+        "audit",
+        "audit --deep",
+        "audit inspect the quoted answer",
+        "audit --deep inspect the quoted answer",
+    ];
+    let mut script = vec![ScriptedTurn::final_text("Frozen source answer.")];
+    for _ in 0..commands.len() * 2 {
+        script.push(ScriptedTurn::final_text(
+            "The quoted answer remains user context.",
+        ));
+    }
+    let mut fixture = TurnFixture::new(script);
+    fixture.run("Seed the assistant reply.").await.unwrap();
+    let store = SessionStore::new(fixture.app.config.history_file.as_path());
+    let source_id = store
+        .read_stored_messages(&fixture.app.session_id, 0)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.message.role == "assistant")
+        .unwrap()
+        .message_id;
+    let mut expected_requests = 1;
+    for prefix in ["/", ":"] {
+        for command in commands {
+            let question = format!("{prefix}{command}");
+            assert_eq!(
+                fixture
+                    .run(&format!("@reply:m{source_id} {question}"))
+                    .await
+                    .unwrap(),
+                TurnOutcome::Continue
+            );
+            expected_requests += 1;
+            let requests = fixture.server.requests();
+            assert_eq!(requests.len(), expected_requests, "{question}");
+            let sent = request_messages(requests.last().unwrap())
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "user")
+                .unwrap();
+            let text = crate::ai::history::value_to_string(&sent["content"]);
+            assert!(text.contains(&question), "{text}");
+            assert!(text.contains("Frozen source answer."), "{text}");
+            let history = fixture.history();
+            let user = history
+                .iter()
+                .rev()
+                .find(|(message, _)| message.role == "user")
+                .unwrap();
+            let parts = user.0.content.as_array().unwrap();
+            assert_eq!(parts.last().unwrap()["text"], question);
+            assert_eq!(parts[0]["source_message_id"], source_id);
+            assert_eq!(parts[0]["text"], "Frozen source answer.");
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|(message, _)| message.role == "user")
+                    .count(),
+                expected_requests
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_reference_plain_compact_and_distill_still_dispatch() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut fixture = TurnFixture::new(Vec::new());
+    // Validation and help are real command outcomes that need no auxiliary model.
+    for prefix in ["/", ":"] {
+        for command in ["compact unexpected", "distill-session --help"] {
+            assert_eq!(
+                fixture.run(&format!("{prefix}{command}")).await.unwrap(),
+                TurnOutcome::Continue
+            );
+            assert!(fixture.server.requests().is_empty());
+            assert!(fixture.history().is_empty());
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_reference_run_loop_preserves_command_text_across_dispatchers() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    // The memo dispatcher loops even in one-shot mode. Keep a broken guard from
+    // blocking on stdin, and restore the process marker even if an assertion fails.
+    struct ServeChildGuard(bool);
+    impl Drop for ServeChildGuard {
+        fn drop(&mut self) {
+            crate::ai::background::set_serve_child_for_test(self.0);
+        }
+    }
+    let _serve_child = ServeChildGuard(crate::ai::background::is_serve_child());
+    crate::ai::background::set_serve_child_for_test(true);
+
+    let commands = [
+        "title quoted title",
+        "skills help",
+        "memo",
+        "compact",
+        "distill-session --help",
+        "audit --deep inspect the quoted answer",
+    ];
+    // A distinct fixture per input keeps @reply:last bound to the seeded answer.
+    for prefix in ["/", ":"] {
+        for command in commands {
+            let mut fixture = TurnFixture::new(vec![
+                ScriptedTurn::final_text("Frozen loop source answer."),
+                ScriptedTurn::final_text("The quoted answer remains user context."),
+            ]);
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                fixture.run_loop("Seed the assistant reply."),
+            )
+            .await
+            .expect("seed run_loop timed out")
+            .unwrap();
+            let store = SessionStore::new(&fixture.app.config.history_file);
+            let source_id = store
+                .read_stored_messages(&fixture.app.session_id, 0)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.message.role == "assistant")
+                .unwrap()
+                .message_id;
+            let question = format!("{prefix}{command}");
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                fixture.run_loop(&format!("@reply:last {question}")),
+            )
+            .await
+            .expect("referenced run_loop timed out")
+            .unwrap();
+
+            let requests = fixture.server.requests();
+            assert_eq!(requests.len(), 2, "{question}");
+            let sent = request_messages(&requests[1])
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "user")
+                .unwrap();
+            let text = crate::ai::history::value_to_string(&sent["content"]);
+            assert!(text.contains(&question), "{text}");
+            assert!(text.contains("Frozen loop source answer."), "{text}");
+            assert!(
+                text.contains(&format!("[Referenced assistant reply: m{source_id}]")),
+                "{text}"
+            );
+            let history = fixture.history();
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|(message, _)| message.role == "user")
+                    .count(),
+                2,
+                "{question}"
+            );
+            let user = history
+                .iter()
+                .rev()
+                .find(|(message, _)| message.role == "user")
+                .unwrap();
+            let parts = user.0.content.as_array().unwrap();
+            assert_eq!(parts.last().unwrap()["text"], question);
+            assert_eq!(parts[0]["type"], "reference");
+            assert_eq!(parts[0]["kind"], "message");
+            assert_eq!(parts[0]["source_message_id"], source_id);
+            assert_eq!(parts[0]["text"], "Frozen loop source answer.");
+            assert_eq!(
+                store
+                    .read_session_title(&fixture.app.session_id)
+                    .unwrap()
+                    .as_deref(),
+                Some("scripted turn")
+            );
+            assert!(
+                !fixture.root.path().join("memory.jsonl").exists(),
+                "{question}"
+            );
+        }
+    }
+
+    // Both pre-turn dispatchers still consume unreferenced commands. The title
+    // mutation proves local dispatch; /skills help is owned by interactive dispatch.
+    let mut fixture = TurnFixture::new(Vec::new());
+    for question in ["/title plain title", "/skills help"] {
+        tokio::time::timeout(Duration::from_secs(20), fixture.run_loop(question))
+            .await
+            .expect("plain command run_loop timed out")
+            .unwrap();
+        assert!(fixture.server.requests().is_empty(), "{question}");
+        assert!(fixture.history().is_empty(), "{question}");
+    }
+    assert_eq!(
+        SessionStore::new(&fixture.app.config.history_file)
+            .read_session_title(&fixture.app.session_id)
+            .unwrap()
+            .as_deref(),
+        Some("plain title")
     );
 }

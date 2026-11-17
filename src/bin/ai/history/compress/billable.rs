@@ -146,6 +146,13 @@ pub(in crate::ai) fn content_part_budget_counts(item: &Value) -> BillableCounts 
     if is_image || is_image_reference {
         return BillableCounts::IMAGE;
     }
+    if item.get("type").and_then(Value::as_str) == Some("reference")
+        && item.get("kind").and_then(Value::as_str) == Some("message")
+    {
+        return BillableCounts::text(&crate::ai::history::reply_reference::materialized_text(
+            item,
+        ));
+    }
     if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
         return BillableCounts::text(text);
     }

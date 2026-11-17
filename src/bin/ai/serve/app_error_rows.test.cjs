@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { loadReplyReferenceHelpers } = require("./app_reply_reference_fixture.cjs");
 const { test } = require("node:test");
 
 const script = fs.readFileSync(process.env.ASERVE_TEST_APP_HTML || path.join(__dirname, "app.html"), "utf8")
@@ -111,6 +112,7 @@ function harness({ realApi = false, phone = false } = {}) {
     createTurnRateLine: () => () => {},
     textOf: (content) => content || "", isRuntimeSyntheticUser: () => false,
   });
+  loadReplyReferenceHelpers(context, script);
   for (const [start, end] of [
     ["// BEGIN execution model", "// END execution model"],
     ["const esc =", "// --- markdown"],

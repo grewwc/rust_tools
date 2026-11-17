@@ -1151,7 +1151,8 @@ pub(super) fn print_help() {
     println!("  a --stop <session-id>         Stop a background session");
     println!("  a -n \"TODO: remember this\"    Save a memo and exit");
     println!("  a -ns \"meeting notes\"         Search memos with AI (one-shot)");
-    println!("  a -ns                        Enter interactive memo search\n");
+    println!("  a -ns                        Enter interactive memo search");
+    println!("  a --session <id> \"@reply:last Explain this answer\"  Quote a committed reply\n");
 
     // ── Options ──────────────────────────────────────────────────
     parser.print_defaults();

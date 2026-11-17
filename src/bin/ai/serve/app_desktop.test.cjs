@@ -6,6 +6,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { loadReplyReferenceHelpers } = require("./app_reply_reference_fixture.cjs");
 
 const html = fs.readFileSync(process.env.ASERVE_TEST_APP_HTML || path.join(__dirname, "app.html"), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
@@ -265,6 +266,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     formatElapsed: () => "0s", replyPaintDelay: () => 0, renderMarkdown: (text) => text,
     loadInfo: async () => {},
   });
+  loadReplyReferenceHelpers(context, script);
   vm.runInContext(marked("execution model"), context);
   vm.runInContext(between("function headers(", "const esc ="), context);
   vm.runInContext(between("// Slash-command completion.", "async function loadInfo()"), context);

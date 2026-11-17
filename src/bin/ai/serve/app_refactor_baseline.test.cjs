@@ -926,3 +926,22 @@ for (const kind of ["command", "skill"]) for (const failAt of ["prevent", "activ
     assert.equal(failed.active, ["prevent", "activate"].includes(failAt) ? 0 : 2);
   });
 }
+
+
+test("reply_reference_shared_harnesses_use_production_question_identity_and_display_helpers", () => {
+  for (const h of [stream.streamHarness(), desktop.harness()]) {
+    const c = h.context, root = h.box || h.elements.msgs;
+    const content = [
+      { type: "reference", kind: "message", source_message_id: 42, text: "frozen body" },
+      { type: "text", text: "Explain the reply" },
+    ];
+    assert.equal(c.textOf(content), "Explain the reply");
+    assert.equal(c.replyQuestionText("@reply:m42 Explain the reply"), "Explain the reply");
+    const bubble = c.addMsgMd("committed body", root);
+    c.setMessageIdentity(bubble, { message_id: 42 });
+    assert.equal(bubble.dataset.messageId, "42");
+    c.decorateReplyReferences(bubble, content);
+    assert.match(bubble.textContent, /Referenced assistant reply: m42/);
+    assert.match(bubble.textContent, /frozen body/);
+  }
+});

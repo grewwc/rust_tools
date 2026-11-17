@@ -468,6 +468,25 @@ pub(super) fn decode_tool_calls(tool_calls: Option<&str>) -> Option<Vec<ToolCall
     tool_calls.and_then(|raw| serde_json::from_str(raw).ok())
 }
 
+fn decode_stored_tool_calls(
+    raw: Option<&str>,
+    message_id: i64,
+) -> rusqlite::Result<Option<Vec<ToolCall>>> {
+    raw.map(|raw| {
+        serde_json::from_str(raw).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Reply reference m{message_id} has invalid tool_calls JSON: {error}"),
+                )),
+            )
+        })
+    })
+    .transpose()
+}
+
 pub(in crate::ai) fn read_all_messages_sqlite(path: &Path) -> io::Result<Vec<Message>> {
     let conn = open_history_db(path)?;
     read_canonical_messages(&conn)
@@ -480,33 +499,139 @@ pub(in crate::ai) fn read_stored_messages_sqlite(
     after_message_id: i64,
 ) -> io::Result<Vec<StoredMessage>> {
     let conn = super::connection::open_history_db_read_only(path)?;
-    // Legacy schemas can have content without timestamp metadata. Project a
-    // missing column as NULL instead of migrating it to a fabricated current time.
+    read_stored_where(&conn, "id > ?1", &[after_message_id], false)
+}
+
+/// Look up stable canonical identities without scanning unrelated message bodies.
+pub(in crate::ai) fn read_stored_messages_by_ids_sqlite(
+    path: &Path,
+    ids: &[i64],
+) -> io::Result<Vec<StoredMessage>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = super::connection::open_history_db_read_only(path)?;
+    let placeholders = vec!["?"; ids.len()].join(",");
+    read_stored_where(&conn, &format!("id IN ({placeholders})"), ids, false)
+}
+
+/// Select conclusions within a real user turn, or count backwards through all
+/// conclusions. Synthetic user messages never split a real user's interval.
+pub(in crate::ai) fn read_assistant_reply_sqlite(
+    path: &Path,
+    user_ordinal: Option<usize>,
+    nth_back: usize,
+) -> io::Result<Option<StoredMessage>> {
+    if nth_back == 0 || user_ordinal == Some(0) {
+        return Ok(None);
+    }
+    let conn = super::connection::open_history_db_read_only(path)?;
+    let mut bounds = Vec::new();
+    let predicate = if let Some(ordinal) = user_ordinal {
+        let offset = i64::try_from(ordinal)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Reply reference user ordinal exceeds SQLite's signed 64-bit range",
+                )
+            })?
+            .checked_sub(1)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Reply reference user ordinal must be positive",
+                )
+            })?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM messages WHERE role = 'user' AND
+             COALESCE(reasoning_content, '') != ?1 ORDER BY id LIMIT 2 OFFSET ?2",
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let ids = stmt
+            .query_map(
+                params![super::super::types::RUNTIME_SYNTHETIC_USER_ORIGIN, offset],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let Some(first) = ids.first() else {
+            return Ok(None);
+        };
+        bounds.push(*first);
+        bounds.push(ids.get(1).copied().unwrap_or(i64::MAX));
+        "role = 'assistant' AND id > ?1 AND id < ?2"
+    } else {
+        "role = 'assistant'"
+    };
+    let mut seen = 0;
+    // Iterate the query lazily; the latest conclusion usually needs one row.
+    read_stored_where_until(&conn, predicate, &bounds, true, |stored| {
+        if super::super::reply_reference::assistant_body(&stored.message).is_some() {
+            seen += 1;
+            seen == nth_back
+        } else {
+            false
+        }
+    })
+    .map(|mut rows| rows.pop())
+}
+
+pub(in crate::ai) fn read_recent_reply_candidates_sqlite(
+    path: &Path,
+) -> io::Result<Vec<StoredMessage>> {
+    let conn = super::connection::open_history_db_read_only(path)?;
+    read_stored_where(
+        &conn,
+        "id IN (SELECT id FROM messages WHERE role = 'assistant' ORDER BY id DESC LIMIT 64)",
+        &[],
+        false,
+    )
+}
+
+fn read_stored_where(
+    conn: &Connection,
+    predicate: &str,
+    ids: &[i64],
+    descending: bool,
+) -> io::Result<Vec<StoredMessage>> {
+    read_stored_where_until(conn, predicate, ids, descending, |_| false)
+}
+
+fn read_stored_where_until(
+    conn: &Connection,
+    predicate: &str,
+    ids: &[i64],
+    descending: bool,
+    mut stop: impl FnMut(&StoredMessage) -> bool,
+) -> io::Result<Vec<StoredMessage>> {
     let timestamp_column = if conn
         .prepare("SELECT * FROM messages LIMIT 0")
         .map_err(|e| io::Error::other(e.to_string()))?
         .column_names()
-        .contains(&"created_at")
+        .any(|name| name == "created_at")
     {
         "created_at"
     } else {
         "NULL"
     };
+    let order = if descending { "DESC" } else { "ASC" };
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT role, content, tool_calls, tool_call_id, reasoning_content, id, {timestamp_column}
-             FROM messages WHERE id > ?1 ORDER BY id ASC"
-        ))
+        "SELECT role, content, tool_calls, tool_call_id, reasoning_content, id, {timestamp_column}
+         FROM messages WHERE {predicate} ORDER BY id {order}"
+    ))
         .map_err(|e| io::Error::other(e.to_string()))?;
     let rows = stmt
-        .query_map([after_message_id], |row| {
+        .query_map(rusqlite::params_from_iter(ids), |row| {
             let content: String = row.get(1)?;
-            let tool_calls: Option<String> = row.get(2)?;
+            let calls: Option<String> = row.get(2)?;
             Ok(StoredMessage {
                 message: Message {
                     role: row.get(0)?,
                     content: decode_message_content(&content),
-                    tool_calls: decode_tool_calls(tool_calls.as_deref()),
+                    tool_calls: decode_stored_tool_calls(calls.as_deref(), row.get(5)?)?,
                     tool_call_id: row.get(3)?,
                     reasoning_content: row.get(4)?,
                 },
@@ -518,8 +643,17 @@ pub(in crate::ai) fn read_stored_messages_sqlite(
             })
         })
         .map_err(|e| io::Error::other(e.to_string()))?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| io::Error::other(e.to_string()))
+    let mut out = Vec::new();
+    for row in rows {
+        let stored = row.map_err(|e| io::Error::other(e.to_string()))?;
+        if stop(&stored) {
+            return Ok(vec![stored]);
+        }
+        if !descending {
+            out.push(stored);
+        }
+    }
+    Ok(out)
 }
 
 pub(in crate::ai) fn read_message_watermark_sqlite(path: &Path) -> io::Result<i64> {
@@ -578,47 +712,54 @@ pub(in crate::ai) fn read_all_messages_with_models_sqlite(
     // `messages` table yet and a pre-migration DB lacks the `source_model`
     // column, so ensure the schema (including the column migration) first.
     init_history_schema(&conn)?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT role, content, tool_calls, tool_call_id, reasoning_content, source_model
-             FROM messages
-             ORDER BY id ASC",
-        )
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    let rows = stmt
-        .query_map([], |row| {
-            let role: String = row.get(0)?;
-            let content: String = row.get(1)?;
-            let tool_calls: Option<String> = row.get(2)?;
-            let tool_call_id: Option<String> = row.get(3)?;
-            let reasoning_content: Option<String> = row.get(4)?;
-            let source_model: Option<String> = row.get(5)?;
-            Ok((
-                role,
-                content,
-                tool_calls,
-                tool_call_id,
-                reasoning_content,
-                source_model,
-            ))
-        })
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    let mut messages = Vec::new();
-    for row in rows {
-        let (role, content, tool_calls, tool_call_id, reasoning_content, source_model) =
-            row.map_err(|e| io::Error::other(e.to_string()))?;
-        messages.push((
+    read_history_with_ids(&conn).map(|rows| {
+        rows.into_iter()
+            .map(|(message, model, _)| (message, model))
+            .collect()
+    })
+}
+
+pub(in crate::ai) fn read_history_with_ids_sqlite(
+    path: &Path,
+) -> io::Result<Vec<(Message, Option<String>, Option<i64>)>> {
+    let conn = super::connection::open_history_db_read_only(path)?;
+    read_history_with_ids(&conn)
+}
+
+fn read_history_with_ids(
+    conn: &Connection,
+) -> io::Result<Vec<(Message, Option<String>, Option<i64>)>> {
+    let source_model = if conn
+        .prepare("SELECT * FROM messages LIMIT 0")
+        .map_err(|e| io::Error::other(e.to_string()))?
+        .column_names()
+        .any(|name| name == "source_model")
+    {
+        "source_model"
+    } else {
+        "NULL"
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT role, content, tool_calls, tool_call_id, reasoning_content, {source_model}, id FROM messages ORDER BY id"
+    )).map_err(|e| io::Error::other(e.to_string()))?;
+    stmt.query_map([], |row| {
+        let content: String = row.get(1)?;
+        let calls: Option<String> = row.get(2)?;
+        Ok((
             Message {
-                role,
+                role: row.get(0)?,
                 content: decode_message_content(&content),
-                tool_calls: decode_tool_calls(tool_calls.as_deref()),
-                tool_call_id,
-                reasoning_content,
+                tool_calls: decode_stored_tool_calls(calls.as_deref(), row.get(6)?)?,
+                tool_call_id: row.get(3)?,
+                reasoning_content: row.get(4)?,
             },
-            source_model,
-        ));
-    }
-    Ok(messages)
+            row.get(5)?,
+            Some(row.get(6)?),
+        ))
+    })
+    .map_err(|e| io::Error::other(e.to_string()))?
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .map_err(|e| io::Error::other(e.to_string()))
 }
 
 pub(super) fn read_messages_since_id(

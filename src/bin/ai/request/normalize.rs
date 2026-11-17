@@ -991,9 +991,12 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
     // the projection loops below move messages out of it instead of cloning
     // each element a second time.
     let mut request_messages = messages.to_vec();
-    request_messages
-        .iter_mut()
-        .for_each(clear_runtime_message_metadata);
+    for message in &mut request_messages {
+        clear_runtime_message_metadata(message);
+        // Keep structured replies in the driver's projection for auxiliary
+        // summaries; previews and sends both materialize the complete body here.
+        super::builder::materialize_reply_references(&mut message.content);
+    }
     crate::ai::history::compress::dedupe_context_checkpoint_markers_for_projection(
         &mut request_messages,
     );

@@ -151,6 +151,51 @@ pub(crate) fn materialize_references(
     content: &mut Value,
     attachment_assets_dir: Option<&Path>,
 ) -> bool {
+    materialize_selected_references(
+        content,
+        attachment_assets_dir,
+        ReferenceMaterialization::All,
+    )
+}
+
+/// Resolve attachments during turn preparation while retaining reply identity
+/// for compression. Reply bodies become plain text only at the wire boundary.
+pub(crate) fn materialize_attachment_references(
+    content: &mut Value,
+    attachment_assets_dir: Option<&Path>,
+) -> bool {
+    materialize_selected_references(
+        content,
+        attachment_assets_dir,
+        ReferenceMaterialization::Attachments,
+    )
+}
+
+pub(super) fn materialize_reply_references(content: &mut Value) -> bool {
+    materialize_selected_references(content, None, ReferenceMaterialization::Replies)
+}
+
+enum ReferenceMaterialization {
+    All,
+    Attachments,
+    Replies,
+}
+
+impl ReferenceMaterialization {
+    fn includes(&self, kind: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Attachments => kind != "message",
+            Self::Replies => kind == "message",
+        }
+    }
+}
+
+fn materialize_selected_references(
+    content: &mut Value,
+    attachment_assets_dir: Option<&Path>,
+    selection: ReferenceMaterialization,
+) -> bool {
     let Value::Array(parts) = content else {
         return false;
     };
@@ -158,12 +203,12 @@ pub(crate) fn materialize_references(
     let mut out: Vec<Value> = Vec::with_capacity(parts.len());
     for part in parts.drain(..) {
         let is_ref = part.get("type").and_then(Value::as_str) == Some("reference");
-        if !is_ref {
+        let kind = part.get("kind").and_then(Value::as_str).unwrap_or("");
+        if !is_ref || !selection.includes(kind) {
             out.push(part);
             continue;
         }
         changed = true;
-        let kind = part.get("kind").and_then(Value::as_str).unwrap_or("");
         let name = part
             .get("name")
             .and_then(Value::as_str)
@@ -198,8 +243,11 @@ pub(crate) fn materialize_references(
                     .unwrap_or("[引用文件快照不可用: attached files]");
                 out.push(json!({ "type": "text", "text": text }));
             }
-            // Forward-compat guard: only image/file exist today (see
-            // build_reference_content), but a reference of any future kind must
+            "message" => out.push(json!({
+                "type": "text",
+                "text": crate::ai::history::reply_reference::materialized_text(&part),
+            })),
+            // Forward-compat guard: a reference of any future kind must
             // never be forwarded verbatim — OpenAI-style content parts reject an
             // unknown `type`, which would fail the whole request.
             _ => out.push(json!({
