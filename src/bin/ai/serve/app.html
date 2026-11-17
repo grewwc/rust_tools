@@ -189,6 +189,12 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessions li.session-running .session-hash { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #sessions li .session-running-badge { display:inline-flex; align-items:center; gap:5px; flex:0 0 auto; padding:1px 6px; border-radius:999px; background:var(--panel); color:var(--acc); font-size:11px; line-height:16px; font-weight:var(--fw-meta); white-space:nowrap; }
 #sessions li .session-running-label { letter-spacing:.04em; }
+/* A session parked on a question trades the running label for an amber
+   CONFIRM/INPUT badge, so a turn blocked on a human decision is visible from
+   the session list instead of only inside that session. */
+#sessions li.session-waiting:not(.cur) { box-shadow:inset 2px 0 0 var(--mark); }
+#sessions li .session-waiting-badge { color:var(--mark); }
+#sessions li .session-waiting-dot { animation:none; }
 #sessions li .session-running-dot { display:inline-block; flex:0 0 6px; width:6px; height:6px; border-radius:50%; background:currentColor; opacity:.86; animation:session-running-pulse 2.8s ease-in-out infinite; }
 @keyframes session-running-pulse { 0%, 100% { opacity:.58; transform:scale(.88); } 50% { opacity:.86; transform:scale(1); } }
 @container session-meta (max-width:72px) {
@@ -1833,10 +1839,12 @@ let staleDone = false; // newest history row has assistant text, possibly provis
 let staleBox = null; // live turn box to update if the server confirms it ended
 let staleTimer = null; // follow-up reload timer while the reply is pending
 let staleTries = 0; // bounded follow-ups: an idle page must not ask forever
+let staleIdleTries = 0; // bounded grace while a finished turn's final row lands
 let staleBusy = false; // one history fetch at a time; ticks may overlap a slow one
 let lastHistoryEndsUnanswered = false; // loaded history has no reply after its user turn
 const STALE_FOLLOW_MS = 1500; // follow-up reload interval: a finished reply must land at once
 const STALE_FOLLOW_TRIES = 800; // ~20 min of visible following, then ↻ takes over
+const STALE_IDLE_TRIES = 8; // ~12s after idle for the final assistant row to land
 const LIVE_STALL_MS = 60000; // no byte at all for this long => the live socket is dead
 
 // A turn can stop and ask for confirmation, and the question is answered over
@@ -8527,30 +8535,42 @@ let nextSessionActivityRevision = 0;
 function normalizeSessionActivity(value) {
   return value === "running" || value === "idle" ? value : "unknown";
 }
+function normalizeSessionWaiting(value) {
+  return value === "confirm" || value === "input" ? value : null;
+}
 function paintSessionActivity(id) {
   const row = sessionActivityRows.get(id);
   if (!row) return;
   const sample = sessionActivitySamples.get(id);
-  const running = sample?.activity === "running" && Date.now() - sample.at < SESSION_ACTIVITY_MAX_AGE_MS;
+  const fresh = !!sample && Date.now() - sample.at < SESSION_ACTIVITY_MAX_AGE_MS;
+  const waiting = fresh ? normalizeSessionWaiting(sample.waiting) : null;
+  const running = fresh && sample.activity === "running";
   const badge = row.querySelector(".session-running-badge");
-  if (!running) {
-    row.classList.remove("session-running");
+  row.classList.toggle("session-running", running || !!waiting);
+  row.classList.toggle("session-waiting", !!waiting);
+  if (!running && !waiting) {
     badge?.remove();
     return;
   }
-  row.classList.add("session-running");
-  if (badge) return;
+  // The badge is rebuilt when the state changes (running -> confirm -> input),
+  // so a question's kind always matches the badge on screen.
+  const kind = waiting || "running";
+  if (badge?.dataset.kind === kind) return;
+  badge?.remove();
+  const text = kind === "input" ? "INPUT" : kind === "confirm" ? "CONFIRM" : "RUNNING";
+  const title = waiting ? `${text}: ${sample.waitingPrompt || "waiting for your answer"}` : "RUNNING";
   const indicator = document.createElement("span");
-  indicator.className = "session-running-badge";
-  indicator.title = "RUNNING";
+  indicator.className = waiting ? "session-running-badge session-waiting-badge" : "session-running-badge";
+  indicator.dataset.kind = kind;
+  indicator.title = title;
   indicator.setAttribute("role", "img");
-  indicator.setAttribute("aria-label", "RUNNING");
+  indicator.setAttribute("aria-label", title);
   const dot = document.createElement("span");
-  dot.className = "session-running-dot";
+  dot.className = waiting ? "session-running-dot session-waiting-dot" : "session-running-dot";
   dot.setAttribute("aria-hidden", "true");
   const label = document.createElement("span");
-  label.className = "session-running-label";
-  label.textContent = "RUNNING";
+  label.className = waiting ? "session-running-label session-waiting-label" : "session-running-label";
+  label.textContent = text;
   label.setAttribute("aria-hidden", "true");
   indicator.appendChild(dot);
   indicator.appendChild(label);
@@ -8583,7 +8603,10 @@ function syncSessionActivityItems(items = lastItems) {
   }
   for (const item of items) if (!sessionActivitySamples.has(item.id)) {
     sessionActivitySamples.set(item.id, {
-      activity: normalizeSessionActivity(sessionActivityItemsBase === sessionActivityBase ? item.activity : "unknown"), at: Date.now(),
+      activity: normalizeSessionActivity(sessionActivityItemsBase === sessionActivityBase ? item.activity : "unknown"),
+      waiting: sessionActivityItemsBase === sessionActivityBase ? normalizeSessionWaiting(item.waiting) : null,
+      waitingPrompt: typeof item.waiting_prompt === "string" ? item.waiting_prompt : "",
+      at: Date.now(),
     });
     sessionActivityRevisions.set(item.id, ++nextSessionActivityRevision);
   }
@@ -8602,7 +8625,12 @@ function mergeSessionActivities(items, { base = executionBase(), revisions = nul
     // A request made before a newer observation or an unload/reload cannot undo it.
     if (revisions && revision !== (revisions.get(item.id) || 0)) continue;
     const activity = normalizeSessionActivity(item.activity);
-    sessionActivitySamples.set(item.id, { activity, at: Date.now() });
+    sessionActivitySamples.set(item.id, {
+      activity,
+      waiting: normalizeSessionWaiting(item.waiting),
+      waitingPrompt: typeof item.waiting_prompt === "string" ? item.waiting_prompt : "",
+      at: Date.now(),
+    });
     sessionActivityRevisions.set(item.id, ++nextSessionActivityRevision);
     paintSessionActivity(item.id);
     if (activity !== "running" && typeof executionState === "function") {
@@ -8614,7 +8642,7 @@ function mergeSessionActivities(items, { base = executionBase(), revisions = nul
 function expireSessionActivities() {
   for (const [id, sample] of sessionActivitySamples) {
     if (Date.now() - sample.at < SESSION_ACTIVITY_MAX_AGE_MS) continue;
-    sessionActivitySamples.set(id, { activity: "unknown", at: Date.now() });
+    sessionActivitySamples.set(id, { activity: "unknown", waiting: null, waitingPrompt: "", at: Date.now() });
     sessionActivityRevisions.set(id, ++nextSessionActivityRevision);
     paintSessionActivity(id);
   }
@@ -8648,8 +8676,11 @@ async function pollSessionActivity() {
           });
           const body = await response.json();
           if (flight.controller.signal.aborted) throw new Error("activity sample timed out");
-          const values = new Map((Array.isArray(body) ? body : []).map((item) => [item?.id, item?.activity]));
-          samples = batch.map((id) => ({ id, activity: values.get(id) }));
+          const values = new Map((Array.isArray(body) ? body : []).map((item) => [item?.id, item || {}]));
+          samples = batch.map((id) => {
+            const item = values.get(id) || {};
+            return { id, activity: item.activity, waiting: item.waiting, waiting_prompt: item.waiting_prompt };
+          });
         } catch (_) {
           samples = batch.map((id) => ({ id, activity: "unknown" }));
         }
@@ -9541,6 +9572,7 @@ function armHistoryFollow() {
   staleSession = sessionId;
   staleTries = 0;
   staleDone = false;
+  staleIdleTries = 0;
   startStaleFollow();
 }
 // A turn streaming in this session writes into its own box. Rebuilding the
@@ -10202,6 +10234,7 @@ async function reloadStale() {
     // transcript already ends in an assistant message.
     const running = await pollConfirm();
     if (sessionId !== forSession || runEpoch !== epoch || eventActive) return;
+    if (running !== false) staleIdleTries = 0;
     if (staleDone && running === false) { stopStaleFollow(); return; }
     const loadId = ++historyLoadSeq;
     let msgs;
@@ -10222,6 +10255,10 @@ async function reloadStale() {
     // exists and history still has no final reply, a daemon restart or crash
     // ended the turn; do not leave the mobile UI stuck in stale-follow mode.
     if (running === false) {
+      // A remote turn can report idle just before its final assistant row is
+      // visible in history. Keep following briefly so the reply is rendered
+      // instead of stopping on a user-only tail.
+      if (!staleDone && staleIdleTries++ < STALE_IDLE_TRIES) return;
       const box = staleBox;
       stopStaleFollow();
       if (box) {
@@ -10322,11 +10359,13 @@ function stopStaleFollow() {
   staleSession = "";
   staleBox = null;
   staleTries = 0;
+  staleIdleTries = 0;
   syncStopButton();
 }
 function startStaleFollow() {
   if (!staleSession || staleSession !== sessionId || staleTimer !== null) return;
   if (document.visibilityState !== "visible") return; // becoming visible again is the other trigger
+  staleIdleTries = 0;
   staleTimer = setInterval(reloadStale, STALE_FOLLOW_MS);
   reloadStale();
   syncStopButton();
@@ -11679,7 +11718,12 @@ async function send() {
     if (typeof syncRemoteTurnNote === "function") syncRemoteTurnNote();
     return;
   }
-  if (!canSend()) return;
+  if (!canSend()) {
+    // Never drop a send silently: "the previous message is still starting" and
+    // "this session is still running" call for different user actions.
+    note(isTurnRunning() ? "this session is still running a turn — stop it first" : "the previous message is still starting");
+    return;
+  }
   // Send the textarea bytes as typed: the server stores them unchanged, so a
   // client-side trim would make the transcript differ from the input. The
   // trimmed view only decides whether there is anything to send. A leading
@@ -12155,6 +12199,7 @@ async function send() {
     staleSession = sessionId;
     staleBox = box;
     staleTries = 0;
+    staleIdleTries = 0;
     // Until the first fetch below, staleDone still describes the transcript
     // from before this turn and would end the follow on its first tick.
     staleDone = false;
@@ -12596,6 +12641,11 @@ function wire() {
     // An empty commit also means cancellation or deleted preedit. The browser
     // owns the resulting value and caret; never reinsert a previous candidate.
     promptComposing = false;
+    settlePromptComposition();
+  });
+  // The deferred half of a composition end, shared with the focus-out
+  // fallback below so both paths apply a commit exactly once.
+  function settlePromptComposition() {
     composingText = "";
     composingBox = null;
     // Leave the commit event before applying page changes. A newer composition
@@ -12629,7 +12679,7 @@ function wire() {
       persistDraft();
       refreshCommandMenu();
     }, 0);
-  });
+  }
   $("prompt").addEventListener("beforeinput", (e) => promptHistory.beforeInput(e));
   $("prompt").addEventListener("input", (e) => {
     if (promptComposing || e.isComposing) {
@@ -12667,6 +12717,10 @@ function wire() {
   });
   $("prompt").addEventListener("click", () => refreshCommandMenu());
   $("prompt").addEventListener("focusout", (e) => {
+    // A composition cannot outlive focus. If the browser drops compositionend
+    // (window or IME switch, a click that ends the word), the stale flag would
+    // refuse every later send with no way back except a reload.
+    if (promptComposing) { promptComposing = false; settlePromptComposition(); }
     const next = e.relatedTarget;
     if (next && (next === $("prompt") || $("cmdmenu").contains(next))) return;
     // Let a tap on an option finish its click before the menu disappears.

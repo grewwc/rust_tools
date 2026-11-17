@@ -807,6 +807,52 @@ fn session_activity_mapping_prefers_active_turns_and_preserves_unknown() {
     std::fs::remove_dir_all(state.history_file.parent().unwrap()).expect("remove test root");
 }
 
+#[test]
+fn session_waiting_publishes_only_an_unanswered_question() {
+    use super::sessions::session_waiting;
+
+    let state = lifecycle_test_state();
+    assert_eq!(session_waiting(&state, "parked"), None);
+
+    let slot = Arc::new(std::sync::Mutex::new(super::ConfirmSlot {
+        pending: Some(super::PendingConfirm {
+            id: 3,
+            prompt: "Run the deploy script?\nThis second line is not the summary.".to_string(),
+            kind: super::ConfirmKind::Confirm,
+            token: 21,
+        }),
+        answers: None,
+    }));
+    state
+        .confirms
+        .lock()
+        .expect("confirms")
+        .insert("parked".to_string(), Arc::clone(&slot));
+    assert_eq!(
+        session_waiting(&state, "parked"),
+        Some((
+            super::SessionWaiting::Confirm,
+            "Run the deploy script?".to_string()
+        ))
+    );
+    // A slot for one session must never flag another session's row.
+    assert_eq!(session_waiting(&state, "elsewhere"), None);
+
+    slot.lock().expect("slot").pending = Some(super::PendingConfirm {
+        id: 4,
+        prompt: format!("paste the token: {}", "x".repeat(400)),
+        kind: super::ConfirmKind::Input,
+        token: 22,
+    });
+    let (kind, prompt) = session_waiting(&state, "parked").expect("input question");
+    assert_eq!(kind, super::SessionWaiting::Input);
+    assert_eq!(prompt.chars().count(), 160);
+
+    // Answering or dismissing the question drops the hint.
+    slot.lock().expect("slot").pending = None;
+    assert_eq!(session_waiting(&state, "parked"), None);
+}
+
 #[tokio::test]
 async fn session_activity_endpoint_bounds_validates_and_avoids_history_reads() {
     let state = lifecycle_test_state();

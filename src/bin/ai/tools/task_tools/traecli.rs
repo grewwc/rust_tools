@@ -102,8 +102,9 @@ fn binary_available(binary: &str) -> bool {
 }
 
 /// Built-in default TraeCLI model, used when neither the call, the
-/// environment, nor the config names one. Verified against `traecli models`.
-pub(crate) const TRAECLI_BUILTIN_DEFAULT_MODEL: &str = "gpt-5.5";
+/// environment, nor the config names one. TraeCLI identifiers are
+/// case-sensitive: keep the exact spelling printed by `traecli models`.
+pub(crate) const TRAECLI_BUILTIN_DEFAULT_MODEL: &str = "GPT-5.6-Sol";
 
 /// Resolve the TraeCLI model: explicit per-call value first, then
 /// `TRAECLI_MODEL`, then `ai.traecli.default_model`, otherwise the built-in

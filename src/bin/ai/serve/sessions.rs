@@ -32,6 +32,33 @@ pub(super) fn session_activity(
     }
 }
 
+/// Cap for the published question text: enough to recognize the gate in a
+/// tooltip, short enough to keep a full-page activity poll small.
+const MAX_WAITING_PROMPT_CHARS: usize = 160;
+
+/// The question a session's turn child is parked on, sampled from the live
+/// confirm slot the answer path writes to. `None` while the turn merely runs:
+/// only an unanswered question is a call for the user.
+pub(super) fn session_waiting(state: &ServeState, id: &str) -> Option<(SessionWaiting, String)> {
+    let slot = state.confirms.lock().ok()?.get(id).cloned()?;
+    let pending = slot.lock().ok()?.pending.clone()?;
+    let kind = match pending.kind {
+        ConfirmKind::Confirm => SessionWaiting::Confirm,
+        ConfirmKind::Input => SessionWaiting::Input,
+    };
+    // A gate prompt can be a multi-line block; the sidebar only has room for
+    // its first line.
+    let prompt = pending
+        .prompt
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(MAX_WAITING_PROMPT_CHARS)
+        .collect();
+    Some((kind, prompt))
+}
+
 /// Bulk, uncached turn samples for loaded IDs. This route deliberately does
 /// not enumerate SQLite files, read metadata, or compute session totals.
 pub(crate) async fn list_session_activity(
@@ -57,9 +84,14 @@ pub(crate) async fn list_session_activity(
     let items: Vec<SessionActivityItem> = req
         .ids
         .into_iter()
-        .map(|id| SessionActivityItem {
-            activity: session_activity(&state, &store, &id),
-            id,
+        .map(|id| {
+            let waiting = session_waiting(&state, &id);
+            SessionActivityItem {
+                activity: session_activity(&state, &store, &id),
+                id,
+                waiting: waiting.as_ref().map(|(kind, _)| *kind),
+                waiting_prompt: waiting.map(|(_, prompt)| prompt),
+            }
         })
         .collect();
     let mut response = Json(items).into_response();
@@ -212,6 +244,8 @@ pub(crate) async fn list_sessions(
                 archived: s.archived,
                 cwd,
                 activity: SessionActivity::Unknown,
+                waiting: None,
+                waiting_prompt: None,
             }
         })
         .collect();
@@ -242,6 +276,9 @@ pub(crate) async fn list_sessions(
     // Probe only the returned page, including an explicitly selected older ID.
     for item in &mut all {
         item.activity = session_activity(&state, &store, &item.id);
+        let waiting = session_waiting(&state, &item.id);
+        item.waiting = waiting.as_ref().map(|(kind, _)| *kind);
+        item.waiting_prompt = waiting.map(|(_, prompt)| prompt);
     }
     let mut response = (StatusCode::OK, Json(serde_json::json!(all))).into_response();
     response

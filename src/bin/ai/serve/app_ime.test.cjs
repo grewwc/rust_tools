@@ -58,6 +58,13 @@ const compositionEndSrc = script.slice(
   script.indexOf('$("prompt").addEventListener("compositionend"'),
   script.indexOf('$("prompt").addEventListener("input"'),
 );
+// The earlier pointerdown listener (skill picker) shares its opening text, so
+// the end anchor is searched from the focus-out listener's own offset.
+const focusoutAt = script.indexOf('$("prompt").addEventListener("focusout"');
+const focusoutSrc = script.slice(
+  focusoutAt,
+  script.indexOf('document.addEventListener("pointerdown"', focusoutAt),
+);
 const syncStopSrc = script.slice(
   script.indexOf("function syncStopButton() {"),
   script.indexOf("// Transient note through the existing #connstat line"),
@@ -500,6 +507,23 @@ test("a previous commit callback preserves work queued during the next compositi
   assert.deepEqual(context.marks, ["latest"]);
   assert.equal(context.prompt.value, "你好 share image");
   assert.equal(run(context, "pendingShare + pendingAppend"), "");
+});
+
+test("a dropped compositionend cannot leave the composer locked after focus leaves", () => {
+  const context = makeContext({ persistDraft: () => {}, note: () => {}, closeCommandMenu: () => {} });
+  vm.runInContext(script.slice(
+    script.indexOf('$("prompt").addEventListener("compositionstart"'),
+    script.indexOf('$("prompt").addEventListener("input"'),
+  ), context);
+  vm.runInContext(focusoutSrc, context);
+  context.document.activeElement = context.prompt;
+  context.prompt.dispatch("compositionstart");
+  context.prompt.value = "你好";
+  assert.equal(run(context, "promptComposing"), true);
+  // No compositionend ever arrives (window switch, a click that ends the word):
+  // only focus leaves the field, and the send guard must clear with it.
+  context.prompt.dispatch("focusout", {});
+  assert.equal(run(context, "promptComposing"), false, "the send guard stayed set after focus left the composer");
 });
 
 test("a transient note never reserves layout or schedules a timer", () => {

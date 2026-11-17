@@ -50,7 +50,18 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
       addEventListener(name, fn) { listen(el.eventListeners, name, fn); },
       get className() { return [...classes].join(" "); },
       set className(value) { classes.clear(); for (const name of value.split(/\s+/).filter(Boolean)) classes.add(name); },
-      classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name), contains: (name) => classes.has(name) },
+      classList: {
+        add: (name) => classes.add(name),
+        remove: (name) => classes.delete(name),
+        contains: (name) => classes.has(name),
+        // The real DOM's two-argument form is what the session badges use to
+        // set a state instead of flipping it.
+        toggle: (name, force) => {
+          const on = force === undefined ? !classes.has(name) : Boolean(force);
+          if (on) classes.add(name); else classes.delete(name);
+          return on;
+        },
+      },
       get textContent() { return text + el.children.map((child) => child.textContent).join(""); },
       set textContent(value) {
         text = String(value);

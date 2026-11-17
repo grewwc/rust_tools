@@ -3165,6 +3165,66 @@ for (const running of [true, null, false]) test(`assistant-ending stale history 
   assert.equal(elements.send.title, running === false ? "send" : "stop this turn");
 });
 
+test("a finished remote turn keeps following history for its final body", async () => {
+  const h = attachmentHarness(), c = h.c, elements = runningComposer(c);
+  Object.assign(c, {
+    staleSession: "s", staleDone: false, staleBusy: false, staleKey: "same",
+    STALE_FOLLOW_TRIES: 300, STALE_IDLE_TRIES: 1, staleIdleTries: 0,
+    historyLoadSeq: 0, historyLoadStates: new Map(), turnRunning: false,
+    note: () => {}, checkInterruptedTurn: () => {},
+    pollConfirm: async () => false, histKey: () => "same",
+    api: async () => ({ headers: { get: () => "1" }, json: async () => [{ role: "user", content: "question" }] }),
+  });
+  c.document.visibilityState = "visible";
+  vm.runInContext(script.slice(script.indexOf("async function reloadStale()"), script.indexOf("// A restart can end a turn")), c);
+  await c.reloadStale();
+  assert.equal(c.staleSession, "s", "an idle sample must not end history follow before the final row lands");
+  assert.equal(c.staleIdleTries, 1);
+  await c.reloadStale();
+  assert.equal(c.staleSession, "", "the bounded grace ends when history never gains a reply");
+  c.syncStopButton();
+  assert.equal(elements.send.title, "send");
+});
+
+test("a final assistant row landing during the idle grace ends the follow", async () => {
+  const h = attachmentHarness(), c = h.c;
+  const replies = [
+    [{ role: "user", content: "question" }],
+    [{ role: "user", content: "question" }, { role: "assistant", content: "answer" }],
+  ];
+  Object.assign(c, {
+    staleSession: "s", staleDone: false, staleBusy: false, staleKey: "same",
+    STALE_FOLLOW_TRIES: 300, STALE_IDLE_TRIES: 4, staleIdleTries: 0,
+    historyLoadSeq: 0, historyLoadStates: new Map(), turnRunning: false,
+    note: () => {}, checkInterruptedTurn: () => {},
+    pollConfirm: async () => false,
+    histKey: (msgs) => msgs.length === 1 ? "same" : "answer",
+    api: async () => ({ headers: { get: () => "2" }, json: async () => replies.shift() }),
+    loadHistory: async () => { c.staleDone = true; },
+  });
+  c.document.visibilityState = "visible";
+  vm.runInContext(script.slice(script.indexOf("async function reloadStale()"), script.indexOf("// A restart can end a turn")), c);
+  await c.reloadStale();
+  assert.equal(c.staleSession, "s", "the first idle sample only starts the grace");
+  await c.reloadStale();
+  assert.equal(c.staleDone, true);
+  assert.equal(c.staleSession, "", "the landed assistant row resolves the follow");
+});
+
+test("re-targeting the follow for another session resets the idle grace", () => {
+  const h = attachmentHarness(), c = h.c;
+  Object.assign(c, {
+    sessionId: "b", staleSession: "a", staleTries: 5, staleDone: true, staleIdleTries: 8,
+    turns: new Map(), isTurnRunning: () => true, startStaleFollow: () => {},
+  });
+  vm.runInContext(script.slice(script.indexOf("function armHistoryFollow()"), script.indexOf("function attachLiveBox(")), c);
+  c.armHistoryFollow();
+  assert.equal(c.staleSession, "b");
+  assert.equal(c.staleTries, 0);
+  assert.equal(c.staleDone, false);
+  assert.equal(c.staleIdleTries, 0, "a new follow target must not inherit the previous grace budget");
+});
+
 test("a stale running sample cannot undo a newer idle sample", async () => {
   const h = attachmentHarness(), c = h.c, responses = [];
   Object.assign(c, { confirmBusy: false, staleSession: "", confirmShown: null,

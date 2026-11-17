@@ -393,6 +393,25 @@ pub(crate) struct SessionItem {
     pub(crate) cwd: String,
     /// Live turn ownership sampled independently of persisted history.
     pub(crate) activity: SessionActivity,
+    /// The question this session's turn child is blocked on, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) waiting: Option<SessionWaiting>,
+    /// First line of that question, capped for a sidebar tooltip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) waiting_prompt: Option<String>,
+}
+
+/// The kind of question a session's turn child is blocked on. Sampled from the
+/// daemon's live confirm slot, which is also what the answer path writes to, so
+/// a parked session can be flagged in the client's session list without
+/// touching history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SessionWaiting {
+    /// A yes/no gate answered by allow/deny.
+    Confirm,
+    /// A free-text question answered through the input field.
+    Input,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -412,6 +431,10 @@ pub(crate) struct SessionActivityReq {
 pub(crate) struct SessionActivityItem {
     pub(crate) id: String,
     pub(crate) activity: SessionActivity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) waiting: Option<SessionWaiting>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) waiting_prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -36,7 +36,7 @@ pub(super) const DESCRIPTOR: Descriptor = Descriptor {
         continue_target_error: Some(runner::CONTINUE_TARGET_ERROR),
         session_footer: Some("Backend session: {session} (resume it via `backend_continue_from`)"),
         worker_model_schema: Some(
-            "Model for backend 'traecli' (see `traecli models`); ignored otherwise. An explicit value overrides the /use session worker model, then TRAECLI_MODEL, ai.traecli.default_model, and built-in 'gpt-5.5' defaults.",
+            "Model for backend 'traecli' (see `traecli models`); ignored otherwise. An explicit value overrides the /use session worker model, then TRAECLI_MODEL, ai.traecli.default_model, and built-in 'GPT-5.6-Sol' defaults.",
         ),
         continuation_schema: Some(
             "Continue a previous traecli run: pass the earlier task's `task_id` to resume its traecli session, or a raw traecli session UUID. Only for backend 'traecli'; the referenced run must have completed.",

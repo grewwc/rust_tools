@@ -106,7 +106,7 @@ impl AiConfig {
     // ── TraeCLI subagent backend ─────────────────────────────
     /// Default model for `backend: "traecli"` subagent runs (a TraeCLI model
     /// slug, see `traecli models`). A per-call `backend_model` wins over this
-    /// key. Unset falls back to `gpt-5.5`.
+    /// key. Unset falls back to `GPT-5.6-Sol`.
     pub const TRAECLI_DEFAULT_MODEL: &str = "ai.traecli.default_model";
 
     // ── Pure mode ─────────────────────────────────────────

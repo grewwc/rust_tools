@@ -114,6 +114,44 @@ for (const phone of [false, true]) test("running badges are added once and remov
   assert.equal(row(h, id).classList.contains("session-running"), false);
 });
 
+test("a session parked on a question paints CONFIRM from the list payload", () => {
+  const items = [
+    { id: "parked", summary: "Parked", activity: "running", waiting: "confirm", waiting_prompt: "Approve the merge?" },
+    { id: "busy", summary: "Busy", activity: "running" },
+  ];
+  const h = harness({ items, sid: "parked" });
+  assert.equal(badge(h, "parked").textContent, "CONFIRM");
+  assert.equal(badge(h, "parked").dataset.kind, "confirm");
+  assert.equal(badge(h, "parked").title, "CONFIRM: Approve the merge?");
+  assert.equal(row(h, "parked").classList.contains("session-waiting"), true);
+  assert.equal(badge(h, "busy").textContent, "RUNNING", "a running session without a question keeps the running badge");
+  assert.equal(row(h, "busy").classList.contains("session-waiting"), false);
+  assert.match(css, /#sessions li\.session-waiting:not\(\.cur\) \{ box-shadow:inset 2px 0 0 var\(--mark\); \}/);
+  assert.match(css, /#sessions li \.session-waiting-badge \{ color:var\(--mark\); \}/);
+});
+
+test("answering the question downgrades the badge instead of leaving it parked", () => {
+  const h = harness({ items: listed("running") }), id = "target-session";
+  h.context.mergeSessionActivities([
+    { id, activity: "running", waiting: "input", waiting_prompt: "paste the token:" },
+  ]);
+  run(h, "paintSessionActivity('target-session');");
+  assert.equal(badge(h, id).textContent, "INPUT");
+  assert.equal(badge(h, id).title, "INPUT: paste the token:");
+
+  // The answer's next sample still runs the turn but carries no question.
+  h.context.mergeSessionActivities([{ id, activity: "running" }]);
+  run(h, "paintSessionActivity('target-session');");
+  assert.equal(badge(h, id).textContent, "RUNNING");
+  assert.equal(badge(h, id).dataset.kind, "running");
+  assert.equal(row(h, id).classList.contains("session-waiting"), false);
+
+  // An idle sample drops both badges.
+  h.context.mergeSessionActivities([{ id, activity: "idle" }]);
+  run(h, "paintSessionActivity('target-session');");
+  assert.equal(badge(h, id), null);
+});
+
 test("activity merges preserve row identity, scroll, selection, filters and the rename editor", () => {
   const h = harness({ items: listed("running") });
   const before = [...h.elements.sesslist.children], count = h.elements.sesscount.textContent;
