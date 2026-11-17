@@ -890,7 +890,7 @@ test("desktop contrast rules preserve the current shared and mobile CSS bytes", 
   const phoneApplicable = desktopMediaQueries().reduce((source, block) => source.replace(block.css, ""), style);
   assert.doesNotMatch(phoneApplicable, /--(?:control-border|danger-text)/);
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "b212e5c4538b24c13b0f21fb28fed6de6ea91087c7a9b26f34f527ac5b332d21",
+    "efbbbc8a2e89c18b4a9ffca6a7409dad6867616a823fff694c78f88e87f5ce8b",
     "desktop contrast changed shared or mobile CSS");
 });
 
@@ -900,7 +900,7 @@ test("desktop overrides leave all phone-applicable CSS byte-identical", () => {
   let phoneApplicable = style;
   for (const block of desktop) phoneApplicable = phoneApplicable.replace(block.css, "");
   assert.equal(createHash("sha256").update(phoneApplicable).digest("hex"),
-    "b212e5c4538b24c13b0f21fb28fed6de6ea91087c7a9b26f34f527ac5b332d21",
+    "efbbbc8a2e89c18b4a9ffca6a7409dad6867616a823fff694c78f88e87f5ce8b",
     "shared or phone CSS changed outside the desktop queries");
 });
 
@@ -1204,7 +1204,7 @@ test("desktop pastel, math, plan/task cards and mobile warm timestamps pin every
     .replace(/:root\[data-theme="light"\][^{]*\{[^{}]*\}/g, "")
     .replace(/\s+/g, "");
   assert.equal(createHash("sha256").update(protectedCss).digest("hex"),
-    "3d4000ef9b4618ab9ee440c250f016fe2262bc47f77d7783a5bae36517ffa63b",
+    "e970112fa6754e69975638c185d3e4871cea57b54cd905575d0368f1b3f77adc",
     "dark or warm CSS changed beyond the pinned baseline");
 });
 

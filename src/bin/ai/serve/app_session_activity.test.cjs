@@ -409,7 +409,7 @@ test("running rail and compact label use theme tokens without overriding selecti
   assert.match(css, /#sessions li\.session-running \{ background:var\(--tint-2\); box-shadow:inset 2px 0 0 var\(--acc-line\); \}/);
   assert.ok(css.indexOf(rail) < css.indexOf("#sessions li.cur {"), "selection keeps its stronger rail and wash");
   assert.match(css, /#sessions li\.cur \{ background:var\(--tint-3\); box-shadow:inset 3px 0 0 var\(--acc\); \}/);
-  assert.match(css, /#sessions li \.session-running-badge \{[^}]*flex:0 0 auto;[^}]*border-radius:999px; background:var\(--panel\); color:var\(--acc\); font-size:11px;[^}]*white-space:nowrap;/);
+  assert.match(css, /#sessions li \.session-running-badge \{[^}]*flex:0 0 auto;[^}]*border-radius:999px; background:var\(--panel\); color:var\(--acc-soft-2\); font-size:11px;[^}]*white-space:nowrap;/);
   assert.match(css, /#sessions li \.session-running-label \{ letter-spacing:\.04em; \}/);
 });
 
