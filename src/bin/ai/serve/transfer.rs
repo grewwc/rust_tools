@@ -213,6 +213,7 @@ pub(crate) async fn import_session(
     let session_guard = lock.lock_owned().await;
     let history_file = state.history_file.clone();
     let import_id = dst_id.clone();
+    let import_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         // Keep the turn lock until import finishes, even if the HTTP request is cancelled.
         let _session_guard = session_guard;
@@ -220,7 +221,11 @@ pub(crate) async fn import_session(
         let tmp = std::env::temp_dir().join(format!("a-serve-import-{}.zip", uuid::Uuid::new_v4()));
         let outcome = (|| {
             std::fs::write(&tmp, &bytes)?;
-            store.import_session_archive(&tmp, &import_id)
+            let id = store.import_session_archive(&tmp, &import_id)?;
+            // Uploaded archives carry history only. Even a previously reserved
+            // lazy destination starts unassigned after a successful import.
+            drop_session_group(&import_state, &id);
+            Ok(id)
         })();
         let _ = std::fs::remove_file(&tmp);
         outcome
@@ -267,12 +272,18 @@ mod tests {
             token: String::new(),
             default_add_dirs: Default::default(),
             cwds: Default::default(),
+            groups: Default::default(),
             locks: Default::default(),
             open_sessions: Default::default(),
             active_turns: Default::default(),
             confirms: Default::default(),
             events: Default::default(),
         };
+        *state.groups.lock().unwrap() = serde_json::from_value(serde_json::json!({
+            "groups": [{"id": "topic", "name": "Topic", "order": 1, "pinned": false}],
+            "assignments": {"source": "topic", "imported": "topic"},
+        }))
+        .unwrap();
         let lock = session_lock(&state, "imported").await;
         let guard = lock.lock().await;
         let req = ImportSessionReq {
@@ -280,7 +291,11 @@ mod tests {
             data: base64::engine::general_purpose::STANDARD.encode(std::fs::read(archive).unwrap()),
             id: "imported".into(),
         };
-        let mut import = tokio::spawn(import_session(State(state), HeaderMap::new(), Json(req)));
+        let mut import = tokio::spawn(import_session(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(req),
+        ));
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), &mut import)
                 .await
@@ -289,6 +304,16 @@ mod tests {
         assert!(!store.session_history_file("imported").exists());
         drop(guard);
         assert_eq!(import.await.unwrap().status(), StatusCode::OK);
+        assert!(groups_snapshot(&state).group_id("imported").is_none());
+        assert_eq!(
+            groups_snapshot(&state).group_id("source").as_deref(),
+            Some("topic")
+        );
+        assert!(
+            load_groups(&state.history_file)
+                .group_id("imported")
+                .is_none()
+        );
         assert!(
             store
                 .read_session_serve_config("imported")

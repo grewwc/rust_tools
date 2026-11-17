@@ -6,6 +6,63 @@ use crate::ai::request::MODEL_SELF_NOTE_CONTEXT_HEADER;
 use crate::ai::request::{DERIVED_CONTEXT_HANDOFF, HISTORY_SUMMARY_CONTEXT_HEADER};
 
 #[test]
+fn runtime_warning_append_normalizes_trailing_whitespace() {
+    let warning = "[Runtime warning] Unverified.";
+    for suffix in ["", "\n", "\n\n", "\n\n\n\n", "\r\n\r\n", " \n\t\n"] {
+        let mut text = format!("正文。{suffix}");
+        append_runtime_warning_once(&mut text, warning);
+        assert_eq!(text, format!("正文。\n\n{warning}"), "suffix: {suffix:?}");
+    }
+}
+
+#[test]
+fn runtime_warning_append_preserves_internal_markdown() {
+    let body =
+        "First paragraph.\n\n\nSecond paragraph.  \nNext line.\n\n```text\n  indented\n\n```";
+    let warning = "[Runtime warning] Unverified.";
+    let mut text = format!("{body}\n\n\n\n");
+    append_runtime_warning_once(&mut text, warning);
+    assert_eq!(text, format!("{body}\n\n{warning}"));
+}
+
+#[test]
+fn runtime_warning_append_whitespace_only_body_has_no_gap() {
+    let warning = "[Runtime warning] Unverified.";
+    for body in ["", "\n\n", " \t\r\n\r\n"] {
+        let mut text = body.to_string();
+        append_runtime_warning_once(&mut text, warning);
+        assert_eq!(text, warning);
+    }
+}
+
+#[test]
+fn runtime_warning_append_duplicate_is_unchanged() {
+    let warning = "[Runtime warning] Unverified.";
+    let original = format!("Body.\n\n{warning}\n\n\n");
+    let mut text = original.clone();
+    append_runtime_warning_once(&mut text, warning);
+    assert_eq!(text, original);
+}
+
+#[test]
+fn runtime_warning_append_visible_notice_uses_same_separator() {
+    let first = "[Runtime warning] First.";
+    let second = "[Runtime warning] Second.";
+    let mut target = Some("Body.\n\n\n\n".to_string());
+    append_user_visible_final_notice(&mut target, first);
+    append_user_visible_final_notice(&mut target, first);
+    append_user_visible_final_notice(&mut target, second);
+    assert_eq!(
+        target.as_deref(),
+        Some(format!("Body.\n\n{first}\n\n{second}").as_str())
+    );
+
+    let mut empty = None;
+    append_user_visible_final_notice(&mut empty, first);
+    assert_eq!(empty.as_deref(), Some(first));
+}
+
+#[test]
 fn task_evidence_reopen_marker_counts_and_survives_reopen_retain() {
     let mut messages: Vec<Message> = Vec::new();
     assert_eq!(task_evidence_reopen_count(&messages), 0);

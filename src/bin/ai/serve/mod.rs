@@ -65,6 +65,8 @@ mod info;
 #[cfg(feature = "serve")]
 mod session_cwd;
 #[cfg(feature = "serve")]
+mod session_groups;
+#[cfg(feature = "serve")]
 mod sessions;
 #[cfg(all(test, feature = "serve"))]
 mod tests;
@@ -90,6 +92,8 @@ pub(crate) use history::*;
 pub(crate) use info::*;
 #[cfg(feature = "serve")]
 pub(crate) use session_cwd::*;
+#[cfg(feature = "serve")]
+use session_groups::*;
 #[cfg(feature = "serve")]
 pub(crate) use sessions::*;
 #[cfg(feature = "serve")]
@@ -1703,7 +1707,9 @@ fn resolve_serve_history_file(
     } else {
         std::env::current_dir()?.join(base_history_file)
     };
-    Ok(super::persona::session_client_history_file(&absolute, persona_id, None))
+    Ok(super::persona::session_client_history_file(
+        &absolute, persona_id, None,
+    ))
 }
 
 #[cfg(feature = "serve")]
@@ -1749,6 +1755,7 @@ pub(in crate::ai) async fn run_serve(
     // process: without this a `--serve-restart` silently reverts every session
     // (and the subagents inheriting from its turns) to the daemon cwd.
     let restored_cwds = load_cwds(&history_file);
+    let restored_groups = load_groups(&history_file);
     eprintln!(
         "[serve] restored {} persisted session working directories",
         restored_cwds.len()
@@ -1758,6 +1765,7 @@ pub(in crate::ai) async fn run_serve(
         token,
         default_add_dirs: Arc::new(default_add_dirs.clone()),
         cwds: Arc::new(std::sync::Mutex::new(restored_cwds)),
+        groups: Arc::new(std::sync::Mutex::new(restored_groups)),
         // One entry per touched session; bounded by session count in practice.
         // Idle eviction is deferred to a later multi-instance pass.
         locks: Arc::new(Mutex::new(HashMap::new())),
@@ -1808,6 +1816,14 @@ pub(in crate::ai) async fn run_serve(
         .route("/subagent-models", get(subagent_models))
         .route("/sessions", get(list_sessions).post(create_session))
         .route(
+            "/session-groups",
+            get(list_session_groups).post(create_session_group),
+        )
+        .route(
+            "/session-groups/{id}",
+            axum::routing::patch(update_session_group).delete(delete_session_group),
+        )
+        .route(
             "/session-activity",
             post(list_session_activity)
                 .layer(DefaultBodyLimit::max(MAX_SESSION_ACTIVITY_REQUEST_BYTES)),
@@ -1819,6 +1835,8 @@ pub(in crate::ai) async fn run_serve(
         .route("/sessions/{id}/fork", post(fork_session))
         .route("/sessions/{id}/title", post(set_session_title))
         .route("/sessions/{id}/mark", post(set_session_mark))
+        .route("/sessions/{id}/archive", post(set_session_archive))
+        .route("/sessions/{id}/group", post(set_session_group))
         .route(
             "/sessions/{id}/config",
             get(get_session_config).post(set_session_config),

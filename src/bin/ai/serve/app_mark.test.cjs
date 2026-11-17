@@ -11,6 +11,13 @@ const html = fs.readFileSync(path.join(__dirname, "app.html"), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const css = html.match(/<style>([\s\S]*?)<\/style>/)[1];
 const plain = (value) => JSON.parse(JSON.stringify(value));
+const sessionRows = (list) => list.querySelectorAll("[data-session-id]");
+function assertUnassignedGroup(list, loadedCount) {
+  const groups = list.querySelectorAll(".session-group-head");
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].querySelector(".session-group-name").textContent, "Unassigned");
+  assert.equal(groups[0].querySelector(".session-group-toggle").title, "Unassigned · " + loadedCount + " loaded sessions");
+}
 function between(start, end) {
   const a = script.indexOf(start), b = script.indexOf(end, a);
   assert.ok(a >= 0 && b > a, "missing page functions: " + start);
@@ -35,7 +42,7 @@ const longSessions = () => [sessions()[0], ...Array.from({ length: 100 }, (_, in
   id: "older-session-" + index, summary: "Older session " + index, marked: false, size_bytes: 1024,
 })), sessions()[1]];
 
-function harness({ phone = false, sid = "open-session", items = sessions(), cachedItems = items, markError = "", confirmDelete = true, beforeMark, sessionsGet, activityGet, historyGet, configGet, realNavigation = false } = {}) {
+function harness({ phone = false, sid = "open-session", items = sessions(), cachedItems = items, groups = [], markError = "", confirmDelete = true, beforeMark, sessionsGet, activityGet, historyGet, configGet, realNavigation = false } = {}) {
   const documentListeners = new Map(), windowListeners = new Map();
   const listen = (listeners, name, fn) => {
     if (!listeners.has(name)) listeners.set(name, []);
@@ -86,12 +93,17 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
       matches(selector) {
         return selector.split(",").some((part) => {
           const s = part.trim();
+          if (s === "[data-session-id]") return typeof el.dataset.sessionId === "string";
           return s.startsWith(".") ? classes.has(s.slice(1)) : tag === s;
         });
       },
       closest(selector) {
         for (let current = el; current; current = current.parentNode) if (current.matches(selector)) return current;
         return null;
+      },
+      contains(target) {
+        for (let current = target; current; current = current.parentNode) if (current === el) return true;
+        return false;
       },
       querySelectorAll(selector) {
         const found = [];
@@ -119,7 +131,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
     ["sessdelcancel", "button"], ["sessdelconfirm", "button"],
   ]) elements[id] = node(tag);
   elements.sessdel.hidden = true;
-  for (const id of ["sessionactionstitle", "sessionactionmark", "sessionactionfork", "sessionactiondelete", "sessionactioncancel"]) elements.sessionactionspanel.appendChild(elements[id]);
+  for (const id of ["sessionactionstitle", "sessionactionmeta", "sessionactionmark", "sessionactionrename", "sessionactionfork", "sessionactionarchive", "sessionactiongroup", "sessionactiondelete", "sessionactioncancel"]) elements.sessionactionspanel.appendChild(elements[id]);
   elements.sessionactions.appendChild(elements.sessionactionsscrim);
   elements.sessionactions.appendChild(elements.sessionactionspanel);
 
@@ -140,6 +152,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
       const parsed = new URL(url);
       const request = { url, path: parsed.pathname, searchParams: parsed.searchParams, method: options.method || "GET", headers: plain(options.headers), body: options.body ? JSON.parse(options.body) : null };
       requests.push(request);
+      if (request.path === "/session-groups") return response({ groups, assignments: {} });
       if (request.path === "/session-activity") {
         if (activityGet) return activityGet(request);
         return response(request.body.ids.map((id) => ({ id, activity: serverItems.find((item) => item.id === id)?.activity ?? "unknown" })));
@@ -163,7 +176,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
       assert.equal(request.path, "/sessions");
       if (sessionsGet) return sessionsGet(request);
       const keywords = (request.searchParams.get("query") || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
-      const matching = serverItems.filter((item) => (request.searchParams.get("marked") !== "true" || item.marked) && keywords.every((keyword) =>
+      const matching = serverItems.filter((item) => (request.searchParams.get("archived") === "only" ? !!item.archived : !item.archived) && (request.searchParams.get("marked") !== "true" || item.marked) && keywords.every((keyword) =>
         ((item.summary || item.first_user_prompt || "") + " " + item.id).toLowerCase().includes(keyword)));
       const ordered = request.searchParams.get("newest") === "true" ? matching.slice().reverse() : matching.slice();
       const offset = Number(request.searchParams.get("offset") || 0);
@@ -219,6 +232,19 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
   }
   elements.sessall = node("button");
   elements.sessmarked = node("button");
+  for (const [id, tag] of [
+    ["sessmore", "details"], ["sessmoretoggle", "summary"], ["sessmorepanel", "div"],
+    ["sessfilterstatus", "span"], ["sessmarkfilter", "div"], ["sessactive", "button"], ["sessarchived", "button"],
+    ["sessiongroupnew", "button"], ["sessiongroupmanage", "button"], ["sessiongroupdialog", "div"],
+    ["sessiongroupscrim", "div"], ["sessiongrouppanel", "section"], ["sessiongrouptitle", "div"],
+    ["sessiongroupbody", "div"], ["sessiongrouperror", "div"], ["sessiongroupcancel", "button"],
+  ]) elements[id] = node(tag);
+  elements.sessmore.open = false;
+  elements.sessiongroupdialog.hidden = true;
+  elements.sessmore.appendChild(elements.sessmoretoggle);
+  elements.sessmore.appendChild(elements.sessmorepanel);
+  for (const id of ["sessactive", "sessarchived", "sessall", "sessmarked", "sessiongroupnew", "sessiongroupmanage"]) elements.sessmorepanel.appendChild(elements[id]);
+  for (const id of ["sessiongrouptitle", "sessiongroupbody", "sessiongrouperror", "sessiongroupcancel"]) elements.sessiongrouppanel.appendChild(elements[id]);
   vm.runInContext(between('  wireSessionSearch();', '$("connbtn").onclick ='), context);
   context.wireSessionActions();
   context.renderSessionList(context.lastItems);
@@ -260,8 +286,9 @@ test("sidebar stars reflect marked state and expose the matching accessible acti
     assert.equal(star.getAttribute("aria-pressed"), String(marked));
     assert.equal(star.getAttribute("aria-label"), marked ? "取消标记" : "标记会话");
     assert.equal(star.title, star.getAttribute("aria-label"));
-    assert.equal(li.children[0].textContent, "✎");
-    assert.equal(li.children[1], star);
+    assert.equal(li.children[0], li.querySelector(".mk"));
+    assert.equal(li.children[1], li.querySelector(".session-title"));
+    assert.equal(li.querySelector(".rn"), null);
   }
 });
 
@@ -289,13 +316,15 @@ for (const marked of [false, true]) test("desktop " + (marked ? "unmarking" : "m
     // Persisting a mark makes the target the newest item in store order.
     sessionsGet: () => response([items[2], items[0], { ...items[1], marked: !marked }]),
   });
-  const rowOrder = () => h.elements.sesslist.children.map((li) => li.querySelector("span").textContent);
+  const rowOrder = () => sessionRows(h.elements.sesslist).map((li) => li.querySelector(".session-title").textContent);
   const expectedOrder = ["Open session", "Target session", "Older session"];
   assert.deepEqual(rowOrder(), expectedOrder);
+  assertUnassignedGroup(h.elements.sesslist, 3);
 
   await h.dispatch(h.row().querySelector(".mk"), "click").done;
 
   assert.deepEqual(rowOrder(), expectedOrder, "mark changes must keep every rendered row in place");
+  assertUnassignedGroup(h.elements.sesslist, 3);
   const star = h.row().querySelector(".mk");
   assert.equal(star.textContent, marked ? "☆" : "★");
   assert.equal(star.getAttribute("aria-pressed"), String(!marked));
@@ -487,7 +516,7 @@ test("desktop, mouse and row controls do not open the phone action sheet", () =>
     assert.equal(h.elements.sessionactions.hidden, true);
   }
   const h = harness({ phone: true });
-  h.dispatch(h.row().querySelector(".rn"), "pointerdown", h.touch());
+  h.dispatch(h.row().querySelector(".mk"), "pointerdown", h.touch());
   h.advance(650);
   assert.equal(h.elements.sessionactions.hidden, true);
   assert.equal(h.timers.size, 0);
@@ -604,7 +633,9 @@ test("filter input resets the session rail while normal re-renders preserve scro
   h.advance(250);
   await settle();
   assert.equal(rail.scrollTop, 0);
-  assert.equal(rail.children.length, 13, "normal list includes the selected session outside the first page");
+  assert.equal(sessionRows(rail).length, 13, "normal list includes the selected session outside the first page");
+  assertUnassignedGroup(rail, 13);
+  assert.equal(rail.querySelectorAll(".session-more").length, 1);
   assert.equal(h.elements.sesscount.textContent, "102 sessions");
   assert.equal(h.context.sessionId, "open-session");
   assert.deepEqual(h.requests.filter((request) => request.path === "/sessions").map((request) => request.searchParams.get("query")), ["Older session", "target", null]);
@@ -615,7 +646,8 @@ test("a fresh session-list render starts at the top", () => {
   assert.equal(rail.children.length, 0);
   assert.equal(rail.scrollTop, 0);
   h.context.renderSessionList(longSessions());
-  assert.equal(rail.children.length, 102);
+  assert.equal(sessionRows(rail).length, 102);
+  assertUnassignedGroup(rail, 102);
   assert.equal(rail.scrollTop, 0);
 });
 
@@ -658,7 +690,8 @@ test("boot renders every fetched session before history and config hydration fin
   const h = harness({ realNavigation: true, sid: "", cachedItems: [], historyGet: () => history.promise, configGet: () => config.promise });
   const boot = h.context.loadSessions();
   await settle();
-  assert.equal(h.elements.sesslist.children.length, 2);
+  assert.equal(sessionRows(h.elements.sesslist).length, 2);
+  assertUnassignedGroup(h.elements.sesslist, 2);
   assert.equal(h.elements.sesscount.textContent, "2 sessions");
   assert.equal(h.context.sessionId, "target-session");
   assert.equal(h.row().classList.contains("cur"), true);
@@ -669,7 +702,8 @@ test("boot renders every fetched session before history and config hydration fin
   assert.equal(h.historyLoads(), 1, "another list refresh shares the selected session's pending hydration");
   history.resolve(response([]));
   await settle();
-  assert.equal(h.elements.sesslist.children.length, 2);
+  assert.equal(sessionRows(h.elements.sesslist).length, 2);
+  assertUnassignedGroup(h.elements.sesslist, 2);
   assert.equal(h.configLoads(), 1, "rows stay visible while config is still pending");
   config.resolve(response({}));
   await boot;
@@ -754,7 +788,7 @@ test("sheet keyboard focus cycles through its actions and Escape restores the st
   const h = harness({ phone: true }), star = h.row().querySelector(".mk");
   h.hold();
   assert.equal(h.document.activeElement, h.elements.sessionactionmark);
-  for (const id of ["sessionactiondelete", "sessionactioncancel", "sessionactionmark"]) {
+  for (const id of ["sessionactionrename", "sessionactionarchive", "sessionactiongroup", "sessionactiondelete", "sessionactioncancel", "sessionactionmark"]) {
     const key = h.dispatch(h.document.activeElement, "keydown", { key: "Tab" });
     assert.equal(key.event.prevented, true);
     assert.equal(h.document.activeElement, h.elements[id]);
@@ -782,11 +816,150 @@ test("mark styles use theme gold and phone actions have 44px touch targets", () 
   assert.match(css, /#sessions li \.mk\[aria-pressed="true"\] \{ color:var\(--mark\); \}/);
   assert.equal((css.match(/--mark:#[a-f0-9]+/gi) || []).length, 3);
   const phoneCSS = css.slice(css.indexOf("@media (max-width:700px)"));
-  assert.match(phoneCSS, /#sessions li \.rn \{ min-width:44px; min-height:44px; \}/);
-  assert.match(phoneCSS, /#sessions li \.mk \{ display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; padding:0; font-size:15px; background:none; \}/);
+  assert.match(phoneCSS, /#sessions li \.mk \{ display:inline-flex; align-items:center; justify-content:center; width:44px; height:44px; padding:0; font-size:15px; background:none; \}/);
+  assert.match(css, /#sessmorepanel button \{[^}]*min-height:44px;/);
   assert.match(phoneCSS, /#sessions li \.mk\[aria-pressed="true"\] \{ color:var\(--mark\); \}/);
   assert.match(css, /#sessionactionspanel button \{ min-width:44px; min-height:44px;/);
   assert.match(html, /id="sessionactions" hidden/);
   assert.match(html, /id="sessionactionspanel" role="dialog" aria-modal="true" aria-labelledby="sessionactionstitle"/);
   assert.match(between("function wire()", "function registerAppServiceWorker()"), /wireSessionActions\(\);/);
+});
+
+test("More contains the filters and group tools without another toolbar row", () => {
+  const menu = html.match(/<details id="sessmore">([\s\S]*?)<\/details>/)[1];
+  for (const id of ["sessactive", "sessarchived", "sessall", "sessmarked", "sessiongroupnew", "sessiongroupmanage"]) assert.match(menu, new RegExp('id="' + id + '"'));
+  assert.match(menu, /<summary id="sessmoretoggle" aria-label="More session options">More<\/summary>/);
+  assert.doesNotMatch(html, /id="sessviewrow"/);
+  assert.match(css, /#sessfilterrow \{ display:flex; align-items:center;[^}]*flex-shrink:0;/);
+  assert.match(css, /#sessfilterrow > #sesscount \{[^}]*min-width:0;[^}]*white-space:nowrap; overflow:hidden; text-overflow:ellipsis;/);
+});
+
+test("choosing a More filter closes the menu and leaves its active state visible", async () => {
+  const h = harness({ items: sessions(true) });
+  assert.equal(h.elements.sessfilterstatus.hidden, true);
+  h.elements.sessmore.open = true;
+  await h.dispatch(h.elements.sessmarked, "click").done;
+  assert.equal(h.elements.sessmore.open, false);
+  assert.equal(h.document.activeElement, h.elements.sessmoretoggle);
+  assert.equal(h.elements.sessfilterstatus.hidden, false);
+  assert.equal(h.elements.sessfilterstatus.textContent, "Starred");
+  assert.deepEqual(sessionRows(h.elements.sesslist).map((li) => li.dataset.sessionId), ["target-session"]);
+  await h.dispatch(h.elements.sessall, "click").done;
+  assert.equal(h.elements.sessfilterstatus.hidden, true);
+  assert.equal(sessionRows(h.elements.sesslist).length, 2);
+});
+
+test("archive and star filters combine without hiding their state or changing selection", async () => {
+  const archived = { id: "archived-session", summary: "Archived title", marked: true, archived: true, size_bytes: 1024 };
+  const h = harness({ items: [...sessions(), archived] });
+  await h.dispatch(h.elements.sessarchived, "click").done;
+  assert.equal(h.elements.sessfilterstatus.textContent, "Archived");
+  assert.equal(h.elements.sessarchived.getAttribute("aria-pressed"), "true");
+  assert.deepEqual(sessionRows(h.elements.sesslist).map((li) => li.dataset.sessionId), [archived.id]);
+  await h.dispatch(h.elements.sessmarked, "click").done;
+  assert.equal(h.elements.sessfilterstatus.textContent, "Archived ★");
+  assert.equal(h.elements.sessfilterstatus.getAttribute("aria-label"), "Archived · Starred");
+  assert.deepEqual(sessionRows(h.elements.sesslist).map((li) => li.dataset.sessionId), [archived.id]);
+  assert.deepEqual(h.switches, []);
+  assert.ok(h.requests.filter((request) => request.path === "/sessions").every((request) => request.searchParams.get("archived") === "only"));
+});
+
+test("More closes on Escape, outside pointer and outside focus without changing filters", () => {
+  const h = harness();
+  h.elements.sessmore.open = true;
+  const key = h.dispatch(h.elements.sessmore, "keydown", { key: "Escape" });
+  assert.equal(key.event.prevented, true);
+  assert.equal(h.elements.sessmore.open, false);
+  assert.equal(h.document.activeElement, h.elements.sessmoretoggle);
+  for (const event of ["pointerdown", "focusin"]) {
+    h.elements.sessmore.open = true;
+    for (const listener of h.documentListeners.get(event)) listener({ target: h.elements.sessmarked });
+    assert.equal(h.elements.sessmore.open, true);
+    for (const listener of h.documentListeners.get(event)) listener({ target: h.elements.prompt });
+    assert.equal(h.elements.sessmore.open, false);
+  }
+  assert.deepEqual(h.requests, []);
+  assert.equal(h.elements.sessfilterstatus.hidden, true);
+});
+
+for (const phone of [false, true]) test("Rename from the action sheet edits its target and Escape preserves title (phone=" + phone + ")", async () => {
+  const h = harness({ phone }), li = h.row();
+  if (phone) h.hold();
+  else h.dispatch(li, "contextmenu");
+  await h.dispatch(h.elements.sessionactionrename, "click").done;
+  const editor = li.querySelector(".rnm");
+  assert.equal(h.elements.sessionactions.hidden, true);
+  assert.equal(editor.value, "Target session");
+  assert.equal(h.document.activeElement, editor);
+  assert.equal(li.classList.contains("session-renaming"), true);
+  h.dispatch(editor, "keydown", { key: "Escape" });
+  assert.equal(h.row().querySelector(".session-title").textContent, "Target session");
+  assert.equal(h.row().querySelector(".rnm"), null);
+  assert.deepEqual(h.requests, []);
+  assert.deepEqual(h.switches, []);
+});
+
+test("row metadata lives in tooltips and the sheet while inactive stars reserve no title space", () => {
+  const h = harness({ items: sessions(true) }), li = h.row();
+  assert.match(li.title, /Target session\nID: target-session\n2 KB/);
+  assert.equal(li.classList.contains("session-marked"), true);
+  assert.equal(h.row("open-session").classList.contains("session-marked"), false);
+  h.dispatch(li, "contextmenu");
+  assert.equal(h.elements.sessionactionmeta.textContent, "ID: target-session\n2 KB\ntest-page");
+  assert.match(css, /#sessions li \.session-hash \{ display:none; \}/);
+  assert.match(css, /#sessions li \.mk \{[^}]*opacity:0; pointer-events:none;/);
+  assert.match(css, /#sessions li\.session-marked \.mk, #sessions li:focus-within \.mk \{ opacity:1; pointer-events:auto; \}/);
+  assert.match(css, /@media \(hover:hover\) \{\s*#sessions li:hover \.mk \{ opacity:1; pointer-events:auto; \}/);
+});
+
+test("empty groups stay available through Manage groups without occupying list rows", async () => {
+  const groups = [{ id: "empty", name: "Empty group", order: 0, pinned: false }];
+  const h = harness({ groups });
+  await h.context.loadSessionGroups();
+  h.context.renderSessionList(h.context.lastItems);
+  assertUnassignedGroup(h.elements.sesslist, 2);
+  h.elements.sessmore.open = true;
+  await h.dispatch(h.elements.sessiongroupmanage, "click").done;
+  assert.equal(h.elements.sessmore.open, false);
+  assert.equal(h.elements.sessiongroupdialog.hidden, false);
+  assert.equal(h.elements.sessiongrouptitle.textContent, "Manage groups");
+  const buttons = h.elements.sessiongroupbody.querySelectorAll("button");
+  assert.deepEqual(buttons.map((button) => button.textContent), ["New group…", "Empty group"]);
+  await h.dispatch(buttons[1], "click").done;
+  assert.equal(h.elements.sessiongrouptitle.textContent, "Empty group");
+  assert.ok(h.elements.sessiongroupbody.querySelectorAll("button").some((button) => button.textContent === "New session in this group"));
+});
+
+test("compact group heads preserve waiting visibility and explicit collapse state", () => {
+  const items = [sessions()[0], { ...sessions()[1], activity: "running", waiting: "confirm", waiting_prompt: "Approve?" }];
+  const h = harness({ items }), head = h.elements.sesslist.querySelector(".session-group-head");
+  const toggle = head.querySelector(".session-group-toggle");
+  assert.equal(head.querySelector(".session-group-count"), null);
+  assert.equal(toggle.title, "Unassigned · 2 loaded sessions");
+  const waiting = head.querySelector(".waiting");
+  assert.equal(waiting.textContent, "1 WAITING");
+  assert.equal(waiting.hidden, false);
+  assert.match(toggle.getAttribute("aria-label"), /1 WAITING/);
+  h.dispatch(toggle, "click");
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.ok(sessionRows(h.elements.sesslist).every((li) => li.hidden));
+  assert.equal(waiting.hidden, false);
+  h.context.renderSessionList(h.context.lastItems);
+  assert.equal(h.elements.sesslist.querySelector(".session-group-toggle").getAttribute("aria-expanded"), "false");
+  assert.ok(sessionRows(h.elements.sesslist).every((li) => li.hidden));
+  h.dispatch(h.elements.sesslist.querySelector(".session-group-toggle"), "click");
+  assert.ok(sessionRows(h.elements.sesslist).every((li) => !li.hidden));
+});
+
+test("phone More keeps archive and group tools while the desktop-only star filter stays hidden", async () => {
+  const h = harness({ phone: true });
+  assert.equal(h.elements.sessmarkfilter.hidden, true);
+  assert.equal(h.elements.sessactive.hidden, false);
+  assert.equal(h.elements.sessiongroupmanage.hidden, false);
+  h.elements.sessmore.open = true;
+  await h.dispatch(h.elements.sessiongroupnew, "click").done;
+  assert.equal(h.elements.sessmore.open, false);
+  assert.equal(h.elements.sessiongrouptitle.textContent, "New group");
+  assert.equal(h.elements.sessiongroupbody.querySelector("input").getAttribute("aria-label"), "Group name");
+  assert.equal(h.document.activeElement, h.elements.sessiongroupbody.querySelector("input"));
 });

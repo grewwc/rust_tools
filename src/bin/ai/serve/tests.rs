@@ -49,12 +49,297 @@ fn lifecycle_test_state() -> super::ServeState {
         token: String::new(),
         default_add_dirs: Default::default(),
         cwds: Default::default(),
+        groups: Default::default(),
         locks: Default::default(),
         open_sessions: Default::default(),
         active_turns: Default::default(),
         confirms: Default::default(),
         events: Default::default(),
     }
+}
+
+async fn session_groups_response_json(response: Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn session_groups_archive_filter_before_paging() {
+    let state = lifecycle_test_state();
+    let store = SessionStore::new(&state.history_file);
+    for id in ["archived", "active", "unassigned"] {
+        store
+            .write_session_title_with_origin(id, "Shared topic", SessionTitleOrigin::User)
+            .unwrap();
+    }
+    store
+        .write_session_mark(
+            "archived",
+            true,
+            crate::ai::history::MarkMessageUpdate::Keep,
+        )
+        .unwrap();
+    let group = session_groups_response_json(
+        create_session_group(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(serde_json::from_value(serde_json::json!({"name": "Topic"})).unwrap()),
+        )
+        .await,
+    )
+    .await;
+    let group_id = group["id"].as_str().unwrap();
+    for id in ["archived", "active"] {
+        assign_session_group(&state, id, Some(group_id)).unwrap();
+    }
+    let response = set_session_archive(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path("archived".into()),
+        Json(SetSessionArchiveReq { archived: true }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        session_groups_response_json(response).await,
+        serde_json::json!({"id": "archived", "archived": true})
+    );
+    assert!(store.read_session_marked("archived").unwrap());
+    assert_eq!(
+        store.read_session_title("archived").unwrap().as_deref(),
+        Some("Shared topic")
+    );
+    for (archive, group_filter, expected) in [
+        ("exclude", Some(group_id), 1),
+        ("only", Some(group_id), 1),
+        ("include", None, 3),
+        ("unknown-value", None, 3),
+        ("include", Some("unassigned"), 1),
+        ("include", Some("missing-group"), 0),
+    ] {
+        let query = serde_json::from_value(serde_json::json!({
+            "archived": archive, "group": group_filter, "query": "shared topic",
+            "limit": 1, "offset": 1, "include": "archived",
+        }))
+        .unwrap();
+        let response = list_sessions(State(state.clone()), HeaderMap::new(), Query(query))
+            .await
+            .into_response();
+        assert_eq!(response.headers()["x-sessions-total"], expected.to_string());
+        let items = session_groups_response_json(response).await;
+        assert_eq!(
+            items.as_array().unwrap().len(),
+            if expected > 1 { 1 } else { 0 }
+        );
+        for item in items.as_array().unwrap() {
+            assert!(
+                item.get("group_id").is_some(),
+                "null group_id must be explicit"
+            );
+        }
+    }
+    let query = serde_json::from_value(serde_json::json!({"archived": "exclude", "group": group_id, "limit": 1, "include": "archived"})).unwrap();
+    let response = list_sessions(State(state.clone()), HeaderMap::new(), Query(query))
+        .await
+        .into_response();
+    let items = session_groups_response_json(response).await;
+    assert_eq!(items.as_array().unwrap().len(), 1);
+    assert_eq!(items[0]["id"], "active");
+    assert_eq!(items[0]["group_id"], group_id);
+    for (id, status) in [
+        ("../invalid", StatusCode::BAD_REQUEST),
+        ("missing", StatusCode::NOT_FOUND),
+    ] {
+        assert_eq!(
+            set_session_archive(
+                State(state.clone()),
+                HeaderMap::new(),
+                Path(id.into()),
+                Json(SetSessionArchiveReq { archived: true })
+            )
+            .await
+            .status(),
+            status
+        );
+    }
+    assert!(!store.session_exists("missing").unwrap());
+    std::fs::remove_dir_all(state.history_file.parent().unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn session_groups_api_lifecycle_contract() {
+    let state = lifecycle_test_state();
+    let group = session_groups_response_json(
+        create_session_group(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(serde_json::from_value(serde_json::json!({"name": "  话题  "})).unwrap()),
+        )
+        .await,
+    )
+    .await;
+    let group_id = group["id"].as_str().unwrap().to_string();
+    assert_eq!(group["name"], "话题");
+    assert_eq!(group["pinned"], false);
+    let updated = update_session_group(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(group_id.clone()),
+        Json(serde_json::from_value(serde_json::json!({"pinned": true, "order": 3.5})).unwrap()),
+    )
+    .await;
+    let updated = session_groups_response_json(updated).await;
+    assert_eq!(updated["pinned"], true);
+    assert_eq!(updated["order"], 3.5);
+    assert_eq!(updated["name"], "话题");
+    for name in [" ".to_string(), "界".repeat(41)] {
+        assert_eq!(
+            create_session_group(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(serde_json::from_value(serde_json::json!({"name": name})).unwrap())
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let legacy = create_session(
+        State(state.clone()),
+        HeaderMap::new(),
+        axum::body::Bytes::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(legacy.status(), StatusCode::OK);
+    assert!(session_groups_response_json(legacy).await["group_id"].is_null());
+    let created = create_session(
+        State(state.clone()),
+        HeaderMap::new(),
+        axum::body::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"group_id": group_id})).unwrap(),
+        ),
+    )
+    .await
+    .into_response();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = session_groups_response_json(created).await;
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["group_id"], group_id);
+    let store = SessionStore::new(&state.history_file);
+    assert!(
+        !store.session_exists(&id).unwrap(),
+        "grouping must preserve lazy creation"
+    );
+    store
+        .write_session_title_with_origin(&id, "Fork source", SessionTitleOrigin::User)
+        .unwrap();
+    let forked = fork_session(State(state.clone()), HeaderMap::new(), Path(id.clone()))
+        .await
+        .into_response();
+    assert_eq!(forked.status(), StatusCode::OK);
+    let forked = session_groups_response_json(forked).await;
+    assert_eq!(forked["group_id"], group_id);
+    assert_eq!(
+        groups_snapshot(&state)
+            .group_id(forked["id"].as_str().unwrap())
+            .as_deref(),
+        Some(group_id.as_str())
+    );
+    assert_eq!(
+        delete_session(State(state.clone()), HeaderMap::new(), Path(id.clone()))
+            .await
+            .into_response()
+            .status(),
+        StatusCode::OK
+    );
+    assert!(groups_snapshot(&state).group_id(&id).is_none());
+    assert_eq!(
+        set_session_group(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("lazy".into()),
+            Json(serde_json::from_value(serde_json::json!({"group_id": group_id})).unwrap())
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert!(!store.session_exists("lazy").unwrap());
+    assert_eq!(
+        set_session_group(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("lazy".into()),
+            Json(serde_json::from_value(serde_json::json!({"group_id": null})).unwrap())
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert!(groups_snapshot(&state).group_id("lazy").is_none());
+    assert_eq!(
+        create_session(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::body::Bytes::from_static(b"{\"group_id\":\"unknown\"}")
+        )
+        .await
+        .into_response()
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        set_session_group(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("lazy".into()),
+            Json(serde_json::from_value(serde_json::json!({"group_id": "unknown"})).unwrap())
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        set_session_group(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("../bad".into()),
+            Json(serde_json::from_value(serde_json::json!({"group_id": null})).unwrap())
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        delete_session_group(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(group_id.clone())
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let snapshot = groups_snapshot(&state);
+    assert!(snapshot.groups.is_empty());
+    assert!(snapshot.assignments.is_empty());
+    assert_eq!(load_groups(&state.history_file), snapshot);
+    assert!(
+        store
+            .session_exists(forked["id"].as_str().unwrap())
+            .unwrap(),
+        "deleting a group must retain sessions"
+    );
+    assert_eq!(
+        delete_session_group(State(state.clone()), HeaderMap::new(), Path(group_id))
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    std::fs::remove_dir_all(state.history_file.parent().unwrap()).unwrap();
 }
 
 #[test]
@@ -70,6 +355,7 @@ fn web_open_slot_allows_owner_reattach_and_rejects_a_second_client() {
         token: String::new(),
         default_add_dirs: Default::default(),
         cwds: Default::default(),
+        groups: Default::default(),
         locks: Default::default(),
         open_sessions: Default::default(),
         active_turns: Default::default(),
@@ -248,6 +534,7 @@ async fn file_route_serves_images_and_guards_access() {
         token: "t".to_string(),
         default_add_dirs: Default::default(),
         cwds: Default::default(),
+        groups: Default::default(),
         locks: Default::default(),
         open_sessions: Default::default(),
         active_turns: Default::default(),
@@ -1115,6 +1402,8 @@ async fn session_activity_list_reports_first_paint_for_the_returned_page() {
         State(state.clone()),
         HeaderMap::new(),
         Query(SessionsQuery {
+            archived: None,
+            group: None,
             limit: None,
             offset: None,
             query: None,
@@ -1861,9 +2150,13 @@ async fn session_create_and_cd_report_the_working_directory() {
         .display()
         .to_string();
 
-    let created = super::create_session(State(state.clone()), HeaderMap::new())
-        .await
-        .into_response();
+    let created = super::create_session(
+        State(state.clone()),
+        HeaderMap::new(),
+        axum::body::Bytes::new(),
+    )
+    .await
+    .into_response();
     assert_eq!(created.status(), StatusCode::OK);
     let body = to_bytes(created.into_body(), usize::MAX)
         .await

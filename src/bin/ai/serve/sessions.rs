@@ -208,8 +208,17 @@ pub(crate) async fn list_sessions(
     };
     let query = q.query.as_deref().unwrap_or_default().trim().to_lowercase();
     let keywords: Vec<&str> = query.split_whitespace().collect();
+    // Snapshot organization once, then release its lock before reading cwd
+    // or live state. All returned rows use the same grouping snapshot.
+    let groups = groups_snapshot(&state);
     let mut all: Vec<SessionItem> = items
         .into_iter()
+        .filter(|s| match q.archived.as_deref() {
+            Some("exclude") => !s.archived,
+            Some("only") => s.archived,
+            _ => true,
+        })
+        .filter(|s| groups.matches_group(&s.id, q.group.as_deref()))
         .filter(|s| !q.marked || s.marked)
         .filter(|s| {
             if keywords.is_empty() {
@@ -235,6 +244,7 @@ pub(crate) async fn list_sessions(
             // `/cd` entry, falling back to the daemon cwd exactly like the
             // turn child will.
             let cwd = session_cwd(&state, &s.id).display().to_string();
+            let group_id = groups.group_id(&s.id);
             SessionItem {
                 id: s.id,
                 size_bytes: s.size_bytes,
@@ -242,6 +252,7 @@ pub(crate) async fn list_sessions(
                 first_user_prompt: s.first_user_prompt,
                 marked: s.marked,
                 archived: s.archived,
+                group_id,
                 cwd,
                 activity: SessionActivity::Unknown,
                 waiting: None,
@@ -298,10 +309,19 @@ pub(crate) async fn list_sessions(
 pub(crate) async fn create_session(
     State(state): State<ServeState>,
     headers: HeaderMap,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
     if let Err(e) = check_auth(&state, &headers) {
         return e.into_response();
     }
+    let req: SetSessionGroupReq = if body.is_empty() {
+        SetSessionGroupReq::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(req) => req,
+            Err(err) => return bad_request(err.to_string()).into_response(),
+        }
+    };
     let store = SessionStore::new(state.history_file.as_path());
     if let Err(err) = store.ensure_root_dir() {
         return (
@@ -315,8 +335,21 @@ pub(crate) async fn create_session(
     // files appear on the first turn (`--session <id>` one-shot). Until then
     // GET history 404s, matching CLI one-shot semantics.
     debug_assert!(SessionStore::validate_session_id(&id).is_ok());
+    if let Some(group_id) = &req.group_id
+        && let Err(err) = assign_session_group(&state, &id, Some(group_id))
+    {
+        return err;
+    }
     let cwd = session_cwd(&state, &id).display().to_string();
-    (StatusCode::OK, Json(CreateSessionResp { id, cwd })).into_response()
+    (
+        StatusCode::OK,
+        Json(CreateSessionResp {
+            id,
+            cwd,
+            group_id: req.group_id,
+        }),
+    )
+        .into_response()
 }
 
 /// Fork session `{id}` into a new branch, mirroring the local `/fork`:
@@ -359,8 +392,17 @@ pub(crate) async fn fork_session(
     // The branch keeps working where its parent was; otherwise the fork would
     // silently revert to the daemon cwd on its first turn.
     copy_session_cwd(&state, &id, &dst);
+    let group_id = copy_session_group(&state, &id, &dst);
     let cwd = session_cwd(&state, &dst).display().to_string();
-    (StatusCode::OK, Json(CreateSessionResp { id: dst, cwd })).into_response()
+    (
+        StatusCode::OK,
+        Json(CreateSessionResp {
+            id: dst,
+            cwd,
+            group_id,
+        }),
+    )
+        .into_response()
 }
 
 /// Delete session `{id}`, mirroring the local `/close` (minus the local
@@ -384,6 +426,7 @@ pub(crate) async fn delete_session(
             // The session's virtual cwd dies with it; a later recreated
             // session of the same id starts from the daemon cwd again.
             drop_session_cwd(&state, &id);
+            drop_session_group(&state, &id);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({"deleted": deleted})),
@@ -432,6 +475,47 @@ pub(crate) async fn set_session_mark(
             (StatusCode::OK, Json(serde_json::json!({"marked": marked}))).into_response()
         }
         Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("session not found: {id}")})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SetSessionArchiveReq {
+    pub(crate) archived: bool,
+}
+
+/// Reuse formal archive metadata without changing titles or important marks.
+pub(crate) async fn set_session_archive(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SetSessionArchiveReq>,
+) -> Response {
+    if let Err(err) = check_auth(&state, &headers) {
+        return err.into_response();
+    }
+    if SessionStore::validate_session_id(&id).is_err() {
+        return bad_request(format!("invalid session id: {id}")).into_response();
+    }
+    let store = SessionStore::new(&state.history_file);
+    let result = with_sessions_lifecycle_lock(store.sessions_root(), || {
+        if !store.session_exists(&id)? {
+            return Ok(false);
+        }
+        store.write_session_archived(&id, req.archived)?;
+        Ok(true)
+    });
+    match result {
+        Ok(true) => Json(serde_json::json!({"id": id, "archived": req.archived})).into_response(),
+        Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": format!("session not found: {id}")})),
         )

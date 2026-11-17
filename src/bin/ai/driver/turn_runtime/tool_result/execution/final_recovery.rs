@@ -270,7 +270,9 @@ pub(in crate::ai::driver::turn_runtime) fn append_runtime_warning_once(
     if text.contains(warning) {
         return;
     }
-    if !text.trim().is_empty() {
+    // Normalize only the append seam; preserve whitespace inside the model's body.
+    text.truncate(text.trim_end().len());
+    if !text.is_empty() {
         text.push_str("\n\n");
     }
     text.push_str(warning);

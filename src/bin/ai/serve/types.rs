@@ -28,6 +28,8 @@ pub(crate) struct ServeState {
     /// so relative paths in all tools, MCP children and the system prompt
     /// resolve per session. An absent entry means "the daemon's own cwd".
     pub(crate) cwds: Arc<std::sync::Mutex<HashMap<String, SessionCwd>>>,
+    /// Sidebar organization only; independent of runtime context and grants.
+    pub(crate) groups: Arc<std::sync::Mutex<super::session_groups::SessionGroups>>,
     /// Per-session async mutex: at most one turn writer per session.
     pub(crate) locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Session id -> pid of the running turn child, for
@@ -387,6 +389,7 @@ pub(crate) struct SessionItem {
     /// Formal archive flag (`/archive`). Clients hide these from the default
     /// listing and expose them through a dedicated archive view.
     pub(crate) archived: bool,
+    pub(crate) group_id: Option<String>,
     /// The session's virtual working directory (`/cd`), or the daemon's own
     /// directory when the session never switched. The web UI shows it in the
     /// session bar so a new session's default directory is visible.
@@ -439,6 +442,9 @@ pub(crate) struct SessionActivityItem {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct SessionsQuery {
+    /// Archive and group constraints apply before search, paging and inclusion.
+    pub(crate) archived: Option<String>,
+    pub(crate) group: Option<String>,
     pub(crate) limit: Option<usize>,
     pub(crate) offset: Option<usize>,
     /// Case-insensitive whitespace-separated keywords; all must match the
@@ -459,6 +465,7 @@ pub(crate) struct SessionsQuery {
 #[derive(Debug, Serialize)]
 pub(crate) struct CreateSessionResp {
     pub(crate) id: String,
+    pub(crate) group_id: Option<String>,
     /// The directory the new session's first turn will run in.
     pub(crate) cwd: String,
 }

@@ -136,6 +136,7 @@ mod tests {
                 token: String::new(),
                 default_add_dirs: Default::default(),
                 cwds: Default::default(),
+                groups: Default::default(),
                 locks: Default::default(),
                 open_sessions: Default::default(),
                 active_turns: Default::default(),

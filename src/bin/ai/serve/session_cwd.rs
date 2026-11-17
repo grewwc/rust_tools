@@ -79,14 +79,10 @@ fn save_cwds(state: &ServeState) {
     // Unique per thread: concurrent `/cd` switches in different sessions
     // serialize on the map lock above, but each still needs its own
     // temporary file so their renames cannot cross.
-    let tmp = path.with_extension(format!(
-        "json.tmp-{:?}",
-        std::thread::current().id()
-    ));
+    let tmp = path.with_extension(format!("json.tmp-{:?}", std::thread::current().id()));
     // The guard stays alive across the write: a second switch serializes its
     // own (newer) snapshot afterwards instead of racing this one to disk.
-    let result = std::fs::write(&tmp, &text)
-        .and_then(|_| std::fs::rename(&tmp, &path));
+    let result = std::fs::write(&tmp, &text).and_then(|_| std::fs::rename(&tmp, &path));
     std::mem::drop(guard);
     if let Err(err) = result {
         eprintln!("[serve] warning: failed to persist session cwds: {err}");
@@ -235,6 +231,7 @@ mod tests {
             token: String::new(),
             default_add_dirs: Default::default(),
             cwds: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            groups: Default::default(),
             locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             open_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -356,7 +353,10 @@ mod tests {
         assert!(shown.stderr.is_empty());
         assert_eq!(
             shown.stdout,
-            format!("Working directory: {}\n", target.canonicalize().unwrap().display())
+            format!(
+                "Working directory: {}\n",
+                target.canonicalize().unwrap().display()
+            )
         );
         let rejected = run_session_cd(&state, "s1", "/pwd extra").expect("pwd");
         assert!(rejected.stdout.is_empty());
@@ -394,6 +394,7 @@ mod tests {
             token: String::new(),
             default_add_dirs: Default::default(),
             cwds: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            groups: Default::default(),
             locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             open_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -444,10 +445,7 @@ mod tests {
         let target = temp_dir("persist-fork-target");
         run_session_cd(&state, "s1", &format!("/cd {}", target.display())).expect("cd");
         copy_session_cwd(&state, "s1", "s2");
-        assert_eq!(
-            session_cwd(&state, "s2"),
-            target.canonicalize().unwrap()
-        );
+        assert_eq!(session_cwd(&state, "s2"), target.canonicalize().unwrap());
     }
 
     /// A restart while a session directory is temporarily unavailable keeps

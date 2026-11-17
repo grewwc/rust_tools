@@ -76,7 +76,7 @@ for (const phone of [false, true]) test("first paint shows a labeled running row
 for (const phone of [false, true]) test("running badges are added once and removed on idle or unknown after repaint (phone=" + phone + ")", () => {
   const h = harness({ phone, items: listed() }), id = "target-session";
   const before = [...h.elements.sesslist.children], target = row(h, id);
-  const controls = [target.querySelector(".rn"), target.querySelector(".mk")];
+  const controls = [target.querySelector(".session-title"), target.querySelector(".mk")];
   assert.equal(badge(h, id), null);
   let indicator;
   for (let i = 0; i < 3; i++) {
@@ -90,7 +90,7 @@ for (const phone of [false, true]) test("running badges are added once and remov
     assert.equal(target.classList.contains("cur"), false, "running does not select the row");
   }
   sameRows(h, before);
-  assert.deepEqual([target.querySelector(".rn"), target.querySelector(".mk")], controls);
+  assert.deepEqual([target.querySelector(".session-title"), target.querySelector(".mk")], controls);
   h.context.mergeSessionActivities([{ id, activity: "idle" }]);
   run(h, "paintSessionActivity('target-session');");
   assert.equal(badge(h, id), null);
@@ -413,11 +413,12 @@ test("running rail and compact label use theme tokens without overriding selecti
   assert.match(css, /#sessions li \.session-running-label \{ letter-spacing:\.04em; \}/);
 });
 
-test("running titles ellipsize beside controls and only constrained metadata hides the label", () => {
-  assert.match(css, /#sessions li\.session-running \.session-title \{ display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; \}/);
+test("titles allow two lines and constrained metadata keeps waiting labels visible", () => {
+  assert.match(css, /#sessions li \.session-title \{[^}]*display:-webkit-box;[^}]*-webkit-line-clamp:2;[^}]*overflow:hidden; white-space:normal; overflow-wrap:anywhere;/);
   assert.match(css, /#sessions li\.session-running \.session-meta \{ display:flex; align-items:center; gap:8px; min-width:0; container:session-meta \/ inline-size; \}/);
   assert.match(css, /#sessions li\.session-running \.session-hash \{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; \}/);
-  assert.match(css, /@container session-meta \(max-width:72px\) \{\s*#sessions li \.session-running-label \{ display:none; \}/);
+  assert.match(css, /#sessions li \.session-hash \{ display:none; \}/);
+  assert.match(css, /@container session-meta \(max-width:72px\) \{\s*#sessions li \.session-running-label:not\(\.session-waiting-label\) \{ display:none; \}/);
   assert.doesNotMatch(css, /@media[^{}]*\{[^}]*\.session-running-label/);
 });
 

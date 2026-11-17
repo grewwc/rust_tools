@@ -175,6 +175,8 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessions.open { display:flex; }
 #sessions ul { list-style:none; margin:0; padding:8px; overflow-y:auto; flex:1; }
 #sessions li { padding:8px; border-radius:8px; font-size:14px; transition:background-color .15s ease, box-shadow .15s ease; }
+#sessions li[data-session-id] { position:relative; margin:4px 0; border:1px solid var(--card-edge, var(--line)); border-radius:10px; background:var(--surface-2); }
+#sessions li[data-session-id]:focus-within { border-color:var(--acc-line); }
 #sessions li.session-running { background:var(--tint-2); box-shadow:inset 2px 0 0 var(--acc-line); }
 #sessions li.cur { background:var(--tint-3); box-shadow:inset 3px 0 0 var(--acc); }
 #sessions li.cur span[role="button"] { font-weight:600; }
@@ -184,7 +186,10 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #msgs .user-msg-row.flash .msg.user { box-shadow:0 0 0 2px var(--acc); }
 #sessions li.holding { background:var(--tint-4); }
 #sessions li small { color:var(--dim); display:block; font-size:12px; }
-#sessions li.session-running .session-title { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#sessions li .session-title { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; white-space:normal; overflow-wrap:anywhere; min-width:0; font-weight:500; line-height:1.4; max-height:2.8em; }
+#sessions li .session-meta { display:none; }
+#sessions li.session-search-result .session-meta { display:flex; min-width:0; }
+#sessions li .session-hash { display:none; }
 #sessions li.session-running .session-meta { display:flex; align-items:center; gap:8px; min-width:0; container:session-meta / inline-size; }
 #sessions li.session-running .session-hash { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #sessions li .session-running-badge { display:inline-flex; align-items:center; gap:5px; flex:0 0 auto; padding:1px 6px; border-radius:999px; background:var(--panel); color:var(--acc); font-size:11px; line-height:16px; font-weight:var(--fw-meta); white-space:nowrap; }
@@ -198,11 +203,11 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessions li .session-running-dot { display:inline-block; flex:0 0 6px; width:6px; height:6px; border-radius:50%; background:currentColor; opacity:.86; animation:session-running-pulse 2.8s ease-in-out infinite; }
 @keyframes session-running-pulse { 0%, 100% { opacity:.58; transform:scale(.88); } 50% { opacity:.86; transform:scale(1); } }
 @container session-meta (max-width:72px) {
-  #sessions li .session-running-label { display:none; }
+  #sessions li .session-running-label:not(.session-waiting-label) { display:none; }
   #sessions li .session-running-badge { gap:0; }
 }
 @media (prefers-reduced-motion:reduce) { #sessions li .session-running-dot { animation:none; } }
-#sessions li .rn, #sessions li .mk { float:right; background:none; border:none; color:var(--dim); font-size:14px; padding:4px 10px; cursor:pointer; }
+#sessions li .mk { position:absolute; right:6px; top:6px; background:none; border:none; color:var(--dim); padding:4px 10px; cursor:pointer; }
 #sessions li .mk { font-size:18px; }
 #sessions li .mk[aria-pressed="true"] { color:var(--mark); }
 #sessions li span[role="button"] { cursor:pointer; }
@@ -220,6 +225,8 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
   border-radius:24px 24px 0 0; box-shadow:var(--shadow-panel);
 }
 #sessionactionstitle { color:var(--dim); font-size:13px; overflow-wrap:anywhere; }
+#sessionactionmeta { color:var(--dim); font-size:12px; white-space:pre-line; overflow-wrap:anywhere; }
+#sessions li.session-renaming .mk { display:none; }
 #sessionactionspanel button { min-width:44px; min-height:44px; text-align:left; }
 #sessionactiondelete { color:var(--err); }
 /* Deleting a session is the one destructive action in the sidebar; confirm it
@@ -240,8 +247,46 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessdelconfirm { color:var(--err); border-color:var(--err); }
 #sessfilter { margin:8px 8px 0; padding:6px 8px; font-size:13px; width:calc(100% - 16px); box-sizing:border-box; }
 #sesscount { padding:4px 12px 0; color:var(--dim); font-size:12px; }
-#sessfilterrow { display:contents; }
-#sessmarkfilter { display:none; }
+#sessfilterrow { display:flex; align-items:center; gap:6px; padding:4px 8px; flex-shrink:0; }
+#sessfilterrow > #sesscount { flex:1; min-width:0; padding:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+#sessfilterstatus { flex:0 0 auto; color:var(--acc); font-size:11px; white-space:nowrap; }
+#sessfilterstatus[hidden] { display:none; }
+#sessmore { position:relative; flex:0 0 auto; }
+#sessmore > summary { display:flex; align-items:center; justify-content:center; gap:4px; box-sizing:border-box; min-width:44px; min-height:44px; padding:4px 6px; font-size:12px; cursor:pointer; list-style:none; border-radius:8px; color:var(--dim); }
+#sessmore > summary::after { content:"⌄"; font-size:11px; line-height:1; }
+#sessmore[open] > summary::after { transform:rotate(180deg); }
+#sessmore > summary::-webkit-details-marker { display:none; }
+#sessmore > summary:focus-visible { outline:2px solid var(--acc-focus); outline-offset:2px; }
+#sessmore[open] > summary { background:var(--tint-3); }
+#sessmorepanel { position:absolute; top:calc(100% + 4px); right:0; z-index:12; box-sizing:border-box; width:208px; max-width:calc(86vw - 16px); max-height:calc(var(--app-height,100vh) * .65); overflow-y:auto; padding:8px; border:1px solid var(--line); border-radius:10px; background:var(--panel); box-shadow:0 4px 12px rgba(0,0,0,.10); }
+#sessarchivefilter, #sessmarkfilter { display:flex; gap:2px; padding:2px; margin-bottom:4px; border-radius:7px; background:var(--surface-2); }
+#sessmarkfilter[hidden] { display:none; }
+#sessmorepanel button { box-sizing:border-box; min-width:0; min-height:44px; padding:4px 8px; font-size:12px; line-height:1.3; border:0; border-radius:5px; background:transparent; color:var(--dim); }
+#sessarchivefilter button, #sessmarkfilter button { flex:1; }
+#sessarchivefilter button[aria-pressed="true"], #sessmarkfilter button[aria-pressed="true"] { background:var(--panel); color:var(--acc); font-weight:600; box-shadow:inset 0 0 0 1px var(--acc-line); }
+#sessgroupactions { display:flex; flex-direction:column; gap:2px; margin-top:6px; padding-top:6px; border-top:1px solid var(--card-edge, var(--line)); }
+#sessiongroupnew, #sessiongroupmanage { width:100%; text-align:left; }
+#sessions li.session-group-head { display:flex; align-items:center; gap:4px; padding:4px; margin-top:6px; border:1px solid var(--line); }
+#sessions li.session-group-head.session-group-waiting { border-color:var(--mark); box-shadow:inset 3px 0 0 var(--mark); }
+#sessions .session-group-toggle { display:flex; flex:1; align-items:center; gap:6px; min-width:0; min-height:36px; padding:4px; border:0; background:transparent; text-align:left; font-size:12px; }
+#sessions .session-group-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
+#sessions .session-group-status { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:3px; }
+#sessions .session-group-badge { color:var(--acc); font-size:10px; white-space:nowrap; }
+#sessions .session-group-badge.waiting { color:var(--mark); font-weight:600; }
+#sessions .session-group-menu { min-height:36px; min-width:32px; padding:4px; border:0; background:transparent; }
+#sessions li[hidden] { display:none; }
+#sessions .session-group-tag { display:inline-block; max-width:100%; margin-left:6px; overflow:hidden; text-overflow:ellipsis; vertical-align:bottom; white-space:nowrap; font-size:11px; color:var(--dim); }
+#sessiongroupdialog[hidden] { display:none; }
+#sessiongroupdialog { position:fixed; inset:0; z-index:16; display:grid; place-items:center; padding:16px; }
+#sessiongroupscrim { position:absolute; inset:0; background:rgba(0,0,0,.55); touch-action:none; }
+#sessiongrouppanel { position:relative; display:flex; flex-direction:column; gap:10px; width:min(100%,380px); max-height:calc(var(--app-height,100vh) * .80); overflow-y:auto; padding:18px; background:var(--panel); border:1px solid var(--line); border-radius:var(--radius-card); box-shadow:var(--shadow-panel); }
+#sessiongrouptitle { font-size:16px; font-weight:600; overflow-wrap:anywhere; }
+#sessiongroupbody { display:flex; flex-direction:column; gap:8px; }
+#sessiongroupbody button, #sessiongroupcancel { min-height:44px; text-align:left; }
+#sessiongroupbody input, #sessiongroupbody select { width:100%; min-height:44px; padding:8px; box-sizing:border-box; font-size:16px; }
+#sessiongroupbody p { margin:0; color:var(--dim); font-size:13px; line-height:1.5; }
+#sessiongroupbody .danger { color:var(--err); }
+#sessiongrouperror { color:var(--err); font-size:12px; overflow-wrap:anywhere; }
 #scrim { display:none; }
 /* The override wrapper is transparent by default; the width queries below
    give it a phone summary row or a desktop row with the team entry. */
@@ -920,7 +965,8 @@ button:active:not(:disabled) { filter:brightness(.96); }
 #themepick button { min-height:44px; border-radius:999px; }
 #jumpbottom { background:var(--acc); box-shadow:var(--shadow-panel); }
 @media (hover:hover) {
-  button:hover:not(:disabled):not(.primary):not(.stop), #sessions li:hover { background-color:var(--surface-hover); }
+  button:hover:not(:disabled):not(.primary):not(.stop) { background-color:var(--surface-hover); }
+  #sessions li[data-session-id]:hover:not(.cur) { background:var(--surface-hover); border-color:var(--line-2); }
 }
 /* Desktop owns its shell geometry; shared theme rules and phone states stay
    independent of the rail, reading column, and compact footer. */
@@ -1054,10 +1100,18 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #sessions li { padding:7px 8px; font-size:14px; line-height:1.4; }
   #sessions li.cur { background:var(--tint-3); box-shadow:inset 3px 0 0 var(--acc); }
   #sessions li span[role="button"] { overflow-wrap:anywhere; }
-  #sessions li small { margin-top:3px; font-size:12px; }
-  #sessions li .rn, #sessions li .mk { width:28px; height:28px; padding:0; font-size:16px; line-height:1; border-radius:6px; }
-  #sessions li .rn:hover, #sessions li .mk:hover,
-  #sessions li .rn:focus-visible, #sessions li .mk:focus-visible { background:var(--surface-hover); }
+  #sessions li small { margin-top:5px; font-size:11px; }
+  #sessions li .mk { width:28px; height:28px; top:5px; padding:0; font-size:14px; line-height:1; border-radius:6px; opacity:0; pointer-events:none; }
+  #sessions li.session-marked .mk, #sessions li:focus-within .mk { opacity:1; pointer-events:auto; }
+  #sessions li.session-marked .session-title, #sessions li:focus-within .session-title { margin-right:28px; }
+  #sessions li .mk:hover, #sessions li .mk:focus-visible { background:var(--surface-hover); }
+  @media (hover:hover) {
+    #sessions li:hover .mk { opacity:1; pointer-events:auto; }
+    #sessions li:hover .session-title { margin-right:28px; }
+  }
+  #sessions li.session-group-head { padding:0 4px; margin-top:6px; border:0; border-radius:6px; background:transparent; }
+  #sessions .session-group-toggle { min-height:28px; padding:2px; color:var(--dim); font-size:11px; }
+  #sessions .session-group-menu { min-height:28px; min-width:28px; padding:2px; }
   #sessionactionspanel {
     top:50%; bottom:auto; transform:translateY(-50%); padding:16px;
     border-bottom:1px solid var(--line); border-radius:var(--radius-card);
@@ -1083,11 +1137,14 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #sesscount { padding:6px 16px; }
   #sessions ul { padding:4px 8px; }
   #sessions li { padding:10px 12px; margin:3px 0; border-radius:12px; }
+  #sessions li[data-session-id] { padding:9px 10px; }
   #sessions li:hover { background:var(--surface-2); }
   #sessions li.cur, #sessions li.cur:hover {
     background:var(--tint-3); box-shadow:inset 3px 0 0 var(--acc);
   }
-  #sessions li .rn, #sessions li .mk { border-radius:8px; }
+  #sessions li.cur[data-session-id] { border-color:var(--acc-line); }
+  #sessions li.session-group-head:hover { background:var(--tint-2); }
+  #sessions li .mk { border-radius:6px; }
   #sessions .rowbtns {
     display:flex; flex:0 0 auto; gap:6px; padding:10px 12px;
     border:0; border-top:1px solid var(--card-edge);
@@ -1103,11 +1160,11 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #skillhint { display:none; }
   .modelrowcheck { border-color:var(--control-border); }
   #sesscount { padding-left:16px; }
-  #sessfilterrow { display:flex; flex-wrap:wrap; align-items:center; gap:6px; padding:6px 12px; }
-  #sessfilterrow > #sesscount { flex:1 1 auto; padding:0; }
-  #sessmarkfilter { display:flex; flex:0 0 auto; gap:2px; padding:2px; border:1px solid var(--line); border-radius:8px; }
-  #sessmarkfilter button { min-height:26px; padding:2px 7px; border:0; border-radius:6px; background:transparent; color:var(--dim); font-size:11px; }
-  #sessmarkfilter button[aria-pressed="true"] { background:var(--tint-3); color:var(--fg); }
+  #sessfilterrow { padding:2px 12px; }
+  #sessmore > summary { min-height:30px; min-width:38px; }
+  #sessmorepanel { padding:6px; }
+  #sessmorepanel button { min-height:28px; padding:3px 8px; }
+  #sessgroupactions button { min-height:30px; }
   #sessions li.session-empty { color:var(--dim); font-size:12px; }
   #sessions li.session-more button { width:100%; padding:6px; color:var(--dim); font-size:12px; }
   #sessions .rowbtns { flex-shrink:0; }
@@ -1321,8 +1378,8 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #sessions { position:absolute; top:0; bottom:0; left:0; z-index:10; width:min(86vw,320px); border-radius:0 20px 20px 0; box-shadow:var(--shadow-panel); }
   #scrim.on { display:block; position:absolute; inset:0; z-index:5; background:rgba(0,0,0,.45); }
   #sessions li { padding:12px 10px; font-size:15px; touch-action:pan-y; -webkit-user-select:none; user-select:none; }
-  #sessions li .rn { min-width:44px; min-height:44px; }
-  #sessions li .mk { display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; padding:0; font-size:15px; background:none; }
+  #sessions li .session-title { margin-right:44px; }
+  #sessions li .mk { display:inline-flex; align-items:center; justify-content:center; width:44px; height:44px; padding:0; font-size:15px; background:none; }
   #sessions li .mk[aria-pressed="true"] { color:var(--mark); }
   #sessions li .rnm { -webkit-user-select:text; user-select:text; }
   .rowbtns button { flex:1; min-height:42px; font-size:13px; }
@@ -1489,7 +1546,11 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <div id="views">
 <div id="scrim"></div>
 <nav id="sessions"><input id="sessfilter" placeholder="search all sessions…" aria-label="Search all sessions by title or ID" title="Match all keywords in any order" autocomplete="off">
-<div id="sessfilterrow"><div id="sesscount"></div><div id="sessmarkfilter" role="group" aria-label="会话星标筛选"><button id="sessall" type="button" aria-pressed="true">全部</button><button id="sessmarked" type="button" aria-pressed="false">仅星标</button></div></div><ul id="sesslist"></ul>
+<div id="sessfilterrow"><div id="sesscount"></div><span id="sessfilterstatus" hidden></span><details id="sessmore"><summary id="sessmoretoggle" aria-label="More session options">More</summary><div id="sessmorepanel">
+<div id="sessarchivefilter" role="group" aria-label="Session archive filter"><button id="sessactive" type="button" aria-pressed="true">Active</button><button id="sessarchived" type="button" aria-pressed="false">Archived</button></div>
+<div id="sessmarkfilter" role="group" aria-label="Session star filter"><button id="sessall" type="button" aria-pressed="true">All</button><button id="sessmarked" type="button" aria-pressed="false">Starred</button></div>
+<div id="sessgroupactions"><button id="sessiongroupnew" type="button">New group…</button><button id="sessiongroupmanage" type="button">Manage groups…</button></div>
+</div></details></div><ul id="sesslist"></ul>
 <details id="promptnav">
 <summary><span class="pnlabel">会话提问</span><span id="promptcount" class="pncount"></span></summary>
 <ol id="promptlist"></ol>
@@ -1651,10 +1712,23 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <div id="sessionactionsscrim"></div>
 <section id="sessionactionspanel" role="dialog" aria-modal="true" aria-labelledby="sessionactionstitle">
 <div id="sessionactionstitle"></div>
+<div id="sessionactionmeta"></div>
 <button id="sessionactionmark" type="button">标记会话</button>
+<button id="sessionactionrename" type="button">Rename…</button>
 <button id="sessionactionfork" type="button" hidden>fork</button>
+<button id="sessionactionarchive" type="button">Archive</button>
+<button id="sessionactiongroup" type="button">Move to group…</button>
 <button id="sessionactiondelete" type="button">删除会话</button>
 <button id="sessionactioncancel" type="button">取消</button>
+</section>
+</div>
+<div id="sessiongroupdialog" hidden>
+<div id="sessiongroupscrim"></div>
+<section id="sessiongrouppanel" role="dialog" aria-modal="true" aria-labelledby="sessiongrouptitle">
+<div id="sessiongrouptitle"></div>
+<div id="sessiongroupbody"></div>
+<div id="sessiongrouperror" role="status" aria-live="polite"></div>
+<button id="sessiongroupcancel" type="button">Cancel</button>
 </section>
 </div>
 <div id="sessdel" hidden>
@@ -8272,6 +8346,7 @@ function renderSessionBar() {
   $("sesstitle").textContent = (s.marked ? "★ " : "") + sessionTitle(s);
   let meta = s.id.slice(0, 8) + " · " + Math.max(1, Math.round(s.size_bytes / 1024)) + " KB";
   if (lastMsgCount != null) meta += " · " + lastMsgCount + " msgs";
+  if (s.archived) meta += " · Archived";
   $("sessmeta").textContent = meta + " · " + PAGE_ID;
 }
 function sessionListItem(id) {
@@ -8292,13 +8367,32 @@ async function toggleSessionMark(s) {
     renderSessionList(lastItems, "mark failed: " + e.message);
   }
 }
+async function toggleSessionArchive(s) {
+  const base = store.base;
+  try {
+    const result = await (await api("/sessions/" + encodeURIComponent(s.id) + "/archive", {
+      method: "POST", body: JSON.stringify({ archived: !s.archived }),
+    })).json();
+    if (base !== store.base) return;
+    s.archived = result.archived;
+    const item = sessionListItem(s.id);
+    if (item) item.archived = result.archived;
+    if (selectedSessionMetadataBase === base && selectedSessionMetadata?.id === s.id) selectedSessionMetadata.archived = result.archived;
+    renderSessionBar();
+    await loadSessions({ preserveSelection: true });
+  } catch (e) {
+    if (base === store.base) renderSessionList(lastItems, "archive failed: " + e.message);
+  }
+}
 let sessionActionTarget = null;
 let sessionActionReturnFocus = null;
 function openSessionActions(s, li, returnFocus) {
   sessionActionTarget = s;
   sessionActionReturnFocus = returnFocus || li.querySelector(isPhoneLayout() ? ".mk" : "span");
   $("sessionactionstitle").textContent = sessionTitle(s);
+  $("sessionactionmeta").textContent = "ID: " + s.id + "\n" + Math.max(1, Math.round(s.size_bytes / 1024)) + " KB" + (s.cwd ? "\n" + s.cwd : "") + "\n" + PAGE_ID;
   $("sessionactionmark").textContent = s.marked ? "取消标记" : "标记会话";
+  $("sessionactionarchive").textContent = s.archived ? "Unarchive" : "Archive";
   $("sessionactionfork").hidden = isPhoneLayout();
   $("sessionactions").hidden = false;
   $("sessionactionmark").focus();
@@ -8347,6 +8441,22 @@ function wireSessionDelete() {
   };
 }
 function wireSessionActions() {
+  $("sessionactionrename").onclick = () => {
+    const s = sessionActionTarget;
+    const li = s && sessionActivityRows.get(s.id);
+    closeSessionActions();
+    if (li) startRename(li, s);
+  };
+  $("sessionactionarchive").onclick = () => {
+    const s = sessionActionTarget;
+    closeSessionActions();
+    if (s) return toggleSessionArchive(s);
+  };
+  $("sessionactiongroup").onclick = () => {
+    const s = sessionActionTarget;
+    closeSessionActions();
+    if (s) return openSessionGroupMove(s);
+  };
   $("sessionactionmark").onclick = () => {
     const s = sessionActionTarget;
     closeSessionActions();
@@ -8478,6 +8588,28 @@ let sessMarkedOnly = false;
 function sessionMarkedFilter() {
   return sessMarkedOnly && !isPhoneLayout();
 }
+function closeSessionSidebarMenu(restoreFocus = true) {
+  const menu = $("sessmore");
+  if (!menu?.open) return;
+  menu.open = false;
+  if (restoreFocus) $("sessmoretoggle").focus();
+}
+function wireSessionSidebarMenu() {
+  const menu = $("sessmore");
+  menu.onkeydown = (ev) => {
+    if (ev.key === "Escape") { ev.preventDefault(); closeSessionSidebarMenu(); }
+  };
+  document.addEventListener("pointerdown", (ev) => {
+    if (menu.open && !menu.contains(ev.target)) closeSessionSidebarMenu(false);
+  });
+  document.addEventListener("focusin", (ev) => {
+    if (menu.open && !menu.contains(ev.target)) closeSessionSidebarMenu(false);
+  });
+  $("sessiongroupmanage").onclick = () => {
+    closeSessionSidebarMenu();
+    return openSessionGroupManager();
+  };
+}
 function setSessionMarkedFilter(markedOnly) {
   if (sessMarkedOnly === !!markedOnly) return;
   sessMarkedOnly = !!markedOnly;
@@ -8488,14 +8620,314 @@ function setSessionMarkedFilter(markedOnly) {
   return loadSessions({ preserveSelection: true });
 }
 function wireSessionMarkedFilter() {
-  $("sessall").onclick = () => setSessionMarkedFilter(false);
-  $("sessmarked").onclick = () => setSessionMarkedFilter(true);
+  $("sessall").onclick = () => { closeSessionSidebarMenu(); return setSessionMarkedFilter(false); };
+  $("sessmarked").onclick = () => { closeSessionSidebarMenu(); return setSessionMarkedFilter(true); };
   window.matchMedia?.("(max-width:700px)").addEventListener?.("change", () => {
     if (sessMarkedOnly) {
       resetSessionSearch();
       void loadSessions({ preserveSelection: true });
     } else renderSessionList(lastItems);
   });
+}
+let sessArchivedOnly = false;
+function sessionArchiveFilter() {
+  return sessArchivedOnly ? "only" : "exclude";
+}
+function sessionMatchesArchive(s, archived = sessionArchiveFilter()) {
+  return archived === "only" ? !!s.archived : !s.archived;
+}
+function setSessionArchiveFilter(archivedOnly) {
+  if (sessArchivedOnly === !!archivedOnly) return;
+  sessArchivedOnly = !!archivedOnly;
+  if (sessionsSearchTimer !== null) clearTimeout(sessionsSearchTimer);
+  sessionsSearchTimer = null;
+  sessionsSearchPending = false;
+  resetSessionSearch();
+  return loadSessions({ preserveSelection: true });
+}
+function wireSessionArchiveFilter() {
+  if ($("sessactive")) $("sessactive").onclick = () => { closeSessionSidebarMenu(); return setSessionArchiveFilter(false); };
+  if ($("sessarchived")) $("sessarchived").onclick = () => { closeSessionSidebarMenu(); return setSessionArchiveFilter(true); };
+  if ($("sessiongroupnew")) $("sessiongroupnew").onclick = () => { closeSessionSidebarMenu(); return openSessionGroupName(); };
+}
+// Groups organize loaded rows only; their counts never imply a server total.
+let sessionGroups = [];
+let sessionGroupAssignments = {};
+let sessionGroupsBase = null;
+let sessionGroupsLoadSeq = 0;
+const sessionGroupHeaders = new Map();
+const SESSION_GROUP_COLLAPSED_KEY = "serve.groups.collapsed.v1";
+let sessionGroupCollapsed = {};
+try {
+  const saved = JSON.parse(localStorage.getItem(SESSION_GROUP_COLLAPSED_KEY) || "{}");
+  if (saved && typeof saved === "object" && !Array.isArray(saved)) sessionGroupCollapsed = saved;
+} catch (_) {}
+function orderedSessionGroups() {
+  return sessionGroupsBase === store.base ? sessionGroups.slice().sort((a, b) =>
+    Number(!!b.pinned) - Number(!!a.pinned) || a.order - b.order || a.id.localeCompare(b.id)) : [];
+}
+function sessionGroupId(s) {
+  if (!s || sessionGroupsBase !== store.base) return null;
+  const id = Object.prototype.hasOwnProperty.call(s, "group_id") ? s.group_id : sessionGroupAssignments[s.id];
+  return typeof id === "string" && sessionGroups.some((group) => group.id === id) ? id : null;
+}
+function currentSessionGroupId() {
+  return sessionGroupId(sessionListItem(sessionId) || { id: sessionId });
+}
+function sessionGroupName(id) {
+  return orderedSessionGroups().find((group) => group.id === id)?.name || "Unassigned";
+}
+async function loadSessionGroups() {
+  const base = store.base, seq = ++sessionGroupsLoadSeq;
+  if (sessionGroupsBase !== base) {
+    sessionGroupsBase = base;
+    sessionGroups = [];
+    sessionGroupAssignments = {};
+  }
+  try {
+    const result = await (await api("/session-groups")).json();
+    if (base !== store.base || seq !== sessionGroupsLoadSeq) return false;
+    sessionGroups = (Array.isArray(result.groups) ? result.groups : []).filter((group) =>
+      typeof group?.id === "string" && typeof group.name === "string");
+    sessionGroupAssignments = result.assignments && typeof result.assignments === "object" && !Array.isArray(result.assignments)
+      ? result.assignments : {};
+    renderSessionList(lastItems);
+    return true;
+  } catch (e) {
+    if (base === store.base && seq === sessionGroupsLoadSeq) note("Groups refresh failed: " + e.message);
+    return false;
+  }
+}
+function sessionGroupCollapseKey(id) {
+  return JSON.stringify([store.base, id]);
+}
+function sessionGroupIsCollapsed(id, items, waiting) {
+  const saved = sessionGroupCollapsed[sessionGroupCollapseKey(id)];
+  return typeof saved === "boolean" ? saved : !items.some((item) => item.id === sessionId) && !waiting;
+}
+function paintSessionGroupActivity() {
+  for (const [id, header] of sessionGroupHeaders) {
+    let running = 0, waiting = 0;
+    for (const item of header.items) {
+      const sample = sessionActivitySamples.get(item.id);
+      if (!sample || Date.now() - sample.at >= SESSION_ACTIVITY_MAX_AGE_MS) continue;
+      if (normalizeSessionWaiting(sample.waiting)) ++waiting;
+      else if (sample.activity === "running") ++running;
+    }
+    header.head.classList.toggle("session-group-waiting", !!waiting);
+    header.running.textContent = running ? running + " RUNNING" : "";
+    header.running.hidden = !running;
+    header.waiting.textContent = waiting ? waiting + " WAITING" : "";
+    header.waiting.hidden = !waiting;
+    header.waiting.title = waiting ? waiting + " loaded sessions need your answer. Expand this group to open them." : "";
+    header.toggle.setAttribute("aria-label", header.toggle.title + (running ? " · " + running + " RUNNING" : "") + (waiting ? " · " + waiting + " WAITING" : ""));
+    const collapsed = sessionGroupIsCollapsed(id, header.items, waiting);
+    header.arrow.textContent = collapsed ? "▸" : "▾";
+    header.toggle.setAttribute("aria-expanded", String(!collapsed));
+    for (const row of header.rows) row.hidden = collapsed;
+  }
+}
+function appendSessionGroupHeader(ul, group, items) {
+  const id = group?.id || null;
+  const head = document.createElement("li");
+  head.className = "session-group-head";
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "session-group-toggle";
+  const arrow = document.createElement("span"), name = document.createElement("span");
+  arrow.setAttribute("aria-hidden", "true");
+  name.className = "session-group-name";
+  name.textContent = (group?.pinned ? "★ " : "") + (group?.name || "Unassigned");
+  name.title = group?.name || "Unassigned";
+  toggle.title = (group?.name || "Unassigned") + " · " + items.length + " loaded sessions";
+  toggle.setAttribute("aria-label", toggle.title);
+  const status = document.createElement("span"), running = document.createElement("span"), waiting = document.createElement("span");
+  status.className = "session-group-status";
+  running.className = "session-group-badge";
+  waiting.className = "session-group-badge waiting";
+  status.appendChild(running);
+  status.appendChild(waiting);
+  for (const child of [arrow, name, status]) toggle.appendChild(child);
+  const header = { head, toggle, arrow, running, waiting, items, rows: [] };
+  sessionGroupHeaders.set(id, header);
+  toggle.onclick = () => {
+    sessionGroupCollapsed[sessionGroupCollapseKey(id)] = toggle.getAttribute("aria-expanded") === "true";
+    try { localStorage.setItem(SESSION_GROUP_COLLAPSED_KEY, JSON.stringify(sessionGroupCollapsed)); } catch (_) {}
+    paintSessionGroupActivity();
+  };
+  head.appendChild(toggle);
+  if (group) {
+    const menu = document.createElement("button");
+    menu.type = "button";
+    menu.className = "session-group-menu";
+    menu.textContent = "⋯";
+    menu.setAttribute("aria-label", "Manage " + group.name);
+    menu.setAttribute("aria-haspopup", "dialog");
+    menu.onclick = () => openSessionGroupMenu(group);
+    head.appendChild(menu);
+  }
+  ul.appendChild(head);
+  return header;
+}
+let sessionGroupReturnFocus = null;
+let sessionGroupDialogBase = null;
+let sessionGroupDialogSeq = 0;
+function closeSessionGroupDialog(restoreFocus = true) {
+  ++sessionGroupDialogSeq;
+  $("sessiongroupdialog").hidden = true;
+  const target = sessionGroupReturnFocus;
+  sessionGroupReturnFocus = null;
+  if (restoreFocus && target?.isConnected) target.focus();
+}
+function openSessionGroupDialog(title) {
+  if ($("sessiongroupdialog").hidden) sessionGroupReturnFocus = document.activeElement;
+  ++sessionGroupDialogSeq;
+  sessionGroupDialogBase = store.base;
+  $("sessiongrouptitle").textContent = title;
+  $("sessiongroupbody").textContent = "";
+  $("sessiongrouperror").textContent = "";
+  $("sessiongroupdialog").hidden = false;
+  $("sessiongroupcancel").disabled = false;
+  $("sessiongroupcancel").onclick = () => closeSessionGroupDialog();
+  $("sessiongroupscrim").onclick = () => closeSessionGroupDialog();
+  $("sessiongrouppanel").onkeydown = (ev) => {
+    if (ev.key === "Escape") { ev.preventDefault(); closeSessionGroupDialog(); }
+    else if (ev.key === "Tab") {
+      const controls = [...$("sessiongrouppanel").querySelectorAll("button,input,select")].filter((el) => !el.disabled && !el.hidden);
+      if (!controls.length) return;
+      const index = controls.indexOf(document.activeElement);
+      ev.preventDefault();
+      controls[(index + (ev.shiftKey ? -1 : 1) + controls.length) % controls.length].focus();
+    }
+  };
+  return $("sessiongroupbody");
+}
+function appendSessionGroupAction(label, action, danger = false) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  if (danger) button.className = "danger";
+  button.onclick = action;
+  $("sessiongroupbody").appendChild(button);
+  return button;
+}
+async function mutateSessionGroup(path, method, body, apply) {
+  const base = sessionGroupDialogBase, seq = sessionGroupDialogSeq;
+  if (base !== store.base) { closeSessionGroupDialog(); return; }
+  const controls = [...$("sessiongrouppanel").querySelectorAll("button,input,select")];
+  for (const control of controls) control.disabled = true;
+  try {
+    const result = await (await api(path, { method, ...(body === undefined ? {} : { body: JSON.stringify(body) }) })).json();
+    if (base !== store.base) return;
+    if (apply) apply(result);
+    if (seq === sessionGroupDialogSeq) closeSessionGroupDialog();
+    await loadSessionGroups();
+    await loadSessions({ preserveSelection: true });
+  } catch (e) {
+    if (base === store.base && seq === sessionGroupDialogSeq) $("sessiongrouperror").textContent = "Group update failed: " + e.message;
+  } finally {
+    for (const control of controls) control.disabled = false;
+  }
+}
+function openSessionGroupName(group = null) {
+  const body = openSessionGroupDialog(group ? "Rename group" : "New group");
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = group?.name || "";
+  input.placeholder = "Group name";
+  input.setAttribute("aria-label", "Group name");
+  body.appendChild(input);
+  const save = () => {
+    const name = input.value.trim();
+    if (!name) { $("sessiongrouperror").textContent = "Enter a group name."; input.focus(); return; }
+    return mutateSessionGroup(group ? "/session-groups/" + encodeURIComponent(group.id) : "/session-groups", group ? "PATCH" : "POST", { name });
+  };
+  const button = appendSessionGroupAction(group ? "Save" : "Create group", save);
+  input.onkeydown = (ev) => { if (ev.key === "Enter" && !ev.isComposing) { ev.preventDefault(); return button.disabled ? undefined : save(); } };
+  input.focus();
+  input.select();
+}
+function openSessionGroupDelete(group) {
+  const body = openSessionGroupDialog("Delete group?");
+  const text = document.createElement("p");
+  text.textContent = "Delete “" + group.name + "” and move its sessions to Unassigned? Sessions and their history will be kept.";
+  body.appendChild(text);
+  appendSessionGroupAction("Delete group", () => mutateSessionGroup("/session-groups/" + encodeURIComponent(group.id), "DELETE"), true);
+  $("sessiongroupcancel").focus();
+}
+async function openSessionGroupManager() {
+  openSessionGroupDialog("Manage groups");
+  const seq = sessionGroupDialogSeq;
+  const loaded = await loadSessionGroups();
+  if (seq !== sessionGroupDialogSeq || sessionGroupDialogBase !== store.base) return;
+  if (!loaded) $("sessiongrouperror").textContent = "Groups refresh failed. Showing cached groups.";
+  const first = appendSessionGroupAction("New group…", () => openSessionGroupName());
+  for (const group of orderedSessionGroups()) appendSessionGroupAction(group.name, () => openSessionGroupMenu(group));
+  first.focus();
+}
+function openSessionGroupMenu(group) {
+  openSessionGroupDialog(group.name);
+  const first = appendSessionGroupAction("New session in this group", () => {
+    closeSessionGroupDialog(false);
+    return createSessionInGroup(group.id);
+  });
+  appendSessionGroupAction("Rename", () => openSessionGroupName(group));
+  appendSessionGroupAction(group.pinned ? "Unpin" : "Pin", () => mutateSessionGroup("/session-groups/" + encodeURIComponent(group.id), "PATCH", { pinned: !group.pinned }));
+  appendSessionGroupAction("Delete group…", () => openSessionGroupDelete(group), true);
+  first.focus();
+}
+async function openSessionGroupMove(s) {
+  openSessionGroupDialog("Move “" + sessionTitle(s) + "” to group");
+  const seq = sessionGroupDialogSeq;
+  $("sessiongroupcancel").focus();
+  const loaded = await loadSessionGroups();
+  if (seq !== sessionGroupDialogSeq || sessionGroupDialogBase !== store.base) return;
+  if (!loaded) { $("sessiongrouperror").textContent = "Could not load groups. Close this panel and try again."; return; }
+  const selected = sessionGroupId(s);
+  for (const group of [...orderedSessionGroups(), { id: null, name: "Unassigned" }]) {
+    const button = appendSessionGroupAction((group.id === selected ? "✓ " : "") + group.name, () => mutateSessionGroup(
+      "/sessions/" + encodeURIComponent(s.id) + "/group", "POST", { group_id: group.id }, (result) => {
+        s.group_id = result.group_id;
+        const item = sessionListItem(s.id);
+        if (item) item.group_id = result.group_id;
+        if (selectedSessionMetadataBase === store.base && selectedSessionMetadata?.id === s.id) selectedSessionMetadata.group_id = result.group_id;
+      }));
+    button.disabled = group.id === selected;
+  }
+}
+async function createSessionInGroup(groupId = null) {
+  const base = store.base;
+  try {
+    const created = await (await api("/sessions", { method: "POST", body: JSON.stringify({ group_id: groupId }) })).json();
+    if (base !== store.base) return;
+    const newId = created.id;
+    if (!isPhoneLayout()) clearDraft(newId);
+    switchSession(newId);
+    if (typeof focusComposer === "function") focusComposer();
+    pendingNew = newId;
+    pendingCwd = created.cwd || "";
+    selectedSessionMetadata = { id: newId, summary: "New session", size_bytes: 0, cwd: pendingCwd, archived: false, group_id: created.group_id === undefined ? groupId : created.group_id };
+    selectedSessionMetadataBase = base;
+    lastMsgCount = null;
+    turnRunning = false;
+    if (sessArchivedOnly) {
+      sessArchivedOnly = false;
+      resetSessionSearch();
+    }
+    sessionGroupCollapsed[sessionGroupCollapseKey(groupId)] = false;
+    try { localStorage.setItem(SESSION_GROUP_COLLAPSED_KEY, JSON.stringify(sessionGroupCollapsed)); } catch (_) {}
+    // Lazy sessions have no history until their first turn persists it.
+    resetTranscript(newId);
+    const placeholder = addMsg("asst", "new session — type below to start.", "asst transcript-placeholder");
+    placeholder.dataset.transcriptPlaceholder = "new-session";
+    commitExecutionView(newId, executionBase());
+    syncStopButton();
+    await loadSessionGroups();
+    await loadSessions({ preserveSelection: true });
+    loadSessionConfig();
+  } catch (e) {
+    if (base === store.base) addMsg("err", "create session failed: " + e.message, "asst err");
+  }
 }
 function sessionListProjection(items, sessFilter, markedOnly = false) {
   const q = sessFilter.trim().toLowerCase();
@@ -8638,6 +9070,7 @@ function mergeSessionActivities(items, { base = executionBase(), revisions = nul
       if (state.remoteActive || state.remotePid) updateExecutionModel({ kind: "remote", active: false }, item.id, base);
     }
   }
+  paintSessionGroupActivity();
 }
 function expireSessionActivities() {
   for (const [id, sample] of sessionActivitySamples) {
@@ -8646,6 +9079,7 @@ function expireSessionActivities() {
     sessionActivityRevisions.set(id, ++nextSessionActivityRevision);
     paintSessionActivity(id);
   }
+  paintSessionGroupActivity();
   if (typeof syncRemoteTurnNote === "function") syncRemoteTurnNote();
 }
 async function pollSessionActivity() {
@@ -8739,19 +9173,47 @@ function refreshSessionActivity(sid, base = executionBase()) {
 // END session activity
 function renderSessionList(items, errText, { preserveScroll = true, followNewest = false } = {}) {
   const markedOnly = sessionMarkedFilter();
-  const { q, shown } = sessionListProjection(items, sessFilter, markedOnly);
-  const searchResults = !!q && sessionsResultQuery === sessFilter.trim() && sessionsResultMarkedOnly === markedOnly;
+  const { q, shown } = sessionListProjection(items.filter((s) => sessionMatchesArchive(s)), sessFilter, markedOnly);
+  const searchResults = !!q && sessionsResultQuery === sessFilter.trim() && sessionsResultMarkedOnly === markedOnly && sessionsResultArchived === sessionArchiveFilter();
   $("sessall")?.setAttribute("aria-pressed", String(!sessMarkedOnly));
   $("sessmarked")?.setAttribute("aria-pressed", String(sessMarkedOnly));
+  $("sessactive")?.setAttribute("aria-pressed", String(!sessArchivedOnly));
+  $("sessarchived")?.setAttribute("aria-pressed", String(sessArchivedOnly));
+  const filterLabels = [sessArchivedOnly ? "Archived" : "", markedOnly ? "Starred" : ""].filter(Boolean);
+  const filterStatus = $("sessfilterstatus");
+  if (filterStatus) {
+    filterStatus.textContent = filterLabels.length === 2 ? "Archived ★" : filterLabels.join(" · ");
+    filterStatus.title = filterLabels.join(" · ");
+    filterStatus.setAttribute("aria-label", filterLabels.join(" · "));
+    filterStatus.hidden = !filterLabels.length;
+  }
+  if ($("sessmarkfilter")) $("sessmarkfilter").hidden = isPhoneLayout();
   const ul = $("sesslist");
   const scrollTop = preserveScroll && ul.children.length ? ul.scrollTop : 0;
   syncSessionActivityItems(items);
   sessionActivityRows.clear();
+  sessionGroupHeaders.clear();
   ul.textContent = "";
-  for (const s of shown) {
+  const entries = [];
+  if (q) entries.push(...shown.map((s) => ({ s })));
+  else if (shown.length) {
+    const buckets = new Map([...orderedSessionGroups().map((group) => [group.id, { group, items: [] }]), [null, { group: null, items: [] }]]);
+    for (const s of shown) buckets.get(sessionGroupId(s)).items.push(s);
+    for (const [groupId, bucket] of buckets) {
+      if (!bucket.items.length) continue;
+      entries.push(bucket);
+      for (const s of bucket.items) entries.push({ s, groupId });
+    }
+  }
+  for (const entry of entries) {
+    if (!entry.s) { appendSessionGroupHeader(ul, entry.group, entry.items); continue; }
+    const s = entry.s;
     const li = document.createElement("li");
     li.dataset.sessionId = s.id;
     if (s.id === sessionId) li.className = "cur";
+    li.classList.toggle("session-marked", !!s.marked);
+    li.classList.toggle("session-search-result", !!q);
+    li.title = sessionTitle(s) + "\nID: " + s.id + "\n" + Math.max(1, Math.round(s.size_bytes / 1024)) + " KB";
     const t = document.createElement("span");
     t.className = "session-title";
     t.textContent = sessionTitle(s);
@@ -8790,11 +9252,6 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
       ev.preventDefault();
       return t.onclick(ev);
     };
-    const rn = document.createElement("button");
-    rn.className = "rn";
-    rn.textContent = "✎";
-    rn.title = "rename";
-    rn.onclick = (ev) => { ev.stopPropagation(); startRename(li, s); };
     const mk = document.createElement("button");
     mk.className = "mk";
     mk.type = "button";
@@ -8815,7 +9272,13 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
     hash.className = "session-hash";
     hash.textContent = s.id.slice(0, 8);
     sm.appendChild(hash);
-    li.appendChild(rn);
+    if (q) {
+      const tag = document.createElement("span");
+      tag.className = "session-group-tag";
+      tag.textContent = sessionGroupName(sessionGroupId(s));
+      tag.title = tag.textContent;
+      sm.appendChild(tag);
+    }
     li.appendChild(mk);
     li.appendChild(t);
     li.appendChild(sm);
@@ -8846,6 +9309,7 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
       li.classList.add("cur");
       t.setAttribute("aria-current", "true");
       renderSessionBar();
+      paintSessionGroupActivity();
       turnRunning = false;
       stopStaleFollow();
       // The question on screen belonged to the session being left; the poll
@@ -8862,7 +9326,9 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
       if (picked && typeof focusComposer === "function") focusComposer();
     };
     ul.appendChild(li);
+    if (!q) sessionGroupHeaders.get(entry.groupId).rows.push(li);
   }
+  paintSessionGroupActivity();
   if (searchResults && !shown.length && !markedOnly) {
     const empty = document.createElement("li");
     empty.className = "session-empty";
@@ -8876,11 +9342,11 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
     if (sessionsHasMore) empty.textContent += "（已加载范围内）";
     ul.appendChild(empty);
   }
-  if ((searchResults || markedOnly) && sessionsHasMore) {
+  if (sessionsHasMore) {
     const more = document.createElement("li"), button = document.createElement("button");
     more.className = "session-more";
     button.type = "button";
-    button.textContent = q ? "加载更多搜索结果" : "加载更多会话";
+    button.textContent = q ? "Load more search results" : "Load more sessions";
     button.onclick = async () => {
       button.disabled = true;
       try { await loadOlderSessions(); }
@@ -8888,6 +9354,12 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
     };
     more.appendChild(button);
     ul.appendChild(more);
+  }
+  if (!q && !markedOnly && !shown.length && !sessionsHasMore && sessionsTotal === 0) {
+    const empty = document.createElement("li");
+    empty.className = "session-empty";
+    empty.textContent = sessArchivedOnly ? "No archived sessions" : "No sessions";
+    ul.appendChild(empty);
   }
   if (errText) {
     const li = document.createElement("li");
@@ -8897,6 +9369,7 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
   const total = sessionListTotal(items, sessionsTotal);
   $("sesscount").textContent = (searchResults || markedOnly) && sessionsSearching && sessionsTotal === null
     ? "searching sessions…" : sessionListCountText(q, shown, items, total, markedOnly, searchResults);
+  $("sesscount").title = $("sesscount").textContent;
   if (followNewest) ul.scrollTop = 0;
   else ul.scrollTop = scrollTop;
 }
@@ -8906,6 +9379,7 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
 function startRename(li, s) {
   const title = li.querySelector(".session-title");
   if (!title) return;
+  li.classList.add("session-renaming");
   const old = sessionTitle(s);
   const inp = document.createElement("input");
   inp.className = "rnm";
@@ -8946,6 +9420,7 @@ let sessionsFilterComposing = false;
 let sessionsSearching = false;
 let sessionsResultQuery = null;
 let sessionsResultMarkedOnly = null;
+let sessionsResultArchived = null;
 let sessionsTotal = null;
 let sessionsPageOffset = 0;
 let sessionsHasMore = false;
@@ -8960,6 +9435,7 @@ function resetSessionSearch() {
   sessionsSearching = !!sessFilter.trim() || sessionMarkedFilter();
   sessionsResultQuery = sessFilter.trim();
   sessionsResultMarkedOnly = sessionMarkedFilter();
+  sessionsResultArchived = sessionArchiveFilter();
   renderSessionBar();
   lastItems = [];
   renderSessionList(lastItems, undefined, { preserveScroll: false });
@@ -9028,11 +9504,12 @@ function sessionPageHasMore(sessionsPageOffset, sessionsTotal, page, pageSize) {
   return typeof sessionsTotal === "number"
     ? sessionsPageOffset < sessionsTotal : page.pageSize === pageSize;
 }
-async function fetchSessionPage(offset, limit, includeSelected = false, query = sessFilter.trim(), markedOnly = sessionMarkedFilter()) {
+async function fetchSessionPage(offset, limit, includeSelected = false, query = sessFilter.trim(), markedOnly = sessionMarkedFilter(), archived = sessionArchiveFilter()) {
   let path = "/sessions?newest=true&limit=" + limit + "&offset=" + offset;
   if (query) path += "&query=" + encodeURIComponent(query);
-  else if (!markedOnly && includeSelected && sessionId) path += "&include=" + encodeURIComponent(sessionId);
+  else if (!markedOnly && includeSelected && sessionId && (!sessionListItem(sessionId) || sessionMatchesArchive(sessionListItem(sessionId), archived))) path += "&include=" + encodeURIComponent(sessionId);
   if (markedOnly) path += "&marked=true";
+  path += "&archived=" + archived;
   const response = await api(path);
   const value = await response.json();
   const items = sessionPageItems(value);
@@ -9045,11 +9522,11 @@ async function fetchSessionPage(offset, limit, includeSelected = false, query = 
 async function loadOlderSessions() {
   if (sessionsLoadingMore || !sessionsHasMore) return;
   sessionsLoadingMore = true;
-  const loadId = sessionsLoadSeq, forSession = sessionId, base = store.base, query = sessFilter.trim(), markedOnly = sessionMarkedFilter();
+  const loadId = sessionsLoadSeq, forSession = sessionId, base = store.base, query = sessFilter.trim(), markedOnly = sessionMarkedFilter(), archived = sessionArchiveFilter();
   const activityRevisions = snapshotSessionActivityRevisions();
   try {
-    const page = await fetchSessionPage(sessionsPageOffset, SESSION_PAGE_SIZE, false, query, markedOnly);
-    if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base || query !== sessFilter.trim() || markedOnly !== sessionMarkedFilter()) return;
+    const page = await fetchSessionPage(sessionsPageOffset, SESSION_PAGE_SIZE, false, query, markedOnly, archived);
+    if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base || query !== sessFilter.trim() || markedOnly !== sessionMarkedFilter() || archived !== sessionArchiveFilter()) return;
     if (typeof page.total === "number") sessionsTotal = page.total;
     sessionsPageOffset = sessionPageNextOffset(sessionsPageOffset, page.pageSize);
     sessionsHasMore = sessionPageHasMore(sessionsPageOffset, sessionsTotal, page, SESSION_PAGE_SIZE);
@@ -9060,11 +9537,11 @@ async function loadOlderSessions() {
       renderSessionList(lastItems);
     } else {
       mergeSessionActivities(page.items, { base, revisions: activityRevisions });
-      if (query || markedOnly) renderSessionList(lastItems);
+      renderSessionList(lastItems);
     }
     void pollSessionActivity();
   } catch (e) {
-    if (loadId === sessionsLoadSeq && forSession === sessionId && base === store.base && query === sessFilter.trim() && markedOnly === sessionMarkedFilter()) {
+    if (loadId === sessionsLoadSeq && forSession === sessionId && base === store.base && query === sessFilter.trim() && markedOnly === sessionMarkedFilter() && archived === sessionArchiveFilter()) {
       renderSessionList(lastItems, "sessions refresh failed: " + e.message);
     }
   } finally {
@@ -9083,21 +9560,20 @@ if ($("sesslist") && typeof $("sesslist").addEventListener === "function") {
   }, { passive: true });
 }
 async function loadSessions({ preserveSelection = false } = {}) {
-  const loadId = ++sessionsLoadSeq, forSession = sessionId, base = store.base, query = sessFilter.trim(), markedOnly = sessionMarkedFilter();
+  const loadId = ++sessionsLoadSeq, forSession = sessionId, base = store.base, query = sessFilter.trim(), markedOnly = sessionMarkedFilter(), archived = sessionArchiveFilter();
   sessionsLoadingMore = false;
   const activityRevisions = snapshotSessionActivityRevisions();
   let items, total, offset, hasMore;
   try {
     const requested = sessionRefreshLimit(sessionsPageOffset, SESSION_PAGE_SIZE);
-    const page = await fetchSessionPage(0, requested, !query && !markedOnly, query, markedOnly);
-    if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base || query !== sessFilter.trim() || markedOnly !== sessionMarkedFilter()) return;
+    const page = await fetchSessionPage(0, requested, !query && !markedOnly, query, markedOnly, archived);
+    if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base || query !== sessFilter.trim() || markedOnly !== sessionMarkedFilter() || archived !== sessionArchiveFilter()) return;
     if (!query && !markedOnly && typeof page.total !== "number") {
       // A running daemon from before paged ordering has no total/order headers.
       // Preserve its legacy full-list behavior until that daemon is restarted;
       // otherwise its oldest first page would be mistaken for the newest one.
-      const legacy = await (await api("/sessions")).json();
-      items = legacySessionItems(legacy);
-      if (items === legacy) items = legacy.reverse();
+      const legacy = await (await api("/sessions?archived=" + archived)).json();
+      items = legacySessionItems(legacy).filter((s) => sessionMatchesArchive(s, archived)).reverse();
       total = items.length;
       offset = items.length;
       hasMore = false;
@@ -9108,23 +9584,24 @@ async function loadSessions({ preserveSelection = false } = {}) {
       items = page.items;
     }
   } catch (e) {
-    if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base || query !== sessFilter.trim() || markedOnly !== sessionMarkedFilter()) return;
+    if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base || query !== sessFilter.trim() || markedOnly !== sessionMarkedFilter() || archived !== sessionArchiveFilter()) return;
     // Keep the last good list so one failed refresh (e.g. a token hiccup)
     // cannot hide every session; the error stays as a tail row instead.
     sessionsSearching = false;
     renderSessionList(lastItems, "sessions refresh failed: " + e.message);
     return;
   }
-  if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base || query !== sessFilter.trim() || markedOnly !== sessionMarkedFilter()) return;
+  if (loadId !== sessionsLoadSeq || forSession !== sessionId || base !== store.base || query !== sessFilter.trim() || markedOnly !== sessionMarkedFilter() || archived !== sessionArchiveFilter()) return;
   sessionsTotal = total;
   sessionsPageOffset = offset;
   sessionsHasMore = hasMore;
   sessionsSearching = false;
   sessionsResultQuery = query;
   sessionsResultMarkedOnly = markedOnly;
+  sessionsResultArchived = archived;
   let hydrate = false;
-  if (query || markedOnly || preserveSelection) {
-    // Search membership has no authority over the current session's lifecycle.
+  if (query || markedOnly || preserveSelection || sessArchivedOnly || sessionListItem(sessionId)?.archived) {
+    // Filter membership has no authority over the current session's lifecycle.
   }
   else if (items.some((s) => s.id === sessionId)) { pendingNew = null; }
   else if (sessionId === pendingNew && sessionId) {
@@ -10290,6 +10767,7 @@ async function completeBoot() {
   try {
     void loadSkills();
     void loadCommands();
+    await loadSessionGroups();
     await loadSessions();
     if (!sessionId) { bootComplete = true; return; }
     if (historyLoadStates.get(sessionId)?.failure) await retryHistory();
@@ -12736,7 +13214,9 @@ function wire() {
   $("menu").onclick = toggleSessions;
   $("sessbar").onclick = toggleSessions;
   wireSessionSearch();
+  wireSessionSidebarMenu();
   wireSessionMarkedFilter();
+  wireSessionArchiveFilter();
   $("connbtn").onclick = () => $("conn").classList.toggle("open");
   // The floating capture button needs a system permission that is granted
   // once; the entry only shows up in shells that know how to open it.
@@ -12784,6 +13264,7 @@ function wire() {
       return;
     }
     if (previousBase !== executionBase()) {
+      closeSessionGroupDialog(false);
       abortEvents();
       pauseHistoryRetry(sessionId);
       ensureTranscriptOwner();
@@ -12793,31 +13274,8 @@ function wire() {
     $("conn").classList.remove("open");
     await boot();
   };
-  $("newbtn").onclick = async () => {
-    try {
-      const created = await (await api("/sessions", { method: "POST" })).json();
-      const newId = created.id;
-      if (!isPhoneLayout()) clearDraft(newId);
-      switchSession(newId);
-      // A fresh session starts with the caret in its composer.
-      if (typeof focusComposer === "function") focusComposer();
-      pendingNew = newId;
-      pendingCwd = created.cwd || "";
-      lastMsgCount = null;
-      turnRunning = false; // fresh id: no turn can be running here (and it 404s a poll)
-      // The id is lazy (no history yet): show it optimistically instead of
-      // loadHistory, which would 404 and print a scary red error, and let
-      // loadSessions refresh only the drawer/bar around the pending id.
-      resetTranscript(newId);
-      const placeholder = addMsg("asst", "new session — type below to start.", "asst transcript-placeholder");
-      placeholder.dataset.transcriptPlaceholder = "new-session";
-      commitExecutionView(newId, executionBase());
-      syncStopButton();
-      await loadSessions();
-      loadSessionConfig(); // a fresh session owns no config; clear the picks
-    } catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); }
-  };
-  $("refresh").onclick = async () => { await loadSessions(); await loadHistory(); await loadSessionConfig({ teamOnly: true }); };
+  $("newbtn").onclick = () => createSessionInGroup(currentSessionGroupId());
+  $("refresh").onclick = async () => { await loadSessionGroups(); await loadSessions(); await loadHistory(); await loadSessionConfig({ teamOnly: true }); };
   $("fork").onclick = () => forkSession(sessionId);
   $("del").onclick = () => deleteSession(sessionId);
   $("img").onclick = () => $("file").click();
@@ -12848,6 +13306,7 @@ async function boot() {
   await loadInfo();
   loadSkills(); // Optional catalog must not delay history or the composer.
   loadCommands();
+  await loadSessionGroups();
   await loadSessions();
   await loadHistory();
   await loadSessionConfig(); // restore this session's picks from the server
