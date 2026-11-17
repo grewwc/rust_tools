@@ -394,6 +394,33 @@ test("desktop session pick moves the caret into the composer", async () => {
   assert.equal(h.document.activeElement, h.elements.prompt, "the picked session is ready for typing");
 });
 
+test("desktop re-clicking the open row leaves the caret out of the composer", async () => {
+  const h = harness(), title = h.title("open-session");
+  title.focus();
+  await h.dispatch(title, "click").done;
+  assert.equal(h.context.sessionId, "open-session");
+  assert.equal(h.document.activeElement, title, "selecting the open row's text must not jump to the composer");
+});
+
+test("desktop drag-selection over a session does not pick it or move the caret", async () => {
+  const h = harness(), title = h.title(), selected = {};
+  h.elements.sessions = { contains: (node) => node === selected };
+  h.context.window.getSelection = () => ({ isCollapsed: false, rangeCount: 1, anchorNode: selected, focusNode: selected });
+  title.focus();
+  await h.select();
+  assert.equal(h.context.sessionId, "open-session", "the drag belongs to copying, not to switching sessions");
+  assert.equal(h.document.activeElement, title, "the selection keeps focus instead of the composer taking it");
+});
+
+test("desktop double-clicking selected title text leaves the action sheet closed", () => {
+  const h = harness(), title = h.title();
+  h.elements.sessions = { contains: () => true };
+  h.context.window.getSelection = () => ({ isCollapsed: false, rangeCount: 1, anchorNode: title, focusNode: title });
+  const double = h.dispatch(title, "dblclick", { detail: 2 });
+  assert.equal(double.event.prevented, false, "the selected word stays available for copying");
+  assert.equal(h.elements.sessionactions.hidden, true);
+});
+
 // Focusing the composer on a phone raises the soft keyboard and scrolls the chat
 // away from the list the user is still tapping through, so the caret stays put.
 test("phone session pick keeps focus off the composer so no keyboard opens", async () => {
