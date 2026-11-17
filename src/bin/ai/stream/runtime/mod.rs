@@ -19,7 +19,10 @@ use crate::commonw::configw;
 
 use super::{
     MarkdownStreamRenderer, PROVIDER_CONTROL_LEAK_FINISH_REASON,
-    extract::{StreamTextEvent, extract_chunk_events_streaming, normalize_stream_text},
+    extract::{
+        StreamTextEvent, extract_chunk_events_streaming, flush_hidden_meta, normalize_stream_text,
+        push_text_with_hidden_meta,
+    },
     framing, normalize,
     render::markdown::{
         clamp_line_to_terminal_row, clamp_line_to_terminal_row_with_reserve,
@@ -465,16 +468,53 @@ fn immediate_cancel_result(app: &App, state: &mut StreamProcessingState) -> Opti
 
 fn flush_inline_markup_normalizer_on_cancel(state: &mut StreamProcessingState) {
     let normalized = state.content.inline_markup_normalizer.flush();
-    if normalized.is_empty() {
-        return;
-    }
+    let markers = StreamMarkers::new();
+    let literal_markers = [markers.hidden_begin, markers.hidden_end];
     // Finish the protocol parsers so a partial tool call stays stripped, but discard
     // emitted tool events because an interrupted stream must never execute them.
-    let (cleaned, _) = state.content.hermes_tool_call_streamer.push(&normalized);
-    let (cleaned, _) = state.content.anthropic_tool_call_streamer.push(&cleaned);
-    let (cleaned, _) = state.content.bare_xml_tool_call_streamer.push(&cleaned);
-    let content = normalize_stream_text(cleaned);
-    state.content.assistant_text.push_str(&content);
+    let (mut cleaned, _) = state.content.hermes_tool_call_streamer.push(&normalized);
+    cleaned.push_str(
+        &state
+            .content
+            .hermes_tool_call_streamer
+            .flush_literal_marker_prefix(&literal_markers),
+    );
+    let (mut cleaned, _) = state.content.anthropic_tool_call_streamer.push(&cleaned);
+    cleaned.push_str(
+        &state
+            .content
+            .anthropic_tool_call_streamer
+            .flush_literal_marker_prefix(&literal_markers),
+    );
+    let (mut cleaned, _) = state.content.bare_xml_tool_call_streamer.push(&cleaned);
+    cleaned.push_str(
+        &state
+            .content
+            .bare_xml_tool_call_streamer
+            .flush_literal_marker_prefix(&literal_markers),
+    );
+    let mut events = Vec::new();
+    push_text_with_hidden_meta(
+        &mut events,
+        normalize_stream_text(cleaned),
+        false,
+        markers.hidden_begin,
+        markers.hidden_end,
+        &mut state.content.hidden_meta_parse,
+    );
+    flush_hidden_meta(
+        &mut events,
+        markers.hidden_begin,
+        markers.hidden_end,
+        &mut state.content.hidden_meta_parse,
+    );
+    for event in events {
+        match event {
+            StreamTextEvent::AppendContent(text) => state.content.assistant_text.push_str(&text),
+            StreamTextEvent::AppendHiddenMeta(text) => state.content.hidden_meta.push_str(&text),
+            _ => {}
+        }
+    }
 }
 
 /// Thinking-fold cleanup on cancel/interrupt: if the fold window is still active we
@@ -678,9 +718,17 @@ fn finalize_stream_response(
     if !deferred_bare_xml.is_empty() {
         let content = normalize_stream_text(deferred_bare_xml);
         if !content.is_empty() {
-            commit_visible_content(app, current_history, markers, &mut state, content)?;
+            commit_hidden_meta_tail(app, current_history, markers, &mut state, content, false)?;
         }
     }
+    commit_hidden_meta_tail(
+        app,
+        current_history,
+        markers,
+        &mut state,
+        String::new(),
+        true,
+    )?;
 
     // Flush whatever the inline `response` splitter still holds. Still capturing means `response` never arrived:
     // under withhold the whole buffer safely falls back as **content** (better to degrade to "thinking leaked into body"
@@ -1252,16 +1300,32 @@ fn flush_inline_markup_normalizer(
     state: &mut StreamProcessingState,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let normalized = state.content.inline_markup_normalizer.flush();
-    let (cleaned, tool_events) = if normalized.is_empty() {
-        (String::new(), Vec::new())
-    } else {
-        let (cleaned, mut tool_events) = state.content.hermes_tool_call_streamer.push(&normalized);
-        let (cleaned, anthropic_events) = state.content.anthropic_tool_call_streamer.push(&cleaned);
-        let (cleaned, bare_xml_events) = state.content.bare_xml_tool_call_streamer.push(&cleaned);
-        tool_events.extend(anthropic_events);
-        tool_events.extend(bare_xml_events);
-        (cleaned, tool_events)
-    };
+    let literal_markers = [markers.hidden_begin, markers.hidden_end];
+    let (mut cleaned, mut tool_events) = state.content.hermes_tool_call_streamer.push(&normalized);
+    cleaned.push_str(
+        &state
+            .content
+            .hermes_tool_call_streamer
+            .flush_literal_marker_prefix(&literal_markers),
+    );
+    let (mut cleaned, anthropic_events) = state.content.anthropic_tool_call_streamer.push(&cleaned);
+    cleaned.push_str(
+        &state
+            .content
+            .anthropic_tool_call_streamer
+            .flush_literal_marker_prefix(&literal_markers),
+    );
+    let (mut cleaned, bare_xml_events) = state.content.bare_xml_tool_call_streamer.push(&cleaned);
+    // Idle literal prefixes must reach hidden-meta parsing before the cancel
+    // check; only active tool candidates belong in the deferred body below.
+    cleaned.push_str(
+        &state
+            .content
+            .bare_xml_tool_call_streamer
+            .flush_literal_marker_prefix(&literal_markers),
+    );
+    tool_events.extend(anthropic_events);
+    tool_events.extend(bare_xml_events);
     let deferred_bare_xml = state.content.bare_xml_tool_call_streamer.flush();
     if !tool_events.is_empty() {
         // The stream is over during flush, so we cannot stop and retry; even if a hallucination marker were detected,
@@ -1271,10 +1335,50 @@ fn flush_inline_markup_normalizer(
     if !cleaned.is_empty() {
         let content = normalize_stream_text(cleaned);
         if !content.is_empty() {
-            commit_visible_content(app, current_history, markers, state, content)?;
+            commit_hidden_meta_tail(app, current_history, markers, state, content, false)?;
         }
     }
     Ok(deferred_bare_xml)
+}
+
+fn commit_hidden_meta_tail(
+    app: &mut App,
+    current_history: &mut String,
+    markers: &StreamMarkers,
+    state: &mut StreamProcessingState,
+    content: String,
+    finish: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut events = Vec::new();
+    push_text_with_hidden_meta(
+        &mut events,
+        content,
+        false,
+        markers.hidden_begin,
+        markers.hidden_end,
+        &mut state.content.hidden_meta_parse,
+    );
+    if finish {
+        flush_hidden_meta(
+            &mut events,
+            markers.hidden_begin,
+            markers.hidden_end,
+            &mut state.content.hidden_meta_parse,
+        );
+    }
+    for event in events {
+        match event {
+            StreamTextEvent::AppendHiddenMeta(text) => state.content.hidden_meta.push_str(&text),
+            StreamTextEvent::AppendContent(text) => {
+                // Finalization has already closed the terminal fold. Recovered
+                // body text must also leave thinking before history is committed.
+                state.content.thinking_open = false;
+                commit_visible_content(app, current_history, markers, state, text)?;
+            }
+            other => render_thinking_event(markers, state, &other)?,
+        }
+    }
+    Ok(())
 }
 
 fn flush_terminal_splitter(

@@ -694,6 +694,9 @@ pub(super) struct HiddenMetaParseState {
     pub(super) hidden_open: bool,
     pub(super) hidden_begin_match: usize,
     pub(super) hidden_end_match: usize,
+    pub(super) hidden_begin_thinking: bool,
+    pub(super) content_markdown: super::extract::HiddenMetaMarkdownState,
+    pub(super) thinking_markdown: super::extract::HiddenMetaMarkdownState,
 }
 
 pub(super) enum StreamChunkStep {

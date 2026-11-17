@@ -2023,15 +2023,51 @@ for (const width of [390, 700, 701, 1280]) {
     await openOtherTranscriptAtBottom(h, width);
     await h.selectHistory("open-session"); h.settleLayout();
     assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
-    const before = h.root.scrollTop, child = h.root.lastElementChild;
+    const child = h.root.lastElementChild;
     h.growLayout(240, child); h.settleLayout();
-    assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : before,
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
       "content grows after the first follow callback, while the scrollport keeps the same size");
-    assert.equal(h.resizeObservers().some((observer) => observer.targets.has(child)), desktop,
-      "desktop observes content children; mobile installs no observer");
+    assert.equal(h.resizeObservers().some((observer) => observer.targets.has(child)), true,
+      "both layouts observe content children for late media and card growth");
     h.context.rememberTranscriptPosition();
-    assert.equal(JSON.parse(h.stored.get("serve.scroll.open-session")).atBottom, desktop,
-      "late layout does not turn a desktop bottom goal into a saved reading offset");
+    assert.equal(JSON.parse(h.stored.get("serve.scroll.open-session")).atBottom, true,
+      "late layout preserves the bottom goal on both layouts");
+    assert.equal(h.elements.jumpbottom.classList.contains("show"), false);
+  });
+  test("transcript ownership follows history appended after landing" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    await openOtherTranscriptAtBottom(h, width);
+    const firstRow = h.root.children[0];
+    h.histories.get("target-session").push({ role: "assistant", content: "Latest streamed answer" });
+    await h.context.loadHistory(); h.settleLayout();
+    assert.equal(h.root.children[0], firstRow, "an append preserves the mounted transcript");
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
+    h.growLayout(180); h.settleLayout();
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
+      "later layout growth retains the history append's live-edge goal");
+    assert.equal(h.context.ownedTranscriptScroll(h.root).following, true);
+  });
+  test("picking the current session row resumes persistent following" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    h.root.scrollTop -= 80; h.flushScroll();
+    assert.equal(h.context.shouldFollowOutput(), false);
+    await h.selectHistory("open-session"); h.settleLayout();
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
+    h.growLayout(180); h.settleLayout();
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
+    assert.equal(h.elements.jumpbottom.classList.contains("show"), false);
+  });
+  test("browser clamping to a new bottom preserves persistent following" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    h.resizeViewport(h.root.clientHeight + 80); h.flushScroll();
+    assert.equal(h.context.shouldFollowOutput(), true,
+      "a viewport expansion clamps scrollTop without an upward gesture");
+    h.growLayout(180); h.settleLayout();
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
+    assert.equal(h.context.ownedTranscriptScroll(h.root).following, true);
   });
   test("desktop transcript ownership ignores a running-elsewhere status notice" + suffix, async () => {
     const h = sessionScrollHarness(width, true);
@@ -2048,20 +2084,35 @@ for (const width of [390, 700, 701, 1280]) {
   test("desktop transcript ownership follows a viewport shrink after landing" + suffix, async () => {
     const h = sessionScrollHarness(width, true);
     await h.openHistory();
-    const before = h.root.scrollTop;
     h.resizeViewport(h.root.clientHeight - 60); h.settleLayout();
-    assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : before);
-    assert.equal(h.resizeObservers().some((observer) => observer.targets.has(h.root)), desktop,
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
+    assert.equal(h.resizeObservers().some((observer) => observer.targets.has(h.root)), true,
       "the scrollport observer handles viewport changes independently of its children");
   });
   test("a taller composer keeps the reader's row instead of following" + suffix, async () => {
-    if (!desktop) return;
     const h = sessionScrollHarness(width, true);
     await h.openHistory();
     const before = h.root.scrollTop;
     h.resizeComposer(140); // a pasted screenshot adds a marker line to the prompt
     h.resizeViewport(h.root.clientHeight - 40); h.settleLayout();
     assert.equal(h.root.scrollTop, before, "the composer's own growth never moves the transcript");
+    assert.equal(h.context.isNearBottom(), false, "the taller composer leaves the retained row above the live edge");
+    assert.equal(h.context.ownedTranscriptScroll(h.root).following, false);
+    assert.equal(h.context.shouldFollowOutput(), false);
+    assert.equal(h.elements.jumpbottom.classList.contains("show"), true,
+      "both layouts offer the jump button when composer growth leaves the reader above the bottom");
+    assert.equal(h.resizeObservers().every((observer) => observer.targets.size === 0), true);
+    // Even a producer that already requested following cannot undo the row
+    // retained for the composer resize.
+    h.context.followOutput(true); h.growLayout(100); h.settleLayout();
+    assert.equal(h.root.scrollTop, before);
+    assert.equal(h.elements.jumpbottom.classList.contains("show"), true);
+    h.context.scrollToLatest(false); h.flushScroll();
+    assert.equal(h.context.shouldFollowOutput(), true);
+    assert.equal(h.elements.jumpbottom.classList.contains("show"), false);
+    h.growLayout(100); h.settleLayout();
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
+      "an explicit jump resumes persistent following after the composer resize");
   });
   test("desktop transcript ownership respects upward input during the fetch" + suffix, async () => {
     const h = sessionScrollHarness(width, true);
@@ -2084,6 +2135,7 @@ for (const width of [390, 700, 701, 1280]) {
     for (const observer of h.resizeObservers()) observer.callback([]);
     h.settleLayout();
     assert.equal(h.root.scrollTop, readingTop, "late resize callbacks never move an active reader");
+    assert.equal(h.elements.jumpbottom.classList.contains("show"), true);
     assert.equal(h.resizeObservers().every((observer) => observer.targets.size === 0), true);
     h.context.rememberTranscriptPosition();
     assert.deepEqual(JSON.parse(h.stored.get("serve.scroll.open-session")), { top: readingTop, atBottom: false });
@@ -2096,13 +2148,11 @@ for (const width of [390, 700, 701, 1280]) {
     assert.equal(h.root.scrollTop, readingTop, "new upward input after switching also stays free of resize following");
     assert.equal(h.resizeObservers().every((observer) => observer.targets.size === 0), true);
     h.context.scrollToLatest(false); h.flushScroll();
-    const resumedTop = h.root.scrollTop;
     h.growLayout(60); h.settleLayout();
-    assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : resumedTop,
-      "the explicit jump resumes desktop following while mobile keeps its current jump behavior");
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
+      "the explicit jump resumes persistent following on both layouts");
   });
   test("a reader's scroll-up during growth is not discarded" + suffix, async () => {
-    if (!desktop) return;
     const h = sessionScrollHarness(width, true);
     await h.openHistory();
     const bottom = h.root.scrollTop;
@@ -2122,10 +2172,9 @@ for (const width of [390, 700, 701, 1280]) {
     const h = sessionScrollHarness(width, true);
     await h.openHistory();
     const child = h.document.createElement("div"); child.className = "msg asst"; child.textContent = "Late task output";
-    const before = h.root.scrollTop;
     h.root.appendChild(child); h.settleLayout();
-    assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : before);
-    assert.equal(h.resizeObservers().some((observer) => observer.targets.has(child)), desktop);
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
+    assert.equal(h.resizeObservers().some((observer) => observer.targets.has(child)), true);
     const obsolete = h.resizeObservers().slice();
     const release = h.deferHistory("target-session"), selecting = h.selectHistory("target-session");
     h.growLayout(120, child);
@@ -2169,12 +2218,11 @@ for (const width of [390, 700, 701, 1280]) {
     assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
       "adoption lands at the live edge on both layouts without an explicit jump");
     assert.equal(h.context.shouldFollowOutput(), true);
-    const before = h.root.scrollTop;
     h.growLayout(400); h.settleLayout();
-    assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : before,
-      "first-turn session creation keeps the same desktop following lifecycle");
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
+      "first-turn session creation keeps persistent following on both layouts");
     h.context.rememberTranscriptPosition();
-    assert.equal(JSON.parse(h.stored.get("serve.scroll.created-session")).atBottom, desktop);
+    assert.equal(JSON.parse(h.stored.get("serve.scroll.created-session")).atBottom, true);
   });
   test("desktop transcript ownership ignores stale older-history pagination after returning to A" + suffix, async () => {
     const h = sessionScrollHarness(width, true);
@@ -2200,7 +2248,7 @@ for (const width of [390, 700, 701, 1280]) {
       "every layout rejects the outgoing session's stale pagination compensation");
     assert.equal(h.context.shouldFollowOutput(), true);
     assert.equal(vm.runInContext("outputFollowSuspended", h.context), false);
-    if (desktop) assert.equal(h.context.ownedTranscriptScroll(h.root).following, true);
+    assert.equal(h.context.ownedTranscriptScroll(h.root).following, true);
     assert.equal(h.root._histOlder, false);
   });
   test("desktop transcript ownership keeps current older-history pagination compensation" + suffix, async () => {
@@ -2242,15 +2290,15 @@ for (const width of [390, 700, 701, 1280]) {
     await h.selectWhileHistoryPending("target-session"); h.settleLayout();
     h.context.scrollToLatest(false); h.flushScroll();
     const bottom = h.root.scrollHeight - h.root.clientHeight;
-    if (desktop) assert.notEqual(h.context.ownedTranscriptScroll(h.root).generation, firstOwner.generation);
+    assert.notEqual(h.context.ownedTranscriptScroll(h.root).generation, firstOwner.generation);
     release(); await paging; h.settleLayout();
     assert.equal(h.root.scrollTop, bottom, "a pager from an earlier visit cannot move the new transcript");
     assert.equal(h.context.shouldFollowOutput(), true);
   });
 }
 
-for (const width of [701, 1280]) for (const input of ["touch", "keyboard", "scrollbar"]) {
-  test("desktop transcript ownership respects " + input + " input before the landing frame at " + width + "px", async () => {
+for (const width of [390, 700, 701, 1280]) for (const input of ["touch", "keyboard", "scrollbar"]) {
+  test("transcript ownership respects " + input + " input before the landing frame at " + width + "px", async () => {
     const h = sessionScrollHarness(width, true);
     await h.openHistory();
     await h.selectHistory("target-session");
@@ -2265,7 +2313,7 @@ for (const width of [701, 1280]) for (const input of ["touch", "keyboard", "scro
       h.root.scrollTop = expected = 60; h.flushScroll();
     }
     h.settleLayout();
-    assert.equal(h.root.scrollTop, expected, "reader input wins over the pending desktop landing");
+    assert.equal(h.root.scrollTop, expected, "reader input wins over the pending landing on both layouts");
     assert.equal(h.resizeObservers().every((observer) => observer.targets.size === 0), true);
   });
 }

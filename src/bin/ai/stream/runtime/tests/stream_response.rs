@@ -1,6 +1,235 @@
 use super::*;
 
 #[test]
+fn hidden_meta_finalization_cancel_preserves_idle_literal_prefix() {
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    crate::ai::driver::signal::clear_request_interrupt();
+    for (input, visible) in [
+        ("answer <meta:self", "answer <meta:self"),
+        ("answer <", "answer <"),
+        ("<meta:self", "<meta:self"),
+        ("answer<meta:self_note>secret</meta:self", "answer"),
+        ("<function=read_file><meta:self", ""),
+        ("<invoke name=\"read_file\"><meta:self", ""),
+        ("<execute_command><meta:self", ""),
+    ] {
+        let mut app = test_app();
+        let markers = StreamMarkers::new();
+        let mut state = StreamProcessingState::new();
+        let mut history = String::new();
+        process_stream_payload(
+            &mut app,
+            &mut history,
+            &markers,
+            &mut state,
+            provider::openai_adapter(),
+            Some("response.output_text.delta"),
+            &serde_json::json!({"delta": input}).to_string(),
+        )
+        .unwrap();
+        app.cancel_stream
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let result = finalize_stream_response(&mut app, &mut history, &markers, state).unwrap();
+        assert_eq!(result.outcome, StreamOutcome::Cancelled);
+        assert_eq!(result.assistant_text, visible, "input: {input:?}");
+        assert!(result.tool_calls.is_empty());
+        assert!(!app.cancel_stream.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    // Cancellation results intentionally omit self-notes. Check the parser's
+    // hidden state separately so a recovered closing prefix cannot leak into body text.
+    let mut app = test_app();
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut history = String::new();
+    process_stream_payload(
+        &mut app,
+        &mut history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_text.delta"),
+        r#"{"delta":"answer<meta:self_note>secret</meta:self"}"#,
+    )
+    .unwrap();
+    let deferred =
+        flush_inline_markup_normalizer(&mut app, &mut history, &markers, &mut state).unwrap();
+    assert!(deferred.is_empty());
+    let result = cancelled_stream_result(&mut state);
+    assert_eq!(result.assistant_text, "answer");
+    assert_eq!(state.content.hidden_meta, "secret</meta:self");
+}
+
+#[test]
+fn hidden_meta_finalization_preserves_prefix_after_reasoning() {
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    crate::ai::driver::signal::clear_request_interrupt();
+    for end in 1.."<meta:self_note>".len() {
+        let input = &"<meta:self_note>"[..end];
+        for cancelled in [false, true] {
+            let mut app = test_app();
+            let markers = StreamMarkers::new();
+            let mut state = StreamProcessingState::new();
+            let mut history = String::new();
+            for (event, delta) in [
+                ("response.reasoning_text.delta", "thinking"),
+                ("response.output_text.delta", input),
+            ] {
+                process_stream_payload(
+                    &mut app,
+                    &mut history,
+                    &markers,
+                    &mut state,
+                    provider::openai_adapter(),
+                    Some(event),
+                    &serde_json::json!({"delta": delta}).to_string(),
+                )
+                .unwrap();
+            }
+            assert!(state.content.thinking_open);
+            assert!(state.content.assistant_text.is_empty());
+            assert!(history.is_empty());
+            state.content.finish_reason_seen = true;
+            state.content.finish_reason_value = Some("stop".to_string());
+            let result = if cancelled {
+                cancelled_stream_result(&mut state)
+            } else {
+                finalize_stream_response(&mut app, &mut history, &markers, state).unwrap()
+            };
+            assert_eq!(result.assistant_text, input);
+            assert_eq!(result.reasoning_text, "thinking");
+            assert!(result.hidden_meta.is_empty());
+            assert_eq!(
+                result.outcome,
+                if cancelled {
+                    StreamOutcome::Cancelled
+                } else {
+                    StreamOutcome::Completed
+                }
+            );
+            if !cancelled {
+                assert_eq!(history, input);
+            }
+        }
+    }
+}
+
+#[test]
+fn hidden_meta_finalization_preserves_unfinished_prefixes() {
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    crate::ai::driver::signal::clear_request_interrupt();
+    for end in 1.."<meta:self_note>".len() {
+        let input = format!("answer {}", &"<meta:self_note>"[..end]);
+        for cancelled in [false, true] {
+            let mut app = test_app();
+            let markers = StreamMarkers::new();
+            let mut state = StreamProcessingState::new();
+            let mut history = String::new();
+            process_stream_payload(
+                &mut app,
+                &mut history,
+                &markers,
+                &mut state,
+                provider::openai_adapter(),
+                Some("response.output_text.delta"),
+                &serde_json::json!({"delta": input}).to_string(),
+            )
+            .unwrap();
+            state.content.finish_reason_seen = true;
+            state.content.finish_reason_value = Some("stop".to_string());
+            if cancelled {
+                let result = cancelled_stream_result(&mut state);
+                assert_eq!(result.outcome, StreamOutcome::Cancelled);
+                assert_eq!(result.assistant_text, input);
+            } else {
+                let result =
+                    finalize_stream_response(&mut app, &mut history, &markers, state).unwrap();
+                assert_eq!(result.outcome, StreamOutcome::Completed);
+                assert_eq!(result.assistant_text, input);
+                assert_eq!(history, input);
+            }
+        }
+    }
+}
+
+#[test]
+fn hidden_meta_finalization_routes_deferred_hidden_tail() {
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    crate::ai::driver::signal::clear_request_interrupt();
+    for (input, visible, hidden) in [
+        (
+            "answer<meta:self_note>secret</meta:self",
+            "answer",
+            "secret</meta:self",
+        ),
+        ("```text\n<meta:self", "```text\n<meta:self", ""),
+        ("`<meta:self", "`<meta:self", ""),
+    ] {
+        let mut app = test_app();
+        let markers = StreamMarkers::new();
+        let mut state = StreamProcessingState::new();
+        let mut history = String::new();
+        process_stream_payload(
+            &mut app,
+            &mut history,
+            &markers,
+            &mut state,
+            provider::openai_adapter(),
+            Some("response.output_text.delta"),
+            &serde_json::json!({"delta": input}).to_string(),
+        )
+        .unwrap();
+        state.content.finish_reason_seen = true;
+        state.content.finish_reason_value = Some("stop".to_string());
+        let result = finalize_stream_response(&mut app, &mut history, &markers, state).unwrap();
+        assert_eq!(result.assistant_text, visible);
+        assert_eq!(result.hidden_meta, hidden);
+        assert_eq!(history, visible);
+    }
+}
+
+#[test]
+fn hidden_meta_prefix_flush_does_not_release_active_tool_bodies() {
+    let mut state = StreamProcessingState::new();
+    let (cleaned, _) = state
+        .content
+        .anthropic_tool_call_streamer
+        .push("<invoke name=\"read_file\"><meta:self");
+    assert!(cleaned.is_empty());
+    flush_inline_markup_normalizer_on_cancel(&mut state);
+    assert!(state.content.assistant_text.is_empty());
+    assert!(state.content.hidden_meta.is_empty());
+
+    let mut state = StreamProcessingState::new();
+    let (cleaned, _) = state
+        .content
+        .hermes_tool_call_streamer
+        .push("<function=read_file><meta:self");
+    assert!(cleaned.is_empty());
+    flush_inline_markup_normalizer_on_cancel(&mut state);
+    assert!(state.content.assistant_text.is_empty());
+    assert!(state.content.hidden_meta.is_empty());
+
+    let mut state = StreamProcessingState::new();
+    let (cleaned, _) = state
+        .content
+        .bare_xml_tool_call_streamer
+        .push("<execute_command><meta:self");
+    assert!(cleaned.is_empty());
+    flush_inline_markup_normalizer_on_cancel(&mut state);
+    assert!(state.content.assistant_text.is_empty());
+    assert!(state.content.hidden_meta.is_empty());
+}
+
+#[test]
 fn stream_response_discards_valid_tools_on_any_explicit_truncation_signal() {
     let _signal_guard = crate::ai::test_support::ENV_LOCK
         .lock()
@@ -164,7 +393,9 @@ async fn stream_response_decode_error_fallback_always_retries_and_discards_tools
 
         let result = handle_stream_decode_error(&mut app, &markers, &mut state, "read failed")
             .await
-            .expect("exceeding the consecutive read-error threshold must return a retryable result");
+            .expect(
+                "exceeding the consecutive read-error threshold must return a retryable result",
+            );
 
         assert_eq!(result.outcome, StreamOutcome::Truncated);
         assert!(result.stream_error);

@@ -4335,7 +4335,7 @@ function isNearBottom(root = $("msgs")) {
 }
 function ownedTranscriptScroll(root = $("msgs"), mounted = true) {
   const state = transcriptScrollState;
-  return isDesktopTranscriptScroll() && state?.sessionId && state.root === root && state.sessionId === sessionId
+  return state?.sessionId && state.root === root && state.sessionId === sessionId
     && state.generation === transcriptScrollGeneration && (!mounted || root._transcriptScrollOwner === state)
     ? state : null;
 }
@@ -4354,14 +4354,12 @@ function beginSessionTranscriptScroll(id) {
   const root = $("msgs");
   root._transcriptScrollSessionGeneration = (root._transcriptScrollSessionGeneration || 0) + 1;
   root._transcriptScrollLanding = { sessionId: id, base: executionBase() };
-  if (window.matchMedia && window.matchMedia("(min-width:701px)").matches
-      && typeof beginTranscriptScroll === "function") beginTranscriptScroll(id);
+  if (typeof beginTranscriptScroll === "function") beginTranscriptScroll(id);
   else if (typeof resetTranscriptScroll === "function") resetTranscriptScroll();
   outputFollowSuspended = false;
   jumpingToBottom = false;
 }
 function beginTranscriptScroll(id, root = $("msgs")) {
-  if (!isDesktopTranscriptScroll()) return;
   clearTranscriptScrollGoal();
   if (scrollPositionTimer !== null) clearTimeout(scrollPositionTimer);
   scrollPositionTimer = null;
@@ -4392,7 +4390,6 @@ function syncTranscriptScrollChildren(state) {
 }
 function queueTranscriptScrollResize(state, entries) {
   if (entries?.length && entries.every((entry) => isRemoteTurnNote(entry.target))) return;
-  if (!isDesktopTranscriptScroll()) { clearTranscriptScrollGoal(state); return; }
   if (ownedTranscriptScroll(state.root) !== state || !state.following || outputFollowSuspended || jumpingToBottom) return;
   // A taller composer (a pasted image adds a marker line, a pending side note
   // appears) only shortens the scrollport; it produces no new rows. Following it
@@ -4400,6 +4397,13 @@ function queueTranscriptScrollResize(state, entries) {
   const height = composerOffsetHeight();
   if (height !== null && height !== state.composerHeight) {
     state.composerHeight = height;
+    if (!isNearBottom(state.root)) {
+      // Keeping this row leaves the live edge, so suspend queued and future
+      // following until the reader explicitly returns with the jump button.
+      clearTranscriptScrollGoal(state);
+      outputFollowSuspended = true;
+      updateJumpButton();
+    }
     return;
   }
   if (!isNearBottom(state.root)) followOutput(true, state.root);
@@ -4428,14 +4432,12 @@ function mountTranscriptScroll(id, follow, root = $("msgs")) {
   const landing = root._transcriptScrollLanding;
   const selected = landing?.sessionId === id && landing.base === executionBase();
   if (selected) delete root._transcriptScrollLanding;
-  if (isDesktopTranscriptScroll()) {
-    if (!transcriptScrollState || transcriptScrollState.sessionId !== id || transcriptScrollState.root !== root) beginTranscriptScroll(id, root);
-    const state = transcriptScrollState;
-    root._transcriptScrollOwner = state;
-    state.following = follow && !outputFollowSuspended;
-    if (state.following) watchTranscriptScroll(state);
-    else clearTranscriptScrollGoal(state);
-  }
+  if (!transcriptScrollState || transcriptScrollState.sessionId !== id || transcriptScrollState.root !== root) beginTranscriptScroll(id, root);
+  const state = transcriptScrollState;
+  root._transcriptScrollOwner = state;
+  state.following = follow && !outputFollowSuspended;
+  if (state.following) watchTranscriptScroll(state);
+  else clearTranscriptScrollGoal(state);
   if (selected) followOutput(follow, root);
 }
 // Scroll position survives a reload per session. `atBottom` is stored instead
@@ -4452,9 +4454,9 @@ function savedTranscriptPosition(id) {
   return null;
 }
 function rememberTranscriptPosition(root = $("msgs"), owner = ownedTranscriptScroll(root)) {
-  if (!sessionId || isDesktopTranscriptScroll() && (!owner || ownedTranscriptScroll(root) !== owner)) return;
+  if (!sessionId || !owner || ownedTranscriptScroll(root) !== owner) return;
   if (root._transcriptOwner && !root.children.length) return;
-  const id = isDesktopTranscriptScroll() ? owner.sessionId : sessionId;
+  const id = owner.sessionId;
   const atBottom = isNearBottom(root) || !!(owner?.following && !outputFollowSuspended);
   try {
     localStorage.setItem(SCROLL_POSITION_PREFIX + id,
@@ -4464,21 +4466,20 @@ function rememberTranscriptPosition(root = $("msgs"), owner = ownedTranscriptScr
 let scrollPositionTimer = null;
 function scheduleRememberTranscriptPosition() {
   if (scrollPositionTimer !== null) return;
-  const root = $("msgs"), desktop = isDesktopTranscriptScroll(), owner = ownedTranscriptScroll(root);
+  const root = $("msgs"), owner = ownedTranscriptScroll(root);
   const sid = sessionId, generation = root._transcriptGeneration;
-  if (desktop && !owner) return;
+  if (!owner) return;
   const timer = setTimeout(() => {
     if (scrollPositionTimer !== timer) return;
     scrollPositionTimer = null;
     if (sid !== sessionId || generation !== root._transcriptGeneration) return;
-    if (desktop && (!isDesktopTranscriptScroll() || ownedTranscriptScroll(root) !== owner)) return;
-    rememberTranscriptPosition(root, desktop ? owner : null);
+    if (ownedTranscriptScroll(root) !== owner) return;
+    rememberTranscriptPosition(root, owner);
   }, 200);
   scrollPositionTimer = timer;
 }
-// New output follows only while the reader is already at the live edge, on both
-// layouts: dragging a desktop transcript down on every chunk makes reading
-// anything above impossible, and the jump button is the way back.
+// The mounted owner keeps the live-edge goal through asynchronous growth on
+// both layouts. Upward reader input suspends it until navigation or a jump.
 function shouldFollowOutput(root = $("msgs")) {
   const state = ownedTranscriptScroll(root, false);
   if (state && root._transcriptScrollOwner !== state) return false;
@@ -4494,14 +4495,14 @@ function noteTranscriptScroll(previousTop, root = $("msgs"), dragging = false) {
   const maxTop = root.scrollHeight - root.clientHeight;
   const clamped = previousTop > maxTop && root.scrollTop >= maxTop - FOLLOW_BOTTOM_GAP;
   if (state && !dragging && (root._transcriptScrollOwner !== state || clamped)) return false;
-  if (isDesktopTranscriptScroll()) clearTranscriptScrollGoal();
+  clearTranscriptScrollGoal();
   outputFollowSuspended = true;
   return true;
 }
 function noteTranscriptIntent(deltaY) {
   if (deltaY < 0) {
     outputFollowSuspended = true;
-    if (isDesktopTranscriptScroll()) clearTranscriptScrollGoal();
+    clearTranscriptScrollGoal();
   } else if (deltaY > 0 && isNearBottom()) {
     outputFollowSuspended = false;
     const state = ownedTranscriptScroll();
@@ -4511,7 +4512,8 @@ function noteTranscriptIntent(deltaY) {
 function updateJumpButton() {
   const button = $("jumpbottom");
   if (!button) return;
-  const show = !jumpingToBottom && !isNearBottom();
+  const following = ownedTranscriptScroll()?.following && !outputFollowSuspended;
+  const show = !jumpingToBottom && !following && !isNearBottom();
   button.classList.toggle("show", show);
   button.setAttribute("aria-hidden", show ? "false" : "true");
   button.tabIndex = show ? 0 : -1;
@@ -4537,11 +4539,11 @@ function resetTranscriptScroll() {
 function followOutput(wasFollowing, root = $("msgs")) {
   if (!wasFollowing) { updateJumpButton(); return; }
   const state = ownedTranscriptScroll(root);
-  if (isDesktopTranscriptScroll() && ownedTranscriptScroll(root, false) && !state) return;
+  if (ownedTranscriptScroll(root, false) && !state) return;
   if (state && !outputFollowSuspended) { state.following = true; watchTranscriptScroll(state); }
   outputFollowRoot = root;
   if (outputFollowFrame !== null) return;
-  const request = { sessionId, generation: transcriptScrollGeneration, desktop: isDesktopTranscriptScroll(), owner: state };
+  const request = { sessionId, generation: transcriptScrollGeneration, owner: state };
   outputFollowRequest = request;
   outputFollowFrame = requestAnimationFrame(() => {
     if (outputFollowRequest !== request) return;
@@ -4549,13 +4551,13 @@ function followOutput(wasFollowing, root = $("msgs")) {
     outputFollowRequest = null;
     const target = outputFollowRoot;
     outputFollowRoot = null;
-    if (request.desktop && (!isDesktopTranscriptScroll() || request.sessionId !== sessionId
-        || request.generation !== transcriptScrollGeneration || request.owner && ownedTranscriptScroll(target) !== request.owner)) return;
+    if (request.sessionId !== sessionId || request.generation !== transcriptScrollGeneration
+        || request.owner && ownedTranscriptScroll(target) !== request.owner) return;
     // A wheel/touch gesture can arrive after a paint requested following but
     // before this frame. Never pull the reader back down after that gesture.
     if (!target || outputFollowSuspended) { updateJumpButton(); return; }
     target.scrollTop = target.scrollHeight;
-    if (request.desktop) target._resetScrollTracking?.(false);
+    target._resetScrollTracking?.(false);
     updateJumpButton();
   });
 }
@@ -9546,6 +9548,11 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
       if (ev?.type !== "keydown" && sessionTextSelected()) return;
       const picked = s.id !== sessionId;
       switchSession(s.id);
+      // Picking the current row is an explicit request to reopen its live edge.
+      if (!picked && typeof beginSessionTranscriptScroll === "function") {
+        beginSessionTranscriptScroll(s.id);
+        if (historySession === s.id && typeof mountTranscriptScroll === "function") mountTranscriptScroll(s.id, true);
+      }
       lastMsgCount = null;
       for (const row of ul.querySelectorAll(".cur")) {
         row.classList.remove("cur");
@@ -10454,7 +10461,7 @@ async function loadHistory(prefetched, canCommit = () => true) {
   const base = executionBase();
   if (forSession !== sessionId || !canCommit()) return;
   ensureTranscriptOwner(forSession, base);
-  if (typeof beginTranscriptScroll === "function" && isDesktopTranscriptScroll()
+  if (typeof beginTranscriptScroll === "function"
       && (!transcriptScrollState || transcriptScrollState.sessionId !== forSession)) beginTranscriptScroll(forSession);
   const loadId = ++historyLoadSeq;
   const current = () => forSession === sessionId && base === executionBase() && loadId === historyLoadSeq && canCommit();
@@ -10757,8 +10764,7 @@ if ($("msgs") && typeof $("msgs").addEventListener === "function") {
   $("msgs").addEventListener("pointercancel", () => { pointerDown = false; }, { passive: true });
   if (typeof window.addEventListener === "function") window.addEventListener("pointerup", () => { pointerDown = false; }, { passive: true });
   $("msgs").addEventListener("keydown", (event) => {
-    if (typeof isDesktopTranscriptScroll === "function" && isDesktopTranscriptScroll()
-        && ["ArrowUp", "PageUp", "Home"].includes(event.key)
+    if (["ArrowUp", "PageUp", "Home"].includes(event.key)
         && !event.target.closest?.("input, textarea, select")) noteTranscriptIntent(-1);
   });
   $("msgs").addEventListener("wheel", (event) => noteTranscriptIntent(event.deltaY), { passive: true });

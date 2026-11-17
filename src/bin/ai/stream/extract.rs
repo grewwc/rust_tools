@@ -429,6 +429,275 @@ mod tests {
         );
     }
 
+    fn hidden_meta_stream_output(chunks: &[&str]) -> (String, String) {
+        let mut thinking_open = false;
+        let mut state = HiddenMetaParseState::default();
+        let mut streamer = InternalToolCallStreamer::new();
+        let mut hermes = HermesXmlToolCallStreamer::new();
+        let mut anthropic = AnthropicXmlToolCallStreamer::new();
+        let mut bare_xml = BareXmlToolCallStreamer::new();
+        let mut normalizer = super::super::inline_recovery::InlineMarkupNormalizer::new();
+        let mut all_events = Vec::new();
+        for text in chunks {
+            let chunk = StreamChunk {
+                choices: vec![StreamChoice {
+                    delta: StreamDelta {
+                        content: (*text).to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let (events, tools) = extract_chunk_events_streaming(
+                &chunk,
+                "<meta:self_note>",
+                "</meta:self_note>",
+                &mut thinking_open,
+                &mut state,
+                &mut streamer,
+                &mut hermes,
+                &mut anthropic,
+                &mut bare_xml,
+                &mut normalizer,
+            );
+            assert!(tools.is_empty());
+            all_events.extend(events);
+        }
+        let literal_markers = ["<meta:self_note>", "</meta:self_note>"];
+        let (mut tail, tools) = hermes.push(&normalizer.flush());
+        assert!(tools.is_empty());
+        tail.push_str(&hermes.flush_literal_marker_prefix(&literal_markers));
+        let (mut tail, tools) = anthropic.push(&tail);
+        assert!(tools.is_empty());
+        tail.push_str(&anthropic.flush_literal_marker_prefix(&literal_markers));
+        let (tail, tools) = bare_xml.push(&tail);
+        assert!(tools.is_empty());
+        for tail in [tail, bare_xml.flush()] {
+            push_text_with_hidden_meta(
+                &mut all_events,
+                normalize_stream_text(tail),
+                false,
+                "<meta:self_note>",
+                "</meta:self_note>",
+                &mut state,
+            );
+        }
+        flush_hidden_meta(
+            &mut all_events,
+            "<meta:self_note>",
+            "</meta:self_note>",
+            &mut state,
+        );
+        let mut visible = String::new();
+        let mut hidden = String::new();
+        for event in all_events {
+            match event {
+                StreamTextEvent::AppendContent(text) => visible.push_str(&text),
+                StreamTextEvent::AppendHiddenMeta(text) => hidden.push_str(&text),
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        (visible, hidden)
+    }
+
+    fn assert_hidden_meta_stream_splits(text: &str, visible: &str, hidden: &str) {
+        for cut in text
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain([text.len()])
+        {
+            assert_eq!(
+                hidden_meta_stream_output(&[&text[..cut], &text[cut..]]),
+                (visible.to_string(), hidden.to_string()),
+                "stream split at {cut}: {text:?}"
+            );
+        }
+        let chunks: Vec<_> = text
+            .char_indices()
+            .map(|(index, ch)| &text[index..index + ch.len_utf8()])
+            .collect();
+        assert_eq!(
+            hidden_meta_stream_output(&chunks),
+            (visible.to_string(), hidden.to_string()),
+            "one character per delta: {text:?}"
+        );
+    }
+
+    #[test]
+    fn hidden_meta_fenced_examples_preserve_following_prose() {
+        let text = "Example:\n```text\n<meta:self_note>private</meta:self_note>\n```\nMore prose.";
+        assert_hidden_meta_stream_splits(text, text, "");
+    }
+
+    #[test]
+    fn hidden_meta_inline_examples_preserve_following_prose() {
+        let text = "- 内部反思写在 `<meta:self_note>` followed by the rest of the answer.";
+        assert_hidden_meta_stream_splits(text, text, "");
+    }
+
+    #[test]
+    fn hidden_meta_prose_markers_survive_every_stream_split() {
+        let text = "before<meta:self_note>secret</meta:self_note>after";
+        assert_hidden_meta_stream_splits(text, "beforeafter", "secret");
+        assert_hidden_meta_stream_splits(
+            "before<meta:self<meta:self_note>secret</meta:self</meta:self_note>after",
+            "before<meta:selfafter",
+            "secret</meta:self",
+        );
+    }
+
+    #[test]
+    fn hidden_meta_code_markers_survive_every_stream_split() {
+        for example in [
+            "~~~~text\n<meta:self_note>literal</meta:self_note>\n~~~~\n",
+            "   ```text\n<meta:self_note>\n   ```\n",
+            "````text\n```\n<meta:self_note>\n````\n",
+            "~~~text\n```\n<meta:self_note>\n~~~\n",
+            "```text\n``` trailing text\n<meta:self_note>\n```\n",
+            "`` <meta:self_note> ` literal </meta:self_note> ``\n",
+            "`<meta:self` and `<meta:self_note>literal</meta:self_note>`\n",
+            "    <meta:self_note>indented</meta:self_note>\n",
+            "\t<meta:self_note>tab indented</meta:self_note>\n",
+            "```text\n<meta:self\n```\n",
+        ] {
+            let text = format!("{example}after<meta:self_note>secret</meta:self_note>done");
+            assert_hidden_meta_stream_splits(&text, &format!("{example}afterdone"), "secret");
+        }
+        let crlf = "~~~text\r\n<meta:self_note>literal</meta:self_note>\r\n~~~\r\nafter";
+        assert_eq!(
+            hidden_meta_stream_output(&[crlf]),
+            (crlf.replace("\r\n", "\n"), String::new())
+        );
+    }
+
+    #[test]
+    fn hidden_meta_unfinished_prefixes_are_flushed() {
+        for end in 1.."<meta:self_note>".len() {
+            let text = format!("answer {}", &"<meta:self_note>"[..end]);
+            assert_hidden_meta_stream_splits(&text, &text, "");
+        }
+        assert_hidden_meta_stream_splits(
+            "answer<meta:self_note>secret</meta:self",
+            "answer",
+            "secret</meta:self",
+        );
+    }
+
+    #[test]
+    fn hidden_meta_container_fences_survive_every_stream_split() {
+        for example in [
+            "> ~~~text\n> <meta:self_note>literal</meta:self_note>\n> ~~~\n",
+            ">~~~text\n><meta:self_note>literal</meta:self_note>\n>~~~\n",
+            "  > > ~~~~text\n>> <meta:self_note>literal</meta:self_note>\n> > ~~~~\n",
+            "- ~~~text\n  <meta:self_note>literal</meta:self_note>\n  ~~~\n",
+            "+ ~~~text\n  <meta:self_note>literal</meta:self_note>\n  ~~~\n",
+            "* ~~~text\n  <meta:self_note>literal</meta:self_note>\n  ~~~\n",
+            "123. ~~~text\n     <meta:self_note>literal</meta:self_note>\n     ~~~\n",
+            "1) ~~~text\n   <meta:self_note>literal</meta:self_note>\n   ~~~\n",
+            "- - ~~~text\n    <meta:self_note>literal</meta:self_note>\n    ~~~\n",
+            "> - ~~~text\n>   <meta:self_note>literal</meta:self_note>\n>   ~~~\n",
+            "- > ~~~text\n  > <meta:self_note>literal</meta:self_note>\n  > ~~~\n",
+            "> ```text\n> <meta:self_note>literal</meta:self_note>\n> ```\n",
+            "> ~~~text\n> <meta:self\n> ~~~\n",
+            "~~~text\n> ~~~\n<meta:self_note>literal</meta:self_note>\n~~~\n",
+            "> ~~~text\n> - ~~~\n> <meta:self_note>literal</meta:self_note>\n> ~~~\n",
+        ] {
+            let text = format!("{example}after<meta:self_note>secret</meta:self_note>done");
+            assert_hidden_meta_stream_splits(&text, &format!("{example}afterdone"), "secret");
+        }
+    }
+
+    #[test]
+    fn hidden_meta_container_prefixes_do_not_turn_prose_into_fences() {
+        for prose in [
+            "ordinary > ~~~\n",
+            "-~~~\n",
+            "1.~~~\n",
+            "    ~~~\n",
+            ">     ~~~\n",
+            "> ~~~text\n> literal\n",
+            "- ~~~text\n  literal\n",
+        ] {
+            let text = format!("{prose}<meta:self_note>secret</meta:self_note>after");
+            assert_hidden_meta_stream_splits(&text, &format!("{prose}after"), "secret");
+        }
+    }
+
+    #[test]
+    fn hidden_meta_container_fences_preserve_crlf_stream_splits() {
+        let text = "> ~~~text\r\n> <meta:self_note>literal</meta:self_note>\r\n> ~~~\r\nafter";
+        for cut in 0..=text.len() {
+            let expected = normalize_stream_text(text[..cut].to_string())
+                + &normalize_stream_text(text[cut..].to_string());
+            assert_eq!(
+                hidden_meta_stream_output(&[&text[..cut], &text[cut..]]),
+                (expected, String::new())
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_meta_crlf_code_markers_survive_every_stream_split() {
+        let text = "~~~text\r\n<meta:self_note>literal</meta:self_note>\r\n~~~\r\nafter";
+        for cut in 0..=text.len() {
+            // Preserve the existing per-delta CRLF normalization, including a
+            // CR and LF received separately, while checking code protection.
+            let expected = normalize_stream_text(text[..cut].to_string())
+                + &normalize_stream_text(text[cut..].to_string());
+            assert_eq!(
+                hidden_meta_stream_output(&[&text[..cut], &text[cut..]]),
+                (expected, String::new())
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_meta_escaped_backticks_do_not_open_code() {
+        assert_hidden_meta_stream_splits(
+            "\\`before<meta:self_note>secret</meta:self_note>after",
+            "\\`beforeafter",
+            "secret",
+        );
+        assert_hidden_meta_stream_splits(
+            "\\\\`<meta:self_note>`after",
+            "\\\\`<meta:self_note>`after",
+            "",
+        );
+        assert_hidden_meta_stream_splits(
+            "`\\`<meta:self_note>secret</meta:self_note>",
+            "`\\`",
+            "secret",
+        );
+    }
+
+    #[test]
+    fn hidden_meta_markdown_state_is_separate_for_reasoning_and_content() {
+        let mut state = HiddenMetaParseState::default();
+        let mut events = Vec::new();
+        for (text, thinking) in [
+            ("`reasoning", true),
+            ("<meta:self_note>secret</meta:self_note>answer", false),
+        ] {
+            push_text_with_hidden_meta(
+                &mut events,
+                text.to_string(),
+                thinking,
+                "<meta:self_note>",
+                "</meta:self_note>",
+                &mut state,
+            );
+        }
+        assert_eq!(
+            events,
+            vec![
+                StreamTextEvent::AppendThinking("`reasoning".to_string()),
+                StreamTextEvent::AppendHiddenMeta("secret".to_string()),
+                StreamTextEvent::AppendContent("answer".to_string())
+            ]
+        );
+    }
+
     #[test]
     fn hidden_meta_markers_can_span_multiple_chunks() {
         let first_chunk = StreamChunk {
@@ -905,9 +1174,7 @@ mod tests {
             tool_events_total.extend(tool_events);
         }
         assert!(
-            !visible.contains("DSML")
-                && !visible.contains("invoke")
-                && !visible.contains("calls"),
+            !visible.contains("DSML") && !visible.contains("invoke") && !visible.contains("calls"),
             "spaced ASCII DSML markup leaked to visible content: {visible:?}; source={full:?}"
         );
         assert_eq!(
@@ -924,8 +1191,7 @@ mod tests {
     fn truncated_spaced_dsml_marker_is_dropped_at_flush() {
         // The reported second line is truncated at `invoke name=`. A protocol
         // prefix that never closes must not be flushed as answer text.
-        let mut normalizer =
-            super::super::inline_recovery::InlineMarkupNormalizer::new();
+        let mut normalizer = super::super::inline_recovery::InlineMarkupNormalizer::new();
         let emitted = normalizer.push("< | | DSML | | calls>\n< | | DSML | | invoke name=");
         assert_eq!(emitted, "<calls>\n");
 
@@ -971,7 +1237,252 @@ mod tests {
     }
 }
 
-fn push_text_with_hidden_meta(
+/// Tracks only Markdown boundaries that make self-note tags literal text.
+/// Delimiter runs remain visible immediately; their meaning is resolved when
+/// the next character arrives, even when that character is in another delta.
+/// Unmatched code delimiters conservatively keep subsequent tags literal.
+#[derive(Default)]
+pub(super) struct HiddenMetaMarkdownState {
+    fence: Option<HiddenMetaFence>,
+    inline_backticks: usize,
+    delimiter_run: Option<(char, usize, bool)>,
+    line_indent: usize,
+    line_has_text: bool,
+    container_prefix: HiddenMetaContainerPrefix,
+    container_indent: usize,
+    quote_depth: usize,
+    indented: bool,
+    escaped: bool,
+    closing_fence: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HiddenMetaFence {
+    marker: char,
+    length: usize,
+    container_indent: usize,
+    quote_depth: usize,
+}
+
+#[derive(Default, Clone, Copy)]
+enum HiddenMetaContainerPrefix {
+    #[default]
+    Start,
+    QuotePadding,
+    ListMarker {
+        width: usize,
+    },
+    OrderedDigits {
+        width: usize,
+        digits: usize,
+    },
+    OrderedMarker {
+        width: usize,
+    },
+}
+
+impl HiddenMetaMarkdownState {
+    /// Recognize only line-start container prefixes. List markers require
+    /// whitespace, and each container permits at most three spaces before it.
+    fn push_line_prefix(&mut self, ch: char) -> bool {
+        if self.line_has_text {
+            return false;
+        }
+        match self.container_prefix {
+            HiddenMetaContainerPrefix::QuotePadding => {
+                self.container_prefix = HiddenMetaContainerPrefix::Start;
+                if ch == ' ' || ch == '\t' {
+                    return false;
+                }
+            }
+            HiddenMetaContainerPrefix::ListMarker { width }
+            | HiddenMetaContainerPrefix::OrderedMarker { width } => {
+                if ch == ' ' || ch == '\t' {
+                    self.container_indent += width + if ch == '\t' { 4 - width % 4 } else { 1 };
+                    self.line_indent = 0;
+                    self.container_prefix = HiddenMetaContainerPrefix::Start;
+                    return false;
+                }
+                self.line_has_text = true;
+                self.leave_finished_container();
+                return false;
+            }
+            HiddenMetaContainerPrefix::OrderedDigits { width, digits } => {
+                if ch.is_ascii_digit() && digits < 9 {
+                    self.container_prefix = HiddenMetaContainerPrefix::OrderedDigits {
+                        width: width + 1,
+                        digits: digits + 1,
+                    };
+                    return false;
+                }
+                if ch == '.' || ch == ')' {
+                    self.container_prefix =
+                        HiddenMetaContainerPrefix::OrderedMarker { width: width + 1 };
+                    return false;
+                }
+                self.line_has_text = true;
+                self.leave_finished_container();
+                return false;
+            }
+            HiddenMetaContainerPrefix::Start => {}
+        }
+
+        let fence_indent = self.fence.map_or(0, |fence| fence.container_indent);
+        let can_start_container =
+            self.line_indent <= 3 + fence_indent && !self.indented && self.inline_backticks == 0;
+        match ch {
+            ' ' => self.line_indent += 1,
+            '\t' => self.line_indent += 4 - self.line_indent % 4,
+            '>' if can_start_container
+                && self
+                    .fence
+                    .is_none_or(|fence| self.quote_depth < fence.quote_depth) =>
+            {
+                self.container_indent += self.line_indent.min(fence_indent);
+                self.quote_depth += 1;
+                self.line_indent = 0;
+                self.container_prefix = HiddenMetaContainerPrefix::QuotePadding;
+                return false;
+            }
+            '-' | '+' | '*' if can_start_container && self.fence.is_none() => {
+                self.container_prefix = HiddenMetaContainerPrefix::ListMarker {
+                    width: self.line_indent + 1,
+                };
+                return false;
+            }
+            '0'..='9' if can_start_container && self.fence.is_none() => {
+                self.container_prefix = HiddenMetaContainerPrefix::OrderedDigits {
+                    width: self.line_indent + 1,
+                    digits: 1,
+                };
+                return false;
+            }
+            _ => {
+                self.line_has_text = true;
+                self.leave_finished_container();
+                return self.line_indent
+                    <= 3 + self.fence.map_or(0, |fence| fence.container_indent);
+            }
+        }
+        if self.line_indent >= 4 && self.fence.is_none() && self.inline_backticks == 0 {
+            self.indented = true;
+        }
+        false
+    }
+
+    fn leave_finished_container(&mut self) {
+        if let Some(fence) = self.fence
+            && (self.quote_depth < fence.quote_depth
+                || self.container_indent + self.line_indent < fence.container_indent)
+        {
+            // A fenced block cannot continue after its quote or list container ends.
+            self.fence = None;
+            self.closing_fence = false;
+            self.indented = self.line_indent >= 4;
+        }
+    }
+
+    fn open_fence(&mut self, marker: char, length: usize) {
+        self.fence = Some(HiddenMetaFence {
+            marker,
+            length,
+            container_indent: self.container_indent,
+            quote_depth: self.quote_depth,
+        });
+    }
+
+    fn push(&mut self, ch: char) -> bool {
+        if let Some((marker, length, line_start)) = self.delimiter_run
+            && ch != marker
+        {
+            self.delimiter_run = None;
+            if let Some(fence) = self.fence {
+                self.closing_fence = line_start && marker == fence.marker && length >= fence.length;
+            } else if marker == '`' {
+                if self.inline_backticks != 0 {
+                    if length == self.inline_backticks {
+                        self.inline_backticks = 0;
+                    }
+                } else if line_start && length >= 3 {
+                    self.open_fence(marker, length);
+                } else {
+                    self.inline_backticks = length;
+                }
+            } else if line_start && length >= 3 {
+                self.open_fence(marker, length);
+            }
+        }
+
+        let in_code = self.fence.is_some() || self.inline_backticks != 0 || self.indented;
+        if ch == '\n' || ch == '\r' {
+            if self.closing_fence {
+                self.fence = None;
+            }
+            self.line_indent = 0;
+            self.line_has_text = false;
+            self.container_prefix = HiddenMetaContainerPrefix::Start;
+            self.container_indent = 0;
+            self.quote_depth = 0;
+            self.indented = false;
+            self.escaped = false;
+            self.closing_fence = false;
+            return in_code;
+        }
+
+        let line_start = self.push_line_prefix(ch);
+        let in_code = self.fence.is_some() || self.inline_backticks != 0 || self.indented;
+
+        if let Some((marker, length, _)) = &mut self.delimiter_run {
+            if ch == *marker {
+                *length += 1;
+            }
+        } else if !self.indented
+            && (!self.escaped || in_code)
+            && (ch == '`' || ch == '~')
+            && self.fence.map_or_else(
+                || ch == '`' || (self.inline_backticks == 0 && line_start),
+                |fence| ch == fence.marker && line_start,
+            )
+        {
+            self.delimiter_run = Some((ch, 1, line_start));
+        }
+
+        if self.closing_fence && ch != ' ' && ch != '\t' {
+            // A fence closes only if the rest of its line is whitespace.
+            self.closing_fence = false;
+        }
+        self.escaped = !in_code && ch == '\\' && !self.escaped;
+        in_code || self.indented
+    }
+}
+
+pub(super) fn flush_hidden_meta(
+    events: &mut Vec<StreamTextEvent>,
+    hidden_begin: &str,
+    hidden_end: &str,
+    state: &mut HiddenMetaParseState,
+) {
+    if state.hidden_begin_match != 0 {
+        let text = hidden_begin
+            .chars()
+            .take(state.hidden_begin_match)
+            .collect();
+        events.push(if state.hidden_begin_thinking {
+            StreamTextEvent::AppendThinking(text)
+        } else {
+            StreamTextEvent::AppendContent(text)
+        });
+        state.hidden_begin_match = 0;
+    }
+    if state.hidden_end_match != 0 {
+        events.push(StreamTextEvent::AppendHiddenMeta(
+            hidden_end.chars().take(state.hidden_end_match).collect(),
+        ));
+        state.hidden_end_match = 0;
+    }
+}
+
+pub(super) fn push_text_with_hidden_meta(
     events: &mut Vec<StreamTextEvent>,
     text: String,
     is_thinking: bool,
@@ -1009,9 +1520,28 @@ fn push_text_with_hidden_meta(
 
     for ch in text.chars() {
         if !hidden_meta_parse.hidden_open {
+            let markdown = if is_thinking {
+                &mut hidden_meta_parse.thinking_markdown
+            } else {
+                &mut hidden_meta_parse.content_markdown
+            };
+            let in_code = markdown.push(ch);
+            if hidden_meta_parse.hidden_begin_match > 0
+                && (in_code || ch != hb[hidden_meta_parse.hidden_begin_match])
+            {
+                visible.extend(hb.iter().take(hidden_meta_parse.hidden_begin_match));
+                hidden_meta_parse.hidden_begin_match = 0;
+            }
+            if in_code {
+                visible.push(ch);
+                continue;
+            }
             if hidden_meta_parse.hidden_begin_match < hb.len()
                 && ch == hb[hidden_meta_parse.hidden_begin_match]
             {
+                if hidden_meta_parse.hidden_begin_match == 0 {
+                    hidden_meta_parse.hidden_begin_thinking = is_thinking;
+                }
                 hidden_meta_parse.hidden_begin_match += 1;
                 if hidden_meta_parse.hidden_begin_match == hb.len() {
                     flush_visible(events, &mut visible, is_thinking);
@@ -1019,12 +1549,6 @@ fn push_text_with_hidden_meta(
                     hidden_meta_parse.hidden_begin_match = 0;
                 }
             } else {
-                if hidden_meta_parse.hidden_begin_match > 0 {
-                    for k in 0..hidden_meta_parse.hidden_begin_match {
-                        visible.push(hb[k]);
-                    }
-                    hidden_meta_parse.hidden_begin_match = 0;
-                }
                 visible.push(ch);
             }
         } else if hidden_meta_parse.hidden_end_match < he.len()
@@ -1038,12 +1562,14 @@ fn push_text_with_hidden_meta(
             }
         } else {
             if hidden_meta_parse.hidden_end_match > 0 {
-                for k in 0..hidden_meta_parse.hidden_end_match {
-                    hidden.push(he[k]);
-                }
+                hidden.extend(he.iter().take(hidden_meta_parse.hidden_end_match));
                 hidden_meta_parse.hidden_end_match = 0;
             }
-            hidden.push(ch);
+            if he.first() == Some(&ch) {
+                hidden_meta_parse.hidden_end_match = 1;
+            } else {
+                hidden.push(ch);
+            }
         }
     }
 

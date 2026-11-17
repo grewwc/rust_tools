@@ -221,6 +221,17 @@ enum HermesXmlPhase {
     InBody { name: String },
 }
 
+/// Release a prefix owned by a downstream literal-tag parser at end of stream.
+/// Other incomplete protocol candidates remain buffered and suppressed.
+fn take_literal_marker_prefix(pending: &mut String, markers: &[&str]) -> String {
+    let candidate = pending.trim_start();
+    if !candidate.is_empty() && markers.iter().any(|marker| marker.starts_with(candidate)) {
+        std::mem::take(pending)
+    } else {
+        String::new()
+    }
+}
+
 /// Suppress Hermes / Qwen-style XML tool calls (`<function=NAME>...</function>`,
 /// possibly wrapped in `<tool_call>`) mid-stream: strip the markup from the visible output
 /// and convert it on the fly into the same Begin/Args/End events as `<|tool_call_begin|>` for the unified pipeline to render.
@@ -234,6 +245,14 @@ pub(super) struct HermesXmlToolCallStreamer {
 impl HermesXmlToolCallStreamer {
     pub(super) fn new() -> Self {
         Self::default()
+    }
+
+    pub(super) fn flush_literal_marker_prefix(&mut self, markers: &[&str]) -> String {
+        if matches!(self.phase, HermesXmlPhase::Idle) {
+            take_literal_marker_prefix(&mut self.pending, markers)
+        } else {
+            String::new()
+        }
     }
 
     pub(super) fn push(&mut self, chunk: &str) -> (String, Vec<InternalToolCallStreamEvent>) {
@@ -401,6 +420,14 @@ const HALLUCINATED_RESULT_TAG_NAMES: &[&str] = &[
 impl AnthropicXmlToolCallStreamer {
     pub(super) fn new() -> Self {
         Self::default()
+    }
+
+    pub(super) fn flush_literal_marker_prefix(&mut self, markers: &[&str]) -> String {
+        if matches!(self.phase, AnthropicXmlPhase::Idle) {
+            take_literal_marker_prefix(&mut self.pending, markers)
+        } else {
+            String::new()
+        }
     }
 
     pub(super) fn push(&mut self, chunk: &str) -> (String, Vec<InternalToolCallStreamEvent>) {
@@ -640,6 +667,14 @@ pub(super) struct BareXmlToolCallStreamer {
 impl BareXmlToolCallStreamer {
     pub(super) fn new() -> Self {
         Self::default()
+    }
+
+    pub(super) fn flush_literal_marker_prefix(&mut self, markers: &[&str]) -> String {
+        if matches!(self.phase, BareXmlPhase::Idle) {
+            take_literal_marker_prefix(&mut self.pending, markers)
+        } else {
+            String::new()
+        }
     }
 
     pub(super) fn push(&mut self, chunk: &str) -> (String, Vec<InternalToolCallStreamEvent>) {
