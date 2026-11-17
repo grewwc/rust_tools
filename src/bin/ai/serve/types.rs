@@ -7,6 +7,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "serve")]
 use std::collections::VecDeque;
+use std::path::PathBuf;
 #[cfg(feature = "serve")]
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "serve")]
