@@ -1524,6 +1524,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <div id="skillfield">
 <button id="oskill" type="button" aria-label="skills for next message" aria-haspopup="listbox" aria-controls="skilloptions" aria-expanded="false" aria-describedby="skillhint" disabled>
 <span id="skillvalue">skill: loading…</span><span id="skillchev" aria-hidden="true"></span>
+</button>
 </div>
 <div id="skillmenu" hidden>
 <div id="skillsearchwrap">
@@ -2329,7 +2330,9 @@ function tokenizeLightCode(source, language) {
   if (config.comments === "slash" || config.comments === "block") add("comment", /\/\*[\s\S]*?(?:\*\/|$)/y);
   if (config.comments === "slash") add("comment", /\/\/[^\n]*/y);
   if (config.comments === "hash") add("comment", /#[^\n]*/y);
-  if (config.comments === "html") add("comment", /<!--[\s\S]*?(?:-->|$)/y);
+  // The character classes keep the HTML comment open/close markers out of
+  // the inline script: HTML tooling rewrites that pair and corrupts the regex.
+  if (config.comments === "html") add("comment", /<[!]--[\s\S]*?(?:--[>]|$)/y);
   if (config.triple) add("string", /(?:"""[\s\S]*?(?:"""|$)|'''[\s\S]*?(?:'''|$))/y);
   if (config.rust) {
     add("string", /r(#+)?"[\s\S]*?"\1/y);
@@ -8316,6 +8319,17 @@ const SESSION_HOLD_MOVE_PX = 12;
 function isPhoneLayout() {
   return !!(window.matchMedia && window.matchMedia("(max-width: 700px)").matches);
 }
+// Dragging across the drawer selects text for copying. The click that ends
+// that drag must not also pick the row: picking clears the selection and moves
+// the caret into the composer.
+function sessionTextSelected() {
+  if (isPhoneLayout()) return false;
+  const selection = window.getSelection?.();
+  if (!selection || selection.isCollapsed || !selection.rangeCount) return false;
+  const nav = $("sessions");
+  return !!nav && [selection.anchorNode, selection.focusNode]
+    .every((node) => !!node && nav.contains(node));
+}
 function sessionHoldConsumed(li) {
   return Number(li.dataset.holdSuppressUntil || 0) > Date.now();
 }
@@ -8669,10 +8683,13 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
     t.onclick = (ev) => {
       ev.stopPropagation();
       if (!isPhoneLayout() && ev.detail > 1) return;
-      li.onclick();
+      li.onclick(ev);
     };
     t.ondblclick = (ev) => {
       if (isPhoneLayout() || ev.detail === 0) return;
+      // The second press selects a word for copying; keep that selection
+      // instead of covering it with the action sheet.
+      if (sessionTextSelected()) return;
       ev.preventDefault();
       ev.stopPropagation();
       openSessionActions(s, li, t);
@@ -8730,8 +8747,11 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
     };
     // Desktop keeps the inline drawer open for repeated switching; the phone
     // drawer floats over the chat, so only it auto-closes after a pick.
-    li.onclick = () => {
+    li.onclick = (ev) => {
       if (sessionHoldConsumed(li)) return;
+      // A pointer click that ends a text drag is a copy gesture, not a pick.
+      if (ev?.type !== "keydown" && sessionTextSelected()) return;
+      const picked = s.id !== sessionId;
       switchSession(s.id);
       lastMsgCount = null;
       for (const row of ul.querySelectorAll(".cur")) {
@@ -8753,7 +8773,8 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
       loadSessionConfig();
       // The picked session is the one the user types into next, so the caret
       // leaves the row this gesture focused (the drawer is already closed).
-      if (typeof focusComposer === "function") focusComposer();
+      // Re-clicking the open row only selects text to copy, so it keeps focus.
+      if (picked && typeof focusComposer === "function") focusComposer();
     };
     ul.appendChild(li);
   }
