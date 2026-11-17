@@ -61,6 +61,9 @@
   color-scheme: dark;
   --bg:#101719; --panel:#192225; --line:#303e42; --fg:#e4edef; --dim:#a0b1b5;
   --acc:#8bd5ca; --ok:#8dd5a0; --err:#ffb4ab; --mark:#f2c66d;
+  --session-running-fg:#a5d6ad; --session-running-bg:#36523c; --session-running-edge:#80ad89;
+  --session-waiting-fg:#e9ca8e; --session-waiting-bg:#594b31; --session-waiting-edge:#bea370;
+  --session-selected-bg:#2d403d; --session-selected-edge:#6b9d92;
   --surface:#243034; --surface-hover:#304045; --surface-2:#202c30; --line-2:#45595e;
   --field:#202c30; --code-bg:#111b1e; --media-bg:#0d1517; --code-toolbar:#202c30;
   --acc-soft:#8bd5ca; --acc-soft-2:#bcece5; --acc-line:#527f79; --acc-line-soft:rgba(139,213,202,.45);
@@ -78,6 +81,9 @@
   color-scheme: light;
   --bg:#f2f0ee; --panel:#faf9f7; --line:#e3dfdb; --fg:#202d2b; --dim:#586b66;
   --acc:#246b60; --ok:#286b3d; --err:#b53e36; --mark:#9a6b12;
+  --session-running-fg:#30633f; --session-running-bg:#dce9df; --session-running-edge:#5b7963;
+  --session-waiting-fg:#795515; --session-waiting-bg:#f1e5cf; --session-waiting-edge:#896e3e;
+  --session-selected-bg:#ddebe7; --session-selected-edge:#5f8579;
   --surface:#f1eeeb; --surface-hover:#eae6e2; --surface-2:#eae6e2; --line-2:#858585;
   --field:#fdfdfc; --code-bg:#f0ece8; --media-bg:#eae6e2; --code-toolbar:#f5f2ef;
   --acc-soft:#246b60; --acc-soft-2:#174e45; --acc-line:#87b4a9; --acc-line-soft:rgba(36,107,96,.38);
@@ -96,6 +102,9 @@
   color-scheme: light;
   --bg:#eee7da; --panel:#f7f0e4; --line:#ddd1bc; --fg:#34362d; --dim:#68695a;
   --acc:#35695d; --ok:#456b36; --err:#a83e2f; --mark:#926313;
+  --session-running-fg:#435f36; --session-running-bg:#e1e6d5; --session-running-edge:#637453;
+  --session-waiting-fg:#76561e; --session-waiting-bg:#ebe2ce; --session-waiting-edge:#837044;
+  --session-selected-bg:#e2eae3; --session-selected-edge:#6e8064;
   --surface:#e9e2d2; --surface-hover:#ded7c5; --surface-2:#f1eadc; --line-2:#c6bca5;
   --field:#f1eadc; --code-bg:#eae3d3; --media-bg:#e4dccb; --code-toolbar:#f1eadc;
   --acc-soft:#35695d; --acc-soft-2:#244d42; --acc-line:#91afa0; --acc-line-soft:rgba(53,105,93,.38);
@@ -173,32 +182,40 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #views { flex:1; display:flex; min-height:0; position:relative; }
 #sessions { width:min(78vw,300px); border-right:1px solid var(--line); background:var(--panel); display:none; flex-direction:column; }
 #sessions.open { display:flex; }
+#sidebarresize { display:none; }
 #sessions ul { list-style:none; margin:0; padding:8px; overflow-y:auto; flex:1; }
 #sessions li { padding:8px; border-radius:8px; font-size:14px; transition:background-color .15s ease, box-shadow .15s ease; }
-#sessions li[data-session-id] { position:relative; margin:4px 0; border:1px solid var(--card-edge, var(--line)); border-radius:10px; background:var(--surface-2); }
+#sessions li[data-session-id] { --session-action-size:22px; --session-action-top:8px; --session-action-right:8px; position:relative; display:flow-root; margin:4px 0; border:1px solid var(--card-edge, var(--line)); border-radius:10px; background:var(--surface-2); }
 #sessions li[data-session-id]:focus-within { border-color:var(--acc-line); }
 #sessions li.session-running { background:var(--tint-2); box-shadow:inset 2px 0 0 var(--acc-line); }
-#sessions li.cur { background:var(--tint-3); box-shadow:inset 3px 0 0 var(--acc); }
-#sessions li.cur span[role="button"] { font-weight:600; }
+#sessions li.cur { background:var(--session-selected-bg); box-shadow:inset 3px 0 0 var(--acc); }
+#sessions li.cur[data-session-id] { background:var(--session-selected-bg); border-color:var(--session-selected-edge); }
 /* The prompt index is a desktop aid for long transcripts; the phone drawer
    keeps its single-column session list. */
 #promptnav { display:none; }
 #msgs .user-msg-row.flash .msg.user { box-shadow:0 0 0 2px var(--acc); }
 #sessions li.holding { background:var(--tint-4); }
 #sessions li small { color:var(--dim); display:block; font-size:12px; }
-#sessions li .session-title { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; white-space:normal; overflow-wrap:anywhere; min-width:0; font-weight:500; line-height:1.4; max-height:2.8em; }
-#sessions li .session-meta { display:none; }
+/* Actions never occupy a content row. The placeholder excludes their footprint
+   from nearby title lines, leaving later lines the full card width. */
+#sessions li .session-controls { position:absolute; top:var(--session-action-top); right:var(--session-action-right); display:flex; flex-wrap:nowrap; align-items:center; gap:2px; }
+#sessions li .session-title { display:block; white-space:normal; overflow-wrap:break-word; word-break:normal; min-width:0; margin:0; color:var(--fg); font-size:13px; font-weight:500; line-height:22px; }
+#sessions li .session-title::before { content:""; float:right; width:calc(var(--session-action-size) + var(--session-action-size) + 8px); height:var(--session-action-size); }
+#sessions li .session-title-token { display:inline-block; max-width:100%; vertical-align:top; overflow-wrap:anywhere; }
+#sessions li .session-meta { clear:both; display:none; margin:0; }
 #sessions li.session-search-result .session-meta { display:flex; min-width:0; }
 #sessions li .session-hash { display:none; }
-#sessions li.session-running .session-meta { display:flex; align-items:center; gap:8px; min-width:0; container:session-meta / inline-size; }
+#sessions li.session-running .session-meta { display:flex; align-items:center; flex-wrap:wrap; gap:4px 8px; min-width:0; container:session-meta / inline-size; }
 #sessions li.session-running .session-hash { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-#sessions li .session-running-badge { display:inline-flex; align-items:center; gap:5px; flex:0 0 auto; padding:1px 6px; border-radius:999px; background:var(--panel); color:var(--acc-soft-2); font-size:11px; line-height:16px; font-weight:var(--fw-meta); white-space:nowrap; }
+/* Dedicated status fills stay distinct from card surfaces in every theme.
+   Inset edges preserve badge dimensions and the existing metadata layout. */
+#sessions li .session-running-badge { display:inline-flex; align-items:center; gap:5px; flex:0 0 auto; padding:1px 6px; border-radius:999px; background:var(--session-running-bg); color:var(--session-running-fg); box-shadow:inset 0 0 0 1px var(--session-running-edge); font-size:11px; line-height:16px; font-weight:600; white-space:nowrap; }
 #sessions li .session-running-label { letter-spacing:.04em; }
 /* A session parked on a question trades the running label for an amber
    CONFIRM/INPUT badge, so a turn blocked on a human decision is visible from
    the session list instead of only inside that session. */
 #sessions li.session-waiting:not(.cur) { box-shadow:inset 2px 0 0 var(--mark); }
-#sessions li .session-waiting-badge { color:var(--mark); }
+#sessions li .session-waiting-badge { background:var(--session-waiting-bg); color:var(--session-waiting-fg); box-shadow:inset 0 0 0 1px var(--session-waiting-edge); }
 #sessions li .session-waiting-dot { animation:none; }
 #sessions li .session-running-dot { display:inline-block; flex:0 0 6px; width:6px; height:6px; border-radius:50%; background:currentColor; opacity:.86; animation:session-running-pulse 2.8s ease-in-out infinite; }
 @keyframes session-running-pulse { 0%, 100% { opacity:.58; transform:scale(.88); } 50% { opacity:.86; transform:scale(1); } }
@@ -207,8 +224,9 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
   #sessions li .session-running-badge { gap:0; }
 }
 @media (prefers-reduced-motion:reduce) { #sessions li .session-running-dot { animation:none; } }
-#sessions li .mk { position:absolute; right:6px; top:6px; background:none; border:none; color:var(--dim); padding:4px 10px; cursor:pointer; }
+#sessions li .mk { width:22px; height:22px; background:none; border:none; color:var(--dim); padding:0; cursor:pointer; }
 #sessions li .mk { font-size:18px; }
+#sessions li .session-menu { width:22px; height:22px; padding:0; border:0; border-radius:6px; background:transparent; color:var(--dim); font-size:18px; line-height:1; }
 #sessions li .mk[aria-pressed="true"] { color:var(--mark); }
 #sessions li span[role="button"] { cursor:pointer; }
 #sessions li span[role="button"]:focus-visible, #sessions li .mk:focus-visible, #sessionactionspanel button:focus-visible { outline:2px solid var(--acc-focus); outline-offset:2px; }
@@ -226,7 +244,7 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 }
 #sessionactionstitle { color:var(--dim); font-size:13px; overflow-wrap:anywhere; }
 #sessionactionmeta { color:var(--dim); font-size:12px; white-space:pre-line; overflow-wrap:anywhere; }
-#sessions li.session-renaming .mk { display:none; }
+#sessions li.session-renaming .session-controls { display:none; }
 #sessionactionspanel button { min-width:44px; min-height:44px; text-align:left; }
 #sessionactiondelete { color:var(--err); }
 /* Deleting a session is the one destructive action in the sidebar; confirm it
@@ -245,14 +263,15 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessdelbtns { display:flex; justify-content:flex-end; gap:8px; margin-top:4px; }
 #sessdelbtns button { flex:1; min-height:44px; }
 #sessdelconfirm { color:var(--err); border-color:var(--err); }
-#sessfilter { margin:8px 8px 0; padding:6px 8px; font-size:13px; width:calc(100% - 16px); box-sizing:border-box; }
-#sesscount { padding:4px 12px 0; color:var(--dim); font-size:12px; }
+#sessfilter { margin:8px 8px 0; padding:6px 8px; font-size:13px; font-weight:500; width:calc(100% - 16px); box-sizing:border-box; }
+#sessfilter::placeholder { color:var(--dim); opacity:1; }
+#sesscount { padding:4px 12px 0; color:var(--dim); font-size:12px; font-weight:500; }
 #sessfilterrow { display:flex; align-items:center; gap:6px; padding:4px 8px; flex-shrink:0; }
 #sessfilterrow > #sesscount { flex:1; min-width:0; padding:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-#sessfilterstatus { flex:0 0 auto; color:var(--acc); font-size:11px; white-space:nowrap; }
+#sessfilterstatus { flex:0 0 auto; color:var(--acc); font-size:11px; font-weight:600; white-space:nowrap; }
 #sessfilterstatus[hidden] { display:none; }
 #sessmore { position:relative; flex:0 0 auto; }
-#sessmore > summary { display:flex; align-items:center; justify-content:center; gap:4px; box-sizing:border-box; min-width:44px; min-height:44px; padding:4px 6px; font-size:12px; cursor:pointer; list-style:none; border-radius:8px; color:var(--dim); }
+#sessmore > summary { display:flex; align-items:center; justify-content:center; gap:4px; box-sizing:border-box; min-width:44px; min-height:44px; padding:4px 6px; font-size:12px; font-weight:500; cursor:pointer; list-style:none; border-radius:8px; color:var(--dim); }
 #sessmore > summary::after { content:"⌄"; font-size:11px; line-height:1; }
 #sessmore[open] > summary::after { transform:rotate(180deg); }
 #sessmore > summary::-webkit-details-marker { display:none; }
@@ -268,14 +287,14 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessiongroupnew, #sessiongroupmanage { width:100%; text-align:left; }
 #sessions li.session-group-head { display:flex; align-items:center; gap:4px; padding:4px; margin-top:6px; border:1px solid var(--line); }
 #sessions li.session-group-head.session-group-waiting { border-color:var(--mark); box-shadow:inset 3px 0 0 var(--mark); }
-#sessions .session-group-toggle { display:flex; flex:1; align-items:center; gap:6px; min-width:0; min-height:36px; padding:4px; border:0; background:transparent; text-align:left; font-size:12px; }
-#sessions .session-group-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
-#sessions .session-group-status { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:3px; }
-#sessions .session-group-badge { color:var(--acc); font-size:10px; white-space:nowrap; }
-#sessions .session-group-badge.waiting { color:var(--mark); font-weight:600; }
+#sessions .session-group-toggle { display:grid; grid-template-columns:auto minmax(0,1fr) auto; flex:1; align-items:center; column-gap:6px; min-width:0; min-height:36px; padding:4px; border:0; background:transparent; text-align:left; font-size:12px; font-weight:600; }
+#sessions .session-group-name { grid-column:2; grid-row:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--fg); }
+#sessions .session-group-status { grid-column:3; grid-row:1; display:flex; flex-wrap:nowrap; align-items:center; gap:3px; }
+#sessions .session-group-badge { padding:1px 4px; border-radius:999px; background:var(--session-running-bg); color:var(--session-running-fg); box-shadow:inset 0 0 0 1px var(--session-running-edge); font-size:10px; font-weight:600; line-height:16px; white-space:nowrap; }
+#sessions .session-group-badge.waiting { background:var(--session-waiting-bg); color:var(--session-waiting-fg); box-shadow:inset 0 0 0 1px var(--session-waiting-edge); font-weight:600; }
 #sessions .session-group-menu { min-height:36px; min-width:32px; padding:4px; border:0; background:transparent; }
 #sessions li[hidden] { display:none; }
-#sessions .session-group-tag { display:inline-block; max-width:100%; margin-left:6px; overflow:hidden; text-overflow:ellipsis; vertical-align:bottom; white-space:nowrap; font-size:11px; color:var(--dim); }
+#sessions .session-group-tag { display:inline-block; min-width:0; max-width:100%; overflow:hidden; text-overflow:ellipsis; vertical-align:bottom; white-space:nowrap; font-size:11px; font-weight:500; color:var(--dim); }
 #sessiongroupdialog[hidden] { display:none; }
 #sessiongroupdialog { position:fixed; inset:0; z-index:16; display:grid; place-items:center; padding:16px; }
 #sessiongroupscrim { position:absolute; inset:0; background:rgba(0,0,0,.55); touch-action:none; }
@@ -1095,21 +1114,23 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #sesstitle { min-width:0; font-size:15px; }
   #sessmeta { min-width:0; overflow:hidden; text-overflow:ellipsis; font-size:13px; }
   #views, #chat { min-width:0; min-height:0; }
-  #sessions { display:flex; flex:0 0 240px; width:240px; min-width:0; min-height:0; }
+  #sessions { display:flex; flex:0 0 var(--sidebar-width,264px); width:var(--sidebar-width,264px); min-width:0; min-height:0; }
+  #sidebarresize { display:block; position:relative; flex:0 0 8px; cursor:col-resize; touch-action:none; user-select:none; }
+  #sidebarresize::after { content:""; position:absolute; inset:0 2px; border-radius:3px; background:transparent; transition:background-color .15s ease; }
+  #sidebarresize:hover::after, #sidebarresize:focus-visible::after, body.sidebar-resizing #sidebarresize::after { background:var(--acc-line); }
+  #sidebarresize:focus-visible { outline:2px solid var(--acc-focus); outline-offset:-2px; }
+  body.sidebar-resizing, body.sidebar-resizing * { cursor:col-resize !important; -webkit-user-select:none !important; user-select:none !important; }
   #sessions ul { min-height:0; padding:8px; }
   #sessions li { padding:7px 8px; font-size:14px; line-height:1.4; }
-  #sessions li.cur { background:var(--tint-3); box-shadow:inset 3px 0 0 var(--acc); }
-  #sessions li span[role="button"] { overflow-wrap:anywhere; }
-  #sessions li small { margin-top:5px; font-size:11px; }
-  #sessions li .mk { width:28px; height:28px; top:5px; padding:0; font-size:14px; line-height:1; border-radius:6px; opacity:0; pointer-events:none; }
+  #sessions li.cur { background:var(--session-selected-bg); box-shadow:inset 3px 0 0 var(--acc); }
+  #sessions li small { font-size:11px; }
+  #sessions li .mk { width:22px; height:22px; padding:0; font-size:14px; line-height:1; border-radius:6px; opacity:0; pointer-events:none; }
   #sessions li.session-marked .mk, #sessions li:focus-within .mk { opacity:1; pointer-events:auto; }
-  #sessions li.session-marked .session-title, #sessions li:focus-within .session-title { margin-right:28px; }
   #sessions li .mk:hover, #sessions li .mk:focus-visible { background:var(--surface-hover); }
   @media (hover:hover) {
     #sessions li:hover .mk { opacity:1; pointer-events:auto; }
-    #sessions li:hover .session-title { margin-right:28px; }
   }
-  #sessions li.session-group-head { padding:0 4px; margin-top:6px; border:0; border-radius:6px; background:transparent; }
+  #sessions li.session-group-head { padding:0 4px; margin-top:2px; border:0; border-radius:6px; background:transparent; }
   #sessions .session-group-toggle { min-height:28px; padding:2px; color:var(--dim); font-size:11px; }
   #sessions .session-group-menu { min-height:28px; min-width:28px; padding:2px; }
   #sessionactionspanel {
@@ -1117,6 +1138,8 @@ button:active:not(:disabled) { filter:brightness(.96); }
     border-bottom:1px solid var(--line); border-radius:var(--radius-card);
   }
   #sessfilter { min-height:32px; font-size:13px; border-color:var(--control-border); }
+  #sessfilterrow { padding:0 8px; }
+  #sessmore > summary { min-height:28px; padding:2px 6px; }
   /* Desktop surfaces share their shape while each palette owns the contrast. */
   body { --radius-card:16px; --radius-control:10px; }
   header, #sessbar { border-bottom-color:var(--card-edge); }
@@ -1137,12 +1160,12 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #sesscount { padding:6px 16px; }
   #sessions ul { padding:4px 8px; }
   #sessions li { padding:10px 12px; margin:3px 0; border-radius:12px; }
-  #sessions li[data-session-id] { padding:9px 10px; }
+  #sessions li[data-session-id] { padding:8px; }
   #sessions li:hover { background:var(--surface-2); }
   #sessions li.cur, #sessions li.cur:hover {
-    background:var(--tint-3); box-shadow:inset 3px 0 0 var(--acc);
+    background:var(--session-selected-bg); box-shadow:inset 3px 0 0 var(--acc);
   }
-  #sessions li.cur[data-session-id] { border-color:var(--acc-line); }
+  #sessions li.cur[data-session-id] { border-color:var(--session-selected-edge); }
   #sessions li.session-group-head:hover { background:var(--tint-2); }
   #sessions li .mk { border-radius:6px; }
   #sessions .rowbtns {
@@ -1378,7 +1401,8 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #sessions { position:absolute; top:0; bottom:0; left:0; z-index:10; width:min(86vw,320px); border-radius:0 20px 20px 0; box-shadow:var(--shadow-panel); }
   #scrim.on { display:block; position:absolute; inset:0; z-index:5; background:rgba(0,0,0,.45); }
   #sessions li { padding:12px 10px; font-size:15px; touch-action:pan-y; -webkit-user-select:none; user-select:none; }
-  #sessions li .session-title { margin-right:44px; }
+  #sessions li[data-session-id] { --session-action-size:44px; --session-action-top:12px; --session-action-right:10px; }
+  #sessions li .session-menu { width:44px; height:44px; }
   #sessions li .mk { display:inline-flex; align-items:center; justify-content:center; width:44px; height:44px; padding:0; font-size:15px; background:none; }
   #sessions li .mk[aria-pressed="true"] { color:var(--mark); }
   #sessions li .rnm { -webkit-user-select:text; user-select:text; }
@@ -1557,6 +1581,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 </details>
 <div class="rowbtns"><button id="fork">fork</button><button id="del">delete</button><button id="refresh">refresh</button></div>
 </nav>
+<div id="sidebarresize" role="separator" tabindex="0" aria-label="Sidebar width" aria-orientation="vertical" aria-controls="sessions" aria-valuemin="220" aria-valuemax="480" aria-valuenow="264" title="264px · drag to resize; double-click to reset"></div>
 <main id="chat">
 <div id="msgwrap">
 <div id="msgs"></div>
@@ -3360,6 +3385,116 @@ function setDrawer(open) {
   $("scrim").classList.toggle("on", open);
   if (open) loadSessions();
 }
+// BEGIN sidebar resize
+const SIDEBAR_WIDTH_KEY = "serve.sidebarWidth";
+const SIDEBAR_DEFAULT_WIDTH = 264;
+const SIDEBAR_MIN_WIDTH = 220;
+const SIDEBAR_MAX_WIDTH = 480;
+const SIDEBAR_CHAT_MIN_WIDTH = 360;
+const SIDEBAR_HANDLE_WIDTH = 8;
+let sidebarWidth = SIDEBAR_DEFAULT_WIDTH;
+function clampSidebarWidth(value, max = SIDEBAR_MAX_WIDTH) {
+  const width = typeof value === "number" ? value
+    : typeof value === "string" && value.trim() ? Number(value) : NaN;
+  return Math.max(SIDEBAR_MIN_WIDTH, Math.min(max, Math.round(Number.isFinite(width) ? width : SIDEBAR_DEFAULT_WIDTH)));
+}
+function sidebarWidthLimit() {
+  const available = $("views").clientWidth || window.innerWidth;
+  return Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, available - SIDEBAR_CHAT_MIN_WIDTH - SIDEBAR_HANDLE_WIDTH));
+}
+function applySidebarWidth() {
+  const max = sidebarWidthLimit(), width = clampSidebarWidth(sidebarWidth, max);
+  document.documentElement.style.setProperty("--sidebar-width", width + "px");
+  const handle = $("sidebarresize");
+  handle.setAttribute("aria-valuemin", SIDEBAR_MIN_WIDTH);
+  handle.setAttribute("aria-valuemax", max);
+  handle.setAttribute("aria-valuenow", width);
+  handle.setAttribute("aria-valuetext", width + " pixels");
+  handle.title = width + "px · drag to resize; double-click or Enter to reset; arrow keys to adjust";
+  return width;
+}
+function saveSidebarWidth() {
+  try { localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth)); } catch (_) {}
+}
+function syncSidebarLayout() {
+  if (isPhoneLayout()) return;
+  requestAnimationFrame(() => {
+    growPrompt(); // Preserve the composer's existing IME guard.
+    updateJumpButton();
+    updateQuestionButton();
+  });
+}
+function wireSidebarResize() {
+  const handle = $("sidebarresize");
+  if (handle.dataset.wired) return;
+  handle.dataset.wired = "true";
+  try { sidebarWidth = clampSidebarWidth(localStorage.getItem(SIDEBAR_WIDTH_KEY)); } catch (_) {}
+  applySidebarWidth();
+  let drag = null;
+  const finish = () => {
+    if (!drag) return;
+    const pointerId = drag.pointerId;
+    drag = null;
+    document.body.classList.remove("sidebar-resizing");
+    if (handle.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
+    saveSidebarWidth();
+    syncSidebarLayout();
+  };
+  const move = (ev) => {
+    if (!drag || ev.pointerId !== drag.pointerId) return;
+    if (isPhoneLayout()) { finish(); return; }
+    ev.preventDefault();
+    ev.stopPropagation();
+    sidebarWidth = clampSidebarWidth(drag.width + ev.clientX - drag.x, sidebarWidthLimit());
+    applySidebarWidth();
+  };
+  handle.onpointerdown = (ev) => {
+    if (isPhoneLayout() || drag || ev.button !== 0 || ev.isPrimary === false) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    handle.setPointerCapture(ev.pointerId);
+    handle.focus({ preventScroll: true });
+    drag = { pointerId: ev.pointerId, x: ev.clientX, width: applySidebarWidth() };
+    document.body.classList.add("sidebar-resizing");
+  };
+  handle.onpointermove = move;
+  handle.onpointerup = (ev) => {
+    if (!drag || ev.pointerId !== drag.pointerId) return;
+    move(ev);
+    finish();
+  };
+  handle.onpointercancel = handle.onlostpointercapture = (ev) => {
+    if (drag?.pointerId === ev.pointerId) finish();
+  };
+  handle.onclick = (ev) => { ev.preventDefault(); ev.stopPropagation(); };
+  const change = (value) => {
+    sidebarWidth = clampSidebarWidth(value, sidebarWidthLimit());
+    applySidebarWidth();
+    saveSidebarWidth();
+    syncSidebarLayout();
+  };
+  handle.ondblclick = (ev) => {
+    if (isPhoneLayout()) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    change(SIDEBAR_DEFAULT_WIDTH);
+  };
+  handle.onkeydown = (ev) => {
+    if (isPhoneLayout() || drag || ev.altKey || ev.ctrlKey || ev.metaKey) return;
+    const step = ev.shiftKey ? 40 : 10, width = applySidebarWidth();
+    const values = { ArrowLeft: width - step, ArrowRight: width + step,
+      Home: SIDEBAR_MIN_WIDTH, End: sidebarWidthLimit(), Enter: SIDEBAR_DEFAULT_WIDTH };
+    if (!Object.hasOwn(values, ev.key)) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    change(values[ev.key]);
+  };
+  window.addEventListener("blur", finish);
+  const resized = () => { finish(); applySidebarWidth(); syncSidebarLayout(); };
+  window.addEventListener("resize", resized);
+  window.matchMedia?.("(max-width:700px)").addEventListener?.("change", resized);
+}
+// END sidebar resize
 // The override row is a collapsed <details> on phones, so its summary
 // mirrors the current picks; "default" means the server value is used.
 function syncOvrSummary() {
@@ -9216,7 +9351,15 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
     li.title = sessionTitle(s) + "\nID: " + s.id + "\n" + Math.max(1, Math.round(s.size_bytes / 1024)) + " KB";
     const t = document.createElement("span");
     t.className = "session-title";
-    t.textContent = sessionTitle(s);
+    // Keep English words, identifiers and paths atomic when they fit a full
+    // card, rather than splitting them to fit beside the action buttons.
+    for (const part of sessionTitle(s).split(/([A-Za-z0-9_]+(?:[./:@#+!-][A-Za-z0-9_]+)*)/)) {
+      if (!part) continue;
+      const text = document.createElement("span");
+      text.textContent = part;
+      if (/^[A-Za-z0-9_]/.test(part)) text.className = "session-title-token";
+      t.appendChild(text);
+    }
     t.setAttribute("role", "button");
     t.setAttribute("tabindex", "0");
     t.title = "switch to " + sessionTitle(s);
@@ -9266,6 +9409,19 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
       try { await toggleSessionMark(s); }
       finally { mk.disabled = false; }
     };
+    const menu = document.createElement("button");
+    menu.className = "session-menu";
+    menu.type = "button";
+    menu.textContent = "⋯";
+    menu.title = "Actions for " + sessionTitle(s);
+    menu.setAttribute("aria-label", menu.title);
+    menu.setAttribute("aria-haspopup", "dialog");
+    menu.setAttribute("aria-controls", "sessionactionspanel");
+    menu.onpointerdown = (ev) => ev.stopPropagation();
+    menu.onclick = (ev) => {
+      ev.stopPropagation();
+      openSessionActions(s, li, menu);
+    };
     const sm = document.createElement("small");
     sm.className = "session-meta";
     const hash = document.createElement("span");
@@ -9279,7 +9435,11 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
       tag.title = tag.textContent;
       sm.appendChild(tag);
     }
-    li.appendChild(mk);
+    const controls = document.createElement("div");
+    controls.className = "session-controls";
+    controls.appendChild(mk);
+    controls.appendChild(menu);
+    li.appendChild(controls);
     li.appendChild(t);
     li.appendChild(sm);
     sessionActivityRows.set(s.id, li);
@@ -13078,6 +13238,7 @@ function wire() {
   };
   window.addEventListener("popstate", () => { if (!$("modelpick").hidden) closeModelSheet(true); });
   wireTeamMode();
+  wireSidebarResize();
   wireSessionActions();
   wireSessionActivityPoll();
   // BEGIN skill picker events

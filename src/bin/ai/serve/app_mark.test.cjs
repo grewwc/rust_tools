@@ -276,6 +276,156 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
   return { context, document, documentListeners, windowListeners, elements, requests, switches, confirmations, draftsCleared, messages, drawerChanges, stored, media, timers, row, advance, touch, hold, dispatch, historyLoads: () => historyLoads, configLoads: () => configLoads };
 }
 
+function resizeHarness(savedWidth) {
+  const h = harness(), properties = new Map(), layoutCalls = [];
+  h.document.documentElement = h.document.createElement();
+  h.document.documentElement.style = { setProperty: (key, value) => properties.set(key, value) };
+  h.document.body = h.document.createElement();
+  h.elements.views = h.document.createElement();
+  h.elements.views.clientWidth = 1200;
+  h.elements.sidebarresize = h.document.createElement();
+  const handle = h.elements.sidebarresize, captured = new Set();
+  handle.setPointerCapture = (id) => captured.add(id);
+  handle.hasPointerCapture = (id) => captured.has(id);
+  handle.releasePointerCapture = (id) => { captured.delete(id); h.dispatch(handle, "lostpointercapture", { pointerId: id }); };
+  Object.assign(h.context, {
+    requestAnimationFrame: (fn) => fn(),
+    growPrompt: () => layoutCalls.push("composer"),
+    updateJumpButton: () => layoutCalls.push("jump"),
+    updateQuestionButton: () => layoutCalls.push("questions"),
+  });
+  h.context.window.innerWidth = 1200;
+  if (savedWidth !== undefined) h.stored.set("serve.sidebarWidth", savedWidth);
+  vm.runInContext(between("// BEGIN sidebar resize", "// END sidebar resize"), h.context);
+  h.context.wireSidebarResize();
+  const pointer = (clientX, pointerId = 7) => ({ pointerId, clientX, pointerType: "mouse", isPrimary: true, button: 0 });
+  const width = () => Number(handle.getAttribute("aria-valuenow"));
+  const windowEvent = (type) => { for (const listener of h.windowListeners.get(type) || []) listener(); };
+  return { ...h, handle, captured, properties, layoutCalls, pointer, width, windowEvent };
+}
+
+test("desktop splitter controls only desktop width and exposes an accessible separator", () => {
+  assert.match(html, /<\/nav>\s*<div id="sidebarresize" role="separator" tabindex="0"[^>]*aria-orientation="vertical" aria-controls="sessions"[^>]*>\s*<\/div>\s*<main id="chat">/);
+  assert.match(css, /#sidebarresize \{ display:none; \}/);
+  const desktop = css.slice(css.indexOf("@media (min-width:701px)"), css.indexOf("@media (max-width:700px)"));
+  assert.match(desktop, /#sessions \{[^}]*flex:0 0 var\(--sidebar-width,264px\); width:var\(--sidebar-width,264px\);/);
+  assert.match(desktop, /#sidebarresize \{ display:block;[^}]*flex:0 0 8px; cursor:col-resize; touch-action:none;/);
+  assert.match(desktop, /#sidebarresize:hover::after, #sidebarresize:focus-visible::after, body\.sidebar-resizing #sidebarresize::after/);
+  assert.match(desktop, /body\.sidebar-resizing \* \{[^}]*user-select:none !important;/);
+  assert.match(css, /#sessions \{ position:absolute;[^}]*width:min\(86vw,320px\);/);
+  assert.match(between("function wire()", "function registerAppServiceWorker()"), /wireSidebarResize\(\);/);
+});
+
+for (const [saved, expected] of [[undefined, 264], ["312", 312], ["100", 220], ["900", 480], ["garbage", 264], ["Infinity", 264], ["", 264]]) {
+  test("sidebar restores and clamps stored width: " + String(saved), () => {
+    const h = resizeHarness(saved);
+    assert.equal(h.width(), expected);
+    assert.equal(h.properties.get("--sidebar-width"), expected + "px");
+    assert.equal(h.handle.getAttribute("aria-valuemin"), "220");
+    assert.equal(h.handle.getAttribute("aria-valuemax"), "480");
+    assert.equal(h.handle.getAttribute("aria-valuetext"), expected + " pixels");
+    assert.match(h.handle.title, new RegExp("^" + expected + "px"));
+  });
+}
+
+test("pointer drag clamps both bounds, captures the pointer and persists only after release", () => {
+  const h = resizeHarness(), down = h.dispatch(h.handle, "pointerdown", h.pointer(264));
+  assert.equal(down.event.prevented, true);
+  assert.equal(down.event.stopped, true);
+  assert.equal(h.captured.has(7), true);
+  assert.equal(h.document.body.classList.contains("sidebar-resizing"), true);
+  h.dispatch(h.handle, "pointermove", h.pointer(1000, 8));
+  assert.equal(h.width(), 264, "an unrelated pointer cannot change width");
+  h.dispatch(h.handle, "pointermove", h.pointer(1000));
+  assert.equal(h.width(), 480);
+  h.dispatch(h.handle, "pointermove", h.pointer(-100));
+  assert.equal(h.width(), 220);
+  assert.equal(h.stored.has("serve.sidebarWidth"), false);
+  const up = h.dispatch(h.handle, "pointerup", h.pointer(350));
+  assert.equal(up.event.prevented, true);
+  assert.equal(up.event.stopped, true);
+  assert.equal(h.width(), 350, "the final pointer position is applied before release");
+  assert.equal(h.stored.get("serve.sidebarWidth"), "350");
+  assert.equal(h.captured.size, 0);
+  assert.equal(h.document.body.classList.contains("sidebar-resizing"), false);
+  assert.deepEqual(h.layoutCalls, ["composer", "jump", "questions"]);
+  assert.equal(h.dispatch(h.handle, "click").event.stopped, true);
+  assert.deepEqual(h.switches, []);
+  assert.deepEqual(h.requests, []);
+});
+
+for (const ending of ["pointercancel", "lostpointercapture", "blur", "resize", "phone"]) test("sidebar drag cleans up when interrupted by " + ending, () => {
+  const h = resizeHarness();
+  h.dispatch(h.handle, "pointerdown", h.pointer(264));
+  h.dispatch(h.handle, "pointermove", h.pointer(320));
+  if (ending === "phone") { h.media.matches = true; for (const listener of h.media.listeners) listener(); }
+  else if (["blur", "resize"].includes(ending)) h.windowEvent(ending);
+  else h.dispatch(h.handle, ending, h.pointer(320));
+  assert.equal(h.captured.size, 0);
+  assert.equal(h.document.body.classList.contains("sidebar-resizing"), false);
+  assert.equal(h.stored.get("serve.sidebarWidth"), "320");
+  h.dispatch(h.handle, "pointermove", h.pointer(400));
+  assert.equal(h.width(), 320);
+  if (ending === "phone") assert.deepEqual(h.layoutCalls, []);
+});
+
+test("narrow desktops reserve chat space and restore the preferred width after expanding", () => {
+  const h = resizeHarness("480");
+  h.elements.views.clientWidth = 701;
+  h.windowEvent("resize");
+  assert.equal(h.width(), 333);
+  assert.equal(h.handle.getAttribute("aria-valuemax"), "333");
+  assert.equal(h.stored.get("serve.sidebarWidth"), "480", "viewport clamping preserves the saved preference");
+  h.dispatch(h.handle, "pointerdown", h.pointer(333));
+  h.dispatch(h.handle, "pointerup", h.pointer(900));
+  assert.equal(h.width(), 333);
+  assert.equal(h.stored.get("serve.sidebarWidth"), "333");
+  h.elements.views.clientWidth = 1200;
+  h.windowEvent("resize");
+  assert.equal(h.width(), 333);
+  const restored = resizeHarness("480");
+  restored.elements.views.clientWidth = 701;
+  restored.windowEvent("resize");
+  restored.elements.views.clientWidth = 1200;
+  restored.windowEvent("resize");
+  assert.equal(restored.width(), 480);
+});
+
+test("keyboard adjustment, endpoints and both reset actions persist their effective width", () => {
+  const h = resizeHarness("350");
+  for (const [key, shiftKey, expected] of [["ArrowLeft", false, 340], ["ArrowRight", true, 380], ["Home", false, 220], ["End", false, 480], ["Enter", false, 264]]) {
+    const event = h.dispatch(h.handle, "keydown", { key, shiftKey }).event;
+    assert.equal(event.prevented, true);
+    assert.equal(event.stopped, true);
+    assert.equal(h.width(), expected);
+    assert.equal(h.stored.get("serve.sidebarWidth"), String(expected));
+  }
+  h.dispatch(h.handle, "keydown", { key: "End" });
+  h.dispatch(h.handle, "dblclick");
+  assert.equal(h.width(), 264);
+  assert.equal(resizeHarness(h.stored.get("serve.sidebarWidth")).width(), 264);
+  assert.equal(h.dispatch(h.handle, "keydown", { key: "Tab" }).event.prevented, false);
+  assert.deepEqual(h.switches, []);
+});
+
+test("phone and non-primary pointer interactions cannot resize, and wiring is idempotent", () => {
+  const h = resizeHarness("350");
+  for (const extra of [{ button: 2 }, { isPrimary: false }]) h.dispatch(h.handle, "pointerdown", { ...h.pointer(350), ...extra });
+  assert.equal(h.captured.size, 0);
+  h.media.matches = true;
+  h.dispatch(h.handle, "pointerdown", h.pointer(350));
+  h.dispatch(h.handle, "pointermove", h.pointer(450));
+  h.dispatch(h.handle, "keydown", { key: "Home" });
+  h.dispatch(h.handle, "dblclick");
+  assert.equal(h.width(), 350);
+  assert.equal(h.captured.size, 0);
+  assert.deepEqual(h.layoutCalls, []);
+  const listeners = h.windowListeners.get("resize").length;
+  h.context.wireSidebarResize();
+  assert.equal(h.windowListeners.get("resize").length, listeners);
+  assert.deepEqual(h.drawerChanges, []);
+});
+
 test("sidebar stars reflect marked state and expose the matching accessible action", () => {
   const h = harness({ items: sessions(true) });
   for (const [id, marked] of [["open-session", false], ["target-session", true]]) {
@@ -286,7 +436,8 @@ test("sidebar stars reflect marked state and expose the matching accessible acti
     assert.equal(star.getAttribute("aria-pressed"), String(marked));
     assert.equal(star.getAttribute("aria-label"), marked ? "取消标记" : "标记会话");
     assert.equal(star.title, star.getAttribute("aria-label"));
-    assert.equal(li.children[0], li.querySelector(".mk"));
+    assert.equal(li.children[0], li.querySelector(".session-controls"));
+    assert.deepEqual(li.children[0].children, [star, li.querySelector(".session-menu")]);
     assert.equal(li.children[1], li.querySelector(".session-title"));
     assert.equal(li.querySelector(".rn"), null);
   }
@@ -819,6 +970,7 @@ test("mark styles use theme gold and phone actions have 44px touch targets", () 
   assert.match(phoneCSS, /#sessions li \.mk \{ display:inline-flex; align-items:center; justify-content:center; width:44px; height:44px; padding:0; font-size:15px; background:none; \}/);
   assert.match(css, /#sessmorepanel button \{[^}]*min-height:44px;/);
   assert.match(phoneCSS, /#sessions li \.mk\[aria-pressed="true"\] \{ color:var\(--mark\); \}/);
+  assert.match(phoneCSS, /#sessions li \.session-menu \{ width:44px; height:44px; \}/);
   assert.match(css, /#sessionactionspanel button \{ min-width:44px; min-height:44px;/);
   assert.match(html, /id="sessionactions" hidden/);
   assert.match(html, /id="sessionactionspanel" role="dialog" aria-modal="true" aria-labelledby="sessionactionstitle"/);
@@ -832,6 +984,9 @@ test("More contains the filters and group tools without another toolbar row", ()
   assert.doesNotMatch(html, /id="sessviewrow"/);
   assert.match(css, /#sessfilterrow \{ display:flex; align-items:center;[^}]*flex-shrink:0;/);
   assert.match(css, /#sessfilterrow > #sesscount \{[^}]*min-width:0;[^}]*white-space:nowrap; overflow:hidden; text-overflow:ellipsis;/);
+  const desktop = css.slice(css.indexOf("@media (min-width:701px)"), css.indexOf("@media (max-width:700px)"));
+  assert.match(desktop, /#sessfilterrow \{ padding:0 8px; \}/);
+  assert.match(desktop, /#sessmore > summary \{ min-height:28px; padding:2px 6px; \}/);
 });
 
 test("choosing a More filter closes the menu and leaves its active state visible", async () => {
@@ -899,7 +1054,7 @@ for (const phone of [false, true]) test("Rename from the action sheet edits its 
   assert.deepEqual(h.switches, []);
 });
 
-test("row metadata lives in tooltips and the sheet while inactive stars reserve no title space", () => {
+test("top-right actions never occupy content rows and only nearby title lines reserve their space", () => {
   const h = harness({ items: sessions(true) }), li = h.row();
   assert.match(li.title, /Target session\nID: target-session\n2 KB/);
   assert.equal(li.classList.contains("session-marked"), true);
@@ -910,6 +1065,47 @@ test("row metadata lives in tooltips and the sheet while inactive stars reserve 
   assert.match(css, /#sessions li \.mk \{[^}]*opacity:0; pointer-events:none;/);
   assert.match(css, /#sessions li\.session-marked \.mk, #sessions li:focus-within \.mk \{ opacity:1; pointer-events:auto; \}/);
   assert.match(css, /@media \(hover:hover\) \{\s*#sessions li:hover \.mk \{ opacity:1; pointer-events:auto; \}/);
+  assert.match(css, /#sessions li\[data-session-id\] \{[^}]*display:flow-root;/);
+  assert.match(css, /#sessions li \.session-controls \{ position:absolute; top:var\(--session-action-top\); right:var\(--session-action-right\); display:flex; flex-wrap:nowrap; align-items:center; gap:2px; \}/);
+  assert.match(css, /#sessions li\[data-session-id\] \{ --session-action-size:22px; --session-action-top:8px; --session-action-right:8px;/);
+  assert.match(css, /#sessions li \.session-title::before \{ content:""; float:right; width:calc\(var\(--session-action-size\) \+ var\(--session-action-size\) \+ 8px\); height:var\(--session-action-size\); \}/);
+  assert.doesNotMatch(css, /#sessions li \.session-controls \{[^}]*float:/);
+  assert.match(css, /#sessions li \.mk \{ width:22px; height:22px;/);
+  assert.match(css, /#sessions li \.session-menu \{ width:22px; height:22px;/);
+  assert.match(css, /#sessions li \.session-meta \{ clear:both; display:none; margin:0; \}/);
+  assert.match(css, /#sessions li\.session-renaming \.session-controls \{ display:none; \}/);
+  assert.doesNotMatch(css, /#sessions li\[data-session-id\] \{[^}]*grid-template-columns/);
+  assert.doesNotMatch(css, /#sessions[^{}]*\.session-title\s*\{[^}]*margin-right:/);
+  assert.match(css, /#sessions li \.session-menu \{ width:44px; height:44px; \}/);
+  assert.match(css, /#sessions li \.mk \{[^}]*width:44px; height:44px;/);
+  const phoneCSS = css.slice(css.indexOf("@media (max-width:700px)"));
+  assert.match(phoneCSS, /#sessions li\[data-session-id\] \{ --session-action-size:44px; --session-action-top:12px; --session-action-right:10px; \}/);
+  const controls = li.querySelector(".session-controls");
+  assert.deepEqual(controls.children, [li.querySelector(".mk"), li.querySelector(".session-menu")]);
+  assert.deepEqual(li.children, [controls, li.querySelector(".session-title"), li.querySelector(".session-meta")]);
+});
+
+for (const phone of [false, true]) test("session menu opens actions with one press and restores focus (phone=" + phone + ")", async () => {
+  const h = harness({ phone }), li = h.row(), menu = li.querySelector(".session-menu");
+  assert.equal(menu.type, "button");
+  assert.equal(menu.getAttribute("aria-label"), "Actions for Target session");
+  assert.equal(menu.getAttribute("aria-haspopup"), "dialog");
+  assert.equal(menu.getAttribute("aria-controls"), "sessionactionspanel");
+  const down = h.dispatch(menu, "pointerdown", h.touch());
+  assert.equal(down.event.stopped, true);
+  h.advance(650);
+  assert.equal(h.elements.sessionactions.hidden, true, "pressing the menu does not start a row hold");
+  const click = h.dispatch(menu, "click");
+  await click.done;
+  assert.equal(click.event.stopped, true);
+  assert.equal(h.elements.sessionactions.hidden, false);
+  assert.equal(h.elements.sessionactionstitle.textContent, "Target session");
+  assert.equal(h.document.activeElement, h.elements.sessionactionmark);
+  for (const id of ["sessionactionrename", "sessionactionarchive", "sessionactiongroup"]) assert.equal(h.elements[id].hidden, false);
+  await h.dispatch(h.elements.sessionactioncancel, "click").done;
+  assert.equal(h.document.activeElement, menu);
+  assert.deepEqual(h.switches, []);
+  assert.deepEqual(h.requests, []);
 });
 
 test("empty groups stay available through Manage groups without occupying list rows", async () => {
@@ -931,7 +1127,7 @@ test("empty groups stay available through Manage groups without occupying list r
 });
 
 test("compact group heads preserve waiting visibility and explicit collapse state", () => {
-  const items = [sessions()[0], { ...sessions()[1], activity: "running", waiting: "confirm", waiting_prompt: "Approve?" }];
+  const items = [{ ...sessions()[0], activity: "running" }, { ...sessions()[1], activity: "running", waiting: "confirm", waiting_prompt: "Approve?" }];
   const h = harness({ items }), head = h.elements.sesslist.querySelector(".session-group-head");
   const toggle = head.querySelector(".session-group-toggle");
   assert.equal(head.querySelector(".session-group-count"), null);
@@ -940,10 +1136,18 @@ test("compact group heads preserve waiting visibility and explicit collapse stat
   assert.equal(waiting.textContent, "1 WAITING");
   assert.equal(waiting.hidden, false);
   assert.match(toggle.getAttribute("aria-label"), /1 WAITING/);
+  const running = head.querySelector(".session-group-badge");
+  assert.equal(running.textContent, "1 RUNNING");
+  assert.equal(running.hidden, false);
+  assert.match(toggle.getAttribute("aria-label"), /1 RUNNING/);
+  assert.match(css, /#sessions \.session-group-toggle \{[^}]*grid-template-columns:auto minmax\(0,1fr\) auto;/);
+  assert.match(css, /#sessions \.session-group-name \{ grid-column:2; grid-row:1;[^}]*white-space:nowrap; color:var\(--fg\);/);
+  assert.match(css, /#sessions \.session-group-status \{ grid-column:3; grid-row:1; display:flex; flex-wrap:nowrap;/);
   h.dispatch(toggle, "click");
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
   assert.ok(sessionRows(h.elements.sesslist).every((li) => li.hidden));
   assert.equal(waiting.hidden, false);
+  assert.equal(running.hidden, false);
   h.context.renderSessionList(h.context.lastItems);
   assert.equal(h.elements.sesslist.querySelector(".session-group-toggle").getAttribute("aria-expanded"), "false");
   assert.ok(sessionRows(h.elements.sesslist).every((li) => li.hidden));

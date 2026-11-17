@@ -127,7 +127,7 @@ test("a session parked on a question paints CONFIRM from the list payload", () =
   assert.equal(badge(h, "busy").textContent, "RUNNING", "a running session without a question keeps the running badge");
   assert.equal(row(h, "busy").classList.contains("session-waiting"), false);
   assert.match(css, /#sessions li\.session-waiting:not\(\.cur\) \{ box-shadow:inset 2px 0 0 var\(--mark\); \}/);
-  assert.match(css, /#sessions li \.session-waiting-badge \{ color:var\(--mark\); \}/);
+  assert.match(css, /#sessions li \.session-waiting-badge \{ background:var\(--session-waiting-bg\); color:var\(--session-waiting-fg\); box-shadow:inset 0 0 0 1px var\(--session-waiting-edge\); \}/);
 });
 
 test("answering the question downgrades the badge instead of leaving it parked", () => {
@@ -408,14 +408,103 @@ test("running rail and compact label use theme tokens without overriding selecti
   const rail = "#sessions li.session-running {";
   assert.match(css, /#sessions li\.session-running \{ background:var\(--tint-2\); box-shadow:inset 2px 0 0 var\(--acc-line\); \}/);
   assert.ok(css.indexOf(rail) < css.indexOf("#sessions li.cur {"), "selection keeps its stronger rail and wash");
-  assert.match(css, /#sessions li\.cur \{ background:var\(--tint-3\); box-shadow:inset 3px 0 0 var\(--acc\); \}/);
-  assert.match(css, /#sessions li \.session-running-badge \{[^}]*flex:0 0 auto;[^}]*border-radius:999px; background:var\(--panel\); color:var\(--acc-soft-2\); font-size:11px;[^}]*white-space:nowrap;/);
+  assert.match(css, /#sessions li\.cur \{ background:var\(--session-selected-bg\); box-shadow:inset 3px 0 0 var\(--acc\); \}/);
+  assert.match(css, /#sessions li\.cur\[data-session-id\] \{ background:var\(--session-selected-bg\); border-color:var\(--session-selected-edge\); \}/);
+  assert.match(css, /#sessions li\.cur, #sessions li\.cur:hover \{\s*background:var\(--session-selected-bg\); box-shadow:inset 3px 0 0 var\(--acc\);/);
+  assert.doesNotMatch(css, /#sessions li\.cur\[data-session-id\] \{[^}]*border-color:var\(--acc-line\)/);
+  assert.match(css, /#sessions li \.session-running-badge \{[^}]*flex:0 0 auto;[^}]*border-radius:999px; background:var\(--session-running-bg\); color:var\(--session-running-fg\); box-shadow:inset 0 0 0 1px var\(--session-running-edge\); font-size:11px;[^}]*white-space:nowrap;/);
   assert.match(css, /#sessions li \.session-running-label \{ letter-spacing:\.04em; \}/);
 });
 
-test("titles allow two lines and constrained metadata keeps waiting labels visible", () => {
-  assert.match(css, /#sessions li \.session-title \{[^}]*display:-webkit-box;[^}]*-webkit-line-clamp:2;[^}]*overflow:hidden; white-space:normal; overflow-wrap:anywhere;/);
-  assert.match(css, /#sessions li\.session-running \.session-meta \{ display:flex; align-items:center; gap:8px; min-width:0; container:session-meta \/ inline-size; \}/);
+test("all themes keep selection distinct and balance status fills", (t) => {
+  const desktopStart = css.indexOf("@media (min-width:701px)");
+  const desktopEnd = css.indexOf("@media (max-width:700px)", desktopStart);
+  const shared = css.slice(0, desktopStart);
+  const desktop = css.slice(desktopStart, desktopEnd);
+  const tokens = (source, theme) => {
+    const selector = theme ? ':root\\[data-theme="' + theme + '"\\]' : ':root';
+    const body = source.match(new RegExp(selector + ' \\{([^}]+)\\}'))?.[1];
+    assert.ok(body, "theme palette exists: " + (theme || "dark"));
+    return Object.fromEntries([...body.matchAll(/--([\w-]+):([^;]+);/g)].map((match) => [match[1], match[2].trim()]));
+  };
+  const rgb = (hex) => {
+    assert.match(hex, /^#[\da-f]{6}$/i, "status colors are opaque");
+    return hex.slice(1).match(/../g).map((channel) => parseInt(channel, 16));
+  };
+  const luminance = (channels) => {
+    const [r, g, b] = channels.map((channel) => {
+      const s = channel / 255;
+      return s <= .04045 ? s / 12.92 : ((s + .055) / 1.055) ** 2.4;
+    });
+    return .2126 * r + .7152 * g + .0722 * b;
+  };
+  const contrast = (a, b) => {
+    const [high, low] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+    return (high + .05) / (low + .05);
+  };
+  for (const theme of ["dark", "light", "warm"]) for (const phone of [true, false]) {
+    const palette = { ...tokens(shared), ...(theme !== "dark" ? tokens(shared, theme) : {}),
+      ...(!phone ? tokens(desktop) : {}), ...(!phone && theme !== "dark" ? tokens(desktop, theme) : {}) };
+    const panel = rgb(palette.panel);
+    const selected = rgb(palette["session-selected-bg"]);
+    const selectedEdge = rgb(palette["session-selected-edge"]);
+    assert.ok(contrast(selectedEdge, panel) >= 3 && contrast(selectedEdge, selected) >= 3,
+      "selected card boundary separates from both the panel and its fill");
+    for (const name of ["fg", "dim"]) assert.ok(contrast(rgb(palette[name]), selected) >= 4.5,
+      "selected title and metadata remain readable");
+    t.diagnostic(`${theme} ${phone ? "phone" : "desktop"} selected: edge/panel ${contrast(selectedEdge, panel).toFixed(2)}:1; edge/fill ${contrast(selectedEdge, selected).toFixed(2)}:1; title/fill ${contrast(rgb(palette.fg), selected).toFixed(2)}:1; metadata/fill ${contrast(rgb(palette.dim), selected).toFixed(2)}:1`);
+    const surfaces = [panel, rgb(palette["surface-2"]), rgb(palette["surface-hover"]), selected];
+    for (const name of ["tint-2", "tint-4"]) {
+      const rgba = palette[name].match(/^rgba\((\d+),(\d+),(\d+),([\d.]+)\)$/);
+      assert.ok(rgba, "card tint is defined");
+      const alpha = Number(rgba[4]);
+      surfaces.push(panel.map((channel, i) => Number(rgba[i + 1]) * alpha + channel * (1 - alpha)));
+    }
+    for (const state of ["running", "waiting"]) {
+      const fill = rgb(palette["session-" + state + "-bg"]);
+      const edge = rgb(palette["session-" + state + "-edge"]);
+      const textRatio = contrast(rgb(palette["session-" + state + "-fg"]), fill);
+      const fillRatios = surfaces.map((surface) => contrast(fill, surface));
+      const edgeRatio = Math.min(...surfaces.map((surface) => contrast(edge, surface)));
+      assert.ok(textRatio >= 4.5, "small status text meets 4.5:1");
+      // The outline carries recognition while the fill stays close to the card.
+      assert.ok(Math.max(...fillRatios) <= 2.5, "status fill avoids a dominant solid block");
+      assert.ok(edgeRatio >= 3, "inset edge separates from every card state and group header");
+      if (theme === "dark") assert.ok(luminance(fill) > luminance(panel) && contrast(fill, panel) >= 1.5,
+        "dark status fill is visibly lighter than the surrounding panel");
+      assert.ok(state === "running" ? fill[1] > fill[0] && fill[1] > fill[2] : fill[0] > fill[1] && fill[1] > fill[2], "green and amber remain distinct");
+      t.diagnostic(`${theme} ${phone ? "phone" : "desktop"} ${state}: text/fill ${textRatio.toFixed(2)}:1; fill/surface ${Math.min(...fillRatios).toFixed(2)}-${Math.max(...fillRatios).toFixed(2)}:1; minimum edge/surface ${edgeRatio.toFixed(2)}:1`);
+    }
+  }
+  for (const [selector, state] of [["#sessions .session-group-badge", "running"], ["#sessions .session-group-badge.waiting", "waiting"]]) {
+    const body = css.match(new RegExp(selector.replaceAll(".", "\\.") + " \\{([^}]+)\\}"))?.[1];
+    assert.ok(body, "group status style exists");
+    for (const [property, suffix] of [["background", "bg"], ["color", "fg"], ["box-shadow:inset 0 0 0 1px", "edge"]]) {
+      assert.ok(body.includes(property + (property.startsWith("box-shadow") ? " " : ":") + `var(--session-${state}-${suffix})`), "group badge shares the status palette");
+    }
+  }
+});
+
+test("titles wrap fully at a moderate weight and waiting labels stay visible", () => {
+  for (const phone of [false, true]) {
+    const titles = ["Short title", "发布 test_aeolus_coding_node 卡片",
+      "为 agent webui 增加会话分组/话题", "Review MR !79 的 Codebase 授权入口缺失",
+      "feat/2026-11-17-critical-premises", "Long identifier " + "x".repeat(160)];
+    const items = titles.map((summary, index) => ({ ...sessions()[0], id: "title-" + index, summary }));
+    const h = harness({ phone, items });
+    for (const item of items) assert.equal(row(h, item.id).querySelector(".session-title").textContent, item.summary);
+    const tokens = (index) => Array.from(row(h, items[index].id).querySelectorAll(".session-title-token"), (token) => token.textContent);
+    assert.deepEqual(tokens(1), ["test_aeolus_coding_node"]);
+    assert.deepEqual(tokens(4), ["feat/2026-11-17-critical-premises"]);
+    assert.deepEqual(tokens(5), ["Long", "identifier", "x".repeat(160)]);
+  }
+  assert.match(css, /#sessions li \.session-title \{ display:block; white-space:normal; overflow-wrap:break-word; word-break:normal;[^}]*color:var\(--fg\); font-size:13px; font-weight:500; line-height:22px;/);
+  assert.match(css, /#sessions li \.session-title-token \{ display:inline-block; max-width:100%; vertical-align:top; overflow-wrap:anywhere; \}/);
+  assert.doesNotMatch(css, /#sessions[^{}]*\.session-title\s*\{[^}]*(?:line-clamp|[;\s](?:min-|max-)?height\s*:|overflow\s*:\s*hidden|text-overflow\s*:)/);
+  assert.doesNotMatch(css, /#sessions li\[data-session-id\]\s*\{[^}]*[;\s](?:min-|max-)?height\s*:/);
+  assert.doesNotMatch(css, /#sessions li\.cur span\[role="button"\] \{[^}]*font-weight/);
+  assert.match(css, /#sessions li\.session-running \.session-meta \{ display:flex; align-items:center; flex-wrap:wrap; gap:4px 8px; min-width:0; container:session-meta \/ inline-size; \}/);
+  assert.doesNotMatch(css, /#sessions[^{}]*(?:\.session-running|\.session-waiting|\.cur)[^{}]*\.session-title\s*\{/);
   assert.match(css, /#sessions li\.session-running \.session-hash \{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; \}/);
   assert.match(css, /#sessions li \.session-hash \{ display:none; \}/);
   assert.match(css, /@container session-meta \(max-width:72px\) \{\s*#sessions li \.session-running-label:not\(\.session-waiting-label\) \{ display:none; \}/);
