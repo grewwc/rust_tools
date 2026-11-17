@@ -389,13 +389,18 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 iteration,
                 max_iterations,
             ) {
-                FinalCitationGateAction::Allow => false,
+                FinalCitationGateAction::Allow => None,
                 FinalCitationGateAction::Reopen => {
                     final_gate_state.consume_retry();
                     *terminal_dedupe_candidate = None;
                     return Ok(TurnLoopStep::Continue);
                 }
-                FinalCitationGateAction::Warn => true,
+                FinalCitationGateAction::Warn => Some(final_citation_warning(
+                    messages,
+                    *force_final_response,
+                    iteration,
+                    max_iterations,
+                )),
             };
             let warn_outstanding_work = match outstanding_work_gate_action(
                 app,
@@ -551,12 +556,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             if warn_unverified_audit_evidence {
                 record_hidden_self_note(app, turn_messages, AUDIT_EVIDENCE_UNVERIFIED_NOTE);
             }
-            if warn_unvalidated_final_citation {
-                append_runtime_warning_once(
-                    &mut stream_result.assistant_text,
-                    FINAL_CITATION_WARNING,
-                );
-                append_user_visible_final_notice(terminal_dedupe_candidate, FINAL_CITATION_WARNING);
+            if let Some(warning) = warn_unvalidated_final_citation {
+                append_runtime_warning_once(&mut stream_result.assistant_text, &warning);
+                append_user_visible_final_notice(terminal_dedupe_candidate, &warning);
                 record_hidden_self_note(app, turn_messages, FINAL_CITATION_UNVERIFIED_NOTE);
             }
             // At the hard cap we no longer reopen, but unreaped subtasks must still enter

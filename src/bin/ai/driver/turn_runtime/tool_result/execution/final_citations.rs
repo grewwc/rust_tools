@@ -44,6 +44,27 @@ pub(in crate::ai::driver::turn_runtime) enum FinalCitationGateAction {
     Warn,
 }
 
+/// Explain a Warn decision using the actual force-final flag, not the combined
+/// gate veto. With no citation retry, force-final or iteration cap, the veto is
+/// the shared retry budget. A prior citation retry takes precedence.
+pub(in crate::ai::driver::turn_runtime) fn final_citation_warning(
+    messages: &[Message],
+    force_final_response: bool,
+    iteration: usize,
+    max_iterations: usize,
+) -> String {
+    let reason = if current_turn_has_internal_marker(messages, FINAL_CITATION_RETRY_MARKER) {
+        "citation retry already requested; citations remain unverified"
+    } else if force_final_response {
+        "forced final response; no citation retry requested"
+    } else if iteration >= max_iterations {
+        "iteration limit reached; no citation retry requested"
+    } else {
+        "shared final-gate retry budget exhausted; no citation retry requested"
+    };
+    format!("{FINAL_CITATION_WARNING} Reason: {reason}.")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::ai::driver::turn_runtime) struct FinalCitation {
     pub(super) text: String,
