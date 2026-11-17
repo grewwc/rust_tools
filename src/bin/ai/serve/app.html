@@ -9154,6 +9154,22 @@ function promptNavHasOlder() {
   const shown = typeof lastMsgCount === "number" ? lastMsgCount : null;
   return total > 0 && shown !== null && shown < total;
 }
+// The rail outlives individual transcript nodes: a history refresh replaces
+// every row before the next animation frame rebuilds the list. Resolve the
+// question against the rows mounted right now so a click cannot scroll a
+// detached node. Text is the fallback while a live row has no canonical index.
+function promptNavRow(historyIndex, text) {
+  let fallback = null;
+  for (const row of $("msgs").querySelectorAll(".user-msg-row")) {
+    const bubble = row.querySelector(".msg.user");
+    if (!bubble) continue;
+    const shown = String(bubble.dataset.question ?? bubble.textContent ?? "").trim().replace(/\s+/g, " ");
+    if (shown !== text) continue;
+    if (bubble.dataset.historyIndex === String(historyIndex)) return row;
+    fallback = row;
+  }
+  return fallback;
+}
 function syncPromptNav() {
   const list = $("promptlist");
   if (!list || !$("msgs")) return;
@@ -9218,9 +9234,15 @@ function syncPromptNav() {
     button.appendChild(index);
     button.appendChild(label);
     button.onclick = () => {
-      row.scrollIntoView({ block: "center", behavior: "smooth" });
-      row.classList.add("flash");
-      setTimeout(() => row.classList.remove("flash"), 1200);
+      // A rebuilt transcript can detach the node this item was built from;
+      // scrolling the currently mounted row keeps the jump working.
+      const target = promptNavRow(item.dataset.historyIndex, text) || row;
+      // A deliberate jump leaves the live edge; a pending follow frame or the
+      // next streamed chunk must not pull the reader back down.
+      outputFollowSuspended = true;
+      target.scrollIntoView({ block: "center", behavior: "smooth" });
+      target.classList.add("flash");
+      setTimeout(() => target.classList.remove("flash"), 1200);
       for (const other of list.querySelectorAll("li.cur")) other.classList.remove("cur");
       item.classList.add("cur");
     };
