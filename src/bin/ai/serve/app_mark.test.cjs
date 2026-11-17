@@ -999,6 +999,10 @@ test("choosing a More filter closes the menu and leaves its active state visible
   assert.equal(h.elements.sessfilterstatus.hidden, false);
   assert.equal(h.elements.sessfilterstatus.textContent, "Starred");
   assert.deepEqual(sessionRows(h.elements.sesslist).map((li) => li.dataset.sessionId), ["target-session"]);
+  assert.equal(h.context.sessionId, "open-session");
+  assert.equal(h.row().hidden, false);
+  assert.equal(h.elements.sesslist.querySelector(".session-group-toggle").getAttribute("aria-expanded"), "true");
+  assert.ok(sessionRows(h.elements.sesslist).filter((li) => !li.hidden).length > 0);
   await h.dispatch(h.elements.sessall, "click").done;
   assert.equal(h.elements.sessfilterstatus.hidden, true);
   assert.equal(sessionRows(h.elements.sesslist).length, 2);
@@ -1011,12 +1015,100 @@ test("archive and star filters combine without hiding their state or changing se
   assert.equal(h.elements.sessfilterstatus.textContent, "Archived");
   assert.equal(h.elements.sessarchived.getAttribute("aria-pressed"), "true");
   assert.deepEqual(sessionRows(h.elements.sesslist).map((li) => li.dataset.sessionId), [archived.id]);
+  assert.equal(h.row(archived.id).hidden, false);
+  assert.equal(h.elements.sesslist.querySelector(".session-group-toggle").getAttribute("aria-expanded"), "true");
   await h.dispatch(h.elements.sessmarked, "click").done;
   assert.equal(h.elements.sessfilterstatus.textContent, "Archived ★");
   assert.equal(h.elements.sessfilterstatus.getAttribute("aria-label"), "Archived · Starred");
   assert.deepEqual(sessionRows(h.elements.sesslist).map((li) => li.dataset.sessionId), [archived.id]);
+  assert.equal(h.row(archived.id).hidden, false);
   assert.deepEqual(h.switches, []);
   assert.ok(h.requests.filter((request) => request.path === "/sessions").every((request) => request.searchParams.get("archived") === "only"));
+});
+
+test("All, Starred and Archived keep independent group collapse choices", async () => {
+  const archived = { id: "archived-session", summary: "Archived title", marked: true, archived: true };
+  const h = harness({ items: [...sessions(true), archived] });
+  const toggle = () => h.elements.sesslist.querySelector(".session-group-toggle");
+  h.dispatch(toggle(), "click");
+  assert.equal(h.row().hidden, true);
+  const allKey = h.context.sessionGroupCollapseKey(null);
+  await h.dispatch(h.elements.sessmarked, "click").done;
+  assert.notEqual(h.context.sessionGroupCollapseKey(null), allKey);
+  assert.equal(h.row().hidden, false);
+  assert.equal(toggle().getAttribute("aria-expanded"), "true");
+  h.dispatch(toggle(), "click");
+  const starredKey = h.context.sessionGroupCollapseKey(null);
+  await h.dispatch(h.elements.sessarchived, "click").done;
+  assert.notEqual(h.context.sessionGroupCollapseKey(null), starredKey);
+  assert.equal(h.row(archived.id).hidden, false);
+  await h.dispatch(h.elements.sessactive, "click").done;
+  assert.equal(h.row().hidden, true);
+  await h.dispatch(h.elements.sessall, "click").done;
+  assert.equal(h.row().hidden, true);
+});
+
+for (const collapsed of [true, false]) {
+  test("Starred preserves explicit " + (collapsed ? "collapse" : "expansion") + " through refresh, polling and paging", async () => {
+    const stars = Array.from({ length: 15 }, (_, index) => ({ id: "star-" + index, summary: "Star " + index, marked: true, activity: "idle" }));
+    const h = harness({ items: [sessions()[0], ...stars], activityGet: (request) => response(request.body.ids.map((id) => ({ id, activity: "running", waiting: "confirm" }))) });
+    await h.dispatch(h.elements.sessmarked, "click").done;
+    const toggle = () => h.elements.sesslist.querySelector(".session-group-toggle");
+    h.dispatch(toggle(), "click");
+    if (!collapsed) h.dispatch(toggle(), "click");
+    const assertChoice = (count) => {
+      assert.equal(toggle().getAttribute("aria-expanded"), String(!collapsed));
+      const rows = sessionRows(h.elements.sesslist);
+      assert.equal(rows.length, count);
+      for (const row of rows) assert.equal(row.hidden, collapsed);
+    };
+    assertChoice(12);
+    h.context.renderSessionList(h.context.lastItems);
+    assertChoice(12);
+    await h.context.loadSessions({ preserveSelection: true });
+    assertChoice(12);
+    h.document.visibilityState = "visible";
+    await h.context.pollSessionActivity();
+    assert.ok(h.requests.some((request) => request.path === "/session-activity"));
+    assertChoice(12);
+    h.document.visibilityState = "hidden";
+    await h.dispatch(h.elements.sesslist.querySelector(".session-more").querySelector("button"), "click").done;
+    assertChoice(15);
+    const pages = h.requests.filter((request) => request.path === "/sessions");
+    assert.ok(pages.every((request) => request.searchParams.get("marked") === "true"));
+    assert.equal(pages.at(-1).searchParams.get("offset"), "12");
+    assert.equal(h.elements.sesscount.textContent, "15 sessions · showing 15");
+    const saved = JSON.parse(h.stored.get("serve.groups.collapsed.v1"));
+    assert.equal(saved[h.context.sessionGroupCollapseKey(null)], collapsed);
+    vm.runInContext("sessionGroupCollapsed = JSON.parse(localStorage.getItem(SESSION_GROUP_COLLAPSED_KEY));", h.context);
+    h.context.renderSessionList(h.context.lastItems);
+    assertChoice(15);
+  });
+}
+
+test("Starred with zero results shows its empty state without a group header", async () => {
+  const h = harness({ groups: [{ id: "empty", name: "Empty group", order: 0, pinned: false }] });
+  await h.context.loadSessionGroups();
+  await h.dispatch(h.elements.sessmarked, "click").done;
+  assert.equal(h.elements.sesslist.querySelector(".session-empty").textContent, "暂无星标会话");
+  assert.equal(h.elements.sesslist.querySelectorAll(".session-group-head").length, 0);
+  assert.equal(sessionRows(h.elements.sesslist).length, 0);
+  assert.equal(h.elements.sesscount.textContent, "0 sessions · showing 0");
+  assert.equal(h.context.sessionId, "open-session");
+});
+
+test("Starred expands every populated group when the selected session is unstarred", async () => {
+  const groups = [{ id: "work", name: "Work", order: 0, pinned: false }, { id: "other", name: "Other", order: 1, pinned: false }];
+  const h = harness({ groups, items: [sessions()[0], ...groups.map((group) => ({ id: group.id + "-star", summary: group.name, marked: true, group_id: group.id })), sessions(true)[1]] });
+  await h.context.loadSessionGroups();
+  await h.dispatch(h.elements.sessmarked, "click").done;
+  assert.equal(h.context.sessionId, "open-session");
+  const heads = h.elements.sesslist.querySelectorAll(".session-group-head");
+  assert.equal(heads.length, 3);
+  for (const head of heads) assert.equal(head.querySelector(".session-group-toggle").getAttribute("aria-expanded"), "true");
+  const rows = sessionRows(h.elements.sesslist);
+  assert.equal(rows.length, 3);
+  for (const row of rows) assert.equal(row.hidden, false);
 });
 
 test("More closes on Escape, outside pointer and outside focus without changing filters", () => {

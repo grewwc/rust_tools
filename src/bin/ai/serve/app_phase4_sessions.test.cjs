@@ -49,9 +49,9 @@ function pageState(h) {
 
 function rendered(h) {
   return {
-    titles: Array.from(h.elements.sesslist.children, (row) => row.querySelector("span")?.textContent).filter((title) => title !== undefined),
+    titles: Array.from(h.elements.sesslist.children, (row) => row.querySelector(".session-title")?.textContent).filter((title) => title !== undefined),
     count: h.elements.sesscount.textContent,
-    tail: Array.from(h.elements.sesslist.children).filter((row) => !row.querySelector("span")).map((row) => row.textContent),
+    tail: Array.from(h.elements.sesslist.children).filter((row) => !row.querySelector("span") && !row.classList.contains("session-more")).map((row) => row.textContent),
     scrollTop: h.elements.sesslist.scrollTop,
   };
 }
@@ -79,16 +79,27 @@ test("star toggles reset paging and append only server-filtered older stars", as
     "x-sessions-total": "2", "x-sessions-page-size": "1",
   });
   await h.dispatch(h.elements.sessmarked, "click").done;
-  assert.deepEqual(firstCalls, ["/sessions?newest=true&limit=12&offset=0&marked=true"]);
+  assert.deepEqual(firstCalls, ["/sessions?newest=true&limit=12&offset=0&marked=true&archived=exclude"]);
   assert.deepEqual(rendered(h).titles, ["First star"]);
-  assert.deepEqual(rendered(h).tail, ["加载更多会话"]);
+  const assertStarsVisible = (count) => {
+    const rows = Array.from(h.elements.sesslist.children).filter((row) => row.dataset.sessionId);
+    assert.equal(rows.length, count);
+    for (const row of rows) assert.equal(row.hidden, false);
+    const heads = h.elements.sesslist.querySelectorAll(".session-group-head");
+    assert.equal(heads.length, 1);
+    assert.equal(heads[0].querySelector(".session-group-name").textContent, "Unassigned");
+    assert.equal(heads[0].querySelector(".session-group-toggle").getAttribute("aria-expanded"), "true");
+  };
+  assertStarsVisible(1);
+  assert.equal(h.elements.sesslist.querySelector(".session-more").textContent, "Load more sessions");
   const calls = installResponse(h, [{ id: "older-star", summary: "Older star", marked: true }], {
     "x-sessions-total": "2", "x-sessions-page-size": "1",
   });
   const more = h.elements.sesslist.querySelector(".session-more").querySelector("button");
   await h.dispatch(more, "click").done;
-  assert.deepEqual(calls, ["/sessions?newest=true&limit=12&offset=1&marked=true"]);
+  assert.deepEqual(calls, ["/sessions?newest=true&limit=12&offset=1&marked=true&archived=exclude"]);
   assert.deepEqual(rendered(h).titles, ["First star", "Older star"]);
+  assertStarsVisible(2);
   assert.deepEqual(rendered(h).tail, []);
   assert.equal(rendered(h).count, "2 sessions · showing 2");
   assert.equal(h.context.sessionId, "open-session");
@@ -205,7 +216,7 @@ test("bounded response projection preserves field order array identity and uncap
   assert.equal(page.items, items);
   assert.equal(page.total, 2.5);
   assert.equal(page.pageSize, 42);
-  assert.deepEqual(calls, ["/sessions?newest=true&limit=12&offset=-2&include=open-session"]);
+  assert.deepEqual(calls, ["/sessions?newest=true&limit=12&offset=-2&include=open-session&archived=exclude"]);
 });
 
 test("session page headers retain native Number conversion and finite fallback behavior", async () => {
@@ -263,7 +274,7 @@ test("refresh requests preserve the loaded offset as the minimum page limit", as
     setPager(h, { offset });
     const calls = installResponse(h, [{ id: "open-session", summary: "Open" }], { "x-sessions-total": "9", "x-sessions-page-size": "1" });
     await h.context.loadSessions();
-    assert.deepEqual(calls, ["/sessions?newest=true&limit=" + limit + "&offset=0&include=open-session"]);
+    assert.deepEqual(calls, ["/sessions?newest=true&limit=" + limit + "&offset=0&include=open-session&archived=exclude"]);
     assert.equal(pageState(h).offset, 1);
     assert.equal(pageState(h).hasMore, true);
   }
@@ -288,76 +299,71 @@ test("legacy refresh reverses the full response and disables incremental paging"
   const calls = [];
   h.context.api = async (url) => {
     calls.push(url);
-    return { json: async () => url === "/sessions" ? legacy : [{ id: "ignored-bounded" }] };
+    return { json: async () => url === "/sessions?archived=exclude" ? legacy : [{ id: "ignored-bounded" }] };
   };
   await h.context.loadSessions();
-  assert.deepEqual(calls, ["/sessions?newest=true&limit=12&offset=0&include=open-session", "/sessions"]);
+  assert.deepEqual(calls, ["/sessions?newest=true&limit=12&offset=0&include=open-session&archived=exclude", "/sessions?archived=exclude"]);
   assert.deepEqual(rendered(h).titles, ["Newest", "Oldest"]);
   assert.equal(pageState(h).total, 2);
   assert.equal(pageState(h).offset, 2);
   assert.equal(pageState(h).hasMore, false);
 });
 
-test("legacy refresh mutates the original response array in place", async () => {
+test("legacy refresh reverses a filtered copy and preserves the original records", async () => {
   const h = harness(), legacy = [{ id: "first", summary: "Oldest" },
     { id: "middle", summary: "Middle" }, { id: "open-session", summary: "Newest" }];
   const original = legacy.slice();
   installResponse(h, legacy);
   await h.context.loadSessions();
-  assert.deepEqual(legacy.map((item) => item.id), ["open-session", "middle", "first"]);
-  assert.equal(legacy[0], original[2]);
-  assert.equal(legacy[1], original[1]);
-  assert.equal(legacy[2], original[0]);
+  assert.deepEqual(legacy, original);
+  assert.deepEqual(rendered(h).titles, ["Newest", "Middle", "Oldest"]);
+  assert.equal(pageState(h).items[0], original[2]);
+  assert.equal(pageState(h).items[1], original[1]);
+  assert.equal(pageState(h).items[2], original[0]);
 });
 
-test("legacy refresh commits the exact response array object", async () => {
+test("legacy refresh commits a separate response array", async () => {
   for (const legacy of [[], [{ id: "open-session" }], [{ id: "first" }, { id: "open-session" }]]) {
     const h = harness();
     installResponse(h, legacy);
     await h.context.loadSessions();
-    assert.equal(pageState(h).items, legacy);
-    assert.equal(h.context.lastItems, legacy);
+    assert.notEqual(pageState(h).items, legacy);
+    assert.deepEqual(plain(pageState(h).items), plain(legacy.slice().reverse()));
+    assert.equal(h.context.lastItems, pageState(h).items);
   }
 });
 
-test("legacy refresh surfaces the native TypeError from reversing a frozen response", async () => {
+test("legacy refresh never calls the original response's reverse method", async () => {
   const h = harness(), legacy = [{ id: "first" }, { id: "open-session" }];
-  let failure;
-  Object.defineProperty(legacy, "reverse", { value() {
-    try { return Array.prototype.reverse.call(this); }
-    catch (error) { failure = { name: error.name, message: error.message }; throw error; }
-  } });
+  Object.defineProperty(legacy, "reverse", { value() { assert.fail("reverse must use the filtered copy"); } });
   Object.freeze(legacy);
   installResponse(h, legacy);
   await h.context.loadSessions();
-  assert.deepEqual(failure, { name: "TypeError",
-    message: "Cannot assign to read only property '0' of object '[object Array]'" });
-  assert.deepEqual(rendered(h).tail, ["sessions refresh failed: " + failure.message]);
+  assert.deepEqual(plain(pageState(h).items), [{ id: "open-session" }, { id: "first" }]);
+  assert.deepEqual(rendered(h).tail, []);
 });
 
-test("legacy refresh preserves the previous list and pager when the response is frozen", async () => {
-  const h = harness(), items = h.context.lastItems;
+test("legacy refresh accepts frozen responses and follows the selected newest session", async () => {
+  const h = harness();
   setPager(h, { total: 31, offset: 24, hasMore: true });
-  h.context.renderSessionList(items);
+  h.context.renderSessionList(h.context.lastItems);
   h.elements.sesslist.scrollTop = 87;
-  const before = rendered(h), selected = h.context.sessionId;
+  const selected = h.context.sessionId;
   const legacy = Object.freeze([{ id: "first", summary: "Oldest" }, { id: "open-session", summary: "Newest" }]);
   installResponse(h, legacy);
   await h.context.loadSessions();
-  const state = pageState(h);
-  assert.equal(state.items, items);
-  assert.equal(h.context.lastItems, items);
-  assert.equal(state.total, 31);
-  assert.equal(state.offset, 24);
-  assert.equal(state.hasMore, true);
-  assert.equal(state.loading, false);
+  assert.deepEqual(rendered(h).titles, ["Newest", "Oldest"]);
+  assert.equal(pageState(h).total, 2);
+  assert.equal(pageState(h).offset, 2);
+  assert.equal(pageState(h).hasMore, false);
+  assert.equal(pageState(h).loading, false);
   assert.equal(h.context.sessionId, selected);
+  assert.equal(rendered(h).scrollTop, 0);
   assert.deepEqual(plain(legacy), [{ id: "first", summary: "Oldest" }, { id: "open-session", summary: "Newest" }]);
-  assert.deepEqual(rendered(h), { ...before,
-    tail: ["sessions refresh failed: Cannot assign to read only property '0' of object '[object Array]'"] });
+  assert.deepEqual(rendered(h).tail, []);
 });
 
-test("legacy refresh retains the native order of indexed array writes", async () => {
+test("legacy refresh performs no indexed writes on the original response", async () => {
   const h = harness(), writes = [];
   const legacy = new Proxy([{ id: "first" }, { id: "second" }, { id: "middle" },
     { id: "fourth" }, { id: "open-session" }], { set(target, key, value, receiver) {
@@ -366,14 +372,15 @@ test("legacy refresh retains the native order of indexed array writes", async ()
   } });
   installResponse(h, legacy);
   await h.context.loadSessions();
-  assert.deepEqual(writes, [["0", "open-session"], ["4", "first"], ["1", "fourth"], ["3", "second"]]);
-  assert.equal(pageState(h).items, legacy);
+  assert.deepEqual(writes, []);
+  assert.notEqual(pageState(h).items, legacy);
+  assert.deepEqual(plain(pageState(h).items), plain(legacy.slice().reverse()));
 });
 
 test("malformed legacy full responses normalize to an empty committed list", async () => {
   for (const legacy of [null, undefined, {}, "bad", false, 7]) {
     const h = harness();
-    h.context.api = async (url) => ({ json: async () => url === "/sessions" ? legacy : [] });
+    h.context.api = async (url) => ({ json: async () => url === "/sessions?archived=exclude" ? legacy : [] });
     await h.context.loadSessions();
     assert.deepEqual(plain(pageState(h).items), []);
     assert.equal(pageState(h).total, 0);
@@ -388,7 +395,7 @@ test("failed bounded or legacy refresh preserves the last good list and pager", 
     const h = harness(), before = h.context.lastItems;
     setPager(h, { total: 31, offset: 24, hasMore: true });
     h.context.api = async (url) => ({
-      json: async () => { if (stage === "body" || stage === "legacy" && url === "/sessions") throw new Error(stage + " failure"); return []; },
+      json: async () => { if (stage === "body" || stage === "legacy" && url === "/sessions?archived=exclude") throw new Error(stage + " failure"); return []; },
       headers: { get() { if (stage === "headers") throw new Error(stage + " failure"); return null; } },
     });
     await h.context.loadSessions();
@@ -421,14 +428,15 @@ test("older-page merge keeps loaded records first and retains duplicates within 
   assert.equal(older.length, 5);
 });
 
-test("an all-known older page advances pagination without rerendering or replacing the list", async () => {
+test("an all-known older page updates the rendered pager without replacing the list", async () => {
   const h = harness(), items = h.context.lastItems, row = h.elements.sesslist.children[0];
   setPager(h, { total: 40, offset: 12, hasMore: true });
   h.elements.sesslist.scrollTop = 77;
   installResponse(h, items, { "x-sessions-total": "40", "x-sessions-page-size": "12" });
   await h.context.loadOlderSessions();
   assert.equal(h.context.lastItems, items);
-  assert.equal(h.elements.sesslist.children[0], row);
+  assert.notEqual(h.elements.sesslist.children[0], row);
+  assert.equal(h.elements.sesslist.querySelector(".session-more").textContent, "Load more sessions");
   assert.equal(h.elements.sesslist.scrollTop, 77);
   assert.equal(pageState(h).offset, 24);
   assert.equal(pageState(h).hasMore, true);

@@ -8834,11 +8834,13 @@ async function loadSessionGroups() {
   }
 }
 function sessionGroupCollapseKey(id) {
-  return JSON.stringify([store.base, id]);
+  return JSON.stringify([store.base, id, sessionMarkedFilter(), sessionArchiveFilter()]);
 }
 function sessionGroupIsCollapsed(id, items, waiting) {
   const saved = sessionGroupCollapsed[sessionGroupCollapseKey(id)];
-  return typeof saved === "boolean" ? saved : !items.some((item) => item.id === sessionId) && !waiting;
+  if (typeof saved === "boolean") return saved;
+  if (items.length && (sessionMarkedFilter() || sessionArchiveFilter() === "only")) return false;
+  return !items.some((item) => item.id === sessionId) && !waiting;
 }
 function paintSessionGroupActivity() {
   for (const [id, header] of sessionGroupHeaders) {
