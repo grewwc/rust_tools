@@ -435,3 +435,25 @@ test("the desktop rail follows canonical side-note rows when a full window advan
   await newest.children[0].dispatch("click");
   assert.ok(h.elements.msgs.querySelectorAll(".user-msg-row").includes(h.scrolls.at(-1).node));
 });
+
+test("a prompt rail click reaches the row mounted after a transcript rebuild", async () => {
+  const messages = Array.from({ length: 6 }, (_, i) => user("question " + i));
+  const h = harness({ phone: false, messages });
+  await h.context.loadHistory();
+  h.context.syncPromptNav();
+  const last = h.elements.promptlist.children.at(-1);
+  // A history refresh replaces the mounted rows synchronously; the rail still
+  // points at the old nodes until its animation-frame rebuild.
+  h.elements.msgs.textContent = "";
+  const row = h.document.createElement("div");
+  row.className = "user-msg-row";
+  const bubble = h.document.createElement("div");
+  bubble.className = "msg user";
+  bubble.dataset.question = "question 5";
+  bubble.dataset.historyIndex = "5";
+  bubble.textContent = "question 5";
+  row.appendChild(bubble);
+  h.elements.msgs.appendChild(row);
+  await last.children[0].dispatch("click");
+  assert.equal(h.scrolls.at(-1).node, row);
+});
