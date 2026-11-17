@@ -14,5 +14,6 @@ mod ipc;
 mod primitives;
 mod process;
 mod scheduler;
+mod scheduler_equivalence;
 mod shm;
 mod vfs;

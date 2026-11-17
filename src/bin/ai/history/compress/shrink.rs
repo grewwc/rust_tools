@@ -1,5 +1,5 @@
 //! History shrink ladder: tool-group folding, removable-message batching,
-//! summary-driven shrinking, and leading-summary handling.
+//! and summary-driven shrinking.
 
 use super::*;
 
@@ -943,13 +943,4 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
         ContextCompressionStatus::Complete
     };
     finish(messages, evidence_window_failure.unwrap_or(status))
-}
-
-#[allow(dead_code)]
-pub(in crate::ai) fn take_leading_summary(messages: &mut Vec<Message>) -> Option<Message> {
-    if messages.first().map(is_summary_message).unwrap_or(false) {
-        Some(messages.remove(0))
-    } else {
-        None
-    }
 }

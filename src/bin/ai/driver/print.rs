@@ -16,14 +16,6 @@ pub(crate) fn print_line(line: &str) {
     crate::ai::stream::side_note_input::print_output_line(line);
 }
 
-pub fn print_assistant_banner() {
-    print_assistant_banner_with_app(None);
-}
-
-pub fn print_assistant_banner_with_app(app: Option<&App>) {
-    print_assistant_banner_with_app_and_skill(app, None);
-}
-
 /// By default the assistant role label line is not printed; it is only kept visible once a skill has been confirmed active.
 pub fn print_assistant_banner_with_app_and_skill(app: Option<&App>, skill_name: Option<&str>) {
     let Some(skill_name) = skill_name else {
@@ -36,17 +28,6 @@ pub fn print_assistant_banner_with_app_and_skill(app: Option<&App>, skill_name: 
         app.map(|a| a.current_agent.as_str()),
         Some(skill_name),
     ));
-}
-
-/// The terminal no longer prints tool output content, only tool call status lines.
-/// Tool results are still written to messages for the model; agent behavior is unaffected.
-pub fn print_tool_output_block(_content: &str) {}
-
-pub fn print_tool_output_line(line: &str) {
-    if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
-        return;
-    }
-    print_line(&format_tool_output_line(line));
 }
 
 pub fn print_tool_note_line(label: &str, value: &str) {
@@ -144,7 +125,10 @@ pub(in crate::ai) fn format_assistant_banner(
     };
     let mut out = format!("{BOLD}{}assistant{RESET}", theme::current().accent_success);
     if let Some(detail) = detail.as_deref() {
-        out.push_str(&format!(" {}· {detail}{RESET}", theme::current().accent_muted));
+        out.push_str(&format!(
+            " {}· {detail}{RESET}",
+            theme::current().accent_muted
+        ));
     }
     out
 }
@@ -254,7 +238,11 @@ fn format_tool_output_line_with_dim(line: &str, dim: bool) -> String {
         };
         format!(
             "  {}│{} {}{}{}",
-            theme::current().accent_rule, RESET, body_style, sanitized, RESET
+            theme::current().accent_rule,
+            RESET,
+            body_style,
+            sanitized,
+            RESET
         )
     }
 }
@@ -410,8 +398,7 @@ fn format_tool_output_block_with_formatter(
 /// `ToolDisplayConfig`; unregistered tools print no target. Callers need not know
 /// specific tool names or argument shapes.
 pub(in crate::ai) fn format_tool_status_target(tool_name: &str, args_json: &str) -> Option<String> {
-    let target =
-        crate::ai::tools::registry::common::tool_display_config(tool_name).status_target?;
+    let target = crate::ai::tools::registry::common::tool_display_config(tool_name).status_target?;
     let args: serde_json::Value = serde_json::from_str(args_json.trim()).ok()?;
     target(&args)
 }
@@ -588,11 +575,10 @@ pub fn print_mcp_tools(report: &McpInitReport, mcp_client: &McpClient) {
 mod tests {
     use super::{
         format_assistant_banner, format_emphasized_tool_output_block, format_empty_state,
-        format_tool_status_target,
         format_ocr_summary_block, format_section_header, format_section_item, format_section_note,
         format_skill_activation_note, format_tool_command_line, format_tool_header,
         format_tool_output_block, format_tool_output_line, format_tool_output_prefix,
-        format_tool_status_completed, format_tool_status_with_command,
+        format_tool_status_completed, format_tool_status_target, format_tool_status_with_command,
         format_tool_status_with_file_target, sanitize_for_terminal,
     };
     use crate::ai::driver::model::{OcrExtraction, OcrImageSummary};

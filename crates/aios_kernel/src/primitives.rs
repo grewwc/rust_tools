@@ -24,7 +24,7 @@
 // =============================================================================
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use crate::types::FastMap;
 
@@ -288,10 +288,6 @@ macro_rules! trace_fields {
         __m
     }};
 }
-
-// Make Ordering available in implementations (in case a use site forgets the import)
-#[allow(dead_code)]
-pub(super) const FUTEX_ORDER: Ordering = Ordering::SeqCst;
 
 // --------------------------------------------------------------------------
 // ResourceLimit / ResourceUsage — cgroup-like resource quotas

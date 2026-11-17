@@ -4,16 +4,16 @@
 
 use super::*;
 
-#[path = "prefix_reuse.rs"]
-mod prefix_reuse;
 #[path = "prefix_cert.rs"]
 mod prefix_cert;
-pub(in crate::ai) use prefix_cert::{
-    PrefixCertificatePolicy, prefix_certificate_json_from_cache, try_reuse_certificate_json,
-};
+#[path = "prefix_reuse.rs"]
+mod prefix_reuse;
 #[cfg(test)]
 pub(in crate::ai) use prefix_cert::{
     PROOF_VERSION, PrefixCertificate, prefix_certificate_from_cache, validate_certificate_json,
+};
+pub(in crate::ai) use prefix_cert::{
+    PrefixCertificatePolicy, prefix_certificate_json_from_cache, try_reuse_certificate_json,
 };
 #[cfg(test)]
 #[path = "prefix_cert_tests.rs"]
@@ -271,8 +271,6 @@ pub(in crate::ai) fn is_compressed_tool_evidence_note(m: &Message) -> bool {
             .trim_start()
             .contains(COMPRESSED_TOOL_EVIDENCE_MARKER)
 }
-
-pub(in crate::ai) const PERSISTED_HISTORY_SUMMARY_MAX_CHARS: usize = 8_000;
 
 pub(in crate::ai) const INTERNAL_NOTE_OVERFLOW_DIR: &str = "internal-note-overflow";
 
@@ -995,77 +993,6 @@ pub(in crate::ai) fn is_summary_or_archive_note(m: &Message) -> bool {
 
 pub(in crate::ai) fn is_archive_note_message(m: &Message) -> bool {
     is_system_like_role(&m.role) && is_archive_note_text(&value_to_string(&m.content))
-}
-
-pub(in crate::ai) fn compact_persisted_history(messages: Vec<Message>) -> Vec<Message> {
-    // This legacy entry point has no authoritative archive sink. Preserve its
-    // input instead of replacing recoverable history with an unbound summary.
-    // Production compaction uses the app-aware or sink-aware entry points.
-    sanitize_persisted_history_messages(messages)
-}
-
-pub(in crate::ai) async fn compact_persisted_history_with_app(
-    app: &App,
-    messages: Vec<Message>,
-) -> Vec<Message> {
-    compact_persisted_history_with_app_inner(app, messages, MAX_HISTORY_TURNS).await
-}
-
-/// Proactive compaction triggered by a task boundary (a turn ended with no
-/// further tool calls, meaning the agent gave its final answer). The threshold is
-/// lowered from `MAX_HISTORY_TURNS` (200) to `PERSISTED_HISTORY_KEEP_RECENT_TURNS`
-/// (160), so the natural "task done" boundary triggers summarization earlier
-/// instead of passively switching only when the hard cap is hit. Conversations
-/// below 160 turns are still never summarized, so short sessions are unaffected.
-pub(in crate::ai) async fn compact_persisted_history_at_boundary_with_app(
-    app: &App,
-    messages: Vec<Message>,
-) -> Vec<Message> {
-    compact_persisted_history_with_app_inner(app, messages, PERSISTED_HISTORY_KEEP_RECENT_TURNS)
-        .await
-}
-
-async fn compact_persisted_history_with_app_inner(
-    app: &App,
-    messages: Vec<Message>,
-    threshold_turns: usize,
-) -> Vec<Message> {
-    let messages = sanitize_persisted_history_messages(messages);
-    let user_turns = user_input_turn_count(&messages);
-    if user_turns <= threshold_turns {
-        return messages;
-    }
-
-    let keep_recent_turns = PERSISTED_HISTORY_KEEP_RECENT_TURNS.min(MAX_HISTORY_TURNS - 1);
-    let split_at = retained_turn_start(&messages, keep_recent_turns);
-    if split_at == 0 || split_at >= messages.len() {
-        return messages;
-    }
-
-    let overflow_dir = crate::ai::history::SessionStore::new(app.config.history_file.as_path())
-        .session_assets_dir(&app.session_id);
-    let Some(plan) = plan_incremental_summary_with_app(
-        app,
-        &messages[..split_at],
-        PERSISTED_HISTORY_SUMMARY_MAX_CHARS,
-        Some(overflow_dir.as_path()),
-    )
-    .await
-    else {
-        return messages;
-    };
-    if !plan.commit() {
-        return messages;
-    }
-    let mut messages = messages;
-    let recent = messages.split_off(split_at);
-    let mut out: Vec<Message> = messages
-        .into_iter()
-        .filter(|message| is_system_like_role(&message.role) || is_side_note_message(message))
-        .collect();
-    out.push(plan.message().clone());
-    out.extend(recent);
-    out
 }
 
 #[cfg(test)]

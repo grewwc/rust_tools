@@ -109,10 +109,6 @@ impl Syscall for LocalOS {
         }
         self.ensure_child_scope(current, target_pid)?;
 
-        if !self.processes.contains_key(&target_pid) {
-            return Err(format!("Target process {} does not exist.", target_pid));
-        }
-
         if let Some(target_proc) = self.processes.get(&target_pid) {
             if target_proc.state == ProcessState::Terminated {
                 let result = target_proc.result.clone().unwrap_or_default();
@@ -151,8 +147,9 @@ impl Syscall for LocalOS {
         self.require_capability(current, |caps| caps.wait, "wait on events")?;
 
         let mut deduped = Vec::new();
+        let mut seen = FastSet::<EventId>::default();
         for event_id in event_ids {
-            if !deduped.iter().any(|existing| existing == &event_id) {
+            if seen.insert(event_id) {
                 deduped.push(event_id);
             }
         }
@@ -390,9 +387,6 @@ impl Syscall for LocalOS {
         self.require_capability(current, |caps| caps.signal, "send signal")?;
         self.ensure_child_scope(current, target_pid)?;
 
-        if !self.processes.contains_key(&target_pid) {
-            return Err(format!("Target process {} does not exist.", target_pid));
-        }
         if matches!(
             self.processes.get(&target_pid).map(|p| &p.state),
             Some(ProcessState::Terminated)

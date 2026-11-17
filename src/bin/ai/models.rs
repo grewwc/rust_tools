@@ -55,7 +55,9 @@ pub(super) fn explicit_prompt_cache_enabled(model: &str) -> bool {
 
 /// Whether Responses requests for `model` carry a session-scoped `prompt_cache_key`.
 pub(super) fn prompt_cache_key_enabled(model: &str) -> bool {
-    model_def(model).map(|m| m.prompt_cache_key).unwrap_or(false)
+    model_def(model)
+        .map(|m| m.prompt_cache_key)
+        .unwrap_or(false)
 }
 
 pub(super) fn enable_thinking(model: &str) -> bool {
@@ -424,12 +426,6 @@ pub(super) fn ensure_models_available() -> Result<(), String> {
 
 pub(super) fn default_vl_model() -> String {
     choose_default_model_name(true).unwrap_or_else(default_model)
-}
-
-pub(super) fn forced_deepseek_model() -> String {
-    model_names::find_by_key("DEEPSEEK_V3")
-        .map(model_handle)
-        .unwrap_or_else(default_model)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

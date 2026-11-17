@@ -386,6 +386,16 @@ impl LocalOS {
         }
 
         let priority = self.process_priority(pid);
+        // Cached priorities are nondecreasing, including tombstones. If the tail fits,
+        // the original search would append, preserving FIFO for equal priorities.
+        if self
+            .ready_queue
+            .back()
+            .is_none_or(|(_, queued_priority)| *queued_priority <= priority)
+        {
+            self.ready_queue.push_back((pid, priority));
+            return;
+        }
         // The priority insertion-point search now reads the cached priority from the tuple instead of
         // querying the processes table. This takes batch wakeup / spawn from O(n^2) to O(n*k) (k =
         // queue length after that priority). Sequence tombstones add no extra cost during comparison.

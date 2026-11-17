@@ -5,9 +5,9 @@ use serde_json::Value;
 use crate::ai::types::App;
 
 use super::types::{
-    MAX_HISTORY_TURNS, Message, ROLE_INTERNAL_NOTE, is_internal_note_role,
-    is_runtime_synthetic_user_message, is_side_note_message, is_system_like_role,
-    last_real_user_index, retained_turn_start, user_input_turn_count,
+    Message, ROLE_INTERNAL_NOTE, is_internal_note_role, is_runtime_synthetic_user_message,
+    is_side_note_message, is_system_like_role, last_real_user_index, retained_turn_start,
+    user_input_turn_count,
 };
 
 // Stage timing is enabled only by the ignored CPU profile test on its thread.
@@ -28,8 +28,7 @@ pub(in crate::ai) mod summary_input;
 pub(in crate::ai) use incremental::SOURCE_DIR;
 pub(in crate::ai) use incremental::is_incremental_summary;
 use incremental::{
-    INCREMENTAL_SUMMARY_PREFIX, plan_incremental_summary_with_app,
-    plan_incremental_summary_without_app, summary_delta_messages,
+    INCREMENTAL_SUMMARY_PREFIX, plan_incremental_summary_without_app, summary_delta_messages,
 };
 mod folded_prune;
 pub(crate) mod llm_prune;

@@ -1231,11 +1231,6 @@ fn load_agents_from_dir_with_level(dir: &Path, level: DiscoveryLevel) -> Vec<Age
     out
 }
 
-/// Legacy wrapper for backward compatibility.
-fn load_agents_from_dir(dir: &Path) -> Vec<AgentManifest> {
-    load_agents_from_dir_with_level(dir, DiscoveryLevel::User)
-}
-
 #[cfg(test)]
 #[path = "agents_tests.rs"]
 mod tests;

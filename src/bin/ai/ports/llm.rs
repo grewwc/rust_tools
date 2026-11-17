@@ -61,8 +61,7 @@ impl LlmClient for DefaultLlmClient {
         Box::pin(async move {
             let model = req.model.clone();
             let raw = if req.tools_enabled {
-                crate::ai::request::do_request_messages(app, &model, req.messages, req.stream)
-                    .await
+                crate::ai::request::do_request_messages(app, &model, req.messages, req.stream).await
             } else {
                 crate::ai::request::do_request_messages_without_tools(
                     app,
@@ -122,13 +121,4 @@ impl<C: LlmClient> LlmClient for LoggingLlmClient<C> {
             res
         })
     }
-}
-
-/// Convenience constructor: returns the default `LlmClient` (`DefaultLlmClient`) so the
-/// driver can plug in with one line.
-///
-/// Keeps zero behavior change: the default chain still uses `DefaultLlmClient`; when
-/// middleware is needed, wrap via `middleware::request::build_llm_client_chain`.
-pub(crate) fn default_llm_client() -> Box<dyn LlmClient> {
-    Box::new(DefaultLlmClient)
 }

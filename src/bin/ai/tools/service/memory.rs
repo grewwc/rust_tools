@@ -141,39 +141,6 @@ fn parse_string_array(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn render_memory_entries(entries: &[AgentMemoryEntry]) -> String {
-    if entries.is_empty() {
-        return "No memory entries found.".to_string();
-    }
-    let mut output = String::new();
-    for (idx, entry) in entries.iter().enumerate() {
-        if idx > 0 {
-            output.push('\n');
-        }
-        output.push_str(&format!(
-            "{}. [{}] {}\n{}",
-            idx + 1,
-            entry.timestamp,
-            entry.category,
-            entry.note
-        ));
-        if let Some(id) = &entry.id
-            && !id.trim().is_empty()
-        {
-            output.push_str(&format!("\nID: {}", id));
-        }
-        if !entry.tags.is_empty() {
-            output.push_str(&format!("\nTags: {}", entry.tags.join(", ")));
-        }
-        if let Some(source) = &entry.source
-            && !source.trim().is_empty()
-        {
-            output.push_str(&format!("\nSource: {}", source));
-        }
-    }
-    output
-}
-
 pub(crate) fn next_memory_id() -> String {
     format!("mem_{}", Uuid::new_v4().simple())
 }
@@ -412,158 +379,6 @@ fn write_memory_entries(
     Ok(())
 }
 
-pub(crate) fn execute_memory_append(args: &Value) -> Result<String, String> {
-    let note = args["note"].as_str().ok_or("Missing note")?.trim();
-    if note.is_empty() {
-        return Err("note is empty".to_string());
-    }
-    let category = normalized_category(args["category"].as_str(), "general");
-    let tags = parse_string_array(&args["tags"]);
-    let source = args["source"]
-        .as_str()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let priority = parse_priority_arg(args, "priority")?
-        .or_else(|| Some(default_priority_for_category(&category)));
-    let (owner_pid, owner_pgid) = current_owner_tags();
-    let entry = AgentMemoryEntry {
-        id: Some(next_memory_id()),
-        timestamp: Local::now().to_rfc3339(),
-        category,
-        note: note.to_string(),
-        tags,
-        source,
-        distilled: None,
-        priority,
-        owner_pid,
-        owner_pgid,
-        image_path: None,
-        model: current_write_model(),
-    };
-
-    let store = MemoryStore::from_env_or_config();
-    store.append(&entry)?;
-    Ok(format!(
-        "Memory appended: {} (id: {})",
-        store.path().display(),
-        entry.id.as_deref().unwrap_or("")
-    ))
-}
-
-pub(crate) fn execute_memory_search(args: &Value) -> Result<String, String> {
-    let query = args["query"].as_str().ok_or("Missing query")?.trim();
-    if query.is_empty() {
-        return Err("query is empty".to_string());
-    }
-    let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 50) as usize;
-    let category_filter = args["category"].as_str().map(|s| s.trim().to_lowercase());
-    let tags_any = parse_string_array(&args["tags_any"])
-        .into_iter()
-        .map(|s| s.to_lowercase())
-        .collect::<Vec<_>>();
-    let tags_all = parse_string_array(&args["tags_all"])
-        .into_iter()
-        .map(|s| s.to_lowercase())
-        .collect::<Vec<_>>();
-    let source_sub = args["source_substring"]
-        .as_str()
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty());
-    let debug_score = args["debug_score"].as_bool().unwrap_or(false);
-    let store = MemoryStore::from_env_or_config();
-    let results = store.search(query, 10_000)?;
-    let viewer = ViewerContext::current();
-
-    let mut scored = Vec::with_capacity(results.len());
-    for (e, _search_score) in results {
-        if !viewer.can_see(&e) {
-            continue;
-        }
-        if let Some(cat) = category_filter.as_ref() {
-            if e.category.to_lowercase() != *cat {
-                continue;
-            }
-        }
-        if !tags_any.is_empty()
-            && !e
-                .tags
-                .iter()
-                .any(|t| tags_any.iter().any(|x| t.to_lowercase() == *x))
-        {
-            continue;
-        }
-        if !tags_all.is_empty()
-            && !tags_all
-                .iter()
-                .all(|x| e.tags.iter().any(|t| t.to_lowercase() == *x))
-        {
-            continue;
-        }
-        if let Some(sub) = source_sub.as_ref() {
-            if !e
-                .source
-                .as_ref()
-                .map(|s| s.to_lowercase().contains(sub))
-                .unwrap_or(false)
-            {
-                continue;
-            }
-        }
-        let mut score = 0.0_f64;
-        let qlc = query.to_lowercase();
-        if e.note.to_lowercase().contains(&qlc) {
-            score += 3.0;
-            score += (qlc.len() as f64).min(20.0) * 0.05;
-        }
-        if e.category.to_lowercase().contains(&qlc) {
-            score += 1.5;
-        }
-        if e.tags.iter().any(|t| t.to_lowercase().contains(&qlc)) {
-            score += 1.2;
-        }
-        if e.source
-            .as_ref()
-            .map(|s| s.to_lowercase().contains(&qlc))
-            .unwrap_or(false)
-        {
-            score += 0.8;
-        }
-        let recency_bonus = parse_rfc3339_ts(&e.timestamp)
-            .map(|ts| {
-                let age_secs = (Utc::now() - ts).num_seconds().max(0) as f64;
-                if age_secs <= 7.0 * 86400.0 {
-                    1.0
-                } else if age_secs <= 30.0 * 86400.0 {
-                    0.3
-                } else {
-                    0.0
-                }
-            })
-            .unwrap_or(0.0);
-        score += recency_bonus;
-        scored.push((score, e));
-    }
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-    let mut top_scored = scored;
-    top_scored.truncate(limit);
-    let top: Vec<AgentMemoryEntry> = top_scored.iter().map(|(_, e)| e.clone()).collect();
-    let mut out = render_memory_entries(&top);
-    if debug_score {
-        out.push_str("\n");
-        out.push_str("--- scores ---\n");
-        for (idx, (s, e)) in top_scored.iter().enumerate() {
-            out.push_str(&format!(
-                "{}. score={:.2} [{}] {}\n",
-                idx + 1,
-                s,
-                e.category,
-                e.note
-            ));
-        }
-    }
-    Ok(out)
-}
-
 /// A scored memo search result.
 pub(crate) struct ScoredMemo {
     pub entry: AgentMemoryEntry,
@@ -664,16 +479,6 @@ pub(crate) fn search_memo_candidates_scored(
     Ok(scored)
 }
 
-pub(crate) fn execute_memory_recent(args: &Value) -> Result<String, String> {
-    let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 50) as usize;
-    let store = MemoryStore::from_env_or_config();
-    let entries = store.recent(limit)?;
-    let viewer = ViewerContext::current();
-    let visible: Vec<AgentMemoryEntry> =
-        entries.into_iter().filter(|e| viewer.can_see(e)).collect();
-    Ok(render_memory_entries(&visible))
-}
-
 pub(crate) fn execute_memory_list_json(args: &Value) -> Result<String, String> {
     let limit = args["limit"].as_u64().unwrap_or(50).clamp(1, 200) as usize;
     let offset = args["offset"].as_u64().unwrap_or(0) as usize;
@@ -688,32 +493,6 @@ pub(crate) fn execute_memory_list_json(args: &Value) -> Result<String, String> {
         visible.into_iter().skip(offset).collect::<Vec<_>>()
     };
     serde_json::to_string(&sliced).map_err(|e| format!("{}", e))
-}
-
-pub(crate) fn execute_memory_rotate(args: &Value) -> Result<String, String> {
-    let max_bytes = args["max_bytes"].as_u64().ok_or("Missing max_bytes")? as u64;
-    let store = MemoryStore::from_env_or_config();
-    let path = store.path().to_path_buf();
-    super::super::storage::with_memory_file_lock(&path, || {
-        let meta = std::fs::metadata(&path).ok();
-        if let Some(meta) = meta {
-            if meta.len() > max_bytes {
-                let ts = Local::now().format("%Y%m%d%H%M%S").to_string();
-                let mut new_name = path.clone();
-                new_name.set_extension(format!("jsonl.{}", ts));
-                std::fs::rename(&path, &new_name)
-                    .map_err(|e| format!("Failed to rotate file: {}", e))?;
-                std::fs::File::create(&path)
-                    .map_err(|e| format!("Failed to create new memory file: {}", e))?;
-                return Ok(format!(
-                    "Rotated: {} -> {}",
-                    path.display(),
-                    new_name.display()
-                ));
-            }
-        }
-        Ok("Rotate skipped: size within limit".to_string())
-    })
 }
 
 pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {

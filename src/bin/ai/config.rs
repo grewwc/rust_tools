@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 
 use crate::ai::config_schema::AiConfig;
 use crate::commonw::{configw, utils::expanduser};
@@ -179,11 +179,6 @@ pub(super) fn pure_startup_default(cfg: &configw::ConfigW) -> bool {
 /// configuration.
 pub(super) fn pure_startup_default_enabled() -> bool {
     pure_startup_default(&configw::get_all_config())
-}
-
-#[allow(dead_code)]
-pub(super) fn clear_history_file(path: &PathBuf) {
-    let _ = fs::remove_file(path);
 }
 
 #[cfg(test)]

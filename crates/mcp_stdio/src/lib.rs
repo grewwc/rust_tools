@@ -49,10 +49,10 @@ pub fn text_content(text: impl Into<String>) -> Value {
 /// split) and append a hint line when the input was cut. The hint wording stays
 /// domain-neutral so every server (browser, spreadsheet, ...) can reuse it.
 pub fn cap_text(s: &str) -> String {
-    if s.chars().count() <= CAP_CHARS {
+    let Some((end, _)) = s.char_indices().nth(CAP_CHARS) else {
         return s.to_string();
-    }
-    let truncated: String = s.chars().take(CAP_CHARS).collect();
+    };
+    let truncated = &s[..end];
     format!(
         "{truncated}\n\n[... truncated: output exceeded {CAP_CHARS} chars; narrow the request (smaller selector/range) or write the full result to a file instead ...]"
     )
