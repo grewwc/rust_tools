@@ -2002,14 +2002,19 @@ const executionModel = (() => {
       state.activities.clear(); summarize(state);
     } else if (event.kind === "live") {
       if (event.entry) { invalidateIdleSample(state); clearRemote(state); server.liveTurns.set(sid, event.entry); }
-      else server.liveTurns.delete(sid);
+      else if (server.liveTurns.delete(sid)) invalidateIdleSample(state);
+    } else if (event.kind === "accepted") {
+      // Headers bind this POST to an accepted turn; earlier polls described
+      // the pre-acceptance state, even though the page already had a live entry.
+      if (event.entry && server.liveTurns.get(sid) === event.entry) invalidateIdleSample(state);
     } else if (event.kind === "remote") {
       if (event.active && !state.running && !server.liveTurns.has(sid)) {
         invalidateIdleSample(state);
         state.remoteActive = true; state.remotePid = event.pid || ""; state.remoteAt = event.at;
       } else clearRemote(state);
     } else if (event.kind === "idle") {
-      if (event.generation === state.sampleGeneration && !state.running && !state.remoteActive && !state.remotePid) {
+      if (event.generation === state.sampleGeneration && !server.liveTurns.has(sid)
+          && !state.running && !state.remoteActive && !state.remotePid) {
         state.idleSample = { generation: event.generation, at: event.at };
       }
     } else if (event.kind === "select") {
@@ -12150,6 +12155,7 @@ async function send() {
       try { detail = (await res.json()).error || detail; } catch (_) {}
       throw new Error(res.status + " " + detail);
     }
+    updateExecutionModel({ kind: "accepted", entry: liveEntry }, sid, sendBase);
     consumeSkillPick(skillSelection); // Accepted by the server, not model completion.
     if (typeof refreshSessionActivity === "function") refreshSessionActivity(sid, sendBase);
     // END turn HTTP acceptance

@@ -67,6 +67,74 @@ for (const phone of [false, true]) for (const sample of ["positive", "previous-t
   });
 }
 
+for (const phone of [false, true]) for (const sample of [
+  "idle while POST pending",
+  "pending POST poll delivered after acceptance",
+  "idle during accepted stream",
+  "live poll delivered after cleanup",
+]) test(`parked turn rejects ${sample} (phone=${phone})`, async () => {
+  const h = sendHarness({ phone }), c = h.c;
+  loadConfirm(c);
+  const idle = { running: false, remote: null, pending: null, turn: 0 };
+  const api = c.api;
+  let respond;
+  const delayed = sample.includes("delivered");
+  c.api = (path, ...args) => path.endsWith("/confirm")
+    ? Promise.resolve({ json: () => delayed
+      ? new Promise((resolve) => { respond = resolve; }) : Promise.resolve(idle) })
+    : api(path, ...args);
+  await h.start();
+  if (sample === "idle during accepted stream" || sample === "live poll delivered after cleanup") await h.accept();
+  const pending = c.pollConfirm();
+  await settle();
+  if (!delayed) {
+    assert.equal(await pending, false);
+    assert.equal(c.executionState().idleSample, null, "a live owner cannot supply durable idle evidence");
+  }
+  if (sample === "idle while POST pending" || sample === "pending POST poll delivered after acceptance") await h.accept();
+  if (sample === "pending POST poll delivered after acceptance") {
+    respond(idle);
+    assert.equal(await pending, null, "HTTP acceptance retires queries made before the turn was accepted");
+    assert.equal(c.executionState().idleSample, null);
+  }
+  await h.frame("subagent_progress", structuredSubagents([structuredTask("parked-worker", 5000)]));
+  await h.finish(() => { h.reader.frame('event: done\ndata: {}\n\n'); h.reader.eof(); });
+  if (sample === "live poll delivered after cleanup") {
+    respond(idle);
+    assert.equal(await pending, null, "a poll from the retired live owner cannot settle its parked tasks");
+  }
+  assert.equal(c.executionState().idleSample, null);
+  assert.equal(c.displayedExecutionState().taskStates.get("parked-worker"), true);
+  assert.equal(c.canStop(), true);
+  assert.equal(c.canSend(), false);
+  assert.equal(h.elements.send.textContent, "⏹");
+
+  // A new idle query after cleanup can still retire the stale displayed task.
+  c.api = (path, ...args) => path.endsWith("/confirm")
+    ? Promise.resolve({ json: async () => idle }) : api(path, ...args);
+  assert.equal(await c.pollConfirm(), false);
+  assert.ok(c.executionState().idleSample);
+  assert.equal(c.canStop(), false);
+  assert.equal(c.canSend(), true);
+  assert.equal(h.elements.send.textContent, "➤");
+  assert.equal(c.displayedExecutionState().taskStates.get("parked-worker"), true);
+  await h.dispose();
+});
+
+test("HTTP acceptance for a replaced live entry cannot retire its replacement's samples", async () => {
+  const h = sendHarness(), c = h.c;
+  await h.start();
+  const original = h.entry();
+  c.updateExecutionModel({ kind: "live", entry: { box: c.document.createElement("div") } });
+  const generation = c.executionState().sampleGeneration;
+  c.updateExecutionModel({ kind: "accepted", entry: original });
+  assert.equal(c.executionState().sampleGeneration, generation);
+  await h.accept();
+  assert.equal(c.executionState().sampleGeneration, generation, "the late POST belongs to the replaced entry");
+  await h.finish(() => { h.reader.frame('event: done\ndata: {}\n\n'); h.reader.eof(); });
+  await h.dispose();
+});
+
 for (const event of [
   { kind: "begin" },
   { kind: "select" },
