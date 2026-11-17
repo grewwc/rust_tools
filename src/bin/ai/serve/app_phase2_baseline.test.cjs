@@ -852,7 +852,15 @@ for (const navigation of ["session ABA", "server ABA"]) {
         pending: { id: 7, prompt: "Confirm navigation question", token: "navigation-question", input: false } });
       {
         assert.equal(await pending, running);
-        if (!running) assert.equal(JSON.stringify(c.executionState()), before);
+        if (!running) {
+          // An idle sample advances the server-sample clock; it must not change
+          // turn identity or lifecycle.
+          const after = JSON.parse(JSON.stringify(c.executionState()));
+          const expected = JSON.parse(before);
+          after.runningAt = expected.runningAt;
+          assert.deepEqual(after, expected);
+          assert.ok(c.executionState().runningAt > 0);
+        }
         else assert.equal(c.turnRunningPid, 42);
         assert.equal(c.turnRunning, running);
         assert.equal(attached, Number(running));

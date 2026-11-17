@@ -560,6 +560,17 @@ pub(in crate::ai) fn choose_larger_mutable_field(
 
 pub(in crate::ai) const CONTEXT_OVERFLOW_TRUNCATED_PREFIX: &str = "[context-overflow-truncated]";
 
+pub(super) const MIN_CONTENT_PREVIEW_CHARS: usize = 32;
+
+pub(super) fn content_truncation_prefix(path: Option<&str>) -> String {
+    match path {
+        Some(path) => format!(
+            "{CONTEXT_OVERFLOW_TRUNCATED_PREFIX} full original archived at: {path}\nhead+tail preview:\n"
+        ),
+        None => format!("{CONTEXT_OVERFLOW_TRUNCATED_PREFIX} head+tail preview:\n"),
+    }
+}
+
 pub(in crate::ai) const CONTEXT_OVERFLOW_UNARCHIVED_POINTER: &str = "[context-overflow-truncated] full original was not archived; inline preview omitted to meet context budget.";
 
 /// Whether text already has the overflow-truncated marker.
@@ -752,7 +763,7 @@ fn truncate_mutable_field_with_policy(
             .into_owned()
     });
     match field {
-        MutableMessageField::Content => {
+        MutableMessageField::Content | MutableMessageField::FileReferenceText(_) => {
             if is_preserved_tool_overflow_content(&message.content)
                 || !mutable_content_can_truncate(
                     message,
@@ -762,7 +773,9 @@ fn truncate_mutable_field_with_policy(
             {
                 return FieldTruncateOutcome::NoProgress;
             }
-            let text = value_to_string(&message.content);
+            let Some(text) = field.original_text(message) else {
+                return FieldTruncateOutcome::NoProgress;
+            };
             let original_chars = text.chars().count();
             let target = original_chars.saturating_sub(reduce_by).max(160);
             let task_review_lines = if message.role == "tool" {
@@ -788,7 +801,7 @@ fn truncate_mutable_field_with_policy(
                 if archived.is_none() && archive_policy == FieldArchivePolicy::Required {
                     return FieldTruncateOutcome::archive_dependent(overflow_dir);
                 }
-                message.content = Value::String(build_stub(archived.as_deref()));
+                field.replace_content_text(message, build_stub(archived.as_deref()));
                 return FieldTruncateOutcome::Truncated;
             }
             // BestEffort fields may reuse an embedded archive path. Required
@@ -822,12 +835,12 @@ fn truncate_mutable_field_with_policy(
                     let Some(pointer) = pointer_for_path(&archive_file_path) else {
                         return FieldTruncateOutcome::target_dependent(reduce_by);
                     };
-                    message.content = Value::String(pointer);
+                    field.replace_content_text(message, pointer);
                     return FieldTruncateOutcome::Truncated;
                 }
                 if let Some(pointer) = build_context_overflow_pointer(&text, target) {
                     if pointer.chars().count() < original_chars {
-                        message.content = Value::String(pointer);
+                        field.replace_content_text(message, pointer);
                         return FieldTruncateOutcome::Truncated;
                     }
                 }
@@ -840,17 +853,8 @@ fn truncate_mutable_field_with_policy(
             // trap it in a "cannot confirm status → poll forever" loop. Keep
             // the original and let the hard budget bail out instead of
             // producing an information-free stub.
-            const MIN_CONTENT_PREVIEW_CHARS: usize = 32;
             let build_truncated = |path: Option<&str>| -> Option<String> {
-                let prefix = path
-                    .map(|p| {
-                        format!(
-                            "[context-overflow-truncated] full original archived at: {p}\nhead+tail preview:\n"
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        "[context-overflow-truncated] head+tail preview:\n".to_string()
-                    });
+                let prefix = content_truncation_prefix(path);
                 let preview_budget = target.saturating_sub(prefix.chars().count());
                 if preview_budget < MIN_CONTENT_PREVIEW_CHARS {
                     // The hard backstop may keep only the recovery pointer when
@@ -893,7 +897,7 @@ fn truncate_mutable_field_with_policy(
                 return FieldTruncateOutcome::archive_dependent(overflow_dir);
             }
             let truncated = build_truncated(archive_file_path.as_deref()).unwrap_or(truncated);
-            message.content = Value::String(truncated);
+            field.replace_content_text(message, truncated);
             FieldTruncateOutcome::Truncated
         }
         MutableMessageField::Reasoning => {

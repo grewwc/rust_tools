@@ -993,9 +993,9 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
     let mut request_messages = messages.to_vec();
     for message in &mut request_messages {
         clear_runtime_message_metadata(message);
-        // Keep structured replies in the driver's projection for auxiliary
-        // summaries; previews and sends both materialize the complete body here.
-        super::builder::materialize_reply_references(&mut message.content);
+        // Keep file and reply provenance in the driver's projection for auxiliary
+        // summaries; previews and sends both materialize complete snapshots here.
+        super::builder::materialize_text_references(&mut message.content);
     }
     crate::ai::history::compress::dedupe_context_checkpoint_markers_for_projection(
         &mut request_messages,

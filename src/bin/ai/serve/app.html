@@ -303,6 +303,17 @@ select, summary { touch-action:manipulation; }
 .msg.md pre, .msg.md code { letter-spacing:normal; }
 .msg.pending { color:var(--dim); font-style:italic; }
 .msg.user { align-self:flex-end; background:var(--acc-solid); color:var(--on-acc); }
+/* Guidance uses a quieter reading surface and a compact marker on both layouts. */
+.msg.user.side-note { background:var(--tint-2); color:var(--fg); border:1px solid var(--acc-line-soft); }
+.side-note-badge {
+  display:inline-flex; flex:0 0 auto; align-items:center; padding:1px 6px;
+  border:1px solid var(--acc-line-soft); border-radius:5px;
+  background:var(--tint-3); color:var(--acc-soft); font-size:10px; line-height:1.6;
+  letter-spacing:.02em; white-space:nowrap; font-weight:500;
+}
+.msg.side-note > .side-note-badge { display:table; margin-bottom:5px; }
+.question-link.side-note-link { border-color:var(--acc-line-soft); }
+.user-msg-row.side-note-row > .msg.side-note { max-width:100%; }
 /* Assistant cards span the row (capped by max-width) so a collapsed fold stays
    tappable across the whole card instead of only over its text. */
 .msg.asst { align-self:stretch; background:var(--panel); border:1px solid var(--line); }
@@ -1871,6 +1882,7 @@ const executionModel = (() => {
   const serverFields = { turns: "liveTurns", pendingUserInputs: "pendingInputs" };
   const freshServer = () => ({ sessions: new Map(), liveTurns: new Map(), pendingInputs: new Map() });
   const freshSession = () => ({ turn: 0, pid: 0, endedPid: 0, running: false, runningAt: 0,
+    sampleGeneration: 0, idleSample: null,
     remoteActive: false, remotePid: "", remoteAt: 0, ended: false, failed: false, history: [], activities: new Map(),
     nextActivity: 0, taskStates: new Map(), taskBusy: null });
   const emptyServer = freshServer(), emptySession = freshSession();
@@ -1900,6 +1912,10 @@ const executionModel = (() => {
     taskStates: value.taskStates.map(([id, active]) => [id, active]),
     busy: value.busy, resetTasks: value.resetTasks === true,
   } : null;
+  const invalidateIdleSample = (state) => {
+    // A turn or owner transition also retires polls still waiting on a response.
+    state.idleSample = null; state.sampleGeneration++;
+  };
   const clearRemote = (state) => {
     state.remoteActive = false; state.remotePid = ""; state.remoteAt = 0;
   };
@@ -1968,6 +1984,9 @@ const executionModel = (() => {
       else if (event.name === "eventSession") { replay.base = base; replay.sessionId = event.value; }
       else if (event.name in serverFields) server[serverFields[event.name]] = event.value;
       else if (event.name in sessionFields) {
+        if ((event.name === "turnRunning" && event.value === true)
+            || (["turnRunningPid", "remoteTurnPid"].includes(event.name)
+              && state[sessionFields[event.name]] !== event.value)) invalidateIdleSample(state);
         state[sessionFields[event.name]] = event.value;
         if (event.name === "turnRunning" && event.value === true) clearRemote(state);
       }
@@ -1978,17 +1997,24 @@ const executionModel = (() => {
       } else snapshotDisplayed(state);
     } else if (event.kind === "begin") {
       state.turn++; state.running = false; state.ended = false; state.failed = false;
+      invalidateIdleSample(state);
       clearRemote(state);
       state.activities.clear(); summarize(state);
     } else if (event.kind === "live") {
-      if (event.entry) { clearRemote(state); server.liveTurns.set(sid, event.entry); }
+      if (event.entry) { invalidateIdleSample(state); clearRemote(state); server.liveTurns.set(sid, event.entry); }
       else server.liveTurns.delete(sid);
     } else if (event.kind === "remote") {
       if (event.active && !state.running && !server.liveTurns.has(sid)) {
+        invalidateIdleSample(state);
         state.remoteActive = true; state.remotePid = event.pid || ""; state.remoteAt = event.at;
       } else clearRemote(state);
+    } else if (event.kind === "idle") {
+      if (event.generation === state.sampleGeneration && !state.running && !state.remoteActive && !state.remotePid) {
+        state.idleSample = { generation: event.generation, at: event.at };
+      }
     } else if (event.kind === "select") {
       state.running = false; state.pid = 0; state.endedPid = 0;
+      invalidateIdleSample(state);
       clearRemote(state); state.ended = false; state.failed = false;
       if (!server.liveTurns.has(sid)) state.activities.clear();
       summarize(state);
@@ -4001,6 +4027,21 @@ function recoverRejectedReplyInput(error, input, targetSession, targetBase, draf
 function isRuntimeSyntheticUser(message) {
   return message.role === "user" && message.reasoning_content === "runtime-origin:synthetic-user:v1";
 }
+// Match history::is_side_note_message: origin plus the first text-part envelope.
+function sideNoteInfo(message) {
+  if (!isRuntimeSyntheticUser(message)) return null;
+  const content = typeof message.content === "string" ? message.content
+    : Array.isArray(message.content) ? message.content.find((part) => part?.type === "text")?.text : null;
+  if (typeof content !== "string") return null;
+  const match = content.match(/^\[side-note from=(.+) ts=(\d+)\] Live guidance \(side-note\) from /);
+  if (!match || BigInt(match[2]) > 18446744073709551615n) return null;
+  return { from: match[1] };
+}
+function sideNoteText(message) {
+  return textOf(message.content, true).replace(
+    /^\[side-note from=.*? ts=\d+\] Live guidance \(side-note\) from [^\n]*\r?\n\r?\n/, ""
+  ).trim();
+}
 // History is the only durable trace of a turn that died with the server. Tool
 // rows may trail the user message, so look back past them; a synthetic image
 // follow-up is not a question the user is still waiting on.
@@ -4392,8 +4433,11 @@ function questionRowsOf(messages, histTotal) {
   const rows = [];
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i];
-    const text = textOf(message.content).trim();
-    if (message.role === "user" && !isRuntimeSyntheticUser(message) && text) rows.push({ text, historyIndex: base + i });
+    const sideNote = sideNoteInfo(message);
+    const text = sideNote ? sideNoteText(message) : textOf(message.content).trim();
+    if (message.role === "user" && (!isRuntimeSyntheticUser(message) || sideNote) && text) {
+      rows.push({ text, historyIndex: base + i, sideNote: !!sideNote });
+    }
   }
   return rows;
 }
@@ -4426,12 +4470,12 @@ async function openQuestionPanel() {
     });
   }
 }
-// Opening the navigator fetches a bounded tail of real user prompts and grows
-// that tail only when the reader asks for older prompts. A jump outside the
+// Opening the navigator fetches a tail of real prompts and committed side notes,
+// growing it only when the reader asks for older entries. A jump outside the
 // mounted transcript expands history only after the reader selects its target.
-// Role metadata maps the menu's real-user ordinal to a canonical index, even
-// when the transcript tail omits earlier prompts or synthetic users. Verify
-// the original display text at that index before jumping to a cached entry.
+// Canonical indices identify both kinds of entry. Role metadata verifies real
+// turn ordinals without assigning synthetic notes a turn number; display text
+// must still match before jumping to a cached entry.
 function userBubbleFor(text, historyIndex) {
   const wanted = String(text || "").trim();
   if (!wanted) return null;
@@ -4451,23 +4495,25 @@ async function renderQuestionPage(panel, list, want) {
   try {
     let cache = null;
     const count = Math.max(40, want);
-    const res = await api("/sessions/" + forSession + "/history?role=user&count=" + count);
+    const res = await api("/sessions/" + forSession + "/history?role=questions&count=" + count);
     const messages = await res.json();
     if (forSession !== sessionId || !panel.classList.contains("open")) return;
-    // Only real user prompts travel. The server counts them across the whole
-    // session and stamps every row with `user_ordinal`, so a partial fetch
-    // still carries exact turn numbers, and one page costs one page.
-    const rows = messages
-      .map((m) => ({
-        text: textOf(m.content).trim().replace(/\s+/g, " "),
-        sourceText: textOf(m.content, true).trim(),
+    // One filtered response keeps mixed entries in canonical order. Only real
+    // prompts carry a user ordinal; side notes retain their canonical index.
+    const rows = messages.map((m) => {
+      const sideNote = !!sideNoteInfo(m);
+      return {
+        text: (sideNote ? sideNoteText(m) : textOf(m.content).trim()).replace(/\s+/g, " "),
+        sourceText: sideNote ? sideNoteText(m) : textOf(m.content, true).trim(),
         ordinal: Number(m.user_ordinal) || 0,
-      }))
-      .filter((row) => row.text && row.ordinal > 0);
+        historyIndex: m.canonical_index,
+        sideNote,
+      };
+    }).filter((row) => row.text && (row.sideNote || row.ordinal > 0));
     cache = { sessionId: forSession, rows, messages, histTotal: rows.length };
     questionCache = cache;
     list.textContent = "";
-    const full = !rows.length || rows[0].ordinal === 1;
+    const full = messages.length < count;
     updateQuestionButton(rows.length);
     if (!rows.length) { list.innerHTML = '<div class="empty">no questions in this session</div>'; return; }
     const shown = Math.min(rows.length, Math.max(1, want));
@@ -4476,10 +4522,10 @@ async function renderQuestionPage(panel, list, want) {
     rows.slice(start).forEach((row) => {
       const button = document.createElement("button");
       button.type = "button";
-      button.className = "question-link";
+      button.className = "question-link" + (row.sideNote ? " side-note-link" : "");
       const num = document.createElement("span");
-      num.className = "num";
-      num.textContent = String(row.ordinal);
+      num.className = row.sideNote ? "side-note-badge" : "num";
+      num.textContent = row.sideNote ? "指引" : String(row.ordinal);
       const text = document.createElement("span");
       text.className = "text";
       text.textContent = row.text;
@@ -4498,8 +4544,11 @@ async function renderQuestionPage(panel, list, want) {
           if (!current()) return;
           if (!Array.isArray(roles)) throw new Error("invalid history role metadata");
           const indices = roles.flatMap((role, index) => role === "user" ? [index] : []);
-          const historyIndex = indices[row.ordinal - 1];
-          if (historyIndex === undefined) { note("this question is no longer available"); return; }
+          const historyIndex = row.sideNote ? row.historyIndex : indices[row.ordinal - 1];
+          if (!Number.isSafeInteger(historyIndex) || historyIndex < 0
+              || (row.sideNote && roles[historyIndex] !== "runtime_synthetic_user")) {
+            note("this question is no longer available"); return;
+          }
           let target = historySession === cache.sessionId ? userBubbleFor(row.sourceText, historyIndex) : null;
           outputFollowSuspended = true;
           if (!target) {
@@ -8905,7 +8954,9 @@ function wireSessionSearch() {
     setSessionSearch(event.target.value);
   };
   $("sessfilter").oninput = (event) => {
-    if (sessionsFilterComposing || event.isComposing) return;
+    if (event.isComposing) return;
+    // A committed input can arrive without compositionend in Chrome/WebView.
+    sessionsFilterComposing = false;
     setSessionSearch(event.target.value);
   };
 }
@@ -9117,7 +9168,12 @@ function syncPromptNav() {
   const signature = rows.length
     + "|" + (rows.length ? rows[0].textContent.length + "/" + rows[rows.length - 1].textContent.length : "")
     + "|" + promptNavHasOlder();
-  if (signature === list._signature) return;
+  if (signature === list._signature && list._firstRow === rows[0]
+      && list._lastRow === rows[rows.length - 1]) return;
+  // Equal-length notes can advance a full window; keep jump targets bound to
+  // the currently mounted rows even when the text-size signature is unchanged.
+  list._firstRow = rows[0];
+  list._lastRow = rows[rows.length - 1];
   const oldItems = [...list.querySelectorAll("li[data-history-index]")];
   const oldFirst = oldItems[0]?.dataset.historyIndex || "";
   const oldSelected = list.querySelector("li.cur")?.dataset.historyIndex || "";
@@ -9134,20 +9190,22 @@ function syncPromptNav() {
   for (const row of rows) {
     const bubble = row.querySelector(".msg.user");
     const text = (bubble ? bubble.dataset.question ?? bubble.textContent : "").trim().replace(/\s+/g, " ");
-    if (text) entries.push({ row, text });
+    if (text) entries.push({ row, text, sideNote: bubble?.dataset.sideNote === "true" });
   }
   const shown = entries.length;
   // Prompts that are still outside the rendered window belong above the first
   // entry, where the older turns continue, not below the newest one.
+  let userOrdinal = 0;
   for (let i = 0; i < shown; i += 1) {
-    const { row, text } = entries[i];
+    const { row, text, sideNote } = entries[i];
     const item = document.createElement("li");
     item.dataset.historyIndex = row.querySelector(".msg.user")?.dataset.historyIndex || String(i);
     const button = document.createElement("button");
     button.type = "button";
     const index = document.createElement("span");
-    index.className = "pni";
-    index.textContent = String(i + 1).padStart(2, "0");
+    index.className = sideNote ? "side-note-badge" : "pni";
+    index.textContent = sideNote ? "指引" : String(++userOrdinal).padStart(2, "0");
+    if (sideNote) button.className = "side-note-link";
     const label = document.createElement("span");
     label.className = "pnt";
     label.textContent = text.slice(0, 120);
@@ -9240,7 +9298,7 @@ function historyRowsOf(msgs, histTotal, showAll) {
   for (let i = 0; i < shown.length; i++) {
     const message = shown[i];
     // Filter only the display rows, keeping canonical offsets and counts intact.
-    if (isRuntimeSyntheticUser(message)) continue;
+    if (isRuntimeSyntheticUser(message) && !sideNoteInfo(message)) continue;
     const text = textOf(message.content, message.role === "user").trim();
     const reasoning = reasoningText(message.reasoning_content);
     if (!text && !reasoning && !(message.task_report && taskReportOf(message.task_report))) continue;
@@ -9269,7 +9327,7 @@ function historyRowsOf(msgs, histTotal, showAll) {
   let lastTaskRow = null;
   for (const row of rows) {
     const m = row.message;
-    if (m.role === "user" || (m.role === "assistant" && !m.tool_calls?.length)) {
+    if ((m.role === "user" && !isRuntimeSyntheticUser(m)) || (m.role === "assistant" && !m.tool_calls?.length)) {
       taskRecords.clear(); lastTaskRow = null;
     }
     const report = m.task_report ? taskReportOf(m.task_report) : null;
@@ -9286,7 +9344,7 @@ function historyRowsOf(msgs, histTotal, showAll) {
   let settled = false;
   const laterTasks = new Map();
   for (const row of rows.slice().reverse()) {
-    if (row.message.role === "user") { settled = false; laterTasks.clear(); }
+    if (row.message.role === "user" && !isRuntimeSyntheticUser(row.message)) { settled = false; laterTasks.clear(); }
     else if (row.message.role === "assistant" && !row.message.tool_calls?.length) settled = true;
     const summary = row.message.task_report ? projectTaskReport(row.message.task_report, false) : null;
     const merged = row.subagentReport ? projectTaskReport(row.subagentReport, false) : null;
@@ -9971,9 +10029,25 @@ function attachUserRewind(d, text, activate) {
   return d;
 }
 function addUserBubble(text, index, parent, timeSource = null) {
-  const d = addMsg("user", text, "user rewindable", parent, timeSource);
+  const sideNote = timeSource && sideNoteInfo(timeSource);
+  const d = addMsg("user", sideNote ? sideNoteText(timeSource) : text,
+    sideNote ? "user side-note" : "user rewindable", parent, timeSource);
   d.dataset.historyIndex = String(index);
-  return attachUserRewind(d, text, () => rewindTo(index, text));
+  if (!sideNote) return attachUserRewind(d, text, () => rewindTo(index, text));
+  d.dataset.sideNote = "true";
+  const badge = document.createElement("span");
+  badge.className = "side-note-badge";
+  badge.textContent = "指引 · side note";
+  badge.title = sideNote.from === "user" ? "From user" : "From agent " + sideNote.from;
+  d.prepend(badge);
+  const host = d.parentNode;
+  if (host) {
+    const row = document.createElement("div");
+    row.className = "user-msg-row side-note-row";
+    host.replaceChild(row, d);
+    row.appendChild(d);
+  }
+  return d;
 }
 function findUserHistoryIndex(messages, histTotal, prompt, minIndex) {
   const expected = replyQuestionText(prompt).trim();
@@ -10369,7 +10443,10 @@ function recoveredProgressView(sid = sessionId) {
   let thinkStartedAt = null;
   let thinkTokens = 0;
   const sealAnswerSegment = () => {
-    if (!bubble || bubble.dataset.segmentSealed) return;
+    if (!bubble || bubble.dataset.segmentSealed) {
+      activity.anchor(phaseBubble);
+      return;
+    }
     const measured = outputRate.text(true);
     lastOutputRate = tokenRate || (measured ? "output " + measured : "") || lastOutputRate;
     if (answer.trim()) {
@@ -10489,7 +10566,7 @@ function recoveredProgressView(sid = sessionId) {
       if (!stored) activity.tool(event);
       paintPhase();
     },
-    subagents(payload, decoded) { activity.subagents(payload, decoded); },
+    subagents(payload, decoded) { sealAnswerSegment(); activity.subagents(payload, decoded); },
     phase(text, waiting) { activity.setPhase(text, waiting); paintPhase(); },
     finish(reason = "ended", source = null) {
       if (bubble && source) bubble._messageTimeSource = { ...source, source_session_id: sid };
@@ -10854,6 +10931,7 @@ async function pollConfirm() {
   const base = executionBase();
   const epoch = runEpoch;
   const startedAt = Date.now();
+  const sampleGeneration = executionState(sid, base).sampleGeneration;
   const activityRevisions = typeof snapshotSessionActivityRevisions === "function" ? snapshotSessionActivityRevisions() : null;
   let body;
   try { body = await (await api("/sessions/" + sid + "/confirm")).json(); }
@@ -10862,6 +10940,7 @@ async function pollConfirm() {
   // session switched, newer turn started): re-check before touching anything.
   if (confirmBusy || sid !== sessionId || base !== executionBase()) return null;
   if (epoch !== runEpoch || seq !== confirmPollSeq) return null;
+  if (sampleGeneration !== executionState(sid, base).sampleGeneration) return null;
   // The same poll reports a live turn for this session: the server is the only
   // source that survives this page losing the stream. A missing field means an
   // older server, treated as "not running".
@@ -10924,6 +11003,12 @@ async function pollConfirm() {
     // The idle cadence stays alive while a session is open; the tick above
     // already samples only every 10s when nothing is running.
   }
+  if (sid !== sessionId || base !== executionBase() || epoch !== runEpoch || seq !== confirmPollSeq) return null;
+  // Only an explicit idle response can retire stale task snapshots. Bind it
+  // to the owner sampled before the fetch; stream cleanup is not idle evidence.
+  if (body.running === false && !remote) {
+    updateExecutionModel({ kind: "idle", generation: sampleGeneration, at: startedAt }, sid, base);
+  }
   syncStopButton();
   // Queue state follows the same poll as the running state: a note may be
   // drained by the turn child between any two samples.
@@ -10956,10 +11041,16 @@ function isTurnRunning() {
   if (remoteTurnIsFresh(state)) return true;
   if (state.live) return true;
   if (state.failed) return false;
+  // A fresh `/confirm` sample saying no turn is authoritative over task
+  // snapshots from history. Without this, a background task that outlived its
+  // turn keeps the composer in the stop state after a reload.
+  const idleSampleFresh = !!state.idleSample && state.idleSample.generation === state.sampleGeneration
+    && state.idleSample.at > 0 && Date.now() - state.idleSample.at < RUNNING_SAMPLE_TTL_MS;
   // A parked foreground turn can close its model-output stream while a
   // subagent is still running. Producer observations for the displayed view,
   // never card placement, decide whether a later snapshot settled that ledger.
-  if ([...displayed.taskStates.values()].some((active) => active === true) || displayed.taskBusy === true) return true;
+  if (!idleSampleFresh
+      && ([...displayed.taskStates.values()].some((active) => active === true) || displayed.taskBusy === true)) return true;
   // OutputComplete ends the visible turn before its child is reaped. Do not
   // let that child's running sample keep the composer stopped after done.
   if (state.ended) return false;
@@ -11821,7 +11912,10 @@ async function send() {
   // thinking phase starts. The next streamed text opens a fresh bubble, matching
   // the separate assistant messages canonical history stores per model response.
   const sealAnswerSegment = () => {
-    if (!bubble || bubble.dataset.segmentSealed) return;
+    if (!bubble || bubble.dataset.segmentSealed) {
+      activity.anchor(phaseBubble);
+      return;
+    }
     const measured = outputRate.text(true);
     lastOutputRate = tokenRate || (measured ? "output " + measured : "") || lastOutputRate;
     if (raw.trim()) {
@@ -11991,6 +12085,7 @@ async function send() {
       schedulePaint();
     },
     subagents(payload, decoded) {
+      sealAnswerSegment();
       // This activity retains the captured server/session owner even while
       // parked; replay's activity belongs to its selected recovery view.
       mutateTranscript(() => activity.subagents(payload, decoded));

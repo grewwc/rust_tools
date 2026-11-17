@@ -265,16 +265,20 @@ pub(crate) async fn read_history(
     if q.role.is_some() || q.count.is_some() {
         let mut rows: Vec<serde_json::Value> = Vec::new();
         let mut user_ordinal = 0usize;
-        for stored in &messages {
+        for (canonical_index, stored) in messages.iter().enumerate() {
             let message = &stored.message;
             let is_real_user =
                 message.role == "user" && !is_runtime_synthetic_user_message(message);
+            let is_side_note = crate::ai::history::is_side_note_message(message);
             if is_real_user {
                 user_ordinal += 1;
             }
             let role_matches = match q.role.as_deref() {
                 None => true,
                 Some("user") => is_real_user,
+                // Question navigator: real turns plus committed side notes, in
+                // canonical order. Other synthetic users stay plumbing.
+                Some("questions") => is_real_user || is_side_note,
                 Some("assistant") => message.role == "assistant",
                 Some("tool") => message.role == "tool",
                 // Same rule as the client system filter (system + internal notes).
@@ -300,10 +304,19 @@ pub(crate) async fn read_history(
             if is_real_user {
                 value["user_ordinal"] = serde_json::json!(user_ordinal);
             }
+            // Position in the full canonical history (before any tail cut), so
+            // the navigator can order mixed rows and jump straight to a row.
+            value["canonical_index"] = serde_json::json!(canonical_index);
             rows.push(value);
         }
         if let Some(count) = q.count {
-            let count = count.min(SERVE_HISTORY_VIEW_COUNT_CAP);
+            // The navigator grows its tail to reach every committed question.
+            // Preview consumers keep their existing bounded count contract.
+            let count = if q.role.as_deref() == Some("questions") {
+                count
+            } else {
+                count.min(SERVE_HISTORY_VIEW_COUNT_CAP)
+            };
             if rows.len() > count {
                 rows.drain(..rows.len() - count);
             }

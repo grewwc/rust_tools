@@ -16,6 +16,7 @@ function between(start, end) {
 }
 const user = (content) => ({ role: "user", content });
 const synthetic = (content) => ({ ...user(content), reasoning_content: "runtime-origin:synthetic-user:v1" });
+const sideNote = (content, from = "user") => synthetic(`[side-note from=${from} ts=1700000000] Live guidance (side-note) from ${from === "user" ? "user" : "upstream agent `" + from + "`"}\n\n${content}`);
 const deferred = () => {
   let resolve;
   const promise = new Promise((done) => { resolve = done; });
@@ -49,10 +50,17 @@ function harness({ messages, phone = true, requestHook } = {}) {
       get innerHTML() { return content; },
       appendChild(child) { child.remove(); child.parentNode = this; this.children.push(child); return child; },
       append(...children) { children.forEach((child) => this.appendChild(child)); },
+      prepend(child) { child.remove(); child.parentNode = this; this.children.unshift(child); },
       replaceChild(next, old) { const index = this.children.indexOf(old); assert.ok(index >= 0); old.parentNode = null; next.parentNode = this; this.children[index] = next; },
       remove() { if (this.parentNode) this.parentNode.children = this.parentNode.children.filter((child) => child !== this); this.parentNode = null; },
       setAttribute(name, value) { this.attributes[name] = String(value); },
-      matches(selector) { return selector.startsWith(".") && selector.slice(1).split(".").every((name) => classes.has(name)); },
+      matches(selector) {
+        const match = selector.match(/^(\w+)?((?:\.[\w-]+)*)(?:\[data-([\w-]+)\])?$/);
+        if (!match) return false;
+        const key = match[3]?.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+        return (!match[1] || match[1] === tag) && match[2].split(".").filter(Boolean).every((name) => classes.has(name))
+          && (!key || Object.hasOwn(this.dataset, key));
+      },
       querySelectorAll(selector) {
         const result = [];
         const visit = (parent) => parent.children.forEach((child) => { if (child.matches(selector)) result.push(child); visit(child); });
@@ -75,7 +83,7 @@ function harness({ messages, phone = true, requestHook } = {}) {
     return el;
   }
   document.createElement = node;
-  const elements = Object.fromEntries(["msgs", "questionpanel", "questionlist", "questionbtn", "questioncount"].map((id) => [id, node()]));
+  const elements = Object.fromEntries(["msgs", "questionpanel", "questionlist", "questionbtn", "questioncount", "promptlist", "promptcount"].map((id) => [id, node()]));
   elements.questionpanel.appendChild(elements.questionlist);
   let current = messages;
   const response = (body, total = current.length) => ({ headers: { get: () => String(total) }, json: async () => body });
@@ -93,11 +101,13 @@ function harness({ messages, phone = true, requestHook } = {}) {
       if (requestHook) await requestHook(request);
       assert.ok(request.startsWith("/sessions/session-a/history"), request);
       if (request.endsWith("?meta=roles")) return response(current.map((message) => context.isRuntimeSyntheticUser(message) ? "runtime_synthetic_user" : message.role));
-      const count = request.match(/\?role=user&count=(\d+)$/);
+      const count = request.match(/\?role=questions&count=(\d+)$/);
       if (count) {
         let ordinal = 0;
-        return response(current.filter((message) => message.role === "user" && !context.isRuntimeSyntheticUser(message))
-          .map((message) => ({ ...message, user_ordinal: ++ordinal })).slice(-Number(count[1])));
+        const rows = current.map((message, canonical_index) => ({ ...message, canonical_index,
+          ...(message.role === "user" && !context.isRuntimeSyntheticUser(message) ? { user_ordinal: ++ordinal } : {}),
+        })).filter((message) => message.role === "user" && (!context.isRuntimeSyntheticUser(message) || context.sideNoteInfo(message)));
+        return response(rows.slice(-Number(count[1])));
       }
       const limit = request.match(/\?limit=(\d+)$/);
       return response(limit ? current.slice(-Number(limit[1])) : current.slice());
@@ -123,7 +133,8 @@ function harness({ messages, phone = true, requestHook } = {}) {
   vm.runInContext(between("async function loadHistory(", "// Scrolling to the top of the transcript"), context);
   vm.runInContext(between("function attachUserRewind(", "function findUserHistoryIndex("), context);
   context.addMsgMd = (text, parent) => context.addMsg("assistant", text, "asst md", parent);
-  const links = () => elements.questionlist.children.filter((child) => child.className === "question-link");
+  vm.runInContext(between("function promptNavHasOlder()", 'if ($("promptlist") && typeof $("promptlist").addEventListener'), context);
+  const links = () => elements.questionlist.children.filter((child) => child.classList.contains("question-link"));
   return { context, document, elements, links, requests, notes, failures, scrolls, focuses, follows,
     setMessages(value) { current = value; },
     async open() { await context.loadHistory(); await context.openQuestionPanel(); },
@@ -166,7 +177,7 @@ test("question tap loads a target outside the phone history window using the rea
   assert.equal(h.context.historySession, "session-a");
   assert.equal(h.context.canonicalHistoryTotal, 251);
   assert.equal(h.context.lastMsgCount, 251);
-  assert.equal(h.requests.filter((request) => !request.includes("role=user") && !request.includes("meta=roles")).length, 2);
+  assert.equal(h.requests.filter((request) => !request.includes("role=questions") && !request.includes("meta=roles")).length, 2);
   assert.equal(h.follows.at(-1), false, "loading an older target must not resume following live output");
   assert.deepEqual(h.failures, []);
 });
@@ -351,4 +362,76 @@ test("a failed navigation request is reported without an unhandled rejection or 
   assert.equal(h.scrolls.length, 0);
   assert.match(h.notes.at(-1), /question.*offline/);
   assert.deepEqual(h.failures, []);
+});
+
+for (const phone of [true, false]) test((phone ? "phone" : "desktop") + " side notes appear in canonical order with a marker and no rewind or turn number", async () => {
+  const h = harness({ phone, messages: [user("first"), sideNote("  focus\non details  ", "lead"), synthetic("hidden handoff"), user("second")] });
+  await h.open();
+  assert.deepEqual(h.links().map((link) => link.children[0].textContent), ["1", "指引", "2"]);
+  assert.deepEqual(h.links().map((link) => link.children[1].textContent), ["first", "focus on details", "second"]);
+  assert.equal(h.links()[1].classList.contains("side-note-link"), true);
+  const bubble = h.elements.msgs.querySelector(".msg.side-note");
+  assert.equal(bubble.dataset.question, "focus\non details");
+  assert.equal(bubble.dataset.historyIndex, "1");
+  assert.equal(bubble.classList.contains("rewindable"), false);
+  assert.equal(bubble.parentNode.querySelector(".rewind-action"), null);
+  assert.equal(bubble.querySelector(".side-note-badge").title, "From agent lead");
+  h.context.syncPromptNav();
+  const rail = h.elements.promptlist.children;
+  assert.deepEqual(rail.map((item) => item.children[0].children[0].textContent), ["01", "指引", "02"]);
+  assert.deepEqual(rail.map((item) => item.dataset.historyIndex), ["0", "1", "3"]);
+  await rail[1].children[0].dispatch("click");
+  assert.equal(h.scrolls.at(-1).node, bubble.parentNode);
+  await h.tap(1);
+  assert.equal(h.scrolls.at(-1).node, bubble);
+  assert.deepEqual(h.failures, []);
+});
+
+for (const phone of [true, false]) test((phone ? "phone" : "desktop") + " a side-note navigator target outside the mounted window loads the canonical row", async () => {
+  const h = harness({ phone, messages: [sideNote("older guidance"), ...Array.from({ length: phone ? 250 : 850 }, (_, i) => ({ role: "assistant", content: "reply " + i }))] });
+  await h.open();
+  assert.equal(h.elements.msgs.querySelector(".msg.side-note"), null);
+  await h.tap(0);
+  assert.equal(h.scrolls.length, 1);
+  assert.equal(h.scrolls[0].node.dataset.sideNote, "true");
+  assert.equal(h.scrolls[0].node.dataset.historyIndex, "0");
+  assert.deepEqual(h.failures, []);
+});
+
+test("image side notes render guidance and image placeholders without exposing transport metadata", async () => {
+  const message = sideNote("");
+  message.content = [{ type: "text", text: message.content }, { type: "image_url", image_url: { url: "(redacted)" } }];
+  const h = harness({ messages: [message, synthetic("[side-note from=user ts=invalid] Live guidance (side-note) from user\n\nhidden")] });
+  await h.open();
+  assert.equal(h.links().length, 1);
+  assert.equal(h.links()[0].children[1].textContent, "[image]");
+  await h.tap(0);
+  assert.equal(h.scrolls[0].node.dataset.question, "[image]");
+});
+
+test("mixed navigation can page back through more than one hundred committed entries", async () => {
+  const h = harness({ messages: Array.from({ length: 121 }, (_, i) => i % 2 ? sideNote("guidance " + i) : user("question " + i)) });
+  await h.open();
+  await h.context.renderQuestionPage(h.elements.questionpanel, h.elements.questionlist, 140);
+  assert.equal(h.links().length, 121);
+  assert.equal(h.elements.questionlist.dataset.hasOlder, "");
+  await h.tap(1);
+  assert.equal(h.scrolls[0].node.dataset.historyIndex, "1");
+});
+
+// A fixed transcript window can replace one note with another of equal length.
+test("the desktop rail follows canonical side-note rows when a full window advances", async () => {
+  const messages = Array.from({ length: 801 }, () => sideNote("same guidance"));
+  const h = harness({ phone: false, messages });
+  await h.context.loadHistory();
+  h.context.syncPromptNav();
+  assert.equal(h.elements.promptlist.children[0].dataset.historyIndex, "1");
+  h.setMessages([...messages, sideNote("same guidance")]);
+  await h.context.loadHistory();
+  h.context.syncPromptNav();
+  assert.equal(h.elements.promptlist.children[0].dataset.historyIndex, "2");
+  const newest = h.elements.promptlist.children.at(-1);
+  assert.equal(newest.dataset.historyIndex, "801");
+  await newest.children[0].dispatch("click");
+  assert.ok(h.elements.msgs.querySelectorAll(".user-msg-row").includes(h.scrolls.at(-1).node));
 });

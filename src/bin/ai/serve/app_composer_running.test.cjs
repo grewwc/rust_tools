@@ -6,6 +6,95 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
+test("fresh idle /confirm clears a stop left by a historical active task", async () => {
+  const h = sendHarness(), c = h.c;
+  loadConfirm(c);
+  c.turnRunningAt = 0;
+  c.updateExecutionModel({ kind: "history", summaries: [
+    { taskStates: [["worker", true]], busy: true, resetTasks: false },
+  ] });
+  c.commitExecutionView();
+  c.syncStopButton();
+  assert.equal(c.canStop(), true, "the historical task needs a stop before the server sample");
+  c.api = async () => ({ json: async () => ({ pending: null, running: false, turn: 0, remote: null }) });
+  await c.pollConfirm();
+  const sampled = c.executionState();
+  assert.equal(sampled.running, false);
+  assert.ok(sampled.idleSample?.at > 0, "an idle poll records explicit server evidence");
+  assert.equal(sampled.idleSample.generation, sampled.sampleGeneration);
+  assert.equal(c.canStop(), false, "fresh idle evidence overrides the stale task snapshot");
+  assert.equal(c.canSend(), true);
+  assert.equal(h.elements.send.textContent, "➤");
+  assert.equal(c.displayedExecutionState().taskStates.get("worker"), true, "canonical history remains intact");
+  const now = c.Date.now();
+  c.Date = { now: () => now + c.RUNNING_SAMPLE_TTL_MS };
+  assert.equal(c.canStop(), true, "expired idle evidence no longer overrides the task snapshot");
+  await h.dispose();
+});
+
+for (const phone of [false, true]) for (const sample of ["positive", "previous-turn idle"]) {
+  test(`parked answerless done retains stop after ${sample} sample (phone=${phone})`, async () => {
+    const h = sendHarness({ phone }), c = h.c;
+    loadConfirm(c);
+    const api = c.api;
+    let body = { running: false, remote: null, pending: null };
+    c.api = (path, ...args) => path.endsWith("/confirm")
+      ? Promise.resolve({ json: async () => body }) : api(path, ...args);
+    if (sample === "previous-turn idle") {
+      await c.pollConfirm();
+      assert.ok(c.executionState().idleSample);
+    }
+    await h.start(); await h.accept();
+    assert.equal(c.executionState().idleSample, null, "begin invalidates the previous turn's idle evidence");
+    if (sample === "positive") {
+      body = { running: true, turn: 42, pending: null };
+      await c.pollConfirm();
+      assert.ok(c.executionState().runningAt > 0);
+    }
+    await h.frame("subagent_progress", structuredSubagents([structuredTask("parked-worker", 5000)]));
+    await h.finish(() => { h.reader.frame('event: done\ndata: {}\n\n'); h.reader.eof(); });
+    const state = h.snapshot();
+    assert.equal(state.live, false);
+    assert.equal(state.ended, true, JSON.stringify(state));
+    assert.equal(c.executionState().running, false, "stream cleanup clears only positive running state");
+    assert.equal(c.executionState().idleSample, null);
+    assert.equal(c.displayedExecutionState().taskStates.get("parked-worker"), true);
+    assert.equal(state.canStop, true);
+    assert.equal(state.canSend, false);
+    assert.equal(state.send, "⏹");
+    assert.equal(state.stopClass, true);
+    await h.dispose();
+  });
+}
+
+for (const event of [
+  { kind: "begin" },
+  { kind: "select" },
+  { kind: "field", name: "turnRunning", value: true },
+  { kind: "field", name: "turnRunningPid", value: 42 },
+  { kind: "field", name: "remoteTurnPid", value: "42" },
+  { kind: "remote", active: true, pid: "42", at: 1000 },
+]) test(`idle evidence expires on ${event.name || event.kind} observations`, async () => {
+  const h = sendHarness(), c = h.c;
+  loadConfirm(c);
+  c.api = async () => ({ json: async () => ({ running: false, pending: null }) });
+  await c.pollConfirm();
+  assert.ok(c.executionState().idleSample);
+  c.updateExecutionModel(event);
+  assert.equal(c.executionState().idleSample, null);
+
+  // A response started under the old owner cannot restore its idle evidence.
+  c.updateExecutionModel({ kind: "select" });
+  let respond;
+  c.api = () => new Promise((resolve) => { respond = resolve; });
+  const pending = c.pollConfirm();
+  c.updateExecutionModel(event);
+  respond({ json: async () => ({ running: false, pending: null }) });
+  assert.equal(await pending, null);
+  assert.equal(c.executionState().idleSample, null);
+  await h.dispose();
+});
+
 function loadFixtures(file, names) {
   const filename = path.join(__dirname, file);
   return new vm.Script(fs.readFileSync(filename, "utf8") +
@@ -19,6 +108,16 @@ function loadFixtures(file, names) {
 const { sendHarness, records, settle } = loadFixtures("app_phase2_baseline.test.cjs", ["sendHarness", "records", "settle"]);
 const { script, structuredTask, structuredSubagents, descendants } = loadFixtures("app_stream.test.cjs", ["script", "structuredTask", "structuredSubagents", "descendants"]);
 const { streamFramerHarness } = loadFixtures("app_phase3_stream_framer.test.cjs", ["streamFramerHarness"]);
+
+function loadConfirm(c) {
+  const from = script.indexOf("async function pollConfirm()");
+  const to = script.indexOf("// Live streams, replay streams", from);
+  assert.ok(from >= 0 && to > from);
+  vm.runInContext(script.slice(from, to), c);
+  c.confirmBusy = false;
+  c.armHistoryFollow = () => {};
+  c.refreshSideNotes = () => {};
+}
 
 function assertStop(h, checkpoint) {
   const state = h.snapshot();

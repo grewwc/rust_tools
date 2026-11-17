@@ -1492,6 +1492,27 @@ test("live phases remain visible after an early assistant answer", () => {
   assert.equal(h.reply(), "I will check that.");
 });
 
+for (const replay of [false, true]) {
+  test(`later subagent report follows a checkpoint-like answer (${replay ? "replay" : "live"})`, () => {
+    const h = replay ? replayHarness() : streamHarness();
+    if (!replay) h.connect();
+    const box = replay ? h.view.box : h.box;
+    const checkpoint = "<context_checkpoint>\nsummary: Saved progress\nContinue with the findings above.\n</context_checkpoint>";
+    h.emit("delta", { delta: checkpoint });
+    const answer = box.children.find((item) => item.matches?.(".msg.asst.md") && !item.hidden);
+    assert.ok(answer, "the checkpoint-like answer must be visible before the report");
+    assert.ok(answer.textContent.includes(checkpoint));
+    h.emit("subagent_progress", structuredSubagents([structuredTask("later-worker", 5000,
+      { active: false, status: "completed", output: "Delivered findings" })]));
+    const card = executionRecords(box).find((item) => item.dataset.subagents === "true");
+    assert.ok(card, "the later report must create a subagent activity");
+    const order = descendants(box);
+    assert.ok(order.indexOf(answer) < order.indexOf(card), "the later subagent event must follow the earlier answer in DOM order");
+    assert.equal(answer.hidden, false);
+    assert.ok(answer.textContent.includes(checkpoint));
+  });
+}
+
 test("prose split by a tool round renders as separate answer bubbles", () => {
   const h = streamHarness();
   h.connect();

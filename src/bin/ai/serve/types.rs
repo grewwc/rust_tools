@@ -455,11 +455,14 @@ pub(crate) struct HistoryQuery {
     pub(crate) meta: Option<String>,
     /// serve-chat preview views: filter by role before the tail cut.
     /// `"system"` also covers `internal_note` rows, matching the client rule.
+    /// `"questions"` selects real user prompts and committed side notes; notes
+    /// remain synthetic user rows rather than turn boundaries.
     #[serde(default)]
     pub(crate) role: Option<String>,
     /// serve-chat preview views: return at most this many rows, cut from the
-    /// end of the role-filtered list (capped server-side). Absent keeps the
-    /// mobile tail-cut semantics of `limit`.
+    /// end of the role-filtered list. Preview roles are capped server-side;
+    /// `"questions"` can grow its tail to reach older navigator entries.
+    /// Absent keeps the mobile tail-cut semantics of `limit`.
     #[serde(default)]
     pub(crate) count: Option<usize>,
     /// serve-chat `/history last [N]`: 1-based N-th-most-recent assistant

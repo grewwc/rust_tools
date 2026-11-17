@@ -213,6 +213,7 @@ fn insert_archive_note_if_missing(messages: &mut Vec<Message>, archive_note: Str
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(in crate::ai) enum MutableMessageField {
     Content,
+    FileReferenceText(usize),
     Reasoning,
     ToolArguments(usize),
 }
@@ -221,6 +222,7 @@ impl MutableMessageField {
     fn archive_label(self) -> String {
         match self {
             MutableMessageField::Content => "content".to_string(),
+            MutableMessageField::FileReferenceText(index) => format!("content[{index}].text"),
             MutableMessageField::Reasoning => "reasoning_content".to_string(),
             MutableMessageField::ToolArguments(index) => {
                 format!("tool_calls[{index}].function.arguments")
@@ -231,12 +233,30 @@ impl MutableMessageField {
     fn original_text(self, message: &Message) -> Option<String> {
         match self {
             MutableMessageField::Content => Some(value_to_string(&message.content)),
+            MutableMessageField::FileReferenceText(index) => {
+                let part = message.content.as_array()?.get(index)?;
+                if part.get("type").and_then(Value::as_str) != Some("reference")
+                    || part.get("kind").and_then(Value::as_str) != Some("file")
+                {
+                    return None;
+                }
+                part.get("text").and_then(Value::as_str).map(str::to_owned)
+            }
             MutableMessageField::Reasoning => message.reasoning_content.clone(),
             MutableMessageField::ToolArguments(index) => message
                 .tool_calls
                 .as_ref()
                 .and_then(|calls| calls.get(index))
                 .map(|call| call.function.arguments.clone()),
+        }
+    }
+
+    /// Replace only the content field validated by `original_text`.
+    fn replace_content_text(self, message: &mut Message, text: String) {
+        match self {
+            Self::Content => message.content = Value::String(text),
+            Self::FileReferenceText(index) => message.content[index]["text"] = Value::String(text),
+            _ => unreachable!("only content fields have content text"),
         }
     }
 }

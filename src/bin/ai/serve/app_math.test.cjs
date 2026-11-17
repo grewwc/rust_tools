@@ -417,6 +417,7 @@ test("question navigator fetches one bounded page and keeps global turn numbers"
     role: "user",
     content: "prompt " + (i + 1),
     user_ordinal: i + 1,
+    canonical_index: i,
   }));
   const links = [];
   const created = [];
@@ -461,8 +462,8 @@ test("question navigator fetches one bounded page and keeps global turn numbers"
     })[id],
     api: async (path) => {
       if (path === "/sessions/session-a/history?meta=roles") return { json: async () => userOrdinals.map(() => "user") };
-      const match = path.match(/^\/sessions\/session-a\/history\?role=user&count=(\d+)$/);
-      assert.ok(match, "the navigator asks only for real user prompts, one bounded page: " + path);
+      const match = path.match(/^\/sessions\/session-a\/history\?role=questions&count=(\d+)$/);
+      assert.ok(match, "the navigator asks for questions and side notes, one bounded page: " + path);
       const count = Number(match[1]);
       assert.ok(count <= 320, "the fetched page stays bounded: " + count);
       paths.push(path);
@@ -505,7 +506,7 @@ test("question navigator fetches one bounded page and keeps global turn numbers"
   await context.openQuestionPanel();
   const questionLinks = links.filter((node) => node.className === "question-link");
   assert.equal(paths.length, 1, "the first open asks for exactly one page");
-  assert.match(paths[0], /role=user&count=40$/, "one bounded page of prompts, not the transcript");
+  assert.match(paths[0], /role=questions&count=40$/, "one bounded page of prompts, not the transcript");
   assert.equal(context.count, 40, "the badge counts the prompts that were fetched");
   assert.equal(questionLinks.length, 20, "only one batch is rendered up front");
   assert.equal(list.scrollTop, list.scrollHeight, "opening lands on the newest prompt");
@@ -1019,7 +1020,7 @@ test("phone session hold targets its own row and scrolling cancels it", () => {
 
 test("targeted session delete preserves the open session", async () => {
   const start = script.indexOf("async function deleteSession(");
-  const end = script.indexOf("// Render the drawer", start);
+  const end = script.indexOf("// Search pages come from the server", start);
   assert.ok(start >= 0 && end > start);
   const calls = [];
   let sessionsLoaded = 0;

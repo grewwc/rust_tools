@@ -3790,6 +3790,105 @@ async fn history_role_count_filters_and_attaches_ordinals() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.contains("invalid history role filter: bogus"));
+
+    // Every committed side note is reachable beyond the preview count cap.
+    // Other synthetic users never become navigator entries or user ordinals.
+    let mut notes: Vec<_> = (0..121)
+        .map(|i| {
+            crate::ai::history::runtime_synthetic_user_message(serde_json::json!(format!(
+                "[side-note from=user ts=1700000000] Live guidance (side-note) from user\n\nguidance {i}"
+            )))
+        })
+        .collect();
+    notes[0].content = serde_json::json!([
+        {"type": "text", "text": notes[0].content.as_str().expect("note text")},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,U0VDUkVU"}},
+    ]);
+    notes.push(crate::ai::history::runtime_synthetic_user_message(
+        serde_json::json!("hidden handoff"),
+    ));
+    append_history_messages(&path, &notes).expect("seed side notes");
+    let (status, total, body) = call(super::HistoryQuery {
+        limit: None,
+        meta: None,
+        role: Some("questions".to_string()),
+        count: Some(200),
+        conclusion: None,
+        user_conclusion: None,
+    })
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(total.as_deref(), Some("130"));
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&body).expect("navigator rows");
+    assert_eq!(rows.len(), 124);
+    assert_eq!(rows[0]["canonical_index"], 1);
+    assert_eq!(rows[1]["canonical_index"], 3);
+    assert_eq!(rows[2]["canonical_index"], 7);
+    assert_eq!(rows[2]["user_ordinal"], 3);
+    for (i, row) in rows[3..].iter().enumerate() {
+        assert_eq!(row["canonical_index"], i + 8);
+        assert!(row.get("user_ordinal").is_none());
+        assert_eq!(row["reasoning_content"], "runtime-origin:synthetic-user:v1");
+    }
+    assert!(!body.contains("hidden handoff"));
+    assert!(!body.contains("U0VDUkVU"));
+
+    let (_, _, body) = call(super::HistoryQuery {
+        limit: None,
+        meta: None,
+        role: Some("questions".to_string()),
+        count: Some(2),
+        conclusion: None,
+        user_conclusion: None,
+    })
+    .await;
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&body).expect("navigator tail");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["canonical_index"], 127);
+    assert_eq!(rows[1]["canonical_index"], 128);
+
+    let (_, _, body) = call(super::HistoryQuery {
+        limit: None,
+        meta: None,
+        role: Some("user".to_string()),
+        count: Some(200),
+        conclusion: None,
+        user_conclusion: None,
+    })
+    .await;
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&body).expect("real users");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[2]["user_ordinal"], 3);
+
+    let (_, _, body) = call(super::HistoryQuery {
+        limit: None,
+        meta: Some("roles".to_string()),
+        role: None,
+        count: None,
+        conclusion: None,
+        user_conclusion: None,
+    })
+    .await;
+    let roles: Vec<String> = serde_json::from_str(&body).expect("roles");
+    assert_eq!(roles.len(), 130);
+    assert_eq!(roles[7], "user");
+    assert!(
+        roles[8..]
+            .iter()
+            .all(|role| role == "runtime_synthetic_user")
+    );
+
+    let (_, _, body) = call(super::HistoryQuery {
+        limit: None,
+        meta: None,
+        role: None,
+        count: Some(200),
+        conclusion: None,
+        user_conclusion: None,
+    })
+    .await;
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&body).expect("preview tail");
+    assert_eq!(rows.len(), 100, "preview consumers keep their count cap");
 }
 
 #[tokio::test]

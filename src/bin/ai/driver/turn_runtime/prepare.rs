@@ -443,10 +443,10 @@ pub(super) async fn prepare_turn(
             Some(reference_assets_dir.as_path()),
         )
         .map_err(|e| e.to_string())?;
-        // Resolve attachments after digest substitution. Reply references retain
-        // their structure for summaries until request normalization.
+        // Resolve images after digest substitution. File and reply references
+        // retain their structure for summaries until request normalization.
         for m in &mut history {
-            crate::ai::request::materialize_attachment_references(
+            crate::ai::request::materialize_image_references(
                 &mut m.content,
                 Some(reference_assets_dir.as_path()),
             );
@@ -526,7 +526,6 @@ pub(super) async fn prepare_turn(
     let ocr_pair = usable_ocr
         .as_ref()
         .map(|ocr| (ocr.tool_name.as_str(), ocr.content.as_str()));
-    let final_question = assemble_effective_question(question, attachments_text, ocr_pair);
     // The persisted text part is the user's own words plus OCR-derived content
     // (already labeled by `[Attached Image Content via ...]`). Text file / PDF
     // attachments are intentionally NOT inlined here: they are persisted as
@@ -706,8 +705,8 @@ pub(super) async fn prepare_turn(
     // message exactly as the model saw it and the cached prefix extends.
     let context_reminder = skill_turn.context_reminder();
     // Two content forms of the same user turn:
-    // - `user_content`: the request projection with inline attachments and
-    //   structured replies, which request normalization expands for the wire.
+    // - `user_content`: the request projection with inline images and structured
+    //   file/reply references, which normalization expands for the wire.
     // - `persisted_user_content`: the PERSISTED form (`reference` parts with
     //   immutable session-asset keys, no source paths or base64) written to
     //   long-term history. Keeping the reference boundary at write time means
@@ -715,8 +714,6 @@ pub(super) async fn prepare_turn(
     //   (another session debugging this one, /history rendering, compression
     //   summaries) can tell the user's own words apart from attached images
     //   instead of mistaking inline image data for real user content.
-    let mut user_content =
-        request::build_content(next_model, &final_question, &app.attached_image_files)?;
     let mut persisted_user_content = request::build_reference_content(
         next_model,
         &persisted_question_text,
@@ -725,11 +722,8 @@ pub(super) async fn prepare_turn(
         attachment_assets_dir.as_path(),
     )?;
     crate::ai::history::reply_reference::append_frozen(&mut persisted_user_content, frozen_replies);
-    crate::ai::history::reply_reference::append_frozen(&mut user_content, frozen_replies);
-    request::materialize_attachment_references(
-        &mut user_content,
-        Some(attachment_assets_dir.as_path()),
-    );
+    let mut user_content = persisted_user_content.clone();
+    request::materialize_image_references(&mut user_content, Some(attachment_assets_dir.as_path()));
     // Persisted track: canonical turn_messages keep the reference boundary.
     let mut user_message = Message {
         role: "user".to_string(),
@@ -738,7 +732,7 @@ pub(super) async fn prepare_turn(
         tool_call_id: None,
         reasoning_content: None,
     };
-    // Request track: inline attachments and structured replies plus the reminder.
+    // Request track: inline images and structured file/reply snapshots plus the reminder.
     let mut request_user_message = Message {
         role: "user".to_string(),
         content: user_content,

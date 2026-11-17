@@ -158,35 +158,35 @@ pub(crate) fn materialize_references(
     )
 }
 
-/// Resolve attachments during turn preparation while retaining reply identity
-/// for compression. Reply bodies become plain text only at the wire boundary.
-pub(crate) fn materialize_attachment_references(
+/// Resolve image assets during turn preparation. Text-file and reply snapshots
+/// retain their provenance for compression until request normalization.
+pub(crate) fn materialize_image_references(
     content: &mut Value,
     attachment_assets_dir: Option<&Path>,
 ) -> bool {
     materialize_selected_references(
         content,
         attachment_assets_dir,
-        ReferenceMaterialization::Attachments,
+        ReferenceMaterialization::Images,
     )
 }
 
-pub(super) fn materialize_reply_references(content: &mut Value) -> bool {
-    materialize_selected_references(content, None, ReferenceMaterialization::Replies)
+pub(super) fn materialize_text_references(content: &mut Value) -> bool {
+    materialize_selected_references(content, None, ReferenceMaterialization::Text)
 }
 
 enum ReferenceMaterialization {
     All,
-    Attachments,
-    Replies,
+    Images,
+    Text,
 }
 
 impl ReferenceMaterialization {
     fn includes(&self, kind: &str) -> bool {
         match self {
             Self::All => true,
-            Self::Attachments => kind != "message",
-            Self::Replies => kind == "message",
+            Self::Images => kind == "image",
+            Self::Text => kind != "image",
         }
     }
 }

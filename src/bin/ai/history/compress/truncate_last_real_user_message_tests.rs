@@ -123,6 +123,104 @@ fn skips_when_no_progress_is_possible() {
 }
 
 #[test]
+fn archive_rescue_preserves_reply_and_question_across_file_parts() {
+    let dir = overflow_dir("file-parts");
+    let first = "A".repeat(30_000);
+    let second = "B".repeat(30_000);
+    let mut messages = vec![msg(
+        "user",
+        serde_json::json!([
+            {"type":"reference", "kind":"message", "source_message_id":42,
+             "role":"assistant", "text":"Prior answer"},
+            {"type":"reference", "kind":"file", "name":"a.txt", "text":first},
+            {"type":"reference", "kind":"file", "name":"b.pdf", "text":second},
+            {"type":"text", "text":"Compare both files using the quoted reply."}
+        ]),
+    )];
+    let canonical = messages.clone();
+    assert!(truncate_last_real_user_message_to_fit(
+        &mut messages,
+        20_000,
+        Some(&dir)
+    ));
+    assert_eq!(messages_total_chars(&messages), 20_000);
+    let parts = messages[0].content.as_array().unwrap();
+    let original_parts = canonical[0].content.as_array().unwrap();
+    assert_eq!(parts[0], original_parts[0]);
+    assert_eq!(parts[3], original_parts[3]);
+    for index in [1, 2] {
+        assert_eq!(parts[index]["kind"], "file");
+        assert_eq!(parts[index]["name"], original_parts[index]["name"]);
+        let archive =
+            std::fs::read_to_string(archived_pointer(parts[index]["text"].as_str().unwrap()))
+                .unwrap();
+        assert!(archive.contains(&first));
+        assert!(archive.contains(&second));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn archive_rescue_refuses_file_array_when_archive_fails() {
+    let blocked =
+        std::env::temp_dir().join(format!("archive-rescue-blocked-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&blocked, "not a directory").unwrap();
+    for body in [
+        "A".repeat(96_000),
+        format!(
+            "[context-overflow-truncated] full original archived at: {}\n{}",
+            blocked.display(),
+            "B".repeat(96_000)
+        ),
+    ] {
+        let mut messages = vec![msg(
+            "user",
+            serde_json::json!([
+                {"type":"reference", "kind":"file", "name":"source.pdf", "text":body},
+                {"type":"text", "text":"Explain the source."}
+            ]),
+        )];
+        let canonical = messages.clone();
+        for archive_dir in [None, Some(blocked.as_path())] {
+            assert!(!truncate_last_real_user_message_to_fit(
+                &mut messages,
+                40_000,
+                archive_dir
+            ));
+            assert_eq!(messages, canonical);
+        }
+    }
+    std::fs::remove_file(blocked).unwrap();
+}
+
+#[test]
+fn archive_rescue_keeps_image_arrays_untouched() {
+    let dir = overflow_dir("image-parts");
+    for image in [
+        serde_json::json!({"type":"image_url", "image_url":{"url":"data:image/png;base64,eA=="}}),
+        serde_json::json!({"type":"reference", "kind":"image", "name":"image.png", "asset":"image.png"}),
+    ] {
+        let mut messages = vec![msg(
+            "user",
+            serde_json::json!([
+                {"type":"reference", "kind":"file", "name":"source.txt", "text":"A".repeat(96_000)},
+                image,
+                {"type":"text", "text":"Compare the file and image."}
+            ]),
+        )];
+        let canonical = messages.clone();
+        assert!(!truncate_last_real_user_message_to_fit(
+            &mut messages,
+            40_000,
+            Some(&dir)
+        ));
+        assert_eq!(messages, canonical);
+        assert!(!dir.join(OVERFLOW_HISTORY_FILENAME).exists());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn refuses_when_overflow_archive_write_fails() {
     // A regular file squatting on the overflow-directory path makes every
     // archive write fail. The rescue must refuse instead of replacing the

@@ -16,9 +16,9 @@ pub(in crate::ai) const MID_TURN_LLM_SUMMARY_MAX_CHARS: usize = 8_000;
 /// mid-turn compression can no longer make progress: its policies never
 /// truncate user messages, so an oversized current user message would
 /// otherwise fail the turn outright. Offloads the middle of the last **real**
-/// user message to the overflow archive and replaces it with a head+tail
-/// preview stub, using the same machinery as mutable assistant fields
-/// ([`truncate_mutable_field`]).
+/// user message (or its file snapshots) to the overflow archive and replaces
+/// those text fields with head+tail previews, using the same machinery as
+/// mutable assistant fields ([`truncate_mutable_field`]).
 ///
 /// Only call this after the provider actually rejected the request: the
 /// pre-request soft budget must keep the current user message intact so
@@ -43,9 +43,10 @@ pub(in crate::ai) fn truncate_last_real_user_message_to_fit(
         return false;
     };
     let message = &mut messages[index];
-    // Multimodal (array) content must not be flattened into a text stub —
-    // that would drop image parts. Only plain string content can be offloaded.
-    if message.content.as_str().is_none() {
+    if message.content.is_array() {
+        return truncate_user_file_references_to_fit(message, total - target_chars, overflow_dir);
+    }
+    if !message.content.is_string() {
         return false;
     }
     truncate_mutable_field(
@@ -57,6 +58,70 @@ pub(in crate::ai) fn truncate_last_real_user_message_to_fit(
         // the archive; without an archived copy the rescue must not fire.
         FieldArchivePolicy::Required,
     )
+}
+
+/// Keep the array's provenance and question intact while rescuing file snapshots.
+/// Image arrays retain their existing protection; reply parts are never truncated.
+fn truncate_user_file_references_to_fit(
+    message: &mut Message,
+    reduce_by: usize,
+    overflow_dir: Option<&Path>,
+) -> bool {
+    if crate::ai::request::content_has_image(&message.content) {
+        return false;
+    }
+    let Some(overflow_dir) = overflow_dir else {
+        return false;
+    };
+    let archive_path = overflow_dir.join(OVERFLOW_HISTORY_FILENAME);
+    let keep_floor =
+        (super::truncate::content_truncation_prefix(Some(&archive_path.to_string_lossy()))
+            .chars()
+            .count()
+            + super::truncate::MIN_CONTENT_PREVIEW_CHARS)
+            .max(160);
+    let parts = message.content.as_array().expect("array content");
+    let mut files: Vec<_> = parts
+        .iter()
+        .enumerate()
+        .filter(|(_, part)| {
+            part.get("type").and_then(Value::as_str) == Some("reference")
+                && part.get("kind").and_then(Value::as_str) == Some("file")
+        })
+        .filter_map(|(index, part)| {
+            let chars = part.get("text")?.as_str()?.chars().count();
+            (chars > 160).then_some((index, chars))
+        })
+        .collect();
+    files.sort_by_key(|(_, chars)| std::cmp::Reverse(*chars));
+    let before = message_billable_chars(message);
+    let target = before.saturating_sub(reduce_by);
+    // Stage every cut so a failed archive write cannot publish a partial rescue.
+    let mut candidate = message.clone();
+    for (index, chars) in files {
+        let remaining = message_billable_chars(&candidate).saturating_sub(target);
+        if remaining == 0 {
+            break;
+        }
+        let reduction = remaining.min(chars.saturating_sub(keep_floor));
+        if reduction == 0 {
+            continue;
+        }
+        if !truncate_mutable_field(
+            &mut candidate,
+            MutableMessageField::FileReferenceText(index),
+            reduction,
+            Some(overflow_dir),
+            FieldArchivePolicy::Required,
+        ) {
+            return false;
+        }
+    }
+    if message_billable_chars(&candidate) >= before {
+        return false;
+    }
+    *message = candidate;
+    true
 }
 
 /// Char budget of the precision tail. The newest tool groups stay verbatim up to
