@@ -305,6 +305,111 @@ fn final_response_citation_gate_reopens_once_then_warns_for_an_invalid_line() {
 }
 
 #[test]
+fn final_response_citation_gate_warning_reports_the_reopen_veto() {
+    let root = std::env::temp_dir().join(format!(
+        "final-citation-warning-reasons-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "first\nsecond\n").unwrap();
+
+    SUBAGENT_CWD.sync_scope(root.clone(), || {
+        for (marker, mut force_final_response, iteration, reason) in [
+            (
+                Some(FINAL_CITATION_RETRY_MARKER),
+                true,
+                16,
+                "citation retry already requested; citations remain unverified",
+            ),
+            (
+                None,
+                true,
+                1,
+                "forced final response; no citation retry requested",
+            ),
+            (
+                None,
+                false,
+                16,
+                "iteration limit reached; no citation retry requested",
+            ),
+            (
+                Some(COMPLETION_EVIDENCE_REQUIRED_MARKER),
+                false,
+                1,
+                "shared final-gate retry budget exhausted; no citation retry requested",
+            ),
+        ] {
+            let mut app = test_app_with_tools(&["read_file"]);
+            let shared_mcp =
+                std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+            let mut messages = marker
+                .map(|marker| Message {
+                    role: ROLE_INTERNAL_NOTE.to_string(),
+                    content: serde_json::Value::String(marker.to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            let message_count = messages.len();
+            let mut turn_messages = Vec::new();
+            let mut persisted_turn_messages = 0usize;
+            let mut final_assistant_text = String::new();
+            let mut final_assistant_recorded = false;
+            let mut terminal_dedupe_candidate = None;
+            let mut turn_had_tool_error = false;
+            let step = handle_iteration_execution(
+                &mut app,
+                "fix the bug",
+                &mcp_snapshot(&shared_mcp),
+                &shared_mcp,
+                IterationExecution::FinalResponse(crate::ai::types::StreamResult {
+                    outcome: crate::ai::types::StreamOutcome::Completed,
+                    assistant_text: "Implemented the change in src/lib.rs:9.".to_string(),
+                    skip_response_drain: true,
+                    ..Default::default()
+                }),
+                &mut messages,
+                &mut turn_messages,
+                false,
+                &mut persisted_turn_messages,
+                &mut final_assistant_text,
+                &mut final_assistant_recorded,
+                &mut force_final_response,
+                &mut terminal_dedupe_candidate,
+                true,
+                iteration,
+                16,
+                0,
+                &mut turn_had_tool_error,
+            )
+            .unwrap();
+
+            assert!(matches!(step, TurnLoopStep::Break), "{reason}");
+            assert!(final_assistant_recorded, "{reason}");
+            assert!(
+                final_assistant_text
+                    .contains(&format!("{FINAL_CITATION_WARNING} Reason: {reason}."))
+            );
+            assert_eq!(
+                terminal_dedupe_candidate.as_deref(),
+                Some(final_assistant_text.as_str())
+            );
+            assert!(!messages[message_count..].iter().any(|message| {
+                message
+                    .content
+                    .as_str()
+                    .is_some_and(|text| text.starts_with(FINAL_CITATION_RETRY_MARKER))
+            }));
+        }
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn final_response_citation_gate_warns_only_after_one_recovery_final() {
     let root = std::env::temp_dir().join(format!(
         "final-citation-finalize-{}",
@@ -385,6 +490,10 @@ fn final_response_citation_gate_warns_only_after_one_recovery_final() {
         assert!(matches!(second_step, TurnLoopStep::Break));
         assert!(final_assistant_recorded);
         assert!(final_assistant_text.contains(FINAL_CITATION_WARNING));
+        assert!(
+            final_assistant_text
+                .contains("Reason: citation retry already requested; citations remain unverified.")
+        );
         assert_eq!(
             terminal_dedupe_candidate.as_deref(),
             Some(final_assistant_text.as_str())
