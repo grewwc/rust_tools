@@ -9,9 +9,14 @@ use crate::ai::{
 };
 use rust_tools::commonw::FastSet;
 use serde_json::Value;
-use std::sync::{LazyLock, Mutex};
+use std::{
+    borrow::Cow,
+    sync::{LazyLock, Mutex},
+};
 
-use super::{TurnOutcome, persistence::persist_pending_turn_messages_for_model};
+use super::{
+    TurnOutcome, persistence::persist_pending_turn_messages_for_model, tool_result::FinalGateState,
+};
 
 const SUBAGENT_TOOL_EVIDENCE_MAX_CALLS: usize = 8;
 const SUBAGENT_TOOL_EVIDENCE_MAX_CHARS_PER_RESULT: usize = 700;
@@ -101,6 +106,81 @@ fn ensure_final_assistant_recorded(
     });
 }
 
+/// Prepare all delivery channels before publication, without reopening model review.
+/// A recorded body stays intact in history; only its new warning needs another row.
+fn prepare_critical_premises_delivery<'a>(
+    final_assistant_text: &'a str,
+    final_assistant_recorded: bool,
+    user_visible_final_suffix: Option<&'a str>,
+    has_pending_critical_premises: bool,
+    turn_messages: &mut Vec<Message>,
+) -> (Cow<'a, str>, bool, Option<Cow<'a, str>>) {
+    if !has_pending_critical_premises || final_assistant_text.trim().is_empty() {
+        return (
+            Cow::Borrowed(final_assistant_text),
+            final_assistant_recorded,
+            user_visible_final_suffix.map(Cow::Borrowed),
+        );
+    }
+
+    let warning = format!(
+        "[Runtime warning] {}",
+        FinalGateState::CRITICAL_PREMISES_WARNING
+    );
+    if final_assistant_text.contains(FinalGateState::CRITICAL_PREMISES_WARNING) {
+        // Recorded answers retain their explicit redraw/stream-deduplication policy.
+        // Local fallbacks hide the body's warning tail, so give both visible consumers
+        // a warning-only suffix rather than replaying an old narration candidate.
+        let suffix = if final_assistant_recorded {
+            user_visible_final_suffix.map(Cow::Borrowed)
+        } else {
+            let suffix = user_visible_final_suffix
+                .map(str::trim)
+                .filter(|text| text.starts_with("[Runtime warning]"));
+            Some(match suffix {
+                Some(suffix)
+                    if suffix
+                        .matches(FinalGateState::CRITICAL_PREMISES_WARNING)
+                        .count()
+                        == 1 =>
+                {
+                    Cow::Borrowed(suffix)
+                }
+                Some(suffix) => {
+                    // Keep other blank-line-separated gate notices while replacing
+                    // missing or duplicate critical notices with one canonical warning.
+                    let other_notices = suffix
+                        .split("\n\n")
+                        .filter(|notice| {
+                            !notice.contains(FinalGateState::CRITICAL_PREMISES_WARNING)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    Cow::Owned(if other_notices.is_empty() {
+                        warning
+                    } else {
+                        format!("{other_notices}\n\n{warning}")
+                    })
+                }
+                None => Cow::Owned(warning),
+            })
+        };
+        return (
+            Cow::Borrowed(final_assistant_text),
+            final_assistant_recorded,
+            suffix,
+        );
+    }
+    if final_assistant_recorded {
+        ensure_final_assistant_recorded(&warning, false, turn_messages);
+    }
+    (
+        Cow::Owned(format!("{final_assistant_text}\n\n{warning}")),
+        final_assistant_recorded,
+        Some(Cow::Owned(warning)),
+    )
+}
+
 /// The model occasionally echoes internal_note entries from the request projection verbatim. Runtime
 /// notes intended only for the model must stay in canonical history but must not be printed to the
 /// terminal as user-visible answers. For already-streamed answers, only append hints that the runtime
@@ -131,7 +211,17 @@ fn terminal_final_text_to_render(
     }
     // This fallback bypasses the streaming projection, so a machine-checked audit
     // envelope must be hidden here as well; canonical history keeps the original.
-    Some(crate::ai::stream::hide_audit_report(terminal_text))
+    let mut visible_text = crate::ai::stream::hide_audit_report(terminal_text);
+    if let Some(warning) = user_visible_suffix
+        .map(str::trim)
+        .filter(|text| text.starts_with("[Runtime warning]"))
+    {
+        if !visible_text.is_empty() {
+            visible_text.push_str("\n\n");
+        }
+        visible_text.push_str(warning);
+    }
+    Some(visible_text)
 }
 
 fn serve_final_text_to_commit(
@@ -643,6 +733,7 @@ pub(super) async fn finalize_turn(
     final_assistant_text: &str,
     final_assistant_recorded: bool,
     user_visible_final_suffix: Option<&str>,
+    has_pending_critical_premises: bool,
     active_skill_name: Option<&str>,
     turn_messages: &mut Vec<Message>,
     one_shot_mode: bool,
@@ -650,6 +741,16 @@ pub(super) async fn finalize_turn(
     should_quit: bool,
     _had_tool_error: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
+    let (delivery_text, final_assistant_recorded, delivery_suffix) =
+        prepare_critical_premises_delivery(
+            final_assistant_text,
+            final_assistant_recorded,
+            user_visible_final_suffix,
+            has_pending_critical_premises,
+            turn_messages,
+        );
+    let final_assistant_text = delivery_text.as_ref();
+    let user_visible_final_suffix = delivery_suffix.as_deref();
     if let Some(subagent_output_for_parent) =
         subagent_result_payload_for_parent(final_assistant_text, turn_messages)
     {
@@ -1545,6 +1646,432 @@ mod tests {
     fn subagent_parent_result_without_tools_is_plain_final_text() {
         let output = format_subagent_result_for_parent("done", &[]);
         assert_eq!(output, "done");
+    }
+
+    #[test]
+    fn critical_premises_pending_fallback_reaches_all_delivery_channels() {
+        let warning = format!(
+            "[Runtime warning] {}",
+            FinalGateState::CRITICAL_PREMISES_WARNING
+        );
+        for original in [
+            "local fallback",
+            "partial repetition output",
+            "truncated partial output",
+        ] {
+            let mut turn_messages = agent_team_tool_messages(&["observed result".to_string()]);
+            let initial_len = turn_messages.len();
+            let (body, recorded, suffix) = prepare_critical_premises_delivery(
+                original,
+                false,
+                Some("unrelated old narration"),
+                true,
+                &mut turn_messages,
+            );
+            let expected = format!("{original}\n\n{warning}");
+            assert_eq!(body.as_ref(), expected.as_str());
+            assert!(!recorded);
+            assert_eq!(suffix.as_deref(), Some(warning.as_str()));
+            assert_eq!(turn_messages.len(), initial_len);
+            let payload =
+                subagent_result_payload_for_parent(body.as_ref(), &turn_messages).unwrap();
+            assert!(payload.contains(&expected));
+            for parent_agent_team_mode in [false, true] {
+                let payload = format_subagent_result_for_parent_with_policy(
+                    body.as_ref(),
+                    &turn_messages,
+                    parent_agent_team_mode,
+                );
+                assert!(payload.contains(&expected));
+                assert!(payload.contains("observed result"));
+            }
+            ensure_final_assistant_recorded(body.as_ref(), recorded, &mut turn_messages);
+            assert_eq!(turn_messages.len(), initial_len + 1);
+            assert_eq!(turn_messages[initial_len].role, "assistant");
+            assert_eq!(
+                value_to_string(&turn_messages[initial_len].content),
+                expected
+            );
+            assert_eq!(
+                terminal_final_text_to_render(body.as_ref(), recorded, suffix.as_deref()),
+                Some(expected.clone())
+            );
+            let committed = serve_final_text_to_commit(body.as_ref(), suffix.as_deref()).unwrap();
+            assert_eq!(committed, expected);
+            assert_eq!(committed.matches(&warning).count(), 1);
+        }
+    }
+
+    #[test]
+    fn critical_premises_recorded_body_gets_warning_row_only() {
+        let original = "already streamed answer";
+        let warning = format!(
+            "[Runtime warning] {}",
+            FinalGateState::CRITICAL_PREMISES_WARNING
+        );
+        let mut turn_messages = Vec::new();
+        ensure_final_assistant_recorded(original, false, &mut turn_messages);
+        let (body, recorded, suffix) = prepare_critical_premises_delivery(
+            original,
+            true,
+            Some("unrelated old narration"),
+            true,
+            &mut turn_messages,
+        );
+        let expected = format!("{original}\n\n{warning}");
+        assert!(recorded);
+        assert_eq!(body.as_ref(), expected.as_str());
+        assert_eq!(suffix.as_deref(), Some(warning.as_str()));
+        ensure_final_assistant_recorded(body.as_ref(), recorded, &mut turn_messages);
+        assert_eq!(turn_messages.len(), 2);
+        assert_eq!(value_to_string(&turn_messages[0].content), original);
+        assert_eq!(turn_messages[1].role, "assistant");
+        assert_eq!(value_to_string(&turn_messages[1].content), warning);
+        assert_eq!(
+            terminal_final_text_to_render(body.as_ref(), recorded, suffix.as_deref()),
+            Some(warning)
+        );
+        assert_eq!(
+            serve_final_text_to_commit(body.as_ref(), suffix.as_deref()),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            subagent_result_payload_for_parent(body.as_ref(), &turn_messages),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn critical_premises_no_pending_is_exact_noop() {
+        let original = "  unchanged body \n";
+        for recorded in [false, true] {
+            for suffix in [None, Some(" unrelated narration candidate ")] {
+                let mut turn_messages = Vec::new();
+                ensure_final_assistant_recorded("existing row", false, &mut turn_messages);
+                let (body, prepared_recorded, prepared_suffix) = prepare_critical_premises_delivery(
+                    original,
+                    recorded,
+                    suffix,
+                    false,
+                    &mut turn_messages,
+                );
+                assert!(matches!(&body, Cow::Borrowed(_)));
+                assert_eq!(body.as_ref(), original);
+                assert_eq!(prepared_recorded, recorded);
+                assert_eq!(prepared_suffix.as_deref(), suffix);
+                assert_eq!(turn_messages.len(), 1);
+                assert_eq!(value_to_string(&turn_messages[0].content), "existing row");
+            }
+        }
+    }
+
+    #[test]
+    fn critical_premises_empty_is_exact_noop() {
+        for original in ["", " \n\t"] {
+            for recorded in [false, true] {
+                for suffix in [None, Some(" unrelated narration candidate ")] {
+                    let mut turn_messages = Vec::new();
+                    ensure_final_assistant_recorded("existing row", false, &mut turn_messages);
+                    let (body, prepared_recorded, prepared_suffix) =
+                        prepare_critical_premises_delivery(
+                            original,
+                            recorded,
+                            suffix,
+                            true,
+                            &mut turn_messages,
+                        );
+                    assert!(matches!(&body, Cow::Borrowed(_)));
+                    assert_eq!(body.as_ref(), original);
+                    assert_eq!(prepared_recorded, recorded);
+                    assert_eq!(prepared_suffix.as_deref(), suffix);
+                    assert_eq!(turn_messages.len(), 1);
+                    assert_eq!(value_to_string(&turn_messages[0].content), "existing row");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn critical_premises_already_warned_fallback_reaches_visible_consumers_once() {
+        let warning = format!(
+            "[Runtime warning] {}",
+            FinalGateState::CRITICAL_PREMISES_WARNING
+        );
+        let warned = format!("existing body\n\n{warning}");
+        let duplicate_body = format!("{warned}\n\n{warning}");
+        let duplicate_suffix = format!("{warning}\n\n{warning}");
+        for original in [warned.as_str(), duplicate_body.as_str()] {
+            for candidate in [
+                None,
+                Some(" unrelated narration candidate "),
+                Some(" \n\t"),
+                Some(warning.as_str()),
+                Some(duplicate_suffix.as_str()),
+            ] {
+                let mut turn_messages = Vec::new();
+                ensure_final_assistant_recorded("existing row", false, &mut turn_messages);
+                let (body, recorded, suffix) = prepare_critical_premises_delivery(
+                    original,
+                    false,
+                    candidate,
+                    true,
+                    &mut turn_messages,
+                );
+                assert!(matches!(&body, Cow::Borrowed(_)));
+                assert_eq!(body.as_ref(), original);
+                assert!(!recorded);
+                assert_eq!(suffix.as_deref(), Some(warning.as_str()));
+                assert_eq!(turn_messages.len(), 1);
+                assert_eq!(value_to_string(&turn_messages[0].content), "existing row");
+                for visible in [
+                    terminal_final_text_to_render(body.as_ref(), recorded, suffix.as_deref())
+                        .unwrap(),
+                    serve_final_text_to_commit(body.as_ref(), suffix.as_deref()).unwrap(),
+                ] {
+                    assert_eq!(visible, warned);
+                    assert_eq!(visible.matches(&warning).count(), 1);
+                    assert!(!visible.contains("unrelated narration candidate"));
+                }
+                ensure_final_assistant_recorded(body.as_ref(), recorded, &mut turn_messages);
+                assert_eq!(turn_messages.len(), 2);
+                assert_eq!(value_to_string(&turn_messages[0].content), "existing row");
+                assert_eq!(turn_messages[1].role, "assistant");
+                assert_eq!(value_to_string(&turn_messages[1].content), original);
+            }
+        }
+    }
+
+    #[test]
+    fn critical_premises_already_warned_fallback_preserves_other_gate_suffixes() {
+        let warning = format!(
+            "[Runtime warning] {}",
+            FinalGateState::CRITICAL_PREMISES_WARNING
+        );
+        let completion = "[Runtime warning] Completion is unverified.";
+        let citation = "[Runtime warning] Final citations are unverified.";
+        let original = format!("existing body\n\n{warning}");
+        let complete_suffix = format!("{completion}\n\n{warning}\n\n{citation}");
+        let duplicate_suffix = format!("{complete_suffix}\n\n{warning}");
+        let expected_deduped = format!("{completion}\n\n{citation}\n\n{warning}");
+        let cases = [
+            (completion, format!("{completion}\n\n{warning}")),
+            (complete_suffix.as_str(), complete_suffix.clone()),
+            (duplicate_suffix.as_str(), expected_deduped),
+        ];
+        for (candidate, expected_suffix) in cases {
+            let mut turn_messages = Vec::new();
+            ensure_final_assistant_recorded("existing row", false, &mut turn_messages);
+            let (body, recorded, suffix) = prepare_critical_premises_delivery(
+                &original,
+                false,
+                Some(candidate),
+                true,
+                &mut turn_messages,
+            );
+            assert!(matches!(&body, Cow::Borrowed(_)));
+            assert_eq!(body.as_ref(), original);
+            assert!(!recorded);
+            assert_eq!(suffix.as_deref(), Some(expected_suffix.as_str()));
+            assert_eq!(turn_messages.len(), 1);
+            assert_eq!(value_to_string(&turn_messages[0].content), "existing row");
+            for visible in [
+                terminal_final_text_to_render(body.as_ref(), recorded, suffix.as_deref()).unwrap(),
+                serve_final_text_to_commit(body.as_ref(), suffix.as_deref()).unwrap(),
+            ] {
+                assert_eq!(visible, format!("existing body\n\n{expected_suffix}"));
+                assert_eq!(visible.matches(&warning).count(), 1);
+                assert_eq!(visible.matches(completion).count(), 1);
+                if candidate.contains(citation) {
+                    assert_eq!(visible.matches(citation).count(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn critical_premises_already_warned_recorded_preserves_delivery_policy() {
+        let warning = format!(
+            "[Runtime warning] {}",
+            FinalGateState::CRITICAL_PREMISES_WARNING
+        );
+        let completion = "[Runtime warning] Completion is unverified.";
+        let notices = format!("{warning}\n\n{completion}");
+        let original = format!("existing body\n\n{notices}");
+        for candidate in [
+            None,
+            Some(" unrelated narration candidate "),
+            Some(notices.as_str()),
+            Some(original.as_str()),
+        ] {
+            let mut turn_messages = Vec::new();
+            ensure_final_assistant_recorded(&original, false, &mut turn_messages);
+            let (body, recorded, suffix) = prepare_critical_premises_delivery(
+                &original,
+                true,
+                candidate,
+                true,
+                &mut turn_messages,
+            );
+            assert!(matches!(&body, Cow::Borrowed(_)));
+            assert_eq!(body.as_ref(), original);
+            assert!(recorded);
+            assert_eq!(suffix.as_deref(), candidate);
+            ensure_final_assistant_recorded(body.as_ref(), recorded, &mut turn_messages);
+            assert_eq!(turn_messages.len(), 1);
+            assert_eq!(turn_messages[0].role, "assistant");
+            assert_eq!(value_to_string(&turn_messages[0].content), original);
+            let terminal =
+                terminal_final_text_to_render(body.as_ref(), recorded, suffix.as_deref());
+            assert_eq!(terminal, candidate.map(|text| text.trim().to_string()));
+            let served = serve_final_text_to_commit(body.as_ref(), suffix.as_deref()).unwrap();
+            match candidate {
+                None => {
+                    // No suffix does not authorize redrawing an already recorded answer.
+                    assert_eq!(terminal, None);
+                    assert_eq!(served, "existing body");
+                }
+                Some(text) if text.contains(&warning) => {
+                    assert_eq!(served, original);
+                    assert_eq!(served.matches(&warning).count(), 1);
+                    assert_eq!(served.matches(completion).count(), 1);
+                    let terminal = terminal.unwrap();
+                    assert_eq!(terminal.matches(&warning).count(), 1);
+                    assert_eq!(terminal.matches(completion).count(), 1);
+                    if text == notices {
+                        assert_eq!(terminal, notices);
+                        assert!(!terminal.contains("existing body"));
+                    }
+                }
+                Some(_) => {
+                    assert_eq!(served, "existing body\n\nunrelated narration candidate");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn critical_premises_already_warned_preserves_safe_hiding() {
+        let warning = format!(
+            "[Runtime warning] {}",
+            FinalGateState::CRITICAL_PREMISES_WARNING
+        );
+        for original in [
+            format!("self_note:completion_evidence_required\n\n{warning}"),
+            format!("[Model-authored note from an earlier turn; internal context]\n\n{warning}"),
+            warning.clone(),
+        ] {
+            let mut turn_messages = Vec::new();
+            let (body, recorded, suffix) = prepare_critical_premises_delivery(
+                &original,
+                false,
+                None,
+                true,
+                &mut turn_messages,
+            );
+            assert!(matches!(&body, Cow::Borrowed(_)));
+            assert_eq!(body.as_ref(), original);
+            assert!(!recorded);
+            assert!(turn_messages.is_empty());
+            assert_eq!(
+                terminal_final_text_to_render(body.as_ref(), recorded, suffix.as_deref()),
+                None
+            );
+            assert_eq!(
+                serve_final_text_to_commit(body.as_ref(), suffix.as_deref()),
+                None
+            );
+        }
+
+        let original = format!(
+            "Visible answer.\n\n<audit_report>{{\"findings\":[]}}</audit_report>\n\n{warning}"
+        );
+        let mut turn_messages = Vec::new();
+        let (body, recorded, suffix) =
+            prepare_critical_premises_delivery(&original, false, None, true, &mut turn_messages);
+        assert_eq!(body.as_ref(), original);
+        assert!(!recorded);
+        assert!(turn_messages.is_empty());
+        ensure_final_assistant_recorded(body.as_ref(), recorded, &mut turn_messages);
+        assert_eq!(turn_messages.len(), 1);
+        assert_eq!(value_to_string(&turn_messages[0].content), original);
+        for visible in [
+            terminal_final_text_to_render(body.as_ref(), recorded, suffix.as_deref()).unwrap(),
+            serve_final_text_to_commit(body.as_ref(), suffix.as_deref()).unwrap(),
+        ] {
+            assert!(visible.starts_with("Visible answer."));
+            assert!(visible.ends_with(&warning));
+            assert_eq!(visible.matches(&warning).count(), 1);
+            assert!(!visible.contains("<audit_report>"));
+            assert!(!visible.contains("\"findings\""));
+        }
+    }
+
+    #[test]
+    fn critical_premises_fallback_never_renders_unrelated_candidate() {
+        let candidate = "unrelated old narration";
+        assert_eq!(
+            terminal_final_text_to_render("local fallback", false, Some(candidate)),
+            Some("local fallback".to_string())
+        );
+        let mut turn_messages = Vec::new();
+        let (body, recorded, suffix) = prepare_critical_premises_delivery(
+            "local fallback",
+            false,
+            Some(candidate),
+            true,
+            &mut turn_messages,
+        );
+        for visible in [
+            terminal_final_text_to_render(body.as_ref(), recorded, suffix.as_deref()).unwrap(),
+            serve_final_text_to_commit(body.as_ref(), suffix.as_deref()).unwrap(),
+        ] {
+            assert_eq!(visible, body.as_ref());
+            assert!(!visible.contains(candidate));
+            assert!(visible.contains(FinalGateState::CRITICAL_PREMISES_WARNING));
+        }
+    }
+
+    #[test]
+    fn critical_premises_warning_preserves_internal_note_and_audit_hiding() {
+        for original in [
+            "self_note:completion_evidence_required",
+            "[Model-authored note from an earlier turn; internal context]",
+            "[Runtime warning] Internal warning only.",
+        ] {
+            let (body, recorded, suffix) =
+                prepare_critical_premises_delivery(original, false, None, true, &mut Vec::new());
+            assert_eq!(
+                terminal_final_text_to_render(body.as_ref(), recorded, suffix.as_deref()),
+                None
+            );
+            assert_eq!(
+                serve_final_text_to_commit(body.as_ref(), suffix.as_deref()),
+                None
+            );
+        }
+
+        let original = "Visible answer.\n\n<audit_report>{\"findings\":[]}</audit_report>";
+        let mut turn_messages = Vec::new();
+        let (body, recorded, suffix) =
+            prepare_critical_premises_delivery(original, false, None, true, &mut turn_messages);
+        ensure_final_assistant_recorded(body.as_ref(), recorded, &mut turn_messages);
+        assert_eq!(value_to_string(&turn_messages[0].content), body.as_ref());
+        assert!(body.contains(original));
+        for visible in [
+            terminal_final_text_to_render(body.as_ref(), recorded, suffix.as_deref()).unwrap(),
+            serve_final_text_to_commit(body.as_ref(), suffix.as_deref()).unwrap(),
+        ] {
+            assert!(visible.starts_with("Visible answer."));
+            assert!(visible.ends_with(FinalGateState::CRITICAL_PREMISES_WARNING));
+            assert_eq!(
+                visible
+                    .matches(FinalGateState::CRITICAL_PREMISES_WARNING)
+                    .count(),
+                1
+            );
+            assert!(!visible.contains("<audit_report>"));
+            assert!(!visible.contains("\"findings\""));
+        }
     }
 
     #[test]

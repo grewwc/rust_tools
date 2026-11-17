@@ -324,7 +324,6 @@ struct TurnOutputState {
     response_model: Option<String>,
     terminal_dedupe_candidate: Option<String>,
     validation_status: Option<crate::ai::request::TransientStatusLine>,
-    gate: FinalGateState,
     had_tool_error: bool,
 }
 
@@ -2182,6 +2181,64 @@ mod audit_orchestration_tests {
     }
 
     #[test]
+    fn critical_premises_fallbacks_share_synchronous_delivery_boundary() {
+        let source = include_str!("orchestrator.rs");
+        let body = source
+            .rsplit_once("async fn run_turn_body_round(")
+            .unwrap()
+            .1;
+        assert_eq!(body.matches("finalize_turn(").count(), 1);
+        let call = body.split_once("let outcome = finalize_turn(").unwrap().1;
+        let call = call.split_once(".await?").unwrap().0;
+        assert!(call.contains("&output.assistant_text"));
+        assert!(call.contains("gate.has_pending_critical_premises()"));
+        let outer = source
+            .rsplit_once("async fn run_turn_body(")
+            .unwrap()
+            .1
+            .split_once("async fn run_turn_body_round(")
+            .unwrap()
+            .0;
+        assert_eq!(
+            outer
+                .matches("let mut gate = FinalGateState::default()")
+                .count(),
+            1
+        );
+        assert!(outer.contains("&mut gate,"));
+        assert!(body.contains("gate: &mut FinalGateState"));
+        assert!(!body.contains("FinalGateState::default()"));
+        assert_eq!(
+            body.matches("gate.begin_audit_followup(&turn_messages)")
+                .count(),
+            2
+        );
+
+        let source = include_str!("finalize.rs");
+        let finalizer = source
+            .split_once("pub(super) async fn finalize_turn(")
+            .unwrap()
+            .1;
+        let prepare = finalizer
+            .find("prepare_critical_premises_delivery(")
+            .unwrap();
+        let publish = finalizer
+            .find("subagent_result_payload_for_parent(")
+            .unwrap();
+        let record = finalizer.find("ensure_final_assistant_recorded(").unwrap();
+        assert!(prepare < publish && publish < record);
+        let helper = source
+            .split_once("fn prepare_critical_premises_delivery")
+            .unwrap()
+            .1
+            .split_once("/// The model occasionally")
+            .unwrap()
+            .0;
+        assert!(!helper.contains(".await"));
+        assert!(!helper.contains("review_critical_premises"));
+    }
+
+    #[test]
     fn audit_default_explicit_bypasses_lead_planning_and_scope_dispatch() {
         let source = include_str!("orchestrator.rs");
         let routing = source
@@ -2419,6 +2476,8 @@ async fn run_turn_body(
     mut delegation_advisory: DelegationAdvisoryState,
     mut llm_summary_budget: LlmSummaryBudget,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
+    // Audit followups are internal stages of one logical turn, not new user turns.
+    let mut gate = FinalGateState::default();
     loop {
         match run_turn_body_round(
             app,
@@ -2437,6 +2496,7 @@ async fn run_turn_body(
             should_quit,
             delegation_advisory,
             llm_summary_budget,
+            &mut gate,
         )
         .await?
         {
@@ -2474,6 +2534,7 @@ async fn run_turn_body_round(
     should_quit: bool,
     delegation_advisory: DelegationAdvisoryState,
     mut llm_summary_budget: LlmSummaryBudget,
+    gate: &mut FinalGateState,
 ) -> Result<TurnBodyStage, Box<dyn std::error::Error>> {
     // Clear the previous round's interrupt flag at the start of every round so it
     // reflects only whether THIS round was interrupted by Ctrl+C.
@@ -3401,7 +3462,7 @@ async fn run_turn_body_round(
                 &mut force_final_response,
                 &mut output.terminal_dedupe_candidate,
                 &mut output.validation_status,
-                &mut output.gate,
+                gate,
                 skill_turn.matched_skill_names().is_empty(),
                 iteration,
                 effective_max_iterations,
@@ -3864,6 +3925,7 @@ async fn run_turn_body_round(
                                 &report,
                                 pending.round,
                             );
+                        gate.begin_audit_followup(&turn_messages);
                         return Ok(TurnBodyStage::AuditFollowup {
                             question: fix_question,
                             pending_audit: pending.next_round(),
@@ -3887,6 +3949,7 @@ async fn run_turn_body_round(
                 &output.assistant_text,
                 output.assistant_recorded,
                 output.terminal_dedupe_candidate.as_deref(),
+                gate.has_pending_critical_premises(),
                 final_skill_name.as_deref(),
                 &mut turn_messages,
                 one_shot_mode,
@@ -3910,6 +3973,7 @@ async fn run_turn_body_round(
                 let instruction = output.assistant_text.clone();
                 match run_audit_subagent(app, &instruction, fast) {
                     Some(report) => {
+                        gate.begin_audit_followup(&turn_messages);
                         return Ok(TurnBodyStage::AuditFollowup {
                             question: crate::ai::driver::commands::audit::build_audit_fix_followup(
                                 &instruction,

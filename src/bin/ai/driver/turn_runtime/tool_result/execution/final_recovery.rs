@@ -31,9 +31,54 @@ pub(in crate::ai::driver::turn_runtime) struct FinalGateState {
     retry_consumed: bool,
     no_tool_retry_consumed: bool,
     outstanding_work_reopens: usize,
+    // Actual execution observations and model-derived dispositions belong to this
+    // turn, not the compressed request projection or session-global tool ledger.
+    pub(super) critical_premises: crate::ai::tools::critical_premises::PremiseState,
+    pub(super) critical_evidence: Vec<crate::ai::tools::critical_premises::EvidenceRecord>,
+    // Canonical positions keep increasing even when the bounded cache evicts records.
+    pub(super) critical_evidence_next_index: usize,
+    pub(super) critical_review_consumed: bool,
+    // Earlier audit stages have separate canonical message buffers. Keep their IDs
+    // reserved even after their observation bodies leave the bounded evidence cache.
+    pub(super) critical_prior_tool_call_ids: rust_tools::commonw::FastSet<String>,
 }
 
 impl FinalGateState {
+    pub(in crate::ai::driver::turn_runtime) const CRITICAL_PREMISES_WARNING: &'static str =
+        super::critical_premises::CRITICAL_PREMISES_WARNING;
+
+    pub(in crate::ai::driver::turn_runtime) fn has_pending_critical_premises(&self) -> bool {
+        !self.critical_premises.pending().is_empty()
+    }
+
+    pub(in crate::ai::driver::turn_runtime) fn begin_audit_followup(
+        &mut self,
+        messages: &[Message],
+    ) {
+        self.critical_prior_tool_call_ids
+            .extend(messages.iter().flat_map(|message| {
+                message
+                    .tool_calls
+                    .iter()
+                    .flatten()
+                    .map(|call| call.id.clone())
+                    .chain(message.tool_call_id.iter().cloned())
+            }));
+        // A followup has a new synthesis stage and may introduce a new plan.
+        // Its load-bearing premises, evidence ordering and shared quality/review
+        // budgets still belong to the same logical turn.
+        self.no_tool_retry_consumed = false;
+        self.outstanding_work_reopens = 0;
+    }
+
+    #[cfg(test)]
+    pub(in crate::ai::driver::turn_runtime) fn set_critical_premises_for_test(
+        &mut self,
+        state: crate::ai::tools::critical_premises::PremiseState,
+    ) {
+        self.critical_premises = state;
+    }
+
     pub(super) fn from_current_turn_markers(messages: &[Message]) -> Self {
         let retry_consumed = [
             INJECTED_CONTEXT_ECHO_RETRY_MARKER,
@@ -54,6 +99,7 @@ impl FinalGateState {
                 messages,
                 OUTSTANDING_WORK_REQUIRED_MARKER,
             )),
+            ..Self::default()
         }
     }
 

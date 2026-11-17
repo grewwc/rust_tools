@@ -3,6 +3,43 @@
 
 use super::*;
 
+/// Compatibility entry point for single-round tests. Production passes the same
+/// turn-owned gate to every invocation of `handle_tool_call_round_with_gate`.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round(
+    app: &mut App,
+    source_model: &str,
+    mcp_client: &McpClient,
+    shared_mcp_client: &SharedMcpClient,
+    tool_call_execution: &ToolCallExecution,
+    messages: &mut Vec<Message>,
+    turn_messages: &mut Vec<Message>,
+    one_shot_mode: bool,
+    persisted_turn_messages: &mut usize,
+    iteration: usize,
+    rejection_reason: Option<ToolCallRejectionReason>,
+    suppressed_read_only_results: &HashMap<String, String>,
+    turn_had_tool_error: &mut bool,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    handle_tool_call_round_with_gate(
+        app,
+        source_model,
+        mcp_client,
+        shared_mcp_client,
+        tool_call_execution,
+        messages,
+        turn_messages,
+        one_shot_mode,
+        persisted_turn_messages,
+        iteration,
+        rejection_reason,
+        suppressed_read_only_results,
+        turn_had_tool_error,
+        &mut FinalGateState::default(),
+    )
+}
+
 #[crate::ai::agent_hang_span(
     "pre-fix",
     "C",
@@ -99,7 +136,7 @@ fn build_first_use_tool_guidance_messages(
     })
 }
 
-pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round(
+pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round_with_gate(
     app: &mut App,
     source_model: &str,
     // Since Step 5, real dispatch is handled by RoundToolExecutorAdapter, which locks
@@ -118,6 +155,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round(
     rejection_reason: Option<ToolCallRejectionReason>,
     suppressed_read_only_results: &HashMap<String, String>,
     turn_had_tool_error: &mut bool,
+    final_gate_state: &mut FinalGateState,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let (remaining_meta, cleaned_assistant_text) = strip_legacy_prune_directives(
         messages,
@@ -166,10 +204,33 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round(
             had_error,
         }
     };
-    let persisted_tool_call_ids =
+    let mut persisted_tool_call_ids =
         crate::ai::history::read_tool_message_ids_sqlite(&app.session_history_file)
             .unwrap_or_default();
+    persisted_tool_call_ids.extend(
+        final_gate_state
+            .critical_evidence
+            .iter()
+            .map(|record| record.tool_call_id.clone()),
+    );
+    persisted_tool_call_ids.extend(
+        final_gate_state
+            .critical_prior_tool_call_ids
+            .iter()
+            .cloned(),
+    );
+    // Canonical turn history retains IDs even when the observation cache evicts
+    // them, context folds them, or pending/ephemeral messages never reach SQLite.
+    persisted_tool_call_ids.extend(turn_messages.iter().flat_map(|message| {
+        message
+            .tool_calls
+            .iter()
+            .flatten()
+            .map(|call| call.id.clone())
+            .chain(message.tool_call_id.iter().cloned())
+    }));
     uniquify_tool_call_occurrences(messages, &persisted_tool_call_ids, &mut exec_result);
+    let premise_guidance = critical_premises::bind_round(final_gate_state, &mut exec_result);
     *turn_had_tool_error |= exec_result.had_error;
     // The apply_patch stale-target ledger must be updated after results settle and before
     // the next round's guard check. messages is not a reliable truth source: history
@@ -213,6 +274,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round(
         turn_messages,
     );
     for message in first_use_guidance_messages {
+        append_message_pair(messages, turn_messages, message);
+    }
+    if let Some(message) = premise_guidance {
         append_message_pair(messages, turn_messages, message);
     }
     record_hidden_self_note(app, turn_messages, &remaining_meta);

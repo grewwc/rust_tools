@@ -434,6 +434,88 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             // complete accepted answer below so finalize renders it exactly once; if an
             // identical tool-round narration was already visible, only new warnings remain.
             *terminal_dedupe_candidate = None;
+            match critical_premises::final_action(
+                final_gate_state,
+                *force_final_response,
+                iteration,
+                max_iterations,
+            ) {
+                critical_premises::FinalAction::Allow => {}
+                critical_premises::FinalAction::Reopen => {
+                    append_message_pair(messages, turn_messages, critical_premises::retry_note());
+                    return Ok(TurnLoopStep::Continue);
+                }
+                critical_premises::FinalAction::Review(input) => {
+                    let result = critical_premises::execute_review(app, &input);
+                    append_message_pair(messages, turn_messages, critical_premises::retry_note());
+                    match result {
+                        Ok(review) => {
+                            let usage = review.usage.as_ref().map(|usage| {
+                                serde_json::json!({
+                                    "prompt_tokens": usage.prompt_tokens,
+                                    "completion_tokens": usage.completion_tokens,
+                                    "total_tokens": usage.total_tokens,
+                                })
+                            });
+                            let advice = serde_json::json!({
+                                "semantic_origin": "model_derived",
+                                "requested_model": review.requested_model,
+                                "source_model": review.model,
+                                "usage": usage,
+                                "usage_status": if usage.is_some() { "reported" } else { "unknown" },
+                                "advice": review.text,
+                            }).to_string();
+                            critical_premises::publish_review_context(
+                                app,
+                                source_model,
+                                Some(&review.model),
+                                advice,
+                                one_shot_mode,
+                                messages,
+                                turn_messages,
+                                persisted_turn_messages,
+                            )?;
+                        }
+                        Err(crate::ai::request::CriticalReviewError::Cancelled) => {
+                            // Cancellation must stop the turn rather than accepting
+                            // the draft that was awaiting premise verification.
+                            critical_premises::publish_review_context(
+                                app, source_model, None,
+                                "Review cancelled; consumption is unknown and premises remain unresolved.".into(),
+                                one_shot_mode, messages, turn_messages, persisted_turn_messages,
+                            )?;
+                            return Ok(TurnLoopStep::Return(
+                                crate::ai::driver::turn_runtime::types::TurnOutcome::Continue,
+                            ));
+                        }
+                        Err(error) => {
+                            critical_premises::publish_review_context(
+                                app,
+                                source_model,
+                                None,
+                                format!(
+                                    "Review unavailable: {error}; consumption is unknown. No status was promoted.",
+                                ),
+                                one_shot_mode,
+                                messages,
+                                turn_messages,
+                                persisted_turn_messages,
+                            )?;
+                        }
+                    }
+                    return Ok(TurnLoopStep::Continue);
+                }
+                critical_premises::FinalAction::Warn => {
+                    append_runtime_warning_once(
+                        &mut stream_result.assistant_text,
+                        critical_premises::CRITICAL_PREMISES_WARNING,
+                    );
+                    append_user_visible_final_notice(
+                        terminal_dedupe_candidate,
+                        critical_premises::CRITICAL_PREMISES_WARNING,
+                    );
+                }
+            }
             if warn_unverified_completion {
                 append_runtime_warning_once(
                     &mut stream_result.assistant_text,
@@ -590,7 +672,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             };
             // Pre-tool-round hook (on_before_tools → ExecuteTools.before).
             app.fire_before_tools_hooks();
-            let tool_round_candidate = handle_tool_call_round(
+            let tool_round_candidate = handle_tool_call_round_with_gate(
                 app,
                 source_model,
                 mcp_client,
@@ -604,6 +686,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 rejection_reason,
                 &suppressed_read_only_results,
                 turn_had_tool_error,
+                final_gate_state,
             )?;
             // A candidate armed by a final gate reopen (the draft conclusion was already
             // streamed live) must survive this verification tool round: the model is

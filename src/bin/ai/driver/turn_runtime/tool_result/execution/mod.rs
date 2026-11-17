@@ -57,6 +57,7 @@ pub(super) use crate::ai::theme::RESET;
 
 mod audit_evidence;
 mod completion_gate;
+mod critical_premises;
 mod evidence_status;
 mod final_citations;
 mod final_recovery;

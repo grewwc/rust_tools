@@ -120,6 +120,187 @@ fn reused_tool_call_id_is_rewritten_for_the_whole_occurrence() {
 }
 
 #[test]
+fn evicted_tool_call_id_stays_reserved_by_canonical_turn_history() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    fn observed_result(call: ToolCall, content: &str) -> ExecuteToolCallsResult {
+        let id = call.id.clone();
+        ExecuteToolCallsResult {
+            executed_tool_calls: vec![call],
+            tool_results: vec![tool_result(&id, content)],
+            cached_hits: vec![false],
+            execution_outcomes: vec![Some(crate::ai::history::ToolExecutionOutcome {
+                tool_call_id: id,
+                execution_signature: "observation-signature".into(),
+                succeeded: true,
+            })],
+            had_error: false,
+        }
+    }
+
+    #[derive(Debug)]
+    struct ObservationMiddleware;
+    impl crate::ai::middleware::ToolMiddleware for ObservationMiddleware {
+        fn name(&self) -> &'static str {
+            "observation-fixture"
+        }
+
+        fn wrap(
+            &self,
+            _: Box<dyn crate::ai::ports::tool::ToolExecutor>,
+        ) -> Box<dyn crate::ai::ports::tool::ToolExecutor> {
+            struct ObservationExecutor;
+            impl crate::ai::ports::tool::ToolExecutor for ObservationExecutor {
+                fn execute<'a>(
+                    &'a self,
+                    _: &'a mut App,
+                    tool_calls: Vec<ToolCall>,
+                ) -> Pin<
+                    Box<
+                        dyn Future<
+                                Output = Result<
+                                    crate::ai::ports::tool::ToolExecOutput,
+                                    Box<dyn std::error::Error + Send + Sync>,
+                                >,
+                            > + Send
+                            + 'a,
+                    >,
+                > {
+                    Box::pin(async move {
+                        assert_eq!(tool_calls.len(), 1);
+                        let result = observed_result(tool_calls[0].clone(), "     1\tnew text");
+                        Ok(crate::ai::ports::tool::ToolExecOutput {
+                            tool_results: result.tool_results,
+                            assistant_messages: Vec::new(),
+                            executed_tool_calls: result.executed_tool_calls,
+                            cached_hits: result.cached_hits,
+                            execution_outcomes: result.execution_outcomes,
+                            had_error: result.had_error,
+                        })
+                    })
+                }
+            }
+            Box::new(ObservationExecutor)
+        }
+    }
+
+    let args = serde_json::json!({"file_path": "file.rs", "use_line_numbers": true});
+    let mut gate = FinalGateState::default();
+    let mut turn_messages = Vec::new();
+    let mut oldest_object = String::new();
+    for index in 0..65 {
+        let call = test_tool_call(&format!("read-{index}"), "read_file", args.clone());
+        let mut result = observed_result(call.clone(), "     1\told text");
+        critical_premises::bind_round(&mut gate, &mut result);
+        if index == 0 {
+            oldest_object = gate.critical_evidence[0].observed_objects[0].object.clone();
+        }
+        turn_messages.push(assistant_tool_call_message(call.clone()));
+        turn_messages.push(tool_result_message(&call.id, "     1\told text"));
+    }
+    assert_eq!(gate.critical_evidence.len(), 64);
+    assert!(
+        gate.critical_evidence
+            .iter()
+            .all(|record| record.tool_call_id != "read-0")
+    );
+
+    let mut app = test_app_with_tools(&["read_file"]);
+    app.tool_middlewares.push(Arc::new(ObservationMiddleware));
+    assert!(
+        crate::ai::history::read_tool_message_ids_sqlite(&app.session_history_file)
+            .unwrap_or_default()
+            .is_empty()
+    );
+    let mut messages = vec![Message {
+        role: ROLE_INTERNAL_NOTE.into(),
+        content: serde_json::json!("Earlier tool calls were folded from the context projection."),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let mcp = McpClient::new();
+    let shared_mcp = Arc::new(std::sync::Mutex::new(McpClient::new()));
+    let mut persisted = 0;
+    let mut had_error = false;
+    handle_tool_call_round_with_gate(
+        &mut app,
+        "",
+        &mcp,
+        &shared_mcp,
+        &ToolCallExecution {
+            stream_result: crate::ai::types::StreamResult {
+                outcome: crate::ai::types::StreamOutcome::ToolCall,
+                tool_calls: vec![test_tool_call("read-0", "read_file", args)],
+                assistant_text: String::new(),
+                hidden_meta: String::new(),
+                reasoning_text: String::new(),
+                reasoning_items: Vec::new(),
+                skip_response_drain: true,
+                truncated_by_length: false,
+                stream_error: false,
+                response_reconciled: false,
+                response_server_mismatch: false,
+                finish_reason_value: None,
+                usage_prompt_tokens: 0,
+                usage_cached_prompt_tokens: 0,
+                usage_completion_tokens: 0,
+                usage_reasoning_tokens: 0,
+            },
+            allowed_tool_names: ["read_file".to_string()].into_iter().collect(),
+        },
+        &mut messages,
+        &mut turn_messages,
+        true,
+        &mut persisted,
+        66,
+        None,
+        &HashMap::new(),
+        &mut had_error,
+        &mut gate,
+    )
+    .unwrap();
+    assert!(!had_error);
+    let new_record = gate.critical_evidence.last().unwrap();
+    assert_ne!(new_record.tool_call_id, "read-0");
+    assert_ne!(new_record.observed_objects[0].object, oldest_object);
+    let new_call = messages
+        .iter()
+        .flat_map(|message| message.tool_calls.iter().flatten())
+        .next()
+        .unwrap();
+    assert_eq!(new_call.id, new_record.tool_call_id);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.tool_call_id.as_deref() == Some(new_call.id.as_str()))
+    );
+    assert_eq!(
+        turn_messages[0].tool_calls.as_ref().unwrap()[0].id,
+        "read-0"
+    );
+    assert_eq!(turn_messages[1].tool_call_id.as_deref(), Some("read-0"));
+    assert_eq!(persisted, 0);
+
+    let update = serde_json::json!({
+        "id": "old", "proposition": "The old read still supports this choice", "impact": "choice", "status": "supported",
+        "evidence": [{"tool_call_id": "read-0", "object": oldest_object, "coverage": "full"}]
+    });
+    let content = crate::ai::tools::critical_premises::execute(&update).unwrap();
+    let mut rejected = observed_result(
+        test_tool_call("track-old", "critical_premises", update),
+        &content,
+    );
+    critical_premises::bind_round(&mut gate, &mut rejected);
+    assert!(rejected.had_error);
+    assert!(rejected.tool_results[0].content.contains("binding failed"));
+    assert!(!rejected.execution_outcomes[0].as_ref().unwrap().succeeded);
+    assert!(!gate.critical_premises.has_records());
+}
+
+#[test]
 fn ctrl_c_during_foreground_tool_round_cancels_without_shutdown() {
     let _env_guard = crate::ai::test_support::ENV_LOCK
         .lock()
@@ -168,6 +349,7 @@ fn ctrl_c_during_foreground_tool_round_cancels_without_shutdown() {
                             name: "execute_command".to_string(),
                             arguments: serde_json::json!({
                                 "command": format!("touch '{command_marker}'; sleep 2"),
+                                "pty": false,
                             })
                             .to_string(),
                         },

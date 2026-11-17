@@ -1,0 +1,35 @@
+{
+  "name": "critical_premises",
+  "description": "Track a bounded key premise controlling the main answer, choice, mutation, or external action. Status is model-derived; syntax-only provisional output is not factual support. The driver binds references to actual current-turn tool observations before retaining a runtime receipt.",
+  "groups": ["builtin"],
+  "first_use_guidance": "Guidance for later critical_premises calls in this turn:\n- Use only material premises whose failure changes the main answer, choice, mutation, or external action. Keep at most 8 IDs; update an existing ID rather than creating duplicates. IDs are 1..64 ASCII letters/digits/_.-. All string limits are UTF-8 byte limits; an update allows at most 8192 string bytes total.\n- Provide the precise proposition and controlling impact. Dependencies must already exist, cannot include self/duplicates, and must remain acyclic. Changing a premise invalidates its transitive dependents to pending until reevaluated. A changed proposition/impact or supported object scope must first be pending/limited, then explicitly reevaluated.\n- Evidence uses exact current-turn tool_call_id and driver-established object tokens. Do not invent object provenance from a model label or command text. Supported requires every reference to have full coverage and bind to a known successful complete result for that exact object, with all dependencies supported and no open gap/conflict. Unknown/future/self-update references are errors; failed, truncated, partial, unknown-outcome or mismatched observations cannot support.\n- Use limited with an explicit gap/scope limitation when evidence cannot certify the requested scope; limited is closed rather than silently supported. Pending, refuted and limited remain model-derived dispositions and may carry negative/partial observations. A runtime receipt certifies evidence identity/outcome/completeness, not the proposition's semantic truth.\n- request_review only requests consideration: eligibility requires pending plus a material gap/conflict and at least one actual verification attempt (failure/partial is allowed). Reviewer text is not new evidence and never upgrades status. No session-global premise state is retained.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["id", "proposition", "impact", "status"],
+    "properties": {
+      "id": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_.-]+$"},
+      "proposition": {"type": "string", "minLength": 1, "maxLength": 2048},
+      "impact": {"type": "string", "enum": ["main_answer", "choice", "mutation", "external_action"]},
+      "status": {"type": "string", "enum": ["pending", "supported", "refuted", "limited"]},
+      "dependencies": {"type": "array", "maxItems": 7, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 64}},
+      "evidence": {
+        "type": "array",
+        "maxItems": 16,
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tool_call_id", "object", "coverage"],
+          "properties": {
+            "tool_call_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "object": {"type": "string", "minLength": 1, "maxLength": 1024, "description": "Exact driver-established observed object token; unknown provenance cannot certify support."},
+            "coverage": {"type": "string", "enum": ["full", "partial"]}
+          }
+        }
+      },
+      "gap": {"type": "string", "maxLength": 2048, "description": "Open gap or explicit scope limitation; required and nonempty for limited."},
+      "conflict": {"type": "string", "maxLength": 2048},
+      "request_review": {"type": "boolean", "default": false}
+    }
+  }
+}

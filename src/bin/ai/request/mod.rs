@@ -3,6 +3,7 @@ use reqwest::StatusCode;
 
 mod aux;
 mod builder;
+mod critical_review;
 mod current_budget;
 mod error;
 mod image_digest;
@@ -29,6 +30,9 @@ pub(crate) use aux::{
 };
 #[cfg(test)]
 use aux::{SESSION_TITLE_BODY_TIMEOUT_SECS, SESSION_TITLE_REQUEST_TIMEOUT_SECS};
+pub(in crate::ai) use critical_review::{
+    CriticalReviewError, CriticalReviewResponse, execute_critical_premises_review,
+};
 pub(crate) use current_budget::CurrentRequestBudget;
 #[allow(unused_imports)]
 pub(crate) use error::{
