@@ -3443,7 +3443,9 @@ fn outstanding_task_anchor_lists_ids_and_required_follow_up() {
     assert!(note.contains("progress: running command · plan: inspect parser"));
     assert!(note.contains("task_id=task_beta status=completed"));
     assert!(note.contains("model=gpt-5.5 desc=verify fix"));
-    assert!(note.contains("use `task_wait` with the same task_ids"));
+    assert!(note.contains("call `task_wait` with the same task_ids"));
+    assert!(note.contains("use `task_status` for a non-blocking snapshot"));
+    assert!(note.contains("only when you have no independent work left"));
 }
 
 #[test]

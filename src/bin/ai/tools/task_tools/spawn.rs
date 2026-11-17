@@ -836,7 +836,7 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
         "spawned": spawned_count,
         "failed": entries.len() - spawned_count,
         "tasks": entries,
-        "next": "Use task_status for non-blocking progress (phase, updates, last activity). Do not duplicate a running branch; use task_wait only when blocked on a result, then task_integrate."
+        "next": "Continue your own independent work first; use task_status for non-blocking progress. Call task_wait only when no independent work remains and your next step needs a result, then task_integrate."
     }))
     .expect("serializing task_spawn result cannot fail"))
 }

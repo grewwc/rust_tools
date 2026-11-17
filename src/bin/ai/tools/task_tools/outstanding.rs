@@ -78,7 +78,7 @@ pub(super) fn render_outstanding_task_anchor(snapshots: &[OutstandingTaskSnapsho
         }
     }
     lines.push(
-        "Required next step: use `task_wait` with the same task_ids to collect results, or `task_status` for a non-blocking snapshot. Before ending the turn, ensure every listed task_id has been handled — including failures."
+        "Required next step: use `task_status` for a non-blocking snapshot; call `task_wait` with the same task_ids only when you have no independent work left. Before ending the turn, ensure every listed task_id has been handled — including failures."
             .to_string(),
     );
     lines.join("\n")

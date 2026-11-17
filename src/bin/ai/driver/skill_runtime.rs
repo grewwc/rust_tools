@@ -1169,7 +1169,7 @@ fn escape_xml_attr(s: &str) -> String {
 const NON_OVERRIDABLE_PROMPT_CONSTRAINTS: &str =
     "correctness guardrails (including git-safety rules), intellectual honesty, safety redlines";
 
-const BASE_TASK_SPAWN_GUIDANCE: &str = "Use `task_spawn` for every delegation, including a single focused subtask whose result you need back. Spawn first, continue any independent parent-side work, then collect with `task_wait`; never block before spawning.";
+const BASE_TASK_SPAWN_GUIDANCE: &str = "Use `task_spawn` for every delegation, including a single focused subtask whose result you need back. Spawn first, keep doing any independent parent-side work while they run, and collect with `task_wait` only when your next step needs the result; never block before spawning.";
 const BASE_SUBAGENT_RESULT_CONTRACT: &str = "Give each subagent an explicit result contract: return a concise conclusion, the key evidence paths/lines or commands, remaining uncertainty, and suggested verification; do not return raw logs, exhaustive search output, or large source excerpts unless requested.";
 
 /// Dedupe only against the reviewed authored contract. A same-named user
@@ -2733,7 +2733,7 @@ mod pure_prompt_tests {
     #[test]
     fn default_profile_prompt_bytes_are_unchanged() {
         // Update this golden value only for deliberate prompt changes.
-        const DEFAULT_PROFILE_PROMPT_HASH: u64 = 15_379_186_106_504_725_919;
+        const DEFAULT_PROFILE_PROMPT_HASH: u64 = 17_226_990_114_972_327_361;
         let prompt = render_turn(None, &[], &tools(FULL_TOOL_SET), &PromptContext::default());
         assert_eq!(
             stable_hash(without_environment_block(&prompt).as_bytes()),
@@ -2796,7 +2796,7 @@ mod agent_team_optimization_tests {
 
     fn assert_legacy_async_bytes(builder: &SystemPromptBuilder) {
         let section = async_section(builder);
-        assert_eq!(section.len(), 2204);
+        assert_eq!(section.len(), 2262);
         let hash = Sha256::digest(section.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -2804,7 +2804,7 @@ mod agent_team_optimization_tests {
         // Captured from the authored section before adding prompt deduplication.
         assert_eq!(
             hash,
-            "57dde939faa78f8c04ac8f81a117326e105a5b7187c1c3b148bba583d5da768d"
+            "097e32ccf71353ef98c47e515f7d998414deac8053cbcc47b95072968d176b7a"
         );
     }
 

@@ -638,9 +638,10 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                     ({timeout_secs}s, wait_policy={policy_label}) has NOT elapsed. The scheduler will wake this \
                     agent as soon as a result is ready. \
                     Pending task_ids: [{}]. event_ids={}. \
-                    Do NOT assume the subagents are stuck and do NOT abandon them to work around this; \
-                    when woken, re-call `task_wait` with the same task_ids to collect results, or use \
-                    `task_status` for a non-blocking snapshot.",
+                    Do NOT assume the subagents are stuck and do NOT abandon them to work around this. \
+                    If you still have independent work, do that before re-calling; otherwise, when woken, \
+                    re-call `task_wait` with the same task_ids to collect results, or use `task_status` \
+                    for a non-blocking snapshot.",
                         still_pending.len(),
                         still_pending.join(", "),
                         wait.event_ids
