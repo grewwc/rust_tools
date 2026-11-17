@@ -2513,7 +2513,7 @@ test("an explicit landing clears the previous transcript's scroll lock", () => {
 test("a sidebar pick lands on the newest turn after its history loads", () => {
   // The pick starts a landing transcript scroll for the incoming session and
   // loads its history behind that intent; a failed load must not break the pick.
-  assert.match(html, /if \(window\.matchMedia && window\.matchMedia\("\(min-width:701px\)"\)\.matches\n\s+&& typeof beginTranscriptScroll === "function"\) beginTranscriptScroll\(nextId\);/);
+  assert.match(html, /if \(typeof beginSessionTranscriptScroll === "function"\) beginSessionTranscriptScroll\(nextId\);/);
   assert.match(html, /Promise\.resolve\(loadHistory\(\)\)\.catch\(\(\) => \{\}\);/);
   assert.match(html, /outputFollowSuspended = false;\n  jumpingToBottom = false;\n  restoreDraft\(\);/);
 });

@@ -794,7 +794,8 @@ test("filter input resets the session rail while normal re-renders preserve scro
 
 test("a fresh session-list render starts at the top", () => {
   const h = harness({ cachedItems: [] }), rail = h.elements.sesslist;
-  assert.equal(rail.children.length, 0);
+  assert.equal(sessionRows(rail).length, 0);
+  assertUnassignedGroup(rail, 0);
   assert.equal(rail.scrollTop, 0);
   h.context.renderSessionList(longSessions());
   assert.equal(sessionRows(rail).length, 102);
@@ -1146,7 +1147,7 @@ for (const phone of [false, true]) test("Rename from the action sheet edits its 
   assert.deepEqual(h.switches, []);
 });
 
-test("top-right actions never occupy content rows and only nearby title lines reserve their space", () => {
+test("desktop actions reserve nearby title space while phone actions share the title and status height", () => {
   const h = harness({ items: sessions(true) }), li = h.row();
   assert.match(li.title, /Target session\nID: target-session\n2 KB/);
   assert.equal(li.classList.contains("session-marked"), true);
@@ -1166,12 +1167,19 @@ test("top-right actions never occupy content rows and only nearby title lines re
   assert.match(css, /#sessions li \.session-menu \{ width:22px; height:22px;/);
   assert.match(css, /#sessions li \.session-meta \{ clear:both; display:none; margin:0; \}/);
   assert.match(css, /#sessions li\.session-renaming \.session-controls \{ display:none; \}/);
-  assert.doesNotMatch(css, /#sessions li\[data-session-id\] \{[^}]*grid-template-columns/);
+  const desktopCSS = css.slice(0, css.indexOf("@media (max-width:700px)"));
+  assert.doesNotMatch(desktopCSS, /#sessions li\[data-session-id\] \{[^}]*grid-template-columns/);
   assert.doesNotMatch(css, /#sessions[^{}]*\.session-title\s*\{[^}]*margin-right:/);
   assert.match(css, /#sessions li \.session-menu \{ width:44px; height:44px; \}/);
   assert.match(css, /#sessions li \.mk \{[^}]*width:44px; height:44px;/);
   const phoneCSS = css.slice(css.indexOf("@media (max-width:700px)"));
-  assert.match(phoneCSS, /#sessions li\[data-session-id\] \{ --session-action-size:44px; --session-action-top:12px; --session-action-right:10px; \}/);
+  assert.match(phoneCSS, /#sessions li\[data-session-id\]:not\(\[hidden\]\) \{\s*display:grid; grid-template-columns:minmax\(0,1fr\) auto; grid-template-rows:auto auto;/);
+  assert.match(phoneCSS, /#sessions li \.session-controls \{ position:static; grid-column:2; grid-row:1 \/ 3; align-self:start; gap:0; \}/);
+  assert.match(phoneCSS, /#sessions li \.session-title::before \{ display:none; \}/);
+  assert.match(phoneCSS, /#sessions li \.session-meta \{ grid-column:1; grid-row:2; align-self:start; margin:0; \}/);
+  assert.match(phoneCSS, /#sessions ul \{ min-height:0;[^}]*overscroll-behavior-y:contain;/);
+  assert.match(phoneCSS, /#sessions \.rowbtns \{ flex:0 0 auto;[^}]*env\(safe-area-inset-bottom\)/);
+  assert.match(phoneCSS, /#sessions \.rowbtns button \{[^}]*min-width:0; min-height:44px;/);
   const controls = li.querySelector(".session-controls");
   assert.deepEqual(controls.children, [li.querySelector(".mk"), li.querySelector(".session-menu")]);
   assert.deepEqual(li.children, [controls, li.querySelector(".session-title"), li.querySelector(".session-meta")]);
@@ -1234,7 +1242,7 @@ test("compact group heads preserve waiting visibility and explicit collapse stat
   assert.match(toggle.getAttribute("aria-label"), /1 RUNNING/);
   assert.match(css, /#sessions \.session-group-toggle \{[^}]*grid-template-columns:auto minmax\(0,1fr\) auto;/);
   assert.match(css, /#sessions \.session-group-name \{ grid-column:2; grid-row:1;[^}]*white-space:nowrap; color:var\(--fg\);/);
-  assert.match(css, /#sessions \.session-group-status \{ grid-column:3; grid-row:1; display:flex; flex-wrap:nowrap;/);
+  assert.match(css, /#sessions \.session-group-status \{ grid-column:2 \/ 4; grid-row:2; display:flex; flex-wrap:wrap;/);
   h.dispatch(toggle, "click");
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
   assert.ok(sessionRows(h.elements.sesslist).every((li) => li.hidden));
@@ -1245,6 +1253,39 @@ test("compact group heads preserve waiting visibility and explicit collapse stat
   assert.ok(sessionRows(h.elements.sesslist).every((li) => li.hidden));
   h.dispatch(h.elements.sesslist.querySelector(".session-group-toggle"), "click");
   assert.ok(sessionRows(h.elements.sesslist).every((li) => !li.hidden));
+});
+
+for (const phone of [false, true]) test("group padding and title toggle once while group actions stay independent (phone=" + phone + ")", async () => {
+  const groups = [{ id: "work", name: "Work", order: 0, pinned: false }];
+  const h = harness({ phone, groups, items: [{ ...sessions()[0], group_id: "work" }, sessions()[1]] });
+  await h.context.loadSessionGroups();
+  h.context.renderSessionList(h.context.lastItems);
+  const heads = h.elements.sesslist.querySelectorAll(".session-group-head");
+  const work = heads[0], unassigned = heads[1], toggle = work.querySelector(".session-group-toggle");
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  h.dispatch(work, "click");
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(h.row("open-session").hidden, true);
+  h.dispatch(work.querySelector(".session-group-name"), "click");
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  const menu = work.querySelector(".session-group-menu");
+  const click = h.dispatch(menu, "click");
+  assert.equal(click.event.stopped, true);
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(h.elements.sessiongrouptitle.textContent, "Work");
+  assert.equal(unassigned.querySelector(".session-group-menu"), null);
+  for (const head of heads) {
+    const create = head.querySelector(".session-group-new");
+    assert.equal(create.textContent, "＋ New");
+    assert.equal(create.title, "New session in " + head.querySelector(".session-group-name").textContent);
+    assert.equal(create.getAttribute("aria-label"), create.title);
+  }
+  const phoneCSS = css.slice(css.indexOf("@media (max-width:700px)"));
+  assert.match(phoneCSS, /#sessions \.session-group-toggle, #sessions \.session-group-new, #sessions \.session-group-menu \{ min-height:44px; \}/);
+  assert.match(phoneCSS, /#sessions \.session-group-menu \{ flex:0 0 44px; min-width:44px; padding:2px; \}/);
+  assert.match(phoneCSS, /#sessions \.session-group-status \{ grid-column:3; grid-row:1; flex-wrap:nowrap; gap:2px; \}/);
+  assert.match(css, /#sessions \.session-group-new \{[^}]*min-width:44px;/);
+  assert.match(css, /#sessions li\.session-more button \{[^}]*min-height:44px;[^}]*border:0; background:transparent;/);
 });
 
 test("phone More keeps archive and group tools while the desktop-only star filter stays hidden", async () => {

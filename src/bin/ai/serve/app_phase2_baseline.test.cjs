@@ -5,7 +5,6 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const crypto = require("node:crypto");
 
 function loadFixtures(file, names) {
   const filename = path.join(__dirname, file);
@@ -28,16 +27,35 @@ const desktop = loadFixtures("app_desktop.test.cjs", ["harness", "loadChat"]);
 const errors = loadFixtures("app_error_rows.test.cjs", ["harness"]);
 const team = loadFixtures("app_team_mode.test.cjs", ["harness", "NORMAL", "TRAECLI", "response"]);
 
-test("owner regression: adoptComposerSession preserves the exact HEAD function contract", () => {
+test("owner regression: adoptComposerSession lands the new session without replacing the draft", () => {
   const start = stream.script.indexOf("function adoptComposerSession(");
   const end = stream.script.indexOf("\n}", start) + 2;
   assert.ok(start >= 0 && end > start);
-  const source = stream.script.slice(start, end), body = source.slice(source.indexOf("{"));
-  // HEAD 18e9fbc3, measured by the independent contracts.cjs checker.
-  assert.equal(source.slice(0, source.indexOf("{")), "function adoptComposerSession(newId, previousId, base) ");
-  assert.equal(Buffer.byteLength(body), 425);
-  assert.equal(crypto.createHash("sha256").update(body).digest("hex"),
-    "b17cffd76ff46aa23f5e3675485a4e06d445c6812bef9580fcece60abb76f006");
+  const calls = [], prompt = { value: "Unsent input" };
+  const context = vm.createContext({
+    sessionId: "", store: { base: "https://serve.test" }, prompt,
+    beginSessionTranscriptScroll: (id) => calls.push(["begin", id]),
+    updateExecutionModel: (event) => calls.push([event.kind]),
+    commitExecutionView: (id, base) => calls.push(["display", id, base]),
+    mountTranscriptScroll: (id, follow) => calls.push(["mount", id, follow]),
+    localStorage: { setItem: (key, value) => calls.push(["store", key, value]) },
+    carrySkillPick: (from, to) => calls.push(["skills", from, to]),
+    carryTeamPick: (from, to, base) => calls.push(["team", from, to, base]),
+  });
+  vm.runInContext(stream.script.slice(start, end), context);
+  assert.equal(context.adoptComposerSession("created", "", "https://serve.test"), true);
+  assert.equal(context.sessionId, "created");
+  assert.equal(context.pendingNew, "created");
+  assert.equal(prompt.value, "Unsent input");
+  assert.deepEqual(calls, [
+    ["begin", "created"], ["select"], ["display", "created", "https://serve.test"],
+    ["mount", "created", true], ["store", "serve.session", "created"],
+    ["skills", "", "created"], ["team", "", "created", "https://serve.test"],
+  ]);
+  calls.length = 0;
+  assert.equal(context.adoptComposerSession("obsolete", "", "https://serve.test"), false);
+  assert.equal(context.adoptComposerSession("obsolete", "created", "https://other.test"), false);
+  assert.deepEqual(calls, [], "a stale response cannot navigate or scroll the current transcript");
 });
 
 function pageSlice(start, end) {

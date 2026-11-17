@@ -1882,7 +1882,7 @@ for (const width of [390, 700, 701, 1280]) for (const withTasks of [false, true]
       "/sessions/open-session/history", "/sessions/target-session/history", "/sessions/open-session/history",
     ]);
   });
-  test("session-switch scroll preserves a saved reading position" + suffix, async () => {
+  test("session-switch scroll opens the live edge despite a saved reading position" + suffix, async () => {
     const h = sessionScrollHarness(width, withTasks);
     await h.openHistory();
     h.root.scrollTop = 120;
@@ -1895,17 +1895,58 @@ for (const width of [390, 700, 701, 1280]) for (const withTasks of [false, true]
     await h.selectHistory("open-session");
     h.flushFrame();
     h.flushScroll();
-    assert.equal(h.root.scrollTop, 120, "an intentionally scrolled-up session keeps the existing restoration policy");
-    assert.equal(h.stored.get("serve.scroll.open-session"), saved, "restoration does not rewrite the saved preference");
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
+      "returning to a session opens its newest message instead of its saved reading offset");
+    assert.equal(h.context.shouldFollowOutput(), true, "the outgoing reader's scroll lock is reset");
+    h.root.scrollTop = 120;
+    h.flushScroll();
     h.histories.get("open-session").push({ role: "assistant", content: "An ordinary in-session update" });
     await h.context.loadHistory();
     h.flushFrame();
     h.flushScroll();
     assert.equal(h.root.scrollTop, 120, "an in-session refresh does not pull a reader to the bottom");
+    assert.equal(h.context.shouldFollowOutput(), false, "polling preserves the new upward reader intent");
+  });
+  test("page reload preserves a saved reading position" + suffix, async () => {
+    const h = sessionScrollHarness(width, withTasks);
+    h.stored.set("serve.scroll.open-session", JSON.stringify({ top: 120, atBottom: false }));
+    await h.context.loadHistory(); h.settleLayout();
+    assert.equal(h.root.scrollTop, 120, "a reload without session navigation retains its saved offset");
+    assert.equal(h.context.shouldFollowOutput(), false);
   });
 }
 
 for (const width of [390, 700, 701, 1280]) {
+  test("session-switch scroll mounts a newly created placeholder at the live edge at " + width + "px", async () => {
+    const h = sessionScrollHarness(width, true);
+    h.elements.sessfilter = h.document.createElement("input");
+    const fetch = h.context.fetch;
+    h.context.fetch = (url, options) => new URL(url).pathname === "/session-groups"
+      ? Promise.resolve(response({ groups: [], assignments: {} })) : fetch(url, options);
+    await h.openHistory();
+    h.root.scrollTop = 120; h.flushScroll();
+    await h.context.createSessionInGroup(null);
+    assert.equal(h.context.sessionId, "fresh-session");
+    assert.ok(h.root.querySelector(".transcript-placeholder"), "creation finishes rendering its placeholder");
+    assert.equal(h.root._transcriptScrollLanding, undefined, "the placeholder consumes the navigation intent");
+    h.growLayout(400); h.settleLayout();
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
+    assert.equal(h.context.shouldFollowOutput(), true);
+  });
+  test("session-switch scroll opens a fork at the live edge at " + width + "px", async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    h.root.scrollTop = 120; h.flushScroll();
+    h.stored.set("serve.scroll.forked-session", JSON.stringify({ top: 120, atBottom: false }));
+    const fetch = h.context.fetch, messages = h.histories.get("open-session");
+    h.context.fetch = (url, options) => new URL(url).pathname === "/sessions/forked-session/history"
+      ? Promise.resolve(response(messages, 200, { "x-history-total": String(messages.length) })) : fetch(url, options);
+    await h.context.forkSession("open-session"); h.settleLayout();
+    assert.equal(h.context.sessionId, "forked-session");
+    assert.equal(h.context.historySession, "forked-session");
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
+    assert.equal(h.context.shouldFollowOutput(), true);
+  });
   test("session-switch scroll respects upward input before the follow frame at " + width + "px", async () => {
     const h = sessionScrollHarness(width, true);
     await h.openHistory();
@@ -2048,8 +2089,11 @@ for (const width of [390, 700, 701, 1280]) {
     assert.deepEqual(JSON.parse(h.stored.get("serve.scroll.open-session")), { top: readingTop, atBottom: false });
     await h.selectHistory("target-session"); h.settleLayout();
     await h.selectHistory("open-session"); h.settleLayout();
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
+      "switching back resets the previous reading position");
+    h.root.scrollTop = readingTop; h.flushScroll();
     h.growLayout(100); h.settleLayout();
-    assert.equal(h.root.scrollTop, readingTop, "a restored reading position also stays free of resize following");
+    assert.equal(h.root.scrollTop, readingTop, "new upward input after switching also stays free of resize following");
     assert.equal(h.resizeObservers().every((observer) => observer.targets.size === 0), true);
     h.context.scrollToLatest(false); h.flushScroll();
     const resumedTop = h.root.scrollTop;
@@ -2105,20 +2149,26 @@ for (const width of [390, 700, 701, 1280]) {
     const restoredRow = h.root.children[0];
     assert.notEqual(restoredRow, firstRow, "A's new transcript generation remounts canonical history");
     assert.equal(restoredRow.dataset.canonicalKey, firstRow.dataset.canonicalKey);
-    assert.equal(h.root.scrollTop, 120);
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
+      "even rapid navigation opens A at its live edge");
     assert.equal(h.stored.get("serve.scroll.target-session"), undefined,
       "no layout saves A's mounted DOM under the unmounted B session");
     release(); await obsoleteLoad; h.settleLayout();
     assert.equal(h.context.historySession, "open-session");
     assert.equal(h.root.children[0], restoredRow, "B's superseded response cannot replace A");
-    assert.deepEqual(JSON.parse(h.stored.get("serve.scroll.open-session")), { top: 120, atBottom: false });
+    assert.deepEqual(JSON.parse(h.stored.get("serve.scroll.open-session")), { top: 120, atBottom: false },
+      "an obsolete history response does not rewrite A's saved reading offset");
   });
   test("desktop transcript ownership carries lazy session adoption into following" + suffix, async () => {
     const h = sessionScrollHarness(width, true);
     await h.openHistory();
     h.context.switchSession(""); await h.context.loadHistory(); h.settleLayout();
+    h.context.noteTranscriptIntent(-1);
     assert.equal(h.context.adoptComposerSession("created-session", "", "https://serve.test"), true);
-    h.context.scrollToLatest(false); h.flushScroll();
+    h.growLayout(400); h.settleLayout();
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
+      "adoption lands at the live edge on both layouts without an explicit jump");
+    assert.equal(h.context.shouldFollowOutput(), true);
     const before = h.root.scrollTop;
     h.growLayout(400); h.settleLayout();
     assert.equal(h.root.scrollTop, desktop ? h.root.scrollHeight - h.root.clientHeight : before,
@@ -2146,10 +2196,10 @@ for (const width of [390, 700, 701, 1280]) {
     assert.equal(h.root.querySelectorAll(".task-output").length, 2);
     release(); await paging; h.settleLayout();
     assert.equal(h.context.historySession, "open-session");
-    assert.equal(h.root.scrollTop, desktop ? bottom : 0,
-      "only desktop rejects B's stale compensation; mobile keeps its current compensation policy");
-    assert.equal(h.context.shouldFollowOutput(), desktop);
-    assert.equal(vm.runInContext("outputFollowSuspended", h.context), !desktop);
+    assert.equal(h.root.scrollTop, bottom,
+      "every layout rejects the outgoing session's stale pagination compensation");
+    assert.equal(h.context.shouldFollowOutput(), true);
+    assert.equal(vm.runInContext("outputFollowSuspended", h.context), false);
     if (desktop) assert.equal(h.context.ownedTranscriptScroll(h.root).following, true);
     assert.equal(h.root._histOlder, false);
   });
@@ -2194,8 +2244,8 @@ for (const width of [390, 700, 701, 1280]) {
     const bottom = h.root.scrollHeight - h.root.clientHeight;
     if (desktop) assert.notEqual(h.context.ownedTranscriptScroll(h.root).generation, firstOwner.generation);
     release(); await paging; h.settleLayout();
-    assert.equal(h.root.scrollTop, desktop ? bottom : 0);
-    assert.equal(h.context.shouldFollowOutput(), desktop);
+    assert.equal(h.root.scrollTop, bottom, "a pager from an earlier visit cannot move the new transcript");
+    assert.equal(h.context.shouldFollowOutput(), true);
   });
 }
 

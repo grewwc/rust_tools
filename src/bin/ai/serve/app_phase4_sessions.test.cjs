@@ -72,6 +72,131 @@ const listed = [
   { id: "unicode-id", summary: "中文 [literal] École" },
 ];
 
+async function groupCreationHarness(phone = false) {
+  const h = harness({ phone });
+  h.elements.sessfilter = h.document.createElement("input");
+  h.elements.sessfilterstatus = h.document.createElement("span");
+  const groups = [{ id: "work", name: "Work", order: 0, pinned: false }];
+  const items = [{ id: "open-session", summary: "Open", group_id: "work", marked: true },
+    { id: "target-session", summary: "Other", group_id: null, marked: true }];
+  const calls = [];
+  h.context.api = async (url, options = {}) => {
+    const request = { path: new URL(url, "https://serve.test").pathname, method: options.method || "GET", body: options.body ? JSON.parse(options.body) : null };
+    calls.push(request);
+    let value = {};
+    if (request.path === "/session-groups") value = { groups, assignments: {} };
+    else if (request.path === "/sessions") value = request.method === "POST"
+      ? { id: "fresh-" + calls.filter((call) => call.method === "POST").length, group_id: request.body.group_id, cwd: "/tmp/new-project" }
+      : items;
+    return { json: async () => value, headers: { get: () => null } };
+  };
+  await h.context.loadSessionGroups();
+  h.context.lastItems = items;
+  h.context.renderSessionList(items);
+  h.context.renderSessionBar();
+  return { h, calls };
+}
+
+for (const phone of [false, true]) for (const groupId of ["work", null]) {
+  test("direct group creation sends its explicit target and coordinates the global plus (phone=" + phone + ", group=" + groupId + ")", async () => {
+    const { h, calls } = await groupCreationHarness(phone);
+    assert.equal(h.elements.newbtn.title, "New session in Work");
+    const head = h.elements.sesslist.querySelectorAll(".session-group-head")[groupId === null ? 1 : 0];
+    const create = head.querySelector(".session-group-new");
+    const expanded = head.querySelector(".session-group-toggle").getAttribute("aria-expanded");
+    const click = h.dispatch(create, "click");
+    assert.equal(click.event.stopped, true);
+    assert.equal(head.querySelector(".session-group-toggle").getAttribute("aria-expanded"), expanded);
+    assert.equal(create.disabled, true);
+    assert.equal(h.elements.newbtn.disabled, true);
+    await click.done;
+    assert.deepEqual(calls.filter((call) => call.method === "POST"), [{ path: "/sessions", method: "POST", body: { group_id: groupId } }]);
+    assert.equal(h.context.sessionId, "fresh-1");
+    assert.equal(h.context.currentSessionGroupId(), groupId);
+    assert.equal(h.elements.newbtn.title, "New session in " + (groupId === null ? "Unassigned" : "Work"));
+    assert.equal(h.elements.newbtn.getAttribute("aria-label"), h.elements.newbtn.title);
+    assert.equal(h.elements.newbtn.disabled, false);
+    assert.equal(h.document.activeElement, phone ? null : h.elements.prompt);
+    assert.equal(h.elements.sesslist.querySelectorAll(".session-group-head")[groupId === null ? 1 : 0].querySelector(".session-group-toggle").getAttribute("aria-expanded"), "true");
+    await h.elements.newbtn.onclick();
+    assert.equal(calls.filter((call) => call.method === "POST").length, 2);
+    assert.equal(calls.filter((call) => call.method === "POST")[1].body.group_id, groupId);
+  });
+}
+
+test("Unassigned offers direct creation even with no unassigned sessions", async () => {
+  const { h } = await groupCreationHarness();
+  h.context.lastItems = [h.context.lastItems[0]];
+  h.context.renderSessionList(h.context.lastItems);
+  const head = h.elements.sesslist.querySelectorAll(".session-group-head")[1];
+  assert.equal(head.querySelector(".session-group-name").textContent, "Unassigned");
+  assert.equal(head.querySelector(".session-group-new").title, "New session in Unassigned");
+  h.context.renderSessionList([]);
+  assert.equal(h.elements.sesslist.querySelector(".session-group-new").title, "New session in Unassigned");
+});
+
+test("creation leaves filtered views so the new session's destination is reachable", async () => {
+  const { h, calls } = await groupCreationHarness();
+  setFilter(h, "Open");
+  vm.runInContext("sessMarkedOnly = true; sessArchivedOnly = true;", h.context);
+  h.elements.sessfilter.value = "Open";
+  await h.elements.newbtn.onclick();
+  assert.equal(vm.runInContext("sessMarkedOnly || sessArchivedOnly || !!sessFilter", h.context), false);
+  assert.equal(h.elements.sessfilter.value, "");
+  assert.equal(h.elements.sessfilterstatus.hidden, true);
+  assert.equal(h.context.currentSessionGroupId(), "work");
+  assert.equal(calls.find((call) => call.method === "POST").body.group_id, "work");
+  assert.equal(h.elements.sesslist.querySelector(".session-group-toggle").getAttribute("aria-expanded"), "true");
+});
+
+test("creation blocks duplicate taps and restores controls after a failed request", async () => {
+  const { h } = await groupCreationHarness();
+  const requests = [], originalApi = h.context.api;
+  let reject;
+  h.context.api = async (url, options = {}) => {
+    if (options.method !== "POST") return originalApi(url, options);
+    requests.push(JSON.parse(options.body));
+    return new Promise((_, rejectRequest) => { reject = rejectRequest; });
+  };
+  const create = h.elements.sesslist.querySelectorAll(".session-group-new")[1];
+  const pending = h.dispatch(create, "click");
+  h.dispatch(create, "click");
+  h.dispatch(h.elements.newbtn, "click");
+  await h.context.createSessionInGroup("work");
+  assert.deepEqual(requests, [{ group_id: null }]);
+  assert.equal(h.elements.newbtn.getAttribute("aria-busy"), "true");
+  reject(new Error("creation unavailable"));
+  await pending.done;
+  assert.equal(h.context.sessionId, "open-session");
+  assert.equal(h.elements.newbtn.disabled, false);
+  assert.equal(h.elements.newbtn.getAttribute("aria-busy"), "false");
+  for (const button of h.elements.sesslist.querySelectorAll(".session-group-new")) assert.equal(button.disabled, false);
+  assert.ok(h.messages.some((message) => message.role === "err" && message.text === "create session failed: creation unavailable"));
+});
+
+test("load more shows progress without duplicating requests and recovers after failure", async () => {
+  const h = harness();
+  setPager(h, { total: 40, offset: 12, hasMore: true });
+  h.context.renderSessionList(h.context.lastItems);
+  let reject, requests = 0;
+  h.context.fetchSessionPage = () => {
+    ++requests;
+    return new Promise((_, rejectRequest) => { reject = rejectRequest; });
+  };
+  const button = h.elements.sesslist.querySelector(".session-more").querySelector("button");
+  const pending = h.dispatch(button, "click");
+  h.dispatch(button, "click");
+  assert.equal(requests, 1);
+  assert.equal(button.textContent, "Loading…");
+  assert.equal(button.getAttribute("aria-busy"), "true");
+  reject(new Error("older unavailable"));
+  await pending.done;
+  const retry = h.elements.sesslist.querySelector(".session-more").querySelector("button");
+  assert.equal(retry.disabled, false);
+  assert.equal(retry.textContent, "Load more sessions");
+  assert.equal(pageState(h).loading, false);
+});
+
 test("star toggles reset paging and append only server-filtered older stars", async () => {
   const h = harness();
   setPager(h, { total: 3, offset: 2, hasMore: true });
