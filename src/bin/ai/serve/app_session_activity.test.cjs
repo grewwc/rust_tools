@@ -499,7 +499,7 @@ test("titles wrap fully at a moderate weight and waiting labels stay visible", (
     assert.deepEqual(tokens(5), ["Long", "identifier", "x".repeat(160)]);
   }
   assert.match(css, /#sessions li \.session-title \{ display:block; white-space:normal; overflow-wrap:break-word; word-break:normal;[^}]*color:var\(--fg\); font-size:13px; font-weight:500; line-height:22px;/);
-  assert.match(css, /#sessions li \.session-title-token \{ display:inline-block; max-width:100%; vertical-align:top; overflow-wrap:anywhere; \}/);
+  assert.match(css, /#sessions li \.session-title-token \{ display:inline; overflow-wrap:anywhere; \}/);
   assert.doesNotMatch(css, /#sessions[^{}]*\.session-title\s*\{[^}]*(?:line-clamp|[;\s](?:min-|max-)?height\s*:|overflow\s*:\s*hidden|text-overflow\s*:)/);
   assert.doesNotMatch(css, /#sessions li\[data-session-id\]\s*\{[^}]*[;\s](?:min-|max-)?height\s*:/);
   assert.doesNotMatch(css, /#sessions li\.cur span\[role="button"\] \{[^}]*font-weight/);

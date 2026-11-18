@@ -174,7 +174,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     ["sessdelcancel", "button"], ["sessdelconfirm", "button"],
   ]) elements[id] = node(tag);
   elements.sessdel.hidden = true;
-  for (const id of ["sessionactionstitle", "sessionactionarchive", "sessionactiongroup", "sessionactiondelete", "sessionactioncancel"]) {
+  for (const id of ["sessionactionstitle", "sessionactionarchive", "sessionactiongroup", "sessionactionrename", "sessionactiondelete", "sessionactioncancel"]) {
     elements.sessionactionspanel.appendChild(elements[id]);
   }
   elements.sessionactions.appendChild(elements.sessionactionsscrim);
@@ -316,7 +316,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     dispatch, row, title, open, select, advance, historyLoads: () => historyLoads, configLoads: () => configLoads, grows: () => grows };
 }
 
-test("desktop double-click opens the shared archive/move/delete sheet without marking", async () => {
+test("desktop double-click opens the shared session action sheet without marking", async () => {
   const h = harness(), title = h.title();
   const click = h.dispatch(title, "click", { detail: 1 });
   assert.equal(h.context.sessionId, "target-session");
@@ -330,7 +330,7 @@ test("desktop double-click opens the shared archive/move/delete sheet without ma
   assert.equal(h.elements.sessionactionmark, undefined);
   assert.equal(h.elements.sessionactionfork, undefined);
   assert.deepEqual(h.elements.sessionactionspanel.querySelectorAll("button").filter((button) => !button.hidden).map((button) => button.textContent),
-    ["Archive", "Move to group…", "删除会话", "取消"]);
+    ["Archive", "Move to group…", "Rename...", "删除会话", "取消"]);
   assert.equal(h.document.activeElement, h.elements.sessionactionarchive);
   assert.equal(h.historyLoads(), 1, "the first click selects, the second must not select twice");
   h.dispatch(h.document.activeElement, "keydown", { key: "Escape" });
@@ -351,7 +351,7 @@ test("desktop right-click opens the shared sheet without switching sessions", as
   assert.equal(h.elements.sessionactionstitle.textContent, "Target session");
   assert.equal(h.elements.sessionactionfork, undefined);
   assert.deepEqual(h.elements.sessionactionspanel.querySelectorAll("button").filter((button) => !button.hidden).map((button) => button.textContent),
-    ["Archive", "Move to group…", "删除会话", "取消"]);
+    ["Archive", "Move to group…", "Rename...", "删除会话", "取消"]);
   await menu.done;
   assert.equal(h.context.sessionId, "open-session");
   assert.equal(h.historyLoads(), 0);
@@ -540,11 +540,11 @@ for (const extra of [{ key: "F10", shiftKey: true }, { key: "ContextMenu" }]) te
   assert.deepEqual(h.requests, []);
 });
 
-test("desktop Tab includes Archive and Move, wraps in both directions, and Cancel or scrim returns focus", () => {
+test("desktop Tab includes Archive, Move and Rename, wraps in both directions, and Cancel or scrim returns focus", () => {
   for (const cancel of ["sessionactioncancel", "sessionactionsscrim"]) {
     const h = harness(), title = h.title();
     h.open();
-    for (const id of ["sessionactiongroup", "sessionactiondelete", "sessionactioncancel", "sessionactionarchive"]) {
+    for (const id of ["sessionactiongroup", "sessionactionrename", "sessionactiondelete", "sessionactioncancel", "sessionactionarchive"]) {
       h.dispatch(h.document.activeElement, "keydown", { key: "Tab" });
       assert.equal(h.document.activeElement, h.elements[id]);
     }

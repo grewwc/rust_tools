@@ -201,7 +201,7 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessions li .session-controls { position:absolute; top:var(--session-action-top); right:var(--session-action-right); display:flex; flex-wrap:nowrap; align-items:center; gap:2px; }
 #sessions li .session-title { display:block; white-space:normal; overflow-wrap:break-word; word-break:normal; min-width:0; margin:0; color:var(--fg); font-size:13px; font-weight:500; line-height:22px; }
 #sessions li .session-title::before { content:""; float:right; width:calc(var(--session-action-size) + var(--session-action-size) + 8px); height:var(--session-action-size); }
-#sessions li .session-title-token { display:inline-block; max-width:100%; vertical-align:top; overflow-wrap:anywhere; }
+#sessions li .session-title-token { display:inline; overflow-wrap:anywhere; }
 #sessions li .session-meta { clear:both; display:none; margin:0; }
 #sessions li.session-search-result .session-meta { display:flex; min-width:0; }
 #sessions li .session-hash { display:none; }
@@ -1439,21 +1439,20 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #scrim.on { display:block; position:absolute; inset:0; z-index:5; background:rgba(0,0,0,.45); }
   #sessions ul { min-height:0; padding:2px 8px 6px; overscroll-behavior-y:contain; }
   #sessions li { padding:4px 8px; font-size:14px; touch-action:pan-y; -webkit-user-select:none; user-select:none; }
-  /* Share the title and status height with the touch controls, rather than
-     clearing a floated 44px placeholder before the status can start. */
+  /* Keep touch actions out of the text flow. Only nearby title lines avoid
+     their footprint; a short title can still share their height with status. */
   #sessions li[data-session-id]:not([hidden]) {
-    display:grid; grid-template-columns:minmax(0,1fr) auto; grid-template-rows:auto auto;
-    column-gap:4px; align-items:center; min-height:54px; margin:3px 0; padding:4px 6px;
+    --session-action-size:44px; --session-action-top:4px; --session-action-right:6px;
+    min-height:54px; margin:3px 0; padding:4px 6px;
   }
-  #sessions li .session-controls { position:static; grid-column:2; grid-row:1 / 3; align-self:start; gap:0; }
-  #sessions li .session-title { grid-column:1; grid-row:1; font-size:13px; line-height:20px; }
-  #sessions li .session-title::before { display:none; }
-  #sessions li .session-meta { grid-column:1; grid-row:2; align-self:start; margin:0; }
+  #sessions li .session-controls { gap:0; }
+  #sessions li .session-title { font-size:13px; line-height:20px; }
+  #sessions li .session-meta { clear:none; margin:0; }
   #sessions li.session-running .session-meta { gap:2px 4px; }
   #sessions li .session-menu { width:44px; height:44px; }
   #sessions li .mk { display:inline-flex; align-items:center; justify-content:center; width:44px; height:44px; padding:0; font-size:15px; background:none; }
   #sessions li .mk[aria-pressed="true"] { color:var(--mark); }
-  #sessions li .rnm { grid-column:1 / -1; min-height:44px; font-size:16px; -webkit-user-select:text; user-select:text; }
+  #sessions li .rnm { min-height:44px; font-size:16px; -webkit-user-select:text; user-select:text; }
   #sessions li.session-group-head { gap:2px; padding:0 2px; margin:8px 0 2px; border-radius:0; }
   #sessions li.session-group-head:first-child { margin-top:0; }
   #sessions .session-group-toggle, #sessions .session-group-new, #sessions .session-group-menu { min-height:44px; }
@@ -1801,6 +1800,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <div id="sessionactionmeta"></div>
 <button id="sessionactionarchive" type="button">Archive</button>
 <button id="sessionactiongroup" type="button">Move to group…</button>
+<button id="sessionactionrename" type="button">Rename...</button>
 <button id="sessionactiondelete" type="button">删除会话</button>
 <button id="sessionactioncancel" type="button">取消</button>
 </section>
@@ -8628,6 +8628,11 @@ function wireSessionActions() {
     closeSessionActions();
     if (s) return openSessionGroupMove(s);
   };
+  $("sessionactionrename").onclick = () => {
+    const s = sessionActionTarget;
+    closeSessionActions();
+    if (s) return openSessionRename(s);
+  };
   $("sessionactiondelete").onclick = () => {
     const s = sessionActionTarget;
     closeSessionActions();
@@ -9311,7 +9316,9 @@ async function openHiddenActiveSession(group, active) {
 }
 function openSelectedSessionRename() {
   const s = sessionListItem(sessionId);
-  if (!s) return;
+  if (s) return openSessionRename(s);
+}
+function openSessionRename(s) {
   const body = openSessionGroupDialog("Rename session");
   const base = store.base, seq = sessionGroupDialogSeq;
   const input = document.createElement("input");
@@ -9796,8 +9803,8 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
     li.title = sessionTitle(s) + "\nID: " + s.id + "\n" + Math.max(1, Math.round(s.size_bytes / 1024)) + " KB";
     const t = document.createElement("span");
     t.className = "session-title";
-    // Keep English words, identifiers and paths atomic when they fit a full
-    // card, rather than splitting them to fit beside the action buttons.
+    // Allow long identifiers and paths to wrap within the space beside the
+    // actions instead of moving an indivisible box to a blank second line.
     for (const part of sessionTitle(s).split(/([A-Za-z0-9_]+(?:[./:@#+!-][A-Za-z0-9_]+)*)/)) {
       if (!part) continue;
       const text = document.createElement("span");

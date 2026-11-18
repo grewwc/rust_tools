@@ -68,27 +68,61 @@ pub(in crate::ai) fn with_sessions_lifecycle_lock<T>(
 /// `overflow-history.md` are appended in place, so linked files would leak
 /// writes across sessions. On APFS the bytes are still cheap via the
 /// copy-on-write clone in `copy_file_fast`.
+/// Symlinks are recreated instead of followed: `fs::copy` rejects a link whose
+/// target is a directory, and dereferencing could read outside the asset tree
+/// or loop forever. Recreating keeps the fork's tree shape and never reads the
+/// link target.
 pub(super) fn copy_dir_recursively(src: &Path, dst: &Path) -> io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
             copy_dir_recursively(&from, &to)?;
-        } else {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            // Skip crash debris: archive commits write `.{name}.*.tmp` and
-            // rename on success, so surviving temp files are never referenced
-            // by any pointer.
-            if name.starts_with('.') && name.ends_with(".tmp") {
-                continue;
-            }
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Skip crash debris: archive commits write `.{name}.*.tmp` and
+        // rename on success, so surviving temp files are never referenced
+        // by any pointer.
+        if name.starts_with('.') && name.ends_with(".tmp") {
+            continue;
+        }
+        if file_type.is_symlink() {
+            copy_symlink(&from, &to)?;
+        } else if file_type.is_file() {
             copy_file_fast(&from, &to)?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot copy asset '{}': not a regular file, directory, or symbolic link",
+                    from.display()
+                ),
+            ));
         }
     }
     Ok(())
+}
+
+/// Recreate the symlink `from` at `to` without dereferencing it.
+#[cfg(unix)]
+fn copy_symlink(from: &Path, to: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(fs::read_link(from)?, to)
+}
+
+#[cfg(not(unix))]
+fn copy_symlink(from: &Path, to: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "cannot copy symbolic link '{}' on this platform",
+            from.display()
+        ),
+    ))
 }
 
 /// Copy one file, using an APFS copy-on-write clone on macOS when possible.
@@ -2703,6 +2737,64 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&target_asset).unwrap(),
             "source checkpoint body"
+        );
+
+        let _ = fs::remove_dir_all(store.sessions_root());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fork_recreates_asset_symlinks_without_following_them() {
+        let history_file = temp_history_file();
+        let store = SessionStore::new(&history_file);
+        let source_id = "source";
+        let target_id = "target";
+        append_history_messages(
+            &store.session_history_file(source_id),
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("fork source".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+
+        let source_assets = store.session_assets_dir(source_id);
+        fs::create_dir_all(source_assets.join("nested")).unwrap();
+        fs::write(source_assets.join("nested/body.md"), "body").unwrap();
+        std::os::unix::fs::symlink("nested", source_assets.join("dir-link")).unwrap();
+        std::os::unix::fs::symlink("nested/body.md", source_assets.join("file-link")).unwrap();
+        std::os::unix::fs::symlink("missing", source_assets.join("dangling")).unwrap();
+        std::os::unix::fs::symlink(".", source_assets.join("cycle")).unwrap();
+
+        store.fork_session(source_id, target_id).unwrap();
+
+        let target_assets = store.session_assets_dir(target_id);
+        assert_eq!(
+            fs::read_to_string(target_assets.join("nested/body.md")).unwrap(),
+            "body"
+        );
+        for (name, expected) in [
+            ("dir-link", "nested"),
+            ("file-link", "nested/body.md"),
+            ("dangling", "missing"),
+            ("cycle", "."),
+        ] {
+            let link = target_assets.join(name);
+            assert!(
+                fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{name} should stay a symlink"
+            );
+            assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from(expected));
+        }
+        assert_eq!(
+            fs::read_to_string(target_assets.join("dir-link/body.md")).unwrap(),
+            "body"
         );
 
         let _ = fs::remove_dir_all(store.sessions_root());

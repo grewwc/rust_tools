@@ -133,7 +133,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
     ["sessdelcancel", "button"], ["sessdelconfirm", "button"],
   ]) elements[id] = node(tag);
   elements.sessdel.hidden = true;
-  for (const id of ["sessionactionstitle", "sessionactionmeta", "sessionactionarchive", "sessionactiongroup", "sessionactiondelete", "sessionactioncancel"]) elements.sessionactionspanel.appendChild(elements[id]);
+  for (const id of ["sessionactionstitle", "sessionactionmeta", "sessionactionarchive", "sessionactiongroup", "sessionactionrename", "sessionactiondelete", "sessionactioncancel"]) elements.sessionactionspanel.appendChild(elements[id]);
   elements.sessionactions.appendChild(elements.sessionactionsscrim);
   elements.sessionactions.appendChild(elements.sessionactionspanel);
 
@@ -958,7 +958,7 @@ test("sheet keyboard focus cycles through its actions and Escape restores the st
   const h = harness({ phone: true }), star = h.row().querySelector(".mk");
   h.hold();
   assert.equal(h.document.activeElement, h.elements.sessionactionarchive);
-  for (const id of ["sessionactiongroup", "sessionactiondelete", "sessionactioncancel", "sessionactionarchive"]) {
+  for (const id of ["sessionactiongroup", "sessionactionrename", "sessionactiondelete", "sessionactioncancel", "sessionactionarchive"]) {
     const key = h.dispatch(h.document.activeElement, "keydown", { key: "Tab" });
     assert.equal(key.event.prevented, true);
     assert.equal(h.document.activeElement, h.elements[id]);
@@ -1148,6 +1148,95 @@ test("More closes on Escape, outside pointer and outside focus without changing 
   assert.equal(h.elements.sessfilterstatus.hidden, true);
 });
 
+for (const phone of [false, true]) test("top edit control persists the current session title (phone=" + phone + ")", async () => {
+  const h = harness({ phone });
+  await h.dispatch(h.elements.sessrename, "click").done;
+  const editor = h.elements.sessiongroupbody.querySelector("input");
+  assert.equal(editor.value, "Open session");
+  editor.value = "  Current title  ";
+  await h.dispatch(editor, "keydown", { key: "Enter" }).done;
+  const requests = h.requests.filter((request) => request.path.endsWith("/title"));
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].method, "POST");
+  assert.equal(requests[0].path, "/sessions/open-session/title");
+  assert.deepEqual(requests[0].body, { title: "Current title" });
+  assert.equal(h.context.sessionId, "open-session");
+  assert.equal(h.elements.sesstitle.textContent, "Current title");
+  assert.equal(h.row("open-session").querySelector(".session-title").textContent, "Current title");
+  assert.equal(h.row().querySelector(".session-title").textContent, "Target session");
+  assert.equal(h.elements.sessiongroupdialog.hidden, true);
+  assert.deepEqual(h.switches, []);
+});
+
+for (const phone of [false, true]) for (const id of ["open-session", "target-session"]) {
+  test("row menu renames without switching the current session (phone=" + phone + ", id=" + id + ")", async () => {
+    const h = harness({ phone });
+    const oldTitle = id === "open-session" ? "Open session" : "Target session";
+    await h.dispatch(h.row(id).querySelector(".session-menu"), "click").done;
+    const rename = h.elements.sessionactionrename;
+    assert.ok(rename, "every session has a visible Rename action");
+    assert.equal(rename.hidden, false);
+    assert.equal(rename.textContent, "Rename...");
+    await h.dispatch(rename, "click").done;
+    assert.equal(h.elements.sessionactions.hidden, true);
+    const editor = h.elements.sessiongroupbody.querySelector("input");
+    assert.equal(editor.value, oldTitle);
+    assert.equal(h.document.activeElement, editor);
+    assert.equal(h.context.sessionId, "open-session");
+    editor.value = "  Renamed " + id + "  ";
+    await h.dispatch(h.elements.sessiongroupbody.querySelector("button"), "click").done;
+    const requests = h.requests.filter((request) => request.path.endsWith("/title"));
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].method, "POST");
+    assert.equal(requests[0].path, "/sessions/" + id + "/title");
+    assert.deepEqual(requests[0].body, { title: "Renamed " + id });
+    assert.ok(h.requests.some((request) => request.path === "/sessions"), "reload titles after persistence");
+    assert.equal(h.context.sessionId, "open-session");
+    assert.equal(h.elements.sesstitle.textContent, id === "open-session" ? "Renamed " + id : "Open session");
+    assert.equal(h.row(id).querySelector(".session-title").textContent, "Renamed " + id);
+    const otherId = id === "open-session" ? "target-session" : "open-session";
+    assert.equal(h.row(otherId).querySelector(".session-title").textContent, id === "open-session" ? "Target session" : "Open session");
+    assert.equal(h.elements.sessiongroupdialog.hidden, true);
+    assert.deepEqual(h.switches, []);
+    assert.equal(h.historyLoads(), 0);
+    assert.equal(h.configLoads(), 0);
+    assert.equal(h.elements.prompt.value, "draft in A");
+  });
+}
+
+test("row rename failure keeps both titles and the editor for retry", async () => {
+  let fail = true;
+  const serverItems = sessions();
+  const h = harness({
+    titlePost: (request) => {
+      if (fail) return response({}, 500);
+      serverItems[1].summary = request.body.title;
+      return response({ title: request.body.title });
+    },
+    sessionsGet: () => response(serverItems),
+  });
+  await h.dispatch(h.row().querySelector(".session-menu"), "click").done;
+  await h.dispatch(h.elements.sessionactionrename, "click").done;
+  const editor = h.elements.sessiongroupbody.querySelector("input");
+  const save = h.elements.sessiongroupbody.querySelector("button");
+  editor.value = "Retried title";
+  await h.dispatch(save, "click").done;
+  assert.match(h.elements.sessiongrouperror.textContent, /^Rename failed: 500/);
+  assert.equal(h.elements.sessiongroupdialog.hidden, false);
+  assert.equal(save.disabled, false);
+  assert.equal(editor.value, "Retried title");
+  assert.equal(h.row().querySelector(".session-title").textContent, "Target session");
+  assert.equal(h.elements.sesstitle.textContent, "Open session");
+  assert.equal(h.context.sessionId, "open-session");
+  fail = false;
+  await h.dispatch(save, "click").done;
+  assert.equal(h.elements.sessiongroupdialog.hidden, true);
+  assert.equal(h.requests.filter((request) => request.path.endsWith("/title")).length, 2);
+  assert.equal(h.row().querySelector(".session-title").textContent, "Retried title");
+  assert.equal(h.elements.sesstitle.textContent, "Open session");
+  assert.deepEqual(h.switches, []);
+});
+
 for (const phone of [false, true]) test("select another session then rename with the top edit control (phone=" + phone + ")", async () => {
   const h = harness({ phone });
   await h.dispatch(h.row(), "click").done;
@@ -1171,7 +1260,7 @@ for (const phone of [false, true]) test("select another session then rename with
   assert.equal(h.elements.sessiongroupdialog.hidden, true);
 });
 
-test("desktop actions reserve nearby title space while phone actions share the title and status height", () => {
+test("overlaid actions reserve nearby title space while phone status shares their height", () => {
   const h = harness({ items: sessions(true) }), li = h.row();
   assert.match(li.title, /Target session\nID: target-session\n2 KB/);
   assert.equal(li.classList.contains("session-marked"), true);
@@ -1197,10 +1286,11 @@ test("desktop actions reserve nearby title space while phone actions share the t
   assert.match(css, /#sessions li \.session-menu \{ width:44px; height:44px; \}/);
   assert.match(css, /#sessions li \.mk \{[^}]*width:44px; height:44px;/);
   const phoneCSS = css.slice(css.indexOf("@media (max-width:700px)"));
-  assert.match(phoneCSS, /#sessions li\[data-session-id\]:not\(\[hidden\]\) \{\s*display:grid; grid-template-columns:minmax\(0,1fr\) auto; grid-template-rows:auto auto;/);
-  assert.match(phoneCSS, /#sessions li \.session-controls \{ position:static; grid-column:2; grid-row:1 \/ 3; align-self:start; gap:0; \}/);
-  assert.match(phoneCSS, /#sessions li \.session-title::before \{ display:none; \}/);
-  assert.match(phoneCSS, /#sessions li \.session-meta \{ grid-column:1; grid-row:2; align-self:start; margin:0; \}/);
+  assert.match(phoneCSS, /#sessions li\[data-session-id\]:not\(\[hidden\]\) \{\s*--session-action-size:44px; --session-action-top:4px; --session-action-right:6px;/);
+  assert.match(phoneCSS, /#sessions li \.session-controls \{ gap:0; \}/);
+  assert.doesNotMatch(phoneCSS, /#sessions[^{}]*(?:li\[data-session-id\]|\.session-controls|\.session-title)[^{}]*\{[^}]*(?:display:grid|position:static|grid-column|grid-row)/);
+  assert.doesNotMatch(phoneCSS, /#sessions li \.session-title::before \{[^}]*display:none/);
+  assert.match(phoneCSS, /#sessions li \.session-meta \{ clear:none; margin:0; \}/);
   assert.match(phoneCSS, /#sessions ul \{ min-height:0;[^}]*overscroll-behavior-y:contain;/);
   assert.match(phoneCSS, /#sessions \.rowbtns \{ flex:0 0 auto;[^}]*env\(safe-area-inset-bottom\)/);
   assert.match(phoneCSS, /#sessions \.rowbtns button \{[^}]*min-width:0; min-height:44px;/);
@@ -1208,6 +1298,28 @@ test("desktop actions reserve nearby title space while phone actions share the t
   assert.deepEqual(controls.children, [li.querySelector(".mk"), li.querySelector(".session-menu")]);
   assert.deepEqual(li.children, [controls, li.querySelector(".session-title"), li.querySelector(".session-meta")]);
 });
+
+for (const phone of [false, true]) for (const marked of [false, true]) {
+  for (const summary of ["feat/2026-11-17-critical-premises", "Short"]) {
+    test(`session title starts beside overlaid actions without an atomic box (phone=${phone}, marked=${marked}, title=${summary})`, () => {
+      const h = harness({ phone, items: [{ ...sessions()[1], summary, marked }] }), li = h.row();
+      const title = li.querySelector(".session-title"), controls = li.querySelector(".session-controls");
+      assert.equal(title.textContent, summary, "the full title is retained");
+      assert.equal(title.children[0].textContent, summary, "no leading placeholder is added to the DOM");
+      assert.equal(title.children[0].className, "session-title-token");
+      assert.equal(li.querySelectorAll(".session-menu").length, 1);
+      assert.equal(li.querySelector(".mk").getAttribute("aria-pressed"), String(marked));
+      assert.deepEqual(controls.children, [li.querySelector(".mk"), li.querySelector(".session-menu")]);
+      assert.match(css, /#sessions li \.session-title-token \{ display:inline; overflow-wrap:anywhere; \}/,
+        "an identifier can break into the remaining first-line space");
+      assert.doesNotMatch(css, /#sessions[^{}]*\.session-title(?:-token)?\s*\{[^}]*(?:inline-block|white-space:nowrap|text-overflow|line-clamp|overflow:hidden)/);
+      assert.match(css, /#sessions li \.session-controls \{ position:absolute;/);
+      assert.doesNotMatch(css, /#sessions[^{}]*\.session-controls\s*\{[^}]*position:(?:static|relative)/);
+      assert.doesNotMatch(css, /#sessions[^{}]*\.session-title\s*\{[^}]*(?:padding-right|margin-right)/,
+        "later title lines retain the full width after the float ends");
+    });
+  }
+}
 
 for (const phone of [false, true]) test("session menu opens actions with one press and restores focus (phone=" + phone + ")", async () => {
   const h = harness({ phone }), li = h.row(), menu = li.querySelector(".session-menu");
