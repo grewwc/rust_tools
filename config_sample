@@ -44,6 +44,9 @@ ai.embedding.enable = true
 ai.embedding.endpoint = https://ark.cn-beijing.volces.com/api/coding/v3/embeddings
 ai.embedding.model = doubao-embedding-vision
 
+# Denying knowledge_search also disables automatic distilled-memory recall.
+ai.tools.permissions = knowledge_search:deny
+
 
 ai.output.postprocess_command = python3 /path/to/rust_tools/scripts/postprocess_terminal.py
 
