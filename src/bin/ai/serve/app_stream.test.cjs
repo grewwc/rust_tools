@@ -446,7 +446,7 @@ function attachmentHarness(headersOnly = false, options) {
 
 function runningComposer(c) {
   const lookup = c.$;
-  const elements = Object.fromEntries(["send", "sidenote", "composer", "turnstatus", "prompt", "sendstatus"].map((id) => [id, {
+  const elements = Object.fromEntries(["send", "sidenote", "composer", "turnstatus", "prompt"].map((id) => [id, {
     textContent: "", hidden: true, dataset: {}, classList: { toggle() {} }, setAttribute() {},
   }]));
   elements.prompt.value = "follow-up draft";
@@ -664,7 +664,7 @@ for (const phone of [false, true]) {
     await h.newButton.onclick();
     assert.match(h.root.textContent, /new session — type below to start\./);
     Object.assign(c, {
-      canSend: () => true, sendBlockReason: () => "", validateSkillInput: () => true, closeCommandMenu() {},
+      canSend: () => true, validateSkillInput: () => true, closeCommandMenu() {},
       dispatchComposerCommands: function* () {}, prepareTurnSession: async () => "b",
       captureSkillPick: () => ({ skills: [] }), setPromptValue: (value) => { h.prompt.value = value; },
       addLiveUserBubble(text) { const row = c.addMsg("user", text, "user"); return { parentNode: row }; },

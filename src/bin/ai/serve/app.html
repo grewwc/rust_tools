@@ -802,10 +802,6 @@ select, summary { touch-action:manipulation; }
 }
 #sidequeuelist .text { min-width:0; white-space:pre-wrap; overflow-wrap:anywhere; }
 #composer { display:flex; position:relative; gap:8px; padding:10px 12px calc(10px + env(safe-area-inset-bottom)); background:var(--panel); border-top:1px solid var(--line); }
-/* Send feedback stays out of flow so it cannot move an active IME or cover a control. */
-#sendstatus { position:absolute; bottom:calc(100% + 4px); left:12px; right:12px; z-index:6; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--panel); color:var(--fg); font-size:13px; overflow-wrap:anywhere; pointer-events:none; }
-#sendstatus[hidden] { display:none; }
-#sendstatus[data-state="error"] { border-color:var(--err); }
 #send[aria-disabled="true"] { opacity:.5; cursor:default; box-shadow:none; }
 #attachments[hidden] { display:none; }
 #attachments {
@@ -1787,7 +1783,6 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <textarea id="prompt" placeholder="ask…" rows="1"></textarea>
 <button id="sidenote" type="button" aria-label="send as side note" aria-hidden="true" tabindex="-1" title="send as side note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v11H9l-4 3V5Z"/><path d="M9 9h6"/></svg><span>note</span></button>
 <button id="send" class="primary">➤</button>
-<div id="sendstatus" role="status" aria-live="polite" hidden></div>
 <details id="attachments" hidden>
 <summary id="attachmentcount" role="status" aria-live="polite"></summary>
 <div id="attachmentnames"></div>
@@ -8130,7 +8125,6 @@ function runDesktopModelCommand(text, options = {}) {
   }
   // An applied setting returns the message that follows it; an unresolved
   // selector only opens the picker, so the text waits in the box for a choice.
-  if (applied && sent && !sent.rest && !options.preview) sendFeedback("模型设置已应用，请输入问题后发送。");
   return applied && sent && sent.rest ? sent.rest : true;
 }
 function desktopCompletionOwner() { return { base: store.base, sid: typeof sessionId === "undefined" ? "" : sessionId }; }
@@ -12353,49 +12347,31 @@ function isTurnRunning() {
   const freshServerTurn = state.running && (Date.now() - state.runningAt) < RUNNING_SAMPLE_TTL_MS;
   return state.attached || state.recovering || freshServerTurn;
 }
-// The same admission reason drives the click guard and the control's state.
-// Preparation owns the setup lock and has already dispatched local commands.
-function canSend() { return !sendBlockReason(); }
-function sendBlockReason({ preparing = false } = {}) {
+function canSend() {
   const state = executionState();
-  if (typeof isRemoteTurn === "function" && isRemoteTurn()) return "当前会话正在另一个进程中运行，请等待本轮结束后再发送。";
-  if (isTurnRunning()) return "当前会话仍在运行，请先停止，或切换到其他会话发送。";
-  if (!preparing && state.sendBusy) return "上一条消息仍在准备发送，请稍候再试。";
-  const text = preparing ? "" : $("prompt").value;
-  if (!preparing) {
-    if (promptComposing) return "请先完成输入法候选词，再发送消息。";
-    if (!text.trim() && !pendingImages.length) return "请先输入消息或添加图片。";
-    if (typeof skillInputReady === "function" && !skillInputReady()) return "请先完成技能搜索输入，再发送消息。";
-  }
+  if (typeof isRemoteTurn === "function" && isRemoteTurn()) return false;
+  if (isTurnRunning() || state.sendBusy || promptComposing) return false;
+  const text = $("prompt").value;
+  if (!text.trim() && !pendingImages.length) return false;
+  if (typeof skillInputReady === "function" && !skillInputReady()) return false;
   const commandName = /^[:/]([a-z-]+)(?:\s|$)/i.exec(text.trim())?.[1].toLowerCase();
-  const localCommand = !preparing && typeof COMPOSER_COMMANDS !== "undefined" && COMPOSER_COMMANDS.some((command) =>
+  const localCommand = typeof COMPOSER_COMMANDS !== "undefined" && COMPOSER_COMMANDS.some((command) =>
     (command.name === commandName || command.aliases?.includes(commandName))
       && typeof command.resolveHandler() === "function" && command.withoutTurn?.(text));
-  if (state.liveCount >= MAX_LIVE_TURNS && !localCommand) return "已有 " + state.liveCount + " 个会话正在运行，请等待其中一个结束后再发送。";
-  if (!preparing && !localCommand && typeof teamPickState === "function") {
+  if (state.liveCount >= MAX_LIVE_TURNS && !localCommand) return false;
+  if (!localCommand && typeof teamPickState === "function") {
     const team = teamPickState();
-    if (team.pending && team.errorSource === "save") return "对话模式保存失败，请点击对话模式重试保存后再发送。";
+    if (team.pending && team.errorSource === "save") return false;
   }
-  return "";
+  return true;
 }
 function canStop() { return isTurnRunning(); }
-function sendFeedback(message, state = "pending", owner = { sessionId, base: executionBase() }) {
-  const status = $("sendstatus");
-  if (!status || owner.sessionId !== sessionId || owner.base !== executionBase()) return;
-  status.textContent = message;
-  status.dataset.state = state;
-  status.hidden = !message;
-  status._sendOwner = message ? { sessionId: owner.sessionId, base: owner.base } : null;
-}
 // Execution accessors bind before the composer and command registries exist.
 var composerControlsReady = false;
 function refreshComposerControls() { if (composerControlsReady) syncStopButton(); }
-function sideNoteBlockReason() {
-  if (sideNoteBusy) return "上一条 side note 仍在发送，请稍候再试。";
-  if (!sessionId) return "请先选择会话后再发送 side note。";
-  if (promptComposing) return "请先完成输入法候选词，再发送 side note。";
-  if (!$("prompt").value.trim() && !pendingImages.length) return "请先输入 side note 或添加图片。";
-  return "";
+function canSendSideNote() {
+  return !sideNoteBusy && !!sessionId && !promptComposing
+    && (!!$("prompt").value.trim() || pendingImages.length > 0);
 }
 // The one send/stop button reflects that predicate: stop glyph plus the stop
 // class while a turn runs, the plain send look otherwise.
@@ -12408,29 +12384,21 @@ function syncStopButton() {
   b.textContent = running ? "⏹" : "➤";
   b.classList.toggle("stop", running);
   const remote = typeof isRemoteTurn === "function" && isRemoteTurn();
-  const blocked = running ? remote ? sendBlockReason() : state.stopBusy ? "正在停止本轮，请稍候。" : "" : sendBlockReason();
-  b.disabled = !!blocked;
-  b.setAttribute("aria-disabled", String(!!blocked));
-  b.setAttribute("aria-describedby", "sendstatus");
+  b.disabled = running ? remote || state.stopBusy : !canSend();
+  b.setAttribute("aria-disabled", String(b.disabled));
   const label = remote
     ? "running in another process"
     : running ? "stop this turn" : "send";
-  b.setAttribute("aria-label", blocked || label);
-  b.title = blocked || label;
-  const status = $("sendstatus"), owner = status?._sendOwner;
-  if (owner && (owner.sessionId !== sessionId || owner.base !== executionBase())) sendFeedback("");
-  if (blocked && (blocked !== "请先输入消息或添加图片。" || $("prompt").value.length)
-      && (!status || status.hidden || status.dataset.state === "blocked")) sendFeedback(blocked, "blocked");
-  else if (!blocked && status?.dataset.state === "blocked") sendFeedback("");
+  b.setAttribute("aria-label", label);
+  b.title = label;
   const sideNote = $("sidenote");
   // The note affordance follows the live view, not the stop glyph's terminal
   // latches: a feed that dropped (or a page resumed mid-turn) still shows the
   // running transcript, and the composer can queue a note into that turn.
   const noteReady = running || state.attached || state.recovering || state.live;
-  const noteBlocked = sideNoteBlockReason();
-  sideNote.disabled = !!noteBlocked;
-  sideNote.setAttribute("aria-disabled", String(!!noteBlocked));
-  sideNote.title = noteBlocked || "send as side note";
+  sideNote.disabled = !canSendSideNote();
+  sideNote.setAttribute("aria-disabled", String(sideNote.disabled));
+  sideNote.title = "send as side note";
   sideNote.setAttribute("aria-hidden", String(!noteReady));
   sideNote.tabIndex = noteReady ? 0 : -1;
   // The side note joins the composer grid as a column of its own, which
@@ -12463,11 +12431,10 @@ function hideNote() {
   el.classList.remove("show", "note");
 }
 async function sendSideNote() {
-  const blocked = sideNoteBlockReason();
-  if (blocked) {
-    sendFeedback(blocked, "error");
+  if (!canSendSideNote()) {
     $("sidenote").disabled = true;
-    if (blocked === "请先输入 side note 或添加图片。") $("prompt").focus();
+    if (!sideNoteBusy && sessionId && !promptComposing
+        && !$("prompt").value.trim() && !pendingImages.length) $("prompt").focus();
     refreshComposerControls();
     return;
   }
@@ -12485,12 +12452,10 @@ async function sendSideNote() {
   // running-state poll, or let that wait change the target session or text.
   const targetSession = sessionId;
   const targetBase = executionBase();
-  const owner = { sessionId: targetSession, base: targetBase };
   const stillSelected = () => sessionId === targetSession && executionBase() === targetBase;
   sideNoteBusy = true;
   $("sidenote").disabled = true;
   note("sending side note…");
-  sendFeedback("正在发送 side note…", "pending", owner);
   try {
     await api("/sessions/" + targetSession + "/side-notes", {
       method: "POST", body: JSON.stringify(body),
@@ -12506,18 +12471,16 @@ async function sendSideNote() {
     }
     if (stillSelected()) {
       note("side note queued — applies at the next model request");
-      sendFeedback("side note 已加入队列，将在下一次模型请求时发送。", "pending", owner);
       void refreshSideNotes();
     }
   } catch (e) {
     if (!stillSelected()) return;
     const filenames = images.map((image) => image.filename).join("、");
-    sendFeedback("side note 发送失败，输入已保留，请重试：" + e.message, "error", owner);
     addMsg("err", "side note failed" + (filenames ? "（" + filenames + "）" : "") + ": " + e.message, "asst err");
     scrollToLatest();
   } finally {
     sideNoteBusy = false;
-    $("sidenote").disabled = !!sideNoteBlockReason();
+    $("sidenote").disabled = !canSendSideNote();
     refreshComposerControls();
   }
 }
@@ -12586,26 +12549,20 @@ async function refreshSideNotes() {
 }
 async function stopTurn() {
   const state = executionState();
-  const report = (message, error = false) => {
-    note(message);
-    sendFeedback(message, error ? "error" : "pending", state);
-  };
-  if (state.stopBusy || !state.sessionId) { report(state.stopBusy ? "正在停止本轮，请稍候。" : "请先选择会话后再发送。", true); return; }
+  if (state.stopBusy || !state.sessionId) return;
   if (typeof isRemoteTurn === "function" && isRemoteTurn()) {
     if (typeof syncRemoteTurnNote === "function") syncRemoteTurnNote();
-    report("当前会话正在另一个进程中运行，请等待本轮结束后再发送。", true);
     return;
   }
   stopBusy = true;
   syncStopButton();
-  report("正在停止本轮…");
   let interrupted = false;
   try {
     const r = await (await api("/sessions/" + state.sessionId + "/interrupt", { method: "POST" })).json();
     interrupted = r.interrupted === true;
   } catch (e) {
     // Transport failure: surface it and let the next poll re-derive the state.
-    report("stop failed: " + e.message, true);
+    note("stop failed: " + e.message);
     stopBusy = false;
     pollConfirm();
     return;
@@ -12613,8 +12570,8 @@ async function stopTurn() {
   stopBusy = false;
   // The POST returned for this owner; the next poll re-asserts its truth.
   updateExecutionModel({ kind: "field", name: "turnRunning", value: false }, state.sessionId, state.base);
-  if (interrupted) report("stopping…");
-  else { report("no turn running"); await loadHistory(); await loadSessions(); }
+  if (interrupted) note("stopping…");
+  else { note("no turn running"); await loadHistory(); await loadSessions(); }
   // The server is the truth for both the pending question and `running`, so an
   // interrupt that cancels a parked question also clears its dialog here.
   pollConfirm();
@@ -12680,10 +12637,9 @@ function applySessionCwd(sid, cwd) {
 // BEGIN composer session adoption
 // A first turn, /cd or /git may create a lazy session. Carry committed picks
 // to that id without restoring an empty draft over the user's current input.
-function adoptComposerSession(newId, previousId, base, adopted = () => {}) {
+function adoptComposerSession(newId, previousId, base) {
   if (typeof newId !== "string" || !newId.trim() || sessionId !== previousId || store.base !== base) return false;
   sessionId = newId;
-  adopted(newId);
   if (newId !== previousId && typeof beginSessionTranscriptScroll === "function") beginSessionTranscriptScroll(newId);
   updateExecutionModel({ kind: "select" });
   commitExecutionView(newId, base);
@@ -12695,17 +12651,15 @@ function adoptComposerSession(newId, previousId, base, adopted = () => {}) {
   return true;
 }
 // END composer session adoption
-async function runCdCommand(text, report, adopted = () => {}) {
+async function runCdCommand(text) {
   const command = cdCommandLine(text);
   if (!command || pendingImages.length) return false;
-  const owner = { sessionId, base: executionBase() };
-  const reject = (message) => report ? report(message) : sendFeedback(message, "error", owner);
   if (!sessionId) {
     const previousId = sessionId, base = store.base;
     let created;
     try { created = await (await api("/sessions", { method: "POST" })).json(); }
-    catch (e) { const message = "create session failed: " + e.message; addMsg("err", message, "asst err"); reject(message + "，输入已保留，请重试。"); return true; }
-    if (!adoptComposerSession(created.id, previousId, base, adopted)) { reject("未能创建会话，或会话已切换，请检查当前会话后再次发送。"); return true; }
+    catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); return true; }
+    if (!adoptComposerSession(created.id, previousId, base)) return true;
     pendingCwd = created.cwd || "";
   }
   const sid = sessionId;
@@ -12781,17 +12735,15 @@ function renderGitOutput(output) {
   addFold("activity log (1) · " + shortLine(last, 80), out).box.classList.add("tool-activity", "git-output");
   scrollToLatest(false);
 }
-async function runGitCommand(text, report, adopted = () => {}) {
+async function runGitCommand(text) {
   const command = gitCommandLine(text);
   if (!command) return false;
-  const owner = { sessionId, base: executionBase() };
-  const reject = (message) => report ? report(message) : sendFeedback(message, "error", owner);
   if (!sessionId) {
     const previousId = sessionId, base = store.base;
     let created;
     try { created = await (await api("/sessions", { method: "POST" })).json(); }
-    catch (e) { const message = "create session failed: " + e.message; addMsg("err", message, "asst err"); reject(message + "，输入已保留，请重试。"); return true; }
-    if (!adoptComposerSession(created.id, previousId, base, adopted)) { reject("未能创建会话，或会话已切换，请检查当前会话后再次发送。"); return true; }
+    catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); return true; }
+    if (!adoptComposerSession(created.id, previousId, base)) return true;
     pendingCwd = created.cwd || "";
   }
   const sid = sessionId, base = store.base;
@@ -12900,14 +12852,13 @@ async function runTransferCommand(text) {
   const command = transferCommandLine(text);
   if (!command) return false;
   const args = command.args;
-  const owner = { sessionId, base: executionBase() };
 
   if (command.cmd === "import") {
     const asArg = args.find((arg) => arg.startsWith("as="));
     const dst = asArg ? asArg.slice(3).trim() : "";
-    if (asArg && !dst) { addMsg("err", "import failed: empty as= id", "asst err"); sendFeedback("请在 as= 后填写会话 ID，再重新导入。", "error", owner); return true; }
+    if (asArg && !dst) { addMsg("err", "import failed: empty as= id", "asst err"); return true; }
     const file = await pickTransferArchive();
-    if (!file) { sendFeedback("已取消导入，输入已保留；点击发送可重新选择文件。", "pending", owner); return true; }
+    if (!file) return true;
     setPromptValue("", true);
     $("prompt").style.height = "auto";
     if (sessionId) clearDraft(sessionId);
@@ -12934,14 +12885,13 @@ async function runTransferCommand(text) {
   const markdown = command.cmd === "export-md";
   if (!markdown && ["last", "latest"].includes(args[0])) {
     addMsg("err", "/export last is not available in the WebUI; open that session and export it there", "asst err");
-    sendFeedback("请先打开要导出的会话，再使用 /export。", "error", owner);
     return true;
   }
   // `/export [selector] [output.zip]` keeps the CLI's optional target; the
   // WebUI only needs the current session, but an explicit id still works.
   const selector = !markdown && args[0] && !["current", "last", "latest"].includes(args[0]) ? args[0] : "";
   const target = markdown ? sessionId : (selector || sessionId);
-  if (!target) { addMsg("err", "export failed: no session selected", "asst err"); sendFeedback("请先选择会话，再导出。", "error", owner); return true; }
+  if (!target) { addMsg("err", "export failed: no session selected", "asst err"); return true; }
   setPromptValue("", true);
   $("prompt").style.height = "auto";
   if (sessionId) clearDraft(sessionId);
@@ -12964,16 +12914,15 @@ async function runTransferCommand(text) {
 // END composer export/import commands
 
 // BEGIN turn session preparation
-async function prepareTurnSession(previousId, base, report = (message) => addMsg("err", message, "asst err"), adopted = () => {}) {
-  if (sessionId !== previousId || store.base !== base) { report("会话或服务器已切换，请再次发送。"); return ""; }
-  const blocked = sendBlockReason({ preparing: true });
-  if (blocked) { report(blocked); return ""; }
+async function prepareTurnSession(previousId, base) {
+  if (sessionId !== previousId || store.base !== base) return "";
+  if (isTurnRunning() || executionState().liveCount >= MAX_LIVE_TURNS) return "";
   let sid = previousId;
   if (!sid) {
     let created;
     try { created = await (await api("/sessions", { method: "POST" })).json(); }
-    catch (e) { report("create session failed: " + e.message + "，输入已保留，请重试。"); return ""; }
-    if (!adoptComposerSession(created.id, previousId, base, adopted)) { report("未能创建会话，或会话已切换，请再次发送。"); return ""; }
+    catch (_) { return ""; }
+    if (!adoptComposerSession(created.id, previousId, base)) return "";
     pendingCwd = created.cwd || "";
     sid = created.id;
     persistPicks();
@@ -12983,10 +12932,8 @@ async function prepareTurnSession(previousId, base, report = (message) => addMsg
   const ready = await ensureTeamConfig(sid, base);
   // A config request can wait for a running turn's snapshot. Navigation while
   // it waits must never send the old input with the newly shown session's picks.
-  if (sid !== sessionId || base !== store.base) { report("会话或服务器已切换，请再次发送。"); return ""; }
-  if (!ready) { report("对话模式尚未保存，输入已保留，请点击对话模式重试保存后再发送。"); return ""; }
-  const changed = sendBlockReason({ preparing: true });
-  if (changed) { report(changed); return ""; }
+  if (sid !== sessionId || base !== store.base || !ready) return "";
+  if (isTurnRunning() || executionState().liveCount >= MAX_LIVE_TURNS) return "";
   return sid;
 }
 // END turn session preparation
@@ -13027,42 +12974,25 @@ function pendingInputAnchor(root) {
   return { afterHistoryKey: previous?.dataset.canonicalIdentity || "", afterHistoryIndex: Number(previous?.dataset.canonicalIndex) };
 }
 async function send() {
-  const status = $("sendstatus");
-  // Share the click action's owner so lazy adoption also scopes its error report.
-  const owner = arguments[0] || { sessionId, base: executionBase() };
-  let rejection = "";
-  const feedback = (message, error = false) => {
-    sendFeedback(message, error ? "error" : message === "正在准备发送…" ? "preparing" : "pending", owner);
-  };
-  const rejectSend = (message) => { rejection = message; feedback(message, true); syncStopButton(); };
-  const adopted = (id) => { owner.sessionId = id; feedback("正在准备发送…"); };
-  let sid, input, text, draftSession, sendBase, ownsSetup = false;
-  try {
-    const blocked = sendBlockReason();
-    if (blocked) {
-      rejectSend(blocked);
-      return;
-    }
-    // Send the textarea bytes as typed: the server stores them unchanged, so a
-    // client-side trim would make the transcript differ from the input. The
-    // trimmed view only decides whether there is anything to send. A leading
-    // setting line is local and leaves the message after it as the prompt.
-    text = $("prompt").value;
-    if (!validateSkillInput()) { rejectSend("请先完成技能搜索输入，再发送消息。"); return; }
-    closeCommandMenu();
+  if (!canSend()) { syncStopButton(); return; }
+  // Send the textarea bytes as typed: the server stores them unchanged, so a
+  // client-side trim would make the transcript differ from the input. The
+  // trimmed view only decides whether there is anything to send. A leading
+  // setting line is local and leaves the message after it as the prompt.
+  const text = $("prompt").value;
+  if (!validateSkillInput()) return;
+  closeCommandMenu();
 
-    draftSession = sessionId;
-    sendBase = store.base;
-    ownsSetup = true;
-    sendBusy = true;
-    input = text;
-    feedback("正在准备发送…");
+  const draftSession = sessionId, sendBase = store.base;
+  sendBusy = true;
+  let sid, input = text;
+  try {
     // Session commands use their own endpoints before preparing a model turn.
     for (const command of dispatchComposerCommands()) {
       if (command.withOwner) {
         // Resolve the command bridge through the ordered dispatcher.
         const runCdCommand = command.handler;
-        if (await runCdCommand(input, rejectSend, adopted)) { if (!rejection) feedback(""); return; }
+        if (await runCdCommand(input)) return;
       } else {
         const runTransferCommand = command.handler;
         if (typeof runTransferCommand !== "function") continue;
@@ -13070,20 +13000,16 @@ async function send() {
         // A model command applies its setting and hands back the rest of the
         // message, which is this turn's prompt.
         if (typeof handled === "string") input = handled;
-        else if (handled) { if (status?.dataset.state === "preparing") feedback(""); return; }
+        else if (handled) return;
       }
     }
-    sid = await prepareTurnSession(draftSession, sendBase, rejectSend, adopted);
-    if (!sid) { if (!rejection) rejectSend("暂时无法发送，输入已保留，请检查会话状态后重试。"); return; }
-  } catch (error) {
-    rejectSend("发送失败，输入已保留，请重试：" + (error?.message || String(error)));
+    sid = await prepareTurnSession(draftSession, sendBase);
+    if (!sid) return;
+  } catch (_) {
     return;
-  } finally { if (ownsSetup) sendBusy = false; } // The stream below owns itself; another session may send now.
-  if (sid !== sessionId || sendBase !== executionBase()) { rejectSend("会话或服务器已切换，请再次发送。"); return; }
-  const changed = sendBlockReason();
-  if (changed) { rejectSend(changed); return; }
-  if ($("prompt").value !== text) { rejectSend("输入已更新，请检查消息后再次发送。"); return; }
-  if (!validateSkillInput()) { rejectSend("请先完成技能搜索输入，再发送消息。"); return; }
+  } finally { sendBusy = false; } // The stream below owns itself; another session may send now.
+  if (sid !== sessionId || sendBase !== executionBase() || !canSend()) return;
+  if ($("prompt").value !== text || !validateSkillInput()) return;
   if (typeof abortEvents === "function") abortEvents();
   const rewindFloor = historySession === sid ? canonicalHistoryTotal : 0;
   void retryHistory();
@@ -13122,7 +13048,6 @@ async function send() {
   };
   pendingInputs.push(userInput);
   pendingUserInputs.set(sid, pendingInputs);
-  feedback("");
 
   stopStaleFollow(); // this turn's own stream owns the view from here on
   runEpoch++; // late polls from any previous turn no longer vote on the button
@@ -13870,10 +13795,8 @@ function wire() {
     output.hidden = true;
   };
   $("send").onclick = async () => {
-    const owner = { sessionId, base: executionBase() };
-    try { if (canStop()) await stopTurn(); else await send(owner); }
-    catch (error) {
-      sendFeedback("发送失败，请重试：" + (error?.message || String(error)), "error", owner);
+    try { if (canStop()) await stopTurn(); else await send(); }
+    catch (_) {
       syncStopButton();
     }
   };
@@ -14024,7 +13947,6 @@ function wire() {
       return;
     }
     promptHistory.recordInput(e);
-    sendFeedback("");
     if (typeof prunePendingImages === "function") prunePendingImages();
     // The resize waits for a frame: an IME word arrives as an input event,
     // and a layout change inside the commit task loses the word.

@@ -30,7 +30,6 @@ function harness({ sessionId = "s1", respond, pickedFile } = {}) {
   const context = vm.createContext({
     sessionId,
     pendingImages: [],
-    executionBase: () => "", sendFeedback() {},
     api: async (url, opts) => {
       calls.push({ url, opts });
       return respond

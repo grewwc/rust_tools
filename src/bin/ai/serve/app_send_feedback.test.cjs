@@ -18,9 +18,7 @@ const html = fs.readFileSync(process.env.ASERVE_TEST_APP_HTML || path.join(__dir
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 
 function harness() {
-  const h = sendHarness(), status = h.elements.sendstatus = h.document.createElement("div");
-  status.hidden = true;
-  h.elements.composer.appendChild(status);
+  const h = sendHarness();
   h.elements.prompt.value = "未完成直接给我结果了？为什么不继续？";
   h.c.window.matchMedia = (query) => ({ matches: query.includes("min-width:701px"), addEventListener() {} });
   const start = script.indexOf("async function stopTurn()"), end = script.indexOf("function parseBlock(raw)", start);
@@ -35,10 +33,7 @@ function assertControl(h, blocked = !h.c.canSend()) {
   assert.equal(button.getAttribute("aria-disabled"), String(blocked));
   if (blocked) assert.equal(button.title, button.getAttribute("aria-label"), "the blocked control describes its action");
 }
-function assertRejected(h, message, draft, { blocked = !h.c.canSend(), requests = 0 } = {}) {
-  assert.equal(h.elements.sendstatus.hidden, false, "the click must surface a visible explanation");
-  assert.equal(h.elements.sendstatus.dataset.state, "error");
-  assert.match(h.elements.sendstatus.textContent, message);
+function assertRejected(h, draft, { blocked = !h.c.canSend(), requests = 0 } = {}) {
   assert.equal(h.elements.prompt.value, draft, "a rejected attempt preserves the draft");
   assert.equal(h.requests.length, requests, "a rejected attempt cannot start a model turn");
   assertControl(h, blocked);
@@ -58,7 +53,6 @@ test("an idle send click starts the ordinary turn and clears its draft", async (
   assert.equal(h.requests[0].body.prompt, draft);
   assert.equal(h.requests[0].body.model, "selected-model");
   assert.equal(h.elements.prompt.value, "");
-  assert.equal(h.elements.sendstatus.hidden, true);
   assert.equal(h.c.executionState().live, true);
   await h.accept();
   h.reader.frame('event: done\ndata: {}\n\n');
@@ -67,34 +61,21 @@ test("an idle send click starts the ordinary turn and clears its draft", async (
   await h.dispose();
 });
 
-test("send feedback is accessible and cannot overlap the composer hit targets", () => {
-  assert.match(html, /<div id="sendstatus"[^>]*role="status"[^>]*aria-live="polite"[^>]*hidden/);
-  const rule = /#sendstatus\s*\{([^}]+)\}/.exec(html)?.[1];
-  assert.ok(rule, "the send feedback has its own layout rule");
-  assert.match(rule, /position:absolute/);
-  assert.match(rule, /bottom:calc\(100% \+ 4px\)/);
-  assert.match(rule, /pointer-events:none/);
-  assert.match(html, /#sendstatus\[hidden\]\s*\{\s*display:none/);
-});
-
-test("the live-turn limit disables sending and reports the count before and after a guarded click", async () => {
+test("the live-turn limit disables sending before and after a guarded click", async () => {
   const h = harness(), c = h.c, draft = h.elements.prompt.value;
   for (let i = 0; i < c.MAX_LIVE_TURNS; i++) c.turns.set("other-" + i, {});
   c.syncStopButton();
   assert.equal(h.elements.send.textContent, "➤", "other sessions do not change this session's send glyph");
   assertControl(h, true);
-  assert.equal(h.elements.sendstatus.hidden, false);
-  assert.match(h.elements.sendstatus.textContent, /已有 4 个会话正在运行/);
   await h.elements.send.onclick();
   await settle();
-  assertRejected(h, /已有 4 个会话正在运行/, draft);
+  assertRejected(h, draft);
   assert.equal(c.sendBusy, false);
   assert.equal(c.canSend(), false);
   c.turns.clear();
   c.syncStopButton();
   assertControl(h, false);
   await h.start(draft);
-  assert.equal(h.elements.sendstatus.hidden, true);
   assert.equal(h.requests[0].body.prompt, draft);
   await finish(h);
 });
@@ -103,14 +84,14 @@ test("a second click cannot clear the first attempt's preparation lock", async (
   const h = harness(), c = h.c, draft = h.elements.prompt.value;
   c.sendBusy = true;
   await h.elements.send.onclick();
-  assertRejected(h, /上一条消息仍在准备发送/, draft);
+  assertRejected(h, draft);
   assert.equal(c.sendBusy, true, "the active attempt still owns its lock");
   c.sendBusy = false;
   assertControl(h, false);
   await h.dispose();
 });
 
-for (const blocked of ["remote", "stopping", "interrupt rejection"]) test("the send button's " + blocked + " stop branch has visible feedback", async () => {
+for (const blocked of ["remote", "stopping", "interrupt rejection"]) test("the send button's " + blocked + " stop branch preserves the draft", async () => {
   const h = harness(), c = h.c, draft = h.elements.prompt.value;
   if (blocked === "remote") c.updateExecutionModel({ kind: "remote", active: true, pid: "4242", at: c.Date.now() });
   else { c.turnRunning = true; c.turnRunningAt = c.Date.now(); }
@@ -119,7 +100,7 @@ for (const blocked of ["remote", "stopping", "interrupt rejection"]) test("the s
   c.syncStopButton();
   assert.equal(c.canStop(), true);
   await h.elements.send.onclick();
-  assertRejected(h, blocked === "remote" ? /另一个进程/ : blocked === "stopping" ? /正在停止/ : /interrupt rejected/, draft,
+  assertRejected(h, draft,
     { blocked: blocked !== "interrupt rejection" });
   if (blocked === "stopping") assert.equal(c.stopBusy, true, "the active interrupt retains its own lock");
   else assert.equal(c.stopBusy, false);
@@ -127,60 +108,54 @@ for (const blocked of ["remote", "stopping", "interrupt rejection"]) test("the s
   await h.dispose();
 });
 
-for (const stage of ["command", "session config"]) test("a " + stage + " preparation exception is visible and retry succeeds", async () => {
+for (const stage of ["command", "session config"]) test("a " + stage + " preparation exception preserves the input and retry succeeds", async () => {
   const h = harness(), c = h.c, draft = h.elements.prompt.value;
   const images = c.pendingImages = [{ filename: "draft.png", data_base64: "image" }];
   const name = stage === "command" ? "runCdCommand" : "ensureTeamConfig", original = c[name];
   c[name] = async () => { throw new Error("preparation disconnected"); };
   await h.elements.send.onclick();
-  assertRejected(h, /发送失败.*preparation disconnected/, draft);
+  assertRejected(h, draft);
   assert.equal(c.pendingImages, images);
   assert.equal(c.sendBusy, false);
   assert.equal(c.canSend(), true);
   c[name] = original;
   await h.start(draft);
-  assert.equal(h.elements.sendstatus.hidden, true);
   assert.match(h.requests[0].body.prompt, /\[\[image:draft\.png\]\]/);
   assert.deepEqual(JSON.parse(JSON.stringify(h.requests[0].body.images)), images);
   await finish(h);
 });
 
-test("a refused mode save cannot silently consume the send click", async () => {
+test("a refused mode save preserves the draft until config is saved", async () => {
   const h = harness(), c = h.c, draft = h.elements.prompt.value;
   const team = { pending: true, saving: null, errorSource: "" };
   c.teamPickState = () => team;
   c.ensureTeamConfig = async () => { team.errorSource = "save"; return false; };
   await h.elements.send.onclick();
-  assertRejected(h, /对话模式尚未保存/, draft);
+  assertRejected(h, draft);
   assert.equal(c.sendBusy, false);
   assert.equal(c.canSend(), false);
-  assert.match(h.elements.send.title, /点击对话模式重试/);
   team.errorSource = "";
   c.ensureTeamConfig = async () => true;
   c.syncStopButton();
   assertControl(h, false);
   await h.start(draft);
-  assert.equal(h.elements.sendstatus.hidden, true);
   await finish(h);
 });
 
-for (const change of ["draft", "session", "server"]) test("a " + change + " change during preparation preserves the input and keeps feedback with its owner", async () => {
+for (const change of ["draft", "session", "server"]) test("a " + change + " change during preparation preserves the input and its owner", async () => {
   const h = harness(), c = h.c;
   let resolve;
   c.ensureTeamConfig = () => new Promise((done) => { resolve = done; });
   const pending = h.elements.send.onclick();
   await settle();
-  assert.equal(h.elements.sendstatus.hidden, false, "preparation has immediate visible progress");
-  assert.match(h.elements.sendstatus.textContent, /正在准备发送/);
   assertControl(h, true);
   if (change === "session") c.switchSession("next-session", false);
   if (change === "server") { c.store.base = "https://other-server.test"; c.syncStopButton(); }
   h.elements.prompt.value = "updated draft";
   resolve(true);
   await pending;
-  if (change === "draft") assertRejected(h, /输入已更新/, "updated draft");
+  if (change === "draft") assertRejected(h, "updated draft");
   else {
-    assert.equal(h.elements.sendstatus.hidden, true, "an old attempt cannot repaint a newly selected session or server");
     assert.equal(h.elements.prompt.value, "updated draft");
     assert.equal(h.requests.length, 0);
     assertControl(h, false);
@@ -195,14 +170,14 @@ test("an unexpected selector exception is caught by the click handler before los
   const images = c.pendingImages = [{ filename: "draft.png", data_base64: "image" }];
   delete h.elements.omodel;
   await h.elements.send.onclick();
-  assertRejected(h, /发送失败/, draft);
+  assertRejected(h, draft);
   assert.equal(c.pendingImages, images);
   assert.equal(c.sendBusy, false);
   assert.equal(c.canSend(), true);
   await h.dispose();
 });
 
-for (const blocked of ["empty", "composition", "skill composition"]) test("a " + blocked + " send attempt has visible feedback", async () => {
+for (const blocked of ["empty", "composition", "skill composition"]) test("a " + blocked + " send attempt preserves the draft", async () => {
   const h = harness(), c = h.c;
   if (blocked === "empty") h.elements.prompt.value = " \t\n ";
   if (blocked === "composition") c.promptComposing = true;
@@ -211,7 +186,7 @@ for (const blocked of ["empty", "composition", "skill composition"]) test("a " +
   c.syncStopButton();
   assertControl(h, true);
   await h.elements.send.onclick();
-  assertRejected(h, blocked === "empty" ? /请先输入消息/ : blocked === "composition" ? /输入法候选词/ : /技能搜索输入/, draft);
+  assertRejected(h, draft);
   assert.equal(c.sendBusy, false);
   assert.equal(c.canSend(), false);
   await h.dispose();
@@ -222,13 +197,11 @@ test("live turns on other servers count toward the same visible limit", async ()
   for (let i = 0; i < 5; i++) c.updateExecutionModel({ kind: "live", entry: {} }, "other-" + i, "https://server-" + i + ".test");
   assert.equal(c.executionState().liveCount, 5);
   assertControl(h, true);
-  assert.match(h.elements.sendstatus.textContent, /已有 5 个会话正在运行/);
   await h.elements.send.onclick();
-  assertRejected(h, /已有 5 个会话正在运行/, draft);
+  assertRejected(h, draft);
   for (let i = 0; i < 2; i++) c.updateExecutionModel({ kind: "live", entry: null }, "other-" + i, "https://server-" + i + ".test");
   assertControl(h, false);
   await h.start(draft);
-  assert.equal(h.elements.sendstatus.hidden, true);
   await finish(h);
 });
 
@@ -240,7 +213,6 @@ for (const changed of ["limit", "local turn", "remote turn", "composition", "ski
     const sending = h.elements.send.onclick();
     await settle();
     assertControl(h, true);
-    assert.match(h.elements.sendstatus.textContent, /正在准备发送/);
     if (changed === "limit") for (let i = 0; i < 4; i++) c.updateExecutionModel({ kind: "live", entry: {} }, "other-" + i);
     if (changed === "local turn") { c.turnRunning = true; c.turnRunningAt = c.Date.now(); }
     if (changed === "remote turn") c.updateExecutionModel({ kind: "remote", active: true, pid: "4242", at: c.Date.now() });
@@ -248,45 +220,42 @@ for (const changed of ["limit", "local turn", "remote turn", "composition", "ski
     if (changed === "skill composition") c.skillInputReady = () => false;
     resolve(true);
     await sending;
-    const expected = changed === "limit" ? /已有 4 个会话/ : changed === "local turn" ? /当前会话仍在运行/
-      : changed === "remote turn" ? /另一个进程/ : changed === "composition" ? /输入法候选词/ : /技能搜索输入/;
-    assertRejected(h, expected, draft, { blocked: changed !== "local turn" });
+    assertRejected(h, draft, { blocked: changed !== "local turn" });
     assert.equal(c.sendBusy, false);
     if (changed === "local turn") assert.equal(h.elements.send.textContent, "⏹", "a local turn retains its stop action");
     await h.dispose();
   });
 }
 
-for (const mismatch of ["session", "server"]) test("an inconsistent " + mismatch + " preparation owner is explained", async () => {
+for (const mismatch of ["session", "server"]) test("an inconsistent " + mismatch + " preparation owner preserves the draft", async () => {
   const h = harness(), c = h.c, draft = h.elements.prompt.value, prepare = c.prepareTurnSession;
   c.prepareTurnSession = (sid, base, ...rest) => prepare(mismatch === "session" ? "obsolete" : sid,
     mismatch === "server" ? "https://obsolete.test" : base, ...rest);
   await h.elements.send.onclick();
-  assertRejected(h, /会话或服务器已切换.*再次发送/, draft);
+  assertRejected(h, draft);
   await h.dispose();
 });
 
-test("an empty preparation result has a visible retry message", async () => {
+test("an empty preparation result preserves the draft", async () => {
   const h = harness(), c = h.c, draft = h.elements.prompt.value;
   c.prepareTurnSession = async () => "";
   await h.elements.send.onclick();
-  assertRejected(h, /暂时无法发送.*输入已保留/, draft);
+  assertRejected(h, draft);
   await h.dispose();
 });
 
-test("a blocker that clears during control synchronization cannot erase the refusal", async () => {
-  const h = harness(), c = h.c, draft = h.elements.prompt.value, original = c.sendBlockReason;
+test("a transient blocker preserves the draft until a later send", async () => {
+  const h = harness(), c = h.c, draft = h.elements.prompt.value, original = c.canSend;
   let blocked = true;
-  c.sendBlockReason = () => {
-    const message = blocked ? "上一条消息仍在准备发送，请稍候再试。" : "";
+  c.canSend = () => {
+    const allowed = !blocked;
     blocked = false;
-    return message;
+    return allowed;
   };
   await h.elements.send.onclick();
-  assertRejected(h, /上一条消息仍在准备发送/, draft, { blocked: false });
-  c.sendBlockReason = original;
+  assertRejected(h, draft, { blocked: false });
+  c.canSend = original;
   await h.start(draft);
-  assert.equal(h.elements.sendstatus.hidden, true);
   await finish(h);
 });
 
@@ -301,7 +270,7 @@ function loadCommandBridges(h) {
 }
 
 for (const command of ["ordinary turn", "/cd /tmp", "/git status"]) {
-  test("failed session adoption reports why " + command + " was retained", async () => {
+  test("failed session adoption retains " + command, async () => {
     const h = harness(), c = h.c;
     loadCommandBridges(h);
     c.switchSession("", false);
@@ -314,13 +283,13 @@ for (const command of ["ordinary turn", "/cd /tmp", "/git status"]) {
     assertControl(h, true);
     resolve({ json: async () => ({ id: "created", cwd: "/srv" }) });
     await sending;
-    assertRejected(h, /未能创建会话.*再次发送/, command);
+    assertRejected(h, command);
     assert.equal(c.sessionId, "");
     await h.dispose();
   });
 }
 
-test("a selector error after adopting a lazy session still belongs to the original send", async () => {
+test("a selector error after adopting a lazy session preserves the original draft", async () => {
   const h = harness(), c = h.c, draft = h.elements.prompt.value;
   c.switchSession("", false);
   h.elements.prompt.value = draft;
@@ -328,11 +297,11 @@ test("a selector error after adopting a lazy session still belongs to the origin
   delete h.elements.omodel;
   await h.elements.send.onclick();
   assert.equal(c.sessionId, "created");
-  assertRejected(h, /发送失败.*重试/, draft);
+  assertRejected(h, draft);
   await h.dispose();
 });
 
-test("a partial session adoption exception cannot hide the send failure", async () => {
+test("a partial session adoption exception preserves the draft and attachments", async () => {
   const h = harness(), c = h.c, draft = h.elements.prompt.value;
   c.switchSession("", false);
   h.elements.prompt.value = draft;
@@ -341,7 +310,7 @@ test("a partial session adoption exception cannot hide the send failure", async 
   c.carryTeamPick = () => { throw new Error("adoption configuration failed"); };
   await h.elements.send.onclick();
   assert.equal(c.sessionId, "created");
-  assertRejected(h, /发送失败.*adoption configuration failed/, draft);
+  assertRejected(h, draft);
   assert.equal(c.pendingImages, images);
   assert.equal(c.sendBusy, false);
   await h.dispose();
@@ -368,8 +337,6 @@ for (const command of ["/cd /tmp", "/git status", "/import", "/model selected-mo
     assert.equal(c.sendBusy, false);
     if (command.startsWith("/cd")) assert.ok(calls.some((path) => path.endsWith("/cd")));
     if (command.startsWith("/git")) assert.ok(calls.some((path) => path.endsWith("/checkpoints")));
-    if (command === "/import") assert.match(h.elements.sendstatus.textContent, /已取消导入.*重新选择文件/);
-    if (command.startsWith("/model")) assert.match(h.elements.sendstatus.textContent, /模型设置已应用.*输入问题/);
     await h.dispose();
   });
 }
@@ -385,21 +352,17 @@ for (const command of ["/cd /tmp", "/model selected-model\nquestion"]) {
     c.syncStopButton();
     assertControl(h, true);
     await h.elements.send.onclick();
-    assertRejected(h, /已有 4 个会话/, command);
+    assertRejected(h, command);
     await h.dispose();
   });
 }
 
-for (const command of ["/import as=", "/export last", "/export"]) test("unusable transfer command " + command + " has an actionable status", async () => {
+for (const command of ["/import as=", "/export last", "/export"]) test("unusable transfer command " + command + " retains the input", async () => {
   const h = harness(), c = h.c;
   loadCommandBridges(h);
   if (command === "/export") c.switchSession("", false);
   h.elements.prompt.value = command;
   await h.elements.send.onclick();
-  assert.equal(h.elements.sendstatus.hidden, false);
-  assert.equal(h.elements.sendstatus.dataset.state, "error");
-  assert.match(h.elements.sendstatus.textContent, command === "/import as=" ? /as= 后填写会话 ID/
-    : command === "/export last" ? /先打开要导出的会话/ : /先选择会话/);
   assert.equal(h.elements.prompt.value, command);
   assert.equal(h.requests.length, 0);
   assertControl(h, false);
@@ -417,7 +380,6 @@ test("whitespace without attachments is blocked, while an image-only draft still
   await h.start("");
   assert.equal(h.requests[0].body.prompt, "[[image:draft.png]]");
   assert.equal(h.requests[0].body.images.length, 1);
-  assert.equal(h.elements.sendstatus.hidden, true);
   await finish(h);
 });
 
@@ -427,7 +389,7 @@ function loadSideNotes(h) {
   vm.runInContext(script.slice(start, end), h.c);
   vm.runInContext('$("sidenote").onclick = sendSideNote;', h.c);
 }
-for (const blocked of ["busy", "empty", "missing session", "composition"]) test("a " + blocked + " side-note attempt has visible feedback", async () => {
+for (const blocked of ["busy", "empty", "missing session", "composition"]) test("a " + blocked + " side-note attempt preserves the draft", async () => {
   const h = harness(), c = h.c;
   loadSideNotes(h);
   c.turnRunning = true; c.turnRunningAt = c.Date.now();
@@ -439,20 +401,17 @@ for (const blocked of ["busy", "empty", "missing session", "composition"]) test(
   assert.equal(h.elements.sidenote.disabled, true);
   const draft = h.elements.prompt.value;
   await h.elements.sidenote.onclick();
-  assertRejected(h, blocked === "busy" ? /side note 仍在发送/ : blocked === "empty" ? /输入 side note/
-    : blocked === "missing session" ? /先选择会话/ : /输入法候选词/, draft, { blocked: false });
+  assertRejected(h, draft, { blocked: false });
   await h.dispose();
 });
 
-for (const outcome of ["queued", "rejected", "session switched"]) test("a side note shows progress and scopes its " + outcome + " result", async () => {
+for (const outcome of ["queued", "rejected", "session switched"]) test("a side note scopes its " + outcome + " result", async () => {
   const h = harness(), c = h.c, draft = h.elements.prompt.value;
   loadSideNotes(h);
   c.turnRunning = true; c.turnRunningAt = c.Date.now();
   let resolve, reject;
   c.api = () => new Promise((yes, no) => { resolve = yes; reject = no; });
   const sending = h.elements.sidenote.onclick();
-  assert.equal(h.elements.sendstatus.hidden, false);
-  assert.match(h.elements.sendstatus.textContent, /正在发送 side note/);
   assert.equal(h.elements.sidenote.disabled, true);
   assertControl(h, false);
   if (outcome === "session switched") { c.switchSession("next-session", false); h.elements.prompt.value = "next draft"; }
@@ -461,17 +420,57 @@ for (const outcome of ["queued", "rejected", "session switched"]) test("a side n
   await sending;
   assert.equal(c.sideNoteBusy, false);
   if (outcome === "session switched") {
-    assert.equal(h.elements.sendstatus.hidden, true);
     assert.equal(h.elements.prompt.value, "next draft");
-  } else if (outcome === "rejected") assertRejected(h, /side note 发送失败.*重试.*offline/, draft, { blocked: false });
+  } else if (outcome === "rejected") assertRejected(h, draft, { blocked: false });
   else {
     assert.equal(h.elements.prompt.value, "");
-    assert.match(h.elements.sendstatus.textContent, /side note 已加入队列/);
   }
   await h.dispose();
 });
 
-test("a stop click reports progress, blocks duplicate interrupts, and keeps the draft", async () => {
+for (const [name, draft] of [
+  ["plain text", '  先检查 <img src=x onerror=alert(1)> & "引号"\n\t保留草稿  '],
+  ["long Unicode text", "第一行\n\t" + "🧭".repeat(600) + "\nHIDDEN_TAIL"],
+]) test("the side-note queue preserves the complete " + name, async (t) => {
+  const h = harness(), c = h.c;
+  t.after(async () => { c.renderSideNotes([]); await h.dispose(); });
+  loadSideNotes(h);
+  h.elements.prompt.value = draft;
+  h.sideNotes.push({ from: "user", content: draft.trim() });
+  await h.elements.sidenote.onclick();
+  await settle();
+  const content = h.elements.sidequeuelist.querySelector(".side-note-text");
+  assert.equal(h.elements.sidequeue.hidden, false);
+  assert.equal(content.textContent, draft.trim(), "the queue retains the full note");
+  assert.equal(content.parentNode.title, draft.trim(), "the tooltip retains the same full note");
+  assert.equal(content.children.length, 0, "note markup cannot create elements in the queue");
+});
+
+test("refreshing and draining a visible queue preserves composer focus", async (t) => {
+  const h = harness(), c = h.c;
+  t.after(async () => { c.renderSideNotes([]); await h.dispose(); });
+  const notes = [{ from: "user", content: "keep this note readable" }];
+  h.elements.prompt.focus();
+  c.renderSideNotes(notes);
+  assert.equal(h.elements.sidequeuelist.querySelector(".side-note-text").textContent, notes[0].content);
+  assert.equal(h.document.activeElement, h.elements.prompt, "refreshing the queue preserves composer focus");
+  c.renderSideNotes(notes.concat({ from: "agent", content: "another note" }));
+  c.renderSideNotes([]);
+  assert.equal(h.elements.sidequeue.hidden, true);
+});
+
+test("a blocked main-composer click preserves an existing side-note queue", async (t) => {
+  const h = harness(), c = h.c, draft = h.elements.prompt.value;
+  t.after(async () => { c.renderSideNotes([]); await h.dispose(); });
+  c.renderSideNotes([{ from: "user", content: "keep this queued note" }]);
+  c.promptComposing = true;
+  c.syncStopButton();
+  await h.elements.send.onclick();
+  assertRejected(h, draft);
+  assert.equal(h.elements.sidequeuelist.querySelector(".side-note-text").textContent, "keep this queued note");
+});
+
+test("a stop click blocks duplicate interrupts and keeps the draft", async () => {
   const h = harness(), c = h.c, draft = h.elements.prompt.value;
   c.turnRunning = true; c.turnRunningAt = c.Date.now();
   let resolve;
@@ -480,9 +479,8 @@ test("a stop click reports progress, blocks duplicate interrupts, and keeps the 
   assertControl(h, false);
   const stopping = h.elements.send.onclick();
   assertControl(h, true);
-  assert.match(h.elements.sendstatus.textContent, /正在停止本轮/);
   await h.elements.send.onclick();
-  assertRejected(h, /正在停止本轮/, draft, { blocked: true });
+  assertRejected(h, draft, { blocked: true });
   resolve({ json: async () => ({ interrupted: true }) });
   await stopping;
   assert.equal(h.elements.prompt.value, draft);
@@ -490,25 +488,14 @@ test("a stop click reports progress, blocks duplicate interrupts, and keeps the 
   await h.dispose();
 });
 
-test("feedback clears on a session switch and stays cleared when returning", async () => {
-  const h = harness(), c = h.c;
-  c.sendFeedback("保存失败，请重试。", "error");
-  c.switchSession("next-session", false);
-  assert.equal(h.elements.sendstatus.hidden, true);
-  c.switchSession("open-session", false);
-  assert.equal(h.elements.sendstatus.hidden, true);
-  await h.dispose();
-});
-
 for (const draft of ["/audit", "/audit -f", "/audit --deep", "/audit 仔细检查这段修改", "/audit -f --deep 检查边界情况\n保留这行"]) {
-  test("send feedback preserves the ordinary turn prompt " + JSON.stringify(draft), async () => {
+  test("ordinary sends preserve the turn prompt " + JSON.stringify(draft), async () => {
     const h = harness();
     h.elements.omodel.value = "selected-model";
     await h.start(draft);
     assert.equal(h.requests.length, 1);
     assert.equal(h.requests[0].body.prompt, draft);
     assert.equal(h.requests[0].body.model, "selected-model", "the override selector owns the request's model");
-    assert.equal(h.elements.sendstatus.hidden, true);
     await finish(h);
   });
 }

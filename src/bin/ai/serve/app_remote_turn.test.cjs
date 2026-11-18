@@ -136,7 +136,7 @@ test("a remote turn blocks sending and follows history without attaching a strea
   assert.equal(node.getAttribute("role"), "note");
   assert.equal(node.getAttribute("aria-label"), "其他进程中的运行状态");
   assert.equal(node.getAttribute("aria-live"), "off");
-  assert.match(h.elements.send.getAttribute("aria-label"), /当前会话正在另一个进程中运行.*等待本轮结束/);
+  assert.equal(h.elements.send.getAttribute("aria-label"), "running in another process");
   assert.equal(h.elements.send.disabled, true);
 });
 

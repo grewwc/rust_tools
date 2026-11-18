@@ -47,11 +47,6 @@ vm.createContext = (sandbox = {}) => {
   loadReplyReferenceHelpers(context, script);
   vm.runInContext(script.slice(script.indexOf("// BEGIN execution model"), script.indexOf("// END execution model")), context);
   vm.runInContext(script.slice(script.indexOf("// BEGIN execution event dispatcher"), script.indexOf("// END execution event dispatcher")), context);
-  context.sendStatus = { hidden: true, textContent: "", dataset: {} };
-  if (typeof context.$ === "function") {
-    const lookup = context.$;
-    context.$ = (id) => id === "sendstatus" ? context.sendStatus : lookup(id);
-  }
   vm.runInContext(script.slice(script.indexOf("function canSend()"), script.indexOf("// The one send/stop button")), context);
   return context;
 };
@@ -883,7 +878,7 @@ test("a slow side-note acknowledgement preserves edits and another session's dra
   }
 });
 
-test("empty side notes are rejected locally with visible feedback and a disabled control", async () => {
+test("empty side notes are rejected locally with a disabled control", async () => {
   const start = script.indexOf("async function sendSideNote(");
   const end = script.indexOf("async function stopTurn(", start);
   let focused = false;
@@ -898,8 +893,6 @@ test("empty side notes are rejected locally with visible feedback and a disabled
   });
   vm.runInContext(script.slice(start, end), context);
   await context.sendSideNote();
-  assert.equal(context.sendStatus.hidden, false);
-  assert.match(context.sendStatus.textContent, /输入 side note 或添加图片/);
   assert.equal(notices.length, 0);
   assert.equal(focused, true);
   assert.equal(button.disabled, true);

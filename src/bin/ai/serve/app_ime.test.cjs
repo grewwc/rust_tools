@@ -66,7 +66,7 @@ const focusoutSrc = script.slice(
   script.indexOf('document.addEventListener("pointerdown"', focusoutAt),
 );
 const syncStopSrc = script.slice(
-  script.indexOf("function sendBlockReason("),
+  script.indexOf("function canSend()"),
   script.indexOf("// Transient note through the existing #connstat line"),
 );
 const noteSrc = script.slice(
@@ -134,7 +134,7 @@ function makeContext(extra) {
     composerDrafts: new Map(),
     composerImageDrafts: new Map(),
     pendingImages: [],
-    sendFeedback() {}, refreshComposerControls() {}, MAX_LIVE_TURNS: 4,
+    refreshComposerControls() {}, MAX_LIVE_TURNS: 4,
     isPhoneLayout: () => false,
   }, extra || {}));
   context.frames = [];
