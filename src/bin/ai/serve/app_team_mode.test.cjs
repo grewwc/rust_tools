@@ -516,6 +516,9 @@ test("failed config blocks the first turn, retains selection, text, images and s
   h.context.closeTeamSheet();
   fail = false;
   h.configs.set("fresh", KERNEL);
+  assert.equal(h.context.canSend(), false);
+  h.context.openTeamSheet();
+  assert.equal(await h.context.applyTeamDraft(), true);
   await h.context.send();
   assert.equal(h.turns().length, 1);
   assert.equal(h.teamPosts().length, 2);
@@ -1039,6 +1042,9 @@ test("a failed mode save retains /use and /reset and retries before submitting e
     assert.equal(h.state().pending, true);
     assert.ok(h.notes.some((text) => text.includes("save unavailable")));
     fail = false;
+    assert.equal(h.context.canSend(), false);
+    h.context.openTeamSheet();
+    assert.equal(await h.context.applyTeamDraft(), true);
     await h.context.send();
     await settle();
     assert.equal(h.turns().length, 1);

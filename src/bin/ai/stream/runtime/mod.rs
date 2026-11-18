@@ -543,6 +543,9 @@ fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
             let _ = io::stdout().flush();
         }
     }
+    crate::ai::background::publish_serve_thinking_done(
+        crate::ai::background::ServeThinkingStatus::Cancelled,
+    );
     StreamResult {
         outcome: StreamOutcome::Cancelled,
         tool_calls: Vec::new(),
@@ -668,6 +671,7 @@ fn finalize_stream_response(
     markers: &StreamMarkers,
     mut state: StreamProcessingState,
 ) -> Result<StreamResult, Box<dyn std::error::Error>> {
+    let thinking_finalizer = crate::ai::background::defer_serve_thinking_close();
     let render_terminal = runtime_ctx::terminal_output_enabled();
     let deferred_dedupe_candidate = state
         .render
@@ -682,16 +686,7 @@ fn finalize_stream_response(
         flush_terminal_filters_to_terminal(markers, &mut state, true)?;
         if state.render.thinking_fold.active {
             finalize_thinking_fold(&mut state)?;
-        } else if crate::ai::background::serve_live_streaming() {
-            // Truncated stream with no local fold: close the remote fold
-            // instead of leaking the end marker to child stdout (the SSE
-            // line pump would forward it as a plain message). Local piped
-            // runs keep printing the marker, as before.
-            crate::ai::background::publish_serve_frame(
-                crate::ai::background::ServeLiveKind::ThinkingDone,
-                "",
-            );
-        } else {
+        } else if !crate::ai::background::serve_live_streaming() {
             write_stream_content(
                 &format!("\n{}\n", markers.end_thinking_tag),
                 &mut state.render.markdown,
@@ -907,6 +902,11 @@ fn finalize_stream_response(
     } else {
         outcome
     };
+    thinking_finalizer.finish(match outcome {
+        StreamOutcome::Cancelled => crate::ai::background::ServeThinkingStatus::Cancelled,
+        StreamOutcome::Truncated => crate::ai::background::ServeThinkingStatus::Truncated,
+        _ => crate::ai::background::ServeThinkingStatus::Completed,
+    });
     // Serve children keep provisional prose private: a failed attempt must not
     // escape through stdout after its live FIFO deliberately withheld it.
     if render_terminal
@@ -1064,6 +1064,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         return None;
     }
 
+    let thinking_finalizer = crate::ai::background::defer_serve_thinking_close();
     let mut fold_settled = false;
     if runtime_ctx::terminal_output_enabled() {
         if state.content.thinking_open {
@@ -1078,15 +1079,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
             let _ = flush_terminal_filters_to_terminal(markers, state, true);
         }
         if state.content.thinking_open && !fold_settled {
-            if crate::ai::background::serve_live_streaming() {
-                // Same off-stdout rule as the splitter Marker arm: close the
-                // remote fold instead of printing the marker where the SSE
-                // line pump would forward it as a plain message.
-                crate::ai::background::publish_serve_frame(
-                    crate::ai::background::ServeLiveKind::ThinkingDone,
-                    "",
-                );
-            } else {
+            if !crate::ai::background::serve_live_streaming() {
                 let _ = write_stream_content(
                     &format!("\n{}\n", markers.end_thinking_tag),
                     &mut state.render.markdown,
@@ -1110,6 +1103,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
     // Discard all unconfirmed calls and replay through the existing stream-error retry path.
     state.content.tool_calls_map.clear();
     let outcome = StreamOutcome::Truncated;
+    thinking_finalizer.finish(crate::ai::background::ServeThinkingStatus::Truncated);
     let assistant_text = std::mem::take(&mut state.content.assistant_text);
     // Serve children keep provisional prose private: a failed attempt must not
     // escape through stdout after its live FIFO deliberately withheld it.

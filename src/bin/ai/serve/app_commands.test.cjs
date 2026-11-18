@@ -567,10 +567,14 @@ test("send command prelude: an unavailable transfer bridge falls through after c
   assert.deepEqual(h.effects.filter(([kind]) => /^run(Cd|Git|Transfer)Command$/.test(kind)).map(([kind]) => kind), ["runCdCommand", "runGitCommand"]);
 });
 
-test("send command prelude: an unexpected command rejection releases sendBusy without clearing the input", async () => {
+test("send command prelude: an unexpected command rejection is visible and releases sendBusy without clearing the input", async () => {
   const h = commandPreludeHarness();
+  const status = h.elements.sendstatus = h.document.createElement("div");
+  status.hidden = true;
   h.context.runCdCommand = async () => { throw new Error("command rejection"); };
-  await assert.rejects(h.send("hello"), /command rejection/);
+  await h.send("hello");
+  assert.equal(status.hidden, false);
+  assert.match(status.textContent, /command rejection/);
   assert.equal(h.context.sendBusy, false);
   assert.equal(h.elements.prompt.value, "hello");
   assert.equal(h.draft(), "hello");

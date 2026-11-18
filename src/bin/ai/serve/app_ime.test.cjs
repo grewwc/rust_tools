@@ -66,7 +66,7 @@ const focusoutSrc = script.slice(
   script.indexOf('document.addEventListener("pointerdown"', focusoutAt),
 );
 const syncStopSrc = script.slice(
-  script.indexOf("function syncStopButton() {"),
+  script.indexOf("function sendBlockReason("),
   script.indexOf("// Transient note through the existing #connstat line"),
 );
 const noteSrc = script.slice(
@@ -134,6 +134,7 @@ function makeContext(extra) {
     composerDrafts: new Map(),
     composerImageDrafts: new Map(),
     pendingImages: [],
+    sendFeedback() {}, refreshComposerControls() {}, MAX_LIVE_TURNS: 4,
     isPhoneLayout: () => false,
   }, extra || {}));
   context.frames = [];
@@ -564,7 +565,7 @@ test("the side note column does not resize the composer during a composition", (
   const send = { textContent: "", classList: { toggle() {} }, setAttribute() {}, title: "" };
   const status = { textContent: "", hidden: true };
   const context = makeContext({
-    $: (id) => ({ send, sidenote, composer, turnstatus: status })[id] || null,
+    $: (id) => ({ send, sidenote, composer, prompt: context.prompt, turnstatus: status })[id] || null,
     isTurnRunning: () => true,
     note: () => {},
   });
@@ -593,7 +594,7 @@ test("a live view keeps the note affordance when the running latch is stale", ()
   };
   const send = { textContent: "", classList: { toggle() {} }, setAttribute() {}, title: "" };
   const context = makeContext({
-    $: (id) => ({ send, sidenote, composer })[id] || null,
+    $: (id) => ({ send, sidenote, composer, prompt: context.prompt })[id] || null,
     isTurnRunning: () => false,
     note: () => {},
   });

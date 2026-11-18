@@ -32,11 +32,13 @@ function harness(confirm, { realCadence = false, legacyActivity = false } = {}) 
   });
   const { context, elements, document } = h;
   const calls = { arm: 0, history: 0, sessions: 0, attach: 0, confirm: [] };
-  for (const id of ["send", "sidenote", "composer"]) {
-    const node = elements[id] = document.createElement(id === "composer" ? "div" : "button");
+  for (const id of ["send", "sidenote", "composer", "prompt"]) {
+    const node = elements[id] = document.createElement(id === "composer" ? "div" : id === "prompt" ? "textarea" : "button");
     node.classList.toggle = (name, active) => active ? node.classList.add(name) : node.classList.remove(name);
   }
+  elements.prompt.value = "follow-up draft";
   Object.assign(context, {
+    pendingImages: [], promptComposing: false, MAX_LIVE_TURNS: 4,
     confirmBusy: false,
     confirmPollSeq: 0,
     confirmPollTimer: null,
@@ -134,7 +136,8 @@ test("a remote turn blocks sending and follows history without attaching a strea
   assert.equal(node.getAttribute("role"), "note");
   assert.equal(node.getAttribute("aria-label"), "其他进程中的运行状态");
   assert.equal(node.getAttribute("aria-live"), "off");
-  assert.equal(h.elements.send.getAttribute("aria-label"), "running in another process");
+  assert.match(h.elements.send.getAttribute("aria-label"), /当前会话正在另一个进程中运行.*等待本轮结束/);
+  assert.equal(h.elements.send.disabled, true);
 });
 
 test("a remote owner without a supplied pid omits the entire parenthetical", async () => {

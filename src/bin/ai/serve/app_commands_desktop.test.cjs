@@ -105,6 +105,7 @@ function harness({ width = 701, catalog = commands, media = "known", respond } =
     setPromptValue(value) { if (context.promptComposing) return false; effects.push(["value", value]); prompt.value = value; return true; },
     growPrompt() { effects.push(["grow"]); }, scheduleGrow() {}, persistDraft() { effects.push(["draft", prompt.value]); },
     traceMark() {}, promptHistory: { capture() {}, record() {}, recordInput() {}, replay() {}, beforeInput() {} },
+    sendFeedback() {}, refreshComposerControls() {}, executionBase: () => context.store.base,
     queueImageFiles(files) { effects.push(["images", files]); }, restoreDraft() {},
     setTimeout(fn) { timers.push(fn); }, isTurnRunning: () => false,
     send() { effects.push(["send"]); }, sendSideNote() { effects.push(["side-note"]); },
@@ -524,7 +525,7 @@ for (const width of [320, 700]) test(width + "px receives no local model command
 test("desktop send dispatcher consumes model commands before preparing a chat turn", async () => {
   const h = await ready({ catalog: modelCatalog });
   Object.assign(h.context, {
-    canSend: () => true, pendingImages: [], validateSkillInput: () => true, sendBusy: false,
+    canSend: () => true, sendBlockReason: () => "", pendingImages: [], validateSkillInput: () => true, sendBusy: false,
     runCdCommand: async () => false, runGitCommand: async () => false,
     prepareTurnSession: async () => { h.effects.push(["prepare-turn"]); return ""; },
   });
@@ -576,7 +577,7 @@ test("send() posts only the lines after a leading model command", () => {
 for (const width of [320, 700]) test(width + "px send dispatcher keeps the original model-text path", async () => {
   const h = await ready({ width, catalog: modelCatalog });
   Object.assign(h.context, {
-    canSend: () => true, pendingImages: [], validateSkillInput: () => true, sendBusy: false,
+    canSend: () => true, sendBlockReason: () => "", pendingImages: [], validateSkillInput: () => true, sendBusy: false,
     runCdCommand: async () => false, runGitCommand: async () => false,
     prepareTurnSession: async () => { h.effects.push(["prepare-turn"]); return ""; },
   });

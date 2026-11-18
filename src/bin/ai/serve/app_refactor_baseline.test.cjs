@@ -264,6 +264,10 @@ test("session navigation retires the previous transcript gate before replacement
   await live.finish(() => {});
   assert.equal(live.liveBox().parentNode, null);
   assert.equal(live.c.displayedExecutionState().sources.size, 0);
+  assert.equal(live.c.isTurnRunning(), false);
+  assert.equal(live.c.canSend(), false, "an empty new-session draft is blocked after the background turn ends");
+  assert.equal(live.elements.send.disabled, true);
+  live.c.setPromptValue("B follow-up draft");
   assert.equal(live.c.canSend(), true);
   assert.equal(live.elements.send.title, "send");
   await live.dispose();

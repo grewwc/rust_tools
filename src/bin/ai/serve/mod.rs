@@ -858,14 +858,15 @@ fn setup_live_fifo(_session_id: &str) -> Option<LiveFifo> {
 /// 10 = input resolved, 11 = assistant body pending, 12 = tool lifecycle,
 /// 13 = committed body, 14/15/16 = chunked committed body start/chunk/end,
 /// 17 = server-computed live thinking rate, 18/19 = model-backed history
-/// compression start/done, 23 = terminal-independent throughput metric).
+/// compression start/done, 23 = terminal-independent throughput metric,
+/// 24 = reasoning text with phase and byte offset).
 #[derive(Debug, PartialEq, Eq)]
 #[cfg(feature = "serve")]
 enum ServeLiveEvent {
     Delta(String),
     ThinkingStart,
     Thinking(String, Option<background::ServeTokenRate>),
-    ThinkingDone,
+    ThinkingDone(background::ServeThinkingDone),
     OutputComplete,
     /// Raw JSON payload of a remote confirmation request.
     ConfirmRequest(String),
@@ -906,10 +907,19 @@ enum ServeLiveEvent {
 struct ServeFrameDecoder {
     buf: Vec<u8>,
     thinking_rate: Option<background::ServeTokenRate>,
+    thinking: Option<ReceivedThinking>,
+    last_thinking_phase: Option<u64>,
     /// In-flight chunked committed body, present between `ReplaceStart` and
     /// `ReplaceEnd`.
     pending_replace: Option<String>,
     pending_json: Option<PendingServeJson>,
+}
+
+#[cfg(feature = "serve")]
+struct ReceivedThinking {
+    phase: Option<u64>,
+    bytes: u64,
+    frame_loss: bool,
 }
 
 #[cfg(feature = "serve")]
@@ -927,6 +937,85 @@ enum ServeJsonKind {
 
 #[cfg(feature = "serve")]
 impl ServeFrameDecoder {
+    fn start_thinking(&mut self, phase: Option<u64>, out: &mut Vec<ServeLiveEvent>) {
+        if phase.is_some()
+            && self
+                .thinking
+                .as_ref()
+                .is_some_and(|active| active.phase == phase)
+        {
+            return;
+        }
+        self.close_thinking(background::ServeThinkingStatus::Interrupted, out);
+        self.thinking_rate = None;
+        self.thinking = Some(ReceivedThinking {
+            phase,
+            bytes: 0,
+            frame_loss: false,
+        });
+        out.push(ServeLiveEvent::ThinkingStart);
+    }
+
+    fn close_thinking(
+        &mut self,
+        status: background::ServeThinkingStatus,
+        out: &mut Vec<ServeLiveEvent>,
+    ) {
+        if let Some(active) = self.thinking.as_ref() {
+            self.thinking_done(
+                background::ServeThinkingDone {
+                    status,
+                    phase: active.phase,
+                    ..Default::default()
+                },
+                out,
+            );
+        }
+    }
+
+    fn thinking_done(
+        &mut self,
+        mut done: background::ServeThinkingDone,
+        out: &mut Vec<ServeLiveEvent>,
+    ) {
+        use background::ServeThinkingStatus;
+        // A failed close is repeated in the next start/output-complete frame.
+        // It must update one phase, never close a newer phase a second time.
+        if done.phase.is_some()
+            && done.phase == self.last_thinking_phase
+            && self
+                .thinking
+                .as_ref()
+                .is_none_or(|active| active.phase != done.phase)
+        {
+            return;
+        }
+        if self.thinking.as_ref().is_some_and(|active| {
+            active.phase.is_some() && done.phase.is_some() && active.phase != done.phase
+        }) {
+            self.close_thinking(ServeThinkingStatus::Interrupted, out);
+        }
+        let active = self.thinking.take();
+        let received_bytes = active.as_ref().map_or(0, |active| active.bytes);
+        let frame_loss = done.dropped_frames > 0
+            || active.as_ref().is_some_and(|active| active.frame_loss)
+            || done.bytes.is_some_and(|bytes| bytes != received_bytes);
+        if frame_loss
+            && matches!(
+                done.status,
+                ServeThinkingStatus::Completed | ServeThinkingStatus::Interrupted
+            )
+        {
+            done.status = ServeThinkingStatus::FrameLoss;
+        }
+        done.phase = done
+            .phase
+            .or_else(|| active.and_then(|active| active.phase));
+        self.last_thinking_phase = done.phase.or(self.last_thinking_phase);
+        self.thinking_rate = None;
+        out.push(ServeLiveEvent::ThinkingDone(done));
+    }
+
     fn append_json_chunk(&mut self, chunk: &str, complete: bool) -> Option<ServeLiveEvent> {
         let mut pending = self.pending_json.take()?;
         if pending.text.len() + chunk.len() > pending.expected_bytes {
@@ -1001,6 +1090,7 @@ impl ServeFrameDecoder {
             let known = kind == background::ServeLiveKind::Delta as u8
                 || kind == background::ServeLiveKind::ThinkingStart as u8
                 || kind == background::ServeLiveKind::Thinking as u8
+                || kind == background::ServeLiveKind::ThinkingChunk as u8
                 || kind == background::ServeLiveKind::ThinkingRate as u8
                 || kind == background::ServeLiveKind::ThinkingDone as u8
                 || kind == background::ServeLiveKind::OutputComplete as u8
@@ -1024,6 +1114,7 @@ impl ServeFrameDecoder {
             let known = known || kind == background::ServeLiveKind::TokenRate as u8;
             if !known || len > background::MAX_SERVE_FRAME_LEN as usize {
                 self.buf.clear();
+                self.close_thinking(background::ServeThinkingStatus::FrameLoss, &mut out);
                 break;
             }
             if self.buf.len() < 5 + len {
@@ -1046,19 +1137,76 @@ impl ServeFrameDecoder {
                     Some(ServeLiveEvent::Delta(payload))
                 }
                 k if k == background::ServeLiveKind::ThinkingStart as u8 => {
-                    self.thinking_rate = None;
-                    Some(ServeLiveEvent::ThinkingStart)
+                    let metadata = serde_json::from_str::<serde_json::Value>(&payload).ok();
+                    if let Some(previous) =
+                        metadata.as_ref().and_then(|value| value.get("previous"))
+                    {
+                        if let Ok(done) = serde_json::from_value(previous.clone()) {
+                            self.thinking_done(done, &mut out);
+                        }
+                    }
+                    let phase = metadata
+                        .as_ref()
+                        .and_then(|value| value.get("phase")?.as_u64());
+                    self.start_thinking(phase, &mut out);
+                    None
                 }
-                k if k == background::ServeLiveKind::Thinking as u8 => Some(
-                    ServeLiveEvent::Thinking(payload, self.thinking_rate.clone()),
-                ),
+                k if k == background::ServeLiveKind::Thinking as u8 => {
+                    let active = self.thinking.get_or_insert(ReceivedThinking {
+                        phase: None,
+                        bytes: 0,
+                        frame_loss: false,
+                    });
+                    active.bytes = active.bytes.saturating_add(payload.len() as u64);
+                    Some(ServeLiveEvent::Thinking(
+                        payload,
+                        self.thinking_rate.clone(),
+                    ))
+                }
+                k if k == background::ServeLiveKind::ThinkingChunk as u8 => {
+                    let chunk = payload.split_once('\n').and_then(|(header, text)| {
+                        let (phase, offset) = header.split_once(' ')?;
+                        Some((
+                            phase.parse::<u64>().ok()?,
+                            offset.parse::<u64>().ok()?,
+                            text,
+                        ))
+                    });
+                    if let Some((phase, offset, text)) = chunk {
+                        self.start_thinking(Some(phase), &mut out);
+                        let active = self.thinking.as_mut().expect("thinking phase installed");
+                        active.frame_loss |= active.bytes != offset;
+                        active.bytes = offset.saturating_add(text.len() as u64);
+                        Some(ServeLiveEvent::Thinking(
+                            text.to_string(),
+                            self.thinking_rate.clone(),
+                        ))
+                    } else {
+                        self.thinking_done(
+                            background::ServeThinkingDone {
+                                status: background::ServeThinkingStatus::FrameLoss,
+                                ..Default::default()
+                            },
+                            &mut out,
+                        );
+                        None
+                    }
+                }
                 k if k == background::ServeLiveKind::ThinkingRate as u8 => {
                     self.thinking_rate = serde_json::from_str(&payload).ok();
                     None
                 }
                 k if k == background::ServeLiveKind::ThinkingDone as u8 => {
-                    self.thinking_rate = None;
-                    Some(ServeLiveEvent::ThinkingDone)
+                    let done = if payload.is_empty() {
+                        background::ServeThinkingDone::default()
+                    } else {
+                        serde_json::from_str(&payload).unwrap_or(background::ServeThinkingDone {
+                            status: background::ServeThinkingStatus::Interrupted,
+                            ..Default::default()
+                        })
+                    };
+                    self.thinking_done(done, &mut out);
+                    None
                 }
                 k if k == background::ServeLiveKind::ConfirmRequest as u8 => {
                     Some(ServeLiveEvent::ConfirmRequest(payload))
@@ -1076,6 +1224,9 @@ impl ServeFrameDecoder {
                     Some(ServeLiveEvent::SubagentProgress(payload))
                 }
                 k if k == background::ServeLiveKind::OutputComplete as u8 => {
+                    if let Ok(done) = serde_json::from_str(&payload) {
+                        self.thinking_done(done, &mut out);
+                    }
                     Some(ServeLiveEvent::OutputComplete)
                 }
                 k if k == background::ServeLiveKind::AssistantBodyPending as u8 => {
@@ -1126,6 +1277,15 @@ impl ServeFrameDecoder {
                 _ => Some(ServeLiveEvent::OutputComplete),
             };
             if let Some(event) = event {
+                if matches!(
+                    event,
+                    ServeLiveEvent::Delta(_)
+                        | ServeLiveEvent::Replace(_)
+                        | ServeLiveEvent::Tool(_)
+                        | ServeLiveEvent::OutputComplete
+                ) {
+                    self.close_thinking(background::ServeThinkingStatus::Interrupted, &mut out);
+                }
                 out.push(event);
             }
         }
@@ -1136,9 +1296,10 @@ impl ServeFrameDecoder {
     /// frame is a truncated write and is dropped.
     fn finish(&mut self) -> Vec<ServeLiveEvent> {
         let tail = std::mem::take(&mut self.buf);
-        let events = self.push(&tail);
+        let mut events = self.push(&tail);
         self.buf.clear();
         self.pending_json = None;
+        self.close_thinking(background::ServeThinkingStatus::Interrupted, &mut events);
         events
     }
 }
@@ -1185,7 +1346,10 @@ fn live_event(event: ServeLiveEvent) -> Option<ServeSse> {
             }
             Some(ServeSse::new("thinking", payload.to_string()))
         }
-        ServeLiveEvent::ThinkingDone => Some(ServeSse::new("thinking_done", "")),
+        ServeLiveEvent::ThinkingDone(done) => Some(ServeSse::new(
+            "thinking_done",
+            serde_json::to_string(&done).ok()?,
+        )),
         ServeLiveEvent::AssistantBodyPending => Some(ServeSse::new("answer_pending", "")),
         ServeLiveEvent::Replace(text) => Some(ServeSse::new(
             "replace",
@@ -1369,17 +1533,6 @@ fn pump_live_fifo(
         }
         if n == 0 {
             if child_done.load(std::sync::atomic::Ordering::SeqCst) {
-                for event in decoder.finish() {
-                    forward_live_event(
-                        event,
-                        turn_done,
-                        tx,
-                        &timing,
-                        t0,
-                        confirm.as_deref(),
-                        metadata.as_mut(),
-                    );
-                }
                 break;
             }
             // Transient EOF (writer not opened yet): back off, don't spin.
@@ -1397,6 +1550,18 @@ fn pump_live_fifo(
                 metadata.as_mut(),
             );
         }
+    }
+    // EOF and read/poll failures must both settle a partial reasoning phase.
+    for event in decoder.finish() {
+        forward_live_event(
+            event,
+            turn_done,
+            tx,
+            &timing,
+            t0,
+            confirm.as_deref(),
+            metadata.as_mut(),
+        );
     }
 }
 

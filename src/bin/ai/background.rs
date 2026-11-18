@@ -350,10 +350,14 @@ pub(crate) fn serve_body_frames(text: &str) -> Vec<(ServeLiveKind, &str)> {
 /// to a char boundary: one frame is one atomic pipe write, and a frame never
 /// splits a character.
 fn serve_payload_chunks(text: &str) -> Vec<&str> {
+    serve_payload_chunks_with_limit(text, MAX_SERVE_FRAME_BYTES)
+}
+
+fn serve_payload_chunks_with_limit(text: &str, limit: usize) -> Vec<&str> {
     let mut chunks = Vec::new();
     let mut start = 0usize;
     while start < text.len() {
-        let mut end = (start + MAX_SERVE_FRAME_BYTES).min(text.len());
+        let mut end = (start + limit).min(text.len());
         while end < text.len() && !text.is_char_boundary(end) {
             end -= 1;
         }
@@ -660,6 +664,30 @@ pub(crate) enum ServeLiveKind {
     JsonEnd = 22,
     /// Exact producer-owned throughput sample for a completed stream phase.
     TokenRate = 23,
+    /// Reasoning text prefixed with its phase and attempted byte offset.
+    ThinkingChunk = 24,
+}
+
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ServeThinkingStatus {
+    #[default]
+    Completed,
+    Cancelled,
+    Truncated,
+    FrameLoss,
+    Interrupted,
+}
+
+/// Display-only reasoning completion metadata. Empty legacy payloads mean
+/// completed; byte offsets let the decoder detect even a missing tail frame.
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct ServeThinkingDone {
+    pub(crate) status: ServeThinkingStatus,
+    pub(crate) phase: Option<u64>,
+    pub(crate) bytes: Option<u64>,
+    pub(crate) dropped_frames: u64,
 }
 
 /// Numeric throughput sample carried over the serve FIFO. The terminal owns
@@ -913,9 +941,10 @@ pub(crate) fn publish_serve_json_frame(kind: ServeLiveKind, text: &str) {
 
 /// Publish one framed event to the serve-owned live FIFO. No-op unless
 /// [`open_serve_live_fifo_from_env`] installed a serve FIFO (normal CLI and
-/// `/bg` runs never take this path). Best-effort like [`publish_live_output`]:
-/// oversized payloads are split at char boundaries, a missing reader drops
-/// the frame, never fails the turn.
+/// `/bg` runs never take this path). Writes remain nonblocking. Reasoning
+/// frames record attempted byte offsets and failed writes, so backpressure
+/// cannot make a partial fold look complete. Failed closes are retried and
+/// carried by the next phase start or output-complete frame.
 ///
 /// Splitting is only sound for kinds whose client semantics append each frame
 /// (`Delta`, thinking text, observer lines). A body that is authoritative as a
@@ -925,21 +954,61 @@ pub(crate) fn publish_serve_frame(kind: ServeLiveKind, text: &str) {
     if !serve_live_streaming() {
         return;
     }
-    // Several paths can close one thinking phase (an explicit end marker in
-    // the stream, end-of-stream finalize, tool dispatch), and the chat client
-    // renders one bubble per phase. Keep the phase state here, at the only
-    // publisher, so a second close for an already-closed phase is dropped
-    // instead of reaching the client as a redundant event.
-    match kind {
-        ServeLiveKind::ThinkingStart => mark_serve_thinking_fold_open(),
-        ServeLiveKind::Thinking if !text.is_empty() => mark_serve_thinking_fold_open(),
-        ServeLiveKind::ThinkingDone => {
-            if !take_serve_thinking_fold_open() {
-                return;
+    with_serve_thinking_state(|state| match kind {
+        ServeLiveKind::ThinkingStart => {
+            state.start();
+            let payload = serde_json::json!({
+                "phase": state.phase,
+                "previous": if state.done_delivered { None } else { state.last_done.as_ref() },
+            });
+            if !write_serve_frame(kind, &payload.to_string()) {
+                state.dropped_frames = state.dropped_frames.saturating_add(1);
             }
         }
-        _ => {}
-    }
+        ServeLiveKind::Thinking if !text.is_empty() => {
+            if !state.open {
+                state.start();
+            }
+            // Two u64 decimal values, a space, and a newline fit in 42 bytes.
+            // Reserve that much before splitting so every frame stays atomic.
+            for chunk in serve_payload_chunks_with_limit(text, MAX_SERVE_FRAME_BYTES - 42) {
+                let payload = format!("{} {}\n{}", state.phase, state.bytes, chunk);
+                state.bytes = state.bytes.saturating_add(chunk.len() as u64);
+                if !write_serve_frame(ServeLiveKind::ThinkingChunk, &payload) {
+                    state.dropped_frames = state.dropped_frames.saturating_add(1);
+                }
+            }
+        }
+        ServeLiveKind::ThinkingDone => {
+            if !state.defer_close {
+                let status = serde_json::from_str::<ServeThinkingDone>(text)
+                    .unwrap_or_default()
+                    .status;
+                state.finish(status);
+            }
+        }
+        ServeLiveKind::OutputComplete => {
+            if state.open {
+                state.finish(ServeThinkingStatus::Interrupted);
+            }
+            let payload = state
+                .last_done
+                .as_ref()
+                .map(|done| serde_json::to_string(done).expect("serializable thinking outcome"));
+            write_serve_frame(kind, payload.as_deref().unwrap_or(text));
+        }
+        _ => {
+            for payload in serve_payload_chunks(text) {
+                write_serve_frame(kind, payload);
+            }
+            if text.is_empty() {
+                write_serve_frame(kind, "");
+            }
+        }
+    });
+}
+
+fn write_serve_frame(kind: ServeLiveKind, text: &str) -> bool {
     #[cfg(test)]
     {
         if TEST_SERVE_FRAMES.with(|slot| slot.borrow().is_some()) {
@@ -948,58 +1017,132 @@ pub(crate) fn publish_serve_frame(kind: ServeLiveKind, text: &str) {
                     frames.push((kind, text.to_string()));
                 }
             });
-            return;
+            return true;
         }
     }
-    if text.is_empty() {
-        let frame = [kind as u8, 0, 0, 0, 0];
-        publish_live_output_bytes(&frame);
-        return;
+    debug_assert!(text.len() <= MAX_SERVE_FRAME_BYTES);
+    let mut frame = Vec::with_capacity(5 + text.len());
+    frame.push(kind as u8);
+    frame.extend_from_slice(&(text.len() as u32).to_be_bytes());
+    frame.extend_from_slice(text.as_bytes());
+    publish_live_output_bytes_impl(&frame, false)
+}
+
+#[derive(Default)]
+struct ServeThinkingPublishState {
+    phase: u64,
+    open: bool,
+    bytes: u64,
+    dropped_frames: u64,
+    last_done: Option<ServeThinkingDone>,
+    done_delivered: bool,
+    defer_close: bool,
+}
+
+impl ServeThinkingPublishState {
+    fn start(&mut self) {
+        if self.open {
+            self.finish(ServeThinkingStatus::Interrupted);
+        }
+        self.phase = self.phase.saturating_add(1);
+        self.open = true;
+        self.bytes = 0;
+        self.dropped_frames = 0;
     }
-    for payload in serve_payload_chunks(text) {
-        let mut frame = Vec::with_capacity(5 + payload.len());
-        frame.push(kind as u8);
-        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        frame.extend_from_slice(payload.as_bytes());
-        publish_live_output_bytes(&frame);
+
+    fn finish(&mut self, status: ServeThinkingStatus) {
+        if self.open {
+            self.open = false;
+            self.done_delivered = false;
+            self.last_done = Some(ServeThinkingDone {
+                status,
+                phase: Some(self.phase),
+                bytes: Some(self.bytes),
+                dropped_frames: self.dropped_frames,
+            });
+        }
+        if self.done_delivered {
+            return;
+        }
+        let Some(done) = self.last_done.as_mut() else {
+            return;
+        };
+        if done.dropped_frames > 0 && done.status == ServeThinkingStatus::Completed {
+            done.status = ServeThinkingStatus::FrameLoss;
+        }
+        let payload = serde_json::to_string(done).expect("serializable thinking outcome");
+        self.done_delivered = write_serve_frame(ServeLiveKind::ThinkingDone, &payload);
+        if !self.done_delivered {
+            done.dropped_frames = done.dropped_frames.saturating_add(1);
+            if done.status == ServeThinkingStatus::Completed {
+                done.status = ServeThinkingStatus::FrameLoss;
+            }
+        }
     }
 }
 
-/// Whether the chat client's live thinking fold is open, i.e. whether a
-/// `ThinkingDone` frame still has a phase to close. Production runs one
-/// foreground turn per serve child, so a process-wide flag matches the FIFO
-/// order; test builds keep it per thread because unit tests publish through
-/// the scoped serve setters in parallel.
+// Serialize phase bookkeeping with its nonblocking writes. Test builds keep
+// it per thread because scoped serve publishers run in parallel unit tests.
 #[cfg(not(test))]
-static SERVE_THINKING_FOLD_OPEN: AtomicBool = AtomicBool::new(false);
+static SERVE_THINKING_STATE: LazyLock<Mutex<ServeThinkingPublishState>> =
+    LazyLock::new(|| Mutex::new(ServeThinkingPublishState::default()));
 
 #[cfg(test)]
 thread_local! {
-    static SERVE_THINKING_FOLD_OPEN: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+    static SERVE_THINKING_STATE: std::cell::RefCell<ServeThinkingPublishState> =
+        std::cell::RefCell::new(ServeThinkingPublishState::default());
 }
 
-fn mark_serve_thinking_fold_open() {
+fn with_serve_thinking_state<T>(run: impl FnOnce(&mut ServeThinkingPublishState) -> T) -> T {
     #[cfg(test)]
     {
-        SERVE_THINKING_FOLD_OPEN.with(|slot| slot.set(true));
+        SERVE_THINKING_STATE.with(|slot| run(&mut slot.borrow_mut()))
     }
     #[cfg(not(test))]
     {
-        SERVE_THINKING_FOLD_OPEN.store(true, Ordering::Relaxed);
+        run(&mut SERVE_THINKING_STATE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()))
     }
 }
 
-/// Clear the open-phase flag, returning whether this call closed a phase and
-/// therefore should publish `ThinkingDone`.
-fn take_serve_thinking_fold_open() -> bool {
-    #[cfg(test)]
-    {
-        SERVE_THINKING_FOLD_OPEN.with(|slot| slot.replace(false))
+pub(crate) fn publish_serve_thinking_done(status: ServeThinkingStatus) {
+    if serve_live_streaming() {
+        with_serve_thinking_state(|state| {
+            state.defer_close = false;
+            state.finish(status);
+        });
     }
-    #[cfg(not(test))]
-    {
-        SERVE_THINKING_FOLD_OPEN.swap(false, Ordering::Relaxed)
+}
+
+/// Finalization can flush synthetic close markers before it knows whether
+/// the response was truncated. Delay those closes until the outcome is known.
+pub(crate) fn defer_serve_thinking_close() -> ServeThinkingFinalizer {
+    let active = serve_live_streaming();
+    if active {
+        with_serve_thinking_state(|state| state.defer_close = true);
+    }
+    ServeThinkingFinalizer { active }
+}
+
+pub(crate) struct ServeThinkingFinalizer {
+    active: bool,
+}
+
+impl ServeThinkingFinalizer {
+    pub(crate) fn finish(mut self, status: ServeThinkingStatus) {
+        if self.active {
+            publish_serve_thinking_done(status);
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for ServeThinkingFinalizer {
+    fn drop(&mut self) {
+        if self.active {
+            publish_serve_thinking_done(ServeThinkingStatus::Interrupted);
+        }
     }
 }
 
@@ -2296,6 +2439,158 @@ mod tests {
         std::env::set_current_dir(&prev).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         result
+    }
+
+    #[test]
+    fn serve_reasoning_chunk_offsets_preserve_utf8_and_atomic_limit() {
+        let text = "é🙂\n".repeat(2000);
+        let (_, frames) = capture_serve_frames(|| {
+            with_serve_live_streaming_for_test(true, || {
+                publish_serve_frame(ServeLiveKind::ThinkingStart, "");
+                publish_serve_frame(ServeLiveKind::Thinking, &text);
+                publish_serve_frame(ServeLiveKind::ThinkingDone, "");
+            })
+        });
+        let mut received = String::new();
+        for (kind, payload) in &frames {
+            assert!(payload.len() <= MAX_SERVE_FRAME_BYTES);
+            if *kind == ServeLiveKind::ThinkingChunk {
+                let (header, chunk) = payload.split_once('\n').unwrap();
+                let (_, offset) = header.split_once(' ').unwrap();
+                assert_eq!(offset.parse::<usize>().unwrap(), received.len());
+                received.push_str(chunk);
+            }
+        }
+        assert_eq!(received, text);
+        let (_, payload) = frames.last().unwrap();
+        let done: ServeThinkingDone = serde_json::from_str(payload).unwrap();
+        assert_eq!(done.status, ServeThinkingStatus::Completed);
+        assert_eq!(done.bytes, Some(text.len() as u64));
+    }
+
+    #[test]
+    fn serve_reasoning_new_phase_closes_unfinished_reasoning() {
+        let (_, frames) = capture_serve_frames(|| {
+            with_serve_live_streaming_for_test(true, || {
+                publish_serve_frame(ServeLiveKind::ThinkingStart, "");
+                publish_serve_frame(ServeLiveKind::Thinking, "partial");
+                publish_serve_frame(ServeLiveKind::ThinkingStart, "");
+                publish_serve_frame(ServeLiveKind::Thinking, "next phase");
+                publish_serve_frame(ServeLiveKind::ThinkingDone, "");
+            })
+        });
+        let closes: Vec<ServeThinkingDone> = frames
+            .iter()
+            .filter_map(|(kind, payload)| {
+                (*kind == ServeLiveKind::ThinkingDone)
+                    .then(|| serde_json::from_str(payload).unwrap())
+            })
+            .collect();
+        assert_eq!(closes.len(), 2);
+        assert_eq!(closes[0].status, ServeThinkingStatus::Interrupted);
+        assert_eq!(closes[1].status, ServeThinkingStatus::Completed);
+    }
+
+    #[test]
+    fn serve_reasoning_deferred_close_marks_unexpected_exit() {
+        let (_, frames) = capture_serve_frames(|| {
+            with_serve_live_streaming_for_test(true, || {
+                publish_serve_frame(ServeLiveKind::ThinkingStart, "");
+                publish_serve_frame(ServeLiveKind::Thinking, "partial");
+                let finalizer = defer_serve_thinking_close();
+                publish_serve_frame(ServeLiveKind::ThinkingDone, "");
+                drop(finalizer);
+            })
+        });
+        let closes: Vec<_> = frames
+            .iter()
+            .filter(|(kind, _)| *kind == ServeLiveKind::ThinkingDone)
+            .collect();
+        assert_eq!(closes.len(), 1);
+        let done: ServeThinkingDone = serde_json::from_str(&closes[0].1).unwrap();
+        assert_eq!(done.status, ServeThinkingStatus::Interrupted);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn serve_reasoning_backpressure_records_loss_and_retries_close() -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let _lock = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let session = std::env::temp_dir().join(format!(
+            "a-serve-reasoning-{}-{}",
+            process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        open_live_output_fifo(session.to_str().unwrap())?;
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                close_live_output_fifo();
+                with_serve_thinking_state(|state| *state = ServeThinkingPublishState::default());
+            }
+        }
+        let _cleanup = Cleanup;
+        with_serve_thinking_state(|state| *state = ServeThinkingPublishState::default());
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(live_fifo_path_for_session(session.to_str().unwrap()))?;
+        let drain = |reader: &mut File| -> std::io::Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => bytes.extend_from_slice(&buf[..n]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(bytes)
+        };
+        with_serve_live_streaming_for_test(true, || -> std::io::Result<()> {
+            publish_serve_frame(ServeLiveKind::ThinkingStart, "");
+            publish_serve_frame(ServeLiveKind::Thinking, "prefix");
+            let prefix = drain(&mut reader)?;
+            assert!(!prefix.is_empty());
+
+            // Fill the actual nonblocking pipe with no concurrent reader.
+            let fill = [b'x'; 4096];
+            let mut full = false;
+            for _ in 0..1024 {
+                if !publish_live_output_bytes_impl(&fill, false) {
+                    full = true;
+                    break;
+                }
+            }
+            assert!(full, "the bounded pipe must exert backpressure");
+            let started = std::time::Instant::now();
+            publish_serve_frame(ServeLiveKind::Thinking, "missing tail");
+            publish_serve_frame(ServeLiveKind::ThinkingDone, "");
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "publishing must not wait for the reader"
+            );
+            drain(&mut reader)?;
+
+            // A failed close remains retryable, with the loss recorded in it.
+            publish_serve_frame(ServeLiveKind::ThinkingDone, "");
+            let close = drain(&mut reader)?;
+            assert_eq!(close[0], ServeLiveKind::ThinkingDone as u8);
+            let len = u32::from_be_bytes(close[1..5].try_into().unwrap()) as usize;
+            assert_eq!(close.len(), 5 + len);
+            let done: ServeThinkingDone = serde_json::from_slice(&close[5..]).unwrap();
+            assert_eq!(done.status, ServeThinkingStatus::FrameLoss);
+            assert_eq!(done.bytes, Some("prefixmissing tail".len() as u64));
+            assert!(done.dropped_frames >= 2);
+            publish_serve_frame(ServeLiveKind::ThinkingDone, "");
+            assert!(
+                drain(&mut reader)?.is_empty(),
+                "a delivered close must be deduplicated"
+            );
+            Ok(())
+        })
     }
 
     #[test]

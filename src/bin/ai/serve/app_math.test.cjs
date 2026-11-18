@@ -35,6 +35,7 @@ vm.createContext = (sandbox = {}) => {
   const context = createContext({
   executionGroupsFor: () => ({ sync() {}, restore() {} }),
   pendingImages: [],
+  promptComposing: false, MAX_LIVE_TURNS: 4,
   historyLoadSeq: 0,
   window: { matchMedia: () => ({ matches: false }), addEventListener() {}, removeEventListener() {} },
   createTurnRateLine: () => () => {},
@@ -46,6 +47,12 @@ vm.createContext = (sandbox = {}) => {
   loadReplyReferenceHelpers(context, script);
   vm.runInContext(script.slice(script.indexOf("// BEGIN execution model"), script.indexOf("// END execution model")), context);
   vm.runInContext(script.slice(script.indexOf("// BEGIN execution event dispatcher"), script.indexOf("// END execution event dispatcher")), context);
+  context.sendStatus = { hidden: true, textContent: "", dataset: {} };
+  if (typeof context.$ === "function") {
+    const lookup = context.$;
+    context.$ = (id) => id === "sendstatus" ? context.sendStatus : lookup(id);
+  }
+  vm.runInContext(script.slice(script.indexOf("function canSend()"), script.indexOf("// The one send/stop button")), context);
   return context;
 };
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
@@ -713,7 +720,7 @@ test("a mobile side note queues text without stopping the running turn", async (
   assert.equal(prompt.value, "");
   assert.equal(prompt.style.height, "auto");
   assert.equal(notices.at(-1), "side note queued — applies at the next model request");
-  assert.equal(button.disabled, false);
+  assert.equal(button.disabled, true);
 });
 
 test("a side note posts immediately despite an expired running-state sample", async () => {
@@ -747,7 +754,7 @@ test("a side note posts immediately despite an expired running-state sample", as
   await sending;
   assert.equal(prompt.value, "");
   assert.equal(notices.at(-1), "side note queued — applies at the next model request");
-  assert.equal(button.disabled, false);
+  assert.equal(button.disabled, true);
 });
 
 test("a failed side note preserves the draft and pending images", async () => {
@@ -813,7 +820,7 @@ test("image side notes upload screenshots once and accept images without text", 
     assert.equal(context.pendingImages.length, 0);
     assert.deepEqual(cleared, ["session-a"]);
     assert.equal(context.sideNoteBusy, false);
-    assert.equal(button.disabled, false);
+    assert.equal(button.disabled, true);
   }
 });
 
@@ -876,7 +883,7 @@ test("a slow side-note acknowledgement preserves edits and another session's dra
   }
 });
 
-test("empty side notes are rejected locally without polling or disabling the control", async () => {
+test("empty side notes are rejected locally with visible feedback and a disabled control", async () => {
   const start = script.indexOf("async function sendSideNote(");
   const end = script.indexOf("async function stopTurn(", start);
   let focused = false;
@@ -891,9 +898,11 @@ test("empty side notes are rejected locally without polling or disabling the con
   });
   vm.runInContext(script.slice(start, end), context);
   await context.sendSideNote();
-  assert.equal(notices.at(-1), "type a side note first");
+  assert.equal(context.sendStatus.hidden, false);
+  assert.match(context.sendStatus.textContent, /输入 side note 或添加图片/);
+  assert.equal(notices.length, 0);
   assert.equal(focused, true);
-  assert.equal(button.disabled, false);
+  assert.equal(button.disabled, true);
   assert.equal(context.sideNoteBusy, false);
 });
 

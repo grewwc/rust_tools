@@ -204,7 +204,9 @@ for (const width of [390, 1280]) for (const subagent of [false, true]) for (cons
     { timeout: 5000 }, async () => {
       const h = streamFramerHarness("replay", { phone: width <= 700 }), c = h.c;
       const controls = sendHarness({ phone: width <= 700 }).elements, lookup = c.$;
-      c.$ = (id) => ["send", "sidenote", "composer"].includes(id) ? controls[id] : lookup(id);
+      controls.prompt.value = "follow-up draft";
+      c.$ = (id) => ["send", "sidenote", "composer", "prompt"].includes(id) ? controls[id] : lookup(id);
+      c.promptComposing = false; c.pendingImages = []; c.MAX_LIVE_TURNS = 4;
       c.holdLayout = (_, apply) => apply();
       c.window.innerWidth = width;
       c.window.matchMedia = (query) => ({

@@ -5357,7 +5357,7 @@ fn transactional_serve_body_frame_decoder_reassembles_pending() {
             ServeLiveEvent::Delta("héllo".to_string()),
             ServeLiveEvent::ThinkingStart,
             ServeLiveEvent::Thinking("带来".to_string(), None),
-            ServeLiveEvent::ThinkingDone,
+            ServeLiveEvent::ThinkingDone(Default::default()),
             ServeLiveEvent::CompressionStart,
             ServeLiveEvent::CompressionDone,
             ServeLiveEvent::AssistantBodyPending,
@@ -5370,6 +5370,162 @@ fn transactional_serve_body_frame_decoder_reassembles_pending() {
     let mut cut = ServeFrameDecoder::default();
     assert_eq!(cut.push(&wire[..10]), vec![]);
     assert_eq!(cut.finish(), vec![]);
+}
+
+#[test]
+fn serve_reasoning_delivery_detects_frame_gaps_and_tail_loss() {
+    use crate::ai::background::{ServeLiveKind, ServeThinkingDone, ServeThinkingStatus};
+    for (chunks, total, dropped, expected) in [
+        (
+            vec![(0, "é"), (2, "tail")],
+            6,
+            0,
+            ServeThinkingStatus::Completed,
+        ),
+        (vec![(2, "tail")], 6, 0, ServeThinkingStatus::FrameLoss),
+        (
+            vec![(0, "a"), (2, "c")],
+            3,
+            0,
+            ServeThinkingStatus::FrameLoss,
+        ),
+        (vec![(0, "prefix")], 12, 0, ServeThinkingStatus::FrameLoss),
+        (vec![(0, "full")], 4, 1, ServeThinkingStatus::FrameLoss),
+    ] {
+        let done = ServeThinkingDone {
+            phase: Some(1),
+            bytes: Some(total),
+            dropped_frames: dropped,
+            ..Default::default()
+        };
+        let mut wire = test_frame(ServeLiveKind::ThinkingStart, br#"{"phase":1}"#);
+        let mut text = String::new();
+        for (offset, chunk) in chunks {
+            text.push_str(chunk);
+            wire.extend(test_frame(
+                ServeLiveKind::ThinkingChunk,
+                format!("1 {offset}\n{chunk}").as_bytes(),
+            ));
+        }
+        wire.extend(test_frame(
+            ServeLiveKind::ThinkingDone,
+            &serde_json::to_vec(&done).unwrap(),
+        ));
+        let mut decoder = ServeFrameDecoder::default();
+        let events: Vec<_> = wire
+            .iter()
+            .flat_map(|byte| decoder.push(&[*byte]))
+            .collect();
+        let received: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ServeLiveEvent::Thinking(text, _) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(received, text);
+        let close = events
+            .into_iter()
+            .find_map(|event| match event {
+                ServeLiveEvent::ThinkingDone(done) => Some(done),
+                _ => None,
+            })
+            .expect("one reasoning close");
+        assert_eq!(close.status, expected);
+        let sse = live_event(ServeLiveEvent::ThinkingDone(close)).unwrap();
+        let outcome: ServeThinkingDone = serde_json::from_str(&sse.data).unwrap();
+        assert_eq!(outcome.status, expected);
+        assert_eq!(sse.kind, "thinking_done");
+        assert_eq!(
+            decoder.push(&test_frame(
+                ServeLiveKind::OutputComplete,
+                &serde_json::to_vec(&done).unwrap()
+            )),
+            vec![ServeLiveEvent::OutputComplete]
+        );
+        assert!(decoder.finish().is_empty());
+    }
+}
+
+#[test]
+fn serve_reasoning_missing_close_is_interrupted_at_phase_change_or_eof() {
+    use crate::ai::background::{ServeLiveKind, ServeThinkingStatus};
+    for end in [
+        Vec::new(),
+        test_frame(ServeLiveKind::Tool, br#"{"id":"call","name":"read_file"}"#),
+        test_frame(ServeLiveKind::Replace, b"answer"),
+        test_frame(ServeLiveKind::OutputComplete, b""),
+        test_frame(ServeLiveKind::ThinkingChunk, b"2 0\nnext phase"),
+        test_frame(ServeLiveKind::ThinkingDone, br#"{"status":"completed"}"#)[..7].to_vec(),
+    ] {
+        let mut decoder = ServeFrameDecoder::default();
+        let wire = [
+            test_frame(ServeLiveKind::ThinkingStart, br#"{"phase":1}"#),
+            test_frame(ServeLiveKind::ThinkingChunk, b"1 0\npartial"),
+            end,
+        ]
+        .concat();
+        let mut events = decoder.push(&wire);
+        events.extend(decoder.finish());
+        let close = events
+            .iter()
+            .position(|event| {
+                matches!(event,
+                    ServeLiveEvent::ThinkingDone(done) if done.phase == Some(1)
+                        && done.status == ServeThinkingStatus::Interrupted
+                )
+            })
+            .expect("a missing close must interrupt the first phase");
+        if let Some(next) = events.iter().position(|event| {
+            matches!(
+                event,
+                ServeLiveEvent::Tool(_)
+                    | ServeLiveEvent::Replace(_)
+                    | ServeLiveEvent::OutputComplete
+            )
+        }) {
+            assert!(
+                close < next,
+                "the interruption must precede the next activity"
+            );
+        }
+        assert!(decoder.finish().is_empty());
+    }
+}
+
+#[test]
+fn serve_reasoning_output_complete_recovers_lost_close_and_whole_phase() {
+    use crate::ai::background::{ServeLiveKind, ServeThinkingDone, ServeThinkingStatus};
+    for status in [
+        ServeThinkingStatus::Cancelled,
+        ServeThinkingStatus::Truncated,
+        ServeThinkingStatus::FrameLoss,
+    ] {
+        for received in [false, true] {
+            let done = ServeThinkingDone {
+                status,
+                phase: Some(1),
+                bytes: Some(7),
+                dropped_frames: 1,
+            };
+            let mut decoder = ServeFrameDecoder::default();
+            if received {
+                decoder.push(&test_frame(ServeLiveKind::ThinkingChunk, b"1 0\npartial"));
+            }
+            let wire = test_frame(
+                ServeLiveKind::OutputComplete,
+                &serde_json::to_vec(&done).unwrap(),
+            );
+            assert_eq!(
+                decoder.push(&wire),
+                vec![
+                    ServeLiveEvent::ThinkingDone(done),
+                    ServeLiveEvent::OutputComplete,
+                ]
+            );
+            assert!(decoder.finish().is_empty());
+        }
+    }
 }
 
 #[tokio::test]

@@ -446,11 +446,13 @@ function attachmentHarness(headersOnly = false, options) {
 
 function runningComposer(c) {
   const lookup = c.$;
-  const elements = Object.fromEntries(["send", "sidenote", "composer", "turnstatus"].map((id) => [id, {
-    textContent: "", hidden: true, classList: { toggle() {} }, setAttribute() {},
+  const elements = Object.fromEntries(["send", "sidenote", "composer", "turnstatus", "prompt", "sendstatus"].map((id) => [id, {
+    textContent: "", hidden: true, dataset: {}, classList: { toggle() {} }, setAttribute() {},
   }]));
+  elements.prompt.value = "follow-up draft";
   Object.assign(c, {
     $: (id) => elements[id] || lookup(id), sideNoteBusy: false,
+    promptComposing: false, pendingImages: [], MAX_LIVE_TURNS: 4,
     holdLayout: (_, apply) => apply(),
   });
   vm.runInContext(script.slice(script.indexOf("function isRemoteTurn()"), script.indexOf("function note(")), c);
@@ -623,6 +625,7 @@ function sessionIsolationHarness(messages, phone) {
   const newButton = {}, prompt = { value: "", style: {}, focus() {} }, lookup = c.$;
   Object.assign(c, {
     $: (id) => id === "newbtn" ? newButton : id === "prompt" ? prompt : lookup(id),
+    promptComposing: false, pendingImages: [], MAX_LIVE_TURNS: 4,
     persistDraft() {}, restoreDraft() {}, resetQuestionNavigator() {}, restoreSkillPick() {}, restoreTeamPick() {},
     clearDraft() {}, loadSessions: async () => {}, loadSessionConfig() {},
     outputFollowSuspended: false, jumpingToBottom: false,
@@ -631,6 +634,7 @@ function sessionIsolationHarness(messages, phone) {
       return parent.appendChild(row);
     },
   });
+  vm.runInContext(script.slice(script.indexOf("function canSend()"), script.indexOf("// The one send/stop button")), c);
   c.localStorage.removeItem = (key) => h.storage.delete(key);
   for (const [start, end] of [["// BEGIN session switch", "// END session switch"],
     ['  $("newbtn").onclick =', '  $("refresh").onclick =']]) {
@@ -660,7 +664,7 @@ for (const phone of [false, true]) {
     await h.newButton.onclick();
     assert.match(h.root.textContent, /new session — type below to start\./);
     Object.assign(c, {
-      canSend: () => true, validateSkillInput: () => true, closeCommandMenu() {},
+      canSend: () => true, sendBlockReason: () => "", validateSkillInput: () => true, closeCommandMenu() {},
       dispatchComposerCommands: function* () {}, prepareTurnSession: async () => "b",
       captureSkillPick: () => ({ skills: [] }), setPromptValue: (value) => { h.prompt.value = value; },
       addLiveUserBubble(text) { const row = c.addMsg("user", text, "user"); return { parentNode: row }; },
@@ -1571,13 +1575,15 @@ test("pending HTTP request paints a connection indicator before any SSE event", 
 });
 
 test("status strip regression: restored sessions keep stop and busy state without a hint row", () => {
-  const elements = Object.fromEntries(["send", "sidenote", "composer"].map((id) => [id, {
+  const elements = Object.fromEntries(["send", "sidenote", "composer", "prompt"].map((id) => [id, {
     textContent: "", hidden: true, attrs: {}, classList: { toggle() {} },
     setAttribute(name, value) { this.attrs[name] = value; },
   }]));
+  elements.prompt.value = "follow-up draft";
   const context = vm.createContext({
     $: (id) => { assert.notEqual(id, "turnstatus", "the removed strip is still accessed"); return elements[id]; },
     sessionId: "a", turns: new Map(),
+    pendingImages: [], MAX_LIVE_TURNS: 4,
     eventActive: false, eventSession: "", eventStreamEnded: false, eventStreamFailed: false,
     staleSession: "", staleDone: false, sideNoteBusy: false,
     turnRunning: true, turnRunningAt: 100000, RUNNING_SAMPLE_TTL_MS: 60000,
@@ -1678,6 +1684,7 @@ test("desktop status keeps only phase and elapsed while main throughput stays vi
   assert.equal(h.mainRate(), "↳ speed · reasoning 18 tok · output 122 tok");
   h.emit("thinking", { text: "brief thought", rate: "~10 tok @ — tok/s" });
   assert.ok(h.titles().includes("thinking… · ~10 tok"));
+  h.emit("thinking_done");
   h.emit("delta", { delta: "Final answer" });
   h.emit("progress", "  \x1b[2m↳ speed · reasoning 800 tok @ 400 tok/s · output 400 tok @ 400 tok/s\x1b[0m");
   assert.deepEqual(h.metrics(), []);
@@ -3333,15 +3340,77 @@ test("the desktop settings row wraps instead of collapsing its inputs", () => {
     "the wrap rule sits inside the desktop media query");
 });
 
-test("a thinking card that lost its completion event joins the run before the next tool record", () => {
+for (const phone of [false, true]) for (const replay of [false, true]) {
+  for (const status of ["cancelled", "truncated", "frame_loss", "interrupted"]) {
+    test(`reasoning interruption survives phase completion and late rate updates (phone=${phone}, replay=${replay}, status=${status})`, () => {
+      const h = replay ? replayHarness({ phone, realThinking: true }) : streamHarness({ phone, realThinking: true });
+      const root = replay ? h.view.box : h.box;
+      const text = "partial reasoning ending with `";
+      h.emit("thinking", { text });
+      h.emit("thinking_done", { status });
+      const fold = executionRecords(root).find((card) => card.dataset.thinkingPhase === "true");
+      assert.equal(fold.body.textContent, text);
+      assert.equal(fold.dataset.thinkingStatus, status);
+      assert.equal(fold.dataset.executionState, "interrupted");
+      assert.match(fold.summary.textContent, /thinking · interrupted/);
+      assert.equal(Boolean(fold.parentNode.classList?.contains("execution-items")), false);
+      h.emit("rate", { phase: "reasoning", tokens: 12, elapsed_ms: 2000, approximate: true });
+      assert.match(fold.summary.textContent, /thinking · interrupted/);
+      assert.match(fold.summary.textContent, /tok/);
+      assert.equal(fold.body.textContent, text);
+    });
+  }
+  test(`reasoning loss creates an explicit empty interruption card (phone=${phone}, replay=${replay})`, () => {
+    const h = replay ? replayHarness({ phone, realThinking: true }) : streamHarness({ phone, realThinking: true });
+    const root = replay ? h.view.box : h.box;
+    h.emit("thinking_done", { status: "frame_loss", dropped_frames: 3 });
+    const folds = executionRecords(root).filter((card) => card.dataset.thinkingPhase === "true");
+    assert.equal(folds.length, 1);
+    assert.equal(folds[0].body.textContent, "");
+    assert.equal(folds[0].dataset.executionState, "interrupted");
+    assert.match(folds[0].summary.textContent, /interrupted \(text missing\)/);
+  });
+  test(`reasoning legacy empty close still completes normally (phone=${phone}, replay=${replay})`, () => {
+    const h = replay ? replayHarness({ phone, realThinking: true }) : streamHarness({ phone, realThinking: true });
+    const root = replay ? h.view.box : h.box;
+    h.emit("thinking", { text: "complete reasoning" });
+    h.emit("thinking_done", "");
+    const fold = executionRecords(root).find((card) => card.dataset.thinkingPhase === "true");
+    assert.equal(fold.dataset.executionState, "completed");
+    assert.doesNotMatch(fold.summary.textContent, /interrupted/);
+  });
+}
+
+test("reasoning interruption flushes the complete pending live tail", () => {
+  const h = streamHarness({ realThinking: true });
+  const first = "first reasoning line\n";
+  const tail = "tail with unicode é🙂 and an unfinished `".repeat(300);
+  h.emit("thinking", { text: first }, { paint: false });
+  h.emit("thinking", { text: tail }, { paint: false });
+  h.emit("thinking_done", { status: "truncated" });
+  const fold = executionRecords(h.box).find((card) => card.dataset.thinkingPhase === "true");
+  assert.equal(fold.body.textContent, first + tail);
+  assert.match(fold.summary.textContent, /interrupted \(truncated\)/);
+});
+
+test("reasoning without a completion event stays interrupted before the next tool", () => {
+  const h = streamHarness();
+  h.emit("thinking", { text: "partial" });
+  h.emit("tool", { id: "next", name: "read_file", phase: "started", arguments: "{}" });
+  const fold = executionRecords(h.box).find((card) => card.dataset.thinkingPhase === "true");
+  assert.equal(fold.dataset.executionState, "interrupted");
+  assert.match(fold.summary.textContent, /thinking · interrupted/);
+});
+
+test("a finished thinking card restores its known completion after phase binding is lost", () => {
   const h = streamHarness();
   const cards = () => executionRecords(h.box);
   h.emit("thinking", { text: "one" });
   h.emit("thinking_done");
   const think = cards().find((card) => card.dataset.thinkingPhase === "true");
   assert.ok(think, "a reasoning phase renders a thinking card");
-  // A reattached stream or a recovered view drops the phase binding, leaving a
-  // finished card "running" while newer tool records keep arriving below it.
+  // The close outcome is known even if a recovered phase binding is stale.
+  // Preserve it when newer tool records prove this card is no longer running.
   think.dataset.executionState = think._executionState = "running";
   h.emit("tool", { id: "t1", name: "task_wait", phase: "started", arguments: "{}" });
   h.emit("tool", { id: "t1", name: "task_wait", phase: "finished", output: "ok" });

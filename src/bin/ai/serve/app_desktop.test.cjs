@@ -2654,7 +2654,7 @@ test("desktop side-note clicks queue the composer text without interrupting the 
   assert.equal(h.context.turns.has("open-session"), true);
   assert.equal(h.elements.send.textContent, "⏹");
   assert.equal(h.elements.prompt.value, "");
-  assert.equal(h.elements.sidenote.disabled, false);
+  assert.equal(h.elements.sidenote.disabled, true);
   assert.equal(h.drafts.has(h.context.draftKey("open-session")), false);
   assert.equal(h.notes.at(-1), "side note queued — applies at the next model request");
 });
@@ -3003,7 +3003,7 @@ for (const modifier of ["metaKey", "ctrlKey"]) {
       assert.equal(h.context.isTurnRunning(), true);
       assert.equal(h.elements.send.textContent, "⏹");
       assert.equal(h.elements.prompt.value, "");
-      assert.equal(h.elements.sidenote.disabled, false);
+      assert.equal(h.elements.sidenote.disabled, true);
       assert.equal(h.drafts.has(h.context.draftKey("open-session")), false);
       assert.equal(h.notes.at(-1), "side note queued — applies at the next model request");
     });
@@ -3022,7 +3022,7 @@ for (const modifier of ["metaKey", "ctrlKey"]) {
       assert.equal(h.elements.prompt.value, draft);
       assert.equal(h.drafts.get(h.context.draftKey("open-session")), draft);
       assert.equal(h.context.sideNoteBusy, false);
-      assert.equal(h.elements.sidenote.disabled, false);
+      assert.equal(h.elements.sidenote.disabled, true);
       assert.equal(h.context.isTurnRunning(), running);
     });
   }

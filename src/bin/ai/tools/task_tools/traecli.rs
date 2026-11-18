@@ -797,6 +797,18 @@ fn run_traecli_blocking_with_evidence(
                 &stderr_text,
             ));
         }
+        if !status.success() {
+            let stderr_tail = truncate_head(stderr_text.trim(), 2000);
+            let detail = if stderr_tail.is_empty() {
+                outcome.result.trim()
+            } else {
+                &stderr_tail
+            };
+            return Err(with_sandbox_hint(
+                format!("traecli exited with status {status}: {detail}"),
+                &stderr_text,
+            ));
+        }
         return Ok(outcome);
     }
 
@@ -2260,6 +2272,59 @@ exit 1"#,
         .unwrap_err();
         assert!(error.starts_with("failed to spawn traecli:"), "{error}");
         assert!(!error.contains("after 3 attempts"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn traecli_runner_respects_exit_status_and_preserves_evidence() {
+        let _process_guard = lock_unpoisoned(&PROCESS_TEST_LOCK);
+        for (exit_code, stderr) in [(0, ""), (1, "Error: backend stream disconnected"), (2, "")] {
+            let script = terminal_test_script(&format!(
+                r#"/bin/cat > /dev/null
+/bin/echo '{{"type":"thread.started","thread_id":"t1"}}'
+/bin/echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"last agent message"}}}}'
+/bin/echo '{{"type":"turn.completed","usage":{{"input_tokens":100,"output_tokens":20}}}}'
+/bin/echo '{{"type":"error","message":"stream disconnected"}}'
+/bin/echo '{stderr}' >&2
+exit {exit_code}"#,
+            ));
+            let evidence_slot = Arc::new(Mutex::new(None));
+            let result = run_traecli_blocking_with_evidence(
+                &test_spec(),
+                Arc::new(AtomicBool::new(false)),
+                script.to_str().unwrap(),
+                Duration::from_secs(2),
+                Vec::new(),
+                Some(evidence_slot.clone()),
+            );
+            std::fs::remove_file(script).unwrap();
+
+            let evidence = lock_unpoisoned(&evidence_slot)
+                .clone()
+                .expect("parsed outcome must be retained even on failure");
+            assert_eq!(evidence.result, "last agent message");
+            assert!(!evidence.is_error);
+            assert_eq!(evidence.session_id.as_deref(), Some("t1"));
+            assert_eq!(evidence.num_turns, Some(1));
+            assert_eq!(evidence.input_tokens, Some(100));
+            assert_eq!(evidence.output_tokens, Some(20));
+
+            if exit_code == 0 {
+                let outcome = result.expect("exit zero must keep its parsed outcome");
+                assert_eq!(outcome.result, evidence.result);
+                assert!(!outcome.is_error);
+            } else {
+                let error =
+                    result.expect_err("nonzero CLI exits must fail even after an agent message");
+                assert!(error.starts_with("traecli exited with status"), "{error}");
+                let detail = if stderr.is_empty() {
+                    evidence.result.as_str()
+                } else {
+                    stderr
+                };
+                assert!(error.contains(detail), "{error}");
+            }
+        }
     }
 
     #[cfg(unix)]

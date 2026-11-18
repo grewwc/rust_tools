@@ -95,6 +95,73 @@ fn serve_thinking_done_publishes_once_per_phase() {
 }
 
 #[test]
+fn serve_reasoning_finalization_reports_stream_outcomes() {
+    use crate::ai::background::{
+        ServeLiveKind, ServeThinkingDone, ServeThinkingStatus, publish_serve_frame,
+    };
+    let _lock = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    crate::ai::driver::signal::clear_request_interrupt();
+    for (cancel_directly, outcome, status) in [
+        (
+            true,
+            StreamOutcome::Cancelled,
+            ServeThinkingStatus::Cancelled,
+        ),
+        (
+            false,
+            StreamOutcome::Cancelled,
+            ServeThinkingStatus::Cancelled,
+        ),
+        (
+            false,
+            StreamOutcome::Truncated,
+            ServeThinkingStatus::Truncated,
+        ),
+        (
+            false,
+            StreamOutcome::Completed,
+            ServeThinkingStatus::Completed,
+        ),
+    ] {
+        let (result, frames) = crate::ai::background::capture_serve_frames(|| {
+            crate::ai::background::with_serve_live_streaming_for_test(true, || {
+                publish_serve_frame(ServeLiveKind::ThinkingStart, "");
+                publish_serve_frame(ServeLiveKind::Thinking, "partial reasoning");
+                let mut app = test_app();
+                let markers = StreamMarkers::new();
+                let mut state = StreamProcessingState::new();
+                state.content.reasoning_text = "partial reasoning".to_string();
+                state.content.thinking_open = true;
+                if outcome == StreamOutcome::Completed {
+                    state.content.finish_reason_seen = true;
+                    state.content.finish_reason_value = Some("stop".to_string());
+                }
+                if cancel_directly {
+                    cancelled_stream_result(&mut state)
+                } else {
+                    app.cancel_stream.store(
+                        outcome == StreamOutcome::Cancelled,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    finalize_stream_response(&mut app, &mut String::new(), &markers, state).unwrap()
+                }
+            })
+        });
+        assert_eq!(result.outcome, outcome);
+        assert_eq!(result.reasoning_text, "partial reasoning");
+        let closes: Vec<ServeThinkingDone> = frames
+            .iter()
+            .filter_map(|(kind, payload)| {
+                (*kind == ServeLiveKind::ThinkingDone)
+                    .then(|| serde_json::from_str(payload).unwrap())
+            })
+            .collect();
+        assert_eq!(closes.len(), 1, "one final close: {frames:?}");
+        assert_eq!(closes[0].status, status);
+    }
+}
+
+#[test]
 fn reasoning_summary_done_snapshot_does_not_duplicate_thinking() {
     // The Responses protocol first streams `.delta` increments, then re-sends the whole reasoning
     // summary via a `.done` event (SnapshotChunk). Without unseen-suffix dedup on the snapshot, thinking prints twice.
