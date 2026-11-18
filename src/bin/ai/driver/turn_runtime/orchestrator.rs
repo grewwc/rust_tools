@@ -29,7 +29,7 @@ use super::{
     },
     llm_summary_budget::LlmSummaryBudget,
     persistence::{persist_pending_turn_messages, persist_pending_turn_messages_for_model},
-    prepare::prepare_turn,
+    prepare::{TurnQuestionOrigin, prepare_turn},
     tool_result::{
         DEGENERATE_REPETITION_FINISH_REASON, FinalGateState, append_empty_response_retry_note,
         audit_evidence_gate_action, completion_evidence_state, completion_tool_result_succeeded,
@@ -1245,25 +1245,41 @@ pub(in crate::ai::driver) async fn run_turn(
     let turn_index = history::reserve_turn_index(&app.session_history_file)?;
     app.fire_turn_start_hooks(turn_index);
 
-    let result = (async {
+    let audit_scope = if allow_commands
+        && crate::ai::driver::commands::audit::parse_audit_command(&question).is_some()
+    {
+        crate::ai::driver::commands::audit::capture_previous_turn_scope(
+            &app.session_history_file,
+            &question,
+        )
+    } else {
+        String::new()
+    };
+    let result = crate::ai::driver::commands::audit::AUDIT_SCOPE_CONTEXT.scope(audit_scope, async {
+        let mut question_origin = TurnQuestionOrigin::User;
         // Default audits retain the single foreground runner; only --deep enters planning.
         let (self_generated_audit, pending_audit) =
             if allow_commands {
                 match crate::ai::driver::commands::audit::parse_audit_command(&question) {
                     Some(crate::ai::driver::commands::audit::AuditCommand::SelfGenerated {
                         fast, deep: false,
-                    }) => (Some(fast), None),
+                    }) => (Some(fast), Some(PendingAudit::new(
+                        crate::ai::driver::commands::audit::AuditCommand::SelfGenerated { fast, deep: false },
+                    ))),
                     Some(crate::ai::driver::commands::audit::AuditCommand::Run {
                         instruction, fast, deep: false,
                     }) => match run_audit_subagent(app, &instruction, fast) {
                         Some(report) => {
+                            question_origin = TurnQuestionOrigin::AuditFollowup {
+                                user_request: Some(question.clone()),
+                            };
                             question = crate::ai::driver::commands::audit::build_audit_fix_followup(
                                 &instruction, &report,
                             );
                             (None, None)
                         }
                         None => {
-                            return Ok(if should_quit { TurnOutcome::Quit } else { TurnOutcome::Continue });
+                            return Err("audit subagent startup failed; requested audit coverage remains unresolved".into());
                         }
                     },
                     Some(command) => {
@@ -1361,6 +1377,7 @@ pub(in crate::ai::driver) async fn run_turn(
                             history_count,
                             turn_index,
                             question,
+                            question_origin,
                             attachments_text.clone(),
                             frozen_replies.clone(),
                             next_model.clone(),
@@ -1394,7 +1411,8 @@ pub(in crate::ai::driver) async fn run_turn(
                                             let fix_question = crate::ai::driver::commands::audit::build_audit_round_followup(instruction, &report, 1);
                                             return run_turn_body(
                                                 app, mcp_client, skill_manifests, history_count, turn_index,
-                                                fix_question, attachments_text, frozen_replies, next_model, None,
+                                                fix_question, TurnQuestionOrigin::AuditFollowup { user_request: None },
+                                                attachments_text, frozen_replies, next_model, None,
                                                 one_shot_mode, None, pending.next_round(), should_quit,
                                                 DelegationAdvisoryState::default(), LlmSummaryBudget::default(),
                                             ).await;
@@ -1569,9 +1587,22 @@ fn pending_audit_dispatch_before_finalization(
     turn_messages: &[history::Message],
     interrupted: bool,
 ) -> Result<Option<AuditDispatch>, String> {
-    let Some(pending) = pending.filter(|pending| pending.is_deep() && !interrupted) else {
+    let Some(pending) = pending.filter(|_| !interrupted) else {
         return Ok(None);
     };
+    if !pending.is_deep() {
+        return match &pending.command {
+            crate::ai::driver::commands::audit::AuditCommand::SelfGenerated { fast, .. }
+                if !crate::ai::driver::commands::audit::turn_successfully_spawned_audit_subagent(turn_messages) => {
+                    Ok(Some(AuditDispatch {
+                        instruction: assistant_text.to_string(),
+                        fast: *fast,
+                        scopes: None,
+                    }))
+                }
+            _ => Ok(None),
+        };
+    }
     let plan = if pending.round == 1 {
         crate::ai::driver::commands::audit::parse_audit_scope_plan(assistant_text)
     } else if assistant_text.contains("<audit_plan>") {
@@ -2167,9 +2198,7 @@ mod audit_orchestration_tests {
             .unwrap()
             .1;
         let classify = body
-            .find(
-                "let audit_dispatch = if pending_audit.as_ref().is_some_and(PendingAudit::is_deep)",
-            )
+            .find("let audit_dispatch = pending_audit_dispatch_before_finalization(")
             .unwrap();
         let handoff = body.find("return Ok(TurnBodyStage::AuditFollowup").unwrap();
         let finalize = body.find("let outcome = finalize_turn(").unwrap();
@@ -2211,7 +2240,7 @@ mod audit_orchestration_tests {
         assert_eq!(
             body.matches("gate.begin_audit_followup(&turn_messages)")
                 .count(),
-            2
+            1
         );
 
         let source = include_str!("finalize.rs");
@@ -2246,8 +2275,8 @@ mod audit_orchestration_tests {
             .nth(1)
             .unwrap();
         let legacy = routing
-            .split("deep: false,")
-            .nth(2)
+            .split("AuditCommand::Run {")
+            .nth(1)
             .unwrap()
             .split("Some(command) =>")
             .next()
@@ -2260,39 +2289,69 @@ mod audit_orchestration_tests {
     }
 
     #[test]
-    fn audit_default_bare_fallback_follows_finalization_and_legacy_detection() {
+    fn audit_default_bare_fallback_precedes_finalization_and_requires_successful_spawn() {
         let source = include_str!("orchestrator.rs");
         let body = source
             .rsplit_once("async fn run_turn_body_round(")
             .unwrap()
             .1;
-        let finalize = body.find("let outcome = finalize_turn(").unwrap();
-        let fallback = body
-            .find("// Preserve the legacy finalize-before-fallback ordering")
+        let dispatch = body
+            .find("let audit_dispatch = pending_audit_dispatch_before_finalization(")
             .unwrap();
-        assert!(finalize < fallback);
-        let legacy = &body[fallback..];
-        assert!(legacy.contains("!app.last_turn_interrupted"));
-        assert!(legacy.contains("turn_spawned_audit_subagent("));
-        assert!(legacy.contains("run_audit_subagent(app, &instruction, fast)"));
-        assert!(legacy.contains("build_audit_fix_followup"));
-        assert!(!legacy.contains("run_audit_scope_round"));
-        let call = history::Message {
-            role: "assistant".into(),
-            content: serde_json::Value::Null,
-            tool_calls: Some(vec![ToolCall {
-                id: "attempt".into(),
-                tool_type: "function".into(),
-                function: FunctionCall {
-                    name: "task_spawn".into(),
-                    arguments: r#"{"tasks":[{"agent":"audit-fast"}]}"#.into(),
-                },
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-        };
-        assert!(audit::turn_spawned_audit_subagent(&[call.clone()]));
-        assert!(!audit::turn_successfully_spawned_audit_subagent(&[call]));
+        let runner = body
+            .find("run_audit_subagent(app, &instruction, fast)")
+            .unwrap();
+        let handoff = body.find("return Ok(TurnBodyStage::AuditFollowup").unwrap();
+        let finalize = body.find("let outcome = finalize_turn(").unwrap();
+        assert!(dispatch < runner && runner < handoff && handoff < finalize);
+        assert!(!body[finalize..].contains("run_audit_subagent("));
+        assert!(body[runner..finalize].contains("No verified audit outcome was produced"));
+
+        for input in [
+            "/audit ",
+            "/audit -f  ",
+            "/audit --fast\t",
+            "/audit --deep",
+            "/audit --deep --fast ",
+        ] {
+            let pending = PendingAudit::new(audit::parse_audit_command(input).unwrap());
+            for messages in [
+                Vec::new(),
+                vec![successful_audit_spawn_messages()[0].clone()],
+            ] {
+                assert!(
+                    pending_audit_dispatch_before_finalization(
+                        Some(&pending),
+                        "Audit task specification only",
+                        &messages,
+                        false,
+                    )
+                    .unwrap()
+                    .is_some(),
+                    "{input}: no successful child must force fallback"
+                );
+            }
+            assert!(
+                pending_audit_dispatch_before_finalization(
+                    Some(&pending),
+                    "Audited result",
+                    &successful_audit_spawn_messages(),
+                    false,
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(
+                pending_audit_dispatch_before_finalization(
+                    Some(&pending),
+                    "Interrupted",
+                    &[],
+                    true,
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
     }
 
     #[test]
@@ -2315,7 +2374,7 @@ mod audit_orchestration_tests {
                 pending_audit_dispatch_before_finalization(
                     Some(&legacy),
                     "<audit_plan>invalid</audit_plan>",
-                    &[],
+                    &successful_audit_spawn_messages(),
                     false,
                 )
                 .unwrap()
@@ -2465,6 +2524,7 @@ async fn run_turn_body(
     history_count: usize,
     turn_index: usize,
     mut question: String,
+    mut question_origin: TurnQuestionOrigin,
     attachments_text: String,
     frozen_replies: Vec<serde_json::Value>,
     next_model: String,
@@ -2486,6 +2546,7 @@ async fn run_turn_body(
             history_count,
             turn_index,
             question,
+            &question_origin,
             attachments_text.clone(),
             frozen_replies.clone(),
             next_model.clone(),
@@ -2508,6 +2569,7 @@ async fn run_turn_body(
                 llm_summary_budget: next_budget,
             } => {
                 question = followup;
+                question_origin = TurnQuestionOrigin::AuditFollowup { user_request: None };
                 self_generated_audit = None;
                 pending_audit = next_audit;
                 delegation_advisory = next_advisory;
@@ -2524,6 +2586,7 @@ async fn run_turn_body_round(
     history_count: usize,
     turn_index: usize,
     question: String,
+    question_origin: &TurnQuestionOrigin,
     attachments_text: String,
     frozen_replies: Vec<serde_json::Value>,
     next_model: String,
@@ -2563,6 +2626,7 @@ async fn run_turn_body_round(
         history_count,
         turn_index,
         &question,
+        question_origin,
         &attachments_text,
         &frozen_replies,
         &next_model,
@@ -2574,7 +2638,7 @@ async fn run_turn_body_round(
         Err(err) => return Err(err),
     };
 
-    // The legacy bare-command note stays independent of deep pending state.
+    // Bare commands receive the same frozen scope as explicit and deep audits.
     if let Some(fast) = self_generated_audit {
         crate::ai::driver::commands::audit::inject_self_generated_audit_note(&mut messages, fast);
         crate::ai::driver::print::print_tool_note_line(
@@ -2595,7 +2659,7 @@ async fn run_turn_body_round(
             role: history::ROLE_INTERNAL_NOTE.into(),
             content: serde_json::Value::String(
                 crate::ai::driver::commands::audit::build_audit_lead_request(
-                    "Audit the changes owned for this request in this session",
+                    "Audit only the previous user turn's changes",
                     *fast,
                     &app.current_model,
                 ),
@@ -3883,16 +3947,12 @@ async fn run_turn_body_round(
             }
             // Audit plans are intermediate output. Dispatch and verification precede
             // finalize_turn, which alone may commit the body and close a serve response.
-            let audit_dispatch = if pending_audit.as_ref().is_some_and(PendingAudit::is_deep) {
-                pending_audit_dispatch_before_finalization(
-                    pending_audit.as_ref(),
-                    &output.assistant_text,
-                    &turn_messages,
-                    app.last_turn_interrupted,
-                )?
-            } else {
-                None
-            };
+            let audit_dispatch = pending_audit_dispatch_before_finalization(
+                pending_audit.as_ref(),
+                &output.assistant_text,
+                &turn_messages,
+                app.last_turn_interrupted,
+            )?;
             if let Some(AuditDispatch {
                 fast,
                 instruction,
@@ -3911,35 +3971,41 @@ async fn run_turn_body_round(
                     &mut persisted_turn_messages,
                 );
                 pending.mark_dispatch();
-                match run_audit_scope_round(
-                    app,
-                    &instruction,
-                    fast,
-                    scopes.as_deref(),
-                    pending.round == 1,
-                ) {
-                    Some(report) => {
-                        let fix_question =
-                            crate::ai::driver::commands::audit::build_audit_round_followup(
-                                &instruction,
-                                &report,
-                                pending.round,
-                            );
-                        gate.begin_audit_followup(&turn_messages);
-                        return Ok(TurnBodyStage::AuditFollowup {
-                            question: fix_question,
-                            pending_audit: pending.next_round(),
-                            delegation_advisory: supervisor.progress.delegation_advisory,
-                            llm_summary_budget,
-                        });
-                    }
-                    None => {
-                        return Err(
-                            "foreground audit startup failed; no verified disposition was produced"
-                                .into(),
-                        );
-                    }
+                let report = if pending.is_deep() {
+                    run_audit_scope_round(
+                        app,
+                        &instruction,
+                        fast,
+                        scopes.as_deref(),
+                        pending.round == 1,
+                    )
+                } else {
+                    run_audit_subagent(app, &instruction, fast)
+                };
+                if let Some(report) = report {
+                    let fix_question = if pending.is_deep() {
+                        crate::ai::driver::commands::audit::build_audit_round_followup(
+                            &instruction,
+                            &report,
+                            pending.round,
+                        )
+                    } else {
+                        crate::ai::driver::commands::audit::build_audit_fix_followup(
+                            &instruction,
+                            &report,
+                        )
+                    };
+                    gate.begin_audit_followup(&turn_messages);
+                    return Ok(TurnBodyStage::AuditFollowup {
+                        question: fix_question,
+                        pending_audit: pending.next_round(),
+                        delegation_advisory: supervisor.progress.delegation_advisory,
+                        llm_summary_budget,
+                    });
                 }
+                output.assistant_text = "[audit] Unable to start the requested audit subagent. No verified audit outcome was produced; coverage remains unresolved.".into();
+                output.assistant_recorded = false;
+                output.terminal_dedupe_candidate = None;
             }
             let outcome = finalize_turn(
                 app,
@@ -3958,41 +4024,6 @@ async fn run_turn_body_round(
                 output.had_tool_error,
             )
             .await?;
-            // Preserve the legacy finalize-before-fallback ordering for bare commands.
-            if let Some(fast) = self_generated_audit
-                && !app.last_turn_interrupted
-                && !crate::ai::driver::commands::audit::turn_spawned_audit_subagent(
-                    turn_messages.as_slice(),
-                )
-            {
-                crate::ai::driver::print::print_line(&format!(
-                    "\n[audit] The lead agent did not start an audit subagent this turn; \
-                     forcing `/audit{}` with this turn's output as the audit instruction.",
-                    if fast { " --fast" } else { "" },
-                ));
-                let instruction = output.assistant_text.clone();
-                match run_audit_subagent(app, &instruction, fast) {
-                    Some(report) => {
-                        gate.begin_audit_followup(&turn_messages);
-                        return Ok(TurnBodyStage::AuditFollowup {
-                            question: crate::ai::driver::commands::audit::build_audit_fix_followup(
-                                &instruction,
-                                &report,
-                            ),
-                            pending_audit: None,
-                            delegation_advisory: supervisor.progress.delegation_advisory,
-                            llm_summary_budget,
-                        });
-                    }
-                    None => {
-                        return Ok(TurnBodyStage::Finished(if should_quit {
-                            TurnOutcome::Quit
-                        } else {
-                            TurnOutcome::Continue
-                        }));
-                    }
-                }
-            }
             Ok(TurnBodyStage::Finished(outcome))
         }
         Err(err_str) => Err(err_str.into()),

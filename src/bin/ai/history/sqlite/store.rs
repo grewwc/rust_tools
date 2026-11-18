@@ -502,6 +502,66 @@ pub(in crate::ai) fn read_stored_messages_sqlite(
     read_stored_where(&conn, "id > ?1", &[after_message_id], false)
 }
 
+/// Read the latest real user turn from canonical history, excluding older turns.
+/// Synthetic user handoffs remain inside the turn rather than becoming boundaries.
+pub(in crate::ai) fn read_previous_turn_messages_sqlite(
+    path: &Path,
+) -> io::Result<Vec<StoredMessage>> {
+    let conn = super::connection::open_history_db_read_only(path)?;
+    let boundary = read_stored_where_until(&conn, "role = 'user'", &[], true, |stored| {
+        !super::super::is_runtime_synthetic_user_message(&stored.message)
+    })?;
+    match boundary.first() {
+        Some(boundary) => read_stored_where(&conn, "id >= ?1", &[boundary.message_id], false),
+        None => Ok(Vec::new()),
+    }
+}
+
+#[cfg(test)]
+mod audit_scope_tests {
+    use super::*;
+
+    #[test]
+    fn audit_previous_turn_boundary_excludes_older_changes_and_keeps_synthetic_handoffs() {
+        let temp = std::env::temp_dir().join(format!("audit-scope-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("history.sqlite");
+        let message = |role: &str, text: &str| Message {
+            role: role.into(),
+            content: serde_json::Value::String(text.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        append_history_sqlite(
+            &path,
+            vec![
+                message("user", "old request"),
+                message("assistant", "old.rs was changed"),
+                message("user", "last request"),
+                message("assistant", "new.rs was changed"),
+                crate::ai::history::runtime_synthetic_user_message(serde_json::json!(
+                    "delegated result"
+                )),
+                message("assistant", "last result"),
+            ],
+        )
+        .unwrap();
+        let records = read_previous_turn_messages_sqlite(&path).unwrap();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].message.content.as_str(), Some("last request"));
+        assert!(crate::ai::history::is_runtime_synthetic_user_message(
+            &records[2].message
+        ));
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.message.content.as_str() == Some("old.rs was changed"))
+        );
+        let _ = std::fs::remove_dir_all(temp);
+    }
+}
+
 /// Look up stable canonical identities without scanning unrelated message bodies.
 pub(in crate::ai) fn read_stored_messages_by_ids_sqlite(
     path: &Path,

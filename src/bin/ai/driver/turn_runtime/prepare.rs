@@ -15,6 +15,39 @@ use crate::ai::{
 
 use super::types::{PersistableContextProjection, TurnPreparation};
 
+/// Audit stages retain the real user boundary while continuing with generated input.
+pub(super) enum TurnQuestionOrigin {
+    User,
+    AuditFollowup {
+        /// Direct audits have not prepared the original user command yet.
+        user_request: Option<String>,
+    },
+}
+
+fn user_turn_message(content: Value, origin: &TurnQuestionOrigin) -> Message {
+    match origin {
+        TurnQuestionOrigin::User => Message {
+            role: "user".into(),
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        TurnQuestionOrigin::AuditFollowup { .. } => runtime_synthetic_user_message(content),
+    }
+}
+
+fn record_user_turn_reminder(message: &mut Message, reminder: &str) {
+    if crate::ai::history::is_runtime_synthetic_user_message(message) {
+        // Generated input can retain the reminder inline without displacing its
+        // origin marker or mixing runtime text into a real user's own content.
+        let content = std::mem::take(&mut message.content);
+        message.content = crate::ai::history::prepend_request_reminder(content, reminder);
+    } else {
+        crate::ai::history::attach_request_reminder(message, reminder);
+    }
+}
+
 fn current_request_tool_names(app: &App) -> rust_tools::commonw::FastSet<String> {
     app.agent_context
         .as_ref()
@@ -50,7 +83,7 @@ fn persisted_user_turn_message(
     persisted_question_text: &str,
     resume_turn: bool,
 ) -> Message {
-    if !resume_turn {
+    if !resume_turn || crate::ai::history::is_runtime_synthetic_user_message(&user_message) {
         return user_message;
     }
 
@@ -383,6 +416,7 @@ pub(super) async fn prepare_turn(
     history_count: usize,
     turn_index: usize,
     question: &str,
+    question_origin: &TurnQuestionOrigin,
     attachments_text: &str,
     frozen_replies: &[Value],
     next_model: &str,
@@ -699,10 +733,10 @@ pub(super) async fn prepare_turn(
     // everything from the reminder onward. Fold it into the **current**
     // user message instead: the current message is always a cache miss
     // anyway, so reminder churn no longer truncates the cached prefix.
-    // The persisted user message records the reminder in its runtime side
-    // channel (content keeps only the user's input), and request
-    // normalization replays it byte-identically, so later turns resend this
-    // message exactly as the model saw it and the cached prefix extends.
+    // Real user messages record the reminder in their runtime side channel;
+    // generated audit followups retain it inline alongside their origin marker.
+    // Both forms replay byte-identically, so later turns resend this message
+    // exactly as the model saw it and the cached prefix extends.
     let context_reminder = skill_turn.context_reminder();
     // Two content forms of the same user turn:
     // - `user_content`: the request projection with inline images and structured
@@ -725,23 +759,11 @@ pub(super) async fn prepare_turn(
     let mut user_content = persisted_user_content.clone();
     request::materialize_image_references(&mut user_content, Some(attachment_assets_dir.as_path()));
     // Persisted track: canonical turn_messages keep the reference boundary.
-    let mut user_message = Message {
-        role: "user".to_string(),
-        content: persisted_user_content,
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-    };
+    let mut user_message = user_turn_message(persisted_user_content, question_origin);
     // Request track: inline images and structured file/reply snapshots plus the reminder.
-    let mut request_user_message = Message {
-        role: "user".to_string(),
-        content: user_content,
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-    };
+    let mut request_user_message = user_turn_message(user_content, question_origin);
     if let Some(reminder) = context_reminder.as_deref() {
-        crate::ai::history::attach_request_reminder(&mut user_message, reminder);
+        record_user_turn_reminder(&mut user_message, reminder);
         request_user_message.content =
             crate::ai::history::prepend_request_reminder(request_user_message.content, reminder);
     }
@@ -775,8 +797,34 @@ pub(super) async fn prepare_turn(
             "text": request::digest_instruction(),
         }));
     }
-    messages.push(request_user_message);
     let mut turn_messages = Vec::with_capacity(8);
+    if let TurnQuestionOrigin::AuditFollowup {
+        user_request: Some(user_request),
+    } = question_origin
+    {
+        // The direct foreground audit ran before preparation. Persist its real
+        // command once, then keep the generated result/fix stage synthetic.
+        let mut content = request::build_reference_content(
+            next_model,
+            user_request,
+            &app.attached_image_files,
+            attachments_text,
+            attachment_assets_dir.as_path(),
+        )?;
+        crate::ai::history::reply_reference::append_frozen(&mut content, frozen_replies);
+        let mut original_user = user_turn_message(content, &TurnQuestionOrigin::User);
+        if let Some(reminder) = context_reminder.as_deref() {
+            crate::ai::history::attach_request_reminder(&mut original_user, reminder);
+        }
+        let mut original_request = original_user.clone();
+        request::materialize_image_references(
+            &mut original_request.content,
+            Some(attachment_assets_dir.as_path()),
+        );
+        messages.push(original_request);
+        turn_messages.push(original_user);
+    }
+    messages.push(request_user_message);
     // A wake-up resume turn's prompt is a system-generated notice, not active
     // user input. Persist it as an internal_note so it is skipped in /history
     // user and history-compression user-turn counting, and gets normalized to
@@ -824,14 +872,256 @@ fn detect_complex_task(question: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        QuestionShape, assemble_effective_question, build_user_redirect_reminder,
-        detect_complex_task, filter_suggested_tool_calls_for_tool_names, inject_integrated_critic,
-        persisted_user_turn_message, task_evidence_handoff_messages,
+        QuestionShape, TurnQuestionOrigin, assemble_effective_question,
+        build_user_redirect_reminder, detect_complex_task,
+        filter_suggested_tool_calls_for_tool_names, inject_integrated_critic,
+        persisted_user_turn_message, record_user_turn_reminder, task_evidence_handoff_messages,
+        user_turn_message,
     };
     use crate::ai::driver::observer::SuggestedToolCall;
     use crate::ai::history::Message;
     use crate::ai::history::ROLE_INTERNAL_NOTE;
     use serde_json::Value;
+
+    #[tokio::test]
+    async fn audit_followup_preparation_preserves_previous_real_user_turn_changes() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for direct in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("audit-followup-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let mut app = crate::ai::driver::tests::test_app("build");
+            app.config.history_file = root.join("history.sqlite");
+            app.session_history_file = app.config.history_file.clone();
+            app.session_id = format!("audit-followup-{direct}");
+            app.config.history_max_chars = 1_000_000;
+            app.cli.background = true;
+            app.observers.clear();
+            let model = app.current_model.clone();
+            let mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+            let write_records = |path: &str| {
+                vec![
+                    Message {
+                        role: "assistant".into(),
+                        content: Value::Null,
+                        tool_calls: Some(vec![crate::ai::types::ToolCall {
+                            id: path.into(),
+                            tool_type: "function".into(),
+                            function: crate::ai::types::FunctionCall {
+                                name: "write_file".into(),
+                                arguments: serde_json::json!({"path": path, "content": "fixed"})
+                                    .to_string(),
+                            },
+                        }]),
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    },
+                    Message {
+                        role: "tool".into(),
+                        content: Value::String(format!("Successfully wrote {path}")),
+                        tool_calls: None,
+                        tool_call_id: Some(path.into()),
+                        reasoning_content: None,
+                    },
+                ]
+            };
+            let mut old = vec![user_turn_message(
+                serde_json::json!("older task"),
+                &TurnQuestionOrigin::User,
+            )];
+            old.extend(write_records("older_changes.rs"));
+            crate::ai::history::append_history_messages(&app.session_history_file, &old).unwrap();
+
+            let user_request = if direct {
+                "/audit -f inspect runtime"
+            } else {
+                "/audit --deep inspect runtime"
+            };
+            let first_origin = if direct {
+                TurnQuestionOrigin::AuditFollowup {
+                    user_request: Some(user_request.into()),
+                }
+            } else {
+                TurnQuestionOrigin::User
+            };
+            let followup_origin = TurnQuestionOrigin::AuditFollowup { user_request: None };
+            let first_followup = crate::ai::driver::commands::audit::build_audit_fix_followup(
+                "inspect runtime",
+                "first audit report",
+            );
+            let round_one = crate::ai::driver::commands::audit::build_audit_round_followup(
+                "inspect runtime",
+                "round-one audit report",
+                1,
+            );
+            let closure = crate::ai::driver::commands::audit::build_audit_round_followup(
+                "inspect runtime",
+                "round-two audit report",
+                2,
+            );
+            let stages = [
+                (
+                    if direct {
+                        first_followup.as_str()
+                    } else {
+                        user_request
+                    },
+                    &first_origin,
+                    Some("before_followup.rs"),
+                ),
+                (
+                    round_one.as_str(),
+                    &followup_origin,
+                    Some("round_one_fix.rs"),
+                ),
+                (closure.as_str(), &followup_origin, None),
+            ];
+            let mut expected_turns = Vec::new();
+            for (text, origin, changed_path) in stages {
+                let mut prepared = super::prepare_turn(
+                    &mut app,
+                    &mcp,
+                    &[],
+                    usize::MAX,
+                    1,
+                    text,
+                    origin,
+                    "",
+                    &[],
+                    &model,
+                    None,
+                )
+                .await
+                .unwrap();
+                let synthetic = matches!(origin, TurnQuestionOrigin::AuditFollowup { .. });
+                let current = prepared.turn_messages.last().unwrap();
+                assert_eq!(
+                    crate::ai::history::is_runtime_synthetic_user_message(current),
+                    synthetic
+                );
+                assert_eq!(
+                    crate::ai::history::is_runtime_synthetic_user_message(
+                        prepared.messages.last().unwrap()
+                    ),
+                    synthetic
+                );
+                if synthetic {
+                    let reminder = prepared
+                        .skill_turn
+                        .context_reminder()
+                        .expect("turn reminder");
+                    assert!(current.content.as_str().unwrap().starts_with(&reminder));
+                    assert_eq!(current.content, prepared.messages.last().unwrap().content);
+                }
+                let outgoing = crate::ai::request::normalize_messages_for_request_for_test(
+                    std::slice::from_ref(prepared.messages.last().unwrap()),
+                );
+                expected_turns.push((current.clone(), outgoing));
+                if let TurnQuestionOrigin::AuditFollowup {
+                    user_request: Some(original),
+                } = origin
+                {
+                    assert_eq!(prepared.turn_messages.len(), 2);
+                    assert_eq!(
+                        prepared.turn_messages[0].content.as_str(),
+                        Some(original.as_str())
+                    );
+                    assert!(!crate::ai::history::is_runtime_synthetic_user_message(
+                        &prepared.turn_messages[0]
+                    ));
+                }
+                if let Some(path) = changed_path {
+                    prepared.turn_messages.extend(write_records(path));
+                }
+                assert!(super::super::persistence::persist_pending_turn_messages(
+                    &app,
+                    false,
+                    &prepared.turn_messages,
+                    &mut 0,
+                ));
+                prepared.skill_turn.restore_agent_context(&mut app);
+            }
+
+            let records =
+                crate::ai::history::read_previous_turn_messages_sqlite(&app.session_history_file)
+                    .unwrap();
+            let messages: Vec<_> = records
+                .iter()
+                .map(|record| record.message.clone())
+                .collect();
+            assert_eq!(crate::ai::history::user_input_turn_count(&messages), 1);
+            assert_eq!(messages[0].content.as_str(), Some(user_request));
+            for (canonical, outgoing) in expected_turns {
+                let stored = messages
+                    .iter()
+                    .find(|message| **message == canonical)
+                    .unwrap();
+                let replay = crate::ai::request::normalize_messages_for_request_for_test(
+                    std::slice::from_ref(stored),
+                );
+                assert_eq!(
+                    serde_json::to_vec(&replay).unwrap(),
+                    serde_json::to_vec(&outgoing).unwrap()
+                );
+            }
+            let scope = crate::ai::driver::commands::audit::capture_previous_turn_scope(
+                &app.session_history_file,
+                "/audit",
+            );
+            assert!(scope.contains("before_followup.rs"), "{scope}");
+            assert!(scope.contains("round_one_fix.rs"), "{scope}");
+            assert!(!scope.contains("older_changes.rs"), "{scope}");
+            assert!(
+                messages
+                    .last()
+                    .unwrap()
+                    .content
+                    .as_str()
+                    .unwrap()
+                    .contains("round-two audit report")
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn audit_followup_origin_survives_reminder_and_resume_persistence() {
+        let reminder = "<system-reminder>\nSaved reminder 🧭\n</system-reminder>";
+        for content in [
+            serde_json::json!("generated audit closure"),
+            serde_json::json!([{ "type": "text", "text": "generated audit closure" }]),
+        ] {
+            let mut message = user_turn_message(
+                content.clone(),
+                &TurnQuestionOrigin::AuditFollowup { user_request: None },
+            );
+            let mut outgoing = message.clone();
+            outgoing.content = crate::ai::history::prepend_request_reminder(content, reminder);
+            record_user_turn_reminder(&mut message, reminder);
+            let persisted = persisted_user_turn_message(message, "generated audit closure", true);
+            let restored: Message =
+                serde_json::from_slice(&serde_json::to_vec(&persisted).unwrap()).unwrap();
+            assert!(crate::ai::history::is_runtime_synthetic_user_message(
+                &restored
+            ));
+            assert_eq!(restored.reasoning_content, outgoing.reasoning_content);
+            assert_eq!(restored.content, outgoing.content);
+            assert_eq!(
+                crate::ai::history::last_real_user_index(std::slice::from_ref(&restored)),
+                None
+            );
+            let replay = crate::ai::request::normalize_messages_for_request_for_test(&[restored]);
+            let wire = crate::ai::request::normalize_messages_for_request_for_test(&[outgoing]);
+            assert_eq!(replay.len(), 1);
+            assert_eq!(
+                serde_json::to_vec(&replay).unwrap(),
+                serde_json::to_vec(&wire).unwrap()
+            );
+            assert!(replay[0].reasoning_content.is_none());
+        }
+    }
 
     #[test]
     fn persisted_user_turn_message_keeps_multimodal_user_content_for_normal_turn() {

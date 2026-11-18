@@ -1815,6 +1815,7 @@ pub(in crate::ai) async fn run_serve(
         .route("/info", get(server_info))
         .route("/subagent-models", get(subagent_models))
         .route("/sessions", get(list_sessions).post(create_session))
+        .route("/session-group-activity", get(list_session_group_activity))
         .route(
             "/session-groups",
             get(list_session_groups).post(create_session_group),

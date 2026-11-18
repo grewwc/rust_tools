@@ -585,6 +585,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             let was_truncated_by_length = stream_result.truncated_by_length;
             record_final_stream_response(
                 app,
+                source_model,
                 stream_result,
                 messages,
                 turn_messages,

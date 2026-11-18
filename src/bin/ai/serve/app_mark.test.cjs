@@ -42,7 +42,7 @@ const longSessions = () => [sessions()[0], ...Array.from({ length: 100 }, (_, in
   id: "older-session-" + index, summary: "Older session " + index, marked: false, size_bytes: 1024,
 })), sessions()[1]];
 
-function harness({ phone = false, sid = "open-session", items = sessions(), cachedItems = items, groups = [], markError = "", confirmDelete = true, beforeMark, sessionsGet, activityGet, historyGet, configGet, realNavigation = false } = {}) {
+function harness({ phone = false, sid = "open-session", items = sessions(), cachedItems = items, groups = [], assignments = {}, storage, groupPatch, markError = "", confirmDelete = true, beforeMark, sessionsGet, activityGet, groupActivityGet, titlePost, historyGet, configGet, realNavigation = false } = {}) {
   const documentListeners = new Map(), windowListeners = new Map();
   const listen = (listeners, name, fn) => {
     if (!listeners.has(name)) listeners.set(name, []);
@@ -118,7 +118,9 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
     return el;
   }
   document.createElement = node;
-  const elements = { sesslist: node("ul"), sessfilter: node("input"), sesscount: node(), sesstitle: node(), sessmeta: node(), sesscwd: node(), msgs: node(), prompt: node("textarea") };
+  const elements = { sesslist: node("ul"), sessfilter: node("input"), sesscount: node(), sesstitle: node(), sessrename: node("button"), fork: node("button"), sessmeta: node(), sesscwd: node(), msgs: node(), prompt: node("textarea") };
+  elements.sessfilter.value = "";
+  elements.sessfilter.hidden = /<input\b[^>]*id="sessfilter"[^>]*\shidden(?:\s|>)/.test(html);
   elements.prompt.value = "draft in A";
   for (const match of html.matchAll(/<(div|section|button)[^>]*id="(sessionaction[^"]*)"[^>]*>([^<]*)/g)) {
     const el = elements[match[2]] = node(match[1]);
@@ -131,11 +133,11 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
     ["sessdelcancel", "button"], ["sessdelconfirm", "button"],
   ]) elements[id] = node(tag);
   elements.sessdel.hidden = true;
-  for (const id of ["sessionactionstitle", "sessionactionmeta", "sessionactionmark", "sessionactionrename", "sessionactionfork", "sessionactionarchive", "sessionactiongroup", "sessionactiondelete", "sessionactioncancel"]) elements.sessionactionspanel.appendChild(elements[id]);
+  for (const id of ["sessionactionstitle", "sessionactionmeta", "sessionactionarchive", "sessionactiongroup", "sessionactiondelete", "sessionactioncancel"]) elements.sessionactionspanel.appendChild(elements[id]);
   elements.sessionactions.appendChild(elements.sessionactionsscrim);
   elements.sessionactions.appendChild(elements.sessionactionspanel);
 
-  const serverItems = plain(items), requests = [], switches = [], confirmations = [], draftsCleared = [], messages = [], drawerChanges = [], stored = new Map();
+  const serverItems = plain(items), requests = [], switches = [], confirmations = [], draftsCleared = [], messages = [], drawerChanges = [], stored = storage || new Map();
   const media = { matches: phone, listeners: [], addEventListener(_, listener) { this.listeners.push(listener); } };
   const timers = new Map();
   let now = 1000, nextTimer = 1, historyLoads = 0, configLoads = 0;
@@ -152,7 +154,22 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
       const parsed = new URL(url);
       const request = { url, path: parsed.pathname, searchParams: parsed.searchParams, method: options.method || "GET", headers: plain(options.headers), body: options.body ? JSON.parse(options.body) : null };
       requests.push(request);
-      if (request.path === "/session-groups") return response({ groups, assignments: {} });
+      if (request.path === "/session-groups") return response({ groups, assignments });
+      if (request.path.startsWith("/session-groups/") && request.method === "PATCH") {
+        if (groupPatch) return groupPatch(request);
+        const group = groups.find((group) => request.path === "/session-groups/" + encodeURIComponent(group.id));
+        assert.ok(group, "unexpected group target");
+        Object.assign(group, request.body);
+        return response(group);
+      }
+      if (request.path === "/session-group-activity") return groupActivityGet ? groupActivityGet(request) : response({ error: "not supported" }, 404);
+      if (request.path.endsWith("/title") && request.method === "POST") {
+        if (titlePost) return titlePost(request);
+        const target = serverItems.find((item) => request.path === "/sessions/" + encodeURIComponent(item.id) + "/title");
+        assert.ok(target, "unexpected rename target");
+        target.summary = request.body.title;
+        return response({});
+      }
       if (request.path === "/session-activity") {
         if (activityGet) return activityGet(request);
         return response(request.body.ids.map((id) => ({ id, activity: serverItems.find((item) => item.id === id)?.activity ?? "unknown" })));
@@ -176,7 +193,8 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
       assert.equal(request.path, "/sessions");
       if (sessionsGet) return sessionsGet(request);
       const keywords = (request.searchParams.get("query") || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
-      const matching = serverItems.filter((item) => (request.searchParams.get("archived") === "only" ? !!item.archived : !item.archived) && (request.searchParams.get("marked") !== "true" || item.marked) && keywords.every((keyword) =>
+      const matching = serverItems.filter((item) => (request.searchParams.get("archived") === "include" || (request.searchParams.get("archived") === "only" ? !!item.archived : !item.archived))
+        && (!request.searchParams.has("group") || (item.group_id || assignments[item.id] || "unassigned") === request.searchParams.get("group")) && (request.searchParams.get("marked") !== "true" || item.marked) && keywords.every((keyword) =>
         ((item.summary || item.first_user_prompt || "") + " " + item.id).toLowerCase().includes(keyword)));
       const ordered = request.searchParams.get("newest") === "true" ? matching.slice().reverse() : matching.slice();
       const offset = Number(request.searchParams.get("offset") || 0);
@@ -233,9 +251,9 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
   elements.sessall = node("button");
   elements.sessmarked = node("button");
   for (const [id, tag] of [
-    ["sessmore", "details"], ["sessmoretoggle", "summary"], ["sessmorepanel", "div"],
+    ["sessmore", "details"], ["sessmoretoggle", "summary"], ["sessmorepanel", "div"], ["sesssearch", "button"],
     ["sessfilterstatus", "span"], ["sessmarkfilter", "div"], ["sessactive", "button"], ["sessarchived", "button"],
-    ["sessiongroupnew", "button"], ["sessiongroupmanage", "button"], ["sessiongroupdialog", "div"],
+    ["sessiongroupnew", "button"], ["sessiongroupmanage", "button"], ["sessiongrouphidden", "button"], ["sessiongrouphiddenactivity", "button"], ["sessiongroupdialog", "div"],
     ["sessiongroupscrim", "div"], ["sessiongrouppanel", "section"], ["sessiongrouptitle", "div"],
     ["sessiongroupbody", "div"], ["sessiongrouperror", "div"], ["sessiongroupcancel", "button"],
   ]) elements[id] = node(tag);
@@ -243,7 +261,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
   elements.sessiongroupdialog.hidden = true;
   elements.sessmore.appendChild(elements.sessmoretoggle);
   elements.sessmore.appendChild(elements.sessmorepanel);
-  for (const id of ["sessactive", "sessarchived", "sessall", "sessmarked", "sessiongroupnew", "sessiongroupmanage"]) elements.sessmorepanel.appendChild(elements[id]);
+  for (const id of ["sesssearch", "sessactive", "sessarchived", "sessall", "sessmarked", "sessiongroupnew", "sessiongroupmanage", "sessiongrouphidden"]) elements.sessmorepanel.appendChild(elements[id]);
   for (const id of ["sessiongrouptitle", "sessiongroupbody", "sessiongrouperror", "sessiongroupcancel"]) elements.sessiongrouppanel.appendChild(elements[id]);
   vm.runInContext(between('  wireSessionSearch();', '$("connbtn").onclick ='), context);
   context.wireSessionActions();
@@ -579,7 +597,7 @@ test("a phone hold opens the action sheet at 650ms and suppresses its row click"
   assert.equal(h.elements.sessionactions.hidden, false);
   assert.equal(li.classList.contains("holding"), false);
   assert.equal(h.elements.sessionactionstitle.textContent, "Target session");
-  assert.equal(h.elements.sessionactionmark.textContent, "标记会话");
+  assert.equal(h.elements.sessionactionmark, undefined);
   assert.equal(h.elements.sessionactiondelete.textContent, "删除会话");
   assert.equal(h.elements.sessionactioncancel.textContent, "取消");
   assert.equal(h.context.sessionHoldConsumed(li), true);
@@ -589,11 +607,11 @@ test("a phone hold opens the action sheet at 650ms and suppresses its row click"
   assert.deepEqual(h.confirmations, []);
 });
 
-for (const marked of [false, true]) test("the phone sheet offers " + (marked ? "unmark" : "mark") + " and toggles only the held session", async () => {
+for (const marked of [false, true]) test("the phone card offers " + (marked ? "unmark" : "mark") + " and toggles only the held session", async () => {
   const h = harness({ phone: true, items: sessions(marked) });
   h.hold();
-  assert.equal(h.elements.sessionactionmark.textContent, marked ? "取消标记" : "标记会话");
-  await h.dispatch(h.elements.sessionactionmark, "click").done;
+  h.dispatch(h.elements.sessionactioncancel, "click");
+  await h.dispatch(h.row().querySelector(".mk"), "click").done;
   assert.equal(h.elements.sessionactions.hidden, true);
   assert.deepEqual(h.requests[0].body, { marked: !marked });
   assert.equal(h.requests.length, 1);
@@ -939,8 +957,8 @@ test("a failed session refresh keeps the last good list and appends its error", 
 test("sheet keyboard focus cycles through its actions and Escape restores the star focus", () => {
   const h = harness({ phone: true }), star = h.row().querySelector(".mk");
   h.hold();
-  assert.equal(h.document.activeElement, h.elements.sessionactionmark);
-  for (const id of ["sessionactionrename", "sessionactionarchive", "sessionactiongroup", "sessionactiondelete", "sessionactioncancel", "sessionactionmark"]) {
+  assert.equal(h.document.activeElement, h.elements.sessionactionarchive);
+  for (const id of ["sessionactiongroup", "sessionactiondelete", "sessionactioncancel", "sessionactionarchive"]) {
     const key = h.dispatch(h.document.activeElement, "keydown", { key: "Tab" });
     assert.equal(key.event.prevented, true);
     assert.equal(h.document.activeElement, h.elements[id]);
@@ -1130,21 +1148,27 @@ test("More closes on Escape, outside pointer and outside focus without changing 
   assert.equal(h.elements.sessfilterstatus.hidden, true);
 });
 
-for (const phone of [false, true]) test("Rename from the action sheet edits its target and Escape preserves title (phone=" + phone + ")", async () => {
-  const h = harness({ phone }), li = h.row();
-  if (phone) h.hold();
-  else h.dispatch(li, "contextmenu");
-  await h.dispatch(h.elements.sessionactionrename, "click").done;
-  const editor = li.querySelector(".rnm");
-  assert.equal(h.elements.sessionactions.hidden, true);
+for (const phone of [false, true]) test("select another session then rename with the top edit control (phone=" + phone + ")", async () => {
+  const h = harness({ phone });
+  await h.dispatch(h.row(), "click").done;
+  assert.equal(h.context.sessionId, "target-session");
+  await h.dispatch(h.elements.sessrename, "click").done;
+  const editor = h.elements.sessiongroupbody.querySelector("input");
   assert.equal(editor.value, "Target session");
   assert.equal(h.document.activeElement, editor);
-  assert.equal(li.classList.contains("session-renaming"), true);
-  h.dispatch(editor, "keydown", { key: "Escape" });
-  assert.equal(h.row().querySelector(".session-title").textContent, "Target session");
-  assert.equal(h.row().querySelector(".rnm"), null);
-  assert.deepEqual(h.requests, []);
-  assert.deepEqual(h.switches, []);
+  editor.value = "Renamed target";
+  await h.dispatch(h.elements.sessiongroupbody.querySelector("button"), "click").done;
+  const request = h.requests.find((request) => request.path.endsWith("/title"));
+  assert.equal(request.path, "/sessions/target-session/title");
+  assert.deepEqual(request.body, { title: "Renamed target" });
+  assert.equal(h.context.sessionId, "target-session");
+  assert.equal(h.elements.sesstitle.textContent, "Renamed target");
+  assert.equal(h.row("open-session").querySelector(".session-title").textContent, "Open session");
+  await h.dispatch(h.row().querySelector(".mk"), "click").done;
+  assert.equal(h.requests.at(-1).path, "/sessions/target-session/mark");
+  await h.dispatch(h.elements.sessrename, "click").done;
+  h.dispatch(h.elements.sessiongrouppanel, "keydown", { key: "Escape" });
+  assert.equal(h.elements.sessiongroupdialog.hidden, true);
 });
 
 test("desktop actions reserve nearby title space while phone actions share the title and status height", () => {
@@ -1200,8 +1224,8 @@ for (const phone of [false, true]) test("session menu opens actions with one pre
   assert.equal(click.event.stopped, true);
   assert.equal(h.elements.sessionactions.hidden, false);
   assert.equal(h.elements.sessionactionstitle.textContent, "Target session");
-  assert.equal(h.document.activeElement, h.elements.sessionactionmark);
-  for (const id of ["sessionactionrename", "sessionactionarchive", "sessionactiongroup"]) assert.equal(h.elements[id].hidden, false);
+  assert.equal(h.document.activeElement, h.elements.sessionactionarchive);
+  for (const id of ["sessionactionarchive", "sessionactiongroup", "sessionactiondelete"]) assert.equal(h.elements[id].hidden, false);
   await h.dispatch(h.elements.sessionactioncancel, "click").done;
   assert.equal(h.document.activeElement, menu);
   assert.deepEqual(h.switches, []);
@@ -1220,8 +1244,8 @@ test("empty groups stay available through Manage groups without occupying list r
   assert.equal(h.elements.sessiongroupdialog.hidden, false);
   assert.equal(h.elements.sessiongrouptitle.textContent, "Manage groups");
   const buttons = h.elements.sessiongroupbody.querySelectorAll("button");
-  assert.deepEqual(buttons.map((button) => button.textContent), ["New group…", "Empty group"]);
-  await h.dispatch(buttons[1], "click").done;
+  assert.deepEqual(buttons.map((button) => button.textContent), ["New group…", "All", "Hidden", "Empty group", "Hide from sidebar"]);
+  await h.dispatch(h.elements.sessiongroupbody.querySelector(".session-group-manager-name"), "click").done;
   assert.equal(h.elements.sessiongrouptitle.textContent, "Empty group");
   assert.ok(h.elements.sessiongroupbody.querySelectorAll("button").some((button) => button.textContent === "New session in this group"));
 });
@@ -1233,16 +1257,22 @@ test("compact group heads preserve waiting visibility and explicit collapse stat
   assert.equal(head.querySelector(".session-group-count"), null);
   assert.equal(toggle.title, "Unassigned · 2 loaded sessions");
   const waiting = head.querySelector(".waiting");
-  assert.equal(waiting.textContent, "1 WAITING");
+  assert.equal(waiting.textContent, "1");
+  assert.equal(waiting.getAttribute("aria-label"), "1 WAITING");
+  assert.match(waiting.title, /need your answer/);
   assert.equal(waiting.hidden, false);
   assert.match(toggle.getAttribute("aria-label"), /1 WAITING/);
   const running = head.querySelector(".session-group-badge");
-  assert.equal(running.textContent, "1 RUNNING");
+  assert.equal(running.textContent, "1");
+  assert.equal(running.getAttribute("aria-label"), "1 RUNNING");
+  assert.equal(running.title, "1 loaded sessions running");
   assert.equal(running.hidden, false);
   assert.match(toggle.getAttribute("aria-label"), /1 RUNNING/);
   assert.match(css, /#sessions \.session-group-toggle \{[^}]*grid-template-columns:auto minmax\(0,1fr\) auto;/);
-  assert.match(css, /#sessions \.session-group-name \{ grid-column:2; grid-row:1;[^}]*white-space:nowrap; color:var\(--fg\);/);
-  assert.match(css, /#sessions \.session-group-status \{ grid-column:2 \/ 4; grid-row:2; display:flex; flex-wrap:wrap;/);
+  assert.match(css, /#sessions \.session-group-toggle \{[^}]*min-height:28px;[^}]*font-size:11px; font-weight:500;/);
+  assert.match(css, /#sessions \.session-group-name \{ grid-column:2; grid-row:1;[^}]*white-space:nowrap; color:var\(--fg\); font-size:12px; font-weight:600; line-height:18px;/);
+  assert.match(css, /#sessions \.session-group-status \{ grid-column:3; grid-row:1; display:flex; flex-wrap:nowrap;/);
+  assert.match(css, /#sessions \.session-group-badge \{[^}]*font-size:10px; font-weight:500; line-height:16px;/);
   h.dispatch(toggle, "click");
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
   assert.ok(sessionRows(h.elements.sesslist).every((li) => li.hidden));
@@ -1253,15 +1283,30 @@ test("compact group heads preserve waiting visibility and explicit collapse stat
   assert.ok(sessionRows(h.elements.sesslist).every((li) => li.hidden));
   h.dispatch(h.elements.sesslist.querySelector(".session-group-toggle"), "click");
   assert.ok(sessionRows(h.elements.sesslist).every((li) => !li.hidden));
+  vm.runInContext("sessionActivitySamples.clear(); paintSessionGroupActivity();", h.context);
+  const refreshedHead = h.elements.sesslist.querySelector(".session-group-head");
+  assert.equal(refreshedHead.querySelector(".session-group-badge").hidden, true);
+  assert.equal(refreshedHead.querySelector(".waiting").hidden, true);
+  assert.match(css, /#sessions \.session-group-badge\[hidden\] \{ display:none; \}/);
 });
 
 for (const phone of [false, true]) test("group padding and title toggle once while group actions stay independent (phone=" + phone + ")", async () => {
-  const groups = [{ id: "work", name: "Work", order: 0, pinned: false }];
+  const groups = [{ id: "work", name: "Work", order: 0, pinned: true }];
   const h = harness({ phone, groups, items: [{ ...sessions()[0], group_id: "work" }, sessions()[1]] });
   await h.context.loadSessionGroups();
   h.context.renderSessionList(h.context.lastItems);
   const heads = h.elements.sesslist.querySelectorAll(".session-group-head");
   const work = heads[0], unassigned = heads[1], toggle = work.querySelector(".session-group-toggle");
+  assert.equal(work.querySelector(".session-group-name").textContent, "Work");
+  assert.equal(work.querySelector(".session-group-name").classList.contains("session-group-pinned"), true);
+  assert.match(css, /#sessions \.session-group-pinned::before \{ content:"★"; margin-right:4px; color:var\(--dim\); font-size:10px; font-weight:500; \}/);
+  assert.match(toggle.getAttribute("aria-label"), /Pinned group/);
+  const arrow = toggle.querySelector(".session-group-arrow");
+  assert.equal(arrow.getAttribute("aria-hidden"), "true");
+  assert.equal(arrow.textContent, "");
+  assert.match(css, /#sessions \.session-group-arrow \{[^}]*grid-column:1; grid-row:1;[^}]*width:12px; height:12px; color:var\(--fg\);/);
+  assert.match(css, /#sessions \.session-group-arrow::before \{ content:""; width:0; height:0; border-top:5px solid transparent; border-bottom:5px solid transparent; border-left:8px solid currentColor; \}/);
+  assert.match(css, /#sessions \.session-group-toggle\[aria-expanded="true"\] \.session-group-arrow::before \{ transform:rotate\(90deg\); \}/);
   assert.equal(toggle.getAttribute("aria-expanded"), "true");
   h.dispatch(work, "click");
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
@@ -1283,8 +1328,12 @@ for (const phone of [false, true]) test("group padding and title toggle once whi
   const phoneCSS = css.slice(css.indexOf("@media (max-width:700px)"));
   assert.match(phoneCSS, /#sessions \.session-group-toggle, #sessions \.session-group-new, #sessions \.session-group-menu \{ min-height:44px; \}/);
   assert.match(phoneCSS, /#sessions \.session-group-menu \{ flex:0 0 44px; min-width:44px; padding:2px; \}/);
-  assert.match(phoneCSS, /#sessions \.session-group-status \{ grid-column:3; grid-row:1; flex-wrap:nowrap; gap:2px; \}/);
-  assert.match(css, /#sessions \.session-group-new \{[^}]*min-width:44px;/);
+  assert.match(phoneCSS, /#sessions \.session-group-status \{ gap:2px; \}/);
+  assert.match(phoneCSS, /#sessions \.session-group-badge \{[^}]*font-size:9px; line-height:14px;/);
+  assert.match(css, /#sessions li\.session-group-head \{[^}]*border:0; border-radius:0; background:transparent; box-shadow:none;/);
+  assert.match(css, /@media \(hover:hover\) and \(pointer:fine\) \{\s*#sessions \.session-group-new, #sessions \.session-group-menu \{ opacity:0; pointer-events:none; \}/);
+  assert.match(css, /#sessions \.session-group-head:focus-within \.session-group-new, #sessions \.session-group-head:focus-within \.session-group-menu \{ opacity:1; pointer-events:auto; \}/);
+  assert.match(css, /#sessions \.session-group-new \{[^}]*min-width:44px;[^}]*font-size:11px;/);
   assert.match(css, /#sessions li\.session-more button \{[^}]*min-height:44px;[^}]*border:0; background:transparent;/);
 });
 

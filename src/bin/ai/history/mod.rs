@@ -76,6 +76,7 @@ pub(in crate::ai) use sessions::{
 pub(in crate::ai) use sqlite::MarkMessageUpdate;
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::fork_history_for_subagent;
+pub(in crate::ai) use sqlite::read_previous_turn_messages_sqlite;
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::{read_all_messages_sqlite, read_all_messages_sqlite_read_only};
 pub(in crate::ai) use sqlite::{
@@ -607,6 +608,8 @@ pub(in crate::ai) fn build_context_history_with_outcome(
     .0)
 }
 
+/// A zero `history_count` uses the configured compression policy; when compression
+/// is disabled, it keeps the full projection instead of selecting an empty tail.
 pub(in crate::ai) fn build_context_history_with_snapshot_basis(
     history_count: usize,
     history_file: &Path,
@@ -667,7 +670,7 @@ pub(in crate::ai) fn build_context_history_with_snapshot_basis(
     let before_chars = messages_total_chars_pub(&history);
     compress::cap_raw_tool_results_for_context(&mut history, overflow_dir.as_deref(), cwd);
     let mut out = if history_max_chars == 0 {
-        let messages = if history_count >= history.len() {
+        let messages = if history_count == 0 || history_count >= history.len() {
             history
         } else {
             history[history.len() - history_count..].to_vec()
@@ -837,7 +840,12 @@ fn context_projection_fingerprint(
     // still match on snapshot-covered loads. Snapshots built under v24 (or
     // earlier) may carry baked base64 image data and must be rebuilt.
     // Rebuild snapshots whose summaries consumed flattened file or reply bodies.
-    const PROJECTION_VERSION: u8 = 29;
+    // v30: disabled compression with a zero history count keeps the full
+    // projection; rebuild older snapshots that may have dropped every message.
+    // v31: preserve encrypted continuation markers on plain assistant answers.
+    // v32: archived successful writes become evidence notes instead of callable
+    // argument pointers; rebuild projections that could teach models to copy stubs.
+    const PROJECTION_VERSION: u8 = 32;
     projection_cache_key(
         PROJECTION_VERSION,
         history_max_chars,
@@ -1255,6 +1263,192 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plain_encrypted_reasoning_rebuilds_old_projection_and_preserves_canonical_tail() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let model = crate::ai::model_names::all()
+            .iter()
+            .find(|entry| entry.reasoning_encrypted_replay)
+            .expect("registry must contain an encrypted replay model")
+            .key
+            .clone();
+        let dir =
+            std::env::temp_dir().join(format!("plain-replay-context-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let history_file = dir.join("history.sqlite");
+        let plain_answer = |id: &str, empty_calls: bool| Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("same final answer"),
+            tool_calls: empty_calls.then(Vec::new),
+            tool_call_id: None,
+            reasoning_content: Some(compress::encode_encrypted_reasoning_replay_state(
+                &model,
+                None,
+                &[
+                    serde_json::json!({"type":"reasoning", "id":id, "encrypted_content":"x".repeat(4_000)}),
+                ],
+            )),
+        };
+        let user = |text: &str| Message {
+            role: "user".to_string(),
+            content: serde_json::json!(text),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let original = vec![
+            user("first question"),
+            plain_answer("rs_context_first", false),
+        ];
+        append_history_messages_for_model(&history_file, &original, &model).unwrap();
+        let old_fingerprint = projection_cache_key(30, 100_000, 8, 2_000, None);
+        let context = sqlite::read_context_history_sqlite(&history_file, &old_fingerprint).unwrap();
+        let mut old_projection = original.clone();
+        old_projection[1].reasoning_content = None;
+        assert!(
+            sqlite::write_context_snapshot_sqlite(
+                &history_file,
+                &old_projection,
+                context.source_message_id,
+                context.canonical_generation,
+                &old_fingerprint
+            )
+            .unwrap()
+        );
+        let rebuilt = build_context_history_with_outcome(
+            usize::MAX,
+            &history_file,
+            100_000,
+            8,
+            2_000,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            rebuilt.messages, original,
+            "the new fingerprint must rebuild a v30 projection that dropped the marker"
+        );
+        let fingerprint = context_projection_fingerprint(100_000, 8, 2_000, None);
+        let current = sqlite::read_context_history_sqlite(&history_file, &fingerprint).unwrap();
+        assert!(
+            sqlite::write_context_snapshot_sqlite(
+                &history_file,
+                &rebuilt.messages,
+                current.source_message_id,
+                current.canonical_generation,
+                &fingerprint
+            )
+            .unwrap()
+        );
+
+        let tail = vec![
+            user("second question"),
+            plain_answer("rs_context_tail", true),
+        ];
+        append_history_messages_for_model(&history_file, &tail, &model).unwrap();
+        let expected = [original, tail].concat();
+        let reloaded = sqlite::read_context_history_sqlite(&history_file, &fingerprint).unwrap();
+        assert_eq!(
+            reloaded.messages, expected,
+            "canonical tail sanitization must preserve empty-call markers"
+        );
+        assert_eq!(
+            build_message_arr(usize::MAX, &history_file).unwrap(),
+            expected,
+            "projection rebuild must leave canonical marker bytes unchanged"
+        );
+        invalidate_context_history_cache_for(&history_file);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn context_history_disabled_compression_keeps_all_messages_for_zero_count() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("context-disabled-zero-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let messages: Vec<Message> = [
+            ("user", "first question"),
+            ("assistant", "first answer"),
+            ("user", "second question"),
+            ("assistant", "second answer"),
+        ]
+        .into_iter()
+        .map(|(role, content)| Message {
+            role: role.into(),
+            content: serde_json::json!(content),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        })
+        .collect();
+
+        for extension in ["txt", "sqlite"] {
+            let history_file = dir.join(format!("history.{extension}"));
+            append_history_messages(&history_file, &messages).unwrap();
+            if extension == "sqlite" {
+                // Reproduce the persisted empty projection produced by v29.
+                let old_fingerprint = projection_cache_key(29, 0, 1, 2_000, None);
+                let context =
+                    sqlite::read_context_history_sqlite(&history_file, &old_fingerprint).unwrap();
+                assert!(
+                    sqlite::write_context_snapshot_sqlite(
+                        &history_file,
+                        &[],
+                        context.source_message_id,
+                        context.canonical_generation,
+                        &old_fingerprint,
+                    )
+                    .unwrap()
+                );
+                assert!(
+                    sqlite::read_context_history_sqlite(&history_file, &old_fingerprint)
+                        .unwrap()
+                        .messages
+                        .is_empty()
+                );
+            }
+
+            for (history_count, expected) in [
+                (0, messages.as_slice()),
+                (1, &messages[3..]),
+                (2, &messages[2..]),
+                (messages.len(), messages.as_slice()),
+                (messages.len() + 1, messages.as_slice()),
+                (usize::MAX, messages.as_slice()),
+            ] {
+                let outcome = build_context_history_with_outcome(
+                    history_count,
+                    &history_file,
+                    0,
+                    1,
+                    2_000,
+                    None,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(outcome.status, ContextCompressionStatus::Disabled);
+                assert_eq!(outcome.messages, expected);
+            }
+
+            let cached =
+                build_context_history_with_outcome(0, &history_file, 0, 1, 2_000, None, None)
+                    .unwrap();
+            assert_eq!(cached.status, ContextCompressionStatus::Disabled);
+            assert_eq!(cached.messages, messages);
+            assert_eq!(
+                build_message_arr(usize::MAX, &history_file).unwrap(),
+                messages,
+                "disabled compression must not mutate canonical history"
+            );
+            invalidate_context_history_cache_for(&history_file);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn context_history_cache_skips_unknown_sqlite_revision() {
         let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
         let history_file = std::env::temp_dir()
@@ -1415,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_cache_key_is_versioned_and_v24_never_reuses_older_snapshots() {
+    fn projection_cache_key_is_versioned_and_v32_never_reuses_older_snapshots() {
         let params = (
             8_000usize,
             2usize,
@@ -1429,6 +1623,9 @@ mod tests {
         let v21_key = projection_cache_key(21, params.0, params.1, params.2, params.3);
         let v22_key = projection_cache_key(22, params.0, params.1, params.2, params.3);
         let v23_key = projection_cache_key(23, params.0, params.1, params.2, params.3);
+        let v24_key = projection_cache_key(24, params.0, params.1, params.2, params.3);
+        let v29_key = projection_cache_key(29, params.0, params.1, params.2, params.3);
+        let v31_key = projection_cache_key(31, params.0, params.1, params.2, params.3);
         assert_ne!(
             v17_key, v18_key,
             "identical projection parameters must not collide across projection versions"
@@ -1436,14 +1633,14 @@ mod tests {
         assert!(v17_key.starts_with("v17|"));
         assert!(v18_key.starts_with("v18|"));
         assert!(v19_key.starts_with("v19|"));
-        // The live fingerprint must carry v24 so old tool-argument previews
-        // are rebuilt from canonical history.
-        // Updating the v24 literal is a deliberate tripwire for the
+        // The live fingerprint must carry v32 so callable argument pointers
+        // are rebuilt from canonical history as successful write evidence notes.
+        // Updating the v32 literal is a deliberate tripwire for the
         // next projection-strategy change.
         let live = context_projection_fingerprint(params.0, params.1, params.2, params.3);
         assert_eq!(
             live,
-            projection_cache_key(24, params.0, params.1, params.2, params.3)
+            projection_cache_key(32, params.0, params.1, params.2, params.3)
         );
         assert_ne!(live, v17_key);
         assert_ne!(live, v18_key);
@@ -1452,6 +1649,9 @@ mod tests {
         assert_ne!(live, v21_key);
         assert_ne!(live, v22_key);
         assert_ne!(live, v23_key);
+        assert_ne!(live, v24_key);
+        assert_ne!(live, v29_key);
+        assert_ne!(live, v31_key);
     }
 
     #[test]

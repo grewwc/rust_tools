@@ -799,9 +799,9 @@ fn sanitize_owned_message_for_persisted_history(
 
     // The persisted history keeps only the assistant facts truly needed across
     // turns:
-    // - `reasoning_content` is hidden reasoning; the persistence layer always
-    //   drops it and never copies it into visible body text. When the provider
-    //   needs the field shape, the request layer fills in an empty string.
+    // - Unmarked `reasoning_content` is hidden reasoning and is never copied
+    //   into visible body text. Marked continuation state stays intact; when
+    //   the provider only needs the field shape, requests fill an empty string.
     // - Assistant narration carrying tool_calls must not be emptied: otherwise
     //   the checkpoint of [`tool_groups::fold_tool_call_group_to_stub`] sees no
     //   text at all and collapses into
@@ -841,7 +841,11 @@ fn sanitize_owned_message_for_persisted_history(
                 sanitized.reasoning_content = None;
             }
         }
-    } else {
+    } else if !sanitized
+        .reasoning_content
+        .as_deref()
+        .is_some_and(|reasoning| reasoning.starts_with(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX))
+    {
         sanitized.reasoning_content = None;
     }
     sanitized
@@ -853,8 +857,8 @@ pub(in crate::ai) fn sanitize_message_for_persisted_history(message: &Message) -
 
 /// Build the persisted projection according to the model protocol. Only models
 /// that explicitly declare they need verbatim replay keep hidden reasoning for
-/// tool-call assistant messages; final answers and other messages are still
-/// always dropped.
+/// tool-call assistant messages. Encrypted continuation markers also survive
+/// on plain final answers; unmarked final-answer reasoning is dropped.
 pub(in crate::ai) fn sanitize_message_for_persisted_history_for_model(
     model: &str,
     message: &Message,
@@ -1007,6 +1011,54 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn plain_encrypted_reasoning_marker_survives_persist_sanitize() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let model = crate::ai::model_names::all()
+            .iter()
+            .find(|entry| entry.reasoning_encrypted_replay)
+            .expect("registry must contain an encrypted replay model")
+            .key
+            .clone();
+        let marker = encode_encrypted_reasoning_replay_state(
+            &model,
+            None,
+            &[
+                serde_json::json!({"type":"reasoning", "id":"rs_plain", "encrypted_content":"x".repeat(4_000)}),
+            ],
+        );
+        for calls in [None, Some(vec![])] {
+            for reasoning in [
+                marker.clone(),
+                "unmarked plaintext".to_string(),
+                encode_reasoning_replay_state(&model, "exact plain"),
+            ] {
+                let mut assistant = message("assistant", "full final answer");
+                assistant.tool_calls = calls.clone();
+                assistant.reasoning_content = Some(reasoning.clone());
+                let expected = (reasoning == marker).then_some(marker.as_str());
+                let sanitized = sanitize_message_for_persisted_history(&assistant);
+                assert_eq!(sanitized.reasoning_content.as_deref(), expected);
+                assert_eq!(sanitized.content, assistant.content);
+                assert_eq!(sanitized.tool_calls, calls);
+                assert_eq!(
+                    sanitize_message_for_persisted_history_for_model(&model, &assistant),
+                    sanitized
+                );
+                assert_eq!(
+                    sanitize_persisted_history_messages(vec![assistant]),
+                    vec![sanitized.clone()]
+                );
+                assert_eq!(
+                    sanitize_message_for_persisted_history(&sanitized),
+                    sanitized
+                );
+            }
         }
     }
 

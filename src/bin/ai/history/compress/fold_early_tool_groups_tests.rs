@@ -32,6 +32,69 @@ fn msg(role: &str, content: &str) -> Message {
     }
 }
 
+#[test]
+fn plain_encrypted_reasoning_markers_survive_dedup_and_truncate() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let model = crate::ai::model_names::all()
+        .iter()
+        .find(|entry| entry.reasoning_encrypted_replay)
+        .expect("registry must contain an encrypted replay model")
+        .key
+        .clone();
+    let mut messages = vec![msg("user", "question")];
+    let mut markers = Vec::new();
+    for index in 0..5 {
+        let mut assistant = msg("assistant", "same answer");
+        assistant.tool_calls = (index % 2 == 1).then(Vec::new);
+        let marker = encode_encrypted_reasoning_replay_state(
+            &model,
+            None,
+            &[
+                serde_json::json!({"type":"reasoning", "id":format!("rs_plain_compress_{index}"), "encrypted_content":"x".repeat(4_000)}),
+            ],
+        );
+        assistant.reasoning_content = Some(marker.clone());
+        markers.push(marker);
+        messages.push(assistant);
+    }
+    keep_only_recent_reasoning_content(&mut messages);
+    dedup_adjacent(&mut messages);
+    assert_eq!(messages.len(), 6);
+    assert!(emergency_cap_messages_to_fit(
+        &mut messages,
+        usize::MAX,
+        160,
+        None,
+        &FxHashSet::default()
+    ));
+    for (message, marker) in messages[1..].iter_mut().zip(&markers) {
+        assert_eq!(message.reasoning_content.as_deref(), Some(marker.as_str()));
+        assert!(!truncate_mutable_field(
+            message,
+            MutableMessageField::Reasoning,
+            marker.len(),
+            None,
+            FieldArchivePolicy::BestEffort
+        ));
+        assert_eq!(message.reasoning_content.as_deref(), Some(marker.as_str()));
+    }
+    // A marker larger than the whole budget must remain intact even when the
+    // compression attempt cannot fit it.
+    assert!(!emergency_cap_messages_to_fit(
+        &mut messages,
+        160,
+        usize::MAX,
+        None,
+        &FxHashSet::default()
+    ));
+    for (message, marker) in messages[1..].iter().zip(&markers) {
+        assert_eq!(message.reasoning_content.as_deref(), Some(marker.as_str()));
+        assert!(decode_encrypted_reasoning_replay_for_model(&model, None, marker).is_some());
+    }
+}
+
 fn large_fold_result(content: &str) -> String {
     format!("{content}\n{}", "fold fixture padding\n".repeat(400))
 }

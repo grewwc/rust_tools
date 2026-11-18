@@ -7,12 +7,14 @@
 //! - prompt-cache breakpoint injection (`cache_control`)
 //! - `reasoning_effort` tier resolution
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use rustc_hash::FxHashMap;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use super::super::{
     history::{Message, is_code_inspection_memory_text, is_system_like_role},
@@ -24,7 +26,7 @@ use super::super::{
     types::{App, ReasoningItemMap},
 };
 use super::types::extract_displayable_text;
-use crate::commonw::{FastSet, configw};
+use crate::commonw::{FastMap, FastSet, configw};
 
 /// Resolve the thinking/reasoning field shapes for each provider adapter.
 ///
@@ -313,6 +315,62 @@ fn decode_encrypted_reasoning_cached(
     }
 }
 
+/// Message positions are local to a request; owners remain stable across
+/// projection compression and are also the durable rejection-ledger keys.
+pub(super) type ReasoningReplayOwners = FastMap<usize, String>;
+
+fn reasoning_replay_owner_from_message(message: &Message) -> Option<Cow<'_, str>> {
+    if message.role != "assistant" {
+        return None;
+    }
+    if let Some(call) = message.tool_calls.as_ref().and_then(|calls| calls.first()) {
+        return Some(Cow::Borrowed(&call.id));
+    }
+    let marker = message.reasoning_content.as_deref()?;
+    if !marker
+        .starts_with(crate::ai::history::compress::PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX)
+    {
+        return None;
+    }
+    // Hash the complete marker, including model, endpoint and every item, so
+    // identical answer text in different turns never shares another payload.
+    let digest = Sha256::digest(marker.as_bytes());
+    let prefix = "plain:";
+    let mut owner = String::with_capacity(prefix.len() + digest.len() * 2);
+    owner.push_str(prefix);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(owner, "{byte:02x}");
+    }
+    Some(Cow::Owned(owner))
+}
+
+pub(super) fn reasoning_replay_owners_for_messages(messages: &[Message]) -> ReasoningReplayOwners {
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(position, message)| {
+            reasoning_replay_owner_from_message(message).map(|owner| (position, owner.into_owned()))
+        })
+        .collect()
+}
+
+/// Resolve replay ownership consistently for serialization and token counting.
+/// Normalized main requests supply the map captured before markers were cleared;
+/// direct builders may derive ownership from their intact messages instead.
+pub(super) fn reasoning_replay_owner<'a>(
+    message: &'a Message,
+    position: usize,
+    owners: Option<&'a ReasoningReplayOwners>,
+) -> Option<Cow<'a, str>> {
+    match owners {
+        Some(owners) => owners
+            .get(&position)
+            .map(|owner| Cow::Borrowed(owner.as_str())),
+        None => reasoning_replay_owner_from_message(message),
+    }
+}
+
 /// Test convenience over
 /// [`reconstruct_encrypted_reasoning_items_for_model_recorded`] that discards
 /// the recorded replay owners.
@@ -359,11 +417,12 @@ impl ReplayTier {
 }
 
 /// Replay owners one attempt splices into the wire body, in message order,
-/// each tagged with the tier that supplied its items. Owners are the first
-/// tool_call id of each assistant tool-call group with items in the merged
-/// map, matching the lookup `responses_input` performs when splicing.
+/// each tagged with the tier that supplied its items. The position map is
+/// captured before normalization clears persisted reasoning markers, and is
+/// shared by wire splicing and prompt counting for this projection.
 #[derive(Debug, Default)]
 pub(super) struct SplicedReplayKeys {
+    message_owners: ReasoningReplayOwners,
     owners: Vec<(String, ReplayTier)>,
     /// Owners the repair removed from this request's replay map but has not
     /// recorded in the rejected-replay ledger yet; only an accepted resend
@@ -372,8 +431,12 @@ pub(super) struct SplicedReplayKeys {
 }
 
 impl SplicedReplayKeys {
-    fn push(&mut self, first_call_id: String, tier: ReplayTier) {
-        self.owners.push((first_call_id, tier));
+    pub(super) fn message_owners(&self) -> &ReasoningReplayOwners {
+        &self.message_owners
+    }
+
+    fn push(&mut self, owner: String, tier: ReplayTier) {
+        self.owners.push((owner, tier));
     }
 
     /// Every spliced owner in message order.
@@ -406,7 +469,7 @@ impl SplicedReplayKeys {
 }
 
 /// Rebuilds the side-channel map for Responses encrypted-reasoning replay from
-/// persisted messages (key = first tool_call id).
+/// persisted messages (key = first tool call id or full plain-turn marker digest).
 ///
 /// Background: an encrypted-replay model's encrypted reasoning lives in the
 /// in-memory `turn_reasoning_items` during the turn that produced it, but that
@@ -415,8 +478,8 @@ impl SplicedReplayKeys {
 /// persisted in `reasoning_content`. This function scans the current request
 /// projection (already pruned naturally by compression, so it only replays
 /// "recent non-folded turns", matching exact-replay's replay scope) and decodes
-/// each marked assistant tool-call turn whose source model matches the current
-/// model back into items, attaching them to its first tool_call id.
+/// each marked assistant turn whose source model matches the current model
+/// back into items, attaching them to its stable replay owner.
 ///
 /// Only fills keys missing from `live`: the in-memory side channel (freshest
 /// capture of the current turn) wins; persisted decoding only fills historical
@@ -447,6 +510,7 @@ pub(super) fn reconstruct_encrypted_reasoning_items_for_model_recorded(
     live: &ReasoningItemMap,
     spliced: &mut SplicedReplayKeys,
 ) -> ReasoningItemMap {
+    spliced.message_owners = reasoning_replay_owners_for_messages(messages);
     let mut merged = live.clone();
     let decode_persisted = models::reasoning_encrypted_replay_enabled(model)
         && crate::ai::history::compress::encrypted_reasoning_replay_runtime_enabled();
@@ -458,32 +522,26 @@ pub(super) fn reconstruct_encrypted_reasoning_items_for_model_recorded(
     // the endpoint identity that rejected them.
     let endpoint_identity = models::endpoint_resource_identity(endpoint);
     load_rejected_replay_keys(session_id, history_path);
-    for message in messages {
-        if message.role != "assistant" {
-            continue;
-        }
-        let Some(first_call_id) = message
-            .tool_calls
-            .as_ref()
-            .and_then(|calls| calls.first())
-            .map(|call| call.id.clone())
-        else {
+    for (position, message) in messages.iter().enumerate() {
+        let Some(owner) = spliced.message_owners.get(&position).cloned() else {
             continue;
         };
         if encrypted_reasoning_replay_key_rejected(
             session_id,
             endpoint_identity.as_deref(),
             model,
-            &first_call_id,
+            &owner,
         ) {
-            merged.remove(&first_call_id);
+            merged.remove(&owner);
             continue;
         }
-        if live.contains_key(&first_call_id) {
-            spliced.push(first_call_id, ReplayTier::Live);
+        if let Some(items) = live.get(&owner) {
+            if !items.is_empty() {
+                spliced.push(owner, ReplayTier::Live);
+            }
             continue;
         }
-        if !decode_persisted || merged.contains_key(&first_call_id) {
+        if !decode_persisted || merged.contains_key(&owner) {
             continue;
         }
         let Some(encoded) = message.reasoning_content.as_deref() else {
@@ -492,8 +550,8 @@ pub(super) fn reconstruct_encrypted_reasoning_items_for_model_recorded(
         if let Some(items) =
             decode_encrypted_reasoning_cached(model, endpoint_identity.as_deref(), encoded)
         {
-            merged.insert(first_call_id.clone(), items);
-            spliced.push(first_call_id, ReplayTier::Persisted);
+            merged.insert(owner.clone(), items);
+            spliced.push(owner, ReplayTier::Persisted);
         }
     }
     merged
@@ -550,7 +608,7 @@ pub(super) fn commit_dropped_replay_tiers(
     let recorded = spliced
         .dropped
         .iter()
-        .map(|first_call_id| rejected_replay_entry(&endpoint_identity, model, first_call_id))
+        .map(|owner| rejected_replay_entry(&endpoint_identity, model, owner))
         .collect::<Vec<_>>();
     reject_encrypted_reasoning_replay_keys(session_id, &endpoint_identity, model, &spliced.dropped);
     let mut entries =
@@ -579,10 +637,10 @@ pub(super) fn commit_dropped_replay_tiers(
 /// rejection persists — and a dropped tier may include owners that were
 /// themselves replayable. Canonical history is truth and is never rewritten
 /// for this, so the marker stays on disk. Instead this ledger remembers each
-/// owner (the first tool_call id of its assistant message) of the tiers whose
+/// owner (a first tool call id or plain-turn marker digest) of the tiers whose
 /// drop let a resend through, for the session + endpoint identity + model, and
 /// reconstruction skips it, live or persisted, in every later attempt. Items
-/// captured after the repair carry new tool_call ids and stay replayable, so a
+/// captured after the repair carry new call ids or markers and stay replayable, so a
 /// resource change costs at most two extra rejected round-trips per endpoint
 /// instead of one per turn.
 ///
@@ -653,11 +711,11 @@ fn rejected_replay_format_discriminator() -> &'static str {
 
 /// Durable ledger entry shape: the replay-marker format that produced the
 /// stored payload, the endpoint identity that rejected the owner, the model,
-/// and the owner's first tool_call id. The session is the enclosing history
+/// and the replay owner. The session is the enclosing history
 /// database file.
-fn rejected_replay_entry(endpoint_identity: &str, model: &str, first_call_id: &str) -> String {
+fn rejected_replay_entry(endpoint_identity: &str, model: &str, owner: &str) -> String {
     format!(
-        "{}\u{1f}{endpoint_identity}\u{1f}{model}\u{1f}{first_call_id}",
+        "{}\u{1f}{endpoint_identity}\u{1f}{model}\u{1f}{owner}",
         rejected_replay_format_discriminator()
     )
 }
@@ -666,11 +724,11 @@ fn rejected_replay_key(
     session_id: &str,
     endpoint_identity: &str,
     model: &str,
-    first_call_id: &str,
+    owner: &str,
 ) -> String {
     format!(
         "{session_id}\u{1f}{}",
-        rejected_replay_entry(endpoint_identity, model, first_call_id)
+        rejected_replay_entry(endpoint_identity, model, owner)
     )
 }
 
@@ -716,7 +774,7 @@ fn encrypted_reasoning_replay_key_rejected(
     session_id: &str,
     endpoint_identity: Option<&str>,
     model: &str,
-    first_call_id: &str,
+    owner: &str,
 ) -> bool {
     // Without an identity there is nothing to scope suppression to; replay
     // stays enabled, matching the marker decode rule.
@@ -730,7 +788,7 @@ fn encrypted_reasoning_replay_key_rejected(
                 session_id,
                 endpoint_identity,
                 model,
-                first_call_id,
+                owner,
             ))
         })
         .unwrap_or(false)
@@ -745,17 +803,17 @@ pub(super) fn reject_encrypted_reasoning_replay_keys(
     session_id: &str,
     endpoint_identity: &str,
     model: &str,
-    first_call_ids: &[String],
+    owners: &[String],
 ) {
     let Ok(mut ledger) = REJECTED_REPLAY_KEYS.lock() else {
         return;
     };
-    for first_call_id in first_call_ids {
+    for owner in owners {
         ledger.insert(rejected_replay_key(
             session_id,
             endpoint_identity,
             model,
-            first_call_id,
+            owner,
         ));
     }
 }
@@ -1154,6 +1212,320 @@ mod encrypted_replay_reconstruct_tests {
         }
     }
 
+    fn plain_answer_with_reasoning(reasoning: String, empty_calls: bool) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: json!("same final answer"),
+            tool_calls: empty_calls.then(Vec::new),
+            tool_call_id: None,
+            reasoning_content: Some(reasoning),
+        }
+    }
+
+    #[test]
+    fn rebuilds_plain_and_tool_reasoning_with_distinct_stable_owners() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let model = first_encrypted_replay_model_key();
+        let first =
+            vec![json!({"type":"reasoning", "id":"rs_plain_first", "encrypted_content":"FIRST"})];
+        let second =
+            vec![json!({"type":"reasoning", "id":"rs_plain_second", "encrypted_content":"SECOND"})];
+        let stale =
+            vec![json!({"type":"reasoning", "id":"rs_tool_stale", "encrypted_content":"STALE"})];
+        let fresh = Arc::new(vec![
+            json!({"type":"reasoning", "id":"rs_tool_fresh", "encrypted_content":"FRESH"}),
+        ]);
+        let messages = vec![
+            plain_answer_with_reasoning(
+                encode_encrypted_reasoning_replay_state(&model, None, &first),
+                false,
+            ),
+            plain_answer_with_reasoning(
+                encode_encrypted_reasoning_replay_state(&model, None, &second),
+                true,
+            ),
+            assistant_call_with_reasoning(
+                "call-mixed-live",
+                Some(encode_encrypted_reasoning_replay_state(
+                    &model, None, &stale,
+                )),
+            ),
+        ];
+        let live = ReasoningItemMap::from_iter([("call-mixed-live".to_string(), fresh.clone())]);
+        let mut spliced = SplicedReplayKeys::default();
+        let rebuilt = reconstruct_encrypted_reasoning_items_for_model_recorded(
+            &model,
+            TEST_ENDPOINT,
+            "plain-mixed-replay",
+            Path::new(""),
+            &messages,
+            &live,
+            &mut spliced,
+        );
+        let first_owner = &spliced.message_owners()[&0];
+        let second_owner = &spliced.message_owners()[&1];
+        assert_ne!(
+            first_owner, second_owner,
+            "identical text must not share reasoning owners"
+        );
+        assert_eq!(rebuilt.get(first_owner).map(Arc::as_ref), Some(&first));
+        assert_eq!(rebuilt.get(second_owner).map(Arc::as_ref), Some(&second));
+        assert!(Arc::ptr_eq(rebuilt.get("call-mixed-live").unwrap(), &fresh));
+        assert_eq!(
+            spliced.tier(ReplayTier::Persisted),
+            vec![first_owner.clone(), second_owner.clone()]
+        );
+        assert_eq!(
+            spliced.tier(ReplayTier::Live),
+            vec!["call-mixed-live".to_string()]
+        );
+
+        let shifted = vec![
+            messages[1].clone(),
+            messages[0].clone(),
+            messages[2].clone(),
+        ];
+        let mut historical = SplicedReplayKeys::default();
+        let rebuilt = reconstruct_encrypted_reasoning_items_for_model_recorded(
+            &model,
+            TEST_ENDPOINT,
+            "plain-mixed-replay",
+            Path::new(""),
+            &shifted,
+            &ReasoningItemMap::default(),
+            &mut historical,
+        );
+        assert_eq!(historical.message_owners()[&0], *second_owner);
+        assert_eq!(historical.message_owners()[&1], *first_owner);
+        assert_eq!(rebuilt.get(first_owner).map(Arc::as_ref), Some(&first));
+        assert_eq!(rebuilt.get(second_owner).map(Arc::as_ref), Some(&second));
+        assert_eq!(
+            rebuilt.get("call-mixed-live").map(Arc::as_ref),
+            Some(&stale)
+        );
+        assert!(historical.tier(ReplayTier::Live).is_empty());
+    }
+
+    #[test]
+    fn plain_replay_filters_model_and_endpoint_mismatches_without_changing_history() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let model = first_encrypted_replay_model_key();
+        let other = crate::ai::model_names::all()
+            .iter()
+            .find(|entry| entry.key != model)
+            .expect("registry must contain a second model")
+            .key
+            .clone();
+        let other_endpoint = "https://other-reasoning-replay.test/v1";
+        let other_identity = crate::ai::models::endpoint_resource_identity(other_endpoint).unwrap();
+        let identity = test_endpoint_identity();
+        let items =
+            vec![json!({"type":"reasoning", "id":"rs_plain_scope", "encrypted_content":"SCOPED"})];
+        let messages = vec![
+            plain_answer_with_reasoning(
+                encode_encrypted_reasoning_replay_state(&model, Some(&identity), &items),
+                false,
+            ),
+            plain_answer_with_reasoning(
+                encode_encrypted_reasoning_replay_state(&other, None, &items),
+                true,
+            ),
+            plain_answer_with_reasoning(
+                encode_encrypted_reasoning_replay_state(&model, Some(&other_identity), &items),
+                true,
+            ),
+            plain_answer_with_reasoning(
+                encode_encrypted_reasoning_replay_state(&model, None, &items),
+                false,
+            ),
+        ];
+        let original = messages.clone();
+        let owners = super::reasoning_replay_owners_for_messages(&messages);
+        let rebuild = |endpoint| {
+            reconstruct_encrypted_reasoning_items_for_model(
+                &model,
+                endpoint,
+                "plain-scoped-replay",
+                &messages,
+                &ReasoningItemMap::default(),
+            )
+        };
+        let current = rebuild(TEST_ENDPOINT);
+        assert_eq!(current.len(), 2);
+        assert!(current.contains_key(&owners[&0]));
+        assert!(!current.contains_key(&owners[&1]));
+        assert!(!current.contains_key(&owners[&2]));
+        assert!(
+            current.contains_key(&owners[&3]),
+            "legacy markers retain model-only replay"
+        );
+        let rerouted = rebuild(other_endpoint);
+        assert!(!rerouted.contains_key(&owners[&0]));
+        assert!(rerouted.contains_key(&owners[&2]));
+        assert!(rerouted.contains_key(&owners[&3]));
+        assert!(rebuild(TEST_ENDPOINT).contains_key(&owners[&0]));
+        assert_eq!(
+            messages, original,
+            "mismatch filtering must not rewrite canonical markers"
+        );
+    }
+
+    #[test]
+    fn plain_replay_rejection_survives_durable_reload_and_projection_position_changes() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let model = first_encrypted_replay_model_key();
+        let session = format!("plain-replay-ledger-{}", uuid::Uuid::new_v4());
+        let history_path = std::env::temp_dir().join(format!("{session}.sqlite"));
+        let rejected = plain_answer_with_reasoning(
+            encode_encrypted_reasoning_replay_state(
+                &model,
+                None,
+                &[
+                    json!({"type":"reasoning", "id":"rs_plain_rejected", "encrypted_content":"REJECTED"}),
+                ],
+            ),
+            false,
+        );
+        let fresh_plain = plain_answer_with_reasoning(
+            encode_encrypted_reasoning_replay_state(
+                &model,
+                None,
+                &[json!({"type":"reasoning", "id":"rs_plain_new", "encrypted_content":"NEW"})],
+            ),
+            true,
+        );
+        let prefix = Message {
+            role: "user".to_string(),
+            content: json!("question"),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let live_message = assistant_call_with_reasoning("call-plain-ledger-live", None);
+        let messages = vec![prefix, rejected.clone(), live_message.clone()];
+        crate::ai::history::append_history_messages(&history_path, &messages).unwrap();
+        let live = ReasoningItemMap::from_iter([(
+            "call-plain-ledger-live".to_string(),
+            Arc::new(vec![
+                json!({"type":"reasoning", "id":"rs_plain_ledger_live", "encrypted_content":"LIVE"}),
+            ]),
+        )]);
+        let mut spliced = SplicedReplayKeys::default();
+        let mut rebuilt = reconstruct_encrypted_reasoning_items_for_model_recorded(
+            &model,
+            TEST_ENDPOINT,
+            &session,
+            &history_path,
+            &messages,
+            &live,
+            &mut spliced,
+        );
+        let rejected_owner = spliced.message_owners()[&1].clone();
+        assert_eq!(
+            drop_next_rejected_replay_tier(&mut rebuilt, &mut spliced),
+            Some((ReplayTier::Persisted, 1))
+        );
+        assert!(!rebuilt.contains_key(&rejected_owner));
+        assert!(rebuilt.contains_key("call-plain-ledger-live"));
+        assert_eq!(spliced.message_owners()[&1], rejected_owner);
+        assert!(
+            reconstruct_encrypted_reasoning_items_for_model(
+                &model,
+                TEST_ENDPOINT,
+                &session,
+                &messages,
+                &live,
+            )
+            .contains_key(&rejected_owner),
+            "dropping a tier only stages its rejection"
+        );
+        commit_dropped_replay_tiers(&session, &model, TEST_ENDPOINT, &history_path, &spliced);
+
+        let shifted = vec![rejected, fresh_plain, live_message];
+        let reader_session = format!("{session}-fresh-reader");
+        let mut reader_spliced = SplicedReplayKeys::default();
+        let replayed = reconstruct_encrypted_reasoning_items_for_model_recorded(
+            &model,
+            TEST_ENDPOINT,
+            &reader_session,
+            &history_path,
+            &shifted,
+            &live,
+            &mut reader_spliced,
+        );
+        assert_eq!(reader_spliced.message_owners()[&0], rejected_owner);
+        assert!(
+            !replayed.contains_key(&rejected_owner),
+            "durable suppression follows the marker, not position"
+        );
+        let new_owner = &reader_spliced.message_owners()[&1];
+        assert_ne!(*new_owner, rejected_owner);
+        assert!(
+            replayed.contains_key(new_owner),
+            "new reasoning at the old position remains replayable"
+        );
+        assert!(replayed.contains_key("call-plain-ledger-live"));
+        let other_endpoint = "https://plain-replay-accepted.test/v1";
+        assert!(
+            reconstruct_encrypted_reasoning_items_for_model(
+                &model,
+                other_endpoint,
+                &reader_session,
+                &shifted,
+                &live,
+            )
+            .contains_key(&rejected_owner),
+            "rejection is scoped to the serving endpoint"
+        );
+        assert_eq!(
+            crate::ai::history::build_message_arr(usize::MAX, &history_path).unwrap(),
+            messages
+        );
+        let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn replay_repair_ignores_empty_live_reasoning_items() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let model = first_encrypted_replay_model_key();
+        let messages = vec![
+            plain_answer_with_reasoning(
+                encode_encrypted_reasoning_replay_state(
+                    &model,
+                    None,
+                    &[
+                        json!({"type":"reasoning", "id":"rs_plain_empty", "encrypted_content":"PERSISTED"}),
+                    ],
+                ),
+                false,
+            ),
+            assistant_call_with_reasoning("call-empty-live", None),
+        ];
+        let owners = super::reasoning_replay_owners_for_messages(&messages);
+        let live = ReasoningItemMap::from_iter([
+            (owners[&0].clone(), Arc::new(Vec::new())),
+            ("call-empty-live".to_string(), Arc::new(Vec::new())),
+        ]);
+        let mut spliced = SplicedReplayKeys::default();
+        let mut rebuilt = reconstruct_encrypted_reasoning_items_for_model_recorded(
+            &model,
+            TEST_ENDPOINT,
+            "empty-live-replay",
+            Path::new(""),
+            &messages,
+            &live,
+            &mut spliced,
+        );
+        assert!(
+            spliced.all().is_empty(),
+            "only items that reach the wire own a replay tier"
+        );
+        assert_eq!(
+            drop_next_rejected_replay_tier(&mut rebuilt, &mut spliced),
+            None
+        );
+    }
+
     #[test]
     fn rebuilds_items_from_encoded_history_for_encrypted_model() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1253,12 +1625,19 @@ mod encrypted_replay_reconstruct_tests {
         assert!(!encrypted_reasoning_replay_runtime_enabled());
         let model = first_encrypted_replay_model_key();
         let items = vec![json!({"encrypted_content":"ENC"})];
-        let messages = vec![assistant_call_with_reasoning(
-            "call-1",
-            Some(encode_encrypted_reasoning_replay_state(
-                &model, None, &items,
-            )),
-        )];
+        let marker = encode_encrypted_reasoning_replay_state(&model, None, &items);
+        let messages = vec![
+            assistant_call_with_reasoning("call-1", Some(marker.clone())),
+            plain_answer_with_reasoning(marker.clone(), false),
+            plain_answer_with_reasoning(
+                encode_encrypted_reasoning_replay_state(
+                    &model,
+                    None,
+                    &[json!({"id":"rs_empty_calls", "encrypted_content":"EMPTY_CALLS"})],
+                ),
+                true,
+            ),
+        ];
         // With replay disabled, no rebuild happens even if the model is capable
         // and history carries an encoded blob.
         assert!(
@@ -1274,6 +1653,17 @@ mod encrypted_replay_reconstruct_tests {
 
         unsafe { std::env::set_var("AIOS_DISABLE_ENCRYPTED_REPLAY", "0") };
         assert!(encrypted_reasoning_replay_runtime_enabled());
+        assert_eq!(
+            reconstruct_encrypted_reasoning_items_for_model(
+                &model,
+                TEST_ENDPOINT,
+                TEST_SESSION,
+                &messages,
+                &ReasoningItemMap::default(),
+            )
+            .len(),
+            3
+        );
 
         unsafe { std::env::remove_var("AIOS_DISABLE_ENCRYPTED_REPLAY") };
         assert!(encrypted_reasoning_replay_runtime_enabled());

@@ -7,8 +7,8 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const fixtureFile = path.join(__dirname, "app_mark.test.cjs");
-const { harness, response, deferred, settle, sessions, longSessions, script } = new vm.Script(
-  fs.readFileSync(fixtureFile, "utf8") + "\n;({ harness, response, deferred, settle, sessions, longSessions, script });",
+const { harness, response, deferred, settle, sessions, longSessions, script, html } = new vm.Script(
+  fs.readFileSync(fixtureFile, "utf8") + "\n;({ harness, response, deferred, settle, sessions, longSessions, script, html });",
   { filename: fixtureFile },
 ).runInNewContext({
   require: (name) => name === "node:test" ? { test() {} } : require(name),
@@ -31,6 +31,115 @@ async function search(h, value) {
 function page(items, total = items.length, size = items.length) {
   return response(items, 200, { "x-sessions-total": String(total), "x-sessions-page-size": String(size) });
 }
+function shortcut(h, target, extra = {}) {
+  const event = { target, key: "f", shiftKey: true, ctrlKey: true, ...extra,
+    prevented: false, stopped: false,
+    preventDefault() { this.prevented = true; }, stopPropagation() { this.stopped = true; } };
+  for (const listener of h.documentListeners.get("keydown") || []) listener(event);
+  return event;
+}
+
+for (const modifier of ["ctrlKey", "metaKey"]) for (const key of ["f", "F"]) {
+  test("session search shortcut opens from the composer and closes from the search input (" + modifier + ", " + key + ")", () => {
+    const h = harness(), filter = h.elements.sessfilter;
+    assert.equal(filter.hidden, true);
+    assert.match(html, /<input\b[^>]*id="sessfilter"[^>]*\shidden(?:\s|>)/);
+    h.elements.prompt.focus();
+    const modifiers = { ctrlKey: false, metaKey: false, [modifier]: true, key };
+    const open = shortcut(h, h.elements.prompt, modifiers);
+    assert.equal(open.prevented, true);
+    assert.equal(open.stopped, true);
+    assert.equal(filter.hidden, false);
+    assert.equal(h.document.activeElement, filter);
+    assert.equal(h.elements.sesssearch.getAttribute("aria-expanded"), "true");
+    assert.equal(h.requests.length, 0, "opening search does not request an empty result page");
+    const repeat = shortcut(h, filter, { ...modifiers, repeat: true });
+    assert.equal(repeat.prevented, true);
+    assert.equal(filter.hidden, false, "holding the shortcut does not toggle repeatedly");
+    const close = shortcut(h, filter, modifiers);
+    assert.equal(close.prevented, true);
+    assert.equal(close.stopped, true);
+    assert.equal(filter.hidden, true);
+    assert.equal(h.document.activeElement, h.elements.prompt);
+    assert.equal(h.elements.sesssearch.getAttribute("aria-expanded"), "false");
+  });
+}
+
+test("ordinary find keys and composing keys do not open session search", () => {
+  const h = harness();
+  for (const extra of [{ shiftKey: false }, { ctrlKey: false }, { key: "g" }, { isComposing: true }]) {
+    const event = shortcut(h, h.elements.prompt, extra);
+    assert.equal(event.prevented, false);
+    assert.equal(event.stopped, false);
+    assert.equal(h.elements.sessfilter.hidden, true);
+  }
+});
+
+for (const phone of [false, true]) test("More offers keyboard-free search and restores menu focus on Escape (phone=" + phone + ")", async () => {
+  const h = harness({ phone }), filter = h.elements.sessfilter;
+  assert.match(html, /<button\b[^>]*id="sesssearch"[^>]*aria-controls="sessfilter"[^>]*>Search sessions…<\/button>/);
+  assert.equal(h.elements.sessmorepanel.contains(h.elements.sesssearch), true);
+  h.elements.sessmore.open = true;
+  h.elements.sesssearch.focus();
+  await h.dispatch(h.elements.sesssearch, "click").done;
+  assert.equal(h.elements.sessmore.open, false);
+  assert.equal(filter.hidden, false);
+  assert.equal(h.document.activeElement, filter);
+  assert.deepEqual(plain(h.drawerChanges), phone ? [true] : []);
+  const escape = h.dispatch(filter, "keydown", { key: "Escape" }).event;
+  assert.equal(escape.prevented, true);
+  assert.equal(escape.stopped, true);
+  assert.equal(filter.hidden, true);
+  assert.equal(h.document.activeElement, h.elements.sessmoretoggle);
+  assert.equal(h.requests.length, 0);
+});
+
+test("empty search collapses on blur while a committed query survives Escape, shortcut and blur", async () => {
+  const h = harness(), filter = h.elements.sessfilter;
+  shortcut(h, h.elements.prompt);
+  h.elements.prompt.focus();
+  h.dispatch(filter, "blur");
+  assert.equal(filter.hidden, true);
+  shortcut(h, h.elements.prompt);
+  await search(h, "target");
+  const before = requests(h).length;
+  h.dispatch(filter, "keydown", { key: "Escape" });
+  shortcut(h, filter);
+  assert.equal(filter.hidden, false);
+  assert.equal(filter.value, "target");
+  h.elements.prompt.focus();
+  h.dispatch(filter, "blur");
+  assert.equal(filter.hidden, false);
+  assert.deepEqual(ids(h), ["target-session"]);
+  assert.equal(requests(h).length, before, "visibility changes do not restart the query");
+  shortcut(h, h.elements.prompt);
+  assert.equal(h.document.activeElement, filter, "a shortcut from another input refocuses the existing query");
+  h.elements.prompt.focus();
+  await search(h, "");
+  assert.equal(filter.hidden, true);
+  assert.equal(requests(h).at(-1).searchParams.has("query"), false);
+  assert.ok(h.row("open-session"));
+});
+
+test("clearing a focused search keeps it editable until blur and Escape does not cancel IME", async () => {
+  const h = harness(), filter = h.elements.sessfilter;
+  shortcut(h, h.elements.prompt);
+  await search(h, "target");
+  await input(h, "");
+  assert.equal(filter.hidden, false);
+  assert.equal(h.document.activeElement, filter);
+  h.dispatch(filter, "compositionstart");
+  const escape = h.dispatch(filter, "keydown", { key: "Escape", isComposing: true }).event;
+  assert.equal(escape.prevented, false);
+  assert.equal(filter.hidden, false);
+  h.dispatch(filter, "compositionend");
+  h.elements.prompt.focus();
+  h.dispatch(filter, "blur");
+  assert.equal(filter.hidden, true);
+  h.advance(250);
+  await settle();
+  assert.equal(requests(h).at(-1).searchParams.has("query"), false);
+});
 
 test("search finds an off-first-page session with reordered keywords and preserves current metadata", async () => {
   const items = longSessions();

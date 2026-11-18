@@ -907,7 +907,7 @@ test("phone session hold targets its own row and scrolling cancels it", () => {
   const deleted = [];
   const document = { activeElement: null };
   const elements = Object.fromEntries([
-    "sessionactions", "sessionactionstitle", "sessionactionmark", "sessionactionfork", "sessionactiondelete",
+    "sessionactions", "sessionactionstitle", "sessionactionarchive", "sessionactiongroup", "sessionactiondelete",
     "sessionactioncancel", "sessionactionsscrim", "sessionactionspanel",
   ].map((id) => [id, { hidden: true, textContent: "", focus() { document.activeElement = this; } }]));
   const media = { matches: true };
@@ -960,7 +960,7 @@ test("phone session hold targets its own row and scrolling cancels it", () => {
   assert.equal(elements.sessionactionstitle.textContent, "Hi session");
   assert.equal(vm.runInContext("sessionActionTarget", context), heldSession);
   assert.equal(vm.runInContext("sessionActionReturnFocus", context), held.marker);
-  assert.equal(document.activeElement, elements.sessionactionmark);
+  assert.equal(document.activeElement, elements.sessionactionarchive);
   assert.deepEqual(deleted, []);
   assert.equal(context.sessionHoldConsumed(held), true);
   assert.equal(held.classList.contains("holding"), false);

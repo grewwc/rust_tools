@@ -18,6 +18,8 @@ pub(super) struct SessionGroup {
     name: String,
     order: f64,
     pinned: bool,
+    #[serde(default)]
+    hidden: bool,
 }
 
 impl SessionGroups {
@@ -140,6 +142,7 @@ pub(super) struct CreateGroupReq {
 pub(super) struct UpdateGroupReq {
     name: Option<String>,
     pinned: Option<bool>,
+    hidden: Option<bool>,
     order: Option<f64>,
 }
 
@@ -156,6 +159,82 @@ pub(super) async fn list_session_groups(
         return err.into_response();
     }
     Json(groups_snapshot(&state)).into_response()
+}
+
+/// Sample all hidden assignments independently of session paging and metadata.
+pub(super) async fn list_session_group_activity(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(err) = check_auth(&state, &headers) {
+        return err.into_response();
+    }
+    // Release the organization lock before any live-state or file-lease probe.
+    let snapshot = groups_snapshot(&state);
+    let result = tokio::task::spawn_blocking(move || {
+        let mut groups = Vec::new();
+        let mut indices = FastMap::default();
+        for group in snapshot.groups.into_iter().filter(|group| group.hidden) {
+            if indices.contains_key(&group.id) {
+                continue;
+            }
+            indices.insert(group.id.clone(), groups.len());
+            groups.push(SessionGroupActivity {
+                group_id: group.id,
+                running: 0,
+                waiting: 0,
+                unknown: 0,
+                active: Vec::new(),
+            });
+        }
+        let store = SessionStore::new(&state.history_file);
+        // Assignments are keyed by session ID, so no candidate can count twice.
+        for (id, group_id) in snapshot.assignments {
+            let Some(&index) = indices.get(&group_id) else {
+                continue;
+            };
+            if SessionStore::validate_session_id(&id).is_err() {
+                continue;
+            }
+            let activity = session_activity(&state, &store, &id);
+            let waiting = session_waiting(&state, &id);
+            let group = &mut groups[index];
+            if waiting.is_some() {
+                group.waiting += 1;
+            } else {
+                match activity {
+                    SessionActivity::Running => group.running += 1,
+                    SessionActivity::Unknown => group.unknown += 1,
+                    SessionActivity::Idle => continue,
+                }
+            }
+            if waiting.is_some() || activity == SessionActivity::Running {
+                group.active.push(SessionGroupActiveItem {
+                    id,
+                    activity,
+                    waiting: waiting.as_ref().map(|(kind, _)| *kind),
+                    waiting_prompt: waiting.map(|(_, prompt)| prompt),
+                });
+            }
+        }
+        for group in &mut groups {
+            group.active.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        }
+        SessionGroupActivityResponse { groups }
+    })
+    .await;
+    let mut response = match result {
+        Ok(activity) => Json(activity).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    };
+    response
+        .headers_mut()
+        .insert("cache-control", HeaderValue::from_static("no-store"));
+    response
 }
 
 pub(super) async fn create_session_group(
@@ -182,6 +261,7 @@ pub(super) async fn create_session_group(
                 .unwrap_or(0.0)
                 + 1.0,
             pinned: false,
+            hidden: false,
         };
         data.groups.push(group.clone());
         Ok(group)
@@ -211,6 +291,9 @@ pub(super) async fn update_session_group(
         }
         if let Some(pinned) = req.pinned {
             group.pinned = pinned;
+        }
+        if let Some(hidden) = req.hidden {
+            group.hidden = hidden;
         }
         if let Some(order) = req.order {
             group.order = order;
@@ -319,6 +402,7 @@ mod tests {
             name: "Topic".into(),
             order: 2.5,
             pinned: true,
+            hidden: true,
         });
         data.assignments
             .insert("lazy-session".into(), "topic".into());
@@ -337,6 +421,28 @@ mod tests {
     }
 
     #[test]
+    fn session_groups_hidden_legacy_sidecar_defaults_to_visible() {
+        let root = std::env::temp_dir().join(format!("a-serve-groups-{}", uuid::Uuid::new_v4()));
+        let history_file = root.join("history.sqlite");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            groups_file(&history_file),
+            br#"{"groups":[{"id":"topic","name":"Topic","order":1.0,"pinned":true}],"assignments":{"session":"topic"}}"#,
+        )
+        .unwrap();
+        let data = load_groups(&history_file);
+        assert_eq!(data.groups.len(), 1, "legacy groups must survive loading");
+        assert!(!data.groups[0].hidden);
+        assert!(data.groups[0].pinned);
+        assert_eq!(data.group_id("session").as_deref(), Some("topic"));
+        assert_eq!(
+            serde_json::to_value(&data).unwrap()["groups"][0]["hidden"],
+            false
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn session_groups_delete_cleans_assignments() {
         let mut data = SessionGroups::default();
         for id in ["keep", "delete"] {
@@ -345,6 +451,7 @@ mod tests {
                 name: id.into(),
                 order: 1.0,
                 pinned: false,
+                hidden: false,
             });
         }
         for (id, group) in [("a", "delete"), ("b", "delete"), ("c", "keep")] {

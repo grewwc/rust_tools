@@ -14,7 +14,9 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 use super::RequestBody;
-use super::reasoning::resolve_reasoning_wire_controls_from_parts;
+use super::reasoning::{
+    ReasoningReplayOwners, reasoning_replay_owner, resolve_reasoning_wire_controls_from_parts,
+};
 use crate::ai::{
     files,
     history::{
@@ -364,9 +366,10 @@ pub(super) fn measure_request_prompt(
     messages: &[Message],
     tools: Option<&Value>,
     reasoning_items: Option<&ReasoningItemMap>,
+    replay_owners: Option<&ReasoningReplayOwners>,
 ) -> PromptCounts {
     let (reasoning, reasoning_encrypted_lower, reasoning_encrypted_upper) =
-        reasoning_item_counts(messages, reasoning_items);
+        reasoning_item_counts(messages, reasoning_items, replay_owners);
     PromptCounts {
         messages: message_prompt_counts(messages),
         tools: tools.map_or(BillableCounts::default(), compact_json_counts),
@@ -382,9 +385,10 @@ pub(super) fn measure_request_prompt_from_definitions(
     messages: &[Message],
     defs: Option<&[ToolDefinition]>,
     reasoning_items: Option<&ReasoningItemMap>,
+    replay_owners: Option<&ReasoningReplayOwners>,
 ) -> PromptCounts {
     let (reasoning, reasoning_encrypted_lower, reasoning_encrypted_upper) =
-        reasoning_item_counts(messages, reasoning_items);
+        reasoning_item_counts(messages, reasoning_items, replay_owners);
     PromptCounts {
         messages: message_prompt_counts(messages),
         tools: defs.map_or(
@@ -397,8 +401,8 @@ pub(super) fn measure_request_prompt_from_definitions(
     }
 }
 
-/// Encrypted reasoning replay spliced in front of Responses function calls.
-/// Only items keyed by a projected message's first tool call reach the wire
+/// Encrypted reasoning replay spliced before Responses assistant turns.
+/// Only items keyed by a projected message's replay owner reach the wire
 /// (see `protocol::responses_input`); entries for compressed-away rounds are
 /// not billed. `encrypted_content` is base64 of an opaque payload: following
 /// codex (`context_manager/history.rs`), decoded bytes ~= 3/4 of the encoded
@@ -408,6 +412,7 @@ pub(super) fn measure_request_prompt_from_definitions(
 fn reasoning_item_counts(
     messages: &[Message],
     items: Option<&ReasoningItemMap>,
+    replay_owners: Option<&ReasoningReplayOwners>,
 ) -> (BillableCounts, usize, usize) {
     const ENCRYPTED_ENVELOPE_BYTES: usize = 650;
     const LOWER_ENCRYPTED_DIVISOR: usize = 4;
@@ -420,8 +425,9 @@ fn reasoning_item_counts(
     let mut encrypted_upper = 0usize;
     let replayed = messages
         .iter()
-        .filter_map(|message| message.tool_calls.as_ref()?.first())
-        .filter_map(|call| items.get(&call.id))
+        .enumerate()
+        .filter_map(|(position, message)| reasoning_replay_owner(message, position, replay_owners))
+        .filter_map(|owner| items.get(owner.as_ref()))
         .flat_map(|items| items.iter());
     for item in replayed {
         let Value::Object(map) = item else {
@@ -558,7 +564,7 @@ pub(super) fn estimate_request_prompt_tokens_from_definitions(
     defs: Option<&[ToolDefinition]>,
     reasoning_items: Option<&ReasoningItemMap>,
 ) -> usize {
-    measure_request_prompt_from_definitions(messages, defs, reasoning_items).lower_tokens()
+    measure_request_prompt_from_definitions(messages, defs, reasoning_items, None).lower_tokens()
 }
 
 /// Pessimistic twin of [`estimate_request_prompt_tokens_from_definitions`],
@@ -568,7 +574,7 @@ pub(super) fn estimate_request_prompt_upper_from_definitions(
     defs: Option<&[ToolDefinition]>,
     reasoning_items: Option<&ReasoningItemMap>,
 ) -> usize {
-    measure_request_prompt_from_definitions(messages, defs, reasoning_items).upper_tokens()
+    measure_request_prompt_from_definitions(messages, defs, reasoning_items, None).upper_tokens()
 }
 
 /// Estimates input tokens for this request: messages + tool schemas + any
@@ -580,7 +586,7 @@ pub(super) fn estimate_request_prompt_tokens(
     tools: Option<&Value>,
     reasoning_items: Option<&ReasoningItemMap>,
 ) -> usize {
-    measure_request_prompt(messages, tools, reasoning_items).lower_tokens()
+    measure_request_prompt(messages, tools, reasoning_items, None).lower_tokens()
 }
 
 /// Pessimistic twin of [`estimate_request_prompt_tokens`]: same inputs,
@@ -591,7 +597,7 @@ pub(super) fn estimate_request_prompt_upper(
     tools: Option<&Value>,
     reasoning_items: Option<&ReasoningItemMap>,
 ) -> usize {
-    measure_request_prompt(messages, tools, reasoning_items).upper_tokens()
+    measure_request_prompt(messages, tools, reasoning_items, None).upper_tokens()
 }
 
 /// Clamp the output cap to the estimated remaining context window. Any supplied
@@ -760,6 +766,39 @@ pub(super) fn build_request_body_from_parts<'a>(
     current_prompt_tokens: Option<u64>,
     reasoning_items: Option<&'a ReasoningItemMap>,
 ) -> RequestBody<'a> {
+    build_request_body_from_parts_with_replay_owners(
+        inputs,
+        messages,
+        stream,
+        enable_thinking,
+        enable_search,
+        tools,
+        tool_choice,
+        reasoning_effort,
+        max_tokens_override,
+        current_prompt_tokens,
+        reasoning_items,
+        None,
+    )
+}
+
+/// Main requests retain the ownership map captured before marker normalization;
+/// auxiliary builders derive ownership directly from their messages.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_request_body_from_parts_with_replay_owners<'a>(
+    inputs: &RequestModelInputs,
+    messages: &'a [Message],
+    stream: bool,
+    enable_thinking: bool,
+    enable_search: Option<bool>,
+    tools: Option<Value>,
+    tool_choice: Option<Value>,
+    reasoning_effort: Option<&'a str>,
+    max_tokens_override: Option<u32>,
+    current_prompt_tokens: Option<u64>,
+    reasoning_items: Option<&'a ReasoningItemMap>,
+    replay_owners: Option<&'a ReasoningReplayOwners>,
+) -> RequestBody<'a> {
     let endpoint = &inputs.endpoint;
     let request_model = inputs.request_model.clone();
     let (thinking, reasoning_effort, reasoning) = resolve_reasoning_wire_controls_from_parts(
@@ -793,7 +832,8 @@ pub(super) fn build_request_body_from_parts<'a>(
     // One traversal yields both the lower bound used by the clamp/budget and
     // the pessimistic bound reported as the interval upper; `PromptTokenFeedback`
     // reads the upper bound off the body instead of re-walking the prompt.
-    let prompt_counts = measure_request_prompt(messages, tools.as_ref(), reasoning_items);
+    let prompt_counts =
+        measure_request_prompt(messages, tools.as_ref(), reasoning_items, replay_owners);
     let est_prompt = prompt_counts.lower_tokens();
     let message_counts = prompt_counts.message_counts();
     let max_tokens = inputs.max_output.map(|model_max| {
@@ -822,6 +862,7 @@ pub(super) fn build_request_body_from_parts<'a>(
         stream_options,
         max_tokens,
         reasoning_items,
+        reasoning_replay_owners: replay_owners,
         tool_errors: None,
         reasoning_encrypted_replay: inputs.encrypted_replay,
         estimated_prompt_tokens: est_prompt,
@@ -1087,7 +1128,7 @@ mod compact_json_char_len_tests {
                 - estimate_request_prompt_upper(&messages, None, Some(&empty_encrypted)),
             1_175
         );
-        let counts = super::measure_request_prompt(&messages, None, Some(&items));
+        let counts = super::measure_request_prompt(&messages, None, Some(&items), None);
         assert_eq!(counts.lower_tokens(), base + 588 + 14);
         assert_eq!(counts.upper_tokens(), upper_with_encrypted);
     }

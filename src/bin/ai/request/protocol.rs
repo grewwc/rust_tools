@@ -8,8 +8,9 @@ use serde_json::{Value, json};
 
 use super::builder::RequestModelInputs;
 use super::reasoning::{
-    apply_prompt_cache_breakpoints, is_code_inspection_memory_message, is_nonempty_text_block,
-    mark_content_cache_breakpoint, resolve_reasoning_wire_controls_from_parts,
+    ReasoningReplayOwners, apply_prompt_cache_breakpoints, is_code_inspection_memory_message,
+    is_nonempty_text_block, mark_content_cache_breakpoint, reasoning_replay_owner,
+    resolve_reasoning_wire_controls_from_parts,
 };
 use super::{RequestBody, types::extract_displayable_text};
 use crate::ai::history::Message;
@@ -297,7 +298,10 @@ fn messages_tools(tools: Option<&Value>) -> Option<Value> {
             let mut converted = serde_json::Map::new();
             converted.insert("name".to_string(), Value::String(name.to_string()));
             if let Some(description) = function.get("description").and_then(Value::as_str) {
-                converted.insert("description".to_string(), Value::String(description.to_string()));
+                converted.insert(
+                    "description".to_string(),
+                    Value::String(description.to_string()),
+                );
             }
             if let Some(parameters) = function.get("parameters") {
                 converted.insert("input_schema".to_string(), parameters.clone());
@@ -399,15 +403,14 @@ pub(crate) fn build_http_body_for_json_messages_from_parts(
     let model = inputs.request_model.as_str();
     let endpoint = inputs.endpoint.as_str();
     let request_messages = json_messages_to_request_messages(messages);
-    let (thinking, reasoning_effort, reasoning) =
-        resolve_reasoning_wire_controls_from_parts(
-            inputs.adapter,
-            model,
-            endpoint,
-            inputs.effort_wire,
-            false,
-            reasoning_effort,
-        );
+    let (thinking, reasoning_effort, reasoning) = resolve_reasoning_wire_controls_from_parts(
+        inputs.adapter,
+        model,
+        endpoint,
+        inputs.effort_wire,
+        false,
+        reasoning_effort,
+    );
     let stream_options = (stream && include_stream_usage).then(|| json!({ "include_usage": true }));
     let mut request = RequestBody {
         model: inputs.request_model.clone(),
@@ -422,6 +425,7 @@ pub(crate) fn build_http_body_for_json_messages_from_parts(
         stream_options,
         max_tokens: None,
         reasoning_items: None,
+        reasoning_replay_owners: None,
         reasoning_encrypted_replay: inputs.encrypted_replay,
         estimated_prompt_tokens: 0,
         estimated_prompt_tokens_upper: 0,
@@ -603,9 +607,8 @@ fn responses_message_content(message: &Message) -> Vec<Value> {
     // Note: do not replay `reasoning_content` as `summary_text` in message content.
     // The Responses API message content only accepts `output_text` / `refusal`; putting
     // `summary_text` in causes a 400. Reasoning summaries are a separate `reasoning` output item,
-    // and replay would need the server-side original item id / encrypted_content, which we do not
-    // persist -- so faithful replay is impossible; do not send them back and let this round's
-    // `reasoning` request parameter fetch them anew.
+    // with server-side ids / encrypted_content replayed through the side channel.
+    // Plaintext reasoning summaries never become assistant message content.
     responses_content_items(&message.role, &message.content)
         .into_iter()
         .filter(|item| !responses_item_is_empty_text(item))
@@ -649,9 +652,17 @@ pub(in crate::ai::request) fn responses_reasoning_replay_stats(
 fn responses_input(
     messages: &[Message],
     reasoning_items: Option<&ReasoningItemMap>,
+    replay_owners: Option<&ReasoningReplayOwners>,
 ) -> Vec<Value> {
     let mut input = Vec::new();
-    for message in messages {
+    for (position, message) in messages.iter().enumerate() {
+        // Both plain answers and tool rounds replay reasoning before any
+        // assistant text, preserving the provider's output-item order.
+        if let Some(items) = reasoning_replay_owner(message, position, replay_owners)
+            .and_then(|owner| reasoning_items?.get(owner.as_ref()))
+        {
+            input.extend(items.iter().cloned());
+        }
         if let Some(tool_calls) = message
             .tool_calls
             .as_ref()
@@ -665,12 +676,6 @@ fn responses_input(
             // preserved on the chat-completions wire (driver/turn_runtime/tool_result/messaging.rs
             // persists it, truncated to 800 chars), so dropping it here would make Responses lose
             // the model's intermediate conclusions across tool hops.
-            if let Some(items) = reasoning_items
-                .zip(tool_calls.first())
-                .and_then(|(map, first)| map.get(&first.id))
-            {
-                input.extend(items.iter().cloned());
-            }
             let narration_items = responses_message_content(message);
             if !narration_items.is_empty() {
                 // The Responses API rejects empty output_text, so only emit the message item when
@@ -727,13 +732,13 @@ fn responses_tools(tools: Option<&Value>, enable_search: bool) -> Option<Value> 
 pub(super) fn build_responses_request_body(request: &RequestBody<'_>) -> Value {
     let mut body = json!({
         "model": request.model,
-        "input": responses_input(request.messages, request.reasoning_items),
+        "input": responses_input(request.messages, request.reasoning_items, request.reasoning_replay_owners),
         "stream": request.stream,
     });
     let object = body.as_object_mut().expect("responses body is an object");
     // Encrypted reasoning replay: only when explicitly requesting `reasoning.encrypted_content`
     // does the server deliver a reasoning item carrying encrypted_content in
-    // `response.output_item.done`, for replay within the same turn's tool chain (see
+    // `response.output_item.done`, for replay within and across turns (see
     // responses_input). Enabled only for models that advertise this capability bit.
     if request.reasoning_encrypted_replay {
         object.insert(
@@ -789,6 +794,7 @@ mod messages_body_tests {
             stream_options: None,
             max_tokens,
             reasoning_items: None,
+            reasoning_replay_owners: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,
             estimated_prompt_tokens_upper: 0,
@@ -819,6 +825,7 @@ mod messages_body_tests {
             stream_options: None,
             max_tokens: Some(8192),
             reasoning_items: None,
+            reasoning_replay_owners: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,
             estimated_prompt_tokens_upper: 0,
@@ -909,6 +916,7 @@ mod messages_body_tests {
             stream_options: None,
             max_tokens: None,
             reasoning_items: None,
+            reasoning_replay_owners: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,
             estimated_prompt_tokens_upper: 0,
@@ -996,6 +1004,7 @@ mod messages_body_tests {
             stream_options: None,
             max_tokens: None,
             reasoning_items: None,
+            reasoning_replay_owners: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,
             estimated_prompt_tokens_upper: 0,
@@ -1118,8 +1127,9 @@ mod messages_body_tests {
         // Registry coverage: the Messages-dialect class the synthetic inputs
         // stand for must keep existing, or the pin tests a dead path.
         assert!(
-            crate::ai::model_names::all().iter().any(|m| m.request_protocol
-                == Some(RequestProtocolDialect::Messages)),
+            crate::ai::model_names::all()
+                .iter()
+                .any(|m| m.request_protocol == Some(RequestProtocolDialect::Messages)),
             "registry must keep at least one Messages-protocol entry"
         );
         let request = RequestBody {
@@ -1135,6 +1145,7 @@ mod messages_body_tests {
             stream_options: None,
             max_tokens: Some(4096),
             reasoning_items: None,
+            reasoning_replay_owners: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,
             estimated_prompt_tokens_upper: 0,
@@ -1170,6 +1181,7 @@ mod messages_body_tests {
             stream_options: None,
             max_tokens: None,
             reasoning_items: None,
+            reasoning_replay_owners: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,
             estimated_prompt_tokens_upper: 0,

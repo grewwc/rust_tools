@@ -440,6 +440,29 @@ pub(crate) struct SessionActivityItem {
     pub(crate) waiting_prompt: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub(super) struct SessionGroupActivityResponse {
+    pub(super) groups: Vec<SessionGroupActivity>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct SessionGroupActivity {
+    pub(super) group_id: String,
+    pub(super) running: u32,
+    pub(super) waiting: u32,
+    pub(super) unknown: u32,
+    pub(super) active: Vec<SessionGroupActiveItem>,
+}
+
+/// Hidden-group polls publish explicit nulls for sessions without a question.
+#[derive(Debug, Serialize)]
+pub(super) struct SessionGroupActiveItem {
+    pub(super) id: String,
+    pub(super) activity: SessionActivity,
+    pub(super) waiting: Option<SessionWaiting>,
+    pub(super) waiting_prompt: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct SessionsQuery {
     /// Archive and group constraints apply before search, paging and inclusion.

@@ -65,6 +65,408 @@ async fn session_groups_response_json(response: Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn session_groups_activity_samples_all_hidden_assignments_without_paging() {
+    use crate::ai::history::turn_lease::TurnLease;
+
+    let state = lifecycle_test_state();
+    let store = SessionStore::new(&state.history_file);
+    *state.groups.lock().unwrap() = serde_json::from_value(serde_json::json!({
+        "groups": [
+            {"id": "hidden", "name": "Hidden", "order": 1, "hidden": true, "pinned": true},
+            {"id": "empty", "name": "Empty", "order": 2, "hidden": true, "pinned": false},
+            {"id": "visible", "name": "Visible", "order": 3, "hidden": false, "pinned": false}
+        ],
+        "assignments": {"page-a": "hidden", "page-b": "hidden", "archived-running": "hidden"}
+    }))
+    .unwrap();
+    for id in ["page-a", "page-b", "archived-running"] {
+        store
+            .write_session_title_with_origin(id, id, SessionTitleOrigin::User)
+            .unwrap();
+    }
+    store
+        .write_session_archived("archived-running", true)
+        .unwrap();
+    let page = list_sessions(
+        State(state.clone()),
+        HeaderMap::new(),
+        Query(
+            serde_json::from_value(serde_json::json!({"archived": "exclude", "limit": 1})).unwrap(),
+        ),
+    )
+    .await
+    .into_response();
+    assert_eq!(page.headers()["x-sessions-total"], "2");
+    let page = session_groups_response_json(page).await;
+    let outside = if page[0]["id"] == "page-a" {
+        "page-b"
+    } else {
+        "page-a"
+    };
+    {
+        let mut groups = state.groups.lock().unwrap();
+        let mut turns = state.active_turns.lock().unwrap();
+        for n in 0..260 {
+            let id = format!("local-{n:03}");
+            groups.assignments.insert(id.clone(), "hidden".into());
+            turns.insert(id, 123);
+        }
+        for id in [
+            outside,
+            "archived-running",
+            "confirm",
+            "visible-running",
+            "deleted-group",
+            "../invalid",
+        ] {
+            turns.insert(id.into(), 123);
+        }
+        for id in [
+            "leased",
+            "confirm",
+            "input",
+            "unknown",
+            "unknown-waiting",
+            "lazy",
+            "dead",
+            "../invalid",
+        ] {
+            groups.assignments.insert(id.into(), "hidden".into());
+        }
+        groups
+            .assignments
+            .insert("visible-running".into(), "visible".into());
+        groups
+            .assignments
+            .insert("deleted-group".into(), "deleted".into());
+    }
+    // An unreadable history body must not matter to an assignment-only poll.
+    std::fs::write(
+        store.session_history_file("leased"),
+        b"not a SQLite database",
+    )
+    .unwrap();
+    let lease = TurnLease::acquire(&store.session_history_file("leased"), "leased").unwrap();
+    std::fs::write(
+        store
+            .session_history_file("dead")
+            .with_extension("turn.lock"),
+        "99999999",
+    )
+    .unwrap();
+    for id in ["unknown", "unknown-waiting"] {
+        std::fs::create_dir(store.session_history_file(id).with_extension("turn.lock")).unwrap();
+    }
+    for (id, kind, prompt) in [
+        (
+            "confirm",
+            ConfirmKind::Confirm,
+            "Allow deployment?\nDetails".to_string(),
+        ),
+        (
+            "input",
+            ConfirmKind::Input,
+            format!("{}\nDetails", "小".repeat(200)),
+        ),
+        (
+            "unknown-waiting",
+            ConfirmKind::Confirm,
+            "Retry?".to_string(),
+        ),
+    ] {
+        state.confirms.lock().unwrap().insert(
+            id.into(),
+            Arc::new(std::sync::Mutex::new(ConfirmSlot {
+                pending: Some(PendingConfirm {
+                    id: 1,
+                    prompt,
+                    kind,
+                    token: 1,
+                }),
+                answers: None,
+            })),
+        );
+    }
+    let response = list_session_group_activity(State(state.clone()), HeaderMap::new()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let response = session_groups_response_json(response).await;
+    let groups = response["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2, "visible and deleted groups must stay out");
+    assert_eq!(
+        groups[1],
+        serde_json::json!({"group_id": "empty", "running": 0, "waiting": 0, "unknown": 0, "active": []})
+    );
+    let hidden = &groups[0];
+    assert_eq!(hidden["group_id"], "hidden");
+    assert_eq!(
+        hidden["running"], 263,
+        "260 local, out-of-page, archived and leased turns"
+    );
+    assert_eq!(
+        hidden["waiting"], 3,
+        "waiting takes priority over running and unknown"
+    );
+    assert_eq!(hidden["unknown"], 1);
+    let active = hidden["active"].as_array().unwrap();
+    assert_eq!(active.len(), 266);
+    let ids: crate::commonw::FastSet<_> = active
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), active.len());
+    for id in [outside, "archived-running", "leased", "local-259"] {
+        let item = active.iter().find(|item| item["id"] == id).unwrap();
+        assert_eq!(
+            item,
+            &serde_json::json!({"id": id, "activity": "running", "waiting": null, "waiting_prompt": null})
+        );
+    }
+    for (id, activity, waiting, prompt) in [
+        (
+            "confirm",
+            "running",
+            "confirm",
+            "Allow deployment?".to_string(),
+        ),
+        ("input", "idle", "input", "小".repeat(160)),
+        (
+            "unknown-waiting",
+            "unknown",
+            "confirm",
+            "Retry?".to_string(),
+        ),
+    ] {
+        assert_eq!(
+            active.iter().find(|item| item["id"] == id).unwrap(),
+            &serde_json::json!({
+                "id": id, "activity": activity, "waiting": waiting, "waiting_prompt": prompt
+            })
+        );
+    }
+    for id in [
+        "unknown",
+        "lazy",
+        "dead",
+        "visible-running",
+        "deleted-group",
+        "../invalid",
+    ] {
+        assert!(
+            !ids.contains(id),
+            "{id} must not publish fake active events"
+        );
+    }
+    for id in ["local-259", "lazy", "dead"] {
+        assert!(
+            !store.session_history_file(id).exists(),
+            "polls must not materialize history"
+        );
+    }
+    assert!(
+        !store
+            .session_history_file("lazy")
+            .with_extension("turn.lock")
+            .exists()
+    );
+    drop(lease);
+    std::fs::remove_dir_all(state.history_file.parent().unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn session_groups_activity_endpoint_auth_no_store_and_no_hidden_groups() {
+    let mut state = lifecycle_test_state();
+    state.token = "group-activity-test".into();
+    *state.groups.lock().unwrap() = serde_json::from_value(serde_json::json!({
+        "groups": [{"id": "visible", "name": "Visible", "order": 1, "hidden": false, "pinned": true}],
+        "assignments": {"local": "visible"}
+    })).unwrap();
+    state
+        .active_turns
+        .lock()
+        .unwrap()
+        .insert("local".into(), 123);
+    let app = Router::new()
+        .route("/session-group-activity", get(list_session_group_activity))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    for token in [None, Some("wrong")] {
+        let mut request = client.get(format!("{base}/session-group-activity"));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        assert_eq!(
+            request.send().await.unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+    }
+    for empty in [false, true] {
+        if empty {
+            *state.groups.lock().unwrap() = Default::default();
+        }
+        let response = client
+            .get(format!("{base}/session-group-activity"))
+            .bearer_auth("group-activity-test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({"groups": []})
+        );
+    }
+    assert!(
+        !state.history_file.parent().unwrap().exists(),
+        "polls must not create storage"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn session_groups_query_intersection_paging_and_include_contract() {
+    async fn fetch(
+        state: &ServeState,
+        query: serde_json::Value,
+        total: usize,
+        page_size: usize,
+    ) -> serde_json::Value {
+        let response = list_sessions(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(serde_json::from_value(query).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-sessions-total"], total.to_string());
+        assert_eq!(
+            response.headers()["x-sessions-page-size"],
+            page_size.to_string()
+        );
+        session_groups_response_json(response).await
+    }
+    let state = lifecycle_test_state();
+    let store = SessionStore::new(&state.history_file);
+    *state.groups.lock().unwrap() = serde_json::from_value(serde_json::json!({
+        "groups": [
+            {"id": "topic", "name": "Topic", "order": 1, "hidden": false, "pinned": false},
+            {"id": "other", "name": "Other", "order": 2, "hidden": true, "pinned": true}
+        ],
+        "assignments": {"match-a": "topic", "match-b": "topic", "not-marked": "topic", "wrong-title": "topic", "not-archived": "topic", "other-group": "other", "stale": "deleted"}
+    })).unwrap();
+    for (id, title, marked, archived) in [
+        ("match-a", "Shared topic", true, true),
+        ("match-b", "Shared topic", true, true),
+        ("not-marked", "Shared topic", false, true),
+        ("wrong-title", "Unrelated", true, true),
+        ("not-archived", "Shared topic", true, false),
+        ("other-group", "Shared topic", true, true),
+        ("unassigned", "Shared topic", true, true),
+        ("stale", "Shared topic", true, true),
+    ] {
+        store
+            .write_session_title_with_origin(id, title, SessionTitleOrigin::User)
+            .unwrap();
+        store
+            .write_session_mark(id, marked, crate::ai::history::MarkMessageUpdate::Keep)
+            .unwrap();
+        store.write_session_archived(id, archived).unwrap();
+    }
+    let base = serde_json::json!({"group": "topic", "archived": "only", "marked": true, "query": " SHARED topic ", "newest": true});
+    let expected = fetch(&state, base.clone(), 2, 2).await;
+    let expected = expected.as_array().unwrap();
+    assert!(
+        expected
+            .iter()
+            .all(|item| item["id"] == "match-a" || item["id"] == "match-b")
+    );
+    for (hidden, pinned) in [(false, false), (true, false), (true, true), (false, true)] {
+        assert_eq!(
+            update_session_group(
+                State(state.clone()),
+                HeaderMap::new(),
+                Path("topic".into()),
+                Json(
+                    serde_json::from_value(serde_json::json!({"hidden": hidden, "pinned": pinned}))
+                        .unwrap()
+                )
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let mut query = base.clone();
+        query["limit"] = serde_json::json!(1);
+        for include in [
+            "other-group",
+            "unassigned",
+            "stale",
+            "not-marked",
+            "wrong-title",
+            "not-archived",
+        ] {
+            query["include"] = serde_json::json!(include);
+            assert_eq!(
+                fetch(&state, query.clone(), 2, 1).await,
+                serde_json::json!([expected[0]])
+            );
+        }
+        query["include"] = expected[1]["id"].clone();
+        assert_eq!(
+            fetch(&state, query.clone(), 2, 1).await,
+            serde_json::json!(expected)
+        );
+        query["include"] = expected[0]["id"].clone();
+        assert_eq!(
+            fetch(&state, query.clone(), 2, 1).await,
+            serde_json::json!([expected[0]])
+        );
+        query["offset"] = serde_json::json!(1);
+        assert_eq!(
+            fetch(&state, query.clone(), 2, 1).await,
+            serde_json::json!([expected[1]])
+        );
+        query["limit"] = serde_json::json!(0);
+        assert_eq!(
+            fetch(&state, query.clone(), 2, 0).await,
+            serde_json::json!([])
+        );
+        query["offset"] = serde_json::json!(0);
+        assert_eq!(
+            fetch(&state, query.clone(), 2, 0).await,
+            serde_json::json!([expected[0]])
+        );
+        query["include"] = serde_json::Value::Null;
+        assert_eq!(fetch(&state, query, 2, 0).await, serde_json::json!([]));
+    }
+    let mut query = base.clone();
+    query["newest"] = serde_json::json!(false);
+    assert_eq!(
+        fetch(&state, query, 2, 2).await,
+        serde_json::json!([expected[1], expected[0]])
+    );
+    let mut query = base.clone();
+    query["group"] = serde_json::json!("missing");
+    query["include"] = expected[0]["id"].clone();
+    assert_eq!(fetch(&state, query, 0, 0).await, serde_json::json!([]));
+    let mut query = base;
+    query["group"] = serde_json::json!("unassigned");
+    query["include"] = expected[0]["id"].clone();
+    let unassigned = fetch(&state, query, 2, 2).await;
+    let items = unassigned.as_array().unwrap();
+    assert!(items.iter().all(|item| item["group_id"].is_null()));
+    assert!(items.iter().any(|item| item["id"] == "stale"));
+    assert!(items.iter().any(|item| item["id"] == "unassigned"));
+    std::fs::remove_dir_all(state.history_file.parent().unwrap()).unwrap();
+}
+
 #[tokio::test]
 async fn session_groups_archive_filter_before_paging() {
     let state = lifecycle_test_state();
@@ -111,33 +513,49 @@ async fn session_groups_archive_filter_before_paging() {
         store.read_session_title("archived").unwrap().as_deref(),
         Some("Shared topic")
     );
-    for (archive, group_filter, expected) in [
-        ("exclude", Some(group_id), 1),
-        ("only", Some(group_id), 1),
-        ("include", None, 3),
-        ("unknown-value", None, 3),
-        ("include", Some("unassigned"), 1),
-        ("include", Some("missing-group"), 0),
-    ] {
-        let query = serde_json::from_value(serde_json::json!({
-            "archived": archive, "group": group_filter, "query": "shared topic",
-            "limit": 1, "offset": 1, "include": "archived",
-        }))
-        .unwrap();
-        let response = list_sessions(State(state.clone()), HeaderMap::new(), Query(query))
-            .await
-            .into_response();
-        assert_eq!(response.headers()["x-sessions-total"], expected.to_string());
-        let items = session_groups_response_json(response).await;
+    for hidden in [false, true] {
+        let response = update_session_group(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(group_id.to_string()),
+            Json(serde_json::from_value(serde_json::json!({"hidden": hidden})).unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            items.as_array().unwrap().len(),
-            if expected > 1 { 1 } else { 0 }
+            session_groups_response_json(response).await["hidden"],
+            hidden
         );
-        for item in items.as_array().unwrap() {
-            assert!(
-                item.get("group_id").is_some(),
-                "null group_id must be explicit"
+        for (archive, group_filter, marked, expected) in [
+            ("exclude", Some(group_id), false, 1),
+            ("only", Some(group_id), false, 1),
+            ("include", None, false, 3),
+            ("unknown-value", None, false, 3),
+            ("include", Some("unassigned"), false, 1),
+            ("include", Some("missing-group"), false, 0),
+            ("include", None, true, 1),
+            ("include", Some(group_id), true, 1),
+        ] {
+            let query = serde_json::from_value(serde_json::json!({
+                "archived": archive, "group": group_filter, "query": "shared topic",
+                "marked": marked, "limit": 1, "offset": 1, "include": "archived",
+            }))
+            .unwrap();
+            let response = list_sessions(State(state.clone()), HeaderMap::new(), Query(query))
+                .await
+                .into_response();
+            assert_eq!(response.headers()["x-sessions-total"], expected.to_string());
+            let items = session_groups_response_json(response).await;
+            assert_eq!(
+                items.as_array().unwrap().len(),
+                if expected > 1 { 1 } else { 0 }
             );
+            for item in items.as_array().unwrap() {
+                assert!(
+                    item.get("group_id").is_some(),
+                    "null group_id must be explicit"
+                );
+            }
         }
     }
     let query = serde_json::from_value(serde_json::json!({"archived": "exclude", "group": group_id, "limit": 1, "include": "archived"})).unwrap();
@@ -165,6 +583,94 @@ async fn session_groups_archive_filter_before_paging() {
         );
     }
     assert!(!store.session_exists("missing").unwrap());
+    std::fs::remove_dir_all(state.history_file.parent().unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn session_groups_hidden_patch_persists_and_get_returns_all() {
+    let state = lifecycle_test_state();
+    let mut group_ids = Vec::new();
+    for name in ["Topic", "Visible"] {
+        let response = create_session_group(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(serde_json::from_value(serde_json::json!({"name": name})).unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let group = session_groups_response_json(response).await;
+        assert_eq!(group["hidden"], false);
+        group_ids.push(group["id"].as_str().unwrap().to_string());
+    }
+    let group_id = &group_ids[0];
+    assign_session_group(&state, "lazy-session", Some(group_id)).unwrap();
+    for (patch, hidden, name, pinned, order) in [
+        (
+            serde_json::json!({"hidden": true}),
+            true,
+            "Topic",
+            false,
+            1.0,
+        ),
+        (
+            serde_json::json!({"name": "Renamed", "pinned": true, "order": 3.5}),
+            true,
+            "Renamed",
+            true,
+            3.5,
+        ),
+        (
+            serde_json::json!({"hidden": false, "pinned": false}),
+            false,
+            "Renamed",
+            false,
+            3.5,
+        ),
+    ] {
+        let response = update_session_group(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(group_id.clone()),
+            Json(serde_json::from_value(patch).unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = session_groups_response_json(response).await;
+        assert_eq!(updated["hidden"], hidden);
+        assert_eq!(updated["name"], name);
+        assert_eq!(updated["pinned"], pinned);
+        assert_eq!(updated["order"], order);
+
+        let persisted = load_groups(&state.history_file);
+        assert_eq!(persisted, groups_snapshot(&state));
+        assert_eq!(
+            persisted.group_id("lazy-session").as_deref(),
+            Some(group_id.as_str())
+        );
+        let mut reloaded = state.clone();
+        reloaded.groups = Arc::new(std::sync::Mutex::new(persisted));
+        let response = list_session_groups(State(reloaded), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed = session_groups_response_json(response).await;
+        let groups = listed["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "GET must retain hidden and visible groups");
+        assert_eq!(groups[0]["id"], group_ids[0]);
+        assert_eq!(groups[0]["hidden"], hidden);
+        assert_eq!(groups[1]["id"], group_ids[1]);
+        assert_eq!(groups[1]["hidden"], false);
+        assert_eq!(listed["assignments"]["lazy-session"], group_ids[0]);
+    }
+    assert_eq!(
+        update_session_group(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("unassigned".into()),
+            Json(serde_json::from_value(serde_json::json!({"hidden": true})).unwrap()),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND,
+    );
     std::fs::remove_dir_all(state.history_file.parent().unwrap()).unwrap();
 }
 

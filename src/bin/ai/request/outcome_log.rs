@@ -359,6 +359,7 @@ mod tests {
             stream_options: None,
             max_tokens: None,
             reasoning_items: None,
+            reasoning_replay_owners: None,
             tool_errors: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,

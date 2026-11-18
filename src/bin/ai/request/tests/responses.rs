@@ -7,6 +7,187 @@ use crate::ai::provider::ApiProvider;
 use serde_json::Value;
 
 #[test]
+fn responses_request_body_replays_plain_and_tool_turns_in_order_and_counts_each_owner() {
+    use super::super::builder::{
+        build_request_body_from_parts_with_replay_owners, measure_request_prompt,
+        measure_request_prompt_from_definitions,
+    };
+    use super::super::reasoning::{
+        SplicedReplayKeys, normalize_reasoning_content_replay_for_model,
+        reconstruct_encrypted_reasoning_items_for_model_recorded,
+    };
+    use crate::ai::history::compress::encode_encrypted_reasoning_replay_state;
+    use crate::ai::types::{FunctionCall, ToolCall};
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let model = crate::ai::model_names::all()
+        .iter()
+        .find(|entry| {
+            entry.reasoning_encrypted_replay
+                && entry.request_protocol == Some(RequestProtocolDialect::Responses)
+                && !crate::ai::models::reasoning_content_replay_enabled(&entry.key)
+        })
+        .expect("registry must contain a Responses encrypted replay model")
+        .key
+        .clone();
+    let item = |id: &str| json!({"type":"reasoning", "id":id, "encrypted_content":"A".repeat(4_000), "summary":[]});
+    let first = item("rs_wire_plain_first");
+    let second = item("rs_wire_plain_second");
+    let tool = item("rs_wire_tool");
+    let plain = |item: &Value, empty_calls: bool| Message {
+        role: "assistant".to_string(),
+        content: json!("same answer"),
+        tool_calls: empty_calls.then(Vec::new),
+        tool_call_id: None,
+        reasoning_content: Some(encode_encrypted_reasoning_replay_state(
+            &model,
+            None,
+            &[item.clone()],
+        )),
+    };
+    let user = |text: &str| Message {
+        role: "user".to_string(),
+        content: json!(text),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    };
+    let mut messages = vec![
+        user("first question"),
+        plain(&first, false),
+        user("second question"),
+        plain(&second, true),
+        Message {
+            role: "assistant".to_string(),
+            content: json!("tool narration"),
+            tool_calls: Some(vec![ToolCall {
+                id: "call-mixed-wire".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: Some(encode_encrypted_reasoning_replay_state(
+                &model,
+                None,
+                &[tool.clone()],
+            )),
+        },
+        Message {
+            role: "tool".to_string(),
+            content: json!("tool result"),
+            tool_calls: None,
+            tool_call_id: Some("call-mixed-wire".to_string()),
+            reasoning_content: None,
+        },
+        user("following question"),
+    ];
+    let mut spliced = SplicedReplayKeys::default();
+    let mut items = reconstruct_encrypted_reasoning_items_for_model_recorded(
+        &model,
+        "https://plain-wire-replay.test/v1",
+        "plain-wire-replay",
+        std::path::Path::new(""),
+        &messages,
+        &Default::default(),
+        &mut spliced,
+    );
+    assert_ne!(spliced.message_owners()[&1], spliced.message_owners()[&3]);
+    items.insert(
+        "compressed-away".to_string(),
+        Arc::new(vec![item("rs_unprojected")]),
+    );
+    normalize_reasoning_content_replay_for_model(&model, &mut messages);
+    assert!(
+        messages
+            .iter()
+            .all(|message| message.reasoning_content.is_none())
+    );
+    let request = build_request_body_from_parts_with_replay_owners(
+        &RequestModelInputs::resolve(&model),
+        &messages,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(&items),
+        Some(spliced.message_owners()),
+    );
+    let body = build_responses_request_body(&request);
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 11);
+    assert_eq!(input[0]["content"][0]["text"], "first question");
+    assert_eq!(input[1], first);
+    assert_eq!(input[2]["role"], "assistant");
+    assert_eq!(input[2]["content"][0]["type"], "output_text");
+    assert_eq!(input[2]["content"][0]["text"], "same answer");
+    assert_eq!(input[3]["content"][0]["text"], "second question");
+    assert_eq!(input[4], second);
+    assert_eq!(input[5]["content"][0]["text"], "same answer");
+    assert_eq!(input[6], tool);
+    assert_eq!(input[7]["content"][0]["text"], "tool narration");
+    assert_eq!(input[8]["type"], "function_call");
+    assert_eq!(input[8]["call_id"], "call-mixed-wire");
+    assert_eq!(input[9]["type"], "function_call_output");
+    assert_eq!(input[10]["content"][0]["text"], "following question");
+    assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    let empty_payloads = items
+        .iter()
+        .map(|(owner, items)| {
+            let stripped = items
+                .iter()
+                .cloned()
+                .map(|mut item| {
+                    item["encrypted_content"] = json!("");
+                    item
+                })
+                .collect();
+            (owner.clone(), Arc::new(stripped))
+        })
+        .collect();
+    let empty_counts = measure_request_prompt(
+        &messages,
+        None,
+        Some(&empty_payloads),
+        Some(spliced.message_owners()),
+    );
+    // Each 4000-byte base64 payload bills ceil((3000 - 650) / 4) tokens;
+    // the upper bound uses divisor 2. The unprojected owner is never billed.
+    assert_eq!(
+        request.estimated_prompt_tokens - empty_counts.lower_tokens(),
+        3 * 588
+    );
+    assert_eq!(
+        request.estimated_prompt_tokens_upper - empty_counts.upper_tokens(),
+        3 * 1_175
+    );
+    let preview = measure_request_prompt_from_definitions(
+        &messages,
+        None,
+        Some(&items),
+        Some(spliced.message_owners()),
+    );
+    assert_eq!(request.estimated_prompt_tokens, preview.lower_tokens());
+    assert_eq!(
+        request.estimated_prompt_tokens_upper,
+        preview.upper_tokens()
+    );
+    assert!(
+        serde_json::to_value(&request)
+            .unwrap()
+            .get("reasoning_replay_owners")
+            .is_none()
+    );
+}
+
+#[test]
 fn responses_protocol_dialect_infers_from_endpoint_when_unspecified() {
     assert_eq!(
         RequestProtocolDialect::infer_from_endpoint("https://api.example.com/v1/chat/completions"),
@@ -37,13 +218,8 @@ fn json_messages_aux_body_uses_responses_protocol_for_responses_dialect() {
         json!({"role": "user", "content": "classify this"}),
     ];
 
-    let body_bytes = build_http_body_for_json_messages_from_parts(
-        &inputs,
-        &messages,
-        false,
-        None,
-        false,
-    );
+    let body_bytes =
+        build_http_body_for_json_messages_from_parts(&inputs, &messages, false, None, false);
     let body: Value = serde_json::from_slice(&body_bytes).expect("body should be valid JSON");
 
     assert_eq!(body["model"], "synthetic-responses-model");
@@ -157,6 +333,7 @@ fn responses_request_body_omits_assistant_reasoning_from_message_content() {
         stream_options: None,
         max_tokens: None,
         reasoning_items: None,
+        reasoning_replay_owners: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
         estimated_prompt_tokens_upper: 0,
@@ -201,6 +378,7 @@ fn responses_request_body_emits_prompt_cache_key_only_when_set() {
         stream_options: None,
         max_tokens: None,
         reasoning_items: None,
+        reasoning_replay_owners: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
         estimated_prompt_tokens_upper: 0,
@@ -254,6 +432,7 @@ fn responses_request_body_emits_bare_function_call_for_tool_turn() {
         stream_options: None,
         max_tokens: None,
         reasoning_items: None,
+        reasoning_replay_owners: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
         estimated_prompt_tokens_upper: 0,
@@ -303,6 +482,7 @@ fn responses_request_body_drops_empty_text_content_items() {
         stream_options: None,
         max_tokens: None,
         reasoning_items: None,
+        reasoning_replay_owners: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
         estimated_prompt_tokens_upper: 0,
@@ -391,6 +571,7 @@ fn responses_request_body_omits_include_without_encrypted_replay() {
         stream_options: None,
         max_tokens: None,
         reasoning_items: None,
+        reasoning_replay_owners: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
         estimated_prompt_tokens_upper: 0,
@@ -449,6 +630,7 @@ fn responses_request_body_replays_reasoning_items_before_function_call() {
         stream_options: None,
         max_tokens: None,
         reasoning_items: Some(&items),
+        reasoning_replay_owners: None,
         reasoning_encrypted_replay: true,
         estimated_prompt_tokens: 0,
         estimated_prompt_tokens_upper: 0,
@@ -505,6 +687,7 @@ fn responses_request_body_degrades_to_bare_function_call_without_reasoning_items
         stream_options: None,
         max_tokens: None,
         reasoning_items: Some(&empty),
+        reasoning_replay_owners: None,
         reasoning_encrypted_replay: true,
         estimated_prompt_tokens: 0,
         estimated_prompt_tokens_upper: 0,
@@ -558,6 +741,7 @@ fn responses_request_body_replays_tool_round_narration_before_function_call() {
         stream_options: None,
         max_tokens: None,
         reasoning_items: None,
+        reasoning_replay_owners: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
         estimated_prompt_tokens_upper: 0,
@@ -621,6 +805,7 @@ fn responses_request_body_orders_reasoning_narration_function_call() {
         stream_options: None,
         max_tokens: None,
         reasoning_items: Some(&items),
+        reasoning_replay_owners: None,
         reasoning_encrypted_replay: true,
         estimated_prompt_tokens: 0,
         estimated_prompt_tokens_upper: 0,

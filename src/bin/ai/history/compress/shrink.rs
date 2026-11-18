@@ -308,13 +308,10 @@ pub(in crate::ai) fn shrink_messages_to_fit(
     // from O(N) to O(1).
     merge_old_user_overflow_stubs(&mut messages, keep_recent_turns, overflow_dir);
 
-    // Proactively slim down the giant arguments of write_file/apply_patch calls
-    // that were "successfully written": once the file is on disk and the result
-    // confirms success, the full body no longer has semantic value, so it can be
-    // replaced with an archive stub without waiting for budget pressure. Anything
-    // inside the protection window (including groups just written this turn,
-    // whose bodies the model may immediately reference to build follow-up edits)
-    // and failed results are always kept, so agent effectiveness does not degrade.
+    // Archive and fold old successful write_file/apply_patch call/result pairs
+    // before budget pressure. Recovery pointers live in evidence notes rather
+    // than callable argument examples. Recent groups, current-turn protected
+    // calls, and failed results remain intact.
     shrink_successful_write_arguments(&mut messages, overflow_dir, protected_tool_call_ids);
 
     // The shrinker is also called directly by the mid-turn path. Enforce the
@@ -757,9 +754,8 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
         merge_old_user_overflow_stubs(&mut messages, keep_recent_turns, overflow_dir)
     );
 
-    // Symmetric with shrink_messages_to_fit: proactively replace giant arguments
-    // of successfully-written write_file/apply_patch calls with archive stubs
-    // (the protection window and failed results are kept).
+    // Symmetric with shrink_messages_to_fit: archive and fold old successful
+    // write_file/apply_patch pairs, preserving recent, protected, and failed calls.
     profile_compression_stage!(
         "shrink_write_arguments",
         shrink_successful_write_arguments(&mut messages, overflow_dir, protected_tool_call_ids)

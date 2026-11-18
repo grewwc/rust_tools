@@ -6,6 +6,7 @@ use super::tool_overflow::{
     task_evidence_review_lines,
 };
 use super::*;
+use crate::commonw::{FastMap, FastSet};
 
 fn mutable_content_can_truncate(
     message: &Message,
@@ -188,7 +189,7 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
     // parseable file_path pointer; the later generic head+tail truncation must
     // never touch that minimal protocol.
     minimize_overflow_stubs_for_hard_budget(messages);
-    minimize_truncated_previews_for_hard_budget(messages);
+    minimize_truncated_previews_for_hard_budget(messages, overflow_dir, protected_tool_call_ids);
     let mut total_chars = messages_total_chars(messages);
     if total_chars <= max_chars {
         return true;
@@ -377,8 +378,8 @@ pub(in crate::ai) fn truncate_unprotected_messages_to_fit(
 
 /// Path C first caps each trimmable field individually so one newest result cannot
 /// monopolize the whole window, then keeps tightening against the total budget.
-/// Neither step deletes messages or tool calls, nor rewrites exact-replay protocol
-/// state, so assistant↔tool pairing and reasoning continuation state stay intact.
+/// Already-archived successful writes may fold as complete call/result pairs;
+/// other calls and exact-replay protocol state retain their pairing.
 pub(in crate::ai) fn emergency_cap_messages_to_fit(
     messages: &mut Vec<Message>,
     max_chars: usize,
@@ -387,7 +388,7 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> bool {
     minimize_overflow_stubs_for_hard_budget(messages);
-    minimize_truncated_previews_for_hard_budget(messages);
+    minimize_truncated_previews_for_hard_budget(messages, overflow_dir, protected_tool_call_ids);
     let mut truncated_any = false;
     for message in messages.iter_mut() {
         if is_system_like_role(&message.role) || message.role == "user" {
@@ -475,9 +476,21 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
 /// computed `target` and refuses when the pointer is larger than that target,
 /// even though swapping an 8K preview for a ~250-char pointer still saves
 /// budget. Run this before that loop so Path C always reaches the smallest
-/// recoverable form first; both replacements keep the archive path and stay
-/// strictly smaller than the preview they replace.
-fn minimize_truncated_previews_for_hard_budget(messages: &mut [Message]) {
+/// recoverable form first. Archived successful writes become non-callable
+/// evidence notes; the remaining previews keep their archive path and shrink.
+pub(super) fn minimize_truncated_previews_for_hard_budget(
+    messages: &mut Vec<Message>,
+    overflow_dir: Option<&Path>,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
+) {
+    // Legacy argument pointers must stop presenting archived successful writes
+    // as callable examples. Keep their original archive locator in the note.
+    fold_successful_write_calls(
+        messages,
+        overflow_dir,
+        protected_tool_call_ids,
+        SuccessfulWriteFoldMode::ArchivedOnly,
+    );
     for message in messages.iter_mut() {
         minimize_truncated_preview_for_hard_budget(message);
     }
@@ -1040,60 +1053,98 @@ fn truncate_mutable_field_with_policy(
     }
 }
 
-/// Proactively slim down the giant arguments of write_file / apply_patch calls
-/// that were "successfully written".
-///
-/// Once the file is on disk (the result message confirms success), the full
-/// content/patch body has no semantic value for later turns — the model references
-/// the file path, not the body — so keeping it only occupies context. This is
-/// independent of budget pressure: as soon as the group has slid out of the recent
-/// protection window (the model can no longer plausibly reference the just-written
-/// body to construct follow-up edits), replace it with a
-/// `_context_overflow_truncated` pointer stub and archive the original with zero
-/// compression. Failed results, in-window results, and current-turn protected ids
-/// are never touched. Recovery metadata keeps the original accessible via
-/// archive_file_path; current files should be re-read for follow-up edits.
+/// Archive and fold successful write_file / apply_patch call/result pairs once
+/// they leave the recent protection window. A recovery pointer belongs in a
+/// runtime evidence note, never in arguments that the model could copy as a new
+/// invocation. Failed, recent, and current-turn protected calls remain intact.
 pub(in crate::ai) fn shrink_successful_write_arguments(
     messages: &mut Vec<Message>,
     overflow_dir: Option<&Path>,
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) {
-    if messages.is_empty() {
+    fold_successful_write_calls(
+        messages,
+        overflow_dir,
+        protected_tool_call_ids,
+        SuccessfulWriteFoldMode::All,
+    );
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SuccessfulWriteFoldMode {
+    All,
+    ArchivedOnly,
+}
+
+struct SuccessfulWriteFoldCall {
+    call_index: usize,
+    result_index: usize,
+    original_arguments_archive_path: Option<String>,
+}
+
+fn fold_successful_write_calls(
+    messages: &mut Vec<Message>,
+    overflow_dir: Option<&Path>,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
+    mode: SuccessfulWriteFoldMode,
+) {
+    let Some(overflow_dir) = overflow_dir else {
+        // Without a durable archive, the original messages are the only truth.
         return;
-    }
+    };
     // Protection window: the most recent KEEP_RECENT_TOOL_GROUPS tool groups that
     // already have results (including groups just written this turn, whose bodies
     // the model may immediately reference for follow-up edits) — their calls
     // always keep full arguments.
-    let protected_recent_call_ids: rustc_hash::FxHashSet<String> =
+    let protected_recent_call_ids: FastSet<String> =
         recent_tool_result_groups(messages, KEEP_RECENT_TOOL_GROUPS)
             .into_iter()
             .flatten()
             .filter_map(|idx| messages[idx].tool_call_id.clone())
             .collect();
-    // tool_call_id -> result text (used to judge success/failure).
-    let result_by_call_id: rustc_hash::FxHashMap<String, String> = messages
-        .iter()
-        .filter(|message| message.role == "tool")
-        .filter_map(|message| {
-            message
-                .tool_call_id
-                .as_deref()
-                .map(|id| (id.to_string(), value_to_string(&message.content)))
-        })
-        .collect();
-
-    let mut changed = false;
-    for message in messages.iter_mut() {
-        if message.role != "assistant" {
+    let archive_path = overflow_dir.join(OVERFLOW_HISTORY_FILENAME);
+    let archive_path = archive_path.to_string_lossy();
+    let mut replacements = FastMap::default();
+    let mut removed_results = FastSet::default();
+    for (assistant_index, assistant) in messages.iter().enumerate() {
+        if assistant.role != "assistant" {
             continue;
         }
-        let Some(tool_calls) = message.tool_calls.as_mut() else {
+        let Some(tool_calls) = assistant
+            .tool_calls
+            .as_ref()
+            .filter(|calls| !calls.is_empty())
+        else {
             continue;
         };
-        // Collect candidates first, to avoid an exclusive-borrow conflict with
-        // truncate_mutable_field.
-        let mut candidates: Vec<(usize, usize)> = Vec::new();
+        let call_ids: FastSet<&str> = tool_calls.iter().map(|call| call.id.as_str()).collect();
+        if call_ids.len() != tool_calls.len() || call_ids.contains("") {
+            continue;
+        }
+        // Pair only within this anchor's consecutive result span. Reused IDs in
+        // later groups must never supply success evidence for an earlier call.
+        let mut result_by_call_id = FastMap::default();
+        let mut duplicate_result = false;
+        for (result_index, result) in messages.iter().enumerate().skip(assistant_index + 1) {
+            if result.role != "tool" {
+                break;
+            }
+            let Some(id) = result
+                .tool_call_id
+                .as_deref()
+                .filter(|id| call_ids.contains(id))
+            else {
+                break;
+            };
+            if result_by_call_id.insert(id, result_index).is_some() {
+                duplicate_result = true;
+                break;
+            }
+        }
+        if duplicate_result {
+            continue;
+        }
+        let mut candidates = Vec::new();
         for (call_index, call) in tool_calls.iter().enumerate() {
             let name = call.function.name.as_str();
             if name != "write_file" && name != "apply_patch" {
@@ -1105,35 +1156,203 @@ pub(in crate::ai) fn shrink_successful_write_arguments(
                 continue;
             }
             let arguments = &call.function.arguments;
-            if arguments.contains("\"_context_overflow_truncated\"") {
-                continue; // already replaced; idempotent (avoids duplicate archiving/duplicate file writes)
-            }
-            let original_chars = arguments.chars().count();
-            if original_chars <= 160 {
+            let original_arguments_archive_path =
+                if is_context_overflow_truncated_tool_arguments(arguments) {
+                    let value: Value =
+                        serde_json::from_str(arguments).expect("validated pointer JSON");
+                    let Some(path) = value
+                        .get("archive_file_path")
+                        .and_then(Value::as_str)
+                        .filter(|path| !path.is_empty() && Path::new(path).is_file())
+                    else {
+                        continue;
+                    };
+                    Some(path.to_string())
+                } else {
+                    if mode == SuccessfulWriteFoldMode::ArchivedOnly
+                        || arguments.contains("\"_context_overflow_truncated\"")
+                        || arguments.chars().count() <= 160
+                    {
+                        continue;
+                    }
+                    None
+                };
+            let Some(&result_index) = result_by_call_id.get(call.id.as_str()) else {
                 continue;
-            }
-            let Some(result_text) = result_by_call_id.get(&call.id) else {
+            };
+            let Some(result_text) = messages[result_index].content.as_str() else {
                 continue;
             };
             if !is_successful_write_result(name, result_text) {
                 continue;
             }
-            candidates.push((call_index, original_chars));
+            candidates.push(SuccessfulWriteFoldCall {
+                call_index,
+                result_index,
+                original_arguments_archive_path,
+            });
         }
-        for (call_index, original_chars) in candidates {
-            if truncate_mutable_field(
-                message,
-                MutableMessageField::ToolArguments(call_index),
-                original_chars.saturating_sub(240),
-                overflow_dir,
-                FieldArchivePolicy::BestEffort,
-            ) {
-                changed = true;
-            }
+        if candidates.is_empty() {
+            continue;
+        }
+        let mut original_messages = vec![assistant.clone()];
+        let mut result_indices = candidates
+            .iter()
+            .map(|candidate| candidate.result_index)
+            .collect::<Vec<_>>();
+        result_indices.sort_unstable();
+        original_messages.extend(
+            result_indices
+                .into_iter()
+                .map(|index| messages[index].clone()),
+        );
+        let folded_indices: FastSet<usize> = candidates
+            .iter()
+            .map(|candidate| candidate.call_index)
+            .collect();
+        let remaining_calls = tool_calls
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !folded_indices.contains(index))
+            .map(|(_, call)| call.clone())
+            .collect::<Vec<_>>();
+        let remaining_assistant = if remaining_calls.is_empty() {
+            None
+        } else {
+            let mut remaining = assistant.clone();
+            remaining.tool_calls = Some(remaining_calls);
+            Some(remaining)
+        };
+        let note = successful_write_evidence_note(&original_messages, &candidates, &archive_path);
+        if !has_valid_folded_tool_provenance(&note) {
+            continue;
+        }
+        let retained_chars = remaining_assistant
+            .as_ref()
+            .map_or(0, message_billable_chars);
+        // Raw small writes must not grow into recovery boilerplate. Legacy
+        // pointers fold even when their safe note is larger: leaving a callable
+        // pointer example would perpetuate the invalid invocation pattern.
+        if candidates
+            .iter()
+            .any(|candidate| candidate.original_arguments_archive_path.is_none())
+            && message_billable_chars(&note) + retained_chars
+                >= messages_total_chars(&original_messages)
+        {
+            continue;
+        }
+        // Commit the unchanged assistant and paired results before mutating any
+        // projection field. A failed append leaves every original message intact.
+        if archive_messages_to_overflow(&original_messages, Some(overflow_dir)).is_none() {
+            continue;
+        }
+        removed_results.extend(candidates.iter().map(|candidate| candidate.result_index));
+        replacements.insert(assistant_index, (note, remaining_assistant));
+    }
+    if replacements.is_empty() {
+        return;
+    }
+    let mut folded = Vec::with_capacity(messages.len());
+    for (index, message) in std::mem::take(messages).into_iter().enumerate() {
+        if let Some((note, remaining_assistant)) = replacements.remove(&index) {
+            folded.push(note);
+            folded.extend(remaining_assistant);
+        } else if !removed_results.contains(&index) {
+            folded.push(message);
         }
     }
-    if changed {
-        insert_overflow_archive_note_if_exists(messages, overflow_dir);
+    *messages = folded;
+    insert_overflow_archive_note_if_exists(messages, Some(overflow_dir));
+}
+
+fn successful_write_evidence_note(
+    original_messages: &[Message],
+    candidates: &[SuccessfulWriteFoldCall],
+    archive_path: &str,
+) -> Message {
+    let mut sources = original_messages.to_vec();
+    let calls = original_messages[0]
+        .tool_calls
+        .as_ref()
+        .expect("write anchor");
+    sources[0].tool_calls = Some(
+        candidates
+            .iter()
+            .map(|candidate| calls[candidate.call_index].clone())
+            .collect(),
+    );
+    let mut lines = vec![
+        format!("compressed_tool_round: {} tool calls (successful writes folded; recoverable)", candidates.len()),
+        COMPRESSED_TOOL_EVIDENCE_MARKER.to_string(),
+        format!("- archive_file_path: {archive_path}"),
+        "- archive_scope: successful_write_projection_messages_verbatim".to_string(),
+        "assistant_checkpoint: completed successful writes; original calls and results are archived.".to_string(),
+        "evidence:".to_string(),
+    ];
+    for candidate in candidates {
+        let call = &calls[candidate.call_index];
+        let name = &call.function.name;
+        let result = original_messages
+            .iter()
+            .skip(1)
+            .find(|message| message.tool_call_id.as_deref() == Some(call.id.as_str()))
+            .and_then(|message| message.content.as_str())
+            .expect("successful write result text");
+        let targets = successful_write_result_targets(name, result);
+        lines.push(format!(
+            "- {name} => success; target_files: {}",
+            serde_json::json!(targets)
+        ));
+        if let Some(path) = &candidate.original_arguments_archive_path {
+            lines.push(format!("  original_arguments_archive_file_path: {path}"));
+        }
+    }
+    lines.push("Recovery: read current target files before follow-up edits; use archive_file_path for the exact historical calls and results.".to_string());
+    let mut note = Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(lines.join("\n")),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    };
+    let group = (0..sources.len()).collect::<Vec<_>>();
+    super::folded_prune::attach_provenance(&mut note, &sources, &group, Some(archive_path));
+    note
+}
+
+fn successful_write_result_targets(tool_name: &str, result_text: &str) -> Vec<String> {
+    let mut lines = result_text.trim_start().lines();
+    let Some(first) = lines.next() else {
+        return Vec::new();
+    };
+    match tool_name {
+        "write_file" => first
+            .strip_prefix("Successfully wrote to ")
+            .map(|path| vec![path.trim().to_string()])
+            .unwrap_or_default(),
+        "apply_patch" => {
+            let Some(target) = first.strip_prefix("Successfully patched ") else {
+                return Vec::new();
+            };
+            let path = |text: &str| {
+                text.rsplit_once("; +")
+                    .map_or(text, |(path, _)| path)
+                    .trim()
+                    .to_string()
+            };
+            if let Some(count) = target
+                .strip_suffix(" files:")
+                .and_then(|count| count.parse::<usize>().ok())
+            {
+                lines
+                    .take(count)
+                    .filter_map(|line| line.strip_prefix("- ").map(path))
+                    .collect()
+            } else {
+                vec![path(target)]
+            }
+        }
+        _ => Vec::new(),
     }
 }
 

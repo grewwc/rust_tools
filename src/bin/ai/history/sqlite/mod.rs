@@ -97,8 +97,9 @@ pub(in crate::ai) use store::{
     count_user_turns_sqlite, message_count_sqlite_read_only, read_all_messages_sqlite,
     read_all_messages_sqlite_read_only, read_all_messages_with_models_sqlite,
     read_assistant_reply_sqlite, read_history_with_ids_sqlite, read_message_watermark_sqlite,
-    read_recent_reply_candidates_sqlite, read_stored_messages_by_ids_sqlite,
-    read_stored_messages_sqlite, replace_all_messages_sqlite, reserve_turn_index_sqlite,
+    read_previous_turn_messages_sqlite, read_recent_reply_candidates_sqlite,
+    read_stored_messages_by_ids_sqlite, read_stored_messages_sqlite, replace_all_messages_sqlite,
+    reserve_turn_index_sqlite,
 };
 pub(in crate::ai) use trim::{
     clear_session_history_sqlite, remap_session_asset_paths_sqlite, truncate_messages_sqlite,

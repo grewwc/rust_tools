@@ -20,7 +20,8 @@ use crate::ai::types::{ReasoningItemMap, ToolDefinition};
 
 use super::aux::charge_llm_usage_to_kernel;
 use super::builder::{
-    build_request_body, clamp_with_estimated_prompt, measure_request_prompt_from_definitions,
+    RequestModelInputs, build_request_body_from_parts_with_replay_owners,
+    clamp_with_estimated_prompt, measure_request_prompt_from_definitions,
     resolve_wire_enable_search,
 };
 use super::current_budget::CurrentRequestBudget;
@@ -523,6 +524,7 @@ pub(crate) async fn preview_request_budget(
             messages,
             tools_defs,
             Some(&core.reasoning_items),
+            Some(core.spliced_replay_keys.message_owners()),
         );
         let feedback = PromptTokenFeedback::capture_preview(
             &app.session_id,
@@ -645,7 +647,9 @@ async fn prepare_projection_core_with_thinking(
     let endpoint = endpoint_for_request_model(app, model);
     // Encrypted reasoning side-channel rebuild: must run before `normalize_reasoning_content_replay_for_model`,
     // because the latter strips the `reasoning_content` (our persisted encoded blob) for encrypted-replay models.
-    // The in-memory side channel (freshest for the current turn) wins; the persisted blob only fills historical gaps. The field is then stripped from the wire projection as usual.
+    // The in-memory side channel wins; persisted blobs fill historical gaps.
+    // Capture message-position owners here as well, before clearing markers,
+    // so serialization, counting and rejection repair retain the same keys.
     let mut spliced_replay_keys = SplicedReplayKeys::default();
     let turn_reasoning_items = reconstruct_encrypted_reasoning_items_for_model_recorded(
         model,
@@ -752,8 +756,8 @@ impl RequestProjection {
         stream: bool,
         previous: Option<&PromptTokenFeedback>,
     ) -> (RequestBody<'a>, PromptTokenFeedback, CurrentRequestBudget) {
-        let mut body = build_request_body(
-            model,
+        let mut body = build_request_body_from_parts_with_replay_owners(
+            &RequestModelInputs::resolve(model),
             &self.messages,
             stream,
             self.enable_thinking,
@@ -764,6 +768,7 @@ impl RequestProjection {
             app.cli.max_tokens_override,
             None,
             Some(&self.reasoning_items),
+            Some(self.spliced_replay_keys.message_owners()),
         );
         // Turn-scoped tool failure flags ride on the main request body only;
         // auxiliary builders construct their own bodies without the side
@@ -1151,6 +1156,123 @@ mod budget_tests {
             ..Default::default()
         });
         app
+    }
+
+    #[test]
+    fn plain_replay_projection_retains_owners_for_wire_budget_and_disable_switch() {
+        use crate::ai::history::compress::encode_encrypted_reasoning_replay_state;
+        use crate::ai::request_protocol::RequestProtocolDialect;
+        use crate::ai::types::{FunctionCall, ToolCall};
+        use std::sync::Arc;
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct RestoreReplayEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreReplayEnv {
+            fn drop(&mut self) {
+                // SAFETY: this test holds ENV_LOCK through restoration.
+                unsafe {
+                    match &self.0 {
+                        Some(value) => std::env::set_var("AIOS_DISABLE_ENCRYPTED_REPLAY", value),
+                        None => std::env::remove_var("AIOS_DISABLE_ENCRYPTED_REPLAY"),
+                    }
+                }
+            }
+        }
+        let _restore = RestoreReplayEnv(std::env::var_os("AIOS_DISABLE_ENCRYPTED_REPLAY"));
+        let model = crate::ai::model_names::all()
+            .iter()
+            .find(|entry| {
+                entry.reasoning_encrypted_replay
+                    && entry.request_protocol == Some(RequestProtocolDialect::Responses)
+                    && !models::reasoning_content_replay_enabled(&entry.key)
+            })
+            .expect("registry must contain a Responses encrypted replay model")
+            .key
+            .clone();
+        let mut app = app();
+        app.current_model = model.clone();
+        app.session_id = format!("plain-replay-budget-{}", uuid::Uuid::new_v4());
+        app.cli.max_tokens_override = Some(512);
+        let mut first = message("assistant", "same answer");
+        first.reasoning_content = Some(encode_encrypted_reasoning_replay_state(
+            &model,
+            None,
+            &[
+                json!({"type":"reasoning", "id":"rs_projection_first", "encrypted_content":"A".repeat(4_000)}),
+            ],
+        ));
+        let mut second = message("assistant", "same answer");
+        second.tool_calls = Some(vec![]);
+        second.reasoning_content = Some(encode_encrypted_reasoning_replay_state(
+            &model,
+            None,
+            &[
+                json!({"type":"reasoning", "id":"rs_projection_second", "encrypted_content":"B".repeat(4_000)}),
+            ],
+        ));
+        let mut live_message = message("assistant", "tool narration");
+        live_message.tool_calls = Some(vec![ToolCall {
+            id: "call-projection-live".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        let mut tool_result = message("tool", "result");
+        tool_result.tool_call_id = Some("call-projection-live".to_string());
+        app.turn_reasoning_items.insert(
+            "call-projection-live".to_string(),
+            Arc::new(vec![
+                json!({"type":"reasoning", "id":"rs_projection_live", "encrypted_content":"LIVE"}),
+            ]),
+        );
+        let messages = vec![
+            message("user", "first question"),
+            first,
+            message("user", "second question"),
+            second,
+            live_message,
+            tool_result,
+            message("user", "following question"),
+        ];
+        let original = messages.clone();
+        for (disable, expected_items) in [("0", 3), ("1", 1), ("disabled", 1), ("", 3)] {
+            // SAFETY: ENV_LOCK serializes process environment changes.
+            unsafe { std::env::set_var("AIOS_DISABLE_ENCRYPTED_REPLAY", disable) };
+            let mut projection = prepare_request_projection(&app, &model, &messages, false)
+                .now_or_never()
+                .expect("projection preparation must not call an auxiliary LLM");
+            assert!(
+                projection
+                    .messages
+                    .iter()
+                    .all(|message| message.reasoning_content.is_none())
+            );
+            assert_eq!(projection.reasoning_items.len(), expected_items);
+            assert_ne!(
+                projection.spliced_replay_keys.message_owners()[&1],
+                projection.spliced_replay_keys.message_owners()[&3]
+            );
+            let (body, _, measured) = projection.measure(&app, &model, false, None);
+            let wire = super::super::protocol::build_responses_request_body(&body);
+            let reasoning = wire["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "reasoning")
+                .collect::<Vec<_>>();
+            assert_eq!(reasoning.len(), expected_items);
+            assert_eq!(reasoning.last().unwrap()["id"], "rs_projection_live");
+            assert_eq!(wire["include"], json!(["reasoning.encrypted_content"]));
+            let preview = preview_request_budget(&app, &model, &messages, false, false)
+                .now_or_never()
+                .expect("preview must not call an auxiliary LLM");
+            assert_eq!(preview.prompt_tokens, measured.prompt_tokens);
+            assert_eq!(body.estimated_prompt_tokens, measured.prompt_tokens);
+            assert_eq!(messages, original);
+        }
     }
 
     #[test]

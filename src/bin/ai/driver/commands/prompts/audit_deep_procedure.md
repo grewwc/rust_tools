@@ -8,9 +8,9 @@ Apply this private procedure only when the user selects `/audit --deep` (optiona
 
 ### 1. Build a self-contained audit prompt
 
-**R0 — mechanical inventory, before building the prompt:** collect the union of the session mutation log (`show_changes`), `git status --porcelain`, and `git diff --stat`. Maintain a lead-owned checklist filtered by ownership for this request, including delegated writes. Mark every item `covered` (cited read range), `gap` (not yet read), or `N.A.` (out of scope, with reason); unknown ownership remains an explicit `gap`. This checklist is not a new report field.
+**R0 — mechanical inventory, before building the prompt:** start from the frozen previous-turn canonical tool records supplied by the driver. Default to that turn's changes, including delegated writes and direct consumers; an explicit scope in the original user audit prompt overrides this default. Maintain a lead-owned checklist with every item `covered` (cited read range), `gap` (not yet read), or `N.A.` (out of scope, with reason). Unknown ownership remains a `gap`; this checklist is not a new report field.
 
-`show_changes` falls back to `git status --porcelain` / `git diff HEAD` when the log is empty; use `include_git: false` for a session-only view when needed. A nonempty mutation log never skips the git cross-check: it covers tool-level writes (`write_file` / `apply_patch` and the patch tools), including parallel subagent writes, but not indirect writes from `execute_command`. Compression drops earlier turns, so memory alone under-reports scope.
+Session mutation logs and Git inventory do not establish turn ownership. Use them only to verify already scoped paths or to investigate the user's explicit alternative scope. Missing tool results, indirect command writes, delegated artifacts, and unavailable per-turn snapshots remain coverage gaps; never widen to the whole session or workspace merely because the artifact is incomplete.
 
 Create an `audit_prompt` from the changes you made for this request. It must include:
 
@@ -20,7 +20,7 @@ Create an `audit_prompt` from the changes you made for this request. It must inc
 - **Verification already run:** State the exact commands and outcomes (build, focused tests, manual checks) or say that none were run. The auditor is told not to repeat the caller's commands, so it needs this to distinguish unverified behavior from behavior you already exercised.
 - **Evidence read list (required):** For each changed file, name the ranges the auditor must read (`path:start-end`, taken from your own `read_file` calls) and the invariant each range checks. Include the caller/dependent ranges that prove the change's impact surface: the audit report requires caller/contract evidence, and the auditor starts from this list and completes the baseline itself with bounded `git`/`rg` reads. The auditor may only cite evidence from its own `read_file` calls in its turn, so this list is what lets it verify quickly. Never list a range you did not read; name it as a coverage gap instead. Include the scope's R0 items and gaps; keep one list per audit scope — see the scoped parallel path in §2.
 
-A task subagent cannot see your conversation history. The `/audit` path adds this session's change context, but the `task_spawn` path receives only `audit_prompt`; therefore, `audit_prompt` must stand alone.
+A task subagent cannot see your conversation history. The `/audit` path adds the frozen audit scope and previous-turn evidence, but the `task_spawn` path receives only `audit_prompt`; therefore, `audit_prompt` must stand alone.
 
 ### 2. Prepare the scoped audit round
 

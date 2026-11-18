@@ -975,11 +975,8 @@ pub(super) fn append_tool_result_messages_for_model(
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
 ) {
-    // 截断 tool-call 前的 assistant narration：纯叙述对后续轮次价值有限，
-    // 多轮叠加后会大幅膨胀上下文，对最终回答几乎没有帮助。
-    // 智能截断：优先回退到最近一处句子边界（。！？.!?\n），保证不腰斩半句话；
-    // 仍然把 cap 控制在 800 字附近，且加 `…[truncated]` 显式标记，
-    // 避免后续 agent 误以为这是完整 narration。
+    // Cap tool-call narration at a nearby sentence boundary and mark the
+    // truncation so later rounds can distinguish it from the full text.
     const TOOL_CALL_NARRATION_MAX_CHARS: usize = 800;
     let narration = if stream_assistant_text.chars().count() > TOOL_CALL_NARRATION_MAX_CHARS {
         smart_truncate_to_sentence(stream_assistant_text, TOOL_CALL_NARRATION_MAX_CHARS)
@@ -991,37 +988,12 @@ pub(super) fn append_tool_result_messages_for_model(
         content: Value::String(stream_assistant_text.to_string()),
         tool_calls: Some(exec_result.executed_tool_calls.clone()),
         tool_call_id: None,
-        reasoning_content: (!stream_reasoning_text.is_empty())
-            .then(|| stream_reasoning_text.to_string()),
-    };
-    // Responses 加密推理落库：encrypted-replay 模型不返回明文 reasoning（summary 恒空），
-    // 其推理只以 encrypted_content item 形式存在。若不落库，仅存于内存侧信道
-    // `turn_reasoning_items`，跨轮 clear / Ctrl+C 后 resume 都会丢失，导致模型"失忆"
-    // （实测：不回放会让"仅存在于私有推理中的状态"跨轮丢失）。这里把本轮 items 连同
-    // 来源模型编码进 canonical 的 `reasoning_content`，与 exact-replay 的明文回放共用
-    // 「带标记则跨压缩保留、按模型解码」的机制；空 items 时保持 None，行为不变。
-    let raw_assistant = if !stream_reasoning_items.is_empty()
-        && crate::ai::models::reasoning_encrypted_replay_enabled(source_model)
-        && crate::ai::history::compress::encrypted_reasoning_replay_runtime_enabled()
-    {
-        // Bind the marker to the endpoint that served this turn: encrypted
-        // items are only accepted by the backing resource that created them,
-        // so a later request routed elsewhere must drop them instead of
-        // replaying another resource's server-side ids.
-        let endpoint = crate::ai::request::endpoint_for_request_model(app, source_model);
-        let endpoint_identity = crate::ai::models::endpoint_resource_identity(&endpoint);
-        Message {
-            reasoning_content: Some(
-                crate::ai::history::compress::encode_encrypted_reasoning_replay_state(
-                    source_model,
-                    endpoint_identity.as_deref(),
-                    stream_reasoning_items,
-                ),
-            ),
-            ..raw_assistant
-        }
-    } else {
-        raw_assistant
+        reasoning_content: recorded_reasoning_content(
+            app,
+            source_model,
+            stream_reasoning_text,
+            stream_reasoning_items,
+        ),
     };
     // Build the projected assistant message from scratch instead of cloning `raw_assistant`
     // and overwriting content: the clone would deep-copy the full narration text that is
@@ -1206,8 +1178,36 @@ fn append_code_inspection_working_memory(
     messages.push(runtime_synthetic_user_message(Value::String(note)));
 }
 
+/// Persist encrypted continuation state for both tool rounds and final text.
+fn recorded_reasoning_content(
+    app: &App,
+    source_model: &str,
+    reasoning_text: &str,
+    reasoning_items: &[Value],
+) -> Option<String> {
+    if !reasoning_items.is_empty()
+        && crate::ai::models::reasoning_encrypted_replay_enabled(source_model)
+        && crate::ai::history::compress::encrypted_reasoning_replay_runtime_enabled()
+    {
+        // Bind the marker to the endpoint that served the response, including
+        // fallback responses whose model differs from app.current_model.
+        let endpoint = crate::ai::request::endpoint_for_request_model(app, source_model);
+        let endpoint_identity = crate::ai::models::endpoint_resource_identity(&endpoint);
+        Some(
+            crate::ai::history::compress::encode_encrypted_reasoning_replay_state(
+                source_model,
+                endpoint_identity.as_deref(),
+                reasoning_items,
+            ),
+        )
+    } else {
+        (!reasoning_text.is_empty()).then(|| reasoning_text.to_string())
+    }
+}
+
 pub(super) fn record_final_stream_response(
     app: &mut App,
+    source_model: &str,
     stream_result: crate::ai::types::StreamResult,
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
@@ -1225,8 +1225,12 @@ pub(super) fn record_final_stream_response(
         content: Value::String(cleaned_assistant_text.clone()),
         tool_calls: None,
         tool_call_id: None,
-        reasoning_content: (!stream_result.reasoning_text.is_empty())
-            .then(|| stream_result.reasoning_text.clone()),
+        reasoning_content: recorded_reasoning_content(
+            app,
+            source_model,
+            &stream_result.reasoning_text,
+            &stream_result.reasoning_items,
+        ),
     };
     messages.push(assistant_msg.clone());
     turn_messages.push(assistant_msg);
@@ -1472,7 +1476,8 @@ mod tests {
         append_tool_result_messages_for_model, build_code_inspection_working_memory,
         collect_repo_inspection_findings, describe_tool_call, extract_tool_result_key_lines,
         is_code_inspection_memory_text, is_repo_inspection_tool, is_runtime_synthetic_user_message,
-        prepare_tool_results_for_history, strip_legacy_prune_directives,
+        prepare_tool_results_for_history, record_final_stream_response,
+        strip_legacy_prune_directives,
     };
     use super::{
         WORKING_CHECKPOINT_FILE_NAME, extract_context_checkpoints, record_hidden_self_note,
@@ -1604,6 +1609,129 @@ mod tests {
                 .collect(),
             had_error: false,
         }
+    }
+
+    #[test]
+    fn plain_final_response_persists_encrypted_reasoning_with_source_model_and_runtime_switch() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct RestoreReplayEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreReplayEnv {
+            fn drop(&mut self) {
+                // SAFETY: this test holds ENV_LOCK through restoration.
+                unsafe {
+                    match &self.0 {
+                        Some(value) => std::env::set_var("AIOS_DISABLE_ENCRYPTED_REPLAY", value),
+                        None => std::env::remove_var("AIOS_DISABLE_ENCRYPTED_REPLAY"),
+                    }
+                }
+            }
+        }
+        let _restore = RestoreReplayEnv(std::env::var_os("AIOS_DISABLE_ENCRYPTED_REPLAY"));
+        let registry = crate::ai::model_names::all();
+        let encrypted = &registry
+            .iter()
+            .find(|entry| entry.reasoning_encrypted_replay)
+            .expect("registry must contain an encrypted replay model")
+            .key;
+        let plain = &registry
+            .iter()
+            .find(|entry| !entry.reasoning_encrypted_replay)
+            .expect("registry must contain a model without encrypted replay")
+            .key;
+        let root =
+            std::env::temp_dir().join(format!("ai-plain-final-replay-{}", uuid::Uuid::new_v4()));
+        let mut app = test_app(root.join("history.sqlite"));
+        app.current_model = plain.clone();
+        app.turn_reasoning_items.insert(
+            "stale-tool-round".to_string(),
+            Arc::new(vec![
+                serde_json::json!({"id":"rs_stale","encrypted_content":"STALE"}),
+            ]),
+        );
+        let items = vec![serde_json::json!({
+            "type":"reasoning", "id":"rs_final", "encrypted_content":"COMPLETE_PAYLOAD", "summary":[]
+        })];
+        for (model, captured, text, disable, marked) in [
+            (encrypted, items.as_slice(), "summary", "0", true),
+            (encrypted, items.as_slice(), "", "", true),
+            (encrypted, items.as_slice(), "summary", " ", true),
+            (encrypted, &[][..], "summary", "0", false),
+            (encrypted, &[][..], "", "0", false),
+            (plain, items.as_slice(), "summary", "0", false),
+            (plain, items.as_slice(), "", "0", false),
+            (encrypted, items.as_slice(), "summary", "1", false),
+            (encrypted, items.as_slice(), "", "disabled", false),
+            (encrypted, items.as_slice(), "summary", " 0 ", false),
+        ] {
+            // SAFETY: ENV_LOCK serializes process environment changes.
+            unsafe { std::env::set_var("AIOS_DISABLE_ENCRYPTED_REPLAY", disable) };
+            let mut messages = Vec::new();
+            let mut turn_messages = Vec::new();
+            let mut final_text = String::new();
+            let mut recorded = false;
+            record_final_stream_response(
+                &mut app,
+                model,
+                crate::ai::types::StreamResult {
+                    outcome: crate::ai::types::StreamOutcome::Completed,
+                    assistant_text: "final answer".to_string(),
+                    reasoning_text: text.to_string(),
+                    reasoning_items: captured.to_vec(),
+                    ..Default::default()
+                },
+                &mut messages,
+                &mut turn_messages,
+                &mut final_text,
+                &mut recorded,
+            );
+            assert!(recorded);
+            assert_eq!(final_text, "final answer");
+            assert_eq!(messages, turn_messages);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].content, serde_json::json!("final answer"));
+            assert!(messages[0].tool_calls.is_none());
+            if marked {
+                let marker = messages[0]
+                    .reasoning_content
+                    .as_deref()
+                    .expect("final marker");
+                let endpoint = crate::ai::request::endpoint_for_request_model(&app, model);
+                let identity = crate::ai::models::endpoint_resource_identity(&endpoint);
+                assert_eq!(
+                    marker,
+                    crate::ai::history::compress::encode_encrypted_reasoning_replay_state(
+                        model,
+                        identity.as_deref(),
+                        &items,
+                    )
+                );
+                assert_eq!(
+                    crate::ai::history::compress::decode_encrypted_reasoning_replay_for_model(
+                        model,
+                        identity.as_deref(),
+                        marker,
+                    ),
+                    Some(items.clone())
+                );
+                assert!(
+                    crate::ai::history::compress::decode_encrypted_reasoning_replay_for_model(
+                        plain,
+                        identity.as_deref(),
+                        marker,
+                    )
+                    .is_none(),
+                    "fallback provenance must use the actual response model"
+                );
+            } else {
+                assert_eq!(
+                    messages[0].reasoning_content.as_deref(),
+                    (!text.is_empty()).then_some(text)
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

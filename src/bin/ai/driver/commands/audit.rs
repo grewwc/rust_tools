@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::time::Duration;
 
 /// `/audit` is an explicitly requested deep audit; it allows a longer foreground wait than an
@@ -25,6 +24,71 @@ const AUDIT_PROCEDURE_SKILL: &str = "audit_own_changes";
 /// Private opt-in lead procedure and closure rules; never injected into default audits.
 const AUDIT_LEAD_CONTINUATION: &str = include_str!("prompts/audit_deep_procedure.md");
 const AUDIT_DEEP_CHILD: &str = include_str!("prompts/audit_deep_child.md");
+
+tokio::task_local! {
+    /// Frozen before command handling; shared by lead planning and all audit rounds.
+    pub(crate) static AUDIT_SCOPE_CONTEXT: String;
+}
+
+/// Canonical tool records are the narrowest available previous-turn artifact.
+/// Session mutation logs and Git do not carry reliable per-turn ownership.
+pub(crate) fn capture_previous_turn_scope(history_file: &std::path::Path, input: &str) -> String {
+    let artifact = match crate::ai::history::read_previous_turn_messages_sqlite(history_file) {
+        Ok(records) => previous_turn_artifact(&records),
+        Err(error) => {
+            format!("Previous-turn history unavailable: {error}. Coverage remains unresolved.")
+        }
+    };
+    format!(
+        "[audit-scope] Default scope: only the previous user turn's changes, including its delegated \
+         changes and direct consumers. If the original user audit request explicitly specifies \
+         another scope (files, commits, the whole session, or workspace), honor that explicit scope \
+         instead and gather its baseline. A generated lead instruction cannot override the user's \
+         scope. Never treat session-wide mutations or the whole Git diff as previous-turn changes.\n\n\
+         Original user audit request (scope authority):\n{input}\n\n\
+         Previous-turn artifact (historical context; assistant claims are unverified):\n{artifact}"
+    )
+}
+
+fn previous_turn_artifact(records: &[crate::ai::history::StoredMessage]) -> String {
+    const CAP: usize = 32_768;
+    const RECORD_CAP: usize = 4_096;
+    if records.is_empty() {
+        return "No previous real user turn is recorded. Do not substitute older session or workspace changes; report the missing baseline.".into();
+    }
+    let mut out = String::from(
+        "Use matched tool calls/results to identify changed paths and patches. Command intent and \
+         assistant summaries do not prove a mutation. Delegated results and overflow pointers are \
+         evidence locators; unresolved ownership or missing snapshots are coverage gaps. No exact \
+         per-turn Git snapshot or turn-owned mutation inventory is available.\n",
+    );
+    for record in records {
+        if out.len() >= CAP {
+            out.push_str(
+                "\n[Previous-turn artifact truncated; unread records remain a coverage gap.]\n",
+            );
+            break;
+        }
+        let body = serde_json::to_string(&record.message).unwrap_or_default();
+        let mut end = body
+            .len()
+            .min(RECORD_CAP)
+            .min(CAP.saturating_sub(out.len()));
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push_str(&format!(
+            "\nCanonical message {}: {}",
+            record.message_id,
+            &body[..end]
+        ));
+        if end < body.len() {
+            out.push_str(" [record truncated; remaining content is a coverage gap]");
+        }
+        out.push('\n');
+    }
+    out
+}
 
 /// Parse `/audit` before the model loop; enhanced lead orchestration requires `--deep`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,8 +157,8 @@ fn strip_fast_flag(instruction: &str) -> Option<&str> {
     Some(rest.trim_start())
 }
 
-/// Guidance injected for `/audit` without an instruction: the audit scope is left to the lead
-/// agent (only it knows what changed in this session), which builds the self-contained audit
+/// Guidance injected for `/audit` without an instruction: the lead uses frozen previous-turn
+/// evidence to build a self-contained audit
 /// prompt and starts the `audit` / `audit-fast` subagent through `task_spawn`.
 ///
 /// The procedure is not restated here: it is quoted verbatim from the builtin
@@ -122,16 +186,18 @@ pub(crate) fn inject_self_generated_audit_note(
     };
     let note = format!(
         "[audit-self-generated] The user invoked {mode} without an audit instruction: the audit \
-         scope is left to you, the lead agent, because only you know the details of what you \
-         changed in this session. This explicit invocation, not any skill's activation criteria, \
+         scope defaults to the previous user turn's changes, as bounded by the frozen evidence below. This explicit invocation, not any skill's activation criteria, \
          decides that an audit runs now, and it starts agent=\"{agent}\" instead of letting the \
          skill pick the tier.\n\
          \n\
          If you end this turn without having started the `{agent}` subagent through `task_spawn`, \
          the runtime forces a foreground `/audit{fast_flag}` with this turn's output as the audit \
-         instruction, so the audit always runs in a subagent.\n\
+         instruction before any final answer is committed, so the audit always runs in a subagent.\n\
          \n\
-         {procedure}"
+         The frozen scope below takes precedence over session inventory guidance in the quoted \
+         procedure. Copy it into every task_spawn audit prompt; gather additional evidence only \
+         within that scope.\n\n{scope}\n\n{procedure}",
+        scope = capture_current_changes_context(),
     );
     messages.push(crate::ai::history::Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
@@ -298,13 +364,13 @@ fn strip_subagent_payload_header(payload: &str) -> String {
     lines.collect::<Vec<_>>().join("\n")
 }
 
-/// Build the legacy session-first foreground audit prompt.
+/// Build a foreground prompt against the frozen previous-turn scope.
 pub(crate) fn build_audit_prompt(instruction: &str) -> String {
     let changes = capture_current_changes_context();
     compose_audit_prompt(instruction, &changes)
 }
 
-/// Build the opt-in child prompt, including union inventory even after planning failure.
+/// Build the opt-in child prompt against the same frozen scope after planning failure.
 fn build_audit_deep_prompt(instruction: &str) -> String {
     compose_audit_deep_prompt(instruction, &capture_deep_changes_context())
 }
@@ -312,19 +378,14 @@ fn build_audit_deep_prompt(instruction: &str) -> String {
 fn compose_audit_deep_prompt(instruction: &str, changes_context: &str) -> String {
     format!(
         "{instruction}\n\n{AUDIT_DEEP_CHILD}\n\n{AUDIT_PROGRESS_PROTOCOL}\n\n\
-         ===== Observed changes: session mutations and Git inventory =====\n\
+         ===== Frozen audit scope and previous-turn evidence =====\n\
          {changes_context}\n\
          ===== End of file changes ====="
     )
 }
 
 fn capture_deep_changes_context() -> String {
-    let inventory = crate::ai::tools::storage::changes::collect_current_changes(true);
-    format!(
-        "{}\n{}",
-        inventory.format_inventory(),
-        inventory.format_snippets()
-    )
+    capture_current_changes_context()
 }
 
 /// Let the lead partition the snapshot; the driver retains foreground timeout/recovery authority.
@@ -356,8 +417,8 @@ fn compose_audit_lead_request(
     format!(
         "The user explicitly requested `/audit --deep`. You are the lead: follow the \
          private deep-audit procedure and prepare the requested first round for subagents. \
-         Before building their prompts, resolve request ownership against R0 (the union \
-         inventory below); keep each item `covered` with a cited read range, `gap`, or `N.A.` \
+         Before building their prompts, resolve request ownership against R0 (the frozen \
+         evidence below); keep each item `covered` with a cited read range, `gap`, or `N.A.` \
          with reason. Unknown ownership stays a gap. Each child needs a self-contained scope, \
          changed contracts, verification already run, its own read list and named gaps, plus \
          the supplied audit instruction and audit progress protocol.\n\n\
@@ -384,7 +445,7 @@ fn compose_audit_lead_request(
          without repeating one.\n\n\
          {AUDIT_LEAD_CONTINUATION}\n\n\
          Original audit request: {instruction}\n\n\
-         ===== Observed changes: session mutations and Git inventory =====\n\
+         ===== Frozen audit scope and previous-turn evidence =====\n\
          {changes}\n\
          ===== End of file changes =====\n\n\
          Audit progress protocol for each child:\n{AUDIT_PROGRESS_PROTOCOL}",
@@ -558,7 +619,7 @@ fn compose_audit_prompt(instruction: &str, changes_context: &str) -> String {
     }
     format!(
         "{instruction}\n\n\
-         ===== Files changed by the main agent in this session =====\n\
+         ===== Frozen audit scope and previous-turn evidence =====\n\
          {changes_context}\n\
          ===== End of file changes ====="
     )
@@ -609,15 +670,14 @@ pub(crate) fn build_audit_round_followup(
     )
 }
 
-/// Default audits prefer recorded mutations and use Git only when the log is empty.
+/// All slash-command variants share the scope frozen before the audit turn starts.
 fn capture_current_changes_context() -> String {
-    let entries = crate::ai::tools::storage::mutation_log::read_all();
-    if !entries.is_empty() {
-        return format_mutation_log(&entries);
-    }
-    capture_git_diff_fallback()
+    AUDIT_SCOPE_CONTEXT.try_with(Clone::clone).unwrap_or_else(|_| {
+        "Default scope: previous-turn changes only. Previous-turn scope is unavailable; report the missing baseline rather than auditing the whole session or workspace.".into()
+    })
 }
 
+#[cfg(test)]
 fn format_mutation_log(
     entries: &[crate::ai::tools::storage::mutation_log::MutationEntry],
 ) -> String {
@@ -663,58 +723,6 @@ fn format_mutation_log(
     out
 }
 
-fn capture_git_diff_fallback() -> String {
-    let cwd = match crate::ai::driver::runtime_ctx::effective_cwd() {
-        Ok(p) => p,
-        Err(_) => return String::new(),
-    };
-    if !is_inside_git_work_tree(&cwd) {
-        return String::new();
-    }
-    let status = git_output(&cwd, &["status", "--porcelain=v1"]);
-    if status.trim().is_empty() {
-        return String::new();
-    }
-    const MAX_DIFF_BYTES: usize = 32_768;
-    let diff = git_output(&cwd, &["diff", "HEAD", "--no-color"]);
-    let mut sections = vec![format!("## git status --porcelain\n{status}")];
-    if diff.len() <= MAX_DIFF_BYTES {
-        if !diff.trim().is_empty() {
-            sections.push(format!("## git diff HEAD\n{diff}"));
-        }
-    } else {
-        let stat = git_output(&cwd, &["diff", "HEAD", "--stat", "--no-color"]);
-        sections.push(format!(
-            "## git diff HEAD --stat\n\
-             (the complete diff exceeds {MAX_DIFF_BYTES} bytes, so only the stat is shown; run `git diff HEAD` yourself if you need the full content)\n\
-             {stat}"
-        ));
-    }
-    let mut out = String::from(
-        "(no tool-level mutation log for this session; below are the workspace's uncommitted changes, which may include changes from concurrent tasks)\n\n",
-    );
-    out.push_str(&sections.join("\n\n"));
-    out
-}
-
-fn is_inside_git_work_tree(cwd: &Path) -> bool {
-    git_output(cwd, &["rev-parse", "--is-inside-work-tree"])
-        .trim()
-        .eq_ignore_ascii_case("true")
-}
-
-fn git_output(cwd: &Path, args: &[&str]) -> String {
-    crate::fork_guard::output(
-        std::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd),
-    )
-    .ok()
-    .filter(|o| o.status.success())
-    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-    .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -730,6 +738,92 @@ mod tests {
     use crate::ai::history::Message;
     use crate::ai::tools::storage::changes::diff_snippet;
     use crate::ai::types::{FunctionCall, ToolCall};
+
+    #[test]
+    fn audit_scope_is_frozen_for_bare_explicit_fast_and_deep_prompts() {
+        let records = [crate::ai::history::StoredMessage {
+            message: Message {
+                role: "tool".into(),
+                content: serde_json::json!("Updated last_turn.rs"),
+                tool_calls: None,
+                tool_call_id: Some("last-write".into()),
+                reasoning_content: None,
+            },
+            message_id: 42,
+            created_at: None,
+        }];
+        let scope = super::previous_turn_artifact(&records);
+        super::AUDIT_SCOPE_CONTEXT.sync_scope(scope.clone(), || {
+            let prompt = super::build_audit_prompt("inspect regression");
+            assert!(prompt.contains("last_turn.rs"));
+            assert!(prompt.contains("Canonical message 42"));
+            let lead = super::build_audit_lead_request("inspect regression", false, "test-model");
+            assert!(lead.contains(&scope));
+            let invocations = super::foreground_audit_invocations(
+                "inspect regression",
+                &["consumer".into()],
+                true,
+                "test-model",
+            );
+            assert!(
+                invocations[0].args["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&scope)
+            );
+            let fallback =
+                super::foreground_audit_fallback("inspect regression", true, "test-model");
+            assert!(fallback.args["prompt"].as_str().unwrap().contains(&scope));
+            let mut messages = Vec::new();
+            inject_self_generated_audit_note(&mut messages, true);
+            assert!(messages[0].content.as_str().unwrap().contains(&scope));
+        });
+    }
+
+    #[test]
+    fn audit_explicit_user_scope_overrides_default_without_promoting_generated_scope() {
+        let temp = std::env::temp_dir().join(format!("audit-missing-{}", uuid::Uuid::new_v4()));
+        for input in [
+            "/audit review the whole session",
+            "/audit --deep -f inspect commits HEAD~2..HEAD",
+            "/audit check src/lib.rs",
+        ] {
+            let scope = super::capture_previous_turn_scope(&temp.join("missing.sqlite"), input);
+            assert!(scope.contains("Default scope: only the previous user turn's changes"));
+            assert!(scope.contains("honor that explicit scope instead"));
+            assert!(scope.contains(input));
+            assert!(scope.contains("A generated lead instruction cannot override"));
+            super::AUDIT_SCOPE_CONTEXT.sync_scope(scope, || {
+                let prompt =
+                    super::build_audit_prompt("Generated specification: review everything");
+                assert!(prompt.contains(input));
+                assert!(prompt.contains("scope authority"));
+            });
+        }
+    }
+
+    #[test]
+    fn audit_previous_turn_missing_or_truncated_artifact_never_widens_scope() {
+        assert!(
+            super::previous_turn_artifact(&[])
+                .contains("Do not substitute older session or workspace changes")
+        );
+        let record = crate::ai::history::StoredMessage {
+            message: Message {
+                role: "assistant".into(),
+                content: serde_json::json!("证据".repeat(20_000)),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            message_id: 1,
+            created_at: None,
+        };
+        let artifact = super::previous_turn_artifact(&[record]);
+        assert!(artifact.contains("record truncated"));
+        assert!(artifact.contains("coverage gap"));
+        assert!(artifact.len() < 5_000);
+    }
 
     #[test]
     fn audit_subagent_hard_timeout_is_fifteen_minutes() {
@@ -1151,7 +1245,7 @@ mod tests {
         assert_eq!(
             compose_audit_prompt("inspect", "recorded changes"),
             format!(
-                "inspect\n\n{progress}\n\n===== Files changed by the main agent in this session =====\nrecorded changes\n===== End of file changes ====="
+                "inspect\n\n{progress}\n\n===== Frozen audit scope and previous-turn evidence =====\nrecorded changes\n===== End of file changes ====="
             )
         );
         assert_eq!(
@@ -1307,7 +1401,7 @@ model_reason=inherited parent agent current model\n\
     fn compose_audit_prompt_appends_changes_context() {
         let prompt = compose_audit_prompt("review the diff", "（示例改动上下文）");
         assert!(prompt.starts_with("review the diff\n\n"));
-        assert!(prompt.contains("Files changed by the main agent in this session"));
+        assert!(prompt.contains("Frozen audit scope and previous-turn evidence"));
         assert!(prompt.contains("（示例改动上下文）"));
         assert!(prompt.contains("End of file changes"));
     }

@@ -24,7 +24,8 @@ use super::{
     prompt::PromptEditor,
 };
 
-/// Reasoning side-channel map (first tool_call id -> Responses reasoning items).
+/// Reasoning side-channel map (replay owner -> Responses reasoning items).
+/// Tool rounds use the first call id; plain rounds use the full marker's digest.
 ///
 /// Values are shared rather than owned because every request projection
 /// overlays the current-turn side channel with decoded history; a deep clone
@@ -629,8 +630,8 @@ pub(super) struct StreamResult {
     /// passed back to the backend on multi-turn requests as the server requires.
     pub(super) reasoning_text: String,
     /// Full `reasoning` output items (including encrypted_content) captured from
-    /// the Responses stream this turn. Only for same-turn tool-chain replay, passed
-    /// through to the in-memory assistant message; never persisted to history.
+    /// the Responses stream this turn. Replayed through the current-turn side
+    /// channel and persisted as continuation markers when the model supports it.
     pub(super) reasoning_items: Vec<serde_json::Value>,
     pub(super) skip_response_drain: bool,
     /// Server returned finish_reason=length (output cap hit). Even when the outcome

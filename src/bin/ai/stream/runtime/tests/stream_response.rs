@@ -1,6 +1,69 @@
 use super::*;
 
 #[test]
+fn plain_completed_stream_returns_full_encrypted_reasoning_items() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    crate::ai::driver::signal::clear_request_interrupt();
+    let mut app = test_app();
+    app.current_model = crate::ai::model_names::all()
+        .iter()
+        .find(|entry| entry.reasoning_encrypted_replay)
+        .expect("registry must contain an encrypted replay model")
+        .key
+        .clone();
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut history = String::new();
+    let full = serde_json::json!({
+        "type":"reasoning", "id":"rs_plain_done", "encrypted_content":"FULL_ENCRYPTED_PAYLOAD", "summary":[]
+    });
+    for (event, payload) in [
+        (
+            "response.output_item.added",
+            serde_json::json!({
+                "output_index":0, "item":{"type":"reasoning", "id":"rs_plain_done", "encrypted_content":"PARTIAL"}
+            }),
+        ),
+        (
+            "response.output_item.done",
+            serde_json::json!({"output_index":0, "item":full.clone()}),
+        ),
+        (
+            "response.output_text.delta",
+            serde_json::json!({"output_index":1, "delta":"plain final answer"}),
+        ),
+        (
+            "response.completed",
+            serde_json::json!({
+                "response":{"status":"completed", "output":[full.clone(), {
+                    "type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"plain final answer"}]
+                }]}
+            }),
+        ),
+    ] {
+        process_stream_payload(
+            &mut app,
+            &mut history,
+            &markers,
+            &mut state,
+            provider::openai_adapter(),
+            Some(event),
+            &payload.to_string(),
+        )
+        .unwrap();
+    }
+    let result = finalize_stream_response(&mut app, &mut history, &markers, state).unwrap();
+    assert_eq!(result.outcome, StreamOutcome::Completed);
+    assert!(result.tool_calls.is_empty());
+    assert_eq!(result.assistant_text, "plain final answer");
+    assert_eq!(result.reasoning_items, vec![full]);
+    assert!(!result.stream_error);
+    assert!(!result.truncated_by_length);
+}
+
+#[test]
 fn hidden_meta_finalization_cancel_preserves_idle_literal_prefix() {
     let _signal_guard = crate::ai::test_support::ENV_LOCK
         .lock()

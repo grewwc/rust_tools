@@ -149,7 +149,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
   document.createElement = node;
   const elements = {};
   for (const [id, tag] of [
-    ["sesslist", "ul"], ["sesscount", "div"], ["sessall", "button"], ["sessmarked", "button"], ["sesstitle", "div"], ["sesscwd", "span"], ["sessmeta", "div"],
+    ["sesslist", "ul"], ["sesscount", "div"], ["sessall", "button"], ["sessmarked", "button"], ["sesstitle", "div"], ["sessrename", "button"], ["sesscwd", "span"], ["sessmeta", "div"],
     ["prompt", "textarea"], ["msgs", "div"], ["promptlist", "ol"], ["promptcount", "span"], ["newbtn", "button"], ["fork", "button"],
     ["refresh", "button"], ["del", "button"], ["omodel", "select"], ["oagent", "select"], ["oeffort", "select"],
     ["composer", "div"], ["img", "button"], ["sidenote", "button"], ["send", "button"], ["turnstatus", "div"],
@@ -174,7 +174,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     ["sessdelcancel", "button"], ["sessdelconfirm", "button"],
   ]) elements[id] = node(tag);
   elements.sessdel.hidden = true;
-  for (const id of ["sessionactionstitle", "sessionactionmark", "sessionactionfork", "sessionactiondelete", "sessionactioncancel"]) {
+  for (const id of ["sessionactionstitle", "sessionactionarchive", "sessionactiongroup", "sessionactiondelete", "sessionactioncancel"]) {
     elements.sessionactionspanel.appendChild(elements[id]);
   }
   elements.sessionactions.appendChild(elements.sessionactionsscrim);
@@ -316,7 +316,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     dispatch, row, title, open, select, advance, historyLoads: () => historyLoads, configLoads: () => configLoads, grows: () => grows };
 }
 
-test("desktop double-click opens the shared mark/fork/delete sheet without marking", async () => {
+test("desktop double-click opens the shared archive/move/delete sheet without marking", async () => {
   const h = harness(), title = h.title();
   const click = h.dispatch(title, "click", { detail: 1 });
   assert.equal(h.context.sessionId, "target-session");
@@ -327,11 +327,11 @@ test("desktop double-click opens the shared mark/fork/delete sheet without marki
   assert.equal(double.event.stopped, true);
   assert.equal(h.elements.sessionactions.hidden, false);
   assert.equal(h.elements.sessionactionstitle.textContent, "Target session");
-  assert.equal(h.elements.sessionactionmark.textContent, "标记会话");
-  assert.equal(h.elements.sessionactionfork.hidden, false);
+  assert.equal(h.elements.sessionactionmark, undefined);
+  assert.equal(h.elements.sessionactionfork, undefined);
   assert.deepEqual(h.elements.sessionactionspanel.querySelectorAll("button").filter((button) => !button.hidden).map((button) => button.textContent),
-    ["标记会话", "fork", "删除会话", "取消"]);
-  assert.equal(h.document.activeElement, h.elements.sessionactionmark);
+    ["Archive", "Move to group…", "删除会话", "取消"]);
+  assert.equal(h.document.activeElement, h.elements.sessionactionarchive);
   assert.equal(h.historyLoads(), 1, "the first click selects, the second must not select twice");
   h.dispatch(h.document.activeElement, "keydown", { key: "Escape" });
   assert.equal(h.elements.sessionactions.hidden, true);
@@ -349,9 +349,9 @@ test("desktop right-click opens the shared sheet without switching sessions", as
   assert.equal(menu.event.stopped, true);
   assert.equal(h.elements.sessionactions.hidden, false);
   assert.equal(h.elements.sessionactionstitle.textContent, "Target session");
-  assert.equal(h.elements.sessionactionfork.hidden, false);
+  assert.equal(h.elements.sessionactionfork, undefined);
   assert.deepEqual(h.elements.sessionactionspanel.querySelectorAll("button").filter((button) => !button.hidden).map((button) => button.textContent),
-    ["标记会话", "fork", "删除会话", "取消"]);
+    ["Archive", "Move to group…", "删除会话", "取消"]);
   await menu.done;
   assert.equal(h.context.sessionId, "open-session");
   assert.equal(h.historyLoads(), 0);
@@ -531,7 +531,7 @@ for (const extra of [{ key: "F10", shiftKey: true }, { key: "ContextMenu" }]) te
   assert.equal(title.getAttribute("aria-haspopup"), "dialog");
   assert.equal(title.getAttribute("aria-controls"), "sessionactionspanel");
   assert.equal(title.getAttribute("aria-keyshortcuts"), "Shift+F10");
-  assert.equal(h.elements.sessionactionmark.textContent, "取消标记");
+  assert.equal(h.elements.sessionactionmark, undefined);
   assert.equal(h.context.sessionId, "open-session");
   const escape = h.dispatch(h.document.activeElement, "keydown", { key: "Escape" });
   assert.equal(escape.event.prevented, true);
@@ -540,11 +540,11 @@ for (const extra of [{ key: "F10", shiftKey: true }, { key: "ContextMenu" }]) te
   assert.deepEqual(h.requests, []);
 });
 
-test("desktop Tab includes Fork, wraps in both directions, and Cancel or scrim returns focus", () => {
+test("desktop Tab includes Archive and Move, wraps in both directions, and Cancel or scrim returns focus", () => {
   for (const cancel of ["sessionactioncancel", "sessionactionsscrim"]) {
     const h = harness(), title = h.title();
     h.open();
-    for (const id of ["sessionactionfork", "sessionactiondelete", "sessionactioncancel", "sessionactionmark"]) {
+    for (const id of ["sessionactiongroup", "sessionactiondelete", "sessionactioncancel", "sessionactionarchive"]) {
       h.dispatch(h.document.activeElement, "keydown", { key: "Tab" });
       assert.equal(h.document.activeElement, h.elements[id]);
     }
@@ -556,11 +556,11 @@ test("desktop Tab includes Fork, wraps in both directions, and Cancel or scrim r
   }
 });
 
-for (const initiallyMarked of [false, true]) test("desktop sheet and star " + (initiallyMarked ? "unmark" : "mark") + " without switching sessions", async () => {
-  for (const sheet of [true, false]) {
+for (const initiallyMarked of [false, true]) test("desktop card star " + (initiallyMarked ? "unmark" : "mark") + " without switching sessions", async () => {
+  for (const sheet of [false]) {
     const h = harness({ marked: initiallyMarked });
     if (sheet) h.open();
-    await h.dispatch(sheet ? h.elements.sessionactionmark : h.row().querySelector(".mk"), "click").done;
+    await h.dispatch(h.row().querySelector(".mk"), "click").done;
     assert.deepEqual(h.requests.map((request) => ({ path: request.path, method: request.method, body: request.body })), [
       { path: "/sessions/target-session/mark", method: "POST", body: { marked: !initiallyMarked } },
     ]);
@@ -570,29 +570,32 @@ for (const initiallyMarked of [false, true]) test("desktop sheet and star " + (i
   }
 });
 
-test("desktop Fork uses the exact sheet target and the session-bar helper, then restores inherited config", async () => {
+test("desktop bottom Fork uses another selected session and restores inherited config", async () => {
   const h = harness();
   h.elements.prompt.value = "stale fork draft";
   h.context.persistDraft("forked-session");
   h.elements.prompt.value = "keep the open session draft";
-  h.open();
-  await h.dispatch(h.elements.sessionactionfork, "click").done;
+  await h.select("target-session");
+  const previousHistoryLoads = h.historyLoads(), previousConfigLoads = h.configLoads();
+  h.requests.length = 0;
+  await h.dispatch(h.elements.fork, "click").done;
   assert.deepEqual(h.requests.map((request) => [request.method, request.path]), [
     ["POST", "/sessions/target-session/fork"], ["GET", "/sessions"],
   ]);
   assert.equal(h.context.sessionId, "forked-session");
   assert.equal(h.elements.prompt.value, "");
-  assert.equal(h.historyLoads(), 1);
-  assert.equal(h.configLoads(), 1);
+  assert.equal(h.historyLoads(), previousHistoryLoads + 1);
+  assert.equal(h.configLoads(), previousConfigLoads + 1);
   assert.equal(h.drafts.get(h.context.draftKey("open-session")), "keep the open session draft");
   assert.match(between('$("fork").onclick =', '$("del").onclick ='), /forkSession\(sessionId\)/);
 });
 
 test("a failed desktop fork keeps selection and the draft", async () => {
   const h = harness({ forkError: "fork unavailable" });
-  h.open();
-  await h.dispatch(h.elements.sessionactionfork, "click").done;
-  assert.equal(h.context.sessionId, "open-session");
+  await h.select("target-session");
+  h.elements.prompt.value = "draft in A";
+  await h.dispatch(h.elements.fork, "click").done;
+  assert.equal(h.context.sessionId, "target-session");
   assert.equal(h.elements.prompt.value, "draft in A");
   assert.match(h.messages.at(-1).text, /fork failed: 503 fork unavailable/);
 });
@@ -766,7 +769,7 @@ test("a first desktop send clears both the anonymous and adopted session drafts"
   assert.equal(h.elements.prompt.value, "");
 });
 
-test("phone drafts continue to restore from storage and the phone hold keeps its original action set", async () => {
+test("phone drafts continue to restore from storage and the phone hold keeps the streamlined action set", async () => {
   const h = harness({ phone: true });
   await h.select();
   h.drafts.set(h.context.draftKey("open-session"), "desktop cache");
@@ -783,9 +786,9 @@ test("phone drafts continue to restore from storage and the phone hold keeps its
   h.advance(650);
   h.dispatch(h.row(), "pointerup", touch);
   assert.equal(h.elements.sessionactions.hidden, false);
-  assert.equal(h.elements.sessionactionfork.hidden, true);
+  assert.equal(h.elements.sessionactionfork, undefined);
   h.dispatch(h.document.activeElement, "keydown", { key: "Tab" });
-  assert.equal(h.document.activeElement, h.elements.sessionactiondelete);
+  assert.equal(h.document.activeElement, h.elements.sessionactiongroup);
   h.dispatch(h.document.activeElement, "keydown", { key: "Escape" });
   assert.equal(h.document.activeElement, star);
 });
@@ -1677,7 +1680,7 @@ for (const width of [701, 1280]) test("execution merge regression: repeated hist
   assert.deepEqual(root.querySelectorAll(".execution-group"), original, "an unchanged paint keeps the original fold nodes");
 });
 
-function sessionScrollHarness(width, withTasks) {
+function sessionScrollHarness(width, withTasks, globalPointerEvents = false) {
   const h = sessionFoldHarness(width), root = h.elements.msgs;
   const frames = new Map(), growth = new Map(), historyGates = new Map();
   const resizeObservers = [], mutationObservers = [], positionSaves = [];
@@ -1727,6 +1730,16 @@ function sessionScrollHarness(width, withTasks) {
     disconnect() { this.children = null; }
   };
   root.clientHeight = 240;
+  root.offsetWidth = width;
+  root.clientWidth = width - 16;
+  root.clientLeft = 0;
+  root.getBoundingClientRect = () => ({ left: 0, right: width });
+  const pointerListeners = new Map();
+  if (globalPointerEvents) h.context.window.addEventListener = (type, listener) => {
+    const listeners = pointerListeners.get(type) || [];
+    listeners.push(listener);
+    pointerListeners.set(type, listeners);
+  };
   Object.defineProperty(root, "scrollHeight", {
     get: () => Math.max(root.clientHeight, 40 + root.children.reduce((sum, child) => sum + heightOf(child), 0)),
   });
@@ -1822,6 +1835,15 @@ function sessionScrollHarness(width, withTasks) {
   return {
     ...h, root, histories, flushFrame, flushScroll,
     pendingFrames: () => frames.size,
+    userScrollUp(value) {
+      h.dispatch(root, "wheel", { deltaY: -1 });
+      root.scrollTop = value;
+      flushScroll();
+    },
+    dispatchPointer(type, event) {
+      if (globalPointerEvents) for (const listener of pointerListeners.get(type) || []) listener(event);
+      else h.dispatch(root, type, event);
+    },
     growLayout(height, node = root.lastElementChild) { growth.set(node, (growth.get(node) || 0) + height); },
     resizeViewport(height) { root.clientHeight = height; root.scrollTop = top; },
     resizeComposer(height) { h.elements.composer.offsetHeight = height; },
@@ -1885,8 +1907,7 @@ for (const width of [390, 700, 701, 1280]) for (const withTasks of [false, true]
   test("session-switch scroll opens the live edge despite a saved reading position" + suffix, async () => {
     const h = sessionScrollHarness(width, withTasks);
     await h.openHistory();
-    h.root.scrollTop = 120;
-    h.flushScroll();
+    h.userScrollUp(120);
     await h.selectHistory("target-session");
     h.flushFrame();
     h.flushScroll();
@@ -1898,8 +1919,7 @@ for (const width of [390, 700, 701, 1280]) for (const withTasks of [false, true]
     assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
       "returning to a session opens its newest message instead of its saved reading offset");
     assert.equal(h.context.shouldFollowOutput(), true, "the outgoing reader's scroll lock is reset");
-    h.root.scrollTop = 120;
-    h.flushScroll();
+    h.userScrollUp(120);
     h.histories.get("open-session").push({ role: "assistant", content: "An ordinary in-session update" });
     await h.context.loadHistory();
     h.flushFrame();
@@ -1924,7 +1944,7 @@ for (const width of [390, 700, 701, 1280]) {
     h.context.fetch = (url, options) => new URL(url).pathname === "/session-groups"
       ? Promise.resolve(response({ groups: [], assignments: {} })) : fetch(url, options);
     await h.openHistory();
-    h.root.scrollTop = 120; h.flushScroll();
+    h.userScrollUp(120);
     await h.context.createSessionInGroup(null);
     assert.equal(h.context.sessionId, "fresh-session");
     assert.ok(h.root.querySelector(".transcript-placeholder"), "creation finishes rendering its placeholder");
@@ -1936,7 +1956,7 @@ for (const width of [390, 700, 701, 1280]) {
   test("session-switch scroll opens a fork at the live edge at " + width + "px", async () => {
     const h = sessionScrollHarness(width, true);
     await h.openHistory();
-    h.root.scrollTop = 120; h.flushScroll();
+    h.userScrollUp(120);
     h.stored.set("serve.scroll.forked-session", JSON.stringify({ top: 120, atBottom: false }));
     const fetch = h.context.fetch, messages = h.histories.get("open-session");
     h.context.fetch = (url, options) => new URL(url).pathname === "/sessions/forked-session/history"
@@ -2002,7 +2022,7 @@ for (const width of [390, 700, 701, 1280]) {
     await h.openHistory();
     await openOtherTranscriptAtBottom(h, width);
     h.advance(200);
-    h.root.scrollTop = 120; h.flushScroll();
+    h.userScrollUp(120);
     const pendingSave = h.queuedPositionSave();
     assert.equal(typeof pendingSave, "function", "the real wire listener queues the position save");
     const savedA = h.stored.get("serve.scroll.open-session");
@@ -2051,7 +2071,7 @@ for (const width of [390, 700, 701, 1280]) {
   test("picking the current session row resumes persistent following" + suffix, async () => {
     const h = sessionScrollHarness(width, true);
     await h.openHistory();
-    h.root.scrollTop -= 80; h.flushScroll();
+    h.userScrollUp(h.root.scrollTop - 80);
     assert.equal(h.context.shouldFollowOutput(), false);
     await h.selectHistory("open-session"); h.settleLayout();
     assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
@@ -2069,10 +2089,89 @@ for (const width of [390, 700, 701, 1280]) {
     assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
     assert.equal(h.context.ownedTranscriptScroll(h.root).following, true);
   });
+  for (const cause of ["programmatic write", "browser anchoring", "clamp with concurrent growth"]) {
+    test("transcript ownership ignores scroll without input: " + cause + suffix, async () => {
+      const h = sessionScrollHarness(width, true);
+      await h.openHistory();
+      await h.selectHistory("target-session"); h.settleLayout();
+      const bottom = h.root.scrollTop;
+      h.context.canonicalHistoryTotal = h.histories.get("target-session").length + 50;
+      let olderLoads = 0;
+      h.context.loadOlderHistory = () => { olderLoads++; };
+      if (cause === "clamp with concurrent growth") {
+        h.resizeViewport(h.root.clientHeight + 80);
+        h.growLayout(180);
+      } else h.root.scrollTop = cause === "programmatic write" ? 0 : bottom - 60;
+      h.flushScroll();
+      assert.equal(h.context.shouldFollowOutput(), true, "geometry alone cannot suspend the live-edge goal");
+      assert.equal(h.context.ownedTranscriptScroll(h.root).following, true);
+      assert.equal(olderLoads, 0, "a scroll event without input cannot start pagination");
+      h.growLayout(100); h.settleLayout();
+      assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
+      assert.equal(h.elements.jumpbottom.classList.contains("show"), false);
+    });
+  }
+  test("search shortcut focus and keyboard layout preserve following" + suffix, async () => {
+    const h = sessionScrollHarness(width, true), keyListeners = [];
+    await h.openHistory();
+    h.elements.sessfilter = h.document.createElement("input");
+    h.elements.sessfilter.hidden = true;
+    h.elements.sesssearch = h.document.createElement("button");
+    h.context.sessFilter = "";
+    h.context.sessionsFilterComposing = false;
+    h.context.closeSessionSidebarMenu = () => {};
+    h.document.addEventListener = (type, listener) => { if (type === "keydown") keyListeners.push(listener); };
+    h.context.wireSessionSearch();
+    h.elements.prompt.focus();
+    for (const listener of keyListeners) listener({ key: "f", shiftKey: true, ctrlKey: true,
+      preventDefault() {}, stopPropagation() {} });
+    assert.equal(h.elements.sessfilter.hidden, false);
+    assert.equal(h.document.activeElement, h.elements.sessfilter);
+    h.resizeComposer(140); h.resizeViewport(h.root.clientHeight - 80); h.settleLayout();
+    assert.equal(h.context.shouldFollowOutput(), true, "focus and keyboard resize preserve reader intent");
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
+    await h.selectHistory("target-session"); h.settleLayout();
+    h.growLayout(180); h.settleLayout();
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
+      "switching sessions after opening search keeps following late content");
+  });
+  test("composer and viewport resize leave an active reader alone" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    h.userScrollUp(h.root.scrollTop - 80);
+    const readingTop = h.root.scrollTop;
+    h.resizeComposer(140); h.resizeViewport(h.root.clientHeight - 40);
+    h.growLayout(100); h.settleLayout();
+    assert.equal(h.root.scrollTop, readingTop);
+    assert.equal(h.context.shouldFollowOutput(), false);
+    assert.equal(h.elements.jumpbottom.classList.contains("show"), true);
+    h.context.scrollToLatest(false); h.flushScroll();
+    h.growLayout(100); h.settleLayout();
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
+    assert.equal(h.context.shouldFollowOutput(), true);
+  });
+  test("text editing, touch contact and transcript padding do not suspend following" + suffix, async () => {
+    const h = sessionScrollHarness(width, true);
+    await h.openHistory();
+    const input = h.document.createElement("input"); h.root.appendChild(input);
+    h.dispatch(input, "keydown", { key: "PageUp" });
+    h.dispatch(h.root, "keydown", { key: "ArrowUp", isComposing: true });
+    h.dispatch(h.root, "keydown", { key: "Home", defaultPrevented: true });
+    h.dispatch(h.root, "touchstart", { touches: [{ clientY: 100 }] });
+    assert.equal(h.context.shouldFollowOutput(), true, "touch contact without a direction is not upward input");
+    h.dispatch(h.root, "touchcancel");
+    h.dispatch(h.root, "touchmove", { touches: [{ clientY: 120 }] });
+    h.dispatch(h.root, "pointerdown", { button: 0, pointerId: 1, clientX: 10, clientY: 100 });
+    h.dispatchPointer("pointermove", { pointerId: 1, clientY: 60 });
+    h.root.scrollTop -= 40; h.flushScroll();
+    assert.equal(h.context.shouldFollowOutput(), true, "padding drags and browser shifts do not claim scrollbar input");
+    h.growLayout(100); h.settleLayout();
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight);
+  });
   test("desktop transcript ownership ignores a running-elsewhere status notice" + suffix, async () => {
     const h = sessionScrollHarness(width, true);
     await h.openHistory();
-    h.root.scrollTop = 0; // A restored reading position, no scroll gesture.
+    h.userScrollUp(0); // A reader paused at an older row before the status note.
     const note = h.document.createElement("div");
     note.className = "msg asst pending remote-turn-note";
     note.textContent = "正在另一个进程中运行（pid 33011）";
@@ -2089,30 +2188,19 @@ for (const width of [390, 700, 701, 1280]) {
     assert.equal(h.resizeObservers().some((observer) => observer.targets.has(h.root)), true,
       "the scrollport observer handles viewport changes independently of its children");
   });
-  test("a taller composer keeps the reader's row instead of following" + suffix, async () => {
+  test("composer growth preserves persistent following" + suffix, async () => {
     const h = sessionScrollHarness(width, true);
     await h.openHistory();
-    const before = h.root.scrollTop;
-    h.resizeComposer(140); // a pasted screenshot adds a marker line to the prompt
+    h.resizeComposer(140);
     h.resizeViewport(h.root.clientHeight - 40); h.settleLayout();
-    assert.equal(h.root.scrollTop, before, "the composer's own growth never moves the transcript");
-    assert.equal(h.context.isNearBottom(), false, "the taller composer leaves the retained row above the live edge");
-    assert.equal(h.context.ownedTranscriptScroll(h.root).following, false);
-    assert.equal(h.context.shouldFollowOutput(), false);
-    assert.equal(h.elements.jumpbottom.classList.contains("show"), true,
-      "both layouts offer the jump button when composer growth leaves the reader above the bottom");
-    assert.equal(h.resizeObservers().every((observer) => observer.targets.size === 0), true);
-    // Even a producer that already requested following cannot undo the row
-    // retained for the composer resize.
-    h.context.followOutput(true); h.growLayout(100); h.settleLayout();
-    assert.equal(h.root.scrollTop, before);
-    assert.equal(h.elements.jumpbottom.classList.contains("show"), true);
-    h.context.scrollToLatest(false); h.flushScroll();
+    assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
+      "the composer changes layout without establishing upward reader intent");
+    assert.equal(h.context.ownedTranscriptScroll(h.root).following, true);
     assert.equal(h.context.shouldFollowOutput(), true);
     assert.equal(h.elements.jumpbottom.classList.contains("show"), false);
     h.growLayout(100); h.settleLayout();
     assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
-      "an explicit jump resumes persistent following after the composer resize");
+      "later output still follows after the composer resize");
   });
   test("desktop transcript ownership respects upward input during the fetch" + suffix, async () => {
     const h = sessionScrollHarness(width, true);
@@ -2129,7 +2217,7 @@ for (const width of [390, 700, 701, 1280]) {
   test("desktop transcript ownership releases following when the reader scrolls away" + suffix, async () => {
     const h = sessionScrollHarness(width, true);
     await h.openHistory();
-    h.root.scrollTop -= 40; h.flushScroll();
+    h.userScrollUp(h.root.scrollTop - 40);
     const readingTop = h.root.scrollTop;
     h.growLayout(180); h.settleLayout();
     for (const observer of h.resizeObservers()) observer.callback([]);
@@ -2143,7 +2231,7 @@ for (const width of [390, 700, 701, 1280]) {
     await h.selectHistory("open-session"); h.settleLayout();
     assert.equal(h.root.scrollTop, h.root.scrollHeight - h.root.clientHeight,
       "switching back resets the previous reading position");
-    h.root.scrollTop = readingTop; h.flushScroll();
+    h.userScrollUp(readingTop);
     h.growLayout(100); h.settleLayout();
     assert.equal(h.root.scrollTop, readingTop, "new upward input after switching also stays free of resize following");
     assert.equal(h.resizeObservers().every((observer) => observer.targets.size === 0), true);
@@ -2159,8 +2247,7 @@ for (const width of [390, 700, 701, 1280]) {
     // The reader scrolls up in the same frame that rows arrive below, so the
     // scroll event observes a changed scrollHeight.
     h.growLayout(180);
-    h.root.scrollTop = bottom - 40;
-    h.flushScroll();
+    h.userScrollUp(bottom - 40);
     const readingTop = h.root.scrollTop;
     h.settleLayout();
     assert.equal(h.root.scrollTop, readingTop, "the growth that preceded the gesture does not outrank it");
@@ -2187,7 +2274,7 @@ for (const width of [390, 700, 701, 1280]) {
   test("desktop transcript ownership survives A to B to A before B finishes fetching" + suffix, async () => {
     const h = sessionScrollHarness(width, true);
     await h.openHistory(); h.advance(200);
-    h.root.scrollTop = 120; h.flushScroll();
+    h.userScrollUp(120);
     const pendingSave = h.queuedPositionSave(), firstRow = h.root.children[0];
     const release = h.deferHistory("target-session");
     h.context.switchSession("target-session");
@@ -2235,7 +2322,7 @@ for (const width of [390, 700, 701, 1280]) {
     h.context.loadOlderHistory = (...args) => {
       const completion = loadOlderHistory(...args); paging ||= completion; return completion;
     };
-    h.root.scrollTop = 0; h.flushScroll();
+    h.userScrollUp(0);
     assert.ok(paging?.then, "scrolling up starts B's deferred older-history request");
     assert.equal(h.root._histOlder, true);
     await h.selectWhileHistoryPending("open-session"); h.settleLayout();
@@ -2254,7 +2341,7 @@ for (const width of [390, 700, 701, 1280]) {
   test("desktop transcript ownership keeps current older-history pagination compensation" + suffix, async () => {
     const h = sessionScrollHarness(width, true);
     await h.openHistory(); await openOtherTranscriptAtBottom(h, width);
-    h.root.scrollTop = 120; h.flushScroll();
+    h.userScrollUp(120);
     const beforeTop = h.root.scrollTop, beforeHeight = h.root.scrollHeight;
     h.context.canonicalHistoryTotal = h.histories.get("target-session").length + 50;
     const release = h.deferHistory("target-session"), paging = h.context.loadOlderHistory();
@@ -2281,7 +2368,7 @@ for (const width of [390, 700, 701, 1280]) {
     h.context.loadOlderHistory = (...args) => {
       const completion = loadOlderHistory(...args); paging ||= completion; return completion;
     };
-    h.root.scrollTop = 0; h.flushScroll();
+    h.userScrollUp(0);
     assert.ok(paging?.then);
     await h.selectWhileHistoryPending("open-session"); h.settleLayout();
     // The outstanding request is already waiting on its gate. Let a fresh B
@@ -2297,19 +2384,25 @@ for (const width of [390, 700, 701, 1280]) {
   });
 }
 
-for (const width of [390, 700, 701, 1280]) for (const input of ["touch", "keyboard", "scrollbar"]) {
+for (const width of [390, 700, 701, 1280]) for (const input of ["touch", "PageUp", "Home", "ArrowUp", "shift-Space", "scrollbar"]) {
   test("transcript ownership respects " + input + " input before the landing frame at " + width + "px", async () => {
-    const h = sessionScrollHarness(width, true);
+    const h = sessionScrollHarness(width, true, input === "scrollbar");
     await h.openHistory();
     await h.selectHistory("target-session");
     let expected = 0;
     if (input === "touch") {
       h.dispatch(h.root, "touchstart", { touches: [{ clientY: 100 }] });
       h.dispatch(h.root, "touchmove", { touches: [{ clientY: 120 }] });
-    } else if (input === "keyboard") h.dispatch(h.root, "keydown", { key: "PageUp" });
+    } else if (input !== "scrollbar") {
+      assert.match(html, /<div\b[^>]*id="msgs"[^>]*tabindex="0"/,
+        "the real transcript is reachable by keyboard focus");
+      h.root.focus();
+      h.dispatch(h.root, "keydown", { key: input === "shift-Space" ? " " : input, shiftKey: input === "shift-Space" });
+    }
     else {
       h.root.scrollTop = 100; h.flushScroll();
-      h.dispatch(h.root, "pointerdown");
+      h.dispatch(h.root, "pointerdown", { button: 0, pointerId: 1, clientX: width - 8, clientY: 100 });
+      h.dispatchPointer("pointermove", { pointerId: 1, clientY: 60 });
       h.root.scrollTop = expected = 60; h.flushScroll();
     }
     h.settleLayout();

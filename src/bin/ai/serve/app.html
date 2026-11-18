@@ -264,6 +264,7 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessdelbtns button { flex:1; min-height:44px; }
 #sessdelconfirm { color:var(--err); border-color:var(--err); }
 #sessfilter { margin:8px 8px 0; padding:6px 8px; font-size:13px; font-weight:500; width:calc(100% - 16px); box-sizing:border-box; }
+#sessfilter[hidden] { display:none; }
 #sessfilter::placeholder { color:var(--dim); opacity:1; }
 #sesscount { padding:4px 12px 0; color:var(--dim); font-size:12px; font-weight:500; }
 #sessfilterrow { display:flex; align-items:center; gap:6px; padding:4px 8px; flex-shrink:0; }
@@ -281,25 +282,36 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessarchivefilter, #sessmarkfilter { display:flex; gap:2px; padding:2px; margin-bottom:4px; border-radius:7px; background:var(--surface-2); }
 #sessmarkfilter[hidden] { display:none; }
 #sessmorepanel button { box-sizing:border-box; min-width:0; min-height:44px; padding:4px 8px; font-size:12px; line-height:1.3; border:0; border-radius:5px; background:transparent; color:var(--dim); }
+#sesssearch { display:block; width:100%; text-align:left; }
 #sessarchivefilter button, #sessmarkfilter button { flex:1; }
 #sessarchivefilter button[aria-pressed="true"], #sessmarkfilter button[aria-pressed="true"] { background:var(--panel); color:var(--acc); font-weight:600; box-shadow:inset 0 0 0 1px var(--acc-line); }
 #sessgroupactions { display:flex; flex-direction:column; gap:2px; margin-top:6px; padding-top:6px; border-top:1px solid var(--card-edge, var(--line)); }
 #sessiongroupnew, #sessiongroupmanage { width:100%; text-align:left; }
-#sessions li.session-group-head { display:flex; align-items:center; gap:4px; padding:4px; margin-top:6px; border:1px solid var(--line); cursor:pointer; }
-#sessions li.session-group-head:active { background:var(--tint-3); }
-#sessions li.session-group-head.session-group-waiting { border-color:var(--mark); box-shadow:inset 3px 0 0 var(--mark); }
-#sessions .session-group-toggle { display:grid; grid-template-columns:auto minmax(0,1fr) auto; flex:1; align-items:center; column-gap:6px; min-width:0; min-height:36px; padding:4px; border:0; background:transparent; text-align:left; font-size:12px; font-weight:600; }
-#sessions .session-group-name { grid-column:2; grid-row:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--fg); }
-#sessions .session-group-status { grid-column:2 / 4; grid-row:2; display:flex; flex-wrap:wrap; align-items:center; gap:3px; }
+#sessiongrouphidden { width:100%; text-align:left; }
+#sessiongrouphiddenactivity { min-height:28px; padding:2px 5px; border:0; border-radius:6px; background:var(--session-running-bg); color:var(--session-running-fg); font-size:10px; }
+#sessiongrouphiddenactivity[hidden] { display:none; }
+#sessiongrouphiddenactivity.waiting { background:var(--session-waiting-bg); color:var(--session-waiting-fg); }
+#sessions li.session-group-head { display:flex; align-items:center; gap:2px; padding:0 4px; margin:12px 0 2px; border:0; border-radius:0; background:transparent; box-shadow:none; cursor:pointer; }
+#sessions li.session-group-head:first-child { margin-top:0; }
+#sessions .session-group-toggle { display:grid; grid-template-columns:auto minmax(0,1fr) auto; flex:1; align-items:center; column-gap:5px; min-width:0; min-height:28px; padding:2px; border:0; background:transparent; color:var(--dim); text-align:left; font-size:11px; font-weight:500; }
+#sessions .session-group-arrow { grid-column:1; grid-row:1; display:grid; place-items:center; width:12px; height:12px; color:var(--fg); }
+#sessions .session-group-arrow::before { content:""; width:0; height:0; border-top:5px solid transparent; border-bottom:5px solid transparent; border-left:8px solid currentColor; }
+#sessions .session-group-toggle[aria-expanded="true"] .session-group-arrow::before { transform:rotate(90deg); }
+#sessions .session-group-name { grid-column:2; grid-row:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--fg); font-size:12px; font-weight:600; line-height:18px; }
+#sessions .session-group-pinned::before { content:"★"; margin-right:4px; color:var(--dim); font-size:10px; font-weight:500; }
+#sessions .session-group-status { grid-column:3; grid-row:1; display:flex; flex-wrap:nowrap; align-items:center; gap:3px; }
 #sessions .session-group-status[hidden] { display:none; }
-#sessions .session-group-badge { padding:1px 4px; border-radius:999px; background:var(--session-running-bg); color:var(--session-running-fg); box-shadow:inset 0 0 0 1px var(--session-running-edge); font-size:10px; font-weight:600; line-height:16px; white-space:nowrap; }
+#sessions .session-group-badge { display:inline-flex; align-items:center; gap:3px; padding:0 4px; border-radius:999px; background:var(--session-running-bg); color:var(--session-running-fg); box-shadow:inset 0 0 0 1px var(--session-running-edge); font-size:10px; font-weight:500; line-height:16px; white-space:nowrap; }
+#sessions .session-group-badge[hidden] { display:none; }
+#sessions .session-group-badge::before { content:""; width:4px; height:4px; border-radius:50%; background:currentColor; }
 #sessions .session-group-badge.waiting { background:var(--session-waiting-bg); color:var(--session-waiting-fg); box-shadow:inset 0 0 0 1px var(--session-waiting-edge); font-weight:600; }
-#sessions .session-group-menu { min-height:36px; min-width:32px; padding:4px; border:0; background:transparent; }
-#sessions .session-group-new { flex:0 0 auto; min-height:36px; min-width:44px; padding:4px 6px; border:0; background:transparent; color:var(--acc); font-size:12px; white-space:nowrap; }
+#sessions .session-group-badge.waiting::before { content:"?"; width:auto; height:auto; background:none; font-size:9px; line-height:1; }
+#sessions .session-group-menu { flex:0 0 24px; min-height:28px; min-width:24px; padding:2px; border:0; background:transparent; color:var(--dim); }
+#sessions .session-group-new { flex:0 0 auto; min-height:28px; min-width:44px; padding:2px 4px; border:0; background:transparent; color:var(--dim); font-size:11px; white-space:nowrap; }
 #sessions .session-group-new:active, #sessions .session-group-menu:active { background:var(--tint-3); }
 #sessions .session-group-toggle:focus-visible, #sessions .session-group-new:focus-visible, #sessions .session-group-menu:focus-visible { outline:2px solid var(--acc-focus); outline-offset:2px; }
 @media (hover:hover) {
-  #sessions li.session-group-head:hover { background:var(--tint-2); }
+  #sessions .session-group-toggle:hover { color:var(--fg); }
   #sessions .session-group-new:hover:not(:disabled), #sessions .session-group-menu:hover { background:var(--surface-hover); }
 }
 #sessions li.session-more { padding:4px; }
@@ -319,6 +331,11 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessiongroupbody input, #sessiongroupbody select { width:100%; min-height:44px; padding:8px; box-sizing:border-box; font-size:16px; }
 #sessiongroupbody p { margin:0; color:var(--dim); font-size:13px; line-height:1.5; }
 #sessiongroupbody .danger { color:var(--err); }
+#sessiongroupbody .session-group-filters { display:flex; gap:6px; }
+#sessiongroupbody .session-group-filters button { flex:1; text-align:center; }
+#sessiongroupbody .session-group-filters button[aria-pressed="true"] { color:var(--acc); border-color:var(--acc); }
+#sessiongroupbody .session-group-manager-row { display:flex; flex-wrap:wrap; gap:6px; padding:6px 0; border-bottom:1px solid var(--line); }
+#sessiongroupbody .session-group-manager-name { width:100%; overflow-wrap:anywhere; }
 #sessiongrouperror { color:var(--err); font-size:12px; overflow-wrap:anywhere; }
 #scrim { display:none; }
 /* The override wrapper is transparent by default; the width queries below
@@ -1144,10 +1161,12 @@ button:active:not(:disabled) { filter:brightness(.96); }
   @media (hover:hover) {
     #sessions li:hover .mk { opacity:1; pointer-events:auto; }
   }
-  #sessions li.session-group-head { padding:0 4px; margin-top:2px; border:0; border-radius:6px; background:transparent; }
-  #sessions .session-group-toggle { min-height:28px; padding:2px; color:var(--dim); font-size:11px; }
-  #sessions .session-group-menu { min-height:28px; min-width:28px; padding:2px; }
-  #sessions .session-group-new { min-height:28px; padding:2px 4px; }
+  /* Reserved action space keeps group labels steady during hover and keyboard focus. */
+  @media (hover:hover) and (pointer:fine) {
+    #sessions .session-group-new, #sessions .session-group-menu { opacity:0; pointer-events:none; }
+    #sessions .session-group-head:hover .session-group-new, #sessions .session-group-head:hover .session-group-menu,
+    #sessions .session-group-head:focus-within .session-group-new, #sessions .session-group-head:focus-within .session-group-menu { opacity:1; pointer-events:auto; }
+  }
   #sessionactionspanel {
     top:50%; bottom:auto; transform:translateY(-50%); padding:16px;
     border-bottom:1px solid var(--line); border-radius:var(--radius-card);
@@ -1175,13 +1194,15 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #sesscount { padding:6px 16px; }
   #sessions ul { padding:4px 8px; }
   #sessions li { padding:10px 12px; margin:3px 0; border-radius:12px; }
+  #sessions li.session-group-head { padding:0 4px; margin:12px 0 2px; border-radius:0; background:transparent; }
+  #sessions li.session-group-head:first-child { margin-top:0; }
   #sessions li[data-session-id] { padding:8px; }
   #sessions li:hover { background:var(--surface-2); }
   #sessions li.cur, #sessions li.cur:hover {
     background:var(--session-selected-bg); box-shadow:inset 3px 0 0 var(--acc);
   }
   #sessions li.cur[data-session-id] { border-color:var(--session-selected-edge); }
-  #sessions li.session-group-head:hover { background:var(--tint-2); }
+  #sessions li.session-group-head:hover { background:transparent; }
   #sessions li .mk { border-radius:6px; }
   #sessions .rowbtns {
     display:flex; flex:0 0 auto; gap:6px; padding:10px 12px;
@@ -1433,11 +1454,11 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #sessions li .mk { display:inline-flex; align-items:center; justify-content:center; width:44px; height:44px; padding:0; font-size:15px; background:none; }
   #sessions li .mk[aria-pressed="true"] { color:var(--mark); }
   #sessions li .rnm { grid-column:1 / -1; min-height:44px; font-size:16px; -webkit-user-select:text; user-select:text; }
-  #sessions li.session-group-head { gap:2px; padding:0 2px; margin:4px 0 2px; border-radius:10px; }
+  #sessions li.session-group-head { gap:2px; padding:0 2px; margin:8px 0 2px; border-radius:0; }
   #sessions li.session-group-head:first-child { margin-top:0; }
   #sessions .session-group-toggle, #sessions .session-group-new, #sessions .session-group-menu { min-height:44px; }
   #sessions .session-group-toggle { padding:2px; column-gap:4px; font-size:12px; }
-  #sessions .session-group-status { grid-column:3; grid-row:1; flex-wrap:nowrap; gap:2px; }
+  #sessions .session-group-status { gap:2px; }
   #sessions .session-group-badge { padding:1px 3px; font-size:9px; line-height:14px; letter-spacing:-.02em; }
   #sessions .session-group-new { padding:2px 4px; font-size:11px; }
   #sessions .session-group-menu { flex:0 0 44px; min-width:44px; padding:2px; }
@@ -1588,7 +1609,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <button id="connbtn" aria-label="connection">⚙</button>
 <button id="newbtn" type="button" class="primary" aria-label="New session in Unassigned" title="New session in Unassigned">＋</button>
 </header>
-<div id="sessbar" title="sessions"><span id="sesstitle">no session</span><span id="sesscwd" hidden></span><span id="sessmeta"></span><button id="questionbtn" type="button" aria-label="show my questions" aria-expanded="false" title="show my questions"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></svg><span id="questioncount" class="count">0</span></button></div>
+<div id="sessbar" title="sessions"><span id="sesstitle">no session</span><span id="sesscwd" hidden></span><span id="sessmeta"></span><button id="sessrename" type="button" aria-label="Rename selected session" title="Rename selected session" disabled>✎</button><button id="questionbtn" type="button" aria-label="show my questions" aria-expanded="false" title="show my questions"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></svg><span id="questioncount" class="count">0</span></button></div>
 <div id="conn">
 <input id="base" placeholder="server, e.g. http://192.168.1.5:8080 (empty = this page)">
 <input id="token" type="password" placeholder="bearer token (ai.serve.token)" style="flex:1">
@@ -1607,11 +1628,13 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <textarea id="inputtrace" hidden readonly rows="5" aria-label="input diagnostics (no typed text)" style="flex-shrink:0;margin:6px 12px;font-size:12px"></textarea>
 <div id="views">
 <div id="scrim"></div>
-<nav id="sessions"><input id="sessfilter" placeholder="search all sessions…" aria-label="Search all sessions by title or ID" title="Match all keywords in any order" autocomplete="off">
-<div id="sessfilterrow"><div id="sesscount"></div><span id="sessfilterstatus" hidden></span><details id="sessmore"><summary id="sessmoretoggle" aria-label="More session options">More</summary><div id="sessmorepanel">
+<nav id="sessions"><input id="sessfilter" type="search" hidden placeholder="search all sessions…" aria-label="Search all sessions by title or ID" title="Match all keywords in any order · Shift+Cmd/Ctrl+F" autocomplete="off">
+<div id="sessfilterrow"><div id="sesscount"></div><span id="sessfilterstatus" hidden></span><button id="sessiongrouphiddenactivity" type="button" hidden aria-label="Activity in hidden groups" aria-haspopup="dialog"></button><details id="sessmore"><summary id="sessmoretoggle" aria-label="More session options">More</summary><div id="sessmorepanel">
+<button id="sesssearch" type="button" aria-controls="sessfilter" aria-expanded="false" aria-keyshortcuts="Control+Shift+F Meta+Shift+F">Search sessions…</button>
 <div id="sessarchivefilter" role="group" aria-label="Session archive filter"><button id="sessactive" type="button" aria-pressed="true">Active</button><button id="sessarchived" type="button" aria-pressed="false">Archived</button></div>
 <div id="sessmarkfilter" role="group" aria-label="Session star filter"><button id="sessall" type="button" aria-pressed="true">All</button><button id="sessmarked" type="button" aria-pressed="false">Starred</button></div>
 <div id="sessgroupactions"><button id="sessiongroupnew" type="button">New group…</button><button id="sessiongroupmanage" type="button">Manage groups…</button></div>
+<button id="sessiongrouphidden" type="button" aria-haspopup="dialog">Hidden groups (0)</button>
 </div></details></div><ul id="sesslist"></ul>
 <details id="promptnav">
 <summary><span class="pnlabel">会话提问</span><span id="promptcount" class="pncount"></span></summary>
@@ -1622,7 +1645,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <div id="sidebarresize" role="separator" tabindex="0" aria-label="Sidebar width" aria-orientation="vertical" aria-controls="sessions" aria-valuemin="220" aria-valuemax="480" aria-valuenow="264" title="264px · drag to resize; double-click to reset"></div>
 <main id="chat">
 <div id="msgwrap">
-<div id="msgs"></div>
+<div id="msgs" tabindex="0"></div>
 <button id="jumpbottom" type="button" aria-label="jump to latest message" aria-hidden="true" tabindex="-1" title="jump to latest">
 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/><path d="M12 4v11"/></svg>
 </button>
@@ -1776,9 +1799,6 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <section id="sessionactionspanel" role="dialog" aria-modal="true" aria-labelledby="sessionactionstitle">
 <div id="sessionactionstitle"></div>
 <div id="sessionactionmeta"></div>
-<button id="sessionactionmark" type="button">标记会话</button>
-<button id="sessionactionrename" type="button">Rename…</button>
-<button id="sessionactionfork" type="button" hidden>fork</button>
 <button id="sessionactionarchive" type="button">Archive</button>
 <button id="sessionactiongroup" type="button">Move to group…</button>
 <button id="sessionactiondelete" type="button">删除会话</button>
@@ -4366,13 +4386,8 @@ function beginTranscriptScroll(id, root = $("msgs")) {
   resetTranscriptScroll();
   transcriptScrollState = {
     sessionId: id, generation: ++transcriptScrollGeneration, root,
-    following: false, children: new Set(), resizeObserver: null, mutationObserver: null,
-    composerHeight: composerOffsetHeight(),
+    following: true, children: new Set(), resizeObserver: null, mutationObserver: null,
   };
-}
-function composerOffsetHeight() {
-  const composer = $("composer");
-  return composer && typeof composer.offsetHeight === "number" ? composer.offsetHeight : null;
 }
 function isRemoteTurnNote(node) {
   return node?.nodeType === 1 && node.classList.contains("remote-turn-note");
@@ -4391,21 +4406,8 @@ function syncTranscriptScrollChildren(state) {
 function queueTranscriptScrollResize(state, entries) {
   if (entries?.length && entries.every((entry) => isRemoteTurnNote(entry.target))) return;
   if (ownedTranscriptScroll(state.root) !== state || !state.following || outputFollowSuspended || jumpingToBottom) return;
-  // A taller composer (a pasted image adds a marker line, a pending side note
-  // appears) only shortens the scrollport; it produces no new rows. Following it
-  // would move a reader who never scrolled, so leave the offset to the reader.
-  const height = composerOffsetHeight();
-  if (height !== null && height !== state.composerHeight) {
-    state.composerHeight = height;
-    if (!isNearBottom(state.root)) {
-      // Keeping this row leaves the live edge, so suspend queued and future
-      // following until the reader explicitly returns with the jump button.
-      clearTranscriptScrollGoal(state);
-      outputFollowSuspended = true;
-      updateJumpButton();
-    }
-    return;
-  }
+  // Layout changes preserve the live-edge goal. Only direct reader input can
+  // suspend it, whether the scrollport changed for the composer or a keyboard.
   if (!isNearBottom(state.root)) followOutput(true, state.root);
 }
 function watchTranscriptScroll(state) {
@@ -4485,19 +4487,10 @@ function shouldFollowOutput(root = $("msgs")) {
   if (state && root._transcriptScrollOwner !== state) return false;
   return !outputFollowSuspended && (!!state?.following || isNearBottom(root));
 }
-function noteTranscriptScroll(previousTop, root = $("msgs"), dragging = false) {
-  if (root.scrollTop >= previousTop) return false;
-  const state = ownedTranscriptScroll(root, false);
-  // A decrease is the reader's gesture unless the browser clamped it at the
-  // new bottom. Growth in the same frame must not discard it: the follow
-  // callback for that growth would pull the view back down while the reader
-  // is above the live edge.
-  const maxTop = root.scrollHeight - root.clientHeight;
-  const clamped = previousTop > maxTop && root.scrollTop >= maxTop - FOLLOW_BOTTOM_GAP;
-  if (state && !dragging && (root._transcriptScrollOwner !== state || clamped)) return false;
-  clearTranscriptScrollGoal();
-  outputFollowSuspended = true;
-  return true;
+function noteTranscriptScroll(previousTop, root = $("msgs")) {
+  // Geometry is useful for pagination, but browser anchoring and programmatic
+  // writes also produce scroll events. They never establish reader intent.
+  return root.scrollTop < previousTop;
 }
 function noteTranscriptIntent(deltaY) {
   if (deltaY < 0) {
@@ -8515,6 +8508,7 @@ async function loadInfo() {
 function renderSessionBar() {
   syncSessionCreationControls();
   const s = sessionListItem(sessionId);
+  if ($("sessrename")) $("sessrename").disabled = !s;
   if (s) { selectedSessionMetadata = s; selectedSessionMetadataBase = store.base; }
   const cwd = s ? (s.cwd || "") : (sessionId && sessionId === pendingNew ? (pendingCwd || "") : "");
   const cwdEl = $("sesscwd");
@@ -8535,7 +8529,7 @@ function renderSessionBar() {
   $("sessmeta").textContent = meta + " · " + PAGE_ID;
 }
 function sessionListItem(id) {
-  return lastItems.find((item) => item.id === id)
+  return sessionGroupRenderedItems(lastItems).find((item) => item.id === id)
     || (selectedSessionMetadataBase === store.base && selectedSessionMetadata?.id === id ? selectedSessionMetadata : null);
 }
 async function toggleSessionMark(s) {
@@ -8576,11 +8570,9 @@ function openSessionActions(s, li, returnFocus) {
   sessionActionReturnFocus = returnFocus || li.querySelector(isPhoneLayout() ? ".mk" : "span");
   $("sessionactionstitle").textContent = sessionTitle(s);
   $("sessionactionmeta").textContent = "ID: " + s.id + "\n" + Math.max(1, Math.round(s.size_bytes / 1024)) + " KB" + (s.cwd ? "\n" + s.cwd : "") + "\n" + PAGE_ID;
-  $("sessionactionmark").textContent = s.marked ? "取消标记" : "标记会话";
   $("sessionactionarchive").textContent = s.archived ? "Unarchive" : "Archive";
-  $("sessionactionfork").hidden = isPhoneLayout();
   $("sessionactions").hidden = false;
-  $("sessionactionmark").focus();
+  $("sessionactionarchive").focus();
 }
 function closeSessionActions() {
   $("sessionactions").hidden = true;
@@ -8626,12 +8618,6 @@ function wireSessionDelete() {
   };
 }
 function wireSessionActions() {
-  $("sessionactionrename").onclick = () => {
-    const s = sessionActionTarget;
-    const li = s && sessionActivityRows.get(s.id);
-    closeSessionActions();
-    if (li) startRename(li, s);
-  };
   $("sessionactionarchive").onclick = () => {
     const s = sessionActionTarget;
     closeSessionActions();
@@ -8641,16 +8627,6 @@ function wireSessionActions() {
     const s = sessionActionTarget;
     closeSessionActions();
     if (s) return openSessionGroupMove(s);
-  };
-  $("sessionactionmark").onclick = () => {
-    const s = sessionActionTarget;
-    closeSessionActions();
-    if (s) return toggleSessionMark(s);
-  };
-  $("sessionactionfork").onclick = () => {
-    const s = sessionActionTarget;
-    closeSessionActions();
-    if (s) return forkSession(s.id);
   };
   $("sessionactiondelete").onclick = () => {
     const s = sessionActionTarget;
@@ -8667,6 +8643,7 @@ function wireSessionActions() {
       buttons[(index + (ev.shiftKey ? -1 : 1) + buttons.length) % buttons.length].focus();
     }
   };
+  if ($("sessrename")) $("sessrename").onclick = openSelectedSessionRename;
   const media = window.matchMedia && window.matchMedia("(max-width: 700px)");
   if (media && media.addEventListener) media.addEventListener("change", closeSessionActions);
 }
@@ -8794,6 +8771,12 @@ function wireSessionSidebarMenu() {
     closeSessionSidebarMenu();
     return openSessionGroupManager();
   };
+  for (const id of ["sessiongrouphidden", "sessiongrouphiddenactivity"]) {
+    if ($(id)) $(id).onclick = () => {
+      closeSessionSidebarMenu();
+      return openSessionGroupManager("hidden");
+    };
+  }
 }
 function setSessionMarkedFilter(markedOnly) {
   if (sessMarkedOnly === !!markedOnly) return;
@@ -8835,12 +8818,38 @@ function wireSessionArchiveFilter() {
   if ($("sessarchived")) $("sessarchived").onclick = () => { closeSessionSidebarMenu(); return setSessionArchiveFilter(true); };
   if ($("sessiongroupnew")) $("sessiongroupnew").onclick = () => { closeSessionSidebarMenu(); return openSessionGroupName(); };
 }
-// Groups organize loaded rows only; their counts never imply a server total.
+// Global rows and temporary group pages share a display, but keep separate cursors.
 let sessionGroups = [];
 let sessionGroupAssignments = {};
 let sessionGroupsBase = null;
 let sessionGroupsLoadSeq = 0;
 const sessionGroupHeaders = new Map();
+// Temporary visibility and collapse state belong to this page, never storage.
+const sessionGroupTemporaryOpen = new Map();
+const sessionGroupPages = new Map();
+let sessionGroupPageEpoch = 0;
+function sessionGroupPageKey(id) {
+  return JSON.stringify([store.base, id, sessFilter.trim(), sessionMarkedFilter(), sessionArchiveFilter()]);
+}
+function sessionGroupRenderedItems(items = lastItems) {
+  if (!sessionGroupTemporaryOpen.size) return items;
+  const merged = items.slice(), known = new Set(items.map((item) => item.id));
+  for (const id of [...orderedSessionGroups().map((group) => group.id), null]) {
+    if (!sessionGroupTemporaryOpen.has(sessionGroupTemporaryKey(id))) continue;
+    const page = sessionGroupPages.get(sessionGroupPageKey(id));
+    for (const item of page?.items || []) {
+      if (sessionGroupId(item) !== id || known.has(item.id)) continue;
+      known.add(item.id);
+      merged.push(item);
+    }
+  }
+  return merged;
+}
+function resetTemporarySessionGroups() {
+  ++sessionGroupPageEpoch;
+  sessionGroupTemporaryOpen.clear();
+  sessionGroupPages.clear();
+}
 let sessionCreationPending = false;
 const SESSION_GROUP_COLLAPSED_KEY = "serve.groups.collapsed.v1";
 let sessionGroupCollapsed = {};
@@ -8863,6 +8872,12 @@ function currentSessionGroupId() {
 function sessionGroupName(id) {
   return orderedSessionGroups().find((group) => group.id === id)?.name || "Unassigned";
 }
+function sessionGroupTemporaryKey(id) {
+  return JSON.stringify([store.base, id]);
+}
+function sessionGroupVisible(group) {
+  return !group.hidden || sessionMarkedFilter() || sessArchivedOnly || sessionGroupTemporaryOpen.has(sessionGroupTemporaryKey(group.id));
+}
 function syncSessionCreationControls() {
   const button = $("newbtn");
   if (button) {
@@ -8882,15 +8897,19 @@ async function loadSessionGroups() {
     sessionGroupsBase = base;
     sessionGroups = [];
     sessionGroupAssignments = {};
+    resetTemporarySessionGroups();
   }
   try {
     const result = await (await api("/session-groups")).json();
     if (base !== store.base || seq !== sessionGroupsLoadSeq) return false;
     sessionGroups = (Array.isArray(result.groups) ? result.groups : []).filter((group) =>
-      typeof group?.id === "string" && typeof group.name === "string");
+      typeof group?.id === "string" && typeof group.name === "string").map((group) => ({ ...group, hidden: group.hidden === true }));
+    const hiddenKeys = new Set(sessionGroups.filter((group) => group.hidden).map((group) => sessionGroupTemporaryKey(group.id)));
+    for (const key of sessionGroupTemporaryOpen.keys()) if (!hiddenKeys.has(key)) sessionGroupTemporaryOpen.delete(key);
     sessionGroupAssignments = result.assignments && typeof result.assignments === "object" && !Array.isArray(result.assignments)
       ? result.assignments : {};
     renderSessionList(lastItems);
+    void pollSessionGroupActivity(true);
     return true;
   } catch (e) {
     if (base === store.base && seq === sessionGroupsLoadSeq) note("Groups refresh failed: " + e.message);
@@ -8901,12 +8920,35 @@ function sessionGroupCollapseKey(id) {
   return JSON.stringify([store.base, id, sessionMarkedFilter(), sessionArchiveFilter()]);
 }
 function sessionGroupIsCollapsed(id, items, waiting) {
+  const temporaryKey = sessionGroupTemporaryKey(id);
+  if (!sessionMarkedFilter() && !sessArchivedOnly && sessionGroupTemporaryOpen.has(temporaryKey)) return sessionGroupTemporaryOpen.get(temporaryKey);
   const saved = sessionGroupCollapsed[sessionGroupCollapseKey(id)];
   if (typeof saved === "boolean") return saved;
   if (items.length && (sessionMarkedFilter() || sessionArchiveFilter() === "only")) return false;
   return !items.some((item) => item.id === sessionId) && !waiting;
 }
 function paintSessionGroupActivity() {
+  const hiddenIds = new Set(orderedSessionGroups().filter((group) => group.hidden).map((group) => group.id));
+  let hiddenRunning = 0, hiddenWaiting = 0;
+  const summaries = [...hiddenIds].map((id) => hiddenSessionGroupActivity(id));
+  for (const activity of summaries) { hiddenRunning += activity.running; hiddenWaiting += activity.waiting; }
+  const unavailable = summaries.some((activity) => activity.unavailable);
+  const incomplete = summaries.some((activity) => activity.incomplete);
+  const hiddenStatus = (hiddenRunning ? " · " + hiddenRunning + " RUNNING" : "") + (hiddenWaiting ? " · " + hiddenWaiting + " WAITING" : "")
+    + (unavailable ? " · activity unavailable" : incomplete ? " · incomplete activity" : "");
+  const hiddenButton = $("sessiongrouphidden"), activityButton = $("sessiongrouphiddenactivity");
+  if (hiddenButton) {
+    hiddenButton.textContent = "Hidden groups (" + hiddenIds.size + ")" + hiddenStatus;
+    hiddenButton.title = "Find hidden groups" + hiddenStatus;
+  }
+  if (activityButton) {
+    activityButton.textContent = "Hidden" + hiddenStatus;
+    activityButton.hidden = !hiddenRunning && !hiddenWaiting && !unavailable && !incomplete;
+    activityButton.classList.toggle("waiting", !!hiddenWaiting);
+    activityButton.setAttribute("aria-label", "Activity in hidden groups" + hiddenStatus + ". Open hidden groups to find these sessions.");
+    activityButton.title = "Find hidden groups" + hiddenStatus;
+  }
+  sessionGroupManagerRender?.();
   for (const [id, header] of sessionGroupHeaders) {
     let running = 0, waiting = 0;
     for (const item of header.items) {
@@ -8915,16 +8957,24 @@ function paintSessionGroupActivity() {
       if (normalizeSessionWaiting(sample.waiting)) ++waiting;
       else if (sample.activity === "running") ++running;
     }
+    if (hiddenIds.has(id)) {
+      const activity = hiddenSessionGroupActivity(id);
+      running = activity.running;
+      waiting = activity.waiting;
+      header.status.title = activity.unavailable ? "activity unavailable" : activity.incomplete ? "incomplete activity" : "";
+    }
     header.head.classList.toggle("session-group-waiting", !!waiting);
-    header.running.textContent = running ? running + " RUNNING" : "";
+    header.running.textContent = running ? String(running) : "";
     header.running.hidden = !running;
-    header.waiting.textContent = waiting ? waiting + " WAITING" : "";
+    header.running.title = running ? running + " loaded sessions running" : "";
+    header.running.setAttribute("aria-label", running + " RUNNING");
+    header.waiting.textContent = waiting ? String(waiting) : "";
     header.waiting.hidden = !waiting;
+    header.waiting.setAttribute("aria-label", waiting + " WAITING");
     header.status.hidden = !running && !waiting;
     header.waiting.title = waiting ? waiting + " loaded sessions need your answer. Expand this group to open them." : "";
     header.toggle.setAttribute("aria-label", header.toggle.title + (running ? " · " + running + " RUNNING" : "") + (waiting ? " · " + waiting + " WAITING" : ""));
     const collapsed = sessionGroupIsCollapsed(id, header.items, waiting);
-    header.arrow.textContent = collapsed ? "▸" : "▾";
     header.toggle.setAttribute("aria-expanded", String(!collapsed));
     for (const row of header.rows) row.hidden = collapsed;
   }
@@ -8937,11 +8987,13 @@ function appendSessionGroupHeader(ul, group, items) {
   toggle.type = "button";
   toggle.className = "session-group-toggle";
   const arrow = document.createElement("span"), name = document.createElement("span");
+  arrow.className = "session-group-arrow";
   arrow.setAttribute("aria-hidden", "true");
   name.className = "session-group-name";
-  name.textContent = (group?.pinned ? "★ " : "") + (group?.name || "Unassigned");
-  name.title = group?.name || "Unassigned";
-  toggle.title = (group?.name || "Unassigned") + " · " + items.length + " loaded sessions";
+  name.classList.toggle("session-group-pinned", !!group?.pinned);
+  name.textContent = group?.name || "Unassigned";
+  name.title = (group?.name || "Unassigned") + (group?.pinned ? " · Pinned group" : "");
+  toggle.title = (group?.name || "Unassigned") + " · " + items.length + " loaded sessions" + (group?.pinned ? " · Pinned group" : "");
   toggle.setAttribute("aria-label", toggle.title);
   const status = document.createElement("span"), running = document.createElement("span"), waiting = document.createElement("span");
   status.className = "session-group-status";
@@ -8950,11 +9002,16 @@ function appendSessionGroupHeader(ul, group, items) {
   status.appendChild(running);
   status.appendChild(waiting);
   for (const child of [arrow, name, status]) toggle.appendChild(child);
-  const header = { head, toggle, arrow, status, running, waiting, items, rows: [] };
+  const header = { head, toggle, status, running, waiting, items, rows: [] };
   sessionGroupHeaders.set(id, header);
   const toggleGroup = () => {
-    sessionGroupCollapsed[sessionGroupCollapseKey(id)] = toggle.getAttribute("aria-expanded") === "true";
-    try { localStorage.setItem(SESSION_GROUP_COLLAPSED_KEY, JSON.stringify(sessionGroupCollapsed)); } catch (_) {}
+    const collapsed = toggle.getAttribute("aria-expanded") === "true";
+    if (!sessionMarkedFilter() && !sessArchivedOnly && sessionGroupTemporaryOpen.has(sessionGroupTemporaryKey(id))) {
+      sessionGroupTemporaryOpen.set(sessionGroupTemporaryKey(id), collapsed);
+    } else {
+      sessionGroupCollapsed[sessionGroupCollapseKey(id)] = collapsed;
+      try { localStorage.setItem(SESSION_GROUP_COLLAPSED_KEY, JSON.stringify(sessionGroupCollapsed)); } catch (_) {}
+    }
     paintSessionGroupActivity();
   };
   toggle.onclick = (event) => { event.stopPropagation(); toggleGroup(); };
@@ -8982,10 +9039,12 @@ function appendSessionGroupHeader(ul, group, items) {
   ul.appendChild(head);
   return header;
 }
+let sessionGroupManagerRender = null;
 let sessionGroupReturnFocus = null;
 let sessionGroupDialogBase = null;
 let sessionGroupDialogSeq = 0;
 function closeSessionGroupDialog(restoreFocus = true) {
+  sessionGroupManagerRender = null;
   ++sessionGroupDialogSeq;
   $("sessiongroupdialog").hidden = true;
   const target = sessionGroupReturnFocus;
@@ -8993,6 +9052,7 @@ function closeSessionGroupDialog(restoreFocus = true) {
   if (restoreFocus && target?.isConnected) target.focus();
 }
 function openSessionGroupDialog(title) {
+  sessionGroupManagerRender = null;
   if ($("sessiongroupdialog").hidden) sessionGroupReturnFocus = document.activeElement;
   ++sessionGroupDialogSeq;
   sessionGroupDialogBase = store.base;
@@ -9015,13 +9075,13 @@ function openSessionGroupDialog(title) {
   };
   return $("sessiongroupbody");
 }
-function appendSessionGroupAction(label, action, danger = false) {
+function appendSessionGroupAction(label, action, danger = false, parent = $("sessiongroupbody")) {
   const button = document.createElement("button");
   button.type = "button";
   button.textContent = label;
   if (danger) button.className = "danger";
   button.onclick = action;
-  $("sessiongroupbody").appendChild(button);
+  parent.appendChild(button);
   return button;
 }
 async function mutateSessionGroup(path, method, body, apply) {
@@ -9068,16 +9128,218 @@ function openSessionGroupDelete(group) {
   appendSessionGroupAction("Delete group", () => mutateSessionGroup("/session-groups/" + encodeURIComponent(group.id), "DELETE"), true);
   $("sessiongroupcancel").focus();
 }
-async function openSessionGroupManager() {
-  openSessionGroupDialog("Manage groups");
+async function openSessionGroupManager(filter = "all") {
+  const body = openSessionGroupDialog("Manage groups");
   const seq = sessionGroupDialogSeq;
   const loaded = await loadSessionGroups();
+  await pollSessionGroupActivity(true);
   if (seq !== sessionGroupDialogSeq || sessionGroupDialogBase !== store.base) return;
   if (!loaded) $("sessiongrouperror").textContent = "Groups refresh failed. Showing cached groups.";
   const first = appendSessionGroupAction("New group…", () => openSessionGroupName());
-  for (const group of orderedSessionGroups()) appendSessionGroupAction(group.name, () => openSessionGroupMenu(group));
-  first.focus();
+  const filters = document.createElement("div");
+  filters.className = "session-group-filters";
+  filters.setAttribute("role", "group");
+  filters.setAttribute("aria-label", "Group visibility filter");
+  body.appendChild(filters);
+  const search = document.createElement("input");
+  search.type = "search";
+  search.value = "";
+  search.placeholder = "Search groups…";
+  search.setAttribute("aria-label", "Search groups by name");
+  body.appendChild(search);
+  const list = document.createElement("div");
+  list.className = "session-group-manager-list";
+  body.appendChild(list);
+  const choices = new Map();
+  const render = () => {
+    for (const [value, button] of choices) button.setAttribute("aria-pressed", String(filter === value));
+    const query = search.value.trim().toLowerCase();
+    const groups = orderedSessionGroups().filter((group) => (filter !== "hidden" || group.hidden) && group.name.toLowerCase().includes(query));
+    list.textContent = "";
+    for (const group of groups) {
+      const row = document.createElement("div");
+      row.className = "session-group-manager-row";
+      const name = appendSessionGroupAction(group.name, () => openSessionGroupMenu(group), false, row);
+      name.className = "session-group-manager-name";
+      name.title = group.name + (group.hidden ? " · Hidden from sidebar" : "");
+      const visibility = appendSessionGroupAction(group.hidden ? "Show in sidebar" : "Hide from sidebar", () => setSessionGroupHidden(group, !group.hidden), false, row);
+      visibility.setAttribute("aria-label", visibility.textContent + ": " + group.name);
+      if (group.hidden) {
+        const open = appendSessionGroupAction("Open", () => openHiddenSessionGroup(group), false, row);
+        open.title = "Open " + group.name + " in the sidebar until this page is refreshed";
+        open.setAttribute("aria-label", "Open hidden group: " + group.name);
+      }
+      if (group.hidden) {
+        const activity = hiddenSessionGroupActivity(group.id);
+        const status = document.createElement("span");
+        status.className = "session-group-manager-activity";
+        status.textContent = sessionGroupActivityText(activity);
+        row.appendChild(status);
+        for (const active of activity.active) {
+          const label = (normalizeSessionWaiting(active.waiting) ? "WAITING" : "RUNNING") + " · " + active.id;
+          const button = appendSessionGroupAction(label, () => openHiddenActiveSession(group, active), false, row);
+          button.title = active.waiting_prompt || "Open active session";
+        }
+      }
+      list.appendChild(row);
+    }
+    if (!groups.length) {
+      const empty = document.createElement("p");
+      empty.textContent = query ? "No groups match your search." : filter === "hidden" ? "No hidden groups." : "No groups yet.";
+      list.appendChild(empty);
+    }
+  };
+  for (const [value, label] of [["all", "All"], ["hidden", "Hidden"]]) {
+    choices.set(value, appendSessionGroupAction(label, () => { filter = value; render(); }, false, filters));
+  }
+  search.oninput = render;
+  let activitySignature = "";
+  sessionGroupManagerRender = () => {
+    if (seq !== sessionGroupDialogSeq || sessionGroupDialogBase !== store.base || $("sessiongroupdialog").hidden) return;
+    const signature = JSON.stringify(orderedSessionGroups().filter((group) => group.hidden).map((group) => hiddenSessionGroupActivity(group.id)));
+    if (signature === activitySignature) return;
+    activitySignature = signature;
+    render();
+  };
+  sessionGroupManagerRender();
+  if (filter === "hidden") search.focus();
+  else first.focus();
 }
+function setSessionGroupHidden(group, hidden) {
+  return mutateSessionGroup("/session-groups/" + encodeURIComponent(group.id), "PATCH", { hidden }, () => {
+    const current = sessionGroups.find((item) => item.id === group.id);
+    if (current) current.hidden = hidden;
+    sessionGroupTemporaryOpen.delete(sessionGroupTemporaryKey(group.id));
+    renderSessionList(lastItems);
+  });
+}
+async function openHiddenSessionGroup(group) {
+  const base = sessionGroupDialogBase;
+  if (base !== store.base) { closeSessionGroupDialog(); return; }
+  closeSessionGroupDialog(false);
+  const filtered = !!sessFilter.trim() || sessMarkedOnly || sessArchivedOnly;
+  sessFilter = "";
+  sessMarkedOnly = false;
+  sessArchivedOnly = false;
+  $("sessfilter").value = "";
+  syncSessionSearchVisibility();
+  if (sessionsSearchTimer !== null) clearTimeout(sessionsSearchTimer);
+  sessionsSearchTimer = null;
+  sessionsSearchPending = false;
+  if (filtered) resetSessionSearch();
+  ++sessionGroupPageEpoch;
+  sessionGroupTemporaryOpen.set(sessionGroupTemporaryKey(group.id), false);
+  if (isPhoneLayout()) setDrawer(true);
+  await Promise.all([loadSessionGroupPage(group.id), filtered ? loadSessions({ preserveSelection: true }) : Promise.resolve()]);
+  if (base !== store.base) return;
+  const header = sessionGroupHeaders.get(group.id);
+  header?.head.scrollIntoView?.({ block: "nearest" });
+  header?.toggle.focus();
+}
+async function fetchSessionGroupPage(id, offset, include = null, archived = sessionArchiveFilter()) {
+  let path = "/sessions?group=" + encodeURIComponent(id || "unassigned") + "&newest=true&archived=" + archived + "&limit=" + SESSION_PAGE_SIZE + "&offset=" + offset;
+  if (include) path += "&include=" + encodeURIComponent(include);
+  const response = await api(path);
+  const items = await response.json();
+  if (!Array.isArray(items)) throw new Error("Invalid group sessions response");
+  const header = (name) => response.headers?.get?.(name) ?? null;
+  return sessionPageProjection(items, header("x-sessions-total"), header("x-sessions-page-size"), SESSION_PAGE_SIZE);
+}
+async function loadSessionGroupPage(id, more = false) {
+  const key = sessionGroupPageKey(id), base = store.base, epoch = sessionGroupPageEpoch;
+  let state = sessionGroupPages.get(key);
+  if (!state) {
+    state = { items: [], total: null, offset: 0, hasMore: false, loading: false, seq: 0, loaded: false, error: "" };
+    sessionGroupPages.set(key, state);
+  }
+  if ((state.loading && state.epoch === epoch) || (more && !state.hasMore)) return;
+  const seq = ++state.seq;
+  state.epoch = epoch;
+  state.loading = true;
+  state.error = "";
+  renderSessionList(lastItems);
+  const current = () => base === store.base && epoch === sessionGroupPageEpoch && key === sessionGroupPageKey(id)
+    && sessionGroupTemporaryOpen.has(sessionGroupTemporaryKey(id)) && sessionGroupPages.get(key) === state && state.seq === seq;
+  try {
+    const offset = more ? state.offset : 0;
+    const page = await fetchSessionGroupPage(id, offset);
+    if (!current()) return;
+    state.items = more ? mergeSessionPageItems(state.items, sessionPageOlderItems(state.items, page)) : page.items;
+    state.total = page.total;
+    state.offset = sessionPageNextOffset(offset, page.pageSize);
+    state.hasMore = sessionPageHasMore(state.offset, state.total, page, SESSION_PAGE_SIZE);
+    state.loaded = true;
+  } catch (e) {
+    if (current()) state.error = "Group sessions unavailable: " + e.message;
+  } finally {
+    if (state.seq === seq) state.loading = false;
+    if (current()) { renderSessionList(lastItems); void pollSessionActivity(); }
+  }
+}
+function appendSessionGroupPageControl(ul, id) {
+  const state = sessionGroupPages.get(sessionGroupPageKey(id));
+  if (!state || !state.loading && !state.error && !state.hasMore) return;
+  const row = document.createElement("li"), button = document.createElement("button");
+  row.className = "session-more";
+  const status = document.createElement("span");
+  status.textContent = state.error || (!state.loaded && state.loading ? "Loading group sessions…" : "");
+  row.appendChild(status);
+  button.type = "button";
+  button.textContent = state.loading ? "Loading…" : state.error ? "Retry group sessions" : "Load more in " + sessionGroupName(id);
+  button.disabled = state.loading;
+  button.setAttribute("aria-busy", String(state.loading));
+  button.onclick = () => loadSessionGroupPage(id, state.loaded && state.hasMore);
+  row.appendChild(button);
+  ul.appendChild(row);
+  sessionGroupHeaders.get(id)?.rows.push(row);
+}
+async function openHiddenActiveSession(group, active) {
+  const base = store.base, seq = sessionGroupDialogSeq;
+  try {
+    const page = await fetchSessionGroupPage(group.id, 0, active.id, "include");
+    if (base !== store.base || seq !== sessionGroupDialogSeq) return;
+    const item = page.items.find((item) => item.id === active.id && sessionGroupId(item) === group.id);
+    if (!item) throw new Error("Active session is no longer available. Refresh activity and retry.");
+    selectedSessionMetadata = item;
+    selectedSessionMetadataBase = base;
+    closeSessionGroupDialog(false);
+    selectSessionListItem(item);
+    renderSessionList(lastItems);
+  } catch (e) {
+    if (base === store.base && seq === sessionGroupDialogSeq) $("sessiongrouperror").textContent = "Session open failed: " + e.message;
+  }
+}
+function openSelectedSessionRename() {
+  const s = sessionListItem(sessionId);
+  if (!s) return;
+  const body = openSessionGroupDialog("Rename session");
+  const base = store.base, seq = sessionGroupDialogSeq;
+  const input = document.createElement("input");
+  input.value = sessionTitle(s);
+  input.maxLength = 200;
+  input.setAttribute("aria-label", "Session title");
+  body.appendChild(input);
+  const save = appendSessionGroupAction("Save", async () => {
+    const title = input.value.trim();
+    if (!title) { input.focus(); return; }
+    save.disabled = true;
+    try {
+      await api("/sessions/" + encodeURIComponent(s.id) + "/title", { method: "POST", body: JSON.stringify({ title }) });
+      if (base !== store.base || seq !== sessionGroupDialogSeq) return;
+      for (const item of [s, ...lastItems, ...[...sessionGroupPages.values()].flatMap((page) => page.items)]) if (item.id === s.id) item.summary = title;
+      closeSessionGroupDialog();
+      renderSessionList(lastItems);
+      renderSessionBar();
+      await loadSessions({ preserveSelection: true });
+    } catch (e) {
+      if (base === store.base && seq === sessionGroupDialogSeq) $("sessiongrouperror").textContent = "Rename failed: " + e.message;
+    } finally { save.disabled = false; }
+  });
+  input.onkeydown = (ev) => { if (ev.key === "Enter" && !ev.isComposing && !save.disabled) { ev.preventDefault(); return save.onclick(); } };
+  input.focus();
+  input.select();
+}
+
 function openSessionGroupMenu(group) {
   openSessionGroupDialog(group.name);
   const first = appendSessionGroupAction("New session in this group", () => {
@@ -9086,6 +9348,8 @@ function openSessionGroupMenu(group) {
   });
   appendSessionGroupAction("Rename", () => openSessionGroupName(group));
   appendSessionGroupAction(group.pinned ? "Unpin" : "Pin", () => mutateSessionGroup("/session-groups/" + encodeURIComponent(group.id), "PATCH", { pinned: !group.pinned }));
+  appendSessionGroupAction(group.hidden ? "Show in sidebar" : "Hide from sidebar", () => setSessionGroupHidden(group, !group.hidden));
+  if (group.hidden) appendSessionGroupAction("Open", () => openHiddenSessionGroup(group));
   appendSessionGroupAction("Delete group…", () => openSessionGroupDelete(group), true);
   first.focus();
 }
@@ -9131,7 +9395,9 @@ async function createSessionInGroup(groupId = null) {
     sessMarkedOnly = false;
     sessFilter = "";
     $("sessfilter").value = "";
+    syncSessionSearchVisibility();
     resetSessionSearch();
+    if (sessionGroups.some((group) => group.id === groupId && group.hidden)) sessionGroupTemporaryOpen.set(sessionGroupTemporaryKey(groupId), false);
     sessionGroupCollapsed[sessionGroupCollapseKey(groupId)] = false;
     try { localStorage.setItem(SESSION_GROUP_COLLAPSED_KEY, JSON.stringify(sessionGroupCollapsed)); } catch (_) {}
     // Lazy sessions have no history until their first turn persists it.
@@ -9169,6 +9435,91 @@ function sessionListCountText(q, shown, items, total, markedOnly = false, search
   return q || markedOnly
     ? total + " sessions · showing " + shown.length + (items.length < total ? " loaded" : "")
     : total + " sessions";
+}
+// Group activity is a complete server snapshot, independent of loaded row samples.
+const sessionGroupActivitySnapshots = new Map();
+let sessionGroupActivityFlight = null;
+let sessionGroupActivityScopeBase = null;
+let sessionGroupActivitySeq = 0;
+function hiddenSessionGroupActivity(id) {
+  const snapshot = sessionGroupActivitySnapshots.get(store.base);
+  if (!snapshot || Date.now() - snapshot.at >= SESSION_ACTIVITY_MAX_AGE_MS || snapshot.status === "unavailable") {
+    return { running: 0, waiting: 0, unknown: 0, active: [], unavailable: true, incomplete: false };
+  }
+  if (snapshot.status === "complete") {
+    const group = snapshot.groups.get(id);
+    return group ? { ...group, unavailable: group.unknown > 0, incomplete: false }
+      : { running: 0, waiting: 0, unknown: 0, active: [], unavailable: true, incomplete: false };
+  }
+  // Older daemons expose only loaded samples; always disclose that limit.
+  let running = 0, waiting = 0;
+  const active = [], seen = new Set();
+  for (const item of sessionGroupRenderedItems(lastItems)) {
+    if (sessionGroupId(item) !== id || seen.has(item.id)) continue;
+    seen.add(item.id);
+    const sample = sessionActivitySamples.get(item.id);
+    if (!sample || Date.now() - sample.at >= SESSION_ACTIVITY_MAX_AGE_MS) continue;
+    if (normalizeSessionWaiting(sample.waiting)) ++waiting;
+    else if (sample.activity === "running") ++running;
+    else continue;
+    active.push({ id: item.id, activity: sample.activity, waiting: sample.waiting, waiting_prompt: sample.waitingPrompt });
+  }
+  return { running, waiting, unknown: 0, active, unavailable: false, incomplete: true };
+}
+function sessionGroupActivityText(activity) {
+  return (activity.running ? activity.running + " RUNNING · " : "")
+    + (activity.waiting ? activity.waiting + " WAITING · " : "")
+    + (activity.unavailable ? "activity unavailable" : activity.incomplete ? "incomplete activity (loaded sessions)" : "Activity up to date");
+}
+async function pollSessionGroupActivity(force = false) {
+  const base = store.base;
+  if (sessionGroupActivityScopeBase !== base) {
+    sessionGroupActivityScopeBase = base;
+    ++sessionGroupActivitySeq;
+    sessionGroupActivityFlight?.controller.abort();
+    sessionGroupActivityFlight = null;
+    // Returning to a server requires fresh evidence, including after an ABA switch.
+    sessionGroupActivitySnapshots.delete(base);
+  }
+  if (sessionGroupsBase !== base || !orderedSessionGroups().some((group) => group.hidden) || !force && document.visibilityState !== "visible") return;
+  if (sessionGroupActivityFlight) {
+    sessionGroupActivityFlight.again = true;
+    return sessionGroupActivityFlight.promise;
+  }
+  const seq = ++sessionGroupActivitySeq;
+  const flight = { base, controller: new AbortController(), again: false, promise: null };
+  sessionGroupActivityFlight = flight;
+  flight.promise = (async () => {
+    const deadline = setTimeout(() => flight.controller.abort(), 5000);
+    try {
+      const response = await api("/session-group-activity", { signal: flight.controller.signal });
+      const body = await response.json();
+      if (flight.controller.signal.aborted) throw new Error("Group activity timed out");
+      if (!body || !Array.isArray(body.groups)) throw new Error("Invalid group activity response");
+      const groups = new Map();
+      for (const group of body.groups) {
+        if (typeof group?.group_id !== "string" || ![group.running, group.waiting, group.unknown].every((count) => Number.isInteger(count) && count >= 0)
+            || !Array.isArray(group.active) || group.active.some((item) => typeof item?.id !== "string") || groups.has(group.group_id)) {
+          throw new Error("Invalid group activity entry");
+        }
+        groups.set(group.group_id, { running: group.running, waiting: group.waiting, unknown: group.unknown, active: group.active });
+      }
+      if (orderedSessionGroups().some((group) => group.hidden && !groups.has(group.id))) throw new Error("Incomplete group activity response");
+      if (base === store.base && seq === sessionGroupActivitySeq) sessionGroupActivitySnapshots.set(base, { at: Date.now(), status: "complete", groups });
+    } catch (e) {
+      if (base === store.base && seq === sessionGroupActivitySeq) {
+        sessionGroupActivitySnapshots.set(base, { at: Date.now(), status: /^404(?:\s|$)/.test(e.message) && !flight.controller.signal.aborted ? "incomplete" : "unavailable", groups: new Map() });
+      }
+    } finally {
+      clearTimeout(deadline);
+      if (sessionGroupActivityFlight === flight) {
+        sessionGroupActivityFlight = null;
+        paintSessionGroupActivity();
+        if (flight.again && document.visibilityState === "visible") void pollSessionGroupActivity();
+      }
+    }
+  })();
+  return flight.promise;
 }
 // BEGIN session activity
 const SESSION_ACTIVITY_POLL_MS = 2500;
@@ -9246,7 +9597,7 @@ function sessionActivityScope() {
   }
   return base;
 }
-function syncSessionActivityItems(items = lastItems) {
+function syncSessionActivityItems(items = sessionGroupRenderedItems(lastItems)) {
   sessionActivityScope();
   const loaded = new Set(items.map((item) => item.id));
   if (sessionActivityItemsBase === sessionActivityBase) {
@@ -9358,6 +9709,7 @@ function scheduleSessionActivityPoll() {
   sessionActivityTimer = setTimeout(() => {
     sessionActivityTimer = null;
     void pollSessionActivity();
+    void pollSessionGroupActivity();
     scheduleSessionActivityPoll();
   }, SESSION_ACTIVITY_POLL_MS);
 }
@@ -9367,11 +9719,13 @@ function wireSessionActivityPoll() {
     sessionActivityTimer = null;
     if (document.visibilityState !== "visible") {
       sessionActivityFlight?.controller.abort();
+      sessionGroupActivityFlight?.controller.abort();
       mergeSessionActivities([...sessionActivitySamples.keys()].map((id) => ({ id, activity: "unknown" })));
       return;
     }
     expireSessionActivities();
     void pollSessionActivity();
+    void pollSessionGroupActivity();
     scheduleSessionActivityPoll();
   };
   document.addEventListener("visibilitychange", resume);
@@ -9395,6 +9749,8 @@ function refreshSessionActivity(sid, base = executionBase()) {
 // END session activity
 function renderSessionList(items, errText, { preserveScroll = true, followNewest = false } = {}) {
   const markedOnly = sessionMarkedFilter();
+  const globalItems = items;
+  items = sessionGroupRenderedItems(items);
   const { q, shown } = sessionListProjection(items.filter((s) => sessionMatchesArchive(s)), sessFilter, markedOnly);
   const searchResults = !!q && sessionsResultQuery === sessFilter.trim() && sessionsResultMarkedOnly === markedOnly && sessionsResultArchived === sessionArchiveFilter();
   $("sessall")?.setAttribute("aria-pressed", String(!sessMarkedOnly));
@@ -9419,15 +9775,17 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
   const entries = [];
   if (q) entries.push(...shown.map((s) => ({ s })));
   else if (shown.length || (!markedOnly && !sessArchivedOnly)) {
-    const buckets = new Map([...orderedSessionGroups().map((group) => [group.id, { group, items: [] }]), [null, { group: null, items: [] }]]);
-    for (const s of shown) buckets.get(sessionGroupId(s)).items.push(s);
+    const buckets = new Map([...orderedSessionGroups().filter(sessionGroupVisible).map((group) => [group.id, { group, items: [] }]), [null, { group: null, items: [] }]]);
+    for (const s of shown) buckets.get(sessionGroupId(s))?.items.push(s);
     for (const [groupId, bucket] of buckets) {
-      if (!bucket.items.length && (groupId !== null || markedOnly || sessArchivedOnly)) continue;
+      if (!bucket.items.length && (groupId !== null || markedOnly || sessArchivedOnly) && !sessionGroupTemporaryOpen.has(sessionGroupTemporaryKey(groupId))) continue;
       entries.push(bucket);
       for (const s of bucket.items) entries.push({ s, groupId });
+      if (sessionGroupTemporaryOpen.has(sessionGroupTemporaryKey(groupId))) entries.push({ pageControl: true, groupId });
     }
   }
   for (const entry of entries) {
+    if (entry.pageControl) { appendSessionGroupPageControl(ul, entry.groupId); continue; }
     if (!entry.s) { appendSessionGroupHeader(ul, entry.group, entry.items); continue; }
     const s = entry.s;
     const li = document.createElement("li");
@@ -9532,8 +9890,7 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
     sessionActivityRows.set(s.id, li);
     paintSessionActivity(s.id);
     bindSessionLongPress(li, s);
-    // Desktop right-click opens the same mark/fork/delete sheet as a double
-    // click, so the actions stay one gesture away without switching sessions.
+    // Desktop right-click opens the same action sheet as a double click.
     li.oncontextmenu = (ev) => {
       if (isPhoneLayout()) return;
       ev.preventDefault();
@@ -9547,7 +9904,6 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
       // A pointer click that ends a text drag is a copy gesture, not a pick.
       if (ev?.type !== "keydown" && sessionTextSelected()) return;
       const picked = s.id !== sessionId;
-      switchSession(s.id);
       // Picking the current row is an explicit request to reopen its live edge.
       if (!picked && typeof beginSessionTranscriptScroll === "function") {
         beginSessionTranscriptScroll(s.id);
@@ -9560,22 +9916,7 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
       }
       li.classList.add("cur");
       t.setAttribute("aria-current", "true");
-      renderSessionBar();
-      paintSessionGroupActivity();
-      turnRunning = false;
-      stopStaleFollow();
-      // The question on screen belonged to the session being left; the poll
-      // below rebuilds it for the one being opened and retries a dropped
-      // sample, so a turn started in another page shows its stop/note controls.
-      hideConfirm();
-      if (isPhoneLayout()) setDrawer(false);
-      pollSwitchRunningState();
-      Promise.resolve(loadHistory()).catch(() => {});
-      loadSessionConfig();
-      // The picked session is the one the user types into next, so the caret
-      // leaves the row this gesture focused (the drawer is already closed).
-      // Re-clicking the open row only selects text to copy, so it keeps focus.
-      if (picked && typeof focusComposer === "function") focusComposer();
+      selectSessionListItem(s);
     };
     ul.appendChild(li);
     if (!q) sessionGroupHeaders.get(entry.groupId).rows.push(li);
@@ -9621,12 +9962,35 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
     li.textContent = errText;
     ul.appendChild(li);
   }
-  const total = sessionListTotal(items, sessionsTotal);
+  const total = sessionListTotal(globalItems, sessionsTotal);
   $("sesscount").textContent = (searchResults || markedOnly) && sessionsSearching && sessionsTotal === null
-    ? "searching sessions…" : sessionListCountText(q, shown, items, total, markedOnly, searchResults);
+    ? "searching sessions…" : sessionListCountText(q, shown, globalItems, total, markedOnly, searchResults);
   $("sesscount").title = $("sesscount").textContent;
   if (followNewest) ul.scrollTop = 0;
   else ul.scrollTop = scrollTop;
+}
+function selectSessionListItem(s) {
+  const picked = s.id !== sessionId;
+  selectedSessionMetadata = s;
+  selectedSessionMetadataBase = store.base;
+  switchSession(s.id);
+  lastMsgCount = null;
+  renderSessionBar();
+  paintSessionGroupActivity();
+  turnRunning = false;
+  stopStaleFollow();
+  // The question on screen belonged to the session being left; the poll
+  // below rebuilds it for the one being opened and retries a dropped
+  // sample, so a turn started in another page shows its stop/note controls.
+  hideConfirm();
+  if (isPhoneLayout()) setDrawer(false);
+  pollSwitchRunningState();
+  Promise.resolve(loadHistory()).catch(() => {});
+  loadSessionConfig();
+  // The picked session is the one the user types into next, so the caret
+  // leaves the row this gesture focused (the drawer is already closed).
+  // Re-clicking the open row only selects text to copy, so it keeps focus.
+  if (picked && typeof focusComposer === "function") focusComposer();
 }
 // Swap one drawer row title for an inline editor: Enter/blur commits via
 // POST /sessions/{id}/title, Esc cancels. A failed commit keeps the old
@@ -9680,9 +10044,37 @@ let sessionsTotal = null;
 let sessionsPageOffset = 0;
 let sessionsHasMore = false;
 let sessionsLoadingMore = false;
+let sessionSearchReturnFocus = null;
+function syncSessionSearchVisibility() {
+  const filter = $("sessfilter");
+  if (filter.value.trim() || sessFilter.trim() || sessionsFilterComposing) filter.hidden = false;
+  else if (document.activeElement !== filter) filter.hidden = true;
+  $("sesssearch")?.setAttribute("aria-expanded", String(!filter.hidden));
+}
+function openSessionSearch() {
+  closeSessionSidebarMenu();
+  const filter = $("sessfilter");
+  if (document.activeElement !== filter) sessionSearchReturnFocus = document.activeElement;
+  if (isPhoneLayout()) setDrawer(true);
+  filter.hidden = false;
+  $("sesssearch")?.setAttribute("aria-expanded", "true");
+  filter.focus();
+}
+function closeSessionSearch(restoreFocus = false) {
+  const filter = $("sessfilter");
+  if (filter.value.trim() || sessFilter.trim() || sessionsFilterComposing) return;
+  filter.hidden = true;
+  $("sesssearch")?.setAttribute("aria-expanded", "false");
+  if (restoreFocus && document.activeElement === filter) {
+    const target = sessionSearchReturnFocus?.isConnected !== false ? sessionSearchReturnFocus : null;
+    (target || $("sessmoretoggle")).focus();
+  }
+  sessionSearchReturnFocus = null;
+}
 function resetSessionSearch() {
   // Invalidate requests immediately and cache the active metadata before clearing.
   ++sessionsLoadSeq;
+  ++sessionGroupPageEpoch;
   sessionsLoadingMore = false;
   sessionsTotal = null;
   sessionsPageOffset = 0;
@@ -9698,6 +10090,7 @@ function resetSessionSearch() {
 function setSessionSearch(value) {
   const previousQuery = sessFilter.trim();
   sessFilter = value;
+  syncSessionSearchVisibility();
   const query = sessFilter.trim();
   const changed = query !== previousQuery;
   if (!changed && !sessionsSearchPending) return;
@@ -9712,6 +10105,25 @@ function setSessionSearch(value) {
   }, SESSION_SEARCH_DELAY_MS);
 }
 function wireSessionSearch() {
+  const filter = $("sessfilter");
+  syncSessionSearchVisibility();
+  if ($("sesssearch")) $("sesssearch").onclick = openSessionSearch;
+  filter.onblur = () => closeSessionSearch();
+  filter.onkeydown = (event) => {
+    if (event.key !== "Escape" || event.isComposing || sessionsFilterComposing) return;
+    event.preventDefault();
+    event.stopPropagation();
+    closeSessionSearch(true);
+  };
+  // Capture the shortcut before text inputs and browser find handlers see it.
+  document.addEventListener("keydown", (event) => {
+    if (!event.shiftKey || !(event.metaKey || event.ctrlKey) || (event.key !== "f" && event.key !== "F") || event.isComposing) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.repeat) return;
+    if (filter.hidden || document.activeElement !== filter) openSessionSearch();
+    else closeSessionSearch(true);
+  }, true);
   $("sessfilter").oncompositionstart = () => {
     sessionsFilterComposing = true;
     if (sessionsSearchTimer !== null) { clearTimeout(sessionsSearchTimer); sessionsSearchTimer = null; }
@@ -10754,38 +11166,66 @@ if ($("msgs") && typeof $("msgs").addEventListener === "function") {
   // has no older rows to reveal.
   let previousTop = $("msgs").scrollTop;
   let previousTouchY = null;
-  let pointerDown = false;
+  let scrollbarPointer = null;
+  let upwardInput = false;
+  const noteInput = (deltaY) => {
+    if (!deltaY) return;
+    upwardInput = deltaY < 0;
+    noteTranscriptIntent(deltaY);
+  };
   $("msgs")._resetScrollTracking = (resetInput = true) => {
     previousTop = $("msgs").scrollTop;
-    if (resetInput) { previousTouchY = null; pointerDown = false; }
+    if (resetInput) { previousTouchY = null; scrollbarPointer = null; upwardInput = false; }
   };
-  $("msgs").addEventListener("pointerdown", (event) => { pointerDown = event.target === $("msgs"); }, { passive: true });
-  $("msgs").addEventListener("pointerup", () => { pointerDown = false; }, { passive: true });
-  $("msgs").addEventListener("pointercancel", () => { pointerDown = false; }, { passive: true });
-  if (typeof window.addEventListener === "function") window.addEventListener("pointerup", () => { pointerDown = false; }, { passive: true });
+  $("msgs").addEventListener("pointerdown", (event) => {
+    const root = $("msgs"), rect = root.getBoundingClientRect?.();
+    // Only a measurable scrollbar gutter establishes drag input; selecting
+    // text or clicking transcript padding must not claim scroll ownership.
+    if (event.target !== root || event.button !== 0 || !rect || root.offsetWidth <= root.clientWidth) return;
+    const contentLeft = rect.left + root.clientLeft, contentRight = contentLeft + root.clientWidth;
+    if (event.clientX >= rect.left && event.clientX < rect.right
+        && (event.clientX < contentLeft || event.clientX >= contentRight)) {
+      scrollbarPointer = { id: event.pointerId, y: event.clientY };
+    }
+  }, { passive: true });
+  const moveScrollbar = (event) => {
+    if (!scrollbarPointer || event.pointerId !== scrollbarPointer.id) return;
+    noteInput(event.clientY - scrollbarPointer.y);
+    scrollbarPointer.y = event.clientY;
+  };
+  const releaseScrollbar = () => {
+    if (scrollbarPointer && isNearBottom()) noteInput(1);
+    scrollbarPointer = null;
+  };
+  const pointerTarget = typeof window.addEventListener === "function" ? window : $("msgs");
+  pointerTarget.addEventListener("pointermove", moveScrollbar, { passive: true });
+  pointerTarget.addEventListener("pointerup", releaseScrollbar, { passive: true });
+  pointerTarget.addEventListener("pointercancel", () => { scrollbarPointer = null; }, { passive: true });
   $("msgs").addEventListener("keydown", (event) => {
-    if (["ArrowUp", "PageUp", "Home"].includes(event.key)
-        && !event.target.closest?.("input, textarea, select")) noteTranscriptIntent(-1);
+    if (event.defaultPrevented || event.isComposing || event.target.closest?.("input, textarea, select, [contenteditable]")) return;
+    if (["ArrowUp", "PageUp", "Home"].includes(event.key) || event.key === " " && event.shiftKey) noteInput(-1);
+    else if (["ArrowDown", "PageDown", "End"].includes(event.key)) noteInput(1);
   });
-  $("msgs").addEventListener("wheel", (event) => noteTranscriptIntent(event.deltaY), { passive: true });
+  $("msgs").addEventListener("wheel", (event) => noteInput(event.deltaY), { passive: true });
   $("msgs").addEventListener("touchstart", (event) => {
     previousTouchY = event.touches?.[0]?.clientY ?? null;
   }, { passive: true });
   $("msgs").addEventListener("touchmove", (event) => {
     const y = event.touches?.[0]?.clientY;
-    if (previousTouchY !== null && y !== undefined) noteTranscriptIntent(previousTouchY - y);
+    if (previousTouchY !== null && y !== undefined) noteInput(previousTouchY - y);
     previousTouchY = y ?? previousTouchY;
   }, { passive: true });
   // Releasing a drag at the live edge is the reader's way back to following.
   $("msgs").addEventListener("touchend", () => {
     previousTouchY = null;
-    if (isNearBottom()) noteTranscriptIntent(1);
+    if (isNearBottom()) noteInput(1);
   }, { passive: true });
+  $("msgs").addEventListener("touchcancel", () => { previousTouchY = null; }, { passive: true });
   $("msgs").addEventListener("scroll", () => {
     const root = $("msgs");
-    const movedUp = noteTranscriptScroll(previousTop, root, pointerDown);
+    const movedUp = noteTranscriptScroll(previousTop, root);
     previousTop = root.scrollTop;
-    if (!movedUp || root.scrollTop > 0) return;
+    if (!upwardInput || !movedUp || root.scrollTop > 0) return;
     if (root.scrollHeight <= root.clientHeight + 8) return;
     loadOlderHistory();
   }, { passive: true });
@@ -13535,7 +13975,7 @@ function wire() {
     await boot();
   };
   $("newbtn").onclick = () => createSessionInGroup(currentSessionGroupId());
-  $("refresh").onclick = async () => { await loadSessionGroups(); await loadSessions(); await loadHistory(); await loadSessionConfig({ teamOnly: true }); };
+  $("refresh").onclick = async () => { resetTemporarySessionGroups(); await loadSessionGroups(); await loadSessions(); await loadHistory(); await loadSessionConfig({ teamOnly: true }); };
   $("fork").onclick = () => forkSession(sessionId);
   $("del").onclick = () => deleteSession(sessionId);
   $("img").onclick = () => $("file").click();

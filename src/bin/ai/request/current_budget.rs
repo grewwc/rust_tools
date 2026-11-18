@@ -256,7 +256,7 @@ mod tests {
     }
 
     fn preview_budget(model: &str, messages: &[Message]) -> CurrentRequestBudget {
-        let prompt = builder::measure_request_prompt_from_definitions(messages, None, None);
+        let prompt = builder::measure_request_prompt_from_definitions(messages, None, None, None);
         let feedback = PromptTokenFeedback::capture_preview(
             "session",
             model,
@@ -317,5 +317,4 @@ mod tests {
         assert!(ascii.upper_tokens() > ascii.prompt_tokens);
         assert_eq!(cjk.upper_tokens(), cjk.prompt_tokens);
     }
-
 }
