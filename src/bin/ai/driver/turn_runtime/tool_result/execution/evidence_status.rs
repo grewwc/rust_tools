@@ -58,7 +58,10 @@ pub(in crate::ai::driver::turn_runtime) fn classify_evidence_status(
     //    `<id>.assets/` below it, so any path component ending in `.sessions`
     //    marks the content as session storage for some history file — including
     //    this agent's own. This covers session DBs, overflow archives, folded
-    //    tool groups, and checkpoints read through any tool.
+    //    tool groups, and checkpoints read through any tool. The disposable
+    //    `<id>.assets/tmp/` scratch subtree is excluded: a live process launched
+    //    from a script written there produces current output, not a history
+    //    replay.
     if arguments_reference_session_storage(arguments) {
         return Some(EvidenceStatus::SessionHistory);
     }
@@ -147,10 +150,26 @@ fn visit_string_values(value: &serde_json::Value, visit: &mut dyn FnMut(&str)) {
 /// in `.sessions`. The component boundary (split on `/`) keeps quotes and
 /// grep-style search terms (`grep foo.sessions src/`) from matching, while
 /// `~/.history_file.sessions/...` and any other `<stem>.sessions/...` layout do.
+///
+/// `<session>.assets/tmp/` is disposable scratch: a live process launched from
+/// a script written there produces current output, so that subtree is not
+/// historical session content. Other `.sessions` paths in the same text still
+/// match.
 fn is_session_storage_path_text(text: &str) -> bool {
-    text.replace('\\', "/")
-        .split('/')
-        .any(|component| !component.is_empty() && component.ends_with(".sessions"))
+    let normalized = text.replace('\\', "/");
+    let components: Vec<&str> = normalized.split('/').collect();
+    components.iter().enumerate().any(|(index, component)| {
+        if component.is_empty() || !component.ends_with(".sessions") {
+            return false;
+        }
+        // `<session>.assets/tmp/` is disposable scratch: a script stored there
+        // is executed live, so its path must not mark the result as history.
+        let scratch = components
+            .get(index + 1)
+            .is_some_and(|next| next.ends_with(".assets"))
+            && components.get(index + 2).is_some_and(|next| *next == "tmp");
+        !scratch
+    })
 }
 
 fn command_from_arguments(tool_name: &str, arguments: &str) -> Option<String> {
@@ -292,6 +311,47 @@ mod tests {
             json!({
                 "command": "sqlite3 /home/u/.history_file.sessions/abc-123.sqlite \"SELECT content FROM messages\"",
                 "cwd": "/tmp"
+            }),
+        );
+        assert_eq!(
+            classify_evidence_status(&app, &call, "row content"),
+            Some(EvidenceStatus::SessionHistory)
+        );
+    }
+
+    #[test]
+    fn does_not_classify_session_temp_script_execution() {
+        let app = test_app(std::env::temp_dir().join("evidence-status-temp-script.sqlite"));
+        let call = tool_call(
+            "c12",
+            "execute_command",
+            json!({
+                "command": "/home/u/Conciliator/.venv/bin/python /home/u/.history_file.sessions/abc-123.assets/tmp/check.py",
+                "cwd": "/home/u/Conciliator"
+            }),
+        );
+        assert_eq!(classify_evidence_status(&app, &call, "live output"), None);
+    }
+
+    #[test]
+    fn does_not_classify_session_temp_script_read() {
+        let app = test_app(std::env::temp_dir().join("evidence-status-temp-read.sqlite"));
+        let call = tool_call(
+            "c13",
+            "read_file",
+            json!({ "file_path": "/home/u/.history_file.sessions/abc-123.assets/tmp/check.py" }),
+        );
+        assert_eq!(classify_evidence_status(&app, &call, "print('live')"), None);
+    }
+
+    #[test]
+    fn still_classifies_session_db_alongside_temp_script() {
+        let app = test_app(std::env::temp_dir().join("evidence-status-temp-script-db.sqlite"));
+        let call = tool_call(
+            "c14",
+            "execute_command",
+            json!({
+                "command": "python /home/u/.history_file.sessions/abc-123.assets/tmp/probe.py /home/u/.history_file.sessions/abc-123.sqlite"
             }),
         );
         assert_eq!(
