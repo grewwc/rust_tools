@@ -28,7 +28,10 @@ test("fresh idle /confirm clears a stop left by a historical active task", async
   assert.equal(c.displayedExecutionState().taskStates.get("worker"), true, "canonical history remains intact");
   const now = c.Date.now();
   c.Date = { now: () => now + c.RUNNING_SAMPLE_TTL_MS };
-  assert.equal(c.canStop(), true, "expired idle evidence no longer overrides the task snapshot");
+  assert.equal(c.canStop(), false, "expiry must not resurrect historical active tasks after authoritative idle");
+  assert.equal(h.elements.send.textContent, "➤");
+  assert.equal(Boolean(h.elements.sesslist.children.find((item) => item.dataset.sessionId === c.sessionId)
+    .querySelector(".session-running-badge")), false, "both projections remain idle after expiry");
   await h.dispose();
 });
 
@@ -176,6 +179,313 @@ function loadFixtures(file, names) {
 const { sendHarness, records, settle } = loadFixtures("app_phase2_baseline.test.cjs", ["sendHarness", "records", "settle"]);
 const { script, structuredTask, structuredSubagents, descendants } = loadFixtures("app_stream.test.cjs", ["script", "structuredTask", "structuredSubagents", "descendants"]);
 const { streamFramerHarness } = loadFixtures("app_phase3_stream_framer.test.cjs", ["streamFramerHarness"]);
+
+for (const status of ["running", "ready", "starting", "processing output"]) {
+  test(`new active ${status} report supersedes idle evidence and an older idle request`, async () => {
+    const h = sendHarness(), c = h.c;
+    loadConfirm(c);
+    const idle = { running: false, pending: null, remote: null };
+    c.api = async () => ({ json: async () => idle });
+    await c.pollConfirm();
+    assert.ok(c.executionState().idleSample);
+    let respond;
+    c.api = () => new Promise((resolve) => { respond = resolve; });
+    const pending = c.pollConfirm();
+    const owner = c.updateExecutionModel({ kind: "activity" });
+    const report = structuredSubagents([structuredTask("fresh-worker", 0, { status, progress: { phase: "starting" } })]).task_report;
+    c.updateExecutionModel({ kind: "task", owner, slot: "subagents", summary: c.projectTaskReport(report) });
+    assert.equal(c.executionState().idleSample, null, "live task evidence retires the older idle observation");
+    assert.equal(h.elements.send.textContent, "⏹");
+    assert.equal(c.canSend(), false);
+    assert.equal(report.tasks[0].status, status, "the producer's detailed status stays intact");
+    respond({ json: async () => idle });
+    assert.equal(await pending, null, "the request predates the active task");
+    assert.equal(c.canStop(), true);
+    await h.dispose();
+  });
+}
+
+test("idle confirmation cadence discovers a turn on the first two-second tick", async () => {
+  const h = sendHarness(), c = h.c;
+  let reads = 0;
+  c.isTurnRunning = () => false;
+  c.pollConfirm = async () => { reads++; return true; };
+  c.ensureConfirmPoll();
+  const timer = [...h.timers.values()].find((item) => item.type === "interval" && item.delay === 2000);
+  assert.ok(timer);
+  await timer.fn();
+  assert.equal(reads, 1, "idle sessions must not skip the first four ticks");
+  h.document.visibilityState = "hidden";
+  await timer.fn();
+  assert.equal(reads, 1, "hidden tabs still do not poll");
+  await h.dispose();
+});
+
+test("confirmation samples update the session badge without waiting for the bulk poll", async () => {
+  const h = sendHarness(), c = h.c;
+  loadConfirm(c);
+  c.lastItems = c.lastItems.map((item) => ({ ...item, activity: "idle" }));
+  c.renderSessionList(c.lastItems);
+  const row = h.elements.sesslist.children.find((item) => item.dataset.sessionId === c.sessionId);
+  let body = { running: true, turn: 42, pending: null, remote: null };
+  c.api = async () => ({ json: async () => body });
+  await c.pollConfirm();
+  assert.equal(row.querySelector(".session-running-label")?.textContent, "RUNNING");
+  body = { running: false, pending: null, remote: null };
+  await c.pollConfirm();
+  assert.equal(row.querySelector(".session-running-badge"), null);
+  await h.dispose();
+});
+
+function assertRunningAgreement(h, expected, checkpoint) {
+  const c = h.c;
+  const row = h.elements.sesslist.children.find((item) => item.dataset.sessionId === c.sessionId);
+  assert.equal(Boolean(row.querySelector(".session-running-badge")), expected, checkpoint + ": sidebar badge");
+  assert.equal(c.isTurnRunning(), expected, checkpoint + ": shared running verdict");
+  assert.equal(c.canStop(), expected, checkpoint + ": composer stop permission");
+  assert.equal(h.elements.send.textContent, expected ? "⏹" : "➤", checkpoint + ": composer glyph");
+  assert.equal(h.elements.send.classList.contains("stop"), expected, checkpoint + ": composer class");
+}
+function agreementHarness() {
+  const h = sendHarness();
+  loadConfirm(h.c);
+  h.c.attachEvents = () => {};
+  h.c.lastItems = h.c.lastItems.map((item) => ({ ...item, activity: "idle" }));
+  h.c.renderSessionList(h.c.lastItems);
+  h.elements.prompt.value = "follow-up draft";
+  h.c.syncStopButton(); // mount controls before exercising automatic updates
+  return h;
+}
+
+function hiddenGroupAgreementHarness(snapshot) {
+  const h = agreementHarness(), c = h.c;
+  for (const id of ["sessiongrouphidden", "sessiongrouphiddenactivity"]) {
+    h.elements[id] = h.document.createElement("button");
+  }
+  c.hiddenGroupSnapshot = snapshot;
+  vm.runInContext(`
+    sessionGroupsBase = store.base;
+    sessionGroups = [{ id: "hidden", name: "Hidden work", order: 0, hidden: true }];
+    lastItems = lastItems.map(item => ({ ...item, group_id: item.id === sessionId ? "hidden" : null }));
+    sessionGroupTemporaryOpen.set(sessionGroupTemporaryKey("hidden"), false);
+    sessionGroupActivitySnapshots.set(store.base, {
+      at: Date.now(), status: "complete", groups: new Map([["hidden", hiddenGroupSnapshot]])
+    });
+    renderSessionList(lastItems);
+  `, c);
+  return h;
+}
+
+function assertHiddenGroupAgreement(h, running, waiting, checkpoint) {
+  const header = vm.runInContext('sessionGroupHeaders.get("hidden")', h.c);
+  const activity = h.c.hiddenSessionGroupActivity("hidden");
+  assert.equal(activity.running, running, checkpoint + ": hidden group running count");
+  assert.equal(activity.waiting, waiting, checkpoint + ": hidden group waiting count");
+  assert.equal(header.running.textContent, running ? String(running) : "", checkpoint + ": group badge count");
+  assert.equal(header.running.hidden, !running, checkpoint + ": group running badge visibility");
+  assert.equal(header.waiting.hidden, !waiting, checkpoint + ": group waiting badge visibility");
+  assert.equal(header.status.hidden, !running && !waiting, checkpoint + ": group status visibility");
+  assert.equal(h.elements.sessiongrouphiddenactivity.hidden, !running && !waiting, checkpoint + ": hidden activity shortcut");
+}
+
+test("unified running: complete idle hidden snapshot merges later loaded activity on every control", async () => {
+  const snapshot = { running: 0, waiting: 0, unknown: 0, active: [] };
+  const h = hiddenGroupAgreementHarness(snapshot), c = h.c;
+  assertRunningAgreement(h, false, "initial idle");
+  assertHiddenGroupAgreement(h, 0, 0, "initial idle");
+  c.mergeSessionActivities([{ id: c.sessionId, activity: "running" }]);
+  assertRunningAgreement(h, true, "loaded session starts after snapshot");
+  assertHiddenGroupAgreement(h, 1, 0, "loaded session starts after snapshot");
+  c.renderSessionList(c.lastItems);
+  assertRunningAgreement(h, true, "list repaint");
+  assertHiddenGroupAgreement(h, 1, 0, "list repaint");
+  c.mergeSessionActivities([{ id: c.sessionId, activity: "running", waiting: "input", waiting_prompt: "Answer?" }]);
+  assertRunningAgreement(h, true, "loaded session waits");
+  assertHiddenGroupAgreement(h, 0, 1, "loaded session waits");
+  c.mergeSessionActivities([{ id: c.sessionId, activity: "idle" }]);
+  assertRunningAgreement(h, false, "loaded session finishes");
+  assertHiddenGroupAgreement(h, 0, 0, "loaded session finishes");
+  assert.deepEqual(snapshot, { running: 0, waiting: 0, unknown: 0, active: [] }, "the source snapshot stays intact");
+  await h.dispose();
+});
+
+test("unified running: hidden snapshot retains unloaded activity while replacing loaded entries", async () => {
+  const snapshot = { running: 2, waiting: 1, unknown: 1, active: [
+    { id: "open-session", activity: "running", waiting: null },
+    { id: "unloaded-running", activity: "running", waiting: null },
+    { id: "unloaded-waiting", activity: "running", waiting: "confirm", waiting_prompt: "Proceed?" },
+  ] };
+  const original = JSON.stringify(snapshot);
+  const h = hiddenGroupAgreementHarness(snapshot), c = h.c;
+  c.mergeSessionActivities([{ id: c.sessionId, activity: "running" }]);
+  assertRunningAgreement(h, true, "loaded entry counted once");
+  assertHiddenGroupAgreement(h, 2, 1, "loaded entry counted once");
+  c.mergeSessionActivities([{ id: c.sessionId, activity: "idle" }]);
+  assertRunningAgreement(h, false, "loaded entry settles");
+  assertHiddenGroupAgreement(h, 1, 1, "unloaded entries retained");
+  const merged = c.hiddenSessionGroupActivity("hidden");
+  assert.deepEqual(Array.from(merged.active, item => item.id), ["unloaded-running", "unloaded-waiting"]);
+  assert.equal(merged.unknown, 1, "unidentified snapshot unknowns remain intact");
+  assert.equal(merged.unavailable, true);
+  assert.equal(JSON.stringify(snapshot), original, "the source snapshot stays intact");
+  await h.dispose();
+});
+
+test("unified running: held terminal lease without PID stays running across bulk and confirm polls", async () => {
+  const h = agreementHarness(), c = h.c;
+  c.api = async () => ({ json: async () => ({ pending: null, running: false, turn: 0, remote: true }) });
+  for (let tick = 0; tick < 3; ++tick) {
+    c.mergeSessionActivities([{ id: c.sessionId, activity: "running" }]);
+    assertRunningAgreement(h, true, "held lease bulk tick " + tick);
+    assert.equal(await c.pollConfirm(), true);
+    assertRunningAgreement(h, true, "held lease confirm tick " + tick);
+    assert.equal(c.isRemoteTurn(), true);
+    assert.equal(c.executionState().remotePid, "", "PID remains optional diagnostic data");
+  }
+  c.api = async () => ({ json: async () => ({ pending: null, running: false, turn: 0, remote: null }) });
+  await c.pollConfirm();
+  assertRunningAgreement(h, false, "released lease confirm");
+  c.mergeSessionActivities([{ id: c.sessionId, activity: "idle" }]);
+  assertRunningAgreement(h, false, "released lease bulk");
+  await h.dispose();
+});
+
+for (const status of ["running", "ready", "starting", "processing output"]) {
+  test(`unified running: fresh bulk idle settles active ${status} on both controls`, async () => {
+    const h = agreementHarness(), c = h.c;
+    const owner = c.updateExecutionModel({ kind: "activity" });
+    const report = structuredSubagents([structuredTask("worker", 0, { status, progress: { phase: "starting" } })]).task_report;
+    c.updateExecutionModel({ kind: "task", owner, slot: "subagents", summary: c.projectTaskReport(report) });
+    assertRunningAgreement(h, true, "live task requires no poll tick");
+    c.mergeSessionActivities([{ id: c.sessionId, activity: "idle" }]);
+    assertRunningAgreement(h, false, "new authoritative bulk idle");
+    assert.equal(c.displayedExecutionState().taskStates.get("worker"), true, "task detail remains available");
+    assert.equal(report.tasks[0].status, status);
+    const now = c.Date.now();
+    c.Date = { now: () => now + 7500 };
+    c.expireSessionActivities();
+    assertRunningAgreement(h, false, "expiry cannot restore historical activity");
+    await h.dispose();
+  });
+}
+
+for (const remote of [null, "4242"]) {
+  test(`unified running: delayed ${remote ? "terminal" : "serve"} running confirm cannot undo newer bulk idle`, async () => {
+    const h = agreementHarness(), c = h.c;
+    let respond;
+    c.api = () => new Promise((resolve) => { respond = resolve; });
+    const pending = c.pollConfirm();
+    c.mergeSessionActivities([{ id: c.sessionId, activity: "idle" }]);
+    assertRunningAgreement(h, false, "new bulk idle before confirm response");
+    respond({ json: async () => ({ running: !remote, turn: remote ? 0 : 42, remote, pending: null }) });
+    assert.equal(await pending, null, "the common gate rejects the older response before transport writes");
+    assertRunningAgreement(h, false, "older running response rejected");
+    assert.equal(c.executionState().remoteActive, false);
+    assert.equal(c.executionState().running, false);
+    await h.dispose();
+  });
+}
+
+test("unified running: terminal idle overrides active historical tasks without deleting their status", async () => {
+  const h = agreementHarness(), c = h.c;
+  c.updateExecutionModel({ kind: "history", summaries: [
+    { taskStates: [["historical-worker", true]], busy: true, resetTasks: false },
+  ] });
+  c.commitExecutionView();
+  c.api = async () => ({ json: async () => ({ running: false, remote: "4242", pending: null }) });
+  await c.pollConfirm();
+  assertRunningAgreement(h, true, "fresh terminal lease");
+  assert.equal(c.isRemoteTurn(), true);
+  c.mergeSessionActivities([{ id: c.sessionId, activity: "idle" }]);
+  assertRunningAgreement(h, false, "latest bulk idle retires terminal and historical task evidence");
+  assert.equal(c.isRemoteTurn(), false);
+  c.commitExecutionView();
+  c.renderSessionList(c.lastItems);
+  assertRunningAgreement(h, false, "history repaint cannot promote active history");
+  assert.equal(c.displayedExecutionState().taskStates.get("historical-worker"), true);
+  await h.dispose();
+});
+
+for (const remote of [null, "4242"]) test(`unified running: ${remote ? "terminal" : "serve"} sample expires on both controls at 7500ms`, async () => {
+  const h = agreementHarness(), c = h.c;
+  c.api = async () => ({ json: async () => ({ running: !remote, turn: remote ? 0 : 42, remote, pending: null }) });
+  await c.pollConfirm();
+  assertRunningAgreement(h, true, "fresh sample");
+  const now = c.Date.now();
+  c.Date = { now: () => now + 7499 };
+  c.expireSessionActivities();
+  assertRunningAgreement(h, true, "one millisecond before common expiry");
+  c.Date = { now: () => now + 7500 };
+  c.expireSessionActivities();
+  assertRunningAgreement(h, false, "common expiry boundary");
+  await h.dispose();
+});
+
+test("unified running: selection and history rebuild cannot revive settled worker status", async () => {
+  const h = agreementHarness(), c = h.c;
+  const history = [{ taskStates: [["settled-worker", true]], busy: true, resetTasks: false }];
+  c.updateExecutionModel({ kind: "history", summaries: history });
+  c.commitExecutionView();
+  c.mergeSessionActivities([{ id: c.sessionId, activity: "idle" }]);
+  assertRunningAgreement(h, false, "latest idle");
+  c.updateExecutionModel({ kind: "select" });
+  c.updateExecutionModel({ kind: "history", summaries: history });
+  c.commitExecutionView();
+  c.renderSessionList(c.lastItems);
+  assertRunningAgreement(h, false, "selection preserves the settled observation");
+  const owner = c.updateExecutionModel({ kind: "activity" });
+  c.updateExecutionModel({ kind: "task", owner, slot: "subagents",
+    summary: { taskStates: [["new-worker", true]], busy: true, resetTasks: true } });
+  assertRunningAgreement(h, true, "a later live producer can still start activity");
+  await h.dispose();
+});
+
+test("unified running: clock-driven composer refresh repaints the expired badge without a bulk poll", async () => {
+  const h = agreementHarness(), c = h.c;
+  c.api = async () => ({ json: async () => ({ running: true, turn: 42, pending: null }) });
+  await c.pollConfirm();
+  assertRunningAgreement(h, true, "fresh serve sample");
+  const now = c.Date.now();
+  c.Date = { now: () => now + 7500 };
+  c.syncStopButton();
+  assertRunningAgreement(h, false, "the same clock boundary repaints both controls");
+  await h.dispose();
+});
+
+test("unified running: persisted selection binds before the sidebar observation maps initialize", () => {
+  const context = vm.createContext({ sessionId: "opened-at-boot", store: { base: "https://server.test" },
+    sessionActivityReady: undefined, Date, paintSessionActivity() { assert.fail("sidebar is not initialized"); },
+    refreshComposerControls() {},
+  });
+  const observerFrom = script.indexOf("function observeSessionActivityExecution(");
+  const observerTo = script.indexOf("function refreshSessionActivity(", observerFrom);
+  vm.runInContext(script.slice(observerFrom, observerTo), context);
+  const from = script.indexOf("// BEGIN execution model"), to = script.indexOf("// END execution model", from);
+  vm.runInContext(script.slice(from, to), context);
+  assert.equal(context.executionState().sessionId, "opened-at-boot");
+  assert.equal(context.executionState().live, false);
+});
+
+test("unified running: first idle two-second tick updates both controls and hidden pages pause", async () => {
+  const h = agreementHarness(), c = h.c;
+  let reads = 0;
+  c.api = async () => { reads++; return { json: async () => ({ running: true, turn: 42, remote: null, pending: null }) }; };
+  c.ensureConfirmPoll();
+  const timer = [...h.timers.values()].find((item) => item.type === "interval" && item.delay === 2000);
+  assert.ok(timer);
+  await timer.fn();
+  assert.equal(reads, 1);
+  assertRunningAgreement(h, true, "first two-second idle tick");
+  h.document.visibilityState = "hidden";
+  await timer.fn();
+  assert.equal(reads, 1, "hidden pages do not sample");
+  h.document.visibilityState = "visible";
+  c.api = async () => { reads++; return { json: async () => ({ running: false, remote: null, pending: null }) }; };
+  await timer.fn();
+  assert.equal(reads, 2);
+  assertRunningAgreement(h, false, "first visible idle response");
+  await h.dispose();
+});
 
 function loadConfirm(c) {
   const from = script.indexOf("async function pollConfirm()");

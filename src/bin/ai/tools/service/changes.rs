@@ -63,7 +63,8 @@ pub(crate) fn handle_show_changes(args: &Value) -> Value {
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
     let is_git_repo = changes::is_inside_git_work_tree(&cwd);
-    let entries = crate::ai::tools::storage::mutation_log::read_all();
+    let snapshot = crate::ai::tools::storage::mutation_log::read_committed_snapshot();
+    let entries = &snapshot.mutations;
     let has_session_mutations = !entries.is_empty();
     let (patch_opt, text_raw) = if include_git {
         (changes::combined_patch(), changes::combined_summary())
@@ -72,7 +73,7 @@ pub(crate) fn handle_show_changes(args: &Value) -> Value {
         let patch = if entries.is_empty() {
             None
         } else {
-            changes::mutation_patch(&entries)
+            changes::mutation_patch(entries)
         };
         let text = if entries.is_empty() {
             "当前会话无文件变更（include_git=false，仅统计 mutation log）。".to_string()
@@ -118,7 +119,7 @@ pub(crate) fn handle_show_changes(args: &Value) -> Value {
         );
     }
 
-    let changed_files = changes::session_grouped_changes().len();
+    let changed_files = changes::grouped_changes(entries).len();
     let mut result = json!({
         "text": text,
         "changed_files": changed_files,
@@ -136,6 +137,39 @@ pub(crate) fn handle_show_changes(args: &Value) -> Value {
             "coverage_gaps": inventory.coverage_gaps,
         });
         result["changed_paths"] = json!(inventory.files);
+    }
+    use crate::ai::tools::storage::mutation_log::{self, VerificationDetailsPage};
+    let full = args
+        .get("verification_full")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let details = full
+        || args
+            .get("verification_details")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let mut page = VerificationDetailsPage::default();
+    if full {
+        page.limit = 0;
+        page.max_bytes = 0;
+    } else {
+        let read_usize = |name: &str, default: usize| {
+            args.get(name)
+                .and_then(Value::as_u64)
+                .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+                .unwrap_or(default)
+        };
+        page.offset = read_usize("verification_offset", page.offset);
+        page.limit = read_usize("verification_limit", page.limit);
+        page.max_bytes = read_usize("verification_max_bytes", page.max_bytes);
+    }
+    let verification = mutation_log::verification_summary_page(
+        snapshot.revision(),
+        &snapshot.checks,
+        details.then_some(&page),
+    );
+    for (key, value) in verification.as_object().unwrap() {
+        result[key] = value.clone();
     }
     result
 }
@@ -413,7 +447,10 @@ mod snapshot_tests {
                 "has_session_mutations",
                 "is_git_repo",
                 "patch_bytes",
-                "text"
+                "revision",
+                "text",
+                "verification",
+                "verification_gaps",
             ]
         );
         assert_eq!(
@@ -423,6 +460,150 @@ mod snapshot_tests {
         assert_eq!(result["changed_files"], 0);
         assert_eq!(result["has_session_mutations"], false);
         assert_eq!(result["patch_bytes"], 0);
+        assert_eq!(result["revision"], 0);
+        assert_eq!(result["verification"]["status"], "no_changes");
+        assert_eq!(result["verification_gaps"]["count"], 0);
+        assert!(result["verification"].get("checks").is_none());
+    }
+
+    #[test]
+    fn show_changes_verification_paging_arguments_are_observable() {
+        use crate::ai::driver::runtime_ctx;
+        use crate::ai::tools::storage::mutation_log;
+        let root =
+            std::env::temp_dir().join(format!("show-changes-pages-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = crate::ai::middleware::test_util::test_app();
+        app.config.history_file = root.join("history.jsonl");
+        app.session_id = "show-changes-pages".into();
+        let context = runtime_ctx::DriverContext::new(
+            app,
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+            std::sync::Arc::new(Vec::new()),
+            std::sync::Arc::new(Vec::new()),
+        );
+        runtime_ctx::SUBAGENT_CWD.sync_scope(root.clone(), || runtime_ctx::DRIVER_CTX.sync_scope(context, || {
+            for index in 0..10 {
+                assert!(mutation_log::begin_check(&format!("check-{index}"), "execute_command", &json!({"command": format!("cargo check --package project-{index}")})).is_some());
+            }
+            let path = mutation_log::log_path().unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let first = handle_show_changes(&json!({"include_git": false, "verification_details": true}));
+            assert_eq!(first["verification"]["checks_page"]["shown"], 8);
+            assert_eq!(first["verification"]["checks_page"]["total"], 10);
+            let next = handle_show_changes(&json!({"include_git": false, "verification_details": true, "verification_offset": 8, "verification_limit": 1, "verification_max_bytes": 0}));
+            assert_eq!(next["verification"]["checks_page"]["shown"], 1);
+            assert_eq!(next["verification"]["checks_page"]["next_offset"], 9);
+            assert_eq!(next["verification"]["checks"][0]["observation"]["originating_command_call_id"], "check-8");
+            for max_bytes in [1, 2] {
+                let tiny = handle_show_changes(&json!({"include_git": false, "verification_details": true, "verification_max_bytes": max_bytes}));
+                assert_eq!(tiny["verification"]["checks"], json!([]));
+                let page = &tiny["verification"]["checks_page"];
+                assert_eq!(page["max_bytes"], 2);
+                assert_eq!(page["shown_bytes"], 2);
+                assert!(page["shown_bytes"].as_u64().unwrap() <= page["max_bytes"].as_u64().unwrap());
+                assert_eq!(page["next_offset"], 0);
+                assert_eq!(page["complete"], false);
+            }
+            let full = handle_show_changes(&json!({"include_git": false, "verification_full": true, "verification_offset": 9, "verification_limit": 1, "verification_max_bytes": 2}));
+            assert_eq!(full["verification"]["checks_page"]["offset"], 0);
+            assert_eq!(full["verification"]["checks_page"]["shown"], 10);
+            assert_eq!(full["verification"]["checks_page"]["complete"], true);
+            assert_eq!(full["verification_gaps"], first["verification_gaps"]);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn show_changes_verification_uses_committed_log_snapshot() {
+        use crate::ai::tools::storage::mutation_log;
+        use std::io::Write;
+
+        let root = std::env::temp_dir().join(format!(
+            "show-changes-committed-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = crate::ai::middleware::test_util::test_app();
+        app.config.history_file = root.join("history.jsonl");
+        app.session_id = "show-changes-committed".into();
+        let context = crate::ai::driver::runtime_ctx::DriverContext::new(
+            app,
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+            std::sync::Arc::new(Vec::new()),
+            std::sync::Arc::new(Vec::new()),
+        );
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(root.clone(), || {
+            crate::ai::driver::runtime_ctx::DRIVER_CTX.sync_scope(context, || {
+                let path = mutation_log::log_path().unwrap();
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let entry = MutationEntry {
+                    entry_id: None,
+                    turn_id: None,
+                    task_id: None,
+                    tool_call_id: None,
+                    seq: 1,
+                    ts: "t".into(),
+                    path: root.join("file.rs").display().to_string(),
+                    op: "write".into(),
+                    before: None,
+                    before_state: Some(BeforeState::Absent),
+                    after: Some("changed\n".into()),
+                    diff: None,
+                };
+                std::fs::write(&path, serde_json::to_string(&entry).unwrap() + "\n").unwrap();
+                let pending = mutation_log::begin_check(
+                    "check",
+                    "execute_command",
+                    &json!({"command": "cargo check"}),
+                );
+                assert!(pending.is_some());
+                let mut terminal = mutation_log::read_checks().last().unwrap().clone();
+                terminal.status = mutation_log::CheckStatus::Success;
+                terminal.observed_success = true;
+                let before = mutation_log::recovered_records_at(&path);
+                let mut writer = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                writer
+                    .write_all(&serde_json::to_vec(&terminal).unwrap())
+                    .unwrap();
+                let args = json!({
+                    "include_git": false,
+                    "limit_snippet": 0,
+                    "verification_details": true,
+                });
+                for _ in 0..3 {
+                    let result = handle_show_changes(&args);
+                    assert_eq!(result["revision"], 1);
+                    assert_eq!(result["changed_files"], 1);
+                    assert_eq!(result["verification"]["status"], "running");
+                    assert_eq!(result["verification_gaps"]["count"], 1);
+                    assert_eq!(
+                        result["verification"]["checks"][0]["observation"]["status"],
+                        "running"
+                    );
+                    assert_eq!(mutation_log::verification_reminder_summary().gaps, 1);
+                    assert_eq!(mutation_log::recovered_records_at(&path), before);
+                }
+                writer.write_all(b"\n").unwrap();
+                for _ in 0..3 {
+                    let result = handle_show_changes(&args);
+                    assert_eq!(result["revision"], 1);
+                    assert_eq!(result["verification"]["status"], "success");
+                    assert_eq!(result["verification_gaps"]["count"], 0);
+                    assert_eq!(
+                        result["verification"]["checks"][0]["observation"],
+                        json!(terminal)
+                    );
+                    assert_eq!(mutation_log::verification_reminder_summary().gaps, 0);
+                    assert_eq!(mutation_log::recovered_records_at(&path), before + 1);
+                }
+            });
+        });
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -443,6 +624,10 @@ mod snapshot_tests {
         let git_path = root.join("git-only\npath.rs");
         std::fs::write(&git_path, "untracked\n").unwrap();
         let entry = MutationEntry {
+            entry_id: None,
+            turn_id: None,
+            task_id: None,
+            tool_call_id: None,
             seq: 1,
             ts: "t".into(),
             path: root.join("mutation-only.rs").display().to_string(),
@@ -537,6 +722,10 @@ mod snapshot_tests {
     fn external_diff_rejects_unavailable_initial_snapshot_before_spawning() {
         for state in [BeforeState::Present, BeforeState::Unknown] {
             let entries = [MutationEntry {
+                entry_id: None,
+                turn_id: None,
+                task_id: None,
+                tool_call_id: None,
                 seq: 0,
                 ts: "t".into(),
                 path: "/proj/file.rs".into(),

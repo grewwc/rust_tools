@@ -390,11 +390,7 @@ fn tool_round_serve_commit_gate_conditions() {
             false,
         ));
         assert!(!should_commit_tool_round_body_for_serve(
-            &None,
-            false,
-            1,
-            16,
-            false,
+            &None, false, 1, 16, false,
         ));
     });
     // CLI mode: never committed.

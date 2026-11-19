@@ -749,9 +749,17 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
         status = "FAILED";
         error = Some(validation_error);
     }
+    let verification = (status == "COMPLETED")
+        .then(|| {
+            task_tools::extract_task_verification(
+                &response_for_validation,
+                response_schema.as_ref(),
+            )
+        })
+        .flatten();
     let backend_session =
         task_tools::backend_session::record_session(backend_id, &task_id, backend_session);
-    let rendered = format_subagent_output(
+    let mut rendered = format_subagent_output(
         status,
         &log_description,
         &log_agent_name,
@@ -763,22 +771,50 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
         error.as_deref(),
         backend_session.as_deref(),
     );
+    if let Some(verification) = &verification {
+        rendered.push('\n');
+        rendered.push_str(&verification.inline_assessment());
+    }
     let content = format!("[task_id={task_id}]\n{rendered}");
-    history::record_delivered_task_evidence(
-        ctx.app_proto.config.history_file.as_path(),
-        &ctx.app_proto.session_id,
-        history::DeliveredTaskEvidence {
-            task_id: &task_id,
-            description: &log_description,
-            agent_name: &log_agent_name,
-            model: &log_model,
-            status: &status.to_ascii_lowercase(),
-            payload: &content,
-        },
-    )
+    let report = verification.map(|verification| task_tools::TaskReportTask {
+        task_id: Some(task_id.clone()),
+        description: log_description.clone(),
+        agent: log_agent_name.clone(),
+        model: log_model.clone(),
+        backend: Some(backend_id.as_str().to_string()),
+        reasoning_effort: log_reasoning_effort.clone(),
+        status: status.to_ascii_lowercase(),
+        elapsed_ms: Some(task_tools::duration_ms(duration)),
+        output: Some(captured_output),
+        error,
+        verification: Some(verification),
+        selection_explanation: Some(log_selection_explanation),
+        ..task_tools::TaskReportTask::default()
+    });
+    let evidence = history::DeliveredTaskEvidence {
+        task_id: &task_id,
+        description: &log_description,
+        agent_name: &log_agent_name,
+        model: &log_model,
+        status: &status.to_ascii_lowercase(),
+        payload: &content,
+    };
+    match report.as_ref() {
+        Some(report) => history::record_delivered_task_evidence_with_report(
+            ctx.app_proto.config.history_file.as_path(),
+            &ctx.app_proto.session_id,
+            evidence,
+            Some(report),
+        ),
+        None => history::record_delivered_task_evidence(
+            ctx.app_proto.config.history_file.as_path(),
+            &ctx.app_proto.session_id,
+            evidence,
+        ),
+    }
     .map_err(|error| format!("failed to persist foreground subagent evidence: {error}"))?;
     Ok(ToolResult {
-        task_report: None,
+        task_report: report.map(task_tools::TaskReport::for_task),
         tool_call_id: tool_call_id.to_string(),
         content,
     })

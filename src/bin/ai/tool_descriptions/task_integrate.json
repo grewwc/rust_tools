@@ -1,18 +1,18 @@
 {
   "name": "task_integrate",
-  "description": "Acknowledge durable subagent results after incorporating or explicitly rejecting them. Every delivered task_id must be integrated before a normal final answer. Example: {\"tasks\": [{\"task_id\": \"task_0123456789abcdef0123456789abcdef\", \"disposition\": \"accepted\", \"summary\": \"Result incorporated; it confirmed the root cause and narrowed the fix.\"}]}",
+  "description": "Acknowledge durable results after incorporation or explicit rejection. Integrate every delivered task_id before a normal final answer. The parent owns acceptance; accepted results with structured verification gaps get post-integration advice. Missing verification never rejects legacy results or changes atomic batches.",
   "parameters": {
     "type": "object",
     "properties": {
       "tasks": {
         "type": "array",
-        "description": "Delivered subagent results; each item needs task_id, disposition, and a conclusion summary.",
+        "description": "Delivered subagent results to acknowledge.",
         "items": {
           "type": "object",
           "properties": {
             "task_id": {
               "type": "string",
-              "description": "The task_id of the delivered result being integrated. Copy it verbatim from the `[task_id=...]` header of a `task_wait` result (task_status adds the same headers for completed results), or the `task_id=`/`new_task_id=` field of a `task_spawn`/`task_audit`/`task_retry` result. Required; must be non-empty."
+              "description": "Non-empty delivered task ID, copied verbatim from task_wait/task_status's `[task_id=...]` header or task_spawn/task_audit/task_retry's `task_id=`/`new_task_id=` field."
             },
             "disposition": {
               "type": "string",
@@ -21,11 +21,11 @@
                 "rejected",
                 "superseded"
               ],
-              "description": "How the parent treats the result: 'accepted' = incorporated into the work, 'rejected' = reviewed but deliberately not used, 'superseded' = replaced by a newer attempt or result."
+              "description": "Parent disposition: accepted = incorporated; rejected = reviewed, deliberately unused; superseded = replaced by a newer attempt or result."
             },
             "summary": {
               "type": "string",
-              "description": "What the parent concluded and how it affects the remaining work. Must be non-empty and at most 6000 characters."
+              "description": "Parent conclusion and effect on remaining work; non-empty, at most 6000 characters."
             }
           },
           "required": [

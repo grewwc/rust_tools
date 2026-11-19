@@ -304,7 +304,8 @@ pub(crate) fn conflict(msg: String) -> (StatusCode, Json<serde_json::Value>) {
 /// active child pid (0 when idle): a page that saw the previous turn's
 /// terminal event uses it to tell that turn's child reap lag apart from a
 /// newly started turn. `remote` is the owner pid of a turn running in another
-/// process (a terminal or a `/bg` session): such a turn has no local event log,
+/// process, or `true` when its held lease has no readable pid marker
+/// (a terminal or a `/bg` session): such a turn has no local event log,
 /// so the page can only report it and refresh history when it ends.
 pub(crate) async fn get_confirm(
     State(state): State<ServeState>,
@@ -332,7 +333,16 @@ pub(crate) async fn get_confirm(
         None
     } else {
         let store = SessionStore::new(state.history_file.as_path());
-        crate::ai::history::turn_lease::turn_lease_owner(&store.session_history_file(&id))
+        if session_activity(&state, &store, &id) == SessionActivity::Running {
+            // The shared lease verdict proves activity; a PID is only diagnostic data.
+            Some(
+                crate::ai::history::turn_lease::turn_lease_owner(&store.session_history_file(&id))
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Bool(true)),
+            )
+        } else {
+            None
+        }
     };
     let body = match pending {
         Some(p) => {
@@ -375,7 +385,6 @@ pub(crate) struct EventsQuery {
 pub(crate) struct ClientQuery {
     pub(crate) client: String,
 }
-
 
 struct AttachState {
     log: Arc<SessionEventLog>,

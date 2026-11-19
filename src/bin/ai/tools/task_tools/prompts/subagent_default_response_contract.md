@@ -1,8 +1,7 @@
 Default response contract (no response_schema was supplied):
-- Use concise Markdown. Prefer these headings, in this order, when they apply:
-  - `**Result**` — the answer or outcome the parent asked for.
-  - `**Evidence**` — the exact files/lines, commands, or outputs that support it.
-  - `**Unresolved**` — what you could not confirm, plus any conflicting evidence.
-  - `**Next Step**` — the smallest follow-up the parent should take, if any.
-- Omit headings that do not apply; a tiny answer may be plain prose.
-- State the basis and scope of each claim, and never present a hypothesis as a verified result.
+- Use concise Markdown with applicable headings in order: `**Result**` (requested outcome), `**Evidence**` (exact files/lines, commands, outputs), `**Unresolved**` (unconfirmed claims, conflicting evidence), `**Next Step**` (smallest parent follow-up). Omit unused headings; tiny answers may be prose. State each claim's basis/scope; hypotheses are not verified results.
+- For fixes/implementations, optionally append one standalone `<task_verification>{JSON}</task_verification>` block after Markdown. It is worker-reported evidence for parent review, not acceptance or a completion gate. Omit it for `<subagent_handoff>` or `<audit_report>`; those take precedence.
+- JSON: `schema: "ai.task-verification"`, `version: 1`, `task_kind: "fix" | "implementation" | "research" | "review" | "other"`; arrays `checks`, `assumptions`, `remaining_uncertainty`; optional `artifact: {paths: string[], revision: string}` identifying the reported result version.
+- Each check: unique string `id`, string `subject`, `phase: "before" | "after" | "other"`, `outcome: "pass" | "fail" | "blocked" | "not_run" | "unknown"`, string arrays `evidence_locations`, `limitations`. Optional: strings `command`, `cwd`, `scenario`; JSON `configuration`; `artifact` identifying tested paths/revision as above. Report actual checks and limitations; unavailable checks are not passes.
+- Fixes may include `regression` linking `before_check_id`/`after_check_id`: before should fail on the old artifact, after pass with matching command, subject, configuration, scenario. A new regression test on the old revision counts as before-evidence. Identify both revisions; result `artifact` may identify after. If reproduction is unavailable, give string `unavailable_reason` and string arrays `alternative_evidence`, `limitations`; this remains a scoped limitation.
+- Limit the block to 8 KiB/16 checks; put detailed logs in evidence artifacts. Missing, malformed, or oversized verification leaves the result available for parent review.

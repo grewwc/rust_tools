@@ -914,6 +914,47 @@ pub(crate) fn format_subagent_model_label(model: &str, reasoning_effort: Option<
     }
 }
 
+/// Only a valid, exactly matching standalone block makes separately rendered
+/// metadata redundant. Preserve malformed, ambiguous, fenced, and legacy bodies.
+pub(super) fn verification_is_in_task_output(
+    output: &str,
+    verification: &TaskVerificationMetadata,
+) -> bool {
+    verification.assessment().schema_status == super::verification::VerificationSchemaStatus::Valid
+        && extract_task_verification(output, None).as_ref() == Some(verification)
+}
+
+const WAIT_VERIFICATION_ASSESSMENT_BYTES: usize = 384;
+
+fn wait_verification_assessment(verification: &TaskVerificationMetadata) -> String {
+    let full = verification.inline_assessment();
+    if full.len() <= WAIT_VERIFICATION_ASSESSMENT_BYTES {
+        return full;
+    }
+    let assessment = verification.assessment();
+    let header = full.lines().next().unwrap_or_default();
+    let omitted = format!(
+        "\n{} advisory gap(s); inline details omitted.",
+        assessment.gaps.len()
+    );
+    let footer = format!(
+        "\nDetails: {}. This assessment is advisory.",
+        super::full_delivered_evidence_hint(super::EvidenceRecoveryFormat::Compact)
+    );
+    let budget = WAIT_VERIFICATION_ASSESSMENT_BYTES
+        .saturating_sub(header.len() + omitted.len() + footer.len() + 3);
+    let first_gap = assessment
+        .gaps
+        .first()
+        .map(String::as_str)
+        .unwrap_or_default();
+    let mut end = first_gap.len().min(budget.saturating_sub(3));
+    while !first_gap.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{header}\n- {}...{omitted}{footer}", &first_gap[..end])
+}
+
 pub(super) fn format_task_result(
     entry: &AsyncTaskEntry,
     result: StoredTaskResult,
@@ -970,6 +1011,15 @@ pub(super) fn format_task_result(
     }
     if task_blocked {
         parts.push(SUBAGENT_BLOCKED_PARENT_GUIDANCE.to_string());
+    }
+    if let Some(verification) = result.verification {
+        // A recovered body can already contain this exact advisory. Its original
+        // verification block must agree with the saved metadata before deduping.
+        if !verification_is_in_task_output(&result.output, &verification)
+            || !result.output.contains(&verification.inline_assessment())
+        {
+            parts.push(wait_verification_assessment(&verification));
+        }
     }
     parts.push(SUBAGENT_PARENT_SUMMARY_REMINDER.to_string());
     parts.join("\n")
@@ -1193,7 +1243,94 @@ mod tests {
             error: None,
             progress: None,
             backend_session: None,
+            verification: None,
         }
+    }
+
+    #[test]
+    fn task_verification_display_dedup_requires_valid_matching_standalone_metadata() {
+        let value = serde_json::json!({"schema": "ai.task-verification", "version": 1, "task_kind": "research", "checks": [], "assumptions": ["parent must review"]});
+        let metadata = TaskVerificationMetadata::from_value(value.clone());
+        let block = format!(
+            "<task_verification>\n{}\n</task_verification>",
+            serde_json::to_string_pretty(&value).unwrap()
+        );
+        assert!(verification_is_in_task_output(
+            &format!("original body\n{block}\nfooter"),
+            &metadata
+        ));
+        for output in [
+            "legacy original body".to_string(),
+            format!("```json\n{block}\n```"),
+            format!("~~~\n{block}\n~~~"),
+            format!("{block}\n{block}"),
+            "<task_verification>{bad json}</task_verification>".to_string(),
+            format!(
+                "<subagent_handoff>{{\"kind\":\"user_input_required\"}}</subagent_handoff>\n{block}"
+            ),
+            format!("<audit_report>{{}}</audit_report>\n{block}"),
+            serde_json::json!({"summary": "structured output", "verification": value}).to_string(),
+        ] {
+            assert!(
+                !verification_is_in_task_output(&output, &metadata),
+                "must retain metadata for {output}"
+            );
+        }
+        let different = TaskVerificationMetadata::from_value(
+            serde_json::json!({"schema": "ai.task-verification", "version": 1, "task_kind": "review", "checks": []}),
+        );
+        assert!(!verification_is_in_task_output(&block, &different));
+        for invalid in [
+            serde_json::json!({"schema": "ai.task-verification", "version": 2, "task_kind": "review", "checks": []}),
+            serde_json::json!({"schema": "ai.task-verification", "version": 1}),
+            serde_json::json!({"schema": "ai.task-verification", "version": 1, "task_kind": "research", "checks": [], "assumptions": ["x".repeat(9000)]}),
+        ] {
+            let invalid_block = format!("<task_verification>{invalid}</task_verification>");
+            let saved = TaskVerificationMetadata::from_value(invalid);
+            assert!(!verification_is_in_task_output(&invalid_block, &saved));
+        }
+    }
+
+    #[test]
+    fn task_wait_verification_assessment_bound_preserves_raw_output_and_navigation() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let mut fixture = ReadyWakeFixture::new(false);
+        let task_id = fixture.spawn();
+        let entry = with_task_entry(&task_id, Clone::clone).unwrap();
+        let value = serde_json::json!({"schema": "ai.task-verification", "version": 1, "task_kind": "research", "checks": [], "assumptions": ["界".repeat(60), "y".repeat(180), "z".repeat(180), "fourth gap"]});
+        let verification = TaskVerificationMetadata::from_value(value.clone());
+        let full = verification.inline_assessment();
+        assert!(full.len() > WAIT_VERIFICATION_ASSESSMENT_BYTES);
+        let bounded = wait_verification_assessment(&verification);
+        assert!(bounded.len() <= WAIT_VERIFICATION_ASSESSMENT_BYTES);
+        assert!(bounded.contains("provenance=worker_reported"));
+        assert!(bounded.contains("schema_status=valid"));
+        assert!(bounded.contains("acceptance=needs_parent_review"));
+        assert!(bounded.contains("4 advisory gap(s); inline details omitted."));
+        assert!(bounded.ends_with(
+            "task_evidence_read(source=\"delivered\", view=\"raw\", exact task_id), omitting fields/max_chars/cursor. This assessment is advisory."
+        ));
+        let original = format!("original body\n<task_verification>{value}</task_verification>");
+        let mut result = ready_result(TaskTerminalStatus::Completed, original.clone());
+        result.verification = Some(verification.clone());
+        let rendered = format_task_result(&entry, result.clone(), None);
+        assert!(rendered.contains(&original));
+        assert!(rendered.contains(&bounded));
+        assert_eq!(
+            serde_json::to_value(result.verification.as_ref().unwrap()).unwrap(),
+            value
+        );
+        result.output.push('\n');
+        result.output.push_str(&full);
+        let recovered = format_task_result(&entry, result, None);
+        assert!(recovered.contains(&original));
+        assert_eq!(recovered.matches("[Task verification]").count(), 1);
+        println!(
+            "wait assessment bytes: prior={}, bounded={}, saved={}",
+            full.len(),
+            bounded.len(),
+            full.len() - bounded.len()
+        );
     }
 
     #[test]
@@ -1272,6 +1409,7 @@ mod tests {
                     error: Some(error.clone()),
                     progress: Some(progress.clone()),
                     backend_session: None,
+                    verification: None,
                 },
             );
         }
@@ -1444,6 +1582,7 @@ mod tests {
                 error: Some("original failure reason".into()),
                 progress: None,
                 backend_session: None,
+                verification: None,
             },
         );
         fixture.publish(

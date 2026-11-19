@@ -157,6 +157,56 @@ pub(super) fn inject_target_repeat_loop_note(messages: &mut Vec<crate::ai::histo
     });
 }
 
+/// Soft notice for a repeat read whose window an earlier successful read already returned in full
+/// and whose file has not been edited since. The bytes cannot differ, so the call adds no
+/// information; name the durable-note recovery path instead of letting the model re-derive the same
+/// evidence from the same window.
+pub(super) fn inject_redundant_read_note(
+    messages: &mut Vec<crate::ai::history::Message>,
+    target: &str,
+    reads: u32,
+) {
+    use crate::ai::history::Message;
+    use serde_json::Value;
+    let note = format!(
+        "[redundant-read] You requested lines of `{target}` that an earlier successful read in this turn already returned in full. The file has not been edited since, so the response is byte-identical and cannot add information ({reads} such repeat reads so far).\n\
+        If the earlier result was folded or offloaded out of your context, recover it once by reading its preserved stub's `file_path` or with `search_overflow`; do not rebuild it by re-reading the same window. Copy the exact lines you still need into a plan note or `<meta:self_note>` checkpoint so later rounds work from that note.\n\
+        Take the next substantive action now: apply the edit you have already designed, run the targeted check, or state the one concrete missing fact and how you will obtain it.\n\
+        {SELF_NOTE_REFLECTION_CHANNEL_HINT}"
+    );
+    messages.push(Message {
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(note),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
+/// Hard stop for redundant window re-reads: the same already-returned window keeps being requested
+/// with no edit in between, so the turn is looping on evidence it already has. Force no-tool
+/// wrap-up.
+pub(super) fn inject_redundant_read_hard_stop_note(
+    messages: &mut Vec<crate::ai::history::Message>,
+    target: &str,
+    reads: u32,
+) {
+    use crate::ai::history::Message;
+    use serde_json::Value;
+    let note = format!(
+        "[low-yield-hard-stop] Windows of `{target}` were re-read {reads} times even though earlier successful reads already returned those lines and the file was never edited.\n\
+        This is a redundant-read loop, not new evidence. From now on you are in no-tool wrap-up mode: do not issue any more tool calls.\n\
+        Summarize the verified facts and the change you have designed; if the work is incomplete, state the exact remaining edit, the file and lines it targets, and what blocked it."
+    );
+    messages.push(Message {
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(note),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
 /// Soft notice for repeated "re-read from the top" rescans of the same target: the same file
 /// keeps being read from the beginning (page width changes each round, or each round mixes in a
 /// different new archive path), accumulating many full re-reads.

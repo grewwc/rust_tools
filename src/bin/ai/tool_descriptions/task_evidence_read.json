@@ -1,6 +1,6 @@
 {
   "name": "task_evidence_read",
-  "description": "Read evidence for one task. The default source=progress refreshes and returns its bounded phase/checkpoint snapshot for diagnosis. source=delivered reads the full persisted status and payload without collecting, refreshing progress, or integrating; available after collection and context compression. Use task_audit for all recorded IDs. Reading never acknowledges integration.",
+  "description": "Read evidence for one task. source=progress (default) returns its live phase/checkpoint snapshot. source=delivered is read-only: with agent-team optimizations enabled, defaults to a summary of at most 2 KiB including payload preview, verification availability, and advisory assessment; otherwise defaults to raw. Full persisted payload: task_evidence_read(source=\"delivered\", view=\"raw\", exact task_id), omitting fields/max_chars/cursor; fields selects metadata and cursor/max_chars page it. Explicit parameters work regardless of the optimization switch. Top-level verification is normalized and assessment is runtime-derived advisory requiring parent review; body-authored assessment values remain unverified worker content in payload/output; limits remain 8 KiB and 16 checks. Reading never collects or integrates. Use task_audit for recorded IDs.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -10,31 +10,46 @@
       },
       "source": {
         "type": "string",
-        "enum": ["progress", "delivered"],
+        "enum": [
+          "progress",
+          "delivered"
+        ],
         "default": "progress",
         "description": "progress preserves the existing live snapshot behavior; delivered performs a read-only lookup of a previously delivered result."
+      },
+      "fields": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": "Select top-level evidence fields, including verification and assessment when available. Unavailable names list available fields. With pagination, payload is serialized selected JSON; repeat identical fields for continuation. Explicit selection works with optimizations disabled."
+      },
+      "max_chars": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Limit raw payload or serialized selected JSON per page in Unicode scalar values. Metadata is outside this limit; verification/assessment remain visible. Returns cursor, shown_chars, total_chars, truncated, next_cursor, and a recovery hint. 0 returns metadata and an empty payload; increase max_chars to advance. Explicit limits work with optimizations disabled."
+      },
+      "view": {
+        "type": "string",
+        "enum": [
+          "summary",
+          "raw"
+        ],
+        "description": "Delivered view: summary returns at most 2 KiB with preview and metadata discovery; raw returns the full original envelope when fields, max_chars, and cursor are omitted. Default is summary with agent-team optimizations enabled, raw otherwise. Projection parameters imply raw; explicit summary cannot be combined with them. Progress supports raw only."
+      },
+      "cursor": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Raw page start as a Unicode scalar offset, default 0. Pass next_cursor and identical fields to continue. Without max_chars, a cursor requests a 2048-character page. Cursor equal to total_chars returns an empty complete page; larger offsets error. Full evidence: task_evidence_read(source=\"delivered\", view=\"raw\", exact task_id), omitting fields/max_chars/cursor."
       }
     },
     "required": [
       "task_id"
     ]
   },
-  "agent_team_optimization_properties": {
-    "fields": {
-      "type": "array",
-      "minItems": 1,
-      "items": {
-        "type": "string",
-        "minLength": 1
-      },
-      "description": "Optional non-empty list of top-level evidence field names. Unavailable names return an error listing available fields. Omit for no field selection; omitting both fields and max_chars preserves the original output. Available when ai.agent_team.optimizations_enabled is true."
-    },
-    "max_chars": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Optional payload limit counted in Unicode scalar values, not bytes; response metadata is outside this limit. Truncation reports shown_chars, total_chars, truncated, and a full-read recovery hint. 0 returns an empty payload. Omit for no character limit; omitting both fields and max_chars preserves the original output. Available when ai.agent_team.optimizations_enabled is true."
-    }
-  },
+  "agent_team_optimization_properties": {},
   "groups": [
     "builtin",
     "task"

@@ -219,6 +219,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
     stopStaleFollow() {}, hideConfirm() {}, pollConfirm() {}, setDrawer: (open) => drawerChanges.push(open), resetPicks() {}, composerInUse: () => false,
     addMsg: (...args) => messages.push(args), note: (text) => messages.push(text),
   });
+  vm.runInContext(between("// BEGIN execution model", "const executionModel ="), context);
   vm.runInContext(between("function headers(", "const esc ="), context);
   vm.runInContext(between("function sessionTitle(s)", "// Phone drawer floats"), context);
   vm.runInContext(between("function renderSessionBar()", "// History is append-only"), context);
@@ -240,7 +241,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
       addMsgMd: (text, parent) => { const row = node(); row.textContent = text; parent.appendChild(row); },
       createTurnRateLine: () => () => {}, estimateTextTokens: () => 0,
     });
-    vm.runInContext(between("// BEGIN execution model", "// END execution model"), context);
+    vm.runInContext(between("const executionModel =", "// END execution model"), context);
     vm.runInContext(between("// BEGIN execution event dispatcher", "// END execution event dispatcher"), context);
     vm.runInContext(between("// BEGIN session switch", "// END session switch"), context);
     vm.runInContext(between("// History is append-only", "// Historical user inputs"), context);
@@ -251,7 +252,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
   elements.sessall = node("button");
   elements.sessmarked = node("button");
   for (const [id, tag] of [
-    ["sessmore", "details"], ["sessmoretoggle", "summary"], ["sessmorepanel", "div"], ["sesssearch", "button"],
+    ["sessmore", "details"], ["sessmoretoggle", "summary"], ["sessmorepanel", "div"], ["sesssearch", "button"], ["sessviewmode", "button"],
     ["sessfilterstatus", "span"], ["sessmarkfilter", "div"], ["sessactive", "button"], ["sessarchived", "button"],
     ["sessiongroupnew", "button"], ["sessiongroupmanage", "button"], ["sessiongrouphidden", "button"], ["sessiongrouphiddenactivity", "button"], ["sessiongroupdialog", "div"],
     ["sessiongroupscrim", "div"], ["sessiongrouppanel", "section"], ["sessiongrouptitle", "div"],
@@ -261,7 +262,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
   elements.sessiongroupdialog.hidden = true;
   elements.sessmore.appendChild(elements.sessmoretoggle);
   elements.sessmore.appendChild(elements.sessmorepanel);
-  for (const id of ["sesssearch", "sessactive", "sessarchived", "sessall", "sessmarked", "sessiongroupnew", "sessiongroupmanage", "sessiongrouphidden"]) elements.sessmorepanel.appendChild(elements[id]);
+  for (const id of ["sesssearch", "sessviewmode", "sessactive", "sessarchived", "sessall", "sessmarked", "sessiongroupnew", "sessiongroupmanage", "sessiongrouphidden"]) elements.sessmorepanel.appendChild(elements[id]);
   for (const id of ["sessiongrouptitle", "sessiongroupbody", "sessiongrouperror", "sessiongroupcancel"]) elements.sessiongrouppanel.appendChild(elements[id]);
   vm.runInContext(between('  wireSessionSearch();', '$("connbtn").onclick ='), context);
   context.wireSessionActions();

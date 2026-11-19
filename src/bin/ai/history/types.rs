@@ -98,12 +98,21 @@ pub(in crate::ai) fn request_reminder(message: &Message) -> Option<&str> {
         .strip_prefix(REQUEST_REMINDER_ORIGIN)
 }
 
+/// Identify retired runtime metadata without loading or changing its assets.
+pub(in crate::ai) fn is_retired_change_set_metadata(message: &Message) -> bool {
+    message
+        .reasoning_content
+        .as_deref()
+        .is_some_and(|text| text.starts_with("runtime-origin:change-set-checkpoint:"))
+}
+
 /// Whether `reasoning_content` carries runtime metadata rather than model
 /// reasoning; such payloads are never truncated, summarized, or shown as
 /// reasoning. A reminder marker counts on any role, so a message whose role
 /// was rewritten still never leaks it to a provider.
 pub(in crate::ai) fn has_runtime_message_metadata(message: &Message) -> bool {
     is_runtime_synthetic_user_message(message)
+        || is_retired_change_set_metadata(message)
         || crate::ai::tools::task_tools::TaskReport::is_message_metadata(message)
         || message
             .reasoning_content
@@ -347,6 +356,32 @@ pub(in crate::ai) fn retained_turn_start(messages: &[Message], max_user_turns: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_change_set_metadata_never_projects_as_system_or_changes_canonical_history() {
+        for role in ["internal_note", "assistant", "user", "system"] {
+            let mut retired = user("Retired checkpoint claim");
+            retired.role = role.into();
+            retired.reasoning_content =
+                Some("runtime-origin:change-set-checkpoint:v1:view:{unverified}".into());
+            let canonical = vec![user("Current request"), retired];
+            let original = canonical.clone();
+            let projected = crate::ai::request::normalize_messages_for_request_for_test(&canonical);
+            assert_eq!(canonical, original);
+            assert_eq!(projected.len(), 1);
+            assert!(
+                projected
+                    .iter()
+                    .all(|message| !message.content.to_string().contains("Retired checkpoint"))
+            );
+        }
+        let ordinary = user("runtime-origin:change-set-checkpoint:v1: quoted user text");
+        assert!(!is_retired_change_set_metadata(&ordinary));
+        assert_eq!(
+            crate::ai::request::normalize_messages_for_request_for_test(&[ordinary]).len(),
+            1
+        );
+    }
 
     fn user(content: &str) -> Message {
         Message {

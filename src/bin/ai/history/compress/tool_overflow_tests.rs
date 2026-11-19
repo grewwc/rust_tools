@@ -1,8 +1,9 @@
 use super::tool_overflow::{
     TOOL_RESULT_FOLD_MIN_CHARS, build_preserved_tool_overflow_stub_with_archive,
-    is_preserved_tool_overflow_stub, task_evidence_review_lines,
+    build_tool_overflow_recall_lines, is_preserved_tool_overflow_stub, task_evidence_review_lines,
 };
 use super::*;
+use crate::ai::tools::task_tools::assert_full_evidence_recovery_hints;
 use crate::ai::types::{FunctionCall, ToolCall};
 use rustc_hash::FxHashSet;
 
@@ -24,6 +25,74 @@ fn prepare_tool_messages_structured(
         cwd,
         protected_tool_call_ids,
     );
+}
+
+#[test]
+fn complete_evidence_recovery_survives_real_compression_stub_paths() {
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-full-evidence-recovery-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let task_id = "task_Original-ID_77";
+    let content = serde_json::json!({
+        "task_id": task_id, "source": "delivered", "status": "completed",
+        "payload": "Conclusion: recover complete evidence.\n".repeat(400),
+    })
+    .to_string();
+    for arguments in [
+        serde_json::json!({"task_id": task_id, "source": "delivered"}),
+        serde_json::json!({"task_id": task_id, "source": "delivered", "view": "summary"}),
+        serde_json::json!({"task_id": task_id, "source": "delivered", "view": "raw", "fields": ["payload"], "max_chars": 100, "cursor": 4}),
+    ] {
+        let arguments = arguments.to_string();
+        let argument_recovery = build_tool_overflow_recall_lines("task_evidence_read", &arguments);
+        let result_recovery = task_evidence_review_lines(&content);
+        for lines in [&argument_recovery, &result_recovery] {
+            assert_full_evidence_recovery_hints(&lines.join("\n"));
+            assert!(lines[0].contains(&format!("\"task_id\":\"{task_id}\"")));
+        }
+        assert_eq!(argument_recovery[0], result_recovery[0]);
+        let mut messages = vec![
+            assistant_call_args("full-recovery", "task_evidence_read", &arguments),
+            tool_result("full-recovery", &content),
+        ];
+        prepare_tool_messages_structured(
+            &mut messages,
+            480,
+            0,
+            Some(&overflow_dir),
+            None,
+            &FxHashSet::default(),
+        );
+        let stub = value_to_string(&messages[1].content);
+        assert!(is_preserved_tool_overflow_stub(&stub), "{stub}");
+        let path = stub
+            .lines()
+            .find_map(|line| line.strip_prefix("- file_path: "))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(resolve_stub_archive_path(path, &overflow_dir)).unwrap(),
+            content
+        );
+        for retained in [
+            stub.clone(),
+            collapse_overflow_stub_to_anchor(&stub).unwrap(),
+            minimize_overflow_stub_to_pointer(&stub).unwrap(),
+        ] {
+            assert_full_evidence_recovery_hints(&retained);
+            assert!(retained.contains(&argument_recovery[0]));
+            assert!(retained.contains("task_id=task_Original-ID_77; status=completed"));
+        }
+        let without_archive = build_preserved_tool_overflow_stub_with_archive(
+            None,
+            "task_evidence_read",
+            &content,
+            &argument_recovery,
+        );
+        assert_full_evidence_recovery_hints(&without_archive);
+        assert!(without_archive.contains("retained task recovery instructions"));
+    }
+    std::fs::remove_dir_all(overflow_dir).unwrap();
 }
 
 #[test]
@@ -357,10 +426,11 @@ fn synchronous_task_results_keep_uuid_review_and_recovery() {
             assert!(
                 retained.contains(&format!(
                     "task_evidence_read({})",
-                    serde_json::json!({"task_id": task_id, "source": "delivered"})
+                    serde_json::json!({"task_id": task_id, "source": "delivered", "view": "raw"})
                 )),
                 "{retained}"
             );
+            assert_full_evidence_recovery_hints(&retained);
             assert_eq!(
                 task_evidence_review_lines(&retained),
                 task_evidence_review_lines(&content)
@@ -409,7 +479,7 @@ fn large_progress_evidence_keeps_progress_recovery_through_compression() {
         let pointer = format!(
             "task_evidence_read({})",
             serde_json::json!({
-                "task_id": "task_progress", "source": "progress"
+                "task_id": "task_progress", "source": "progress", "view": "raw"
             })
         );
         for retained in [
@@ -418,6 +488,7 @@ fn large_progress_evidence_keeps_progress_recovery_through_compression() {
             minimize_overflow_stub_to_pointer(&stub).unwrap(),
         ] {
             assert!(retained.contains(&pointer), "{retained}");
+            assert_full_evidence_recovery_hints(&retained);
             assert!(retained.contains("task_id=task_progress"), "{retained}");
             assert!(retained.contains("status=running"), "{retained}");
             assert!(
@@ -504,7 +575,7 @@ fn large_task_evidence_compresses_with_review_and_delivery_recovery() {
                     assert!(
                         retained.contains(&format!(
                             "task_evidence_read({})",
-                            serde_json::json!({"task_id": "task_review", "source": "delivered"})
+                            serde_json::json!({"task_id": "task_review", "source": "delivered", "view": "raw"})
                         )),
                         "{retained}"
                     );
@@ -617,6 +688,7 @@ fn archive_unavailable_task_evidence_stub_preserves_each_review_across_passes() 
         assert!(!first_stub.contains("- file_path: "));
         assert!(!first_stub.contains("Full historical result saved to session asset:"));
         assert_eq!(task_evidence_review_lines(&first_stub), expected_reviews);
+        assert_full_evidence_recovery_hints(&first_stub);
         for index in 0..12 {
             let status = if index % 2 == 0 {
                 "completed"
@@ -768,6 +840,7 @@ fn archived_task_evidence_above_floor_keeps_each_review_field() {
         minimize_overflow_stub_to_pointer(&stub).unwrap(),
     ] {
         assert_eq!(task_evidence_review_lines(&retained), expected_reviews);
+        assert_full_evidence_recovery_hints(&retained);
         for expected in [
             "- task_status: task_id=task_first; status=completed",
             "- task_status: task_id=task_second; status=failed",
@@ -781,7 +854,7 @@ fn archived_task_evidence_above_floor_keeps_each_review_field() {
         for task_id in ["task_first", "task_second"] {
             assert!(retained.contains(&format!(
                 "task_evidence_read({})",
-                serde_json::json!({"task_id": task_id, "source": "delivered"})
+                serde_json::json!({"task_id": task_id, "source": "delivered", "view": "raw"})
             )));
         }
     }
@@ -2001,7 +2074,7 @@ fn path_c_spills_aggregated_task_wait_result_losslessly() {
             assert!(
                 retained.contains(&format!(
                     "task_evidence_read({})",
-                    serde_json::json!({"task_id": task_id, "source": "delivered"})
+                    serde_json::json!({"task_id": task_id, "source": "delivered", "view": "raw"})
                 )),
                 "{retained}"
             );
@@ -2016,6 +2089,7 @@ fn path_c_spills_aggregated_task_wait_result_losslessly() {
     assert_eq!(count, 1);
     let recall = value_to_string(&folded[0].content);
     assert!(recall.contains("task_evidence_read("), "{recall}");
+    assert_full_evidence_recovery_hints(&recall);
     assert!(
         recall.contains("task_id=task_one") && recall.contains("task_id=task_two"),
         "{recall}"
@@ -2114,6 +2188,7 @@ fn task_evidence_read_recovery_stays_inline_through_floor() {
             recall.contains("task_id=task_recover") && recall.contains("task_evidence_read("),
             "{recall}"
         );
+        assert_full_evidence_recovery_hints(&recall);
         for use_projection_cap in [false, true] {
             let mut candidate = messages.clone();
             let spilled = if use_projection_cap {
@@ -2148,6 +2223,7 @@ fn task_evidence_read_recovery_stays_inline_through_floor() {
                 stub.contains("task_id=task_recover") && stub.contains("task_evidence_read("),
                 "{stub}"
             );
+            assert_full_evidence_recovery_hints(&stub);
             assert_eq!(
                 spill_protected_precision_to_fit(
                     &mut candidate,

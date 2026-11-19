@@ -38,6 +38,7 @@ mod cascade;
 mod collect;
 mod dispatch;
 mod epoll;
+mod evidence_recovery;
 mod outstanding;
 mod progress;
 mod quiet;
@@ -48,6 +49,7 @@ mod spawn;
 mod traecli;
 mod traecli_models;
 mod types;
+mod verification;
 mod wait;
 
 // `collect` items are `pub(super)` (task_tools-tree visible), so the re-export
@@ -59,6 +61,11 @@ pub(crate) use collect::publish_task_result;
 pub(in crate::ai::tools::task_tools) use collect::*;
 pub(crate) use dispatch::*;
 pub(crate) use epoll::*;
+#[cfg(test)]
+pub(crate) use evidence_recovery::assert_full_evidence_recovery_hints;
+pub(crate) use evidence_recovery::{
+    EvidenceRecoveryFormat, full_delivered_evidence_hint, task_evidence_recovery_hint,
+};
 pub(crate) use outstanding::*;
 pub(crate) use progress::*;
 pub(crate) use quiet::{is_agent_team_mode, is_agent_team_wait_deadline_message};
@@ -74,8 +81,11 @@ pub(crate) use traecli_models::backend_model_names;
 #[cfg(test)]
 pub(crate) use traecli_models::with_traecli_model_names_for_test;
 pub(crate) use types::*;
+pub(crate) use verification::{TaskVerificationMetadata, extract_task_verification};
 pub(crate) use wait::*;
 
 #[cfg(test)]
 #[path = "../task_tools_tests.rs"]
 mod tests;
+
+pub(crate) use dispatch::read_delivered_verification_report;

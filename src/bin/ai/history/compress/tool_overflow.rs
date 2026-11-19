@@ -15,6 +15,7 @@ use serde_json::Value;
 use crate::ai::files::{
     diff_line_tags, extract_key_lines, preview_anchor, split_line_number_prefix,
 };
+use crate::ai::tools::task_tools::task_evidence_recovery_hint;
 use crate::ai::{
     history::HistoryMessageSummarizer,
     tools::{
@@ -196,9 +197,9 @@ pub(super) fn task_evidence_review_lines(content: &str) -> Vec<String> {
                         "delivered"
                     }
                 });
-            let arguments = serde_json::json!({"task_id": task_id, "source": source});
             task_lines.push(format!(
-                "- task_evidence: task_id={task_id}; task_evidence_read({arguments})"
+                "- task_evidence: task_id={task_id}; {}",
+                task_evidence_recovery_hint(task_id, source)
             ));
             // Missing state is explicit rather than inferring successful completion.
             task_lines.push(format!(
@@ -1508,9 +1509,9 @@ pub(super) fn build_tool_overflow_recall_lines(tool_name: &str, arguments: &str)
                     .get("source")
                     .and_then(Value::as_str)
                     .unwrap_or("progress");
-                let arguments = serde_json::json!({"task_id": task_id, "source": source});
                 vec![format!(
-                    "- task_evidence: task_id={task_id}; task_evidence_read({arguments})"
+                    "- task_evidence: task_id={task_id}; {}",
+                    task_evidence_recovery_hint(task_id, source)
                 )]
             })
             .unwrap_or_default(),

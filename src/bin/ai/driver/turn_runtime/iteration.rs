@@ -1,3 +1,4 @@
+use crate::ai::tools::task_tools::{EvidenceRecoveryFormat, full_delivered_evidence_hint};
 use colored::Colorize;
 use rust_tools::commonw::FastSet;
 use serde_json::Value;
@@ -114,6 +115,108 @@ fn segment_verification_effect(tokens: &[String]) -> (bool, bool) {
         _ => false,
     };
     (scope_review, behavior_check)
+}
+
+#[derive(Clone, Copy)]
+enum BehaviorCheckSuccessSource {
+    CargoBuild,
+    CargoTest,
+    TestRunner,
+}
+
+/// A sentinel has a known source only when one check feeds presentation-only
+/// pipe segments. Arbitrary shell siblings can emit the same text themselves.
+fn behavior_check_success_source_for_args(args: &Value) -> Option<BehaviorCheckSuccessSource> {
+    let command = args.get("command")?.as_str()?;
+    let segments = crate::ai::tools::service::audit::split_unquoted_command_segments(command);
+    let first = segments.first()?;
+    let tokens = shell_command_tokens(&first.command);
+    if !segment_verification_effect(&tokens).1 {
+        return None;
+    }
+    let mut remaining = command.trim_start().strip_prefix(&first.command)?;
+    for segment in segments.iter().skip(1) {
+        let tokens = shell_command_tokens(&segment.command);
+        remaining = remaining.trim_start().strip_prefix('|')?.trim_start();
+        if remaining.starts_with('|')
+            || !matches!(command_program(&tokens), Some("tail" | "head"))
+            || !tokens
+                .iter()
+                .skip(1)
+                .all(|token| token.starts_with('-') || token.parse::<u64>().is_ok())
+        {
+            return None;
+        }
+        remaining = remaining.strip_prefix(&segment.command)?;
+    }
+    if !remaining.trim().is_empty() {
+        return None;
+    }
+    match (
+        command_program(&tokens)?,
+        command_subcommand(&tokens).unwrap_or_default(),
+    ) {
+        ("cargo", "test") => Some(BehaviorCheckSuccessSource::CargoTest),
+        ("cargo", "check" | "clippy" | "build") => Some(BehaviorCheckSuccessSource::CargoBuild),
+        ("pytest" | "go" | "npm" | "pnpm" | "yarn" | "make", _) => {
+            Some(BehaviorCheckSuccessSource::TestRunner)
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn behavior_check_output_confirms_source_success(
+    args: &serde_json::Value,
+    content: &serde_json::Value,
+) -> bool {
+    if behavior_check_output_reports_failure(content) {
+        return false;
+    }
+    let text = content.as_str().unwrap_or_default().to_ascii_lowercase();
+    match behavior_check_success_source_for_args(args) {
+        Some(BehaviorCheckSuccessSource::CargoBuild) => {
+            text.contains("finished") && text.contains("target(s)")
+        }
+        Some(BehaviorCheckSuccessSource::CargoTest) => text.contains("test result: ok"),
+        Some(BehaviorCheckSuccessSource::TestRunner) => text.contains("all tests passed"),
+        None => false,
+    }
+}
+
+pub(super) fn behavior_check_output_confirms_success(content: &serde_json::Value) -> bool {
+    !behavior_check_output_reports_failure(content)
+        && behavior_check_output_has_success_sentinel(content)
+}
+
+/// A local success observation can coexist with a whole-command failure.
+pub(super) fn behavior_check_output_has_success_sentinel(content: &serde_json::Value) -> bool {
+    let text = content.as_str().unwrap_or_default().to_ascii_lowercase();
+    text.contains("test result: ok")
+        || (text.contains("finished") && text.contains("target(s)"))
+        || text.contains("all tests passed")
+}
+
+pub(super) fn behavior_check_output_reports_failure(content: &serde_json::Value) -> bool {
+    let text = content.as_str().unwrap_or_default().to_ascii_lowercase();
+    text.contains("test result: failed")
+        || text.contains("\nfailures:")
+        || text.contains("error:")
+        || text.contains("error[")
+        || text.contains("could not compile")
+        || text.lines().any(|line| {
+            let line = line.trim().trim_matches('=').trim();
+            line == "failures"
+                || line == "failed"
+                || line.starts_with("failed ")
+                || line
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|pair| {
+                        pair[0].parse::<u64>().is_ok_and(|count| count > 0)
+                            && pair[1].trim_end_matches([',', ';']) == "failed"
+                    })
+        })
 }
 
 /// Write-file intent classification for single-segment commands.
@@ -1006,6 +1109,7 @@ fn clear_outstanding_task_anchor(messages: &mut Vec<Message>) {
 }
 
 fn refresh_outstanding_task_anchor(messages: &mut Vec<Message>, session_id: &str) {
+    let recovery_hint = full_delivered_evidence_hint(EvidenceRecoveryFormat::ToolCall);
     clear_outstanding_task_anchor(messages);
     let agent_team_mode = task_tools::is_agent_team_mode();
     let note = if agent_team_mode {
@@ -1013,7 +1117,7 @@ fn refresh_outstanding_task_anchor(messages: &mut Vec<Message>, session_id: &str
             Ok(Some(note)) => note,
             Ok(None) => return,
             Err(error) => format!(
-                "{}\nTask state error: {error}. Inspect `task_status`; full evidence: `task_evidence_read` (source=\"delivered\", task_id).",
+                "{}\nTask state error: {error}. Inspect `task_status`; full evidence: {recovery_hint}.",
                 task_tools::outstanding_task_anchor_prefix()
             ),
         }
@@ -1321,6 +1425,7 @@ async fn apply_request_budget(
         tools_enabled,
     )
     .await;
+    let mut verification_compacted = report.changed && report.projection_committed();
     let post_chars = crate::ai::history::messages_total_chars_pub(messages);
     attempt.finish(
         &app.session_id,
@@ -1374,6 +1479,7 @@ async fn apply_request_budget(
         .await;
         let effective = summary.effective;
         let inserted = summary.summary_inserted;
+        verification_compacted |= inserted;
         let model_called = summary.model_called;
         let candidate_history = summary.messages;
 
@@ -1488,6 +1594,7 @@ async fn apply_request_budget(
         .await;
         let effective = summary.effective;
         let inserted = summary.summary_inserted;
+        verification_compacted |= inserted;
         let model_called = summary.model_called;
         let mut candidate = summary.messages;
         active_plan.restore(&mut candidate);
@@ -1511,6 +1618,9 @@ async fn apply_request_budget(
     }
     if report.projection_committed() {
         *persistable_context = None;
+    }
+    if super::prepare::refresh_verification_reminder(app, messages, verification_compacted) {
+        budget = request::preview_request_budget(app, model, messages, true, tools_enabled).await;
     }
     budget
 }
@@ -1577,6 +1687,7 @@ async fn request_model_response(
     // request about to be sent. Reclaim rewrites history mid-prefix, so it
     // runs only under token pressure (see `RECLAIM_PRESSURE_TOKENS`); the
     // model has no housekeeping protocol to follow either way.
+    super::prepare::refresh_verification_reminder(app, messages, false);
     context_budget::ensure_active_plan(app, messages);
     let before_budget =
         reclaim_tool_evidence_under_pressure(app, next_model, messages, !force_final_response)
@@ -2781,6 +2892,68 @@ mod tests {
         refresh_outstanding_task_anchor(&mut messages, "session-without-tasks");
 
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn refresh_outstanding_task_anchor_error_keeps_full_raw_recovery_hint() {
+        use crate::ai::driver::runtime_ctx::{self, DRIVER_CTX, DriverContext};
+
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let context = DriverContext::new(
+            crate::ai::middleware::test_util::test_app(),
+            Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+        );
+        let kernel = context.app_proto.os.clone();
+        // Poison only this test's kernel to exercise the actual task-state error injection.
+        let poisoned_kernel = kernel.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _lock = poisoned_kernel.lock().unwrap();
+                panic!("anchor recovery test kernel error");
+            })
+            .join()
+            .is_err()
+        );
+        let prefix = crate::ai::tools::task_tools::outstanding_task_anchor_prefix();
+        let mut messages = vec![Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(format!("{prefix}\nstale")),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        DRIVER_CTX.sync_scope(context, || {
+            runtime_ctx::set_active_skill_names(vec!["agent-team".to_string()]);
+            assert!(crate::ai::tools::task_tools::is_agent_team_mode());
+            refresh_outstanding_task_anchor(&mut messages, "anchor-recovery-test");
+        });
+        kernel.clear_poison();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, ROLE_INTERNAL_NOTE);
+        let note = messages[0].content.as_str().unwrap();
+        assert!(note.starts_with(prefix));
+        assert!(!note.contains("stale"));
+        assert!(note.contains("Task state error: Failed to lock AIOS kernel:"));
+        assert!(note.contains("Inspect `task_status`; full evidence:"));
+        let recovery_args = note
+            .split_once("`task_evidence_read` (")
+            .unwrap()
+            .1
+            .split_once(')')
+            .unwrap()
+            .0;
+        assert_eq!(
+            recovery_args,
+            "source=\"delivered\", view=\"raw\", exact task_id"
+        );
+        assert!(note.contains("omitting fields/max_chars/cursor"));
+        for parameter in ["fields", "max_chars", "cursor"] {
+            assert!(!recovery_args.contains(&format!("{parameter}=")));
+        }
     }
 
     #[test]

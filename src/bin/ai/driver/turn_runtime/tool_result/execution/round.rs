@@ -162,48 +162,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round_with_gate(
         &tool_call_execution.stream_result.hidden_meta,
         &tool_call_execution.stream_result.assistant_text,
     );
-    let mut exec_result = if let Some(reason) = rejection_reason {
-        reject_tool_calls(&tool_call_execution.stream_result.tool_calls, reason)
-    } else {
-        // Step 5: build the per-round ToolExecutor chain with real dispatch as the inner
-        // adapter; an empty middleware chain is the identity — zero behavior change.
-        let adapter = RoundToolExecutorAdapter {
-            session_id: app.session_id.clone(),
-            shared_mcp_client: shared_mcp_client.clone(),
-            allowed_tool_names: tool_call_execution.allowed_tool_names.clone(),
-            suppressed_read_only_results: suppressed_read_only_results.clone(),
-            iteration,
-        };
-        let executor = build_tool_executor_chain(app.tool_middlewares.clone(), Box::new(adapter));
-        // The port `execute` is async; this path is synchronous driving (including test
-        // threads without a tokio runtime), so futures_executor::block_on blocks the
-        // current thread (independent executor, usable in any context).
-        let output = futures_executor::block_on(
-            executor.execute(app, tool_call_execution.stream_result.tool_calls.clone()),
-        )
-        // The port error is `Box<dyn Error + Send + Sync>` while this function returns
-        // `Box<dyn Error>` (Sized constraint); map to `io::Error` first then propagate
-        // with `?`; no prefix is added so middleware/dispatch context is preserved.
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let ToolExecOutput {
-            tool_results,
-            assistant_messages,
-            executed_tool_calls,
-            cached_hits,
-            execution_outcomes,
-            had_error,
-        } = output;
-        // Assistant messages injected by middleware (always empty with the current empty
-        // chain): the field is kept; mounting is left for future middleware capability.
-        let _unwired_assistant_messages = assistant_messages;
-        ExecuteToolCallsResult {
-            executed_tool_calls,
-            tool_results,
-            cached_hits,
-            execution_outcomes,
-            had_error,
-        }
-    };
     let mut persisted_tool_call_ids =
         crate::ai::history::read_tool_message_ids_sqlite(&app.session_history_file)
             .unwrap_or_default();
@@ -229,7 +187,66 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round_with_gate(
             .map(|call| call.id.clone())
             .chain(message.tool_call_id.iter().cloned())
     }));
-    uniquify_tool_call_occurrences(messages, &persisted_tool_call_ids, &mut exec_result);
+    let mut tool_calls = tool_call_execution.stream_result.tool_calls.clone();
+    uniquify_tool_calls(
+        messages,
+        &persisted_tool_call_ids,
+        &mut tool_calls,
+        rejection_reason.is_none(),
+    );
+    // Suppression was selected against provider IDs. Transfer it per occurrence
+    // before middleware and registry dispatch observe the canonical IDs.
+    let suppressed_read_only_results = tool_call_execution
+        .stream_result
+        .tool_calls
+        .iter()
+        .zip(&tool_calls)
+        .filter_map(|(original, occurrence)| {
+            suppressed_read_only_results
+                .get(&original.id)
+                .map(|content| (occurrence.id.clone(), content.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut exec_result = if let Some(reason) = rejection_reason {
+        reject_tool_calls(&tool_calls, reason)
+    } else {
+        // Step 5: build the per-round ToolExecutor chain with real dispatch as the inner
+        // adapter; an empty middleware chain is the identity — zero behavior change.
+        let adapter = RoundToolExecutorAdapter {
+            session_id: app.session_id.clone(),
+            shared_mcp_client: shared_mcp_client.clone(),
+            allowed_tool_names: tool_call_execution.allowed_tool_names.clone(),
+            suppressed_read_only_results,
+            iteration,
+        };
+        let executor = build_tool_executor_chain(app.tool_middlewares.clone(), Box::new(adapter));
+        // The port `execute` is async; this path is synchronous driving (including test
+        // threads without a tokio runtime), so futures_executor::block_on blocks the
+        // current thread (independent executor, usable in any context).
+        let output = futures_executor::block_on(executor.execute(app, tool_calls))
+            // The port error is `Box<dyn Error + Send + Sync>` while this function returns
+            // `Box<dyn Error>` (Sized constraint); map to `io::Error` first then propagate
+            // with `?`; no prefix is added so middleware/dispatch context is preserved.
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let ToolExecOutput {
+            tool_results,
+            assistant_messages,
+            executed_tool_calls,
+            cached_hits,
+            execution_outcomes,
+            had_error,
+        } = output;
+        // Assistant messages injected by middleware (always empty with the current empty
+        // chain): the field is kept; mounting is left for future middleware capability.
+        let _unwired_assistant_messages = assistant_messages;
+        ExecuteToolCallsResult {
+            executed_tool_calls,
+            tool_results,
+            cached_hits,
+            execution_outcomes,
+            had_error,
+        }
+    };
     let premise_guidance = critical_premises::bind_round(final_gate_state, &mut exec_result);
     *turn_had_tool_error |= exec_result.had_error;
     // The apply_patch stale-target ledger must be updated after results settle and before
@@ -421,19 +438,21 @@ pub(in crate::ai::driver::turn_runtime) fn execute_tool_calls_with_suppressed_re
 }
 
 /// `tool_call_id` only guarantees association within a single model response; some
-/// providers/fallbacks reuse ids across rounds. Before writing history, any colliding
-/// assistant/tool/outcome triple is rewritten to a fresh occurrence ID so later
-/// compression and structured outcomes always associate with one real call.
-pub(in crate::ai::driver::turn_runtime) fn uniquify_tool_call_occurrences(
+/// providers/fallbacks reuse ids across rounds. Assign fresh occurrence IDs before
+/// middleware or dispatch so logs, locators, results and history share one identity.
+/// Execution logs can survive an interrupted round without its history commit, so
+/// executed calls must never depend on provider IDs or recovered history for uniqueness.
+fn uniquify_tool_calls(
     messages: &[Message],
     persisted_tool_call_ids: &[String],
-    result: &mut ExecuteToolCallsResult,
+    tool_calls: &mut [ToolCall],
+    fresh_execution: bool,
 ) {
     let mut used = messages
         .iter()
         .flat_map(|message| message.tool_calls.iter().flatten())
         .map(|call| call.id.clone())
-        .collect::<HashSet<_>>();
+        .collect::<FastSet<_>>();
     used.extend(
         messages
             .iter()
@@ -444,19 +463,41 @@ pub(in crate::ai::driver::turn_runtime) fn uniquify_tool_call_occurrences(
     // collides with an old message that is no longer in live context.
     used.extend(persisted_tool_call_ids.iter().cloned());
 
-    for index in 0..result.executed_tool_calls.len() {
-        let original = result.executed_tool_calls[index].id.clone();
-        let occurrence_id = if used.insert(original.clone()) {
-            original
-        } else {
+    // Reserve provider IDs too, including IDs from later calls in this response.
+    let provider_ids = tool_calls
+        .iter()
+        .map(|call| call.id.clone())
+        .collect::<FastSet<_>>();
+    for call in tool_calls {
+        // Rejected calls have no execution side effects and retain their association
+        // IDs when possible; every dispatched occurrence receives a fresh identity.
+        if fresh_execution || !used.insert(call.id.clone()) {
             loop {
                 let candidate = format!("call_{}", uuid::Uuid::new_v4().simple());
-                if used.insert(candidate.clone()) {
-                    break candidate;
+                if !provider_ids.contains(&candidate) && used.insert(candidate.clone()) {
+                    call.id = candidate;
+                    break;
                 }
             }
-        };
-        result.executed_tool_calls[index].id = occurrence_id.clone();
+        }
+    }
+}
+
+/// Preserve the result-level fixture helper while production assigns IDs pre-dispatch.
+#[cfg(test)]
+pub(in crate::ai::driver::turn_runtime) fn uniquify_tool_call_occurrences(
+    messages: &[Message],
+    persisted_tool_call_ids: &[String],
+    result: &mut ExecuteToolCallsResult,
+) {
+    uniquify_tool_calls(
+        messages,
+        persisted_tool_call_ids,
+        &mut result.executed_tool_calls,
+        true,
+    );
+    for (index, call) in result.executed_tool_calls.iter().enumerate() {
+        let occurrence_id = call.id.clone();
         if let Some(tool_result) = result.tool_results.get_mut(index) {
             tool_result.tool_call_id = occurrence_id.clone();
         }

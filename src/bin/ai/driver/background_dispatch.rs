@@ -2447,6 +2447,19 @@ pub(super) fn dispatch_background_batch(
             } else {
                 None
             };
+            let verification = if result.is_ok()
+                && memory_merge_error.is_none()
+                && handoff.is_none()
+                && handoff_parse_error.is_none()
+                && response_validation_error.is_none()
+            {
+                task_tools::extract_task_verification(
+                    &response_for_validation,
+                    response_schema.as_ref(),
+                )
+            } else {
+                None
+            };
             let mut os = task_os.lock().unwrap();
             os.set_current_pid(Some(pid));
             let task_blocked = result.is_ok()
@@ -2479,7 +2492,7 @@ pub(super) fn dispatch_background_batch(
                     .as_ref()
                     .and_then(|handoff| handoff.suggested_action.as_deref())
                     .unwrap_or(&captured_output);
-                let payload = serde_json::json!({
+                let mut payload = serde_json::json!({
                     "status": if task_blocked {
                         "blocked"
                     } else if task_succeeded {
@@ -2498,8 +2511,12 @@ pub(super) fn dispatch_background_batch(
                         .or(handoff_error),
                     "progress": progress,
                     "backend_session": backend_session,
-                })
-                .to_string();
+                });
+                if let Some(verification) = verification {
+                    payload["verification"] = serde_json::to_value(verification)
+                        .expect("verification metadata is a JSON value");
+                }
+                let payload = payload.to_string();
                 if let Err(error) = task_tools::publish_task_result(
                     os.as_mut(), task_id.as_deref(), pid, result_channel_id, payload,
                 ) {

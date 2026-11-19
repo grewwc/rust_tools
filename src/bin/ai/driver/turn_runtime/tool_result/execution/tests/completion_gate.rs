@@ -611,6 +611,262 @@ fn completion_evidence_gate_accepts_successful_post_mutation_check() {
 }
 
 #[test]
+fn completion_evidence_gate_sleep_wrapped_running_session_requires_terminal_result() {
+    use crate::ai::driver::turn_runtime::progress::{
+        ToolResultProgressStatus, classify_tool_result_progress,
+    };
+    let output = "Note: this command runs `sleep`, which blocks the whole turn on dead time — it is expensive. Use it only when truly necessary (e.g. waiting for a server to accept connections); prefer starting the work with `yield_time_ms` and polling it with `command_session`, or `task_wait` for subagent tasks.\n[session sleep-check]\n[command session running]\nstdout:\nFinished dev target(s)\n";
+    let messages = vec![
+        assistant_tool_call_message(test_tool_call(
+            "write",
+            "write_file",
+            serde_json::json!({"file_path": "/tmp/project/lib.rs", "content": "changed"}),
+        )),
+        tool_result_message("write", "Successfully wrote file"),
+        assistant_tool_call_message(test_tool_call(
+            "start",
+            "execute_command",
+            serde_json::json!({"command": "sleep 30 && cargo check --bin a"}),
+        )),
+        tool_result_message("start", output),
+    ];
+    assert_eq!(
+        classify_tool_result_progress(output),
+        ToolResultProgressStatus::Running
+    );
+    assert!(!completion_tool_result_succeeded(&messages[3].content));
+    let evidence = completion_evidence_state(&messages);
+    assert!(evidence.successful_mutation);
+    assert!(!evidence.successful_post_mutation_verification);
+    assert!(!evidence.successful_post_mutation_activity);
+    assert!(!evidence.successful_post_mutation_failed_check);
+    for (body, passed) in [
+        (
+            "[session sleep-check]\n[command session exited: exit code 0]\n",
+            true,
+        ),
+        (
+            "Exit code: 1\n[session sleep-check]\n[command session exited: exit code 1]\nFinished dev target(s)\n",
+            false,
+        ),
+    ] {
+        let mut terminal = messages.clone();
+        terminal.push(assistant_tool_call_message(test_tool_call(
+            "poll",
+            "command_session",
+            serde_json::json!({"action": "poll", "session_id": "sleep-check"}),
+        )));
+        terminal.push(tool_result_message(
+            "poll",
+            &format!("Note: result wrapper\n{body}"),
+        ));
+        let evidence = completion_evidence_state(&terminal);
+        assert_eq!(
+            evidence.successful_post_mutation_verification, passed,
+            "{body}"
+        );
+        assert_eq!(
+            evidence.successful_post_mutation_failed_check, !passed,
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn completion_evidence_gate_compound_pytest_failure_dominates_cargo_success() {
+    for join in [";", "||", "|", "&&"] {
+        for failure in [
+            "FAILED tests/test_example.py::test_assertion - AssertionError",
+            "1 failed in 0.01s",
+            "================ FAILURES ================",
+        ] {
+            let messages = vec![
+                assistant_tool_call_message(test_tool_call(
+                    "write",
+                    "write_file",
+                    serde_json::json!({"file_path": "/tmp/project/lib.rs", "content": "changed"}),
+                )),
+                tool_result_message("write", "Successfully wrote file"),
+                assistant_tool_call_message(test_tool_call(
+                    "check",
+                    "execute_command",
+                    serde_json::json!({"command": format!("pytest -q {join} cargo check --bin a")}),
+                )),
+                tool_result_message("check", &format!("{failure}\nFinished dev target(s)\n")),
+            ];
+            assert!(behavior_check_output_reports_failure(&messages[3].content));
+            assert!(!behavior_check_output_confirms_success(
+                &messages[3].content
+            ));
+            let evidence = completion_evidence_state(&messages);
+            assert!(
+                !evidence.successful_post_mutation_verification,
+                "{join}: {failure}"
+            );
+            assert!(
+                evidence.successful_post_mutation_failed_check,
+                "{join}: {failure}"
+            );
+            let mut projected = messages.clone();
+            assert_eq!(
+                completion_evidence_gate_action(
+                    &mut projected,
+                    &messages,
+                    "Completed.",
+                    false,
+                    2,
+                    16
+                ),
+                CompletionEvidenceGateAction::Warn
+            );
+        }
+    }
+    assert!(!behavior_check_output_reports_failure(&serde_json::json!(
+        "test result: ok. 1 passed; 0 failed; 0 ignored"
+    )));
+}
+
+#[test]
+fn completion_evidence_gate_compound_success_sentinel_requires_known_source() {
+    for command in [
+        "pytest -q; cargo check --bin a",
+        "pytest -q || cargo check --bin a",
+        "cargo check; echo 'Finished dev target(s)'",
+        "cargo check | tail results.txt",
+    ] {
+        let messages = vec![
+            assistant_tool_call_message(test_tool_call(
+                "write",
+                "write_file",
+                serde_json::json!({"file_path": "/tmp/project/lib.rs", "content": "changed"}),
+            )),
+            tool_result_message("write", "Successfully wrote file"),
+            assistant_tool_call_message(test_tool_call(
+                "check",
+                "execute_command",
+                serde_json::json!({"command": command}),
+            )),
+            tool_result_message(
+                "check",
+                "unrecognized check output\nFinished dev target(s)\n",
+            ),
+        ];
+        let evidence = completion_evidence_state(&messages);
+        assert!(!evidence.successful_post_mutation_verification, "{command}");
+        assert!(!evidence.successful_post_mutation_failed_check, "{command}");
+    }
+}
+
+#[test]
+fn completion_evidence_gate_async_poll_binds_cumulative_check_evidence() {
+    for (command, early, terminal, passed, failed) in [
+        (
+            "pytest -q; cargo check --bin a",
+            "FAILED tests/test_example.py::test_assertion",
+            "Finished dev target(s)",
+            false,
+            true,
+        ),
+        (
+            "pytest -q; cargo check --bin a",
+            "",
+            "1 failed in 0.01s\nFinished dev target(s)",
+            false,
+            true,
+        ),
+        (
+            "pytest -q; cargo check --bin a",
+            "unrecognized check output",
+            "Finished dev target(s)",
+            false,
+            false,
+        ),
+        (
+            "cargo test --bin a focused 2>&1 | tail -6",
+            "test result: ok. 1 passed; 0 failed",
+            "",
+            true,
+            false,
+        ),
+    ] {
+        let mut messages = vec![
+            assistant_tool_call_message(test_tool_call(
+                "write",
+                "write_file",
+                serde_json::json!({"file_path": "/tmp/project/lib.rs", "content": "changed"}),
+            )),
+            tool_result_message("write", "Successfully wrote file"),
+            assistant_tool_call_message(test_tool_call(
+                "start",
+                "execute_command",
+                serde_json::json!({"command": command}),
+            )),
+            tool_result_message(
+                "start",
+                &format!(
+                    "Note: result wrapper\n[session check]\n[command session running]\nstdout:\n{early}\n"
+                ),
+            ),
+        ];
+        assert!(!completion_evidence_state(&messages).successful_post_mutation_verification);
+        messages.push(assistant_tool_call_message(test_tool_call(
+            "poll",
+            "command_session",
+            serde_json::json!({"action": "poll", "session_id": "check"}),
+        )));
+        messages.push(tool_result_message(
+            "poll",
+            &format!(
+                "[session check]\n[command session exited: exit code 0]\nstdout:\n{terminal}\n"
+            ),
+        ));
+        let evidence = completion_evidence_state(&messages);
+        assert_eq!(
+            evidence.successful_post_mutation_verification, passed,
+            "{command}, {early:?}, {terminal:?}"
+        );
+        assert_eq!(
+            evidence.successful_post_mutation_failed_check, failed,
+            "{command}, {early:?}, {terminal:?}"
+        );
+    }
+}
+
+#[test]
+fn completion_evidence_gate_async_old_check_cannot_verify_later_mutation() {
+    let messages = vec![
+        assistant_tool_call_message(test_tool_call(
+            "write",
+            "write_file",
+            serde_json::json!({"file_path": "/tmp/project/lib.rs", "content": "changed"}),
+        )),
+        tool_result_message("write", "Successfully wrote file"),
+        assistant_tool_call_message(test_tool_call(
+            "start",
+            "execute_command",
+            serde_json::json!({"command": "cargo check --bin a"}),
+        )),
+        tool_result_message("start", "[session check]\n[command session running]\n"),
+        assistant_tool_call_message(test_tool_call(
+            "later-write",
+            "write_file",
+            serde_json::json!({"file_path": "/tmp/project/lib.rs", "content": "changed again"}),
+        )),
+        tool_result_message("later-write", "Successfully wrote file"),
+        assistant_tool_call_message(test_tool_call(
+            "poll",
+            "command_session",
+            serde_json::json!({"action": "poll", "session_id": "check"}),
+        )),
+        tool_result_message(
+            "poll",
+            "[session check]\n[command session exited: exit code 0]\n",
+        ),
+    ];
+    assert!(!completion_evidence_state(&messages).successful_post_mutation_verification);
+}
+
+#[test]
 fn completion_evidence_gate_accepts_piped_check_with_success_sentinel() {
     let command = "cargo test --bin a replayed_content_part_added 2>&1 | tail -6";
     let mutation = test_tool_call(

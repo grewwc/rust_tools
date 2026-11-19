@@ -11,12 +11,60 @@ use super::*;
 pub(crate) enum ToolResultProgressStatus {
     Success,
     Failure,
+    Running,
+    Unknown,
     DedupOnly,
     BlockedOutsideWorkspace(String),
 }
 
+/// Strip tool-owned notes before interpreting the command result envelope.
+/// Stop at the first payload line so stdout cannot impersonate session metadata.
+fn command_result_payload(mut text: &str) -> &str {
+    text = text.trim_start();
+    while text.starts_with("Note:") {
+        text = text
+            .split_once('\n')
+            .map_or("", |(_, rest)| rest)
+            .trim_start();
+    }
+    text
+}
+
+pub(in crate::ai::driver::turn_runtime) fn command_session_result(
+    text: &str,
+) -> Option<(Option<&str>, ToolResultProgressStatus)> {
+    let mut lines = command_result_payload(text).lines();
+    let mut header = lines.next()?;
+    let failed_exit = header.starts_with("Exit code:");
+    if failed_exit {
+        header = lines.next()?;
+    }
+    let id = header
+        .strip_prefix("[session ")
+        .and_then(|id| id.strip_suffix(']'));
+    let status = if id.is_some() {
+        lines.next().unwrap_or_default()
+    } else {
+        header
+    };
+    let outcome = if failed_exit {
+        ToolResultProgressStatus::Failure
+    } else if status == "[command session running]" {
+        ToolResultProgressStatus::Running
+    } else if status == "[command session exited: exit code 0]" {
+        ToolResultProgressStatus::Success
+    } else if status.starts_with("[command session exited:") {
+        ToolResultProgressStatus::Failure
+    } else if id.is_some() {
+        ToolResultProgressStatus::Unknown
+    } else {
+        return None;
+    };
+    Some((id, outcome))
+}
+
 pub(crate) fn classify_tool_result_progress(text: &str) -> ToolResultProgressStatus {
-    let text = text.trim_start();
+    let text = command_result_payload(text);
     if let Some(path) = blocked_outside_workspace_path(text) {
         return ToolResultProgressStatus::BlockedOutsideWorkspace(path);
     }
@@ -25,6 +73,9 @@ pub(crate) fn classify_tool_result_progress(text: &str) -> ToolResultProgressSta
     }
     if is_dedup_only_tool_result(text) {
         return ToolResultProgressStatus::DedupOnly;
+    }
+    if let Some((_, status)) = command_session_result(text) {
+        return status;
     }
     if text.starts_with("Error:") || text.starts_with("Exit code:") {
         return ToolResultProgressStatus::Failure;
@@ -133,6 +184,8 @@ pub(super) fn extract_round_targets_inner(
             Some(
                 ToolResultProgressStatus::BlockedOutsideWorkspace(_)
                 | ToolResultProgressStatus::Failure
+                | ToolResultProgressStatus::Running
+                | ToolResultProgressStatus::Unknown
                 | ToolResultProgressStatus::DedupOnly,
             ) => continue,
         }
@@ -446,6 +499,161 @@ pub(super) fn extract_round_mutated_targets(
         }
     }
     out
+}
+
+/// A line window that `read_file` actually returned to the model this round.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ReadWindow {
+    pub(super) target: String,
+    /// 1-based first line of the window.
+    pub(super) start: usize,
+    /// Exact content fingerprints of the complete lines returned, without display line numbers.
+    pub(super) line_fingerprints: Vec<[u8; 32]>,
+    /// A partial line or ambiguous raw notice may contain evidence outside the complete lines.
+    pub(super) has_partial_line: bool,
+}
+
+/// Bind coverage to the returned snapshot, never a later stat/read of the file. A command or
+/// background writer may already have changed the file again when this result is observed.
+fn rendered_read_line_fingerprints(
+    text: &str,
+    start: usize,
+    use_line_numbers: bool,
+) -> (Vec<[u8; 32]>, bool) {
+    use sha2::{Digest, Sha256};
+
+    // The renderer appends truncation notices at the end. A bare `... [` in source is content;
+    // even a complete notice-shaped source line in the middle cannot hide subsequent lines.
+    let mut lines: Vec<&str> = text.lines().collect();
+    let notice = lines.last().copied().filter(|line| {
+        line.starts_with("... [truncated: ")
+            && line.ends_with(']')
+            && (line.contains(". Continue: offset=")
+                || line.contains("truncated mid-line. Continue same line: offset="))
+    });
+    let has_partial_line = notice
+        .is_some_and(|line| line.contains("truncated mid-line. Continue same line: offset="));
+    if notice.is_some() {
+        lines.pop();
+    }
+    if has_partial_line {
+        lines.pop();
+    }
+    // Ordinary paging notices leave every displayed line complete. Strip only the exact
+    // expected display layer, and keep raw reads (including their whitespace) byte-sensitive.
+    let numbered = use_line_numbers
+        && lines
+            .iter()
+            .enumerate()
+            .all(|(i, line)| line.starts_with(&format!("{:>6}\t", start.saturating_add(i))));
+    let fingerprints = lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let content = if numbered {
+                line.strip_prefix(&format!("{:>6}\t", start.saturating_add(i)))
+                    .unwrap_or(line)
+            } else {
+                line
+            };
+            Sha256::digest(content.as_bytes()).into()
+        })
+        .collect();
+    // Raw suffixes lack the display-layer provenance of numbered output. If the omitted
+    // notice might be source text, matching the remaining lines cannot prove redundancy.
+    (fingerprints, has_partial_line || (notice.is_some() && !numbered))
+}
+
+/// Extract the line windows `read_file` actually returned this round. Failed, blocked, running,
+/// unknown, and dedup-only calls are skipped: only a successful read hands the model the lines, so
+/// only it can establish coverage or prove a later window redundant. The window ends at the
+/// rendered line count, not the requested `limit`, because the character cap can stop rendering
+/// early.
+pub(super) fn extract_round_read_windows(
+    messages: &[crate::ai::history::Message],
+) -> Vec<ReadWindow> {
+    use serde_json::Value;
+    let Some(last_assistant) = messages.iter().rev().find(|m| m.role == "assistant") else {
+        return Vec::new();
+    };
+    let Some(tool_calls) = last_assistant.tool_calls.as_ref() else {
+        return Vec::new();
+    };
+    let results_by_call_id: FxHashMap<&str, (&str, ToolResultProgressStatus)> = messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .filter_map(|message| {
+            let call_id = message.tool_call_id.as_deref()?;
+            let text = message.content.as_str().unwrap_or_default();
+            Some((call_id, (text, classify_tool_result_progress(text))))
+        })
+        .collect();
+    let mut out = Vec::new();
+    for call in tool_calls.iter() {
+        if call.function.name != "read_file" {
+            continue;
+        }
+        let Some((text, status)) = results_by_call_id.get(call.id.as_str()) else {
+            continue;
+        };
+        if !matches!(status, ToolResultProgressStatus::Success) {
+            continue;
+        }
+        let Ok(args) = serde_json::from_str::<Value>(call.function.arguments.as_str()) else {
+            continue;
+        };
+        let Some(map) = args.as_object() else {
+            continue;
+        };
+        let Some(path) = ["file_path", "path"]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(|v| v.as_str()))
+        else {
+            continue;
+        };
+        // The tool defaults offset to 1 and limit to 200; offset 0 is treated as the first line.
+        let start = map
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .max(1) as usize;
+        // A char-offset continuation pages inside one line; line coverage cannot express which
+        // characters it returned, so it proves nothing about later line windows.
+        if map.get("char_offset").and_then(|v| v.as_u64()).unwrap_or(0) > 0 {
+            continue;
+        }
+        let (line_fingerprints, has_partial_line) = rendered_read_line_fingerprints(
+            text,
+            start,
+            map.get("use_line_numbers")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+        );
+        if line_fingerprints.is_empty() {
+            continue;
+        }
+        out.push(ReadWindow {
+            target: normalize_rescan_path(path),
+            start,
+            line_fingerprints,
+            has_partial_line,
+        });
+    }
+    out
+}
+
+/// Whether the last assistant message in this round calls a direct file-mutation tool. Detection is
+/// by tool name on purpose: `apply_patch` accepts patch text without a `file_path` argument, so a
+/// target-based check misses those edits and would leave read coverage describing pre-edit bytes.
+pub(super) fn round_has_direct_mutation_tool(messages: &[crate::ai::history::Message]) -> bool {
+    let Some(last_assistant) = messages.iter().rev().find(|m| m.role == "assistant") else {
+        return false;
+    };
+    last_assistant.tool_calls.as_ref().is_some_and(|calls| {
+        calls
+            .iter()
+            .any(|call| is_direct_file_mutation_tool(&call.function.name))
+    })
 }
 
 /// 稳定的「无进展」软阈值。免费探索区内返回 usize::MAX（永不触发）。
