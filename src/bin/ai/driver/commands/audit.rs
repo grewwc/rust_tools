@@ -1451,6 +1451,10 @@ model_reason=inherited parent agent current model\n\
     fn format_mutation_log_groups_by_path_and_shows_net_change() {
         use crate::ai::tools::storage::mutation_log::MutationEntry;
         let entries = vec![MutationEntry {
+            entry_id: None,
+            turn_id: None,
+            task_id: None,
+            tool_call_id: None,
             seq: 1,
             ts: "t1".into(),
             path: "/proj/src/a.rs".into(),
@@ -1473,6 +1477,10 @@ model_reason=inherited parent agent current model\n\
         use crate::ai::tools::storage::mutation_log::{BeforeState, MutationEntry};
         for state in [BeforeState::Present, BeforeState::Unknown] {
             let mut entries = vec![MutationEntry {
+                entry_id: None,
+                turn_id: None,
+                task_id: None,
+                tool_call_id: None,
                 seq: 0,
                 ts: "t".into(),
                 path: "/proj/existing.rs".into(),
@@ -1483,6 +1491,10 @@ model_reason=inherited parent agent current model\n\
                 diff: None,
             }];
             entries.push(MutationEntry {
+                entry_id: None,
+                turn_id: None,
+                task_id: None,
+                tool_call_id: None,
                 seq: 1,
                 ts: "t".into(),
                 path: entries[0].path.clone(),
@@ -1519,6 +1531,10 @@ model_reason=inherited parent agent current model\n\
         };
         let content = "same line\n".repeat(200_000);
         let entries = [MutationEntry {
+            entry_id: None,
+            turn_id: None,
+            task_id: None,
+            tool_call_id: None,
             seq: 0,
             ts: "t".into(),
             path: "/proj/large.rs".into(),

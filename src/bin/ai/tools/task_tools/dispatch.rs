@@ -221,6 +221,9 @@ pub(crate) fn execute_task_evidence_read(args: &Value) -> Result<String, String>
         }
         Some(_) => return Err("source must be 'progress' or 'delivered'".to_string()),
     };
+    if source == "progress" && args.get("view").and_then(Value::as_str) == Some("summary") {
+        return Err("view=summary is available only with source=delivered".to_string());
+    }
     let task_id = args
         .get("task_id")
         .and_then(Value::as_str)
@@ -260,21 +263,50 @@ pub(crate) fn execute_task_evidence_read(args: &Value) -> Result<String, String>
             task_id,
         ).map_err(|error| format!("Failed to read delivered evidence for task {task_id}: {error}"))?
             .ok_or_else(|| format!("No delivered evidence for task {task_id} in this session; use task_audit to list recorded IDs"))?;
-        let evidence = serde_json::json!({
+        let report = task_evidence::read_delivered_task_report(
+            context.app_proto.config.history_file.as_path(),
+            &context.app_proto.session_id,
+            task_id,
+        )
+        // Optional display metadata cannot block access to the durable payload.
+        .ok()
+        .flatten()
+        .filter(|report| report.status == status);
+        let mut evidence = serde_json::json!({
             "task_id": task_id,
             "source": "delivered",
             "status": status,
             "payload": payload,
         });
-        let full = serde_json::to_string_pretty(&evidence)
-            .map_err(|error| format!("Failed to render delivered evidence: {error}"))?;
-        return options.render_delivered(
-            task_id,
-            full,
-            evidence,
-            context.app_proto.config.history_file.as_path(),
-            &context.app_proto.session_id,
-        );
+        if let Some(verification) = report
+            .as_ref()
+            .and_then(|report| report.verification.as_ref())
+        {
+            // Only the full raw payload guarantees that matching standalone metadata
+            // remains visible. Summaries, pages, and field selections need it separately.
+            // Also inspect the original body: a task header can hide a handoff prefix.
+            if !options.needs_full_delivered()
+                || !super::wait::verification_is_in_task_output(&payload, verification)
+                || !report
+                    .as_ref()
+                    .and_then(|report| report.output.as_deref())
+                    .is_some_and(|output| {
+                        super::wait::verification_is_in_task_output(output, verification)
+                    })
+            {
+                evidence["verification"] = serde_json::to_value(verification)
+                    .expect("verification metadata is a JSON value");
+            }
+            evidence["assessment"] = serde_json::to_value(verification.assessment())
+                .expect("verification assessment is serializable");
+        }
+        let full = if options.needs_full_delivered() {
+            serde_json::to_string_pretty(&evidence)
+                .map_err(|error| format!("Failed to render delivered evidence: {error}"))?
+        } else {
+            String::new()
+        };
+        return options.render_delivered(task_id, full, evidence, report.as_ref());
     }
 
     if let Some(slot) = task_progress_slot(task_id)
@@ -449,7 +481,7 @@ pub(super) fn execute_task_integrate(args: &Value) -> Result<String, String> {
              No integrations were applied."
         ));
     }
-    Ok(format!(
+    let mut reply = format!(
         "Integrated {} task result(s): {}",
         integrated.len(),
         integrated
@@ -457,7 +489,43 @@ pub(super) fn execute_task_integrate(args: &Value) -> Result<String, String> {
             .map(|(task_id, _, _)| task_id.as_str())
             .collect::<Vec<_>>()
             .join(", ")
-    ))
+    );
+    // The parent decision and atomic transaction above remain authoritative. Metadata reads
+    // and advisory gaps must never turn successful integration into a tool failure.
+    let mut advisory_bytes = 0;
+    let mut omitted = 0;
+    for (task_id, disposition, _) in &integrated {
+        if disposition != "accepted" {
+            continue;
+        }
+        let report = task_evidence::read_delivered_task_report(history_file, session_id, task_id)
+            .ok()
+            .flatten();
+        let Some(verification) = report
+            .as_ref()
+            .and_then(|report| report.verification.as_ref())
+        else {
+            continue;
+        };
+        if verification.assessment().gaps.is_empty() {
+            continue;
+        }
+        let label: String = task_id.chars().take(96).collect();
+        let advisory = format!(
+            "\nVerification advisory for task_id={label}:\n{}",
+            verification.inline_assessment()
+        );
+        if advisory_bytes + advisory.len() <= 2048 {
+            advisory_bytes += advisory.len();
+            reply.push_str(&advisory);
+        } else {
+            omitted += 1;
+        }
+    }
+    if omitted > 0 {
+        reply.push_str(&format!("\n{omitted} additional verification advisories; read each delivered assessment for details."));
+    }
+    Ok(reply)
 }
 
 /// Error text for a missing or empty `task_id`. Appends the ids of delivered but
@@ -889,13 +957,10 @@ mod optimization_gate_tests {
 
     #[test]
     fn task_evidence_master_gate_controls_runtime_projection() {
-        for (config, enabled) in [
-            ("", false),
-            (
-                "ai.agent_team.optimizations_enabled = false\nai.agent_team.persist_status_cursor = true\n",
-                false,
-            ),
-            ("ai.agent_team.optimizations_enabled = true\n", true),
+        for config in [
+            "",
+            "ai.agent_team.optimizations_enabled = false\nai.agent_team.persist_status_cursor = true\n",
+            "ai.agent_team.optimizations_enabled = true\n",
         ] {
             super::super::agent_team::tests::with_status_test_context_with_config(config, || {
                 let task_id = "gate-evidence";
@@ -915,18 +980,18 @@ mod optimization_gate_tests {
                 let invalid = execute_task_evidence_read(
                     &json!({"task_id": task_id, "fields": [], "max_chars": -1}),
                 );
-                if enabled {
-                    let selected: Value = serde_json::from_str(&selected).unwrap();
-                    assert_eq!(selected["payload"], json!({"checkpoint_excerpt": "α界🙂z"}));
-                    let bounded: Value = serde_json::from_str(&bounded).unwrap();
-                    assert_eq!(bounded["payload"], "");
-                    assert_eq!(bounded["truncated"], true);
-                    assert!(invalid.is_err());
-                } else {
-                    assert_eq!(selected.as_bytes(), original.as_bytes());
-                    assert_eq!(bounded.as_bytes(), original.as_bytes());
-                    assert_eq!(invalid.unwrap().as_bytes(), original.as_bytes());
-                }
+                let selected: Value = serde_json::from_str(&selected).unwrap();
+                assert_eq!(selected["payload"], json!({"checkpoint_excerpt": "α界🙂z"}));
+                let bounded: Value = serde_json::from_str(&bounded).unwrap();
+                assert_eq!(bounded["payload"], "");
+                assert_eq!(bounded["truncated"], true);
+                assert_eq!(bounded["next_cursor"], 0);
+                assert!(invalid.is_err());
+                assert!(
+                    execute_task_evidence_read(&json!({"task_id": task_id, "view": "summary"}))
+                        .unwrap_err()
+                        .contains("source=delivered")
+                );
             });
         }
     }
@@ -1026,4 +1091,13 @@ mod optimization_gate_tests {
             });
         }
     }
+}
+
+/// Read-only verification access for on-demand runtime navigation hints.
+pub(crate) fn read_delivered_verification_report(
+    history_file: &std::path::Path,
+    session_id: &str,
+    task_id: &str,
+) -> Result<Option<super::TaskReportTask>, String> {
+    task_evidence::read_delivered_task_report(history_file, session_id, task_id)
 }

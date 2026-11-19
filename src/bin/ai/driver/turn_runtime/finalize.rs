@@ -1,3 +1,4 @@
+use crate::ai::tools::task_tools::{EvidenceRecoveryFormat, full_delivered_evidence_hint};
 use crate::ai::{
     driver::print::{format_empty_state, print_assistant_banner_with_app_and_skill},
     history::{
@@ -339,6 +340,7 @@ fn format_full_subagent_result_for_parent(
     final_assistant_text: &str,
     turn_messages: &[Message],
 ) -> String {
+    let recovery_hint = full_delivered_evidence_hint(EvidenceRecoveryFormat::ToolCall);
     let final_assistant_text = final_assistant_text.trim();
     let evidence = collect_subagent_tool_evidence(turn_messages);
     if evidence.is_empty() {
@@ -358,7 +360,7 @@ fn format_full_subagent_result_for_parent(
         // delivered payload for one-call recovery.
         output.push_str(&format!(
             "\n[evidence truncated: showing {} of {} characters. Recover the full delivered \
-             payload with `task_evidence_read` (source=\"delivered\") using this task's id.]",
+             payload with {recovery_hint}.]",
             output.chars().count(),
             evidence_block.chars().count()
         ));
@@ -387,6 +389,7 @@ fn format_agent_team_subagent_result_for_parent(
     final_assistant_text: &str,
     turn_messages: &[Message],
 ) -> String {
+    let recovery_hint = full_delivered_evidence_hint(EvidenceRecoveryFormat::ToolCall);
     use super::tool_result::completion_tool_result_succeeded;
     use rust_tools::commonw::FastMap;
 
@@ -427,7 +430,7 @@ fn format_agent_team_subagent_result_for_parent(
         evidence.len(),
         failures.min(shown),
     );
-    let pointer = "Full delivered payload: `task_evidence_read` (source=\"delivered\", this task's id). Ellipses mark excerpts.\n";
+    let pointer = format!("Full delivered payload: {recovery_hint}. Ellipses mark excerpts.\n");
     let line_limit = AGENT_TEAM_SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS
         .saturating_sub(output.chars().count() + pointer.chars().count())
         / shown;
@@ -445,7 +448,7 @@ fn format_agent_team_subagent_result_for_parent(
         ));
         output.push('\n');
     }
-    output.push_str(pointer);
+    output.push_str(&pointer);
     debug_assert!(output.chars().count() <= AGENT_TEAM_SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS);
     if !final_assistant_text.is_empty() {
         output.push_str("\n[Subagent final answer]\n");
@@ -1314,6 +1317,15 @@ mod tests {
     }
 
     #[test]
+    fn complete_evidence_recovery_full_formatter_truncation_keeps_contract() {
+        let messages = agent_team_tool_messages(&vec!["observed detail\n".repeat(300); 10]);
+        let output = format_full_subagent_result_for_parent("final answer", &messages);
+        assert!(output.contains("[evidence truncated: showing"));
+        crate::ai::tools::task_tools::assert_full_evidence_recovery_hints(&output);
+        assert!(output.ends_with("[Subagent final answer]\nfinal answer"));
+    }
+
+    #[test]
     fn agent_team_parent_context_evidence_bounds_and_preserves_late_errors_and_final() {
         let mut results = (0..10)
             .map(|index| format!("result-{index}\n{}", "界".repeat(1_000)))
@@ -1334,7 +1346,11 @@ mod tests {
         assert!(evidence.contains("4/10 results; failures=1, failure excerpts shown=1"));
         assert!(evidence.contains("[failed] => Error: late read failed"));
         assert!(evidence.contains("task_evidence_read"));
+        crate::ai::tools::task_tools::assert_full_evidence_recovery_hints(evidence);
         assert!(evidence.contains("source=\"delivered\""));
+        assert!(evidence.contains("view=\"raw\""));
+        assert!(evidence.contains("exact task_id"));
+        assert!(evidence.contains("omitting fields/max_chars/cursor"));
         assert_eq!(final_answer, final_text.trim());
 
         for result in &mut results {

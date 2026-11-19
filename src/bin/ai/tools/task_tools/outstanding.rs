@@ -132,10 +132,10 @@ fn render_agent_team_outstanding_task_anchor(
             task_id, status, phase, task.idle_secs
         ));
     }
-    lines.push(
-        "Collect with `task_wait`; full evidence: `task_evidence_read` (source=\"delivered\", task_id). Handle failures before finishing."
-            .to_string(),
-    );
+    lines.push(format!(
+        "Collect with `task_wait`; full evidence: {}. Handle failures before finishing.",
+        super::full_delivered_evidence_hint(super::EvidenceRecoveryFormat::ToolCall),
+    ));
     Some(lines.join("\n"))
 }
 
@@ -262,7 +262,7 @@ pub(crate) fn outstanding_task_anchor_prefix() -> &'static str {
     OUTSTANDING_SUBAGENT_TASKS_NOTE_PREFIX
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StoredTaskResult {
     pub(crate) status: String,
     pub(crate) output: String,
@@ -271,6 +271,8 @@ pub(crate) struct StoredTaskResult {
     pub(crate) progress: Option<String>,
     #[serde(default)]
     pub(crate) backend_session: Option<String>,
+    #[serde(default)]
+    pub(crate) verification: Option<TaskVerificationMetadata>,
 }
 
 pub(super) fn read_task_result(
@@ -332,6 +334,21 @@ mod tests {
         assert!(note.contains("task-invalid status=error(Failed to decode stored task result)"));
         assert!(note.contains("task_evidence_read"));
         assert!(note.contains("source=\"delivered\""));
+        let recovery_args = note
+            .split_once("`task_evidence_read` (")
+            .unwrap()
+            .1
+            .split_once(')')
+            .unwrap()
+            .0;
+        assert_eq!(
+            recovery_args,
+            "source=\"delivered\", view=\"raw\", exact task_id"
+        );
+        assert!(note.contains("omitting fields/max_chars/cursor"));
+        for parameter in ["fields", "max_chars", "cursor"] {
+            assert!(!recovery_args.contains(&format!("{parameter}=")));
+        }
         assert!(!note.contains("model="));
         assert!(!note.contains("progress:"));
     }

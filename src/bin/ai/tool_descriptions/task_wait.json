@@ -1,6 +1,6 @@
 {
   "name": "task_wait",
-  "description": "Wait for one or more task_spawn subagent tasks to complete and collect their results. Use task_status while you still have independent work; this call may suspend the parent until a result is ready. timeout_secs bounds this call: on expiry it returns the collected results plus a note that the rest are still running. Responses include pending tasks' latest live progress/checkpoint snapshots. It can also return early with a PARKED status while tasks are still running; in both cases call again with the same task_ids.",
+  "description": "Wait for and collect task_spawn results, including pending tasks' latest live progress/checkpoint snapshots. Timeout or early PARKED returns collected results with tasks still running; retry the same task_ids. Optional structured verification adds a bounded assessment (worker_reported, needs_parent_review); completion is not acceptance. Full verification: task_evidence_read(source=\"delivered\", view=\"raw\", exact task_id), omitting fields/max_chars/cursor.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -9,13 +9,13 @@
         "items": {
           "type": "string"
         },
-        "description": "Array of task_id strings returned by task_spawn."
+        "description": "Task IDs returned by task_spawn."
       },
       "timeout_secs": {
         "type": "integer",
         "minimum": 1,
         "maximum": 300,
-        "description": "Wait budget in seconds for THIS call (default 30; maximum 300). Suspends the parent — call only after independent work is exhausted. Hitting the budget does NOT cancel or stall subagents; they keep running — use task_status while other work remains."
+        "description": "This call's wait budget in seconds (default 30, max 300). May suspend the parent: use task_status while independent work remains. Expiry neither cancels nor stalls subagents."
       },
       "wait_policy": {
         "type": "string",
@@ -23,7 +23,7 @@
           "all",
           "any"
         ],
-        "description": "'any' (default) returns on the first finisher; 'all' collects every finished result but returns early (PARKED) while any task is still running. Remaining tasks stay alive and can be retrieved later."
+        "description": "any (default) returns on the first finisher; all collects every finished result, returning early (PARKED) while any remain running. Retrieve remaining results later."
       }
     },
     "required": [

@@ -691,6 +691,44 @@ mod tests {
                 )
                 .unwrap();
         }
+
+        fn publication_channel(&self, task_id: &str) -> AsyncTaskEntry {
+            let mut entry = with_task_entry(task_id, Clone::clone).unwrap();
+            let mut os = self.context.app_proto.os.lock().unwrap();
+            os.channel_close(None, ChannelId(entry.result_channel_id))
+                .unwrap();
+            os.channel_destroy(None, ChannelId(entry.result_channel_id))
+                .unwrap();
+            entry.result_channel_id = os
+                .channel_create_tagged_with_holders(
+                    Some(self.owner_pid),
+                    1,
+                    "verification-result".into(),
+                    ChannelOwnerTag::TaskResult,
+                    vec!["task_result.producer".into(), "task_result.consumer".into()],
+                )
+                .raw();
+            drop(os);
+            lock_task_registry()
+                .get_mut(&task_id.to_string())
+                .unwrap()
+                .result_channel_id = entry.result_channel_id;
+            entry
+        }
+
+        fn publish_verification(
+            &self,
+            task_id: &str,
+            output: &str,
+            verification: Value,
+        ) -> AsyncTaskEntry {
+            let entry = self.publication_channel(task_id);
+            self.scope(|| with_os_kernel(|os| publish_task_result(
+                os, Some(task_id), entry.pid, entry.result_channel_id,
+                serde_json::json!({"status": "completed", "output": output, "verification": verification}).to_string(),
+            ))).unwrap();
+            entry
+        }
     }
 
     impl Drop for RuntimeFixture {
@@ -705,6 +743,270 @@ mod tests {
                 .retain(|key, _| key.session_id != self.context.app_proto.session_id);
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn task_verification_survives_publication_channel_loss_and_delivered_read() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let _config = StatusConfigGuard::new("ai.agent_team.optimizations_enabled = true\n");
+        for team in [false, true] {
+            let mut fixture = RuntimeFixture::new();
+            if !team {
+                fixture.context.active_skill_names.write().unwrap().clear();
+            }
+            let task_id = fixture.spawn();
+            let verification = super::super::verification::fix_verification_fixture();
+            let body = format!(
+                "  unchanged final bytes  \n<task_verification>{verification}</task_verification>\n  "
+            );
+            let metadata = extract_task_verification(&body, None).unwrap();
+            let entry = fixture.publish_verification(
+                &task_id,
+                &body,
+                serde_json::to_value(&metadata).unwrap(),
+            );
+            {
+                let mut os = fixture.context.app_proto.os.lock().unwrap();
+                let result = read_task_result(os.as_mut(), entry.result_channel_id, true)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(result.output, body);
+                assert_eq!(result.verification, Some(metadata.clone()));
+                os.channel_release_named(
+                    ChannelId(entry.result_channel_id),
+                    "task_result.consumer",
+                )
+                .unwrap();
+                os.channel_destroy(None, ChannelId(entry.result_channel_id))
+                    .unwrap();
+            }
+            lock_unpoisoned(&TASK_PROGRESS_REGISTRY).remove(&task_id);
+            let (rendered, report) = fixture.scope(|| {
+                capture_task_report("task_wait", || {
+                    execute_task_wait(&serde_json::json!({"task_ids": [&task_id]}))
+                })
+            });
+            let rendered = rendered.unwrap();
+            assert!(rendered.contains("schema_status=valid"), "{rendered}");
+            assert!(rendered.contains("acceptance=needs_parent_review"));
+            let report = report.unwrap();
+            assert!(report.supported());
+            assert_eq!(report.tasks[0].output.as_deref(), Some(body.as_str()));
+            assert_eq!(report.tasks[0].verification, Some(metadata));
+            assert!(with_task_entry(&task_id, |_| ()).is_none());
+            let delivered = fixture
+                .scope(|| {
+                    execute_task_evidence_read(&serde_json::json!({
+                        "task_id": task_id, "source": "delivered", "view": "raw",
+                    }))
+                })
+                .unwrap();
+            let delivered: Value = serde_json::from_str(&delivered).unwrap();
+            assert_eq!(delivered["status"], "completed");
+            assert_eq!(delivered["payload"], rendered);
+            assert!(delivered["payload"].as_str().unwrap().contains(body.trim()));
+            assert!(delivered.get("verification").is_none());
+            assert_eq!(delivered["assessment"]["provenance"], "worker_reported");
+            assert_eq!(delivered["assessment"]["schema_status"], "valid");
+            assert_eq!(delivered["assessment"]["gaps"], serde_json::json!([]));
+            let selected = fixture.scope(|| execute_task_evidence_read(&serde_json::json!({
+                "task_id": task_id, "source": "delivered", "fields": ["verification", "assessment", "output"],
+            }))).unwrap();
+            let selected: Value = serde_json::from_str(&selected).unwrap();
+            assert_eq!(selected["verification"], verification);
+            assert_eq!(selected["payload"]["verification"], verification);
+            assert_eq!(selected["payload"]["assessment"], delivered["assessment"]);
+            assert_eq!(selected["payload"]["output"], body);
+            assert!(
+                crate::ai::history::read_integrated_task_ids(
+                    &fixture.context.app_proto.config.history_file,
+                    &fixture.context.app_proto.session_id,
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn task_verification_delivered_read_is_read_only() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let _config = StatusConfigGuard::new("ai.agent_team.optimizations_enabled = true\n");
+        let mut fixture = RuntimeFixture::new();
+        fixture.context.active_skill_names.write().unwrap().clear();
+        let mut future = super::super::verification::fix_verification_fixture();
+        future["version"] = serde_json::json!(2);
+        future["checks"] = serde_json::json!({"future": "shape"});
+        let mut tasks = Vec::new();
+        for (verification, expected) in [
+            (
+                super::super::verification::fix_verification_fixture(),
+                "valid",
+            ),
+            (
+                serde_json::json!({"schema": "ai.task-verification", "version": 1, "checks": false}),
+                "invalid",
+            ),
+            (future, "unsupported"),
+        ] {
+            let task_id = fixture.spawn();
+            fixture.publish_verification(
+                &task_id,
+                "  preserved raw output  \n",
+                verification.clone(),
+            );
+            let before_collection = fixture
+                .scope(|| {
+                    execute_task_evidence_read(&serde_json::json!({
+                        "task_id": task_id, "source": "delivered",
+                    }))
+                })
+                .unwrap_err();
+            assert!(before_collection.contains("No delivered evidence"));
+            assert!(with_task_entry(&task_id, |_| ()).is_some());
+            tasks.push((task_id, verification, expected));
+        }
+        let status = fixture
+            .scope(|| execute_task_status(&serde_json::json!({})))
+            .unwrap();
+        assert!(status.contains("schema_status=valid"));
+        assert!(status.contains("schema_status=invalid"));
+        assert!(status.contains("schema_status=unsupported"));
+        let history_file = &fixture.context.app_proto.config.history_file;
+        let session_id = &fixture.context.app_proto.session_id;
+        let store_path = crate::ai::history::SessionStore::new(history_file)
+            .session_assets_dir(session_id)
+            .join("context-checkpoints/task-evidence.sqlite");
+        let before = fs::read(&store_path).unwrap();
+        for (task_id, verification, expected) in &tasks {
+            let full = fixture
+                .scope(|| {
+                    execute_task_evidence_read(&serde_json::json!({
+                        "task_id": task_id, "source": "delivered", "view": "raw",
+                    }))
+                })
+                .unwrap();
+            let full: Value = serde_json::from_str(&full).unwrap();
+            assert_eq!(&full["verification"], verification);
+            assert_eq!(full["assessment"]["schema_status"], *expected);
+            assert_eq!(full["status"], "completed");
+            let selected = fixture.scope(|| execute_task_evidence_read(&serde_json::json!({
+                "task_id": task_id, "source": "delivered", "fields": ["verification", "assessment"],
+            }))).unwrap();
+            let selected: Value = serde_json::from_str(&selected).unwrap();
+            assert_eq!(selected["payload"]["verification"], full["verification"]);
+            assert_eq!(selected["payload"]["assessment"], full["assessment"]);
+            assert!(with_task_entry(task_id, |_| ()).is_none());
+        }
+        assert_eq!(fs::read(&store_path).unwrap(), before);
+        assert!(
+            crate::ai::history::read_integrated_task_ids(history_file, session_id)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Corrupt optional outer metadata must not trigger the diagnostic writer on a read.
+        let connection = rusqlite::Connection::open(&store_path).unwrap();
+        connection
+            .execute(
+                "UPDATE task_evidence SET report_json = 'invalid report' WHERE task_id = ?1",
+                [&tasks[0].0],
+            )
+            .unwrap();
+        drop(connection);
+        let before = fs::read(&store_path).unwrap();
+        let degraded = fixture
+            .scope(|| {
+                execute_task_evidence_read(&serde_json::json!({
+                    "task_id": tasks[0].0, "source": "delivered", "view": "raw",
+                }))
+            })
+            .unwrap();
+        let degraded: Value = serde_json::from_str(&degraded).unwrap();
+        assert_eq!(degraded["status"], "completed");
+        assert!(
+            degraded["payload"]
+                .as_str()
+                .unwrap()
+                .contains("preserved raw output")
+        );
+        assert!(degraded.get("verification").is_none());
+        assert_eq!(fs::read(store_path).unwrap(), before);
+    }
+
+    #[test]
+    fn task_integrate_verification_guidance_preserves_legacy_and_atomic_batch_behavior() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let mut fixture = RuntimeFixture::new();
+        fixture.context.active_skill_names.write().unwrap().clear();
+        let legacy = fixture.spawn();
+        let fix = fixture.spawn();
+        let rejected = fixture.spawn();
+        let superseded = fixture.spawn();
+        let undelivered = fixture.spawn();
+        fixture.publish(&legacy, "completed", "legacy completion", None);
+        let mut verification = super::super::verification::fix_verification_fixture();
+        verification.as_object_mut().unwrap().remove("regression");
+        for task_id in [&fix, &rejected, &superseded] {
+            fixture.publish_verification(task_id, "fix report", verification.clone());
+        }
+        fixture
+            .scope(|| execute_task_status(&serde_json::json!({})))
+            .unwrap();
+        let integration = |task_id: &str, disposition: &str| {
+            serde_json::json!({
+                "task_id": task_id, "disposition": disposition, "summary": "parent reviewed this result",
+            })
+        };
+        let failed_batch = fixture
+            .scope(|| {
+                execute_task_integrate(&serde_json::json!({
+                    "tasks": [integration(&fix, "accepted"), integration(&undelivered, "accepted")],
+                }))
+            })
+            .unwrap_err();
+        assert!(failed_batch.contains("No integrations were applied"));
+        assert!(
+            crate::ai::history::read_integrated_task_ids(
+                &fixture.context.app_proto.config.history_file,
+                &fixture.context.app_proto.session_id,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let legacy_reply = fixture
+            .scope(|| {
+                execute_task_integrate(&serde_json::json!({
+                    "tasks": [integration(&legacy, "accepted")],
+                }))
+            })
+            .unwrap();
+        assert_eq!(
+            legacy_reply,
+            format!("Integrated 1 task result(s): {legacy}")
+        );
+        let reply = fixture.scope(|| execute_task_integrate(&serde_json::json!({
+            "tasks": [integration(&fix, "accepted"), integration(&rejected, "rejected"), integration(&superseded, "superseded")],
+        }))).unwrap();
+        assert!(
+            reply.contains(&format!("Verification advisory for task_id={fix}:")),
+            "{reply}"
+        );
+        assert!(reply.contains("no regression before/after references"));
+        assert!(!reply.contains(&format!("Verification advisory for task_id={rejected}:")));
+        assert!(!reply.contains(&format!("Verification advisory for task_id={superseded}:")));
+        let integrated = crate::ai::history::read_integrated_task_ids(
+            &fixture.context.app_proto.config.history_file,
+            &fixture.context.app_proto.session_id,
+        )
+        .unwrap();
+        assert_eq!(integrated.len(), 4);
+        assert!(
+            [legacy, fix, rejected, superseded]
+                .iter()
+                .all(|id| integrated.contains(id))
+        );
+        assert!(!integrated.contains(&undelivered));
     }
 
     #[test]

@@ -543,6 +543,7 @@ fn store_test_tool_cache(args: &serde_json::Value, content: &str) -> ToolCall {
             tool_call_id: call.id.clone(),
             content: content.to_string(),
         },
+        &collect_tool_cache_file_fingerprints("read_file", args),
     );
     call
 }
@@ -640,6 +641,115 @@ fn tool_cache_does_not_store_empty_or_failed_results() {
             assert!(store.recent(10).unwrap().is_empty());
             assert!(super::load_cached_tool_result("cache-test", &call, &args).is_none());
         }
+    });
+}
+
+#[test]
+fn tool_cache_rejects_legacy_metadata_only_fingerprints_and_unavailable_sources() {
+    with_tool_cache_store(|store, args| {
+        let call = store_test_tool_cache(&args, "complete result");
+        let mut entry = store.recent(10).unwrap().remove(0);
+        let mut note: serde_json::Value = serde_json::from_str(&entry.note).unwrap();
+        for fingerprint in note["file_fingerprints"].as_array_mut().unwrap() {
+            fingerprint
+                .as_object_mut()
+                .unwrap()
+                .remove("content_sha256");
+            fingerprint
+                .as_object_mut()
+                .unwrap()
+                .remove("validated_bytes");
+        }
+        let legacy: ToolCachePayload = serde_json::from_value(note.clone()).unwrap();
+        assert!(!tool_cache_validation_matches(&legacy));
+        fs::write(store.path(), "").unwrap();
+        entry.id = None;
+        entry.note = note.to_string();
+        store.append(&entry).unwrap();
+        assert!(super::load_cached_tool_result("cache-test", &call, &args).is_none());
+        fs::remove_file(args["file_path"].as_str().unwrap()).unwrap();
+        assert!(!tool_cache_validation_matches(&legacy));
+        assert!(super::load_cached_tool_result("cache-test", &call, &args).is_none());
+    });
+}
+
+#[test]
+fn tool_cache_does_not_certify_a_result_after_source_changes_during_execution() {
+    with_tool_cache_store(|store, args| {
+        let call = tool_call_with_args("read_file", &args.to_string());
+        let before = collect_tool_cache_file_fingerprints("read_file", &args);
+        let content = crate::ai::tools::service::file::execute_read_file(&args).unwrap();
+        let path = args["file_path"].as_str().unwrap();
+        let mtime = fs::metadata(path).unwrap().modified().unwrap();
+        fs::write(path, "changed source").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        assert_eq!(before[0].size, fs::metadata(path).unwrap().len());
+        super::store_tool_cache_result(
+            "cache-test",
+            &call,
+            &args,
+            &crate::ai::types::ToolResult {
+                task_report: None,
+                tool_call_id: call.id.clone(),
+                content,
+            },
+            &before,
+        );
+        assert!(store.recent(10).unwrap().is_empty());
+        assert!(super::load_cached_tool_result("cache-test", &call, &args).is_none());
+    });
+}
+
+#[test]
+fn tool_cache_large_file_validation_is_bounded_and_checks_returned_content() {
+    use std::io::{Seek, SeekFrom, Write};
+    with_tool_cache_store(|_, mut args| {
+        let path = args["file_path"].as_str().unwrap().to_string();
+        fs::write(&path, "version-0\n".repeat(1_000_000)).unwrap();
+        args["offset"] = json!(100);
+        args["limit"] = json!(5);
+        let fingerprints = collect_tool_cache_file_fingerprints("read_file", &args);
+        assert_eq!(fingerprints.len(), 1);
+        let validated = fingerprints[0].validated_bytes;
+        assert!(
+            validated < fingerprints[0].size,
+            "do not scan the unrelated large-file tail"
+        );
+        assert!(validated >= 2 * crate::ai::tools::service::file::WINDOW_READ_CHUNK_BYTES as u64);
+        let content = crate::ai::tools::service::file::execute_read_file(&args).unwrap();
+        let call = store_test_tool_cache(&args, &content);
+        assert_eq!(
+            super::load_cached_tool_result("cache-test", &call, &args)
+                .unwrap()
+                .content,
+            content
+        );
+        let mut file = fs::File::options().write(true).open(&path).unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        // A same-size, same-mtime change outside the dependency prefix leaves this window valid.
+        file.seek(SeekFrom::Start(validated + 100)).unwrap();
+        file.write_all(b"version-1").unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        assert_eq!(
+            super::load_cached_tool_result("cache-test", &call, &args)
+                .unwrap()
+                .content,
+            content
+        );
+        // The returned line must invalidate even with identical metadata.
+        file.seek(SeekFrom::Start(99 * 10)).unwrap();
+        file.write_all(b"version-1").unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        assert!(super::load_cached_tool_result("cache-test", &call, &args).is_none());
+        let changed = crate::ai::tools::service::file::execute_read_file(&args).unwrap();
+        assert!(changed.contains("version-1"));
     });
 }
 

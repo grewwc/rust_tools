@@ -124,8 +124,6 @@ A worker branch must be sized to its own bounded turn budget: the default subage
 
 ### Dispatch, wait, and stop discipline
 
-- Enumerate all independent branches before dispatch, then send them together
-  in one `task_spawn` call (up to 8); never spawn-wait-spawn-wait independent work.
 - Prefer fewer, larger branches, each owning a self-contained deliverable sized
   to the subagent iteration budget, over many small tasks.
 - Request a targeted `task_status` snapshot only when a scheduling or
@@ -148,16 +146,11 @@ A worker branch must be sized to its own bounded turn budget: the default subage
 - Use `task_evidence_read` only for delivered claims the parent will reuse; do
   not request exhaustive logs.
 
-1. Define the evidence split up front — each branch's question, scope, inputs,
-   and acceptance criteria — then dispatch all independent branches in ONE
-   `task_spawn` call (up to 8). Never drip-feed one task and wait before
-   spawning the next, and never serialize independent spawns. When the split
-   itself needs investigation, run one planning-first worker, then batch the
-   resulting branches. For implementation work, let workers propose the
-   breakdown and design. Keep the final cross-worker split, scope and product
-   decisions, consequential-risk decisions, scheduling, acceptance, final
-   review, and synthesis in the parent; coordinate overlapping edits through
-   disjoint ownership.
+1. Define each branch's question, scope, inputs, and acceptance criteria before
+   dispatch; send all independent branches in ONE `task_spawn` call (up to 8),
+   never serialized spawn/wait pairs. If the split needs investigation, first
+   delegate planning, then batch its branches. Workers propose implementation
+   breakdown/design; the parent retains the final split and Parent responsibilities.
 2. For a broad review or audit with independent scopes, prefer a few broad,
    disjoint evidence branches — for example subsystem A, subsystem B,
    contracts/tests, and adversarial verification — over single-question
@@ -171,15 +164,11 @@ A worker branch must be sized to its own bounded turn budget: the default subage
 
 ## Quiet mode
 
-This workflow takes precedence over routine startup checks, status polling, and
-post-wait status rechecks described elsewhere in this skill.
+Dispatch, wait, and stop discipline takes precedence over routine startup checks,
+status polling, and post-wait rechecks: wait with `wait_policy=all`,
+`timeout_secs=300`; terminal results wake the parent early. Status snapshots are
+only for scheduling/cancellation decisions; expiry does not prove a stall.
 
-- When blocked on results, prefer one `task_wait` with `wait_policy=all`. The
-  runtime permits a five-minute budget and delivers terminal results as they
-  arrive; use `timeout_secs=300` to avoid waking the parent model only to renew
-  a wait. Budget expiry is normal scheduling and does not prove a stall.
-- Avoid `task_status` polling. Request a targeted status snapshot only when a
-  scheduling or cancellation decision needs the current state.
 - Use `task_evidence_read` for detail, including `source=delivered` for claims
   taken from a delivered result; compact previews are recovery locators.
 - Ask subagents for short summaries, remaining uncertainty, and artifact paths.
@@ -196,6 +185,7 @@ Every delegated prompt must be self-contained and include:
 - whether the work is read-only or may edit files;
 - required invariants and edge cases;
 - the expected result format: concise conclusion, exact artifact/version, key evidence locations or commands, exact verification scope and result for each check (what ran, where, and under which configuration or scenario), changes made if any, assumptions, remaining uncertainty and what it does not cover, and recommended verification.
+- for fix or implementation work using the default Markdown result contract, request the optional `<task_verification>` block (`ai.task-verification` v1) with actual checks and tested artifact revisions. Treat its assessment as worker-reported guidance requiring parent acceptance. An explicit `response_schema` remains exact and may declare its own top-level `verification` property; do not combine this block with `<audit_report>` or control handoff envelopes.
 
 `inherit: cwd,skills` already supplies the workspace and the parent's active skills, so do not paste AGENTS.md or skill bodies into the prompt. Use `inherit: history` only when the worker genuinely needs the full prior conversation; otherwise a background brief is cheaper and more focused.
 
@@ -268,8 +258,8 @@ applicable policy take precedence; risk tiering cannot downgrade them.
 - Treat subagent output as evidence to review, not authority. Inspect each final deliverable and match decision-bearing claims to sufficient evidence before accepting it; select additional verification under Risk-tiered acceptance.
 - Own the verification contract: delegation changes who runs a check, never what the result proves. A worker PASS proves only the exact subject it measured — command, target, configuration, inputs, and scenario — never the user-visible claim by itself.
 - Before accepting, restate the claim and the scope it must hold in, then require matching evidence: for fix claims, the same failure reproduced before the change and the same scenario passing after, or a documented reason reproduction is impossible plus the alternative evidence and its limits; for new behavior, read-only, or analysis claims, evidence on the same subject and scope. Prefer one mechanism-covering or boundary/repeated-operation case over several adjacent green checks. State what the evidence does not cover; never promote a scoped PASS into a broader claim.
-- A folded, truncated, or checkpointed task result is a locator, not evidence. Before repeating numbers, quoted output, or absence claims, read the delivered payload with `task_evidence_read(source=delivered)` or the named archive; the inline preview is only a recall anchor. Do not mark a task integrated until that read is done and the claims you will reuse are checked.
-- Follow the runtime task-tool guidance for integration, evidence recovery, and retries. Wait only when blocked on results, using `wait_policy=all` and `timeout_secs=300`; `PARKED` or budget expiry is normal scheduling, not a stall signal, and is never a reason to cancel. While `task_status` shows recent `last activity` or advancing progress, keep waiting. Cancel a branch when its scope changed, it failed, a fresh `task_status` snapshot confirms sustained zero progress, or its result is no longer needed; once the task's acceptance criteria are met, cancel remaining low-value or superseded branches instead of awaiting them.
+- A folded, truncated, or checkpointed task result is a locator, not evidence. Before repeating numbers, quoted output, or absence claims, read the delivered payload with `task_evidence_read(source="delivered", view="raw", exact task_id), omitting fields/max_chars/cursor`, or the named archive; the inline preview is only a recall anchor. Do not mark a task integrated until that read is done and the claims you will reuse are checked.
+- Follow runtime task-tool guidance and Dispatch, wait, and stop discipline. Recent `last activity` or advancing progress means keep waiting. Cancellation reasons: changed scope, failure, sustained zero progress confirmed by fresh `task_status`, or an unneeded result. `PARKED`/expiry alone never justify cancellation.
 - Synthesize one coherent final answer. Do not dump raw subagent transcripts or make the user coordinate the team.
 
 ## Backend selection and rework loop
@@ -285,11 +275,7 @@ applicable policy take precedence; risk tiering cannot downgrade them.
 - stretch the trivial atomic action exception to cover search, analysis, multi-step work, or edits;
 - spawn a worker for one trivial atomic action whose spawn costs more than the work;
 - treat delegation as reserved for large or multi-branch work;
-- drip-feed one task and wait before spawning the next, or serialize independent spawns instead of one batch;
-- start a broad review with many single-question micro-tasks instead of a few disjoint evidence branches;
-- keep awaiting low-value or superseded branches after the acceptance criteria are met;
-- spawn a third evidence round on a disputed claim instead of reporting the unresolved conflict;
-- cancel a worker whose progress is still advancing while its result is still needed, or only because `task_wait` timed out;
+- violate the dispatch, wait, cancellation, or two-round evidence/rework limits above;
 - keep a tightly coupled edit in the parent instead of assigning the whole edit to one worker;
 - split one tightly coupled edit across multiple writers;
 - delegate several versions of the same tightly coupled edit;

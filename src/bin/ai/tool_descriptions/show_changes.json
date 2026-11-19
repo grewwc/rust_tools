@@ -1,12 +1,12 @@
 {
   "name": "show_changes",
-  "description": "Show all file changes recorded in the current session (plus optional git diff fallback). Returns a compact summary with per-file status and a unified diff snippet. Use this before concluding a task to verify modifications.",
+  "description": "Show all file changes recorded in the current session (plus optional git diff fallback). Returns a compact summary with per-file status and a unified diff snippet. Use this before concluding a task to verify modifications. Includes the persistent session mutation revision and current/stale command verification gaps. Checks cover only the recorded command scope, not semantic correctness; request verification_details for provenance and evidence locators.",
   "parameters": {
     "type": "object",
     "properties": {
       "path": {
         "type": "string",
-        "description": "Optional file path filter — when set, only changes touching this path (substring match) are shown."
+        "description": "Optional file path filter \u2014 when set, only changes touching this path (substring match) are shown."
       },
       "include_git": {
         "type": "boolean",
@@ -17,6 +17,29 @@
         "minimum": 0,
         "maximum": 4000,
         "description": "Maximum characters of the change summary to include (default 120 means 9600 characters; 0 disables this truncation, but the summary itself is still capped at 14,000 characters and the git fallback at 32,768 diff bytes). "
+      },
+      "verification_details": {
+        "type": "boolean",
+        "description": "Include whole latest command observations with revision coverage, status, origin/poll call IDs and evidence locators (default false). Defaults to 8 checks and 8192 bytes per page; checks_page reports shown/total counts and the next page."
+      },
+      "verification_offset": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Start at this latest-check index when verification_details is true (default 0). Pagination uses the current committed snapshot; verify revision and observation IDs if commands or mutations run between pages."
+      },
+      "verification_limit": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Maximum whole verification checks per page (default 8; 0 disables the count cap)."
+      },
+      "verification_max_bytes": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Maximum pretty-printed verification.checks array bytes per page (default 8192; 0 disables the byte cap). Nonzero budgets are normalized to at least 2 bytes for the empty array; checks_page.max_bytes reports the effective cap. An oversized next observation is omitted whole, with next_check_bytes and a hint to lift this cap."
+      },
+      "verification_full": {
+        "type": "boolean",
+        "description": "Return all latest verification checks from the current committed snapshot, enabling details and ignoring offset/count/byte caps (default false)."
       }
     },
     "required": []

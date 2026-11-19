@@ -128,7 +128,8 @@ fn execute_inner_shell_command(inner: &str, cwd: Option<&str>) -> Result<String,
 /// layer as plain data, supporting `cat` literals and generic harmless
 /// commands. The substituted command is still fully audited afterwards, so a
 /// replacement that turns into a blocked program name or dangerous argument is
-/// still rejected.
+/// still rejected. Chains require deferred evaluation; reject them before any
+/// substitution side effect until the runner supports that execution model.
 fn materialize_safe_shell_substitutions(
     command: &str,
     cwd: Option<&str>,
@@ -137,6 +138,16 @@ fn materialize_safe_shell_substitutions(
     if substitutions.is_empty() {
         // Fast path: nothing to materialize; return the command unchanged.
         return Ok(command.to_string());
+    }
+    if substitutions
+        .iter()
+        .any(|substitution| substitution.outer_has_control_flow)
+    {
+        return Err(
+            "command substitution in a chained command requires deferred evaluation; \
+             run each segment as a separate command"
+                .to_string(),
+        );
     }
     let mut materialized = command.to_string();
     for substitution in substitutions.into_iter().rev() {
@@ -159,10 +170,25 @@ fn materialize_safe_shell_substitutions(
                 execute_inner_shell_command(&inner, cwd)?
             }
         };
-        materialized.replace_range(
-            substitution.start..substitution.end,
-            &shell_single_quote(&contents),
-        );
+        let replacement = if substitution.bare {
+            // Unquoted substitution output is word-split by the shell: render
+            // each whitespace-separated piece as its own quoted word so the
+            // materialized command matches shell word-splitting without
+            // re-parsing output as command structure. Empty output removes
+            // the word entirely, matching the shell.
+            let pieces: Vec<String> = contents
+                .split_whitespace()
+                .map(shell_single_quote)
+                .collect();
+            if pieces.is_empty() {
+                String::new()
+            } else {
+                pieces.join(" ")
+            }
+        } else {
+            shell_single_quote(&contents)
+        };
+        materialized.replace_range(substitution.start..substitution.end, &replacement);
     }
     Ok(materialized)
 }
@@ -520,7 +546,12 @@ where
     }
 
     let output = command_runner::run_command_streaming(
-        &command, cwd, timeout, pseudo_terminal, input, on_chunk,
+        &command,
+        cwd,
+        timeout,
+        pseudo_terminal,
+        input,
+        on_chunk,
     )?;
     let interrupted = output.timed_out || output.cancelled || output.stalled;
     let mut formatted = format_command_result(output, timeout);
@@ -550,7 +581,8 @@ mod tests {
     use super::{
         MAX_COMMAND_INPUT_BYTES, MAX_COMMAND_OUTPUT_CHARS, SLEEP_WARNING,
         confirm_gated_git_subcommand, confirm_git_confirm_gated_if_needed, contains_sleep,
-        execute_command, format_command_result, resolve_command_timeout, truncate_chars,
+        execute_command, format_command_result, materialize_safe_shell_substitutions,
+        resolve_command_timeout, truncate_chars,
     };
     use crate::cmd::run::CommandRunResult;
     use serde_json::json;
@@ -572,6 +604,26 @@ mod tests {
     }
 
     // ---- confirm-gated git subcommands (commit / push / stash / checkout / switch) ----
+
+    #[test]
+    fn materializes_bare_substitution_as_split_quoted_words() {
+        let path = temporary_file_path("bare-substitution");
+        fs::write(&path, "alpha beta\ngamma").unwrap();
+        // Bare whole-word `$(...)`: output is word-split, each piece quoted.
+        let command = format!("echo $(cat {})", path.display());
+        let materialized = materialize_safe_shell_substitutions(&command, None).unwrap();
+        assert_eq!(materialized, "echo 'alpha' 'beta' 'gamma'");
+        // Quoted whole-word `"$(...)"`: output stays one quoted word.
+        let command = format!("echo \"$(cat {})\"", path.display());
+        let materialized = materialize_safe_shell_substitutions(&command, None).unwrap();
+        assert_eq!(materialized, "echo 'alpha beta\ngamma'");
+        // Empty bare output removes the word entirely (shell semantics).
+        let empty = temporary_file_path("bare-substitution-empty");
+        fs::write(&empty, "").unwrap();
+        let command = format!("echo $(cat {})", empty.display());
+        let materialized = materialize_safe_shell_substitutions(&command, None).unwrap();
+        assert_eq!(materialized, "echo ");
+    }
 
     #[test]
     fn commit_detection_matches_plain_git_commit() {
@@ -635,7 +687,10 @@ mod tests {
         );
         // Case-insensitive: the audit layer's old hard block matched `PUSH`,
         // so the gate must too, otherwise `git PUSH` bypasses confirmation.
-        assert_eq!(confirm_gated_git_subcommand("git PUSH origin"), Some("push"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git PUSH origin"),
+            Some("push")
+        );
         assert_eq!(
             confirm_gated_git_subcommand("git status && git push -u origin main"),
             Some("push")
@@ -723,8 +778,14 @@ mod tests {
         // are additionally hard-blocked by the audit layer before this gate;
         // detection here still covers them so a fail-closed error is the
         // fallback wherever the audit layer is bypassed.
-        assert_eq!(confirm_gated_git_subcommand("git checkout"), Some("checkout"));
-        assert_eq!(confirm_gated_git_subcommand("git checkout main"), Some("checkout"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git checkout"),
+            Some("checkout")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git checkout main"),
+            Some("checkout")
+        );
         assert_eq!(
             confirm_gated_git_subcommand("git checkout -b feature/x"),
             Some("checkout")
@@ -733,7 +794,10 @@ mod tests {
             confirm_gated_git_subcommand("git checkout -- src/main.rs"),
             Some("checkout")
         );
-        assert_eq!(confirm_gated_git_subcommand("git checkout -f main"), Some("checkout"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git checkout -f main"),
+            Some("checkout")
+        );
         assert_eq!(
             confirm_gated_git_subcommand("git -C /repo checkout main"),
             Some("checkout")
@@ -754,8 +818,14 @@ mod tests {
             confirm_gated_git_subcommand("git -C /repo add . && git -C /repo checkout main"),
             Some("checkout")
         );
-        assert_eq!(confirm_gated_git_subcommand("env git checkout main"), Some("checkout"));
-        assert_eq!(confirm_gated_git_subcommand("nohup git checkout main"), Some("checkout"));
+        assert_eq!(
+            confirm_gated_git_subcommand("env git checkout main"),
+            Some("checkout")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("nohup git checkout main"),
+            Some("checkout")
+        );
         assert_eq!(
             confirm_gated_git_subcommand("command git checkout main"),
             Some("checkout")
@@ -769,7 +839,10 @@ mod tests {
         // (`-- <path>`, `-f`, `--discard-changes`) are hard-blocked by the
         // audit layer first.
         assert_eq!(confirm_gated_git_subcommand("git switch"), Some("switch"));
-        assert_eq!(confirm_gated_git_subcommand("git switch main"), Some("switch"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git switch main"),
+            Some("switch")
+        );
         assert_eq!(
             confirm_gated_git_subcommand("git switch -c feature/x"),
             Some("switch")
@@ -778,7 +851,10 @@ mod tests {
             confirm_gated_git_subcommand("git switch --detach"),
             Some("switch")
         );
-        assert_eq!(confirm_gated_git_subcommand("git switch -f main"), Some("switch"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git switch -f main"),
+            Some("switch")
+        );
         assert_eq!(
             confirm_gated_git_subcommand("git -C /repo switch main"),
             Some("switch")
@@ -799,8 +875,14 @@ mod tests {
             confirm_gated_git_subcommand("git -C /repo add . && git -C /repo switch main"),
             Some("switch")
         );
-        assert_eq!(confirm_gated_git_subcommand("env git switch main"), Some("switch"));
-        assert_eq!(confirm_gated_git_subcommand("nohup git switch main"), Some("switch"));
+        assert_eq!(
+            confirm_gated_git_subcommand("env git switch main"),
+            Some("switch")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("nohup git switch main"),
+            Some("switch")
+        );
         assert_eq!(
             confirm_gated_git_subcommand("command git switch main"),
             Some("switch")
@@ -986,6 +1068,130 @@ mod tests {
     }
 
     #[test]
+    fn execute_command_materializes_substitution_with_force_overwrite_redirection() {
+        let source = temporary_file_path("force_overwrite_source");
+        let destination = temporary_file_path("force_overwrite_destination");
+        let contents = "redirected file data";
+        fs::write(&source, contents).expect("write test source");
+
+        for backtick in [false, true] {
+            let word = if backtick {
+                format!("\"`cat {}`\"", source.display())
+            } else {
+                format!("\"$(cat {})\"", source.display())
+            };
+            for target in ["/dev/null".to_string(), destination.display().to_string()] {
+                fs::write(&destination, "stale output").expect("write existing destination");
+                let command = format!("printf '%s' {word} >|{target}");
+                let materialized = materialize_safe_shell_substitutions(&command, None);
+                let result = execute_command(&json!({
+                    "command": command,
+                    "pty": false,
+                    "timeout": 5,
+                }));
+                let output = fs::read_to_string(&destination).expect("read destination");
+
+                assert_eq!(
+                    materialized.unwrap(),
+                    format!("printf '%s' '{contents}' >|{target}"),
+                );
+                assert_eq!(
+                    result.unwrap(),
+                    "(command succeeded with exit code 0 and produced no output)",
+                );
+                assert_eq!(
+                    output,
+                    if target == "/dev/null" {
+                        "stale output"
+                    } else {
+                        contents
+                    },
+                );
+                assert_eq!(fs::read_to_string(&source).unwrap(), contents);
+            }
+        }
+
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_file(&destination);
+    }
+
+    #[test]
+    fn execute_command_rejects_chained_substitution_before_short_circuited_side_effects() {
+        for (prefix, substitution) in [
+            ("false &&", "dollar"),
+            ("true ||", "dollar"),
+            ("false &&", "backtick"),
+        ] {
+            let probe = temporary_file_path("chained_substitution_probe");
+            let word = if substitution == "backtick" {
+                format!("\"`touch {}`\"", probe.display())
+            } else {
+                format!("\"$(touch {})\"", probe.display())
+            };
+            let result = execute_command(&json!({
+                "command": format!("{prefix} echo {word}"),
+                "pty": false,
+                "timeout": 5,
+            }));
+            let created = probe.exists();
+            let _ = fs::remove_file(&probe);
+
+            assert!(!created, "short-circuited substitution created {probe:?}");
+            let err = result.unwrap_err();
+            assert!(err.contains("chained command"), "err: {err}");
+        }
+    }
+
+    #[test]
+    fn execute_command_rejects_chained_substitution_before_dependent_file_read() {
+        for connector in ["&&", "||", ";", "|", "&"] {
+            let path = temporary_file_path("chained_substitution_source");
+            fs::write(&path, "stale").expect("write test source");
+            let result = execute_command(&json!({
+                "command": format!(
+                    r#"echo fresh > {} {connector} cat "$(cat {})""#,
+                    path.display(), path.display(),
+                ),
+                "pty": false,
+                "timeout": 5,
+            }));
+            let contents = fs::read_to_string(&path).unwrap();
+            let _ = fs::remove_file(&path);
+
+            assert_eq!(contents, "stale", "blocked chain wrote its first segment");
+            let err = result.unwrap_err();
+            assert!(err.contains("chained command"), "err: {err}");
+        }
+
+        // A nonexistent source must be rejected as unsupported control flow,
+        // without attempting the later read before the first segment writes it.
+        let path = temporary_file_path("chained_substitution_new_source");
+        let result = execute_command(&json!({
+            "command": format!(
+                r#"echo fresh > {} && echo "$(cat {})""#,
+                path.display(), path.display(),
+            ),
+            "pty": false,
+            "timeout": 5,
+        }));
+        let created = path.exists();
+        let _ = fs::remove_file(&path);
+        assert!(!created, "blocked chain created its source");
+        let err = result.unwrap_err();
+        assert!(err.contains("chained command"), "err: {err}");
+    }
+
+    #[test]
+    fn execute_command_keeps_non_chained_substitution_control_characters() {
+        let result = execute_command(&json!({
+            "command": r#"printf '%s%s' "$(printf alpha; printf beta)" ';|&'"#,
+            "pty": false,
+            "timeout": 5,
+        }));
+        assert_eq!(result.unwrap(), "alphabeta;|&");
+    }
+
+    #[test]
     fn file_read_substitution_content_still_passes_command_audit() {
         let path = temporary_file_path("unsafe_file_read_substitution");
         fs::write(&path, "rm").expect("write test file");
@@ -1137,7 +1343,8 @@ mod tests {
             json!({"command": "printf ok", "pty": false, "write_stdin": "x\n"}),
             json!({"command": "printf ok", "pty": false, "close_session": true}),
         ] {
-            let err = execute_command(&args).expect_err("session control belongs to command_session");
+            let err =
+                execute_command(&args).expect_err("session control belongs to command_session");
             assert!(err.contains("command_session"), "err: {err}");
         }
     }

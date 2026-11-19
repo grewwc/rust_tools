@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::error::Error;
 use std::fs;
-use std::io::Write;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration as StdDuration, UNIX_EPOCH};
 
@@ -75,6 +75,7 @@ pub(super) enum ToolRoute {
 struct PreparedToolCall {
     route: ToolRoute,
     args: Value,
+    cache_file_fingerprints: Vec<CachedFileFingerprint>,
 }
 
 pub(super) struct ExecuteToolCallsResult {
@@ -150,6 +151,10 @@ struct CachedFileFingerprint {
     path: String,
     size: u64,
     modified_ms: Option<u64>,
+    #[serde(default)]
+    content_sha256: Option<String>,
+    #[serde(default)]
+    validated_bytes: u64,
 }
 
 const TOOL_CACHE_RECENT_LIMIT: usize = 400;
@@ -213,7 +218,11 @@ fn prepare_tool_call(
     }
     let route = route_tool_call(mcp_client, &tool_call.function.name);
     validate_tool_call_args(mcp_client, tool_call, &route, &args)?;
-    Ok(PreparedToolCall { route, args })
+    Ok(PreparedToolCall {
+        route,
+        args,
+        cache_file_fingerprints: Vec::new(),
+    })
 }
 
 /// Cache of compiled JSON Schema validators for builtin tools, keyed by tool
@@ -860,7 +869,13 @@ fn finalize_execution_result(
     let run_result = match result {
         Ok(tool_result) => {
             if executed && !cached {
-                store_tool_cache_result(session_id, tool_call, &prepared.args, &tool_result);
+                store_tool_cache_result(
+                    session_id,
+                    tool_call,
+                    &prepared.args,
+                    &tool_result,
+                    &prepared.cache_file_fingerprints,
+                );
             }
             RunOneResult {
                 tool_result,
@@ -1112,7 +1127,7 @@ fn run_one_inner(
     if let Some(observer) = observer.as_deref_mut() {
         observer.on_tool_dispatched(tool_call);
     }
-    let prepared = match prepare_tool_call(mcp_client, tool_call, allowed_tool_names) {
+    let mut prepared = match prepare_tool_call(mcp_client, tool_call, allowed_tool_names) {
         Ok(prepared) => prepared,
         Err(tool_result) => {
             return (
@@ -1153,7 +1168,14 @@ fn run_one_inner(
         return (prepared.route, result);
     }
 
-    if let Some(tool_result) = load_cached_tool_result(session_id, tool_call, &prepared.args) {
+    prepared.cache_file_fingerprints =
+        collect_tool_cache_file_fingerprints(&tool_call.function.name, &prepared.args);
+    if let Some(tool_result) = load_cached_tool_result_with_fingerprints(
+        session_id,
+        tool_call,
+        &prepared.args,
+        &prepared.cache_file_fingerprints,
+    ) {
         return (
             prepared.route,
             RunOneResult {
@@ -1581,12 +1603,23 @@ fn notify_tool_finished(
     }
 }
 
+#[cfg(test)]
 fn load_cached_tool_result(
     session_id: &str,
     tool_call: &ToolCall,
     args: &Value,
 ) -> Option<ToolResult> {
-    if !should_store_or_load_tool_cache(&tool_call.function.name, args) {
+    let current = collect_tool_cache_file_fingerprints(&tool_call.function.name, args);
+    load_cached_tool_result_with_fingerprints(session_id, tool_call, args, &current)
+}
+
+fn load_cached_tool_result_with_fingerprints(
+    session_id: &str,
+    tool_call: &ToolCall,
+    args: &Value,
+    current: &[CachedFileFingerprint],
+) -> Option<ToolResult> {
+    if current.is_empty() {
         return None;
     }
     let source = format!("session:{session_id}");
@@ -1619,7 +1652,7 @@ fn load_cached_tool_result(
         if payload.tool_name != tool_call.function.name || payload.args != *args {
             continue;
         }
-        if !tool_cache_validation_matches(&payload) {
+        if payload.file_fingerprints != current {
             continue;
         }
         return Some(ToolResult {
@@ -1644,18 +1677,25 @@ fn store_tool_cache_result(
     tool_call: &ToolCall,
     args: &Value,
     tool_result: &ToolResult,
+    expected_fingerprints: &[CachedFileFingerprint],
 ) {
-    if !should_store_or_load_tool_cache(&tool_call.function.name, args) {
+    if expected_fingerprints.is_empty() {
         return;
     }
     if tool_result.content.trim().is_empty() || tool_result.content.starts_with("Error:") {
+        return;
+    }
+    // Bind the returned snapshot to both sides of execution. If a writer changed the source
+    // after dispatch, a post-read digest alone could certify an older rendered result as current.
+    let current = collect_tool_cache_file_fingerprints(&tool_call.function.name, args);
+    if current != expected_fingerprints {
         return;
     }
     let payload = ToolCachePayload {
         tool_name: tool_call.function.name.clone(),
         args: args.clone(),
         result: tool_result.content.clone(),
-        file_fingerprints: collect_tool_cache_file_fingerprints(&tool_call.function.name, args),
+        file_fingerprints: current,
     };
     let Ok(note) = serde_json::to_string(&payload) else {
         return;
@@ -1727,11 +1767,11 @@ fn should_store_or_load_tool_cache(tool_name: &str, args: &Value) -> bool {
     if !is_cacheable_tool_name(tool_name) {
         return false;
     }
-    // 目前只有 read_file 缓存具备可校验的环境指纹。搜索/目录/MCP 读取类工具虽然是
-    // 只读，但其结果会随外部状态变化；没有对应 fingerprint 时不落盘/不命中缓存，
-    // 避免把陈旧检索结果直接回放给模型。
-    tool_name == TOOL_CACHE_READ_FILE_TOOL
-        && !collect_tool_cache_file_fingerprints(tool_name, args).is_empty()
+    // Only read_file has verifiable source content. Search, directory, and MCP results
+    // depend on external state and cannot be replayed without their own validation contract.
+    tool_cache_file_path(tool_name, args)
+        .and_then(|path| fs::metadata(path).ok())
+        .is_some_and(|metadata| metadata.is_file())
 }
 
 fn build_tool_cache_key(name: &str, args: &Value) -> String {
@@ -1745,15 +1785,26 @@ fn build_tool_cache_key(name: &str, args: &Value) -> String {
     s
 }
 
+#[cfg(test)]
 fn tool_cache_validation_matches(payload: &ToolCachePayload) -> bool {
     let current = collect_tool_cache_file_fingerprints(&payload.tool_name, &payload.args);
-    current == payload.file_fingerprints
+    !current.is_empty() && current == payload.file_fingerprints
 }
 
 fn collect_tool_cache_file_fingerprints(
     tool_name: &str,
     args: &Value,
 ) -> Vec<CachedFileFingerprint> {
+    if !should_store_or_load_tool_cache(tool_name, args) {
+        return Vec::new();
+    }
+    tool_cache_file_path(tool_name, args)
+        .and_then(|path| cached_file_fingerprint_for_path(&path, args))
+        .into_iter()
+        .collect()
+}
+
+fn tool_cache_file_path(tool_name: &str, args: &Value) -> Option<PathBuf> {
     let path = match tool_name {
         TOOL_CACHE_READ_FILE_TOOL => args
             .get("file_path")
@@ -1761,12 +1812,15 @@ fn collect_tool_cache_file_fingerprints(
             .and_then(Value::as_str),
         _ => None,
     };
-    path.and_then(cached_file_fingerprint_for_path)
-        .into_iter()
-        .collect()
+    let store = builtin_tools::storage::file_store::FileStore::new(PathBuf::from(path?));
+    store.validate_read_access().ok()?;
+    Some(store.path().to_path_buf())
 }
 
-fn cached_file_fingerprint_for_path(path: &str) -> Option<CachedFileFingerprint> {
+fn cached_file_fingerprint_for_path(path: &Path, args: &Value) -> Option<CachedFileFingerprint> {
+    use builtin_tools::service::file::{FULL_READ_MAX_BYTES, WINDOW_READ_CHUNK_BYTES};
+    use sha2::{Digest, Sha256};
+
     let meta = fs::metadata(path).ok()?;
     if !meta.is_file() {
         return None;
@@ -1776,10 +1830,61 @@ fn cached_file_fingerprint_for_path(path: &str) -> Option<CachedFileFingerprint>
         .ok()
         .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64);
+
+    // Small reads render exact totals, so their entire source influences the result. Large
+    // reads only depend on the prefix through the requested window plus a continuation probe.
+    // Hash those bytes with the reader's shared bounds to retain stable large-file cache reuse
+    // without allocating the whole source or scanning an unrelated multi-GB tail.
+    let mut remaining_lines = (meta.len() > FULL_READ_MAX_BYTES).then(|| {
+        let offset = args["offset"].as_u64().unwrap_or(1) as usize;
+        let limit = args["limit"].as_u64().unwrap_or(200) as usize;
+        offset.saturating_sub(1).saturating_add(limit)
+    });
+    let mut file = fs::File::open(path).ok()?;
+    let mut buffer = vec![0; WINDOW_READ_CHUNK_BYTES];
+    let mut digest = Sha256::new();
+    let mut validated_bytes = 0u64;
+    let mut probe = false;
+    loop {
+        // Fill the chunk even when read returns short: service ranges use byte boundaries,
+        // and validating less than its last chunk could miss bytes that affect UTF-8 decoding.
+        let mut filled = 0;
+        while filled < buffer.len() {
+            let read = file.read(&mut buffer[filled..]).ok()?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        if filled == 0 {
+            break;
+        }
+        let bytes = &buffer[..filled];
+        digest.update(bytes);
+        validated_bytes += filled as u64;
+        if probe {
+            break;
+        }
+        if let Some(lines) = remaining_lines.as_mut() {
+            *lines = lines.saturating_sub(bytes.iter().filter(|&&byte| byte == b'\n').count());
+            probe = *lines == 0;
+        }
+    }
+    let current_meta = fs::metadata(path).ok()?;
+    if current_meta.len() != meta.len() || current_meta.modified().ok() != meta.modified().ok() {
+        return None;
+    }
+    let content_sha256 = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     Some(CachedFileFingerprint {
-        path: Path::new(path).display().to_string(),
+        path: path.display().to_string(),
         size: meta.len(),
         modified_ms,
+        content_sha256: Some(content_sha256),
+        validated_bytes,
     })
 }
 

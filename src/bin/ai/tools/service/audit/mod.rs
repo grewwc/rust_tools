@@ -251,8 +251,16 @@ mod tests {
     }
 
     #[test]
-    fn injection_blocks_backtick_command_substitution() {
-        assert!(validate_no_injection_surface("echo `whoami`").is_err());
+    fn injection_validates_backtick_command_substitution() {
+        // Backticks follow the same trust model as `$(...)`: the inner command
+        // is recursively validated, so safe inners pass and unsafe inners are
+        // blocked.
+        assert!(validate_no_injection_surface("echo `whoami`").is_ok());
+        assert!(validate_no_injection_surface("echo \"`whoami`\"").is_ok());
+        let err = validate_no_injection_surface("echo `rm -rf /`").unwrap_err();
+        assert!(err.contains("backtick"), "got: {err}");
+        let err = validate_no_injection_surface("echo `seq 1 40").unwrap_err();
+        assert!(err.contains("backtick"), "got: {err}");
     }
 
     #[test]
@@ -393,9 +401,48 @@ mod tests {
         assert!(err.contains("command substitution"), "got: {err}");
         let err = validate("env $(echo rm) -rf /").unwrap_err();
         assert!(err.contains("command substitution"), "got: {err}");
-        // Backticks remain banned.
+        // Bare backticks reach the shell raw and stay blocked at audit level
+        // (production materializes safe whole-word forms before this audit).
         let err = validate("echo `whoami`").unwrap_err();
         assert!(err.contains("backtick"), "got: {err}");
+    }
+
+    #[test]
+    fn materialization_accepts_bare_chain_and_backtick_forms() {
+        // Bare whole-word `$(...)` in an argument position materializes
+        // (split-insert) when the inner command is harmless.
+        let subs = safe_shell_substitutions("echo $(date) && echo ok");
+        assert_eq!(subs.len(), 1);
+        assert!(subs[0].bare);
+        assert!(matches!(
+            subs[0].kind,
+            SafeShellSubstitutionKind::Command { ref inner } if inner == "date"
+        ));
+        // Chains with pipes materialize too; the materialized command is
+        // re-audited before execution.
+        let subs = safe_shell_substitutions(r#"git log "$(git rev-parse HEAD)" | head"#);
+        assert_eq!(subs.len(), 1);
+        assert!(!subs[0].bare);
+        // Backticks: bare and quoted whole-word forms.
+        let subs = safe_shell_substitutions("echo `date`");
+        assert_eq!(subs.len(), 1);
+        assert!(subs[0].bare);
+        let subs = safe_shell_substitutions("echo \"`date`\"");
+        assert_eq!(subs.len(), 1);
+        assert!(!subs[0].bare);
+        // Unsafe inner backticks fail closed.
+        assert!(safe_shell_substitutions("echo `rm -rf /`").is_empty());
+    }
+
+    #[test]
+    fn materialization_still_rejects_escape_positions() {
+        // Partial-word fusions, assignments, for-in lists, and compound
+        // keywords stay on the raw fail-closed path.
+        assert!(safe_shell_substitutions("echo \"user=$(whoami)\"").is_empty());
+        assert!(safe_shell_substitutions("cmd=$(printf rm)").is_empty());
+        assert!(safe_shell_substitutions("for i in $(seq 1 40); do echo $i; done").is_empty());
+        assert!(safe_shell_substitutions("while \"$(printf true)\"; do echo x; done").is_empty());
+        assert!(safe_shell_substitutions("echo $(echo r)m -rf /").is_empty());
     }
 
     #[test]
@@ -486,10 +533,17 @@ mod tests {
             safe_shell_substitutions(r#"echo "$(cat /tmp/a)" "$(cat /tmp/b)""#).len(),
             2
         );
-        // Outer pipes/connectors -> the whole command is not recognized as a safe
-        // substitution
-        assert!(safe_shell_substitutions(r#"echo "$(cat /tmp/dsl.json)" | jq ."#).is_empty());
-        assert!(safe_shell_substitutions(r#"echo "$(cat /tmp/dsl.json)" && id"#).is_empty());
+        // Control operators are now accepted as separators: whole-word
+        // substitutions in chains still materialize (the materialized command
+        // is re-audited before execution).
+        assert_eq!(
+            safe_shell_substitutions(r#"echo "$(cat /tmp/dsl.json)" | jq ."#).len(),
+            1
+        );
+        assert_eq!(
+            safe_shell_substitutions(r#"echo "$(cat /tmp/dsl.json)" && id"#).len(),
+            1
+        );
         // Complete-word or embedded `$()` are only allowed end-to-end for
         // pure-data programs (`echo`): the inner command is validated (`cat`
         // of a literal absolute path) and the program name is unaffected.

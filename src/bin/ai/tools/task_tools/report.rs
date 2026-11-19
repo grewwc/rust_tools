@@ -72,6 +72,9 @@ pub(crate) struct TaskReportTask {
     /// None means no delivered result; Some preserves the exact delivered bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) output: Option<String>,
+    /// Optional worker claims; lenient decoding cannot invalidate the terminal result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verification: Option<TaskVerificationMetadata>,
     /// Only bounded display previews set this; canonical/ledger output remains complete.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) output_truncated: bool,
@@ -231,6 +234,7 @@ impl TaskReportTask {
             active: false,
             error: result.error.clone(),
             output: Some(result.output.clone()),
+            verification: result.verification.clone(),
             progress_text: result.progress.clone(),
             ..Self::from_entry(task_id, entry, result.status.clone(), false)
         }
@@ -544,6 +548,9 @@ mod tests {
             model: "Model with spaces".into(),
             status: "completed".into(),
             output: Some(output.into()),
+            verification: Some(TaskVerificationMetadata::from_value(
+                super::super::verification::fix_verification_fixture(),
+            )),
             ..TaskReportTask::default()
         });
         let message = crate::ai::history::Message {

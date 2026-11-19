@@ -42,7 +42,6 @@ function harness(confirm, { realCadence = false, legacyActivity = false } = {}) 
     confirmBusy: false,
     confirmPollSeq: 0,
     confirmPollTimer: null,
-    confirmPollTick: 0,
     runEpoch: 0,
     turnRunning: false,
     turnRunningAt: 0,
@@ -322,15 +321,18 @@ test("unknown activity and session or server changes clear the visible remote ow
   }
 });
 
-for (const activityPolling of [false, true]) test("an 8s-delayed initial confirm cannot create a notice under the real idle cadence (activity polling=" + activityPolling + ")", async () => {
+for (const activityPolling of [false, true]) test("an 8s-delayed initial confirm cannot override newer two-second idle samples (activity polling=" + activityPolling + ")", async () => {
   const slow = deferred();
-  const h = harness(() => slow.promise, { realCadence: true, legacyActivity: true }), c = h.context;
+  let reads = 0;
+  const h = harness(() => ++reads === 1 ? slow.promise : response(remoteSample(null)),
+    { realCadence: true, legacyActivity: true }), c = h.context;
   const startedAt = c.Date.now();
   const revision = c.snapshotSessionActivityRevisions().get("s1");
   const pending = c.pollConfirm();
   if (activityPolling) c.wireSessionActivityPoll();
   await h.advanceCadence(8000);
-  assert.deepEqual(h.calls.confirm, [startedAt], "idle ticks at 2/4/6/8s issue no newer confirm request");
+  const earlyRequests = [startedAt, ...[2000, 4000, 6000, 8000].map((ms) => startedAt + ms)];
+  assert.deepEqual(h.calls.confirm, earlyRequests, "idle ticks sample every two seconds");
   assert.equal(h.notices().length, 0);
   if (activityPolling) assert.notEqual(c.snapshotSessionActivityRevisions().get("s1"), revision,
     "expiry must invalidate the old request even when a legacy sample was already unknown");
@@ -340,7 +342,7 @@ for (const activityPolling of [false, true]) test("an 8s-delayed initial confirm
   assert.equal(c.remoteTurnPid, "");
   h.setConfirm(remoteSample("96706"));
   await h.advanceCadence(2000);
-  assert.deepEqual(h.calls.confirm, [startedAt, startedAt + 10000]);
+  assert.deepEqual(h.calls.confirm, [...earlyRequests, startedAt + 10000]);
   assert.equal(h.notices().length, 1);
   assert.equal(h.notices()[0].textContent, "正在另一个进程中运行（pid 96706）；本轮结束后结果会自动出现在这里。");
   c.stopConfirmPoll();

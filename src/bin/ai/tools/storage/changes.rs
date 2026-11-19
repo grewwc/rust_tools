@@ -173,7 +173,7 @@ pub(crate) fn collect_current_changes(include_git: bool) -> ChangeInventory {
     }
     if !inventory.files.is_empty() {
         inventory.coverage_gaps.push(
-            "Request/task ownership is unknown for every path: mutation records identify session tool operations but carry no request/task owner, and Git changes may include concurrent work. Keep these paths in scope until ownership is resolved.".to_string(),
+            "Request/task ownership is unknown for every path: mutation identities supply optional tool/turn/task provenance but do not prove request ownership, and Git changes may include concurrent work. Keep these paths in scope until ownership is resolved.".to_string(),
         );
     }
     inventory
@@ -374,14 +374,16 @@ fn parse_inventory_mutations(content: &str, errors: &mut Vec<String>) -> Vec<Mut
     content
         .lines()
         .enumerate()
-        .filter_map(|(index, line)| match serde_json::from_str(line) {
-            Ok(entry) => Some(entry),
-            Err(error) => {
-                errors.push(format!(
-                    "Session mutation log record {} could not be collected: {error}",
-                    index + 1
-                ));
-                None
+        .filter_map(|(index, line)| {
+            match crate::ai::tools::storage::mutation_log::parse_mutation(line) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    errors.push(format!(
+                        "Session mutation log record {} could not be collected: {error}",
+                        index + 1
+                    ));
+                    None
+                }
             }
         })
         .collect()
@@ -1205,6 +1207,28 @@ fn sanitize_filename(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn mutation_observation_inventory_ignores_check_records_without_collection_errors() {
+        let content = concat!(
+            "{\"record_type\":\"check_observation\",\"command\":\"cargo check\",\"path\":\"/fake/check.rs\",\"seq\":99,\"op\":\"write\",\"ts\":\"t\",\"before\":null,\"after\":\"not a file\"}\n",
+            "{\"seq\":1,\"ts\":\"t\",\"path\":\"/project/a.rs\",\"op\":\"write\",\"before\":null,\"after\":\"a\",\"diff\":\"+ a\"}\n"
+        );
+        let root =
+            std::env::temp_dir().join(format!("inventory-observation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("mutation_log.jsonl");
+        std::fs::write(&path, content).unwrap();
+        let mut inventory = empty_inventory();
+        inventory.log_path = Some(path);
+        let entries = inventory.read_mutations();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "/project/a.rs");
+        assert!(inventory.collection_errors.is_empty());
+        assert_eq!(grouped_changes(&entries).len(), 1);
+        assert!(!mutation_patch(&entries).unwrap().contains("/fake/check.rs"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn empty_inventory() -> ChangeInventory {
         ChangeInventory {
             files: Vec::new(),
@@ -1251,6 +1275,10 @@ mod tests {
         std::fs::remove_file(root.join("deleted.rs")).unwrap();
         std::fs::write(root.join("untracked\t\nfile.txt"), "new\n").unwrap();
         let entries = [MutationEntry {
+            entry_id: None,
+            turn_id: None,
+            task_id: None,
+            tool_call_id: None,
             seq: 1,
             ts: "t".into(),
             path: root.join("mutation-only.rs").display().to_string(),
@@ -1348,6 +1376,10 @@ mod tests {
         assert!(inventory.collection_complete());
         let entries = [
             MutationEntry {
+                entry_id: None,
+                turn_id: None,
+                task_id: None,
+                tool_call_id: None,
                 seq: 1,
                 ts: "t".into(),
                 path: "/proj/first.rs".into(),
@@ -1358,6 +1390,10 @@ mod tests {
                 diff: None,
             },
             MutationEntry {
+                entry_id: None,
+                turn_id: None,
+                task_id: None,
+                tool_call_id: None,
                 seq: 2,
                 ts: "t".into(),
                 path: "/proj/later.rs".into(),
@@ -1427,6 +1463,10 @@ mod tests {
     fn unavailable_initial_snapshot_survives_later_mutations_and_renderers() {
         for state in [BeforeState::Present, BeforeState::Unknown] {
             let mut entries = vec![MutationEntry {
+                entry_id: None,
+                turn_id: None,
+                task_id: None,
+                tool_call_id: None,
                 seq: 0,
                 ts: "t".into(),
                 path: "/proj/existing.rs".into(),
@@ -1450,6 +1490,10 @@ mod tests {
                 if index > 0 {
                     let (op, before, after, before_state) = later[index - 1];
                     entries.push(MutationEntry {
+                        entry_id: None,
+                        turn_id: None,
+                        task_id: None,
+                        tool_call_id: None,
                         seq: index as u64,
                         ts: "t".into(),
                         path: entries[0].path.clone(),
@@ -1501,6 +1545,10 @@ mod tests {
             (BeforeState::Present, Some(""), "modified"),
         ] {
             let entry = MutationEntry {
+                entry_id: None,
+                turn_id: None,
+                task_id: None,
+                tool_call_id: None,
                 seq: 0,
                 ts: "t".into(),
                 path: "/proj/file.rs".into(),
@@ -1523,6 +1571,10 @@ mod tests {
         let content = "same line\n".repeat(200_000);
         for diff in [None, entry_diff(Some(&content), Some(&content))] {
             let entry = MutationEntry {
+                entry_id: None,
+                turn_id: None,
+                task_id: None,
+                tool_call_id: None,
                 seq: 0,
                 ts: "t".into(),
                 path: "/proj/large.rs".into(),
@@ -1547,6 +1599,10 @@ mod tests {
     fn grouped_changes_computes_net_correctly() {
         let entries = vec![
             MutationEntry {
+                entry_id: None,
+                turn_id: None,
+                task_id: None,
+                tool_call_id: None,
                 seq: 0,
                 ts: "t".into(),
                 path: "/tmp/proj/a.rs".into(),
@@ -1557,6 +1613,10 @@ mod tests {
                 diff: Some("+ hello\n".into()),
             },
             MutationEntry {
+                entry_id: None,
+                turn_id: None,
+                task_id: None,
+                tool_call_id: None,
                 seq: 1,
                 ts: "t".into(),
                 path: "/tmp/proj/b.rs".into(),
@@ -1567,6 +1627,10 @@ mod tests {
                 diff: Some("- old\n+ new\n".into()),
             },
             MutationEntry {
+                entry_id: None,
+                turn_id: None,
+                task_id: None,
+                tool_call_id: None,
                 seq: 2,
                 ts: "t".into(),
                 path: "/tmp/proj/b.rs".into(),
@@ -1593,6 +1657,10 @@ mod tests {
     #[test]
     fn mutation_patch_contains_expected_headers() {
         let entries = vec![MutationEntry {
+            entry_id: None,
+            turn_id: None,
+            task_id: None,
+            tool_call_id: None,
             seq: 0,
             ts: "t".into(),
             path: "/tmp/proj/new.rs".into(),
@@ -1667,6 +1735,10 @@ mod tests {
         );
         let entries = vec![
             MutationEntry {
+                entry_id: None,
+                turn_id: None,
+                task_id: None,
+                tool_call_id: None,
                 seq: 0,
                 ts: "t".into(),
                 path: "/proj/big.rs".into(),
@@ -1677,6 +1749,10 @@ mod tests {
                 diff: entry_diff(Some(&before), Some(&after)),
             },
             MutationEntry {
+                entry_id: None,
+                turn_id: None,
+                task_id: None,
+                tool_call_id: None,
                 seq: 1,
                 ts: "t".into(),
                 path: "/proj/big.rs".into(),
@@ -1730,6 +1806,10 @@ mod tests {
         );
         let entries = vec![
             MutationEntry {
+                entry_id: None,
+                turn_id: None,
+                task_id: None,
+                tool_call_id: None,
                 seq: 0,
                 ts: "t".into(),
                 path: "/proj/created.rs".into(),
@@ -1740,6 +1820,10 @@ mod tests {
                 diff: entry_diff(None, Some(&v1)),
             },
             MutationEntry {
+                entry_id: None,
+                turn_id: None,
+                task_id: None,
+                tool_call_id: None,
                 seq: 1,
                 ts: "t".into(),
                 path: "/proj/created.rs".into(),
@@ -1800,6 +1884,10 @@ mod tests {
             "test fixture must exceed the snapshot cap"
         );
         let entries = vec![MutationEntry {
+            entry_id: None,
+            turn_id: None,
+            task_id: None,
+            tool_call_id: None,
             seq: 0,
             ts: "t".into(),
             path: "/proj/deleted.rs".into(),

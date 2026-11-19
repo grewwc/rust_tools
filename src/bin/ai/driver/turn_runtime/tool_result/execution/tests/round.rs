@@ -120,6 +120,585 @@ fn reused_tool_call_id_is_rewritten_for_the_whole_occurrence() {
 }
 
 #[test]
+#[cfg(unix)]
+fn reused_tool_call_id_real_dispatch_matches_mutation_and_check_locators() {
+    use crate::ai::driver::runtime_ctx;
+    use crate::ai::tools::storage::{command_session, mutation_log};
+    use std::os::unix::fs::PermissionsExt;
+
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let _session_guard = command_session::tests::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    struct SessionCleanup(Vec<String>);
+    impl Drop for SessionCleanup {
+        fn drop(&mut self) {
+            for id in &self.0 {
+                let _ = command_session::close(id);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct CaptureIds(Arc<std::sync::Mutex<Vec<String>>>);
+    impl crate::ai::middleware::ToolMiddleware for CaptureIds {
+        fn name(&self) -> &'static str {
+            "capture-occurrence-ids"
+        }
+
+        fn wrap(&self, inner: Box<dyn ToolExecutor>) -> Box<dyn ToolExecutor> {
+            struct CaptureExecutor {
+                inner: Box<dyn ToolExecutor>,
+                ids: Arc<std::sync::Mutex<Vec<String>>>,
+            }
+            impl ToolExecutor for CaptureExecutor {
+                fn execute<'a>(
+                    &'a self,
+                    app: &'a mut App,
+                    calls: Vec<ToolCall>,
+                ) -> Pin<
+                    Box<
+                        dyn Future<
+                                Output = Result<
+                                    ToolExecOutput,
+                                    Box<dyn std::error::Error + Send + Sync>,
+                                >,
+                            > + Send
+                            + 'a,
+                    >,
+                > {
+                    self.ids
+                        .lock()
+                        .unwrap()
+                        .extend(calls.iter().map(|call| call.id.clone()));
+                    self.inner.execute(app, calls)
+                }
+            }
+            Box::new(CaptureExecutor {
+                inner,
+                ids: self.0.clone(),
+            })
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("a-round-id-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let _cleanup = Cleanup(root.clone());
+    // A local check fixture runs through the real command service. Release files
+    // control completion order without depending on compiler timing or network.
+    let script = root.join("pytest");
+    fs::write(
+        &script,
+        "#!/bin/sh\nstate=$(cat a.rs)\n: > \"started-$state\"\nwhile [ ! -f \"release-$state\" ]; do sleep 0.01; done\nif [ \"$state\" = first ]; then printf '1 failed in 0.01s\\n'; exit 1; fi\nprintf '1 passed in 0.01s\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let names = [
+        "write_file",
+        "execute_command",
+        "command_session",
+        "read_file",
+    ];
+    let mut app = test_app_with_tools(&names);
+    app.session_id = "reused-call-round".into();
+    app.config.history_file = root.join(".git/runtime/history.sqlite");
+    app.config.base_history_file = app.config.history_file.clone();
+    app.session_history_file = crate::ai::history::SessionStore::new(&app.config.history_file)
+        .session_history_file(&app.session_id);
+    let seen_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.tool_middlewares
+        .push(Arc::new(CaptureIds(seen_ids.clone())));
+    let shared_mcp = Arc::new(std::sync::Mutex::new(McpClient::new()));
+    let mcp = mcp_snapshot(&shared_mcp);
+    let context = runtime_ctx::DriverContext::from_app_snapshot(
+        &app,
+        shared_mcp.clone(),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+    );
+    runtime_ctx::DRIVER_CTX.sync_scope(context, || {
+        runtime_ctx::SUBAGENT_CWD.sync_scope(root.clone(), || {
+            runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.sync_scope(true, || {
+                let mut sessions = SessionCleanup(Vec::new());
+                let mut messages = Vec::new();
+                let mut turn_messages = Vec::new();
+                let mut persisted = 0;
+                let mut had_error = false;
+                let mut gate = FinalGateState::default();
+                let mut iteration = 0;
+                let mut run = |name: &str, args: Value, suppressed: &HashMap<String, String>| {
+                    iteration += 1;
+                    handle_tool_call_round_with_gate(
+                        &mut app,
+                        "",
+                        &mcp,
+                        &shared_mcp,
+                        &ToolCallExecution {
+                            stream_result: crate::ai::types::StreamResult {
+                                outcome: crate::ai::types::StreamOutcome::ToolCall,
+                                tool_calls: vec![test_tool_call("reused", name, args)],
+                                assistant_text: String::new(),
+                                hidden_meta: String::new(),
+                                reasoning_text: String::new(),
+                                reasoning_items: Vec::new(),
+                                skip_response_drain: true,
+                                truncated_by_length: false,
+                                stream_error: false,
+                                response_reconciled: false,
+                                response_server_mismatch: false,
+                                finish_reason_value: None,
+                                usage_prompt_tokens: 0,
+                                usage_cached_prompt_tokens: 0,
+                                usage_completion_tokens: 0,
+                                usage_reasoning_tokens: 0,
+                            },
+                            allowed_tool_names: names.iter().map(|name| name.to_string()).collect(),
+                        },
+                        &mut messages,
+                        &mut turn_messages,
+                        false,
+                        &mut persisted,
+                        iteration,
+                        None,
+                        suppressed,
+                        &mut had_error,
+                        &mut gate,
+                    )
+                    .unwrap();
+                    let result = turn_messages
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == "tool")
+                        .unwrap();
+                    (
+                        result.tool_call_id.clone().unwrap(),
+                        result.content.as_str().unwrap().to_string(),
+                    )
+                };
+                let empty = HashMap::new();
+                let (write_old, old_write) = run(
+                    "write_file",
+                    serde_json::json!({"file_path": "a.rs", "content": "first"}),
+                    &empty,
+                );
+                assert!(old_write.contains("Successfully wrote"), "{old_write}");
+                let check_args = serde_json::json!({
+                    "command": "./pytest -q", "pty": false, "yield_time_ms": 5000,
+                    "cwd": root.to_string_lossy(),
+                });
+                let (check_old, old_start) = run("execute_command", check_args.clone(), &empty);
+                let (old_session, old_status) =
+                    crate::ai::driver::turn_runtime::command_session_observation(&old_start).unwrap();
+                assert!(old_start.contains("[command session running]"), "{old_start}");
+                let old_session = old_session.unwrap();
+                sessions.0.push(old_session.clone());
+                assert!(fs::metadata(root.join("started-first")).is_ok());
+                let (write_new, new_write) = run(
+                    "write_file",
+                    serde_json::json!({"file_path": "a.rs", "content": "second"}),
+                    &empty,
+                );
+                assert!(new_write.contains("Successfully wrote"), "{new_write}");
+                let (check_new, new_start) = run("execute_command", check_args, &empty);
+                let (new_session, new_status) =
+                    crate::ai::driver::turn_runtime::command_session_observation(&new_start).unwrap();
+                assert!(new_start.contains("[command session running]"), "{new_start}");
+                assert_eq!(old_status, new_status);
+                let new_session = new_session.unwrap();
+                sessions.0.push(new_session.clone());
+                assert_ne!(old_session, new_session);
+                assert!(fs::metadata(root.join("started-second")).is_ok());
+                fs::write(root.join("release-second"), "").unwrap();
+                let (poll_new, new_result) = run(
+                    "command_session",
+                    serde_json::json!({"action": "poll", "session_id": new_session, "yield_time_ms": 5000}),
+                    &empty,
+                );
+                assert!(new_result.contains("exit code 0"), "{new_result}");
+                fs::write(root.join("release-first"), "").unwrap();
+                let (poll_old, old_result) = run(
+                    "command_session",
+                    serde_json::json!({"action": "poll", "session_id": old_session, "yield_time_ms": 5000}),
+                    &empty,
+                );
+                assert!(old_result.contains("exit code 1"), "{old_result}");
+                let (suppressed_id, suppressed_result) = run(
+                    "read_file",
+                    serde_json::json!({"file_path": "does-not-exist"}),
+                    &[("reused".to_string(), "Read suppressed by prior observation".to_string())]
+                        .into_iter()
+                        .collect(),
+                );
+                assert_eq!(suppressed_result, "Read suppressed by prior observation");
+                drop(run);
+
+                let expected_ids = [
+                    write_old.clone(), check_old.clone(), write_new.clone(), check_new.clone(),
+                    poll_new.clone(), poll_old.clone(), suppressed_id,
+                ];
+                assert!(expected_ids.iter().all(|id| id != "reused"));
+                assert_eq!(expected_ids.iter().collect::<FastSet<_>>().len(), expected_ids.len());
+                assert_eq!(*seen_ids.lock().unwrap(), expected_ids);
+                let entries = mutation_log::read_all();
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].tool_call_id.as_deref(), Some(write_old.as_str()));
+                assert_eq!(entries[1].tool_call_id.as_deref(), Some(write_new.as_str()));
+                let checks = mutation_log::read_checks();
+                for (origin, poll, revision, status) in [
+                    (&check_old, &poll_old, 1, mutation_log::CheckStatus::Failure),
+                    (&check_new, &poll_new, 2, mutation_log::CheckStatus::Success),
+                ] {
+                    let observations = checks.iter()
+                        .filter(|check| &check.originating_command_call_id == origin)
+                        .collect::<Vec<_>>();
+                    assert_eq!(observations.len(), 3);
+                    assert!(observations.iter().all(|check| check.covers_revision == revision));
+                    assert_eq!(&observations[0].tool_call_id, origin);
+                    assert_eq!(&observations[1].tool_call_id, origin);
+                    assert_eq!(&observations[2].tool_call_id, poll);
+                    assert_eq!(observations[2].status, status);
+                }
+                let summary = mutation_log::verification_summary(2, &checks, true);
+                assert_eq!(summary["verification"]["status"], "success");
+                assert_eq!(summary["verification_gaps"]["count"], 0);
+                assert_eq!(summary["verification"]["checks"].as_array().unwrap().len(), 1);
+                assert_eq!(
+                    summary["verification"]["checks"][0]["observation"]["originating_command_call_id"],
+                    check_new,
+                );
+                let history = crate::ai::history::read_all_messages_sqlite(&app.session_history_file).unwrap();
+                assert_eq!(history, turn_messages);
+                assert_eq!(persisted, turn_messages.len());
+                let persisted_calls = history.iter()
+                    .flat_map(|message| message.tool_calls.iter().flatten())
+                    .map(|call| call.id.clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(persisted_calls, expected_ids);
+                for check in &checks {
+                    assert_eq!(check.evidence_locator, format!("tool_call_id:{}", check.tool_call_id));
+                    assert!(persisted_calls.contains(&check.originating_command_call_id));
+                    assert!(history.iter().any(|message| {
+                        message.tool_call_id.as_deref() == Some(check.tool_call_id.as_str())
+                    }));
+                }
+                let outcomes = crate::ai::history::read_tool_execution_outcomes_sqlite(&app.session_history_file).unwrap();
+                assert!(outcomes.iter().all(|outcome| persisted_calls.contains(&outcome.tool_call_id)));
+            })
+        })
+    });
+}
+
+#[test]
+fn fresh_tool_call_ids_do_not_depend_on_saved_history() {
+    let provider_id = "call_00000000000040008000000000000000";
+    let result = || ExecuteToolCallsResult {
+        executed_tool_calls: vec![test_tool_call(
+            provider_id,
+            "execute_command",
+            serde_json::json!({"command": "true"}),
+        )],
+        tool_results: vec![ToolResult {
+            task_report: None,
+            tool_call_id: provider_id.into(),
+            content: "done".into(),
+        }],
+        cached_hits: vec![false],
+        execution_outcomes: vec![None],
+        had_error: false,
+    };
+    let mut first = result();
+    let mut recovered = result();
+    uniquify_tool_call_occurrences(&[], &[], &mut first);
+    uniquify_tool_call_occurrences(&[], &[], &mut recovered);
+    let first_id = &first.executed_tool_calls[0].id;
+    let recovered_id = &recovered.executed_tool_calls[0].id;
+    assert_ne!(first_id, provider_id);
+    assert_ne!(recovered_id, provider_id);
+    assert_ne!(first_id, recovered_id);
+    assert_eq!(&first.tool_results[0].tool_call_id, first_id);
+    assert_eq!(&recovered.tool_results[0].tool_call_id, recovered_id);
+}
+
+#[cfg(unix)]
+fn check_identity_after_uncommitted_round_recovery(same_command: bool, delayed_poll: bool) {
+    use crate::ai::driver::runtime_ctx;
+    use crate::ai::tools::storage::{command_session, mutation_log};
+    use std::os::unix::fs::PermissionsExt;
+
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let _session_guard = command_session::tests::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    struct Cleanup {
+        root: PathBuf,
+        sessions: Vec<String>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for session in &self.sessions {
+                let _ = command_session::close(session);
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[derive(Debug)]
+    struct InterruptAfterDispatch;
+    impl crate::ai::middleware::ToolMiddleware for InterruptAfterDispatch {
+        fn name(&self) -> &'static str {
+            "interrupt-before-history-commit"
+        }
+
+        fn wrap(&self, inner: Box<dyn ToolExecutor>) -> Box<dyn ToolExecutor> {
+            struct InterruptExecutor(Box<dyn ToolExecutor>);
+            impl ToolExecutor for InterruptExecutor {
+                fn execute<'a>(
+                    &'a self,
+                    app: &'a mut App,
+                    calls: Vec<ToolCall>,
+                ) -> Pin<
+                    Box<
+                        dyn Future<
+                                Output = Result<
+                                    ToolExecOutput,
+                                    Box<dyn std::error::Error + Send + Sync>,
+                                >,
+                            > + Send
+                            + 'a,
+                    >,
+                > {
+                    Box::pin(async move {
+                        self.0.execute(app, calls).await?;
+                        Err(std::io::Error::other("interrupted before history commit").into())
+                    })
+                }
+            }
+            Box::new(InterruptExecutor(inner))
+        }
+    }
+
+    #[derive(Default)]
+    struct RoundState {
+        messages: Vec<Message>,
+        turn_messages: Vec<Message>,
+        persisted: usize,
+        gate: FinalGateState,
+        had_error: bool,
+    }
+    impl RoundState {
+        fn run(
+            &mut self,
+            app: &mut App,
+            shared_mcp: &SharedMcpClient,
+            name: &str,
+            args: Value,
+        ) -> Result<(String, String), String> {
+            handle_tool_call_round_with_gate(
+                app,
+                "",
+                &mcp_snapshot(shared_mcp),
+                shared_mcp,
+                &ToolCallExecution {
+                    stream_result: crate::ai::types::StreamResult {
+                        outcome: crate::ai::types::StreamOutcome::ToolCall,
+                        tool_calls: vec![test_tool_call("reused", name, args)],
+                        skip_response_drain: true,
+                        ..Default::default()
+                    },
+                    allowed_tool_names: ["write_file", "execute_command", "command_session"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                },
+                &mut self.messages,
+                &mut self.turn_messages,
+                false,
+                &mut self.persisted,
+                1,
+                None,
+                &HashMap::new(),
+                &mut self.had_error,
+                &mut self.gate,
+            )
+            .map_err(|error| error.to_string())?;
+            let result = self
+                .turn_messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "tool")
+                .unwrap();
+            Ok((
+                result.tool_call_id.clone().unwrap(),
+                result.content.as_str().unwrap().to_string(),
+            ))
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("a-round-recovery-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let mut cleanup = Cleanup {
+        root: root.clone(),
+        sessions: Vec::new(),
+    };
+    let script = root.join("pytest");
+    fs::write(
+        &script,
+        "#!/bin/sh\nstate=$(cat a.rs)\n: > \"started-$state\"\nif [ -f delayed ] && [ \"$state\" = first ]; then while [ ! -f release-first ]; do sleep 0.01; done; fi\nif [ \"$state\" = first ]; then printf '1 failed in 0.01s\\n'; exit 1; fi\nprintf '1 passed in 0.01s\\n'\n",
+    ).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    if delayed_poll {
+        fs::write(root.join("delayed"), "").unwrap();
+    }
+    let make_app = || {
+        let mut app = test_app_with_tools(&["write_file", "execute_command", "command_session"]);
+        app.session_id = "recovered-call-round".into();
+        app.config.history_file = root.join(".git/runtime/history.sqlite");
+        app.config.base_history_file = app.config.history_file.clone();
+        app.session_history_file = crate::ai::history::SessionStore::new(&app.config.history_file)
+            .session_history_file(&app.session_id);
+        app
+    };
+    let mut app = make_app();
+    let shared_mcp = Arc::new(std::sync::Mutex::new(McpClient::new()));
+    let context = runtime_ctx::DriverContext::from_app_snapshot(
+        &app,
+        shared_mcp.clone(),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+    );
+    runtime_ctx::DRIVER_CTX.sync_scope(context, || {
+        runtime_ctx::SUBAGENT_CWD.sync_scope(root.clone(), || {
+            runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.sync_scope(true, || {
+                let mut state = RoundState::default();
+                let (_, written) = state.run(&mut app, &shared_mcp, "write_file",
+                    serde_json::json!({"file_path": "a.rs", "content": "first"})).unwrap();
+                assert!(written.contains("Successfully wrote"), "{written}");
+                let saved_history = crate::ai::history::read_all_messages_sqlite(&app.session_history_file).unwrap();
+                let old_args = serde_json::json!({
+                    "command": "./pytest -q", "pty": false, "yield_time_ms": 5000,
+                    "cwd": root.to_string_lossy(),
+                });
+                app.tool_middlewares.push(Arc::new(InterruptAfterDispatch));
+                let error = state.run(&mut app, &shared_mcp, "execute_command", old_args.clone()).unwrap_err();
+                assert!(error.contains("interrupted before history commit"), "{error}");
+                let old_checks = mutation_log::read_checks();
+                assert_eq!(old_checks.len(), 2);
+                let old_origin = old_checks[0].originating_command_call_id.clone();
+                assert_ne!(old_origin, "reused");
+                assert!(old_checks.iter().all(|check| check.covers_revision == 1 && check.originating_command_call_id == old_origin));
+                if let Some(session) = &old_checks[1].command_session_id {
+                    cleanup.sessions.push(session.clone());
+                }
+                assert_eq!(old_checks[1].status, if delayed_poll { mutation_log::CheckStatus::Running } else { mutation_log::CheckStatus::Failure });
+                assert!(fs::metadata(root.join("started-first")).is_ok());
+                assert_eq!(crate::ai::history::read_all_messages_sqlite(&app.session_history_file).unwrap(), saved_history);
+                assert_eq!(state.turn_messages, saved_history);
+                assert_eq!(state.persisted, saved_history.len());
+                assert!(!crate::ai::history::read_tool_message_ids_sqlite(&app.session_history_file).unwrap().contains(&old_origin));
+
+                // Discard the interrupted runtime and preserve exactly the durable log.
+                // Replacing its inode also forces the incremental index to recover it.
+                let log_path = mutation_log::log_path().unwrap();
+                let saved_log = fs::read(&log_path).unwrap();
+                fs::rename(&log_path, log_path.with_extension("saved")).unwrap();
+                fs::write(&log_path, &saved_log).unwrap();
+                drop(state);
+                drop(app);
+                let mut app = make_app();
+                let mut state = RoundState {
+                    messages: saved_history.clone(),
+                    turn_messages: saved_history.clone(),
+                    persisted: saved_history.len(),
+                    ..Default::default()
+                };
+                assert!(state.gate.critical_evidence.is_empty());
+                assert!(state.gate.critical_prior_tool_call_ids.is_empty());
+                assert_eq!(fs::read(&log_path).unwrap(), saved_log);
+                let (_, written) = state.run(&mut app, &shared_mcp, "write_file",
+                    serde_json::json!({"file_path": "a.rs", "content": "second"})).unwrap();
+                assert!(written.contains("Successfully wrote"), "{written}");
+                let mut new_args = old_args;
+                if !same_command {
+                    new_args["command"] = serde_json::json!("./pytest -q new");
+                }
+                let (new_origin, new_result) = state.run(&mut app, &shared_mcp, "execute_command", new_args).unwrap();
+                assert_ne!(new_origin, old_origin);
+                assert_ne!(new_origin, "reused");
+                assert!(new_result.contains("exit code 0"), "{new_result}");
+                let poll_id = if delayed_poll {
+                    fs::write(root.join("release-first"), "").unwrap();
+                    let (id, result) = state.run(&mut app, &shared_mcp, "command_session",
+                        serde_json::json!({"action": "poll", "session_id": cleanup.sessions[0], "yield_time_ms": 5000})).unwrap();
+                    assert!(result.contains("exit code 1"), "{result}");
+                    assert_ne!(id, old_origin);
+                    assert_ne!(id, new_origin);
+                    assert_ne!(id, "reused");
+                    Some(id)
+                } else { None };
+                let checks = mutation_log::read_checks();
+                let old = checks.iter().filter(|check| check.originating_command_call_id == old_origin).collect::<Vec<_>>();
+                let new = checks.iter().filter(|check| check.originating_command_call_id == new_origin).collect::<Vec<_>>();
+                assert_eq!(old.len(), if delayed_poll { 3 } else { 2 });
+                assert_eq!(new.len(), 2);
+                assert_eq!(&checks[..2], old_checks.as_slice());
+                assert!(old.iter().all(|check| check.command == "./pytest -q" && check.covers_revision == 1));
+                assert_eq!(old.last().unwrap().status, mutation_log::CheckStatus::Failure);
+                assert!(new.iter().all(|check| check.covers_revision == 2));
+                assert_eq!(new.last().unwrap().status, mutation_log::CheckStatus::Success);
+                if let Some(id) = poll_id {
+                    let terminal = old.last().unwrap();
+                    assert_eq!(terminal.tool_call_id, id);
+                    assert_eq!(terminal.evidence_locator, format!("tool_call_id:{id}"));
+                }
+                let summary = mutation_log::verification_summary(2, &checks, true);
+                assert_eq!(summary["verification"]["status"], if same_command { "success" } else { "stale" });
+                assert_eq!(summary["verification_gaps"]["count"], if same_command { 0 } else { 1 });
+                assert_eq!(summary["verification"]["checks"].as_array().unwrap().len(), if same_command { 1 } else { 2 });
+                assert!(summary["verification"]["checks"].as_array().unwrap().iter().any(|check| check["observation"]["originating_command_call_id"] == new_origin && check["observation"]["status"] == "success"));
+                let reminder = mutation_log::verification_reminder_summary();
+                assert_eq!(reminder.revision, 2);
+                assert_eq!(reminder.gaps, if same_command { 0 } else { 1 });
+                assert_eq!(reminder.stale_checks, if same_command { 0 } else { 1 });
+                let history = crate::ai::history::read_all_messages_sqlite(&app.session_history_file).unwrap();
+                assert_eq!(history, state.turn_messages);
+                assert!(history.iter().any(|message| message.tool_call_id.as_deref() == Some(new_origin.as_str())));
+                assert!(!history.iter().any(|message| message.tool_call_id.as_deref() == Some(old_origin.as_str())));
+            })
+        })
+    });
+}
+
+#[test]
+#[cfg(unix)]
+fn recovered_tool_call_id_same_command_keeps_independent_origins() {
+    check_identity_after_uncommitted_round_recovery(true, false);
+}
+
+#[test]
+#[cfg(unix)]
+fn recovered_tool_call_id_different_command_retains_stale_failure() {
+    check_identity_after_uncommitted_round_recovery(false, false);
+}
+
+#[test]
+#[cfg(unix)]
+fn recovered_tool_call_id_delayed_old_poll_cannot_replace_new_check() {
+    check_identity_after_uncommitted_round_recovery(true, true);
+}
+
+#[test]
 fn evicted_tool_call_id_stays_reserved_by_canonical_turn_history() {
     let _env_guard = crate::ai::test_support::ENV_LOCK
         .lock()

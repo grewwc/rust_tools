@@ -10,24 +10,36 @@ use serde_json::{Map, Value, json};
 use crate::ai::history::{SessionStore, with_sessions_lifecycle_lock};
 use crate::ai::types::App;
 
-use super::super::{TaskReport, TaskTerminalStatus};
+use super::super::{TaskReport, TaskReportTask, TaskTerminalStatus};
 
 pub(in crate::ai::tools::task_tools) type StatusCursor =
     FastMap<String, (String, String, u64, u64)>;
 static STATUS_CURSOR_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const DELIVERED_SUMMARY_MAX_BYTES: usize = 2 * 1024;
+const EVIDENCE_PAGE_CHARS: usize = 2048;
+
+#[derive(Default, PartialEq, Eq)]
+enum EvidenceView {
+    #[default]
+    Raw,
+    Summary,
+}
 
 #[derive(Default)]
 pub(in crate::ai::tools::task_tools) struct EvidenceReadOptions {
     fields: Option<Vec<String>>,
     max_chars: Option<usize>,
+    cursor: Option<usize>,
+    view: EvidenceView,
 }
 
 impl EvidenceReadOptions {
     pub(super) fn for_optimizations(args: &Value, enabled: bool) -> Result<Self, String> {
-        if !enabled {
-            return Ok(Self::default());
+        let mut options = Self::parse(args)?;
+        if enabled && args.get("view").is_none() && !options.has_projection() {
+            options.view = EvidenceView::Summary;
         }
-        Self::parse(args)
+        Ok(options)
     }
 
     pub(super) fn parse(args: &Value) -> Result<Self, String> {
@@ -59,11 +71,46 @@ impl EvidenceReadOptions {
                     .ok_or_else(|| "max_chars must be a non-negative integer".to_string())
             })
             .transpose()?;
-        Ok(Self { fields, max_chars })
+        let cursor = args
+            .get("cursor")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| {
+                        "cursor must be a non-negative Unicode character offset".to_string()
+                    })
+            })
+            .transpose()?;
+        let view = match args.get("view") {
+            None => EvidenceView::Raw,
+            Some(Value::String(view)) if view == "raw" => EvidenceView::Raw,
+            Some(Value::String(view)) if view == "summary" => EvidenceView::Summary,
+            Some(_) => return Err("view must be 'summary' or 'raw'".to_string()),
+        };
+        if view == EvidenceView::Summary
+            && (fields.is_some() || cursor.is_some() || max_chars.is_some())
+        {
+            return Err("fields, max_chars, and cursor require view=raw; omit view for automatic projection".to_string());
+        }
+        Ok(Self {
+            fields,
+            max_chars,
+            cursor,
+            view,
+        })
+    }
+
+    fn has_projection(&self) -> bool {
+        self.fields.is_some() || self.max_chars.is_some() || self.cursor.is_some()
+    }
+
+    pub(super) fn needs_full_delivered(&self) -> bool {
+        self.view == EvidenceView::Raw && !self.has_projection()
     }
 
     pub(super) fn render_progress(&self, task_id: &str, full: String) -> Result<String, String> {
-        if self.fields.is_none() && self.max_chars.is_none() {
+        if !self.has_projection() {
             return Ok(full);
         }
         let document = if self.fields.is_some() {
@@ -81,12 +128,12 @@ impl EvidenceReadOptions {
         task_id: &str,
         full: String,
         mut document: Value,
-        history_file: &Path,
-        session_id: &str,
+        report: Option<&TaskReportTask>,
     ) -> Result<String, String> {
-        if self.fields.is_none() && self.max_chars.is_none() {
+        if self.needs_full_delivered() && !document.is_object() {
             return Ok(full);
         }
+        let mut raw_document = document.clone();
         let payload = document["payload"].as_str().unwrap_or_default().to_string();
         let fields = document
             .as_object_mut()
@@ -94,8 +141,136 @@ impl EvidenceReadOptions {
         if let Ok(Value::Object(payload_fields)) = serde_json::from_str(&payload) {
             extend_missing_fields(fields, payload_fields);
         }
-        extend_delivered_report_fields(history_file, session_id, task_id, fields)?;
+        let report = report.filter(|report| {
+            fields.get("status").and_then(Value::as_str) == Some(report.status.as_str())
+                && report.task_id.as_deref() == Some(task_id)
+        });
+        if let Some(report) = report {
+            extend_delivered_report_fields(fields, report)?;
+        }
+        // Report metadata owns advisory claims; body-authored assessments remain in payload/output.
+        let metadata = report
+            .and_then(|report| report.verification.clone())
+            .or_else(|| {
+                fields
+                    .get("verification")
+                    .filter(|value| !value.is_null())
+                    .map(|value| {
+                        super::super::verification::TaskVerificationMetadata::from_value(
+                            value.clone(),
+                        )
+                    })
+            });
+        let assessment = metadata
+            .as_ref()
+            .map_or_else(
+                || Ok(json!({"available": false, "acceptance": "needs_parent_review"})),
+                |metadata| serde_json::to_value(metadata.assessment()),
+            )
+            .map_err(|error| error.to_string())?;
+        if let Some(metadata) = &metadata {
+            fields.insert(
+                "verification".to_string(),
+                serde_json::to_value(metadata).map_err(|error| error.to_string())?,
+            );
+        } else {
+            fields.remove("verification");
+        }
+        fields.insert("assessment".to_string(), assessment.clone());
+        if self.needs_full_delivered() {
+            // Keep the original payload and standalone-report deduplication in complete raw reads.
+            if raw_document.get("verification").is_some()
+                || report
+                    .and_then(|report| report.verification.as_ref())
+                    .is_none()
+            {
+                if let Some(verification) = fields.get("verification") {
+                    raw_document["verification"] = verification.clone();
+                }
+            }
+            raw_document["assessment"] = assessment;
+            return serde_json::to_string_pretty(&raw_document).map_err(|error| error.to_string());
+        }
+        if self.view == EvidenceView::Summary {
+            return self.render_summary(task_id, &document);
+        }
         self.render(task_id, "delivered", full, document)
+    }
+
+    fn render_summary(&self, task_id: &str, document: &Value) -> Result<String, String> {
+        let payload = document["payload"].as_str().unwrap_or_default();
+        let total_chars = payload.chars().count();
+        // All views use the same normalized advisory, with only the summary representation bounded.
+        let verification = document.get("verification");
+        let assessment = document.get("assessment");
+        let gaps = assessment.and_then(|value| value["gaps"].as_array());
+        let mut response = json!({
+            "task_id": json_text_prefix(task_id, 256),
+            "source": "delivered", "view": "summary",
+            "status": json_text_prefix(document["status"].as_str().unwrap_or_default(), 64),
+            "payload": "", "shown_chars": 0, "total_chars": total_chars,
+            "shown_bytes": 0, "total_bytes": payload.len(),
+            "truncated": total_chars > 0,
+            "next_cursor": if total_chars > 0 { Some(0) } else { None },
+            "verification": {
+                "available": verification.is_some(), "summary_only": true,
+                "max_bytes": super::super::verification::TASK_VERIFICATION_MAX_BYTES,
+                "max_checks": super::super::verification::TASK_VERIFICATION_MAX_CHECKS,
+            },
+            "assessment": {"available": verification.is_some(), "summary_only": true},
+            "recovery_hint": format!("Reuse the exact requested task_id: {} for full evidence; add cursor/max_chars to page or fields=[verification,assessment] for metadata. Read-only; does not integrate.", super::super::full_delivered_evidence_hint(super::super::EvidenceRecoveryFormat::Compact))
+        });
+        if response["task_id"].as_str() != Some(task_id) {
+            response["task_id_truncated"] = json!(true);
+        }
+        if document["status"].as_str() != response["status"].as_str() {
+            response["status_truncated"] = json!(true);
+        }
+        if let Some(error) = document.get("error").and_then(Value::as_str) {
+            response["error"] = json!(json_text_prefix(error, 192));
+            response["error_truncated"] = json!(response["error"].as_str() != Some(error));
+        }
+        if let Some(verification) = verification {
+            response["verification"]["total_bytes"] = json!(
+                serde_json::to_vec(verification)
+                    .map_err(|error| error.to_string())?
+                    .len()
+            );
+            response["verification"]["total_checks"] =
+                json!(verification["checks"].as_array().map_or(0, Vec::len));
+        }
+        if let Some(assessment) = assessment {
+            for key in ["provenance", "schema_status", "acceptance"] {
+                if let Some(value) = assessment.get(key).and_then(Value::as_str) {
+                    response["assessment"][key] = json!(json_text_prefix(value, 64));
+                }
+            }
+            response["assessment"]["total_gaps"] = json!(gaps.map_or(0, Vec::len));
+            if let Some(gap) = gaps.and_then(|gaps| gaps.first()).and_then(Value::as_str) {
+                response["assessment"]["first_gap"] = json!(json_text_prefix(gap, 192));
+            }
+        }
+        // Reserve space for the decimal counters that grow after adding the preview.
+        let metadata_bytes = serde_json::to_vec(&response)
+            .map_err(|error| error.to_string())?
+            .len();
+        let budget = DELIVERED_SUMMARY_MAX_BYTES.saturating_sub(metadata_bytes + 60);
+        let preview = json_text_prefix(payload, budget);
+        let shown_chars = preview.chars().count();
+        response["shown_bytes"] = json!(preview.len());
+        response["payload"] = json!(preview);
+        response["shown_chars"] = json!(shown_chars);
+        response["truncated"] = json!(shown_chars < total_chars);
+        response["next_cursor"] = json!(if shown_chars < total_chars {
+            Some(shown_chars)
+        } else {
+            None
+        });
+        let rendered = serde_json::to_string(&response).map_err(|error| error.to_string())?;
+        if rendered.len() > DELIVERED_SUMMARY_MAX_BYTES {
+            return Err("Delivered summary metadata exceeds its byte budget; read view=raw with fields or max_chars".to_string());
+        }
+        Ok(rendered)
     }
 
     fn render(
@@ -106,10 +281,11 @@ impl EvidenceReadOptions {
         document: Value,
     ) -> Result<String, String> {
         let recovery = format!(
-            "Read the full evidence with task_evidence_read(task_id={task_id:?}, source={source:?}) and omit fields and max_chars. Reading does not collect or integrate the task."
+            "Read the full evidence with {}. To continue, repeat the same fields with cursor=next_cursor and max_chars>0. Reading does not collect or integrate the task.",
+            super::super::task_evidence_recovery_hint(task_id, source)
         );
         let mut response = json!({ "task_id": task_id, "source": source });
-        for key in ["status", "error"] {
+        for key in ["status", "error", "verification", "assessment"] {
             if let Some(value) = document.get(key) {
                 response[key] = value.clone();
             }
@@ -149,17 +325,32 @@ impl EvidenceReadOptions {
         } else {
             Value::String(full)
         };
-        if let Some(max_chars) = self.max_chars {
+        if self.max_chars.is_some() || self.cursor.is_some() {
+            let max_chars = self.max_chars.unwrap_or(EVIDENCE_PAGE_CHARS);
             let text = match projected {
                 Value::String(text) => text,
                 value => serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?,
             };
             let total_chars = text.chars().count();
-            let prefix: String = text.chars().take(max_chars).collect();
+            let cursor = self.cursor.unwrap_or(0);
+            if cursor > total_chars {
+                return Err(format!(
+                    "cursor {cursor} exceeds total_chars {total_chars}; start with cursor=0"
+                ));
+            }
+            let prefix: String = text.chars().skip(cursor).take(max_chars).collect();
+            let shown_chars = prefix.chars().count();
+            let next_cursor = cursor + shown_chars;
             response["payload"] = Value::String(prefix);
-            response["shown_chars"] = json!(total_chars.min(max_chars));
+            response["cursor"] = json!(cursor);
+            response["shown_chars"] = json!(shown_chars);
             response["total_chars"] = json!(total_chars);
-            response["truncated"] = json!(total_chars > max_chars);
+            response["truncated"] = json!(next_cursor < total_chars);
+            response["next_cursor"] = json!(if next_cursor < total_chars {
+                Some(next_cursor)
+            } else {
+                None
+            });
             response["recovery_hint"] = json!(recovery);
         } else {
             response["payload"] = projected;
@@ -169,23 +360,41 @@ impl EvidenceReadOptions {
     }
 }
 
+/// Limit the encoded JSON string contents, including escaping, without splitting UTF-8.
+fn json_text_prefix(text: &str, max_bytes: usize) -> String {
+    let mut bytes = 0;
+    text.chars()
+        .take_while(|character| {
+            let encoded = match character {
+                '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+                character if character.is_control() && *character <= '\u{1f}' => 6,
+                character => character.len_utf8(),
+            };
+            bytes += encoded;
+            bytes <= max_bytes
+        })
+        .collect()
+}
+
 fn extend_missing_fields(document: &mut Map<String, Value>, extra: Map<String, Value>) {
     for (key, value) in extra {
         document.entry(key).or_insert(value);
     }
 }
 
-/// Read structured output without the ledger reader's optional diagnostic writes.
-fn extend_delivered_report_fields(
+/// Read optional metadata without diagnostics, migrations, or any other ledger writes.
+pub(super) fn read_delivered_task_report(
     history_file: &Path,
     session_id: &str,
     task_id: &str,
-    document: &mut Map<String, Value>,
-) -> Result<(), String> {
+) -> Result<Option<TaskReportTask>, String> {
     SessionStore::validate_session_id(session_id).map_err(|error| error.to_string())?;
     let path = SessionStore::new(history_file)
         .session_assets_dir(session_id)
         .join("context-checkpoints/task-evidence.sqlite");
+    if !path.is_file() {
+        return Ok(None);
+    }
     let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| format!("Failed to read delivered evidence fields: {error}"))?;
     let has_report: bool = connection.query_row(
@@ -193,31 +402,36 @@ fn extend_delivered_report_fields(
         [], |row| row.get(0),
     ).map_err(|error| format!("Failed to inspect delivered evidence fields: {error}"))?;
     if !has_report {
-        return Ok(());
+        return Ok(None);
     }
-    let report_json: Option<Option<String>> = connection
+    let row: Option<(String, Option<String>)> = connection
         .query_row(
-            "SELECT report_json FROM task_evidence WHERE task_id = ?1 AND delivered_at_unix_ms > 0",
+            "SELECT status, report_json FROM task_evidence WHERE task_id = ?1 AND delivered_at_unix_ms > 0",
             [task_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|error| format!("Failed to read delivered evidence fields: {error}"))?;
-    let Some(Some(report_json)) = report_json else {
-        return Ok(());
+    let Some((status, Some(report_json))) = row else {
+        return Ok(None);
     };
     let Ok(mut report) = serde_json::from_str::<TaskReport>(&report_json) else {
-        return Ok(());
+        return Ok(None);
     };
     if !report.supported() || report.tasks.len() != 1 {
-        return Ok(());
+        return Ok(None);
     }
     let task = report.tasks.pop().expect("one report task checked above");
-    if task.task_id.as_deref() != Some(task_id)
-        || document.get("status").and_then(Value::as_str) != Some(task.status.as_str())
-    {
-        return Ok(());
+    if task.task_id.as_deref() != Some(task_id) || status != task.status {
+        return Ok(None);
     }
+    Ok(Some(task))
+}
+
+fn extend_delivered_report_fields(
+    document: &mut Map<String, Value>,
+    task: &TaskReportTask,
+) -> Result<(), String> {
     if let Some(error) = &task.error {
         document.insert("error".to_string(), Value::String(error.clone()));
     }
@@ -360,44 +574,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_evidence_master_off_ignores_projection_and_preserves_bytes() {
+    fn task_evidence_master_off_honors_projection_and_preserves_unselected_bytes() {
         let original = " opaque progress bytes α界🙂\n";
-        for args in [
-            json!({"fields": ["missing"], "max_chars": 0}),
-            json!({"fields": [], "max_chars": -1}),
-            json!({"fields": null, "max_chars": "invalid"}),
-        ] {
-            let options = EvidenceReadOptions::for_optimizations(&args, false).unwrap();
+        for enabled in [false, true] {
+            let defaults = EvidenceReadOptions::for_optimizations(&json!({}), enabled).unwrap();
             assert_eq!(
-                options
+                defaults
                     .render_progress("task-id", original.to_string())
                     .unwrap(),
                 original
             );
-            assert_eq!(
-                options
-                    .render_delivered(
-                        "task-id",
-                        original.to_string(),
-                        Value::Null,
-                        Path::new("/unused/history.sqlite"),
-                        "unused-session",
-                    )
+            let options =
+                EvidenceReadOptions::for_optimizations(&json!({"max_chars": 2}), enabled).unwrap();
+            let bounded: Value = serde_json::from_str(
+                &options
+                    .render_progress("task-id", "α界🙂".to_string())
                     .unwrap(),
-                original,
-            );
+            )
+            .unwrap();
+            assert_eq!(bounded["payload"], "α界");
+            assert_eq!(bounded["truncated"], true);
+            assert_eq!(bounded["next_cursor"], 2);
+            for invalid in [
+                json!({"fields": []}),
+                json!({"max_chars": -1}),
+                json!({"fields": null, "max_chars": "invalid"}),
+            ] {
+                assert!(EvidenceReadOptions::for_optimizations(&invalid, enabled).is_err());
+            }
         }
-        let options =
-            EvidenceReadOptions::for_optimizations(&json!({"max_chars": 2}), true).unwrap();
-        let bounded: Value = serde_json::from_str(
-            &options
-                .render_progress("task-id", "α界🙂".to_string())
+        let raw = EvidenceReadOptions::for_optimizations(&json!({}), false).unwrap();
+        assert_eq!(
+            raw.render_delivered("task-id", original.to_string(), Value::Null, None)
                 .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(bounded["payload"], "α界");
-        assert_eq!(bounded["truncated"], true);
-        assert!(EvidenceReadOptions::for_optimizations(&json!({"fields": []}), true).is_err());
+            original
+        );
     }
 
     #[test]
@@ -417,8 +628,7 @@ mod tests {
                     "opaque / task id ",
                     delivered.to_string(),
                     Value::Null,
-                    Path::new("/unused/history.sqlite"),
-                    "unused-session",
+                    None,
                 )
                 .unwrap(),
             delivered
@@ -439,7 +649,7 @@ mod tests {
             selected["selection"]["recovery_hint"]
                 .as_str()
                 .unwrap()
-                .contains("omit fields and max_chars")
+                .contains("omitting fields/max_chars/cursor")
         );
         let missing = EvidenceReadOptions::parse(&json!({"fields": ["conclusion"]})).unwrap();
         let error = missing
@@ -487,6 +697,169 @@ mod tests {
         ] {
             assert!(EvidenceReadOptions::parse(&args).is_err(), "{args}");
         }
+    }
+
+    #[test]
+    fn task_evidence_read_summary_bounds_escaped_bytes_and_recovers_metadata() {
+        let verification = super::super::super::verification::TaskVerificationMetadata::from_value(
+            super::super::super::verification::fix_verification_fixture(),
+        );
+        let payload = "\"\\\n\u{00}α界🙂".repeat(4096);
+        let document = json!({"task_id": "task-id", "status": "completed", "payload": payload,
+            "verification": verification, "assessment": verification.assessment()});
+        let summary = EvidenceReadOptions::for_optimizations(&json!({}), true)
+            .unwrap()
+            .render_delivered("task-id", String::new(), document.clone(), None)
+            .unwrap();
+        assert!(
+            summary.len() <= DELIVERED_SUMMARY_MAX_BYTES,
+            "{}",
+            summary.len()
+        );
+        let value: Value = serde_json::from_str(&summary).unwrap();
+        assert_eq!(value["view"], "summary");
+        assert_eq!(value["verification"]["available"], true);
+        assert_eq!(value["verification"]["total_checks"], 2);
+        assert_eq!(value["assessment"]["schema_status"], "valid");
+        assert_eq!(value["assessment"]["acceptance"], "needs_parent_review");
+        assert_eq!(value["total_bytes"], payload.len());
+        assert_eq!(value["total_chars"], payload.chars().count());
+        assert_eq!(value["next_cursor"], value["shown_chars"]);
+        assert_eq!(
+            value["shown_bytes"],
+            value["payload"].as_str().unwrap().len()
+        );
+        assert!(payload.starts_with(value["payload"].as_str().unwrap()));
+        assert!(summary.len() * 10 < serde_json::to_vec(&document).unwrap().len());
+
+        for (invalid, message) in [
+            (
+                json!({"schema": "ai.task-verification", "version": 1, "checks": vec![json!({}); 17]}),
+                "16-check",
+            ),
+            (
+                json!({"schema": "ai.task-verification", "version": 1, "note": "界".repeat(8192)}),
+                "8 KiB",
+            ),
+        ] {
+            let metadata =
+                super::super::super::verification::TaskVerificationMetadata::from_value(invalid);
+            let document = json!({"status": "completed", "payload": payload,
+                "verification": metadata, "assessment": metadata.assessment()});
+            let summary = EvidenceReadOptions::for_optimizations(&json!({}), true)
+                .unwrap()
+                .render_delivered("task-id", String::new(), document.clone(), None)
+                .unwrap();
+            assert!(summary.len() <= DELIVERED_SUMMARY_MAX_BYTES);
+            let summary: Value = serde_json::from_str(&summary).unwrap();
+            assert_eq!(summary["status"], "completed");
+            assert_eq!(summary["assessment"]["schema_status"], "invalid");
+            assert!(
+                summary["assessment"]["first_gap"]
+                    .as_str()
+                    .unwrap()
+                    .contains(message)
+            );
+            let full = serde_json::to_string_pretty(&document).unwrap();
+            let raw = EvidenceReadOptions::for_optimizations(&json!({"view": "raw"}), true)
+                .unwrap()
+                .render_delivered("task-id", full.clone(), document, None)
+                .unwrap();
+            assert_eq!(raw.as_bytes(), full.as_bytes());
+        }
+    }
+
+    #[test]
+    fn task_evidence_read_pagination_preserves_assessment_and_unicode_offsets() {
+        let verification = super::super::super::verification::TaskVerificationMetadata::from_value(
+            json!({"schema": "ai.task-verification"}),
+        );
+        let document = json!({"status": "completed", "payload": "α界🙂z",
+            "verification": verification,
+            "assessment": verification.assessment()});
+        for enabled in [false, true] {
+            let mut recovered = String::new();
+            let mut cursor = 0;
+            loop {
+                let options = EvidenceReadOptions::for_optimizations(
+                    &json!({"max_chars": 2, "cursor": cursor}),
+                    enabled,
+                )
+                .unwrap();
+                let page: Value = serde_json::from_str(
+                    &options
+                        .render_delivered("task-id", String::new(), document.clone(), None)
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(page["verification"], document["verification"]);
+                assert_eq!(page["assessment"], document["assessment"]);
+                assert_eq!(page["cursor"], cursor);
+                recovered.push_str(page["payload"].as_str().unwrap());
+                match page["next_cursor"].as_u64() {
+                    Some(next) => {
+                        assert!(next > cursor);
+                        cursor = next;
+                    }
+                    None => {
+                        assert_eq!(page["truncated"], false);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(recovered, "α界🙂z");
+            let options =
+                EvidenceReadOptions::for_optimizations(&json!({"max_chars": 0}), enabled).unwrap();
+            let page: Value = serde_json::from_str(
+                &options
+                    .render_delivered("task-id", String::new(), document.clone(), None)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(page["payload"], "");
+            assert_eq!(page["next_cursor"], 0);
+            assert_eq!(page["verification"], document["verification"]);
+            assert_eq!(page["assessment"], document["assessment"]);
+            for (cursor, error) in [(4, false), (5, true)] {
+                let options =
+                    EvidenceReadOptions::for_optimizations(&json!({"cursor": cursor}), enabled)
+                        .unwrap();
+                let result =
+                    options.render_delivered("task-id", String::new(), document.clone(), None);
+                if error {
+                    assert!(result.unwrap_err().contains("total_chars 4"));
+                } else {
+                    let page: Value = serde_json::from_str(&result.unwrap()).unwrap();
+                    assert_eq!(page["payload"], "");
+                    assert_eq!(page["next_cursor"], Value::Null);
+                    assert_eq!(page["truncated"], false);
+                }
+            }
+        }
+        for args in [
+            json!({"cursor": -1}),
+            json!({"cursor": "2"}),
+            json!({"cursor": null}),
+            json!({"view": "other"}),
+            json!({"view": "summary", "fields": ["verification"]}),
+            json!({"view": "summary", "cursor": 0}),
+        ] {
+            assert!(EvidenceReadOptions::parse(&args).is_err(), "{args}");
+        }
+        let options = EvidenceReadOptions::parse(
+            &json!({"fields": ["assessment"], "cursor": 0, "max_chars": 1}),
+        )
+        .unwrap();
+        let page: Value = serde_json::from_str(
+            &options
+                .render_delivered("task-id", String::new(), document.clone(), None)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page["payload"], "{");
+        assert_eq!(page["next_cursor"], 1);
+        assert_eq!(page["selection"]["fields"], json!(["assessment"]));
+        assert_eq!(page["assessment"], document["assessment"]);
     }
 
     #[test]

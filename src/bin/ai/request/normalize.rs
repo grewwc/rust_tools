@@ -991,6 +991,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
     // the projection loops below move messages out of it instead of cloning
     // each element a second time.
     let mut request_messages = messages.to_vec();
+    request_messages.retain(|message| !crate::ai::history::is_retired_change_set_metadata(message));
     for message in &mut request_messages {
         clear_runtime_message_metadata(message);
         // Keep file and reply provenance in the driver's projection for auxiliary

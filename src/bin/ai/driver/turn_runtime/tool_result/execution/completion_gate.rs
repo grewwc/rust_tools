@@ -61,6 +61,8 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
 ) -> CompletionEvidenceState {
     let mut state = CompletionEvidenceState::default();
     let mut calls_by_id: HashMap<String, ToolCall> = HashMap::new();
+    let mut command_sessions: HashMap<String, (ToolCall, String, usize, bool)> = HashMap::new();
+    let mut mutation_revision = 0;
 
     for message in turn_messages {
         if let Some(tool_calls) = &message.tool_calls {
@@ -79,48 +81,100 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
             continue;
         };
 
+        use crate::ai::driver::turn_runtime::progress::{
+            ToolResultProgressStatus, classify_tool_result_progress, command_session_result,
+        };
+        let is_poll = tool_call.function.name == "command_session";
         let tool_succeeded = completion_tool_result_succeeded(&message.content);
+        let mut tool_failed = matches!(
+            classify_tool_result_progress(message.content.as_str().unwrap_or_default()),
+            ToolResultProgressStatus::Failure
+                | ToolResultProgressStatus::BlockedOutsideWorkspace(_)
+        );
+        let mut evidence_content = message.content.clone();
+        let mut covers_mutation = true;
+        let originating_call;
+        let tool_call = if is_poll {
+            let Ok(args) = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+            else {
+                continue;
+            };
+            if !matches!(
+                args.get("action").and_then(serde_json::Value::as_str),
+                Some("poll" | "write")
+            ) {
+                continue;
+            }
+            let origin = args
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| command_sessions.get_mut(id));
+            let Some((call, output, revision, failed)) = origin else {
+                continue;
+            };
+            *failed |= tool_failed;
+            tool_failed = *failed;
+            output.push('\n');
+            output.push_str(message.content.as_str().unwrap_or_default());
+            evidence_content = serde_json::Value::String(output.clone());
+            covers_mutation = *revision == mutation_revision;
+            originating_call = call.clone();
+            &originating_call
+        } else {
+            if tool_call.function.name == "execute_command"
+                && let Some((Some(id), _)) =
+                    command_session_result(message.content.as_str().unwrap_or_default())
+            {
+                command_sessions.insert(
+                    id.to_string(),
+                    (
+                        tool_call.clone(),
+                        message.content.as_str().unwrap_or_default().to_string(),
+                        mutation_revision,
+                        tool_failed,
+                    ),
+                );
+            }
+            tool_call
+        };
         if tool_call.function.name == "execute_command" {
-            let effects = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
-                .ok()
-                .map(|args| {
-                    crate::ai::driver::turn_runtime::iteration::execute_command_segment_effects_for_args(&args)
-                })
+            let args = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
                 .unwrap_or_default();
+            let effects = {
+                crate::ai::driver::turn_runtime::iteration::execute_command_segment_effects_for_args(
+                    &args,
+                )
+            };
             let output_confirms_behavior_check =
-                behavior_check_output_confirms_success(&message.content);
+                crate::ai::driver::turn_runtime::iteration::behavior_check_output_confirms_source_success(&args, &evidence_content);
             // Command-level determination: whether the whole command output a failed known check.
             // When `cargo check | tail -5` fails, the tail segment itself is not a check; if
             // judged per segment it would be misrecorded as “post-mutation activity”, so the
             // whole command must be considered together.
             let output_reports_behavior_failure =
-                behavior_check_output_reports_failure(&message.content);
+                behavior_check_output_reports_failure(&evidence_content);
             let mut command_has_failed_known_check = false;
             for effect in &effects {
                 command_has_failed_known_check |=
-                    effect.behavior_check && (!tool_succeeded || output_reports_behavior_failure);
+                    effect.behavior_check && (tool_failed || output_reports_behavior_failure);
             }
-            let had_mutation_before_command = state.successful_mutation;
-            // A session poll has no `command` argument, so its effects cannot be
-            // recovered from the current call. The shared status classifier
-            // already marks a leading `Exit code:` as failure; if the captured
-            // output also reports a known failed check, record that fact even
-            // when the originating command is not in this tool call.
+            let had_mutation_before_command = state.successful_mutation && covers_mutation;
             if had_mutation_before_command && output_reports_behavior_failure {
                 state.successful_post_mutation_failed_check = true;
             }
             for effect in &effects {
-                let had_mutation = state.successful_mutation;
+                let had_mutation = state.successful_mutation && covers_mutation;
                 // Command-level changes are only recorded into successful_mutation (for
                 // downstream consumers such as checkpoint-phase hints) and no longer reset
                 // gate signals: command-level “changes” are intent classification and may
                 // misjudge read-only commands as changes; resetting would make the gate
                 // think “nothing was done after the mutation”, causing false Reopen/Warn
                 // and forcing the model to repeat conclusions.
-                if effect.project_mutation {
+                if !is_poll && effect.project_mutation {
                     state.successful_mutation = true;
                 }
                 if tool_succeeded
+                    && !command_has_failed_known_check
                     && had_mutation
                     && (effect.success_guaranteed
                         || (effect.behavior_check && output_confirms_behavior_check))
@@ -154,6 +208,7 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
             // Tool-level mutations (apply_patch / write_file) are the gate's only trusted
             // change evidence; each success invalidates earlier verification.
             state.successful_mutation = true;
+            mutation_revision += 1;
             state.successful_tool_level_mutation = true;
             state.successful_post_mutation_verification = false;
             state.successful_post_mutation_scope_review = false;
@@ -175,25 +230,13 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
 pub(in crate::ai::driver::turn_runtime) fn behavior_check_output_confirms_success(
     content: &serde_json::Value,
 ) -> bool {
-    let text = content.as_str().unwrap_or_default().to_ascii_lowercase();
-    if behavior_check_output_reports_failure(content) {
-        return false;
-    }
-
-    text.contains("test result: ok")
-        || (text.contains("finished") && text.contains("target(s)"))
-        || text.contains("all tests passed")
+    crate::ai::driver::turn_runtime::iteration::behavior_check_output_confirms_success(content)
 }
 
 pub(in crate::ai::driver::turn_runtime) fn behavior_check_output_reports_failure(
     content: &serde_json::Value,
 ) -> bool {
-    let text = content.as_str().unwrap_or_default().to_ascii_lowercase();
-    text.contains("test result: failed")
-        || text.contains("\nfailures:")
-        || text.contains("error:")
-        || text.contains("error[")
-        || text.contains("could not compile")
+    crate::ai::driver::turn_runtime::iteration::behavior_check_output_reports_failure(content)
 }
 
 pub(in crate::ai::driver::turn_runtime) fn completion_tool_result_succeeded(
@@ -207,7 +250,10 @@ pub(in crate::ai::driver::turn_runtime) fn completion_tool_result_succeeded(
     // wrapper must not require teaching each consumer a new failure prefix.
     !matches!(
         classify_tool_result_progress(content.as_str().unwrap_or_default()),
-        ToolResultProgressStatus::Failure | ToolResultProgressStatus::BlockedOutsideWorkspace(_)
+        ToolResultProgressStatus::Failure
+            | ToolResultProgressStatus::BlockedOutsideWorkspace(_)
+            | ToolResultProgressStatus::Running
+            | ToolResultProgressStatus::Unknown
     )
 }
 

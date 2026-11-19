@@ -375,12 +375,12 @@ const WINDOW_CAP_CHARS: usize = MAX_READ_FILE_RESULT_CHARS;
 /// totals and truncation wording). Larger files use the bounded windowed reader in
 /// `execute_read_file_windowed`, so a huge read no longer holds the shared kernel lock for the
 /// whole file nor loads it entirely into memory.
-const FULL_READ_MAX_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const FULL_READ_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Chunk size for the windowed reader: bounds how long each read holds the global kernel lock
 /// (~1 MiB of page-cache IO is sub-millisecond on SSD), so one big read can no longer stall every
 /// other tenant of the shared kernel.
-const WINDOW_READ_CHUNK_BYTES: usize = 1024 * 1024;
+pub(crate) const WINDOW_READ_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// When this read did not reach end-of-file, append an explicit note telling the model that more lines remain
 /// and how to continue reading. Prevents the model from misreading a "truncated result" as the "complete file".

@@ -1632,6 +1632,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <nav id="sessions"><input id="sessfilter" type="search" hidden placeholder="search all sessions…" aria-label="Search all sessions by title or ID" title="Match all keywords in any order · Shift+Cmd/Ctrl+F" autocomplete="off">
 <div id="sessfilterrow"><div id="sesscount"></div><span id="sessfilterstatus" hidden></span><button id="sessiongrouphiddenactivity" type="button" hidden aria-label="Activity in hidden groups" aria-haspopup="dialog"></button><details id="sessmore"><summary id="sessmoretoggle" aria-label="More session options">More</summary><div id="sessmorepanel">
 <button id="sesssearch" type="button" aria-controls="sessfilter" aria-expanded="false" aria-keyshortcuts="Control+Shift+F Meta+Shift+F">Search sessions…</button>
+<button id="sessviewmode" type="button">List view</button>
 <div id="sessarchivefilter" role="group" aria-label="Session archive filter"><button id="sessactive" type="button" aria-pressed="true">Active</button><button id="sessarchived" type="button" aria-pressed="false">Archived</button></div>
 <div id="sessmarkfilter" role="group" aria-label="Session star filter"><button id="sessall" type="button" aria-pressed="true">All</button><button id="sessmarked" type="button" aria-pressed="false">Starred</button></div>
 <div id="sessgroupactions"><button id="sessiongroupnew" type="button">New group…</button><button id="sessiongroupmanage" type="button">Manage groups…</button></div>
@@ -1965,7 +1966,7 @@ let runEpoch = 0; // bumped every time this page starts a stream: a poll sent
 // True while the server reports a live turn for the shown session (GET
 // /confirm). Cleared when a stream starts or ends here, on session switch, or
 // when an interrupt POST returns; the next poll is the truth again. The sample
-// expires (RUNNING_SAMPLE_TTL_MS): stale ticks refresh it every 4s and event
+// expires (SESSION_RUNNING_TTL_MS): stale ticks refresh it every 4s and event
 // polls refresh it on return, so only a dead sample can go stale — and a dead
 // sample must not hold the stop button forever.
 // `turnRunning` and `turnRunningAt` project the selected session's sample.
@@ -1975,7 +1976,6 @@ let runEpoch = 0; // bumped every time this page starts a stream: a poll sent
 // new turn whose stream must be attached even before an idle poll clears the
 // terminal marker.
 // `turnRunningPid` and `endedTurnPid` belong to the selected execution record.
-const RUNNING_SAMPLE_TTL_MS = 60000; // a running sample older than this is stale
 // A turn owned by another process has no local
 // event stream. `/confirm` reports its owner pid; the page can only show that
 // it is running and follow persisted history until the round lands.
@@ -2015,7 +2015,6 @@ let confirmPollTimer = null; // keeps answering native requests even when histor
 let eventAbort = null; // AbortController for the reattached event stream
 let eventFailures = 0;
 let confirmPollSeq = 0;
-let confirmPollTick = 0; // idle ticks are cheap: only every fifth one asks the server
 // `eventActive` and `eventSession` project the execution model's replay owner.
 let recoveredView = null; // progress card rendered from replayed events
 // True once the reattached event stream closed with the server's terminal
@@ -2026,6 +2025,8 @@ let recoveredView = null; // progress card rendered from replayed events
 // `eventStreamFailed` projects the selected execution's confirmed failure.
 
 // BEGIN execution model
+// Every running observation and its UI projections share this freshness bound.
+const SESSION_RUNNING_TTL_MS = 7500;
 // Execution observations have producer-owned slots. Rendering may regroup the
 // corresponding cards, but never changes the order or authority of these slots.
 const executionModel = (() => {
@@ -2049,7 +2050,7 @@ const executionModel = (() => {
   const serverFields = { turns: "liveTurns", pendingUserInputs: "pendingInputs" };
   const freshServer = () => ({ sessions: new Map(), liveTurns: new Map(), pendingInputs: new Map() });
   const freshSession = () => ({ turn: 0, pid: 0, endedPid: 0, running: false, runningAt: 0,
-    sampleGeneration: 0, idleSample: null,
+    sampleGeneration: 0, idleSample: null, activitySample: null,
     remoteActive: false, remotePid: "", remoteAt: 0, ended: false, failed: false, history: [], activities: new Map(),
     nextActivity: 0, taskStates: new Map(), taskBusy: null });
   const emptyServer = freshServer(), emptySession = freshSession();
@@ -2079,9 +2080,11 @@ const executionModel = (() => {
     taskStates: value.taskStates.map(([id, active]) => [id, active]),
     busy: value.busy, resetTasks: value.resetTasks === true,
   } : null;
-  const invalidateIdleSample = (state) => {
+  const invalidateIdleSample = (state, preserveActivity = false) => {
     // A turn or owner transition also retires polls still waiting on a response.
-    state.idleSample = null; state.sampleGeneration++;
+    state.idleSample = null;
+    if (!preserveActivity) state.activitySample = null;
+    state.sampleGeneration++;
   };
   const clearRemote = (state) => {
     state.remoteActive = false; state.remotePid = ""; state.remoteAt = 0;
@@ -2169,7 +2172,7 @@ const executionModel = (() => {
       state.activities.clear(); summarize(state);
     } else if (event.kind === "live") {
       if (event.entry) { invalidateIdleSample(state); clearRemote(state); server.liveTurns.set(sid, event.entry); }
-      else if (server.liveTurns.delete(sid)) invalidateIdleSample(state);
+      else if (server.liveTurns.delete(sid)) invalidateIdleSample(state, true);
     } else if (event.kind === "accepted") {
       // Headers bind this POST to an accepted turn; earlier polls described
       // the pre-acceptance state, even though the page already had a live entry.
@@ -2179,6 +2182,32 @@ const executionModel = (() => {
         invalidateIdleSample(state);
         state.remoteActive = true; state.remotePid = event.pid || ""; state.remoteAt = event.at;
       } else clearRemote(state);
+    } else if (event.kind === "observation") {
+      // Accept once, before either the sidebar or composer consumes the sample.
+      if (event.generation != null && event.generation !== state.sampleGeneration) return null;
+      if (Date.now() - event.sample.at >= SESSION_RUNNING_TTL_MS) return null;
+      const sample = event.sample;
+      state.sampleGeneration++;
+      if (event.transport) {
+        state.running = event.transport.running;
+        state.runningAt = sample.at;
+        state.pid = event.transport.pid;
+        clearRemote(state);
+        if (event.transport.remote && !state.running && !server.liveTurns.has(sid)) {
+          state.remoteActive = true; state.remotePid = event.transport.remotePid; state.remoteAt = sample.at;
+        }
+      } else if (sample.activity !== "running") {
+        state.running = false; clearRemote(state);
+      }
+      // A local POST/stream remains its own owner until cleanup. A pre-acceptance
+      // idle poll must not become durable evidence against its parked workers.
+      if (sample.activity === "idle" && server.liveTurns.has(sid)) return read(sid, base);
+      // A failed bulk read supplies no evidence against a fresh producer.
+      // Keep its timestamp; expiry still retires it at the common TTL.
+      state.activitySample = sample.activity === "unknown" && sample.source === "bulk"
+        && state.activitySample?.source === "task" && Date.now() - state.activitySample.at < SESSION_RUNNING_TTL_MS
+        ? { ...state.activitySample, revision: sample.revision } : sample;
+      state.idleSample = sample.activity === "idle" ? { generation: state.sampleGeneration, at: sample.at } : null;
     } else if (event.kind === "idle") {
       if (event.generation === state.sampleGeneration && !server.liveTurns.has(sid)
           && !state.running && !state.remoteActive && !state.remotePid) {
@@ -2186,7 +2215,8 @@ const executionModel = (() => {
       }
     } else if (event.kind === "select") {
       state.running = false; state.pid = 0; state.endedPid = 0;
-      invalidateIdleSample(state);
+      // Selection retires ownership, but does not make settled history active.
+      invalidateIdleSample(state, state.activitySample?.activity !== "running");
       clearRemote(state); state.ended = false; state.failed = false;
       if (!server.liveTurns.has(sid)) state.activities.clear();
       summarize(state);
@@ -2203,6 +2233,11 @@ const executionModel = (() => {
       const activity = state.activities.get(event.owner.id);
       if (!activity) return;
       if (event.kind === "task") {
+        // Live producer evidence supersedes idle samples and requests that
+        // predate it. Historical reports do not enter this branch.
+        if (event.summary?.busy === true || event.summary?.taskStates.some(([, active]) => active === true)) {
+          invalidateIdleSample(state);
+        }
         if (event.advance) activity.slots.delete(event.slot);
         activity.slots.set(event.slot, summaryOf(event.summary));
         // A completed report may advance its logical observation beside the
@@ -2239,7 +2274,26 @@ function executionState(sid = typeof sessionId === "undefined" ? "" : sessionId,
 }
 function remoteTurnIsFresh(state) {
   return !!state.sessionId && !state.live && !state.running && !state.attached
-    && !!(state.remoteActive || state.remotePid) && Date.now() - state.remoteAt < REMOTE_RUNNING_TTL_MS;
+    && !!(state.remoteActive || state.remotePid) && Date.now() - state.remoteAt < SESSION_RUNNING_TTL_MS;
+}
+function executionIsRunning(state, ledger = state) {
+  if (!state.sessionId) return false;
+  if (state.live) return true;
+  if (state.failed) return false;
+  const sample = state.activitySample;
+  const activeTasks = [...ledger.taskStates.values()].some((active) => active === true) || ledger.taskBusy === true;
+  if (state.ended && !activeTasks && !remoteTurnIsFresh(state)) return false;
+  if (sample) {
+    // Idle/unknown also retire historical task and recovery evidence after TTL.
+    // Expiry removes a positive observation; it cannot resurrect an older one.
+    if (sample.activity === "idle") return false;
+    if (state.attached || (state.recovering && sample.activity === "unknown" && sample.source === "bulk")) return true;
+    return sample.activity === "running" && Date.now() - sample.at < SESSION_RUNNING_TTL_MS;
+  }
+  if (remoteTurnIsFresh(state)) return true;
+  if (activeTasks) return true;
+  if (state.ended) return false;
+  return state.attached || state.recovering || (state.running && Date.now() - state.runningAt < SESSION_RUNNING_TTL_MS);
 }
 // Every execution write, including the legacy identifier accessors, enters here.
 function updateExecutionModel(event, sid = event.owner?.sessionId ?? (typeof sessionId === "undefined" ? "" : sessionId), base = event.owner?.base ?? executionBase()) {
@@ -8785,6 +8839,21 @@ async function deleteSession(targetId, confirmed = false) {
 // Search pages come from the server; the projection also keeps cached rows
 // consistent after local edits. Both constraints filter the full server list.
 let sessMarkedOnly = false;
+const SESSION_VIEW_MODE_KEY = "serve.sessionViewMode";
+let sessionViewMode = "group";
+try {
+  const saved = localStorage.getItem(SESSION_VIEW_MODE_KEY);
+  if (saved === "list" || saved === "group") sessionViewMode = saved;
+} catch (_) {}
+function setSessionViewMode(mode) {
+  const next = mode === "list" ? "list" : "group";
+  if (sessionViewMode === next) return;
+  sessionViewMode = next;
+  try { localStorage.setItem(SESSION_VIEW_MODE_KEY, next); } catch (_) {}
+  if (next === "list") resetTemporarySessionGroups();
+  syncSessionCreationControls();
+  renderSessionList(lastItems);
+}
 function sessionMarkedFilter() {
   return sessMarkedOnly && !isPhoneLayout();
 }
@@ -8796,6 +8865,10 @@ function closeSessionSidebarMenu(restoreFocus = true) {
 }
 function wireSessionSidebarMenu() {
   const menu = $("sessmore");
+  if ($("sessviewmode")) $("sessviewmode").onclick = () => {
+    closeSessionSidebarMenu();
+    setSessionViewMode(sessionViewMode === "group" ? "list" : "group");
+  };
   menu.onkeydown = (ev) => {
     if (ev.key === "Escape") { ev.preventDefault(); closeSessionSidebarMenu(); }
   };
@@ -8870,7 +8943,7 @@ function sessionGroupPageKey(id) {
   return JSON.stringify([store.base, id, sessFilter.trim(), sessionMarkedFilter(), sessionArchiveFilter()]);
 }
 function sessionGroupRenderedItems(items = lastItems) {
-  if (!sessionGroupTemporaryOpen.size) return items;
+  if (sessionViewMode === "list" || !sessionGroupTemporaryOpen.size) return items;
   const merged = items.slice(), known = new Set(items.map((item) => item.id));
   for (const id of [...orderedSessionGroups().map((group) => group.id), null]) {
     if (!sessionGroupTemporaryOpen.has(sessionGroupTemporaryKey(id))) continue;
@@ -8916,10 +8989,13 @@ function sessionGroupTemporaryKey(id) {
 function sessionGroupVisible(group) {
   return !group.hidden || sessionMarkedFilter() || sessArchivedOnly || sessionGroupTemporaryOpen.has(sessionGroupTemporaryKey(group.id));
 }
+function sessionCreationGroupId() {
+  return sessionViewMode === "list" ? null : currentSessionGroupId();
+}
 function syncSessionCreationControls() {
   const button = $("newbtn");
   if (button) {
-    button.title = "New session in " + sessionGroupName(currentSessionGroupId());
+    button.title = "New session in " + sessionGroupName(sessionCreationGroupId());
     button.setAttribute("aria-label", button.title);
     button.disabled = sessionCreationPending;
     button.setAttribute("aria-busy", String(sessionCreationPending));
@@ -8990,10 +9066,9 @@ function paintSessionGroupActivity() {
   for (const [id, header] of sessionGroupHeaders) {
     let running = 0, waiting = 0;
     for (const item of header.items) {
-      const sample = sessionActivitySamples.get(item.id);
-      if (!sample || Date.now() - sample.at >= SESSION_ACTIVITY_MAX_AGE_MS) continue;
-      if (normalizeSessionWaiting(sample.waiting)) ++waiting;
-      else if (sample.activity === "running") ++running;
+      const activity = sessionActivityDisplay(item.id);
+      if (activity.waiting) ++waiting;
+      else if (activity.running) ++running;
     }
     if (hiddenIds.has(id)) {
       const activity = hiddenSessionGroupActivity(id);
@@ -9254,6 +9329,7 @@ function setSessionGroupHidden(group, hidden) {
 async function openHiddenSessionGroup(group) {
   const base = sessionGroupDialogBase;
   if (base !== store.base) { closeSessionGroupDialog(); return; }
+  setSessionViewMode("group");
   closeSessionGroupDialog(false);
   const filtered = !!sessFilter.trim() || sessMarkedOnly || sessArchivedOnly;
   sessFilter = "";
@@ -9284,6 +9360,7 @@ async function fetchSessionGroupPage(id, offset, include = null, archived = sess
   return sessionPageProjection(items, header("x-sessions-total"), header("x-sessions-page-size"), SESSION_PAGE_SIZE);
 }
 async function loadSessionGroupPage(id, more = false) {
+  if (sessionViewMode !== "group") return;
   const key = sessionGroupPageKey(id), base = store.base, epoch = sessionGroupPageEpoch;
   let state = sessionGroupPages.get(key);
   if (!state) {
@@ -9333,6 +9410,7 @@ function appendSessionGroupPageControl(ul, id) {
 }
 async function openHiddenActiveSession(group, active) {
   const base = store.base, seq = sessionGroupDialogSeq;
+  setSessionViewMode("group");
   try {
     const page = await fetchSessionGroupPage(group.id, 0, active.id, "include");
     if (base !== store.base || seq !== sessionGroupDialogSeq) return;
@@ -9414,6 +9492,7 @@ async function openSessionGroupMove(s) {
 }
 async function createSessionInGroup(groupId = null) {
   if (sessionCreationPending) return;
+  if (sessionViewMode === "list") groupId = null;
   const base = store.base;
   sessionCreationPending = true;
   syncSessionCreationControls();
@@ -9437,9 +9516,11 @@ async function createSessionInGroup(groupId = null) {
     $("sessfilter").value = "";
     syncSessionSearchVisibility();
     resetSessionSearch();
-    if (sessionGroups.some((group) => group.id === groupId && group.hidden)) sessionGroupTemporaryOpen.set(sessionGroupTemporaryKey(groupId), false);
-    sessionGroupCollapsed[sessionGroupCollapseKey(groupId)] = false;
-    try { localStorage.setItem(SESSION_GROUP_COLLAPSED_KEY, JSON.stringify(sessionGroupCollapsed)); } catch (_) {}
+    if (sessionViewMode === "group") {
+      if (sessionGroups.some((group) => group.id === groupId && group.hidden)) sessionGroupTemporaryOpen.set(sessionGroupTemporaryKey(groupId), false);
+      sessionGroupCollapsed[sessionGroupCollapseKey(groupId)] = false;
+      try { localStorage.setItem(SESSION_GROUP_COLLAPSED_KEY, JSON.stringify(sessionGroupCollapsed)); } catch (_) {}
+    }
     // Lazy sessions have no history until their first turn persists it.
     resetTranscript(newId);
     const placeholder = addMsg("asst", "new session — type below to start.", "asst transcript-placeholder");
@@ -9476,35 +9557,52 @@ function sessionListCountText(q, shown, items, total, markedOnly = false, search
     ? total + " sessions · showing " + shown.length + (items.length < total ? " loaded" : "")
     : total + " sessions";
 }
-// Group activity is a complete server snapshot, independent of loaded row samples.
+// Group snapshots preserve unloaded activity; loaded rows use the shared verdict.
 const sessionGroupActivitySnapshots = new Map();
 let sessionGroupActivityFlight = null;
 let sessionGroupActivityScopeBase = null;
 let sessionGroupActivitySeq = 0;
 function hiddenSessionGroupActivity(id) {
   const snapshot = sessionGroupActivitySnapshots.get(store.base);
-  if (!snapshot || Date.now() - snapshot.at >= SESSION_ACTIVITY_MAX_AGE_MS || snapshot.status === "unavailable") {
-    return { running: 0, waiting: 0, unknown: 0, active: [], unavailable: true, incomplete: false };
+  const fresh = !!snapshot && Date.now() - snapshot.at < SESSION_ACTIVITY_MAX_AGE_MS;
+  const group = fresh && snapshot.status === "complete" ? snapshot.groups.get(id) : null;
+  if (group) {
+    let { running, waiting } = group;
+    const active = new Map(group.active.map((item) => [item.id, item]));
+    const seen = new Set();
+    for (const item of sessionGroupRenderedItems(lastItems)) {
+      if (sessionGroupId(item) !== id || seen.has(item.id)) continue;
+      seen.add(item.id);
+      // Replace only this loaded session's contribution, preserving off-page totals.
+      const previous = active.get(item.id);
+      if (previous) {
+        if (normalizeSessionWaiting(previous.waiting)) --waiting;
+        else if (previous.activity === "running") --running;
+        active.delete(item.id);
+      }
+      const activity = sessionActivityDisplay(item.id);
+      if (activity.waiting) ++waiting;
+      else if (activity.running) ++running;
+      else continue;
+      active.set(item.id, { id: item.id, activity: "running", waiting: activity.waiting,
+        waiting_prompt: activity.sample?.waitingPrompt || "" });
+    }
+    return { ...group, running, waiting, active: [...active.values()], unavailable: group.unknown > 0, incomplete: false };
   }
-  if (snapshot.status === "complete") {
-    const group = snapshot.groups.get(id);
-    return group ? { ...group, unavailable: group.unknown > 0, incomplete: false }
-      : { running: 0, waiting: 0, unknown: 0, active: [], unavailable: true, incomplete: false };
-  }
-  // Older daemons expose only loaded samples; always disclose that limit.
+  // Missing snapshot coverage still exposes loaded activity while disclosing the gap.
   let running = 0, waiting = 0;
   const active = [], seen = new Set();
   for (const item of sessionGroupRenderedItems(lastItems)) {
     if (sessionGroupId(item) !== id || seen.has(item.id)) continue;
     seen.add(item.id);
-    const sample = sessionActivitySamples.get(item.id);
-    if (!sample || Date.now() - sample.at >= SESSION_ACTIVITY_MAX_AGE_MS) continue;
-    if (normalizeSessionWaiting(sample.waiting)) ++waiting;
-    else if (sample.activity === "running") ++running;
+    const activity = sessionActivityDisplay(item.id);
+    if (activity.waiting) ++waiting;
+    else if (activity.running) ++running;
     else continue;
-    active.push({ id: item.id, activity: sample.activity, waiting: sample.waiting, waiting_prompt: sample.waitingPrompt });
+    active.push({ id: item.id, activity: "running", waiting: activity.waiting, waiting_prompt: activity.sample?.waitingPrompt || "" });
   }
-  return { running, waiting, unknown: 0, active, unavailable: false, incomplete: true };
+  const incomplete = fresh && snapshot.status !== "complete" && snapshot.status !== "unavailable";
+  return { running, waiting, unknown: 0, active, unavailable: !incomplete, incomplete };
 }
 function sessionGroupActivityText(activity) {
   return (activity.running ? activity.running + " RUNNING · " : "")
@@ -9563,7 +9661,7 @@ async function pollSessionGroupActivity(force = false) {
 }
 // BEGIN session activity
 const SESSION_ACTIVITY_POLL_MS = 2500;
-const SESSION_ACTIVITY_MAX_AGE_MS = 7500;
+const SESSION_ACTIVITY_MAX_AGE_MS = SESSION_RUNNING_TTL_MS;
 // `var`, not `const`: the execution model binds before this block is
 // evaluated, and its first update reads this TTL through remoteTurnIsFresh.
 var REMOTE_RUNNING_TTL_MS = SESSION_ACTIVITY_MAX_AGE_MS;
@@ -9571,6 +9669,8 @@ const SESSION_ACTIVITY_BATCH_SIZE = 256;
 const sessionActivitySamples = new Map();
 const sessionActivityRows = new Map();
 const sessionActivityRevisions = new Map();
+// Hoisted as undefined during accessor binding; observations paint after setup.
+var sessionActivityReady = true;
 let sessionActivityBase = null;
 let sessionActivityItemsBase = null;
 let sessionActivitySupported = false;
@@ -9583,13 +9683,19 @@ function normalizeSessionActivity(value) {
 function normalizeSessionWaiting(value) {
   return value === "confirm" || value === "input" ? value : null;
 }
+function sessionActivityDisplay(id) {
+  const sample = sessionActivitySamples.get(id);
+  const fresh = !!sample && Date.now() - sample.at < SESSION_ACTIVITY_MAX_AGE_MS;
+  const state = typeof executionState === "function" ? executionState(id) : null;
+  const ledger = state && typeof displayedExecutionState === "function" ? displayedExecutionState() : null;
+  const running = state ? executionIsRunning(state, ledger?.sessionId === id && ledger.base === state.base ? ledger : state)
+    : fresh && sample.activity === "running";
+  return { running, waiting: running && fresh ? normalizeSessionWaiting(sample.waiting) : null, sample };
+}
 function paintSessionActivity(id) {
   const row = sessionActivityRows.get(id);
   if (!row) return;
-  const sample = sessionActivitySamples.get(id);
-  const fresh = !!sample && Date.now() - sample.at < SESSION_ACTIVITY_MAX_AGE_MS;
-  const waiting = fresh ? normalizeSessionWaiting(sample.waiting) : null;
-  const running = fresh && sample.activity === "running";
+  const { sample, running, waiting } = sessionActivityDisplay(id);
   const badge = row.querySelector(".session-running-badge");
   row.classList.toggle("session-running", running || !!waiting);
   row.classList.toggle("session-waiting", !!waiting);
@@ -9647,13 +9753,20 @@ function syncSessionActivityItems(items = sessionGroupRenderedItems(lastItems)) 
     for (const id of map.keys()) if (!loaded.has(id)) map.delete(id);
   }
   for (const item of items) if (!sessionActivitySamples.has(item.id)) {
-    sessionActivitySamples.set(item.id, {
+    const revision = ++nextSessionActivityRevision;
+    const retained = typeof executionState === "function" ? executionState(item.id).activitySample : null;
+    const sample = retained || {
       activity: normalizeSessionActivity(sessionActivityItemsBase === sessionActivityBase ? item.activity : "unknown"),
       waiting: sessionActivityItemsBase === sessionActivityBase ? normalizeSessionWaiting(item.waiting) : null,
       waitingPrompt: typeof item.waiting_prompt === "string" ? item.waiting_prompt : "",
-      at: Date.now(),
-    });
-    sessionActivityRevisions.set(item.id, ++nextSessionActivityRevision);
+      at: Date.now(), revision, source: "list",
+    };
+    sessionActivitySamples.set(item.id, sample);
+    sessionActivityRevisions.set(item.id, revision);
+    // Cached history is provisional until a live observation arrives.
+    if (!retained && sample.activity === "running" && typeof updateExecutionModel === "function") {
+      updateExecutionModel({ kind: "observation", sample }, item.id);
+    }
   }
   return loaded;
 }
@@ -9661,39 +9774,37 @@ function snapshotSessionActivityRevisions() {
   sessionActivityScope();
   return new Map(sessionActivityRevisions);
 }
-function mergeSessionActivities(items, { base = executionBase(), revisions = null } = {}) {
-  if (base !== executionBase()) return;
+function mergeSessionActivities(items, { base = executionBase(), revisions = null, at = Date.now(), source = "bulk", transport = null, generation = null } = {}) {
+  const accepted = new Set();
+  if (base !== executionBase() || Date.now() - at >= SESSION_ACTIVITY_MAX_AGE_MS) return accepted;
   const loaded = syncSessionActivityItems();
   for (const item of items) {
-    if (!loaded.has(item.id)) continue;
+    if (!loaded.has(item.id) && !["confirm", "task", "terminal"].includes(source)) continue;
     const revision = sessionActivityRevisions.get(item.id) || 0;
     // A request made before a newer observation or an unload/reload cannot undo it.
     if (revisions && revision !== (revisions.get(item.id) || 0)) continue;
-    const activity = normalizeSessionActivity(item.activity);
-    sessionActivitySamples.set(item.id, {
-      activity,
+    let sample = { activity: normalizeSessionActivity(item.activity),
       waiting: normalizeSessionWaiting(item.waiting),
       waitingPrompt: typeof item.waiting_prompt === "string" ? item.waiting_prompt : "",
-      at: Date.now(),
-    });
-    sessionActivityRevisions.set(item.id, ++nextSessionActivityRevision);
-    paintSessionActivity(item.id);
-    if (activity !== "running" && typeof executionState === "function") {
-      const state = executionState(item.id, base);
-      if (state.remoteActive || state.remotePid) updateExecutionModel({ kind: "remote", active: false }, item.id, base);
+      at, revision: ++nextSessionActivityRevision, source };
+    if (typeof updateExecutionModel === "function") {
+      const result = updateExecutionModel({ kind: "observation", sample, transport, generation }, item.id, base);
+      if (!result) continue;
+      sample = result.activitySample || sample;
     }
+    sessionActivitySamples.set(item.id, sample);
+    sessionActivityRevisions.set(item.id, sample.revision);
+    accepted.add(item.id);
+    paintSessionActivity(item.id);
   }
   paintSessionGroupActivity();
+  return accepted;
 }
 function expireSessionActivities() {
-  for (const [id, sample] of sessionActivitySamples) {
-    if (Date.now() - sample.at < SESSION_ACTIVITY_MAX_AGE_MS) continue;
-    sessionActivitySamples.set(id, { activity: "unknown", waiting: null, waitingPrompt: "", at: Date.now() });
-    sessionActivityRevisions.set(id, ++nextSessionActivityRevision);
-    paintSessionActivity(id);
-  }
-  paintSessionGroupActivity();
+  const expired = [...sessionActivitySamples].filter(([, sample]) => Date.now() - sample.at >= SESSION_ACTIVITY_MAX_AGE_MS);
+  mergeSessionActivities(expired.map(([id]) => ({ id, activity: "unknown" })), { source: "expiry" });
   if (typeof syncRemoteTurnNote === "function") syncRemoteTurnNote();
+  if (typeof refreshComposerControls === "function") refreshComposerControls();
 }
 async function pollSessionActivity() {
   const base = sessionActivityScope();
@@ -9716,6 +9827,7 @@ async function pollSessionActivity() {
         const batch = ids.slice(offset, offset + SESSION_ACTIVITY_BATCH_SIZE).filter((id) => loaded.has(id));
         if (!batch.length) continue;
         let samples;
+        const startedAt = Date.now();
         try {
           if (flight.controller.signal.aborted) throw new Error("activity sample timed out");
           const response = await api("/session-activity", {
@@ -9732,7 +9844,7 @@ async function pollSessionActivity() {
           samples = batch.map((id) => ({ id, activity: "unknown" }));
         }
         if (base !== executionBase() || document.visibilityState !== "visible") break;
-        mergeSessionActivities(samples, { base, revisions });
+        mergeSessionActivities(samples, { base, revisions, at: startedAt });
       }
     } finally {
       clearTimeout(deadline);
@@ -9774,9 +9886,33 @@ function wireSessionActivityPoll() {
   resume();
 }
 function observeSessionActivityExecution(event, sid, base) {
-  if (!sid || base !== executionBase() || event.kind !== "finish") return;
+  if (!sessionActivityReady) return;
+  if (!sid || base !== executionBase()) return;
+  // Lifecycle and accepted observations repaint both consumers synchronously.
+  if (!["task", "finish"].includes(event.kind)) {
+    paintSessionActivity(sid);
+    paintSessionGroupActivity();
+    return;
+  }
   const state = executionState(sid, base);
-  if (event.owner?.turn !== state.turn) return;
+  if (event.owner?.turn !== state.turn || !state.activities.has(event.owner.id)) return;
+  if (event.kind === "task") {
+    if (event.summary?.busy !== true && !event.summary?.taskStates.some(([, active]) => active === true)) return;
+    if (state.taskBusy !== true && ![...state.taskStates.values()].some((active) => active === true)) return;
+    // Only a producer observation promotes activity. Keep an unanswered
+    // question visible while its workers continue; completion still samples
+    // the server because it does not prove the turn child has been reaped.
+    const sample = sessionActivitySamples.get(sid);
+    const fresh = sample && Date.now() - sample.at < SESSION_ACTIVITY_MAX_AGE_MS;
+    mergeSessionActivities([{ id: sid, activity: "running",
+      waiting: fresh ? sample.waiting : null, waiting_prompt: fresh ? sample.waitingPrompt : "" }], { base, source: "task" });
+    return;
+  }
+  if (event.answer || event.reason === "interrupted" || event.reason === "failed") {
+    mergeSessionActivities([{ id: sid, activity: "idle" }], { base, source: "terminal" });
+  }
+  paintSessionActivity(sid);
+  paintSessionGroupActivity();
   refreshSessionActivity(sid, base);
 }
 function refreshSessionActivity(sid, base = executionBase()) {
@@ -9789,6 +9925,8 @@ function refreshSessionActivity(sid, base = executionBase()) {
 // END session activity
 function renderSessionList(items, errText, { preserveScroll = true, followNewest = false } = {}) {
   const markedOnly = sessionMarkedFilter();
+  const grouped = sessionViewMode === "group";
+  if ($("sessviewmode")) $("sessviewmode").textContent = grouped ? "List view" : "Group view";
   const globalItems = items;
   items = sessionGroupRenderedItems(items);
   const { q, shown } = sessionListProjection(items.filter((s) => sessionMatchesArchive(s)), sessFilter, markedOnly);
@@ -9813,7 +9951,7 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
   sessionGroupHeaders.clear();
   ul.textContent = "";
   const entries = [];
-  if (q) entries.push(...shown.map((s) => ({ s })));
+  if (q || !grouped) entries.push(...shown.map((s) => ({ s })));
   else if (shown.length || (!markedOnly && !sessArchivedOnly)) {
     const buckets = new Map([...orderedSessionGroups().filter(sessionGroupVisible).map((group) => [group.id, { group, items: [] }]), [null, { group: null, items: [] }]]);
     for (const s of shown) buckets.get(sessionGroupId(s))?.items.push(s);
@@ -9913,7 +10051,7 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
     hash.className = "session-hash";
     hash.textContent = s.id.slice(0, 8);
     sm.appendChild(hash);
-    if (q) {
+    if (q && grouped) {
       const tag = document.createElement("span");
       tag.className = "session-group-tag";
       tag.textContent = sessionGroupName(sessionGroupId(s));
@@ -9959,7 +10097,7 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
       selectSessionListItem(s);
     };
     ul.appendChild(li);
-    if (!q) sessionGroupHeaders.get(entry.groupId).rows.push(li);
+    if (!q && grouped) sessionGroupHeaders.get(entry.groupId).rows.push(li);
   }
   paintSessionGroupActivity();
   if (searchResults && !shown.length && !markedOnly) {
@@ -11647,14 +11785,11 @@ function ensureConfirmPoll() {
   if (confirmPollTimer !== null) return;
   confirmPollTimer = setInterval(async () => {
     if (document.visibilityState !== "visible") return;
-    // While this page believes a turn is in flight, ask often: that answer
-    // decides the composer and the transcript refresh. An idle page keeps the
-    // slow cadence for native requests that arrive long after the turn.
-    if (!isTurnRunning() && ++confirmPollTick % 5 !== 0) return;
+    // Idle pages must discover a turn started by another tab or terminal on
+    // the same cadence as running pages; local belief can lag the server.
     const sid = sessionId, epoch = runEpoch;
-    const running = await pollConfirm();
+    await pollConfirm();
     if (sid !== sessionId || epoch !== runEpoch) return;
-    // Active remote turns use the same fast cadence; idle tabs sample every 10s.
     if (!sessionId) stopConfirmPoll();
   }, 2000); // fallback only; the reattached event stream is the primary path
 }
@@ -12185,7 +12320,7 @@ async function attachEvents() {
     view.remove();
     if (recoveredView === view) recoveredView = null;
     if (eventAbort === controller) { eventAbort = null; eventActive = false; eventSession = ""; syncStopButton(); }
-    const fresh = turnRunning && Date.now() - turnRunningAt < RUNNING_SAMPLE_TTL_MS;
+    const fresh = turnRunning && Date.now() - turnRunningAt < SESSION_RUNNING_TTL_MS;
     if (!owned) return;
     if (!finished && (timedOut || !controller.signal.aborted)) eventFailures++;
     if (!finished && fresh && !turns.has(sid) && eventFailures < 5 && (timedOut || !controller.signal.aborted)) {
@@ -12235,22 +12370,23 @@ async function pollConfirm() {
   // source that survives this page losing the stream. A missing field means an
   // older server, treated as "not running".
   const remote = body.remote === true || (typeof body.remote === "string" && !!body.remote.trim());
-  // Delivery cannot renew ownership evidence captured before a slow request.
-  if (remote && Date.now() - startedAt >= REMOTE_RUNNING_TTL_MS) return null;
-  // An activity observation received after this request takes precedence over
-  // its older remote owner, even when no stream has changed the run epoch.
-  if (remote && activityRevisions && activityRevisions.get(sid) !== snapshotSessionActivityRevisions().get(sid)) return null;
+  // Every source crosses the same revision/freshness gate before side effects.
   const wasRunning = turnRunning, wasRemote = isRemoteTurn();
-  turnRunning = body.running === true;
   const pid = Number(body.turn) || 0;
   const remotePid = typeof body.remote === "string" && /^[1-9]\d*$/.test(body.remote.trim()) ? body.remote.trim() : "";
-  const previous = executionState();
-  if ((remote && !turnRunning) || previous.remoteActive || previous.remotePid) {
-    updateExecutionModel({ kind: "remote", active: remote && !turnRunning, pid: remotePid, at: startedAt }, sid, base);
-  }
+  const pendingSample = body.pending;
+  const native = pendingSample?.input && typeof pendingSample.prompt === "string" && pendingSample.prompt.startsWith(NATIVE_PREFIX);
+  const sample = { id: sid, activity: body.running === true || remote ? "running" : "idle",
+    waiting: pendingSample && !native ? pendingSample.input ? "input" : "confirm" : null,
+    waiting_prompt: pendingSample && !native && typeof pendingSample.prompt === "string" ? pendingSample.prompt.split("\n")[0] : "" };
+  const transport = { running: body.running === true, pid, remote: remote && body.running !== true, remotePid };
+  if (typeof mergeSessionActivities === "function") {
+    const accepted = mergeSessionActivities([sample], { base, revisions: activityRevisions, at: startedAt,
+      source: "confirm", transport, generation: sampleGeneration });
+    if (!accepted.has(sid)) return null;
+  } else if (!updateExecutionModel({ kind: "observation", sample: { ...sample, at: startedAt, source: "confirm" },
+      transport, generation: sampleGeneration }, sid, base)) return null;
   if (turnRunning) {
-    turnRunningPid = pid;
-    turnRunningAt = Date.now();
     // A successful server sample can reopen a retry budget exhausted offline.
     // Keep the existing bounded burst while allowing recovery without reload.
     if (eventFailures >= 5) eventFailures = 0;
@@ -12290,15 +12426,10 @@ async function pollConfirm() {
       await loadHistory();
       void loadSessions();
     }
-    // The idle cadence stays alive while a session is open; the tick above
-    // already samples only every 10s when nothing is running.
+    // The cadence stays alive while a session is open so a later turn can
+    // be discovered without waiting for any local execution event.
   }
   if (sid !== sessionId || base !== executionBase() || epoch !== runEpoch || seq !== confirmPollSeq) return null;
-  // Only an explicit idle response can retire stale task snapshots. Bind it
-  // to the owner sampled before the fetch; stream cleanup is not idle evidence.
-  if (body.running === false && !remote) {
-    updateExecutionModel({ kind: "idle", generation: sampleGeneration, at: startedAt }, sid, base);
-  }
   syncStopButton();
   // Queue state follows the same poll as the running state: a note may be
   // drained by the turn child between any two samples.
@@ -12323,29 +12454,8 @@ function isRemoteTurn() {
   return remoteTurnIsFresh(executionState());
 }
 function isTurnRunning() {
-  const state = executionState();
-  const displayed = displayedExecutionState();
-  if (!state.sessionId) return false;
-  // Another process's turn has no local stream and no `turnRunning` sample,
-  // but it must still block a second send and keep history follow alive.
-  if (remoteTurnIsFresh(state)) return true;
-  if (state.live) return true;
-  if (state.failed) return false;
-  // A fresh `/confirm` sample saying no turn is authoritative over task
-  // snapshots from history. Without this, a background task that outlived its
-  // turn keeps the composer in the stop state after a reload.
-  const idleSampleFresh = !!state.idleSample && state.idleSample.generation === state.sampleGeneration
-    && state.idleSample.at > 0 && Date.now() - state.idleSample.at < RUNNING_SAMPLE_TTL_MS;
-  // A parked foreground turn can close its model-output stream while a
-  // subagent is still running. Producer observations for the displayed view,
-  // never card placement, decide whether a later snapshot settled that ledger.
-  if (!idleSampleFresh
-      && ([...displayed.taskStates.values()].some((active) => active === true) || displayed.taskBusy === true)) return true;
-  // OutputComplete ends the visible turn before its child is reaped. Do not
-  // let that child's running sample keep the composer stopped after done.
-  if (state.ended) return false;
-  const freshServerTurn = state.running && (Date.now() - state.runningAt) < RUNNING_SAMPLE_TTL_MS;
-  return state.attached || state.recovering || freshServerTurn;
+  const state = executionState(), displayed = displayedExecutionState();
+  return executionIsRunning(state, displayed.sessionId === state.sessionId && displayed.base === state.base ? displayed : state);
 }
 function canSend() {
   const state = executionState();
@@ -12381,6 +12491,11 @@ function syncStopButton() {
   const state = executionState();
   const b = $("send");
   const running = isTurnRunning();
+  // A clock-driven composer refresh must repaint the same expired observation.
+  if (typeof sessionActivityReady !== "undefined" && sessionActivityReady) {
+    paintSessionActivity(state.sessionId);
+    paintSessionGroupActivity();
+  }
   b.textContent = running ? "⏹" : "➤";
   b.classList.toggle("stop", running);
   const remote = typeof isRemoteTurn === "function" && isRemoteTurn();
@@ -13613,7 +13728,7 @@ async function send() {
   // delayed poll follows on purpose: past `done`, server `running=true` can
   // only be reap lag (the child is reaped after OutputComplete) or a new
   // remote turn, and one boolean cannot tell them apart — latching it nailed
-  // the button red for up to RUNNING_SAMPLE_TTL_MS. Event polls (return,
+  // the button red for up to SESSION_RUNNING_TTL_MS. Event polls (return,
   // stale ticks, boot) re-derive the truth when there is something to see.
   // ... only for the session this feed belongs to: a sample that describes the
   // session on screen (some other session's turn) is not this stream's to clear.
@@ -13669,7 +13784,7 @@ function syncRemoteTurnNote({ create = false } = {}) {
 }
 function observeRemoteTurnNoteExecution(event, sid, base) {
   if (sid !== sessionId || base !== executionBase()) return;
-  if (["remote", "begin", "live", "select", "field", "finish", "display"].includes(event.kind)) syncRemoteTurnNote();
+  if (["remote", "observation", "begin", "live", "select", "field", "finish", "display"].includes(event.kind)) syncRemoteTurnNote();
 }
 // END remote turn note
 
@@ -14057,7 +14172,7 @@ function wire() {
     $("conn").classList.remove("open");
     await boot();
   };
-  $("newbtn").onclick = () => createSessionInGroup(currentSessionGroupId());
+  $("newbtn").onclick = () => createSessionInGroup(sessionCreationGroupId());
   $("refresh").onclick = async () => { resetTemporarySessionGroups(); await loadSessionGroups(); await loadSessions(); await loadHistory(); await loadSessionConfig({ teamOnly: true }); };
   $("fork").onclick = () => forkSession(sessionId);
   $("del").onclick = () => deleteSession(sessionId);

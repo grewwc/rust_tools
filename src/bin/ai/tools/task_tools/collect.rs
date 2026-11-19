@@ -331,6 +331,7 @@ pub(super) fn drain_task_result(
                     Some(&report),
                 )?;
             }
+            let verification = report.verification.clone();
             record_report_task(report);
             mark_task_retry_status(task_id, &status);
             lock_unpoisoned(&TASK_PROGRESS_REGISTRY).take(&task_id.to_string());
@@ -342,6 +343,7 @@ pub(super) fn drain_task_result(
                     error: None,
                     progress: None,
                     backend_session: None,
+                    verification,
                 },
                 rendered,
             }));
@@ -364,6 +366,7 @@ pub(super) fn drain_task_result(
                 task_id,
                 None,
             ),
+            verification: None,
         };
         let rendered = format_task_result_with_id(task_id, entry, result.clone());
         let report = TaskReportTask::terminal(task_id, entry, &result);
@@ -442,6 +445,7 @@ pub(super) fn poll_owned_task_result(task_id: &str) -> Result<OwnedTaskPoll, Str
                     error: None,
                     progress: None,
                     backend_session: None,
+                    verification: None,
                 },
                 rendered: payload,
             });

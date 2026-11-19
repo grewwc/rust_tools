@@ -2203,6 +2203,21 @@ fn pb_read_round(messages: &mut Vec<crate::ai::history::Message>, path: &str, id
     messages.push(pb_tool_result(id, &format!("body of {path}")));
 }
 
+fn pb_window_read_round(
+    messages: &mut Vec<crate::ai::history::Message>,
+    path: &str,
+    offset: usize,
+    limit: usize,
+    id: &str,
+) {
+    messages.push(pb_task_tool_msg(
+        "read_file",
+        serde_json::json!({"path": path, "offset": offset, "limit": limit}),
+        id,
+    ));
+    messages.push(pb_tool_result(id, &"line\n".repeat(limit)));
+}
+
 fn pb_task_tool_msg(
     tool_name: &str,
     args: serde_json::Value,
@@ -2893,6 +2908,863 @@ fn target_rescan_ignores_monotonic_pagination() {
             "monotonic pagination must not trigger rescan at round {i}: {signal:?}"
         );
     }
+}
+
+#[test]
+fn redundant_window_reread_soft_prompt_and_hard_stop() {
+    // A sub-window of an already returned read cannot add information: the file is unchanged, so
+    // the bytes are identical. Interleave new files each round so exact/coarse/target detectors
+    // stay quiet, and keep one gap round between redundant reads so the target window never fills.
+    let mut supervisor = TurnSupervisor::default();
+    supervisor.iteration = 30;
+    let mut messages = Vec::new();
+    let file = "src/redundant.rs";
+    pb_window_read_round(&mut messages, file, 100, 50, "w0");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None
+    );
+    let mut soft_seen = false;
+    let mut hard_seen = false;
+    for i in 1..=6 {
+        // Each redundant window is fully inside the first read's [100, 150).
+        let offset = 100 + i;
+        let limit = 50 - i;
+        pb_window_read_round(&mut messages, file, offset, limit, &format!("r{i}"));
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        match signal {
+            ToolLoopSignal::RedundantRead(target, reads) => {
+                assert_eq!(target, file);
+                assert_eq!(reads, REDUNDANT_READ_SOFT_THRESHOLD);
+                soft_seen = true;
+            }
+            ToolLoopSignal::RedundantReadHard(target, reads) => {
+                assert_eq!(target, file);
+                assert_eq!(reads, REDUNDANT_READ_HARD_THRESHOLD);
+                hard_seen = true;
+            }
+            ToolLoopSignal::None => {}
+            other => panic!("round r{i} hit an unrelated detector: {other:?}"),
+        }
+        // A fresh file between redundant reads keeps whole-round windows from aligning.
+        pb_window_read_round(
+            &mut messages,
+            &format!("src/other-{i}.rs"),
+            1,
+            5,
+            &format!("n{i}"),
+        );
+        let gap = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        assert_eq!(gap, ToolLoopSignal::None, "gap round {i}: {gap:?}");
+    }
+    assert!(soft_seen, "3rd redundant read must inject the soft notice");
+    assert!(hard_seen, "6th redundant read must hard-stop");
+}
+
+#[test]
+fn monotonic_windows_are_not_redundant_reads() {
+    // Forward paging advances the window; every read returns new lines and must stay free.
+    let mut supervisor = TurnSupervisor::default();
+    supervisor.iteration = 30;
+    let mut messages = Vec::new();
+    let file = "src/big-paged.rs";
+    for i in 0..8 {
+        let offset = 1 + i * 100;
+        pb_window_read_round(&mut messages, file, offset, 100, &format!("m{i}"));
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        assert!(
+            !matches!(
+                signal,
+                ToolLoopSignal::RedundantRead(..) | ToolLoopSignal::RedundantReadHard(..)
+            ),
+            "paging round {i} must not be judged a redundant re-read: {signal:?}"
+        );
+    }
+    assert!(supervisor.progress.redundant_read_counts.is_empty());
+}
+
+#[test]
+fn redundant_read_counts_reset_on_edit() {
+    // After an edit the file may genuinely differ, so coverage and counts must restart.
+    let mut supervisor = TurnSupervisor::default();
+    supervisor.iteration = 30;
+    let mut messages = Vec::new();
+    let file = "src/edited.rs";
+    pb_window_read_round(&mut messages, file, 100, 50, "e0");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None
+    );
+    pb_window_read_round(&mut messages, file, 110, 20, "e1");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None
+    );
+    assert_eq!(
+        supervisor.progress.redundant_read_counts.get(file),
+        Some(&1)
+    );
+    messages.push(pb_write_file_msg(file, "edit"));
+    messages.push(pb_tool_result("edit", "Successfully wrote file."));
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None
+    );
+    assert!(
+        supervisor.progress.redundant_read_counts.is_empty(),
+        "an edit must clear redundant-read counts"
+    );
+    assert!(!supervisor.progress.read_coverage.contains_key(file));
+    // The first read after the edit re-establishes coverage instead of counting as redundant.
+    pb_window_read_round(&mut messages, file, 101, 49, "e2");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None
+    );
+    assert!(supervisor.progress.redundant_read_counts.is_empty());
+}
+
+#[test]
+fn redundant_read_counts_reset_on_truncation_retry() {
+    // Truncation clears the conversation, so re-reading the same window to rebuild context is
+    // recovery, not a loop: counts and coverage must restart with the history.
+    let mut supervisor = TurnSupervisor::default();
+    supervisor.iteration = 30;
+    let mut messages = Vec::new();
+    let file = "src/truncated.rs";
+    pb_window_read_round(&mut messages, file, 100, 50, "t0");
+    supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+    pb_window_read_round(&mut messages, file, 110, 20, "t1");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None
+    );
+    assert_eq!(
+        supervisor.progress.redundant_read_counts.get(file),
+        Some(&1)
+    );
+    supervisor.progress.reset_after_truncation();
+    assert!(supervisor.progress.redundant_read_counts.is_empty());
+    assert!(!supervisor.progress.read_coverage.contains_key(file));
+    // The first post-truncation re-read re-establishes coverage instead of counting.
+    pb_window_read_round(&mut messages, file, 110, 20, "t2");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None
+    );
+    assert!(supervisor.progress.redundant_read_counts.is_empty());
+}
+
+#[test]
+fn redundant_reads_cleared_by_pathless_apply_patch() {
+    // `apply_patch` accepts patch text without a `file_path` argument; detection must be by tool
+    // name, otherwise the edit leaves coverage describing pre-edit bytes and the first verifying
+    // re-read is misjudged as redundant.
+    let mut supervisor = TurnSupervisor::default();
+    supervisor.iteration = 30;
+    let mut messages = Vec::new();
+    let file = "src/patched.rs";
+    pb_window_read_round(&mut messages, file, 100, 50, "p0");
+    supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+    pb_window_read_round(&mut messages, file, 110, 20, "p1");
+    supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+    assert_eq!(
+        supervisor.progress.redundant_read_counts.get(file),
+        Some(&1)
+    );
+    messages.push(pb_task_tool_msg(
+        "apply_patch",
+        serde_json::json!({"patch": "*** Begin Patch\n*** Update File: src/patched.rs\n*** End Patch"}),
+        "edit",
+    ));
+    messages.push(pb_tool_result("edit", "Applied patch."));
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None
+    );
+    assert!(
+        supervisor.progress.redundant_read_counts.is_empty(),
+        "a pathless apply_patch must clear redundant-read counts"
+    );
+    pb_window_read_round(&mut messages, file, 110, 20, "p2");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None
+    );
+    assert!(supervisor.progress.redundant_read_counts.is_empty());
+}
+
+struct ReadCoverageFixture(PathBuf);
+
+impl ReadCoverageFixture {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("read-coverage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("window.rs"), Self::content(0)).unwrap();
+        Self(dir)
+    }
+
+    fn content(version: usize) -> String {
+        (1..=120)
+            .map(|line| format!("version-{version} line-{line}\n"))
+            .collect()
+    }
+}
+
+impl Drop for ReadCoverageFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn pb_driver_cached_window_read_round(
+    messages: &mut Vec<crate::ai::history::Message>,
+    path: &std::path::Path,
+    numbered: bool,
+    id: &str,
+) -> (String, bool) {
+    let args = serde_json::json!({
+        // Raw windows reach EOF so no ambiguous paging suffix masks complete-line coverage.
+        "file_path": path, "offset": 100, "limit": if numbered { 5 } else { 21 },
+        "use_line_numbers": numbered,
+    });
+    let mut call = pb_task_tool_msg("read_file", args, id);
+    let mcp = crate::ai::mcp::McpClient::new();
+    let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+    let result = crate::ai::driver::tools::execute_tool_calls(
+        "read-coverage-cache",
+        &mcp,
+        &shared_mcp,
+        call.tool_calls.as_ref().unwrap(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(!result.had_error, "{:?}", result.tool_results);
+    assert_eq!(result.tool_results.len(), 1);
+    let text = result.tool_results[0].content.clone();
+    call.tool_calls = Some(result.executed_tool_calls);
+    messages.push(call);
+    messages.push(pb_tool_result(id, &text));
+    (text, result.cached_hits[0])
+}
+
+fn with_driver_read_cache_fixture(check: impl FnOnce(&ReadCoverageFixture)) {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let fixture = ReadCoverageFixture::new();
+    crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(fixture.0.clone(), || {
+        crate::ai::driver::runtime_ctx::SUBAGENT_MEMORY_PATH.sync_scope(
+            fixture.0.join("memory.jsonl"),
+            || {
+                crate::ai::driver::runtime_ctx::SUPPRESS_TERMINAL_OUTPUT
+                    .sync_scope(true, || check(&fixture));
+            },
+        );
+    });
+}
+
+fn assert_driver_cache_changed_content_resets_redundant_reads(restore_mtime: bool) {
+    with_driver_read_cache_fixture(|fixture| {
+        // Exercise both raw and numbered output through the actual driver dispatch/cache boundary.
+        for numbered in [false, true] {
+            let path = fixture
+                .0
+                .join(if numbered { "numbered.rs" } else { "raw.rs" });
+            std::fs::write(&path, ReadCoverageFixture::content(0)).unwrap();
+            let original_mtime =
+                std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_000_000);
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+                .unwrap();
+            let original_meta = std::fs::metadata(&path).unwrap();
+            let target = path.to_string_lossy().into_owned();
+            let mut supervisor = TurnSupervisor::default();
+            supervisor.iteration = 30;
+            let mut messages = Vec::new();
+            let (_, cached) =
+                pb_driver_cached_window_read_round(&mut messages, &path, numbered, "initial");
+            assert!(!cached);
+            assert_eq!(
+                supervisor.progress.observe_round_reads(
+                    &messages,
+                    supervisor.iteration,
+                    PROGRESS_FREE_EXPLORE_ROUNDS
+                ),
+                ToolLoopSignal::None
+            );
+            for reread in 1..=REDUNDANT_READ_SOFT_THRESHOLD {
+                let (_, cached) = pb_driver_cached_window_read_round(
+                    &mut messages,
+                    &path,
+                    numbered,
+                    &format!("cached-{reread}"),
+                );
+                assert!(cached, "unchanged source must retain driver cache reuse");
+                let signal = supervisor.progress.observe_round_reads(
+                    &messages,
+                    supervisor.iteration,
+                    PROGRESS_FREE_EXPLORE_ROUNDS,
+                );
+                if reread == REDUNDANT_READ_SOFT_THRESHOLD {
+                    assert_eq!(
+                        signal,
+                        ToolLoopSignal::RedundantRead(target.clone(), reread)
+                    );
+                } else {
+                    assert_eq!(signal, ToolLoopSignal::None);
+                }
+            }
+            assert_eq!(
+                supervisor.progress.redundant_read_counts.get(&target),
+                Some(&3)
+            );
+            for version in 1..=8 {
+                std::fs::write(&path, ReadCoverageFixture::content(version)).unwrap();
+                let mtime = if restore_mtime {
+                    original_meta.modified().unwrap()
+                } else {
+                    original_mtime + std::time::Duration::from_nanos(version as u64 * 100)
+                };
+                file.set_times(std::fs::FileTimes::new().set_modified(mtime))
+                    .unwrap();
+                let current_meta = std::fs::metadata(&path).unwrap();
+                assert_eq!(current_meta.len(), original_meta.len());
+                assert_eq!(
+                    current_meta
+                        .modified()
+                        .unwrap()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis(),
+                    original_meta
+                        .modified()
+                        .unwrap()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis(),
+                    "the metadata cache key must collide"
+                );
+                if restore_mtime {
+                    assert_eq!(
+                        current_meta.modified().unwrap(),
+                        original_meta.modified().unwrap()
+                    );
+                }
+                let (text, cached) = pb_driver_cached_window_read_round(
+                    &mut messages,
+                    &path,
+                    numbered,
+                    &format!("version-{version}"),
+                );
+                assert!(
+                    text.contains(&format!("version-{version} line-100")),
+                    "{text}"
+                );
+                assert!(!cached, "changed content must invalidate the driver cache");
+                let signal = supervisor.progress.observe_round_reads(
+                    &messages,
+                    supervisor.iteration,
+                    PROGRESS_FREE_EXPLORE_ROUNDS,
+                );
+                assert!(!matches!(signal, ToolLoopSignal::RedundantReadHard(..)));
+                assert!(!matches!(
+                    signal.intervention(),
+                    Some((_, SignalKind::HardStop))
+                ));
+                assert_eq!(signal, ToolLoopSignal::None);
+                assert!(
+                    !supervisor
+                        .progress
+                        .redundant_read_counts
+                        .contains_key(&target)
+                );
+                assert!(
+                    !supervisor
+                        .progress
+                        .redundant_read_note_targets
+                        .contains(&target)
+                );
+                supervisor.next_iteration();
+            }
+        }
+    });
+}
+
+#[test]
+fn redundant_reads_driver_cache_refreshes_same_millisecond_updates() {
+    assert_driver_cache_changed_content_resets_redundant_reads(false);
+}
+
+#[test]
+fn redundant_reads_driver_cache_refreshes_restored_mtime_updates() {
+    assert_driver_cache_changed_content_resets_redundant_reads(true);
+}
+
+#[test]
+fn redundant_reads_driver_cache_unchanged_content_hard_stops_at_six() {
+    with_driver_read_cache_fixture(|fixture| {
+        let path = fixture.0.join("window.rs");
+        let target = path.to_string_lossy().into_owned();
+        let mut supervisor = TurnSupervisor::default();
+        supervisor.iteration = 30;
+        let mut messages = Vec::new();
+        for reread in 0..=REDUNDANT_READ_HARD_THRESHOLD {
+            let (text, cached) = pb_driver_cached_window_read_round(
+                &mut messages,
+                &path,
+                true,
+                &format!("reread-{reread}"),
+            );
+            assert!(text.contains("version-0 line-100"));
+            assert_eq!(cached, reread > 0);
+            let signal = supervisor.progress.observe_round_reads(
+                &messages,
+                supervisor.iteration,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            );
+            if reread == REDUNDANT_READ_HARD_THRESHOLD {
+                assert_eq!(signal, ToolLoopSignal::RedundantReadHard(target.clone(), 6));
+                assert!(matches!(
+                    signal.intervention(),
+                    Some((_, SignalKind::HardStop))
+                ));
+            }
+        }
+    });
+}
+
+fn pb_executed_window_read_round(
+    messages: &mut Vec<crate::ai::history::Message>,
+    offset: usize,
+    limit: usize,
+    id: &str,
+) -> String {
+    let args = serde_json::json!({"path": "window.rs", "offset": offset, "limit": limit});
+    // Execute the service on every call, including identical arguments: a replayed result
+    // would not exercise the changed-content regression.
+    let text = crate::ai::tools::service::file::execute_read_file(&args).unwrap();
+    assert_eq!(
+        classify_tool_result_progress(&text),
+        ToolResultProgressStatus::Success
+    );
+    messages.push(pb_task_tool_msg("read_file", args, id));
+    messages.push(pb_tool_result(id, &text));
+    text
+}
+
+fn pb_seed_redundant_middle_reads(
+    supervisor: &mut TurnSupervisor,
+    messages: &mut Vec<crate::ai::history::Message>,
+) {
+    supervisor.iteration = 30;
+    pb_executed_window_read_round(messages, 90, 20, "initial-window");
+    assert_eq!(
+        supervisor.record_tool_signatures(messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None
+    );
+    for i in 1..=REDUNDANT_READ_SOFT_THRESHOLD {
+        pb_executed_window_read_round(messages, 100, 5, &format!("unchanged-{i}"));
+        let signal = supervisor.record_tool_signatures(messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        if i == REDUNDANT_READ_SOFT_THRESHOLD {
+            assert_eq!(signal, ToolLoopSignal::RedundantRead("window.rs".into(), i));
+        } else {
+            assert_eq!(signal, ToolLoopSignal::None);
+        }
+        // Keep unrelated signature detectors quiet without clearing this target's count.
+        pb_window_read_round(
+            messages,
+            &format!("src/gap-{i}.rs"),
+            1,
+            5,
+            &format!("gap-{i}"),
+        );
+        assert_eq!(
+            supervisor.record_tool_signatures(messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::None
+        );
+    }
+    assert_eq!(
+        supervisor.progress.redundant_read_counts.get("window.rs"),
+        Some(&3)
+    );
+    assert!(
+        supervisor
+            .progress
+            .redundant_read_note_targets
+            .contains("window.rs")
+    );
+}
+
+fn pb_read_coverage_gap_rounds(
+    supervisor: &mut TurnSupervisor,
+    messages: &mut Vec<crate::ai::history::Message>,
+    episode: &str,
+) {
+    for i in 0..2 {
+        let id = format!("coverage-gap-{episode}-{i}");
+        pb_window_read_round(messages, &format!("src/{id}.rs"), 1, 5, &id);
+        assert_eq!(
+            supervisor.record_tool_signatures(messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::None
+        );
+    }
+}
+
+#[test]
+fn redundant_reads_reset_after_command_updates_same_middle_window() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let fixture = ReadCoverageFixture::new();
+    crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(fixture.0.clone(), || {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        pb_seed_redundant_middle_reads(&mut supervisor, &mut messages);
+
+        let args = serde_json::json!({"command": "tee window.rs", "cwd": fixture.0, "input": ReadCoverageFixture::content(1)});
+        let text = crate::ai::tools::service::command::execute_command(&args).unwrap();
+        messages.push(pb_task_tool_msg("execute_command", args, "command-update"));
+        messages.push(pb_tool_result("command-update", &text));
+        assert_eq!(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS), ToolLoopSignal::None);
+        // A command name alone cannot prove a file changed; only the returned read can.
+        assert_eq!(supervisor.progress.redundant_read_counts.get("window.rs"), Some(&3));
+        pb_read_coverage_gap_rounds(&mut supervisor, &mut messages, "command");
+
+        let text = pb_executed_window_read_round(&mut messages, 100, 5, "updated-window");
+        assert!(text.contains("version-1 line-100"));
+        assert_eq!(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS), ToolLoopSignal::None);
+        assert!(!supervisor.progress.redundant_read_counts.contains_key("window.rs"));
+        assert!(!supervisor.progress.redundant_read_note_targets.contains("window.rs"));
+        assert!(supervisor.progress.read_coverage.contains_key("src/gap-1.rs"));
+        // The changed overlap discarded the old coverage outside the new window as well.
+        assert_eq!(supervisor.progress.read_coverage.get("window.rs").unwrap().len(), 5);
+    });
+}
+
+#[test]
+fn redundant_reads_reset_after_yielded_background_update_without_direct_edit() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let _session_guard = crate::ai::tools::storage::command_session::tests::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let fixture = ReadCoverageFixture::new();
+    crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(fixture.0.clone(), || {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        pb_seed_redundant_middle_reads(&mut supervisor, &mut messages);
+
+        // The process waits for a pipe input, so it cannot race the initial yielded result.
+        let command = format!("read gate; printf '%s' '{}' > window.rs", ReadCoverageFixture::content(1));
+        let args = serde_json::json!({"command": command, "cwd": fixture.0, "yield_time_ms": 5000, "pty": false});
+        let started = crate::ai::tools::service::command::execute_command(&args).unwrap();
+        let (session_id, status) = command_session_result(&started).unwrap();
+        assert_eq!(status, ToolResultProgressStatus::Running);
+        let session_id = session_id.unwrap().to_string();
+        messages.push(pb_task_tool_msg("execute_command", args, "background-start"));
+        messages.push(pb_tool_result("background-start", &started));
+        assert_eq!(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS), ToolLoopSignal::None);
+
+        let args = serde_json::json!({"action": "write", "session_id": session_id, "write_stdin": "continue\n", "yield_time_ms": 5000});
+        let completed = crate::ai::tools::service::command_session::execute_command_session(&args).unwrap();
+        // Completed, drained sessions are already removed; close only cleans up a still-live one.
+        let _ = crate::ai::tools::storage::command_session::close(&session_id);
+        assert_eq!(command_session_result(&completed).unwrap().1, ToolResultProgressStatus::Success);
+        messages.push(pb_task_tool_msg("command_session", args, "background-completed"));
+        messages.push(pb_tool_result("background-completed", &completed));
+        assert!(!round_has_direct_mutation_tool(&messages));
+        assert_eq!(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS), ToolLoopSignal::None);
+        assert_eq!(supervisor.progress.redundant_read_counts.get("window.rs"), Some(&3));
+
+        let text = pb_executed_window_read_round(&mut messages, 100, 5, "background-updated-window");
+        assert!(text.contains("version-1 line-100"));
+        assert_eq!(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS), ToolLoopSignal::None);
+        assert!(!supervisor.progress.redundant_read_counts.contains_key("window.rs"));
+        assert!(!supervisor.progress.redundant_read_note_targets.contains("window.rs"));
+        assert!(messages.iter().filter_map(|m| m.tool_calls.as_ref()).flatten()
+            .all(|call| !is_direct_file_mutation_tool(&call.function.name)));
+    });
+}
+
+#[test]
+fn redundant_reads_continuously_changing_content_never_requests_no_tool_handoff() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let fixture = ReadCoverageFixture::new();
+    crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(fixture.0.clone(), || {
+        let mut supervisor = TurnSupervisor::default();
+        supervisor.iteration = 30;
+        let mut messages = Vec::new();
+        pb_executed_window_read_round(&mut messages, 100, 5, "version-0");
+        assert_eq!(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS), ToolLoopSignal::None);
+        for version in 1..=8 {
+            let args = serde_json::json!({"command": "tee window.rs", "cwd": fixture.0, "input": ReadCoverageFixture::content(version)});
+            let text = crate::ai::tools::service::command::execute_command(&args).unwrap();
+            let id = format!("update-{version}");
+            messages.push(pb_task_tool_msg("execute_command", args, &id));
+            messages.push(pb_tool_result(&id, &text));
+            assert_eq!(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS), ToolLoopSignal::None);
+            pb_read_coverage_gap_rounds(&mut supervisor, &mut messages, &id);
+            let text = pb_executed_window_read_round(&mut messages, 100, 5, &format!("version-{version}"));
+            assert!(text.contains(&format!("version-{version} line-100")));
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            // HardStop is the runtime decision that schedules the next request without tools.
+            assert!(!matches!(signal.intervention(), Some((_, SignalKind::HardStop))),
+                "new content at version {version} requested no-tool handoff: {signal:?}");
+            supervisor.next_iteration();
+        }
+        assert!(!supervisor.progress.redundant_read_counts.contains_key("window.rs"));
+        assert!(!supervisor.progress.redundant_read_note_targets.contains("window.rs"));
+    });
+}
+
+#[test]
+fn redundant_reads_raw_notice_like_source_tracks_changes_after_ellipsis() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let fixture = ReadCoverageFixture::new();
+    crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(fixture.0.clone(), || {
+        let mut ledger = ProgressLedger::default();
+        let mut messages = Vec::new();
+        for version in 0..=8 {
+            let content = format!("stable\n... [source text]\nversion-{version}\n");
+            std::fs::write(fixture.0.join("raw.txt"), &content).unwrap();
+            let args = serde_json::json!({
+                "path": "raw.txt", "offset": 1, "limit": 3, "use_line_numbers": false,
+            });
+            // Execute the real renderer each time so every snapshot contains the current version.
+            let text = crate::ai::tools::service::file::execute_read_file(&args).unwrap();
+            assert_eq!(text, content.trim_end_matches('\n'));
+            let id = format!("raw-version-{version}");
+            messages.push(pb_task_tool_msg("read_file", args, &id));
+            messages.push(pb_tool_result(&id, &text));
+            let signal = ledger.observe_round_reads(
+                &messages,
+                30 + version,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            );
+            assert_eq!(
+                signal,
+                ToolLoopSignal::None,
+                "changed raw content at version {version} must not count as redundant"
+            );
+        }
+        let windows = extract_round_read_windows(&messages);
+        assert_eq!(windows[0].line_fingerprints.len(), 3);
+        assert!(!windows[0].has_partial_line);
+        assert_eq!(ledger.read_coverage["raw.txt"].len(), 3);
+        assert!(!ledger.redundant_read_counts.contains_key("raw.txt"));
+        assert!(!ledger.redundant_read_note_targets.contains("raw.txt"));
+    });
+}
+
+#[test]
+fn read_coverage_normalizes_display_but_preserves_content_whitespace() {
+    let mut ledger = ProgressLedger::default();
+    let mut messages = Vec::new();
+    for (id, numbered, text) in [
+        ("numbered", true, "   100\t  alpha \n   101\tbeta"),
+        ("raw", false, "  alpha \nbeta"),
+        ("changed-indent", false, " alpha \nbeta"),
+    ] {
+        messages.push(pb_task_tool_msg(
+            "read_file",
+            serde_json::json!({
+                "path": "whitespace.rs", "offset": 100, "limit": 2, "use_line_numbers": numbered,
+            }),
+            id,
+        ));
+        messages.push(pb_tool_result(id, text));
+        assert_eq!(
+            ledger.observe_round_reads(&messages, 30, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::None
+        );
+        if id == "raw" {
+            assert_eq!(ledger.redundant_read_counts.get("whitespace.rs"), Some(&1));
+        } else {
+            assert!(!ledger.redundant_read_counts.contains_key("whitespace.rs"));
+        }
+    }
+}
+
+#[test]
+fn read_coverage_excludes_partial_lines_without_shifting_line_positions() {
+    let mut ledger = ProgressLedger::default();
+    let mut messages = Vec::new();
+    messages.push(pb_task_tool_msg(
+        "read_file",
+        serde_json::json!({
+            "path": "clipped.rs", "offset": 100, "limit": 2,
+        }),
+        "clipped",
+    ));
+    messages.push(pb_tool_result("clipped", "   100\tcomplete\n   101\tpartial…\n... [truncated: capped at 16 chars; line 101 truncated mid-line. Continue same line: offset=101, char_offset=7, limit=1.]"));
+    assert_eq!(
+        ledger.observe_round_reads(&messages, 30, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None
+    );
+    assert_eq!(ledger.read_coverage.get("clipped.rs").unwrap().len(), 1);
+
+    messages.push(pb_task_tool_msg(
+        "read_file",
+        serde_json::json!({
+            "path": "clipped.rs", "offset": 101, "limit": 1,
+        }),
+        "full-line",
+    ));
+    messages.push(pb_tool_result(
+        "full-line",
+        "   101\tpartial line now returned in full",
+    ));
+    assert_eq!(
+        ledger.observe_round_reads(&messages, 30, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None
+    );
+    assert!(ledger.redundant_read_counts.is_empty());
+    assert_eq!(ledger.read_coverage.get("clipped.rs").unwrap().len(), 2);
+
+    messages.push(pb_task_tool_msg(
+        "read_file",
+        serde_json::json!({
+            "path": "clipped.rs", "offset": 100, "limit": 2,
+        }),
+        "changed-partial-line",
+    ));
+    messages.push(pb_tool_result("changed-partial-line", "   100\tcomplete\n   101\tchanged partial…\n... [truncated: capped at 16 chars; line 101 truncated mid-line. Continue same line: offset=101, char_offset=15, limit=1.]"));
+    assert_eq!(
+        ledger.observe_round_reads(&messages, 30, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None
+    );
+    assert!(
+        ledger.redundant_read_counts.is_empty(),
+        "an unverified partial line must not bill an otherwise covered read"
+    );
+
+    // A raw source line resembling a tool notice cannot shift subsequent content onto its number.
+    messages.push(pb_task_tool_msg(
+        "read_file",
+        serde_json::json!({
+            "path": "notice.rs", "offset": 100, "limit": 3, "use_line_numbers": false,
+        }),
+        "notice-like-source",
+    ));
+    messages.push(pb_tool_result(
+        "notice-like-source",
+        "complete\n... [source text]\nafter notice",
+    ));
+    let windows = extract_round_read_windows(&messages);
+    assert_eq!(windows[0].line_fingerprints.len(), 3);
+    assert!(!windows[0].has_partial_line);
+}
+
+#[test]
+fn read_coverage_notice_detection_preserves_source_and_rejects_ambiguous_suffixes() {
+    for (id, numbered, text, line_count, partial) in [
+        (
+            "source-mid-line-words",
+            false,
+            "complete\n... [source text truncated mid-line.]\nafter notice",
+            3,
+            false,
+        ),
+        (
+            "source-full-notice-in-middle",
+            false,
+            "complete\n... [truncated: lines 100-100 of 102; 2 more not shown. Continue: offset=101]\nafter notice",
+            3,
+            false,
+        ),
+        (
+            "source-mid-line-notice-in-middle",
+            false,
+            "complete\n... [truncated: capped at 16 chars; line 100 truncated mid-line. Continue same line: offset=100, char_offset=7, limit=1.]\nafter notice",
+            3,
+            false,
+        ),
+        (
+            "numbered-paging-notice",
+            true,
+            "   100\tcomplete\n... [truncated: lines 100-100 of 102; 2 more not shown. Continue: offset=101]",
+            1,
+            false,
+        ),
+        (
+            "raw-ambiguous-notice",
+            false,
+            "complete\n... [truncated: lines 100-100 of 102; 2 more not shown. Continue: offset=101]",
+            1,
+            true,
+        ),
+    ] {
+        let mut ledger = ProgressLedger::default();
+        let mut messages = Vec::new();
+        for reread in 0..=8 {
+            let call_id = format!("{id}-{reread}");
+            messages.push(pb_task_tool_msg(
+                "read_file",
+                serde_json::json!({
+                    "path": id, "offset": 100, "limit": 3, "use_line_numbers": numbered,
+                }),
+                &call_id,
+            ));
+            messages.push(pb_tool_result(&call_id, text));
+            let windows = extract_round_read_windows(&messages);
+            assert_eq!(windows[0].line_fingerprints.len(), line_count, "{id}");
+            assert_eq!(windows[0].has_partial_line, partial, "{id}");
+            let signal = ledger.observe_round_reads(
+                &messages,
+                30 + reread,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            );
+            if partial {
+                assert_eq!(signal, ToolLoopSignal::None, "{id}");
+                assert!(!ledger.redundant_read_counts.contains_key(id));
+            } else if reread == 6 {
+                assert_eq!(signal, ToolLoopSignal::RedundantReadHard(id.into(), 6));
+            }
+        }
+    }
+}
+
+#[test]
+fn read_coverage_uses_returned_snapshot_when_file_changes_before_observation() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let fixture = ReadCoverageFixture::new();
+    crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(fixture.0.clone(), || {
+        let mut ledger = ProgressLedger::default();
+        let mut messages = Vec::new();
+        pb_executed_window_read_round(&mut messages, 100, 5, "snapshot-0");
+        assert_eq!(
+            ledger.observe_round_reads(&messages, 30, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::None
+        );
+
+        // This second read actually executed and returned the old content. A write after its
+        // return must not retroactively label its unchanged output as fresh evidence.
+        let text = pb_executed_window_read_round(&mut messages, 100, 5, "snapshot-0-again");
+        assert!(text.contains("version-0 line-100"));
+        std::fs::write(fixture.0.join("window.rs"), ReadCoverageFixture::content(1)).unwrap();
+        assert_eq!(
+            ledger.observe_round_reads(&messages, 30, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::None
+        );
+        assert_eq!(ledger.redundant_read_counts.get("window.rs"), Some(&1));
+
+        let text = pb_executed_window_read_round(&mut messages, 100, 5, "snapshot-1");
+        assert!(text.contains("version-1 line-100"));
+        assert_eq!(
+            ledger.observe_round_reads(&messages, 30, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::None
+        );
+        assert!(!ledger.redundant_read_counts.contains_key("window.rs"));
+    });
 }
 
 #[test]

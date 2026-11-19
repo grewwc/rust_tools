@@ -1600,6 +1600,81 @@ fn session_activity_mapping_prefers_active_turns_and_preserves_unknown() {
     std::fs::remove_dir_all(state.history_file.parent().unwrap()).expect("remove test root");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn session_activity_confirm_and_list_agree_for_held_lease_without_owner() {
+    use crate::ai::history::turn_lease::TurnLease;
+
+    let state = lifecycle_test_state();
+    let store = SessionStore::new(&state.history_file);
+    let id = "terminal-without-owner";
+    store
+        .write_session_title_with_origin(id, id, SessionTitleOrigin::User)
+        .expect("persist terminal session");
+    let history = store.session_history_file(id);
+    let lock = history.with_extension("turn.lock");
+    let mut lease = Some(TurnLease::acquire(&history, id).expect("terminal lease"));
+
+    for (scenario, expected_remote, expected_activity) in [
+        (
+            "held with owner",
+            serde_json::json!(std::process::id().to_string()),
+            "running",
+        ),
+        ("held without owner", serde_json::json!(true), "running"),
+        ("released with stale owner", serde_json::Value::Null, "idle"),
+    ] {
+        match scenario {
+            "held without owner" => std::fs::write(&lock, "").expect("clear held owner"),
+            "released with stale owner" => {
+                drop(lease.take());
+                std::fs::write(&lock, std::process::id().to_string()).expect("write stale owner");
+            }
+            _ => {}
+        }
+        let list = list_sessions(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(SessionsQuery {
+                archived: None,
+                group: None,
+                limit: None,
+                offset: None,
+                query: None,
+                marked: false,
+                newest: false,
+                include: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(list.status(), StatusCode::OK, "{scenario}");
+        let items = session_groups_response_json(list).await;
+        let item = items
+            .as_array()
+            .expect("list array")
+            .iter()
+            .find(|item| item["id"] == id)
+            .expect("listed terminal session");
+        assert_eq!(item["activity"], expected_activity, "{scenario}");
+
+        let confirm = get_confirm(State(state.clone()), HeaderMap::new(), Path(id.to_string()))
+            .await
+            .into_response();
+        assert_eq!(confirm.status(), StatusCode::OK, "{scenario}");
+        let view = session_groups_response_json(confirm).await;
+        assert_eq!(view["running"], false, "no local child: {scenario}");
+        assert_eq!(view["turn"], 0, "{scenario}");
+        assert_eq!(view["remote"], expected_remote, "{scenario}");
+        assert_eq!(
+            view["running"] == true || !view["remote"].is_null(),
+            item["activity"] == "running",
+            "confirm and list must publish the same lease verdict: {scenario}"
+        );
+    }
+    std::fs::remove_dir_all(state.history_file.parent().unwrap()).expect("remove test root");
+}
+
 #[test]
 fn session_waiting_publishes_only_an_unanswered_question() {
     use super::sessions::session_waiting;

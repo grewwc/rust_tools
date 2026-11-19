@@ -102,28 +102,96 @@ fn find_matching_shell_paren(command: &str, open_idx: usize) -> Option<usize> {
     None
 }
 
+/// Find the closing backtick matching the opening backtick at `open_idx`.
+/// Inside a backtick span a backslash escapes the next character (`` \` `` is
+/// a literal backtick), so escaped backticks do not close the span.
+fn find_matching_backtick(command: &str, open_idx: usize) -> Option<usize> {
+    let bytes = command.as_bytes();
+    if bytes.get(open_idx) != Some(&b'`') {
+        return None;
+    }
+    let mut i = open_idx + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'`' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ShellWordSpan {
     start: usize,
     end: usize,
 }
 
-/// Parse the outer shell word used only for restricted file-read substitution.
-/// Deliberately does not reuse `tokenize_shell_words`: that would erase quote
-/// provenance, making it impossible to prove the `$()` really sits inside one
-/// complete double-quoted word. Only simple command lines without control
-/// operators, escapes, or extra active expansions are accepted.
-fn restricted_outer_shell_words(command: &str) -> Option<(Vec<ShellWordSpan>, Vec<usize>)> {
+/// Kind of an active substitution marker found in the outer command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubMarkerKind {
+    /// `$(...)` command substitution.
+    Dollar,
+    /// `` `...` `` backtick command substitution.
+    Backtick,
+}
+
+/// An active substitution marker at a byte position.
+#[derive(Debug, Clone, Copy)]
+struct SubMarker {
+    at: usize,
+    kind: SubMarkerKind,
+}
+
+/// Shell reserved words whose presence makes the command compound (loops,
+/// conditionals, `case`) or reorders execution (`!`). Substitution output in
+/// their condition/list positions would be executed as a command or fed into
+/// a loop variable, which the per-segment audit cannot see, so such commands
+/// are never materialized.
+const SHELL_COMPOUND_KEYWORDS: &[&str] = &[
+    "for", "while", "until", "if", "elif", "then", "else", "do", "done", "case", "esac", "select",
+    "function", "time", "!", "in",
+];
+
+/// Parse the outer shell words used only for restricted substitution
+/// materialization. Deliberately does not reuse `tokenize_shell_words`: that
+/// would erase quote provenance, making it impossible to prove a substitution
+/// really sits inside one complete word. Control operators (`; | & < >`) are
+/// accepted as separators for classification, but outer control flow is
+/// recorded so the caller can reject eager materialization of chains. Escapes,
+/// globs, subshell grouping, compound keywords, and extra active expansions
+/// are still rejected.
+fn restricted_outer_shell_words(
+    command: &str,
+) -> Option<(Vec<ShellWordSpan>, Vec<SubMarker>, bool)> {
     if command.bytes().any(|b| matches!(b, b'\n' | b'\r')) {
         return None;
     }
 
     let bytes = command.as_bytes();
     let mut words = Vec::new();
-    let mut active_dollars = Vec::new();
+    let mut markers = Vec::new();
+    let mut outer_has_control_flow = false;
     let mut i = 0;
     while i < bytes.len() {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        while i < bytes.len()
+            && (bytes[i].is_ascii_whitespace() || is_substitution_word_boundary(bytes[i]))
+        {
+            // Only unquoted outer operators are visited here; operators in
+            // substitution bodies and quoted data do not chain outer commands.
+            // An ampersand in `<&`, `>&`, or `&>` is a redirection, not a chain.
+            // Likewise, the pipe in `>|` forces overwrite rather than piping.
+            if bytes[i] == b';'
+                || (bytes[i] == b'|' && !(i > 0 && bytes[i - 1] == b'>'))
+                || (bytes[i] == b'&'
+                    && !(i > 0 && matches!(bytes[i - 1], b'<' | b'>'))
+                    && bytes.get(i + 1) != Some(&b'>'))
+            {
+                outer_has_control_flow = true;
+            }
             i += 1;
         }
         if i == bytes.len() {
@@ -145,30 +213,63 @@ fn restricted_outer_shell_words(command: &str) -> Option<(Vec<ShellWordSpan>, Ve
             if in_double {
                 match b {
                     b'"' => in_double = false,
-                    // The restricted grammar rejects backslashes and backticks,
-                    // so they cannot alter quoting or expansion semantics.
-                    b'\\' | b'`' => return None,
+                    // The restricted grammar rejects backslashes, so they
+                    // cannot alter quoting semantics. Backticks inside double
+                    // quotes are active substitution markers.
+                    b'\\' => return None,
+                    b'`' => {
+                        let close = find_matching_backtick(command, i)?;
+                        markers.push(SubMarker {
+                            at: i,
+                            kind: SubMarkerKind::Backtick,
+                        });
+                        i = close + 1;
+                        continue;
+                    }
                     b'$' => {
                         if bytes.get(i + 1) != Some(&b'(') {
                             return None;
                         }
-                        active_dollars.push(i);
+                        markers.push(SubMarker {
+                            at: i,
+                            kind: SubMarkerKind::Dollar,
+                        });
                     }
                     _ => {}
                 }
                 i += 1;
                 continue;
             }
-            if b.is_ascii_whitespace() {
+            if b.is_ascii_whitespace() || is_substitution_word_boundary(b) {
                 break;
             }
             match b {
                 b'\'' => in_single = true,
                 b'"' => in_double = true,
+                b'`' => {
+                    let close = find_matching_backtick(command, i)?;
+                    markers.push(SubMarker {
+                        at: i,
+                        kind: SubMarkerKind::Backtick,
+                    });
+                    i = close + 1;
+                    continue;
+                }
+                b'$' => {
+                    if bytes.get(i + 1) != Some(&b'(') {
+                        return None;
+                    }
+                    let close = find_matching_shell_paren(command, i + 1)?;
+                    markers.push(SubMarker {
+                        at: i,
+                        kind: SubMarkerKind::Dollar,
+                    });
+                    i = close + 1;
+                    continue;
+                }
                 // The outer word must not contain chars that change command
                 // structure or trigger expansion or globbing.
-                b'\\' | b'`' | b'$' | b'(' | b')' | b'{' | b'}' | b';' | b'&' | b'|' | b'<'
-                | b'>' | b'*' | b'?' | b'[' => return None,
+                b'\\' | b'(' | b')' | b'{' | b'}' | b'*' | b'?' | b'[' => return None,
                 _ => {}
             }
             i += 1;
@@ -178,7 +279,14 @@ fn restricted_outer_shell_words(command: &str) -> Option<(Vec<ShellWordSpan>, Ve
         }
         words.push(ShellWordSpan { start, end: i });
     }
-    Some((words, active_dollars))
+    if words.iter().any(|w| {
+        SHELL_COMPOUND_KEYWORDS
+            .iter()
+            .any(|k| *k == &command[w.start..w.end])
+    }) {
+        return None;
+    }
+    Some((words, markers, outer_has_control_flow))
 }
 
 /// Allow only ASCII absolute paths and forbid empty, `.`, and `..` components;
@@ -211,47 +319,92 @@ pub(crate) enum SafeShellSubstitutionKind {
 pub(crate) struct SafeShellSubstitution {
     pub(crate) start: usize,
     pub(crate) end: usize,
+    /// Whether the substitution word was unquoted (`$(...)` / `` `...` ``).
+    /// Unquoted output is word-split by the shell, so the materializer renders
+    /// it as split quoted words instead of one quoted word.
+    pub(crate) bare: bool,
+    /// Eager evaluation would run substitutions from later or skipped segments
+    /// before the outer shell controls their execution. Such chains require
+    /// deferred evaluation and must be rejected by the current materializer.
+    pub(crate) outer_has_control_flow: bool,
     pub(crate) kind: SafeShellSubstitutionKind,
 }
 
-/// Recognize and classify harmless `"$(...)"` substitutions in a simple outer
-/// command.
+/// Recognize and classify harmless substitutions in a restricted outer command.
+/// Classification does not prove eager evaluation is safe: callers must also
+/// check `outer_has_control_flow` before reading files or running inner commands.
 ///
-/// - The outer command must use the restricted grammar: no control operators, no
-///   escapes, no extra active expansions, and every `$()` must be a complete
-///   double-quoted word `"$(inner)"`.
+/// - The outer command must use the restricted grammar (see
+///   `restricted_outer_shell_words`), and every active substitution must form
+///   a complete word: a double-quoted `"$(inner)"` / `` "`inner`" `` or a bare
+///   `$(inner)` / `` `inner` ``. Anything else — partial-word fusions,
+///   assignment values, `for ... in` list elements — is left raw so the
+///   position guard can reject it (variable escape / word-split hazards).
 /// - If `inner` is `cat /absolute/path/literal`, take the file-read path (no
 ///   shell execution).
 /// - Otherwise, if `inner` itself passes `validate_execute_command` (i.e. is
 ///   judged harmless by the existing blacklist), treat it as an executable
 ///   harmless command substitution.
-/// - If any `$()` fails both categories above, the whole thing is unsafe; return
-///   empty so the upper injection validation can block it.
+/// - If any substitution fails both categories above, the whole thing is
+///   unsafe; return empty so the upper injection validation can block it.
 pub(crate) fn safe_shell_substitutions(command: &str) -> Vec<SafeShellSubstitution> {
-    let Some((words, active_dollars)) = restricted_outer_shell_words(command) else {
+    let Some((words, markers, outer_has_control_flow)) = restricted_outer_shell_words(command)
+    else {
         return Vec::new();
     };
-    if active_dollars.is_empty() {
+    if markers.is_empty() {
         return Vec::new();
     }
-    let mut substitutions = Vec::with_capacity(active_dollars.len());
-    for dollar_idx in active_dollars {
+    let mut substitutions = Vec::with_capacity(markers.len());
+    for marker in markers {
         let Some(word) = words
             .iter()
-            .find(|word| word.start <= dollar_idx && dollar_idx < word.end)
+            .find(|word| word.start <= marker.at && marker.at < word.end)
             .copied()
         else {
             return Vec::new();
         };
         let raw_word = &command[word.start..word.end];
-        if dollar_idx != word.start + 1
-            || raw_word.len() < 5
-            || !raw_word.starts_with("\"$(")
-            || !raw_word.ends_with(")\"")
+        let (bare, inner) = match marker.kind {
+            SubMarkerKind::Dollar
+                if marker.at == word.start + 1
+                    && raw_word.starts_with("\"$(")
+                    && raw_word.ends_with(")\"") =>
+            {
+                (false, &command[word.start + 3..word.end - 2])
+            }
+            SubMarkerKind::Dollar
+                if marker.at == word.start
+                    && raw_word.starts_with("$(")
+                    && raw_word.ends_with(')') =>
+            {
+                (true, &command[word.start + 2..word.end - 1])
+            }
+            SubMarkerKind::Backtick
+                if marker.at == word.start + 1
+                    && raw_word.starts_with("\"`")
+                    && raw_word.ends_with("`\"") =>
+            {
+                (false, &command[word.start + 2..word.end - 2])
+            }
+            SubMarkerKind::Backtick
+                if marker.at == word.start
+                    && raw_word.starts_with('`')
+                    && raw_word.ends_with('`') =>
+            {
+                (true, &command[word.start + 1..word.end - 1])
+            }
+            _ => return Vec::new(),
+        };
+        // `for ... in` list elements feed the loop variable, which the audit
+        // cannot track; only the raw position guard's literal-`seq` rule may
+        // accept them. Compound keywords are rejected by the grammar already;
+        // this is defense in depth for `for` at the start of the command.
+        if let Some(prefix_end) = for_in_list_prefix_end(command)
+            && word.start >= prefix_end
         {
             return Vec::new();
         }
-        let inner = &command[word.start + 3..word.end - 2];
         let inner_trim = inner.trim();
         if inner_trim.is_empty() || inner_trim.contains('\0') {
             return Vec::new();
@@ -261,6 +414,8 @@ pub(crate) fn safe_shell_substitutions(command: &str) -> Vec<SafeShellSubstituti
                 substitutions.push(SafeShellSubstitution {
                     start: word.start,
                     end: word.end,
+                    bare,
+                    outer_has_control_flow,
                     kind: SafeShellSubstitutionKind::FileRead {
                         path: path.to_string(),
                     },
@@ -272,6 +427,8 @@ pub(crate) fn safe_shell_substitutions(command: &str) -> Vec<SafeShellSubstituti
             substitutions.push(SafeShellSubstitution {
                 start: word.start,
                 end: word.end,
+                bare,
+                outer_has_control_flow,
                 kind: SafeShellSubstitutionKind::Command {
                     inner: inner_trim.to_string(),
                 },
@@ -301,7 +458,8 @@ pub(crate) fn safe_shell_substitutions(command: &str) -> Vec<SafeShellSubstituti
 /// literal-`seq` loop list. Generating the *program name* from a
 /// substitution remains banned — its output is word-split into command
 /// words, so `$(echo r)m -rf /` could run `rm` at runtime; that guard lives
-/// in `validate_single_segment`. Backticks stay banned (legacy form).
+/// in `validate_single_segment`. Backticks are validated recursively like
+/// `$()` (legacy form with the same trust model).
 /// Process substitution `<(...)` / `>(...)` is allowed after recursively
 /// validating the inner command, avoiding false blocks on common usages
 /// like diff/sort.
@@ -340,10 +498,14 @@ pub(crate) fn validate_no_injection_surface(command: &str) -> Result<(), String>
                     continue;
                 }
                 b'`' => {
-                    return Err(
-                        "backtick command substitution is not allowed; pass a literal command instead"
-                            .to_string(),
-                    );
+                    let close = find_matching_backtick(command, i)
+                        .ok_or_else(|| "unterminated backtick command substitution".to_string())?;
+                    let inner = command[i + 1..close].trim();
+                    validate_execute_command(inner).map_err(|reason| {
+                        format!("unsafe backtick command substitution: {reason}")
+                    })?;
+                    i = close + 1;
+                    continue;
                 }
                 b'"' => {
                     in_double = false;
@@ -369,10 +531,13 @@ pub(crate) fn validate_no_injection_surface(command: &str) -> Result<(), String>
             continue;
         }
         if b == b'`' {
-            return Err(
-                "backtick command substitution is not allowed; pass a literal command instead"
-                    .to_string(),
-            );
+            let close = find_matching_backtick(command, i)
+                .ok_or_else(|| "unterminated backtick command substitution".to_string())?;
+            let inner = command[i + 1..close].trim();
+            validate_execute_command(inner)
+                .map_err(|reason| format!("unsafe backtick command substitution: {reason}"))?;
+            i = close + 1;
+            continue;
         }
         if !in_double && b == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'<' {
             if let Some((end, spec)) = parse_heredoc_at(command, i) {
@@ -563,8 +728,8 @@ fn for_in_list_prefix_end(command: &str) -> Option<usize> {
 /// literal integer bounds (`seq 40`, `seq 1 40`, `seq 1 2 40`). Such output is
 /// provably numeric, so storing it in a loop variable cannot smuggle a program
 /// name or an audited argument value past the checks below.
-fn is_literal_seq_substitution(command: &str, dollar_at: usize, close: usize) -> bool {
-    let inner = command[dollar_at + 2..close].trim();
+fn is_literal_seq_substitution(inner: &str) -> bool {
+    let inner = inner.trim();
     let mut words = inner.split_whitespace();
     if words.next() != Some("seq") {
         return false;
@@ -583,47 +748,52 @@ fn is_literal_seq_substitution(command: &str, dollar_at: usize, close: usize) ->
     (1..=3).contains(&count)
 }
 
-/// Reject a single active `$(...)` whose runtime output could reach a position
-/// the audit semantically checks (the program name, a `git` subcommand, an
-/// interpreter `-c` flag, a path or glob subject to scope confinement). The
-/// output is unverifiable runtime data, so `git "pu$(printf sh)"` would execute
-/// `git push` at runtime and bypass the literal-token checks below. Worse, any
-/// substitution stored in a shell variable escapes per-segment analysis
-/// entirely: `for cmd in $(printf rm); do $cmd -rf target; done` and
+/// Reject a single active substitution (`$(...)` or backtick) whose runtime
+/// output could reach a position the audit semantically checks (the program
+/// name, a `git` subcommand, an interpreter `-c` flag, a path or glob subject
+/// to scope confinement). The output is unverifiable runtime data, so
+/// `git "pu$(printf sh)"` would execute `git push` at runtime and bypass the
+/// literal-token checks below. Worse, any substitution stored in a shell
+/// variable escapes per-segment analysis entirely:
+/// `for cmd in $(printf rm); do $cmd -rf target; done` and
 /// `cmd=$(printf rm); $cmd -rf target` split into individually innocent
 /// segments while the shell executes the banned program. Shell variables are
 /// not tracked, so only two positions pass: a `for ... in` list word holding
 /// exactly `$(seq FIRST LAST)` with literal integer bounds (provably numeric
-/// output), and a complete double-quoted word `"$(...)"` in an argument of a
-/// pure-data program (`echo`/`printf`/`seq`/`date`, which command.rs
-/// materializes before execution). Every other form is rejected.
+/// output), and a complete double-quoted word `"$(...)"` / `` "`...`" `` in an
+/// argument of a pure-data program (`echo`/`printf`/`seq`/`date`, which
+/// command.rs materializes before execution). Every other form is rejected.
 pub(crate) fn check_substitution_at(
     command: &str,
-    dollar_at: usize,
+    marker_at: usize,
+    marker: SubMarkerKind,
     program: &str,
     eff_program: &str,
 ) -> Result<(), String> {
+    let label = match marker {
+        SubMarkerKind::Dollar => "command substitution `$(...)`",
+        SubMarkerKind::Backtick => "backtick command substitution",
+    };
     let bytes = command.as_bytes();
-    let mut word_start = dollar_at;
+    let mut word_start = marker_at;
     while word_start > 0 && !is_substitution_word_boundary(bytes[word_start - 1]) {
         word_start -= 1;
     }
     // Assignment values (including `VAR=...` env prefixes) flow into shell
     // variables the audit cannot track: `cmd=$(printf rm); $cmd ...` would
     // execute `rm` without any segment seeing it. Banned in every form.
-    if let Some((name, _)) = command[word_start..dollar_at].split_once('=') {
+    if let Some((name, _)) = command[word_start..marker_at].split_once('=') {
         let mut chars = name.chars();
         let is_name = chars
             .next()
             .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
             && chars.all(|c| c == '_' || c.is_ascii_alphanumeric());
         if is_name {
-            return Err(
-                "command substitution `$(...)` may not appear in an assignment value; its \
-                 output flows into a shell variable, which the audit cannot track. Use a \
-                 literal value or a `for i in $(seq FIRST LAST)` loop instead"
-                    .to_string(),
-            );
+            return Err(format!(
+                "{label} may not appear in an assignment value; its output flows into a \
+                 shell variable, which the audit cannot track. Use a literal value or a \
+                 `for i in $(seq FIRST LAST)` loop instead"
+            ));
         }
     }
     // The substitution sits inside the very first word, so it can generate the
@@ -633,44 +803,46 @@ pub(crate) fn check_substitution_at(
         .position(|b| !b.is_ascii_whitespace())
         .unwrap_or(0);
     if word_start == first_word_start {
-        return Err(
-            "command substitution `$(...)` cannot generate the program name; pass a literal \
-             program instead"
-                .to_string(),
-        );
+        return Err(format!(
+            "{label} cannot generate the program name; pass a literal program instead"
+        ));
     }
-    let Some(close) = find_matching_shell_paren(command, dollar_at + 1) else {
-        return Err("unbalanced command substitution `$(...)`".to_string());
+    let Some(close) = (match marker {
+        SubMarkerKind::Dollar => find_matching_shell_paren(command, marker_at + 1),
+        SubMarkerKind::Backtick => find_matching_backtick(command, marker_at),
+    }) else {
+        return Err(format!("unbalanced {label}"));
     };
     let mut word_end = close + 1;
     while word_end < bytes.len() && !is_substitution_word_boundary(bytes[word_end]) {
         word_end += 1;
     }
-    // Exact-word shapes. Only a complete double-quoted word `"$(...)"` is
-    // materialized by command.rs; any other form reaches the shell raw, where
-    // its output undergoes word-splitting and glob expansion.
-    let bare_exact = word_start == dollar_at && word_end == close + 1;
-    let quoted_exact = dollar_at == word_start + 1
+    // Exact-word shapes. Only a complete double-quoted word `"$(...)"` /
+    // `` "`...`" `` is materialized by command.rs; any other form reaches the
+    // shell raw, where its output undergoes word-splitting and glob expansion.
+    let bare_exact = word_start == marker_at && word_end == close + 1;
+    let quoted_exact = marker_at == word_start + 1
         && word_end == close + 2
         && bytes.get(word_start) == Some(&b'"')
         && bytes.get(close + 1) == Some(&b'"');
+    let inner = match marker {
+        SubMarkerKind::Dollar => &command[marker_at + 2..close],
+        SubMarkerKind::Backtick => &command[marker_at + 1..close],
+    };
     // `for ... in` list elements feed the loop variable, which the audit
     // cannot track — only provably numeric `seq` output is safe there, as an
     // exact list word (so digit output cannot fuse with literal affixes).
     if eff_program == "for" {
         if let Some(prefix_end) = for_in_list_prefix_end(command) {
             if word_start >= prefix_end {
-                if (bare_exact || quoted_exact)
-                    && is_literal_seq_substitution(command, dollar_at, close)
-                {
+                if (bare_exact || quoted_exact) && is_literal_seq_substitution(inner) {
                     return Ok(());
                 }
-                return Err(
-                    "command substitution `$(...)` in a `for ... in` list must be exactly \
-                     `$(seq FIRST LAST)` with literal integer bounds; its output flows into \
-                     the loop variable, which the audit cannot track"
-                        .to_string(),
-                );
+                return Err(format!(
+                    "{label} in a `for ... in` list must be exactly `$(seq FIRST LAST)` \
+                     with literal integer bounds; its output flows into the loop variable, \
+                     which the audit cannot track"
+                ));
             }
         }
     }
@@ -683,10 +855,10 @@ pub(crate) fn check_substitution_at(
         return Ok(());
     }
     Err(format!(
-        "command substitution `$(...)` may not generate an argument for `{program}`: its \
-         runtime output cannot be verified, so it could bypass the sandbox checks (git \
-         subcommand blocks, interpreter `-c`, path/glob scope). Use a literal argument, a \
-         complete double-quoted word (`\"$(...)\"`) with `echo`/`printf`, or a \
+        "{label} may not generate an argument for `{program}`: its runtime output cannot \
+         be verified, so it could bypass the sandbox checks (git subcommand blocks, \
+         interpreter `-c`, path/glob scope). Use a literal argument, a complete \
+         double-quoted word (`\"$(...)\"`) with `echo`/`printf`, or a \
          `for i in $(seq FIRST LAST)` loop instead"
     ))
 }
@@ -757,7 +929,27 @@ pub(crate) fn validate_substitution_positions(command: &str, program: &str) -> R
                 }
                 // `$(( ... ))` is arithmetic expansion, not a substitution.
                 b'$' if bytes.get(i + 1) == Some(&b'(') && bytes.get(i + 2) != Some(&b'(') => {
-                    check_substitution_at(command, i, program, &eff_program)?;
+                    check_substitution_at(
+                        command,
+                        i,
+                        SubMarkerKind::Dollar,
+                        program,
+                        &eff_program,
+                    )?;
+                }
+                b'`' => {
+                    let Some(close) = find_matching_backtick(command, i) else {
+                        return Err("unbalanced backtick command substitution".to_string());
+                    };
+                    check_substitution_at(
+                        command,
+                        i,
+                        SubMarkerKind::Backtick,
+                        program,
+                        &eff_program,
+                    )?;
+                    i = close + 1;
+                    continue;
                 }
                 _ => {}
             }
@@ -775,7 +967,15 @@ pub(crate) fn validate_substitution_positions(command: &str, program: &str) -> R
                 in_double = true;
             }
             b'$' if bytes.get(i + 1) == Some(&b'(') && bytes.get(i + 2) != Some(&b'(') => {
-                check_substitution_at(command, i, program, &eff_program)?;
+                check_substitution_at(command, i, SubMarkerKind::Dollar, program, &eff_program)?;
+            }
+            b'`' => {
+                let Some(close) = find_matching_backtick(command, i) else {
+                    return Err("unbalanced backtick command substitution".to_string());
+                };
+                check_substitution_at(command, i, SubMarkerKind::Backtick, program, &eff_program)?;
+                i = close + 1;
+                continue;
             }
             // `<<<` herestrings are not heredocs; their content still undergoes
             // expansion, so it must be scanned rather than skipped.

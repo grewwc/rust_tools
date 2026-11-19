@@ -16,6 +16,16 @@ const { harness, response, deferred, html } = new vm.Script(
 });
 const run = (h, source) => vm.runInContext(source, h.context);
 const plain = (value) => JSON.parse(JSON.stringify(value));
+const agreementFile = path.join(__dirname, "app_composer_running.test.cjs");
+const { hiddenGroupAgreementHarness, assertRunningAgreement } = new vm.Script(
+  fs.readFileSync(agreementFile, "utf8") + "\n;({ hiddenGroupAgreementHarness, assertRunningAgreement });",
+  { filename: agreementFile },
+).runInNewContext({
+  require: (name) => name === "node:test" ? { test() {} } : require(name),
+  __dirname, __filename: agreementFile, process, console, Buffer,
+  TextEncoder, TextDecoder, AbortController, URL, URLSearchParams,
+  setTimeout, clearTimeout, setInterval, clearInterval, setImmediate,
+});
 const groups = () => [
   { id: "visible", name: "Work", order: 0, pinned: false },
   { id: "hidden/group", name: "Old Work", order: 1, pinned: true, hidden: true },
@@ -488,6 +498,75 @@ test("full group snapshot expires at 7.5 seconds and 404 fallback is explicitly 
   h.context.mergeSessionActivities([{ id: "hidden-session", activity: "running" }]);
   await h.context.pollSessionGroupActivity(true);
   assert.equal(h.elements.sessiongrouphidden.textContent, "Hidden groups (2) · 1 RUNNING · incomplete activity");
+});
+
+function publishLocalActiveTask(c) {
+  const owner = c.updateExecutionModel({ kind: "activity" });
+  c.updateExecutionModel({ kind: "task", owner, slot: "subagents",
+    summary: { taskStates: [["local-worker", true]], busy: true, resetTasks: true } });
+  assert.equal(c.executionState().activitySample.source, "task", "the observation comes from live task activity");
+}
+function assertUnavailableGroupWithLocalActivity(h, id, checkpoint) {
+  assertRunningAgreement(h, true, checkpoint);
+  const activity = h.c.hiddenSessionGroupActivity(id);
+  assert.equal(activity.running, 1, checkpoint + ": loaded local contribution");
+  assert.equal(activity.active.some(item => item.id === h.c.sessionId), true);
+  assert.equal(activity.unavailable, true, checkpoint + ": missing snapshot evidence stays disclosed");
+  assert.equal(activity.incomplete, false);
+  const header = vm.runInContext("sessionGroupHeaders.get(" + JSON.stringify(id) + ")", h.c);
+  assert.equal(header.running.textContent, "1");
+  assert.equal(header.running.hidden, false);
+  assert.equal(header.status.hidden, false);
+  assert.equal(header.status.title, "activity unavailable");
+  assert.equal(h.elements.sessiongrouphiddenactivity.hidden, false);
+  assert.match(h.elements.sessiongrouphidden.textContent, /1 RUNNING · activity unavailable/);
+}
+
+test("expired hidden snapshot retains fresh local active task counts and unavailable status", async () => {
+  const h = hiddenGroupAgreementHarness({ running: 0, waiting: 0, unknown: 0, active: [] }), c = h.c;
+  const started = c.Date.now();
+  c.Date = { now: () => started + 7500 };
+  c.expireSessionActivities();
+  assert.equal(c.hiddenSessionGroupActivity("hidden").unavailable, true, "the complete snapshot reached its TTL");
+  publishLocalActiveTask(c);
+  assertUnavailableGroupWithLocalActivity(h, "hidden", "fresh task after snapshot expiry");
+  c.renderSessionList(c.lastItems);
+  assertUnavailableGroupWithLocalActivity(h, "hidden", "repaint after snapshot expiry");
+  await h.dispose();
+});
+
+test("snapshot missing newly loaded hidden group retains local active counts and unavailable status", async () => {
+  const h = hiddenGroupAgreementHarness({ running: 0, waiting: 0, unknown: 0, active: [] }), c = h.c;
+  const pending = deferred();
+  c.lastItems = c.lastItems.map(item => ({ ...item, group_id: item.id === c.sessionId ? "new-hidden" : null }));
+  vm.runInContext(`
+    sessionGroupActivityScopeBase = store.base;
+    sessionGroupTemporaryOpen.set(sessionGroupTemporaryKey("new-hidden"), false);
+  `, c);
+  const refreshedGroups = [
+    { id: "hidden", name: "Hidden work", order: 0, hidden: true },
+    { id: "new-hidden", name: "New hidden work", order: 1, hidden: true },
+  ];
+  c.api = async endpoint => {
+    if (endpoint === "/session-groups") return { json: async () => ({ groups: refreshedGroups, assignments: {} }) };
+    assert.equal(endpoint, "/session-group-activity");
+    return pending.promise;
+  };
+  try {
+    assert.equal(await c.loadSessionGroups(), true);
+    assert.equal(vm.runInContext('sessionGroupActivitySnapshots.get(store.base).status', c), "complete");
+    assert.equal(vm.runInContext('sessionGroupActivitySnapshots.get(store.base).groups.has("new-hidden")', c), false);
+    publishLocalActiveTask(c);
+    assertUnavailableGroupWithLocalActivity(h, "new-hidden", "new group while snapshot refresh is pending");
+    c.renderSessionList(c.lastItems);
+    assertUnavailableGroupWithLocalActivity(h, "new-hidden", "new group repaint while refresh is pending");
+  } finally {
+    pending.resolve({ json: async () => ({ groups: refreshedGroups.map(group => ({
+      group_id: group.id, running: 0, waiting: 0, unknown: 0, active: [],
+    })) }) });
+    await vm.runInContext("sessionGroupActivityFlight?.promise", c);
+    await h.dispose();
+  }
 });
 
 test("group polling runs beside loaded activity every 2.5 seconds and probes on tab return and network recovery", async () => {

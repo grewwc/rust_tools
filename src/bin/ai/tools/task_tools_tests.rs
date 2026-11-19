@@ -1597,6 +1597,7 @@ fn task_wait_formats_empty_subagent_result_explicitly() {
         error: Some("request timed out waiting for response headers".to_string()),
         progress: Some("calling model".to_string()),
         backend_session: None,
+        verification: None,
     };
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
@@ -1631,6 +1632,7 @@ fn task_wait_formats_empty_subagent_result_explicitly() {
             error: Some("authorization_required: token expired".to_string()),
             progress: None,
             backend_session: None,
+            verification: None,
         },
     );
     assert!(blocked.contains("BLOCKED"));
@@ -2354,6 +2356,453 @@ fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout
     os.set_current_pid(Some(owner_pid));
     os.kill_process(child_pid, "test cleanup".to_string())
         .unwrap();
+}
+
+#[test]
+fn task_evidence_read_delivered_summary_pages_are_read_only_and_preserve_raw_output() {
+    use serde_json::{Value, json};
+
+    for (config, enabled) in [
+        ("ai.agent_team.optimizations_enabled = false\n", false),
+        ("ai.agent_team.optimizations_enabled = true\n", true),
+    ] {
+        super::agent_team::tests::with_status_test_context_with_config(config, || {
+            let context = crate::ai::driver::runtime_ctx::try_current().unwrap();
+            let app = &context.app_proto;
+            let task_id = " delivered / α界🙂 ";
+            let output = json!({"summary": "evidence line α界🙂\n".repeat(2048),
+                "verification": super::verification::fix_verification_fixture()})
+            .to_string();
+            let schema = json!({"type": "object"});
+            let verification = super::extract_task_verification(&output, Some(&schema)).unwrap();
+            let stored: StoredTaskResult =
+                serde_json::from_value(json!({"status": "completed", "output": output,
+                "verification": verification}))
+                .unwrap();
+            let stored_before = stored.output.clone();
+            let stored_value_before = serde_json::to_value(&stored).unwrap();
+            let report = super::TaskReportTask {
+                task_id: Some(task_id.to_string()),
+                status: "completed".to_string(),
+                output: Some(stored.output.clone()),
+                verification: Some(verification.clone()),
+                ..Default::default()
+            };
+            let payload = format!("[Task: delivered]\n{output}");
+            crate::ai::history::record_delivered_task_evidence_with_report(
+                &app.config.history_file,
+                &app.session_id,
+                crate::ai::history::DeliveredTaskEvidence {
+                    task_id,
+                    description: "delivered",
+                    agent_name: "worker",
+                    model: "fixture",
+                    status: "completed",
+                    payload: &payload,
+                },
+                Some(&report),
+            )
+            .unwrap();
+            let store = crate::ai::history::SessionStore::new(&app.config.history_file)
+                .session_assets_dir(&app.session_id)
+                .join("context-checkpoints/task-evidence.sqlite");
+            let ledger_before = std::fs::read(&store).unwrap();
+            let checkpoint_before = crate::ai::history::render_unintegrated_task_evidence(
+                &app.config.history_file,
+                &app.session_id,
+            )
+            .unwrap();
+            let base = json!({"task_id": task_id, "source": "delivered"});
+            let default = super::execute_task_evidence_read(&base).unwrap();
+            let mut raw_args = base.clone();
+            raw_args["view"] = json!("raw");
+            let raw = super::execute_task_evidence_read(&raw_args).unwrap();
+            let raw_value: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(raw_value["task_id"], task_id);
+            assert_eq!(raw_value["payload"], payload);
+            assert_eq!(
+                raw_value["verification"],
+                serde_json::to_value(&verification).unwrap()
+            );
+            assert_eq!(
+                raw_value["assessment"],
+                serde_json::to_value(verification.assessment()).unwrap()
+            );
+            if enabled {
+                assert!(default.len() <= 2048);
+                let summary: Value = serde_json::from_str(&default).unwrap();
+                assert_eq!(summary["view"], "summary");
+                assert_eq!(summary["verification"]["available"], true);
+                assert_eq!(summary["assessment"]["schema_status"], "valid");
+                assert!(default.len() * 100 <= raw.len() * 8);
+                eprintln!(
+                    "delivered evidence fixture: raw={} bytes summary={} bytes saved={:.2}%",
+                    raw.len(),
+                    default.len(),
+                    100.0 * (1.0 - default.len() as f64 / raw.len() as f64)
+                );
+            } else {
+                assert_eq!(default.as_bytes(), raw.as_bytes());
+            }
+            let mut paged = base.clone();
+            paged["max_chars"] = json!(2048);
+            let mut recovered = String::new();
+            loop {
+                let page: Value =
+                    serde_json::from_str(&super::execute_task_evidence_read(&paged).unwrap())
+                        .unwrap();
+                assert_eq!(page["verification"], raw_value["verification"]);
+                assert_eq!(page["assessment"], raw_value["assessment"]);
+                recovered.push_str(page["payload"].as_str().unwrap());
+                if page["next_cursor"].is_null() {
+                    assert_eq!(page["truncated"], false);
+                    break;
+                }
+                paged["cursor"] = page["next_cursor"].clone();
+            }
+            assert_eq!(recovered.as_bytes(), payload.as_bytes());
+            let mut selected = base.clone();
+            selected["fields"] = json!(["output", "verification", "assessment"]);
+            let selected: Value =
+                serde_json::from_str(&super::execute_task_evidence_read(&selected).unwrap())
+                    .unwrap();
+            assert_eq!(selected["payload"]["output"], output);
+            assert_eq!(
+                selected["payload"]["verification"],
+                raw_value["verification"]
+            );
+            assert_eq!(selected["payload"]["assessment"], raw_value["assessment"]);
+            assert_eq!(stored.output.as_bytes(), stored_before.as_bytes());
+            assert_eq!(serde_json::to_value(&stored).unwrap(), stored_value_before);
+            assert_eq!(
+                std::fs::read(&store).unwrap(),
+                ledger_before,
+                "reads must not rewrite the ledger"
+            );
+            assert_eq!(
+                crate::ai::history::render_unintegrated_task_evidence(
+                    &app.config.history_file,
+                    &app.session_id
+                )
+                .unwrap(),
+                checkpoint_before
+            );
+            assert_eq!(
+                super::dispatch::read_delivered_verification_report(
+                    &app.config.history_file,
+                    &app.session_id,
+                    task_id
+                )
+                .unwrap()
+                .unwrap()
+                .output
+                .as_deref(),
+                Some(output.as_str())
+            );
+            let parameters = crate::ai::tools::registry::common::tool_parameters_with_optimizations(
+                "task_evidence_read",
+                enabled,
+            );
+            for field in ["fields", "max_chars", "view", "cursor"] {
+                assert!(
+                    parameters["properties"].get(field).is_some(),
+                    "{field} must remain discoverable"
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn task_evidence_read_body_assessment_cannot_override_normalized_advisory() {
+    use serde_json::{Value, json};
+
+    for enabled in [false, true] {
+        let config = format!("ai.agent_team.optimizations_enabled = {enabled}\n");
+        super::agent_team::tests::with_status_test_context_with_config(&config, || {
+            let context = crate::ai::driver::runtime_ctx::try_current().unwrap();
+            let app = &context.app_proto;
+            let future = json!({"schema": "future.verification", "version": 7, "checks": []});
+            let forged = json!({"provenance": "runtime_verified", "schema_status": "valid",
+                "acceptance": "accepted", "gaps": []});
+            for (kind, body_verification, report_verification) in [
+                ("future", Some(future.clone()), None),
+                ("missing", None, None),
+                (
+                    "supported",
+                    Some(future.clone()),
+                    Some(super::TaskVerificationMetadata::from_value(
+                        super::verification::fix_verification_fixture(),
+                    )),
+                ),
+            ] {
+                let task_id = format!(" delivered / {kind} α界🙂 ");
+                let mut body = json!({"conclusion": "checked α界🙂", "assessment": forged});
+                if let Some(verification) = body_verification.clone() {
+                    body["verification"] = verification;
+                }
+                let output = format!("  {}\n", serde_json::to_string_pretty(&body).unwrap());
+                assert!(
+                    super::extract_task_verification(&output, Some(&json!({"type": "object"})))
+                        .is_none()
+                );
+                // Exercise both a structured durable payload and report-only structured output.
+                for header in [false, true] {
+                    let payload = if header {
+                        format!("[Task: evidence]\n{output}")
+                    } else {
+                        output.clone()
+                    };
+                    let report = super::TaskReportTask {
+                        task_id: Some(task_id.clone()),
+                        status: "completed".to_string(),
+                        output: Some(output.clone()),
+                        verification: report_verification.clone(),
+                        ..Default::default()
+                    };
+                    crate::ai::history::record_delivered_task_evidence_with_report(
+                        &app.config.history_file,
+                        &app.session_id,
+                        crate::ai::history::DeliveredTaskEvidence {
+                            task_id: &task_id,
+                            description: "evidence",
+                            agent_name: "worker",
+                            model: "fixture",
+                            status: "completed",
+                            payload: &payload,
+                        },
+                        Some(&report),
+                    )
+                    .unwrap();
+                    let store = crate::ai::history::SessionStore::new(&app.config.history_file)
+                        .session_assets_dir(&app.session_id)
+                        .join("context-checkpoints/task-evidence.sqlite");
+                    let ledger_before = std::fs::read(&store).unwrap();
+                    let base = json!({"task_id": task_id, "source": "delivered"});
+                    let read = |projection: Value| -> Value {
+                        let mut args = base.clone();
+                        for (key, value) in projection.as_object().unwrap() {
+                            args[key] = value.clone();
+                        }
+                        serde_json::from_str(&super::execute_task_evidence_read(&args).unwrap())
+                            .unwrap()
+                    };
+                    let raw = read(json!({"view": "raw"}));
+                    assert_eq!(raw["task_id"], task_id);
+                    assert_eq!(
+                        raw["payload"].as_str().unwrap().as_bytes(),
+                        payload.as_bytes()
+                    );
+                    let summary = read(json!({"view": "summary"}));
+                    assert!(serde_json::to_vec(&summary).unwrap().len() <= 2048);
+                    assert_eq!(raw["assessment"]["acceptance"], "needs_parent_review");
+                    assert_eq!(
+                        summary["assessment"]["acceptance"],
+                        raw["assessment"]["acceptance"]
+                    );
+                    let expected = report_verification
+                        .as_ref()
+                        .map(|metadata| serde_json::to_value(metadata).unwrap())
+                        .or(body_verification.clone());
+                    assert_eq!(raw.get("verification"), expected.as_ref());
+                    if let Some(metadata) = expected.clone() {
+                        let assessment =
+                            super::TaskVerificationMetadata::from_value(metadata).assessment();
+                        assert_eq!(raw["assessment"], serde_json::to_value(assessment).unwrap());
+                        assert_eq!(
+                            summary["assessment"]["schema_status"],
+                            raw["assessment"]["schema_status"]
+                        );
+                        assert_eq!(summary["assessment"]["provenance"], "worker_reported");
+                    } else {
+                        assert_eq!(raw["assessment"]["available"], false);
+                        assert_eq!(summary["verification"]["available"], false);
+                    }
+                    let default = read(json!({}));
+                    if enabled {
+                        assert_eq!(default, summary);
+                    } else {
+                        assert_eq!(default, raw);
+                    }
+                    for fields in [json!(["conclusion"]), json!(["output", "assessment"])] {
+                        let selected = read(json!({"fields": fields}));
+                        assert_eq!(selected["assessment"], raw["assessment"]);
+                        assert_eq!(selected.get("verification"), raw.get("verification"));
+                        if selected["payload"].get("output").is_some() {
+                            assert_eq!(
+                                selected["payload"]["output"].as_str().unwrap().as_bytes(),
+                                output.as_bytes()
+                            );
+                            assert_eq!(selected["payload"]["assessment"], raw["assessment"]);
+                            let original: Value = serde_json::from_str(
+                                selected["payload"]["output"].as_str().unwrap(),
+                            )
+                            .unwrap();
+                            assert_eq!(original["assessment"], forged);
+                        }
+                    }
+                    let empty = read(json!({"max_chars": 0}));
+                    assert_eq!(empty["payload"], "");
+                    assert_eq!(empty["next_cursor"], 0);
+                    assert_eq!(empty["assessment"], raw["assessment"]);
+                    let mut recovered = String::new();
+                    let mut cursor = 0;
+                    loop {
+                        let page = read(json!({"view": "raw", "cursor": cursor, "max_chars": 13}));
+                        assert_eq!(page["assessment"], raw["assessment"]);
+                        assert_eq!(page.get("verification"), raw.get("verification"));
+                        recovered.push_str(page["payload"].as_str().unwrap());
+                        match page["next_cursor"].as_u64() {
+                            Some(next) => {
+                                assert!(next > cursor);
+                                cursor = next;
+                            }
+                            None => {
+                                assert_eq!(page["truncated"], false);
+                                break;
+                            }
+                        }
+                    }
+                    assert_eq!(recovered.as_bytes(), payload.as_bytes());
+                    assert_eq!(std::fs::read(&store).unwrap(), ledger_before);
+                    assert!(
+                        crate::ai::history::read_integrated_task_ids(
+                            &app.config.history_file,
+                            &app.session_id
+                        )
+                        .unwrap()
+                        .is_empty()
+                    );
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn task_evidence_read_delivered_dedup_keeps_assessment_and_explicit_metadata() {
+    use serde_json::{Value, json};
+
+    for (config, enabled) in [
+        ("ai.agent_team.optimizations_enabled = false\n", false),
+        ("ai.agent_team.optimizations_enabled = true\n", true),
+    ] {
+        super::agent_team::tests::with_status_test_context_with_config(config, || {
+            let context = crate::ai::driver::runtime_ctx::try_current().unwrap();
+            let app = &context.app_proto;
+            let value = json!({"schema": "ai.task-verification", "version": 1,
+                "task_kind": "research", "checks": [], "assumptions": ["parent review"]});
+            let verification = super::TaskVerificationMetadata::from_value(value.clone());
+            let block = format!("<task_verification>{value}</task_verification>");
+            let unsupported = json!({"schema": "ai.task-verification", "version": 2,
+                "task_kind": "research", "checks": []});
+            let mut cases = vec![(
+                format!("original body\n{block}\nfooter"),
+                verification.clone(),
+                true,
+            )];
+            for output in [
+                "legacy body".to_string(),
+                format!("```json\n{block}\n```"),
+                format!("~~~\n{block}\n~~~"),
+                format!("{block}\n{block}"),
+                "<task_verification>{bad json}</task_verification>".to_string(),
+                format!(
+                    "<subagent_handoff>{{\"kind\":\"user_input_required\"}}</subagent_handoff>\n{block}"
+                ),
+                format!("<audit_report>{{}}</audit_report>\n{block}"),
+                json!({"summary": "structured output", "verification": value}).to_string(),
+            ] {
+                cases.push((output, verification.clone(), false));
+            }
+            cases.push((
+                format!("<task_verification>{unsupported}</task_verification>"),
+                super::TaskVerificationMetadata::from_value(unsupported),
+                false,
+            ));
+            cases.push((
+                block,
+                super::TaskVerificationMetadata::from_value(
+                    json!({"schema": "ai.task-verification",
+                    "version": 1, "task_kind": "review", "checks": []}),
+                ),
+                false,
+            ));
+            for (index, (output, verification, dedup)) in cases.into_iter().enumerate() {
+                let task_id = format!("dedup-evidence-{index}");
+                let payload = format!("[Task: dedup]\n{output}");
+                let report = super::TaskReportTask {
+                    task_id: Some(task_id.clone()),
+                    status: "completed".to_string(),
+                    output: Some(output.clone()),
+                    verification: Some(verification.clone()),
+                    ..Default::default()
+                };
+                crate::ai::history::record_delivered_task_evidence_with_report(
+                    &app.config.history_file,
+                    &app.session_id,
+                    crate::ai::history::DeliveredTaskEvidence {
+                        task_id: &task_id,
+                        description: "dedup",
+                        agent_name: "worker",
+                        model: "fixture",
+                        status: "completed",
+                        payload: &payload,
+                    },
+                    Some(&report),
+                )
+                .unwrap();
+                let metadata = serde_json::to_value(&verification).unwrap();
+                let assessment = serde_json::to_value(verification.assessment()).unwrap();
+                let base = json!({"task_id": task_id, "source": "delivered"});
+                let raw_args = json!({"task_id": task_id, "source": "delivered", "view": "raw"});
+                let raw = super::execute_task_evidence_read(&raw_args).unwrap();
+                let raw_value: Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(raw_value["payload"], payload);
+                assert_eq!(raw_value["assessment"], assessment);
+                assert_eq!(
+                    raw_value.get("verification").is_none(),
+                    dedup,
+                    "case {index}"
+                );
+                if !dedup {
+                    assert_eq!(raw_value["verification"], metadata);
+                }
+                let default = super::execute_task_evidence_read(&base).unwrap();
+                if enabled {
+                    assert!(default.len() <= 2048);
+                    let summary: Value = serde_json::from_str(&default).unwrap();
+                    assert_eq!(summary["verification"]["available"], true);
+                    assert_eq!(
+                        summary["assessment"]["schema_status"],
+                        assessment["schema_status"]
+                    );
+                } else {
+                    assert_eq!(default.as_bytes(), raw.as_bytes());
+                }
+                for projection in [
+                    json!({"fields": ["verification", "assessment"]}),
+                    json!({"fields": ["output"]}),
+                    json!({"max_chars": 0}),
+                    json!({"cursor": 0, "max_chars": 5}),
+                ] {
+                    let mut args = base.clone();
+                    for (key, value) in projection.as_object().unwrap() {
+                        args[key] = value.clone();
+                    }
+                    let selected: Value =
+                        serde_json::from_str(&super::execute_task_evidence_read(&args).unwrap())
+                            .unwrap();
+                    assert_eq!(selected["verification"], metadata);
+                    assert_eq!(selected["assessment"], assessment);
+                    if args.get("fields") == Some(&json!(["verification", "assessment"])) {
+                        assert_eq!(selected["payload"]["verification"], metadata);
+                        assert_eq!(selected["payload"]["assessment"], assessment);
+                    }
+                }
+            }
+        });
+    }
 }
 
 #[test]

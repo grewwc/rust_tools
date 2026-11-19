@@ -28,6 +28,46 @@ function sameRows(h, before) {
   for (const [index, element] of before.entries()) assert.equal(h.elements.sesslist.children[index], element);
 }
 
+test("active producer reports immediately update the session and group despite an older idle poll", async () => {
+  const old = deferred();
+  const items = listed().map((item) => ({ ...item, group_id: "workers" }));
+  const h = harness({ items, groups: [{ id: "workers", name: "Workers", order: 0 }], realNavigation: true,
+    activityGet: () => old.promise });
+  const before = [...h.elements.sesslist.children];
+  h.document.visibilityState = "visible";
+  const pending = h.context.pollSessionActivity();
+  const owner = h.context.updateExecutionModel({ kind: "activity" });
+  h.context.updateExecutionModel({ kind: "task", owner, slot: "subagents",
+    summary: { taskStates: [["worker", true]], busy: true, resetTasks: true } });
+  assert.equal(running(h, "open-session"), true, "no timer tick is needed after the task event");
+  const head = h.elements.sesslist.querySelector(".session-group-head");
+  assert.equal(head.querySelector(".session-group-badge").textContent, "1");
+  old.resolve(response(listed().map(({ id }) => ({ id, activity: "idle" }))));
+  await pending;
+  assert.equal(running(h, "open-session"), true, "the old bulk request cannot undo the task event");
+  sameRows(h, before);
+  h.context.mergeSessionActivities([{ id: "open-session", activity: "idle" }]);
+  assert.equal(running(h, "open-session"), false, "a later authoritative idle sample still settles the session");
+});
+
+test("active reports keep waiting badges and ignore removed or previous-turn producers", () => {
+  const h = harness({ items: listed(), realNavigation: true });
+  const owner = h.context.updateExecutionModel({ kind: "activity" });
+  const task = { kind: "task", owner, slot: "subagents",
+    summary: { taskStates: [["worker", true]], busy: true, resetTasks: true } };
+  h.context.mergeSessionActivities([{ id: "open-session", activity: "running", waiting: "confirm", waiting_prompt: "Approve?" }]);
+  h.context.updateExecutionModel(task);
+  assert.equal(badge(h, "open-session").dataset.kind, "confirm");
+  assert.equal(badge(h, "open-session").title, "CONFIRM: Approve?");
+  h.context.updateExecutionModel({ kind: "remove", owner });
+  h.context.mergeSessionActivities([{ id: "open-session", activity: "idle" }]);
+  h.context.updateExecutionModel(task);
+  assert.equal(running(h, "open-session"), false, "a removed producer cannot promote running");
+  h.context.updateExecutionModel({ kind: "begin" });
+  h.context.updateExecutionModel(task);
+  assert.equal(running(h, "open-session"), false, "an older turn cannot promote running");
+});
+
 const sendFixture = path.join(__dirname, "app_phase2_baseline.test.cjs");
 const { sendHarness } = new vm.Script(
   fs.readFileSync(sendFixture, "utf8") + "\n;({ sendHarness });", { filename: sendFixture },
@@ -285,12 +325,15 @@ test("authoritative observations reject an older idle sample and reconcile on th
   stale.resolve(response([{ id: "open-session", activity: "idle" }, { id: "target-session", activity: "idle" }]));
   await pending;
   assert.equal(running(h, "open-session"), true);
+  h.context.updateExecutionModel({ kind: "live", entry: null });
   await h.context.pollSessionActivity();
-  assert.equal(running(h, "open-session"), false, "a newer backend sample reconciles the earlier observation");
+  assert.equal(running(h, "open-session"), false, "a newer backend sample reconciles the earlier observation after local stream cleanup");
+  assert.equal(h.context.executionIsRunning(h.context.executionState()), false, "composer uses the same idle verdict");
   h.context.updateExecutionModel({ kind: "live", entry: {} });
   h.context.mergeSessionActivities([{ id: "open-session", activity: "running" }]);
   assert.equal(running(h, "open-session"), true);
   h.context.updateExecutionModel({ kind: "finish", owner, reason: "ended", answer: true });
+  h.context.updateExecutionModel({ kind: "live", entry: null });
   await settle();
   assert.equal(running(h, "open-session"), false, "the completion poll's idle sample clears the dot");
   assert.equal(activityRequests(h).length, 3, "completion immediately samples the backend");
@@ -518,23 +561,28 @@ test("only the six-pixel dot breathes and reduced motion disables its animation"
   assert.match(css, /@media \(prefers-reduced-motion:reduce\) \{ #sessions li \.session-running-dot \{ animation:none; \} \}/);
 });
 
-test("pending and accepted local submissions cannot synthesize a running dot", async () => {
+test("pending and accepted local submissions keep the badge consistent with their live stream owner", async () => {
   const h = harness({ items: listed(), realNavigation: true });
   h.context.updateExecutionModel({ kind: "begin" });
   h.context.updateExecutionModel({ kind: "live", entry: { userInput: { settled: false } } });
   const pending = { requests: h.requests.length, backend_fixture: "idle", dot: running(h, "open-session"),
     sample: samples(h).find(([id]) => id === "open-session")[1] };
-  assert.equal(pending.dot, false, JSON.stringify(pending));
+  assert.equal(pending.dot, true, JSON.stringify(pending));
+  assert.equal(h.context.executionIsRunning(h.context.executionState()), true, "the same live owner drives the composer");
   assert.equal(pending.sample, "idle");
   assert.equal(pending.requests, 0);
   h.context.executionState().liveEntry.userInput.settled = true;
-  assert.equal(running(h, "open-session"), false, "HTTP acceptance alone cannot prove that a child is running");
+  assert.equal(running(h, "open-session"), true, "the browser retains its own live owner through HTTP acceptance");
   h.document.visibilityState = "visible";
   await h.context.pollSessionActivity();
-  assert.equal(running(h, "open-session"), false, "an idle server sample stays idle after submission");
+  assert.equal(running(h, "open-session"), true, "a pre-cleanup idle sample cannot erase the live POST owner");
+  h.context.updateExecutionModel({ kind: "live", entry: null });
+  await h.context.pollSessionActivity();
+  assert.equal(running(h, "open-session"), false, "fresh idle after cleanup retires both projections");
+  assert.equal(h.context.executionIsRunning(h.context.executionState()), false);
 });
 
-test("real submission and acceptance sample activity without promoting an idle session", async () => {
+test("real submission and acceptance sample activity while both controls follow the live owner", async () => {
   const h = sendHarness(), c = h.c;
   let backend = "idle", reads = 0;
   c.lastItems = c.lastItems.map((item) => ({ ...item, activity: backend }));
@@ -557,17 +605,22 @@ test("real submission and acceptance sample activity without promoting an idle s
   await h.start();
   assert.equal(h.requests.length, 1, "the actual turn POST was submitted");
   assert.ok(reads >= 1, "submission immediately requests authoritative activity");
-  assert.equal(isRunning(), false);
+  assert.equal(isRunning(), true);
+  assert.equal(c.canStop(), true);
+  assert.equal(h.elements.send.textContent, "⏹");
   await h.accept();
   assert.ok(reads >= 2, "acceptance reconciles activity again");
-  assert.equal(isRunning(), false, "accepted HTTP headers still do not prove a child is registered");
+  assert.equal(isRunning(), true, "accepted headers retain the live browser owner");
+  assert.equal(c.canStop(), true);
   backend = "running";
   await c.pollSessionActivity();
   assert.equal(isRunning(), true);
   const beforeDone = reads;
   await h.frame("done", {});
   assert.ok(reads > beforeDone, "completion immediately refreshes authoritative activity");
-  assert.equal(isRunning(), true, "done does not clear a still-registered child");
+  assert.equal(isRunning(), false, "terminal evidence settles both controls before child reaping");
+  assert.equal(c.canStop(), false);
+  assert.equal(h.elements.send.textContent, "➤");
   backend = "idle";
   await c.pollSessionActivity();
   assert.equal(isRunning(), false);
@@ -613,6 +666,8 @@ test("done cannot produce an idle-then-running flip while the child is still reg
   await settle();
   sequence.push(running(h, "open-session"));
   assert.deepEqual(sequence, [true, true, true], "done precedes child reaping, so it cannot clear the running dot");
+  h.context.updateExecutionModel({ kind: "live", entry: null });
   h.context.mergeSessionActivities([{ id: "open-session", activity: "idle" }]);
-  assert.equal(running(h, "open-session"), false, "the first authoritative idle sample clears the dot");
+  assert.equal(running(h, "open-session"), false, "the first authoritative idle sample after stream cleanup clears the dot");
+  assert.equal(h.context.executionIsRunning(h.context.executionState()), false);
 });

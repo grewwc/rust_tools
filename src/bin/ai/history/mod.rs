@@ -341,9 +341,10 @@ pub(in crate::ai) use types::{
     CODE_INSPECTION_MEMORY_PREFIX, COLON, MAX_HISTORY_TURNS, Message, NEWLINE,
     SkillActivationEvent, StoredMessage, ToolExecutionOutcome, attach_request_reminder,
     clear_runtime_message_metadata, has_runtime_message_metadata, is_code_inspection_memory_text,
-    is_runtime_synthetic_user_message, is_side_note_message, is_user_input_message,
-    last_real_user_index, prepend_request_reminder, redact_inline_image_data, request_reminder,
-    runtime_synthetic_user_message, user_input_turn_count,
+    is_retired_change_set_metadata, is_runtime_synthetic_user_message, is_side_note_message,
+    is_user_input_message, last_real_user_index, prepend_request_reminder,
+    redact_inline_image_data, request_reminder, runtime_synthetic_user_message,
+    user_input_turn_count,
 };
 
 pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;
@@ -845,7 +846,11 @@ fn context_projection_fingerprint(
     // v31: preserve encrypted continuation markers on plain assistant answers.
     // v32: archived successful writes become evidence notes instead of callable
     // argument pointers; rebuild projections that could teach models to copy stubs.
-    const PROJECTION_VERSION: u8 = 32;
+    // v34: retired change-set metadata is filtered from request projections;
+    // verification now refers to the existing mutation log on demand.
+    // v35: full task evidence recovery explicitly selects the raw view; rebuild
+    // older snapshots from canonical evidence after the default became summary.
+    const PROJECTION_VERSION: u8 = 35;
     projection_cache_key(
         PROJECTION_VERSION,
         history_max_chars,
@@ -1609,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_cache_key_is_versioned_and_v32_never_reuses_older_snapshots() {
+    fn projection_cache_key_is_versioned_and_v35_never_reuses_older_snapshots() {
         let params = (
             8_000usize,
             2usize,
@@ -1626,6 +1631,8 @@ mod tests {
         let v24_key = projection_cache_key(24, params.0, params.1, params.2, params.3);
         let v29_key = projection_cache_key(29, params.0, params.1, params.2, params.3);
         let v31_key = projection_cache_key(31, params.0, params.1, params.2, params.3);
+        let v32_key = projection_cache_key(32, params.0, params.1, params.2, params.3);
+        let v34_key = projection_cache_key(34, params.0, params.1, params.2, params.3);
         assert_ne!(
             v17_key, v18_key,
             "identical projection parameters must not collide across projection versions"
@@ -1633,14 +1640,13 @@ mod tests {
         assert!(v17_key.starts_with("v17|"));
         assert!(v18_key.starts_with("v18|"));
         assert!(v19_key.starts_with("v19|"));
-        // The live fingerprint must carry v32 so callable argument pointers
-        // are rebuilt from canonical history as successful write evidence notes.
-        // Updating the v32 literal is a deliberate tripwire for the
+        // The live fingerprint must carry v35 to rebuild full evidence recovery.
+        // Updating the v35 literal is a deliberate tripwire for the
         // next projection-strategy change.
         let live = context_projection_fingerprint(params.0, params.1, params.2, params.3);
         assert_eq!(
             live,
-            projection_cache_key(32, params.0, params.1, params.2, params.3)
+            projection_cache_key(35, params.0, params.1, params.2, params.3)
         );
         assert_ne!(live, v17_key);
         assert_ne!(live, v18_key);
@@ -1652,6 +1658,141 @@ mod tests {
         assert_ne!(live, v24_key);
         assert_ne!(live, v29_key);
         assert_ne!(live, v31_key);
+        assert_ne!(live, v32_key);
+        assert_ne!(live, v34_key);
+        assert_ne!(
+            live,
+            projection_cache_key(33, params.0, params.1, params.2, params.3)
+        );
+    }
+
+    #[test]
+    fn v35_sqlite_context_rebuilds_v34_evidence_snapshot_without_rewriting_canonical() {
+        use crate::ai::tools::task_tools::assert_full_evidence_recovery_hints;
+        use crate::ai::types::{FunctionCall, ToolCall};
+
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("v35-evidence-context-{}", uuid::Uuid::new_v4()));
+        let task_id = "task_Original-ID_77";
+        for source in ["delivered", "progress"] {
+            let session_dir = dir.join(source);
+            std::fs::create_dir_all(&session_dir).unwrap();
+            let history_file = session_dir.join("history.sqlite");
+            let overflow_dir = session_dir.join("archives");
+            let arguments = serde_json::json!({"task_id": task_id, "source": source});
+            let raw_evidence = serde_json::json!({
+                "task_id": task_id,
+                "source": source,
+                "status": "completed",
+                "payload": "Conclusion: preserve complete original evidence.\n".repeat(2_000),
+            })
+            .to_string();
+            assert!(raw_evidence.chars().count() > compress::TOOL_RESULT_RAW_HARD_CAP_CHARS);
+            let canonical = vec![
+                Message {
+                    role: "assistant".into(),
+                    content: serde_json::json!(""),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "original-evidence-call".into(),
+                        tool_type: "function".into(),
+                        function: FunctionCall {
+                            name: "task_evidence_read".into(),
+                            arguments: arguments.to_string(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                Message {
+                    role: "tool".into(),
+                    content: serde_json::json!(raw_evidence),
+                    tool_calls: None,
+                    tool_call_id: Some("original-evidence-call".into()),
+                    reasoning_content: None,
+                },
+            ];
+            append_history_messages(&history_file, &canonical).unwrap();
+            // Seed an actual saved projection with the pre-summary-default hint.
+            // Only canonical raw evidence is rebuilt; no old stub is migrated.
+            let old_stub = format!(
+                "[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]\n\
+                 Output preserved for tool `task_evidence_read`.\n\
+                 - recovery: canonical history; locate the full result using the retained task ids.\n\
+                 - task_evidence: task_id={task_id}; task_evidence_read({arguments}); use this exact task_id, omitting fields/max_chars/cursor"
+            );
+            assert!(!old_stub.contains("\"view\""));
+            let mut old_projection = canonical.clone();
+            old_projection[1].content = serde_json::json!(old_stub);
+            let old_fingerprint = projection_cache_key(34, 0, 8, 2_000, Some(&overflow_dir));
+            let initial =
+                sqlite::read_context_history_sqlite(&history_file, &old_fingerprint).unwrap();
+            assert!(
+                sqlite::write_context_snapshot_sqlite(
+                    &history_file,
+                    &old_projection,
+                    initial.source_message_id,
+                    initial.canonical_generation,
+                    &old_fingerprint,
+                )
+                .unwrap()
+            );
+            let old = sqlite::read_context_history_sqlite(&history_file, &old_fingerprint).unwrap();
+            assert!(old.snapshot_is_current);
+            assert_eq!(old.messages, old_projection);
+
+            let fingerprint = context_projection_fingerprint(0, 8, 2_000, Some(&overflow_dir));
+            assert_ne!(fingerprint, old_fingerprint);
+            let rejected =
+                sqlite::read_context_history_sqlite(&history_file, &fingerprint).unwrap();
+            assert!(!rejected.snapshot_is_current);
+            assert!(rejected.snapshot_meta.is_none());
+            assert_eq!(rejected.messages, canonical);
+            assert_eq!(rejected.snapshot_stamp, old.snapshot_stamp);
+            let (rebuilt, basis) = build_context_history_with_snapshot_basis(
+                usize::MAX,
+                &history_file,
+                0,
+                8,
+                2_000,
+                Some(overflow_dir),
+                None,
+            )
+            .unwrap();
+            let rebuilt_stub = rebuilt.messages[1].content.as_str().unwrap();
+            assert!(rebuilt_stub.starts_with("[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]"));
+            assert_ne!(rebuilt_stub, old_stub);
+            assert_full_evidence_recovery_hints(rebuilt_stub);
+            for call in rebuilt_stub
+                .lines()
+                .filter_map(|line| line.split_once("task_evidence_read(").map(|(_, call)| call))
+            {
+                let recovered_arguments = serde_json::Deserializer::from_str(call)
+                    .into_iter::<serde_json::Value>()
+                    .next()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(recovered_arguments["view"], "raw");
+                assert_eq!(recovered_arguments["task_id"], task_id);
+                assert_eq!(recovered_arguments["source"], source);
+            }
+            let basis = basis.expect("SQLite rebuild retains snapshot coordinates");
+            assert!(
+                persist_context_snapshot_from_basis(&history_file, &rebuilt.messages, &basis)
+                    .unwrap()
+            );
+            let current = sqlite::read_context_history_sqlite(&history_file, &fingerprint).unwrap();
+            assert!(current.snapshot_is_current);
+            assert_eq!(current.messages, rebuilt.messages);
+            assert_eq!(
+                build_message_arr(usize::MAX, &history_file).unwrap(),
+                canonical,
+                "rebuilding and saving the projection must leave canonical raw evidence intact"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

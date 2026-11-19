@@ -563,7 +563,7 @@ static AGENT_TEAM_SCHEMA_EXTENSIONS: LazyLock<
     .collect()
 });
 
-/// The declarative base schema remains the legacy schema for every metadata consumer.
+/// The declarative base schema includes explicit reads for every metadata consumer.
 /// Request builders add opt-in properties using one configuration snapshot per batch.
 pub(crate) fn tool_parameters_with_optimizations(name: &str, enabled: bool) -> Value {
     let mut parameters = super::tool_metadata::tool_parameters(name);
@@ -772,7 +772,7 @@ mod manifest_tool_name_tests {
     const HEAD_AGENT_TEAM_DEFINITION_BYTES: &[(&str, &str)] = &[
         (
             "task_evidence_read",
-            r##"{"type":"function","function":{"name":"task_evidence_read","description":"Read evidence for one task. The default source=progress refreshes and returns its bounded phase/checkpoint snapshot for diagnosis. source=delivered reads the full persisted status and payload without collecting, refreshing progress, or integrating; available after collection and context compression. Use task_audit for all recorded IDs. Reading never acknowledges integration.","parameters":{"type":"object","properties":{"task_id":{"type":"string","description":"Exact task_id returned by task_spawn or listed by task_audit. Delivered lookup preserves the ID verbatim."},"source":{"type":"string","enum":["progress","delivered"],"default":"progress","description":"progress preserves the existing live snapshot behavior; delivered performs a read-only lookup of a previously delivered result."}},"required":["task_id"]}}}"##,
+            r##"{"type":"function","function":{"name":"task_evidence_read","description":"Read evidence for one task. source=progress (default) returns its live phase/checkpoint snapshot. source=delivered is read-only: with agent-team optimizations enabled, defaults to a summary of at most 2 KiB including payload preview, verification availability, and advisory assessment; otherwise defaults to raw. Full persisted payload: task_evidence_read(source=\"delivered\", view=\"raw\", exact task_id), omitting fields/max_chars/cursor; fields selects metadata and cursor/max_chars page it. Explicit parameters work regardless of the optimization switch. Top-level verification is normalized and assessment is runtime-derived advisory requiring parent review; body-authored assessment values remain unverified worker content in payload/output; limits remain 8 KiB and 16 checks. Reading never collects or integrates. Use task_audit for recorded IDs.","parameters":{"type":"object","properties":{"task_id":{"type":"string","description":"Exact task_id returned by task_spawn or listed by task_audit. Delivered lookup preserves the ID verbatim."},"source":{"type":"string","enum":["progress","delivered"],"default":"progress","description":"progress preserves the existing live snapshot behavior; delivered performs a read-only lookup of a previously delivered result."},"fields":{"type":"array","minItems":1,"items":{"type":"string","minLength":1},"description":"Select top-level evidence fields, including verification and assessment when available. Unavailable names list available fields. With pagination, payload is serialized selected JSON; repeat identical fields for continuation. Explicit selection works with optimizations disabled."},"max_chars":{"type":"integer","minimum":0,"description":"Limit raw payload or serialized selected JSON per page in Unicode scalar values. Metadata is outside this limit; verification/assessment remain visible. Returns cursor, shown_chars, total_chars, truncated, next_cursor, and a recovery hint. 0 returns metadata and an empty payload; increase max_chars to advance. Explicit limits work with optimizations disabled."},"view":{"type":"string","enum":["summary","raw"],"description":"Delivered view: summary returns at most 2 KiB with preview and metadata discovery; raw returns the full original envelope when fields, max_chars, and cursor are omitted. Default is summary with agent-team optimizations enabled, raw otherwise. Projection parameters imply raw; explicit summary cannot be combined with them. Progress supports raw only."},"cursor":{"type":"integer","minimum":0,"description":"Raw page start as a Unicode scalar offset, default 0. Pass next_cursor and identical fields to continue. Without max_chars, a cursor requests a 2048-character page. Cursor equal to total_chars returns an empty complete page; larger offsets error. Full evidence: task_evidence_read(source=\"delivered\", view=\"raw\", exact task_id), omitting fields/max_chars/cursor."}},"required":["task_id"]}}}"##,
         ),
         (
             "task_status",
@@ -787,6 +787,23 @@ mod manifest_tool_name_tests {
             r##"{"type":"function","function":{"name":"run_agent_graph","description":"Start, advance, inspect, or cancel a checkpointed agent graph. Static mode runs a conditional DAG and reduces node outputs into shared state. Dynamic mode selects relevant candidates, propagates messages, and pools a final answer.","parameters":{"type":"object","required":["action"],"properties":{"action":{"type":"string","enum":["start","advance","status","cancel"],"description":"Operation. start requires mode, question, and `static_graph` or `dynamic_graph` matching mode; advance, status, and cancel require graph_id. Call advance until the graph is terminal."},"graph_id":{"type":"string","description":"Graph UUID returned by start; required for advance, status, and cancel."},"mode":{"type":"string","enum":["static","dynamic"],"description":"Graph strategy for start: static runs static_graph; dynamic runs dynamic_graph."},"name":{"type":"string","description":"Optional graph name for start. Default agent-graph."},"question":{"type":"string","description":"Non-empty problem or objective given to the graph."},"max_parallel":{"type":"integer","minimum":1,"maximum":8,"description":"Maximum concurrent graph tasks. Default 4; clamped to 1..=8."},"static_graph":{"type":"object","description":"Static-mode definition: shared initial state, executable nodes, and conditional dependency edges.","required":["nodes"],"properties":{"initial_state":{"type":"object","description":"Initial shared JSON state. Defaults to an empty object."},"nodes":{"type":"array","maxItems":128,"description":"DAG nodes to execute (maximum 128). Node ids must be unique.","items":{"type":"object","required":["id","description","prompt"],"properties":{"id":{"type":"string","description":"Unique node identifier."},"description":{"type":"string","description":"Short explanation of the node's responsibility."},"prompt":{"type":"string","description":"Instructions executed by this node."},"agent":{"type":"string","description":"Optional agent profile name for the node task."},"model":{"type":"string","description":"Optional model override for the node task."},"inherit":{"type":"string","description":"Context inherited by the node task: none, all, cwd, memory, history, skills, or a comma-separated combination. Default cwd,skills."},"response_schema":{"type":"object","description":"Optional JSON Schema constraining the node's final output."},"output_key":{"type":"string","description":"Shared-state key receiving the reduced node output. Defaults to the node id."},"reducer":{"type":"string","enum":["replace","append_array","merge_object","concat"],"description":"How to combine this output with the current output_key value. Default replace."},"max_retries":{"type":"integer","minimum":0,"description":"Maximum retries after a failed node attempt. Default 0."}}}},"edges":{"type":"array","maxItems":1024,"description":"Directed dependencies between nodes (maximum 1024). Defaults to no edges.","items":{"type":"object","required":["from","to"],"properties":{"from":{"type":"string","description":"Predecessor node id."},"to":{"type":"string","description":"Successor node id."},"condition":{"type":"object","description":"Optional gate. Omit for always; on_success runs only after a completed predecessor, on_failure only after a failed predecessor, output_contains requires text, and json_pointer_equals requires pointer and value.","required":["kind"],"properties":{"kind":{"type":"string","enum":["always","on_success","on_failure","output_contains","json_pointer_equals"],"description":"Gate type."},"text":{"type":"string","description":"Required when kind is output_contains: substring in the predecessor output."},"pointer":{"type":"string","description":"Required when kind is json_pointer_equals: JSON Pointer into the predecessor output."},"value":{"description":"Required when kind is json_pointer_equals: expected JSON value."}}}}}}}},"dynamic_graph":{"type":"object","description":"Dynamic-mode definition: candidate agents plus optional topology and pooling policy.","required":["candidates"],"properties":{"candidates":{"type":"array","minItems":2,"maxItems":16,"description":"Candidate agents considered for the graph (2 to 16). Candidate ids must be unique.","items":{"type":"object","required":["id","role"],"properties":{"id":{"type":"string","description":"Unique candidate identifier."},"role":{"type":"string","description":"Candidate specialty used during relevance scoring and answer generation."},"prompt":{"type":"string","description":"Optional candidate-specific instructions."},"agent":{"type":"string","description":"Optional agent profile name for this candidate."},"model":{"type":"string","description":"Optional model override for this candidate."},"inherit":{"type":"string","description":"Context inherited by candidate tasks: none, all, cwd, memory, history, skills, or a comma-separated combination. Default cwd,skills."}}}},"policy":{"type":"object","description":"Optional candidate-selection, edge-selection, and final-pooling policy.","properties":{"min_selected":{"type":"integer","minimum":2,"description":"Minimum candidates retained after relevance scoring. Default 2."},"max_selected":{"type":"integer","minimum":2,"description":"Maximum candidates retained after relevance scoring. Default 4."},"relevance_threshold":{"type":"number","minimum":0,"maximum":1,"description":"Minimum candidate relevance score. Default 0.2."},"edge_threshold":{"type":"number","minimum":0,"maximum":1,"description":"Minimum pairwise relevance score for a message edge. Default 0.35."},"pool":{"type":"string","enum":["max","judge"],"description":"Final-answer strategy: max selects the highest-scored answer; judge asks a pooling agent to synthesize one. Default judge."},"pool_agent":{"type":"string","description":"Optional agent profile for judge pooling."},"pool_model":{"type":"string","description":"Optional model override for judge pooling."}}}}}}}}}"##,
         ),
     ];
+
+    #[test]
+    fn complete_evidence_recovery_tool_descriptions_are_effective() {
+        for enabled in [false, true] {
+            crate::ai::tools::enable_tools::with_agent_team_optimizations_for_test(
+                &format!("ai.agent_team.optimizations_enabled = {enabled}\n"),
+                || {
+                    let names = ["task_evidence_read", "task_wait"].map(String::from);
+                    for definition in get_tool_definitions_by_names(&names) {
+                        crate::ai::tools::task_tools::assert_full_evidence_recovery_hints(
+                            &definition.function.description,
+                        );
+                    }
+                },
+            );
+        }
+    }
 
     #[test]
     fn agent_team_master_off_schemas_match_head_bytes() {
@@ -827,7 +844,7 @@ mod manifest_tool_name_tests {
                         serde_json::to_vec(&super::super::tool_metadata::tool_parameters(name))
                             .unwrap(),
                         serde_json::to_vec(&expected.function.parameters).unwrap(),
-                        "direct metadata remains legacy for {name}",
+                        "direct metadata matches the base schema for {name}",
                     );
                 }
             });
@@ -1024,18 +1041,38 @@ fn execute_tool_call_with_args_impl(
         return Err(unknown_tool_error_message(name));
     };
     let started = std::time::Instant::now();
-    let exec = run_tool_guarded(&name, || {
-        if let Some(stream_exec) = TOOL_STREAM_INDEX.get_ref(&name.to_string()).copied() {
-            let mut sink = |_chunk: &[u8]| {};
-            let writer = match on_chunk {
-                Some(writer) => writer,
-                None => &mut sink,
-            };
-            stream_exec(args, writer)
-        } else {
-            (spec.execute)(args)
-        }
+    let pending_check =
+        crate::ai::tools::storage::mutation_log::begin_check(tool_call_id, name, args);
+    let exec = crate::ai::tools::storage::mutation_log::with_tool_call(tool_call_id, || {
+        run_tool_guarded(&name, || {
+            if let Some(stream_exec) = TOOL_STREAM_INDEX.get_ref(&name.to_string()).copied() {
+                let mut sink = |_chunk: &[u8]| {};
+                let writer = match on_chunk {
+                    Some(writer) => writer,
+                    None => &mut sink,
+                };
+                stream_exec(args, writer)
+            } else {
+                (spec.execute)(args)
+            }
+        })
     });
+    if pending_check.is_some() {
+        match &exec {
+            Ok(text) => crate::ai::tools::storage::mutation_log::finish_check(
+                pending_check,
+                name,
+                args,
+                text,
+            ),
+            Err(text) => crate::ai::tools::storage::mutation_log::finish_check(
+                pending_check,
+                name,
+                args,
+                &format!("Error: {text}"),
+            ),
+        }
+    }
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match exec {
         Ok(result) => {

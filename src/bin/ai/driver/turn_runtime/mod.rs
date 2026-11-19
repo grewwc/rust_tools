@@ -54,6 +54,63 @@ pub(in crate::ai) use tool_result::stale_patch_targets_from_messages;
 use tool_result::{prepare_recent_tool_result, prepare_tool_result};
 pub(super) use types::TurnOutcome;
 
+/// Command evidence shared by completion gating and mutation-log observations.
+pub(in crate::ai) struct CommandCheckEvidence {
+    pub reported_failure: bool,
+    pub observed_success: bool,
+    pub partial_success: bool,
+    pub success_guaranteed: bool,
+    pub status: progress::ToolResultProgressStatus,
+    pub session_id: Option<String>,
+}
+
+pub(in crate::ai) fn command_check_evidence(
+    args: &serde_json::Value,
+    text: &str,
+) -> Option<CommandCheckEvidence> {
+    let effects = iteration::execute_command_segment_effects_for_args(args);
+    let behavior = effects.iter().any(|effect| effect.behavior_check);
+    if !behavior && !effects.iter().any(|effect| effect.scope_review) {
+        return None;
+    }
+    let guaranteed = effects
+        .iter()
+        .filter(|effect| effect.behavior_check || effect.scope_review)
+        .all(|effect| effect.success_guaranteed);
+    let content = serde_json::Value::String(text.to_string());
+    let failure = behavior && iteration::behavior_check_output_reports_failure(&content);
+    let local_success = behavior && iteration::behavior_check_output_has_success_sentinel(&content);
+    let observed_success = !failure
+        && local_success
+        && (guaranteed || iteration::behavior_check_output_confirms_source_success(args, &content));
+    let (id, mut status) = progress::command_session_result(text)
+        .map(|(id, status)| (id.map(str::to_string), status))
+        .unwrap_or_else(|| (None, progress::classify_tool_result_progress(text)));
+    if status == progress::ToolResultProgressStatus::Success {
+        status = if failure {
+            progress::ToolResultProgressStatus::Failure
+        } else if guaranteed {
+            progress::ToolResultProgressStatus::Success
+        } else {
+            progress::ToolResultProgressStatus::Unknown
+        };
+    }
+    Some(CommandCheckEvidence {
+        reported_failure: failure,
+        observed_success,
+        partial_success: local_success && !observed_success,
+        success_guaranteed: guaranteed,
+        status,
+        session_id: id,
+    })
+}
+
+pub(in crate::ai) fn command_session_observation(
+    text: &str,
+) -> Option<(Option<String>, progress::ToolResultProgressStatus)> {
+    progress::command_session_result(text).map(|(id, status)| (id.map(str::to_string), status))
+}
+
 /// Merges adjacent compression phases into a single status line so each phase does not occupy its own line.
 #[derive(Default)]
 pub(super) struct CompressionReport {

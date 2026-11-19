@@ -134,6 +134,14 @@ const TARGET_RESCAN_HARD_THRESHOLD: u32 = 4;
 /// necessarily triggers within 4 rounds; a legitimate re-read spread across many rounds after
 /// context compression expires the count and never accumulates to the hard threshold.
 const TARGET_RESCAN_WINDOW_ROUNDS: usize = 8;
+/// Redundant-window re-read thresholds. A `read_file` window whose every returned complete line
+/// matches the earlier content fingerprints cannot add information. Changed overlapping content,
+/// paging (advancing windows), and reading a new target never count. The 3rd redundant
+/// read on one target injects an advisory that names the recovery path (copy the needed lines into
+/// a durable note once instead of re-deriving them from the same window); the 6th forces wrap-up.
+/// Any direct edit, successful or failed, clears the whole table because the model is acting.
+const REDUNDANT_READ_SOFT_THRESHOLD: u32 = 3;
+const REDUNDANT_READ_HARD_THRESHOLD: u32 = 6;
 const TASK_ANCHOR_MAX_QUESTION_CHARS: usize = 220;
 
 /// Argument keys treated as "volatile paging/window" and stripped when computing coarse signatures.
@@ -420,6 +428,13 @@ enum ToolLoopSignal {
     /// The same target has been re-read from the top past the hard threshold: switch to no-tool handoff
     /// and force an answer.
     TargetRescanHard(String, u32),
+    /// A `read_file` window returned complete lines matching their earlier content fingerprints,
+    /// so the call adds no information. Prompt once per
+    /// target and name the durable-note recovery path instead of re-reading.
+    RedundantRead(String, u32),
+    /// Redundant window re-reads passed the hard threshold: switch to no-tool handoff and force an
+    /// answer.
+    RedundantReadHard(String, u32),
     /// `execute_command` spins idly on the same coarse target for too long; force convergence directly.
     CoarseHard,
     Soft,
@@ -460,6 +475,8 @@ impl ToolLoopSignal {
             Self::TargetRepeat => Some(("target_repeat", SignalKind::Advisory)),
             Self::TargetRescan(..) => Some(("target_rescan", SignalKind::Advisory)),
             Self::TargetRescanHard(..) => Some(("target_rescan_hard", SignalKind::HardStop)),
+            Self::RedundantRead(..) => Some(("redundant_read", SignalKind::Advisory)),
+            Self::RedundantReadHard(..) => Some(("redundant_read_hard", SignalKind::HardStop)),
             Self::CoarseHard => Some(("coarse_hard", SignalKind::HardStop)),
             Self::Soft => Some(("exact_soft", SignalKind::Advisory)),
             Self::Hard => Some(("exact_hard", SignalKind::HardStop)),
@@ -588,6 +605,14 @@ struct ProgressLedger {
     from_top_reads: FxHashMap<String, (u32, usize)>,
     /// Targets that already received a TargetRescan soft prompt (once per target per round).
     rescan_note_injected: FxHashSet<String>,
+    /// Per-target complete line content fingerprints from actual `read_file` results. A changed
+    /// overlapping line invalidates the entire target's old coverage before recording new lines.
+    read_coverage: FxHashMap<String, FxHashMap<usize, [u8; 32]>>,
+    /// Per-target count of redundant window re-reads in this turn. Unlike `consecutive_no_progress`
+    /// it is not reset by new bytes from other windows; a direct edit or changed overlap clears it.
+    redundant_read_counts: FxHashMap<String, u32>,
+    /// Targets that already received the redundant-read advisory.
+    redundant_read_note_targets: FxHashSet<String>,
 }
 
 impl ProgressLedger {
@@ -644,6 +669,90 @@ impl ProgressLedger {
         ToolLoopSignal::DelegationRequired
     }
 
+    /// Judge this round's complete `read_file` lines against the content actually returned earlier.
+    /// Only fully covered, matching lines prove a redundant read. That is the one repeat pattern the
+    /// signature, target-repeat, and from-top detectors all miss while the model cycles through a
+    /// few files with a new window each round.
+    ///
+    /// Coverage accumulates during free exploration but signals never fire there: orientation
+    /// re-reads are legitimate. A direct edit clears the table; changed overlapping content also
+    /// invalidates the target regardless of which command or background task changed the file.
+    fn observe_round_reads(
+        &mut self,
+        messages: &[crate::ai::history::Message],
+        iteration: usize,
+        free_explore_rounds: usize,
+    ) -> ToolLoopSignal {
+        // A direct edit invalidates every covered range: later reads return different bytes. Clear
+        // before inspecting this round's reads, and record nothing for the round, so a read that ran
+        // before the edit cannot leave coverage describing pre-edit content.
+        if round_has_direct_mutation_tool(messages) {
+            self.read_coverage.clear();
+            self.redundant_read_counts.clear();
+            self.redundant_read_note_targets.clear();
+            return ToolLoopSignal::None;
+        }
+        let mut signal = ToolLoopSignal::None;
+        for window in extract_round_read_windows(messages) {
+            let coverage = self.read_coverage.entry(window.target.clone()).or_default();
+            let content_changed =
+                window
+                    .line_fingerprints
+                    .iter()
+                    .enumerate()
+                    .any(|(i, fingerprint)| {
+                        coverage
+                            .get(&window.start.saturating_add(i))
+                            .is_some_and(|old| old != fingerprint)
+                    });
+            if content_changed {
+                // A changed overlap proves the old target snapshot is stale. Clear its coverage,
+                // count, and prompt mark together before installing the actual returned lines.
+                coverage.clear();
+                self.redundant_read_counts.remove(&window.target);
+                self.redundant_read_note_targets.remove(&window.target);
+            }
+            let covered = window
+                .line_fingerprints
+                .iter()
+                .enumerate()
+                .all(|(i, fingerprint)| {
+                    coverage.get(&window.start.saturating_add(i)) == Some(fingerprint)
+                });
+            if !covered {
+                coverage.extend(
+                    window
+                        .line_fingerprints
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, fingerprint)| (window.start.saturating_add(i), fingerprint)),
+                );
+                continue;
+            }
+            // The unrecorded partial line may differ; matching complete lines cannot prove
+            // that the entire result is redundant.
+            if window.has_partial_line || iteration <= free_explore_rounds {
+                continue;
+            }
+            let reads = self
+                .redundant_read_counts
+                .entry(window.target.clone())
+                .or_insert(0);
+            *reads += 1;
+            if *reads >= REDUNDANT_READ_HARD_THRESHOLD {
+                return ToolLoopSignal::RedundantReadHard(window.target, *reads);
+            }
+            if *reads >= REDUNDANT_READ_SOFT_THRESHOLD
+                && self
+                    .redundant_read_note_targets
+                    .insert(window.target.clone())
+            {
+                signal = ToolLoopSignal::RedundantRead(window.target, *reads);
+            }
+        }
+        signal
+    }
+
     /// Reset the escalation ladder: clear the no-progress counter and the one-shot soft/ledger/hard/grace
     /// state so billing restarts from zero. Shared by two scenarios:
     /// 1. Truncation retry (mark_truncation_skip): after a truncation clears history, re-reading is
@@ -676,6 +785,12 @@ impl ProgressLedger {
         // counts are exactly the independent defense against that escape).
         self.from_top_reads.clear();
         self.rescan_note_injected.clear();
+        // Truncation clears the conversation, so the model must re-read windows it already saw to
+        // rebuild context. Keeping coverage or counts would judge that recovery as redundant reads
+        // and could hard-stop the turn during legitimate context rebuilding.
+        self.read_coverage.clear();
+        self.redundant_read_counts.clear();
+        self.redundant_read_note_targets.clear();
     }
 }
 
@@ -774,6 +889,13 @@ impl TurnSupervisor {
         let Some(sigs) = extract_round_tool_signatures(signature_messages) else {
             return ToolLoopSignal::None;
         };
+        // Observe returned content before call-pattern detectors can return early. Even an
+        // advisory about repeated arguments must not leave coverage bound to an older snapshot.
+        let redundant_signal = self.progress.observe_round_reads(
+            signature_messages,
+            self.iteration,
+            free_explore_rounds,
+        );
         self.tool_signature_history.push(sigs);
         if self.tool_signature_history.len() > TOOL_SIGNATURE_HISTORY_LIMIT {
             let drop = self.tool_signature_history.len() - TOOL_SIGNATURE_HISTORY_LIMIT;
@@ -913,6 +1035,12 @@ impl TurnSupervisor {
         }
         if let Some(signal) = rescan_signal {
             return signal;
+        }
+        // Redundant-window re-read detection: independent of round signatures. Paging advances the
+        // window and never counts; repeating complete lines with matching content fingerprints
+        // counts for that target until a direct edit or changed overlap clears it.
+        if redundant_signal != ToolLoopSignal::None {
+            return redundant_signal;
         }
         // When neither exact nor coarse catches a "signature repetition" loop, hand off to the
         // Progress Budget: it catches divergent loops whose parameters change every round but never
@@ -3712,6 +3840,36 @@ async fn run_turn_body_round(
                     "low-yield-hard-stop",
                 );
                 record_force_final_reason(&mut messages, "low_yield_repetition", iteration, None);
+                force_final_response = true;
+            }
+            ToolLoopSignal::RedundantRead(target, reads) => {
+                crate::ai::driver::print::print_tool_note_line(
+                    "agent-health",
+                    &format!(
+                        "window of {target} re-read with unchanged content {reads} times: injecting converge hint"
+                    ),
+                );
+                inject_redundant_read_note(&mut messages, &target, reads);
+            }
+            ToolLoopSignal::RedundantReadHard(target, reads) => {
+                crate::ai::driver::print::print_tool_note_line(
+                    "agent-health",
+                    &format!(
+                        "window of {target} re-read with unchanged content past the hard threshold: switching to no-tool handoff (reads: {reads})"
+                    ),
+                );
+                inject_redundant_read_hard_stop_note(&mut messages, &target, reads);
+                supervisor.maybe_inject_task_anchor(
+                    &mut messages,
+                    &question,
+                    "redundant-read-hard-stop",
+                );
+                record_force_final_reason(
+                    &mut messages,
+                    "redundant_read",
+                    iteration,
+                    Some(&target),
+                );
                 force_final_response = true;
             }
             ToolLoopSignal::Soft => {

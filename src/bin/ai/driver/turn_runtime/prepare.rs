@@ -1,3 +1,4 @@
+use crate::ai::tools::task_tools::{EvidenceRecoveryFormat, full_delivered_evidence_hint};
 use serde_json::Value;
 use std::path::Path;
 
@@ -838,6 +839,8 @@ pub(super) async fn prepare_turn(
         crate::ai::driver::runtime_ctx::is_resume_turn(),
     ));
 
+    refresh_verification_reminder(app, &mut messages, false);
+
     let max_iterations = app
         .agent_context
         .as_ref()
@@ -859,6 +862,104 @@ pub(super) async fn prepare_turn(
         max_iterations,
         pending_image_digests,
     })
+}
+
+const VERIFICATION_REMINDER_PREFIX: &str = "[runtime verification reminder]";
+
+fn is_verification_reminder(message: &Message) -> bool {
+    message.role == ROLE_INTERNAL_NOTE
+        && message
+            .content
+            .as_str()
+            .is_some_and(|text| text.starts_with(VERIFICATION_REMINDER_PREFIX))
+}
+
+/// A bounded navigation hint; task claims stay in the existing evidence ledger.
+fn verification_reminder_text(
+    revision: u64,
+    stale: usize,
+    gaps: usize,
+    pending_tasks: usize,
+    task_gaps: usize,
+    resume: bool,
+    compacted: bool,
+) -> Option<String> {
+    if (revision == 0 && pending_tasks == 0) || !(resume || compacted || gaps > 0 || task_gaps > 0)
+    {
+        return None;
+    }
+    let mut text = format!(
+        "{VERIFICATION_REMINDER_PREFIX}\nVerification pending for revision {revision}: {stale} stale check(s), {gaps} command gap(s). Inspect show_changes before relying on earlier results."
+    );
+    if pending_tasks > 0 {
+        let recovery_hint = full_delivered_evidence_hint(EvidenceRecoveryFormat::Compact);
+        text.push_str(&format!(" {pending_tasks} unintegrated task result(s), {task_gaps} report gap(s); inspect the full {recovery_hint} for the exact ledger task IDs. Verification metadata is optional; reading does not integrate the task."));
+    }
+    Some(text)
+}
+
+pub(super) fn refresh_verification_reminder(
+    app: &App,
+    messages: &mut Vec<Message>,
+    compacted: bool,
+) -> bool {
+    use crate::ai::tools::storage::mutation_log;
+    let summary = mutation_log::verification_reminder_summary();
+    let pending =
+        crate::ai::history::read_task_spawn_audit(&app.config.history_file, &app.session_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| {
+                record.delivered_at_unix_ms > 0 && record.integrated_at_unix_ms.is_none()
+            })
+            .collect::<Vec<_>>();
+    let task_gaps = pending
+        .iter()
+        .filter(|record| {
+            record.status != "completed"
+                || crate::ai::tools::task_tools::read_delivered_verification_report(
+                    &app.config.history_file,
+                    &app.session_id,
+                    &record.task_id,
+                )
+                .ok()
+                .flatten()
+                .and_then(|task| task.verification)
+                // Missing optional metadata is not a verification gap.
+                .is_some_and(|verification| !verification.assessment().gaps.is_empty())
+        })
+        .count();
+    let compacted = compacted
+        || messages
+            .iter()
+            .any(crate::ai::history::compress::is_context_compaction_state);
+    let text = verification_reminder_text(
+        summary.revision,
+        summary.stale_checks,
+        summary.gaps,
+        pending.len(),
+        task_gaps,
+        crate::ai::driver::runtime_ctx::is_resume_turn(),
+        compacted,
+    );
+    let previous = messages
+        .iter()
+        .find(|message| is_verification_reminder(message))
+        .and_then(|message| message.content.as_str());
+    if previous == text.as_deref() {
+        return false;
+    }
+    messages.retain(|message| !is_verification_reminder(message));
+    if let Some(text) = text {
+        messages.push(Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(text),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+    }
+    true
 }
 
 /// C3: complex-task detection -- a lightweight heuristic based purely on
@@ -883,6 +984,347 @@ mod tests {
     use crate::ai::history::ROLE_INTERNAL_NOTE;
     use serde_json::Value;
 
+    #[test]
+    fn verification_reminder_requires_work_and_recovery_or_current_gaps() {
+        use super::verification_reminder_text as reminder;
+        for (resume, compacted) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert!(reminder(0, 0, 0, 0, 0, resume, compacted).is_none());
+        }
+        assert!(reminder(2, 0, 0, 0, 0, false, false).is_none());
+        assert!(reminder(2, 0, 0, 0, 0, true, false).is_some());
+        assert!(reminder(2, 0, 0, 0, 0, false, true).is_some());
+        for gaps in [1, 2, 3] {
+            assert!(reminder(2, 0, gaps, 0, 0, false, false).is_some());
+        }
+        let stale = reminder(2, 1, 1, 0, 0, false, false).unwrap();
+        assert!(stale.contains("revision 2: 1 stale check(s)"));
+        assert!(stale.contains("show_changes"));
+        assert!(reminder(0, 0, 0, 1, 0, false, false).is_none());
+        assert!(reminder(0, 0, 0, 1, 0, true, false).is_some());
+        let task_gap = reminder(0, 0, 0, 1, 1, false, false).unwrap();
+        assert!(task_gap.contains("1 unintegrated task result(s), 1 report gap(s)"));
+        assert!(
+            task_gap
+                .contains("task_evidence_read(source=\"delivered\", view=\"raw\", exact task_id)")
+        );
+        assert!(task_gap.contains("omitting fields/max_chars/cursor"));
+        assert!(!task_gap.contains("fields=["));
+    }
+
+    #[test]
+    fn verification_reminder_legacy_delivered_tasks_use_readable_evidence_hint() {
+        use crate::ai::driver::runtime_ctx;
+        use crate::ai::history::{
+            DeliveredTaskEvidence, record_delivered_task_evidence_with_report,
+        };
+        use crate::ai::tools::task_tools::{TaskReportTask, execute_task_evidence_read};
+        use crate::commonw::configw;
+
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = std::env::temp_dir().join(format!("legacy-reminder-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        struct RestoreConfig {
+            previous: Option<std::ffi::OsString>,
+            root: std::path::PathBuf,
+        }
+        impl Drop for RestoreConfig {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.previous.take() {
+                        Some(value) => std::env::set_var("CONFIGW_PATH", value),
+                        None => std::env::remove_var("CONFIGW_PATH"),
+                    }
+                }
+                configw::refresh();
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+        let _restore = RestoreConfig {
+            previous: std::env::var_os("CONFIGW_PATH"),
+            root: root.clone(),
+        };
+        let config_path = root.join("test.configw");
+        unsafe { std::env::set_var("CONFIGW_PATH", &config_path) };
+        let valid = serde_json::json!({
+            "schema": "ai.task-verification", "version": 1, "task_kind": "review",
+            "checks": [{"id": "source", "subject": "owning source", "phase": "other",
+                "outcome": "pass", "evidence_locations": ["src/source.rs:10"]}],
+        });
+        for enabled in [false, true] {
+            std::fs::write(
+                &config_path,
+                format!("ai.agent_team.optimizations_enabled = {enabled}\n"),
+            )
+            .unwrap();
+            configw::refresh();
+            assert_eq!(
+                crate::ai::config::agent_team_optimizations().optimizations_enabled(),
+                enabled
+            );
+            for (kind, report_present, verification, status, expected_gaps) in [
+                ("legacy", false, None, "completed", 0),
+                ("research", true, None, "completed", 0),
+                ("review", true, None, "completed", 0),
+                ("verified", true, Some(valid.clone()), "completed", 0),
+                ("invalid", true, Some(serde_json::json!({})), "completed", 1),
+                ("failed", false, None, "failed", 1),
+            ] {
+                let mut app = crate::ai::middleware::test_util::test_app();
+                app.config.history_file = root.join("sessions/history.sqlite");
+                app.session_id = format!("reminder-{kind}-{enabled}");
+                let owner_pid = app.os.lock().unwrap().begin_foreground(
+                    "owner".into(),
+                    "review delivered evidence".into(),
+                    10,
+                    8,
+                    None,
+                );
+                app.os.lock().unwrap().set_current_pid(Some(owner_pid));
+                let payload = format!("  {kind} delivered evidence α界🙂\n");
+                let report = report_present.then(|| TaskReportTask {
+                    task_id: Some(kind.into()),
+                    status: status.into(),
+                    verification: verification
+                        .clone()
+                        .map(|value| serde_json::from_value(value).unwrap()),
+                    ..Default::default()
+                });
+                record_delivered_task_evidence_with_report(
+                    &app.config.history_file,
+                    &app.session_id,
+                    DeliveredTaskEvidence {
+                        task_id: kind,
+                        description: kind,
+                        agent_name: kind,
+                        model: "test-model",
+                        status,
+                        payload: &payload,
+                    },
+                    report.as_ref(),
+                )
+                .unwrap();
+                let store_path = crate::ai::history::SessionStore::new(&app.config.history_file)
+                    .session_assets_dir(&app.session_id)
+                    .join("context-checkpoints/task-evidence.sqlite");
+                let before = std::fs::read(&store_path).unwrap();
+                let context = runtime_ctx::DriverContext::new(
+                    app.clone(),
+                    std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+                    std::sync::Arc::new(Vec::new()),
+                    std::sync::Arc::new(Vec::new()),
+                );
+                runtime_ctx::SUBAGENT_CWD.sync_scope(root.clone(), || {
+                    runtime_ctx::TURN_IDENTITY.sync_scope((app.session_id.clone(), 0), || {
+                        runtime_ctx::DRIVER_CTX.sync_scope(context, || {
+                            let mut messages = Vec::new();
+                            assert_eq!(
+                                super::refresh_verification_reminder(&app, &mut messages, false),
+                                expected_gaps > 0,
+                                "{kind}, optimizations={enabled}"
+                            );
+                            super::refresh_verification_reminder(&app, &mut messages, true);
+                            assert_eq!(messages.len(), 1);
+                            let text = messages[0].content.as_str().unwrap();
+                            assert!(text.contains(&format!(
+                                "1 unintegrated task result(s), {expected_gaps} report gap(s)"
+                            )));
+                            assert!(text.contains("task_evidence_read(source=\"delivered\", view=\"raw\", exact task_id)"));
+                            assert!(text.contains("omitting fields/max_chars/cursor"));
+                            assert!(!text.contains("fields=["));
+                            let delivered = execute_task_evidence_read(&serde_json::json!({
+                                "task_id": kind, "source": "delivered", "view": "raw",
+                            }))
+                            .unwrap();
+                            let delivered: Value = serde_json::from_str(&delivered).unwrap();
+                            assert_eq!(delivered["payload"], payload);
+                            assert_eq!(delivered["status"], status);
+                            assert_eq!(delivered.get("verification"), verification.as_ref());
+                            let default = execute_task_evidence_read(&serde_json::json!({
+                                "task_id": kind, "source": "delivered",
+                            }))
+                            .unwrap();
+                            let default: Value = serde_json::from_str(&default).unwrap();
+                            if enabled {
+                                assert_eq!(default["view"], "summary");
+                                assert_eq!(default["verification"]["available"], verification.is_some());
+                                assert_eq!(default["assessment"]["acceptance"], "needs_parent_review");
+                            } else {
+                                assert_eq!(default, delivered);
+                            }
+                        })
+                    })
+                });
+                assert_eq!(std::fs::read(&store_path).unwrap(), before);
+                assert!(
+                    crate::ai::history::read_integrated_task_ids(
+                        &app.config.history_file,
+                        &app.session_id,
+                    )
+                    .unwrap()
+                    .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verification_reminder_refresh_is_on_demand_and_does_not_rewrite_evidence() {
+        use crate::ai::driver::runtime_ctx;
+        use crate::ai::tools::storage::mutation_log;
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("verification-reminder-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = crate::ai::middleware::test_util::test_app();
+        app.config.history_file = root.join("sessions/history.sqlite");
+        app.session_id = "reminder-test".into();
+        let context = runtime_ctx::DriverContext::new(
+            app.clone(),
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+            std::sync::Arc::new(Vec::new()),
+            std::sync::Arc::new(Vec::new()),
+        );
+        runtime_ctx::SUBAGENT_CWD.sync_scope(root.clone(), || {
+            runtime_ctx::DRIVER_CTX.sync_scope(context, || {
+                let quoted = user_turn_message(
+                    serde_json::json!("[runtime verification reminder] literal user text"),
+                    &TurnQuestionOrigin::User,
+                );
+                let mut messages = vec![quoted.clone()];
+                assert!(!super::refresh_verification_reminder(
+                    &app,
+                    &mut messages,
+                    false
+                ));
+                mutation_log::with_tool_call("write", || {
+                    mutation_log::record(&root.join("a.rs"), "write", None, Some("a"))
+                });
+                assert!(super::refresh_verification_reminder(
+                    &app,
+                    &mut messages,
+                    false
+                ));
+                assert_eq!(messages.len(), 2);
+                assert_eq!(messages[0], quoted);
+                let path = mutation_log::log_path().unwrap();
+                for _ in 0..8 {
+                    assert!(!super::refresh_verification_reminder(
+                        &app,
+                        &mut messages,
+                        false
+                    ));
+                    assert_eq!(mutation_log::recovered_records_at(&path), 1);
+                    assert_eq!(mutation_log::full_reads_at(&path), 0);
+                }
+                let pending = mutation_log::begin_check(
+                    "check",
+                    "execute_command",
+                    &serde_json::json!({"command":"cargo check"}),
+                );
+                mutation_log::finish_check(
+                    pending,
+                    "execute_command",
+                    &serde_json::json!({"command":"cargo check"}),
+                    "Finished dev target(s)",
+                );
+                let evidence = std::fs::read(mutation_log::log_path().unwrap()).unwrap();
+                assert!(super::refresh_verification_reminder(
+                    &app,
+                    &mut messages,
+                    false
+                ));
+                assert_eq!(messages, vec![quoted.clone()]);
+                assert_eq!(mutation_log::recovered_records_at(&path), 3);
+                crate::ai::history::compress::upsert_context_compaction_state(&mut messages);
+                assert!(super::refresh_verification_reminder(
+                    &app,
+                    &mut messages,
+                    false
+                ));
+                assert_eq!(messages.len(), 3);
+                assert!(!super::refresh_verification_reminder(
+                    &app,
+                    &mut messages,
+                    false
+                ));
+                assert_eq!(
+                    std::fs::read(mutation_log::log_path().unwrap()).unwrap(),
+                    evidence
+                );
+                assert_eq!(mutation_log::recovered_records_at(&path), 3);
+                assert_eq!(mutation_log::full_reads_at(&path), 0);
+                let append = |value: Value| {
+                    use std::io::Write;
+                    let mut line = serde_json::to_vec(&value).unwrap();
+                    line.push(b'\n');
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(&line)
+                        .unwrap();
+                };
+                let mut mutation = serde_json::to_value(&mutation_log::read_all()[0]).unwrap();
+                mutation["seq"] = serde_json::json!(2);
+                append(mutation);
+                assert!(super::refresh_verification_reminder(
+                    &app,
+                    &mut messages,
+                    false
+                ));
+                let reminder = messages
+                    .iter()
+                    .find(|message| super::is_verification_reminder(message))
+                    .unwrap();
+                assert!(
+                    reminder
+                        .content
+                        .as_str()
+                        .unwrap()
+                        .contains("revision 2: 1 stale check(s), 1 command gap(s)")
+                );
+                assert_eq!(mutation_log::recovered_records_at(&path), 4);
+                let mut check =
+                    serde_json::to_value(mutation_log::read_checks().last().unwrap()).unwrap();
+                check["covers_revision"] = serde_json::json!(2);
+                check["originating_command_call_id"] = serde_json::json!("recheck");
+                append(check);
+                assert!(super::refresh_verification_reminder(
+                    &app,
+                    &mut messages,
+                    false
+                ));
+                let reminder = messages
+                    .iter()
+                    .find(|message| super::is_verification_reminder(message))
+                    .unwrap();
+                assert!(
+                    reminder
+                        .content
+                        .as_str()
+                        .unwrap()
+                        .contains("revision 2: 0 stale check(s), 0 command gap(s)")
+                );
+                let evidence = std::fs::read(&path).unwrap();
+                let full_reads = mutation_log::full_reads_at(&path);
+                for _ in 0..8 {
+                    assert!(!super::refresh_verification_reminder(
+                        &app,
+                        &mut messages,
+                        false
+                    ));
+                    assert_eq!(mutation_log::recovered_records_at(&path), 5);
+                    assert_eq!(mutation_log::full_reads_at(&path), full_reads);
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), evidence);
+            })
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[tokio::test]
     async fn audit_followup_preparation_preserves_previous_real_user_turn_changes() {
         let _guard = crate::ai::test_support::ENV_LOCK
