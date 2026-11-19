@@ -128,8 +128,16 @@ fn execute_inner_shell_command(inner: &str, cwd: Option<&str>) -> Result<String,
 /// layer as plain data, supporting `cat` literals and generic harmless
 /// commands. The substituted command is still fully audited afterwards, so a
 /// replacement that turns into a blocked program name or dangerous argument is
-/// still rejected. Chains require deferred evaluation; reject them before any
-/// substitution side effect until the runner supports that execution model.
+/// still rejected.
+///
+/// A substitution that follows a command separator (`;`, `|`, `&&`, `||`) is
+/// rejected before any side effect: eager evaluation would run it before the
+/// shell decides whether the earlier segment even runs, so
+/// `echo fresh > f && cat "$(cat f)"` must not read `f` early.
+///
+/// A simple `NAME=$(...)` assignment becomes `NAME='<literal>'`, and every
+/// later `$NAME` / `${NAME}` reference is expanded to that same literal, so a
+/// value that names a blocked program still reaches the blacklist.
 fn materialize_safe_shell_substitutions(
     command: &str,
     cwd: Option<&str>,
@@ -141,7 +149,7 @@ fn materialize_safe_shell_substitutions(
     }
     if substitutions
         .iter()
-        .any(|substitution| substitution.outer_has_control_flow)
+        .any(|substitution| substitution.after_command_separator)
     {
         return Err(
             "command substitution in a chained command requires deferred evaluation; \
@@ -149,11 +157,25 @@ fn materialize_safe_shell_substitutions(
                 .to_string(),
         );
     }
-    let mut materialized = command.to_string();
-    for substitution in substitutions.into_iter().rev() {
-        let contents = match substitution.kind {
+    // Plan reference expansion before running anything: a reference the plan
+    // cannot bind must reject the command before a substituted command has any
+    // side effect.
+    let spans: Vec<SubstitutionSpan<'_>> = substitutions
+        .iter()
+        .map(|substitution| SubstitutionSpan {
+            start: substitution.start,
+            end: substitution.end,
+            assignment: substitution.assignment.as_deref(),
+        })
+        .collect();
+    let references = plan_assignment_references(command, &spans)?;
+    let mut edits: Vec<(usize, usize, String)> = Vec::with_capacity(substitutions.len());
+    // (name, value) for materialized assignments, used to expand references.
+    let mut assigned: Vec<(String, String)> = Vec::new();
+    for substitution in &substitutions {
+        let contents = match &substitution.kind {
             super::audit::SafeShellSubstitutionKind::FileRead { path } => {
-                read_literal_file_substitution(&path)?
+                read_literal_file_substitution(path)?
             }
             super::audit::SafeShellSubstitutionKind::Command { inner } => {
                 // The inner command must pass the full gate too: re-run
@@ -164,13 +186,19 @@ fn materialize_safe_shell_substitutions(
                 // Without this, `echo "$(git commit -am x)"` would commit
                 // before the outer confirmation, leaving only `echo '...'`
                 // after materialization and bypassing the gate.
-                super::audit::validate_execute_command(&inner)
+                super::audit::validate_execute_command(inner)
                     .map_err(|reason| format!("inner substitution blocked: {reason}"))?;
-                confirm_git_confirm_gated_if_needed(&inner)?;
-                execute_inner_shell_command(&inner, cwd)?
+                confirm_git_confirm_gated_if_needed(inner)?;
+                execute_inner_shell_command(inner, cwd)?
             }
         };
-        let replacement = if substitution.bare {
+        let replacement = if let Some(name) = substitution.assignment.as_deref() {
+            // Assignment values are never word-split by the shell, so one
+            // quoted literal preserves the exact value.
+            let replacement = format!("{name}={}", shell_single_quote(&contents));
+            assigned.push((name.to_string(), contents));
+            replacement
+        } else if substitution.bare {
             // Unquoted substitution output is word-split by the shell: render
             // each whitespace-separated piece as its own quoted word so the
             // materialized command matches shell word-splitting without
@@ -188,9 +216,598 @@ fn materialize_safe_shell_substitutions(
         } else {
             shell_single_quote(&contents)
         };
-        materialized.replace_range(substitution.start..substitution.end, &replacement);
+        edits.push((substitution.start, substitution.end, replacement));
     }
+    for reference in &references {
+        let Some((_, value)) = assigned.iter().find(|(name, _)| name == reference.name) else {
+            // The plan only emits references it proved bindable; reaching here
+            // means the shapes diverged, so refuse rather than let the shell
+            // expand an audited-as-opaque `$NAME`.
+            return Err(format!(
+                "cannot bind `${}` to its materialized assignment; use a literal value",
+                reference.name
+            ));
+        };
+        let replacement = if reference.in_double {
+            let mut escaped = String::with_capacity(value.len());
+            push_double_quoted_value(&mut escaped, value);
+            escaped
+        } else {
+            shell_single_quote(value)
+        };
+        edits.push((reference.start, reference.end, replacement));
+    }
+    // Apply every edit once, in order. Overlapping spans would mean an offset
+    // plan bug, so fail closed instead of building a command nobody audited.
+    edits.sort_by_key(|(start, _, _)| *start);
+    let mut materialized = String::with_capacity(command.len());
+    let mut cursor = 0;
+    for (start, end, replacement) in edits {
+        if start < cursor || end > command.len() {
+            return Err(
+                "materialized command substitutions overlap; run each segment as a \
+                 separate command"
+                    .to_string(),
+            );
+        }
+        materialized.push_str(&command[cursor..start]);
+        materialized.push_str(&replacement);
+        cursor = end;
+    }
+    materialized.push_str(&command[cursor..]);
     Ok(materialized)
+}
+
+/// A `$NAME` / `${NAME}` reference whose value a materialized assignment fixes.
+struct PlannedReference<'a> {
+    start: usize,
+    end: usize,
+    in_double: bool,
+    name: &'a str,
+}
+
+/// One classified substitution span, as the reference planner sees it.
+struct SubstitutionSpan<'a> {
+    start: usize,
+    end: usize,
+    assignment: Option<&'a str>,
+}
+
+/// Builtins that write a variable, so a later reference no longer reads the
+/// materialized assignment value.
+const ASSIGNING_BUILTINS: [&str; 8] = [
+    "declare", "export", "let", "local", "read", "readonly", "typeset", "unset",
+];
+
+/// Builtins that run shell code the audit cannot read. When a command
+/// materializes a variable, such code could reassign it behind the expanded
+/// literal's back, so the pair is rejected instead of expanded.
+const DYNAMIC_CODE_BUILTINS: [&str; 3] = ["eval", "source", "."];
+
+/// How a shell word participates in its segment.
+enum ShellWordRole {
+    /// `NAME=...` before the command word: an assignment, not the command.
+    Assignment,
+    /// The segment's command word.
+    Command,
+    /// Any other argument.
+    Argument,
+}
+
+/// Plan literal expansion for every reference to a variable this command
+/// materializes.
+///
+/// Shell variables are command-global and assigned in order, so the plan is
+/// all-or-nothing: a reference reads the materialized value only when nothing
+/// can change the variable first. A reassignment in assignment position, an
+/// assigning builtin, `printf -v NAME`, a reference before the assignment, or a
+/// reference inside another substitution's text all make the value unprovable,
+/// so they reject the command instead of leaving `$NAME` for the shell to
+/// expand after the audit has already passed.
+fn plan_assignment_references<'a>(
+    command: &'a str,
+    spans: &'a [SubstitutionSpan<'a>],
+) -> Result<Vec<PlannedReference<'a>>, String> {
+    let mut assignments: Vec<(&'a str, usize, usize)> = Vec::new();
+    for span in spans {
+        let Some(name) = span.assignment else {
+            continue;
+        };
+        if assignments.iter().any(|(seen, _, _)| *seen == name) {
+            return Err(format!(
+                "`{name}` is assigned by more than one command substitution here; its \
+                 value would depend on evaluation order"
+            ));
+        }
+        assignments.push((name, span.start, span.end));
+    }
+    if assignments.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Another substitution's text runs in the inner command this layer executes
+    // separately, where the materialized variable is unset; the shell would read
+    // the outer value instead, so the two disagree.
+    for span in spans {
+        let text = &command[span.start..span.end];
+        for (name, _, _) in &assignments {
+            if contains_variable_reference(text, name) {
+                return Err(format!(
+                    "command substitution text reads `${name}`, which this command \
+                     materializes separately; use a literal value"
+                ));
+            }
+            // Arithmetic contexts reference variables without a `$`, so the
+            // check above misses them; the inner shell has no such variable.
+            if arithmetic_mentions(text, name) {
+                return Err(format!(
+                    "command substitution text reads `{name}` inside an arithmetic \
+                     expression, where this command materializes it separately; use a \
+                     literal value"
+                ));
+            }
+        }
+    }
+
+    let bytes = command.as_bytes();
+    let mut references = Vec::new();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut word_start: Option<usize> = None;
+    let mut command_word_seen = false;
+    let mut segment_assigns_materialized = false;
+    let mut assigning_builtin = false;
+    let mut printf_command = false;
+    let mut printf_v = false;
+    let mut awaiting_wrapped_command = false;
+    let mut span = 0;
+    while i < bytes.len() {
+        if span < spans.len() && i == spans[span].start {
+            // A materialized substitution is a whole word. It keeps assignment
+            // semantics only while no command word precedes it; after one it is
+            // a temporary environment assignment that does not persist.
+            let assigned_name = spans[span].assignment;
+            if let Some(name) = assigned_name {
+                if command_word_seen {
+                    return Err(format!(
+                        "`{name}` is materialized in front of a command word, which makes it \
+                         a temporary environment assignment; its value does not persist"
+                    ));
+                }
+                segment_assigns_materialized = true;
+            }
+            i = spans[span].end;
+            span += 1;
+            word_start = None;
+            continue;
+        }
+        let b = bytes[i];
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'\\' {
+            i += 2;
+            continue;
+        }
+        if b == b'\'' && !in_double {
+            in_single = true;
+            word_start.get_or_insert(i);
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_double = !in_double;
+            word_start.get_or_insert(i);
+            i += 1;
+            continue;
+        }
+        if b == b'$' {
+            word_start.get_or_insert(i);
+            let rest = &command[i..];
+            if rest.starts_with("$((") {
+                let end = skip_shell_arithmetic(command, i)
+                    .ok_or_else(|| "unbalanced arithmetic expansion in command".to_string())?;
+                let body = &command[i + 3..end - 2];
+                for (name, _, _) in &assignments {
+                    if arithmetic_writes(body, name) {
+                        return Err(format!(
+                            "`$(( ... ))` updates `{name}` with arithmetic, and this command \
+                             materializes that variable; the audit cannot prove which value a \
+                             later reference reads"
+                        ));
+                    }
+                }
+                i = end;
+                continue;
+            }
+            if rest.starts_with("$(") {
+                // Every active substitution is either classified above or the
+                // audit already rejected the command; reaching here means the
+                // shape changed, so refuse instead of leaving it to the shell.
+                return Err("unproven command substitution in a materialized command".to_string());
+            }
+            if let Some((name, len, plain)) = variable_reference(rest) {
+                if let Some((_, _, assignment_end)) =
+                    assignments.iter().find(|(seen, _, _)| *seen == name)
+                {
+                    if !plain {
+                        return Err(format!(
+                            "`${{{name}...}}` applies modifiers the materializer cannot bind; \
+                             use a literal value"
+                        ));
+                    }
+                    if i < *assignment_end {
+                        return Err(format!(
+                            "`${name}` is read before this command assigns it; the audit \
+                             cannot tell which value the shell uses"
+                        ));
+                    }
+                    references.push(PlannedReference {
+                        start: i,
+                        end: i + len,
+                        in_double,
+                        name,
+                    });
+                }
+                i += len;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if !in_double && (b.is_ascii_whitespace() || is_shell_word_separator(b)) {
+            if let Some(start) = word_start.take() {
+                let word = &command[start..i];
+                check_arithmetic_write(word, &assignments)?;
+                match shell_word_role(word, command_word_seen) {
+                    ShellWordRole::Assignment => {
+                        let reused = assignment_word_name(word).is_some_and(|name| {
+                            assignments.iter().any(|(seen, _, _)| *seen == name)
+                        });
+                        if reused {
+                            return Err(format!(
+                                "`{word}` reassigns a variable this command materializes; the \
+                                 audit cannot tell which value a later reference reads"
+                            ));
+                        }
+                    }
+                    ShellWordRole::Command => {
+                        if segment_assigns_materialized {
+                            return Err(
+                                "a materialized assignment in front of a command word becomes \
+                                 a temporary environment assignment; its value does not persist"
+                                    .to_string(),
+                            );
+                        }
+                        command_word_seen = true;
+                        if let Some(name) = word_literal(word) {
+                            if DYNAMIC_CODE_BUILTINS.contains(&name) {
+                                return Err(format!(
+                                    "`{name}` runs code this audit cannot read; a command that \
+                                     materializes a variable cannot prove the value stays fixed"
+                                ));
+                            }
+                            // `command`/`builtin`/`exec` run the next word as the
+                            // command, so an assigning builtin can be one word later.
+                            awaiting_wrapped_command =
+                                matches!(name, "command" | "builtin" | "exec");
+                            assigning_builtin = ASSIGNING_BUILTINS.contains(&name);
+                            printf_command = name == "printf";
+                        } else {
+                            awaiting_wrapped_command = false;
+                            assigning_builtin = false;
+                            printf_command = false;
+                        }
+                    }
+                    ShellWordRole::Argument => {
+                        // The first non-option word after a wrapper is the real
+                        // command word: `command export L=2` still assigns `L`.
+                        if awaiting_wrapped_command && !word.starts_with('-') {
+                            awaiting_wrapped_command = false;
+                            if let Some(name) = word_literal(word) {
+                                assigning_builtin = ASSIGNING_BUILTINS.contains(&name);
+                                printf_command = name == "printf";
+                            }
+                        }
+                        let literal = word_literal(word).unwrap_or(word);
+                        let overwrites = assignments.iter().any(|(seen, _, _)| *seen == literal)
+                            || assignment_word_name(literal).is_some_and(|name| {
+                                assignments.iter().any(|(seen, _, _)| *seen == name)
+                            });
+                        if overwrites && (assigning_builtin || printf_v) {
+                            return Err(format!(
+                                "`{word}` overwrites a variable this command materializes; the \
+                                 audit cannot tell which value a later reference reads"
+                            ));
+                        }
+                        if printf_command && literal == "-v" {
+                            printf_v = true;
+                        } else if printf_v {
+                            printf_v = false;
+                        }
+                    }
+                }
+            }
+            if is_shell_word_separator(b) {
+                command_word_seen = false;
+                segment_assigns_materialized = false;
+                assigning_builtin = false;
+                printf_command = false;
+                printf_v = false;
+                awaiting_wrapped_command = false;
+            }
+            i += 1;
+            continue;
+        }
+        word_start.get_or_insert(i);
+        i += 1;
+    }
+    if let Some(start) = word_start {
+        let word = &command[start..];
+        check_arithmetic_write(word, &assignments)?;
+        if shell_word_role(word, command_word_seen).is_assignment()
+            && assignment_word_name(word)
+                .is_some_and(|name| assignments.iter().any(|(seen, _, _)| *seen == name))
+        {
+            return Err(format!(
+                "`{word}` reassigns a variable this command materializes; the audit cannot \
+                 tell which value a later reference reads"
+            ));
+        }
+    }
+    Ok(references)
+}
+
+impl ShellWordRole {
+    fn is_assignment(&self) -> bool {
+        matches!(self, Self::Assignment)
+    }
+}
+
+fn shell_word_role(word: &str, command_word_seen: bool) -> ShellWordRole {
+    if !command_word_seen && assignment_word_name(word).is_some() {
+        ShellWordRole::Assignment
+    } else if command_word_seen {
+        ShellWordRole::Argument
+    } else {
+        ShellWordRole::Command
+    }
+}
+
+/// `NAME` when `word` is an `NAME=value` / `NAME+=value` assignment word.
+fn assignment_word_name(word: &str) -> Option<&str> {
+    if word.starts_with(['"', '\'']) {
+        return None;
+    }
+    let (name, _) = word.split_once('=')?;
+    let name = name.strip_suffix('+').unwrap_or(name);
+    is_shell_name(name).then_some(name)
+}
+
+/// The text the shell passes through unchanged: an unquoted word, or one
+/// whole-word quote pair whose body expands and escapes nothing. Returns `None`
+/// when the word needs `$`/backtick expansion or escape processing, because the
+/// audit cannot then know what the shell reads or writes.
+fn word_literal(word: &str) -> Option<&str> {
+    if let Some(inner) = word
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        return (!inner.contains(['\'', '\\'])).then_some(inner);
+    }
+    if let Some(inner) = word
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        return (!inner.contains(['"', '\\', '$', '`'])).then_some(inner);
+    }
+    (!word.contains(['\'', '"', '\\', '$', '`'])).then_some(word)
+}
+
+/// The variable an arithmetic word updates: `L++`, `L--`, `++L`, or `--L`.
+fn arithmetic_write_target(word: &str) -> Option<&str> {
+    let name = word
+        .strip_suffix("++")
+        .or_else(|| word.strip_suffix("--"))
+        .or_else(|| word.strip_prefix("++"))
+        .or_else(|| word.strip_prefix("--"))?;
+    is_shell_name(name).then_some(name)
+}
+
+/// Reject an arithmetic update of a materialized variable in any word
+/// position: `L++`/`++L` are arithmetic statements in some shells and command
+/// names in others, and `let L++` always mutates. Either way the value a later
+/// reference reads is no longer the materialized literal, so nothing expands.
+fn check_arithmetic_write(word: &str, assignments: &[(&str, usize, usize)]) -> Result<(), String> {
+    let literal = word_literal(word).unwrap_or(word);
+    let Some(name) = arithmetic_write_target(literal) else {
+        return Ok(());
+    };
+    if assignments.iter().any(|(seen, _, _)| *seen == name) {
+        return Err(format!(
+            "`{word}` updates a variable this command materializes with arithmetic; the audit \
+             cannot prove which value a later reference reads"
+        ));
+    }
+    Ok(())
+}
+
+fn contains_variable_reference(text: &str, name: &str) -> bool {
+    let mut from = 0;
+    while let Some(found) = text[from..].find('$') {
+        let at = from + found;
+        match variable_reference(&text[at..]) {
+            Some((seen, len, _)) => {
+                if seen == name {
+                    return true;
+                }
+                from = at + len;
+            }
+            None => from = at + 1,
+        }
+    }
+    false
+}
+
+fn is_shell_word_separator(b: u8) -> bool {
+    matches!(b, b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b')')
+}
+
+/// Split a `$NAME` or `${NAME}` reference off the front of `rest` (which starts
+/// with `$`), returning the name, the number of bytes it spans, and whether the
+/// form is plain. Braced forms with modifiers (`${NAME:-x}`) are reported as
+/// non-plain because their expansion rules differ. Returns `None` for other `$`
+/// forms (`$1`, `$?`, `$(`, ...).
+fn variable_reference(rest: &str) -> Option<(&str, usize, bool)> {
+    let after = rest.strip_prefix('$')?;
+    if let Some(body) = after.strip_prefix('{') {
+        let close = body.find('}')?;
+        let inner = &body[..close];
+        let name_end = inner
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(inner.len());
+        let name = &inner[..name_end];
+        if !is_shell_name(name) {
+            return None;
+        }
+        return Some((name, close + 3, name_end == inner.len()));
+    }
+    let end = after
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(after.len());
+    let name = after.get(..end)?;
+    if !is_shell_name(name) {
+        return None;
+    }
+    Some((name, end + 1, true))
+}
+
+fn is_shell_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Insert a value inside a double-quoted shell string so only printable
+/// characters can affect the shell: `\`, `"`, `` ` ``, and `$` are escaped.
+fn push_double_quoted_value(out: &mut String, value: &str) {
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '"' | '`' | '$') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+}
+
+/// Index just past the `))` closing the arithmetic expansion at `dollar_at`.
+fn skip_shell_arithmetic(command: &str, dollar_at: usize) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let mut depth = 2usize;
+    let mut i = dollar_at + 3;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether `b` can be part of a shell identifier, so a name match inside a
+/// longer identifier is not a variable reference.
+fn is_identifier_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Whether `expr` mentions `name` as a standalone identifier.
+fn mentions_identifier(expr: &str, name: &str) -> bool {
+    let bytes = expr.as_bytes();
+    expr.match_indices(name).any(|(at, _)| {
+        (at == 0 || !is_identifier_byte(bytes[at - 1]))
+            && (at + name.len() == bytes.len() || !is_identifier_byte(bytes[at + name.len()]))
+    })
+}
+
+/// Whether an arithmetic expression writes `name` via `++`, `--`, or an
+/// assignment operator. A `$`-prefixed mention reads the expanded value rather
+/// than writing the variable, and comparisons (`==`, `>=`, `<=`, `!=`) are not
+/// assignments.
+fn arithmetic_writes(expr: &str, name: &str) -> bool {
+    let bytes = expr.as_bytes();
+    for (at, _) in expr.match_indices(name) {
+        let before_ok = at == 0 || (!is_identifier_byte(bytes[at - 1]) && bytes[at - 1] != b'$');
+        let after = at + name.len();
+        if !before_ok || (after < bytes.len() && is_identifier_byte(bytes[after])) {
+            continue;
+        }
+        let previous = expr[..at].trim_end();
+        if previous.ends_with("++") || previous.ends_with("--") {
+            return true;
+        }
+        let next = expr[after..].trim_start();
+        if next.starts_with("++") || next.starts_with("--") {
+            return true;
+        }
+        if ["+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "|=", "^="]
+            .iter()
+            .any(|op| next.starts_with(op))
+        {
+            return true;
+        }
+        if next
+            .strip_prefix('=')
+            .is_some_and(|rest| !rest.starts_with('='))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `text` references `name` through an arithmetic context, where the
+/// shell substitutes the variable without a `$` prefix: `$(( ... ))` bodies and
+/// `let` arguments.
+fn arithmetic_mentions(text: &str, name: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // The cursor advances in bytes; only slice text after locating the
+        // ASCII delimiters, which are necessarily UTF-8 character boundaries.
+        if bytes[i..].starts_with(b"$((") {
+            if let Some(end) = skip_shell_arithmetic(text, i) {
+                if mentions_identifier(&text[i + 3..end - 2], name) {
+                    return true;
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    // `let` evaluates its arguments as arithmetic, but only in command
+    // position; the leading `$(` of an enclosing substitution is trimmed so the
+    // first word of the inner command still reads as that command.
+    for segment in text.split([';', '|', '&']) {
+        let mut words = segment.split_whitespace();
+        let Some(first) = words.next() else {
+            continue;
+        };
+        if first.trim_start_matches(['$', '(', '`']) == "let" {
+            return words.any(|argument| mentions_identifier(argument, name));
+        }
+    }
+    false
 }
 
 /// Truncate over-long output keeping head and tail, with **actionable
@@ -491,10 +1108,7 @@ where
         );
     }
     let yield_ms = args["yield_time_ms"].as_u64().map(resolve_session_yield);
-    let raw_command = args["command"]
-        .as_str()
-        .filter(|command| !command.trim().is_empty())
-        .ok_or("Missing command")?;
+    let raw_command = super::execute_command_arg(args).ok_or("Missing command")?;
     let cwd = args["cwd"].as_str().filter(|dir| !dir.trim().is_empty());
     // Materialize harmless "$(...)" first (cat literals and generic harmless
     // commands); the result is still fully audited afterwards.
@@ -1068,6 +1682,276 @@ mod tests {
     }
 
     #[test]
+    fn execute_command_materializes_assignment_value_and_expands_references() {
+        // The `L=$(pipeline); ... "$L" ... "$((L-1))"` shape: the assignment
+        // becomes a literal and every later reference is expanded, so the audit
+        // validates the concrete value instead of blocking the variable.
+        let result = execute_command(&json!({
+            "command": r#"L=$(printf 'x:42\n' | grep 'x:42' | cut -d: -f2); echo "line=$L"; echo "range=$((L-14)),$(($L+2))""#,
+            "pty": false,
+            "timeout": 5,
+        }))
+        .unwrap();
+        assert_eq!(result, "line=42\nrange=28,44");
+    }
+
+    #[test]
+    fn execute_command_materializes_unicode_assignment_text() {
+        for value in ["你好", "café", "😀"] {
+            let result = execute_command(&json!({
+                "command": format!(
+                    r#"L=$(printf '%s' '{value}'); printf '<%s><%s>' "$L" "${{L}}""#
+                ),
+                "pty": false,
+                "timeout": 5,
+            }))
+            .unwrap();
+            assert_eq!(result, format!("<{value}><{value}>"));
+        }
+    }
+
+    #[test]
+    fn execute_command_blocks_assignment_value_that_names_blocked_program() {
+        let target = temporary_file_path("assignment_program_target");
+        fs::write(&target, "keep").expect("write target");
+        let result = execute_command(&json!({
+            "command": format!("cmd=$(printf rm); $cmd -rf {}", target.display()),
+            "pty": false,
+            "timeout": 5,
+        }));
+        let kept = fs::read_to_string(&target).ok();
+        let _ = fs::remove_file(&target);
+        assert_eq!(kept.as_deref(), Some("keep"), "materialized value ran `rm`");
+        let err = result.unwrap_err();
+        assert!(err.contains("rm"), "err: {err}");
+    }
+
+    #[test]
+    fn execute_command_keeps_assignment_bindings_after_shorter_first_value() {
+        // The first assignment materializes much shorter than its source text.
+        // Offsets recorded against the pre-edit string would go stale and leave
+        // `$B` unexpanded, so the audit would pass a program the shell resolves
+        // from the variable; every edit is applied once against the original
+        // text instead.
+        let target = temporary_file_path("shifted_assignment_target");
+        fs::write(&target, "keep").expect("write target");
+        let result = execute_command(&json!({
+            "command": format!(
+                r#"A=$(printf 'yyyyyyyyyyyyyyyyyyyyyyyy') B=$(printf rm); $B -rf {}"#,
+                target.display(),
+            ),
+            "pty": false,
+            "timeout": 5,
+        }));
+        let kept = fs::read_to_string(&target).ok();
+        let _ = fs::remove_file(&target);
+        assert_eq!(kept.as_deref(), Some("keep"), "materialized value ran `rm`");
+        let err = result.unwrap_err();
+        assert!(err.contains("rm"), "err: {err}");
+    }
+
+    #[test]
+    fn execute_command_keeps_assignment_bindings_after_longer_first_value() {
+        // Same binding, with the first assignment growing: the materialized
+        // literal is longer than the substitution text it replaces.
+        let source = temporary_file_path("growing_assignment_source");
+        fs::write(&source, "z".repeat(200)).expect("write source");
+        let target = temporary_file_path("growing_assignment_target");
+        fs::write(&target, "keep").expect("write target");
+        let result = execute_command(&json!({
+            "command": format!(
+                r#"A=$(cat {}) B=$(printf rm); $B -rf {}"#,
+                source.display(),
+                target.display(),
+            ),
+            "pty": false,
+            "timeout": 5,
+        }));
+        let kept = fs::read_to_string(&target).ok();
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_file(&target);
+        assert_eq!(kept.as_deref(), Some("keep"), "materialized value ran `rm`");
+        let err = result.unwrap_err();
+        assert!(err.contains("rm"), "err: {err}");
+    }
+
+    #[test]
+    fn execute_command_expands_multiple_assignments_in_one_segment() {
+        let result = execute_command(&json!({
+            "command": r#"A=$(printf 'x') B=$(printf 'y'); echo "$A$B""#,
+            "pty": false,
+            "timeout": 5,
+        }))
+        .unwrap();
+        assert_eq!(result, "xy");
+    }
+
+    #[test]
+    fn execute_command_rejects_reference_the_materialized_value_cannot_cover() {
+        // Each shape makes the value a later reference reads unprovable: a
+        // reassignment, a temporary environment assignment, an assigning
+        // builtin, `printf -v`, a read before the assignment, or a reference
+        // inside another substitution's text. Silent literal expansion would
+        // execute a command the user did not write, so they must be rejected.
+        for (command, fragment) in [
+            ("L=$(printf 1); L=2; echo \"$L\"", "reassigns"),
+            ("L=$(printf 1) echo \"$L\"", "temporary environment"),
+            ("L=$(printf 1); unset L; echo \"$L\"", "overwrites"),
+            ("L=$(printf 1); export L=2; echo \"$L\"", "overwrites"),
+            (
+                "L=$(printf 1); printf -v L '%s' 2; echo \"$L\"",
+                "overwrites",
+            ),
+            ("echo \"$L\" L=$(printf 1)", "read before"),
+            (
+                "N=$(printf a) M=$(printf '%s' \"$N\"); echo \"$M\"",
+                "reads",
+            ),
+            ("L=$(printf 1); echo \"${L:-fallback}\"", "modifiers"),
+        ] {
+            let err = execute_command(&json!({
+                "command": command,
+                "pty": false,
+                "timeout": 5,
+            }))
+            .unwrap_err();
+            assert!(
+                err.contains(fragment),
+                "command {command:?} should mention {fragment:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn execute_command_rejects_arithmetic_write_to_materialized_variable() {
+        // `L++` mutates the variable in shells that evaluate it and is a
+        // (missing) command in others; either way the value read afterwards is
+        // not the materialized literal, so the command must not be rewritten.
+        for command in [
+            r#"L=$(printf 1); L++; echo "$L""#,
+            r#"L=$(printf 1); L--; echo "$L""#,
+            r#"L=$(printf 1); ++L; echo "$L""#,
+            r#"L=$(printf 1); let L++; echo "$L""#,
+        ] {
+            let err = execute_command(&json!({
+                "command": command,
+                "pty": false,
+                "timeout": 5,
+            }))
+            .unwrap_err();
+            assert!(
+                err.contains("arithmetic"),
+                "command {command:?} should mention arithmetic, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn execute_command_rejects_arithmetic_expansion_write_to_materialized_variable() {
+        // `$(( ... ))` can reassign its variables, so a later `$L` expanded to
+        // the materialized literal would disagree with the shell's own value.
+        for command in [
+            r#"L=$(printf 1); echo "$((L++))"; echo "$L""#,
+            r#"L=$(printf 1); echo "$((++L))"; echo "$L""#,
+            r#"L=$(printf 1); echo "$((L--))"; echo "$L""#,
+            r#"L=$(printf 1); echo "$((L+=1))"; echo "$L""#,
+            r#"L=$(printf 1); echo "$((L=2))"; echo "$L""#,
+            r#"L=$(printf 1); echo "$((L<<=2))"; echo "$L""#,
+            r#"L=$(printf 1); echo "$((L ++))"; echo "$L""#,
+            r#"L=$(printf 1); echo "$((++ L))"; echo "$L""#,
+            r#"L=$(printf 1); echo "$((L --))"; echo "$L""#,
+            r#"L=$(printf 1); echo "$((-- L))"; echo "$L""#,
+            r#"L=$(printf 1); echo "$((L += 1))"; echo "$L""#,
+            r#"L=$(printf 1); echo "$((L = 2))"; echo "$L""#,
+            r#"L=$(printf 1); echo "$((L <<= 2))"; echo "$L""#,
+        ] {
+            let err = execute_command(&json!({
+                "command": command,
+                "pty": false,
+                "timeout": 5,
+            }))
+            .unwrap_err();
+            assert!(
+                err.contains("arithmetic"),
+                "command {command:?} should mention arithmetic, got: {err}"
+            );
+        }
+
+        // Pure reads keep working: the shell evaluates the untouched
+        // expression against the materialized value.
+        let out = execute_command(&json!({
+            "command": r#"L=$(printf 5); echo "$((L+1))""#,
+            "pty": false,
+            "timeout": 5,
+        }))
+        .unwrap();
+        assert_eq!(out, "6");
+        let comparisons = execute_command(&json!({
+            "command": r#"L=$(printf 5); printf '%s,%s,%s,%s' "$((L == 5))" "$((L != 5))" "$((L <= 5))" "$((L >= 5))""#,
+            "pty": false,
+            "timeout": 5,
+        }))
+        .unwrap();
+        assert_eq!(comparisons, "1,0,1,1");
+    }
+
+    #[test]
+    fn execute_command_rejects_bare_arithmetic_reference_in_substitution_text() {
+        // The substitution body runs in a separate shell that never sees the
+        // materialized variable, so an arithmetic reference there would read an
+        // unset value instead of the literal. Both substitutions sit in the
+        // first segment, where materialization is allowed.
+        for command in [
+            r#"L=$(printf 5) B=$(echo $((L+1))); echo "$B""#,
+            r#"L=$(printf 5) B=$(echo $((L++))); echo "$B""#,
+            r#"L=$(printf 5) B=$(let L+=5; echo $((L))); echo "$B""#,
+        ] {
+            let err = execute_command(&json!({
+                "command": command,
+                "pty": false,
+                "timeout": 5,
+            }))
+            .unwrap_err();
+            assert!(
+                err.contains("arithmetic"),
+                "command {command:?} should mention arithmetic, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn execute_command_follows_wrapped_and_quoted_assigning_command_words() {
+        for command in [
+            r#"L=$(printf 1); command export L=2; echo "$L""#,
+            r#"L=$(printf 1); builtin export L=2; echo "$L""#,
+            r#"L=$(printf 1); 'export' L=2; echo "$L""#,
+            r#"L=$(printf 1); command unset L; echo "$L""#,
+            r#"L=$(printf 1); eval 'L=2'; echo "$L""#,
+        ] {
+            let err = execute_command(&json!({
+                "command": command,
+                "pty": false,
+                "timeout": 5,
+            }))
+            .unwrap_err();
+            assert!(
+                err.contains("overwrites") || err.contains("cannot read"),
+                "command {command:?} should be rejected, got: {err}"
+            );
+        }
+
+        // Non-writing forms keep working: a wrapper around a read, and an `env`
+        // prefix, which does not change the shell's own variable.
+        let output = execute_command(&json!({
+            "command": r#"L=$(printf 1); command echo "$L"; env L=2 echo "$L""#,
+            "pty": false,
+            "timeout": 5,
+        }))
+        .unwrap();
+        assert_eq!(output, "1\n1");
+    }
+
+    #[test]
     fn execute_command_materializes_substitution_with_force_overwrite_redirection() {
         let source = temporary_file_path("force_overwrite_source");
         let destination = temporary_file_path("force_overwrite_destination");
@@ -1322,6 +2206,47 @@ mod tests {
         }))
         .expect("cat with stdin should run");
         assert!(output.contains("service-stdin"), "out: {output}");
+    }
+
+    #[test]
+    fn execute_command_accepts_cmd_alias() {
+        let output = execute_command(&json!({
+            "cmd": "printf alias-ok",
+            "pty": false,
+        }))
+        .expect("cmd alias should run");
+        assert!(output.contains("alias-ok"), "out: {output}");
+    }
+
+    #[test]
+    fn execute_command_preserves_cmd_alias_whitespace() {
+        for key in ["command", "cmd"] {
+            let args = json!({
+                key: "  printf ws  ",
+                "pty": false,
+            });
+            // The service passes the original text through materialization to audit
+            // and execution; downstream runner normalization keeps its existing behavior.
+            let raw_command = super::super::execute_command_arg(&args).unwrap();
+            assert_eq!(raw_command, "  printf ws  ");
+            assert_eq!(
+                materialize_safe_shell_substitutions(raw_command, None).unwrap(),
+                "  printf ws  "
+            );
+            assert_eq!(execute_command(&args).unwrap(), "ws");
+        }
+    }
+
+    #[test]
+    fn execute_command_prefers_canonical_command_over_cmd_alias() {
+        let output = execute_command(&json!({
+            "command": "printf canonical",
+            "cmd": "printf alias",
+            "pty": false,
+        }))
+        .expect("canonical command should run");
+        assert!(output.contains("canonical"), "out: {output}");
+        assert!(!output.contains("alias"), "out: {output}");
     }
 
     #[test]

@@ -424,10 +424,8 @@ pub(in crate::ai::driver::turn_runtime) fn final_citation_base_dirs(
                 push_citation_base_dir(&mut base_dirs, cwd.clone());
             }
             if tool_call.function.name == "execute_command" {
-                let command_cwd = args
-                    .get("command")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|command| {
+                let command_cwd =
+                    crate::ai::tools::service::execute_command_arg(&args).and_then(|command| {
                         inline_execute_command_cd_dir(
                             command,
                             tool_cwd.as_deref().or(effective_cwd),

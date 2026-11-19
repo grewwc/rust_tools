@@ -15,6 +15,13 @@ pub(crate) mod speech;
 pub(crate) mod talk;
 pub(crate) mod task;
 
+/// Read `execute_command`'s canonical argument or its hidden compatibility alias.
+/// A present canonical value wins even when invalid; preserve command whitespace.
+pub(crate) fn execute_command_arg(args: &Value) -> Option<&str> {
+    let command = args.get("command").or_else(|| args.get("cmd"))?.as_str()?;
+    (!command.trim().is_empty()).then_some(command)
+}
+
 /// Parse a count-like argument as an unsigned integer within `min..=max`.
 ///
 /// Tool schemas describe counts as integers, so some models emit `2.0`; accept
@@ -159,7 +166,31 @@ fn integral_float_to_u64(value: f64) -> Option<u64> {
 mod tests {
     use serde_json::json;
 
-    use super::{arg_bool, arg_str, arg_string_list, arg_u64};
+    use super::{arg_bool, arg_str, arg_string_list, arg_u64, execute_command_arg};
+
+    #[test]
+    fn execute_command_arg_preserves_whitespace_and_cmd_alias_precedence() {
+        for key in ["command", "cmd"] {
+            assert_eq!(
+                execute_command_arg(&json!({key: "  printf ws  "})),
+                Some("  printf ws  ")
+            );
+            for value in [json!(" \t\n "), json!(null), json!(42), json!(true)] {
+                assert_eq!(execute_command_arg(&json!({key: value})), None);
+            }
+        }
+        assert_eq!(
+            execute_command_arg(&json!({"command": "  printf canonical  ", "cmd": "printf alias"})),
+            Some("  printf canonical  ")
+        );
+        for value in [json!(" \t\n "), json!(null), json!(42), json!(true)] {
+            assert_eq!(
+                execute_command_arg(&json!({"command": value, "cmd": "printf alias"})),
+                None
+            );
+        }
+        assert_eq!(execute_command_arg(&json!({})), None);
+    }
 
     #[test]
     fn arg_u64_accepts_integral_numbers_and_strings() {

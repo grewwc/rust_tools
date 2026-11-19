@@ -127,7 +127,7 @@ enum BehaviorCheckSuccessSource {
 /// A sentinel has a known source only when one check feeds presentation-only
 /// pipe segments. Arbitrary shell siblings can emit the same text themselves.
 fn behavior_check_success_source_for_args(args: &Value) -> Option<BehaviorCheckSuccessSource> {
-    let command = args.get("command")?.as_str()?;
+    let command = crate::ai::tools::service::execute_command_arg(args)?;
     let segments = crate::ai::tools::service::audit::split_unquoted_command_segments(command);
     let first = segments.first()?;
     let tokens = shell_command_tokens(&first.command);
@@ -624,7 +624,7 @@ pub(super) fn execute_command_segment_effects(command: &str) -> Vec<ExecuteComma
 pub(super) fn execute_command_segment_effects_for_args(
     args: &Value,
 ) -> Vec<ExecuteCommandSegmentEffect> {
-    let Some(command) = args.get("command").and_then(Value::as_str) else {
+    let Some(command) = crate::ai::tools::service::execute_command_arg(args) else {
         return Vec::new();
     };
     analyze_execute_command(command, &command_base_dir(args)).effects
@@ -691,7 +691,7 @@ pub(super) fn project_instruction_target_paths_from_tool_calls(
         if tool_call.function.name == "execute_command" {
             let base = command_base_dir(&args);
             let project_root = project_root_dir();
-            if let Some(command) = args.get("command").and_then(Value::as_str) {
+            if let Some(command) = crate::ai::tools::service::execute_command_arg(&args) {
                 let analysis = analyze_execute_command(command, &base);
                 for path in analysis
                     .mutation_targets

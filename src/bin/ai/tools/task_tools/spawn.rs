@@ -68,6 +68,20 @@ pub(super) fn current_task_owner_pid_opt() -> Option<u64> {
         .flatten()
 }
 
+/// Number of tracked tasks owned by this session and the current process.
+/// `None` means the process context is unavailable, so callers must fail closed
+/// and keep task lifecycle tools mounted.
+pub(crate) fn outstanding_task_count_for_current_owner(session_id: &str) -> Option<usize> {
+    let owner_pid = current_task_owner_pid_opt()?;
+    let registry = lock_task_registry();
+    Some(
+        registry
+            .iter()
+            .filter(|(_, entry)| task_entry_owned_by(entry, session_id, owner_pid))
+            .count(),
+    )
+}
+
 pub(super) fn active_foreground_owner_pid(os: &mut dyn Kernel) -> Option<u64> {
     if let Some(pid) = os.current_process_id()
         && os.get_process(pid).is_some_and(|proc| proc.is_foreground)
@@ -849,11 +863,18 @@ mod lifecycle_mount_tests {
 
     #[test]
     fn task_lifecycle_signal_follows_committed_spawn_and_preserves_errors() {
-        for auto_mount in [false, true] {
+        // Mounting lifecycle schemas is a spawn obligation, not an agent-team
+        // optimization, so the default configuration must behave like every
+        // switch combination: a committed spawn exposes the lifecycle family.
+        for config in [
+            "",
+            "ai.agent_team.optimizations_enabled = true\n\
+             ai.agent_team.auto_mount_lifecycle_tools = false\n",
+            "ai.agent_team.optimizations_enabled = true\n\
+             ai.agent_team.auto_mount_lifecycle_tools = true\n",
+        ] {
             with_agent_team_optimizations_for_test(
-                &format!(
-                    "ai.agent_team.optimizations_enabled = true\nai.agent_team.auto_mount_lifecycle_tools = {auto_mount}\n"
-                ),
+                config,
                 || {
                     let mut app = super::super::tests::test_app_with_model(String::new());
                     app.session_id = format!("spawn-mount-{}", Uuid::new_v4().simple());
@@ -920,18 +941,18 @@ mod lifecycle_mount_tests {
                                 .map(|tool| tool.function.name)
                                 .collect::<Vec<_>>();
                             queued.sort_unstable();
-                            if auto_mount {
-                                assert_eq!(
-                                    queued,
-                                    crate::ai::tools::registry::common::task_lifecycle_tool_names()
-                                );
-                                assert!(!queued.iter().any(|name| name == "task_spawn"));
-                            } else {
-                                assert!(queued.is_empty());
-                                assert!(enable_tools::explicit_enabled_tool_names().is_empty());
-                            }
+                            let lifecycle =
+                                crate::ai::tools::registry::common::task_lifecycle_tool_names();
+                            assert_eq!(queued, lifecycle);
+                            assert!(!queued.iter().any(|name| name == "task_spawn"));
+                            let mut explicit = enable_tools::explicit_enabled_tool_names();
+                            explicit.sort_unstable();
+                            assert_eq!(explicit, lifecycle);
                             assert!(enable_tools::drain_pending_enable().is_empty());
                             discard_tasks_for_session(&app.session_id);
+                            enable_tools::settle_task_lifecycle_mount();
+                            assert!(!enable_tools::task_lifecycle_tools_mounted());
+                            assert!(enable_tools::explicit_enabled_tool_names().is_empty());
                             enable_tools::clear_explicitly_enabled_tools(&app.session_id);
                         });
                     });

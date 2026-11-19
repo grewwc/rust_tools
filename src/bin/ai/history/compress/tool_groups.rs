@@ -565,8 +565,7 @@ fn tool_call_invocation_recall(tool_call: &ToolCall) -> String {
     let args = serde_json::from_str::<Value>(&tool_call.function.arguments).ok();
     let command = args
         .as_ref()
-        .and_then(|args| args.get("command"))
-        .and_then(Value::as_str)
+        .and_then(crate::ai::tools::service::execute_command_arg)
         .map(|command| truncate_to_chars(&normalize_whitespace(command), 720));
     let cwd = args
         .as_ref()
@@ -586,6 +585,49 @@ fn tool_call_invocation_recall(tool_call: &ToolCall) -> String {
         String::new()
     } else {
         format!(" [{}]", fields.join("; "))
+    }
+}
+
+#[cfg(test)]
+mod cmd_alias_tests {
+    use super::*;
+
+    #[test]
+    fn cmd_alias_history_recall_preserves_command_and_canonical_precedence() {
+        let call = |args: Value| ToolCall {
+            id: "alias-recall".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall {
+                name: "execute_command".to_string(),
+                arguments: args.to_string(),
+            },
+        };
+        let canonical = call(serde_json::json!({"command": "cat src/alias.txt"}));
+        for args in [
+            serde_json::json!({"cmd": "cat src/alias.txt"}),
+            serde_json::json!({"command": "cat src/alias.txt", "cmd": "touch src/wrong.txt"}),
+        ] {
+            let alias = call(args);
+            assert_eq!(
+                tool_call_invocation_recall(&alias),
+                " [command: cat src/alias.txt]"
+            );
+            assert_eq!(
+                super::super::tool_overflow::build_tool_overflow_recall_lines(
+                    "execute_command",
+                    &alias.function.arguments
+                ),
+                super::super::tool_overflow::build_tool_overflow_recall_lines(
+                    "execute_command",
+                    &canonical.function.arguments
+                )
+            );
+        }
+        let unrelated = super::super::tool_overflow::build_tool_overflow_recall_lines(
+            "shell",
+            r#"{"cmd":"cat src/alias.txt"}"#,
+        );
+        assert!(unrelated.is_empty());
     }
 }
 

@@ -916,8 +916,8 @@ fn preserved_tool_overflow_path_in_arguments(
     match tool_name {
         "read_file" => preserved_tool_overflow_read_file_path(arguments, overflow_dir),
         "execute_command" => {
-            let command = value_string_from_keys(&args, &["command"])?;
-            archived_asset_path_in_command(&command, overflow_dir, cwd, result_text)
+            let command = crate::ai::tools::service::execute_command_arg(&args)?;
+            archived_asset_path_in_command(command, overflow_dir, cwd, result_text)
         }
         _ => None,
     }
@@ -1517,7 +1517,12 @@ pub(super) fn build_tool_overflow_recall_lines(tool_name: &str, arguments: &str)
             .unwrap_or_default(),
         "execute_command" | "run_command" | "shell" | "bash" => {
             let mut lines = Vec::with_capacity(2);
-            if let Some(command) = value_string_from_keys(&args, &["command"]) {
+            let command = if tool_name == "execute_command" {
+                crate::ai::tools::service::execute_command_arg(&args).map(str::to_owned)
+            } else {
+                value_string_from_keys(&args, &["command"])
+            };
+            if let Some(command) = command {
                 lines.push(format!(
                     "- original_command: {}",
                     truncate_to_chars(&normalize_whitespace(&command), 720)

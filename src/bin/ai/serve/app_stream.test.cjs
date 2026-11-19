@@ -794,7 +794,7 @@ for (const phone of [false, true]) {
     c.addMsg = (...args) => errors.push(args);
     const rowA = c.document.createElement("div"), inputsA = c.pendingUserInputs;
     inputsA.set("s", [{ row: rowA }]);
-    const start = script.indexOf("async function rewindTo(");
+    const start = script.indexOf("function retireRewoundView(");
     vm.runInContext(script.slice(start, script.indexOf("// The reply to a turn", start)), c);
     const rewinding = c.rewindTo(0, "A prompt"); await h.settle();
     c.store.base = "https://server-b"; c.ensureTranscriptOwner();
@@ -804,6 +804,80 @@ for (const phone of [false, true]) {
     assert.equal(inputsB.get("s")?.[0].row, rowB, "A's response cannot remove B's pending input");
     assert.equal(inputsA.has("s"), false, "A's accepted rewind retires A's pending input");
     assert.deepEqual(errors, [], "A's response cannot append a notice to B's transcript");
+  });
+
+  test(`rewind drops the erased turn's live view (phone=${phone})`, async () => {
+    const messages = [
+      { role: "user", content: "keep this" },
+      { role: "assistant", content: "kept answer" },
+      { role: "user", content: "rewind here" },
+      { role: "tool", content: "erased tool row" },
+      { role: "assistant", content: "erased answer" },
+    ];
+    const h = sessionIsolationHarness(messages, phone), c = h.c;
+    await c.loadHistory();
+    assert.match(h.root.textContent, /erased answer/);
+    const box = c.document.createElement("div");
+    box.className = "turn";
+    fixtureFold(() => c.document.createElement("div"), "thinking", "unfinished feed trace", box);
+    h.root.appendChild(box);
+    const input = { row: c.document.createElement("div"), prompt: "rewind here", minIndex: 2, settled: true };
+    c.pendingUserInputs.set("s", [input]);
+    c.turns.set("s", { box, userInput: input, lastEventAt: Date.now() });
+    c.removeDisplayedNode = (node) => node.remove();
+    c.revokePreviews = () => {};
+    c.askRewind = async () => true;
+    c.loadSessions = async () => {};
+    const kept = messages.slice(0, 2);
+    c.api = async (url) => {
+      if (url.endsWith("/rewind")) return { json: async () => ({ removed: 3 }) };
+      assert.match(url, /\/history\?limit=/);
+      return { headers: { get: () => String(kept.length) }, json: async () => kept };
+    };
+    const notices = [];
+    c.addMsg = (role, text, cls) => { notices.push([role, text, cls]); };
+    const start = script.indexOf("function retireRewoundView(");
+    vm.runInContext(script.slice(start, script.indexOf("// The reply to a turn", start)), c);
+    await c.rewindTo(2, "rewind here");
+    assert.equal(c.turns.has("s"), false, "the rewound turn must stop being live");
+    assert.equal(box.parentNode, null, "the erased turn's box must not be re-attached");
+    assert.doesNotMatch(h.root.textContent, /erased answer|unfinished feed trace/);
+    assert.match(h.root.textContent, /kept answer/);
+    assert.deepEqual(notices, [["ok", "rewound: removed 3 message(s).", "asst"]]);
+    assert.equal(c.pendingUserInputs.has("s"), false);
+  });
+
+  test(`a late rewind response cannot retire a newer turn (phone=${phone})`, async () => {
+    const h = sessionIsolationHarness([], phone), c = h.c;
+    let finish;
+    c.askRewind = async () => true;
+    c.loadHistory = async () => {};
+    c.loadSessions = async () => {};
+    c.addMsg = () => {};
+    c.removeDisplayedNode = (node) => node.remove();
+    c.revokePreviews = () => {};
+    c.api = () => new Promise((resolve) => { finish = () => resolve({ json: async () => ({ removed: 1 }) }); });
+
+    const oldBox = c.document.createElement("div");
+    const oldEntry = { box: oldBox, userInput: {}, lastEventAt: c.Date.now() };
+    h.root.appendChild(oldBox); c.turns.set("s", oldEntry);
+    const oldInput = { row: c.document.createElement("div") };
+    c.pendingUserInputs.set("s", [oldInput]);
+
+    const start = script.indexOf("function retireRewoundView(");
+    vm.runInContext(script.slice(start, script.indexOf("// The reply to a turn", start)), c);
+    const rewinding = c.rewindTo(0, "old prompt"); await h.settle();
+
+    const newBox = c.document.createElement("div"), newInput = { row: c.document.createElement("div") };
+    const newEntry = { box: newBox, userInput: newInput, lastEventAt: c.Date.now() };
+    h.root.appendChild(newBox); c.turns.set("s", newEntry);
+    c.pendingUserInputs.set("s", [newInput]);
+    c.runEpoch++;
+
+    finish(); await rewinding;
+    assert.equal(c.turns.get("s"), newEntry, "the newer turn stays live");
+    assert.equal(newBox.parentNode, h.root, "the newer turn's card stays mounted");
+    assert.equal(c.pendingUserInputs.get("s")?.[0], newInput, "the newer turn's pending input stays");
   });
 }
 

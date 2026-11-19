@@ -348,10 +348,17 @@ pub(in crate::ai::driver::turn_runtime) fn execute_command_uses_pseudo_terminal(
 /// Render the arguments of command-like tools (e.g. `execute_command`) into a single-line
 /// readable command text, printed in the terminal when the tool starts. Multi-line
 /// commands are folded to one line; overlong ones are truncated.
-/// Returns None when parsing fails (missing `command` field or invalid JSON).
-pub(in crate::ai::driver::turn_runtime) fn format_command_input(arguments: &str) -> Option<String> {
+/// Returns None when parsing fails (missing/invalid command argument or invalid JSON).
+pub(in crate::ai::driver::turn_runtime) fn format_command_input(
+    tool_name: &str,
+    arguments: &str,
+) -> Option<String> {
     let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
-    let command = args.get("command")?.as_str()?;
+    let command = if tool_name == "execute_command" {
+        crate::ai::tools::service::execute_command_arg(&args)?
+    } else {
+        args.get("command")?.as_str()?
+    };
     // Fold newlines so a command never spans multiple terminal lines and disturbs the
     // status-line layout
     let mut line = command.replace('\n', " ⏎ ").replace('\r', "");
@@ -401,7 +408,9 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
             tool_call.function.name.as_str(),
             "execute_command" | "run_command" | "shell" | "bash"
         ) {
-            if let Some(line) = format_command_input(&tool_call.function.arguments) {
+            if let Some(line) =
+                format_command_input(&tool_call.function.name, &tool_call.function.arguments)
+            {
                 if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
                     return;
                 }

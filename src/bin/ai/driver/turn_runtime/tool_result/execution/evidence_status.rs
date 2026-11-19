@@ -77,7 +77,7 @@ pub(in crate::ai::driver::turn_runtime) fn classify_evidence_status(
     if matches!(
         tool_name,
         "execute_command" | "run_command" | "shell" | "bash"
-    ) && command_from_arguments(arguments)
+    ) && command_from_arguments(tool_name, arguments)
         .is_some_and(|command| is_git_history_command(&command))
     {
         return Some(EvidenceStatus::GitHistory);
@@ -153,12 +153,16 @@ fn is_session_storage_path_text(text: &str) -> bool {
         .any(|component| !component.is_empty() && component.ends_with(".sessions"))
 }
 
-fn command_from_arguments(arguments: &str) -> Option<String> {
+fn command_from_arguments(tool_name: &str, arguments: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
-    value
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
+    if tool_name == "execute_command" {
+        crate::ai::tools::service::execute_command_arg(&value).map(str::to_owned)
+    } else {
+        value
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    }
 }
 
 /// Version-control subcommands whose output is a point-in-time snapshot of the

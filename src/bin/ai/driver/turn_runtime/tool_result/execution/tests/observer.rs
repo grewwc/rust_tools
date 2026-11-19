@@ -5,13 +5,17 @@ use super::common::*;
 
 #[test]
 fn command_input_marks_pseudo_terminal_mode() {
-    let pty = format_command_input(r#"{"command":"login --qr","pty":true,"cwd":"/tmp"}"#)
-        .expect("valid command arguments");
+    let pty = format_command_input(
+        "execute_command",
+        r#"{"command":"login --qr","pty":true,"cwd":"/tmp"}"#,
+    )
+    .expect("valid command arguments");
     assert_eq!(pty, "login --qr  (cwd: /tmp)  (PTY)");
 
-    let piped = format_command_input(r#"{"command":"git diff","pty":false}"#)
+    let piped = format_command_input("execute_command", r#"{"command":"git diff","pty":false}"#)
         .expect("valid command arguments");
     assert_eq!(piped, "git diff");
+    assert_eq!(format_command_input("shell", r#"{"cmd":"git diff"}"#), None);
 }
 
 #[test]

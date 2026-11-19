@@ -156,17 +156,73 @@ const SHELL_COMPOUND_KEYWORDS: &[&str] = &[
     "function", "time", "!", "in",
 ];
 
+/// Skip an arithmetic expansion beginning at the `$` of `$((`, returning the
+/// index just past its closing `))`. Arithmetic output is numeric, so the
+/// materializer treats the whole expansion as inert text; a nested `$(...)`
+/// inside it stays subject to the injection guard, which scans arithmetic
+/// separately.
+fn skip_arithmetic_expansion(command: &str, dollar_at: usize) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let mut depth = 2usize;
+    let mut i = dollar_at + 3;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Skip a plain variable reference (`$NAME`, `${NAME}`, `$?`, `$1`, ...)
+/// beginning at `dollar_at`, returning the index just past it. These are not
+/// command substitutions: the materializer expands the ones whose assignment
+/// it produced and leaves every other reference to the shell, which is what
+/// the audit already tolerates. `$'...'` / `$"..."` quoting and braced
+/// expansions that embed a substitution are rejected so no active form hides
+/// inside a skipped span.
+fn skip_variable_reference(command: &str, dollar_at: usize) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let next = *bytes.get(dollar_at + 1)?;
+    if next == b'{' {
+        let close = command[dollar_at + 2..].find('}')? + dollar_at + 2;
+        let body = &command[dollar_at + 2..close];
+        if body.contains("$(") || body.contains('`') {
+            return None;
+        }
+        return Some(close + 1);
+    }
+    if !(next.is_ascii_alphanumeric()
+        || matches!(next, b'_' | b'?' | b'!' | b'#' | b'@' | b'*' | b'$' | b'-'))
+    {
+        return None;
+    }
+    let mut i = dollar_at + 1;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    Some(i.max(dollar_at + 2))
+}
+
 /// Parse the outer shell words used only for restricted substitution
 /// materialization. Deliberately does not reuse `tokenize_shell_words`: that
 /// would erase quote provenance, making it impossible to prove a substitution
 /// really sits inside one complete word. Control operators (`; | & < >`) are
-/// accepted as separators for classification, but outer control flow is
-/// recorded so the caller can reject eager materialization of chains. Escapes,
-/// globs, subshell grouping, compound keywords, and extra active expansions
-/// are still rejected.
+/// accepted as separators; the first separator position is returned so the
+/// caller can reject eager materialization of substitutions that follow a
+/// segment boundary (their input may depend on an earlier segment). Escapes,
+/// globs, subshell grouping, heredocs/newlines, compound keywords, and
+/// substitutions nested in `${...}` are still rejected.
 fn restricted_outer_shell_words(
     command: &str,
-) -> Option<(Vec<ShellWordSpan>, Vec<SubMarker>, bool)> {
+) -> Option<(Vec<ShellWordSpan>, Vec<SubMarker>, Option<usize>)> {
     if command.bytes().any(|b| matches!(b, b'\n' | b'\r')) {
         return None;
     }
@@ -174,7 +230,7 @@ fn restricted_outer_shell_words(
     let bytes = command.as_bytes();
     let mut words = Vec::new();
     let mut markers = Vec::new();
-    let mut outer_has_control_flow = false;
+    let mut first_separator: Option<usize> = None;
     let mut i = 0;
     while i < bytes.len() {
         while i < bytes.len()
@@ -190,7 +246,7 @@ fn restricted_outer_shell_words(
                     && !(i > 0 && matches!(bytes[i - 1], b'<' | b'>'))
                     && bytes.get(i + 1) != Some(&b'>'))
             {
-                outer_has_control_flow = true;
+                first_separator.get_or_insert(i);
             }
             i += 1;
         }
@@ -227,13 +283,19 @@ fn restricted_outer_shell_words(
                         continue;
                     }
                     b'$' => {
-                        if bytes.get(i + 1) != Some(&b'(') {
-                            return None;
+                        if bytes.get(i + 1) == Some(&b'(') {
+                            if bytes.get(i + 2) == Some(&b'(') {
+                                i = skip_arithmetic_expansion(command, i)?;
+                                continue;
+                            }
+                            markers.push(SubMarker {
+                                at: i,
+                                kind: SubMarkerKind::Dollar,
+                            });
+                        } else {
+                            i = skip_variable_reference(command, i)?;
+                            continue;
                         }
-                        markers.push(SubMarker {
-                            at: i,
-                            kind: SubMarkerKind::Dollar,
-                        });
                     }
                     _ => {}
                 }
@@ -257,7 +319,12 @@ fn restricted_outer_shell_words(
                 }
                 b'$' => {
                     if bytes.get(i + 1) != Some(&b'(') {
-                        return None;
+                        i = skip_variable_reference(command, i)?;
+                        continue;
+                    }
+                    if bytes.get(i + 2) == Some(&b'(') {
+                        i = skip_arithmetic_expansion(command, i)?;
+                        continue;
                     }
                     let close = find_matching_shell_paren(command, i + 1)?;
                     markers.push(SubMarker {
@@ -286,7 +353,7 @@ fn restricted_outer_shell_words(
     }) {
         return None;
     }
-    Some((words, markers, outer_has_control_flow))
+    Some((words, markers, first_separator))
 }
 
 /// Allow only ASCII absolute paths and forbid empty, `.`, and `..` components;
@@ -323,23 +390,34 @@ pub(crate) struct SafeShellSubstitution {
     /// Unquoted output is word-split by the shell, so the materializer renders
     /// it as split quoted words instead of one quoted word.
     pub(crate) bare: bool,
-    /// Eager evaluation would run substitutions from later or skipped segments
-    /// before the outer shell controls their execution. Such chains require
-    /// deferred evaluation and must be rejected by the current materializer.
-    pub(crate) outer_has_control_flow: bool,
+    /// Set when this substitution is the whole value of a simple `NAME=...`
+    /// assignment. The materializer replaces the value with a quoted literal
+    /// and expands later `$NAME` references to it, so the variable never
+    /// carries unverified runtime data into a checked position.
+    pub(crate) assignment: Option<String>,
+    /// The substitution follows a command separator (`;`, `|`, `&&`, `||`), so
+    /// eager evaluation would run it before the shell decides whether the
+    /// earlier segment even runs. Such forms require deferred evaluation and
+    /// must be rejected by the current materializer.
+    pub(crate) after_command_separator: bool,
     pub(crate) kind: SafeShellSubstitutionKind,
 }
 
 /// Recognize and classify harmless substitutions in a restricted outer command.
 /// Classification does not prove eager evaluation is safe: callers must also
-/// check `outer_has_control_flow` before reading files or running inner commands.
+/// reject substitutions flagged `after_command_separator` before reading files
+/// or running inner commands.
 ///
 /// - The outer command must use the restricted grammar (see
-///   `restricted_outer_shell_words`), and every active substitution must form
-///   a complete word: a double-quoted `"$(inner)"` / `` "`inner`" `` or a bare
-///   `$(inner)` / `` `inner` ``. Anything else — partial-word fusions,
-///   assignment values, `for ... in` list elements — is left raw so the
-///   position guard can reject it (variable escape / word-split hazards).
+///   `restricted_outer_shell_words`). Every active substitution must form a
+///   complete word: a double-quoted `"$(inner)"` / `` "`inner`" ``, a bare
+///   `$(inner)` / `` `inner` ``, or the whole value of a simple `NAME=...`
+///   assignment. Anything else — partial-word fusions, `for ... in` list
+///   elements — is left raw so the position guard can reject it.
+/// - An assignment value is safe to materialize because the replacement is a
+///   quoted literal and every later `$NAME` reference is expanded to that same
+///   literal before validation, so an assigned `rm` still reaches the program
+///   blacklist as `rm`.
 /// - If `inner` is `cat /absolute/path/literal`, take the file-read path (no
 ///   shell execution).
 /// - Otherwise, if `inner` itself passes `validate_execute_command` (i.e. is
@@ -347,9 +425,52 @@ pub(crate) struct SafeShellSubstitution {
 ///   harmless command substitution.
 /// - If any substitution fails both categories above, the whole thing is
 ///   unsafe; return empty so the upper injection validation can block it.
+/// A shell variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_shell_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Match the four whole-word substitution shapes against `word`, returning
+/// whether the word was unquoted together with the inner command text.
+fn exact_substitution_shape<'a>(
+    command: &'a str,
+    word: ShellWordSpan,
+    marker: SubMarker,
+) -> Option<(bool, &'a str)> {
+    let raw_word = &command[word.start..word.end];
+    match marker.kind {
+        SubMarkerKind::Dollar
+            if marker.at == word.start + 1
+                && raw_word.starts_with("\"$(")
+                && raw_word.ends_with(")\"") =>
+        {
+            Some((false, &command[word.start + 3..word.end - 2]))
+        }
+        SubMarkerKind::Dollar
+            if marker.at == word.start && raw_word.starts_with("$(") && raw_word.ends_with(')') =>
+        {
+            Some((true, &command[word.start + 2..word.end - 1]))
+        }
+        SubMarkerKind::Backtick
+            if marker.at == word.start + 1
+                && raw_word.starts_with("\"`")
+                && raw_word.ends_with("`\"") =>
+        {
+            Some((false, &command[word.start + 2..word.end - 2]))
+        }
+        SubMarkerKind::Backtick
+            if marker.at == word.start && raw_word.starts_with('`') && raw_word.ends_with('`') =>
+        {
+            Some((true, &command[word.start + 1..word.end - 1]))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn safe_shell_substitutions(command: &str) -> Vec<SafeShellSubstitution> {
-    let Some((words, markers, outer_has_control_flow)) = restricted_outer_shell_words(command)
-    else {
+    let Some((words, markers, first_separator)) = restricted_outer_shell_words(command) else {
         return Vec::new();
     };
     if markers.is_empty() {
@@ -365,37 +486,31 @@ pub(crate) fn safe_shell_substitutions(command: &str) -> Vec<SafeShellSubstituti
             return Vec::new();
         };
         let raw_word = &command[word.start..word.end];
-        let (bare, inner) = match marker.kind {
-            SubMarkerKind::Dollar
-                if marker.at == word.start + 1
-                    && raw_word.starts_with("\"$(")
-                    && raw_word.ends_with(")\"") =>
-            {
-                (false, &command[word.start + 3..word.end - 2])
+        let (bare, inner, assignment) = match exact_substitution_shape(command, word, marker) {
+            Some((bare, inner)) => (bare, inner, None),
+            // `NAME=$(inner)` / `NAME="$(inner)"`: an assignment value does not
+            // reach a checked position as text, so accept it only as a
+            // whole-word value that materialization turns into a literal and
+            // expands at every later `$NAME` reference.
+            None => {
+                let Some((name, _rhs)) = raw_word.split_once('=') else {
+                    return Vec::new();
+                };
+                if !is_shell_name(name) {
+                    return Vec::new();
+                }
+                let rhs_span = ShellWordSpan {
+                    start: word.start + name.len() + 1,
+                    end: word.end,
+                };
+                let Some((bare, inner)) = exact_substitution_shape(command, rhs_span, marker)
+                else {
+                    return Vec::new();
+                };
+                (bare, inner, Some(name.to_string()))
             }
-            SubMarkerKind::Dollar
-                if marker.at == word.start
-                    && raw_word.starts_with("$(")
-                    && raw_word.ends_with(')') =>
-            {
-                (true, &command[word.start + 2..word.end - 1])
-            }
-            SubMarkerKind::Backtick
-                if marker.at == word.start + 1
-                    && raw_word.starts_with("\"`")
-                    && raw_word.ends_with("`\"") =>
-            {
-                (false, &command[word.start + 2..word.end - 2])
-            }
-            SubMarkerKind::Backtick
-                if marker.at == word.start
-                    && raw_word.starts_with('`')
-                    && raw_word.ends_with('`') =>
-            {
-                (true, &command[word.start + 1..word.end - 1])
-            }
-            _ => return Vec::new(),
         };
+        let after_command_separator = first_separator.is_some_and(|sep| word.start > sep);
         // `for ... in` list elements feed the loop variable, which the audit
         // cannot track; only the raw position guard's literal-`seq` rule may
         // accept them. Compound keywords are rejected by the grammar already;
@@ -415,7 +530,8 @@ pub(crate) fn safe_shell_substitutions(command: &str) -> Vec<SafeShellSubstituti
                     start: word.start,
                     end: word.end,
                     bare,
-                    outer_has_control_flow,
+                    assignment,
+                    after_command_separator,
                     kind: SafeShellSubstitutionKind::FileRead {
                         path: path.to_string(),
                     },
@@ -428,7 +544,8 @@ pub(crate) fn safe_shell_substitutions(command: &str) -> Vec<SafeShellSubstituti
                 start: word.start,
                 end: word.end,
                 bare,
-                outer_has_control_flow,
+                assignment,
+                after_command_separator,
                 kind: SafeShellSubstitutionKind::Command {
                     inner: inner_trim.to_string(),
                 },
@@ -781,7 +898,11 @@ pub(crate) fn check_substitution_at(
     }
     // Assignment values (including `VAR=...` env prefixes) flow into shell
     // variables the audit cannot track: `cmd=$(printf rm); $cmd ...` would
-    // execute `rm` without any segment seeing it. Banned in every form.
+    // execute `rm` without any segment seeing it. The materializer handles the
+    // simple `NAME=<whole-word substitution>` form by substituting a literal
+    // and expanding later references, so anything that reaches this guard was
+    // not materializable (compound syntax, heredocs, multi-line input) and
+    // stays banned.
     if let Some((name, _)) = command[word_start..marker_at].split_once('=') {
         let mut chars = name.chars();
         let is_name = chars
@@ -790,9 +911,10 @@ pub(crate) fn check_substitution_at(
             && chars.all(|c| c == '_' || c.is_ascii_alphanumeric());
         if is_name {
             return Err(format!(
-                "{label} may not appear in an assignment value; its output flows into a \
-                 shell variable, which the audit cannot track. Use a literal value or a \
-                 `for i in $(seq FIRST LAST)` loop instead"
+                "{label} may not appear in an assignment value here; the value would flow \
+                 into a shell variable the audit cannot track. Assignments are materialized \
+                 only when the value is one whole-word substitution in a simple single-line \
+                 command; inline the command where its output is used instead of storing it"
             ));
         }
     }

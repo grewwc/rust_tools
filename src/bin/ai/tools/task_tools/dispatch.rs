@@ -525,6 +525,7 @@ pub(super) fn execute_task_integrate(args: &Value) -> Result<String, String> {
     if omitted > 0 {
         reply.push_str(&format!("\n{omitted} additional verification advisories; read each delivered assessment for details."));
     }
+    crate::ai::tools::enable_tools::settle_task_lifecycle_mount();
     Ok(reply)
 }
 

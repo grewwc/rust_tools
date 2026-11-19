@@ -99,7 +99,8 @@ impl AiConfig {
     pub const AGENT_TEAM_PERSIST_STATUS_CURSOR: &str = "ai.agent_team.persist_status_cursor";
     /// Merge ready results into the wake-up turn. Default false.
     pub const AGENT_TEAM_MERGE_READY_RESULTS: &str = "ai.agent_team.merge_ready_results";
-    /// Mount lifecycle tools after the first spawn. Default false.
+    /// Defer the lifecycle task-tool schemas until the first spawn. Mounting
+    /// after a committed spawn is unconditional. Default false.
     pub const AGENT_TEAM_AUTO_MOUNT_LIFECYCLE_TOOLS: &str =
         "ai.agent_team.auto_mount_lifecycle_tools";
 

@@ -210,13 +210,15 @@ pub(super) fn extract_round_targets_inner(
                 targets.push(format!("{}:{key}:{target}", tc.function.name));
             }
         }
-        if let Some(cmd) = map.get("command").and_then(|v| v.as_str()) {
-            // 用 coarse 签名（而非命令前两 token）作为目标标识：`git log`/`git show`/
-            // `git diff` 等围绕同一份证据来回切视角的只读取证会归并到同一个
-            // `git:inspect` 目标，不再被逐条误判为「新目标 = 新进展」。否则模型只要
-            // 每轮换一个 git 子命令，assess_progress 就持续判定有进展并清空循环历史，
-            // 使 coarse-hard 永远攒不满窗口——这正是多样化只读命令逃逸 loop guard 的
-            // 根因。coarse 归一对无法解析的命令会回退到命令原文，语义与旧行为一致。
+        let command = if tc.function.name == "execute_command" {
+            crate::ai::tools::service::execute_command_arg(&args)
+        } else {
+            map.get("command").and_then(Value::as_str)
+        };
+        if let Some(cmd) = command {
+            // Coarse signatures group repeated Git inspections of the same evidence
+            // into one target, so changing subcommands cannot reset loop detection.
+            // Unparseable commands retain the existing fallback to their original text.
             let target = coarse_execute_command_signature(cmd);
             targets.push(format!("{}:{}", tc.function.name, target));
         }
@@ -296,7 +298,7 @@ pub(super) fn extract_round_evidence_fingerprints(
             let Ok(args) = serde_json::from_str::<Value>(arguments) else {
                 continue;
             };
-            let Some(command) = args.get("command").and_then(|value| value.as_str()) else {
+            let Some(command) = crate::ai::tools::service::execute_command_arg(&args) else {
                 continue;
             };
             if !execute_command_is_read_only(command) {
@@ -454,7 +456,7 @@ pub(super) fn extract_round_from_top_read_targets(
                 }
             }
             "execute_command" => {
-                let Some(command) = map.get("command").and_then(|v| v.as_str()) else {
+                let Some(command) = crate::ai::tools::service::execute_command_arg(&args) else {
                     continue;
                 };
                 if command_reads_from_top(command) {

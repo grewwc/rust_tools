@@ -56,6 +56,15 @@ pub(super) fn extract_round_tool_signatures_inner(
         // coarse 模式下先剥离易变翻页参数，让同一目标资源的不同分页折叠为同一签名。
         let args_norm = serde_json::from_str::<Value>(args_raw)
             .map(|mut v| {
+                if name == "execute_command" {
+                    if let Some(command) =
+                        crate::ai::tools::service::execute_command_arg(&v).map(str::to_owned)
+                        && let Some(object) = v.as_object_mut()
+                    {
+                        object.remove("cmd");
+                        object.insert("command".to_string(), Value::String(command));
+                    }
+                }
                 if coarse {
                     strip_volatile_args(&mut v);
                     normalize_coarse_tool_args(name, &mut v);
@@ -88,6 +97,11 @@ pub(super) fn normalize_coarse_tool_args(tool_name: &str, value: &mut serde_json
 }
 
 pub(super) fn normalize_coarse_execute_command_args(value: &mut serde_json::Value) {
+    let Some(command) =
+        crate::ai::tools::service::execute_command_arg(value).map(coarse_execute_command_signature)
+    else {
+        return;
+    };
     let Some(map) = value.as_object_mut() else {
         return;
     };
@@ -95,13 +109,6 @@ pub(super) fn normalize_coarse_execute_command_args(value: &mut serde_json::Valu
         .get("cwd")
         .and_then(|v| v.as_str())
         .map(normalize_path_like_token);
-    let Some(command) = map
-        .get("command")
-        .and_then(|v| v.as_str())
-        .map(coarse_execute_command_signature)
-    else {
-        return;
-    };
     map.clear();
     map.insert("command".to_string(), serde_json::Value::String(command));
     if let Some(cwd) = cwd {
@@ -750,8 +757,7 @@ pub(super) fn round_has_mutation(messages: &[crate::ai::history::Message]) -> bo
                     // mutation candidate, matching the previous fail-safe.
                     return true;
                 };
-                args.get("command")
-                    .and_then(|v| v.as_str())
+                crate::ai::tools::service::execute_command_arg(&args)
                     .map(|cmd| !execute_command_is_read_only(cmd))
                     .unwrap_or(true)
             }

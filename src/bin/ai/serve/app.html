@@ -11539,8 +11539,33 @@ function askRewind(short) {
     if (typeof ok.focus === "function") ok.focus();
   });
 }
+// A rewind truncates every canonical row from the anchored input on, and the
+// server serializes that truncation behind the session's turn lock. A live
+// view of the removed turn can still be mounted here (the feed has not seen
+// its terminal event yet), and loadHistory deliberately protects and
+// re-attaches live boxes after rebuilding the transcript. Retire that view
+// with the truncated history instead of re-appending the removed turn's tools
+// and thinking under the rewind notice until a manual refresh.
+function retireRewoundView(sid, base, live, eventController, staleBoxAtStart) {
+  // The rewind response can arrive after this session started another turn.
+  // Only the turn that was live when the rewind began belongs to this result;
+  // matching by session alone would delete the newer turn's card and feed.
+  if (live && executionState(sid, base).liveEntry === live) {
+    if (live.box) {
+      revokePreviews(live.box);
+      removeDisplayedNode(live.box);
+    }
+    updateExecutionModel({ kind: "live", entry: null }, sid, base);
+  }
+  if (base !== executionBase()) return;
+  if (eventController && eventSession === sid && eventAbort === eventController) abortEvents();
+  if (staleBoxAtStart && staleSession === sid && staleBox === staleBoxAtStart) stopStaleFollow();
+}
 async function rewindTo(index, preview, targetSession = sessionId) {
-  const targetBase = executionBase(), targetInputs = pendingUserInputs;
+  const targetBase = executionBase(), targetInputsMap = pendingUserInputs;
+  const targetInputs = new Set(targetInputsMap.get(targetSession) || []);
+  const targetLive = executionState(targetSession, targetBase).liveEntry;
+  const targetEvent = eventAbort, targetStale = staleBox, targetEpoch = runEpoch;
   const short = preview.length > 80 ? preview.slice(0, 79) + "…" : preview;
   if (!(await askRewind(short))) return;
   if (targetBase !== executionBase()) return;
@@ -11548,16 +11573,25 @@ async function rewindTo(index, preview, targetSession = sessionId) {
     const res = await (await api("/sessions/" + targetSession + "/rewind", {
       method: "POST", body: JSON.stringify({ message_index: index }),
     })).json();
-    for (const input of targetInputs.get(targetSession) || []) {
-      input.row.remove();
-      revokePreviews(input.row);
-    }
-    targetInputs.delete(targetSession);
+    const retireInputs = (inputs) => {
+      const current = inputs.get(targetSession) || [];
+      for (const input of targetInputs) {
+        if (!current.includes(input)) continue;
+        input.row.remove();
+        revokePreviews(input.row);
+      }
+      const remaining = current.filter((input) => !targetInputs.has(input));
+      if (remaining.length) inputs.set(targetSession, remaining);
+      else inputs.delete(targetSession);
+    };
+    retireInputs(targetInputsMap);
+    if (pendingUserInputs !== targetInputsMap) retireInputs(pendingUserInputs);
+    retireRewoundView(targetSession, targetBase, targetLive, targetEvent, targetStale);
     if (targetBase !== executionBase()) return;
     await loadSessions();
     if (sessionId !== targetSession) { note("rewound the background session"); return; }
     await loadHistory();
-    if (sessionId === targetSession && targetBase === executionBase()) {
+    if (sessionId === targetSession && targetBase === executionBase() && targetEpoch === runEpoch) {
       addMsg("ok", "rewound: removed " + res.removed + " message(s).", "asst");
     }
   } catch (e) {

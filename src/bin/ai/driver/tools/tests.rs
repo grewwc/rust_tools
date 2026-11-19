@@ -1038,6 +1038,23 @@ fn schema_gate_resolves_all_declared_compat_aliases() {
         r#"{"note": "steer left", "target": "task-1"}"#,
     );
     assert!(super::prepare_tool_call(&mcp, &side_note_target, None).is_ok());
+    // `execute_command` accepts the shell-tool `cmd` spelling; the service
+    // reads it as a fallback for `command`.
+    let command_alias =
+        tool_call_with_args("execute_command", r#"{"cmd": "printf ok", "pty": false}"#);
+    let prepared =
+        super::prepare_tool_call(&mcp, &command_alias, None).expect("cmd alias must pass the gate");
+    assert_eq!(prepared.args["command"], "printf ok");
+    assert!(prepared.args.get("cmd").is_none());
+    // The canonical key wins when both spellings are present.
+    let command_both = tool_call_with_args(
+        "execute_command",
+        r#"{"command": "printf canonical", "cmd": "printf alias", "pty": false}"#,
+    );
+    let prepared = super::prepare_tool_call(&mcp, &command_both, None)
+        .expect("canonical command plus alias must pass the gate");
+    assert_eq!(prepared.args["command"], "printf canonical");
+    assert!(prepared.args.get("cmd").is_none());
     // The canonical key wins when both spellings are present; the alias must
     // not linger as an unknown field.
     let both = tool_call_with_args(

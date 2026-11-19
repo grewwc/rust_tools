@@ -272,14 +272,16 @@ pub(in crate::ai::driver::turn_runtime) fn read_only_tool_signature(
     // normalization); but for same-turn replay, build-verification output contains volatile
     // progress/duration lines and the latest state must be observed, so exclude them here.
     if tool_call.function.name == "execute_command" {
-        let command = args
-            .get("command")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
+        let command = crate::ai::tools::service::execute_command_arg(&args)?;
         if !crate::ai::driver::turn_runtime::checkpoint::execute_command_is_read_only(command)
             || crate::ai::driver::turn_runtime::checkpoint::command_is_cargo_verify(command)
         {
             return None;
+        }
+        let command = command.to_string();
+        if let Some(object) = args.as_object_mut() {
+            object.remove("cmd");
+            object.insert("command".to_string(), serde_json::Value::String(command));
         }
     }
     // P3: normalize read_file paths so `./x` and `x` count as the same read (aligned with

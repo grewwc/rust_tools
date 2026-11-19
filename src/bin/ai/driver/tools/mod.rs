@@ -212,12 +212,15 @@ fn prepare_tool_call(
             ),
         });
     }
-    let args = parse_tool_args(tool_call)?;
+    let mut args = parse_tool_args(tool_call)?;
     if let Some(stub_error) = overflow_stub_argument_error(tool_call, &args) {
         return Err(stub_error);
     }
     let route = route_tool_call(mcp_client, &tool_call.function.name);
     validate_tool_call_args(mcp_client, tool_call, &route, &args)?;
+    if matches!(&route, ToolRoute::Builtin) {
+        canonicalize_builtin_args(&tool_call.function.name, &mut args);
+    }
     Ok(PreparedToolCall {
         route,
         args,
@@ -297,16 +300,20 @@ fn mcp_arg_validator(name: &str, schema: &Value) -> Option<Arc<jsonschema::Valid
 
 /// Per-tool compatibility aliases: (tool name, alias key, canonical key).
 ///
-/// Services accept these historical spellings alongside the canonical key
+/// Services accept these compatibility spellings alongside the canonical key
 /// (`resolve_file_path_arg` / `optional_file_path_arg` take `path`;
-/// `execute_send_side_note` takes `content` / `target_task_id` / `target`),
-/// but published schemas only declare the canonical key. The table is
-/// per-tool on purpose: a global alias would collide with declared fields
-/// (`content` is a real parameter of `write_file`, not an alias for `note`).
+/// `execute_command` takes `cmd`; `execute_send_side_note` takes `content` /
+/// `target_task_id` / `target`), but published schemas only declare the
+/// canonical key. The table is per-tool on purpose: a global alias would
+/// collide with declared fields (`content` is a real parameter of `write_file`,
+/// not an alias for `note`).
 const BUILTIN_ARG_ALIASES: &[(&str, &str, &str)] = &[
     ("read_file", "path", "file_path"),
     ("write_file", "path", "file_path"),
     ("apply_patch", "path", "file_path"),
+    // Some shell-tool callers spell the command argument `cmd`; the service
+    // reads it as a fallback and dispatch canonicalizes it after validation.
+    ("execute_command", "cmd", "command"),
     ("send_side_note", "content", "note"),
     ("send_side_note", "target_task_id", "task_id"),
     ("send_side_note", "target", "task_id"),
@@ -314,8 +321,7 @@ const BUILTIN_ARG_ALIASES: &[(&str, &str, &str)] = &[
 
 /// Normalize a validation-only copy of builtin tool arguments.
 ///
-/// Two provider/service realities force this (the service still receives the
-/// original args, so no downstream behavior changes):
+/// Two provider/service realities force this:
 /// - Bridges materialize absent optionals as explicit `null` (observed for
 ///   apply_patch `patch`/`patch_file`). Services treat null as "not
 ///   provided", while published schemas don't list null types, so drop
@@ -325,6 +331,9 @@ const BUILTIN_ARG_ALIASES: &[(&str, &str, &str)] = &[
 ///   to the canonical key (canonical wins when both are present) and remove
 ///   the alias key, so a compatible call isn't rejected at the gate — and the
 ///   alias can't linger as an unknown field either.
+///
+/// The gate never mutates the dispatch args; `canonicalize_builtin_args`
+/// applies the accepted aliases to them after validation.
 /// Never applied to MCP: server schemas keep their original semantics and
 /// the gate validates exactly what the server will receive.
 fn normalize_for_validation(tool_name: &str, args: &Value, schema: &Value) -> Value {
@@ -354,6 +363,30 @@ fn normalize_for_validation(tool_name: &str, args: &Value, schema: &Value) -> Va
         }
     }
     Value::Object(normalized)
+}
+
+/// Apply accepted compatibility aliases to the args that will be dispatched.
+///
+/// Validation works on a copy so it can stay side-effect free, but services and
+/// dispatch-time consumers (check logging, execution) read the published key.
+/// Canonicalize the real args after the gate accepts them, preserving the same
+/// precedence as validation: an explicit canonical value wins and the alias key
+/// is removed.
+fn canonicalize_builtin_args(tool_name: &str, args: &mut Value) {
+    let Some(object) = args.as_object_mut() else {
+        return;
+    };
+    for (tool, alias, canonical) in BUILTIN_ARG_ALIASES {
+        if *tool != tool_name {
+            continue;
+        }
+        let Some(alias_value) = object.remove(*alias) else {
+            continue;
+        };
+        if !object.contains_key(*canonical) {
+            object.insert(canonical.to_string(), alias_value);
+        }
+    }
 }
 
 /// Unknown-field guard for builtin tools: the published schema is the whole

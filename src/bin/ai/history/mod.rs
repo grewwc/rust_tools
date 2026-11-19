@@ -331,6 +331,7 @@ pub(in crate::ai) use task_evidence::{
     DeliveredTaskEvidence, integrate_task_evidence, integrate_task_evidence_batch,
     read_available_task_evidence_status_payload, read_integrated_task_ids,
     read_task_evidence_report, read_task_evidence_status_payload, read_task_spawn_audit,
+    read_unintegrated_task_evidence,
     record_delivered_task_evidence, record_delivered_task_evidence_with_report,
     record_published_task_evidence_with_report, record_task_publication_warning,
     record_task_spawn_audit, record_uncollected_task_terminal_status,

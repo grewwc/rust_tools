@@ -33,6 +33,9 @@ struct ExplicitEnableState {
     /// A committed spawn keeps lifecycle schemas available across turn
     /// rebuilds and scheduler wakeups, until the session's task tools reset.
     task_spawn_succeeded: bool,
+    /// Lifecycle names auto-mounted by the committed spawn. Cleanup removes
+    /// only these; a name the user enabled explicitly stays resident.
+    auto_task_lifecycle_names: Vec<String>,
 }
 
 /// active/catalog/pending 都是 turn 级状态，避免并发 Agent 覆盖或偷取消费。
@@ -190,31 +193,34 @@ pub(crate) fn task_lifecycle_tools_mounted() -> bool {
 
 /// Publish only a committed spawn. Queuing schemas through the normal enable
 /// path also handles iterations that reuse their existing skill-turn guard.
-/// Record the fact while the flag is off so turning it on cannot hide tools
-/// for tasks that this owner already spawned.
+/// Lifecycle schemas are mounted regardless of the optional initial schema
+/// deferral: the completion gate can require `task_integrate` once a task
+/// exists, so the tool must exist even when the manifest only pinned
+/// `task_spawn` or opted out of the deferred task-group expansion.
 pub(crate) fn record_successful_task_spawn() {
     if crate::ai::driver::runtime_ctx::current_subagent_depth() != 0 {
         return;
     }
-    let auto_mount = crate::ai::config::agent_team_optimizations().auto_mount_lifecycle_tools();
-    let names = auto_mount
-        .then(super::registry::common::task_lifecycle_tool_names)
-        .unwrap_or_default();
+    let names = super::registry::common::task_lifecycle_tool_names();
     let turn = current_turn_identity();
     let owner = current_enable_owner(&turn);
     if let Ok(mut s) = STATE.write() {
-        s.explicit
-            .entry(owner.clone())
-            .or_default()
-            .task_spawn_succeeded = true;
-        if auto_mount {
-            let state = s.turns.entry(turn).or_default();
-            for name in &names {
-                if !state.active_tool_names.contains(name) && !state.pending_enable.contains(name) {
-                    state.pending_enable.push(name.clone());
-                }
+        let explicit = s.explicit.entry(owner.clone()).or_default();
+        explicit.task_spawn_succeeded = true;
+        for name in &names {
+            if !explicit.tool_names.contains(name) {
+                explicit.tool_names.push(name.clone());
+                explicit.auto_task_lifecycle_names.push(name.clone());
             }
-            mark_explicitly_enabled_tools(&mut s, owner, &names);
+            // A committed spawn is a fresh request to keep the lifecycle
+            // schemas resident, so it also resets their idle counter.
+            explicit.tool_age.insert(name.clone(), 0);
+        }
+        let state = s.turns.entry(turn).or_default();
+        for name in &names {
+            if !state.active_tool_names.contains(name) && !state.pending_enable.contains(name) {
+                state.pending_enable.push(name.clone());
+            }
         }
     }
 }
@@ -223,6 +229,50 @@ pub(crate) fn task_lifecycle_schemas_deferred(auto_mount_lifecycle_tools: bool) 
     auto_mount_lifecycle_tools
         && crate::ai::driver::runtime_ctx::current_subagent_depth() == 0
         && !task_lifecycle_tools_mounted()
+}
+
+/// Drop the lifecycle schemas that were auto-mounted by `task_spawn` once the
+/// session has no delivered-but-unintegrated evidence and no tracked task.
+/// Names the user enabled explicitly are not in `auto_task_lifecycle_names`
+/// and therefore stay resident.
+fn clear_task_lifecycle_mount(session_id: &str) {
+    let Ok(mut s) = STATE.write() else {
+        return;
+    };
+    let Some(explicit) = s.explicit.get_mut(&(session_id.to_string(), None)) else {
+        return;
+    };
+    let auto = std::mem::take(&mut explicit.auto_task_lifecycle_names);
+    explicit.tool_names.retain(|name| !auto.contains(name));
+    for name in &auto {
+        explicit.tool_age.remove(name);
+    }
+    explicit.task_spawn_succeeded = false;
+}
+
+/// Called after `task_integrate` succeeds. The lifecycle family remains
+/// mounted while any task is still tracked or any delivered evidence is still
+/// unintegrated; once both are gone, return to the lazy default.
+pub(crate) fn settle_task_lifecycle_mount() {
+    let Some(context) = crate::ai::driver::runtime_ctx::try_current() else {
+        return;
+    };
+    let history_file = context.app_proto.config.history_file.as_path();
+    let session_id = context.app_proto.session_id.as_str();
+    let pending = match crate::ai::history::read_unintegrated_task_evidence(history_file, session_id)
+    {
+        Ok(pending) => pending,
+        // A ledger read failure must not hide tools for work that may remain.
+        Err(_) => return,
+    };
+    if !pending.is_empty() {
+        return;
+    }
+    if crate::ai::tools::task_tools::outstanding_task_count_for_current_owner(session_id)
+        == Some(0)
+    {
+        clear_task_lifecycle_mount(session_id);
+    }
 }
 
 /// 清空 explicit-enabled tool 列表。
@@ -254,6 +304,9 @@ pub(crate) fn clear_task_family_explicitly_enabled_tools(session_id: &str) {
         explicit
             .tool_age
             .retain(|name, _| !family.iter().any(|family_name| family_name == name));
+        explicit
+            .auto_task_lifecycle_names
+            .retain(|name| !family.iter().any(|family_name| family_name == name));
         explicit.task_spawn_succeeded = false;
     }
 }
@@ -281,6 +334,13 @@ where
     if let Some(explicit) = s.explicit.get_mut(&owner) {
         let mut to_remove: Vec<String> = Vec::new();
         for name in &explicit.tool_names {
+            // Auto-mounted lifecycle schemas are governed by task settlement,
+            // not by the generic idle-age policy: a task that is still running
+            // must keep its wait/status/integrate tools no matter how many
+            // turns pass without a call.
+            if explicit.auto_task_lifecycle_names.contains(name) {
+                continue;
+            }
             if used.contains(name) {
                 explicit.tool_age.insert(name.clone(), 0);
             } else {
@@ -296,6 +356,9 @@ where
             for name in &to_remove {
                 explicit.tool_age.remove(name);
             }
+            explicit
+                .auto_task_lifecycle_names
+                .retain(|name| !to_remove.contains(name));
         }
     }
     clear_turn_state(&mut s, &turn, &owner);
@@ -310,6 +373,9 @@ fn mark_explicitly_enabled_tools(s: &mut EnableState, owner: EnableOwner, names:
         if !explicit.tool_names.contains(name) {
             explicit.tool_names.push(name.clone());
         }
+        // A user-facing enable request takes ownership of a name that was
+        // previously auto-mounted by `task_spawn`.
+        explicit.auto_task_lifecycle_names.retain(|auto| auto != name);
         // A fresh enable request is an explicit request to keep the tool
         // resident, so it must reset the idle counter. Otherwise a tool that
         // was enabled earlier, aged while idle, and re-enabled can be demoted
@@ -1004,6 +1070,35 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn task_lifecycle_cleanup_keeps_explicitly_enabled_names() {
+        let owner = format!("cleanup-owner-{}", uuid::Uuid::new_v4().simple());
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope((owner.clone(), 1), || {
+            let _guard = EnableTurnStateGuard::enter();
+            set_explicit_enabled_tool_names(vec![
+                "knowledge_search".to_string(),
+                "task_wait".to_string(),
+            ]);
+            record_successful_task_spawn();
+            assert!(task_lifecycle_tools_mounted());
+            assert_eq!(
+                explicit_enabled_tool_names()
+                    .into_iter()
+                    .filter(|name| name == "task_wait")
+                    .count(),
+                1
+            );
+
+            clear_task_lifecycle_mount(&owner);
+
+            assert!(!task_lifecycle_tools_mounted());
+            assert_eq!(
+                explicit_enabled_tool_names(),
+                vec!["knowledge_search".to_string(), "task_wait".to_string()]
+            );
+        });
     }
 
     #[test]

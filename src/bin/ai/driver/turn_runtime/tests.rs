@@ -5,6 +5,55 @@
 use super::*;
 
 #[test]
+fn cmd_alias_raw_checkpoint_and_loop_analysis_matches_canonical() {
+    let round = |args| checkpoint_tool_round("alias", "execute_command", args, "contents");
+    let mutation = round(serde_json::json!({"cmd": "printf changed > src/alias.txt"}));
+    let mutation_call = &mutation[0].tool_calls.as_ref().unwrap()[0];
+    assert_eq!(checkpoint_tool_call_effects(mutation_call), (true, false));
+    assert!(round_has_mutation(&mutation));
+    let verification = round(serde_json::json!({"cmd": "cargo test --bin a focused_test"}));
+    let verification_call = &verification[0].tool_calls.as_ref().unwrap()[0];
+    assert_eq!(
+        checkpoint_tool_call_effects(verification_call),
+        (false, true)
+    );
+
+    let canonical = round(serde_json::json!({"command": "cat src/alias.txt"}));
+    for args in [
+        serde_json::json!({"cmd": "cat src/alias.txt"}),
+        serde_json::json!({"command": "cat src/alias.txt", "cmd": "touch src/wrong.txt"}),
+    ] {
+        let alias = round(args.clone());
+        assert!(!round_has_mutation(&alias));
+        assert_eq!(
+            extract_round_tool_signatures(&alias),
+            extract_round_tool_signatures(&canonical)
+        );
+        assert_eq!(
+            extract_round_tool_signatures_coarse(&alias),
+            extract_round_tool_signatures_coarse(&canonical)
+        );
+        assert_eq!(
+            extract_round_targets(&alias),
+            extract_round_targets(&canonical)
+        );
+        assert_eq!(
+            extract_round_evidence_fingerprints(&alias),
+            extract_round_evidence_fingerprints(&canonical)
+        );
+        assert_eq!(
+            extract_round_from_top_read_targets(&alias),
+            vec!["src/alias.txt"]
+        );
+        let mut alias_coarse = args;
+        let mut canonical_coarse = serde_json::json!({"command": "cat src/alias.txt"});
+        normalize_coarse_execute_command_args(&mut alias_coarse);
+        normalize_coarse_execute_command_args(&mut canonical_coarse);
+        assert_eq!(alias_coarse, canonical_coarse);
+    }
+}
+
+#[test]
 fn stream_error_retry_policy_rejects_slow_or_repeated_failures() {
     assert!(should_retry_stream_error(1, Duration::from_secs(10)));
     assert!(should_retry_stream_error(

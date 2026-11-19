@@ -281,8 +281,7 @@ pub(in crate::ai::driver::turn_runtime) fn tool_call_is_successful_mutation_cand
             serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
                 .ok()
                 .and_then(|args| {
-                    args.get("command")
-                        .and_then(serde_json::Value::as_str)
+                    crate::ai::tools::service::execute_command_arg(&args)
                         .map(crate::ai::driver::turn_runtime::iteration::execute_command_may_mutate)
                 })
                 .unwrap_or(false)

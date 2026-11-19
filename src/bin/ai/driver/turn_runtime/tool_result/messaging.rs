@@ -849,7 +849,9 @@ fn current_tool_result_recall_anchors(tool_call: &ToolCall) -> Vec<String> {
     };
     match tool_call.function.name.as_str() {
         "read_file" => read_file_recall_anchors(&args),
-        "execute_command" | "run_command" | "shell" | "bash" => command_recall_anchors(&args),
+        "execute_command" | "run_command" | "shell" | "bash" => {
+            command_recall_anchors(&tool_call.function.name, &args)
+        }
         _ => generic_tool_recall_anchors(&args),
     }
 }
@@ -868,9 +870,14 @@ fn read_file_recall_anchors(args: &Value) -> Vec<String> {
     anchors
 }
 
-fn command_recall_anchors(args: &Value) -> Vec<String> {
+fn command_recall_anchors(tool_name: &str, args: &Value) -> Vec<String> {
     let mut anchors = Vec::new();
-    if let Some(command) = value_string_from_keys(args, &["command"]) {
+    let command = if tool_name == "execute_command" {
+        crate::ai::tools::service::execute_command_arg(args).map(str::to_owned)
+    } else {
+        value_string_from_keys(args, &["command"])
+    };
+    if let Some(command) = command {
         anchors.push(format!(
             "original_command: {}",
             truncate_inline(&normalize_anchor_text(&command), 720)

@@ -4,6 +4,71 @@ use super::super::*;
 use super::common::*;
 
 #[test]
+fn cmd_alias_raw_consumers_preserve_mutation_verification_and_replay_checks() {
+    use crate::ai::driver::turn_runtime::iteration;
+
+    let call = |args| test_tool_call("alias", "execute_command", args);
+    let mutation = call(serde_json::json!({"cmd": "  printf changed > src/alias.txt  "}));
+    let root = crate::ai::driver::runtime_ctx::effective_cwd().unwrap();
+    assert_eq!(
+        iteration::project_instruction_target_paths_from_tool_calls(
+            std::slice::from_ref(&mutation),
+            false
+        ),
+        vec![root.join("src/alias.txt")]
+    );
+    let args = serde_json::from_str(&mutation.function.arguments).unwrap();
+    assert!(
+        iteration::execute_command_segment_effects_for_args(&args)
+            .iter()
+            .any(|effect| effect.project_mutation)
+    );
+    assert!(tool_call_is_successful_mutation_candidate(&mutation));
+    assert!(read_only_tool_signature(&mutation).is_none());
+
+    let verification =
+        call(serde_json::json!({"cmd": "cargo test --bin a focused_test | tail -n 20"}));
+    assert!(read_only_tool_signature(&verification).is_none());
+    let args = serde_json::from_str(&verification.function.arguments).unwrap();
+    assert!(
+        iteration::execute_command_segment_effects_for_args(&args)
+            .iter()
+            .any(|effect| effect.behavior_check)
+    );
+    assert!(iteration::behavior_check_output_confirms_source_success(
+        &args,
+        &serde_json::json!("test result: ok")
+    ));
+
+    let canonical = call(serde_json::json!({"command": "  cat src/alias.txt  "}));
+    for args in [
+        serde_json::json!({"cmd": "  cat src/alias.txt  "}),
+        serde_json::json!({"command": "  cat src/alias.txt  ", "cmd": "touch src/wrong.txt"}),
+    ] {
+        let alias = call(args.clone());
+        assert!(!tool_call_is_successful_mutation_candidate(&alias));
+        assert_eq!(
+            read_only_tool_signature(&alias),
+            read_only_tool_signature(&canonical)
+        );
+        assert_eq!(
+            format_command_input("execute_command", &alias.function.arguments),
+            Some("  cat src/alias.txt  ".to_string())
+        );
+    }
+    for value in [
+        serde_json::json!(" \t "),
+        Value::Null,
+        serde_json::json!(17),
+    ] {
+        let invalid = call(serde_json::json!({"command": value, "cmd": "cat src/alias.txt"}));
+        assert!(read_only_tool_signature(&invalid).is_none());
+        let args = serde_json::from_str(&invalid.function.arguments).unwrap();
+        assert!(iteration::execute_command_segment_effects_for_args(&args).is_empty());
+    }
+}
+
+#[test]
 fn scoped_instruction_preflight_blocks_first_mutation_until_rules_are_loaded() {
     let root = std::env::temp_dir().join(format!(
         "scoped-preflight-{}",

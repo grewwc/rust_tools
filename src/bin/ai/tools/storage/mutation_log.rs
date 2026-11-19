@@ -852,7 +852,7 @@ fn begin_check_at(path: &Path, id: &str, name: &str, args: &Value) -> Option<Pen
                 .try_with(|(_, id)| *id)
                 .ok(),
             task_id: crate::ai::driver::runtime_ctx::try_subagent_task_id(),
-            command: args.get("command")?.as_str()?.to_string(),
+            command: crate::ai::tools::service::execute_command_arg(args)?.to_string(),
             cwd: args
                 .get("cwd")
                 .and_then(Value::as_str)
@@ -1240,6 +1240,22 @@ mod tests {
     impl Drop for ObservationFixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn cmd_alias_check_observation_preserves_original_command() {
+        let fixture = ObservationFixture::new();
+        fixture.observe(
+            "alias-check",
+            "execute_command",
+            json!({"cmd": "  cargo check --bin a  "}),
+            "Finished dev profile",
+        );
+        let checks = read_checks_at(&fixture.path());
+        assert_eq!(checks.len(), 2);
+        for check in checks {
+            assert_eq!(check.command, "  cargo check --bin a  ");
         }
     }
 

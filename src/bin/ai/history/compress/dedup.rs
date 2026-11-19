@@ -579,7 +579,12 @@ fn dedup_tool_target_summary(tool_name: &str, args: &str) -> Option<String> {
             }
         }
         "execute_command" | "run_command" | "shell" | "bash" => {
-            if let Some(command) = dedup_arg_string(&args, &["command"]) {
+            let command = if tool_name == "execute_command" {
+                crate::ai::tools::service::execute_command_arg(&args).map(str::to_owned)
+            } else {
+                dedup_arg_string(&args, &["command"])
+            };
+            if let Some(command) = command {
                 fields.push(format!(
                     "command={}",
                     truncate_to_chars(&normalize_whitespace(&command), 360)

@@ -436,13 +436,19 @@ mod tests {
 
     #[test]
     fn materialization_still_rejects_escape_positions() {
-        // Partial-word fusions, assignments, for-in lists, and compound
-        // keywords stay on the raw fail-closed path.
+        // Partial-word fusions, for-in lists, and compound keywords stay on the
+        // raw fail-closed path.
         assert!(safe_shell_substitutions("echo \"user=$(whoami)\"").is_empty());
-        assert!(safe_shell_substitutions("cmd=$(printf rm)").is_empty());
         assert!(safe_shell_substitutions("for i in $(seq 1 40); do echo $i; done").is_empty());
         assert!(safe_shell_substitutions("while \"$(printf true)\"; do echo x; done").is_empty());
         assert!(safe_shell_substitutions("echo $(echo r)m -rf /").is_empty());
+        // A simple assignment value is materializable (the value becomes a
+        // literal and later references are expanded), but the raw validator
+        // stays fail-closed for callers that execute without materializing.
+        let subs = safe_shell_substitutions("cmd=$(printf rm)");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].assignment.as_deref(), Some("cmd"));
+        assert!(validate("cmd=$(printf rm)").is_err());
     }
 
     #[test]
