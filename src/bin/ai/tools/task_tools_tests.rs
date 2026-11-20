@@ -1595,6 +1595,8 @@ fn task_wait_formats_empty_subagent_result_explicitly() {
         status: "failed".to_string(),
         output: String::new(),
         error: Some("request timed out waiting for response headers".to_string()),
+        cancel_reason: None,
+        partial_output: None,
         progress: Some("calling model".to_string()),
         backend_session: None,
         verification: None,
@@ -1630,6 +1632,8 @@ fn task_wait_formats_empty_subagent_result_explicitly() {
             status: "blocked".to_string(),
             output: "authenticate in the foreground".to_string(),
             error: Some("authorization_required: token expired".to_string()),
+            cancel_reason: None,
+            partial_output: None,
             progress: None,
             backend_session: None,
             verification: None,
@@ -3437,7 +3441,8 @@ async fn task_cancel_aborts_worker_and_leaves_result_collectable_via_task_wait()
         .expect("task_wait should collect cancelled result");
 
     assert!(wait_output.contains("CANCELLED"));
-    assert!(wait_output.contains("Failure reason: cancelled by parent agent"));
+    assert!(wait_output.contains("Cancellation reason: cancelled by parent agent"));
+    assert!(!wait_output.contains("Failure reason:"));
     assert!(remove_task_entry(&task_id).is_none());
 
     let os = app.os.lock().unwrap();
@@ -4768,6 +4773,87 @@ impl Drop for ParentCheckpointTask {
         let _ = os.futex_destroy(self.futex);
         let _ = os.kill_process(self.child_pid, "test cleanup".into());
     }
+}
+
+#[test]
+fn task_cancel_team_with_recent_progress_through_public_cancel() {
+    use super::agent_team::{
+        TeamLifecycle, TeamState, TeamTaskState, atomic_write_json, load_checkpoint,
+    };
+    use crate::ai::driver::runtime_ctx::TURN_IDENTITY;
+    use std::sync::atomic::Ordering;
+
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let task = ParentCheckpointTask::new();
+    let root = std::env::temp_dir().join(format!("cancel-team-{}", uuid::Uuid::new_v4().simple()));
+    let mut app = test_app_with_model(String::new());
+    app.os = task.kernel.clone();
+    app.session_id = task.session_id.clone();
+    app.config.history_file = root.join("history.sqlite");
+    app.session_history_file = app.config.history_file.clone();
+    let context = DriverContext::new(
+        app,
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+    );
+    let manage_team = inventory::iter::<super::ToolRegistration>
+        .into_iter()
+        .find(|registration| registration.spec.name == "manage_team")
+        .expect("manage_team must be registered")
+        .spec
+        .execute;
+    TURN_IDENTITY.sync_scope((task.session_id.clone(), 0), || {
+        DRIVER_CTX.sync_scope(context, || {
+            let created: serde_json::Value = serde_json::from_str(
+                &manage_team(&serde_json::json!({
+                    "action": "create", "name": "explicit cancellation", "goal": "cancel recent work",
+                    "members": [{"id": "worker", "role": "worker"}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let team_id = created["team_id"].as_str().unwrap();
+            manage_team(&serde_json::json!({
+                "action": "add_task", "team_id": team_id,
+                "task": {"id": "work", "title": "recent work", "prompt": "work", "assignee": "worker"}
+            }))
+            .unwrap();
+            let mut team: TeamState = load_checkpoint("teams", team_id).unwrap();
+            let running = team.tasks.get_mut("work").unwrap();
+            running.state = TeamTaskState::Running;
+            running.runtime_task_id = Some(task.task_id.clone());
+            atomic_write_json(
+                std::path::Path::new(created["checkpoint"].as_str().unwrap()),
+                &team,
+            )
+            .unwrap();
+            task.publish("recent team findings");
+            let cancelled = super::with_task_entry(&task.task_id, |entry| entry.cancel_stream.clone())
+                .unwrap();
+            let guarded = execute_task_cancel(&serde_json::json!({"task_ids": [&task.task_id]}))
+                .expect_err("ordinary task_cancel must still reject recent progress");
+            assert!(guarded.contains("recent progress"));
+            assert!(!cancelled.load(Ordering::Acquire));
+
+            let output = manage_team(&serde_json::json!({
+                "action": "cancel", "team_id": team_id, "reason": "explicit cancellation requested"
+            }))
+            .expect("explicit team cancellation must bypass the recent-progress guard");
+
+            assert!(cancelled.load(Ordering::Acquire));
+            assert!(!output.contains("Cancelled nothing"));
+            assert!(output.contains("Cancellation reason: explicit cancellation requested"));
+            let cancelled_team: TeamState = load_checkpoint("teams", team_id).unwrap();
+            assert_eq!(cancelled_team.lifecycle, TeamLifecycle::Cancelled);
+            assert_eq!(cancelled_team.tasks["work"].state, TeamTaskState::Cancelled);
+            assert_eq!(cancelled_team.tasks["work"].runtime_state.as_deref(), Some("cancelled"));
+            assert!(super::with_task_entry(&task.task_id, |_| ()).is_none());
+        })
+    });
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

@@ -11,12 +11,20 @@ use crate::ai::tools::task_tools::BackendId;
 pub(super) const MAX_SESSION_ACTIVITY_IDS: usize = 256;
 pub(super) const MAX_SESSION_ACTIVITY_REQUEST_BYTES: usize = 64 * 1024;
 
+/// Sample whether the session has a live foreground turn or parked work.
+///
+/// A foreground loop releases its turn lease when it yields to wait for
+/// subagent results, but it keeps a work lease until it resumes or exits. Both
+/// leases mean the session is still owned by live work; only their absence
+/// means idle.
 pub(super) fn session_activity(
     state: &ServeState,
     store: &SessionStore,
     id: &str,
 ) -> SessionActivity {
-    use crate::ai::history::turn_lease::{TurnLeaseProbe, probe_turn_lease};
+    use crate::ai::history::turn_lease::{
+        TurnLeaseProbe, probe_session_work_lease, probe_turn_lease,
+    };
 
     let local = state
         .active_turns
@@ -25,9 +33,13 @@ pub(super) fn session_activity(
     if matches!(local, Ok(true)) {
         return SessionActivity::Running;
     }
-    match probe_turn_lease(&store.session_history_file(id)) {
-        TurnLeaseProbe::Held => SessionActivity::Running,
-        TurnLeaseProbe::Free if local.is_ok() => SessionActivity::Idle,
+    let history = store.session_history_file(id);
+    match (
+        probe_turn_lease(&history),
+        probe_session_work_lease(&history),
+    ) {
+        (TurnLeaseProbe::Held, _) | (_, TurnLeaseProbe::Held) => SessionActivity::Running,
+        (TurnLeaseProbe::Free, TurnLeaseProbe::Free) if local.is_ok() => SessionActivity::Idle,
         _ => SessionActivity::Unknown,
     }
 }

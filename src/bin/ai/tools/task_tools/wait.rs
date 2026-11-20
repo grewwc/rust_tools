@@ -813,12 +813,23 @@ pub(super) fn write_terminal_subagent_result(
     result_channel_id: u64,
     completion_futex_addr: aios_kernel::primitives::FutexAddr,
     status: &str,
-    error: &str,
+    reason: &str,
 ) {
     // The caller must first abort the Tokio task actually running the subagent; the kernel process
     // state alone does not stop the Future inside the hosting process. Only then terminate the
     // kernel process and publish the terminal result.
-    let _ = os.kill_process(pid, format!("{}: {}", status, error));
+    let cancelled = status == TaskTerminalStatus::Cancelled.as_str();
+    let partial_output = cancelled
+        .then(|| {
+            task_progress_slot(task_id)
+                .and_then(|slot| {
+                    crate::ai::driver::runtime_ctx::subagent_progress_state_snapshot(&slot)
+                })
+                .as_ref()
+                .and_then(cancellation_partial_output)
+        })
+        .flatten();
+    let _ = os.kill_process(pid, format!("{}: {}", status, reason));
     let backend_session = backend_session::record_session(task_backend_id(task_id), task_id, None);
     // Then write the terminal result as the subagent and release the producer side (the result
     // channel's producer ownership check requires current == pid). Although the process is already
@@ -826,19 +837,50 @@ pub(super) fn write_terminal_subagent_result(
     // drop_terminated), so the write is still valid.
     let original = os.current_process_id();
     os.set_current_pid(Some(pid));
-    let payload = serde_json::json!({
-        "status": status,
-        "output": "",
-        "error": error,
-        "progress": current_task_progress(task_id),
-        "backend_session": backend_session,
-    })
-    .to_string();
+    let result = StoredTaskResult {
+        status: status.to_string(),
+        output: partial_output.clone().unwrap_or_default(),
+        error: (!cancelled).then(|| reason.to_string()),
+        cancel_reason: cancelled.then(|| reason.to_string()),
+        partial_output,
+        progress: current_task_progress(task_id),
+        backend_session,
+        verification: None,
+    };
+    let payload = serde_json::to_string(&result).expect("serializing a task result cannot fail");
     if let Err(error) = publish_task_result(os, Some(task_id), pid, result_channel_id, payload) {
         eprintln!("[Task result delivery] {error}");
     }
     let _ = os.futex_store(completion_futex_addr, 1);
     os.set_current_pid(original);
+}
+
+/// Running backends keep unfinished assistant text locally. Preserve their shared checkpoint
+/// excerpt, or an activity line, with explicit provenance rather than presenting it as a final answer.
+fn cancellation_partial_output(
+    snapshot: &crate::ai::driver::runtime_ctx::SubagentProgressSnapshot,
+) -> Option<String> {
+    if let Some(excerpt) = snapshot.checkpoint_excerpt.as_deref()
+        && !excerpt.trim().is_empty()
+    {
+        return Some(format!(
+            "Saved checkpoint excerpt (partial result):\n{excerpt}"
+        ));
+    }
+    snapshot
+        .timeline
+        .iter()
+        .rev()
+        .find(|event| {
+            event.kind == crate::ai::driver::runtime_ctx::SubagentProgressEventKind::Activity
+                && !event.summary.trim().is_empty()
+        })
+        .map(|event| {
+            format!(
+                "Last recorded activity (partial progress):\n{}",
+                event.summary
+            )
+        })
 }
 pub(super) fn task_wait_sources(
     os: &mut dyn Kernel,
@@ -962,6 +1004,7 @@ pub(super) fn format_task_result(
 ) -> String {
     let duration_secs = entry.started_at.elapsed().as_secs_f64();
     let task_blocked = result.status == TaskTerminalStatus::Blocked.as_str();
+    let task_cancelled = result.status == TaskTerminalStatus::Cancelled.as_str();
     let mut parts = vec![format!(
         "[Task: {} via {} @ {}] {} after {:.1}s",
         entry.description,
@@ -985,21 +1028,40 @@ pub(super) fn format_task_result(
         entry.selection_explanation.clone()
     };
     parts.push(selection_explanation);
-    if let Some(error) = result.error
+    if task_cancelled {
+        if let Some(reason) = result
+            .cancel_reason
+            .as_deref()
+            .filter(|reason| !reason.trim().is_empty())
+            .or(result.error.as_deref())
+            && !reason.trim().is_empty()
+        {
+            parts.push(format!("Cancellation reason: {reason}"));
+        }
+    } else if let Some(error) = result.error.as_deref()
         && !error.trim().is_empty()
     {
-        parts.push(format!("Failure reason: {}", error));
+        parts.push(format!("Failure reason: {error}"));
     }
     if let Some(progress) = result.progress
         && !progress.trim().is_empty()
     {
         parts.push(format!("Last known progress: {}", progress));
     }
-    if !result.output.trim().is_empty() {
+    let output = if task_cancelled {
+        result
+            .partial_output
+            .as_deref()
+            .filter(|output| !output.trim().is_empty())
+            .unwrap_or(&result.output)
+    } else {
+        &result.output
+    };
+    if !output.trim().is_empty() {
         if result.status == "completed" {
-            parts.push(result.output.trim().to_string());
+            parts.push(output.trim().to_string());
         } else {
-            parts.push(format!("Partial output:\n{}", result.output.trim()));
+            parts.push(format!("Partial output:\n{}", output.trim()));
         }
     } else {
         parts.push("(subagent did not produce any final assistant text)".to_string());
@@ -1197,6 +1259,8 @@ mod tests {
                         "status": result.status,
                         "output": result.output,
                         "error": result.error,
+                        "cancel_reason": result.cancel_reason,
+                        "partial_output": result.partial_output,
                         "progress": result.progress,
                         "backend_session": result.backend_session,
                     })
@@ -1241,10 +1305,86 @@ mod tests {
             status: status.as_str().into(),
             output,
             error: None,
+            cancel_reason: None,
+            partial_output: None,
             progress: None,
             backend_session: None,
             verification: None,
         }
+    }
+
+    #[test]
+    fn task_terminal_cancelled_formats_cancellation_and_partial_output() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let mut fixture = ReadyWakeFixture::new(false);
+        let task_id = fixture.spawn();
+        let entry = with_task_entry(&task_id, Clone::clone).unwrap();
+        let mut result = ready_result(TaskTerminalStatus::Cancelled, "older partial output".into());
+        result.cancel_reason = Some("work superseded".into());
+        result.partial_output = Some("saved partial findings".into());
+        result.error = Some("legacy cancellation reason".into());
+        let output = format_task_result(&entry, result, None);
+        assert!(output.contains("Cancellation reason: work superseded"));
+        assert!(output.contains("Partial output:\nsaved partial findings"));
+        assert!(!output.contains("Failure reason:"));
+        assert!(!output.contains("older partial output"));
+        assert!(!output.contains("legacy cancellation reason"));
+    }
+
+    #[test]
+    fn task_terminal_legacy_cancelled_error_remains_cancellation_in_report() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let mut fixture = ReadyWakeFixture::new(false);
+        let task_id = fixture.spawn();
+        let entry = with_task_entry(&task_id, Clone::clone).unwrap();
+        let result: StoredTaskResult = serde_json::from_value(serde_json::json!({
+            "status": "cancelled", "output": "legacy partial text", "error": "old parent reason"
+        }))
+        .unwrap();
+        assert!(result.cancel_reason.is_none());
+        assert!(result.partial_output.is_none());
+        let output = format_task_result(&entry, result.clone(), None);
+        assert!(output.contains("Cancellation reason: old parent reason"));
+        assert!(output.contains("Partial output:\nlegacy partial text"));
+        assert!(!output.contains("Failure reason:"));
+        let report = TaskReportTask::terminal(&task_id, &entry, &result);
+        let serialized = serde_json::to_value(report).unwrap();
+        assert_eq!(serialized["cancel_reason"], "old parent reason");
+        assert_eq!(serialized["partial_output"], "legacy partial text");
+        assert!(serialized.get("error").is_none());
+    }
+
+    #[test]
+    fn task_terminal_failures_keep_failure_reason_and_error_field() {
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        let mut fixture = ReadyWakeFixture::new(false);
+        let task_id = fixture.spawn();
+        let entry = with_task_entry(&task_id, Clone::clone).unwrap();
+        for status in [
+            TaskTerminalStatus::Failed,
+            TaskTerminalStatus::Timeout,
+            TaskTerminalStatus::Blocked,
+        ] {
+            let mut result = ready_result(status, "partial failure evidence".into());
+            result.error = Some("original failure reason".into());
+            let output = format_task_result(&entry, result.clone(), None);
+            assert!(output.contains("Failure reason: original failure reason"));
+            assert!(!output.contains("Cancellation reason:"));
+            let serialized =
+                serde_json::to_value(TaskReportTask::terminal(&task_id, &entry, &result)).unwrap();
+            assert_eq!(serialized["error"], "original failure reason");
+            assert!(serialized.get("cancel_reason").is_none());
+        }
+    }
+
+    #[test]
+    fn task_terminal_cancelled_serialization_skips_absent_error_and_partial_output() {
+        let mut result = ready_result(TaskTerminalStatus::Cancelled, String::new());
+        result.cancel_reason = Some("cancelled by parent agent".into());
+        let serialized = serde_json::to_value(result).unwrap();
+        assert_eq!(serialized["cancel_reason"], "cancelled by parent agent");
+        assert!(serialized.get("error").is_none());
+        assert!(serialized.get("partial_output").is_none());
     }
 
     #[test]
@@ -1407,6 +1547,8 @@ mod tests {
                     status: status.as_str().into(),
                     output: output.clone(),
                     error: Some(error.clone()),
+                    cancel_reason: None,
+                    partial_output: None,
                     progress: Some(progress.clone()),
                     backend_session: None,
                     verification: None,
@@ -1580,6 +1722,8 @@ mod tests {
                 status: "failed".into(),
                 output: failure_output.into(),
                 error: Some("original failure reason".into()),
+                cancel_reason: None,
+                partial_output: None,
                 progress: None,
                 backend_session: None,
                 verification: None,

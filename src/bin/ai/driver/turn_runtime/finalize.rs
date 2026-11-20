@@ -735,6 +735,7 @@ pub(super) async fn finalize_turn(
     question: &str,
     final_assistant_text: &str,
     final_assistant_recorded: bool,
+    request_error_detail: Option<&str>,
     user_visible_final_suffix: Option<&str>,
     has_pending_critical_premises: bool,
     active_skill_name: Option<&str>,
@@ -768,11 +769,18 @@ pub(super) async fn finalize_turn(
     }
 
     if !final_assistant_text.trim().is_empty() {
-        ensure_final_assistant_recorded(
-            final_assistant_text,
-            final_assistant_recorded,
-            turn_messages,
-        );
+        if let Some(detail) = request_error_detail {
+            turn_messages.push(crate::ai::history::request_error_message(
+                final_assistant_text,
+                detail,
+            ));
+        } else {
+            ensure_final_assistant_recorded(
+                final_assistant_text,
+                final_assistant_recorded,
+                turn_messages,
+            );
+        }
         // Persist before any terminal rendering. Rendering is display-only and can
         // fail (e.g. EAGAIN on a non-blocking tty); such a failure must never drop
         // the canonical assistant message from history.
@@ -783,6 +791,13 @@ pub(super) async fn finalize_turn(
             turn_messages,
             persisted_turn_messages,
         );
+        // History owns the diagnostic before replay can replace the live row.
+        if let Some(detail) = request_error_detail {
+            crate::ai::background::publish_serve_json_frame(
+                crate::ai::background::ServeLiveKind::RequestError,
+                detail,
+            );
+        }
         // Serve children commit the accepted body through their live FIFO below;
         // their stdout must not render a second copy.
         if crate::ai::driver::runtime_ctx::terminal_output_enabled()
@@ -1250,6 +1265,76 @@ async fn request_outside_turn_title(
 mod tests {
     use super::*;
     use crate::ai::types::{FunctionCall, ToolCall};
+
+    #[tokio::test]
+    async fn request_error_finalization_persists_one_row_with_optional_warning() {
+        let placeholder = "[Request failed this round; please retry or rephrase]";
+        let detail = "request failed: 502 upstream reset";
+        for critical_premises in [false, true] {
+            let root = std::env::temp_dir().join(format!("request-error-{}", uuid::Uuid::new_v4()));
+            let mut app = crate::ai::middleware::test_util::test_app();
+            app.config.history_file = root.join("history.sqlite");
+            app.session_id = "request-error".into();
+            app.cli.session = Some(app.session_id.clone());
+            app.session_history_file =
+                crate::ai::history::SessionStore::new(&app.config.history_file)
+                    .session_history_file(&app.session_id);
+            let mut messages = Vec::new();
+            let mut persisted = 0;
+            crate::ai::driver::runtime_ctx::SUPPRESS_TERMINAL_OUTPUT
+                .scope(
+                    true,
+                    finalize_turn(
+                        &mut app,
+                        "test-model",
+                        "test-model",
+                        "",
+                        placeholder,
+                        false,
+                        Some(detail),
+                        None,
+                        critical_premises,
+                        None,
+                        &mut messages,
+                        true,
+                        &mut persisted,
+                        true,
+                        false,
+                    ),
+                )
+                .await
+                .unwrap();
+            let restored =
+                crate::ai::history::read_all_messages_sqlite(&app.session_history_file).unwrap();
+            assert_eq!(
+                restored.len(),
+                1,
+                "a final warning must not duplicate the retry row"
+            );
+            assert_eq!(persisted, 1);
+            let body = restored[0].content.as_str().unwrap();
+            assert!(body.starts_with(placeholder));
+            assert_eq!(
+                body.contains(FinalGateState::CRITICAL_PREMISES_WARNING),
+                critical_premises
+            );
+            assert_eq!(
+                crate::ai::history::request_error_detail(&restored[0]),
+                Some(detail)
+            );
+            let projected = crate::ai::request::normalize_messages_for_request_for_test(&restored);
+            assert_eq!(projected[0].content, restored[0].content);
+            assert!(
+                projected[0].reasoning_content.is_none(),
+                "display diagnostics must not reach a provider"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        assert_eq!(
+            terminal_final_text_to_render(placeholder, false, None).as_deref(),
+            Some(placeholder)
+        );
+    }
 
     #[test]
     fn compact_session_history_skips_in_flight_projection_without_waiting() {

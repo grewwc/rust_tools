@@ -666,6 +666,12 @@ pub(crate) enum ServeLiveKind {
     TokenRate = 23,
     /// Reasoning text prefixed with its phase and attempted byte offset.
     ThinkingChunk = 24,
+    /// Diagnostic text for a model request that ended the turn's round.
+    ///
+    /// JSON-framed like tool events so a provider error body can span multiple
+    /// frames. The serve daemon forwards it as a non-terminal Web UI row; it
+    /// never enters canonical history.
+    RequestError = 25,
 }
 
 #[derive(Clone, Copy, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -885,7 +891,8 @@ pub(crate) fn serve_json_frames(kind: ServeLiveKind, text: &str) -> Vec<(ServeLi
     let name = match kind {
         ServeLiveKind::Tool => "tool",
         ServeLiveKind::SubagentProgress => "subagent_progress",
-        _ => panic!("only tool and subagent progress JSON events support chunking"),
+        ServeLiveKind::RequestError => "request_error",
+        _ => panic!("only tool, subagent progress, and request error JSON events support chunking"),
     };
     let mut chunks = Vec::new();
     let mut start = 0;

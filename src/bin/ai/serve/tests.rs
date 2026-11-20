@@ -32,6 +32,88 @@ fn truncate_turn_error_cuts_on_character_boundaries() {
     assert_eq!(kept.chars().count(), MAX_TURN_ERROR_CHARS, "{kept}");
 }
 
+/// A failed request's real provider/transport message must reach the Web UI
+/// even though the child exits successfully and canonical history keeps only
+/// the generic retry placeholder.
+#[test]
+fn request_error_live_frame_preserves_original_detail() {
+    use crate::ai::background::{ServeLiveKind, serve_json_frames};
+
+    for detail in [
+        "request failed: 502 Bad Gateway: upstream connection reset".to_string(),
+        format!(
+            "request failed: 400 invalid request body: {}",
+            "界".repeat(3000)
+        ),
+    ] {
+        let frames = serve_json_frames(ServeLiveKind::RequestError, &detail);
+        let wire = frames
+            .iter()
+            .flat_map(|(kind, payload)| test_frame(*kind, payload.as_bytes()))
+            .collect::<Vec<_>>();
+        let mut decoder = ServeFrameDecoder::default();
+        let events = wire
+            .chunks(83)
+            .flat_map(|chunk| decoder.push(chunk))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events,
+            vec![ServeLiveEvent::RequestError(detail.clone())],
+            "one assembled diagnostic regardless of frame size"
+        );
+        assert!(decoder.finish().is_empty());
+
+        let sse = live_event(ServeLiveEvent::RequestError(detail.clone()))
+            .expect("request errors have a Web UI event");
+        assert_eq!(sse.kind, "request_error");
+        let payload: serde_json::Value = serde_json::from_str(&sse.data).unwrap();
+        assert_eq!(payload["error"].as_str(), Some(detail.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn request_error_history_recovers_display_detail_without_changing_body() {
+    let state = lifecycle_test_state();
+    let root = state.history_file.parent().unwrap().to_path_buf();
+    let store = SessionStore::new(&state.history_file);
+    let placeholder = "[Request failed this round; please retry or rephrase]";
+    let detail = "request failed: 502 Bad Gateway upstream reset";
+    let message = crate::ai::history::request_error_message(placeholder, detail);
+    crate::ai::history::append_history_messages(
+        &store.session_history_file("request-error-history"),
+        std::slice::from_ref(&message),
+    )
+    .unwrap();
+    for query in [
+        serde_json::json!({}),
+        serde_json::json!({"limit": 1}),
+        serde_json::json!({"role": "assistant"}),
+        serde_json::json!({"conclusion": 1}),
+    ] {
+        let response = super::read_history(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("request-error-history".into()),
+            Query(serde_json::from_value(query).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(rows[0]["content"], placeholder);
+        assert_eq!(rows[0]["request_error"], detail);
+        assert!(rows[0].get("reasoning_content").is_none());
+    }
+    assert_eq!(
+        store.read_all_messages("request-error-history").unwrap(),
+        vec![message]
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// Handler-level coverage for the two session-lifecycle routes: a
 /// missing fork source 404s, a malformed id 400s, and deleting a
 /// missing session still succeeds (idempotent, so client retries after
@@ -1548,7 +1630,7 @@ async fn confirm_reports_a_remote_turn_owner_from_the_turn_lease() {
 #[test]
 fn session_activity_mapping_prefers_active_turns_and_preserves_unknown() {
     use super::sessions::session_activity;
-    use crate::ai::history::turn_lease::TurnLease;
+    use crate::ai::history::turn_lease::{SessionWorkLease, TurnLease};
 
     let state = lifecycle_test_state();
     let store = SessionStore::new(state.history_file.as_path());
@@ -1587,6 +1669,16 @@ fn session_activity_mapping_prefers_active_turns_and_preserves_unknown() {
         SessionActivity::Running
     );
     drop(lease);
+    assert_eq!(
+        session_activity(&state, &store, "samehead-a"),
+        SessionActivity::Idle
+    );
+    let work = SessionWorkLease::acquire(&history, "samehead-a").expect("parked work lease");
+    assert_eq!(
+        session_activity(&state, &store, "samehead-a"),
+        SessionActivity::Running
+    );
+    drop(work);
     assert_eq!(
         session_activity(&state, &store, "samehead-a"),
         SessionActivity::Idle

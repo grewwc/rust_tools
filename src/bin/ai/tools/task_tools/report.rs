@@ -63,6 +63,10 @@ pub(crate) struct TaskReportTask {
     pub(crate) progress_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cancel_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) partial_output: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) error_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -230,9 +234,21 @@ impl TaskReportTask {
         entry: &AsyncTaskEntry,
         result: &StoredTaskResult,
     ) -> Self {
+        let cancelled = result.status == TaskTerminalStatus::Cancelled.as_str();
         Self {
             active: false,
-            error: result.error.clone(),
+            error: (!cancelled).then(|| result.error.clone()).flatten(),
+            cancel_reason: cancelled
+                .then(|| {
+                    result
+                        .cancel_reason
+                        .clone()
+                        .or_else(|| result.error.clone())
+                })
+                .flatten(),
+            partial_output: result.partial_output.clone().or_else(|| {
+                (cancelled && !result.output.trim().is_empty()).then(|| result.output.clone())
+            }),
             output: Some(result.output.clone()),
             verification: result.verification.clone(),
             progress_text: result.progress.clone(),
@@ -310,7 +326,10 @@ impl TaskReport {
 
     pub(crate) fn truncate_outputs(&mut self, max_bytes: usize) {
         for task in &mut self.tasks {
-            if let Some(output) = task.output.as_mut() {
+            for output in [&mut task.output, &mut task.partial_output]
+                .into_iter()
+                .flatten()
+            {
                 if output.len() > max_bytes {
                     task.output_total_bytes.get_or_insert(output.len());
                     let mut end = max_bytes;

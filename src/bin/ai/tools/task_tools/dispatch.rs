@@ -688,6 +688,17 @@ pub(crate) fn discard_tasks_for_session(session_id: &str) {
 }
 
 pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
+    execute_task_cancel_with_progress(args, |task_id| {
+        task_progress_slot(task_id).and_then(|slot| {
+            crate::ai::driver::runtime_ctx::subagent_progress_state_snapshot(&slot)
+        })
+    })
+}
+
+fn execute_task_cancel_with_progress(
+    args: &Value,
+    snapshot_for: impl Fn(&str) -> Option<crate::ai::driver::runtime_ctx::SubagentProgressSnapshot>,
+) -> Result<String, String> {
     ensure_top_level_task_orchestration("task_cancel")?;
     let task_ids = args["task_ids"]
         .as_array()
@@ -698,6 +709,11 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
     if task_ids.is_empty() {
         return Err("task_ids array cannot be empty".to_string());
     }
+    let force = match args.get("force") {
+        None => false,
+        Some(Value::Bool(force)) => *force,
+        Some(_) => return Err("'force' must be a boolean".to_string()),
+    };
     let reason = args
         .get("reason")
         .and_then(Value::as_str)
@@ -720,15 +736,7 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
                 Some(entry)
                     if task_entry_owned_by(entry, &current_session_id, current_owner_pid) =>
                 {
-                    Some((
-                        tid.clone(),
-                        entry.session_id.clone(),
-                        entry.pid,
-                        entry.result_channel_id,
-                        entry.completion_futex_addr,
-                        entry.abort_handle.clone(),
-                        entry.cancel_stream.clone(),
-                    ))
+                    Some((tid.clone(), entry.clone()))
                 }
                 _ => {
                     not_found.push(tid.clone());
@@ -738,17 +746,49 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
             .collect::<Vec<_>>()
     };
 
-    // The real Tokio Future must be stopped before entering the kernel to write the cancelled
-    // terminal state; otherwise, after the logical process is terminated, network requests or
-    // tool calls can still run in the background and race with the terminal write.
-    for (_, _, _, _, _, abort_handle, cancel_stream) in &candidates {
-        cancel_stream.store(true, Ordering::Release);
-        if let Some(handle) = abort_handle {
-            handle.abort();
-        }
+    // Sample terminal truth before progress, holding neither the task registry nor the kernel
+    // lock while acquiring a progress slot. Every requested task is checked before any abort.
+    let candidates = with_os_kernel(|os| {
+        candidates
+            .into_iter()
+            .map(|(tid, entry)| {
+                let (_, active) = task_state_snapshot(os, entry.result_channel_id, entry.pid)?;
+                Ok((tid, entry, active))
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })?;
+    let recent = candidates
+        .iter()
+        .filter(|(_, _, active)| *active)
+        .filter_map(|(tid, _, _)| {
+            let snapshot = snapshot_for(tid)?;
+            if force || snapshot.stale_for >= TASK_CANCEL_RECENT_PROGRESS {
+                return None;
+            }
+            let progress = TaskReportProgress::from(&snapshot);
+            Some(format!(
+                "{tid}: last activity {}ms ago (stale_for_ms={}, elapsed_ms={}, sequence={}, phase={:?}, latest_activity={:?})",
+                progress.stale_for_ms,
+                progress.stale_for_ms,
+                progress.elapsed_ms,
+                progress.sequence,
+                progress.phase,
+                progress.latest_activity.as_deref().unwrap_or(&progress.phase),
+            ))
+        })
+        .collect::<Vec<_>>();
+    if !recent.is_empty() {
+        return Err(format!(
+            "[task_cancel] Cancelled nothing: recent progress protects these active tasks:\n{}\nRun task_status and keep waiting while progress advances. Pass force: true only after checking progress and confirming that work is superseded or no longer needed, never to shorten a wait.",
+            recent.join("\n")
+        ));
     }
 
-    for (tid, session_id, pid, result_channel_id, completion_futex_addr, _, _) in candidates {
+    for (tid, entry, active) in candidates {
+        if !active {
+            already_finished.push(tid);
+            continue;
+        }
         // Only cancel subagents that are still running. Tasks that already ended (completed
         // normally / failed / process terminated) are neither killed nor given a terminal result —
         // otherwise a "cancelled" message would be appended to the channel and the channel
@@ -757,15 +797,21 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
         // is left to the collector (task_wait's ready / failure path, or a task_wait after
         // task_status).
         let was_pending = with_os_kernel(|os| {
-            if !is_task_pending(os, pid)? {
+            if !task_state_snapshot(os, entry.result_channel_id, entry.pid)?.1 {
                 return Ok(false);
+            }
+            // Abort is nonblocking. Rechecking while holding the kernel lock protects a result
+            // published between preflight and cancellation without touching finished workers.
+            entry.cancel_stream.store(true, Ordering::Release);
+            if let Some(handle) = &entry.abort_handle {
+                handle.abort();
             }
             write_terminal_subagent_result(
                 os,
                 &tid,
-                pid,
-                result_channel_id,
-                completion_futex_addr,
+                entry.pid,
+                entry.result_channel_id,
+                entry.completion_futex_addr,
                 TaskTerminalStatus::Cancelled.as_str(),
                 &reason,
             );
@@ -773,7 +819,7 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
         })?;
         if was_pending {
             record_uncollected_terminal_status(
-                &session_id,
+                &entry.session_id,
                 &tid,
                 TaskTerminalStatus::Cancelled.as_str(),
             );
@@ -1003,6 +1049,7 @@ mod optimization_gate_tests {
         fn drop(&mut self) {
             for task_id in &self.0 {
                 remove_task_entry(task_id);
+                lock_unpoisoned(&TASK_PROGRESS_REGISTRY).remove(task_id);
             }
         }
     }
@@ -1023,7 +1070,7 @@ mod optimization_gate_tests {
                     None,
                     None,
                 )?;
-                let channel = os.channel_create(Some(pid), 1, "gate-result".to_string());
+                let channel = os.channel_create(Some(owner_pid), 1, "gate-result".to_string());
                 let futex = os.futex_create(0, "gate-complete".to_string());
                 Ok((pid, channel.raw(), futex))
             })
@@ -1055,6 +1102,344 @@ mod optimization_gate_tests {
             tasks.0.push(task_id);
         }
         tasks
+    }
+
+    fn with_cancellation_test_context<T>(operation: impl FnOnce() -> T) -> T {
+        super::super::agent_team::tests::with_status_test_context_with_config(
+            "ai.agent_team.optimizations_enabled = true\n",
+            operation,
+        )
+    }
+
+    fn cancellation_progress(task_id: &str, checkpoint: Option<&str>) {
+        use crate::ai::driver::runtime_ctx;
+        let slot = runtime_ctx::new_subagent_progress_slot();
+        runtime_ctx::publish_subagent_activity_to_slot(
+            &slot,
+            "working",
+            "read_file cancellation evidence",
+        );
+        if let Some(checkpoint) = checkpoint {
+            runtime_ctx::publish_subagent_checkpoint_to_slot(&slot, "Saved finding", checkpoint);
+        }
+        lock_unpoisoned(&TASK_PROGRESS_REGISTRY).insert(task_id.to_string(), slot);
+    }
+
+    fn assert_cancellation_left_active(task_id: &str) {
+        let entry = with_task_entry(task_id, Clone::clone).unwrap();
+        assert!(!entry.cancel_stream.load(Ordering::Acquire));
+        with_os_kernel(|os| {
+            assert!(is_task_pending(os, entry.pid)?);
+            assert!(read_task_result(os, entry.result_channel_id, false)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn task_cancel_rejects_recent_activity_without_force() {
+        with_cancellation_test_context(|| {
+            let tasks = register_pending_tasks();
+            cancellation_progress(&tasks.0[0], None);
+            let error = execute_task_cancel(&json!({"task_ids": [&tasks.0[0]]})).unwrap_err();
+            for expected in [
+                tasks.0[0].as_str(),
+                "Cancelled nothing",
+                "stale_for_ms=",
+                "elapsed_ms=",
+                "sequence=",
+                "working",
+                "read_file cancellation evidence",
+                "task_status",
+                "force: true",
+            ] {
+                assert!(error.contains(expected), "{error}");
+            }
+            assert_cancellation_left_active(&tasks.0[0]);
+        });
+    }
+
+    #[test]
+    fn task_cancel_mixed_batch_cancels_nothing_when_one_task_is_recent() {
+        with_cancellation_test_context(|| {
+            let tasks = register_pending_tasks();
+            cancellation_progress(&tasks.0[1], None);
+            let error =
+                execute_task_cancel(&json!({"task_ids": tasks.0, "force": false})).unwrap_err();
+            assert!(error.contains(&tasks.0[1]));
+            for task_id in &tasks.0 {
+                assert_cancellation_left_active(task_id);
+            }
+        });
+    }
+
+    #[test]
+    fn task_cancel_force_preserves_checkpoint_in_wait_report_and_evidence() {
+        with_cancellation_test_context(|| {
+            let tasks = register_pending_tasks();
+            let task_id = &tasks.0[0];
+            let checkpoint = "Candidate finding: cancellation must preserve collected evidence.";
+            cancellation_progress(task_id, Some(checkpoint));
+            let output = execute_task_cancel(&json!({
+                "task_ids": [task_id], "force": true, "reason": "work superseded"
+            }))
+            .unwrap();
+            assert!(output.contains("Cancelled 1 task(s)"));
+            let entry = with_task_entry(task_id, Clone::clone).unwrap();
+            assert!(entry.cancel_stream.load(Ordering::Acquire));
+            let raw = with_os_kernel(|os| {
+                assert!(!is_task_pending(os, entry.pid)?);
+                os.channel_peek(None, ChannelId(entry.result_channel_id))
+            })
+            .unwrap();
+            let IpcRecvResult::Message(raw) = raw else {
+                panic!("cancelled result must remain in its channel");
+            };
+            let terminal: Value = serde_json::from_str(&raw).unwrap();
+            let result: StoredTaskResult = serde_json::from_str(&raw).unwrap();
+            assert_eq!(terminal["status"], "cancelled");
+            assert_eq!(terminal["cancel_reason"], "work superseded");
+            assert!(terminal.get("error").is_none());
+            assert!(
+                result
+                    .partial_output
+                    .as_deref()
+                    .unwrap()
+                    .contains(checkpoint)
+            );
+            assert!(
+                result
+                    .partial_output
+                    .as_deref()
+                    .unwrap()
+                    .contains("Saved checkpoint excerpt")
+            );
+            assert_eq!(
+                result.partial_output.as_deref(),
+                Some(result.output.as_str())
+            );
+
+            let (wait, report) = capture_task_report("task_wait", || {
+                execute_task_wait(&json!({"task_ids": [task_id]}))
+            });
+            let wait = wait.unwrap();
+            assert!(wait.contains("Cancellation reason: work superseded"));
+            assert!(wait.contains("Partial output:"));
+            assert!(wait.contains(checkpoint));
+            assert!(!wait.contains("Failure reason:"));
+            let report = serde_json::to_value(report.unwrap()).unwrap();
+            assert_eq!(report["tasks"][0]["cancel_reason"], "work superseded");
+            assert!(report["tasks"][0].get("error").is_none());
+            assert_eq!(
+                report["tasks"][0]["partial_output"],
+                terminal["partial_output"]
+            );
+
+            let evidence: Value = serde_json::from_str(
+                &execute_task_evidence_read(
+                    &json!({"task_id": task_id, "source": "delivered", "view": "raw"}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(evidence["cancel_reason"], "work superseded");
+            assert_eq!(evidence["partial_output"], terminal["partial_output"]);
+            assert!(evidence.get("error").is_none());
+            let summary: Value = serde_json::from_str(
+                &execute_task_evidence_read(&json!({"task_id": task_id, "source": "delivered"}))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(summary["cancel_reason"], "work superseded");
+            assert!(summary.get("error").is_none());
+            let selected: Value = serde_json::from_str(
+                &execute_task_evidence_read(&json!({
+                    "task_id": task_id, "source": "delivered",
+                    "fields": ["cancel_reason", "partial_output"]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(selected["payload"]["cancel_reason"], "work superseded");
+            assert_eq!(
+                selected["payload"]["partial_output"],
+                terminal["partial_output"]
+            );
+        });
+    }
+
+    #[test]
+    fn task_cancel_allows_stale_progress_at_and_beyond_threshold() {
+        with_cancellation_test_context(|| {
+            let tasks = register_pending_tasks();
+            for (task_id, stale_ms) in tasks.0.iter().zip([60_000, 120_000]) {
+                let output =
+                    execute_task_cancel_with_progress(&json!({"task_ids": [task_id]}), |_| {
+                        Some(
+                            serde_json::from_value(json!({
+                                "phase": "working", "checkpoint_summary": null,
+                                "elapsed_ms": 376_000, "stale_for_ms": stale_ms,
+                                "checkpoint_due": true, "sequence": 142, "timeline": []
+                            }))
+                            .unwrap(),
+                        )
+                    })
+                    .unwrap();
+                assert!(output.contains("Cancelled 1 task(s)"));
+                let entry = with_task_entry(task_id, Clone::clone).unwrap();
+                assert!(entry.cancel_stream.load(Ordering::Acquire));
+                assert_eq!(
+                    with_os_kernel(|os| read_task_result(os, entry.result_channel_id, false))
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "cancelled"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn task_cancel_allows_missing_progress_without_fabricating_output() {
+        with_cancellation_test_context(|| {
+            let tasks = register_pending_tasks();
+            execute_task_cancel(&json!({"task_ids": [&tasks.0[0]]})).unwrap();
+            let entry = with_task_entry(&tasks.0[0], Clone::clone).unwrap();
+            let result = with_os_kernel(|os| read_task_result(os, entry.result_channel_id, false))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                result.cancel_reason.as_deref(),
+                Some("cancelled by parent agent")
+            );
+            assert!(result.error.is_none());
+            assert!(result.partial_output.is_none());
+            assert!(result.output.is_empty());
+        });
+    }
+
+    #[test]
+    fn task_cancel_force_preserves_latest_activity_in_task_status_report() {
+        with_cancellation_test_context(|| {
+            let tasks = register_pending_tasks();
+            let task_id = &tasks.0[0];
+            cancellation_progress(task_id, None);
+            execute_task_cancel(&json!({"task_ids": [task_id], "force": true})).unwrap();
+            let (status, report) = capture_task_report("task_status", || {
+                execute_task_status(&json!({"task_id": task_id}))
+            });
+            let status = status.unwrap();
+            assert!(status.contains("Cancellation reason: cancelled by parent agent"));
+            assert!(status.contains("Last recorded activity (partial progress):"));
+            assert!(status.contains("read_file cancellation evidence"));
+            assert!(!status.contains("Failure reason:"));
+            let report = report.unwrap();
+            assert_eq!(report.tasks.len(), 1);
+            assert_eq!(report.tasks[0].status, "cancelled");
+            assert!(report.tasks[0].error.is_none());
+            assert!(
+                report.tasks[0]
+                    .partial_output
+                    .as_deref()
+                    .unwrap()
+                    .contains("read_file")
+            );
+        });
+    }
+
+    #[test]
+    fn task_cancel_leaves_terminal_tasks_and_published_assistant_output_untouched() {
+        with_cancellation_test_context(|| {
+            let tasks = register_pending_tasks();
+            for task_id in &tasks.0 {
+                cancellation_progress(task_id, Some("unfinished checkpoint"));
+            }
+            let entry = with_task_entry(&tasks.0[0], Clone::clone).unwrap();
+            with_os_kernel(|os| {
+                os.channel_send(
+                    Some(entry.pid),
+                    ChannelId(entry.result_channel_id),
+                    json!({
+                        "status": "completed", "output": "exact final assistant text", "error": null
+                    })
+                    .to_string(),
+                )?;
+                let terminated = with_task_entry(&tasks.0[1], Clone::clone).unwrap();
+                os.kill_process(terminated.pid, "already terminated".into())?;
+                Ok(())
+            })
+            .unwrap();
+            let output = execute_task_cancel(
+                &json!({"task_ids": [&tasks.0[0], &tasks.0[1], "missing-task"]}),
+            )
+            .unwrap();
+            assert!(output.contains("2 task_id(s) were already finished"));
+            assert!(output.contains("missing-task"));
+            for task_id in &tasks.0 {
+                assert!(
+                    !with_task_entry(task_id, |entry| entry.cancel_stream.load(Ordering::Acquire))
+                        .unwrap()
+                );
+            }
+            let result = with_os_kernel(|os| read_task_result(os, entry.result_channel_id, false))
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.status, "completed");
+            assert_eq!(result.output, "exact final assistant text");
+            assert!(result.cancel_reason.is_none());
+        });
+    }
+
+    #[test]
+    fn task_cancel_rechecks_results_published_after_preflight() {
+        with_cancellation_test_context(|| {
+            let tasks = register_pending_tasks();
+            let task_id = &tasks.0[0];
+            let entry = with_task_entry(task_id, Clone::clone).unwrap();
+            let output = execute_task_cancel_with_progress(&json!({"task_ids": [task_id]}), |_| {
+                with_os_kernel(|os| {
+                    os.channel_send(Some(entry.pid), ChannelId(entry.result_channel_id), json!({
+                        "status": "completed", "output": "won the publication race", "error": null
+                    }).to_string())
+                })
+                .unwrap();
+                None
+            })
+            .unwrap();
+            assert!(output.contains("already finished"));
+            assert!(!entry.cancel_stream.load(Ordering::Acquire));
+            assert_eq!(
+                with_os_kernel(|os| read_task_result(os, entry.result_channel_id, false))
+                    .unwrap()
+                    .unwrap()
+                    .output,
+                "won the publication race"
+            );
+        });
+    }
+
+    #[test]
+    fn task_cancel_requires_a_boolean_force_and_advertises_default_false() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../tool_descriptions/task_cancel.json")).unwrap();
+        assert_eq!(
+            schema["parameters"]["properties"]["force"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            schema["parameters"]["properties"]["force"]["default"],
+            false
+        );
+        with_cancellation_test_context(|| {
+            let tasks = register_pending_tasks();
+            assert_eq!(
+                execute_task_cancel(&json!({"task_ids": tasks.0, "force": "true"})).unwrap_err(),
+                "'force' must be a boolean"
+            );
+            for task_id in &tasks.0 {
+                assert_cancellation_left_active(task_id);
+            }
+        });
     }
 
     #[test]

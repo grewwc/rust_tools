@@ -785,10 +785,10 @@ fn finalize_stream_response(
         // completed stream without any usage block means the provider dropped
         // the accounting data: surface the gap instead of silently skipping
         // kernel charging (token stats would be missing with no trace).
-        crate::ai::request::emit_request_diagnostic(format_args!(
-            "[Warning] 流式响应结束但未收到 usage (model={})：本次调用未计入 token 统计，/usage 将缺失此调用",
-            app.current_model
-        ));
+        // crate::ai::request::emit_request_diagnostic(format_args!(
+        //     "[Warning] 流式响应结束但未收到 usage (model={})：本次调用未计入 token 统计，/usage 将缺失此调用",
+        //     app.current_model
+        // ));
     }
     let (mut tool_calls, dropped_malformed) =
         collect_valid_tool_calls(&mut state.content.tool_calls_map);

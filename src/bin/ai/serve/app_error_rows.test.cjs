@@ -412,6 +412,20 @@ test("ending recovery removes the warning without removing canonical rows", asyn
   assert.deepEqual(h.root.children, content);
 });
 
+test("request_error dispatches a non-terminal diagnostic detail", () => {
+  const h = harness();
+  const rows = [];
+  const view = { requestError(text) { rows.push(text); } };
+  h.context.dispatchExecutionEvent(
+    "request_error",
+    JSON.stringify({ error: "request failed: 502 Bad Gateway" }),
+    view,
+    "replay",
+  );
+  h.context.dispatchExecutionEvent("request_error", "not json", view, "replay");
+  assert.deepEqual(rows, ["request failed: 502 Bad Gateway"]);
+});
+
 for (const rendered of [false, true]) test(`history recovery ${rendered ? "preserves" : "replaces"} the live error (history already rendered=${rendered})`, async () => {
   const h = harness();
   if (rendered) await h.recoverHistory();

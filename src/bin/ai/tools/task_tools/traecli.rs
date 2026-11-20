@@ -1088,13 +1088,13 @@ fn traecli_event_progress(
         "item.completed" | "item.failed" => {
             active_items.complete(value);
             (
-                active_items.phase().unwrap_or("processing output"),
+                active_items.phase().unwrap_or("awaiting backend event"),
                 if kind == "item.failed" {
                     item.map(|item| format!("failed: {}", traecli_item_activity(item)))
                         .unwrap_or_else(|| "item failed".to_string())
                 } else {
                     item.map(traecli_item_completion)
-                        .unwrap_or_else(|| "processing output".to_string())
+                        .unwrap_or_else(|| "awaiting backend event".to_string())
                 },
             )
         }
@@ -1186,7 +1186,7 @@ fn traecli_item_completion(item: &Value) -> String {
         }
         "agent_message" => "response ready".to_string(),
         "reasoning" => "reasoning complete".to_string(),
-        _ => "processing output".to_string(),
+        _ => "awaiting backend event".to_string(),
     }
 }
 
@@ -2620,7 +2620,7 @@ exit {exit_code}"#,
             record_traecli_event(&spec, &event.to_string(), &mut stdout, &mut active_items);
             let snapshot =
                 crate::ai::driver::runtime_ctx::subagent_progress_state_snapshot(&slot).unwrap();
-            assert_eq!(snapshot.phase, "processing output");
+            assert_eq!(snapshot.phase, "awaiting backend event");
             let progress = snapshot.display();
             assert!(
                 progress.starts_with(&format!("completed: rg -n foo src · exit {exit_code}")),
@@ -2654,7 +2654,7 @@ exit {exit_code}"#,
                     let mut active_items = TraeCliActiveItems::default();
                     for (kind, identified, expected) in [
                         ("item.started", start_identified, "running command"),
-                        (terminal_kind, !start_identified, "processing output"),
+                        (terminal_kind, !start_identified, "awaiting backend event"),
                     ] {
                         let mut event = serde_json::json!({
                             "type": kind,
@@ -2700,7 +2700,7 @@ exit {exit_code}"#,
                     ("item.started", "A", "sleep 1", "running command"),
                     ("item.started", "B", "sleep 2", "running command"),
                     (terminal_kind, "A", "sleep 1", "running command"),
-                    (terminal_kind, "B", "sleep 2", "processing output"),
+                    (terminal_kind, "B", "sleep 2", "awaiting backend event"),
                 ] {
                     let mut event = serde_json::json!({
                         "type": kind,

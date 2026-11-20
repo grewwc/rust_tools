@@ -876,11 +876,6 @@ select, summary { touch-action:manipulation; }
 .msg.user > .message-actions, #sidequeuelist .message-actions { display:flex; justify-content:flex-end; align-items:center; gap:8px; margin-top:8px; }
 .message-actions > .message-time { margin-right:auto; }
 .answer-actions > .message-time { margin-right:auto; }
-/* Throughput is a footer inside an assistant card. Phones use their existing
-   status card while running, then keep this footer with the completed turn. */
-.turn-rate { flex:0 0 auto; max-width:100%; margin-top:8px; color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums; white-space:normal; overflow-wrap:anywhere; }
-/* A rate with no answer card is a footer strip, not another message bubble. */
-.msg.asst.rate-card { padding:0 12px; background:none; border:0; box-shadow:none; }
 .msg.md .answer-copy { position:relative; flex:0 0 auto; min-width:52px; min-height:32px; padding:4px 10px; border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--dim); font-size:12px; touch-action:manipulation; }
 /* The box stays small; the touch area still reaches the 44px target. */
 .msg.md .answer-copy::after { content:""; position:absolute; inset:-6px; }
@@ -5640,7 +5635,9 @@ function projectTaskReport(value, includeOutput = true) {
       task.model ? "(" + text(task.model) + ")" : "", task.reasoning_effort ? "(effort: " + text(task.reasoning_effort) + ")" : ""]
       .filter(Boolean).join(" ");
     const status = text(task.status), timing = elapsed === null ? "" : " " + formatSubagentElapsed(Math.floor(elapsed / 1000));
-    const taskState = task.error || ["failed", "error"].includes(status) ? "failed" : task.active ? "running"
+    const cancelled = ["cancelled", "canceled"].includes(status);
+    const taskState = cancelled ? "cancelled"
+      : task.error || ["failed", "error", "timeout"].includes(status) ? "failed" : task.active ? "running"
       : ["completed", "done"].includes(status) ? "done" : "neutral";
     add("description", text(task.description) || "Task", id);
     add("status", status + timing, id, (status === "completed" ? "done" : status) + timing);
@@ -5666,7 +5663,10 @@ function projectTaskReport(value, includeOutput = true) {
     for (const row of rows.slice(progressStart)) if (row.preview === undefined) {
       row.preview = task.active && row.kind === "meta" ? row.text : null;
     }
-    if (text(task.error)) add("error", "Failure reason: " + task.error, id);
+    if (cancelled) {
+      const reason = text(task.cancel_reason) || text(task.error);
+      if (reason) add("cancel-reason", "Cancellation reason: " + reason, id);
+    } else if (text(task.error)) add("error", "Failure reason: " + task.error, id);
     if (text(task.selection_explanation)) add("meta", task.selection_explanation, id);
     if (text(task.inherit)) add("meta", "inherit: " + task.inherit, id);
     if (includeOutput && typeof task.output === "string") add("output-body", task.output, id);
@@ -5682,6 +5682,9 @@ function projectTaskReport(value, includeOutput = true) {
   }
   if (text(report.error)) add("error", report.error);
   return { rows, taskStates, busy: active > 0, resetTasks: report.snapshot === true };
+}
+function taskResultHasException(result) {
+  return result?.rows.some((row) => row.kind === "error" || row.taskState === "failed") === true;
 }
 // A live card paints from the last snapshot it received. The turn publishes a
 // frame as each progress event lands, so silence this long means the subagent
@@ -5905,7 +5908,7 @@ function bindStoredFold(det, key) {
 loadFoldOpenState();
 
 // Live rates are display-only and never persisted in canonical messages.
-// Keep the last value per reasoning/answer text so a reload can still show it.
+// Keep the last value per reasoning/answer text across reloads.
 const RATE_STORAGE = "serve.rates";
 // The rate cache keys the exact canonical body. It never derives state from
 // text markers, because those markers belong to independent display features.
@@ -6020,61 +6023,8 @@ function createOutputRateCounter() {
   };
 }
 function statusRateText(text) {
-  // Throughput belongs to the thinking/output rows, not the Processing strip.
+  // The Processing strip keeps only the phase and elapsed time.
   return "";
-}
-function createTurnRateLine(parent, before) {
-  let line = null, card = null;
-  return (text) => {
-    text = displayRateText(text);
-    if (!text) {
-      if (line) line.remove();
-      if (card) card.remove();
-      return;
-    }
-    // A turn-level output rate belongs only to a visible answer. The streaming
-    // answer is a plain `.msg.asst` until markdown replaces it, while thinking,
-    // tool and subagent folds all carry a <details>; exclude those so the rate
-    // never mounts as a separate card under a fold.
-    let host = Array.from(parent.children).reverse().find((child) =>
-      child !== before && !child.hidden && child.classList.contains("asst") &&
-      !child.classList.contains("rate-card") && !child.classList.contains("pending") &&
-      !child.classList.contains("err") &&
-      (child.classList.contains("md") || !child.querySelector("details")));
-    if (!host) {
-      // A rate card under a fold duplicates that fold's own progress and looks
-      // like a separate message; keep it out of the transcript there. The card
-      // remains for a turn that has no visible answer or fold yet.
-      const last = Array.from(parent.children).reverse().find((child) =>
-        child !== before && child !== card && !child.hidden && child.classList.contains("asst"));
-      const summary = last && (last.summary ||
-        (typeof last.querySelector === "function" ? last.querySelector("summary") : null));
-      if (summary) {
-        if (line) line.remove();
-        if (card) card.remove();
-        return;
-      }
-      if (!card) {
-        card = document.createElement("div");
-        card.className = "msg asst rate-card";
-      }
-      parent.insertBefore(card, before && before.parentNode === parent ? before : null);
-      host = card;
-    } else if (card) {
-      card.remove();
-    }
-    if (!line) {
-      line = document.createElement("div");
-      line.className = "turn-rate";
-      line.dataset.turnRate = "1";
-    }
-    const actions = host.querySelector(".answer-actions");
-    if (line.parentNode !== host || (actions ? line.nextElementSibling !== actions : host.lastElementChild !== line)) {
-      host.insertBefore(line, actions || null);
-    }
-    line.hidden = false;
-    line.textContent = "↳ speed · " + text;
-  };
 }
 function rememberRate(kind, sid, text, rate, phaseKey = "", authoritative = false) {
   rate = displayRateText(rate);
@@ -6341,17 +6291,14 @@ function executionGroupsFor(parent, stored = false) {
     }
     // The most recent progress stays outside, even after it finishes. A new
     // execution item or answer advances the boundary; status paint does not.
-    // A trailing rate line is metadata, not the newest record: the run boundary
-    // must still be the latest real card, or a fresh record could be swallowed.
-    const rates = (node) => node.dataset?.turnRate !== undefined;
     let progressBefore = null;
     if (latestProgress && units.includes(latestProgress)) {
       units.splice(units.indexOf(latestProgress), 1);
-      const last = units.findLastIndex((node) => !node.hidden && !node.classList.contains("pending") && !rates(node));
+      const last = units.findLastIndex((node) => !node.hidden && !node.classList.contains("pending"));
       progressBefore = units[last + 1] || null;
       units.splice(last + 1, 0, latestProgress);
     } else latestProgress = null;
-    const latest = units.findLast((node) => !node.hidden && !node.classList.contains("pending") && !rates(node));
+    const latest = units.findLast((node) => !node.hidden && !node.classList.contains("pending"));
     // Expanded completed cards wait for a collapse before joining a group.
     // Fresh active progress has its explicit display position above.
     const expanded = (node) => {
@@ -6416,9 +6363,6 @@ function executionGroupsFor(parent, stored = false) {
     const used = new Map();
     let fold = null;
     for (const node of units) {
-      // Per-message rate text sits between records; it neither joins a group nor
-      // breaks one. Without this a stored turn's trailing rate ends every run.
-      if (rates(node)) continue;
       if (!folding.has(node)) { fold = null; continue; }
       if (!fold) {
         const inner = node.querySelector("details");
@@ -6549,9 +6493,9 @@ function createSubagentClock(fold, owner) {
     if (title !== lastTitle || rawText !== lastRawText) {
       fold.set(title, rawText); lastTitle = title; lastRawText = rawText;
     }
-    renderTaskToolResult(fold, projectTaskReport(value));
-    fold.box.dataset.executionException = fold.box._executionException = String(Boolean(value?.error)
-      || Boolean(value?.tasks.some((task) => task.error)));
+    const result = projectTaskReport(value);
+    renderTaskToolResult(fold, result);
+    fold.box.dataset.executionException = fold.box._executionException = String(taskResultHasException(result));
   };
   const clock = {
     box: fold.box,
@@ -6677,13 +6621,11 @@ function createLiveActivity(parent, before, sid = sessionId, base = executionBas
   const renderTool = (tool) => {
     const call = { function: { name: tool.name, arguments: tool.arguments || "{}" } };
     const icon = tool.running ? "◌ " : tool.ok === false ? "! " : tool.ok === true ? "✓ " : "• ";
-    const taskReport = taskReportOf(tool.task_report);
     const taskResult = projectTaskReport(tool.task_report, false);
     const title = icon + callLabel(call) + (taskResult ? " · raw" : "") + (tool.cached ? " · cached" : "");
     tool.fold.box.dataset.running = tool.fold.box._executionRunning = String(tool.running);
     tool.fold.box.dataset.executionState = tool.fold.box._executionState = tool.running ? "running" : "completed";
-    tool.fold.box.dataset.executionException = tool.fold.box._executionException = String(tool.ok === false || Boolean(taskReport?.error)
-      || Boolean(taskReport?.tasks.some((task) => task.error)));
+    tool.fold.box.dataset.executionException = tool.fold.box._executionException = String(tool.ok === false || taskResultHasException(taskResult));
     const args = tool.arguments ? "Arguments\n" + tool.arguments + (tool.arguments_truncated ? "\n[preview truncated]" : "") + "\n\n" : "";
     tool.fold.set(title, args + (tool.output || "")
       + (tool.output_truncated ? "\n[preview truncated; full output in history]" : ""));
@@ -10688,6 +10630,7 @@ function historyRowsOf(msgs, histTotal, showAll) {
       message.tool_call_id ? calls.get(message.tool_call_id) : null,
     ];
     if (message.task_report) identity.push(message.task_report);
+    if (typeof message.request_error === "string") identity.push(message.request_error);
     if (Array.isArray(message.content)) identity.push(message.content.filter((part) => part?.type === "reference" && part.kind === "message"));
     if (Number.isSafeInteger(message.message_id)) identity.push(message.message_id);
     rows.push({
@@ -10766,8 +10709,8 @@ function renderHistoryRow(row, parent) {
     user(snapshot) { addUserBubble(snapshot.text, snapshot.historyIndex, parent, snapshot.message); },
     assistant(snapshot) {
       const m = snapshot.message;
-      // Reconciliation counts canonical messages. Keep the reasoning, answer and
-      // rate in one row so a later refresh cannot trim the rate as an extra row.
+      // Reconciliation counts canonical messages. Keep the reasoning and answer
+      // together in one row across refreshes.
       const group = document.createElement("div");
       group.className = "turn";
       // A persisted assistant message without tool calls is the terminal answer
@@ -10778,9 +10721,8 @@ function renderHistoryRow(row, parent) {
       if (!Array.isArray(m.tool_calls) || m.tool_calls.length === 0) observe(group, "answer",
         { taskStates: [], busy: null, resetTasks: true });
       const rateSession = sessionId;
-      const showTurnRate = createTurnRateLine(group);
       const thinkingCount = snapshot.reasoning ? "~" + estimateTextTokens(snapshot.reasoning) + " tok" : "";
-      return { group, rateSession, showTurnRate, thinkingCount, thinkingSummary: null };
+      return { group, rateSession, thinkingCount, thinkingSummary: null };
     },
     thinking(snapshot, turn) {
       const fold = addFold("thinking", snapshot.reasoning, turn.group);
@@ -10790,9 +10732,13 @@ function renderHistoryRow(row, parent) {
       if (det && typeof bindStoredFold === "function") bindStoredFold(det, sessionId + "\n" + foldIdentity + ":thinking");
       return summary;
     },
-    answer(snapshot, turn) { addMsgMd(snapshot.text, turn.group, textOf(snapshot.message.content), snapshot.message); },
+    answer(snapshot, turn) {
+      const detail = snapshot.message.request_error;
+      if (typeof detail === "string" && detail) addMsg("err", detail, "asst err request-error", turn.group);
+      addMsgMd(snapshot.text, turn.group, textOf(snapshot.message.content), snapshot.message);
+    },
     rates(snapshot, turn) {
-      const { group, rateSession, showTurnRate, thinkingCount, thinkingSummary } = turn;
+      const { group, rateSession, thinkingCount, thinkingSummary } = turn;
       // Replay may fill the rate cache after this canonical row was mounted.
       // Refresh its metadata without rebuilding answer bodies or open folds.
       group._aserveRefreshRates = () => {
@@ -10800,8 +10746,6 @@ function renderHistoryRow(row, parent) {
           const rate = (typeof storedRate === "function" ? storedRate("thinking", rateSession, snapshot.reasoning) : "") || thinkingCount;
           thinkingSummary.textContent = "thinking · " + rate;
         }
-        const rate = typeof storedRate === "function" ? storedRate("turn", rateSession, snapshot.text) || storedRate("turn", rateSession, snapshot.reasoning) : "";
-        showTurnRate(rate);
       };
       group._aserveRefreshRates();
     },
@@ -10824,8 +10768,7 @@ function renderHistoryRow(row, parent) {
         executionBoxes.push(fold.box);
         fold.box.dataset.executionState = fold.box._executionState = "completed";
         fold.box.dataset.executionSettled = fold.box._executionSettled = String(snapshot.executionSettled === true);
-        const taskReport = taskReportOf(m.task_report);
-        fold.box.dataset.executionException = fold.box._executionException = String(Boolean(taskReport?.error) || Boolean(taskReport?.tasks.some((task) => task.error)));
+        fold.box.dataset.executionException = fold.box._executionException = String(taskResultHasException(taskResult));
       }
       return { container, fold };
     },
@@ -10859,14 +10802,13 @@ function renderHistoryRow(row, parent) {
       subagents.box.dataset.subagents = "true";
       subagents.box.dataset.executionState = subagents.box._executionState = "completed";
       subagents.box.dataset.executionSettled = subagents.box._executionSettled = String(snapshot.executionSettled === true);
-      subagents.box.dataset.executionException = subagents.box._executionException = String(Boolean(snapshot.subagentReport.error) || Boolean(snapshot.subagentReport.tasks.some((task) => task.error)));
+      subagents.box.dataset.executionException = subagents.box._executionException = String(taskResultHasException(summary));
       renderTaskToolResult(subagents, summary);
       return subagents;
     },
   };
   dispatchExecutionSnapshot(row, historyView, "history");
-  const last = parent?.lastElementChild;
-  const node = last && last.dataset && last.dataset.turnRate ? last.previousElementSibling : last;
+  const node = parent?.lastElementChild;
   if (node?.dataset) {
     const data = node.dataset;
     data.canonicalIndex = String(row.historyIndex);
@@ -11877,7 +11819,6 @@ function recoveredProgressView(sid = sessionId) {
   const answerBubbles = [bubble];
   const outputRate = createOutputRateCounter();
   const thinkingRates = createThinkingRateRecorder(sid, () => paintPhase());
-  const showTurnRate = createTurnRateLine(box, phaseBubble);
   const clockStart = Date.now();
   let think = null;
   let thinking = "";
@@ -11943,7 +11884,6 @@ function recoveredProgressView(sid = sessionId) {
     const counts = statusRateText((isPhoneLayout() && think && thinkRate ? "reasoning " + thinkRate : rate)
       || (outputRate.counts() ? "output " + outputRate.counts() : ""));
     phaseBubble.textContent = activity.label() + (counts ? " · " + counts : "") + " · " + formatElapsed(Date.now() - clockStart);
-    showTurnRate(rate || lastOutputRate);
   };
   const paintAnswer = (timeSource = null) => {
     if (answer && !tokenRate && !lastOutputRate) {
@@ -12023,6 +11963,11 @@ function recoveredProgressView(sid = sessionId) {
       paintPhase();
     },
     subagents(payload, decoded) { sealAnswerSegment(); activity.subagents(payload, decoded); },
+    requestError(text) {
+      if (box.querySelector(".live-request-error")) return;
+      const row = addMsg("err", text, "asst err live-request-error", box);
+      box.insertBefore(row, phaseBubble);
+    },
     phase(text, waiting) { activity.setPhase(text, waiting); paintPhase(); },
     finish(reason = "ended", source = null) {
       if (bubble && source) bubble._messageTimeSource = { ...source, source_session_id: sid };
@@ -12045,7 +11990,6 @@ function recoveredProgressView(sid = sessionId) {
         if (answer.trim()) last.dataset.taskReset = "true";
       }
       phaseBubble.remove();
-      showTurnRate(rate);
     },
     remove() { closed = true; clearInterval(phaseTimer); endThinking(); activity.remove?.(); removeDisplayedNode(box); },
   };
@@ -12144,6 +12088,12 @@ const EXECUTION_EVENT_HANDLERS = Object.freeze({
   },
   compression_done(event, view) {
     view.phase("Processing…");
+  },
+  request_error(event, view) {
+    withParsedExecutionEvent(event, (value) => {
+      const text = value.error || "";
+      if (text) view.requestError(text);
+    });
   },
   delta(event, view, policy) { dispatchAnswerEvent(event, view, policy, "delta", "delta"); },
   replace(event, view, policy) { dispatchAnswerEvent(event, view, policy, "text", "replace"); },
@@ -13261,16 +13211,12 @@ async function send() {
       || (outputRate.counts() ? "output " + outputRate.counts() : ""));
     return "◌ " + activity.label() + (rate ? " · " + rate : "") + " · " + formatElapsed(Date.now() - clockStart);
   };
-  // Phones show live rates in the phase card; desktop and completed turns use
-  // the last assistant card's footer instead of adding a bare transcript row.
-  const showTurnRate = createTurnRateLine(box, phaseBubble);
   const phaseTimer = setInterval(() => {
     // The box is parked while the user reads another session; keep the clock
     // live through that detach so it is current when attachLiveBox restores it.
     if (executionState(sid, sendBase).liveEntry !== liveEntry) { clearInterval(phaseTimer); return; }
     refreshThinkingRate();
     phaseBubble.textContent = phaseLine();
-    showTurnRate(mainRate());
   }, 1000);
   let activityDirty = true;
   const setPhase = (label, waiting = false) => {
@@ -13354,9 +13300,6 @@ async function send() {
         bubble.parentNode._executionGroups.sync();
       }
     }
-    // Streaming markdown replaces the answer body. Attach throughput after
-    // that write so its footer survives each paint.
-    showTurnRate(mainRate());
     if (sid === sessionId) followOutput(follow);
   };
   const schedulePaint = () => { if (paintTimer === null) paintTimer = setTimeout(paint, replyPaintDelay(raw.length)); };
@@ -13473,7 +13416,6 @@ async function send() {
     bubble.textContent = msg;
     bubble.dataset.taskReset = "true";
     if (lastOutputRate) {
-      showTurnRate(lastOutputRate);
       const identity = raw.trim() ? raw : sealedAnswerText || lastThinkingText;
       if (identity) rememberRate("turn", sid, identity, lastOutputRate);
     }
@@ -13561,6 +13503,14 @@ async function send() {
       // parked; replay's activity belongs to its selected recovery view.
       mutateTranscript(() => activity.subagents(payload, decoded));
       activityDirty = true;
+      schedulePaint();
+    },
+    requestError(text) {
+      if (box.querySelector(".live-request-error")) return;
+      mutateTranscript(() => {
+        const row = addMsg("err", text, "asst err live-request-error", box);
+        box.insertBefore(row, phaseBubble);
+      });
       schedulePaint();
     },
   };
@@ -13669,7 +13619,7 @@ async function send() {
           const finalRate = tokenRate || (finalLiveRate ? "output " + finalLiveRate : "") || lastOutputRate;
           tokenRate = finalRate;
           preserveAnswerRate(finalRate);
-          mutateTranscript(() => { phaseBubble.remove(); showTurnRate(finalRate); });
+          mutateTranscript(() => { phaseBubble.remove(); });
           if (!answerDirty && bubble) mutateTranscript(() => {
             bubble.classList.remove("pending");
             if (!raw) bubble.textContent = "";
@@ -13699,7 +13649,6 @@ async function send() {
       addAnswerCopy(bubble, raw);
       if (bubble._messageTimeSource) setMessageTimestamp(bubble, bubble._messageTimeSource);
     }
-    if (finished) showTurnRate(mainRate());
     if (!finished && !turnError) {
       // Only the session on screen can be followed from history here; a stalled
       // turn in a session the user has left is retired, and its reply is what

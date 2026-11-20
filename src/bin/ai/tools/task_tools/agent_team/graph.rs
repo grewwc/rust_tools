@@ -1786,6 +1786,7 @@ fn cancel_graph(graph: &mut AgentGraphCheckpoint) -> Result<(), String> {
         execute_task_cancel(&json!({
             "task_ids": task_ids,
             "reason": format!("agent graph {} cancelled", graph.graph_id),
+            "force": true,
         }))?;
         match &mut graph.run {
             GraphRun::Static(run) => {
@@ -1842,6 +1843,7 @@ fn active_graph_task_ids(graph: &AgentGraphCheckpoint) -> Vec<String> {
 }
 
 /// Cancel runtime tasks left in flight by budget exhaustion or spawn failure.
+/// The graph has already failed, so its abandoned work bypasses the recent-progress guard.
 /// Cancellation uses the shared task protocol and clears references even on failure;
 /// session teardown remains responsible for any surviving process groups.
 fn cancel_active_runtime_tasks(graph: &mut AgentGraphCheckpoint, reason: &str) {
@@ -1850,6 +1852,7 @@ fn cancel_active_runtime_tasks(graph: &mut AgentGraphCheckpoint, reason: &str) {
         let _ = execute_task_cancel(&json!({
             "task_ids": task_ids,
             "reason": format!("{reason}: {}", graph.graph_id),
+            "force": true,
         }));
     }
     match &mut graph.run {
@@ -2391,6 +2394,115 @@ mod tests {
 
     fn status_options(summary: bool, since: Option<u64>) -> StatusViewOptions {
         StatusViewOptions { summary, since }
+    }
+
+    fn assert_graph_cancellation_bypasses_recent_progress(explicit_cancel: bool) {
+        use crate::ai::driver::runtime_ctx;
+        use crate::ai::tools::task_tools::{
+            AsyncTaskEntry, TASK_PROGRESS_REGISTRY, execute_task_wait, insert_task_entry_for_test,
+            lock_unpoisoned, remove_task_entry, with_os_kernel, with_task_entry,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        super::super::tests::with_status_test_context(|| {
+            let mut graph = status_test_graph(false);
+            (graph.session_id, graph.owner_pid) = active_identity().unwrap();
+            graph.lifecycle = if explicit_cancel {
+                GraphLifecycle::Running
+            } else {
+                GraphLifecycle::Failed
+            };
+            let task_id = format!("graph-cleanup-{}", Uuid::new_v4().simple());
+            let (pid, channel, futex) = with_os_kernel(|os| {
+                let pid = os.spawn(
+                    Some(graph.owner_pid),
+                    "worker".into(),
+                    "abandoned work".into(),
+                    20,
+                    4,
+                    None,
+                    None,
+                )?;
+                let channel = os.channel_create(Some(graph.owner_pid), 1, "cleanup-result".into());
+                let futex = os.futex_create(0, "cleanup-complete".into());
+                Ok((pid, channel.raw(), futex))
+            })
+            .unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            insert_task_entry_for_test(
+                task_id.clone(),
+                AsyncTaskEntry {
+                    session_id: graph.session_id.clone(),
+                    evidence_history_file: None,
+                    owner_pid: graph.owner_pid,
+                    pid,
+                    result_channel_id: channel,
+                    completion_futex_addr: futex,
+                    description: "abandoned graph work".into(),
+                    agent_name: "worker".into(),
+                    backend: None,
+                    model: "test-model".into(),
+                    is_model_auto_selected: false,
+                    auto_model_fallback: None,
+                    selection_explanation: "cleanup test".into(),
+                    inherit: InheritOptions::default(),
+                    abort_handle: None,
+                    cancel_stream: cancelled.clone(),
+                    started_at: Instant::now(),
+                    last_progress_notification_at: None,
+                    last_progress_persisted_at: None,
+                },
+            );
+            let slot = runtime_ctx::new_subagent_progress_slot();
+            runtime_ctx::publish_subagent_activity_to_slot(&slot, "working", "recent graph work");
+            lock_unpoisoned(&TASK_PROGRESS_REGISTRY).insert(task_id.clone(), slot);
+            let GraphRun::Static(run) = &mut graph.run else {
+                unreachable!()
+            };
+            let node = run.nodes.get_mut("z").unwrap();
+            node.status = NodeStatus::Running;
+            node.runtime_task_id = Some(task_id.clone());
+            assert!(execute_task_cancel(&json!({"task_ids": [&task_id]})).is_err());
+
+            if explicit_cancel {
+                cancel_graph(&mut graph).unwrap();
+                assert_eq!(graph.lifecycle, GraphLifecycle::Cancelled);
+            } else {
+                cancel_active_runtime_tasks(&mut graph, "agent graph failed");
+            }
+
+            assert!(cancelled.load(Ordering::Acquire));
+            assert!(with_task_entry(&task_id, |_| ()).is_some());
+            let GraphRun::Static(run) = &graph.run else {
+                unreachable!()
+            };
+            assert!(run.nodes["z"].runtime_task_id.is_none());
+            let output = execute_task_wait(&json!({"task_ids": [&task_id]})).unwrap();
+            if explicit_cancel {
+                assert!(output.contains(&format!(
+                    "Cancellation reason: agent graph {} cancelled",
+                    graph.graph_id
+                )));
+            } else {
+                assert!(output.contains("Cancellation reason: agent graph failed"));
+            }
+            assert!(output.contains("recent graph work"));
+            assert!(!output.contains("Failure reason:"));
+            remove_task_entry(&task_id);
+            lock_unpoisoned(&TASK_PROGRESS_REGISTRY).remove(&task_id);
+        });
+    }
+
+    #[test]
+    fn task_cancel_graph_failure_cleanup_cancels_abandoned_recent_work() {
+        assert_graph_cancellation_bypasses_recent_progress(false);
+    }
+
+    #[test]
+    fn task_cancel_explicit_graph_succeeds_with_recent_progress() {
+        assert_graph_cancellation_bypasses_recent_progress(true);
     }
 
     #[test]

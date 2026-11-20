@@ -344,8 +344,8 @@ pub(in crate::ai) use types::{
     clear_runtime_message_metadata, has_runtime_message_metadata, is_code_inspection_memory_text,
     is_retired_change_set_metadata, is_runtime_synthetic_user_message, is_side_note_message,
     is_user_input_message, last_real_user_index, prepend_request_reminder,
-    redact_inline_image_data, request_reminder, runtime_synthetic_user_message,
-    user_input_turn_count,
+    redact_inline_image_data, request_error_detail, request_error_message, request_reminder,
+    runtime_synthetic_user_message, user_input_turn_count,
 };
 
 pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;

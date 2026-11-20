@@ -538,5 +538,12 @@ pub(super) fn serve_history_message(
             .expect("serialized message is an object")
             .remove("reasoning_content");
     }
+    if let Some(detail) = crate::ai::history::request_error_detail(message) {
+        value["request_error"] = serde_json::json!(detail);
+        value
+            .as_object_mut()
+            .expect("serialized message is an object")
+            .remove("reasoning_content");
+    }
     Ok(value)
 }

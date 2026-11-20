@@ -859,7 +859,7 @@ fn setup_live_fifo(_session_id: &str) -> Option<LiveFifo> {
 /// 13 = committed body, 14/15/16 = chunked committed body start/chunk/end,
 /// 17 = server-computed live thinking rate, 18/19 = model-backed history
 /// compression start/done, 23 = terminal-independent throughput metric,
-/// 24 = reasoning text with phase and byte offset).
+/// 24 = reasoning text with phase and byte offset, 25 = request error detail).
 #[derive(Debug, PartialEq, Eq)]
 #[cfg(feature = "serve")]
 enum ServeLiveEvent {
@@ -889,6 +889,8 @@ enum ServeLiveEvent {
     TokenRate(background::ServeTokenRate),
     CompressionStart,
     CompressionDone,
+    /// Diagnostic text for a model request that ended the turn's round.
+    RequestError(String),
 }
 
 /// Incremental parser for serve-live frames (`[kind: u8][len: u32 BE][payload]`):
@@ -933,6 +935,7 @@ struct PendingServeJson {
 enum ServeJsonKind {
     Tool,
     SubagentProgress,
+    RequestError,
 }
 
 #[cfg(feature = "serve")]
@@ -1032,6 +1035,7 @@ impl ServeFrameDecoder {
         Some(match pending.kind {
             ServeJsonKind::Tool => ServeLiveEvent::Tool(pending.text),
             ServeJsonKind::SubagentProgress => ServeLiveEvent::SubagentProgress(pending.text),
+            ServeJsonKind::RequestError => ServeLiveEvent::RequestError(pending.text),
         })
     }
 
@@ -1053,6 +1057,7 @@ impl ServeFrameDecoder {
         let kind = match kind {
             "tool" => ServeJsonKind::Tool,
             "subagent_progress" => ServeJsonKind::SubagentProgress,
+            "request_error" => ServeJsonKind::RequestError,
             _ => return,
         };
         self.pending_json = Some(PendingServeJson {
@@ -1106,7 +1111,8 @@ impl ServeFrameDecoder {
                 || kind == background::ServeLiveKind::ReplaceEnd as u8
                 || kind == background::ServeLiveKind::Tool as u8
                 || kind == background::ServeLiveKind::CompressionStart as u8
-                || kind == background::ServeLiveKind::CompressionDone as u8;
+                || kind == background::ServeLiveKind::CompressionDone as u8
+                || kind == background::ServeLiveKind::RequestError as u8;
             let known = known
                 || kind == background::ServeLiveKind::JsonStart as u8
                 || kind == background::ServeLiveKind::JsonChunk as u8
@@ -1260,6 +1266,9 @@ impl ServeFrameDecoder {
                 k if k == background::ServeLiveKind::Tool as u8 => {
                     Some(ServeLiveEvent::Tool(payload))
                 }
+                k if k == background::ServeLiveKind::RequestError as u8 => {
+                    Some(ServeLiveEvent::RequestError(payload))
+                }
                 k if k == background::ServeLiveKind::CompressionStart as u8 => {
                     Some(ServeLiveEvent::CompressionStart)
                 }
@@ -1369,6 +1378,10 @@ fn live_event(event: ServeLiveEvent) -> Option<ServeSse> {
         }
         ServeLiveEvent::CompressionStart => Some(ServeSse::new("compression_start", "")),
         ServeLiveEvent::CompressionDone => Some(ServeSse::new("compression_done", "")),
+        ServeLiveEvent::RequestError(detail) => Some(ServeSse::new(
+            "request_error",
+            serde_json::json!({"error": detail}).to_string(),
+        )),
         ServeLiveEvent::OutputComplete => None,
     }
 }

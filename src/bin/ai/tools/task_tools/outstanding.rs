@@ -266,7 +266,12 @@ pub(crate) fn outstanding_task_anchor_prefix() -> &'static str {
 pub(crate) struct StoredTaskResult {
     pub(crate) status: String,
     pub(crate) output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cancel_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) partial_output: Option<String>,
     #[serde(default)]
     pub(crate) progress: Option<String>,
     #[serde(default)]

@@ -51,9 +51,14 @@ pub(super) struct ToolCallExecution {
     pub(super) allowed_tool_names: FastSet<String>,
 }
 
+pub(super) struct RequestFailure {
+    pub(super) text: String,
+    pub(super) detail: String,
+}
+
 pub(super) enum IterationExecution {
     Exit(TurnOutcome),
-    RequestFailed(String),
+    RequestFailed(RequestFailure),
     EmptyResponse,
     /// The response for this round was truncated (server finish_reason=length, or a tool-call
     /// arguments JSON was dropped as incomplete). Retry automatically after injecting a

@@ -119,8 +119,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
         // Sub-agent request-budget finalization is also intercepted by the
         // orchestrator; this arm only keeps the match exhaustive.
         IterationExecution::RequestDeadlineExceeded(_) => Ok(TurnLoopStep::Continue),
-        IterationExecution::RequestFailed(text) => {
-            *final_assistant_text = text;
+        IterationExecution::RequestFailed(failure) => {
+            *final_assistant_text = failure.text;
+            *final_assistant_recorded = false;
             Ok(TurnLoopStep::Break)
         }
         IterationExecution::EmptyResponse => {

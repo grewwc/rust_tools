@@ -1427,17 +1427,10 @@ for (const width of [390, 1280]) {
       { role: "assistant", content: "Final answer" },
     ];
     for (const row of h.context.historyRowsOf(rows, rows.length, true).rows) h.context.renderHistoryRow(row, parent);
-    for (const turn of parent.querySelectorAll(".turn")) {
-      const rate = h.document.createElement("div");
-      rate.className = "rate"; rate.dataset.turnRate = "1";
-      turn.appendChild(rate);
-    }
     h.context.executionGroupsFor(parent, true).sync();
-    // One stored turn ends each assistant row with a rate line; it must not split
-    // the run, or every task card stays in its own "Completed execution · 1" group.
     assert.deepEqual(parent.querySelectorAll(".execution-group").map((group) => group.querySelector("summary").textContent),
       ["Completed execution · 5"], "consecutive stored task records share one group");
-    assert.equal(parent.querySelectorAll(".execution-items .rate").length, 0, "rate text stays outside the wrapped records");
+    assert.equal(parent.querySelectorAll(".turn-rate").length, 0);
   });
 
   test(`stored records keep their place when a live row arrives at ${width}px`, () => {
@@ -3117,18 +3110,6 @@ test("phone user rows and side-note CSS retain their geometry and state rules", 
   assert.equal(prompt["max-height"], "calc(var(--app-height, 100vh) * .38)");
 });
 
-test("throughput footers wrap inside styled cards at phone and desktop widths", () => {
-  for (const phone of [true, false]) {
-    const rate = responsiveRule(".turn-rate", phone);
-    assert.equal(rate.flex, "0 0 auto");
-    assert.equal(rate["max-width"], "100%");
-    assert.equal(rate["white-space"], "normal");
-    assert.equal(rate["overflow-wrap"], "anywhere");
-    assert.equal(rate["border-top"], undefined);
-    assert.notEqual(rate.display, "none");
-  }
-});
-
 test("short-thinking early repaint: real send paints and saves its first chunk's 250ms rate before thinking_done", async () => {
   const thought = "The status bar rate removal worker (task_03504bdf97f1481fba03b62252ab9ef4) is completed. Let me collect it with task_wait.";
   const h = harness({ phone: true });
@@ -3202,7 +3183,7 @@ test("short-thinking early repaint: real send paints and saves its first chunk's
 });
 
 for (const [phone, width] of [[true, 320], [true, 375], [true, 700], [false, 1280]]) {
-  test((phone ? "phone" : "desktop") + " width " + width + " keeps rates on its live surface and restores card footers", async () => {
+  test((phone ? "phone" : "desktop") + " width " + width + " omits speed metadata during live output, completion and history", async () => {
     const h = harness({ phone });
     loadChat(h);
     vm.runInContext(between("function toolArgsOf(", "const FOLD_ROLE_LABELS"), h.context);
@@ -3248,9 +3229,7 @@ for (const [phone, width] of [[true, 320], [true, 375], [true, 700], [false, 128
     await frame('event: rate\ndata: {"phase":"output","tokens":40,"elapsed_ms":2000}\n\n');
     // The fixture queues browser paint timers until its clock is advanced.
     h.advance(1000);
-    const lines = h.elements.msgs.querySelectorAll(".turn-rate");
-    assert.equal(lines.length, 1, "both layouts keep throughput in the assistant card");
-    assert.equal(lines[0].textContent, "↳ speed · output 40 tok @ 20 tok/s");
+    assert.equal(h.elements.msgs.querySelectorAll(".turn-rate").length, 0);
     const thoughts = h.elements.msgs.querySelectorAll(".prog");
     assert.deepEqual(thoughts.map((thought) => thought.textContent), ["first thought", "second thought"]);
     h.elements.turnstatus.hidden = true;
@@ -3262,14 +3241,14 @@ for (const [phone, width] of [[true, 320], [true, 375], [true, 700], [false, 128
     const ancestors = [];
     for (let element = status; element; element = element.parentNode) {
       ancestors.push(element);
-      assert.equal(element.hidden, false, "a hidden ancestor contains the main rate");
+      assert.equal(element.hidden, false, "a hidden ancestor contains the processing status");
       assert.notEqual(element.id, "turnstatus");
       const selectors = [element.tagName, element.id ? "#" + element.id : "",
         ...element.className.split(/\s+/).filter(Boolean).map((name) => "." + name)].filter(Boolean);
       for (const selector of selectors) {
         const style = responsiveRule(selector, phone);
-        assert.notEqual(style.display, "none", selector + " hides main throughput");
-        assert.notEqual(style.visibility, "hidden", selector + " hides main throughput");
+        assert.notEqual(style.display, "none", selector + " hides processing status");
+        assert.notEqual(style.visibility, "hidden", selector + " hides processing status");
       }
       assert.notEqual(element.style.display, "none");
       assert.notEqual(element.style.visibility, "hidden");
@@ -3278,25 +3257,19 @@ for (const [phone, width] of [[true, 320], [true, 375], [true, 700], [false, 128
     assert.ok(ancestors.includes(h.document.body));
     assert.equal(responsiveRule(".msg.asst", phone).background, "var(--panel)");
     assert.equal(responsiveRule(".msg.asst", phone).border, "1px solid var(--line)");
-    const rate = responsiveRule(".turn-rate", phone);
-    assert.equal(rate.flex, "0 0 auto");
-    assert.equal(rate["max-width"], "100%");
-    assert.equal(rate["white-space"], "normal");
-    assert.equal(rate["overflow-wrap"], "anywhere");
     assert.equal(responsiveRule(".turn", phone)["min-width"], "0");
     assert.equal(responsiveRule("#msgs", phone)["overflow-y"], "auto");
     await frame("event: done\ndata: \n\n");
     await pending;
-    const completed = h.elements.msgs.querySelectorAll(".turn-rate");
-    assert.equal(completed.length, 1);
-    const line = completed[0];
-    assert.equal(line.textContent, "↳ speed · output 40 tok @ 20 tok/s");
-    assert.ok(line.parentNode.classList.contains("msg") && line.parentNode.classList.contains("asst"));
-    assert.ok(!line.parentNode.classList.contains("pending"));
+    assert.equal(h.elements.msgs.querySelectorAll(".turn-rate").length, 0);
+    const answer = h.elements.msgs.querySelector(".md");
+    assert.equal(answer.textContent, "live answer");
+    assert.ok(!answer.classList.contains("pending"));
     assert.equal(h.elements.msgs.querySelectorAll(".pending").length, 0);
     assert.deepEqual(h.elements.msgs.querySelectorAll(".prog"), thoughts, "completion lost a thinking body");
 
     // Rebuild canonical history from the same cache a refreshed page reads.
+    const savedRates = h.stored.get("serve.rates");
     const history = h.document.createElement("div");
     for (const [index, content, reasoning] of [[0, "", "first thought"], [1, "live answer", "second thought"]]) {
       h.context.renderHistoryRow({
@@ -3304,12 +3277,11 @@ for (const [phone, width] of [[true, 320], [true, 375], [true, 700], [false, 128
         historyIndex: index, identity: "answer-" + index, key: "canonical-" + index,
       }, history);
     }
-    const restored = history.querySelectorAll(".turn-rate");
-    assert.equal(restored.length, 1);
-    assert.equal(restored[0].textContent, line.textContent);
-    assert.ok(restored[0].parentNode.classList.contains("msg"));
+    assert.equal(history.querySelectorAll(".turn-rate").length, 0);
+    assert.equal(history.querySelector(".md").textContent, "live answer");
     assert.deepEqual(history.querySelectorAll(".prog").map((thought) => thought.textContent), ["first thought", "second thought"]);
     assert.doesNotMatch(history.textContent, /— tok\/s/);
+    assert.equal(h.stored.get("serve.rates"), savedRates, "history rendering changed cached metrics");
   });
 }
 

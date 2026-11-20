@@ -995,6 +995,22 @@ fn wait_window_needs_side_note_listener(
     has_pending_foreground || (!one_shot_mode && bg_subagents_in_flight)
 }
 
+fn ensure_session_work_lease(
+    lease: &mut Option<crate::ai::history::turn_lease::SessionWorkLease>,
+    history_file: &std::path::Path,
+    session_id: &str,
+) -> std::io::Result<()> {
+    if lease.is_none() && crate::ai::history::is_sqlite_path(history_file) {
+        *lease = Some(
+            crate::ai::history::turn_lease::SessionWorkLease::acquire_retrying(
+                history_file,
+                session_id,
+            )?,
+        );
+    }
+    Ok(())
+}
+
 /// Main event loop for AIOS.
 /// Coordinates execution of both foreground and background processes.
 ///
@@ -1150,6 +1166,10 @@ async fn run_loop(
         crate::ai::stream::side_note_input::SideNoteInputGuard,
     > = None;
     let mut parked_foreground_wait_guard: Option<signal::ParkedForegroundWaitGuard> = None;
+    // Acquire before foreground execution and retain through yield, scheduling,
+    // result collection and resume. Only a genuinely idle loop releases it.
+    // Its lifetime is independent of the stdin listener's turn/wait handoff.
+    let mut session_work_lease: Option<crate::ai::history::turn_lease::SessionWorkLease> = None;
     loop {
         let epoch = next_scheduler_epoch();
 
@@ -1226,6 +1246,11 @@ async fn run_loop(
             // `run_foreground_resume` takes foreground stdin. Move the parked-wait
             // guard into the turn so its interrupt state is handed off atomically.
             drop(wait_window_side_note_input.take());
+            ensure_session_work_lease(
+                &mut session_work_lease,
+                &app.session_history_file,
+                &app.session_id,
+            )?;
             subagent_status_line.finish();
             run_foreground_resume(
                 app,
@@ -1255,11 +1280,21 @@ async fn run_loop(
         } else if !pending_foreground {
             drop(parked_foreground_wait_guard.take());
         }
-        if wait_window_needs_side_note_listener(
+        let wait_window = wait_window_needs_side_note_listener(
             pending_foreground,
             one_shot_mode,
             bg_subagents_inflight(),
-        ) {
+        );
+        if pending_foreground || bg_subagents_inflight() {
+            ensure_session_work_lease(
+                &mut session_work_lease,
+                &app.session_history_file,
+                &app.session_id,
+            )?;
+        } else {
+            drop(session_work_lease.take());
+        }
+        if wait_window {
             if wait_window_side_note_input.is_none() {
                 wait_window_side_note_input = spawn_wait_window_side_note_input(app);
             }
@@ -1629,6 +1664,12 @@ async fn run_loop(
             continue;
         }
 
+        ensure_session_work_lease(
+            &mut session_work_lease,
+            &app.session_history_file,
+            &app.session_id,
+        )?;
+
         if !one_shot_mode {
             try_finalize_mcp_preload(
                 app,
@@ -1930,6 +1971,49 @@ mod wait_window_tests {
         assert!(!wait_window_needs_side_note_listener(false, true, true));
         // Nothing pending: off.
         assert!(!wait_window_needs_side_note_listener(false, false, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_work_lease_remains_held_across_yield_and_resume() {
+        use crate::ai::history::turn_lease::{
+            TurnLease, TurnLeaseProbe, probe_session_work_lease, probe_turn_lease,
+        };
+        let root = std::env::temp_dir().join(format!("driver-work-{}", uuid::Uuid::new_v4()));
+        let history = root.join("session.sqlite");
+        let mut work = None;
+        super::ensure_session_work_lease(&mut work, &history, "session").unwrap();
+        let turn = TurnLease::acquire(&history, "session").unwrap();
+        assert_eq!(probe_session_work_lease(&history), TurnLeaseProbe::Held);
+        drop(turn);
+        assert_eq!(probe_turn_lease(&history), TurnLeaseProbe::Free);
+        assert_eq!(probe_session_work_lease(&history), TurnLeaseProbe::Held);
+        // Scheduler wakes and resume reuse the original file description.
+        super::ensure_session_work_lease(&mut work, &history, "session").unwrap();
+        assert_eq!(probe_session_work_lease(&history), TurnLeaseProbe::Held);
+        let resumed_turn = TurnLease::acquire(&history, "session").unwrap();
+        drop(resumed_turn);
+        assert_eq!(probe_session_work_lease(&history), TurnLeaseProbe::Held);
+        drop(work.take());
+        assert_eq!(probe_session_work_lease(&history), TurnLeaseProbe::Free);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_work_lease_acquisition_failure_is_not_silenced() {
+        use crate::ai::history::turn_lease::SessionWorkLease;
+        let root = std::env::temp_dir().join(format!("driver-work-{}", uuid::Uuid::new_v4()));
+        let history = root.join("session.sqlite");
+        let held = SessionWorkLease::acquire(&history, "session").unwrap();
+        let mut work = None;
+        let error = super::ensure_session_work_lease(&mut work, &history, "session").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(work.is_none());
+        drop(held);
+        super::ensure_session_work_lease(&mut work, &history, "session").unwrap();
+        drop(work);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

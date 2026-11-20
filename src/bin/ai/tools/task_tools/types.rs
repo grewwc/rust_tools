@@ -63,6 +63,8 @@ pub(super) const SUBAGENT_WALL_CLOCK_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(60 * 60);
 pub(super) const SUBAGENT_PROGRESS_NOTIFY_INTERVAL: Duration = Duration::from_secs(15);
 pub(super) const SUBAGENT_PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_secs(10);
+/// Recent live progress protects an entire cancellation batch unless the caller explicitly forces it.
+pub(super) const TASK_CANCEL_RECENT_PROGRESS: Duration = Duration::from_secs(60);
 
 /// Granular control over which slices of the parent agent's execution
 /// context are inherited by a spawned sub-agent. Defaults are cwd+skills=true

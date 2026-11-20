@@ -332,6 +332,8 @@ pub(super) fn drain_task_result(
                 )?;
             }
             let verification = report.verification.clone();
+            let cancel_reason = report.cancel_reason.clone();
+            let partial_output = report.partial_output.clone();
             record_report_task(report);
             mark_task_retry_status(task_id, &status);
             lock_unpoisoned(&TASK_PROGRESS_REGISTRY).take(&task_id.to_string());
@@ -341,6 +343,8 @@ pub(super) fn drain_task_result(
                     status,
                     output: rendered.clone(),
                     error: None,
+                    cancel_reason,
+                    partial_output,
                     progress: None,
                     backend_session: None,
                     verification,
@@ -360,6 +364,8 @@ pub(super) fn drain_task_result(
                 "Subagent process pid={} terminated without publishing any output.",
                 entry.pid
             )),
+            cancel_reason: None,
+            partial_output: None,
             progress: current_task_progress(task_id),
             backend_session: backend_session::record_session(
                 task_backend(entry.backend).descriptor().id,
@@ -443,6 +449,8 @@ pub(super) fn poll_owned_task_result(task_id: &str) -> Result<OwnedTaskPoll, Str
                     status,
                     output: payload.clone(),
                     error: None,
+                    cancel_reason: None,
+                    partial_output: None,
                     progress: None,
                     backend_session: None,
                     verification: None,

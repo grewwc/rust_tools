@@ -26,7 +26,7 @@ use super::{
     TurnOutcome, context_budget,
     llm_summary_budget::{LlmSummaryBudget, LlmSummaryGate},
     persistence::persist_pending_turn_messages,
-    types::{IterationExecution, PersistableContextProjection, ToolCallExecution},
+    types::{IterationExecution, PersistableContextProjection, RequestFailure, ToolCallExecution},
 };
 
 struct StreamingFlagGuard {
@@ -985,7 +985,7 @@ fn handle_request_error(
     one_shot_mode: bool,
     turn_messages: &[Message],
     persisted_turn_messages: &mut usize,
-) -> String {
+) -> RequestFailure {
     app.streaming
         .store(false, std::sync::atomic::Ordering::Relaxed);
     persist_pending_turn_messages(app, one_shot_mode, turn_messages, persisted_turn_messages);
@@ -1002,7 +1002,23 @@ fn handle_request_error(
     } else {
         eprintln!("[Info] Request failed this round; session kept alive, you can keep asking.");
     }
-    "[Request failed this round; please retry or rephrase]".to_string()
+    RequestFailure {
+        text: "[Request failed this round; please retry or rephrase]".to_string(),
+        detail: bounded_request_error_detail(&err_text),
+    }
+}
+
+/// Keep a live request-error row readable: provider error bodies can be much
+/// larger than the terminal line a human would scan, and the first status and
+/// message bytes carry the diagnosis.
+fn bounded_request_error_detail(text: &str) -> String {
+    const MAX_CHARS: usize = 4000;
+    if text.chars().count() <= MAX_CHARS {
+        return text.to_string();
+    }
+    let mut detail: String = text.chars().take(MAX_CHARS).collect();
+    detail.push('…');
+    detail
 }
 
 fn request_interrupt_pending(shutdown: &AtomicBool, cancel_stream: &AtomicBool) -> bool {
@@ -2351,10 +2367,10 @@ pub(super) async fn execute_turn_iteration(
                             rate_limit_attempts
                         );
                     }
-                    return Ok(IterationExecution::RequestFailed(
-                        "[Provider rate limit persisted after retries; please retry later or increase provisioned throughput units]"
-                            .to_string(),
-                    ));
+                    return Ok(IterationExecution::RequestFailed(RequestFailure {
+                        text: "[Provider rate limit persisted after retries; please retry later or increase provisioned throughput units]".to_string(),
+                        detail: bounded_request_error_detail(&err_text),
+                    }));
                 }
 
                 // Not retryable or retries exhausted — never fabricate a Completed
@@ -2408,6 +2424,25 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, atomic::Ordering};
+
+    #[test]
+    fn request_error_carries_bounded_detail_to_finalization() {
+        let app = crate::ai::middleware::test_util::test_app();
+        let error = request::RequestError::status(
+            reqwest::StatusCode::BAD_GATEWAY,
+            format!("upstream reset {}", "界".repeat(5000)),
+        );
+        let expected = super::bounded_request_error_detail(&error.to_string());
+        let mut persisted = 0;
+        let failure = super::handle_request_error(&app, error, false, &[], &mut persisted);
+        assert_eq!(persisted, 0);
+        assert_eq!(
+            failure.text,
+            "[Request failed this round; please retry or rephrase]"
+        );
+        assert_eq!(failure.detail, expected);
+        assert_eq!(expected.chars().count(), 4001);
+    }
 
     #[test]
     fn request_boundary_reclaims_small_backlog_without_model_marks() {

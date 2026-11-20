@@ -42,6 +42,27 @@ function structuredIdentityRows(h) {
   return h.box.children.flatMap((card) => [...card.querySelectorAll(".task-block")]
     .map((block) => block.querySelector(".task-identity").textContent + " · " + block.querySelector(".task-status").textContent));
 }
+function assertTerminalTaskCards(root, task, failure, reason) {
+  const cards = executionRecords(root).filter((card) => card.dataset.taskOutput === "true");
+  assert.equal(cards.length, 2, "both the raw tool preview and dedicated task card are rendered");
+  for (const card of cards) {
+    const block = card.querySelector(".task-block"), status = block.querySelector(".task-status");
+    assert.equal(status.textContent, task.status + " 12s", "the terminal header retains its status and duration");
+    assert.equal(block.dataset.state, failure ? "failed" : "cancelled");
+    assert.equal(status.dataset.state, block.dataset.state);
+    assert.equal(card.dataset.executionException, String(failure));
+    const reasonRow = block.querySelector(failure ? ".task-error" : ".task-cancel-reason");
+    if (reason) assert.equal(reasonRow?.textContent, (failure ? "Failure reason: " : "Cancellation reason: ") + reason);
+    else assert.equal(reasonRow, null);
+    if (failure) assert.equal(block.querySelector(".task-cancel-reason"), null);
+    else {
+      assert.equal(block.querySelector(".task-error"), null);
+      assert.ok(!block.textContent.includes("Failure reason:"));
+      assert.ok([block, ...descendants(block)].every((node) => node.dataset.state !== "failed"
+        && !node.classList.contains("failed") && !node.classList.contains("error") && !node.classList.contains("err")));
+    }
+  }
+}
 
 // Most fixtures predate the typed rate frame. Translate only their fixture
 // input at the test boundary so the renderer is exercised through the current
@@ -306,7 +327,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
     step(ms = 1000) { clock.now += ms; for (const { fn } of [...intervals.values()]) fn(); },
     fail: () => vm.runInContext('fail("turn failed")', context),
     reply: () => vm.runInContext("(bubble || answerBubbles.at(-1)).innerHTML", context),
-    // Throughput belongs inside a styled card, never at the turn's root.
+    // Assistant throughput must not create a separate transcript row.
     metrics: () => box.children.filter((item) => item.dataset.turnRate).map((item) => item.textContent),
     answerCount: () => vm.runInContext("answerBubbles.filter((b) => b.innerHTML).length", context),
   };
@@ -642,6 +663,39 @@ function sessionIsolationHarness(messages, phone) {
   }
   return { ...h, newButton, prompt };
 }
+
+test("request error detail survives replay completion and history reload", async () => {
+  const detail = "request failed: 502 Bad Gateway upstream reset";
+  const messages = [{ role: "assistant", content: "[Request failed this round; please retry or rephrase]", request_error: detail }];
+  const h = retainedHistoryHarness(messages), c = h.c;
+  c.addMsg = (role, text, cls, parent = h.root) => {
+    const row = c.document.createElement("div");
+    row.className = "msg " + cls; row.dataset.role = role; row.textContent = text;
+    return parent.appendChild(row);
+  };
+  const pending = c.attachEvents();
+  await h.settle();
+  await h.frame("event: request_error\ndata: " + JSON.stringify({ error: detail }) + "\n\n");
+  assert.match(h.root.textContent, /502 Bad Gateway upstream reset/);
+  await h.frame("event: done\ndata: \n\n");
+  await pending;
+  assert.equal(c.eventStreamEnded, true);
+  assert.equal(h.historyCalls.length, 1);
+  assert.equal(h.root.querySelectorAll(".live-request-error").length, 0);
+  assert.equal(h.root.querySelectorAll(".request-error").length, 1);
+  assert.match(h.root.textContent, /502 Bad Gateway upstream reset/);
+  await c.loadHistory();
+  assert.equal(h.root.querySelectorAll(".request-error").length, 1, "refresh must retain exactly one diagnostic");
+});
+
+test("request error detail is recovered by a new page from history alone", () => {
+  const detail = "request failed: 400 invalid tool arguments";
+  const h = coldHistoryHarness("");
+  h.mount(JSON.stringify([{ role: "assistant", content: "[Request failed this round; please retry or rephrase]", request_error: detail }]));
+  assert.equal(h.root.querySelectorAll(".request-error").length, 1);
+  assert.match(h.root.textContent, /400 invalid tool arguments/);
+  assert.match(h.root.textContent, /Request failed this round/);
+});
 
 for (const phone of [false, true]) {
   test(`session isolation regression: folded nodes cannot revive in a new transcript (phone=${phone})`, async () => {
@@ -1167,7 +1221,7 @@ for (const otherServer of [false, true]) test("execution merge regression: a his
 });
 
 for (const reasoning of ["", "saved thought"]) {
-  test("retained canonical history gains replay " + (reasoning ? "thinking and output rates" : "output rate") + " without remounting", async () => {
+  test("retained canonical history preserves replay " + (reasoning ? "thinking and output metrics" : "output metrics") + " without remounting or speed metadata", async () => {
     const h = retainedHistoryHarness([
       { role: "user", content: "question" },
       { role: "tool", content: "tool result" },
@@ -1198,23 +1252,21 @@ for (const reasoning of ["", "saved thought"]) {
     assert.equal(canonical.children.find((child) => child.className === "msg asst md"), answer);
     assert.equal(h.c.storedRate("turn", "s", "saved answer"), rate);
     const visible = h.visibleRates();
-    assert.equal(visible.length, 1, "retained canonical history did not display the newly cached rate");
-    assert.equal(visible[0].textContent, "↳ speed · " + rate);
-    assert.equal(visible[0].parentNode, answer);
+    assert.equal(visible.length, 0, "retained canonical history displayed the newly cached rate");
     if (thinking) {
       assert.equal(thinking.summary.textContent, "thinking · ~20 tok @ 10 tok/s");
       assert.equal(thinking.details.open, true, "rate refresh collapsed a retained thinking fold");
     }
     await h.c.loadHistory();
     assert.deepEqual(h.root.children, original);
-    assert.deepEqual(h.visibleRates(), visible, "another retained load duplicated or replaced the rate row");
+    assert.deepEqual(h.visibleRates(), visible, "another retained load added speed metadata");
     const updated = rate.replace("40 tok @ 20 tok/s", "60 tok @ 30 tok/s");
     h.c.rememberRate("turn", "s", "saved answer", updated);
     if (reasoning) h.c.rememberRate("thinking", "s", reasoning, "~20 tok @ 10 tok/s");
     await h.c.loadHistory();
     assert.deepEqual(h.root.children, original);
     assert.deepEqual(h.visibleRates(), visible);
-    assert.equal(visible[0].textContent, "↳ speed · " + updated);
+    assert.equal(h.c.storedRate("turn", "s", "saved answer"), updated);
     if (thinking) assert.equal(thinking.summary.textContent, "thinking · ~20 tok @ 10 tok/s");
     h.storage.delete("serve.rates");
     await h.c.loadHistory();
@@ -1604,11 +1656,7 @@ test("prose split by a tool round renders as separate answer bubbles", () => {
   const answers = h.box.children.filter((item) => item.classList && !item.summary && !item.body);
   const texts = answers.map((item) => item.innerHTML).filter(Boolean);
   assert.deepEqual(texts, ["first segment.", "second segment."]);
-  const rates = rateNodes(h.box);
-  assert.equal(rates.length, 1);
-  assert.equal(rates[0].hidden, false);
-  assert.equal(rates[0].parentNode, h.box.children.at(-2));
-  assert.equal(rates[0].textContent, "↳ speed · output ~4 tok");
+  assert.equal(rateNodes(h.box).length, 0);
   const shape = h.box.children.map((item) => (item.summary ? "fold" : item.dataset.turnRate ? "rate" : item.innerHTML || "status"));
   assert.deepEqual(shape, ["first segment.", "fold", "second segment.", "status"]);
 });
@@ -1624,7 +1672,7 @@ test("replayed phases remain visible after an early assistant answer", () => {
   assert.equal(h.status(), "Thinking… · 0:00");
 });
 
-test("turn throughput never duplicates the rate inside a thinking-only card", () => {
+test("turn throughput stays absent from thinking and answer cards", () => {
   const h = streamHarness({ realThinking: true });
   h.connect();
   h.emit("thinking", { text: "reasoning" });
@@ -1633,10 +1681,8 @@ test("turn throughput never duplicates the rate inside a thinking-only card", ()
     "turn throughput must not attach below a thinking fold");
   h.emit("delta", { delta: "answer" });
   h.emit("", "↳ speed · reasoning 22 tok · output 82 tok @ 151 tok/s");
-  const line = rateNodes(h.box)[0];
-  assert.ok(line);
-  assert.ok(line.parentNode.classList.contains("asst"));
-  assert.ok(line.parentNode.classList.contains("md"));
+  assert.equal(rateNodes(h.box).length, 0);
+  assert.equal(h.reply(), "answer");
 });
 
 test("pending HTTP request paints a connection indicator before any SSE event", () => {
@@ -1747,7 +1793,7 @@ test("live tools separate real thinking phases, while logs cannot split tokens",
   assert.equal(h.pendingVisible(), false, "a completed turn must not retain a running indicator");
 });
 
-test("desktop status keeps only phase and elapsed while main throughput stays visible", () => {
+test("desktop status keeps only phase and elapsed without assistant speed metadata", () => {
   const h = streamHarness({ phaseClock: true });
   h.emit("progress", "request diagnostic");
   h.emit("thinking_done");
@@ -1755,7 +1801,7 @@ test("desktop status keeps only phase and elapsed while main throughput stays vi
   assert.deepEqual(h.metrics(), []);
   assert.equal(h.pending(), "◌ Processing… · 0:00");
   assert.doesNotMatch(h.pending(), /tok/);
-  assert.equal(h.mainRate(), "↳ speed · reasoning 18 tok · output 122 tok");
+  assert.equal(h.mainRate(), "");
   h.emit("thinking", { text: "brief thought", rate: "~10 tok @ — tok/s" });
   assert.ok(h.titles().includes("thinking… · ~10 tok"));
   h.emit("thinking_done");
@@ -1764,10 +1810,10 @@ test("desktop status keeps only phase and elapsed while main throughput stays vi
   assert.deepEqual(h.metrics(), []);
   assert.equal(h.pending(), "◌ Responding… · 0:00");
   assert.doesNotMatch(h.pending(), /tok/);
-  assert.match(h.mainRate(), /reasoning 800 tok @ 400 tok\/s · output 400 tok @ 400 tok\/s/);
+  assert.equal(h.mainRate(), "");
   h.step(88000);
   assert.equal(h.pending(), "◌ Responding… · 1:28");
-  assert.match(h.mainRate(), /reasoning 800 tok @ 400 tok\/s · output 400 tok @ 400 tok\/s/);
+  assert.equal(h.mainRate(), "");
   assert.equal(h.titles().filter((title) => title.startsWith("activity log")).length, 0);
   assert.doesNotMatch(h.bodies().join("\n"), /400 tok\/s/);
   h.emit("done");
@@ -1777,7 +1823,7 @@ test("desktop status keeps only phase and elapsed while main throughput stays vi
   assert.doesNotMatch(h.mainRate() + h.titles().join("\n"), /— tok\/s/);
 });
 
-test("typed rate events render producer metrics without parsing terminal output", () => {
+test("typed rate events preserve producer metrics without assistant speed metadata", () => {
   const h = streamHarness({ phone: true, realThinking: true });
   h.emit("thinking_start");
   h.emit("thinking", { text: "brief thought", rate: {
@@ -1787,11 +1833,14 @@ test("typed rate events render producer metrics without parsing terminal output"
   h.emit("delta", { delta: "Final answer" });
   h.emit("rate", { phase: "reasoning", tokens: 8, elapsed_ms: 1_000, approximate: false });
   h.emit("rate", { phase: "output", tokens: 40, elapsed_ms: 2_000, approximate: false });
-  assert.equal(h.mainRate(), "↳ speed · reasoning 8 tok @ 8 tok/s · output 40 tok @ 20 tok/s");
-  // Plain terminal stdout is not a rate event and cannot change this display.
+  assert.equal(h.mainRate(), "");
+  // Plain terminal stdout is not a rate event and cannot change the metrics.
   h.context.kind = "";
   h.context.payload = "↳ speed · output 999 tok @ 999 tok/s";
-  assert.equal(h.mainRate(), "↳ speed · reasoning 8 tok @ 8 tok/s · output 40 tok @ 20 tok/s");
+  vm.runInContext('dispatchExecutionEvent(kind, payload, liveView, "live"); flushPaint();', h.context);
+  assert.equal(h.mainRate(), "");
+  h.emit("done");
+  assert.equal(h.context.storedRate("turn", "s", "Final answer"), "reasoning 8 tok @ 8 tok/s · output 40 tok @ 20 tok/s");
 });
 
 test("rate merge is pure and leaves the previous phase map and sample intact", () => {
@@ -1819,7 +1868,7 @@ test("rate merge is pure and leaves the previous phase map and sample intact", (
 
 for (const recovered of [false, true]) for (const phone of [false, true]) {
   const name = (recovered ? "replayed" : "live") + (phone ? " phone" : " desktop");
-  test(name + " rate stages keep display order through repeated samples and generation overrides", () => {
+  test(name + " rate stages preserve cached metrics without assistant speed metadata", () => {
     const options = { phone, realThinking: true };
     const h = recovered ? replayHarness(options) : streamHarness(options);
     const box = recovered ? h.view.box : h.box;
@@ -1834,19 +1883,15 @@ for (const recovered of [false, true]) for (const phone of [false, true]) {
       ["output", 10, "reasoning 20 tok @ 20 tok/s · output 10 tok @ 10 tok/s"],
       ["reasoning", 4, "reasoning 4 tok @ 4 tok/s · output 10 tok @ 10 tok/s"],
     ];
-    let line = null;
-    for (const [phase, tokens, expected] of stages) {
+    for (const [phase, tokens] of stages) {
       h.emit("rate", { phase, tokens, elapsed_ms: 1000, approximate: false });
-      assert.equal(h.mainRate(), "↳ speed · " + expected);
+      assert.equal(h.mainRate(), "");
       assert.equal(recovered ? h.status() : h.pending(), (recovered ? "" : "◌ ") + "Responding… · 0:00");
-      const visible = rateNodes(box);
-      assert.equal(visible.length, 1);
-      if (line) assert.equal(visible[0], line, "a new sample must update the existing rate node");
-      line = visible[0];
+      assert.equal(rateNodes(box).length, 0);
     }
     if (recovered) h.view.finish();
     else h.emit("done");
-    assert.equal(rateNodes(box)[0], line);
+    assert.equal(rateNodes(box).length, 0);
     assert.equal(h.context.storedRate("turn", "s", "answer"), stages.at(-1)[2]);
   });
 
@@ -1857,17 +1902,17 @@ for (const recovered of [false, true]) for (const phone of [false, true]) {
     h.emit("rate", { phase: "output", tokens: 8, elapsed_ms: 6667, approximate: true });
     h.emit("rate", { phase: "reasoning", tokens: 22, elapsed_ms: null });
     const first = "reasoning 22 tok · output ~8 tok @ 1.2 tok/s";
-    assert.equal(h.mainRate(), "↳ speed · " + first);
+    assert.equal(h.mainRate(), "");
     h.emit("tool", { id: "rate-tool", name: "read_file", phase: "finished", ok: true });
     h.emit("delta", { delta: "next answer" });
     assert.equal(h.context.storedRate("turn", "s", "first answer"), first);
-    assert.equal(h.mainRate(), "↳ speed · " + first);
+    assert.equal(h.mainRate(), "");
     h.emit("rate", { phase: "output", tokens: 21, elapsed_ms: 499 });
-    assert.equal(h.mainRate(), "↳ speed · reasoning 22 tok · output 21 tok");
+    assert.equal(h.mainRate(), "");
     h.emit("rate", { phase: "generation", tokens: 123.5, elapsed_ms: 1235, approximate: true });
-    assert.equal(h.mainRate(), "↳ speed · generation ~123.5 tok @ 100 tok/s");
+    assert.equal(h.mainRate(), "");
     h.emit("rate", { phase: "output", tokens: 2, elapsed_ms: 500 });
-    assert.equal(h.mainRate(), "↳ speed · output 2 tok @ 4 tok/s");
+    assert.equal(h.mainRate(), "");
     for (const sample of [
       { phase: "unknown", tokens: 100, elapsed_ms: 1000 },
       { phase: "generation", tokens: 0, elapsed_ms: 1000 },
@@ -1875,7 +1920,7 @@ for (const recovered of [false, true]) for (const phone of [false, true]) {
       { phase: "output", tokens: "NaN", elapsed_ms: null },
     ]) {
       h.emit("rate", sample);
-      assert.equal(h.mainRate(), "↳ speed · output 2 tok @ 4 tok/s", "invalid samples cannot alter the stage projection");
+      assert.equal(h.mainRate(), "", "invalid samples cannot add speed metadata");
     }
     if (recovered) h.view.finish();
     else h.emit("done");
@@ -1884,40 +1929,33 @@ for (const recovered of [false, true]) for (const phone of [false, true]) {
   });
 }
 
-test("ordinary streamed output shows a live rate and keeps a final estimate", () => {
+test("ordinary streamed output omits speed metadata and keeps a final estimate", () => {
   const h = streamHarness();
   h.emit("delta", { delta: "abcdefgh" });
   h.ageOutput(1000);
   h.emit("delta", { delta: "ijkl" });
   assert.equal(h.pending(), "◌ Responding… · 0:01");
   assert.doesNotMatch(h.pending(), /tok/);
-  assert.match(h.mainRate(), /output ~3 tok @ [\d.]+ tok\/s/);
+  assert.equal(h.mainRate(), "");
   h.emit("done");
   assert.equal(h.metrics().length, 0);
   assert.match(h.answerRate(), /output ~3 tok @ [\d.]+ tok\/s/);
 });
 
 for (const phone of [true, false]) {
-  test((phone ? "phone" : "desktop") + " main rate is visible during output and restores after a page refresh", () => {
+  test((phone ? "phone" : "desktop") + " output and refreshed history omit speed metadata while preserving cached metrics", () => {
     const h = streamHarness({ phone });
     h.emit("delta", { delta: "abcdefgh" });
     h.ageOutput(1000);
     h.emit("delta", { delta: "ijkl" });
-    if (phone) {
-      assert.doesNotMatch(h.pending(), /tok/, "the phone status bar must stay compact");
-      assert.match(h.mainRate(), /output ~3 tok @ 3.00 tok\/s/);
-      assert.match(rateNodes(h.box)[0].parentNode.className, /\bmsg asst\b/);
-    } else {
-      assert.match(h.mainRate(), /output ~3 tok @ 3.00 tok\/s/);
-      assert.equal(rateNodes(h.box)[0].parentNode, h.box.children.at(-2));
-      assert.doesNotMatch(h.pending(), /tok/);
-    }
+    assert.doesNotMatch(h.pending(), /tok/, "the status bar must stay compact");
+    assert.equal(rateNodes(h.box).length, 0);
     h.emit("done");
-    const line = rateNodes(h.box)[0];
-    assert.equal(line.hidden, false);
-    assert.match(line.parentNode.className, /\bmsg asst\b/);
+    assert.equal(rateNodes(h.box).length, 0);
+    assert.equal(h.context.storedRate("turn", "s", "abcdefghijkl"), "output ~3 tok @ 3.00 tok/s");
     const refreshed = historyRateHarness(h.storage, "abcdefghijkl", "", phone);
-    assert.equal(refreshed.restoredRate(), h.mainRate());
+    assert.equal(refreshed.restoredRate(), "");
+    assert.equal(refreshed.group.querySelector(".msg.asst.md").textContent, "abcdefghijkl");
     assert.equal(refreshed.msgs.children.length, 1, "the rate must not add a canonical reconciliation row");
     assert.equal(refreshed.group.dataset.canonicalKey, "canonical-answer");
   });
@@ -1931,22 +1969,21 @@ test("completion after a tool round caches the sealed answer instead of empty ra
   h.emit("", "↳ speed · output 20 tok @ 10 tok/s");
   h.emit("done");
   assert.equal(h.context.storedRate("turn", "s", "answer before a tool"), "output 20 tok @ 10 tok/s");
-  assert.equal(historyRateHarness(h.storage, "answer before a tool").restoredRate(), "↳ speed · output 20 tok @ 10 tok/s");
+  assert.equal(historyRateHarness(h.storage, "answer before a tool").restoredRate(), "");
 });
 
-test("desktop throughput follows new answer and tool cards at the end of the live turn", () => {
+test("desktop speed metadata stays absent across answer and tool rounds", () => {
   const h = streamHarness();
   h.emit("delta", { delta: "first answer" });
   h.emit("", "↳ speed · output 40 tok @ 20 tok/s");
   h.emit("tool", { phase: "started", name: "read_file", id: "r" });
   h.emit("delta", { delta: "next answer" });
   h.emit("", "↳ speed · output 60 tok @ 30 tok/s");
-  const line = rateNodes(h.box)[0];
-  assert.equal(line.dataset.turnRate, "1", "the main rate was left above newer transcript nodes");
-  assert.equal(line.textContent, "↳ speed · output 60 tok @ 30 tok/s");
-  assert.equal(line.parentNode, h.box.children.at(-2));
+  assert.equal(rateNodes(h.box).length, 0);
+  assert.equal(h.context.storedRate("turn", "s", "first answer"), "output 40 tok @ 20 tok/s");
   h.emit("done");
-  assert.equal(line.parentNode, h.box.children.at(-1));
+  assert.equal(rateNodes(h.box).length, 0);
+  assert.equal(h.context.storedRate("turn", "s", "next answer"), "output 60 tok @ 30 tok/s");
 });
 
 test("a display replacement does not attach a rate to a different canonical body", () => {
@@ -1971,7 +2008,7 @@ test("uncached history stays empty while a replacement starts a local timing win
   h.emit("replace", { text: "buffered answer" });
   h.ageOutput(1000);
   h.emit("done");
-  assert.match(h.mainRate(), /^↳ speed · output ~4 tok @ [\d.]+ tok\/s$/);
+  assert.equal(h.mainRate(), "");
   assert.match(h.context.storedRate("turn", "s", "buffered answer"), /^output ~4 tok @ [\d.]+ tok\/s$/);
 });
 
@@ -1987,8 +2024,7 @@ test("typed replay rate events are dispatched while comment heartbeats stay sepa
   await h.frame("data: ↳ speed · reasoning 6.7k tok @ 86.2 tok/s · output 415 tok @ 167 tok/s\n\n");
   assert.deepEqual(seen, ["rate", "rate"]);
   const box = h.c.recoveredView.box;
-  const main = rateNodes(box)[0];
-  assert.match(main.textContent, /86.2 tok\/s.*167 tok\/s/);
+  assert.equal(rateNodes(box).length, 0);
   assert.equal(box.lastElementChild.textContent, "Reconnecting… · 0:00");
   assert.doesNotMatch(box.lastElementChild.textContent, /tok/);
   await h.frame("event: done\ndata: \n\n");
@@ -2009,7 +2045,8 @@ test("replayed completion preserves reasoning and output caches before teardown"
   assert.equal(h.loads(), 1);
   const refreshed = historyRateHarness(h.storage, "saved answer", "saved thought", true);
   assert.equal(refreshed.restoredThinking(), "thinking · ~10 tok @ 5 tok/s");
-  assert.equal(refreshed.restoredRate(), "↳ speed · output 40 tok @ 20 tok/s");
+  assert.equal(refreshed.restoredRate(), "");
+  assert.equal(refreshed.context.storedRate("turn", "s", "saved answer"), "output 40 tok @ 20 tok/s");
   assert.equal(refreshed.msgs.children.length, 1);
 });
 
@@ -2018,34 +2055,31 @@ test("recovered output rates share live measurement while desktop status stays c
   h.emit("delta", { delta: "abcdefgh" });
   h.ageOutput(1000);
   h.emit("delta", { delta: "ijkl" });
-  assert.match(h.mainRate(), /output ~3 tok @ 3.00 tok\/s/);
+  assert.equal(h.mainRate(), "");
   assert.equal(h.status(), "Responding… · 0:01");
   assert.doesNotMatch(h.status(), /tok/);
   h.view.finish();
-  assert.equal(historyRateHarness(h.storage, "abcdefghijkl").restoredRate(), h.mainRate());
+  assert.equal(historyRateHarness(h.storage, "abcdefghijkl").restoredRate(), "");
+  assert.equal(h.context.storedRate("turn", "s", "abcdefghijkl"), "output ~3 tok @ 3.00 tok/s");
 });
 
 for (const recovered of [false, true]) {
-  test((recovered ? "replayed" : "live") + " phone rates use one styled status surface during generation", () => {
+  test((recovered ? "replayed" : "live") + " phone omits assistant speed metadata during generation and history rendering", () => {
     const h = recovered ? replayHarness({ phone: true }) : streamHarness({ phone: true });
     h.emit("delta", { delta: "answer" });
-    h.emit("progress", "↳ speed · reasoning 67 tok @ 69.6 tok/s · output 148 tok @ — tok/s");
+    h.emit("progress", "↳ speed · reasoning 328 tok @ 55.7 tok/s · output 132 tok @ — tok/s");
     const status = recovered ? h.status() : h.pending();
     assert.doesNotMatch(status, /tok/, "the phone status bar must not own throughput");
-    assert.match(h.mainRate(), /reasoning 67 tok @ 69\.6 tok\/s · output 148 tok/);
-    assert.doesNotMatch(h.mainRate(), /— tok\/s/);
+    assert.equal(h.mainRate(), "");
     const box = recovered ? h.view.box : h.box;
-    assert.equal(rateNodes(box).length, 1);
+    assert.equal(rateNodes(box).length, 0);
     if (recovered) h.view.finish();
     else h.emit("done");
-    const rates = rateNodes(box);
-    assert.equal(rates.length, 1, "completed phone rates must remain visible");
-    assert.match(rates[0].parentNode.className, /\bmsg\b/);
-    assert.match(rates[0].parentNode.className, /\basst\b/);
-    assert.ok(!box.children.some((child) => child.dataset.turnRate), "a bare rate escaped its card");
+    assert.equal(rateNodes(box).length, 0, "completion added speed metadata");
+    assert.equal(h.context.storedRate("turn", "s", "answer"), "reasoning 328 tok @ 55.7 tok/s · output 132 tok");
     const refreshed = historyRateHarness(h.storage, "answer", "", true);
-    assert.equal(refreshed.restoredRate(), rates[0].textContent);
-    assert.match(rateNodes(refreshed.group)[0].parentNode.className, /\bmsg\b/);
+    assert.equal(refreshed.restoredRate(), "");
+    assert.equal(refreshed.group.querySelector(".msg.asst.md").textContent, "answer");
   });
 
   test((recovered ? "replayed" : "live") + " first thinking content and its completed timing survive later phases", () => {
@@ -2528,7 +2562,7 @@ test("unmeasured structured samples never render a dash rate", () => {
   for (const phone of [false, true]) {
     const refreshed = historyRateHarness(h.storage, "old answer", "old thought", phone);
     assert.equal(refreshed.restoredThinking(), "thinking · ~10 tok");
-    assert.equal(refreshed.restoredRate(), "↳ speed · reasoning 67 tok @ 69.6 tok/s · output 148 tok");
+    assert.equal(refreshed.restoredRate(), "");
     assert.doesNotMatch(refreshed.restoredRate() + refreshed.restoredThinking(), /— tok\/s/);
   }
 });
@@ -2646,16 +2680,14 @@ test("desktop cold reload restores thinking rates and counts across a 316-messag
   assert.equal(summaries[1].textContent, "thinking · ~78 tok");
   assert.ok(summaries.every((summary) => summary.textContent.startsWith("thinking · ")));
   assert.equal(h.root.children[3].querySelector(".prog").textContent, uncachedThought);
-  const rates = rateNodes(h.root);
-  assert.equal(rates.length, 1);
-  assert.equal(rates[0].textContent, "↳ speed · output 40 tok @ 20 tok/s");
-  assert.equal(rates[0].parentNode, h.root.children[1].querySelector(".msg.asst.md"));
+  assert.equal(rateNodes(h.root).length, 0);
+  assert.equal(h.root.children[1].querySelector(".msg.asst.md").textContent, "saved answer");
   assert.doesNotMatch(h.root.textContent, /— tok\/s/);
   assert.equal(h.root.querySelector(".pending"), null);
   assert.equal(h.storage.get("serve.rates"), savedRates);
 });
 
-test("phone cold reopen restores persisted rates inside assistant cards without live turn state", () => {
+test("phone cold reopen preserves thinking rates and omits assistant speed metadata without live turn state", () => {
   const seed = coldHistoryHarness("{}");
   const savedRates = JSON.stringify({
     "thinking|s|phase:fixture": { structured: true, textKey: seed.context.rateTextKey("saved thought", true), rate: "~4 tok @ 8 tok/s" },
@@ -2668,12 +2700,9 @@ test("phone cold reopen restores persisted rates inside assistant cards without 
     "undefined,undefined,undefined,undefined");
   h.mount(JSON.stringify([{ role: "assistant", content: "saved answer", reasoning_content: "saved thought" }]));
   assert.equal(h.root.children.length, 1, "rate restoration added a canonical history row");
-  const group = h.root.lastElementChild, rates = rateNodes(h.root);
-  assert.equal(rates.length, 1, "the reopened phone lost its cached rate");
-  assert.equal(rates[0].textContent, "↳ speed · reasoning 67 tok @ 69.6 tok/s · output 148 tok @ 20 tok/s");
-  assert.equal(rates[0].parentNode, group.querySelector(".msg.asst.md"));
-  assert.ok(!group.children.some((child) => child.dataset.turnRate), "a bare rate escaped its card");
-  for (let node = rates[0]; node; node = node.parentNode) assert.equal(node.hidden, false);
+  const group = h.root.lastElementChild;
+  assert.equal(rateNodes(h.root).length, 0, "the reopened phone added speed metadata");
+  assert.equal(group.querySelector(".msg.asst.md").textContent, "saved answer");
   assert.equal(group.querySelector("summary").textContent, "thinking · ~4 tok @ 8 tok/s");
   assert.equal(group.querySelector(".prog").textContent, "saved thought");
   assert.equal(h.root.querySelector(".pending"), null, "cold history depends on a live status bubble");
@@ -2688,10 +2717,8 @@ test("phone cold reopen omits rate text when structured samples lack timing", ()
   });
   const h = coldHistoryHarness(savedRates);
   h.mount(JSON.stringify([{ role: "assistant", content: "saved answer", reasoning_content: "saved thought" }]));
-  const rates = rateNodes(h.root);
-  assert.equal(rates.length, 1);
-  assert.equal(rates[0].textContent, "↳ speed · reasoning 67 tok @ 69.6 tok/s · output 148 tok");
-  assert.ok(rates[0].parentNode.matches(".msg.asst.md"));
+  assert.equal(rateNodes(h.root).length, 0);
+  assert.equal(h.root.querySelector(".msg.asst.md").textContent, "saved answer");
   assert.equal(h.root.querySelector("summary").textContent, "thinking · ~4 tok");
   assert.equal(h.root.querySelector(".prog").textContent, "saved thought");
   assert.doesNotMatch(h.root.textContent, /— tok\/s/);
@@ -2710,7 +2737,7 @@ test("a thinking-only turn restores one rate inside its fold", () => {
   assert.equal(refreshed.restoredRate(), "");
 });
 
-test("a recovered single output chunk gains a main rate on the clock and stops ticking at completion", () => {
+test("a recovered single output chunk caches its rate without rendering speed metadata and stops ticking at completion", () => {
   const h = replayHarness(), intervals = new Map();
   h.view.remove();
   h.context.setInterval = (fn, ms) => { intervals.set(1, { fn, ms }); return 1; };
@@ -2722,15 +2749,16 @@ test("a recovered single output chunk gains a main rate on the clock and stops t
   assert.equal(tick.ms, 1000);
   h.ageOutput(1000);
   tick.fn();
-  const line = rateNodes(view.box)[0];
-  assert.equal(line.textContent, "↳ speed · output ~2 tok @ 2.00 tok/s");
+  assert.equal(rateNodes(view.box).length, 0);
   assert.equal(view.box.lastElementChild.textContent, "Responding… · 0:01");
   assert.doesNotMatch(view.box.lastElementChild.textContent, /tok/);
   view.finish();
   assert.equal(intervals.size, 0);
+  assert.equal(h.context.storedRate("turn", "s", "abcdefgh"), "output ~2 tok @ 2.00 tok/s");
   h.ageOutput(1000);
   tick.fn();
-  assert.equal(line.textContent, "↳ speed · output ~2 tok @ 2.00 tok/s", "a queued clock tick changed completed throughput");
+  assert.equal(rateNodes(view.box).length, 0);
+  assert.equal(h.context.storedRate("turn", "s", "abcdefgh"), "output ~2 tok @ 2.00 tok/s", "a queued clock tick changed completed throughput");
 });
 
 test("untyped legacy rate cache entries are ignored", () => {
@@ -2746,7 +2774,8 @@ test("an invalid cache container is replaced by newly recorded throughput", () =
     h.emit("delta", { delta: "answer" });
     h.emit("", "↳ speed · output 40 tok @ 20 tok/s");
     h.emit("done");
-    assert.equal(historyRateHarness(h.storage, "answer").restoredRate(), "↳ speed · output 40 tok @ 20 tok/s");
+    assert.equal(historyRateHarness(h.storage, "answer").restoredRate(), "");
+    assert.equal(h.context.storedRate("turn", "s", "answer"), "output 40 tok @ 20 tok/s");
   }
 });
 
@@ -2764,7 +2793,7 @@ test("parallel tool completion and confirmation preserve the remaining active st
   h.fail();
   assert.ok(h.titles().some((title) => title.includes("interrupted")));
   assert.ok(h.bodies().some((text) => text.includes("B")));
-  assert.equal(h.mainRate(), "↳ speed · output 40 tok @ 20 tok/s");
+  assert.equal(h.mainRate(), "");
 });
 
 for (const recovered of [false, true]) {
@@ -2820,7 +2849,7 @@ test("a subagent fold does not leak the turn rate as a separate bubble", () => {
   h.emit("rate", { phase: "output", tokens: 40, elapsed_ms: 2000, approximate: false });
   assert.equal(rateNodes(h.box).length, 0, "a rate must not mount under a subagent fold");
   h.emit("delta", { delta: "Final answer" });
-  assert.equal(rateNodes(h.box).length, 1, "the rate belongs to the answer once it exists");
+  assert.equal(rateNodes(h.box).length, 0, "the answer must not render speed metadata");
 });
 
 test("subagent snapshots stay distinct from logs and empty thinking markers", () => {
@@ -2890,6 +2919,41 @@ test("subagent elapsed ticker preserves terminal text and stops on explicit comp
   const frozen = structuredIdentityRows(h);
   assert.equal(h.intervals.size, 0); h.step(3000); assert.deepEqual(structuredIdentityRows(h), frozen);
 });
+
+for (const scenario of [
+  { name: "cancellation with legacy error", fields: { status: "cancelled", error: "Parent stopped this task" }, reason: "Parent stopped this task" },
+  { name: "cancellation prefers cancel_reason", fields: { status: "cancelled", cancel_reason: "Parent superseded this task", error: "Legacy reason" }, reason: "Parent superseded this task" },
+  { name: "cancellation with cancel_reason only", fields: { status: "cancelled", cancel_reason: "No longer needed" }, reason: "No longer needed" },
+  { name: "cancellation accepts canceled spelling", fields: { status: "canceled", error: "Parent stopped this task" }, reason: "Parent stopped this task" },
+  ...["failed", "error", "timeout"].flatMap((status) => [
+    { name: "failure reason for " + status, fields: { status, error: "Worker execution failed" }, failure: true, reason: "Worker execution failed" },
+    { name: "failure state for " + status + " without error text", fields: { status }, failure: true },
+  ]),
+]) {
+  test(`task report ${scenario.name} in live task cards`, () => {
+    const task = structuredTask("terminal_task", 12000, { active: false, progress: null, ...scenario.fields });
+    const report = { ...structuredSubagents([task]).task_report, operation: "task_wait", snapshot: false };
+    for (const phone of [false, true]) {
+      const h = streamHarness({ phone });
+      h.emit("tool", { id: "wait", name: "task_wait", phase: "finished", ok: true, output: "raw task result\n", task_report: report });
+      assertTerminalTaskCards(h.box, task, scenario.failure === true, scenario.reason);
+    }
+  });
+
+  test(`task report ${scenario.name} in canonical task cards`, async () => {
+    const task = structuredTask("terminal_task", 12000, { active: false, progress: null, ...scenario.fields });
+    const report = { ...structuredSubagents([task]).task_report, operation: "task_wait", snapshot: false };
+    const messages = [
+      { role: "assistant", content: "", tool_calls: [{ id: "wait", function: { name: "task_wait", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "wait", content: "raw task result\n", task_report: report },
+    ];
+    for (const phone of [false, true]) {
+      const h = retainedHistoryHarness(messages, { phone });
+      await h.c.loadHistory();
+      assertTerminalTaskCards(h.root, task, scenario.failure === true, scenario.reason);
+    }
+  });
+}
 
 test("subagent elapsed ticker pauses while hidden or detached and resumes one interval", () => {
   const h = streamHarness({ activityOnly: true });

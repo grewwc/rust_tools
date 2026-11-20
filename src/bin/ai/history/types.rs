@@ -67,6 +67,26 @@ pub(super) const FOLDED_TOOL_ORIGIN: &str = "runtime-origin:folded-tool-evidence
 /// request extends the previous request instead of diverging at that message.
 const REQUEST_REMINDER_ORIGIN: &str = "runtime-origin:request-reminder:v1:";
 
+/// Display-only request diagnostics travel with the canonical retry placeholder.
+const REQUEST_ERROR_ORIGIN: &str = "runtime-origin:request-error:v1:";
+
+pub(in crate::ai) fn request_error_message(placeholder: &str, detail: &str) -> Message {
+    Message {
+        role: "assistant".to_string(),
+        content: Value::String(placeholder.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: Some(format!("{REQUEST_ERROR_ORIGIN}{detail}")),
+    }
+}
+
+pub(in crate::ai) fn request_error_detail(message: &Message) -> Option<&str> {
+    message
+        .reasoning_content
+        .as_deref()?
+        .strip_prefix(REQUEST_ERROR_ORIGIN)
+}
+
 /// Prepends a context reminder to user content. The single formatting entry
 /// for both the live request and the replay of persisted reminders.
 pub(in crate::ai) fn prepend_request_reminder(content: Value, reminder: &str) -> Value {
@@ -113,6 +133,7 @@ pub(in crate::ai) fn is_retired_change_set_metadata(message: &Message) -> bool {
 pub(in crate::ai) fn has_runtime_message_metadata(message: &Message) -> bool {
     is_runtime_synthetic_user_message(message)
         || is_retired_change_set_metadata(message)
+        || request_error_detail(message).is_some()
         || crate::ai::tools::task_tools::TaskReport::is_message_metadata(message)
         || message
             .reasoning_content

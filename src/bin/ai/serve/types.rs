@@ -394,7 +394,7 @@ pub(crate) struct SessionItem {
     /// directory when the session never switched. The web UI shows it in the
     /// session bar so a new session's default directory is visible.
     pub(crate) cwd: String,
-    /// Live turn ownership sampled independently of persisted history.
+    /// Live turn or parked-work ownership sampled independently of persisted history.
     pub(crate) activity: SessionActivity,
     /// The question this session's turn child is blocked on, if any.
     #[serde(skip_serializing_if = "Option::is_none")]

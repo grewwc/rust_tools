@@ -1,6 +1,6 @@
 {
   "name": "task_cancel",
-  "description": "Cancel one or more still-running asynchronously spawned subagent tasks (from task_spawn). Terminates the subagent process and fills its result slot with a 'cancelled' terminal result, so later task_wait/task_status reports cancelled instead of hanging; you must still collect that cancelled result with `task_wait` or `task_status` before it can be integrated. Use for a stuck or superseded task, not to shorten a wait: cancellation discards undelivered work; prefer waiting or reporting verified state.",
+  "description": "Cancel one or more still-running asynchronously spawned subagent tasks (from task_spawn). Preflights the whole batch: if any active task has live progress within the last 60 seconds, rejects the call and cancels nothing unless force is true. Check task_status and keep waiting while progress advances. Use force only for superseded or no-longer-needed work, never to shorten a wait. Terminates the subagent process and fills its result slot with a 'cancelled' terminal result carrying cancel_reason separately from error and preserving available partial output. Collect that result with task_wait or task_status before integration and resource cleanup.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -14,6 +14,11 @@
       "reason": {
         "type": "string",
         "description": "Optional reason for canceling these tasks."
+      },
+      "force": {
+        "type": "boolean",
+        "default": false,
+        "description": "Bypass the recent-progress guard only when work is superseded or no longer needed. Never use force to shorten a wait. Without force, one active task with progress less than 60 seconds old rejects the entire batch."
       }
     },
     "required": [

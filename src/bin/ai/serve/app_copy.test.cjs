@@ -7,7 +7,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
-const html = fs.readFileSync(path.join(__dirname, "app.html"), "utf8");
+const html = fs.readFileSync(process.env.ASERVE_TEST_APP_HTML || path.join(__dirname, "app.html"), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 function between(start, end) {
   const first = script.indexOf(start), last = script.indexOf(end, first);
@@ -561,7 +561,7 @@ test("replay seals separate Markdown rounds with raw copy text and stored timest
 });
 
 for (const reason of ["ended", "interrupted"]) {
-  test("replay " + reason + " finalizes sanitized previews and preserves copy, time and throughput", async () => {
+  test("replay " + reason + " finalizes sanitized previews and preserves copy and time without speed metadata", async () => {
     const copied = [], h = replayHarness({ clipboard: { writeText: async (text) => copied.push(text) } });
     const raw = '## Final\n\n**bold** and `code`\n\n```html\n<div onclick="bad()">preview<script>bad()</script></div>\n```';
     h.view.delta(raw, { timestamp: 1700000000123 });
@@ -579,8 +579,8 @@ for (const reason of ["ended", "interrupted"]) {
     assert.equal(answer.querySelectorAll("[data-copy-answer]").length, 1);
     assert.equal(answer.querySelectorAll(".message-time").length, 1);
     assert.equal(answer.querySelector(".message-time").getAttribute("datetime"), "2023-11-14T22:13:20.123Z");
-    assert.equal(answer.querySelector(".turn-rate").textContent, "↳ speed · output 40 tok @ 20 tok/s");
-    assert.equal(h.view.box.querySelectorAll(".turn-rate").length, 1);
+    assert.equal(answer.querySelector(".turn-rate"), null);
+    assert.equal(h.view.box.querySelectorAll(".turn-rate").length, 0);
     assert.equal(h.view.box.querySelector(".pending"), null);
     assert.equal(h.view.box.className, "turn recovered");
     assert.equal(await h.tap(answer.querySelector("[data-copy-answer]")), true);
@@ -591,30 +591,28 @@ for (const reason of ["ended", "interrupted"]) {
 }
 
 for (const phone of [true, false]) {
-  test((phone ? "phone" : "desktop") + " final rendering keeps throughput outside copied answer text", async () => {
+  test((phone ? "phone" : "desktop") + " final rendering preserves copied answer text without speed metadata", async () => {
     const copied = [];
     const h = streamHarness({ phone, clipboard: { writeText: async (text) => copied.push(text) } });
     h.emit("delta", { delta: "provisional answer" });
-    // app_stream's phone generation tests also keep one styled rate surface visible.
     h.emit("rate", { phase: "output", tokens: 40, elapsed_ms: 2000 });
-    assert.equal(h.box.querySelectorAll(".turn-rate").length, 1);
+    assert.equal(h.box.querySelectorAll(".turn-rate").length, 0);
     const raw = "Final answer\nNext line";
     h.emit("replace", { text: raw });
     h.emit("done");
-    const footers = h.box.querySelectorAll(".turn-rate");
-    assert.equal(footers.length, 1, "final markdown rendering removed or duplicated throughput");
-    const footer = footers[0], answer = footer.parentNode;
+    assert.equal(h.box.querySelectorAll(".turn-rate").length, 0, "final markdown rendering added speed metadata");
+    const answer = h.box.children.find((row) => row.classList.contains("asst") && row.classList.contains("md")
+      && !row.classList.contains("pending"));
     assert.ok(answer.classList.contains("msg") && answer.classList.contains("asst"));
-    assert.equal(footer.textContent, "↳ speed · output 40 tok @ 20 tok/s");
     assert.doesNotMatch(answer.querySelector(".answer-body").textContent, /speed|tok\/s/);
     assert.equal(h.box.querySelectorAll("[data-copy-answer]").length, 1);
     assert.equal(await h.tap(answer.querySelector("[data-copy-answer]")), true);
-    assert.deepEqual(copied, [raw], "the new rate footer leaked into copied markdown");
+    assert.deepEqual(copied, [raw], "copy did not preserve the final markdown");
     answer.querySelector(".answer-body").renderedText = raw;
     h.context.answer = answer;
     vm.runInContext("answerCopyTexts.delete(answer);", h.context);
     assert.equal(await h.tap(answer.querySelector("[data-copy-answer]")), true);
-    assert.deepEqual(copied, [raw, raw], "rendered-text copy included throughput");
+    assert.deepEqual(copied, [raw, raw], "rendered-text copy changed the answer");
   });
 }
 

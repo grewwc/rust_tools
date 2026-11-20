@@ -142,6 +142,68 @@ impl SessionOpenLease {
     }
 }
 
+/// The advisory work lease for one session.
+///
+/// A foreground loop acquires it before execution and retains it until no
+/// foreground process or background subagent owns live work. In particular it
+/// spans the release and reacquisition of the turn lease around cooperative
+/// waits, including scheduler dispatch and result collection. It is not a write
+/// lock; the turn lease remains the authority that serializes history writes.
+///
+/// The lock file is `<history_file stem>.work.lock` beside the session
+/// database, so it follows the exact file the work writes even when the session
+/// id was sanitized on its way to disk.
+#[derive(Debug)]
+pub(in crate::ai) struct SessionWorkLease {
+    _lease: FileLease,
+}
+
+impl SessionWorkLease {
+    /// Acquire `history_file`'s work lease without waiting.
+    ///
+    /// A lease held by another live process returns
+    /// `io::ErrorKind::WouldBlock`; status probes treat that as evidence of
+    /// live work, while this holder keeps its own lease.
+    pub(in crate::ai) fn acquire(history_file: &Path, session_id: &str) -> io::Result<Self> {
+        FileLease::acquire(
+            history_file,
+            "work.lock",
+            "running background work",
+            "work loop",
+            session_id,
+        )
+        .map(|lease| Self { _lease: lease })
+    }
+
+    /// Acquire the work lease, retrying briefly when another probe holds the
+    /// free lock for the instant it samples ownership.
+    ///
+    /// A status probe takes the exclusive flock and releases it immediately to
+    /// distinguish free from held. If the wait window's acquisition lands in
+    /// that microsecond window, one `WouldBlock` must not leave the whole wait
+    /// unleased; a few scheduler yields let the probe finish. A genuinely held
+    /// lease still returns `WouldBlock` after the bounded attempts.
+    pub(in crate::ai) fn acquire_retrying(
+        history_file: &Path,
+        session_id: &str,
+    ) -> io::Result<Self> {
+        let mut last = None;
+        for _ in 0..8 {
+            match Self::acquire(history_file, session_id) {
+                Ok(lease) => return Ok(lease),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    last = Some(err);
+                    std::thread::yield_now();
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::WouldBlock, "session work lease is held")
+        }))
+    }
+}
+
 #[cfg(unix)]
 fn open_lock_file(path: &Path) -> io::Result<File> {
     OpenOptions::new()
@@ -207,10 +269,22 @@ pub(in crate::ai) enum TurnLeaseProbe {
 /// Sample turn ownership without creating files or reading session history.
 /// A stale PID marker alone is never evidence of a running turn.
 pub(in crate::ai) fn probe_turn_lease(history_file: &Path) -> TurnLeaseProbe {
+    probe_lease(history_file, "turn.lock")
+}
+
+/// Sample whether a live foreground loop still owns background work.
+///
+/// This is the parked-wait signal: the turn lease is free while a foreground
+/// process waits for subagent results, but the session is still owned.
+pub(in crate::ai) fn probe_session_work_lease(history_file: &Path) -> TurnLeaseProbe {
+    probe_lease(history_file, "work.lock")
+}
+
+fn probe_lease(history_file: &Path, suffix: &str) -> TurnLeaseProbe {
     if !crate::ai::history::is_sqlite_path(history_file) {
         return TurnLeaseProbe::Free;
     }
-    let path = history_file.with_extension("turn.lock");
+    let path = history_file.with_extension(suffix);
     let file = match open_existing_lock_file(&path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return TurnLeaseProbe::Free,
@@ -326,6 +400,56 @@ mod tests {
         drop(turn);
         drop(open);
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn work_lease_is_independent_of_turn_lease() {
+        let root = temp_root();
+        let history = root.join("session-a.sqlite");
+        let turn = TurnLease::acquire(&history, "session-a").expect("turn lease");
+        let work = SessionWorkLease::acquire(&history, "session-a").expect("work lease");
+        assert_eq!(probe_turn_lease(&history), TurnLeaseProbe::Held);
+        assert_eq!(probe_session_work_lease(&history), TurnLeaseProbe::Held);
+        drop(turn);
+        assert_eq!(probe_turn_lease(&history), TurnLeaseProbe::Free);
+        assert_eq!(probe_session_work_lease(&history), TurnLeaseProbe::Held);
+        drop(work);
+        assert_eq!(probe_session_work_lease(&history), TurnLeaseProbe::Free);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn work_lease_probe_distinguishes_free_held_and_unknown() {
+        let root = temp_root();
+        let history = root.join("session-a.sqlite");
+        let lock = history.with_extension("work.lock");
+        assert_eq!(probe_session_work_lease(&history), TurnLeaseProbe::Free);
+        assert!(!lock.exists(), "probing must not create a missing lock");
+
+        let lease = SessionWorkLease::acquire(&history, "session-a").expect("work lease");
+        assert_eq!(probe_session_work_lease(&history), TurnLeaseProbe::Held);
+        drop(lease);
+        assert_eq!(probe_session_work_lease(&history), TurnLeaseProbe::Free);
+
+        fs::remove_file(&lock).expect("remove free lock");
+        fs::create_dir(&lock).expect("make lock unprobeable");
+        assert_eq!(probe_session_work_lease(&history), TurnLeaseProbe::Unknown);
+        fs::remove_dir_all(&root).expect("remove test root");
+    }
+
+    #[test]
+    fn retrying_work_lease_reports_a_held_lease_and_acquires_a_free_one() {
+        let root = temp_root();
+        let history = root.join("session-a.sqlite");
+        let lease = SessionWorkLease::acquire(&history, "session-a").expect("work lease");
+        let err = SessionWorkLease::acquire_retrying(&history, "session-a")
+            .expect_err("a held work lease must not be stolen");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        drop(lease);
+        let retried =
+            SessionWorkLease::acquire_retrying(&history, "session-a").expect("free work lease");
+        drop(retried);
+        fs::remove_dir_all(&root).expect("remove test root");
     }
 
     #[test]

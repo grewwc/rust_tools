@@ -1298,6 +1298,7 @@ fn cancel_team(team: &mut TeamState, reason: &str) -> Result<Vec<String>, String
         notes.push(execute_task_cancel(&json!({
             "task_ids": runtime_ids,
             "reason": reason,
+            "force": true,
         }))?);
         notes.extend(collect_team_results(team)?);
     }

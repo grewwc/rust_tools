@@ -148,6 +148,26 @@ impl EvidenceReadOptions {
         if let Some(report) = report {
             extend_delivered_report_fields(fields, report)?;
         }
+        if fields.get("status").and_then(Value::as_str)
+            == Some(TaskTerminalStatus::Cancelled.as_str())
+        {
+            let reason = fields
+                .get("cancel_reason")
+                .or_else(|| fields.get("error"))
+                .cloned();
+            fields.remove("error");
+            raw_document
+                .as_object_mut()
+                .expect("delivered evidence envelope")
+                .remove("error");
+            if let Some(reason) = reason {
+                fields.insert("cancel_reason".to_string(), reason.clone());
+                raw_document["cancel_reason"] = reason;
+            }
+            if let Some(partial_output) = fields.get("partial_output") {
+                raw_document["partial_output"] = partial_output.clone();
+            }
+        }
         // Report metadata owns advisory claims; body-authored assessments remain in payload/output.
         let metadata = report
             .and_then(|report| report.verification.clone())
@@ -229,6 +249,14 @@ impl EvidenceReadOptions {
         if let Some(error) = document.get("error").and_then(Value::as_str) {
             response["error"] = json!(json_text_prefix(error, 192));
             response["error_truncated"] = json!(response["error"].as_str() != Some(error));
+        }
+        if let Some(reason) = document.get("cancel_reason").and_then(Value::as_str) {
+            response["cancel_reason"] = json!(json_text_prefix(reason, 192));
+            response["cancel_reason_truncated"] =
+                json!(response["cancel_reason"].as_str() != Some(reason));
+            response["cancel_reason_total_bytes"] = json!(reason.len());
+            response["cancel_reason_shown_bytes"] =
+                json!(response["cancel_reason"].as_str().unwrap_or_default().len());
         }
         if let Some(verification) = verification {
             response["verification"]["total_bytes"] = json!(
@@ -432,7 +460,8 @@ fn extend_delivered_report_fields(
     document: &mut Map<String, Value>,
     task: &TaskReportTask,
 ) -> Result<(), String> {
-    if let Some(error) = &task.error {
+    let cancelled = task.status == TaskTerminalStatus::Cancelled.as_str();
+    if !cancelled && let Some(error) = &task.error {
         document.insert("error".to_string(), Value::String(error.clone()));
     }
     if !task.output_truncated
@@ -441,10 +470,19 @@ fn extend_delivered_report_fields(
     {
         extend_missing_fields(document, output_fields);
     }
-    if let Value::Object(metadata) =
+    if let Value::Object(mut metadata) =
         serde_json::to_value(task).map_err(|error| error.to_string())?
     {
+        if cancelled {
+            metadata.remove("error");
+        }
         extend_missing_fields(document, metadata);
+    }
+    if cancelled {
+        document.remove("error");
+        if let Some(reason) = task.cancel_reason.as_ref().or(task.error.as_ref()) {
+            document.insert("cancel_reason".to_string(), Value::String(reason.clone()));
+        }
     }
     Ok(())
 }

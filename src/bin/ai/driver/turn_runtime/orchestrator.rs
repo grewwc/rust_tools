@@ -329,6 +329,7 @@ mod digest_backfill_tests;
 struct TurnOutputState {
     assistant_text: String,
     assistant_recorded: bool,
+    request_error_detail: Option<String>,
     response_model: Option<String>,
     terminal_dedupe_candidate: Option<String>,
     validation_status: Option<crate::ai::request::TransientStatusLine>,
@@ -3132,6 +3133,9 @@ async fn run_turn_body_round(
         };
         let was_final_response = matches!(&execution, IterationExecution::FinalResponse(_));
         let had_tool_call_execution = matches!(&execution, IterationExecution::ToolCall(_));
+        if let IterationExecution::RequestFailed(failure) = &execution {
+            output.request_error_detail = Some(failure.detail.clone());
+        }
         supervisor
             .progress
             .delegation_advisory
@@ -4172,6 +4176,7 @@ async fn run_turn_body_round(
                 &question,
                 &output.assistant_text,
                 output.assistant_recorded,
+                output.request_error_detail.as_deref(),
                 output.terminal_dedupe_candidate.as_deref(),
                 gate.has_pending_critical_premises(),
                 final_skill_name.as_deref(),
