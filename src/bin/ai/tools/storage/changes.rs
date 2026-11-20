@@ -592,10 +592,9 @@ pub(crate) fn grouped_changes(entries: &[MutationEntry]) -> Vec<FileChange> {
     grouped
 }
 
-/// Renderable diff block for one file. When snapshots are complete it keeps the
-/// existing net-diff logic (small-file behavior unchanged); when truncated it
-/// uses the authoritative diff recorded at write time so the truncation edge is
-/// never rendered as a deletion.
+/// Render a net diff from complete snapshots, or recorded per-write diffs when snapshots
+/// are capped so truncation edges are not rendered as deletions. Unavailable preimages
+/// remain explicit.
 pub(crate) fn file_snippet(g: &FileChange, max_lines: usize) -> Option<String> {
     if g.before_unavailable() {
         return Some(g.unavailable_notice().to_string());
@@ -696,7 +695,7 @@ pub(crate) fn diff_snippet(
     }
 }
 
-/// Derive a combined patch from mutation records in a viewer-compatible unified format.
+/// Derive a combined display patch from grouped mutation records.
 pub fn mutation_patch(entries: &[MutationEntry]) -> Option<String> {
     let grouped = grouped_changes(entries);
     if grouped.is_empty() {
@@ -715,13 +714,9 @@ pub fn mutation_patch(entries: &[MutationEntry]) -> Option<String> {
         match g.net.as_str() {
             "created" => {
                 out.push_str(&format!("--- /dev/null\n+++ b/{}\n", g.rel));
-                // A `--- /dev/null` patch body must be pure additions (the new
-                // content). Only a single-write create yields a full dump in
-                // diffs; any later write produces an incremental diff (pure `+`
-                // for appends, `- `/`+ ` for edits) whose lines reference a base
-                // version that does not exist under /dev/null. So only use
-                // diffs.last() for the single-write case and otherwise dump the
-                // (capped) final snapshot, which is at least a valid all-`+` body.
+                // Prefer a sole recorded diff for a creation. Multiple diffs describe
+                // intermediate versions rather than /dev/null, so use the capped final
+                // snapshot as an additions-only body.
                 if !g.snapshots_full() {
                     let mut used_diff = false;
                     if g.diffs.len() == 1 {
@@ -748,11 +743,8 @@ pub fn mutation_patch(entries: &[MutationEntry]) -> Option<String> {
             }
             "deleted" => {
                 out.push_str(&format!("--- a/{}\n+++ /dev/null\n", g.rel));
-                // A `+++ /dev/null` patch body must be pure deletions. The delete
-                // entry's own diff is the full `-` dump; prefer it, and only fall
-                // back to the (capped) before snapshot when no authoritative diff
-                // exists (old logs written without the diff field), so the patch is
-                // never an empty body under the deletion header.
+                // Prefer the last recorded diff for a deletion; older logs without diff
+                // data fall back to the capped initial snapshot.
                 if !g.snapshots_full() {
                     let mut used_diff = false;
                     if let Some(d) = g.diffs.last() {
@@ -776,8 +768,7 @@ pub fn mutation_patch(entries: &[MutationEntry]) -> Option<String> {
             _ => {
                 out.push_str(&format!("--- a/{}\n+++ b/{}\n", g.rel, g.rel));
                 if !g.snapshots_full() {
-                    // With truncated snapshots, use the authoritative diff
-                    // directly (`- `/`+ ` lines are the patch body).
+                    // Retain per-write diffs when capped snapshots cannot support a net comparison.
                     let body = g.diffs.join("");
                     out.push_str(&body);
                     if !body.ends_with('\n') {
@@ -1056,7 +1047,6 @@ pub fn open_changes(requested: Option<EditorKind>) -> Result<String, String> {
     let editor = resolve_editor(requested, &cwd);
     let patch_path = write_combined_patch()?;
 
-    // Dispatch to the resolved viewer.
     let result = match editor {
         EditorKind::Vscode => open_with_vscode(&patch_path, &cwd),
         EditorKind::Cursor => open_with_cursor(&patch_path),
@@ -1104,9 +1094,8 @@ fn open_with_vscode(patch_path: &Path, cwd: &Path) -> Result<String, String> {
             .as_deref()
             .map(|c| std::fs::write(&after_path, c).is_ok())
             .unwrap_or(true);
-        // Truncated snapshots are not the full file, so code --diff would show a
-        // wrong comparison; fall back to opening the patch instead (the patch is
-        // built from the authoritative diff recorded at write time).
+        // Capped or unavailable snapshots cannot support a complete `code --diff`
+        // comparison; open the display patch instead.
         if before_ok && after_ok && g.snapshots_full() {
             // Launch the two-file comparison in the background.
             let mut cmd = Command::new("code");
@@ -1706,10 +1695,8 @@ mod tests {
 
     #[test]
     fn truncated_snapshots_use_stored_diff_without_false_deletions() {
-        // Regression: when before/after snapshots are truncated (> MAX_CONTENT_BYTES)
-        // the display must use the authoritative diff recorded at write time and
-        // must not render the truncation edge as a deletion (an untouched 295-line
-        // tail was once shown as `-`).
+        // When before/after snapshots are capped, render recorded per-write diffs without
+        // treating the truncation edge as a deletion.
         use crate::ai::tools::storage::mutation_log::{cap_content, entry_diff};
 
         let mut before = String::new();
@@ -1778,7 +1765,6 @@ mod tests {
         assert!(snippet.contains("+ TO_BE_ADDED_V2"), "snippet: {snippet}");
         // The untouched tail must never be rendered as deleted (false-deletion regression).
         assert!(!snippet.contains("- tail line"), "snippet: {snippet}");
-        // mutation_patch uses the authoritative diff as well.
         let patch = mutation_patch(&entries).unwrap();
         assert!(patch.contains("- TO_BE_REMOVED"), "patch: {patch}");
         assert!(patch.contains("+ TO_BE_ADDED"), "patch: {patch}");

@@ -105,9 +105,9 @@ pub(in crate::ai) use asset_remap::remap_message_for_session_move;
 const KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS: usize = 48_000;
 
 /// The checkpoint body is already written to the session asset; this short
-/// marker is the model's only index for relocating that body after
-/// compression, so history compression must never swallow or drop it. The
-/// request projection may replace many old markers with a hierarchical index
+/// marker lets the model relocate that body after compression, so the request
+/// projection must retain a locator for each checkpoint path. It may keep only
+/// the newest marker for a mutable path or replace old markers with an index
 /// holding every exact path; that index is protected by the same rule, and the
 /// original markers always stay in canonical history.
 pub(in crate::ai) fn is_context_checkpoint_marker(m: &Message) -> bool {
@@ -302,14 +302,9 @@ fn protected_tool_context_message(
         })
 }
 
-/// "Budget char count" of a Value's content (Unicode scalar count).
-/// Historically this returned byte length, overestimating the char budget ~3x for
-/// Chinese/emoji content: a 36K-char soft threshold could be falsely triggered by
-/// a 12K-char Chinese turn, re-running the compaction pipeline over and over. Now
-/// measured uniformly by `chars().count()`, consistent with the naming of the
-/// outer `cap_chars` / `max_chars` thresholds. Image parts are billed nominally
-/// via [`IMAGE_BUDGET_CHARS`], keeping base64 text length from polluting the
-/// budget (see that constant's doc).
+/// Content size for char budgets, measured in Unicode scalars rather than bytes.
+/// Image parts use [`IMAGE_BUDGET_CHARS`] so base64 length does not dominate
+/// the budget.
 fn value_len_chars(v: &Value) -> usize {
     value_billable_counts(v).chars()
 }
@@ -330,17 +325,9 @@ fn value_billable_counts(v: &Value) -> BillableCounts {
 /// "Billed char count" of a single message entering a model request — the single
 /// authoritative measure.
 ///
-/// Historically many budget checks counted only `content`, entirely missing
-/// `tool_calls[].function.arguments` (typically `apply_patch` puts a whole large
-/// patch into arguments with empty content) and `reasoning_content` (long
-/// thinking chains), letting large messages bypass compaction gating and making
-/// TPM preflight and the max_tokens clamp underestimate input together.
-///
-/// This combines all three into one measure, aligned with the SQL side
-/// `total_message_chars_sqlite`
-/// (`length(content)+length(tool_calls)+length(reasoning_content)`), so the
-/// "in-memory budget" and "persisted budget" share one measure. Images are still
-/// billed nominally via [`IMAGE_BUDGET_CHARS`] (see `value_len_chars`).
+/// Combine content, serialized tool calls, and reasoning so patches in arguments
+/// and thinking chains cannot bypass compression budgets. Images use the nominal
+/// [`IMAGE_BUDGET_CHARS`] cost rather than their persisted text length.
 pub(in crate::ai) fn message_billable_chars(m: &Message) -> usize {
     message_billable_counts(m).chars()
 }
@@ -482,9 +469,9 @@ fn is_summary_message(message: &Message) -> bool {
     is_summary_note_text(&value_to_string(&message.content))
 }
 
-/// Protection window over recent complete tool groups. An assistant(tool_calls)
-/// batch is an indivisible evidence unit: it must never be truncated message by
-/// message, or parallel reads would leave half a batch behind.
+/// Retention window over recent tool groups. Count assistant/tool batches as
+/// indivisible units so a parallel batch cannot be split by a message-count
+/// cutoff.
 pub(in crate::ai) const KEEP_RECENT_TOOL_GROUPS: usize = 4;
 
 /// Window sequence for progressive folding: tightens stepwise from
@@ -506,13 +493,9 @@ fn progressive_fold_windows() -> Vec<usize> {
     windows
 }
 
-/// Whether message content contains a real image attachment (OpenAI Vision
-/// schema). The image must exist as a multimodal `Value::Array`, and the array
-/// must contain
-/// `{"type":"image_url", "image_url":{...}}`。
-/// The old implementation misjudged via `text.contains("data:image/")`: the agent
-/// merely discussing the `data:image/png` string in plain text got the whole
-/// message replaced, losing information.
+/// Detect image parts only in multimodal content arrays. A part counts if its
+/// type is `image_url` or it carries an `image_url` field; plain text mentioning
+/// an image data URL is not an attachment.
 fn message_contains_image(content: &Value) -> bool {
     let Some(arr) = content.as_array() else {
         return false;

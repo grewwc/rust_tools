@@ -3,21 +3,17 @@
 //! Inspired by the Unix `/proc` filesystem: it summarizes all "live" sessions
 //! in one table.
 //!
-//! Data sources (triple probe, falling back layer by layer):
-//! 1. **PID files** (`<id>.pid` in the sessions directory): written automatically
-//!    when a newer `a` starts, removed automatically on exit. Most reliable.
-//! 2. **`lsof` scan**: only for `a` processes not registered via a PID file,
-//!    query the `.sqlite` files they have open (`lsof -p`), rather than
-//!    recursively scanning the whole sessions directory. Covers sessions started
-//!    by older versions of `a` (they do not write PID files), though idle
-//!    older-version sessions waiting for input may be missed.
-//! 3. **`pgrep` count**: counts all processes named `a`, to hint
-//!    "N `a` processes are running, but only M sessions were identified".
+//! Data sources:
+//! - PID markers (`<id>.<pid>.pid`, plus legacy `<id>.pid`) identify sessions.
+//! - The `a` process list identifies PIDs without markers for an `lsof -p`
+//!   query of open SQLite files. Idle processes with no open history file
+//!   can be missed.
+//! - The process count is compared with identified session records to
+//!   surface possible processes without known sessions.
 //!
-//! Sessions whose last recorded activity is older than `STALE_AFTER_HOURS` are
-//! tagged `stale`: the process may still be alive (e.g. an orphaned terminal
-//! host/worker pair after the terminal closed), but no agent work is happening,
-//! so it must not look identical to an active session.
+//! Sessions whose last recorded activity is more than `STALE_AFTER_HOURS`
+//! hours old are tagged `stale`. This reports persisted activity age,
+//! independently of the process's current liveness or subagent progress.
 //!
 //! Note: sessions suspended via `/bg`, `/suspend`, etc. are **not** active:
 //! their processes have exited, only their state was saved for later recovery.
@@ -30,9 +26,7 @@ use chrono::{DateTime, Local};
 
 use crate::ai::{driver::session_pid, history::SessionStore, types::App};
 
-/// A session whose last recorded activity is older than this many hours is
-/// tagged `stale` in the listing: its process may still be alive, but no
-/// agent work has happened recently.
+/// Age threshold for tagging a session's persisted activity as stale.
 const STALE_AFTER_HOURS: i64 = 24;
 
 /// Merged active-session record.
@@ -101,7 +95,7 @@ pub fn try_handle_proc_command(app: &App, input: &str) -> Result<bool, Box<dyn s
         insert_active_session(&mut by_session_pid, sid, pid, "lsof");
     }
 
-    // Exclude our own process: `a /proc` is a one-shot query, not a real active session.
+    // Exclude the querying process so it does not list itself as a peer session.
     let sessions: Vec<&ActiveSession> = by_session_pid
         .values()
         .filter(|s| s.pid != current_pid)
@@ -223,9 +217,8 @@ fn insert_active_session(
         });
 }
 
-/// A session counts as stale when its last recorded activity predates the
-/// cutoff: its process may still be alive, but no agent work is happening.
-/// Sessions whose activity cannot be determined are never stale.
+/// Whether the last recorded activity predates the cutoff.
+/// Unknown activity timestamps are treated as non-stale.
 fn is_stale(modified: Option<&DateTime<Local>>, cutoff: DateTime<Local>) -> bool {
     modified.is_some_and(|modified| *modified < cutoff)
 }

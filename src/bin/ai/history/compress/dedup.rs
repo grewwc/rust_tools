@@ -1,4 +1,4 @@
-//! Dedup helpers for compress (extracted from mod.rs).
+//! Duplicate tool-result handling and reasoning retention for request projections.
 
 use serde_json::Value;
 
@@ -77,14 +77,12 @@ pub(super) fn dedup_adjacent(messages: &mut Vec<Message>) {
 ///   group is still in context; once the whole group is replaced by a summary, no
 ///   replay is needed;
 /// - other assistant messages with `tool_calls` keep full reasoning_content only
-///   for the most recent `KEEP_RECENT_TOOL_CALL_REASONING` turns, older ones set
+///   for the most recent `KEEP_RECENT_TOOL_CALL_REASONING` messages, older ones set
 ///   to None; missing fields DeepSeek requires are backfilled with empty strings
 ///   by the request layer, avoiding historical reasoning text accumulating
-///   monotonically over long sessions, slowing responses and "getting dumber";
+///   monotonically over long sessions and consuming the context budget;
 /// - plain-answer assistant messages without tool_calls: keep only the most
-///   recent one's reasoning_content, the rest set to None (OpenAI et al. only
-///   require reasoning paired with the most recent tool_call in the same turn;
-///   old plain-answer reasoning can be dropped safely).
+///   recent one's reasoning_content, the rest set to None.
 pub(super) fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
     // Index of the most recent assistant reasoning "without tool_calls" — this one
     // is kept.
@@ -125,7 +123,7 @@ pub(super) fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
         {
             continue;
         }
-        // Turns with tool_calls: keep only the most recent N full reasonings, the
+        // Messages with tool_calls: keep only the most recent N full reasonings, the
         // rest set to None.
         if m.tool_calls.is_some() {
             let rank = seen_tool_call_reasoning;
@@ -135,7 +133,7 @@ pub(super) fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
             }
             continue;
         }
-        // Plain-answer turns: keep only the most recent one.
+        // Plain-answer messages: keep only the most recent one.
         if Some(idx) == keep_plain_idx {
             continue;
         }
@@ -143,12 +141,10 @@ pub(super) fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
     }
 }
 
-/// Cross-turn tool result dedup: when the same (tool_name, normalized_args)
-/// appears multiple times in the history, earlier tool results are replaced with
-/// a single-line stub (tool_call_id kept to preserve OpenAI tool-calls protocol
-/// correctness). Only content is compressed, no messages deleted, avoiding a
-/// broken pairing between assistant tool_calls and tool responses. The most
-/// recent KEEP_RECENT_TOOL_GROUPS complete tool groups are always kept in full.
+/// Replace repeated tool results with back-reference stubs while retaining
+/// tool_call_id for protocol pairing. Precision tools and `tree` deduplicate by
+/// content hash; other tools use normalized call arguments. Recent groups are
+/// protected from numbered-line overlap removal, but can still receive dedup stubs.
 pub(super) fn dedup_repeated_tool_results(
     messages: &mut [Message],
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
@@ -156,8 +152,7 @@ pub(super) fn dedup_repeated_tool_results(
     use rustc_hash::{FxHashMap, FxHasher};
     use std::hash::{Hash, Hasher};
 
-    // Collect (tool_name, args_signature) -> occurrence counts and indices
-    // Map tool_call_id -> (name, args) via assistant.tool_calls
+    // Reused call IDs cannot identify one invocation; exclude them from dedup.
     let mut id_occurrences: FxHashMap<String, usize> = FxHashMap::default();
     for message in messages.iter() {
         for tool_call in message.tool_calls.iter().flatten() {
@@ -207,24 +202,9 @@ pub(super) fn dedup_repeated_tool_results(
     // (name, args) -> the "newest full-text-kept" tool call under that signature,
     // used as the fold back-reference.
     let mut seen: FxHashMap<(String, String), DedupToolOccurrence> = FxHashMap::default();
-    // (tool_name, content_hash) -> the tool call where that content version most
-    // recently appeared.
-    // Content-level dedup is the key to breaking the "re-reading the same whole
-    // file" amnesia loop: for non-compressible tools like read_file, repeated
-    // reads of the same (file) often return **byte-identical** full text (measured
-    // at ~52% of all tool bytes). Such redundant copies can be folded losslessly,
-    // while versions whose content truly changed (e.g. an edited file) survive
-    // intact because their hash differs.
-    //
-    // **Key point**: the key does not carry `args_norm` — historically args were
-    // part of the key, so explicit "case/path variants of the same query"
-    // (`readFileLines` vs `read_file_lines`, case-sensitivity differences, etc.)
-    // would not collapse even when returning **byte-identical** "no hit" bodies,
-    // piling up 6+ copies of 15KB identical content at the tail (see the e75fc2e5
-    // session dump). Switched to `(tool_name, content_hash)`: fold whenever the
-    // returned body itself matches — different args are handled separately by the
-    // call-signature dedup's `seen` counter and do not affect content-level
-    // folding.
+    // Index by tool name and result-content hash, independent of arguments, so
+    // identical bodies from different calls reuse the newest occurrence.
+    // Different content versions keep separate entries.
     let mut seen_content: FxHashMap<(String, u64), DedupToolOccurrence> = FxHashMap::default();
     // Scan from newest to oldest so the newest call keeps full text and only older
     // duplicates get folded. Especially critical for retry-after-failure: a

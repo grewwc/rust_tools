@@ -53,8 +53,6 @@ fn identity_of(metadata: &fs::Metadata, len: u64, mtime: SystemTime) -> FileIden
             dev: metadata.dev(),
             ino: metadata.ino(),
             ctime_sec: metadata.ctime(),
-            // ctime_nsec is i32 on some targets and i64 on others; narrow
-            // explicitly so the struct shape stays stable across platforms.
             ctime_nsec: metadata.ctime_nsec() as i64,
         }
     }
@@ -209,11 +207,9 @@ impl ArchiveRoot {
             .map(|(content, _)| content)
     }
 
-    /// Identity of the held session root directory itself: the device/inode
-    /// pair of the directory descriptor captured at `new` time. Callers bind
-    /// cached file bodies to this pair so entries from one session directory
-    /// can never be served for another path that merely reuses the same
-    /// spelling after the directory was replaced.
+    /// Device/inode identity of the held root directory on Unix; `(0, 0)` elsewhere.
+    /// Used to bind caches to the held directory rather than a pathname that can
+    /// be reused after replacement.
     pub(super) fn root_identity(&self) -> (u64, u64) {
         #[cfg(unix)]
         {
@@ -231,11 +227,10 @@ impl ArchiveRoot {
         }
     }
 
-    /// Opens `path` through the session-bound safe path (every component opened
-    /// with O_NOFOLLOW relative to a held directory descriptor) and returns the
-    /// open descriptor plus the file identity observed on that descriptor.
-    /// The identity covers length, mtime, device/inode, and change time so an
-    /// equal-length replacement that restores the mtime is still a mismatch.
+    /// Open within the session root and return descriptor-observed file identity.
+    /// On Unix, component opens use `O_NOFOLLOW` with held directories, and the
+    /// identity includes device/inode and change time to detect replacements
+    /// that restore mtime.
     pub(super) fn open_versioned(&self, path: &Path) -> Option<(File, FileIdentity)> {
         let file = self.open(path)?;
         let metadata = file.metadata().ok()?;
@@ -374,8 +369,8 @@ impl ArchiveRoot {
             if metadata.is_file() {
                 files.push(path);
             } else if metadata.is_dir() && depth < max_depth && *remaining_entries > 0 {
-                // Enumerate the same directory we inspected, not its pathname:
-                // renames after open must not redirect enumeration to a link.
+                // On Unix, enumerate the inspected directory descriptor so a rename
+                // cannot redirect traversal through a replacement path.
                 if let Some(children) = self.children(file, &path, remaining_entries) {
                     stack.extend(children.into_iter().rev().map(|child| (child, depth + 1)));
                 }

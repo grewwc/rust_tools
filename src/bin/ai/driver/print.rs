@@ -9,9 +9,8 @@ use crate::ai::{
 
 /// Write one complete terminal line through the footer-aware stdout path.
 ///
-/// Every driver and stream status line goes through this entry: the side-note
-/// composer reserves the bottom row, and a bare `println!` that starts on it would
-/// scroll a partially overwritten composer line into scrollback.
+/// The side-note composer reserves the bottom row. A bare `println!` starting
+/// there would scroll a partially overwritten composer into scrollback.
 pub(crate) fn print_line(line: &str) {
     crate::ai::stream::side_note_input::print_output_line(line);
 }
@@ -274,9 +273,8 @@ pub(in crate::ai) fn sanitize_for_terminal(text: &str) -> String {
                     i += 1;
                 }
             } else {
-                // Unknown ESC sequence. Preserve the old behavior of dropping the following
-                // payload as well, but do it in char units instead of raw bytes so we never
-                // slice inside a UTF-8 code point.
+                // Drop an unknown ESC sequence and its following character,
+                // advancing by a full UTF-8 character to avoid slicing a code point.
                 i += 1;
                 while i < bytes.len() && !text.is_char_boundary(i) {
                     i += 1;
@@ -292,9 +290,8 @@ pub(in crate::ai) fn sanitize_for_terminal(text: &str) -> String {
             continue;
         }
 
-        // `i` is a byte index. In rare cases (e.g. binary blobs containing ESC + UTF8 leading
-        // bytes), previous byte-based skipping can leave `i` in the middle of a UTF8 sequence.
-        // Never slice `text[i..]` unless `i` is a valid char boundary.
+        // Maintain a UTF-8 character boundary before slicing `text[i..]`;
+        // escape-sequence parsing advances the cursor in byte units.
         while i < bytes.len() && !text.is_char_boundary(i) {
             i += 1;
         }

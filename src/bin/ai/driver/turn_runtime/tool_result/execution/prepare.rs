@@ -1,5 +1,5 @@
-//! Tool-result preparation: inline/offload decisions and the lossless
-//! line-trim policy for evidence-bearing tool outputs.
+//! Tool-result preparation: inline/offload decisions, lossy overview sampling,
+//! and raw current-round evidence.
 
 use super::*;
 
@@ -13,10 +13,9 @@ pub(in crate::ai::driver::turn_runtime) fn supports_line_trim(tool_name: &str) -
     matches!(tool_name, "tree" | "ast_outline")
 }
 
-/// Fold "medium-sized" structured output (between MAX_TOOL_RESULT_LINE_TRIM_CHARS and
-/// MAX_TOOL_RESULT_INLINE_CHARS) into: first N lines + a few keyword-matching lines +
-/// last M lines + a middle marker. Nothing is written to disk and the overall semantics
-/// are preserved; it only squeezes out the redundant middle.
+/// Sample structured overview output into head lines, keyword-matching middle lines,
+/// and tail lines. Omitted lines are marked; no recovery archive is written here, so
+/// callers must restrict this lossy projection to tools accepted by `supports_line_trim`.
 pub(in crate::ai::driver::turn_runtime) fn line_trim_middle(content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
@@ -114,10 +113,8 @@ pub(in crate::ai::driver::turn_runtime) fn prepare_tool_result(
 
     if char_count <= inline_limit && supports_line_trim(tool_name) {
         let trimmed = line_trim_middle(content);
-        // Reuse the trimmed byte length as a cheap short-circuit: trimmed is
-        // assembled from selected lines of content (possibly rewritten; ASCII/UTF-8
-        // preserved), so if it is shorter in bytes it is necessarily shorter in
-        // chars too — no need for a full chars().count() second scan.
+        // Count characters only if trimming first reduces the byte length; added
+        // sample labels can change byte and character savings independently.
         if trimmed.len() < content.len() && trimmed.chars().count() < char_count {
             return PreparedToolResult {
                 content_for_model: trimmed,

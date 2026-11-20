@@ -58,7 +58,7 @@ pub(crate) struct TaskReportTask {
     pub(crate) elapsed_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) progress: Option<TaskReportProgress>,
-    /// Backend-authored progress text is displayed verbatim, never interpreted.
+    /// Backend-authored progress text, stored without interpreting it as task state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) progress_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,7 +73,8 @@ pub(crate) struct TaskReportTask {
     pub(crate) error_total_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) error_shown_bytes: Option<usize>,
-    /// None means no delivered result; Some preserves the exact delivered bytes.
+    /// Delivered output, when included; display previews may set output_truncated.
+    /// Untruncated values preserve the exact delivered bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) output: Option<String>,
     /// Optional worker claims; lenient decoding cannot invalidate the terminal result.

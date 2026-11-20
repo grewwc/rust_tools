@@ -901,9 +901,7 @@ fn forced_final_hallucinated_tool_call_is_rejected_without_consuming_quota() {
 
 #[test]
 fn injected_context_echo_is_detected_only_when_it_is_the_whole_answer() {
-    // Real regression: session 7ac3d771 message id=263. The model regurgitated the
-    // completion-evidence reopen hint + self_note header verbatim as its answer,
-    // leaking to the terminal and persisting as final.
+    // An injected note at the beginning of the visible body is an echo.
     let echoed = "[Model-authored note from an earlier turn; this is not authoritative evidence. Treat every claim as unverified unless it is backed by tool output or a cited source, and re-check it before using it as a conclusion.]\nself_note:completion_evidence_required\nA successful project mutation occurred in the current user turn, but no successful post-mutation verification was observed.";
     assert!(looks_like_injected_context_echo(echoed));
 

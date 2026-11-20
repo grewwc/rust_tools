@@ -9,7 +9,7 @@
 /// Some git global options consume the argument right after them: `-C <path>`,
 /// `-c <name>=<value>`,
 /// `--git-dir <path>`、`--work-tree <path>`、`--namespace <name>`、`--exec-path <path>`。
-/// `=`-attached forms (e.g. `--git-dir=/repo`, `-C/repo`) consume no extra token.
+/// Inline value forms (e.g. `--git-dir=/repo`, `-C/repo`) consume no extra token.
 /// The first token after `--` is treated as the subcommand.
 pub(crate) fn git_subcommand_index(command_tokens: &[String]) -> Option<usize> {
     const VALUE_CONSUMING_LONG: &[&str] =
@@ -138,10 +138,9 @@ pub(crate) fn is_cargo_fmt_program(program: &str) -> bool {
 /// harmless and necessary); only the subcommands below are hard-blocked. Global
 /// option variants (e.g. `git -C /repo rm`) hit too.
 const BLOCKED_GIT_SUBCOMMANDS: &[(&str, &str)] = &[
-    // `git rm` physically deletes files from the working tree, unrecoverable;
-    // `git rm --cached` only removes the index entry, but blocking outright is
-    // safer than per-argument analysis. Use safe tools like `trash` to delete
-    // files.
+    // `git rm` can discard working-tree content. `--cached` only updates the index,
+    // but block both forms to avoid per-argument analysis. Use apply_patch with
+    // `*** Delete File:` to remove project files.
     (
         "rm",
         "git rm is blocked by sandbox policy; delete project files with apply_patch `*** Delete File:`",
@@ -167,9 +166,6 @@ pub(crate) fn blocked_git_subcommand(command_tokens: &[String]) -> Option<&'stat
 /// when they would truly destroy uncommitted changes (working-tree/staged
 /// changes, untracked files), avoiding collateral damage to normal workflows.
 /// Returns the rejection reason on a hit.
-///
-/// Covers the user requirement "ban `git checkout --` and any command that
-/// deletes currently uncommitted files irreversibly".
 pub(crate) fn blocked_git_destructive(command_tokens: &[String]) -> Option<&'static str> {
     let idx = git_subcommand_index(command_tokens)?;
     // Subcommand names are case-insensitive; match after lowercasing.
@@ -196,12 +192,9 @@ pub(crate) fn blocked_git_destructive(command_tokens: &[String]) -> Option<&'sta
                     "git checkout --force/-B discards uncommitted changes when switching branches",
                 );
             }
-            // With no `--` and no force, use heuristics to detect file paths:
-            // 1. `.`/`..`/`./`/`../` are obviously path shapes — block directly.
-            // 2. An argument ending in a file extension (e.g. `src/main.rs`,
-            //    `package.json`) is most likely a file path, not a branch name;
-            //    the `.` suffix of branch/tag names is usually numeric (e.g.
-            //    `v1.2.3`), not all letters, so no false block.
+            // Without `--` or force, block path-like tokens conservatively:
+            // `.`/`..`/`./`/`../` shapes and short alphabetic extensions.
+            // Branch names with the same shapes can also be rejected.
             let looks_like_path = rest.iter().any(|t| {
                 if t.starts_with('-') {
                     return false;
@@ -211,7 +204,7 @@ pub(crate) fn blocked_git_destructive(command_tokens: &[String]) -> Option<&'sta
                     || t.starts_with("./")
                     || t.starts_with("../")
                     || t.rfind('.').map_or(false, |pos| {
-                        // Skip dotfiles (.gitignore etc.); already covered above.
+                        // Ignore bare dotfile names; explicit `./` paths were already handled.
                         pos > 0 && {
                             let ext = &t[pos + 1..];
                             !ext.is_empty()
@@ -244,9 +237,9 @@ pub(crate) fn blocked_git_destructive(command_tokens: &[String]) -> Option<&'sta
             }
             None
         }
-        // `git restore` defaults to restoring the working tree, discarding
-        // uncommitted working-tree changes; only "--staged alone" is a safe
-        // unstage (working tree untouched, reversible).
+        // `git restore` without `--staged` can discard working-tree edits.
+        // Explicit `--worktree` is blocked; the remaining `--staged` forms leave
+        // the working tree untouched.
         "restore" => {
             if rest.iter().any(|t| t == "--worktree") {
                 return Some("git restore --worktree discards uncommitted working-tree changes");
@@ -259,7 +252,7 @@ pub(crate) fn blocked_git_destructive(command_tokens: &[String]) -> Option<&'sta
                 return Some("git restore --source=... discards uncommitted working-tree changes");
             }
             if has_staged {
-                // Unstage only, working tree untouched, reversible — allow.
+                // With `--worktree` ruled out, `--staged` leaves the working tree untouched.
                 return None;
             }
             Some("git restore discards uncommitted working-tree changes")
@@ -275,8 +268,8 @@ pub(crate) fn blocked_git_destructive(command_tokens: &[String]) -> Option<&'sta
             }
             None
         }
-        // `git clean -f` deletes untracked files, unrecoverable; `-n` (dry-run)
-        // and the like do not actually delete — allow.
+        // Force flags are blocked conservatively because `git clean` can delete
+        // untracked files. Forms without an explicit force flag pass this check.
         "clean" => {
             if rest.iter().any(|t| {
                 t == "-f"

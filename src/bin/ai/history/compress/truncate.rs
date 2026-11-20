@@ -51,7 +51,7 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit(
 /// length because the truncation ellipsis is three bytes. A successful field
 /// truncation therefore refreshes its entry explicitly; the byte check only
 /// catches replacements made outside this pass. A value with no cheap byte
-/// length is marked unknown and always recomputed.
+/// length has no byte-length signal, so callers must refresh it after mutation.
 struct MessageFieldCounts {
     entries: Vec<FieldCountEntry>,
 }
@@ -67,8 +67,8 @@ struct FieldCountEntry {
     argument_bytes: Vec<Option<usize>>,
 }
 
-/// Byte length of a value when it is a string; composite values have no cheap
-/// length and therefore never match a cached entry.
+/// Byte-length hint for string content; composite values have no such cache
+/// invalidation signal.
 fn value_byte_len(value: &Value) -> Option<usize> {
     match value {
         Value::String(text) => Some(text.len()),
@@ -184,10 +184,9 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
         return true;
     }
 
-    // The overflow asset is the single source of truth for protected evidence. When
-    // the budget is short, drop the optional preview first and keep only the
-    // parseable file_path pointer; the later generic head+tail truncation must
-    // never touch that minimal protocol.
+    // Overflow stubs must retain a parseable file_path pointer. Drop optional
+    // previews first under budget pressure; generic head+tail truncation must
+    // never touch the minimal recovery protocol.
     minimize_overflow_stubs_for_hard_budget(messages);
     minimize_truncated_previews_for_hard_budget(messages, overflow_dir, protected_tool_call_ids);
     let mut total_chars = messages_total_chars(messages);
@@ -290,8 +289,8 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
                 blocked_fields.insert((message_index, field), outcome.blocks_forever());
                 continue;
             }
-            // A two-char cut leaves `len()` unchanged: 4000 ASCII chars become
-            // 3998 chars plus the three-byte ellipsis, still 4000 bytes. The
+            // A two-char cut can leave `len()` unchanged: 4000 ASCII bytes become
+            // 3997 ASCII bytes plus a three-byte ellipsis. The
             // byte-only staleness check cannot see that edit, so refresh the
             // entry here instead of letting the next scan use the old count.
             counts.entries[message_index] = MessageFieldCounts::entry(&messages[message_index]);
@@ -513,9 +512,8 @@ fn minimize_truncated_preview_for_hard_budget(message: &mut Message) {
     }
     // Fold stubs are system-like and never enter the generic truncation loop,
     // but their two guidance lines are static boilerplate (~350 chars per
-    // stub), not evidence: the full group content lives behind
-    // archive_file_path. Shrink them to short budget notes so the hard
-    // target stays reachable when several folded groups accumulate.
+    // stub), not evidence. Shrink them while retaining recall lines and archive
+    // pointers so several folded groups can fit within the hard target.
     if message.role == crate::ai::history::ROLE_INTERNAL_NOTE
         && let Value::String(text) = &message.content
         && text.contains("compressed_tool_round")
@@ -592,9 +590,8 @@ pub(in crate::ai) fn is_context_overflow_truncated_stub(text: &str) -> bool {
         .starts_with(CONTEXT_OVERFLOW_TRUNCATED_PREFIX)
 }
 
-/// Extract the `archived at: <path>` target embedded in an overflow stub, if
-/// any. The canonical form puts the pointer on the first line; a legacy inline
-/// form cuts the path at `;` or end of line.
+/// Extract the trimmed remainder of a line containing `archived at:` from an
+/// overflow stub. This parser does not validate the path.
 pub(in crate::ai) fn embedded_archive_path(text: &str) -> Option<&str> {
     text.lines()
         .find_map(|line| line.split_once("archived at: ").map(|(_, p)| p.trim()))
@@ -859,13 +856,9 @@ fn truncate_mutable_field_with_policy(
                 }
                 return FieldTruncateOutcome::target_dependent(reduce_by);
             }
-            // When the preview budget is too small, the stub would be only a
-            // long path with no actual content (a fake truncation): a small
-            // result (e.g. a task_status poll) turned into an empty-preview
-            // stub leaves the model unable to judge the real state and can
-            // trap it in a "cannot confirm status → poll forever" loop. Keep
-            // the original and let the hard budget bail out instead of
-            // producing an information-free stub.
+            // Soft compaction requires a meaningful preview: a bare path can hide
+            // a small status result's state and induce repeated polling. The hard
+            // backstop may use a terminal pointer when the preview cannot fit.
             let build_truncated = |path: Option<&str>| -> Option<String> {
                 let prefix = content_truncation_prefix(path);
                 let preview_budget = target.saturating_sub(prefix.chars().count());
@@ -896,10 +889,9 @@ fn truncate_mutable_field_with_policy(
             else {
                 return FieldTruncateOutcome::target_dependent(reduce_by);
             };
-            // Truncate only when the archived form keeps a meaningful preview;
-            // only after the archive write actually failed may we degrade to
-            // the no-path inline stub, so a good archive is never downgraded
-            // to an unreadable preview.
+            // Validate the archived form before writing. BestEffort fields may
+            // fall back to a no-path stub on write failure; Required fields retain
+            // the original instead.
             let archive_file_path =
                 archive_truncated_field_to_overflow(message, field, overflow_dir);
             // Required policy (current user instruction): without an archived

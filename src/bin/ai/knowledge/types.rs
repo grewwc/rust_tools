@@ -1,9 +1,7 @@
-/// Unified category and knowledge type definitions.
-/// Single source of truth — replaces scattered string lists.
+//! Shared knowledge categories and lifetime policies.
 use serde::{Deserialize, Serialize};
 
 /// All valid knowledge categories.
-/// Replaces the 5 scattered string lists across the codebase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Category {
@@ -136,7 +134,6 @@ impl std::fmt::Display for Category {
 }
 
 /// Knowledge type — determines TTL and validation strategy.
-/// Merges the old and new KnowledgeType enums into one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KnowledgeType {

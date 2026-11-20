@@ -1,6 +1,6 @@
-/// Decision log module - records the AI agent's key decision-making process
-///
-/// Used for meta-cognition: traces back "why a certain choice was made", aiding debugging and optimization
+//! Decision records and context-projection telemetry for debugging and feedback.
+//!
+//! Separate retention keeps request telemetry from evicting decisions or their feedback targets.
 use chrono::Local;
 use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use crate::commonw::configw;
 
 /// Byte cap for the on-disk decision log; exceeding it triggers one tail-retaining compaction. About 8MB.
 const DECISION_LOG_MAX_PERSIST_BYTES: u64 = 8 * 1024 * 1024;
-/// Number of recent lines retained after compaction (same order as the in-memory max_capacity, enough to replay the current session).
+/// Number of recent lines retained after on-disk compaction.
 const DECISION_LOG_RETAIN_LINES: usize = 2000;
 /// File-name suffixes of the persisted streams written beside a session history file.
 const DECISION_LOG_FILE_SUFFIX: &str = ".decision-log.jsonl";
@@ -220,9 +220,10 @@ impl DecisionLogStore {
         }
     }
 
-    /// Compacts the on-disk log file down to the most recent `DECISION_LOG_RETAIN_LINES` lines, using a temp file
-    /// + atomic rename so readers never see a partial file. Best-effort: any failed step aborts the compaction without
-    /// affecting the main flow. Concurrent writes follow last-writer-wins; at most a few not-yet-compacted tail lines are lost.
+    /// Retain the newest `DECISION_LOG_RETAIN_LINES` lines using a temp file
+    /// and rename. Failures leave the main flow running. Concurrent writers are
+    /// not serialized, so a compaction can discard appended records or race
+    /// another compaction.
     fn compact_persist_file(&self, path: &Path) {
         let Ok(file) = std::fs::File::open(path) else {
             return;
@@ -282,7 +283,6 @@ impl DecisionLogStore {
 
     fn push_decision(&self, log: DecisionLog) {
         let mut logs = self.logs.lock().unwrap();
-        // If over capacity, drop the oldest 10%.
         if logs.len() >= self.max_capacity {
             let remove_count = self.max_capacity / 10;
             logs.drain(0..remove_count);
@@ -745,8 +745,7 @@ pub fn log_scheduler_dispatch(
 }
 
 /// Helper: record a session-title generation failure (silent paths such as transport/HTTP/parse errors or low-quality rejection).
-/// Title generation failures used to leave only a commented-out eprintln, so users could not tell a "request timeout" from
-/// "the model replied but was rejected by quality filtering", leaving the session stuck on a fallback title, unobservable.
+/// Distinguish transport failures from quality rejection when a fallback title is retained.
 pub fn log_session_title_failure(
     store: &DecisionLogStore,
     session_id: &str,
@@ -840,7 +839,6 @@ mod tests {
     fn test_log_store_capacity() {
         let store = DecisionLogStore::new(10);
 
-        // Add 15 log entries
         for i in 0..15 {
             store.log(DecisionLog {
                 timestamp: 0,
@@ -857,7 +855,6 @@ mod tests {
             });
         }
 
-        // Only the most recent 10 entries should be kept (in practice 9-10 are kept because 10% get dropped)
         let recent = store.recent(100);
         assert!(recent.len() <= 10);
         assert_eq!(recent[0].turn_id, 5); // the oldest one is entry 5
@@ -1194,10 +1191,8 @@ mod tests {
         let reader = BufReader::new(std::fs::File::open(&path).unwrap());
         let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
         assert_eq!(lines.len(), DECISION_LOG_RETAIN_LINES);
-        // The latest tail must be retained: the last line has turn_id == total - 1.
         let last: DecisionLog = serde_json::from_str(lines.last().unwrap()).unwrap();
         assert_eq!(last.turn_id, total - 1);
-        // The oldest retained line should be total - RETAIN_LINES.
         let first: DecisionLog = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(first.turn_id, total - DECISION_LOG_RETAIN_LINES);
 

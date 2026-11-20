@@ -65,7 +65,7 @@ pub(crate) fn parse_changes_command(input: &str) -> Option<ChangesCommand> {
             let editor = if editor_raw.is_empty() {
                 None
             } else {
-                // 支持 --open=vscode 形式
+                // Accept an editor value written as a separate `=name` token.
                 let v = if let Some(eq) = editor_raw.strip_prefix('=') {
                     eq
                 } else if editor_raw.starts_with('-') {
@@ -74,9 +74,9 @@ pub(crate) fn parse_changes_command(input: &str) -> Option<ChangesCommand> {
                 } else {
                     editor_raw
                 };
-                // 处理 `--open=vscode` 粘连在 first token 的情况：`--open=code`
+                // If the editor token supplied no name, look for a later
+                // `--open=name` spelling in the argument text.
                 if v.is_empty() {
-                    // 尝试从 original args 解析 `--open=xxx`
                     if let Some(pos) = args.find("--open=") {
                         let tail = &args[pos + "--open=".len()..];
                         let tok = tail.split_whitespace().next().unwrap_or("");
@@ -92,14 +92,13 @@ pub(crate) fn parse_changes_command(input: &str) -> Option<ChangesCommand> {
                     changes::EditorKind::from_str(v)
                 }
             };
-            // 若用户传了未知编辑器名，给出 Help 而非静默忽略，便于纠正
             if let Some(tok) = tokens.peek() {
                 // 多余参数忽略
                 let _ = tok;
             }
             // 校验：如果用户显式给了编辑器名但未识别，视为用法错误
             if !editor_raw.is_empty() && editor.is_none() {
-                // 尝试提取等号后的原始值用于提示
+                // Preserve the explicit value for editor validation.
                 let raw = if let Some(eq) = args.find("--open=") {
                     &args[eq + "--open=".len()..]
                         .split_whitespace()

@@ -1,13 +1,8 @@
-//! Unit tests for the byte-budget escape valve of
+//! Character-budget checks for
 //! `keep_recent_user_turns_when_trimming`.
 //!
-//! Covers change B: the protected tail window was originally defined only by
-//! "user turn count" with no byte cap, so tool-heavy agentic sessions (few user
-//! turns x hundreds of tool calls per turn) could grow the tail window to MB
-//! scale and structurally prevent convergence. With the byte cap in place, an
-//! oversized tail window gradually shrinks the number of protected turns (at
-//! least 1), exposing earlier tool groups to the fold/spill path. Normal small
-//! tail-window behavior is unchanged.
+//! Reduce user-turn protection when the tail exceeds the total budget, retaining
+//! at least one turn so the newest user input remains protected.
 
 use super::*;
 
@@ -61,9 +56,8 @@ fn tail_window_shrinks_when_bytes_exceed_budget() {
     assert_eq!(keep_recent_user_turns_when_trimming(&messages, 40_000), 1);
 }
 
-/// Floor invariant: even if the latest turn alone exceeds the budget, never go
-/// below 1 turn (the latest user turn and its tool groups must be preserved
-/// verbatim; group-level protection continues to provide the safety net).
+/// Even if the latest turn alone exceeds the budget, retain its user boundary.
+/// Tool-group folding has its own retention policy.
 #[test]
 fn tail_window_never_drops_below_one_turn() {
     let huge = "y".repeat(200_000);

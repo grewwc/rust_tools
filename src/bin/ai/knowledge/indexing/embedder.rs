@@ -2,9 +2,9 @@
 //!
 //! Calls a remote OpenAI-compatible `/embeddings` endpoint (default: Doubao
 //! `doubao-embedding-vision`, 384 dims), configured via the `ai.embedding.*`
-//! keys. When no API key is configured or the endpoint is unreachable the
-//! provider stays absent (`is_ready() == false`) and knowledge search
-//! degrades to BM25-only hybrid results.
+//! keys. Disabled embedding or a missing key prevents provider installation.
+//! Endpoint failures return `None` from embedding requests; `is_ready()` checks
+//! installation without probing endpoint reachability.
 
 use std::sync::OnceLock;
 
@@ -21,7 +21,7 @@ pub const DEFAULT_EMBEDDING_DIM: usize = 384;
 
 /// Embedding provider trait; a provider produces dense vectors for texts.
 pub trait EmbeddingProvider: Send + Sync {
-    /// Embed a single text; `None` on failure or empty input.
+    /// Embed a single nonblank text.
     fn embed(&self, text: &str) -> Option<Vec<f32>>;
     /// Embed a batch of texts; `None` on failure.
     fn embed_texts(&self, texts: &[&str]) -> Option<Vec<Vec<f32>>>;
@@ -84,7 +84,20 @@ impl RemoteEmbeddingProvider {
 
 impl EmbeddingProvider for RemoteEmbeddingProvider {
     fn embed(&self, text: &str) -> Option<Vec<f32>> {
-        self.embed_texts(&[text]).map(|mut v| v.remove(0))
+        // Blank input has no embedding: `embed_texts` filters blanks out and
+        // returns an empty batch, so there is nothing to index into.
+        if text.trim().is_empty() {
+            return None;
+        }
+        self.embed_texts(&[text]).and_then(|mut v| {
+            // A malformed endpoint response may omit embeddings for a valid
+            // input; treat that as no embedding instead of panicking.
+            if v.is_empty() {
+                None
+            } else {
+                Some(v.remove(0))
+            }
+        })
     }
 
     fn embed_texts(&self, texts: &[&str]) -> Option<Vec<Vec<f32>>> {
@@ -129,13 +142,14 @@ impl EmbeddingProvider for RemoteEmbeddingProvider {
 /// Process-wide provider, installed once by `warm_up`.
 static PROVIDER: OnceLock<Option<RemoteEmbeddingProvider>> = OnceLock::new();
 
-/// Install the embedding provider from config (best-effort; no-op on failure).
+/// Initialize the process-wide provider once, recording absence when embedding
+/// is disabled or provider construction fails.
 pub fn warm_up() {
     let provider = RemoteEmbeddingProvider::from_config();
     let _ = PROVIDER.set(provider);
 }
 
-/// True when a usable embedding provider is installed.
+/// Whether a configured provider is installed; no endpoint probe is performed.
 pub fn is_ready() -> bool {
     PROVIDER.get().is_some_and(|p| p.is_some())
 }

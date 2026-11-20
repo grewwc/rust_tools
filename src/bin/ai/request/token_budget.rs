@@ -1,8 +1,8 @@
 //! TPM preflight rate limiting for LLM requests.
 //!
-//! The 429 issue addressed here comes from repeatedly sending prompt + tool schemas within a
-//! 60-second window during one turn, not a single request exceeding context. Reserve sliding-window
-//! budget before each physical HTTP send; wait cancellably when exhausted, limiting rate without cutting tools or iterations.
+//! Repeated prompts and tool schemas can exhaust TPM even when each request
+//! fits the context window. Reserve sliding-window budget before each physical
+//! HTTP send and wait cancellably when exhausted.
 
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};

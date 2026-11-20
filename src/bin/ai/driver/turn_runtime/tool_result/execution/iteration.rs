@@ -142,27 +142,10 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             }
         }
         IterationExecution::FinalResponse(mut stream_result) => {
-            // Completion veto: while unclosed subagent tasks remain, bounce the round
-            // back to force collecting their results. But the iteration hard cap must be
-            // respected — otherwise, when a subtask never reaches a terminal state and
-            // the model refuses task_wait, this would livelock forever, and resetting
-            // force_final_response every round would keep knocking out the
-            // orchestrator's safety brakes (tool-loop / progress-budget /
-            // iteration-limit hard-stop). The same applies once any brake has fired:
-            // when force_final_response is already set, the turn is in no-tool
-            // wrap-up and must synthesize from evidence on hand instead of
-            // demanding more tool calls — reopening here would contradict the
-            // no-tool directive in the same prompt and ping-pong with the brake
-            // (observed as repeated task_integrate/plan_update rounds that clear
-            // the flag, re-trigger the hard-stop, and spin through the reopen
-            // budgets). Past the hard cap, finalization is allowed so
-            // max_iterations stays the authoritative ceiling.
-            //
-            // On top of the hard cap, a **separate reopen quota** is added: once the
-            // reopen count within one turn reaches TASK_EVIDENCE_REOPEN_MAX, no more
-            // bounces happen. Otherwise dead ends that can never be integrated (like
-            // TIMED_OUT), or a model that keeps refusing task_integrate, would reopen
-            // forever and spin to 4096.
+            // Reopen for outstanding tasks only within the dedicated evidence budget
+            // and iteration limit. Forced no-tool wrap-up must use evidence on hand:
+            // reopening would demand tool calls that the same request disables.
+            // The evidence budget bounds retries for results that cannot be integrated.
             let reopen_count = task_evidence_reopen_count(messages);
             let reopen_budget_exhausted = reopen_count >= TASK_EVIDENCE_REOPEN_MAX;
             if !*force_final_response
@@ -295,12 +278,8 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 return Ok(TurnLoopStep::Continue);
             }
             show_final_response_validation_status(final_validation_status);
-            // Injected-note regurgitation gate: takes priority over the other final gates.
-            // When the model spits a runtime context note back verbatim as its answer
-            // (especially common with weak models after the earlier kinds of reopen), the
-            // text has no answer value and leaks internal prompts to the terminal and into
-            // the persisted final. On a hit, give one no-tool synthesis retry; if it still
-            // regurgitates, stop the round with a user-visible error instead of accepting it.
+            // Reject injected-context echoes before other final gates can annotate or
+            // persist them. The shared retry allows one no-tool synthesis attempt.
             let final_gate_reopen_allowed =
                 final_gate_state.can_reopen(*force_final_response, iteration, max_iterations);
             let outstanding_work_reopen_allowed = final_gate_state.can_reopen_outstanding_work(
@@ -436,9 +415,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     crate::ai::request::strip_digest_blocks(&stream_result.assistant_text).trim()
                         == candidate.trim()
                 });
-            // The current response has passed the final gate. The slot is filled with the
-            // complete accepted answer below so finalize renders it exactly once; if an
-            // identical tool-round narration was already visible, only new warnings remain.
+            // Clear the narration candidate before premise validation, which can still
+            // reopen this draft. An accepted answer fills the slot below unless matching
+            // tool-round narration was already visible; then only new warnings remain.
             *terminal_dedupe_candidate = None;
             match critical_premises::final_action(
                 final_gate_state,
@@ -692,21 +671,15 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 turn_had_tool_error,
                 final_gate_state,
             )?;
-            // A candidate armed by a final gate reopen (the draft conclusion was already
-            // streamed live) must survive this verification tool round: the model is
-            // expected to re-answer verbatim after verification, and only the draft
-            // (not the tool round's short narration) can suppress that redraw in the
-            // next round's terminal dedupe. Only fill the slot when it is empty.
+            // Preserve an existing visible narration candidate across tool rounds;
+            // replacing it with shorter narration would lose deduplication of a later
+            // matching final answer.
             if terminal_dedupe_candidate.is_none() {
                 *terminal_dedupe_candidate = tool_round_candidate.clone();
             }
-            // Serve web UI renders only committed assistant messages: intermediate
-            // tool-round bodies are streamed as provisional deltas but never
-            // committed, so a long waiting turn (e.g. task_wait loops) leaves the
-            // user with no visible reply. Commit this round's visible body
-            // (digest/audit already projected out) so the web UI shows
-            // intermediate progress. The force-final no-tool retry path is
-            // excluded: finalize commits that body once with its warning appended.
+            // Commit visible tool-round narration so long waits show progress in
+            // the serve UI. Below the iteration cap, a consumed no-tool retry
+            // defers further forced-final narration to finalization with its warning.
             if should_commit_tool_round_body_for_serve(
                 &tool_round_candidate,
                 *force_final_response,
@@ -867,12 +840,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
     }
 }
 
-/// Whether this tool round's visible body should be committed to serve clients
-/// as a provisional reply. Serve web UI renders only committed assistant
-/// messages, so a long waiting turn (e.g. task_wait loops) would otherwise
-/// leave the user with no visible reply. The force-final no-tool retry path is
-/// excluded: finalize commits that body exactly once with its warning
-/// appended, so an intermediate commit would duplicate it.
+/// Commit visible tool-round narration to serve clients so long waits show progress.
+/// After the no-tool retry has been consumed, defer further forced-final narration
+/// below the iteration cap; finalization publishes that response with its warning.
 pub(in crate::ai::driver::turn_runtime) fn should_commit_tool_round_body_for_serve(
     tool_round_candidate: &Option<String>,
     force_final_response: bool,

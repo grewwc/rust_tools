@@ -64,9 +64,8 @@ pub(super) fn enable_thinking(model: &str) -> bool {
     model_def(model).map(|m| m.enable_thinking).unwrap_or(false)
 }
 
-/// 返回该模型在模型注册表（[models/](../../../../models)）中声明的默认推理强度
-/// （`reasoning_effort`）。CLI / `/model effort` 命令的覆盖会在
-/// `request::resolve_reasoning_effort` 里优先生效，此处仅给出"模型默认"。
+/// Return the model registry's default reasoning effort. Request-layer CLI and
+/// `/model effort` overrides are applied separately.
 pub(super) fn default_reasoning_effort(model: &str) -> Option<ReasoningEffort> {
     model_def(model).and_then(|m| m.reasoning_effort)
 }
@@ -115,15 +114,14 @@ pub(super) fn reasoning_effort_conflicts_with_tools(model: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 返回该模型在模型注册表（[models/](../../../../models)）中声明的单次响应最大输出
-/// token 数（`max_output_tokens`）。缺省时为 `None`，请求不下发 `max_tokens`，
-/// 沿用 provider 默认补全上限。
+/// Return the output cap declared in the model registry. An unset cap leaves
+/// the response limit to the provider.
 pub(super) fn max_output_tokens(model: &str) -> Option<u32> {
     model_def(model).and_then(|m| m.max_output_tokens)
 }
 
-/// 返回该模型在模型注册表（[models/](../../../../models)）中声明的请求层 TPM 预检预算。
-/// 仅当显式配置了正整数时返回 `Some(limit)`；未配置或为 0 都视为关闭预检等待。
+/// Return the model registry's positive TPM preflight limit; an unset or zero
+/// value disables preflight waiting.
 pub(super) fn request_tpm_limit(model: &str) -> Option<u64> {
     model_def(model)
         .and_then(|m| m.request_tpm_limit)
@@ -239,7 +237,7 @@ fn maybe_decrypt(value: &str) -> String {
 /// of its identifying parts is stored. The digest covers scheme, host,
 /// non-default port and path: a gateway can route different backing resources
 /// under different paths on one host, so the host alone is not enough. Query
-/// and fragment never identify a resource and are ignored.
+/// and fragment are excluded from this identity.
 ///
 /// Returns `None` when `endpoint` is not an absolute URL with a host; callers
 /// must then keep the identity-less behaviour (nothing to compare against, so
@@ -328,7 +326,6 @@ fn default_context_window_tokens_for_tier(tier: ModelQualityTier) -> usize {
         ModelQualityTier::Flagship => 256_000,
         ModelQualityTier::Strong => 200_000,
         ModelQualityTier::Standard => 128_000,
-        // Basic → 100K token = 200K 字符（CHARS_PER_TOKEN=2），作为 LLM 摘要默认阈值。
         ModelQualityTier::Basic => 100_000,
     }
 }
@@ -367,9 +364,7 @@ fn vl_model_search_candidates() -> Vec<(String, String)> {
 }
 
 pub(super) fn default_model() -> String {
-    // 依赖前置 [`ensure_models_available`] 在 run() 入口就检查过模型注册表（models/），
-    // 这里的 fallback 路径（vl 模型缺失时）总会拿到至少一个候选。
-    // 最后兜底返回空串避免 process::exit；上层若真的拿到空串会立即报错。
+    // Keep error reporting with the caller when no model can be selected.
     choose_default_model_name(false)
         .or_else(|| choose_default_model_name(true))
         .unwrap_or_default()
@@ -407,8 +402,8 @@ fn model_auto_select_enabled(model: &ModelDef, disabled: &[String]) -> bool {
     !model_matches_disabled_tokens(model, disabled) && !runtime_model_disabled(model)
 }
 
-/// 启动时调用，确保至少存在一个可用 model。
-/// 在 run() 入口集中报错，避免 [`default_model`] 在更深的调用链里 panic / exit。
+/// Validate that the registry has a model eligible for automatic default
+/// selection so startup can report an unusable registry early.
 pub(super) fn ensure_models_available() -> Result<(), String> {
     if model_names::all().is_empty() {
         return Err(
@@ -619,16 +614,15 @@ pub(super) fn auto_subagent_model_for_agent(
     auto_subagent_model_choice_for_agent(agent, description, prompt).model
 }
 
-/// 未显式指定模型时，始终按任务难度和 agent 分级自动选择子 agent 模型。
-/// 默认继承父 agent 当前使用的模型（`parent_model` 存在时跳过自动选择）；
-/// 仅当配置 `ai.subagent.model_inherit = false/0` 时，才走自动选择逻辑。
+/// Inherit a non-empty parent model unless `ai.subagent.model_inherit` is
+/// exactly `false` or `0`. Without inheritance, select from the registry using
+/// task difficulty and the agent's model tier.
 pub(super) fn choose_model_for_subagent(
     parent_model: Option<&str>,
     agent: &AgentManifest,
     description: &str,
     prompt: &str,
 ) -> SubagentModelChoice {
-    // 默认继承主 agent 模型；显式设置 ai.subagent.model_inherit=false/0 时改用自动选择。
     if let Some(model) = parent_model
         && !model.trim().is_empty()
     {
@@ -789,8 +783,9 @@ fn classify_subagent_task_difficulty(description: &str, prompt: &str) -> Subagen
     SubagentTaskDifficulty::Standard
 }
 
-/// 根据模型注册表（models/）中的 subagent_priority 字段选择子 agent 模型。
-/// priority 越大越优先；同 priority 时按 quality_tier 和 target_tier 适配度排序。
+/// Prefer models satisfying `target_tier`, then higher `subagent_priority` and
+/// `quality_tier`. If none are eligible, relax the thinking requirement before
+/// falling back to `default_model`.
 fn pick_subagent_model(require_thinking: bool, target_tier: ModelStrengthTier) -> String {
     pick_subagent_model_excluding(require_thinking, target_tier, None).unwrap_or_else(default_model)
 }
@@ -821,7 +816,6 @@ fn pick_subagent_model_excluding(
         })
         .collect();
 
-    // 按 (满足 target_tier, priority, quality_tier) 降序排列
     candidates.sort_by(|a, b| {
         let a_satisfies = quality_tier_satisfies_target(a.quality_tier, target_tier) as u8;
         let b_satisfies = quality_tier_satisfies_target(b.quality_tier, target_tier) as u8;

@@ -1,4 +1,4 @@
-//! Driver behavior tests: model resolution, OCR fallback, and interrupt-futex signaling.
+//! Driver tests for model resolution, OCR usability, and interrupt-futex signaling.
 
 use std::sync::{Arc, atomic::AtomicBool};
 

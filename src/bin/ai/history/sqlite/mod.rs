@@ -45,7 +45,7 @@ pub(super) use lock::{
     delete_session_state_lock, remove_session_state_lock_entry, with_session_state_lock,
 };
 
-// External call surface (unchanged from the pre-split single module): these
+// Shared SQLite call surface: these
 // `pub(in crate::ai)` items are what history/mod.rs, sessions.rs, blob.rs and
 // checkpoint.rs reach through `super::sqlite::…`.
 pub(in crate::ai) use connection::close_cached_write_conn;

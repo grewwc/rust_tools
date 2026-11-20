@@ -4,7 +4,7 @@
 // broadcasts a brief, collects member replies from its own inbox, and either
 // broadcasts the next round or closes the room. Members participate with
 // `talk_send` back to the host; absent (inactive) members are woken by
-// re-executing this binary headlessly (`a --session <member> "<brief>"`),
+// re-executing this binary headlessly (`a --session <member> -- "<brief>"`),
 // whose reply comes back through the same inbox — the host never parses
 // child-process output.
 //
@@ -59,10 +59,8 @@ pub(crate) struct DiscussState {
     /// this list is the host's ownership record, alongside the room transcript.
     #[serde(default)]
     pub spawned: Vec<String>,
-    /// Skills the `/discuss` command propagated to this room's members.
-    /// Rendered into every round brief as `@skills:` mentions so each wake
-    /// force-activates them. `#[serde(default)]` keeps rooms started before
-    /// skill propagation loadable.
+    /// Skills propagated by `/discuss`, rendered as `@skills:` mentions in full
+    /// start/wake briefs. `#[serde(default)]` keeps states without skills loadable.
     #[serde(default)]
     pub skills: Vec<String>,
     pub max_rounds: u32,
@@ -153,9 +151,8 @@ pub(crate) fn save_state(history_file: &Path, state: &DiscussState) -> Result<()
 /// the reply, and the `enable_tools` fallback in case `talk_send` is lazy in
 /// its turn.
 ///
-/// `role` appends an assigned stance. It is empty for explicit members without
-/// one; spawned members always carry one (host-provided or the default argue
-/// cycle).
+/// Append an assigned stance when `role` is nonempty. Automatically created
+/// members get default stances when the request provides no roles.
 pub(crate) fn round_brief_for(state: &DiscussState, role: &str) -> String {
     let skills_lines = if state.skills.is_empty() {
         String::new()
@@ -241,9 +238,8 @@ fn sanitize_room_for_id(room: &str) -> String {
     }
 }
 
-/// Fresh member session id embedding the room (visible ownership in
-/// `session_list`). Retried on collision; the id is only reserved here — the
-/// member's sqlite is created later by its own woken process, never by us.
+/// Generate an unused member session id containing the room name. Retry observed
+/// collisions; the member's woken process later creates its database.
 fn spawn_member_id(store: &SessionStore, room_part: &str, index: usize) -> Result<String, String> {
     for _ in 0..100 {
         let rand = &uuid::Uuid::new_v4().simple().to_string()[..8];
@@ -333,7 +329,6 @@ pub(crate) fn start_room(
             "discuss room '{room}' already exists; pick another room name"
         ));
     }
-    // Resolve members, roles, and the spawned-ownership record.
     let (members, roles, spawned): (Vec<String>, Vec<String>, Vec<String>) = if use_explicit {
         if req.members.len() > MAX_DISCUSS_MEMBERS {
             return Err(format!(
@@ -446,7 +441,7 @@ pub(crate) fn start_room(
             }
         }
     }
-    // Host marker first so the transcript opens with the round-1 brief.
+    // Append the opening marker after the per-member send mirrors.
     append_transcript(
         from_history_file,
         &room,
@@ -485,12 +480,6 @@ pub(crate) fn display_role(role: &str) -> &str {
     }
 }
 
-/// Detached headless re-execution of this binary for one member, with
-/// stdout/stderr to a per-round wake log for audit. Records the woken
-/// bookkeeping on success and returns the core note; callers add their own
-/// prefix. `exe_override` is a test hook; production passes `None` to re-exec
-/// itself.
-///
 /// The brief travels behind `--` as one verbatim element, so the woken
 /// child's CLI parser never re-interprets brief bytes (leading dashes,
 /// quotes, `--key=value`) as options: the turn sees exactly this text.
@@ -499,6 +488,9 @@ fn headless_cmd(exe: &Path, member: &str, brief: &str) -> std::process::Command 
     cmd.arg("--session").arg(member).arg("--").arg(brief);
     cmd
 }
+/// Re-execute one member headlessly with a per-round wake log. Record wake
+/// bookkeeping on spawn success and return a note for the caller to label.
+/// `exe_override` supplies a test binary; production re-executes itself.
 fn spawn_headless(
     from_history_file: &Path,
     state: &mut DiscussState,
@@ -628,8 +620,8 @@ pub(crate) fn release_dead_wakes(
 pub(crate) struct CollectOutcome {
     pub replies: Vec<TalkMessage>,
     pub missing: Vec<String>,
-    /// True when the host pressed Ctrl+C mid-wait: the wait ended early, but
-    /// `replies` (already appended to the transcript) is still valid.
+    /// True when collection was canceled mid-wait; collected replies remain
+    /// available in this outcome.
     pub canceled: bool,
 }
 
@@ -638,9 +630,8 @@ pub(crate) struct CollectOutcome {
 /// whatever was already collected). Non-room mail is requeued untouched. Replies are
 /// attributed by arrival window (drained since the previous collect).
 ///
-/// Every newly drained reply is appended to the room transcript before the
-/// next sleep, so killing the collect mid-wait loses at most in-flight
-/// memory, never already-drained replies.
+/// Transcript persistence is best-effort: failed batches remain in memory for
+/// retry on a later poll and may still be unpersisted when collection exits.
 pub(crate) fn collect_round(
     history_file: &Path,
     room: &str,
@@ -814,10 +805,7 @@ pub(crate) fn close_room(
     Ok(talk::talk_room_file(from_history_file, &state.room))
 }
 
-/// Read-only progress snapshot of one room: round state, per-member
-/// reply/wake/liveness flags, uncollected room mail still in the host inbox,
-/// and the transcript tail. Never drains, wakes, or writes — safe to call any
-/// time, including right after a resume that left a `discuss_collect` behind.
+/// Reply, wake, and liveness flags for one discussion member.
 #[derive(Debug, Clone)]
 pub(crate) struct MemberProgress {
     pub member: String,
@@ -835,6 +823,8 @@ pub(crate) struct StatusEvent {
     pub preview: String,
 }
 
+/// Room progress, including member flags, uncollected inbox mail, and recent
+/// transcript events.
 #[derive(Debug, Clone)]
 pub(crate) struct RoomStatus {
     pub room: String,
@@ -878,9 +868,8 @@ fn preview_body(body: &str) -> String {
     }
 }
 
-/// Build the progress snapshot for `room`. Reads the room state, the room
-/// transcript, and the host inbox (peeked, never drained); the only files
-/// touched are the host's own.
+/// Build progress from host room files and a non-draining inbox peek; member
+/// liveness comes from the shared session PID registry.
 pub(crate) fn room_status(history_file: &Path, room: &str) -> Result<RoomStatus, String> {
     let state = load_state(history_file, room).map_err(|e| {
         let known = list_rooms(history_file);
@@ -1083,8 +1072,7 @@ mod tests {
         vec!["member-1".to_string(), "member-2".to_string()]
     }
 
-    /// Positional wrapper keeping the pre-`StartRequest` call shape for the
-    /// explicit-members tests below.
+    /// Convenience wrapper for explicit-member fixtures.
     fn start(
         store: &SessionStore,
         host_hist: &Path,
@@ -1252,9 +1240,8 @@ mod tests {
             .unwrap();
         let out = collect_round(&host_hist, "r4", &state.members, 5);
         assert_eq!(out.replies.len(), 1);
-        // The reply reached the room transcript inside collect_round itself —
-        // no service-layer follow-up needed, so a killed wait loses nothing
-        // already drained, and nothing is recorded twice.
+        // A successful collect writes the reply exactly once without a
+        // service-layer append.
         let transcript =
             std::fs::read_to_string(talk::talk_room_file(&host_hist, "r4")).unwrap();
         assert_eq!(transcript.matches("member-2 view").count(), 1);
@@ -1352,10 +1339,8 @@ mod tests {
         let (dir, store, host_hist, _m1, _m2) = fixture();
         let mut state =
             start(&store, &host_hist, "t", &members(), None, Some("r4")).unwrap().state;
-        // No live process owns the fixture sessions, so wake re-execs. A tiny
-        // `exit 0` script stands in for the binary: spawn success plus the
-        // woken bookkeeping is what this pins (the real child path needs a
-        // live model and is verified manually).
+        // Use an `exit 0` fixture to verify spawn and wake bookkeeping without
+        // a model request.
         let fake_bin = dir.join("fake-a");
         std::fs::write(&fake_bin, "#!/bin/sh\nexit 0\n").unwrap();
         #[cfg(unix)]

@@ -27,7 +27,7 @@ const MAX_INTERNAL_OUTPUT_BYTES: usize = 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Dispatch a command to an internal handler when the named program is
-/// missing. `None` means "run it through the normal shell path".
+/// missing. `None` means "run it through the normal command executor".
 pub(crate) fn try_run(
     command: &str,
     cwd: Option<&str>,
@@ -110,9 +110,10 @@ enum CopyError {
     TimedOut,
 }
 
-/// A command the shell would run as one plain program invocation: no pipes,
-/// redirections, substitutions, globbing, subshells, or comments. Quotes and
-/// backslash escapes are allowed because the tokenizer understands them.
+/// Accept a single program invocation without unquoted pipes, redirections,
+/// substitutions, globbing, subshells, or comments. Quoted literals and
+/// unquoted backslash escapes are allowed; double-quoted backslashes and
+/// expansions use the normal executor.
 fn is_simple_command(command: &str) -> bool {
     let bytes = command.as_bytes();
     let mut index = 0;
@@ -280,8 +281,8 @@ fn replace_file(temp: &Path, target: &Path) -> io::Result<()> {
     fs::rename(temp, target)
 }
 
-/// Shell-style wildcard match (`*` any run, `?` one character). Patterns are
-/// short, so the straightforward dynamic program is enough.
+/// Wildcard match supporting only `*` (any run) and `?` (one character);
+/// all other pattern characters are literal.
 fn wildcard_match(pattern: &str, text: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = text.chars().collect();

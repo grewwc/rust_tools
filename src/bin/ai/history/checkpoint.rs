@@ -70,10 +70,10 @@ const ASSET_INDEX_VERSION: u32 = 1;
 const ASSET_INDEX_HEADER_BYTES: u64 = 20;
 const ASSET_INDEX_ENTRY_FIXED_BYTES: u64 = 44;
 const ASSET_INDEX_MAX_PATH_BYTES: usize = 1 << 20;
-/// Git-style pointer to the most recently preserved checkpoint. It is a plain
-/// file (not a checkpoint directory), so it never shows up in listings; it
-/// only records a name for the `HEAD` (`@`) alias to resolve. `-` is the
-/// previous checkout instead (see `PREV_HEAD_REF_FILE`).
+/// HEAD state: an attached `ref: branches/<name>` pointer or a detached
+/// checkpoint name, resolved by the `HEAD` (`@`) alias. This plain ref file
+/// never appears in checkpoint listings. `-` resolves the previous checkout
+/// instead (see `PREV_HEAD_REF_FILE`).
 const HEAD_REF_FILE: &str = "HEAD.ref";
 const HEAD_BRANCH_PREFIX: &str = "ref: branches/";
 const BRANCHES_DIR: &str = "branches";
@@ -189,9 +189,8 @@ pub(in crate::ai) struct CheckpointInfo {
     pub(in crate::ai) message: Option<String>,
     pub(in crate::ai) modified_local: Option<DateTime<Local>>,
     pub(in crate::ai) size_bytes: u64,
-    /// Bytes charged to the per-session checkpoint quota. COW-cloned file data
-    /// is shared with the live assets and therefore does not consume quota
-    /// until a later snapshot has to materialize its own copy.
+    /// Bytes charged to the per-session checkpoint quota. Newly copied asset
+    /// data is charged; COW clones and hard links reused from a parent are not.
     pub(in crate::ai) storage_bytes: u64,
     /// Parent checkpoint name (`None` for roots). A parent that no longer
     /// exists (deleted after the child was saved) is kept as-is so the tree
@@ -429,9 +428,8 @@ impl CheckpointStore {
             let parent_base = parent
                 .as_deref()
                 .and_then(|name| store.snapshot_base(name));
-            // Non-APFS filesystems have no COW clone. Estimate the bytes a
-            // snapshot would materialize before staging so an oversized live
-            // asset tree fails immediately instead of being copied first.
+            // On non-macOS targets, estimate materialized snapshot bytes before
+            // staging so an oversized live asset tree fails before being copied.
             // When the full tree does not fit but the durable assets do, leave
             // the disposable scratch directory out instead of failing.
             #[cfg(not(target_os = "macos"))]
@@ -508,8 +506,8 @@ impl CheckpointStore {
         })
     }
 
-    /// List all checkpoints of this session (newest first by modification
-    /// time; size includes assets).
+    /// List this session's checkpoints newest first by save timestamp, with
+    /// filesystem-time fallbacks for older layouts. Size includes assets.
     pub(in crate::ai) fn list(&self) -> io::Result<Vec<CheckpointInfo>> {
         self.with_locked(|store| store.list_unlocked())
     }
@@ -574,7 +572,8 @@ impl CheckpointStore {
         })
     }
 
-    /// Validate a branch creation and resolve its start without mutating refs.
+    /// Validate branch creation and resolve its start without creating the
+    /// requested branch.
     pub(in crate::ai) fn prepare_branch(
         &self,
         name: &str,
@@ -783,8 +782,8 @@ impl CheckpointStore {
         })
     }
 
-    /// Delete every checkpoint of this session (generation dirs, legacy
-    /// files, and the HEAD pointer). The live history is untouched.
+    /// Delete this session's checkpoint generations and legacy files, then
+    /// reset branches and HEAD to unborn `main`. The live history is untouched.
     /// Returns the number of checkpoints removed. The live-base pointer is
     /// kept on purpose, mirroring `delete`: the live history still derives
     /// from a now-deleted checkpoint, so the next save shows up as an
@@ -815,7 +814,7 @@ impl CheckpointStore {
     }
 
     /// Read the resolved HEAD checkpoint target.
-    /// Returns `None` only when no checkpoint has been saved or restored yet.
+    /// Returns `None` when HEAD has no target, including an unborn branch.
     pub(in crate::ai) fn head_target(&self) -> io::Result<Option<String>> {
         self.with_locked(|store| store.head_target_unlocked())
     }
@@ -900,9 +899,9 @@ impl CheckpointStore {
         }
     }
 
-    /// Read the live-base pointer (which checkpoint the live history was last
-    /// saved from or rolled back to). Returns `None` when nothing has been
-    /// saved or rolled back yet.
+    /// Read the resolved HEAD target, falling back to the live-base pointer
+    /// when HEAD has no target. The base may name a deleted checkpoint so the
+    /// next save preserves orphan lineage.
     pub(in crate::ai) fn base_target(&self) -> io::Result<Option<String>> {
         self.with_locked(|store| store.base_target_unlocked())
     }
@@ -1288,9 +1287,8 @@ impl CheckpointStore {
     /// Whether the live canonical messages match the named checkpoint.
     /// Runtime-owned assets may be compacted, archived, or regenerated without
     /// adding a turn, so asset-directory drift must not mint an auto checkpoint.
-    /// The checkpoint database opens read-only, so comparing never bumps the
-    /// directory mtime that `SAVED` displays. Returns `Ok(false)` when the
-    /// checkpoint does not exist; I/O errors pass through so the caller can
+    /// The checkpoint database opens read-only. Missing checkpoints return
+    /// `Ok(false)`; I/O errors pass through so the caller can
     /// fall back to preserving (fail safe, never fail lossy).
     pub(in crate::ai) fn live_matches_checkpoint(
         &self,
@@ -1456,14 +1454,10 @@ impl CheckpointStore {
                     continue;
                 }
                 // `None` here means pre-tracking (v1); the save-order fallback
-                // below fills it in after sorting. `SAVED` shows when the
-                // snapshot was taken, not the directory mtime: reads used to
-                // open the snapshot sqlite read-write and SQLite drops
-                // transient sidecars inside its directory, which bumps the
-                // mtime long after the save and used to steal the `[latest]`
-                // tag. Manifests without a timestamp fall back to the manifest
-                // file mtime (creating sidecars never rewrites that file),
-                // then to the directory mtime.
+                // below fills it in after sorting. SQLite sidecars can change
+                // directory mtime without a new save, so prefer the manifest's
+                // save timestamp. Older manifests fall back to the manifest
+                // file mtime, then the directory mtime.
                 let known =
                     read_generation_manifest_with_metadata(&path, &metadata, &manifest_metadata);
                 let manifest_mtime = manifest_metadata
@@ -1522,7 +1516,7 @@ impl CheckpointStore {
                 None,
             ));
         }
-        // Newest-first; break mtime ties by name so the order stays
+        // Newest-first; break timestamp ties by name so the order stays
         // deterministic (and matches timestamped `auto-*` names) instead of
         // depending on directory read order.
         out.sort_by(|a, b| {
@@ -1530,9 +1524,8 @@ impl CheckpointStore {
                 .cmp(&a.0.modified_local)
                 .then_with(|| b.0.name.cmp(&a.0.name))
         });
-        // Fill in parents: recorded v2 links win, with self-links (a replaced
-        // checkpoint re-saved from itself) demoted to roots so the forest can
-        // never cycle. Pre-tracking snapshots have no lineage on disk, so they
+        // Recorded v2 parent links win; invalid self-links become roots.
+        // Pre-tracking snapshots have no lineage on disk, so they
         // chain in save order and the tree still reads top-down.
         let names: Vec<String> = out.iter().map(|(cp, _)| cp.name.clone()).collect();
         for (index, (cp, known)) in out.iter_mut().enumerate() {
@@ -1561,9 +1554,8 @@ impl CheckpointStore {
         Ok(None)
     }
 
-    /// Lightweight existence check for checkout validation. Unlike `list()`,
-    /// this skips the recursive size walk, so switching stays O(1) instead of
-    /// O(total checkpoint bytes) like a full `git status` would.
+    /// Check generation readiness or legacy snapshot existence after recovery,
+    /// without collecting listing metadata or calculating checkpoint sizes.
     pub(in crate::ai) fn checkpoint_exists(&self, name: &str) -> io::Result<bool> {
         let normalized = sanitize_name(name);
         self.with_locked(|store| Ok(store.checkpoint_source_unlocked(&normalized)?.is_some()))
@@ -1734,7 +1726,7 @@ impl CheckpointStore {
         // Only the SQLite snapshot is staged: generation assets are immutable,
         // so `complete_live_rollback` restores them from the source generation
         // (recorded in the manifest) instead of paying a second full-tree copy
-        // checkpoint -> txn. This halves the assets I/O on every checkout.
+        // checkpoint -> txn.
         fs::create_dir_all(&self.dir)?;
         let transaction = self
             .dir
@@ -2976,9 +2968,8 @@ fn estimate_snapshot_dir(
     Ok(())
 }
 
-/// Overflow assets are UUID-named and immutable after writing. Rollback only
-/// restores files referenced by the checkpoint; it must not replace the live
-/// directory wholesale: a concurrent writer may have created a new asset and
+/// Merge snapshotted asset paths into the live directory instead of replacing
+/// it wholesale: a concurrent writer may have created a new asset and
 /// committed its stub to the canonical DB after the rollback, and deleting
 /// that file would leave a `file_path` that can never be read back.
 fn restore_checkpoint_assets(
@@ -2998,9 +2989,8 @@ fn restore_checkpoint_assets(
 /// fingerprint is a cheap prefilter. The bytes are compared before a live file
 /// is left alone because a same-length rewrite can share every timestamp tick
 /// with the save. Files without an index entry (legacy generations, symlinks,
-/// scratch paths) are replaced as before. On non-macOS, compare the checkpoint
-/// with the live file before staging a replacement. On APFS each replacement
-/// is another COW clone rather than a full byte copy.
+/// scratch paths) are replaced. On a fingerprint match, compare bytes before
+/// skipping a replacement. macOS tries a COW clone and falls back to a byte copy.
 fn copy_dir_skip_identical(
     source: &Path,
     destination: &Path,
@@ -3136,8 +3126,9 @@ fn replace_snapshot_file(source: &Path, destination: &Path, may_match: bool) -> 
     replace_file_via_temporary(source, destination, may_match)
 }
 
-/// Normalize a checkpoint name into a safe file name (alphanumeric, `-`, `_`;
-/// everything else becomes `_`).
+/// Keep ASCII alphanumerics, `-`, and `_`; replace whitespace, `.`, and `/`
+/// with `_` and drop other characters. Trim edge underscores and use
+/// `checkpoint` when the result is empty.
 fn sanitize_name(name: &str) -> String {
     // Keep in sync with `is_reserved_checkpoint_name` below.
     let mut out = String::new();
@@ -3958,7 +3949,6 @@ mod tests {
         )
         .unwrap();
 
-        // Save checkpoint c1.
         let ckpt = store.save("c1").unwrap();
         assert!(ckpt.exists());
 
@@ -3975,7 +3965,6 @@ mod tests {
         )
         .unwrap();
 
-        // list can see c1.
         let listed = store.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "c1");
@@ -4006,7 +3995,6 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].name, "c2");
 
-        // Cleanup.
         if let Some(grandparent) = history_file.parent() {
             let _ = fs::remove_dir_all(grandparent);
         }
@@ -4051,7 +4039,7 @@ mod tests {
     fn head_pointer_tracks_current_checkpoint_and_clears_on_delete() {
         let history_file = temp_history_file();
         let store = CheckpointStore::new(&history_file, "sess-head");
-        // No HEAD before anything is preserved.
+        // An unborn HEAD has no checkpoint target.
         assert_eq!(store.head_target().unwrap(), None);
 
         append_history_messages(

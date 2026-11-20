@@ -1,9 +1,7 @@
 //! Process supervision for `a --serve`: `--serve-start`, `--serve-stop`,
 //! `--serve-restart`, and `--serve-status`.
 //!
-//! A serve daemon is machine-global (unlike `-bg` tasks, which are
-//! session-scoped and tracked by `<sessionid>.pid` in the working directory),
-//! so its state lives in one fixed place: `serve.pid` plus `serve.log` under
+//! Management uses one state slot per user: `serve.pid` and `serve.log` under
 //! the user config dir (`A_SERVE_STATE_DIR` overrides it for tests and
 //! relocation).
 //!
@@ -399,7 +397,7 @@ fn foreground_add_dirs(roots: &[PathBuf], previous: Option<&ServeState>, pid: u3
     retained
 }
 
-/// Read the state file. `Ok(None)` means no daemon was ever recorded here;
+/// Read the state file. `Ok(None)` means the state file is absent;
 /// a corrupt file is an error (it names a pid we must not guess at).
 fn read_state_file(path: &Path) -> Result<Option<ServeState>, Box<dyn std::error::Error>> {
     let text = match std::fs::read_to_string(path) {
@@ -481,8 +479,8 @@ fn query_healthz(
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
-        // This probe authenticates the daemon by pid/state ownership. Its TLS
-        // certificate may be signed by a phone-only private CA.
+        // Management probes accept private-CA certificates without requiring
+        // that CA in this machine's trust store.
         .danger_accept_invalid_certs(tls.is_some())
         .build()?;
     let resp = client
@@ -638,12 +636,10 @@ fn start_daemon(
 ///
 /// The daemon is started from this copy, so replacing the install path (a
 /// rebuild, `cp --remove-destination`) cannot unlink the file every turn
-/// re-execs. Copies are keyed by content: an unchanged binary reuses its copy,
-/// and pruning keeps [`KEEP_RUN_COPIES`] generations without ever unlinking a
-/// file some live process is executing. (The state file also blocks a second
-/// start while a daemon runs, but it can be missing or hand-deleted, so
-/// pruning does not rely on it.) The state dir must allow exec: the daemon
-/// runs from this copy, not from the install path.
+/// re-execs. Copies are keyed by content: an unchanged binary reuses its copy.
+/// Pruning keeps [`KEEP_RUN_COPIES`] generations and skips live executables
+/// when `executing_paths` can enumerate them. The state dir must allow exec:
+/// the daemon runs from this copy.
 #[cfg(unix)]
 fn freeze_daemon_exe(dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     freeze_copy(&crate::ai::exe_path::runtime_exe()?, dir)

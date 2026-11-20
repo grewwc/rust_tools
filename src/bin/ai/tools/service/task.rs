@@ -1,10 +1,10 @@
 // Host-side multi-worker task tool services: `task_start` / `task_assign` /
 // `task_collect` / `task_close` / `task_room_status`.
 //
-// The host splits a goal into per-worker assignments over the talk mailbox;
-// every function below touches only the host's own files (room state, room
-// transcript, worker inboxes via `push_talk`). A worker's sqlite database is
-// written solely by that worker's own process. All five stay on the
+// The host splits a goal into per-worker assignments over the talk mailbox,
+// updating its room state/transcript and sending mail to worker inboxes via
+// `push_talk`. A worker's sqlite database is written solely by that worker's
+// own process. All five tools stay on the
 // fail-closed defaults: serial execution, no retry (`task_collect` drains
 // the host inbox and must never be replayed).
 use serde_json::Value;

@@ -10,18 +10,18 @@ use crate::ai::types::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// Request-to-request prompt continuity, used to attribute provider prompt
-/// cache misses to the projection change that caused them. Carries message
-/// counts only; no bodies or fingerprints leave the process.
+/// Request-to-request prompt continuity for diagnosing provider cache behavior.
+/// Carries message counts and a settings-change flag; bodies and fingerprints
+/// remain local.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PrefixReuse {
     pub(crate) previous_messages: usize,
     pub(crate) current_messages: usize,
-    /// Leading messages identical to the previous request; the provider cache
-    /// can reuse at most this prefix (plus tools/system when settings match).
+    /// Complete leading messages identical to the previous request. Partial-message
+    /// cache reuse is not measured here.
     pub(crate) common_prefix_messages: usize,
-    /// Model, tools, or reasoning settings changed, which restarts the cache
-    /// regardless of how many messages match.
+    /// Model, endpoint, or hashed request settings differ from the previous
+    /// request; matching messages alone do not establish cache continuity.
     pub(crate) settings_changed: bool,
 }
 
@@ -71,15 +71,12 @@ fn stable_message_count(messages: &[Message]) -> usize {
 
 /// Fallback ratio when a request carries no message text to observe.
 pub(crate) const DEFAULT_CHARS_PER_TOKEN_MILLI: usize = 2_000;
-/// Bounds on the derived ratio: below 0.5 chars/token only images or exotic
-/// scripts remain, above 4 the estimate would promise more savings per char
-/// than English prose ever yields.
+/// Limit how much extreme script or usage ratios can amplify the character target.
 const MIN_CHARS_PER_TOKEN_MILLI: usize = 500;
 const MAX_CHARS_PER_TOKEN_MILLI: usize = 4_000;
 
-/// Hash a JSON value without serializing it: no JSON escaping, no transient
-/// string allocation. Object iteration follows the map's own order, which is
-/// deterministic for a given value, so equal values hash equally. Numbers use
+/// Hash a JSON value without allocating its serialized representation.
+/// Object iteration follows the map's order, matching request serialization. Numbers use
 /// their display form (tiny, one numeric leaf at a time).
 fn hash_value(value: &Value, state: &mut impl Hasher) {
     match value {
@@ -116,9 +113,8 @@ fn hash_value(value: &Value, state: &mut impl Hasher) {
 
 /// Hash one message exactly as `hash_value(&serde_json::to_value(message))`,
 /// without building the serialized value: `Serialize` field order, field names,
-/// object lengths and array lengths are all included. The serialized-shape
-/// parity keeps a newly added `Message` field from silently escaping the
-/// fingerprint.
+/// object lengths and array lengths are all included. Keep this layout in sync
+/// with `Message` serialization so fields do not escape the fingerprint.
 pub(in crate::ai) fn hash_message(message: &Message, state: &mut impl Hasher) {
     5u8.hash(state);
     let mut fields = 2usize;
@@ -180,9 +176,9 @@ fn fingerprint_message(message: &Message) -> u64 {
 }
 
 /// Hash the request settings side of the calibration identity without
-/// serializing the (potentially large) tool schema. Covers the same fields as
-/// the previous serialized tuple: model, thinking map, search flag, tools,
-/// tool choice, reasoning effort/reasoning, encrypted-replay flag, stream.
+/// serializing the (potentially large) tool schema. Covers model, thinking map,
+/// search flag, tools, tool choice, reasoning effort/reasoning, encrypted-replay
+/// flag, and stream.
 fn fingerprint_settings(body: &RequestBody<'_>) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();
     hash_settings_head(

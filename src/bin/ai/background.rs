@@ -53,12 +53,10 @@ const LIVE_BACKGROUND_RESUME_DELAY: Duration = Duration::from_millis(250);
 
 /// Live-output FIFO for a real-time `/bg` handoff (see [`detach_live_session`]).
 ///
-/// After the handoff stdout/stderr are drained by an in-process relay and — by
-/// the user's explicit requirement — no output log is written, so the only way
-/// to observe a backgrounded session is a live channel. A named pipe is used
-/// deliberately: FIFO data never persists on disk. A later `a` invocation on
-/// the same session attaches to the pipe (see [`attach_live_session`]) and
-/// replays the chunks until the background process exits.
+/// After the handoff stdout/stderr are drained by an in-process relay without
+/// an output log. A named pipe lets [`attach_live_session`] watch new chunks
+/// without persisting the stream on disk; chunks produced without an attached
+/// reader are dropped.
 static LIVE_OUTPUT_FIFO: LazyLock<Mutex<Option<LiveOutputFifo>>> =
     LazyLock::new(|| Mutex::new(None));
 
@@ -78,10 +76,9 @@ fn live_fifo_path_for_session(session_id: &str) -> PathBuf {
 
 /// Parent-process entry for background mode (synchronous): spawns the daemon child before creating the tokio runtime.
 ///
-/// This function first interactively reads the task description (while the TTY
-/// is still held), then uses posix_spawn to re-exec a fresh process as the
-/// daemon (see [`spawn_daemon_child`]); the parent then `exit(0)`s so the shell
-/// returns immediately. The task body lives in [`run_background_child`].
+/// If no task was passed positionally, read it while the TTY is still held.
+/// [`spawn_daemon_child`] then re-execs the worker and the parent exits so the
+/// shell regains control. The task body lives in [`run_background_child`].
 pub(super) fn run_background(mut cli: ParsedCli) -> Result<(), Box<dyn std::error::Error>> {
     // Generate the session id (also used as the log file name).
     let session_id = cli
@@ -112,7 +109,6 @@ pub(super) fn run_background(mut cli: ParsedCli) -> Result<(), Box<dyn std::erro
 
     spawn_daemon_child(&cli, &session_id, &log_path)?;
 
-    // Parent exits; the shell returns immediately.
     process::exit(0)
 }
 
@@ -140,7 +136,7 @@ pub(super) fn run_background_child(
         runtime.block_on(driver::run_with_cli(cli))
     };
 
-    // Clean up the PID file after the task finishes (regardless of success or failure).
+    // Remove the PID marker once the driver returns, including driver errors.
     let _ = std::fs::remove_file(&pid_path);
 
     result
@@ -164,8 +160,8 @@ pub(super) fn run_background_child(
 pub(crate) fn detach_live_session(session_id: &str) -> std::io::Result<()> {
     let pid_path = pid_path_for_session(session_id);
 
-    // All realistically fallible setup happens before standard descriptors change.
-    // If any of it fails, the user remains in the foreground with a usable terminal.
+    // Start the resume helper and publish the PID before redirecting streams;
+    // failure here leaves the original terminal descriptors intact.
     spawn_resume_helper()?;
     write_pid_file(&pid_path)?;
 
@@ -250,8 +246,7 @@ pub(super) fn cleanup_live_background_pid_file() {
         // the session is over. Drop the binding, otherwise a later terminal that
         // reuses the same key would silently resume a finished session. On the
         // handoff-failure path the binding was already rolled back, so this is a
-        // no-op there. (A SIGKILLed process skips this cleanup; the binding then
-        // remains, matching the pre-fix behavior.)
+        // no-op there. SIGKILL skips this cleanup and leaves the binding in place.
         if let Some(session_id) = pid_path.file_stem().and_then(|s| s.to_str()) {
             let _ = crate::ai::history::SuspendedSessionStore::new()
                 .remove_for_session(session_id, None);
@@ -289,11 +284,9 @@ fn open_live_output_fifo(_session_id: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Publish one committed assistant-text chunk to the live-output FIFO opened
-/// by a real-time `/bg` handoff. Best-effort by contract: never blocks, never
-/// fails the caller, and silently drops chunks while nobody is attached.
-/// Serve children publish these chunks through their framed FIFO; the `/bg`
-/// byte protocol remains live and untouched.
+/// Best-effort raw assistant-text publishing with nonblocking pipe writes.
+/// Chunks are dropped when no reader is attached. A live `/bg` stdio relay
+/// and serve streaming both own their output and bypass this path.
 pub(crate) fn publish_live_output(text: &str) {
     if text.is_empty() {
         return;
@@ -435,12 +428,10 @@ fn publish_live_output_bytes_impl(bytes: &[u8], wait_for_reader: bool) -> bool {
     true
 }
 
-/// Environment handoff for serve-mode chunk streaming: the serve SSE endpoint
-/// pre-creates a per-turn FIFO and passes its path here before spawning a
-/// one-shot child. The child then publishes every committed assistant-text
-/// chunk into that pipe through the existing [`publish_live_output`] path, so
-/// the server can forward token-level deltas without re-running the turn
-/// in-process. Never set by users; only by `serve::post_turn_sse`.
+/// Internal FIFO handoff from `serve::post_turn_sse`: the SSE endpoint
+/// pre-creates a per-turn pipe before spawning its one-shot child.
+/// [`publish_serve_frame`] and [`publish_serve_json_frame`] write framed events
+/// for the daemon to forward to the client.
 pub(crate) const SERVE_LIVE_FIFO_ENV: &str = "A_SERVE_LIVE_FIFO";
 
 /// Marker for any one-shot child spawned by `serve` (both the SSE and the
@@ -662,7 +653,7 @@ pub(crate) enum ServeLiveKind {
     JsonStart = 20,
     JsonChunk = 21,
     JsonEnd = 22,
-    /// Exact producer-owned throughput sample for a completed stream phase.
+    /// Producer-owned throughput sample for a completed stream phase.
     TokenRate = 23,
     /// Reasoning text prefixed with its phase and attempted byte offset.
     ThinkingChunk = 24,
@@ -1267,7 +1258,7 @@ pub(super) enum AttachOutcome {
 }
 
 /// Attach to a session running in the shell background after a real-time `/bg`
-/// handoff and replay its live output until the background process exits.
+/// handoff and display newly published output until the background process exits.
 ///
 /// Returns [`AttachOutcome::BackgroundCompleted`] immediately when the session
 /// is not live, so callers can use this as an unconditional pre-step. This is a
@@ -1421,15 +1412,12 @@ fn spawn_resume_helper() -> std::io::Result<()> {
 /// Wait on the live-handoff helper from a detached thread so it cannot linger
 /// as a zombie for the rest of this process's life.
 ///
-/// The helper exits ~250 ms after sending SIGCONT (see
-/// [`resume_detached_parent`]), while the parent keeps running as a background
-/// job. Dropping its `Child` without waiting would leave one zombie per `/bg`
-/// handoff until this process exits, so a reaper thread waits on it as soon as
-/// it terminates. The child is handed to the thread over a channel: if thread
-/// creation fails, the `Child` is dropped unwaited right here (reverting to the
-/// old single-zombie behavior) rather than waiting inline — blocking would
-/// swallow the helper's SIGCONT before the parent stops itself with SIGTSTP in
-/// `detach_live_session`, leaving this process stopped forever.
+/// [`resume_detached_parent`] sends SIGCONT after a delay and then exits while
+/// its parent keeps running. Dropping `Child` without waiting leaves a zombie.
+/// A channel transfers ownership only after the reaper thread starts. If thread
+/// creation fails, drop the handle without waiting: an inline wait would let
+/// SIGCONT arrive before [`detach_live_session`] raises SIGTSTP, leaving the
+/// parent stopped with no helper to resume it.
 #[cfg(unix)]
 fn reap_live_background_helper(child: std::process::Child) {
     let (tx, rx) = std::sync::mpsc::channel::<std::process::Child>();
@@ -1497,9 +1485,9 @@ fn spawn_live_stdio_relay(read_fd: OwnedFd) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn ignore_terminal_hangups() {
-    // After the shell has put this job in the background, closing the original
-    // terminal can send SIGHUP. Standard streams are already `/dev/null`, so
-    // ignoring the hangup keeps the live turn alive without further terminal I/O.
+    // Closing the original terminal can send SIGHUP after the job backgrounds.
+    // Stdin is `/dev/null` and stdout/stderr feed the relay; ignore terminal
+    // signals so the live turn can continue without the controlling terminal.
     unsafe {
         let _ = libc::signal(libc::SIGHUP, libc::SIG_IGN);
         let _ = libc::signal(libc::SIGTTIN, libc::SIG_IGN);
@@ -1582,7 +1570,7 @@ pub(super) fn stop_background(session_id: &str) -> Result<(), Box<dyn std::error
         )
     })?;
 
-    // If the process no longer exists, clean up the pid file and exit gracefully.
+    // Treat a failed liveness probe as a stale PID marker and clean it up.
     let alive = unsafe { libc::kill(pid, 0) } == 0;
     if !alive {
         let _ = std::fs::remove_file(&pid_path);
@@ -1596,7 +1584,6 @@ pub(super) fn stop_background(session_id: &str) -> Result<(), Box<dyn std::error
         .into());
     }
 
-    // Send SIGTERM (equivalent of ctrl+c).
     eprintln!("[stop] sending SIGTERM to session {session_id} (PID {pid})...");
     let ret = unsafe { libc::kill(pid, libc::SIGTERM) };
     if ret != 0 {
@@ -1612,8 +1599,7 @@ pub(super) fn stop_background(session_id: &str) -> Result<(), Box<dyn std::error
         eprintln!("       kill -9 {pid}");
     } else {
         let _ = std::fs::remove_file(&pid_path);
-        // Confirmed stopped: the session is over, so no suspended binding should
-        // remain either.
+        // A failed liveness probe also clears the suspended-session binding.
         let _ =
             crate::ai::history::SuspendedSessionStore::new().remove_for_session(session_id, None);
         eprintln!("[stop] session {session_id} (PID {pid}) stopped.");
@@ -1633,14 +1619,9 @@ fn pid_path_for_session(session_id: &str) -> PathBuf {
 
 /// Serialize the parsed `ParsedCli` into the daemon child's argv (excluding argv[0]).
 ///
-/// Fixes a bug in the original `spawn_daemon_child`, which used
-/// `std::env::args_os().skip(1)` directly and lost the task description in the
-/// "no positional args + interactive input" scenario: the parent writes the
-/// task into `cli.args` via `read_task_interactively` in `run_background`, but
-/// a child still reading the raw `env::args` would never receive it and would
-/// only run an empty prompt plus the background directive. This function
-/// rebuilds argv from `cli` as the single source of truth so interactively
-/// read tasks are passed through.
+/// Rebuild argv from `cli` so tasks read by [`read_task_interactively`] in
+/// [`run_background`] reach the child. Raw process arguments do not contain
+/// input collected after startup.
 pub(crate) fn build_daemon_args(cli: &ParsedCli, session_id: &str) -> Vec<std::ffi::OsString> {
     use std::ffi::OsString;
     let mut args: Vec<OsString> = Vec::new();
@@ -1765,8 +1746,7 @@ pub(crate) fn build_daemon_args(cli: &ParsedCli, session_id: &str) -> Vec<std::f
 
 /// Use posix_spawn to launch a freshly exec'd `a --daemon-child <session>` as the daemon:
 ///
-/// - stdin -> /dev/null, stdout/stderr -> log file (same as the old
-///   double-fork behavior);
+/// - stdin -> /dev/null, stdout/stderr -> log file;
 /// - the daemon child calls `setsid` before parsing the CLI, creating an
 ///   independent session and detaching from the controlling terminal;
 /// - goes through `fork_guard::spawn` (on macOS std `Command` uses
@@ -2086,9 +2066,9 @@ mod tests {
 
     #[test]
     fn daemon_args_contains_interactively_entered_task() {
-        // Regression: when `a -bg` has no positional args, the parent writes the
-        // task into cli.args in read_task_interactively; the child must receive
-        // the same task re-serialized through ParsedCli, not the raw env::args.
+        // `run_background` stores the interactively read task in `cli.args`;
+        // re-executing from ParsedCli must preserve that input, which raw process
+        // arguments do not contain.
         let mut cli = parse_cli_args(["a".to_string(), "-bg".to_string()].into_iter());
         assert!(cli.args.is_empty());
         assert!(cli.background);
@@ -2100,10 +2080,8 @@ mod tests {
         cli.session = Some(session_id.clone());
 
         let args = build_daemon_args(&cli, &session_id);
-        // Must contain the --daemon-child <session> prefix
         assert_eq!(args[0].to_string_lossy(), "--daemon-child");
         assert_eq!(args[1].to_string_lossy(), session_id);
-        // Must contain the interactively entered task (as a trailing positional arg)
         let args_str: Vec<String> = args
             .iter()
             .map(|s| s.to_string_lossy().to_string())
@@ -2187,7 +2165,6 @@ mod tests {
 
     #[test]
     fn daemon_args_roundtrip_via_parse() {
-        // Ensure the serialized args can be correctly reconstructed by parse_cli_args
         let mut cli = parse_cli_args(
             [
                 "a".to_string(),
@@ -2256,12 +2233,10 @@ mod tests {
         let pid = child.id() as i32;
         reap_live_background_helper(child);
 
-        // The child must no longer be a child of this process shortly after it
-        // exits: `waitpid(pid, WNOHANG)` returns 0 while the child still exists
-        // (running or zombie) and -1/ECHILD once the reaper thread reaped it.
-        // If this test's own waitpid wins the race instead, the child is
-        // reaped all the same and the reaper thread's `wait` simply fails with
-        // ECHILD (ignored via `let _`).
+        // `waitpid(pid, WNOHANG)` returns 0 while the child is running, its PID
+        // when this test reaps it, or -1/ECHILD after the reaper thread has reaped it.
+        // If this test wins the race, the reaper's `wait` fails with ECHILD,
+        // which it ignores.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let rc = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
@@ -2380,8 +2355,8 @@ mod tests {
         Ok(())
     }
 
-    /// Round-trip the live-output FIFO: the backgrounded side publishes chunks
-    /// and a detached attach reader replays them until the background exits.
+    /// Round-trip chunks through a live-output FIFO, then verify that attach
+    /// completes immediately once the PID marker has been removed.
     #[test]
     #[cfg(unix)]
     fn live_output_fifo_roundtrip() -> std::io::Result<()> {
@@ -2398,8 +2373,6 @@ mod tests {
 
         let result = (|| -> std::io::Result<()> {
             let session = "fifo-roundtrip-session";
-            // This test process plays the backgrounded agent: register its own
-            // pid so attach_live_session sees a live session.
             write_pid_file(&pid_path_for_session(session))?;
             open_live_output_fifo(session)?;
 

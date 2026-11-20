@@ -14,7 +14,7 @@ use crate::ai::{
 use super::{
     MarkdownStreamRenderer,
     inline_recovery::InlineMarkupNormalizer,
-    runtime::ProviderControlLeakScanner,
+    runtime::{ProviderControlLeakScanner, ReasoningCorruptionScanner},
     splitter::{
         AnthropicXmlToolCallStreamer, BareXmlToolCallStreamer, HermesXmlToolCallStreamer,
         InternalToolCallStreamer, StreamSplitter,
@@ -546,6 +546,9 @@ pub(super) struct StreamContentState {
     /// Incremental scan over `reasoning_text` for a leaked provider control envelope
     /// (see `ProviderControlLeakScanner`); keeps the per-fragment check linear.
     pub(super) provider_control_leak: ProviderControlLeakScanner,
+    /// Incremental guard for a reasoning stream that decodes into garbage
+    /// (replacement/control characters or leaked special-token placeholders).
+    pub(super) reasoning_corruption: ReasoningCorruptionScanner,
     /// Complete `reasoning` output items captured from the Responses stream this
     /// turn (including encrypted_content). Only used for same-turn tool-chain
     /// replay; never persisted to history.
@@ -625,6 +628,7 @@ impl StreamContentState {
             hidden_meta: String::new(),
             reasoning_text: String::new(),
             provider_control_leak: ProviderControlLeakScanner::new(),
+            reasoning_corruption: ReasoningCorruptionScanner::new(),
             reasoning_items: Vec::new(),
             open_output_items: 0,
             hidden_meta_parse: HiddenMetaParseState::default(),

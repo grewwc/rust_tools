@@ -376,8 +376,6 @@ fn known_model_entries_resolve_exactly_by_name() {
 
 #[test]
 fn model_keys_resolve_to_model_handles() {
-    // Validate the key→handle mapping in reverse against the first real entry in
-    // the model registry, rather than hardcoding a specific key.
     let first = super::model_names::all()
         .first()
         .map(|m| {
@@ -446,11 +444,9 @@ fn duplicate_name_entries_stay_selectable_by_key() {
 
 #[test]
 fn output_caps_above_the_tier_default_window_declare_an_explicit_window() {
-    // The request builder clamps max_tokens to `window - est_prompt - safety margin`
-    // (CONTEXT_WINDOW_SAFETY_MARGIN_TOKENS in src/bin/ai/request/builder.rs), so an entry whose
-    // declared output cap only fits because no window was declared gets clamped on every request.
-    // Encoded registry-wide so it catches new entries too, instead of pinning the models that
-    // happened to need an explicit window when the rule was first written.
+    // Without a declared window, output caps must fit below the tier fallback
+    // with room for a prompt safety margin. Check every registry entry so new
+    // models preserve this pairing.
     const SAFETY_MARGIN_TOKENS: usize = 2_048;
 
     for def in super::model_names::all() {
@@ -480,12 +476,8 @@ fn output_caps_above_the_tier_default_window_declare_an_explicit_window() {
 
 #[test]
 fn half_window_entries_declare_window_consistent_with_output_cap() {
-    // Entries on the half-window pattern (256K context window, 128K output cap)
-    // must declare both explicitly: a 256K output cap cannot coexist with a
-    // 256K window (prompt + 2048 safety margin would always exceed it, so the
-    // builder would clamp max_tokens below the declared cap on every request),
-    // and an explicit window keeps a future tier-default change from silently
-    // re-clamping max_tokens. Discovered by the declared values, not by key.
+    // Explicit window and output-cap values must round-trip without tier
+    // fallback substitution. Select fixtures by their declared limits.
     let matches: Vec<String> = super::model_names::all()
         .iter()
         .filter(|m| {
@@ -505,12 +497,9 @@ fn half_window_entries_declare_window_consistent_with_output_cap() {
 
 #[test]
 fn all_models_declare_output_cap_below_context_window() {
-    // Registry-wide guard for the output-cap / window pairing convention. The request
-    // builder clamps max_tokens to `window - est_prompt - 2048`, so a max_output_tokens
-    // that reaches or exceeds the effective context window (declared or tier fallback)
-    // is silently unreachable and long generations truncate early. Covers every model,
-    // including ones added later (deepseek-v4-flash and the gpt-5.x / doubao-seed-2.1
-    // families are the known cases that previously relied on an explicit declaration).
+    // A declared output cap must fit below the effective context window,
+    // including the tier fallback when no window is declared. Check every
+    // registry entry so new models preserve this pairing.
     for def in super::model_names::all() {
         let Some(out) = def.max_output_tokens else {
             continue;
@@ -893,10 +882,6 @@ fn localhost_endpoint_supports_anonymous_auth() {
 
 #[test]
 fn default_model_prefers_high_quality_alibaba_or_compatible_model() {
-    // default_model is filtered by Alibaba / Compatible adapter in choose_default_model_name,
-    // then falls back to the full set and picks the highest quality_tier. The invariant is
-    //  1. must be non-vl
-    //  2. quality_tier must be at least as high as every candidate under the same adapter preference
     let def = super::model_names::find_by_identifier(&default_model())
         .expect("default model must exist in model registry");
     assert!(!def.is_vl, "default model should be non-VL");
@@ -912,10 +897,8 @@ fn default_model_prefers_high_quality_alibaba_or_compatible_model() {
 
 #[test]
 fn opencode_model_entries_do_not_advertise_thinking_when_disabled() {
-    // This used to hard-assert the fixed model name gpt-5.4-pro; it now targets any
-    // opencode model that explicitly declares enable_thinking=false in the model registry,
-    // checking that enable_thinking() matches the config. Specific registry entry changes
-    // no longer break this test, while still guarding the invariant of not misreading false as true.
+    // Discover an OpenCode model that explicitly disables thinking so registry
+    // renames do not affect the check.
     let candidate = super::model_names::all()
         .iter()
         .find(|m| m.adapter == ApiProvider::OpenCode && !m.enable_thinking)
@@ -926,16 +909,14 @@ fn opencode_model_entries_do_not_advertise_thinking_when_disabled() {
 }
 
 #[test]
-/// Regression test: the api_key_config_key field in the model registry may be encrypted (enc:...),
-/// so api_key_for_model must decrypt it first before using it as the key name in configw.
-/// Before the fix: the encrypted string was used directly as the key name -> not found -> fallthrough to the global api_key -> 401.
+/// Encrypted `api_key_config_key` values must be decrypted before the config
+/// lookup, or a valid model-specific key can fall through to another credential.
 fn api_key_config_key_decrypts_before_configw_lookup() {
     use crate::ai::test_support::ENV_LOCK;
     use crate::commonw::{configw, secret};
 
     let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 
-    // Find a model in the registry whose api_key_config_key is encrypted
     let target = super::model_names::all().iter().find_map(|m| {
         let enc = m.api_key_config_key.as_deref()?;
         if !secret::is_encrypted(enc) {
@@ -947,7 +928,7 @@ fn api_key_config_key_decrypts_before_configw_lookup() {
     });
 
     let Some((model_key, config_key_name)) = target else {
-        // No encrypted api_key_config_key entries exist, so this scenario cannot be tested
+        // No decryptable encrypted key name is available in the registry.
         return;
     };
 
@@ -962,14 +943,12 @@ fn api_key_config_key_decrypts_before_configw_lookup() {
         return;
     };
 
-    // Create a temp directory and copy the key file into it (keeping it decryptable)
     let temp_dir =
         std::env::temp_dir().join(format!("rt_enc_test_{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&temp_dir).unwrap();
     let temp_secret = temp_dir.join(".configW.secret");
     std::fs::copy(&real_secret_path, &temp_secret).unwrap();
 
-    // Write the temporary config file
     let cfg_path = temp_dir.join("configw");
     let test_value = "test-encrypted-key-resolution-value";
     std::fs::write(&cfg_path, format!("{config_key_name} = {test_value}\n")).unwrap();
@@ -978,10 +957,9 @@ fn api_key_config_key_decrypts_before_configw_lookup() {
     unsafe { std::env::set_var("CONFIGW_PATH", &cfg_path) };
     configw::refresh();
 
-    // Deliberately set global_fallback to a value that can never be right, so there is no fallthrough
+    // Distinguish a successful model-specific lookup from credential fallback.
     let resolved = api_key_for_model(&model_key, "GLOBAL_FALLBACK_SHOULD_NOT_BE_USED");
 
-    // Restore the environment
     match old_cfg {
         Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
         None => unsafe { std::env::remove_var("CONFIGW_PATH") },

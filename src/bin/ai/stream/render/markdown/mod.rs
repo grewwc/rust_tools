@@ -184,17 +184,13 @@ pub(in crate::ai) struct MarkdownStreamRenderer {
     line_preview_emitted: bool,
     line_preview_height: usize,
     table_state: TableState,
-    // 表格缓冲期已在屏幕上显示了一行占位提示（“⋯ 生成表格中”）。表格就绪一次性
-    // 渲染时需先用确定的 `\x1b[1A\r\x1b[0J` 上移恰好 1 行清掉它——占位强制单行且
-    // 短于终端宽，故这个“1 行”不依赖任何折行预测，不会重现残像叠表。
+    // The placeholder must fit one physical row: `clear_table_placeholder`
+    // erases it by moving up one row.
     table_placeholder_shown: bool,
     dimmed: bool,
     code_preview_segment_width: usize,
-    // Per-line cache for code-block realtime rendering: `block_indent`, the line
-    // number label, and the ioctl'd terminal width are constant within a line, so
-    // recomputing them on every character cost 2 heap allocations + 1 syscall per
-    // char. Refreshed lazily by `refresh_code_block_line_ctx` when the line number
-    // or indent changes.
+    // Cache the code-block indent, number label, and wrapping width for each line
+    // to avoid rebuilding them per character.
     code_block_ctx_line: usize,
     code_block_ctx_indent: String,
     code_block_ctx_num_str: String,
@@ -208,7 +204,7 @@ pub(in crate::ai) struct MarkdownStreamRenderer {
     html_table_buf: String,
     html_table_preview_height: usize,
     html_table_indent: String,
-    // 数学块缓冲区：积累 $$/\[/\] 之间的内容，块结束后一次性渲染
+    // Math content is buffered until the active delimiter or fence closes.
     math_block_buf: Vec<String>,
     /// Number of chars currently buffered in `line_buf`. Maintained incrementally
     /// at every mutation point (the push/take helpers below are the only ones) so
@@ -465,9 +461,7 @@ impl MarkdownStreamRenderer {
         std::mem::take(&mut self.line_buf)
     }
 
-    /// Recomputes the preview height if an echo path marked it stale; see the
-    /// `line_preview_height_stale` field for why this is equivalent to the former
-    /// per-char eager recomputation.
+    /// Recompute the preview height lazily after an echo path marks it stale.
     fn refresh_stale_line_preview_height(&mut self) {
         if !self.line_preview_height_stale {
             return;
@@ -688,11 +682,9 @@ impl MarkdownStreamRenderer {
         live_preview_cursor_rows(&self.line_buf)
     }
 
-    /// Refresh the per-line code-block context (indent copy, line-number label,
-    /// terminal width) when the current line or indent changed. The width re-queries
-    /// the terminal once per line instead of per character; the finished line's
-    /// height is still recomputed with a fresh ioctl in `code_block_preview_height`,
-    /// so a mid-line resize only affects wrapping of the current partial line.
+    /// Cache code-block layout for the current line and indent. Completed-line
+    /// preview height is measured with the current width in `code_block_preview_height`,
+    /// which may differ from the width cached before a mid-line resize.
     fn refresh_code_block_line_ctx(&mut self) {
         if self.code_block_ctx_line != self.code_line_number
             || self.code_block_ctx_indent != self.code_block_indent
@@ -992,7 +984,7 @@ impl MarkdownStreamRenderer {
 
         let rendered = match parse_html_table(&buf) {
             Some(table) => render_html_table(&indent, &table),
-            // No `</table>` arrived: keep the model's raw text (see `ensure_trailing_newline`).
+            // Keep failed parses line-terminated so later input starts below the raw table.
             None => Self::ensure_trailing_newline(buf),
         };
 
@@ -1026,7 +1018,7 @@ impl MarkdownStreamRenderer {
 
         let rendered = match parse_html_table(&buf) {
             Some(table) => render_html_table(&indent, &table),
-            // No `</table>` arrived: keep the model's raw text (see `ensure_trailing_newline`).
+            // Keep failed parses line-terminated so later input starts below the raw table.
             None => Self::ensure_trailing_newline(buf),
         };
 
@@ -1085,8 +1077,8 @@ impl MarkdownStreamRenderer {
         self.render_table_column_block(indent, header, align, rows, 0..cols)
     }
 
-    /// 续接列块：不画顶部边框，用 mid separator 衔接上一块，避免宽表分列时
-    /// 每块都像独立新表（header 反复出现）。
+    /// Start continuation column blocks with a middle border to show that they belong
+    /// to the same wide table. Each block still renders its own column headers.
     fn render_table_column_block_continuation(
         &self,
         indent: &str,
@@ -1170,8 +1162,9 @@ impl MarkdownStreamRenderer {
         self.render_line_no_table(&format!("{indent}{rest}"))
     }
 
-    /// 表格缓冲期的单行占位提示。仅在 tty 且尚未显示时返回一行短提示并置位标志。
-    /// 强制单行、短于终端宽，保证只占 1 个物理行，清除时上移量恒为 1。
+    /// Emit the table-generation placeholder once on a TTY. The caller's indentation
+    /// and the label must fit one physical row because `clear_table_placeholder`
+    /// erases one row.
     fn table_placeholder_line(&mut self, indent: &str) -> String {
         if !self.tty || self.table_placeholder_shown {
             return String::new();
@@ -1180,8 +1173,8 @@ impl MarkdownStreamRenderer {
         format!("{indent}{}⋯ 生成表格中\x1b[0m\n", theme::current().accent_muted)
     }
 
-    /// 若占位提示正显示在屏幕上，返回清除它的确定序列（上移 1 行并清到屏末）。
-    /// 上移量恒为 1，不依赖任何折行预测，故不会重现残像叠表。
+    /// Clear the placeholder with a one-row cursor move and erase to screen end.
+    /// This assumes the placeholder occupied a single physical row.
     fn clear_table_placeholder(&mut self) -> String {
         if !self.table_placeholder_shown {
             return String::new();
@@ -1190,15 +1183,11 @@ impl MarkdownStreamRenderer {
         "\x1b[1A\r\x1b[0J".to_string()
     }
 
-    /// Render one logical prose line into physical rows that fit the terminal.
+    /// Render one logical prose line using the preview width and explicit row breaks.
     ///
-    /// The answer body previously relied on the terminal's soft wrap. That is
-    /// harmless in native terminals, but xterm.js (VS Code / Trae) reflows an
-    /// already-drawn long logical row when the panel is resized, which moves the
-    /// rows this renderer later addresses with relative cursor moves. Emitting
-    /// explicit newlines keeps every physical row stable. `first_prefix` is the
-    /// rendered marker for the first row (list bullet, quote bar); continuation
-    /// rows use `continuation`, whose display width is `marker_width`.
+    /// Hard line breaks preserve the chosen wrap boundaries when the terminal
+    /// reflows scrollback after a resize. `first_prefix` decorates the first row;
+    /// continuation rows use `continuation`, whose display width is `marker_width`.
     fn render_wrapped_prose(
         &self,
         indent: &str,
@@ -1493,17 +1482,12 @@ mod parser;
 #[cfg(test)]
 mod tests;
 
-// Re-export externally-visible / test-visible measurement helpers through the
-// `markdown` module root so `render::markdown::X` paths (stream runtime) and the
-// inline `tests` module (via `use super::*`) keep their pre-split names.
+// Keep shared width helpers available to stream runtime and renderer tests.
 pub(in crate::ai) use crate::ai::stream::render::inline::terminal_cell_width;
 pub(in crate::ai) use width::{
     TerminalWidthSnapshot, clamp_line_to_terminal_row, clamp_line_to_terminal_row_with_reserve,
     live_preview_cursor_rows, raw_terminal_rows, wrap_line_to_terminal_rows_with_reserve,
 };
-// The serve client is the only caller that reports a display width, and it
-// exists only in the serve builds; without the gate this re-export is dead
-// weight in a default build and warns as an unused import.
 pub(in crate::ai) use width::raw_terminal_cols;
 // Impl-only helpers: imported privately for the methods above; not part of the
 // public `markdown` surface.

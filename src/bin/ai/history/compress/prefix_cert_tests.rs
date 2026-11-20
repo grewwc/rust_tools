@@ -544,7 +544,7 @@ fn prefix_cert_policy_preserves_lexical_path_key_and_memory_estimate() {
         &policy
     ));
 
-    // Equivalent lexical spelling must not invent a smaller B1 byte estimate.
+    // Equivalent lexical spelling must not invent a smaller cached byte estimate.
     let outcome = ContextCompressionOutcome::new(
         prefix.clone(),
         messages_total_chars(&prefix),

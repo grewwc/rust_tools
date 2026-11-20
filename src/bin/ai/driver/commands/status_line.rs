@@ -12,19 +12,8 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
-/// Show a dim hint on the current terminal line and erase it automatically
-/// after `duration`.
-///
-/// How it works:
-/// 1. `\x1b[2K` - clear the entire current line (cursor position unchanged)
-/// 2. `\x1b[2m` - enable the dim style (ANSI standard; terminals usually
-///    render it in gray)
-/// 3. Print the text + `\x1b[0m` to reset the style
-/// 4. Wait for the given duration
-/// 5. Clear the line again with `\x1b[2K`
-///
-/// What the user sees: a gray hint appears briefly and then disappears,
-/// leaving no trace in the terminal history.
+/// Show a dim hint on stderr's current line for the default duration.
+/// Blocks until the line is erased; callers must own that line during the wait.
 pub(crate) fn show_status(msg: &str) {
     show_status_with_duration(msg, Duration::from_secs(2));
 }
@@ -32,13 +21,11 @@ pub(crate) fn show_status(msg: &str) {
 pub(crate) fn show_status_with_duration(msg: &str, duration: Duration) {
     let mut stderr = io::stderr();
 
-    // Clear the current line → write the dimmed message → flush
     let _ = write!(stderr, "\x1b[2K\x1b[2m{}\x1b[0m", msg);
     let _ = stderr.flush();
 
     std::thread::sleep(duration);
 
-    // Clear the current line again → flush (the user sees the hint disappear)
     let _ = write!(stderr, "\x1b[2K");
     let _ = stderr.flush();
 }

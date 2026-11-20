@@ -205,11 +205,10 @@ pub(super) fn attach_provenance(
 /// rebind the content hash to the (possibly rewritten) note body, so the note
 /// keeps its pruning authority in the new session.
 /// Returns the re-encoded sidecar, or `None` when `reasoning` carries no
-/// structurally valid provenance or nothing needed changing. Structural checks
-/// mirror `provenance()` except the content hash, which is rebound here rather
-/// than verified — but only after the old hash is verified against the
-/// pre-move body, so a move never launders an already-invalid sidecar into
-/// pruning authority it did not have.
+/// decodable provenance, its archive path or sources are empty, or nothing
+/// needed changing. When the body changes, verify its old hash before rebinding;
+/// other structural checks remain `provenance()`'s responsibility, so a move
+/// cannot turn malformed source metadata into pruning authority.
 pub(super) fn remap_provenance_for_session_move(
     reasoning: &str,
     pre_move_content: &str,

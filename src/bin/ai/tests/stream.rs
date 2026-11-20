@@ -75,7 +75,6 @@ fn table_preview_lines_are_not_double_printed_after_live_emit() {
     assert!(!end_out.contains("| name | value |"));
     assert!(!end_out.contains("| --- | --- |"));
     assert!(!end_out.contains("| foo | bar |"));
-    // Plain text after the table outputs normally
     assert!(end_out.contains("done"));
 }
 
@@ -90,7 +89,7 @@ fn table_live_preview_detection_requires_table_like_content() {
 #[test]
 fn math_frac_renders_with_nested_braces() {
     let mut renderer = stream::MarkdownStreamRenderer::new_with_tty(true);
-    // Block math lines now buffer: lines between `$$`/`\[` and `$$`/`\]` accumulate first and render
+    // Block math lines buffer: lines between `$$`/`\[` and `$$`/`\]` accumulate first and render
     // in one shot when the closing delimiter arrives, preventing the live preview from emitting raw TeX and then appending the Unicode result after a newline (duplicate output).
     assert_eq!(renderer.consume_line("$$", false), "");
     assert_eq!(
@@ -113,7 +112,6 @@ fn math_frac_renders_with_nested_braces() {
 #[test]
 fn math_renderer_preserves_longer_commands_and_literal_braces() {
     let mut renderer = stream::MarkdownStreamRenderer::new_with_tty(true);
-    // Buffered block math lines render in one shot at the closing delimiter (see above).
     assert_eq!(renderer.consume_line("$$", false), "");
     assert_eq!(
         renderer.consume_line(
@@ -140,7 +138,6 @@ fn math_renderer_preserves_longer_commands_and_literal_braces() {
 #[test]
 fn math_renderer_maps_mathbb_and_preserves_unknown_commands() {
     let mut renderer = stream::MarkdownStreamRenderer::new_with_tty(true);
-    // Buffered block math lines render in one shot at the closing delimiter (see above).
     assert_eq!(renderer.consume_line("$$", false), "");
     assert_eq!(
         renderer.consume_line(r"\mathbb{R} \customcmd \alpha", false),

@@ -41,8 +41,8 @@ struct Catalog<'a> {
     json: String,
 }
 
-/// Why automatic recall stopped before building a catalog. `Empty` is the
-/// normal "nothing recallable" case and stays silent; `Abstained` carries a
+/// Catalog construction result. `Empty` is the normal "nothing recallable"
+/// case and stays silent; `Abstained` carries a
 /// user-facing reason when eligible memories exist but the catalog policy
 /// refuses them, so abstention stays observable instead of silent.
 enum CatalogOutcome<'a> {

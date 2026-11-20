@@ -1,5 +1,5 @@
 //! Process-local session indices and deferred continuation-note transactions.
-//! Continuations wait for terminal publication and for the actual backend run to end.
+//! Recorded task continuations require terminal publication and the actual backend run to end.
 
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};

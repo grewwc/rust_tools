@@ -55,16 +55,10 @@ pub(super) fn parse_stream_payload(
         }
     }
 
-    // Some gateways (opencode zen / encrypted channel) omit a usable SSE `event:` name and carry
-    // the event type only in the JSON top-level `type` field. The `response.output_item.done`
-    // payload holding the encrypted reasoning would otherwise be ignored by the event-name branch
-    // or silently swallowed by the adapter's loose chunk parse, which breaks replaying it in the
-    // next tool request; a future gateway moving the full payload into `.added` is covered too.
-    // Only the reasoning capture reacts to the JSON `type` fallback added here, other item types
-    // keep their existing path. The pre-screen and the `type` comparisons it guards are
-    // ASCII-case-insensitive, like every other protocol token in this file: a gateway that varies
-    // the case of these markers reaches the same branches, while ordinary delta chunks still skip
-    // the JSON parse.
+    // Some gateways carry Responses event types only in the JSON `type` field.
+    // Parse these payloads before the adapter's loose chunk path so terminal
+    // status and reasoning-item state are preserved. Case-insensitive screening
+    // keeps unrelated deltas from paying for a JSON parse here.
     if ascii_contains(payload, "response.output_item.done")
         || ascii_contains(payload, "response.output_item.added")
         || ascii_contains(payload, "response.completed")
@@ -113,13 +107,9 @@ pub(super) fn parse_stream_payload(
         }
     }
 
-    // Non-SSE event path: parse the payload once and reuse the same Value for both
-    // error detection and chunk construction (aligned with the SSE path, which
-    // merges error detection into its single parse, so each chunk is no longer
-    // parsed twice). StreamChunk fields are all #[serde(default)], so {"error":{...}}
-    // is intercepted by the error check first; only when parsing fails or the JSON
-    // cannot deserialize into a chunk (e.g. noisy wrapped JSON) do we fall back to
-    // the adapter's loose parse — semantics are identical to before.
+    // Reuse the parsed Value for error detection and chunk construction. Check
+    // top-level errors before attempting a chunk; leave unparsable or unsupported
+    // shapes to the adapter's loose parse.
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
         if let Some(err_msg) = value.get("error").and_then(extract_error_message) {
             return ParsedStreamPayload::Error(err_msg);
@@ -140,16 +130,14 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
     if event_type.eq_ignore_ascii_case("done") || event_type.eq_ignore_ascii_case("[done]") {
         return Some(ParsedStreamPayload::Done);
     }
-    // 统一解析一次并复用：各事件分支共享同一 Value，避免每个 chunk 双重 JSON
-    // 解析；顶层 error 对象检测也在此完成（StreamChunk 全字段 #[serde(default)]，
-    // 纯 error payload 会被静默反序列化为空 chunk 丢弃）。
+    // Parse once for this event dispatch and check top-level errors before a
+    // payload can be interpreted as an empty chunk.
     let value: serde_json::Value = serde_json::from_str(payload).ok()?;
     if let Some(err_msg) = value.get("error").and_then(extract_error_message) {
         return Some(ParsedStreamPayload::Error(err_msg));
     }
-/// Server-assembled visible text from a Responses terminal event: concatenate every
-/// `output[].content[].text` part. Only `message` items carry displayable text;
-/// `reasoning` items have no `content[].text`, so they contribute nothing.
+/// Concatenate every string at `output[].content[].text` in a Responses terminal
+/// payload for reconciliation with streamed output.
 fn extract_response_server_text(response: &serde_json::Value) -> String {
     let mut out = String::new();
     if let Some(items) = response.get("output").and_then(|o| o.as_array()) {
@@ -345,16 +333,10 @@ fn parse_output_item_event(
         .trim()
         .to_ascii_lowercase();
 
-    // 捕获 reasoning item：`.done` 上的完整 `encrypted_content` 始终可回放；`.added`
-    // 在现网是固定短串 stub（不可回放、回放会 400），但若未来网关把完整载荷移到
-    // `.added` 需前向兼容。约定阈值：real 载荷实测 900-1500 长度，stub 恒为短串
-    // （<100），以 256 为分界足以区分二者且不误伤短推理链的加密块。
     if item_type == "reasoning" {
-        // Capture the item for same-turn tool-chain replay: a `.done` payload carries the real
-        // `encrypted_content`, an `.added` payload is a fixed short stub in production (not
-        // replayable — replaying it returns 400) but is captured too in case a future gateway moves
-        // the full payload there. Fixed threshold: real payloads measure 900-1500 chars while stubs
-        // stay short (<100), so 256 separates them without misjudging a short chain's encrypted block.
+        // Keep nonempty encrypted_content from done items for same-turn replay.
+        // Added items must pass a byte-length heuristic to avoid replaying short
+        // placeholders.
         let encrypted_len = item
             .get("encrypted_content")
             .and_then(serde_json::Value::as_str)
@@ -414,10 +396,8 @@ fn parse_content_part_event(
         return Some(ParsedStreamPayload::Ignore);
     }
     if part_type == "summary_text" {
-        // summary_text 的 content_part 事件（added/done）都是已流式输出过的推理
-        // 摘要重发，而非模型增量。统一按 SnapshotChunk 处理，走未见后缀去重，
-        // 避免 added 事件携带的完整文本按 Append 模式用原文重复累积 reasoning_text，
-        // 污染退化检测并可能诱发 thinking 重复渲染（gpt-5.5/5.6 多发此路径）。
+        // Treat summary_text added/done parts as reasoning snapshots so
+        // deduplication appends only text that has not already been seen.
         return Some(ParsedStreamPayload::SnapshotChunk(single_delta_chunk(
             "", &text,
         )));
@@ -509,9 +489,9 @@ fn response_declares_incomplete(response: &serde_json::Value) -> bool {
 }
 
 /// Payload for a response the provider declared incomplete. `max_output_tokens` maps onto
-/// `finish_reason=length` (mirrors @ai-sdk/openai's mapOpenAIResponseFinishReason): the partial
-/// text produced so far is kept, usage stays available like on a completed response, and the
-/// existing truncation ladders keep reading the shape they already handle.
+/// `finish_reason=length`: the partial text produced so far is kept, usage stays
+/// available like on a completed response, and the existing truncation ladders
+/// keep reading the shape they already handle.
 ///
 /// A *named* stop reason other than the output cap stays an error, because a retry cannot fix a
 /// content filter or a server-side cancel. A stop declared without any reason (a gateway that keeps
@@ -606,9 +586,9 @@ fn extract_output_index(value: &serde_json::Value) -> usize {
     {
         return idx as usize;
     }
-    // output_index 缺失时，使用 call_id/item_id 的哈希作为合成索引，
-    // 避免多个并行工具调用全部碰撞到 index 0 互相覆盖。
-    // 哈希值映射到 [10000, usize::MAX) 区间，不与真实 output_index（通常 0-9）冲突。
+    // Derive a synthetic index from the call/item identifier when output_index
+    // is absent so parallel calls can be grouped by identity. The wrapping hash
+    // can overlap provider-provided indices.
     let id = extract_call_identifier(value);
     if !id.is_empty() {
         let mut hash = 10000u64;
@@ -896,9 +876,8 @@ mod tests {
 
     #[test]
     fn reasoning_added_with_short_stub_reports_open_item_without_replay_payload() {
-        // The live `.added` payload is a short stub (not replayable — replaying it returns 400), so
-        // no payload is captured, but the open state must still be reported: the stream layer uses
-        // it to keep a hidden-thinking silence from being read as a stalled stream.
+        // Short added payloads are withheld from replay, while the open state
+        // still reaches the stream layer for hidden-thinking silence handling.
         let payload = r#"{"type":"response.output_item.added","item":{"type":"reasoning","encrypted_content":"short-stub"}}"#;
         for event_type in [
             Some("response.output_item.added"),
@@ -915,8 +894,8 @@ mod tests {
 
     #[test]
     fn reasoning_added_with_long_encrypted_content_is_captured_via_fallback() {
-        // Forward compatibility: if a gateway moves the full encrypted payload to `.added`
-        // (>=256 chars), it must be captured for replay and reported as an open item.
+        // An added payload that passes the byte-length heuristic is retained
+        // for replay and still reports an open item.
         let long = "a".repeat(512);
         let payload = format!(
             r#"{{"type":"response.output_item.added","item":{{"id":"rs_1","type":"reasoning","encrypted_content":"{long}"}}}}"#
@@ -1256,9 +1235,8 @@ mod tests {
 
     #[test]
     fn content_part_summary_text_maps_to_reasoning_snapshot_chunk() {
-        // summary_text 的 content_part 事件（added/done）是对已流式输出的推理
-        // 摘要重发，统一按 SnapshotChunk 处理以走未见后缀去重，避免重复累积
-        // reasoning_text（gpt-5.5/5.6 多发此路径）。
+        // summary_text belongs in reasoning, and its added event is a snapshot
+        // for unseen-suffix deduplication.
         let payload = r#"{"part":{"type":"summary_text","text":"step summary"}}"#;
         match parse_stream_payload(
             provider::openai_adapter(),
@@ -1474,7 +1452,6 @@ mod tests {
 
     #[test]
     fn normal_chunk_without_error_field_still_parses() {
-        // 确保正常 chunk 不被 extract_provider_error 误判
         let payload = r#"{"choices":[{"delta":{"content":"hello"}}]}"#;
         match parse_stream_payload(provider::openai_adapter(), payload, None) {
             ParsedStreamPayload::Chunk(chunk) => {

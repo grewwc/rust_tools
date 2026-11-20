@@ -19,9 +19,8 @@
 // - OPOST kept: the main agent's rendered output `\n` → `\r\n` conversion is unaffected.
 // - ECHO off with self-managed echo: backspace can erase by character width, and
 //   Ctrl+G itself produces no echo to interfere with rendering.
-// - Short poll + stop flag: when stream_response ends (any return path) the guard
-//   requests exit and waits for the terminal to be restored, avoiding leftover cbreak
-//   state affecting the later input box.
+// - Short poll + stop flag: when stream_response ends, the guard requests exit
+//   and waits for a bounded interval for the listener's terminal-cleanup acknowledgement.
 use std::{
     collections::VecDeque,
     io::{self, IsTerminal, Write},
@@ -44,7 +43,7 @@ use crate::commonw::prompt::{acquire_background_stdin, foreground_stdin_requeste
 
 /// Ctrl+G (BEL)
 const CTRL_G: u8 = 0x07;
-/// Poll interval in milliseconds; also bounds how quickly the stop flag is observed.
+/// Poll interval in milliseconds for idle input and stop checks.
 const POLL_MS: i32 = 50;
 
 /// Upper bound for one `CSI 18 t` round trip inside the listener loop.
@@ -276,7 +275,7 @@ const SHUTDOWN_WAIT_MS: u64 = 250;
 /// Upper bound for waiting at startup for the listener to take over the terminal;
 /// on timeout the not-yet-started task is not allowed to modify the terminal.
 const STARTUP_WAIT_MS: u64 = 250;
-/// Number of physical rows permanently reserved for the bottom composer row. Model
+/// Number of physical rows reserved for the bottom composer row. Model
 /// output scrolls continuously in the scroll region above it.
 const FOOTER_ROWS: u16 = 1;
 const COMPOSER_PREFIX: &str = "  [side-note] Esc/F2 send · Ctrl+G cancel > ";
@@ -503,9 +502,9 @@ fn active_footer_row() -> Option<u16> {
 
 /// Repaint the composer line the listener last drew, if any.
 ///
-/// No-op in listening mode and after the composer closed: the paint snapshot is
-/// cleared under the stdout lock by `clear_input`/`leave`, so a writer that runs
-/// after the composer is gone cannot resurrect its row.
+/// No-op without a paint snapshot. `clear_input` clears it before erasing the
+/// footer; `leave` clears it under the stdout lock so subsequent writers cannot
+/// repaint a closed composer.
 pub(super) fn repaint_composer(out: &mut impl Write) -> io::Result<()> {
     let Some((rows, cols, input)) = composer_paint() else {
         return Ok(());
@@ -588,9 +587,7 @@ pub(crate) fn side_note_input_enabled() -> bool {
     let depth = runtime_ctx::current_subagent_depth();
     let enabled =
         term_out && stdin_tty && depth == 0 && !crate::ai::background::live_background_active();
-    // Temporary diagnostics (prints the real value of each enable condition when
-    // RUST_TOOLS_SIDE_NOTE_DEBUG=1), for locating why the listener fails to start
-    // when "Ctrl+G does nothing"; remove after diagnosis.
+    // Print listener eligibility conditions when RUST_TOOLS_SIDE_NOTE_DEBUG is present.
     if std::env::var_os("RUST_TOOLS_SIDE_NOTE_DEBUG").is_some() {
         eprintln!(
             "[side-note-debug] enabled={enabled} term_out={term_out} stdin_tty={stdin_tty} depth={depth}"
@@ -606,8 +603,8 @@ pub(crate) fn live_listener_threads() -> usize {
     LISTENER_COUNT.load(Ordering::Acquire)
 }
 
-/// RAII guard: holds the background listener task, requests exit on drop and waits
-/// for the terminal to be restored.
+/// RAII guard: requests listener exit on drop and waits for a bounded interval
+/// for its terminal-cleanup acknowledgement.
 pub(crate) struct SideNoteInputGuard {
     stop: Arc<AtomicBool>,
     terminal_released: mpsc::Receiver<()>,
@@ -618,9 +615,8 @@ pub(crate) struct SideNoteInputGuard {
 ///
 /// Local turns append to the session's file queue; the serve-chat client has
 /// no local queue (its turn runs in a server-side child), so its drafts are
-/// POSTed to the serve session instead. The listener owns no terminal duties
-/// and only waits on the sink at poll cadence, so a blocking HTTP POST with
-/// its own short timeout composes the same way a filesystem write does.
+/// POSTed to the serve session instead. Sink I/O runs on a separate worker so
+/// the listener can stop waiting and restore terminal state even if a write blocks.
 #[derive(Clone)]
 pub(crate) enum SideNoteSink {
     /// `push_side_note` into this history file's queue.
@@ -882,8 +878,9 @@ impl Drop for SideNoteInputGuard {
 /// (self-managed echo so erasing by character width works), ISIG kept (Ctrl+C still
 /// raises SIGINT) and OPOST kept (output newline conversion unaffected).
 ///
-/// Reads are also non-blocking: every read site polls for readability first,
-/// but a byte can vanish between poll and read (competing reader, pty quirk),
+/// Private-handle reads are non-blocking; the stdin fallback may retain blocking
+/// reads if `fcntl` fails. Every read site polls for readability first, but a
+/// byte can vanish between poll and read (competing reader, pty quirk),
 /// and a blocking read would then stall forever holding the stdin lease while
 /// ignoring the stop flag — wedging the next input box, which waits on that
 /// lease. With a non-blocking fd the race degrades to an `EAGAIN` retry that
@@ -900,7 +897,7 @@ impl Drop for SideNoteInputGuard {
 /// be opened does it fall back to the old stdin-based behavior.
 struct CbreakTerm {
     saved: libc::termios,
-    /// Handle the listener polls and reads; non-blocking on entry.
+    /// Handle used for listener input, including the stdin fallback.
     read_fd: libc::c_int,
     /// True when `read_fd` is our own open and is closed on drop.
     owns_read_fd: bool,
@@ -977,7 +974,7 @@ impl CbreakTerm {
         }
     }
 
-    /// Handle the listener polls and reads; non-blocking for this listener.
+    /// Handle the listener polls and reads.
     fn read_fd(&self) -> libc::c_int {
         self.read_fd
     }
@@ -1059,9 +1056,8 @@ impl Drop for CbreakTerm {
     }
 }
 
-/// Number of terminal columns occupied by a character (East Asian Wide / Fullwidth
-/// count as 2 columns, everything else 1). Used for exact column alignment of input
-/// echo and backspace erasure.
+/// Estimate terminal columns using wide-character and emoji ranges, with a
+/// one-column fallback. Used to size the composer and its input viewport.
 fn char_width(c: char) -> usize {
     let cp = c as u32;
     if (0x1100..=0x115F).contains(&cp)
@@ -1097,8 +1093,8 @@ fn composer_layout(cols: usize) -> (&'static str, Option<char>) {
     }
 }
 
-/// Trim long input to a single-line tail view, always leaving one column for the
-/// composer's visible caret so the bottom line never wraps.
+/// Trim long input to a single-line tail view, reserving space for the prefix,
+/// optional caret, and a spare column to avoid wrapping.
 fn input_viewport_with_layout(
     input: &[char],
     cols: usize,
@@ -1156,10 +1152,6 @@ fn composer_line_parts(input: &[char], cols: usize) -> (&'static str, String, St
 /// model text would split the save/draw/restore. Do not leave the real cursor in
 /// the footer, so the next model/token output does not start from the input row;
 /// the tail uses a visible block caret to mark the edit point.
-///
-/// Argument order is load-bearing: the first positional `{}` is the absolute CUP
-/// row; an SGR string in that slot would terminate the CSI early and draw the
-/// composer at the model-output cursor instead of the footer row.
 fn composer_line_bytes(rows: u16, cols: u16, input: &[char]) -> String {
     let (prefix, visible, caret) = composer_line_parts(input, cols as usize);
     format!(
@@ -1233,10 +1225,9 @@ fn persist_side_note_interruptibly(
     }
 }
 
-/// Submit the current draft (shared by the Esc/F2/Alt+Enter submit keys): with empty
-/// content just exit input mode; otherwise write to the foreground queue. On write
-/// failure the draft is kept and the composer stays, never silently losing the
-/// instruction.
+/// Submit the current draft through its sink, or signal a background handoff for
+/// a local `/bg` request. Empty drafts close input mode; failed writes keep the
+/// draft and composer open for retry.
 fn submit_draft(
     sink: &SideNoteSink,
     stop: &AtomicBool,
@@ -1299,7 +1290,7 @@ enum SubmitFlow {
     Continue,
     /// A `/bg`-family draft was accepted; the caller exits the listener.
     Background,
-    /// The footer is gone or the write failed; the caller exits the listener.
+    /// The footer is unavailable, terminal I/O failed, or submission was interrupted.
     Stop,
 }
 
@@ -1361,8 +1352,8 @@ fn read_byte_timeout(fd: libc::c_int, timeout_ms: i32, stop: &AtomicBool) -> Opt
             return None;
         }
         let mut byte = [0u8; 1];
-        // SAFETY: one-byte stack buffer. The listener handle is non-blocking, so a
-        // byte that vanished after poll surfaces as `EAGAIN` instead of a stall.
+        // SAFETY: `byte` is writable for the one-byte read. On a non-blocking
+        // handle, a byte lost after poll produces `EAGAIN` rather than a stall.
         let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
         if n == 1 {
             return Some(byte[0]);
@@ -1421,14 +1412,10 @@ fn read_escape_byte(
         .or_else(|| read_byte_timeout(fd, timeout_ms, stop))
 }
 
-/// Decide whether the keys following ESC (0x1b) form a submit key: bare Esc, F2
-/// (`ESC O Q` / `ESC [ 1 2 ~`), Alt+Enter (`ESC \r` / `ESC \n`). Terminals emit the
-/// full function-key sequence in a single write burst, so follow-up bytes are almost
-/// immediately available; whether or not it submits, this function consumes every
-/// follow-up byte after ESC so bytes from other sequences such as arrow keys or
-/// terminal replies cannot leak into the draft. A CSI sequence that straddles the
-/// follow-up timeout is stored in `pending_csi` and resumed on later bytes instead
-/// of letting its tail become draft text.
+/// Recognize bare Esc, F2 (`ESC O Q` / `ESC [ 1 2 ~`), and Alt+Enter
+/// (`ESC \r` / `ESC \n`). Other CSI keys and terminal replies are consumed
+/// without submitting. A CSI sequence that straddles the follow-up timeout is
+/// stored in `pending_csi` and resumed so its tail does not become draft text.
 fn is_submit_escape(
     fd: libc::c_int,
     replay: &mut VecDeque<u8>,
@@ -1466,7 +1453,6 @@ fn is_submit_escape(
     }
 }
 
-/// Returns why the listener released terminal input ownership.
 /// Scans an accumulated buffer for a `CSI 8 ; rows ; cols t` text-area report.
 /// `Partial` keeps the read going, `Invalid` replays the bytes as ordinary input.
 #[derive(Debug, PartialEq, Eq)]
@@ -1519,8 +1505,8 @@ fn scan_text_area_report(buf: &[u8]) -> ReportScan {
     }
 }
 
-/// Service one coalesced request on the stdin owner. The shared state remains
-/// unlocked during I/O, so a slow or unsupported terminal cannot stall rendering.
+/// Service one coalesced request on the stdin owner. Keep shared state unlocked
+/// during I/O so render threads can queue requests and use cached answers.
 fn service_pending_width_query(fd: libc::c_int, replay: &mut VecDeque<u8>) {
     if !width_query_state().pending {
         return;
@@ -1530,9 +1516,9 @@ fn service_pending_width_query(fd: libc::c_int, replay: &mut VecDeque<u8>) {
     width_query_state().complete(cols, Instant::now(), kernel_cols);
 }
 
-/// One `CSI 18 t` round trip on the listener's own tty handle. Bytes read while
-/// hunting for the reply that turn out to be ordinary input are pushed to `replay`, which
-/// the loop's byte source drains first, so a query can never eat a keystroke.
+/// One `CSI 18 t` round trip on the listener's tty handle. Bytes rejected as a
+/// text-area report are replayed through the loop's byte source so ordinary
+/// input can resume.
 fn service_width_query(fd: libc::c_int, replay: &mut VecDeque<u8>) -> Option<u16> {
     let mut out = io::stdout();
     if out.write_all(b"\x1b[18t").is_err() || out.flush().is_err() {
@@ -1572,8 +1558,8 @@ fn service_width_query(fd: libc::c_int, replay: &mut VecDeque<u8>) -> Option<u16
             continue;
         }
         let mut byte = [0u8; 1];
-        // SAFETY: one-byte stack buffer. The listener handle is non-blocking, so a
-        // byte that vanished after poll surfaces as `EAGAIN` instead of a stall.
+        // SAFETY: `byte` is writable for the one-byte read. On a non-blocking
+        // handle, a byte lost after poll produces `EAGAIN` rather than a stall.
         let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
         if n <= 0 {
             if n < 0 {
@@ -1603,7 +1589,6 @@ fn side_note_input_loop(
     stop: &AtomicBool,
     term: CbreakTerm,
 ) -> SideNoteLoopExit {
-    // Input mode: UTF-8 byte accumulation buffer + parsed characters + echoed column count
     let mut pending: Vec<u8> = Vec::new();
     // Partial CSI sequence that straddled a follow-up timeout (for example a
     // terminal width report replayed by the query service); later bytes continue
@@ -1619,8 +1604,8 @@ fn side_note_input_loop(
         .map(|draft| draft.input.clone())
         .unwrap_or_default();
     let mut in_input = restored.as_ref().is_some_and(|draft| draft.in_input);
-    // Created lazily on the first Ctrl+G: a turn that never enters input mode must not
-    // touch the scroll region or the cursor position.
+    // Reserve only when opening or restoring the composer; an idle listener must
+    // leave the scroll region and cursor position untouched.
     let mut footer: Option<FooterReservation> = None;
     if in_input && !should_yield_stdin(stop) {
         // The draft was visible when the previous listener stopped: reopen the
@@ -1647,11 +1632,10 @@ fn side_note_input_loop(
         }
     }
     let mut background_requested = false;
-    // Bytes the width-query service read while hunting for its `CSI 18 t` reply but that
-    // turned out to be ordinary input; the byte source below drains them first so a query
-    // never eats a keystroke.
+    // Replay ordinary input read during a width query before polling the terminal
+    // for more bytes.
     let mut replay: VecDeque<u8> = VecDeque::new();
-    // Kept alive for the whole loop: cbreak termios and the non-blocking read handle.
+    // Kept alive for the whole loop: cbreak termios and the read handle.
     let read_fd = term.read_fd();
 
     loop {
@@ -1717,9 +1701,8 @@ fn side_note_input_loop(
                 break;
             }
             let mut byte = [0u8; 1];
-            // SAFETY: one-byte stack buffer. The listener handle is non-blocking, so
-            // a byte that vanished after poll surfaces as `EAGAIN` (handled below)
-            // instead of stalling the lease holder.
+            // SAFETY: `byte` is writable for the one-byte read. On a non-blocking
+            // handle, a byte lost after poll produces `EAGAIN` rather than a stall.
             let n = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), 1) };
             if n == 0 {
                 break; // EOF
@@ -1806,9 +1789,7 @@ fn side_note_input_loop(
         // accumulated UTF-8
         match b {
             0x0d | 0x0a => {
-                // Enter no longer sends: aligned with the main input's "Enter=newline,
-                // Esc/F2 submit" key semantics. In the single-line composer Enter is
-                // ignored outright to avoid accidental submits.
+                // Ignore Enter in the single-line composer to avoid accidental submissions.
             }
             0x7f | 0x08 => {
                 // backspace: redraw the single-line viewport; long input never

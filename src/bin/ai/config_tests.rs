@@ -66,9 +66,7 @@ fn history_max_chars_is_fixed_and_window_independent_unless_configured() {
         .expect("registry must contain a >=1M-token model");
 
     let unset = configw::ConfigW::parse("");
-    // The budget no longer scales with the model window: a 1M-token model gets
-    // exactly the same fixed default as a 128K one, so a large declared window
-    // cannot inflate resident history and per-request tokens stay stable.
+    // A larger advertised context window must not increase resident history.
     assert_eq!(
         super::history_max_chars_for_model(&unset, &small),
         super::DEFAULT_HISTORY_MAX_CHARS

@@ -17,8 +17,8 @@ use super::*;
 
 /// Marker for content read from this agent's own stored session data: session
 /// DBs, overflow archives, folded tool groups, checkpoints, or the history
-/// replay. Reading them back is legitimate, but the content is a snapshot of
-/// the past, not the live conversation or the current filesystem.
+/// replay. The content is a snapshot of the past, not the live conversation or
+/// the current filesystem; this marker does not authorize access to session storage.
 pub(in crate::ai::driver::turn_runtime) const SESSION_HISTORY_MARKER: &str = "[reference: session-history - content read from this agent's own stored session data (a session DB, archive, or checkpoint file); it reflects a past state, not the live conversation or current filesystem]";
 
 /// Marker for content read from a file the runtime knows is stale: a patch
@@ -147,9 +147,9 @@ fn visit_string_values(value: &serde_json::Value, visit: &mut dyn FnMut(&str)) {
 }
 
 /// A text references session storage when it contains a path component ending
-/// in `.sessions`. The component boundary (split on `/`) keeps quotes and
-/// grep-style search terms (`grep foo.sessions src/`) from matching, while
-/// `~/.history_file.sessions/...` and any other `<stem>.sessions/...` layout do.
+/// in `.sessions`. Splitting on `/` avoids matching a bare search term such as
+/// `grep foo.sessions src/`, while `~/.history_file.sessions/...` matches. This is
+/// a textual path heuristic, not shell parsing.
 ///
 /// `<session>.assets/tmp/` is disposable scratch: a live process launched from
 /// a script written there produces current output, so that subtree is not

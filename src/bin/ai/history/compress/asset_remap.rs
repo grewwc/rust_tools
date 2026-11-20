@@ -13,8 +13,8 @@
 //! - Import (source unknown): the recorded path must be absolute and contain a
 //!   known asset-internal anchor; the tail from that anchor is joined onto the
 //!   target and rewritten only when it exists there.
-//! - Relative paths are left untouched: they resolve against the current
-//!   session and survive moves on their own.
+//! - Relative pointers are left untouched; this remapper relocates only absolute
+//!   filesystem paths.
 //! - Only writer-exact labels are recognized; project source pointers such as
 //!   `original_file_path` are never rewritten.
 //! - Rewritten tails must stay inside the target assets directory; a tail that
@@ -97,7 +97,7 @@ pub(super) fn remap_asset_path(
     }
 }
 
-/// Reject empty tails and tails escaping the target via `..`.
+/// Accept empty tails for asset-directory pointers; reject tails containing `..`.
 fn checked_relative_tail(tail: &Path) -> Option<PathBuf> {
     if tail.as_os_str().is_empty() {
         return Some(PathBuf::new());
@@ -192,10 +192,9 @@ fn remap_line_pointers(line: &str, source_assets: Option<&Path>, target_assets: 
     remap_json_key_occurrences(&out, source_assets, target_assets)
 }
 
-/// Rewrite the first `<prefix><path-to-EOL>` occurrence. The path keeps
-/// leading whitespace trimmed and trailing whitespace trimmed; interior
-/// spaces (e.g. macOS user names) are preserved. The value runs to end of
-/// line by writer contract, so no second occurrence can follow on the line.
+/// Rewrite the first `<prefix><path-to-EOL>` occurrence. Parse the path without
+/// surrounding whitespace, then preserve that whitespace and interior spaces in
+/// the output. The value runs to end of line by writer contract.
 fn remap_line_prefix_occurrences(
     line: &str,
     prefix: &str,
@@ -264,8 +263,8 @@ fn remap_json_key_occurrences(
 
 /// Parse `: "<value>"` at the start of `text` (allowing whitespace around the
 /// colon). Returns the value plus its byte offsets within `text`, excluding
-/// the quotes. Values with escapes are rejected: asset paths never contain
-/// quotes, and a truncation would be worse than leaving the text alone.
+/// the quotes. Values with escapes are rejected; leaving unsupported path text
+/// untouched is safer than partially rewriting a JSON string.
 fn parse_json_string_value(text: &str) -> Option<(&str, usize, usize)> {
     let after_ws = text.trim_start_matches([' ', '\t']);
     let mut offset = text.len() - after_ws.len();
@@ -284,7 +283,7 @@ fn parse_json_string_value(text: &str) -> Option<(&str, usize, usize)> {
 }
 
 /// Relocate archive pointers in one persisted message. Checkpoint markers are
-/// handled separately by the caller (original sqlite remap, behavior frozen);
+/// handled separately by the caller;
 /// `content_already_changed` tells provenance whether the body was rewritten
 /// before this call, and `pre_move_content` is the exact pre-move body used to
 /// verify the old provenance hash before rebinding (never launder an already

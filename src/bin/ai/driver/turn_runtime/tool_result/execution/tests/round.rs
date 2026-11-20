@@ -1006,9 +1006,8 @@ fn ctrl_c_during_foreground_tool_round_cancels_without_shutdown() {
 
 #[test]
 fn registered_tool_middleware_intercepts_real_dispatch_round() {
-    // Step 5 integration verification: middleware registered in
-    // `app.tool_middlewares` must really intercept the dispatch round of
-    // `handle_tool_call_round` (the middleware behavior path beyond the empty chain).
+    // Middleware registered in app.tool_middlewares must intercept the real
+    // handle_tool_call_round dispatch, including a non-empty chain.
     #[derive(Debug)]
     struct CountingMiddleware {
         calls: Arc<std::sync::atomic::AtomicUsize>,

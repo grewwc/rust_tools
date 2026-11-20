@@ -1,7 +1,6 @@
 // =============================================================================
 // Note/Memo Search + Knowledge Consolidation CLI Subsystem
 // =============================================================================
-// Note/memo search + knowledge consolidation CLI subfeature extracted from driver/mod.rs.
 // =============================================================================
 
 use std::path::PathBuf;
@@ -87,17 +86,14 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
         }
     };
 
-    // Image persistence dir: note_images/ next to the memory file. The previous
-    // implementation wrote screenshots to /tmp, deleted them immediately, and stored
-    // image_path: None, losing the image for good so the memo could never reference
-    // the original again. Switched to persistent storage.
+    // Store clipboard images beside the memory file so saved memos retain
+    // their attachment paths.
     let images_dir = store
         .path()
         .parent()
         .map(|parent| parent.join("note_images"))
         .unwrap_or_else(|| PathBuf::from("note_images"));
 
-    // Try to fetch an image from the clipboard and persist it
     let clipboard_image_path: Option<String> = match Clipboard::new() {
         Ok(mut clipboard) => {
             if let Ok(image) = clipboard.get_image() {
@@ -141,12 +137,10 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
 
     let (note_content, note_model): (String, Option<String>) =
         if let Some(image_path) = &clipboard_image_path {
-        // Image present: ask the vision model to interpret the content
         println!("[note] Detected image in clipboard, analyzing...");
 
         let model = crate::ai::models::determine_vl_model(&app.current_model);
 
-        // Build the message that includes the image
         let content = crate::ai::request::build_content(
             &model,
             "请详细描述这张图片的内容，包括关键信息、文字、数据等。用中文回答。",
@@ -158,7 +152,6 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
             "content": content,
         })];
 
-        // Call the model
         match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
             Ok(response) => (
                 crate::ai::request::extract_response_text(&response)
@@ -172,9 +165,8 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
             }
         }
     } else {
-        // No image: get the raw text (from the text after -n or the multi-line input
-        // box), and always have the model interpret and organize it before saving
-        // instead of dumping the raw text directly.
+        // Ask the model to organize CLI/editor text before saving; retain raw
+        // input if organization fails or returns no text.
         let raw = if let Some(text) = provided_text.filter(|t| !t.trim().is_empty()) {
             text
         } else {
@@ -215,9 +207,8 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                 {
-                    // Raw input saved only when the model yields nothing; that
-                    // fallback carries no model attribution.
                     Some(text) => (text, Some(model.clone())),
+                    // An empty response retains raw input without model attribution.
                     None => (raw, None),
                 }
             }
@@ -315,7 +306,6 @@ impl SearchSpinner {
     }
 
     fn stop(self) {
-        // Consume explicitly to trigger Drop.
         drop(self);
     }
 }
@@ -423,8 +413,8 @@ fn build_note_search_chat_history(
 fn select_note_search_candidates<'a>(
     candidates: &'a [crate::ai::tools::service::memory::ScoredMemo],
 ) -> Vec<&'a crate::ai::tools::service::memory::ScoredMemo> {
-    // Lexical-only scoring: no comparable semantic threshold anymore, so keep
-    // every candidate for the LLM (matches the historical no-embedding path).
+    // Lexical scores rank candidates rather than define a semantic acceptance
+    // threshold, so pass every retrieved candidate to the model.
     candidates.iter().collect()
 }
 
@@ -465,9 +455,6 @@ async fn answer_memo_search(
         return Ok(format!("没有在知识库中找到与「{}」相关的内容。", question));
     }
 
-    // The semantic tightening was removed along with the embedding pipeline:
-    // lexical scores have no comparable threshold, so every candidate is kept for
-    // the LLM (consistent with the historical no-embedding path; no candidate lost).
     let selected = select_note_search_candidates(&candidates);
 
     // Feed the retrieved entries as context so the model answers the user's
@@ -616,7 +603,6 @@ impl ConsolidationScope {
     fn merged_category(self) -> &'static str {
         match self {
             Self::Memo => "memo",
-            // Keep the original consolidate merge target for non-memo entries.
             Self::OtherKnowledge => "user_memory",
         }
     }
@@ -748,10 +734,9 @@ async fn consolidate_scope(
         let id = entry.id.as_deref().unwrap_or("unknown");
         let prio = entry.priority.unwrap_or(100);
         let ts_short: String = entry.timestamp.chars().take(10).collect();
-        // The preview is what the model uses for merge/delete decisions. 500 chars
-        // covers the vast majority of memos; overlong entries are explicitly marked
-        // as truncated. Merges still store the full original text (see
-        // build_consolidation_merge_entries), so preview truncation loses nothing.
+        // Bound previews for model decisions and mark truncation explicitly.
+        // `build_consolidation_merge_entries` appends full source text when
+        // constructing merged notes.
         let note_len = entry.note.chars().count();
         let preview: String = if note_len > 500 {
             entry.note.chars().take(500).collect::<String>()
@@ -894,22 +879,12 @@ async fn consolidate_scope(
     Ok(())
 }
 
-/// Handle --consolidate-knowledge: read all knowledge entries → model analysis →
-/// run the consolidation.
+/// Consolidate memos and other knowledge in separate bounded batches.
+/// Exclude protected priorities, missing IDs, and memos with images. Merge
+/// construction retains source text alongside the model summary.
 ///
-/// **Optimization strategy** (avoid timeouts / control tokens):
-/// 1. Only entries with priority < 200 are analyzed (>= 200 is protected)
-/// 2. memos and other categories each take the **most recent 15** by timestamp
-///    descending, never mixed in one pass
-/// 3. Each preview is truncated to **500 chars**; merged entries still get the
-///    full source memo text on write (lossless)
-/// 4. JSON format is used (cheaper in tokens than free text)
-/// 5. English system prompt (models respond faster)
-///
-/// Read scope: main file plus all rotated archives (all_with_archives).
-/// Historical memos/knowledge moved into archives by rotation also enter
-/// consolidation; the corresponding deletes land in the archive file itself via
-/// apply_batch_update.
+/// Read the main memory file and rotated archives so eligible archived entries
+/// can also be updated through `apply_batch_update`.
 pub(super) async fn handle_consolidate_knowledge(
     app: &App,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1002,7 +977,6 @@ pub(super) async fn handle_note_delete(
         query
     };
 
-    // Retrieve candidate entries.
     let candidates =
         match crate::ai::tools::service::memory::search_memo_candidates(&query, 10, false) {
             Ok(c) => c,
@@ -1190,10 +1164,7 @@ pub(super) async fn handle_note_edit(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
-    // Status-line coloring follows the active theme so this screen matches the
-    // rest of the terminal: the label uses the primary accent, the action
-    // hints the success accent, the candidate indices the warning accent, and
-    // the field names a plain dim style.
+    // Use the active theme so notebook edit screens match terminal output.
     let theme = crate::ai::theme::current();
     let ne = format!("{BOLD}{}[note-edit]{RESET}", theme.accent_primary);
     let field = DIM;
@@ -1233,7 +1204,6 @@ pub(super) async fn handle_note_edit(
     // automatically before output), same as -ns.
     let spinner = SearchSpinner::start("匹配知识库条目");
 
-    // Retrieve candidate entries.
     let candidates =
         match crate::ai::tools::service::memory::search_memo_candidates(&query, 10, false) {
             Ok(c) => c,
@@ -1288,7 +1258,6 @@ pub(super) async fn handle_note_edit(
         eprintln!("{ne} 模型匹配失败: {}", err);
     }
 
-    // Parse the set of indices returned by the model.
     let parse_indices = |s: &str, max: usize| -> Vec<usize> {
         let mut out: Vec<usize> = Vec::new();
         let mut num = String::new();

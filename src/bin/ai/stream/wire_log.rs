@@ -1,27 +1,23 @@
 //! Raw-wire recorder for streamed model responses.
 //!
-//! On by default; set the `AIOS_STREAM_WIRE_LOG` environment switch to `0` to
-//! disable it. While enabled, every response stream appends one JSONL line to
+//! On by default; set `AIOS_STREAM_WIRE_LOG` to `0` or a blank value to disable
+//! it. Enabled streams with observed events attempt to append one JSONL line to
 //! `<session assets>/stream_wire.log` describing
 //! what the provider actually sent over the wire: per-event-type counts, the
 //! tail of the event sequence, the terminal event payload, usage numbers, the
 //! output-item summary and the client-side outcome classification.
 //!
-//! This exists to diagnose responses that end "normally" while the model was
-//! evidently cut off mid-work. In that case the client has no error, no retry
-//! and no warning; a wire-level record is the evidence that separates "the
-//! model chose to stop here" from "the gateway cut the generation after a few
-//! tokens and still declared the response complete". A cut wire shows a
-//! missing terminal event, an output item left open (`added` with no `done`),
-//! or a short declared-complete response whose `output` array lacks the final
-//! message item.
+//! Provider declarations and client outcomes are recorded together to diagnose
+//! streams that stop mid-output or report completion without an expected final
+//! message. Event counts, item phases, and terminal payloads preserve the wire
+//! evidence without assuming why generation stopped.
 //!
 //! Design constraints:
-//! - On by default: every response stream records one line unless the switch
-//!   is set to `0` when the stream starts.
+//! - On by default: an unset switch enables recording; `0` and blank values
+//!   disable it when the stream starts.
 //! - Best-effort: recording never influences streaming; failures are dropped.
-//!   One line is written per streamed response by `Drop`, so every exit path
-//!   (completion, error, cancellation, panic unwind) leaves the same evidence.
+//!   `Drop` attempts one append on any exit path, including panic unwinding,
+//!   when at least one event was observed and a target path was resolved.
 //! - Bounded: a line caps the raw terminal payload, the item list, the
 //!   event-label tail and the distinct label count; the log file rotates to
 //!   `stream_wire.log.1` past 8 MiB.
@@ -59,8 +55,8 @@ const OUTCOME_LOG_FILE: &str = "stream_outcomes.jsonl";
 
 /// Per-line cap for the raw terminal-event payload copy (the Responses wire
 /// repeats the full output array — including encrypted reasoning blobs — inside
-/// `response.completed`, so the raw copy must be bounded while the parsed
-/// summary stays complete).
+/// `response.completed`, so the raw copy must be bounded; parsed item summaries
+/// are retained separately).
 const MAX_TERMINAL_RAW_BYTES: usize = 16 * 1024;
 
 /// Per-line cap for the serialized `incomplete_details` copy.
@@ -156,8 +152,8 @@ impl StreamWireLog {
         }
     }
 
-    /// Arm the recorder for a new response stream. With the switch set to `0`
-    /// this resolves nothing and every later call is a no-op.
+    /// Arm the verbose recorder for a new response stream. A disabled switch
+    /// skips target resolution and wire-event capture.
     pub(super) fn arm(&mut self, model: &str) {
         self.enabled = stream_wire_log_enabled();
         if !self.enabled {
@@ -288,8 +284,9 @@ impl StreamWireLog {
     /// Always-on outcome record: one minimal JSONL line per finalized response in
     /// `<session assets>/stream_outcomes.jsonl`, independent of the verbose wire
     /// log. Request-side records (`request::outcome_log`) share this file.
-    /// Called right after `note_outcome`, so `self.client` already holds
-    /// the classification; best-effort and silent without a session dir.
+    /// Uses metadata captured by `arm` and `note_outcome`; disabling verbose
+    /// capture can leave those fields empty. Best-effort and silent without a
+    /// session dir.
     pub(super) fn append_outcome_record(&self) {
         let Some(dir) = current_session_assets_dir() else {
             return;
@@ -658,7 +655,7 @@ mod tests {
         let mut log = StreamWireLog::disabled();
         log.observe(Some("response.output_text.delta"), r#"{"delta":"hi"}"#);
         assert_eq!(log.total_events, 0);
-        // `finish` must stay a no-op without the switch (and must not panic).
+        // `finish` must stay a no-op for a disabled recorder.
         log.finish();
     }
 

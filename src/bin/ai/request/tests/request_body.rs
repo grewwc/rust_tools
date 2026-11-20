@@ -14,12 +14,9 @@ use crate::ai::provider::{
 };
 use serde_json::Value;
 
-/// Synthetic pre-resolved inputs for wire-behavior assertions. Every wire test
-/// builds its body from one of these literals instead of a registry key, so
-/// registry renames cannot move the test onto a fallback path. The
-/// (adapter, request_model, endpoint, effort_wire) quad mirrors what the old
-/// registry entry resolved to; see `thinking_dialect_for` in
-/// `src/bin/ai/provider/adapter/thinking.rs` for the dispatch each triple hits.
+/// Pre-resolved fixtures keep wire assertions independent of registry renames.
+/// `resolve_reasoning_wire_controls_from_parts` in `request/reasoning.rs`
+/// combines provider dialect selection with explicit effort wire placement.
 fn synthetic_inputs(
     request_model: &str,
     endpoint: &str,
@@ -48,9 +45,8 @@ fn user_hi() -> Vec<Message> {
     }]
 }
 
-/// Registry-free twin of the old `expected_max_tokens_field` helper: reuses the
-/// production clamp over synthetic inputs to build the expected `max_tokens`
-/// fragment (`,"max_tokens":N` when the inputs declare an output cap).
+/// Reuse the production clamp over pre-resolved inputs to construct the expected
+/// `max_tokens` fragment (`,"max_tokens":N` when the inputs declare an output cap).
 fn expected_max_tokens_field_from_parts(inputs: &RequestModelInputs, messages: &[Message]) -> String {
     match inputs.max_output {
         Some(model_max) => {
@@ -73,11 +69,9 @@ const MODELHUB_ENDPOINT: &str = "https://dataagent-dev-llm.bytedance.net/v1";
 fn dashscope_and_other_adapter_request_body_wire_format_is_byte_stable() {
     let messages = user_hi();
 
-    // Alibaba TopLevel-wire shape (mirrors the old "first Alibaba adapter entry
-    // declaring top_level effort wire" lookup): enable_thinking/enable_search
-    // and the top-level reasoning_effort are all sent — the declared wire
-    // placement means the tier bypasses the dialect's binary-switch omission in
-    // resolve_reasoning_wire_controls.
+    // Declared top-level effort placement bypasses the dialect's binary-switch
+    // omission, retaining `reasoning_effort` alongside `enable_thinking` and
+    // `enable_search`.
     let alibaba_inputs = RequestModelInputs {
         max_output: Some(131_072),
         context_window: 1_000_000,
@@ -145,8 +139,8 @@ fn dashscope_and_other_adapter_request_body_wire_format_is_byte_stable() {
         )
     );
 
-    // Registry coverage: the classes the old test discovered dynamically must
-    // still exist (the wire shapes above pin what they resolve to).
+    // Require registry entries for both adapter classes to keep these fixtures
+    // relevant to production.
     assert!(
         crate::ai::model_names::all().iter().any(|model| {
             model.adapter == ApiProvider::Alibaba
@@ -206,9 +200,8 @@ fn prompt_feedback_clamp_preserves_current_count_without_truncating_overflow() {
 fn short_prompt_keeps_every_declared_output_budget() {
     let messages = user_hi();
 
-    // A short prompt must not squeeze a declared completion budget: whenever
-    // the window covers `max_output_tokens + safety margin`, the full cap has
-    // to survive (synthetic pin of the clamp rule).
+    // A short prompt retains the full output cap when the window covers the
+    // prompt, cap, and safety margin.
     let est = estimate_request_prompt_tokens(&messages, None, None);
     assert_eq!(
         clamp_with_estimated_prompt_from_parts(200_000, est, 32_768),
@@ -239,10 +232,8 @@ fn short_prompt_keeps_every_declared_output_budget() {
 fn build_request_body_sends_provider_model_name_for_key_handle() {
     let messages = user_hi();
 
-    // The wire model name is the provider-side request name, while the
-    // selector key may include a platform suffix (mirrors the old plaintext
-    // OpenCode DeepSeek entry with thinking enabled, whose key carried the
-    // `-opencode` suffix but whose wire name did not).
+    // The wire body carries the pre-resolved provider request name; registry
+    // selector keys may include platform suffixes.
     let inputs = RequestModelInputs {
         context_window: 1_024_000,
         ..synthetic_inputs(
@@ -276,8 +267,8 @@ fn build_request_body_sends_provider_model_name_for_key_handle() {
         Some("enabled")
     );
 
-    // Registry coverage: the key-handle-vs-provider-name mapping stays
-    // exercised by a real entry.
+    // Require a thinking-enabled plaintext OpenCode DeepSeek entry so the
+    // provider-name fixture corresponds to a registered model class.
     assert!(
         crate::ai::model_names::all().iter().any(|m| {
             m.adapter == ApiProvider::OpenCode
@@ -293,13 +284,9 @@ fn build_request_body_sends_provider_model_name_for_key_handle() {
 fn opencode_thinking_entries_send_thinking_object_and_declared_effort() {
     let messages = user_hi();
 
-    // The OpenCode dialect only sends the thinking object for DeepSeek models
-    // (thinking_dialect_for in src/bin/ai/provider/adapter/thinking.rs). The
-    // top-level reasoning_effort is placed as well: the mirrored entries
-    // declare `reasoning_effort_wire: "top_level"` (DeepSeek v4 on the OpenCode
-    // Zen gateway supports [none, low, high, max] per the official API docs),
-    // so the tier bypasses the dialect's binary-switch omission in
-    // resolve_reasoning_wire_controls.
+    // OpenCode dispatch selects the thinking object for DeepSeek request names.
+    // Explicit top-level effort placement emits the tier alongside that object
+    // without relying on the dialect's default effort behavior.
     let inputs = synthetic_inputs(
         "synthetic-deepseek-wire",
         OPENCODE_DEFAULT_ENDPOINT,
@@ -357,13 +344,8 @@ fn opencode_thinking_entries_send_thinking_object_and_declared_effort() {
 fn deepseek_official_entries_send_thinking_object_and_effort() {
     let messages = user_hi();
 
-    // The official DeepSeek endpoint (api.deepseek.com) uses the same `thinking`
-    // object dialect as the OpenCode Zen gateway (thinking_dialect_for in
-    // src/bin/ai/provider/adapter/thinking.rs), per the official thinking-mode
-    // docs: {"thinking": {"type": "enabled"}} together with the top-level
-    // reasoning_effort — the official API documents `[none, low, high, max]`
-    // (graded), and the mirrored entry declares `reasoning_effort_wire:
-    // "top_level"`, so the tier is sent.
+    // The official DeepSeek endpoint selects the same thinking-object dialect
+    // as OpenCode DeepSeek. Explicit top-level wire placement also emits effort.
     let inputs = synthetic_inputs(
         "synthetic-deepseek-official",
         DASHSCOPE_DEEPSEEK_OFFICIAL_ENDPOINT,
@@ -423,9 +405,8 @@ fn deepseek_official_entries_send_thinking_object_and_effort() {
 
 #[test]
 fn dashscope_deepseek_uses_model_specific_reasoning_contract() {
-    // Mirrors the old `deepseek-v4.1-flash` entry: Alibaba adapter on the
-    // DashScope compatible-mode endpoint, top_level effort wire, exact
-    // reasoning replay.
+    // Exercise Alibaba on DashScope with top-level effort and source-tagged
+    // exact reasoning replay.
     const REQUEST_MODEL: &str = "synthetic-dashscope-deepseek";
     let messages = user_hi();
 
@@ -537,8 +518,6 @@ fn dashscope_deepseek_uses_model_specific_reasoning_contract() {
 
 #[test]
 fn dashscope_deepseek_sends_effort_and_exact_reasoning_replay() {
-    // Same mirrored entry as above: Alibaba adapter on DashScope, top_level
-    // effort wire, exact reasoning replay.
     const REQUEST_MODEL: &str = "synthetic-dashscope-deepseek";
     let messages = user_hi();
 
@@ -567,9 +546,8 @@ fn dashscope_deepseek_sends_effort_and_exact_reasoning_replay() {
             .and_then(|value| value.as_bool()),
         Some(true)
     );
-    // Effort tier sent on the wire: the declared top-level reasoning_effort
-    // wire placement (DashScope DeepSeek v4 supports low/high/max per the
-    // official docs) bypasses the dialect's binary-switch omission.
+    // Declared top-level wire placement emits effort even for a binary-switch
+    // dialect.
     assert_eq!(json.get("reasoning_effort"), Some(&json!("high")));
     assert!(json.get("reasoning").is_none());
 
@@ -590,9 +568,8 @@ fn dashscope_deepseek_sends_effort_and_exact_reasoning_replay() {
 
 #[test]
 fn dashscope_qwen_metadata_matches_documented_thinking_controls() {
-    // Registry coverage (was key-specific metadata assertions on qwen3.8-max /
-    // qwen3.8-flash-alibaba): the documented class — Alibaba thinking-enabled
-    // entries with a Max default effort — must still exist.
+    // Discover Alibaba thinking fixtures by metadata so renaming models cannot
+    // invalidate coverage.
     let matching: Vec<_> = crate::ai::model_names::all()
         .iter()
         .filter(|def| {
@@ -611,8 +588,6 @@ fn dashscope_qwen_metadata_matches_documented_thinking_controls() {
 
 #[test]
 fn opencode_disabled_thinking_object_with_declared_effort() {
-    // Mirrors the old plaintext OpenCode DeepSeek thinking-enabled entry:
-    // OpenCode adapter, DeepSeek request name, declared top_level wire.
     const REQUEST_MODEL: &str = "synthetic-deepseek-wire";
     let (thinking, top_level_reasoning_effort, nested_reasoning) =
         resolve_reasoning_wire_controls_from_parts(
@@ -624,12 +599,8 @@ fn opencode_disabled_thinking_object_with_declared_effort() {
             Some("high"),
         );
 
-    // The OpenCode DeepSeek dialect always sends thinking:{"type":"disabled"}
-    // when force-off is requested (the reliable off-switch). The top-level
-    // reasoning_effort is still placed because of the declared
-    // `reasoning_effort_wire: "top_level"` — the official API documents
-    // `[none, low, high, max]` and the disabled thinking object takes
-    // precedence, so carrying the tier is harmless.
+    // Disabling the switch does not suppress an explicitly selected top-level
+    // effort field. Check both serialized controls independently.
     assert_eq!(
         thinking
             .get("thinking")
@@ -654,12 +625,8 @@ fn opencode_disabled_thinking_object_with_declared_effort() {
 
 #[test]
 fn effort_value_adaptation_is_per_vendor_on_wire() {
-    // The same local tier must adapt per vendor on the wire: models without a
-    // registry-declared wire placement follow the dialect default (binary-switch
-    // dialects omit it); declared models (qwen / DeepSeek v4 on DashScope,
-    // official DeepSeek, OpenCode Zen) and effort-only dialects pass it
-    // through. No if/else in the request layer — the declared placement or the
-    // dialect owns the value.
+    // Explicit effort wire placement selects the top-level or nested field.
+    // Otherwise the provider dialect supplies the effort behavior.
     let (thinking, top_level, nested) = resolve_reasoning_wire_controls_from_parts(
         ApiProvider::Alibaba,
         "synthetic-qwen",
@@ -695,9 +662,7 @@ fn effort_value_adaptation_is_per_vendor_on_wire() {
     );
     assert!(nested.is_none());
 
-    // The mirrored Volcano DeepSeek entry declares top_level wire placement
-    // like the rest of the DeepSeek v4 family (effort-only NoThinkingDialect
-    // passes it through unchanged either way).
+    // The Volcano fixture exercises top-level effort without a thinking switch.
     let (thinking, top_level, nested) = resolve_reasoning_wire_controls_from_parts(
         ApiProvider::Compatible,
         "synthetic-deepseek-volcano",
@@ -740,10 +705,8 @@ fn effort_value_adaptation_is_per_vendor_on_wire() {
 
 #[test]
 fn model_effort_graded_reflects_registry_declared_gradation() {
-    // A declared wire placement means the model is vendor-verified graded (qwen
-    // / DeepSeek v4 on DashScope, official DeepSeek, OpenCode Go), so "graded"
-    // is true. Undeclared models follow the dialect default, where
-    // binary-switch dialects omit the tier.
+    // Declared effort wire placement marks the model as graded. Without a
+    // declaration, gradation follows the provider dialect.
     assert!(model_effort_graded_from_parts(
         TOP_LEVEL,
         ApiProvider::Alibaba,
@@ -827,9 +790,7 @@ fn responses_protocol_entries_support_reasoning_with_tools() {
     );
 }
 
-/// Synthetic Responses-dialect inputs (mirrors the old modelhub `compatible`
-/// Responses entries such as gpt-5.6-luna: no declared effort wire, encrypted
-/// replay capability).
+/// Responses fixtures use encrypted replay with no explicit effort wire placement.
 fn synthetic_responses_inputs(request_model: &str) -> RequestModelInputs {
     RequestModelInputs {
         dialect: RequestProtocolDialect::Responses,
@@ -889,14 +850,11 @@ fn responses_request_body_uses_function_tools_and_nested_reasoning() {
 
 #[test]
 fn responses_force_off_override_emits_none_effort_on_wire() {
-    // The truncation ladder's last-resort force-off fallback (thinking_disabled_override) must
-    // actually disable thinking on the Responses wire. The mirrored modelhub entries use
-    // NoThinkingDialect (no thinking field), so the only lever is reasoning.effort="none";
-    // without the override the ladder's "low" effort would keep thinking on — the pre-fix no-op.
+    // For EffortNone dialects, the truncation override replaces the reduced
+    // "low" tier with "none" so Responses receives its reasoning.effort off control.
     let messages = user_hi();
-    // The dialect predicates come from production dispatch on the synthetic
-    // triple (Compatible adapter + modelhub endpoint), exactly as production
-    // resolves them for the mirrored entries.
+    // Use production dialect dispatch for the fixture's adapter, request name,
+    // and endpoint.
     let effort_reduces =
         reasoning_effort_reduces_thinking_for(ApiProvider::Compatible, "synthetic-modelhub-model", MODELHUB_ENDPOINT);
     let off_capability =

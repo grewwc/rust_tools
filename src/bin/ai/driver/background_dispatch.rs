@@ -1,9 +1,8 @@
 //! Background process dispatch: select ready processes, decode task goals,
 //! build questions, clone app context, and spawn each as a tokio task.
 //!
-//! Extracted from `driver/mod.rs` `run_loop` to establish a clear boundary
-//! between background dispatch and the foreground interaction loop
-//! (review Finding #1, Phase 2).
+//! Keeps background dispatch separate from the foreground interaction in
+//! `run_loop` (`driver/mod.rs`).
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -33,11 +32,10 @@ use super::scheduler::{
 use super::turn_runtime;
 use super::{BgSubagentGuard, TASK_PID, terminate_and_cleanup};
 
-/// Background subagent history is kept only while the process can still be
-/// scheduled. Normal termination, failure, panic, or a `task_cancel` that aborts
-/// the future are all cleaned up via Drop. Private memory files and the exclusive
-/// cwd scratch directory share history's lifetime and are reclaimed here too,
-/// preventing buildup over long runs.
+/// Reclaim task history and private artifacts on drop unless explicitly preserved.
+/// Tasks that remain scheduled or need result-delivery recovery retain all artifacts;
+/// failed memory merges retain private memory independently. Aborts and panics
+/// drop the remaining artifacts.
 struct BackgroundSubagentHistoryGuard {
     path: Option<PathBuf>,
     memory_path: Option<PathBuf>,
@@ -53,10 +51,8 @@ impl BackgroundSubagentHistoryGuard {
         }
     }
 
-    /// Register the private memory files and exclusive cwd scratch directory that
-    /// are spawned with the task and must be reclaimed with history's lifetime.
-    /// Paths are built deterministically, so they can be computed once at
-    /// construction.
+    /// Register private memory and the exclusive scratch cwd for cleanup unless
+    /// explicitly preserved, using the paths chosen when the task was created.
     fn with_scoped_artifacts(
         mut self,
         memory_path: Option<PathBuf>,
@@ -232,13 +228,6 @@ impl SubagentStatusLine {
             });
         }
 
-        // The side-note composer (Ctrl+G) owns the footer row / DECSTBM scroll
-        // region while open: the in-place redraw is deferred (see
-        // `redraw_status_line`) so its bare `\r\x1b[2K` cannot displace the
-        // output cursor or erase the composer draft. Serve frames above still
-        // publish. This deferral applies to every scheduler-tick refresh in the
-        // run loop — both the task_wait PARKED wait window and the
-        // background-subagent wait window.
         self.redraw_status_line(
             &status_line,
             crate::ai::stream::side_note_input::side_note_composer_active(),
@@ -364,7 +353,7 @@ struct ProgressFrameState {
 static PROGRESS_FRAME_STATE: std::sync::LazyLock<std::sync::Mutex<ProgressFrameState>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::default());
 
-/// Publish the current subagent status as soon as a progress event lands.
+/// Publish subagent status from progress events, subject to deduplication and throttling.
 ///
 /// The scheduling loop refreshes the line between turns, so a turn blocked in a
 /// model call would otherwise keep serving the snapshot published before that
@@ -842,15 +831,9 @@ fn status_progress_text(progress: &str) -> String {
     }
 }
 
-/// Coexistence rule with the side-note composer (Ctrl+G): while the composer
-/// owns the footer row / DECSTBM scroll region, the in-place status-line
-/// redraw must be deferred — its bare `\r\x1b[2K` would displace the output
-/// cursor and erase the composer draft. The deferred line is also not
-/// recorded, so a later `finish` has nothing stale to finalize; the next
-/// refresh after the composer closes redraws it. Unchanged lines and non-TTY
-/// streams defer for the same reason (nothing new to draw). This applies to
-/// every scheduler-tick refresh in the run loop, i.e. both the task_wait
-/// PARKED wait window and the background-subagent wait window.
+/// Defer redraws while the side-note composer owns the footer and scroll region:
+/// status writes could displace the output cursor or erase the draft. Unchanged
+/// lines and non-TTY streams also skip rendering.
 fn status_line_redraw_deferred(
     composer_active: bool,
     last_line: Option<&str>,
@@ -1836,8 +1819,8 @@ mod tests {
         assert!(!cwd.exists(), "cwd scratch dir must be recursively cleaned");
         assert!(!assets.exists(), "subagent assets dir must be cleaned");
 
-        // preserve() must also keep memory/cwd/assets (normal-end / resume scenarios:
-        // the resumed process still reads its plan-state / side-notes / checkpoint).
+        // preserve() keeps memory/cwd/assets for a scheduled task's next turn,
+        // including its plan-state, side-notes, and checkpoint.
         let history2 = root.join("session.subagent-task_y.sqlite");
         let memory2 = root.join("agent_memory.subagent-task_y.jsonl");
         let cwd2 = root.join("subagent-cwd-task_y");
@@ -1909,7 +1892,7 @@ mod tests {
     }
 }
 
-/// Persisted kernel goals ignore external resume fields, as the original dispatch did.
+/// Persisted kernel goals ignore legacy external resume fields.
 fn prepare_background_subagent_continuation(
     backend: &dyn task_tools::Backend,
     context: &task_tools::ContinueContext<'_>,
@@ -2131,10 +2114,9 @@ pub(super) fn dispatch_background_batch(
             Vec::new()
         };
         // Background tasks need their own streaming/cancel_stream flags:
-        // `App::clone` by default shares the same Arc set with the parent App, so
-        // concurrent background run_turns would overwrite each other's streaming
-        // and cancel each other (clear_stream_cancel resets the shared
-        // cancel_stream). A background task's cancel_stream must be shared with
+        // shared flags would let concurrent turns overwrite each other's streaming
+        // state and cancel each other when clear_stream_cancel resets the flag.
+        // A background task's cancel_stream must be shared with
         // its registry entry: the sync command polls it and kills the actual OS
         // process group on timeout/cancel, and Tokio abort alone cannot interrupt
         // an in-flight sync poll. shutdown still stays shared with the parent
@@ -2215,11 +2197,8 @@ pub(super) fn dispatch_background_batch(
         let phase_slot_for_backend = phase_slot.clone();
         let parent_history_for_scopes = original_history_file.clone();
 
-        // Private memory files and the exclusive cwd scratch directory are
-        // spawned with the task and reclaimed with history's lifetime (preserve
-        // keeps them on normal end; Drop cleans them up on error/abort/panic).
-        // Both paths must reuse the same logic used at creation time, so a second
-        // divergent definition cannot cause missed or wrong deletions.
+        // Private memory and scratch cwd reuse their creation-time path helpers
+        // so cleanup cannot miss artifacts or target different paths.
         let scoped_memory_path = (!inherit.memory).then(|| {
             runtime_ctx::make_subagent_memory_path(&parent_history_for_scopes, &scope_task_id)
         });
@@ -2404,8 +2383,8 @@ pub(super) fn dispatch_background_batch(
                     backend.run(context, events, backend_cancel).await
                 }
             };
-            // Keep the existing external failure payload and default progress;
-            // sessions are independently promoted from the captured slot.
+            // External execution failures use empty output and default progress;
+            // backend sessions are captured independently.
             let (captured_output, response_for_validation, progress) =
                 if outcome.execution_error.is_some()
                     && execution_mode == task_tools::ExecutionMode::External

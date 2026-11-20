@@ -76,9 +76,8 @@ pub(in crate::ai::driver) fn command_routing_allowed(
 /// where `a`'s own option parsing ends and verbatim command text begins, so
 /// command flags like `--prefix` reach the command dispatcher unmodified. The
 /// REPL dispatches raw input directly and never goes through this predicate.
-/// Keep the word list in sync with the `try_handle_*_command` matchers in this
-/// module: a missing word only degrades one-shot flag pass-through to the old
-/// mangled behavior, never misroutes input.
+/// Keep this list in sync with the local handlers so one-shot CLI option
+/// parsing preserves the command's flags and arguments.
 pub fn is_local_command_start(token: &str) -> bool {
     let trimmed = token.trim();
     let Some(rest) = trimmed
@@ -147,10 +146,10 @@ pub fn is_local_command_start(token: &str) -> bool {
     )
 }
 
-/// Commands classified as server-owned even though the local REPL recognizes
-/// them. Serve-chat intercepts `/use` and `/reset` through the config endpoint;
-/// `/subagent` rides the same endpoint without the sticky-skill rule, and all
-/// three classifier routes remain compatible. The turn child executes `/memo`
+/// Commands classified as server-owned. Serve-chat intercepts `/use` and
+/// `/reset` through the config endpoint. Other forwarded words must pass
+/// `is_local_command_start`; `/memo` is recognized through its own parser.
+/// The turn child executes `/memo`
 /// after pre-turn dispatch, `/audit` and `/distill-session` in the turn
 /// dispatcher, and `/mark`, `/unmark`, `/archive`, `/title`, and `/export-md` in the
 /// pre-turn local-command path. `/task`, `/discuss`, and `/goal` inject a
@@ -328,9 +327,8 @@ pub fn local_command_reserved_flags(head: &str) -> &'static [&'static str] {
         // alias, which would swallow the message as its value.
         "git" => &["-m", "--message"],
         "distill-session" => distill_session::FLAGS,
-        // `--prefix` is not a registered global today, so this entry changes
-        // no current behavior; it only guards the `sessions delete --prefix`
-        // grammar against a future global collision of the same shape.
+        // Reserve the session-delete prefix selector so a global option cannot
+        // consume the command's value.
         "sessions" | "session" | "ss" => &["--prefix"],
         _ => &[],
     }
@@ -603,12 +601,9 @@ fn main_command_kind(trimmed_line: &str) -> Option<&'static str> {
     None
 }
 
-/// Parse a fenced-code marker: the fence character (backtick or tilde), the
-/// run length, and whatever follows the run. Returns `None` for lines that
-/// cannot start a fence (fewer than three fence characters, wrong leading
-/// character). Follows CommonMark: a closing fence uses the same character,
-/// is at least as long as the opening run, and carries no info string; an
-/// opening backtick fence's info string must not contain a backtick.
+/// Parse a candidate fence into its character, run length, and remaining text.
+/// Runs shorter than three characters are rejected; `feed_fence_line` applies
+/// the opening/closing-fence rules.
 /// Command scans skip fenced lines so code examples mentioning `/task` or
 /// `/skills` stay question text.
 fn fence_marker(trimmed_line: &str) -> Option<(char, usize, &str)> {
@@ -651,10 +646,9 @@ fn feed_fence_line(open: &mut Option<(char, usize)>, trimmed_line: &str) -> bool
 
 /// Every main-command line in `input`, in order of appearance.
 ///
-/// Engages only when a `/task` / `/discuss` handler would claim the input:
-/// the first non-empty line starts with `/` or `:` and is a main command or
-/// a `/skills` selection. Plain prose stays a question even when later lines
-/// happen to start with a command word, so it is never rejected here.
+/// Engages only when the first non-empty line is a slash/colon main command
+/// or a `/skills` selection. Plain prose stays a question even when later
+/// lines start with a command word, so it is never rejected here.
 fn conflicting_main_commands(input: &str) -> Vec<&'static str> {
     let first = input.lines().map(str::trim).find(|line| !line.is_empty());
     let Some(first) = first else {
@@ -1105,8 +1099,7 @@ mod tests {
     #[test]
     fn multi_main_send_reports_every_command_line() {
         use super::conflicting_main_commands;
-        // The reported case: handler order used to silently start discuss and
-        // swallow the /task line into its topic.
+        // Command precedence must not hide a second main command in topic text.
         assert_eq!(
             conflicting_main_commands("/skills code-review\n/task fix login\n/discuss API options"),
             vec!["task", "discuss"]
@@ -1120,7 +1113,7 @@ mod tests {
             conflicting_main_commands("/goal ship it\n/task fix login"),
             vec!["goal", "task"]
         );
-        // A repeated single command is still one send only if it appears once.
+        // Repeated invocations of the same main command also conflict.
         assert!(conflicting_main_commands("/task fix login").len() < 2);
         assert!(conflicting_main_commands("/task a\n/task b").len() >= 2);
         // Single main plus skills is the legal combined send.

@@ -176,8 +176,7 @@ fn agent_snapshot_paths(
     paths
 }
 
-/// Publish the live subagent view for this process. An empty snapshot clears
-/// the sidecar so completed and collected tasks do not appear as active.
+/// Remove this process's subagent snapshot sidecars for the session.
 pub(in crate::ai) fn clear_agent_snapshots(
     sessions_root: &std::path::Path,
     session_id: &str,
@@ -193,6 +192,8 @@ pub(in crate::ai) fn clear_agent_snapshots(
     error.map_or(Ok(()), Err)
 }
 
+/// Publish this process's live subagent view. An empty snapshot clears the
+/// sidecars so completed and collected tasks do not appear as active.
 pub(in crate::ai) fn write_agent_snapshots(
     sessions_root: &std::path::Path,
     session_id: &str,
@@ -262,7 +263,7 @@ pub(in crate::ai) struct SessionPidGuard {
 
 impl SessionPidGuard {
     /// Writes `<session_id>.<pid>.pid` under `sessions_root`, containing the current
-    /// process PID. On write failure only prints a warning; never blocks startup.
+    /// process PID. A write failure only prints a warning; startup may continue.
     pub(in crate::ai) fn register(sessions_root: &std::path::Path, session_id: &str) -> Self {
         match mark_session_pid(sessions_root, session_id, false) {
             Ok(path) => Self {
@@ -363,19 +364,14 @@ fn cleanup_current_process_markers(sessions_root: &std::path::Path) {
     }
 }
 
-/// 判断哪个目录是"sessions 基目录"——即包含所有 `.sqlite` 文件和
-/// `*.sessions/` 子目录的公共父目录。
-///
-/// 不同 persona / config 的 `a` 进程可能使用不同的 `history_file`，
-/// 导致 `sessions_root` 不同（可能是顶层 `~/.xxx.sessions/`，也可能是
-/// 其下的 `~/.xxx.sessions/persona.sessions/` 子目录）。
-/// 基目录是包含 `*.sessions` 子目录的那一层。
+/// Resolve the scan base for roots that may differ by persona or config.
+/// Prefer `sessions_root` when it has `*.sessions` entries; otherwise use its
+/// parent when that parent has `*.sessions` or `*.sqlite` entries.
+/// Fall back to the supplied root when neither directory matches.
 fn resolve_sessions_base(sessions_root: &std::path::Path) -> std::path::PathBuf {
-    // 如果 sessions_root 自身包含 *.sessions 子目录，它就是基目录。
     if dir_has_sessions_subdirs(sessions_root) {
         return sessions_root.to_path_buf();
     }
-    // 否则检查父目录。
     if let Some(parent) = sessions_root.parent() {
         if dir_has_sessions_subdirs(parent) || dir_has_sqlite_files(parent) {
             return parent.to_path_buf();
@@ -454,11 +450,9 @@ pub(in crate::ai) fn scan_session_pids(
     Ok(found)
 }
 
-/// 扫描 sessions 基目录及其所有 `*.sessions/` 子目录，汇总所有活跃 PID 文件。
-///
-/// 不同 persona / config 的 `a` 进程可能使用不同的 `history_file`，
-/// 导致 PID 文件分布在不同目录。此函数自动定位基目录并递归扫描，
-/// 确保所有活跃 session 都被发现。
+/// Scan the resolved base and its immediate `*.sessions` subdirectories.
+/// Persona or config differences can place PID markers in sibling roots;
+/// combine those roots and deduplicate `(session_id, pid)` pairs.
 pub(in crate::ai) fn scan_all_session_pids(
     sessions_root: &std::path::Path,
 ) -> io::Result<Vec<(String, i32, bool)>> {
@@ -486,18 +480,10 @@ pub(in crate::ai) fn scan_all_session_pids(
     Ok(all)
 }
 
-/// 通过 `lsof` 发现给定进程正在使用的 `.sqlite` 文件，作为 PID 文件机制的兜底。
-///
-/// 旧版本 `a` 启动的 session 不会写 PID 文件，但如果该 session 正在读写
-/// history（SQLite 连接打开中），`lsof` 能抓到。对于空闲等待输入的旧版本
-/// session 可能漏报。
-///
-/// 与旧实现的关键区别：不再用 `lsof +D <sessions_root>` 递归扫描整个 sessions
-/// 目录树（条目多时极慢），而是直接查询给定 PID 的文件描述符表
-/// （`lsof -p pids -Fpcn`），只看这些进程打开了哪些 `.sqlite`。
-///
-/// `pids` 应为"未通过 PID 文件登记的 `a` 进程"列表。返回 (session_id, pid)，
-/// 已按 session_id 去重。
+/// Discover open SQLite history files for processes missing PID markers.
+/// Idle processes with no open SQLite file can be missed.
+/// Query the supplied PIDs directly instead of traversing the sessions tree.
+/// Return `(session_id, pid)` pairs deduplicated by session ID.
 pub(in crate::ai) fn discover_lsof_sessions(
     _sessions_root: &std::path::Path,
     pids: &[i32],
@@ -537,8 +523,7 @@ pub(in crate::ai) fn discover_lsof_sessions(
                 if let Some(pid) = current_pid {
                     let path = std::path::Path::new(&line[1..]);
                     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        // .sqlite-wal 的 file_stem 是 "abc.sqlite-wal"，需要再去掉 -wal
-                        // 但 .sqlite 的 file_stem 是 "abc"
+                        // `file_stem` removes `.sqlite`, `.sqlite-wal`, and `.sqlite-shm` alike.
                         let sid = stem
                             .strip_suffix("-wal")
                             .or_else(|| stem.strip_suffix("-shm"))
@@ -553,11 +538,8 @@ pub(in crate::ai) fn discover_lsof_sessions(
     found.into_iter().collect()
 }
 
-/// 检测进程是否有控制终端（tty）。
-/// 前台交互式 session 有 tty（如 ttys001），`a -bg` daemon 没有（显示为 `??`）。
-///
-/// 一次性批量查询多个进程，把 N 次 `ps` 的 fork/exec 降为单次。这是 `/proc`
-/// 输出循环里的主要性能瓶颈点：旧实现对每个活跃 session 各跑一次 `ps`。
+/// Report whether each PID has a controlling terminal (`??` means none).
+/// Query all PIDs in one `ps` call to avoid a fork/exec per session.
 pub(in crate::ai) fn tty_map_for_pids(pids: &[i32]) -> FxHashMap<i32, bool> {
     let mut map = FxHashMap::default();
     if pids.is_empty() {

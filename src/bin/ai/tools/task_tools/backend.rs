@@ -94,7 +94,7 @@ pub(crate) enum ExecutionMode {
     External,
 }
 
-/// Existing backend wording, retained as templates for migrated consumers.
+/// Backend-specific wording and schema fragments used by shared consumers.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BackendText {
     pub(crate) display_name: &'static str,
@@ -291,9 +291,8 @@ pub(crate) fn task_backend(backend: Option<BackendId>) -> Arc<dyn Backend> {
     backend.unwrap_or_default().resolve()
 }
 
-/// Parse the optional per-call `backend_model` task field: a model name in
-/// the selected backend's own registry, or `None` for the backend default.
-/// Empty and null values mean "no override".
+/// Parse and trim the optional per-call `backend_model` string.
+/// Missing, empty, and null values mean no override; non-string values are rejected.
 pub(crate) fn parse_backend_model(value: Option<&Value>) -> Result<Option<String>, String> {
     parse_optional_string_field(value, "backend_model")
 }

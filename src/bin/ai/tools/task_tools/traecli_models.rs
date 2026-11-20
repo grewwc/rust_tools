@@ -110,8 +110,7 @@ pub(crate) fn traecli_model_names() -> Vec<String> {
         return cached;
     }
 
-    // Discover outside the cache lock: a slow or stuck `traecli models` must
-    // not make every later completion return an empty list.
+    // Run discovery outside the cache lock so other completion calls can read cached names.
     let discovered = discover_model_names(&binary);
     let mut cache = lock_model_cache();
     cache.apply_refresh(&binary, Instant::now(), discovered)
@@ -127,8 +126,8 @@ fn lock_model_cache() -> std::sync::MutexGuard<'static, ModelCache> {
     }
 }
 
-/// The installed `traecli models` prints one case-sensitive identifier per
-/// stdout line. Reject prose/diagnostics and deduplicate without changing order.
+/// Parse case-sensitive model identifiers from one line each, rejecting lines
+/// outside the accepted character set and preserving order while deduplicating.
 fn parse_model_names(output: &str) -> Vec<String> {
     let mut seen = FastSet::default();
     output
@@ -343,9 +342,8 @@ mod tests {
             ["GPT-5.5", "GPT-6.1-Sol"]
         );
 
-        // This exercises the production subprocess path, not the completion
-        // test hook. A normal cold start above the old 500 ms limit must still
-        // produce candidates.
+        // Exercise the production subprocess path with a delayed start, ensuring
+        // discovery accepts output that arrives within DISCOVERY_TIMEOUT.
         std::fs::write(
             &binary,
             "#!/bin/sh\nsleep 1\nprintf 'GPT-6.1-Sol\\nGPT-6-Astra\\n'\n",

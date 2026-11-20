@@ -942,9 +942,8 @@ fn apply_batch_update_deletes_across_rotation_archives() {
 
 #[test]
 fn legacy_rows_without_model_field_still_deserialize() {
-    // Pre-provenance JSONL rows carry no `model` key; `#[serde(default)]` must
-    // keep them readable, and re-serializing a model-less entry must not emit
-    // a `model` key (skip_serializing_if keeps old rows byte-stable).
+    // Rows without `model` must still deserialize, and entries without a model
+    // must omit that key when serialized.
     let row = r#"{"id":"mem_legacy","timestamp":"2025-06-01T00:00:00+08:00","category":"user_memory","note":"legacy note","tags":[],"source":"cli_note","priority":150}"#;
     let entry: AgentMemoryEntry = serde_json::from_str(row).unwrap();
     assert_eq!(entry.model, None);

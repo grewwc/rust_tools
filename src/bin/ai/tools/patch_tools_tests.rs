@@ -139,9 +139,8 @@ fn apply_patch_schema_does_not_expose_legacy_dry_run() {
     assert!(schema["properties"].get("dry_run").is_none());
 }
 
-/// Offline replay: uses the actual apply_patch inputs the model issued in a real session (history.json),
-/// reconstructs the "file truth at the time" from them, and runs them through the **current** code, printing each patch's real
-/// success/failure. This is not a conventional assertion test — it verifies the "real call success rate", not the assertions I wrote.
+/// Replay patches from `replay_manifest.json` against independently rebuilt fixtures.
+/// Each result is printed; the replay does not assert a minimum success rate.
 ///
 /// Ignored by default; enable when needed with:
 ///   AI_PATCH_REPLAY_DIR=/tmp/patch_review cargo test --bin a replay_apply_patch -- --ignored --nocapture
@@ -390,7 +389,7 @@ fn apply_unified_patch_context_mismatch_omits_already_applied_hint() {
 
 #[test]
 fn apply_unified_patch_tolerates_confusable_quotes() {
-    // P0: models often auto-replace ASCII quotes/hyphens with typographic smart quotes / en-dash.
+    // Models often auto-replace ASCII quotes/hyphens with typographic smart quotes / en-dash.
     // Such purely typographic differences must not cause a context mismatch -- after normalize_confusables normalization they should match.
     // Key safety property: the context line outputs the original file content (actual), not the smart quote from the patch,
     // so the ASCII characters in the file are never "replaced" with smart quotes.
@@ -421,8 +420,7 @@ fn apply_unified_patch_detects_ambiguous_match() {
     assert!(err.contains("line 3"), "err was: {err}");
 }
 
-/// When the model wrongly writes `@@ -0,0 +1,3 @@` (insert at file start), normalize it to old_start=1,
-/// instead of treating it as "no nominal line number" (old_start=0) and reporting a context mismatch with "declared line 0".
+/// A zero-line insertion header maps to the first file position (`old_start = 1`).
 #[test]
 fn parse_unified_hunks_normalizes_zero_declared_line_to_one() {
     let patch = "@@ -0,0 +1,3 @@\n+aaa\n+bbb\n+ccc\n";
@@ -575,8 +573,8 @@ fn apply_patch_rejects_oversized_inline_patch() {
     assert!(err.contains("patch_file"), "err was: {err}");
 }
 
-/// A patch_file carrying a large patch (>8K inline cap) should succeed: the inline limit applies only to inline patches;
-/// otherwise the audit-flagged "recommended fallback path is actually unusable" contradiction cannot be resolved.
+/// A patch supplied through `patch_file` can exceed the inline size limit.
+/// File-backed patches use their own cap.
 #[test]
 fn apply_patch_large_patch_file_above_inline_limit_applies() {
     let temp = make_temp_path("patch_file_large");
@@ -704,8 +702,8 @@ fn apply_unified_patch_context_mismatch_emits_pasteable_block_without_partial_ma
     );
 }
 
-/// "hunks out of order" is no longer a bare string: it should state the reason, give pasteable current text, and
-/// suggest reordering by line number or switching to Replace in line. In a real session the model lost 4 rounds in a row on the bare error.
+/// Out-of-order errors must explain the cursor constraint and include current text
+/// plus options for reordering hunks or using Replace in line.
 #[test]
 fn apply_unified_patch_out_of_order_error_is_actionable() {
     // File: `first` before `last`. The patch writes the hunks in reverse order: first modifies `last` (line 4),
@@ -750,7 +748,7 @@ fn apply_unified_patch_disambiguates_ambiguous_match_by_nearby_declared_line() {
 #[test]
 fn apply_unified_patch_rejects_declared_line_when_not_clear_nearest() {
     let original = "dup\nleft\nmid\ndup\nright\n";
-    // The nominal line 3 sits between two `dup`s with equal candidate distance; it must not guess.
+    // The declared line lies between repeated anchors without a clear nearest match.
     let patch = "@@ -3,1 +3,1 @@\n-dup\n+changed\n";
     let err = apply_unified_patch(original, patch).unwrap_err();
     assert!(err.contains("ambiguous patch"), "err was: {err}");
@@ -758,11 +756,8 @@ fn apply_unified_patch_rejects_declared_line_when_not_clear_nearest() {
 
 #[test]
 fn apply_unified_patch_finds_unique_match_beyond_search_radius() {
-    // The file has 150 lines; the only match is at line 130 (0-based 129).
-    // The hunk header claims line 1, nominal=0, and find_hunk_offset's ±50 window searches [0,50),
-    // which cannot find the match at 129. But all_hunk_match_positions can find the unique match across the whole file.
-    // Previously the code ignored the forward.len()==1 result and fell back to find_hunk_offset, causing a false
-    // "context mismatch"。
+    // The unique target is outside the nominal search window; the full-file
+    // candidate search must still locate it.
     let mut lines: Vec<String> = (0..130).map(|i| format!("filler{i}")).collect();
     lines.push("unique_target".to_string());
     lines.push("after_target".to_string());
@@ -770,7 +765,6 @@ fn apply_unified_patch_finds_unique_match_beyond_search_radius() {
     let original = lines.join("\n") + "\n";
 
     let patch = "@@ -1,2 +1,2 @@\n-unique_target\n+changed\n+after_target\n";
-    // Deliberately uses a wrong nominal line number (-1) to simulate stale line numbers
     let result = apply_unified_patch(&original, patch).unwrap_or_else(|err| {
         panic!("apply_patch should find unique match beyond ±50 radius, but got: {err}")
     });
@@ -884,16 +878,7 @@ fn apply_unified_patch_rejects_fuzzy_context_when_remove_anchor_is_ambiguous() {
 
 #[test]
 fn apply_unified_patch_fuzzy_context_rejects_when_nominal_not_in_candidates() {
-    // When the position old_start points to is not in the candidate list, it should still be rejected.
-    // original: line 0="old target", line 1="xxx", line 2="old target", line 3="yyy"
-    // patch: @@ -2,1 +2,1 @@ — old_start=2 → nominal=1
-    // The hunk has only a remove line (no context); remove "xxx" appears at line 1.
-    // But another variant: multiple "old target" as remove, and old_start points to a position with no match.
-    // original: line 0="old target", line 1="aaa", line 2="old target", line 3="bbb"
-    // patch: @@ -3,1 +3,1 @@ — old_start=3 → nominal=2
-    // remove "old target" matches line 0 (pos=0) and line 2 (pos=2);
-    // nominal=2 is in the candidate list → it is accepted (correct behavior).
-    // Changed to: old_start points to a line number that does not exist in the file.
+    // An out-of-range nominal position cannot choose between repeated remove anchors.
     let original = "old target\naaa\nold target\nbbb\n";
     let patch = "@@ -5,1 +5,1 @@\n-old target\n+changed\n";
     // old_start=5 → nominal=4, but the file has only 4 lines (index 0-3).
@@ -1543,7 +1528,6 @@ fn parse_unified_hunks_error_message_names_expected_prefixes() {
     );
 }
 
-// ── Fix 1: strip_code_fence should tolerate trailing blank lines after the closing fence ──
 
 #[test]
 fn strip_code_fence_tolerates_trailing_blank_lines() {
@@ -1563,7 +1547,6 @@ fn strip_code_fence_tolerates_trailing_blank_lines() {
     );
 }
 
-// ── Fix 2: give a clear error when the hunk header is missing ──
 
 #[test]
 fn parse_unified_hunks_missing_header_gives_clear_error() {
@@ -1574,14 +1557,10 @@ fn parse_unified_hunks_missing_header_gives_clear_error() {
     assert!(err.contains("content lines"), "err was: {err}");
 }
 
-// ── Fix 3: envelope Update synthesized headers use old_start=0 ──
 
 #[test]
 fn execute_apply_patch_update_envelope_without_header_does_not_match_at_line_1() {
-    // When the file start happens to match the hunk's context lines, the nominal match with old_start=1 may wrongly hit
-    // the file start instead of where the model actually wants to change. old_start=0 gives the same nominal=0,
-    // but with clearer semantics: no nominal position, relying on a whole-file search for a unique location.
-    // Here we verify that a unique match not at the file start is located correctly.
+    // A headerless update uses content anchors to locate a unique match away from the file start.
     let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let path = make_temp_path("update_nohdr_mid").with_extension("txt");
     let base = path.parent().unwrap().to_path_buf();
@@ -1607,7 +1586,6 @@ fn execute_apply_patch_update_envelope_without_header_does_not_match_at_line_1()
     let _ = fs::remove_dir_all(base);
 }
 
-// ── Fix 4: fill in bare line prefixes when the envelope Update has no hunk header ──
 
 #[test]
 fn execute_apply_patch_update_envelope_tolerates_bare_lines() {
@@ -1637,7 +1615,6 @@ fn execute_apply_patch_update_envelope_tolerates_bare_lines() {
     let _ = fs::remove_dir_all(base);
 }
 
-// ── Fix 5: context lines tolerate line-number prefixes ──
 
 #[test]
 fn apply_unified_patch_tolerates_line_number_prefix_in_context() {
@@ -1725,7 +1702,7 @@ fn strip_line_number_prefix_does_not_strip_code_lines() {
 
 #[test]
 fn strip_number_prefix_anchored_is_separator_agnostic() {
-    // Anchor-based: keyed to the real line, stripping the line-number column regardless of separator, with almost zero false positives.
+    // Strip a numeric column only when the remainder matches the actual line.
     use super::strip_number_prefix_anchored;
     let actual = "    let x = 1;";
     // read_file TAB / grep `| ` / `: ` / space / `.` / `)` all compatible
@@ -1866,7 +1843,6 @@ fn apply_unified_patch_bare_at_header_requires_unique_match() {
 
 #[test]
 fn execute_apply_patch_envelope_with_bare_at_header() {
-    // Reproduces the user report: canonical *** Begin Patch envelope + bare @@ header.
     let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let path = make_temp_path("envelope_bare_at").with_extension("txt");
     let base = path.parent().unwrap().to_path_buf();
@@ -1892,7 +1868,7 @@ fn execute_apply_patch_envelope_with_bare_at_header() {
     let _ = fs::remove_dir_all(base);
 }
 
-// ======================== ReplaceInLine (P2) tests ========================
+// ======================== ReplaceInLine tests ========================
 
 fn make_envelope(op: PatchEnvelopeOp, target: &str, body: &[&str]) -> super::PatchEnvelope {
     super::PatchEnvelope {
@@ -1945,8 +1921,6 @@ fn inline_replace_preserves_trailing_newline() {
 
 #[test]
 fn inline_replace_anchor_tolerates_confusable() {
-    // The anchor uses em-dash (—, U+2014), while the file has ASCII hyphen (-).
-    // Anchor normalized matching should tolerate it, but old must still match exactly.
     let original = "the quick—brown fox\njumps over\n";
     let envelope = make_envelope(
         PatchEnvelopeOp::ReplaceInLine,

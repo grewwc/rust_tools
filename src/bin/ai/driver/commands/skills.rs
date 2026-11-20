@@ -217,12 +217,9 @@ pub fn try_handle_skills_command(
 /// Greedily collects **consecutive** tokens that match a skill name as the skill
 /// set (case-insensitive, normalized by manifest, deduplicated, input order
 /// preserved); the remaining tokens become this turn's question.
-/// A skill name is a kebab-case identifier (ASCII letters/digits/`-`/`_`); a
-/// token that does not match as a whole but whose ident prefix matches a skill
-/// name is treated as "name + question text glued without a space" (e.g.
-/// `/skill Code-Review` with the question glued on), and the glued part
-/// together with the
-/// following tokens becomes the question.
+/// A token with no whole-name match may still have an ASCII identifier prefix
+/// (letters, digits, `-`, or `_`) matching a skill. Its suffix and subsequent
+/// tokens then become the question.
 /// Returns (normalized name list, rest).
 fn resolve_implicit_selection<'m>(
     tokens: &[&'m str],
@@ -433,9 +430,7 @@ mod tests {
 
     #[test]
     fn question_repeating_skill_name() {
-        // /skill code-review code-review + glued question: duplicate skill names are
-        // deduplicated and the glued body is kept only once (the whole string is
-        // no longer treated as the question).
+        // Duplicate skill names are deduplicated; the glued suffix is preserved once.
         let (names, rest) = resolve("code-review code-review帮我review");
         assert_eq!(names, vec!["code-review"]);
         assert_eq!(rest.as_deref(), Some("帮我review"));
@@ -459,8 +454,8 @@ mod tests {
 
     #[test]
     fn unknown_subcommand_no_names() {
-        // Matches no skill name → no skill, no question (the command layer takes
-        // the Unknown branch)
+        // No skill matches: the resolver keeps the token as question text, while
+        // the command rejects the selection because the name list is empty.
         let (names, rest) = resolve("fizzbuzz");
         assert!(names.is_empty());
         assert_eq!(rest.as_deref(), Some("fizzbuzz"));

@@ -26,14 +26,10 @@ static SIGINT_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// sub-agent is still stuck in the silent prepare phase with streaming=false,
 /// so the Shutdown branch wins).
 ///
-/// This registry lets SIGINT first target-cancel the "most recent foreground
-/// sub-agent": the first Ctrl+C only flips that sub-agent's own cancel flag
-/// (never touching the global shutdown), and the parent turn survives after
-/// receiving the sub-agent's cancellation error; if the sub-agent is stuck
-/// (cancel requested but still on the stack), a second Ctrl+C goes straight to
-/// the lock-free forced exit — soft cancellation has proven ineffective, and
-/// the foreground turn activity flag would keep sigint_action permanently
-/// latched on CancelStream (see probe_foreground_subagent).
+/// The first Ctrl+C sets the top sub-agent's private cancel flag and notifies
+/// its waiters without setting global shutdown. A second Ctrl+C while that
+/// entry remains registered forces exit: the foreground activity flag would
+/// otherwise keep selecting soft cancellation.
 ///
 /// A stack supports nested sub-agents: targeted cancellation always applies to
 /// the top of the stack (deepest, most recently dispatched).
@@ -56,8 +52,8 @@ enum ForegroundSubagentProbe {
     /// Targeted cancellation of the top-of-stack sub-agent happened (its cancel
     /// flag was flipped and it was notified); this interrupt was consumed.
     Cancelled,
-    /// The top-of-stack sub-agent was previously asked to cancel but still has
-    /// not exited → stuck; soft cancellation is exhausted and a forced exit is due.
+    /// The top sub-agent is still registered after a previous cancellation request;
+    /// this second interrupt requests forced exit.
     Stuck,
 }
 
@@ -182,15 +178,10 @@ impl Drop for ForegroundSubagentGuard {
     }
 }
 
-/// Probes how one SIGINT should act on the top-of-stack foreground sub-agent,
-/// possibly canceling it in a targeted way.
-///
-/// See the semantics of the three [`ForegroundSubagentProbe`] variants. `Stuck`
-/// is one of the two cases that `try_cancel_foreground_subagent() -> bool` used
-/// to lump together as `false` (empty stack / stuck); callers must distinguish
-/// them: an empty stack takes normal sigint_action, a stuck sub-agent goes
-/// straight to forced exit, otherwise `foreground_turn_active()==true` keeps it
-/// latched on CancelStream forever.
+/// Probe targeted cancellation of the top foreground sub-agent.
+/// Distinguish an empty stack from a second interrupt while the target remains
+/// registered: the former follows `sigint_action`; the latter forces exit
+/// because the foreground activity flag would otherwise keep canceling.
 fn probe_foreground_subagent() -> ForegroundSubagentProbe {
     let cancel_flag = {
         let Ok(mut stack) = FOREGROUND_SUBAGENTS.lock() else {
@@ -200,10 +191,8 @@ fn probe_foreground_subagent() -> ForegroundSubagentProbe {
             return ForegroundSubagentProbe::None;
         };
         if top.cancel_requested {
-            // Cancellation was requested but the sub-agent is still on the stack →
-            // stuck. Soft cancellation has proven ineffective (if it worked, this
-            // guard would already have dropped when the foreground runner returned), so
-            // escalation to a forced exit is required.
+            // A second interrupt arrived before the runner dropped its guard.
+            // Escalate immediately so repeated Ctrl+C does not stay on soft cancellation.
             return ForegroundSubagentProbe::Stuck;
         }
         top.cancel_requested = true;
@@ -221,12 +210,9 @@ fn probe_foreground_subagent() -> ForegroundSubagentProbe {
     ForegroundSubagentProbe::Cancelled
 }
 
-/// Lock-free forced-exit fallback: used on paths where the user has clearly
-/// pressed Ctrl+C multiple times (Exit branch) or a foreground sub-agent is
-/// stuck (Stuck escalation). Never call anything that locks the kernel on this
-/// path (request_tool_cancel / request_shutdown both take locks) — if some
-/// background task holds the kernel lock, this would block and process::exit
-/// would never run, manifesting as "Ctrl+C can't close the app".
+/// Force exit after repeated Ctrl+C or targeted-cancellation escalation.
+/// Never take a blocking kernel lock on this path: a background task may hold
+/// it, preventing `process::exit` from running.
 /// Close stdin first so the input thread blocked on read returns.
 #[inline]
 #[cfg_attr(not(test), allow(unused_variables))] // shutdown is used by the test branch only; avoid an unused warning in non-test builds
@@ -272,17 +258,9 @@ pub(in crate::ai) fn handle_sigint(
         match probe_foreground_subagent() {
             ForegroundSubagentProbe::Cancelled => return,
             ForegroundSubagentProbe::Stuck => {
-                // The top-of-stack sub-agent was asked to cancel but still has not
-                // exited (stuck). The foreground turn's activity flag is true the
-                // whole time, so calling sigint_action as usual would stay on
-                // CancelStream forever (it only sets a soft flag while the main
-                // thread has long been parked with nobody polling) — exactly the
-                // root cause of "Ctrl+C can't close the app". Soft cancellation has
-                // proven ineffective, and the runtime may already be wedged (a
-                // worker stuck on a lock leaves Notify/timers unpolled), so the
-                // shutdown branch's reliance on runtime observation cannot help
-                // either; the only way out is the lock-free forced-exit fallback
-                // (see force_exit_after_sigint).
+                // A second interrupt while the same runner remains registered
+                // requests forced exit. Bypass the foreground activity flag and
+                // blocking shutdown paths so escalation can finish if runtime work stalls.
                 force_exit_after_sigint(shutdown);
                 return;
             }
@@ -738,8 +716,7 @@ mod tests {
             Some(0)
         );
 
-        // Second SIGINT: the sub-agent is still on the stack (stuck) → not
-        // consumed; classified as stuck.
+        // A second probe while the target remains registered requests escalation.
         assert_eq!(probe_foreground_subagent(), ForegroundSubagentProbe::Stuck);
 
         // Returning from the foreground runner unregisters the target. Subsequent

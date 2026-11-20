@@ -1,6 +1,4 @@
-// =============================================================================
-// Orchestrator tests (extracted from orchestrator.rs, logic preserved)
-// =============================================================================
+// Turn-supervisor, checkpoint, and progress-budget tests.
 
 use super::*;
 
@@ -294,13 +292,8 @@ fn detect_execute_command_coarse_loop_requires_execute_command_only_signatures()
 
 #[test]
 fn detect_tool_loop_matches_cycle_prefix_when_window_not_divisible_by_period() {
-    // Regression: soft window 4 is not divisible by period 3; the old
-    // implementation hit `window % period != 0` and `continue`d directly, so
-    // A-B-C-A-B-C got an unannounced hard stop at round 6 (hard is checked
-    // first and soft second, so soft could never fire first and the escalation
-    // invariant was broken). The fix treats "several full cycles plus a
-    // partial-cycle prefix" as a loop too, so the 3-cycle case gets Soft first
-    // at round 4 (A-B-C-A).
+    // A soft window ending partway through a three-round cycle must still
+    // detect repetition before the larger hard window does.
     let a = vec!["tree::{\"path\":\"src\"}".to_string()];
     let b = vec!["read_file::{\"path\":\"src/bin/a.rs\"}".to_string()];
     let c = vec!["tree::{\"path\":\"src/bin\"}".to_string()];
@@ -310,7 +303,7 @@ fn detect_tool_loop_matches_cycle_prefix_when_window_not_divisible_by_period() {
         &[a.clone(), b.clone(), c.clone()],
         TOOL_LOOP_SOFT_WINDOW
     ));
-    // 3 cycles + 1 prefix exactly fills soft window 4: should trigger Soft.
+    // One complete three-round cycle plus its first round fills the soft window.
     assert!(detect_tool_loop(
         &[a.clone(), b.clone(), c.clone(), a.clone()],
         TOOL_LOOP_SOFT_WINDOW
@@ -337,16 +330,14 @@ fn detect_tool_loop_matches_cycle_prefix_when_window_not_divisible_by_period() {
 
 #[test]
 fn execute_command_is_read_only_skips_nav_segments_and_requires_all_substantive_read_only() {
-    // Leading cd/export segments have no side effects and should be skipped:
-    // `cd X && git status` is read-only.
+    // Navigation and environment segments are ignored by the progress heuristic.
     assert!(execute_command_is_read_only(
         "cd /tmp && git status --short"
     ));
     assert!(execute_command_is_read_only(
         "cd /tmp && export FOO=1 && ls -la"
     ));
-    // Any substantive segment that may change → not read-only (closes the old
-    // implementation's blind spot of looking only at the first segment).
+    // A mutating substantive segment makes the whole command a mutation candidate.
     assert!(!execute_command_is_read_only("ls /tmp && rm -rf build"));
     assert!(!execute_command_is_read_only(
         "cd /tmp && git checkout master"
@@ -354,9 +345,8 @@ fn execute_command_is_read_only_skips_nav_segments_and_requires_all_substantive_
     // Purely read-only commands still hold.
     assert!(execute_command_is_read_only("git log --oneline -5"));
     assert!(execute_command_is_read_only("ls -la /tmp"));
-    // cargo verification subcommands do not modify source → read-only;
-    // rerunning the same verification command must no longer count as a
-    // Mutation.
+    // Cargo verification is read-only for progress accounting even when it
+    // writes build artifacts.
     assert!(execute_command_is_read_only("cargo check --bin a"));
     assert!(execute_command_is_read_only(
         "cd /Users/bytedance/rust_tools && cargo test --bin a focused_test"
@@ -425,9 +415,7 @@ fn distinct_echo_probes_do_not_each_count_as_new_evidence() {
         ]
     };
 
-    // Mutually distinct echo probes: before the fix each produced a fresh
-    // fingerprint that refreshed the budget; after the fix none counts as
-    // evidence.
+    // Changing an echo literal must not manufacture new evidence.
     assert!(
         extract_round_evidence_fingerprints(&echo_round(
             "c1",
@@ -440,8 +428,7 @@ fn distinct_echo_probes_do_not_each_count_as_new_evidence() {
     assert!(
         extract_round_evidence_fingerprints(&echo_round("c2", "echo \\\"x\\\"", "x")).is_empty()
     );
-    // Control: real read-only exploration (cat of file contents) still
-    // produces an evidence fingerprint, unaffected.
+    // The read-only command control still contributes an evidence fingerprint.
     assert!(
         !extract_round_evidence_fingerprints(&echo_round("c3", "cat version.txt", "1.2.3"))
             .is_empty(),
@@ -534,8 +521,7 @@ fn task_progress_after_loop_soft_restarts_tool_loop_ladder() {
     }
     assert!(supervisor.loop_breaker_injected);
 
-    // A real mutation after soft means the task is progressing; the old loop
-    // state must be cleared.
+    // A mutation candidate after the soft notice resets the loop state.
     messages.push(pb_apply_patch_msg("patch-1"));
     assert!(matches!(
         supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS,),
@@ -584,17 +570,9 @@ fn soft_rearms_coarse_and_target_gates_so_post_soft_page_cycling_is_still_caught
     assert!(!supervisor.coarse_loop_note_injected);
     assert!(!supervisor.target_repeat_note_injected);
 
-    // Phase 2: after soft, the model switches to a batch of `ls` variants over
-    // the same log directory. exact signatures all differ, so exact soft/hard
-    // never re-fires; but every coarse signature is `ls:/data01/logs`, so
-    // Coarse should fire once COARSE_WINDOW fills (the old implementation kept
-    // that gate permanently blocked by loop_breaker_injected and leaked to the
-    // iteration cap).
-    // Note: the first `ls` round sees `/data01/logs` as a brand-new target and
-    // takes assess_progress's new-target + already-injected-loop branch,
-    // triggering reset_tool_loop_escalation (clears the coarse history and
-    // re-arms the gate). COARSE_WINDOW more rounds of the same coarse sample
-    // must be accumulated afterwards.
+    // After soft, distinct `ls` commands over one directory share a coarse target.
+    // The first listing adds a new target and resets loop escalation, so a full
+    // coarse window must accumulate after that reset.
     let ls_variants = [
         "ls -lt /data01/logs | head -20",
         "ls -la /data01/logs | head -30",
@@ -606,8 +584,7 @@ fn soft_rearms_coarse_and_target_gates_so_post_soft_page_cycling_is_still_caught
     for (i, cmd) in ls_variants.iter().enumerate() {
         messages.push(pb_execute_command_msg(cmd, &format!("ls-{i}")));
         let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
-        // Round 5 (ls-5, index 5) is the first round that fills COARSE_WINDOW
-        // after the reset.
+        // Count the coarse window from the reset caused by the first listing.
         if i == TOOL_LOOP_COARSE_WINDOW {
             assert!(
                 matches!(signal, ToolLoopSignal::Coarse),
@@ -669,7 +646,6 @@ fn mark_truncation_skip_resets_full_loop_detection_ladder() {
         messages.push(assistant_with_read(&format!("tc2-{i}")));
         let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         if i == TOOL_LOOP_SOFT_WINDOW - 1 {
-            // The 4th occurrence should trigger soft.
             assert!(matches!(signal, ToolLoopSignal::Soft));
             assert!(supervisor.loop_breaker_injected);
         } else {
@@ -683,7 +659,6 @@ fn mark_truncation_skip_resets_full_loop_detection_ladder() {
         messages.push(assistant_with_read(&format!("tc3-{i}")));
         let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         if i == TOOL_LOOP_HARD_WINDOW - 1 {
-            // Only after 6 more repeats following soft should hard fire.
             assert!(matches!(signal, ToolLoopSignal::Hard));
             assert!(supervisor.hard_loop_stop_injected);
         }
@@ -736,13 +711,9 @@ fn coarse_execute_command_signature_collapses_log_listing_window_variants() {
 
 #[test]
 fn coarse_execute_command_signature_collapses_middle_paging_offsets() {
-    // Root cause of pagination-loop escapes: offset literals in
-    // `tail -c +N` / `sed -n 'N,Mp'` used to be kept in the coarse signature,
-    // so paging the same file through different windows produced a distinct
-    // signature every round and neither coarse nor target-repeat could catch
-    // it. Offsets/line ranges describe the "window", not the target resource,
-    // and should be stripped (like read_file's offset/limit stripping) so
-    // paging variants collapse into one signature.
+    // Window offsets do not identify a different resource. Strip them from
+    // coarse signatures so paging one file remains recognizable as repetition,
+    // while different file paths still stay distinct.
     let a = coarse_execute_command_signature("tail -c +2401 src/all_desc.txt | head -c 2400");
     let b = coarse_execute_command_signature("tail -c +4801 src/all_desc.txt | head -c 2400");
     let c = coarse_execute_command_signature("tail -c +1 src/all_desc.txt | head -c 1400");
@@ -762,14 +733,9 @@ fn coarse_execute_command_signature_collapses_middle_paging_offsets() {
 
 #[test]
 fn coarse_catches_middle_paging_loop_never_from_top() {
-    // Pure "paging" loop: the same file is read repeatedly from mid-file
-    // offsets (tail -c +N with a different offset each round, never +1, so the
-    // from-top rescan detector cannot catch it). Whole-round raw commands all
-    // differ, so exact matching fails; before the fix the coarse signature
-    // kept the offset literal and the whole-round coarse sets never matched
-    // either, letting the loop escape to the iteration cap. After the fix
-    // offsets are stripped and everything folds to `tail:<file>`: Coarse soft
-    // notice on round 5, CoarseHard hard stop on round 8.
+    // Middle-file paging avoids the from-top rescan detector and changes exact
+    // signatures. Coarse signatures must still recognize the shared file and
+    // escalate through the coarse soft and hard windows.
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
     let file = "src/all_desc.txt";
@@ -2127,11 +2093,7 @@ fn required_delegation_advisory_stands_down_after_delegation() {
     }
 }
 
-// ===== Progress Budget (behavioral-signal progress budget) tests =====
-// These cases deliberately make every round's tool signature differ (different
-// paths) to bypass exact/coarse "signature repetition" detection and verify
-// the third layer, assess_progress's "information gain" rule: a successful
-// read of a new target counts as progress; a failed read (no target) does not.
+// Progress-budget tests cover new targets, repeated evidence, failures, and mutations.
 
 fn pb_read_msg(path: &str, id: &str) -> crate::ai::history::Message {
     crate::ai::history::Message {
@@ -2309,13 +2271,8 @@ fn pb_task_round(
     messages.push(pb_tool_result(id, result));
 }
 
-/// A failed read-only call round: the assistant issues read_file followed by a
-/// tool result indicating the read failed. Failed calls do not enter
-/// `extract_round_targets` (no targets → no information gain → no progress),
-/// and because each round uses a different path they bypass exact/coarse
-/// signature loop detection, making this the only no-progress driver of the
-/// progress-budget escalation ladder after "unify on behavioral signals"
-/// (successful new-target reads always count as progress).
+/// Failed read fixture with no target or evidence gain. Distinct paths let
+/// tests isolate progress-budget escalation from signature-loop detection.
 fn pb_failed_read_round(messages: &mut Vec<crate::ai::history::Message>, path: &str, id: &str) {
     pb_failed_read_round_reasoning(messages, path, id, None);
 }
@@ -2376,12 +2333,8 @@ fn progress_budget_no_gain_reading_triggers_soft_after_free_rounds() {
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
     let mut signals = Vec::new();
-    // iterations 1..=25: the free zone (<=20) stays fully silent; from 21 on,
-    // no-progress accumulates, and at round 25 consecutive=5 reaches
-    // soft_threshold(25)=5, firing the soft notice.
-    // Failed reads manufacture "no information gain" rounds: successful
-    // new-target reads always count as progress and cannot accumulate
-    // no-progress.
+    // Failed reads of distinct targets isolate the no-progress counter from
+    // repetition detectors; the free-exploration window delays the soft notice.
     for i in 1..=25 {
         supervisor.next_iteration();
         pb_failed_read_round(&mut messages, &format!("src/f{i}.rs"), &format!("tc-{i}"));
@@ -2414,12 +2367,9 @@ fn progress_budget_same_target_paging_is_progress_but_coarse_brake_still_fires()
         );
         let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         if i == TOOL_LOOP_COARSE_WINDOW - 1 {
-            // Paging the same file fills the coarse window: exact signatures
-            // differ because offsets differ (no soft/hard), but the coarse
-            // signatures match once offsets are stripped, so the one-shot
-            // Coarse brake should still fire. This is the key guarantee of the
-            // "progress hashing must ignore offset/limit to prevent budget
-            // escapes" invariant.
+            // Distinct offsets keep exact signatures different, while the shared
+            // file still fills the coarse window. Fresh page contents must not
+            // disable this independent repetition check.
             assert!(
                 matches!(signal, ToolLoopSignal::Coarse),
                 "round {i}: same-file paging must still trip the coarse brake: {signal:?}"
@@ -2472,13 +2422,8 @@ fn progress_budget_readonly_novel_targets_warn_once_after_breadth_threshold() {
     assert_eq!(supervisor.progress.consecutive_no_progress, 0);
 }
 
-/// Pure read-only divergence (zero mutations, constantly switching to new
-/// target reads) must be forcibly wrapped up once the accumulated target count
-/// reaches `READ_ONLY_BREADTH_HARD_STOP_TARGETS` — even though every round
-/// reads a new target / new bytes, repeatedly resetting the regular
-/// no-progress counter. This criterion is decoupled from content novelty and
-/// is the final brake for the "diagnostic agent diverging read-only for two
-/// hours without wrapping up" incident.
+/// The breadth ceiling limits unbounded read-only exploration even when new
+/// targets and bytes keep the regular no-progress counter at zero.
 #[test]
 fn progress_budget_pure_readonly_divergence_hard_stops_after_breadth_ceiling() {
     let mut supervisor = TurnSupervisor::default();
@@ -2513,9 +2458,8 @@ fn progress_budget_pure_readonly_divergence_hard_stops_after_breadth_ceiling() {
     );
 }
 
-/// Once any mutation happened in this turn, the breadth hard stop stands down
-/// permanently: normal "read many files + edit" implementation tasks are not
-/// subject to this brake, avoiding degraded agent effectiveness.
+/// The breadth hard stop stands down after project-mutation progress;
+/// plan/task lifecycle actions alone do not disable it.
 #[test]
 fn progress_budget_breadth_hard_stop_never_fires_after_mutation() {
     let mut supervisor = TurnSupervisor::default();
@@ -2644,11 +2588,8 @@ fn blocked_outside_workspace_command_normalizes_to_stable_target() {
 
 #[test]
 fn browser_navigation_and_read_count_as_progress_targets() {
-    // Browser tools are not in MUTATION_TOOL_NAMES and their args carry no
-    // path/query; without extracting url/selector, navigating to a new page or
-    // reading a new selector would be misjudged as no progress, and a normal
-    // multi-step browsing turn would be wrongly stopped by LowProgressHard
-    // under the progress-budget ladder.
+    // Browser targets use URL/selector arguments, so target tracking must cover
+    // these alongside filesystem paths and search queries.
     let mut messages = Vec::new();
     pb_task_round(
         &mut messages,
@@ -2816,13 +2757,8 @@ fn target_repeat_does_not_fire_on_write_file_progress() {
 
 #[test]
 fn target_rescan_catches_pagination_loop_with_mixed_rounds() {
-    // Reproduces the real escape pattern of session f319d490: the same file is
-    // read from the top repeatedly (page width changes every round: 2400B →
-    // 1400B → read_file line paging), interleaved with new archive paths that
-    // differ every round — whole-round signatures never match and all three
-    // whole-round detectors (exact/coarse/target-repeat) miss; the rescan
-    // counter accumulates per target, decoupled from whole-round signatures:
-    // the 3rd from-top read injects the soft notice, the 4th hard-stops.
+    // Mixed page widths and interleaved archive reads exercise per-target
+    // from-top rescan tracking alongside coarse-cycle detection.
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
     let file = "src/all_desc.txt";
@@ -2875,11 +2811,8 @@ fn target_rescan_catches_pagination_loop_with_mixed_rounds() {
         &format!("tail -c +1401 {file} | head -c 1400"),
         "t1p1",
     );
-    // After the fix: tail/sed offset/line-range literals are stripped, the
-    // window [tail,tail,archive,tail,tail] folds into the 3-cycle
-    // [tail,tail,archive], and coarse hits early when the window fills
-    // (catching this paging + interleaved-rounds loop before the from-top
-    // rescan does).
+    // Removing window literals exposes the three-round pattern
+    // [tail, tail, archive] even while paging offsets vary.
     let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
     assert!(
         matches!(signal, ToolLoopSignal::Coarse),
@@ -2961,9 +2894,9 @@ fn target_rescan_ignores_monotonic_pagination() {
 
 #[test]
 fn redundant_window_reread_soft_prompt_and_hard_stop() {
-    // A sub-window of an already returned read cannot add information: the file is unchanged, so
-    // the bytes are identical. Interleave new files each round so exact/coarse/target detectors
-    // stay quiet, and keep one gap round between redundant reads so the target window never fills.
+    // Covered sub-windows return the same line bytes. Fresh files between reads
+    // keep signature and target windows from aligning, isolating redundant-read
+    // escalation.
     let mut supervisor = TurnSupervisor::default();
     supervisor.iteration = 30;
     let mut messages = Vec::new();
@@ -3075,8 +3008,8 @@ fn redundant_read_counts_reset_on_edit() {
 
 #[test]
 fn redundant_read_counts_reset_on_truncation_retry() {
-    // Truncation clears the conversation, so re-reading the same window to rebuild context is
-    // recovery, not a loop: counts and coverage must restart with the history.
+    // A truncation retry may rebuild the request projection, so reset coverage
+    // and counts before treating repeated reads as redundant.
     let mut supervisor = TurnSupervisor::default();
     supervisor.iteration = 30;
     let mut messages = Vec::new();
@@ -3877,12 +3810,8 @@ fn target_rescan_window_decays_stale_counts() {
 
 #[test]
 fn target_rescan_window_decay_grants_fresh_soft_warning_per_episode() {
-    // Regression: decay opens a new re-read episode, and every loop segment
-    // must get its own soft warning. The old implementation only reset the
-    // counter on decay without clearing rescan_note_injected, so when the
-    // second segment accumulated to soft, insert returned false → the soft
-    // notice was skipped and it went straight to a hard stop (the soft→hard
-    // escalation invariant was broken).
+    // Expiring a rescan episode must also re-arm its soft notice so the next
+    // episode starts with a warning before it can reach the hard stop.
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
     let target = "src/episode-file.rs";
@@ -3911,9 +3840,7 @@ fn target_rescan_window_decay_grants_fresh_soft_warning_per_episode() {
             assert_eq!(signal, ToolLoopSignal::None, "episode1 round r{iter}");
         }
     }
-    // After 9 rounds (gap=9 > TARGET_RESCAN_WINDOW_ROUNDS=8) → the counter
-    // decays and restarts from 1, and the soft-notice flag must be cleared
-    // together with the episode (the point of this fix).
+    // A gap beyond the rescan window resets both the counter and its soft-notice flag.
     supervisor.iteration = 12;
     pb_execute_command_round(&mut messages, &format!("nl -ba {target}"), "r12");
     assert_eq!(
@@ -3921,10 +3848,8 @@ fn target_rescan_window_decay_grants_fresh_soft_warning_per_episode() {
         ToolLoopSignal::None,
         "decay round r12"
     );
-    // Episode 2: the 2nd occurrence soft-notices again — this segment's own
-    // warning; soft must not be skipped in favor of a hard stop just because
-    // the previous segment already warned; the 3rd occurrence gives no new
-    // signal.
+    // The new episode earns its own soft notice; the previous episode's
+    // one-shot flag must not suppress it.
     supervisor.iteration = 13;
     pb_execute_command_round(&mut messages, &format!("head -n 200 {target}"), "r13");
     assert!(
@@ -3967,7 +3892,7 @@ fn target_rescan_resets_on_other_file_mutation() {
             );
         }
     }
-    // Round 3: edit the other file B → the table clears A's counts.
+    // Edit the other file to clear this target's rescan counts.
     supervisor.iteration = 4;
     let id = "w4";
     messages.push(pb_write_file_msg("src/edit-b.rs", id));
@@ -4093,12 +4018,8 @@ fn repeated_identical_write_file_still_hits_exact_tool_loop() {
     );
 }
 
-/// Regression: repeatedly writing the same "sandbox boundary rejected" path
-/// (different content each round, same file_path) used to be miscounted as
-/// mutation-progress and, never entering the target history, escaped every
-/// loop guard. After the fix: blocked writes no longer count as progress, are
-/// normalized into a stable target, and the target-repeat guard hits within a
-/// few rounds.
+/// Blocked writes of varying content must remain one stable target without
+/// counting as mutation progress, allowing target-repeat detection to fire.
 #[test]
 fn repeated_blocked_write_to_same_path_triggers_target_repeat() {
     let mut supervisor = TurnSupervisor::default();
@@ -4137,10 +4058,7 @@ fn repeated_blocked_write_to_same_path_triggers_target_repeat() {
     assert!(supervisor.target_repeat_note_injected);
 }
 
-/// Regression: a blocked write must not zero the no-progress budget.
-/// Previously `_ => true` counted failed writes as mutations too, resetting
-/// consecutive_no_progress on every retry so the progress budget never
-/// escalated.
+/// A blocked write must not reset the no-progress budget.
 #[test]
 fn blocked_write_does_not_count_as_mutation_progress() {
     let blocked = "Error: write_file failed: File error (/out/x.json): Write blocked: \
@@ -4218,7 +4136,7 @@ fn progress_budget_mutation_action_resets_no_progress() {
         assert!(matches!(signal, ToolLoopSignal::None));
     }
     assert_eq!(supervisor.progress.consecutive_no_progress, 4);
-    // One real mutation action: the no-progress counter resets to zero.
+    // A mutation candidate with no reported result conservatively resets the counter.
     messages.push(pb_apply_patch_msg("patch-1"));
     let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
     assert!(matches!(signal, ToolLoopSignal::None));
@@ -4458,16 +4376,11 @@ fn task_wait_status_coarse_signatures_ignore_polling_noise() {
 
 #[test]
 fn progress_budget_real_progress_resets_ladder_but_preserves_episode_cooldown() {
-    // After a soft notice is injected, if the model takes an action that truly
-    // advances the task, the whole escalation ladder (soft_injected /
-    // ledger_injected / hard_injected / grace) must reset so the next
-    // no-progress round starts over from soft instead of skipping to
-    // ledger/hard because of residual soft_injected. Otherwise, in long tasks
-    // a single early divergence makes every subsequent refocusing reminder
-    // slide to a hard stop faster.
+    // Mutation progress must reset escalation flags so a later no-progress episode
+    // starts at soft; preserve cooldown to avoid repeating prompts too soon.
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
-    // Pin inside the metered zone (iteration=30 -> over=10 -> soft_threshold=5).
+    // Start beyond the free-exploration window.
     supervisor.iteration = 30;
 
     // Phase 1: 5 consecutive no-information-gain rounds (failed reads)
@@ -4480,8 +4393,7 @@ fn progress_budget_real_progress_resets_ladder_but_preserves_episode_cooldown() 
     assert!(matches!(last, ToolLoopSignal::LowProgressSoft));
     assert!(supervisor.progress.soft_injected);
 
-    // Phase 2: one real mutation action (apply_patch) -> substantive progress,
-    // resetting the whole escalation ladder.
+    // A mutation candidate resets the escalation ladder.
     messages.push(pb_apply_patch_msg("patch-1"));
     let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
     assert!(matches!(signal, ToolLoopSignal::None));

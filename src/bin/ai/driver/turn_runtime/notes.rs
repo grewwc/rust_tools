@@ -1,9 +1,4 @@
-// =============================================================================
-// Model-Visible Notes
-// =============================================================================
-// Extracted from orchestrator.rs during a logic-preserving split.
-// Injectors for model-visible loop / progress / checkpoint notes and force-final reason recording.
-// =============================================================================
+// Model-visible loop, progress, and checkpoint notes and transient stop reasons.
 
 use super::*;
 
@@ -85,10 +80,8 @@ pub(in crate::ai::driver::turn_runtime) fn record_force_final_reason(
         return;
     }
 
-    // Persist to the decision log (disk JSONL): an observable channel for no-tool-handoff root
-    // causes. The decision log is a session-side record that never enters the model context, so
-    // there is no replay problem of an internal note being promoted to system; control state in
-    // canonical turn_messages still lives only in the current request projection.
+    // Log the stop reason outside the model-visible projection so diagnostics
+    // survive without replaying transient no-tool control state.
     crate::ai::driver::decision_log::log_runtime_stop(
         crate::ai::driver::decision_log::get_decision_log_store(),
         &crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
@@ -108,9 +101,8 @@ pub(in crate::ai::driver::turn_runtime) fn record_force_final_reason(
         tool_call_id: None,
         reasoning_content: None,
     };
-    // Runtime stop reasons belong only to the current request projection; if written to canonical
-    // turn_messages, the next round would promote the stale no-tool-handoff control state back to
-    // system and replay it forever.
+    // Keep stop reasons out of canonical turn_messages so later turns do not
+    // replay stale no-tool instructions.
     messages.push(event);
 }
 
@@ -157,10 +149,9 @@ pub(super) fn inject_target_repeat_loop_note(messages: &mut Vec<crate::ai::histo
     });
 }
 
-/// Soft notice for a repeat read whose window an earlier successful read already returned in full
-/// and whose file has not been edited since. The bytes cannot differ, so the call adds no
-/// information; name the durable-note recovery path instead of letting the model re-derive the same
-/// evidence from the same window.
+/// Soft notice when a returned read window matches previously observed lines.
+/// The result contains no new complete-line evidence; recover any offloaded
+/// source from its durable stub instead of re-reading that window.
 pub(super) fn inject_redundant_read_note(
     messages: &mut Vec<crate::ai::history::Message>,
     target: &str,
@@ -183,9 +174,8 @@ pub(super) fn inject_redundant_read_note(
     });
 }
 
-/// Hard stop for redundant window re-reads: the same already-returned window keeps being requested
-/// with no edit in between, so the turn is looping on evidence it already has. Force no-tool
-/// wrap-up.
+/// No-tool wrap-up notice for repeated windows that match previously returned
+/// complete-line evidence.
 pub(super) fn inject_redundant_read_hard_stop_note(
     messages: &mut Vec<crate::ai::history::Message>,
     target: &str,
@@ -274,17 +264,10 @@ pub(super) fn inject_coarse_hard_loop_stop_note(messages: &mut Vec<crate::ai::hi
     });
 }
 
-/// Progress Budget level 1 (soft reflection): several consecutive rounds with no measurable
-/// information gain.
-/// For convergence-style notices while tools may still continue (soft / breadth / ledger), the
-/// ledger / summary the model is asked to write is **internal self-reflection** and must go into
-/// the hidden `<meta:self_note>...</meta:self_note>` channel: the stream layer
-/// [`push_text_with_hidden_meta`](crate::ai::stream) strips it from visible output, persists it
-/// as an internal_note, and the model still reads it next round. Without constraining the landing
-/// spot, the model would write this mid-reflection into the user-facing body, get it streamed
-/// immediately as a "preliminary conclusion", and duplicate the real final answer (the direct
-/// cause of that incident). Hard-stop / iteration-limit force-final notices do not apply this
-/// constraint -- there the body text is the final answer.
+/// Keep soft progress/breadth/ledger reflections in the hidden `<meta:self_note>`
+/// channel so they do not duplicate the eventual user-facing answer.
+/// Hard-stop and iteration-limit notes omit this constraint because their body
+/// is the final answer.
 pub(super) const SELF_NOTE_REFLECTION_CHANNEL_HINT: &str = "\n\
     Important (placement constraint): the ledger / summary asked for above is internal self-reflection; write it in full \
     between `<meta:self_note>` and `</meta:self_note>`; it is not shown to the user but stays in your subsequent context.\n\
@@ -477,7 +460,7 @@ pub(super) fn tool_round_checkpoint_record(
     }
 }
 
-/// Self-reflection prompt after max_iterations is hit (replaces an outright force_final surrender).
+/// Reflect on remaining work when the tool-iteration budget is exhausted.
 pub(super) fn inject_iteration_limit_reflect_note(
     messages: &mut Vec<crate::ai::history::Message>,
     max_iterations: usize,

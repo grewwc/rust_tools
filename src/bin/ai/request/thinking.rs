@@ -45,7 +45,6 @@ use super::routing::{extract_router_content, strip_json_fence};
 pub(super) async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool {
     let cfg = configw::get_all_config();
     let force_thinking = config_bool_is_true(cfg.get_opt(AiConfig::MODEL_THINKING));
-    // Check config for auto-thinking override
     let auto_enabled = cfg
         .get_opt(AiConfig::MODEL_AUTO_THINKING_ENABLE)
         .map(|v| !v.trim().eq_ignore_ascii_case("false"))
@@ -63,13 +62,8 @@ pub(super) async fn resolve_thinking(app: &App, model: &str, messages: &[Message
     }
 
     let raw_question = latest_user_message_text(messages).unwrap_or_default();
-    // Injected `<system-reminder>...</system-reminder>` context is prepended to
-    // the current user message (see prepare.rs / skill_runtime.rs). It can
-    // inflate a one-word "hi" into a multi-thousand-character blob, defeating
-    // the local thinking short-circuit (which keys off question length) and
-    // falling through to the multi-second model gate. These reminder blocks are
-    // stripped here before judging, using only what the user actually typed for
-    // intent and thinking decisions.
+    // Ignore runtime reminders so their size cannot trigger thinking for a
+    // short user question.
     let question = strip_system_reminders(&raw_question);
     let question = question.trim();
     if !question.is_empty() {
@@ -110,23 +104,16 @@ pub(super) fn resolve_thinking_static(
     default_effort: Option<ReasoningEffort>,
 ) -> Option<bool> {
     // Truncation-retry fallback: after repeated truncation, thinking is forcibly
-    // disabled with priority over everything (including force_thinking), leaving
-    // the whole output budget to visible content. Restored by the orchestrator
-    // at the end of the turn.
+    // disabled with priority over everything (including force_thinking).
+    // The provider's off capability still determines the wire controls.
+    // Restored by the orchestrator at the end of the turn.
     if thinking_disabled_override {
         return Some(false);
     }
 
-    // Explicit user "effort off" (`/effort off`, `/model effort off`,
-    // `--reasoning-effort off`) also turns thinking off on dialects whose
-    // declared off capability is a real wire off-switch (DashScope
-    // `enable_thinking:false`, DeepSeek `thinking:{"type":"disabled"}`) — same
-    // precedence tier as the truncation fallback above: a recent explicit
-    // in-session command wins over the persistent `ai.model.thinking=true`
-    // config. Effort-only dialects (capability [`ThinkingOffCapability::EffortNone`])
-    // are not handled here: `resolve_reasoning_effort` expresses their off as
-    // `reasoning_effort: "none"` instead. Unsupported dialects keep thinking on
-    // and the `/effort off` handler reports that honestly.
+    // Explicit effort-off overrides forced thinking only for real wire switches.
+    // Effort-only providers encode off in `resolve_reasoning_effort`; providers
+    // without an off control follow the remaining thinking policy.
     if effort_override == Some(None) && matches!(off_capability, ThinkingOffCapability::RealSwitch)
     {
         return Some(false);
@@ -136,7 +123,6 @@ pub(super) fn resolve_thinking_static(
         return Some(thinking_enabled);
     }
 
-    // Model must support thinking
     if !thinking_enabled {
         return Some(false);
     }
@@ -174,10 +160,8 @@ pub(crate) fn latest_user_message_text(messages: &[Message]) -> Option<String> {
 /// Strips `<system-reminder>...</system-reminder>` blocks injected into user
 /// messages.
 ///
-/// prepare.rs / skill_runtime.rs prepend context reminders to the current user
-/// message (to preserve prompt cache). These blocks are large and pollute the
-/// intent/thinking judgment input, making a one-word "hi" look like long text.
-/// They are removed before judgment, leaving only the user's actual input.
+/// Exclude runtime context from question-complexity decisions so large reminders
+/// do not make a short user question appear complex.
 pub(crate) fn strip_system_reminders(text: &str) -> Cow<'_, str> {
     const OPEN: &str = "<system-reminder>";
     const CLOSE: &str = "</system-reminder>";
@@ -233,17 +217,16 @@ pub(crate) fn local_thinking_decision(question: &str) -> Option<bool> {
         return Some(true);
     }
 
-    // Always return a decision instead of None, so resolve_thinking never falls
-    // through to the multi-second model gate. The middle ground (long but
-    // unstructured) leans false (fast); complex inputs are already reliably
-    // judged true above.
+    // Prefer the fast path for remaining shapes; returning a decision keeps
+    // nonempty questions from falling through to the auxiliary model gate.
     Some(false)
 }
 
 /// Ask the model whether this request needs thinking mode.
 ///
 /// Returns `Some(decision)` only when response parses successfully and confidence
-/// passes configured threshold; otherwise returns `None` for local fallback.
+/// passes the configured threshold; otherwise returns `None`, and
+/// `resolve_thinking` defaults to disabled.
 #[crate::ai::agent_hang_span(
     "pre-fix",
     "G",

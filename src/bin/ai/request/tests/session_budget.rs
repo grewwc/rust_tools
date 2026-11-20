@@ -206,10 +206,8 @@ fn prompt_feedback_app_forks_do_not_inherit_usage_or_pending_requests() {
 
 #[test]
 fn child_forks_do_not_inherit_reasoning_effort_controls() {
-    // `/effort off` (Some(None)) is upgraded to "thinking off" on the wire; if
-    // subagents/background helpers inherited it, delegated tasks would silently
-    // lose thinking. The foreground driver snapshot must keep it so the current
-    // turn still honors the command.
+    // Foreground effort and truncation overrides must not leak into child tasks.
+    // Driver snapshots preserve them for the current turn.
     let mut app = test_app();
     app.cli.reasoning_effort_override = Some(None);
     app.cli.thinking_disabled_override = true;
@@ -620,10 +618,8 @@ fn prompt_cache_model_support_does_not_guess_by_name() {
 
 #[test]
 fn prompt_cache_model_support_rejects_non_anthropic_dialect_models() {
-    // The registry currently holds no OpenAi-adapter entry, so the old
-    // OpenAi-only probe always skipped. Cover the live non-Anthropic
-    // classes (Compatible + OpenAi) instead: none may enable the
-    // Anthropic cache. Hard-fails when both classes disappear.
+    // Compatible/OpenAi entries must keep Anthropic explicit cache disabled.
+    // Require at least one entry so the assertion is not vacuous.
     use crate::ai::provider::ApiProvider;
     let entries: Vec<_> = crate::ai::model_names::all()
         .into_iter()

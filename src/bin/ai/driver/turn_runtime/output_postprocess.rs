@@ -121,8 +121,7 @@ mod tests {
 
     #[test]
     fn failing_command_falls_back_to_original() {
-        // A command that cannot be spawned must fall back to the original
-        // text so the turn is never blocked by post-processing.
+        // A missing program causes the shell command to fail; retain the original text.
         let text = "原样保留：main。rs".to_string();
         assert_eq!(
             postprocess_with_command("definitely_not_a_real_command_xyz", text.clone()),

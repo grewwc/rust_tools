@@ -99,11 +99,9 @@ pub(in crate::ai::history) fn with_session_state_lock<T>(
     result
 }
 
-/// A poisoned lock means a previous holder panicked while holding the in-process
-/// history lock. The on-disk cross-process `flock` and the SQLite transaction are
-/// still real safety boundaries, so we keep recovering here (preserving the
-/// original semantics), but no longer silently: a one-time warning is printed to
-/// help investigate the upstream defect that caused the panic.
+/// A poisoned lock records an earlier panic while holding an in-process history
+/// lock. Recovery still uses the file lock and SQLite transaction boundaries;
+/// each recovery warns so the upstream panic remains visible.
 fn warn_session_lock_poison(path: &Path, which: &str) {
     eprintln!(
         "[Warning] {} was poisoned (a previous holder panicked). \

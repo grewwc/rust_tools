@@ -223,7 +223,7 @@ pub(super) fn behavior_check_output_reports_failure(content: &serde_json::Value)
 ///
 /// The read-only/non-read-only two-state semantics are folded into this three-state enum; non-read-only mixes two meanings:
 /// - `WriteIntended`: a program known to explicitly write local files (`sed -i`, `bytedcli --output-dir`,
-///   `git commit`, `cargo build`, etc.), or a known mutator;
+///   `git commit`, etc.), or a known mutator;
 /// - `Unknown`: an unrecognized program (interpreters/scripts like `python3`/`node`/`perl -e`) with
 ///   neither read-only nor write knowledge — it may or may not write.
 ///
@@ -354,10 +354,8 @@ fn segment_write_kind(tokens: &[String]) -> SegmentWriteKind {
             }
         }
         "pytest" => SegmentWriteKind::ReadOnly,
-        // `bytedcli` is the ByteDance internal platform CLI (codebase/db/faas/log subcommands
-        // are all remote API queries/operations); it does not write local project files by default, so it is classified read-only;
-        // but `--output`/`--output-dir`/`--manifest` explicitly write local files
-        // (e.g. `codebase mr artifacts download --output-dir ...`) and must count as a change.
+        // Treat bytedcli as read-only for local-project classification unless an
+        // output flag supplies write intent. This says nothing about remote side effects.
         "bytedcli" => {
             if tokens.iter().any(|token| {
                 token == "--output"
@@ -564,10 +562,9 @@ fn analyze_execute_command(command: &str, initial_cwd: &Path) -> ExecuteCommandA
         let read_only = matches!(write_kind, SegmentWriteKind::ReadOnly);
         let (mut command_targets, known_mutator) = mutation_target_tokens(&tokens);
         raw_targets.append(&mut command_targets);
-        // Only programs "known to write local files" (WriteIntended or a known mutator) may be judged
-        // as a project change from the project cwd alone; unknown programs (python3/node/...) have no write
-        // evidence, and the cwd fallback would misjudge read-only checks as changes, tripping the completion evidence gate
-        // (`successful_post_mutation_verification` gets reset) and making the model repeat its conclusion.
+        // Only known writers may imply a project mutation from cwd alone. Unknown
+        // programs can run read-only checks; treating their cwd as write evidence
+        // would mislead checkpoint-phase consumers of this classification.
         let known_writer = matches!(write_kind, SegmentWriteKind::WriteIntended) || known_mutator;
         let mutation = has_redirection || !read_only;
         if !mutation {
@@ -756,9 +753,8 @@ pub(super) fn refresh_skill_turn_for_iteration(
     // is still compared later (`prev_skills != next_skills`).
     let prev_skills = skill_turn.matched_skill_names().to_vec();
 
-    // Explicit change requests from the model via the activate_skill / deactivate_skill tools take priority:
-    // force-activate by name and skip automatic routing scores. The tool side already validates the name (it must really exist);
-    // here skill_manifests is checked once more, falling back to automatic routing on a miss.
+    // Explicit activate_skill / deactivate_skill requests take priority over routing
+    // scores. If named activation fails, rebuild with the same requested selection.
     // Multiple skills: a pending action can be Add (append) or Remove (drop); multiple calls within the
     // same turn are all applied in order (queue semantics, no last-write-wins) against the current active set.
     use crate::ai::tools::skill_tools::PendingSkillAction;
@@ -823,8 +819,7 @@ pub(super) fn refresh_skill_turn_for_iteration(
     let project_targets = project_instruction_target_paths(messages);
     // Carry what the previous guard accumulated this turn (prepare-time facts,
     // critic/observer guidance, resident scoped-instruction directories) before
-    // pushing scoped instructions, so the rebuilt prompt is a superset of the
-    // one the model saw on the previous iteration.
+    // adding new scoped instructions, preserving this runtime context across skill changes.
     new_skill_turn.inherit_turn_state(skill_turn);
     let scoped_project_instructions_ready =
         new_skill_turn.push_scoped_project_instructions(required_project_targets, &project_targets);
@@ -870,11 +865,8 @@ fn inject_required_project_instructions_for_first_iteration(
     ready
 }
 
-/// Overwrite the system message with the guard's current prompt, but only when the
-/// text actually differs: overwriting with the same string is not just useless, it
-/// repeatedly invalidates the upstream prompt cache (e.g. anthropic cache_control
-/// hits, or the driver's internal string hash reuse), silently wasting tokens in
-/// long multi-iteration turns.
+/// Update the system message only when prompt bytes differ, avoiding a redundant
+/// string allocation and replacement on unchanged iterations.
 fn sync_system_message(
     skill_turn: &mut super::super::skill_runtime::SkillTurnGuard,
     messages: &mut [Message],
@@ -1313,14 +1305,12 @@ async fn reclaim_tool_evidence_under_pressure(
     budget
 }
 
-/// Build the LLM client chain used for real requests: an empty chain by default = go straight to `DefaultLlmClient` (zero behavior change);
-/// with `RequestMiddleware` registered, wrap in registration order (retries/short-circuits/auditing take effect on production requests).
+/// Wrap DefaultLlmClient with the configured request middleware in registration order.
 fn build_llm_request_client(app: &App) -> Box<dyn LlmClient> {
     build_llm_client_chain(app.llm_middlewares.clone(), Box::new(DefaultLlmClient))
 }
 
-/// Send one LLM request through the client chain and normalize errors back to `RequestError`:
-/// the default chain passes through unchanged (downcast succeeds; fallback/over-limit classification behavior is unchanged);
+/// Send one LLM request through the client chain and retain typed `RequestError`s;
 /// non-`RequestError` errors produced by custom middleware count as local policy failures and do not trigger model fallback.
 async fn send_llm_request(
     client: &dyn LlmClient,
@@ -1347,8 +1337,8 @@ async fn send_llm_request(
     }
 }
 
-/// Measure only after runtime notes, tool visibility and fixed plan overhead are
-/// present. Character targets guide mechanical work; they never establish fit.
+/// Locate an unchanged projection slice before replacing it with a summary. Prefer
+/// its recorded range, then search by exact messages if earlier notes shifted it.
 fn locate_persistable_context(
     messages: &[Message],
     projection: &PersistableContextProjection,
@@ -2739,7 +2729,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // The RequestMiddleware chain is wired into the real request path (regression guard for the P2 fix):
+    // The RequestMiddleware chain is wired into the real request path:
     // middleware registered in `app.llm_middlewares` must take effect when production requests build the chain
     // (build_llm_request_client) and send (send_llm_request).
     // ------------------------------------------------------------------
@@ -3273,8 +3263,8 @@ mod tests {
 
     #[test]
     fn bytedcli_remote_queries_are_not_project_mutations() {
-        // bytedcli only performs remote API queries/operations, so it must not trip the completion evidence
-        // gate's project-change judgment, nor derive project-instruction targets.
+        // These remote-query fixtures must not imply local project mutations or
+        // project-instruction preflight targets.
         for command in [
             "bytedcli codebase mr get -R \"byteapi/bytedcli\"",
             "bytedcli --json codebase commit list -R \"byteapi/bytedcli\" --revision master",
@@ -3307,13 +3297,8 @@ mod tests {
 
     #[test]
     fn git_readonly_listing_queries_are_not_project_mutations() {
-        // Regression: git read-only query subcommands (tag -l / worktree list / ls-remote / remote -v /
-        // fetch) used to be treated as WriteIntended (git subcommands outside the whitelist were all treated as writes),
-        // tripping the cwd fallback into a project_mutation misjudgment from the project cwd. Within the same turn this resets
-        // successful_post_mutation_verification: e.g. in `git status --short &&
-        // git worktree list && git tag -l`, the verification evidence from git status is reset by the
-        // misjudged worktree list / tag -l afterwards, making the completion evidence gate falsely report "no post-change
-        // verification observed" (session a48935d1 messages 169/170 got Warned for exactly this, forcing the conclusion to carry a bogus unverified warning).
+        // These Git forms are queries for the local-project classifier, including
+        // when chained or preceded by global options; cwd alone must not imply a write.
         for command in [
             "git tag -l \"V2.78*\"",
             "git tag | grep -c foo",
@@ -3360,13 +3345,9 @@ mod tests {
 
     #[test]
     fn unknown_interpreter_readonly_checks_are_not_project_mutations() {
-        // Regression: "unknown programs" such as python3/node/perl -e running read-only checks from the
-        // project cwd used to be misjudged as project_mutation by the cwd fallback, tripping the completion evidence gate
-        // (resetting successful_post_mutation_verification) and forcing the model to repeat its
-        // conclusion (session 9cec82e3's last three turns 277/310/329 all tripped on this).
-        // Fix: only programs "known to write local files" (WriteIntended or a known mutator)
-        // may be judged a project change from the cwd alone; unknown programs require write evidence
-        // (redirection / a resolvable in-project target) and cannot be classified by enumerating interpreter names (impossible to be exhaustive).
+        // Unknown interpreters may run read-only checks, so project cwd alone must
+        // not establish a project mutation. Redirection and known in-place edit
+        // flags supply write intent independently of the interpreter name.
         for command in [
             "python3 -c \"import json; print('ok')\"",
             "node -e \"console.log('ok')\"",

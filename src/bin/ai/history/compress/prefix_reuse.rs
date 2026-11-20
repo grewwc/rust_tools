@@ -262,7 +262,7 @@ fn trimming_turns(chars: usize) -> usize {
 
 pub(super) fn retention_boundaries(messages: &[Message], chars: usize) -> (usize, usize) {
     // Both certified projections fit the entire budget, so the existing
-    // byte-cap escape valve cannot reduce the base protection window.
+    // char-budget escape valve cannot reduce the base protection window.
     let keep = trimming_turns(chars);
     (
         retained_turn_start(messages, keep),

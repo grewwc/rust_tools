@@ -1,8 +1,5 @@
 //! Background process scheduler: epoch management, dispatch scoring,
 //! cooldown / circuit-breaker, and batch selection.
-//!
-//! Extracted from `driver/mod.rs` to establish a clear boundary between
-//! the scheduler and the main run loop (review Finding #1, Phase 2).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -468,12 +465,6 @@ pub(super) fn maybe_emit_scheduler_eval(epoch: u64, session_id: &str) {
     let blocked_rate = blocked as f64 / total as f64;
     let healthy = failing_rate < 0.35 && cooling_rate < 0.20;
 
-    // crate::ai::driver::print::print_tool_note_line(
-    //     "scheduler-eval",
-    //     &format!(
-    //         "epoch={epoch} total={total} failing={failing} cooling={cooling} blocked={blocked}"
-    //     ),
-    // );
     log_scheduler_decision(
         session_id,
         epoch,

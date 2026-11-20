@@ -5,18 +5,18 @@
 //! `aios_kernel::primitives::LlmUsageRing`). This module is the "persistence" side of auditing:
 //! it drains [`LlmUsageRecord`] entries from the kernel ledger into a separate `token_usage`
 //! table, recording:
-//!   - `created_at`     : persistence time (Unix epoch seconds, i.e. when the call ended)
+//!   - `created_at`     : batch persistence time (Unix epoch seconds)
 //!   - `model`          : model name
 //!   - `input_tokens`   : input tokens (prompt_tokens)
 //!   - `output_tokens`  : output tokens (completion_tokens)
 //!   - `total_tokens`   : total tokens (prompt + completion)
 //!
 //! The database defaults to `~/.config/rust_tools/token_usage.db`, in the same directory as
-//! `agent_memory.db`. The connection lives in a global `LazyLock<Mutex<Connection>>` singleton to avoid
-//! contending with the `app.os` kernel lock. Writes are best-effort: failures only log a warning and never block the main flow.
+//! `agent_memory.db`. The connection lives in a global `LazyLock<Option<Mutex<Connection>>>` singleton to avoid
+//! contending with the `app.os` kernel lock. Writes are best-effort: failures log warnings and do not propagate to callers.
 //!
 //! Follows the repo convention: no migrations framework; tables are created with `CREATE TABLE IF NOT EXISTS`.
-//! Supports purging data older than the retention window (`cleanup_old`), auto-triggered periodically from the write path. New
+//! Supports purging data older than the retention window (`cleanup_old_locked`), auto-triggered periodically from the write path. New
 //! columns are migrated incrementally via `ALTER TABLE ADD COLUMN`, ignoring "duplicate column" errors.
 
 use std::path::PathBuf;
@@ -41,8 +41,8 @@ const MICROS_PER_CENT: u64 = 10_000;
 /// Self-insertion counter used to trigger automatic cleanup at a fixed frequency.
 static INSERT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Kernel ledger cursor up to which records have been drained and persisted (kernel `LlmUsageRecord::seq`).
-/// Callers use it to fetch incremental records via the kernel's `llm_usage_drain_since(cursor)`, advancing it after a successful persist.
+/// Kernel ledger cursor (`LlmUsageRecord::seq`) for records already handled.
+/// Advances after a successful persist, an empty drain, or disabled accounting.
 static DRAIN_CURSOR: AtomicU64 = AtomicU64::new(0);
 
 /// Global connection singleton. `None` means initialization failed (e.g. path not writable); subsequent writes are skipped.
@@ -103,7 +103,6 @@ fn open_store() -> Result<Connection, String> {
     for sql in &migrations {
         if let Err(e) = conn.execute_batch(sql) {
             let msg = e.to_string();
-            // SQLite 3.35+ returns 1 "duplicate column name"; older versions return different wording.
             if !msg.to_lowercase().contains("duplicate column") {
                 eprintln!("[TokenUsage] migration warning: {e}");
             }
@@ -137,9 +136,9 @@ pub(crate) fn drain_cursor() -> u64 {
 /// Serializes the whole "drain from the kernel ledger -> persist -> advance the cursor"
 /// sequence performed by `charge_llm_usage_via_kernel`. Without it, two concurrent LLM
 /// callers (e.g. in-process subagents) could both read the same cursor, drain the same
-/// ledger records, and double-insert them into `token_usage`. The cursor only advances
-/// after a successful commit, so a caller that waits on this lock then reads an
-/// already-advanced cursor and fetches only new records.
+/// ledger records, and double-insert them into `token_usage`. The cursor advances
+/// before this lock is released, after a commit or an intentional skipped batch,
+/// so waiting callers fetch only newer records.
 pub(crate) fn drain_lock() -> std::sync::MutexGuard<'static, ()> {
     static DRAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     DRAIN_LOCK.lock().unwrap_or_else(|p| p.into_inner())
@@ -200,7 +199,7 @@ pub(crate) fn persist_drained(records: &[LlmUsageRecord], new_head: u64) {
                 r.cached_prompt_tokens as i64,
             ]) {
                 eprintln!("[TokenUsage] insert failed: {e}");
-                // Roll back the whole batch and keep the drain cursor, so failed records never cause a permanent accounting gap.
+                // Roll back the whole batch and retain the cursor so a later drain can retry.
                 return;
             } else {
                 inserted += 1;
@@ -343,13 +342,14 @@ pub(crate) fn query_by_model(window_secs: Option<u64>) -> Option<Vec<UsageByMode
     Some(rows.filter_map(|r| r.ok()).collect())
 }
 
-/// Query per-day aggregated usage for the last N calendar days (one row per day), newest first.
+/// Aggregate the last `days * 24` hours by local calendar date, newest first.
+/// A zero `days` value disables the time cutoff.
 pub(crate) fn query_daily_breakdown(days: u64) -> Option<Vec<DailyUsage>> {
     query_daily_impl(days, None)
 }
 
 /// Query the most recent N days that have data (one row per day), newest first.
-/// Difference from [`query_daily_breakdown`]: that function truncates to a calendar-day window; this one has no time window,
+/// Difference from [`query_daily_breakdown`]: that function uses an elapsed-time window; this one has no time window,
 /// and just takes the first `limit` days that have data, fitting the "default overview shows the most recent days with data" case.
 pub(crate) fn query_recent_days(limit: usize) -> Option<Vec<DailyUsage>> {
     query_daily_impl(0, Some(limit as i64))
@@ -357,7 +357,7 @@ pub(crate) fn query_recent_days(limit: usize) -> Option<Vec<DailyUsage>> {
 
 /// Internal implementation of per-day usage aggregation.
 ///
-/// - `days > 0`: only count the last `days` calendar days (`cutoff = now - days*86400`).
+/// - `days > 0`: count the last `days * 24` hours (`cutoff = now - days*86400`).
 /// - `limit > 0`: keep only the first `limit` days that have data (`ORDER BY day DESC LIMIT limit`).
 fn query_daily_impl(days: u64, limit: Option<i64>) -> Option<Vec<DailyUsage>> {
     let store = STORE.as_ref()?;
@@ -365,7 +365,7 @@ fn query_daily_impl(days: u64, limit: Option<i64>) -> Option<Vec<DailyUsage>> {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    // days=0 means no time window (cutoff=0); otherwise only the last `days` calendar days are counted.
+    // days=0 disables the cutoff; positive values count the last days*24 hours.
     let cutoff = if days == 0 {
         0i64
     } else {

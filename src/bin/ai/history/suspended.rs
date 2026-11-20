@@ -217,7 +217,6 @@ impl SuspendedSessionStore {
                 SuspendedSessionFile::Many(entries) => all.extend(entries),
             }
         }
-        // 按挂起时间倒序排列（新的在前）。
         all.sort_by(|a, b| b.suspended_at.cmp(&a.suspended_at));
         Ok(all)
     }
@@ -695,7 +694,6 @@ mod tests {
         assert!(ids.contains(&"sess-a"));
         assert!(ids.contains(&"sess-b"));
 
-        // 清空一个终端后，list_all 只剩另一个的条目。
         store.clear_for_terminal_key("tty:/dev/ttys010").unwrap();
         let remaining = store.list_all().unwrap();
         assert_eq!(remaining.len(), 1);

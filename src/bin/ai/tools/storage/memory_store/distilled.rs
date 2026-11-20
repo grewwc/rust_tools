@@ -271,7 +271,7 @@ impl MemoryStore {
         })
     }
 
-    /// Perform an atomic idempotent write of user-visible long-term knowledge. `knowledge_save` retries and duplicate
+    /// Append user-visible long-term knowledge with duplicate checks under the memory lock. `knowledge_save` retries and duplicate
     /// tool calls must not create duplicate JSONL records or repeated RAG upserts; other
     /// MemoryStore callers keep their original semantics.
     pub(crate) fn append_idempotent_knowledge(
@@ -281,8 +281,8 @@ impl MemoryStore {
         let entry = cap_memory_entry(entry);
         self.ensure_memory_file_for_lock()?;
         let key = equivalent_knowledge_key(&entry);
-        // Fingerprint validation and cache-hit checks run under the file lock, ensuring the same view of the
-        // file state as scanning/appending/consolidation, avoiding the race where an external write changed the file but the cache wrongly returned Duplicate.
+        // Check the fingerprint and duplicate cache under the same lock as scanning/appending.
+        // This keeps in-process writers from changing the file between the cache check and append.
         super::super::with_memory_file_lock(&self.path, || {
             let fingerprint = memory_file_fingerprint(&self.path);
             let cache_hit = {

@@ -117,9 +117,9 @@ fn parse_overflow_history(markdown: &str) -> Vec<Message> {
 ///
 /// The Markdown body is only a projection for humans and search tools; parsing
 /// it back from headings alone would lose metadata such as `tool_call_id` /
-/// `tool_calls` / `model` and could be confused by identical headings inside the
-/// body. If raw JSON is found but any block is corrupt, fall back to the legacy
-/// Markdown parser for the whole file instead of silently restoring only part
+/// `tool_calls` / `reasoning_content` and could be confused by identical headings
+/// inside the body. If raw JSON is found but any block is corrupt, fall back to
+/// the legacy Markdown parser for the whole file instead of silently restoring only part
 /// of the messages.
 fn parse_lossless_raw_messages(markdown: &str) -> Option<Vec<Message>> {
     // Envelope text switched from Chinese to English; archives written by older

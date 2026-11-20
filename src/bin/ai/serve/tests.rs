@@ -114,12 +114,8 @@ async fn request_error_history_recovers_display_detail_without_changing_body() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-/// Handler-level coverage for the two session-lifecycle routes: a
-/// missing fork source 404s, a malformed id 400s, and deleting a
-/// missing session still succeeds (idempotent, so client retries after
-/// a dropped connection stay safe). Body shapes are covered by the
-/// client loopback tests in `chat.rs`; store behavior by the
-/// `SessionStore` fork/delete tests.
+/// Isolate handler tests from real session history with a unique temporary
+/// root and no authentication requirement.
 fn lifecycle_test_state() -> super::ServeState {
     let root = std::env::temp_dir().join(format!(
         "a-serve-lifecycle-{}-{}",
@@ -1097,11 +1093,10 @@ async fn file_route_serves_images_and_guards_access() {
         Uuid::new_v4()
     ));
     std::fs::create_dir_all(&base).expect("base");
-    // The workspace root is derived from the process cwd at request time
-    // (it tracks `/cd`), so relative media paths resolve against the cwd
-    // itself; `base` stays outside it so the traversal/outside assertions
-    // keep their meaning. Unique file names keep parallel tests from
-    // colliding on the shared cwd.
+    // This session has no virtual cwd, so its preview root falls back to
+    // the process cwd. Keep `base` outside that root so outside-path assertions
+    // retain their meaning. Unique filenames avoid collisions between tests
+    // sharing the cwd.
     let unique = format!(
         "a-serve-file-route-{}-{}",
         std::process::id(),
@@ -1484,10 +1479,8 @@ fn decoder_passes_input_frames_through() {
     );
 }
 
-/// The reattach stream must close with the same terminal marker the turn
-/// stream uses. Without it a client cannot tell "the turn ended" from "the
-/// connection dropped": it re-attaches every couple of seconds, and each
-/// attempt tears down and rebuilds its progress view.
+/// Read-only followers can tail an owned session without claiming its
+/// write slot.
 #[tokio::test]
 async fn session_events_stream_allows_a_read_only_follower() {
     use super::EventsQuery;
@@ -1507,6 +1500,7 @@ async fn session_events_stream_allows_a_read_only_follower() {
         Path("s-shared".to_string()),
         Query(EventsQuery {
             after: 0,
+            tail: None,
             client: "follower".to_string(),
         }),
     )
@@ -1527,6 +1521,48 @@ async fn session_events_stream_allows_a_read_only_follower() {
     );
 }
 
+/// A reattach can cap the replay to the newest records without replaying the
+/// same backlog again from the live cursor.
+#[tokio::test]
+async fn session_events_stream_honors_a_tail_cap() {
+    use super::EventsQuery;
+    use axum::body::to_bytes;
+    use axum::extract::{Path, Query, State};
+
+    let state = lifecycle_test_state();
+    let log = state.events.begin("s-tail");
+    for text in ["one", "two", "three", "four"] {
+        log.publish("delta", text);
+    }
+    log.finish();
+    let response = stream_session_events(
+        State(state),
+        HeaderMap::new(),
+        Path("s-tail".to_string()),
+        Query(EventsQuery {
+            after: 0,
+            tail: Some(2),
+            client: "test".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(!text.contains("data: one"), "{text}");
+    assert!(!text.contains("data: two"), "{text}");
+    assert!(text.contains("data: three"), "{text}");
+    assert!(text.contains("data: four"), "{text}");
+    assert_eq!(
+        text.matches("event: delta").count(),
+        2,
+        "the tail must not replay the dropped records from the live cursor: {text}"
+    );
+}
+
+/// Reattach streams close with the turn stream's terminal marker so clients
+/// can distinguish completion from a dropped connection and avoid repeatedly
+/// rebuilding their progress view.
 #[tokio::test]
 async fn session_events_stream_ends_with_the_terminal_marker() {
     use super::EventsQuery;
@@ -1546,6 +1582,7 @@ async fn session_events_stream_ends_with_the_terminal_marker() {
         Path("s-finished".to_string()),
         Query(EventsQuery {
             after: 0,
+            tail: None,
             client: "test".to_string(),
         }),
     )
@@ -1560,9 +1597,8 @@ async fn session_events_stream_ends_with_the_terminal_marker() {
         "the terminal marker must come last: {text}"
     );
 
-    // A session with no event log at all: still a terminal marker, not a 404.
-    // A 404 is indistinguishable from a lost stream, which is what made
-    // clients re-attach forever.
+    // A session with no event log still returns a terminal marker so
+    // clients can distinguish completion from a lost stream.
     claim_web_session(&state, "s-missing", "test").expect("claim missing");
     let response = stream_session_events(
         State(state),
@@ -1570,6 +1606,7 @@ async fn session_events_stream_ends_with_the_terminal_marker() {
         Path("s-missing".to_string()),
         Query(EventsQuery {
             after: 0,
+            tail: None,
             client: "test".to_string(),
         }),
     )
@@ -2123,8 +2160,8 @@ async fn confirm_answer_reaches_the_child_stdin_once() {
         http::{HeaderMap, StatusCode},
         response::IntoResponse,
     };
-    // Stand-in turn child: consumes one stdin line and echoes it, which is
-    // what the real child's confirmation reader does.
+    // Echo one stdin line so the test can inspect the answer written by
+    // the daemon.
     let mut child = std::process::Command::new("/bin/sh")
         .arg("-c")
         .arg("read line; echo \"$line\"")
@@ -2232,15 +2269,14 @@ async fn confirm_answer_reaches_the_child_stdin_once() {
     let _ = child.wait();
 }
 
-/// The input question path of `/confirm`: the client's text is written to
-/// the child's stdin verbatim (with a newline), the cancel answer writes
-/// the cancel marker, and an empty text is refused without writing.
+/// The input-question path of `/confirm`: one non-empty line reaches the
+/// child unchanged; blank or multi-line answers leave the question pending.
 #[cfg(unix)]
 #[tokio::test]
 async fn input_answer_reaches_the_child_stdin_once() {
     use axum::{extract::Path, http::HeaderMap, http::StatusCode, response::IntoResponse};
-    // Stand-in turn child: consumes one stdin line and echoes it, which is
-    // what the real child's input reader does.
+    // Echo one stdin line so the test can inspect the answer written by
+    // the daemon.
     let mut child = std::process::Command::new("/bin/sh")
         .arg("-c")
         .arg("read line; echo \"$line\"")
@@ -5443,7 +5479,7 @@ fn stage_turn_images_rejects_unsafe_uploads() {
         let err = stage_turn_images(&dir, &[upload(bad, b"x")]).expect_err("must reject");
         assert!(!err.is_empty(), "empty error for {bad:?}");
     }
-    // Uppercase image extensions are accepted (folders stay lowercase-safe).
+    // Uppercase image extensions are accepted without renaming the file.
     let upper = std::env::temp_dir().join(format!("a-serve-stage-{}", Uuid::new_v4()));
     stage_turn_images(&upper, &[upload("PHOTO.PNG", b"x")]).expect("uppercase ext ok");
     assert!(upper.join("PHOTO.PNG").is_file());
@@ -5514,10 +5550,9 @@ fn transactional_serve_body_frame_decoder_reassembles_pending() {
     let mut decoder = ServeFrameDecoder::default();
     // Split inside the first header: nothing complete yet.
     assert_eq!(decoder.push(&wire[..2]), vec![]);
-    // Header complete (5 + "h" + first byte of "é" = 9 bytes fed): the
-    // delta frame still waits for its tail.
+    // The header is complete, but the delta payload still needs its tail.
     assert_eq!(decoder.push(&wire[2..9]), vec![]);
-    // The rest completes the delta plus all six trailing frames.
+    // The rest completes the delta and every trailing frame.
     assert_eq!(
         decoder.push(&wire[9..]),
         vec![
@@ -5870,12 +5905,10 @@ fn chunked_replace_assembly_survives_interleaved_frames() {
     );
 }
 
-/// Offline pump wiring check with a fake writer (no model key needed):
-/// framed bytes written into the FIFO must surface as SSE events, an
-/// output-complete frame must end the turn while the child is still
-/// "alive", and the pump must stop once the child is reaped and the
-/// pipe is drained. `axum::Event` is opaque, so this asserts event flow
-/// and clean exit, not payload text (covered by the decoder test above).
+/// Exercise FIFO-to-SSE event flow without a model process. The output-complete
+/// frame ends the turn before simulated child reap; the pump then exits
+/// after the child is marked done and the pipe is drained. Payload contents
+/// are covered by the decoder tests.
 #[cfg(unix)]
 #[test]
 fn live_fifo_pump_forwards_frames_and_ends_turn_early() {
@@ -5899,9 +5932,9 @@ fn live_fifo_pump_forwards_frames_and_ends_turn_early() {
             None,
         )
     });
-    // Fake turn child: a delta frame split mid-header and inside a
-    // multibyte character, then an output-complete frame; the writer
-    // closes (EOF) while the child is still "alive".
+    // Fake turn child: split a multibyte delta frame inside its header,
+    // then write the remaining bytes and output-complete frame. The writer
+    // closes while the simulated child is still running.
     let path = fifo.path.clone();
     std::thread::spawn(move || {
         use std::io::Write;

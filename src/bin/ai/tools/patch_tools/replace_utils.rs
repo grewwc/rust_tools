@@ -51,19 +51,19 @@ pub(crate) fn preview_patch_body_line(line: &str) -> String {
     format!("{head:?}...")
 }
 
-/// Inline substring replacement: use `anchor:` to locate the line, then exactly replace
-/// `old:` with `new:` within that line.
+/// Inline substring replacement: use `anchor:` to locate the line, then replace the
+/// unique `old:` match with `new:` within that line.
 ///
 /// Designed for the most common editing scenario — "change a few words inside one long
 /// single-line string" — avoiding a full-line rewrite.
 ///
-/// Safety design (to rule out "executed successfully but replaced the wrong position"):
+/// Matching and validation rules:
 /// - `anchor` locates the line via normalized substring matching (confusable-tolerant), but is
 ///   **only used for locating**;
-/// - `old` uses **exact** substring matching (no normalization) to determine the byte range to
-///   replace, ruling out positional drift;
+/// - `old` first uses exact substring matching; if absent, it tolerates confusable characters
+///   and outer whitespace while retaining the matched original byte range;
 /// - `anchor` must uniquely match one line, otherwise error (to avoid changing the wrong place);
-/// - `old` must appear exactly once in that line, otherwise error (to avoid changing the wrong
+/// - the selected `old` match must be unique in that line, otherwise error (to avoid changing the wrong
 ///   position);
 /// - if `old == new` (identical before/after), report an error as a no-op so it isn't mistaken
 ///   for success;
@@ -214,9 +214,8 @@ pub(crate) fn apply_inline_replace(
         }
     };
 
-    // Exact replacement: byte range [pos, pos+old.len()).
-    // pos is the byte index returned by str::find; old is valid UTF-8, so pos and
-    // pos+old.len() both lie on char boundaries and slicing is safe.
+    // Both exact and tolerant matching return byte boundaries in the original line.
+    // Use match_len because a normalized match can occupy a different number of UTF-8 bytes.
     let replaced_line = format!(
         "{}{}{}",
         &target_line[..pos],

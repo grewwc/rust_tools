@@ -3,10 +3,9 @@ use super::*;
 pub(super) static TASK_PROGRESS_REGISTRY: LazyLock<
     Mutex<SkipMap<String, crate::ai::driver::runtime_ctx::SubagentPhaseSlot>>,
 > = LazyLock::new(|| Mutex::new(SkipMap::default()));
-/// Progress evidence is written infrequently and the files are small, so a single in-process lock
-/// guarantees that snapshots for the same task cannot truncate each other through the shared temp
-/// path; ordering is also compared before persisting, so a late stale snapshot cannot overwrite
-/// newer evidence.
+/// Serialize the compare-and-write sequence for in-process progress snapshots.
+/// A late snapshot must not replace a newer sequence/elapsed pair after both
+/// writers compare against the same stored version.
 pub(super) static TASK_PROGRESS_FILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 pub(crate) fn task_progress_slot(
     task_id: &str,
@@ -130,16 +129,9 @@ pub(crate) fn record_subagent_progress_update(
         }
     }
     if update.1 {
-        // Progress events only refresh the foreground status line (notify_scheduler makes the
-        // scheduling loop tick once to redraw the subagent status line); they must **never**
-        // wake_process a parked parent agent back to Ready. Otherwise a progress event every 15s
-        // would force the parent through a full model-call round trip just to park again, turning
-        // the foreground into busy-wait spinning that burns an inference every ~9s (see the
-        // agent-team fan-out stall). Only three terminal paths genuinely need to wake the parent,
-        // and each triggers independently without relying on this code:
-        //   1. Subtask finished/failed: channel_send + futex_store -> notify_events_completed;
-        //   2. task_wait budget exhausted: wake_expired_task_waits;
-        //   3. task_cancel: flips the cancel futex directly.
+        // Progress updates refresh the status line without waking a parked parent.
+        // Waking for progress alone would spend model rounds just to wait again.
+        // Completion, wait deadlines, and cancellation wake the parent independently.
         crate::ai::driver::notify_scheduler();
     }
 }

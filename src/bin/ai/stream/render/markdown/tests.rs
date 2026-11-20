@@ -182,7 +182,6 @@
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         renderer.bol = true;
 
-        // 新契约：疑似表头行进入缓冲并显示单行占位提示（不 echo 原始 markdown）。
         let first = renderer
             .write_chunk_for_test("| **Header** | Value |\n", false)
             .unwrap();
@@ -284,10 +283,8 @@
 
     #[test]
     fn blockquote_and_rule_render_with_cleaner_structure() {
-        // The thematic break length is `28.min(preview_terminal_width())`, which depends on
-        // the ambient terminal width. Pin COLUMNS (under the shared env lock, like every
-        // sibling test that touches it) so the cap of 28 always applies and the assertion
-        // is independent of the runner's COLUMNS and of concurrent env-mutating tests.
+        // Fix the COLUMNS fallback under the shared environment lock so the
+        // rule-length assertion does not depend on another test's environment changes.
         let _guard = env_guard();
         unsafe { std::env::set_var("COLUMNS", "200") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
@@ -368,9 +365,7 @@
         // Serializes against tests that mutate COLUMNS: a narrow width wraps the
         // fixture lines and breaks the substring-position assertions below.
         let _guard = env_guard();
-        // End-to-end shape of the misaligned replay: outer ```text wrapping
-        // inner fences, each with content, closed by bare fences. Content must
-        // stay between its block's ╭─ / ╰ borders instead of leaking outside.
+        // Content must stay between its block's borders even when info fences are nested.
         let text = concat!(
             "```text\n",
             "```think\n",
@@ -412,10 +407,7 @@
 
     #[test]
     fn unclosed_fence_swallows_rest_like_commonmark() {
-        // A stray ``` that opens a block with no closer keeps everything after
-        // it as code content — the same behavior as CommonMark renderers (e.g.
-        // GitHub). The real fix for such source is the author's; the renderer
-        // stays spec-faithful.
+        // CommonMark leaves an unclosed block open through end of input.
         let text = "done\n\n```\nstill code\n";
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         let out = renderer.write_block_for_test(text, false).unwrap();
@@ -522,9 +514,7 @@
     #[test]
     fn code_block_long_line_wraps_without_gutter_prefix() {
         let _guard = env_guard();
-        // preview_terminal_width 引入 RIGHT_MARGIN=4 与 MIN_PREVIEW_WIDTH=20
-        // 之后，最小有效宽度是 20。这里给 30 列模拟终端宽度，扣除右边距得到
-        // 26 列内容宽度（block_indent="" + gutter 1 列），实际 wrap 阈值约 25。
+        // Pin a terminal width narrower than the input to exercise wrapping without a gutter.
         unsafe { std::env::set_var("COLUMNS", "30") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         let _ = renderer.consume_line("```text", false);
@@ -926,7 +916,6 @@
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         renderer.bol = true;
 
-        // 新契约：表头行返回单行占位提示；分隔行、数据行静默缓冲返回空。
         let header = renderer.consume_line("| Header | Value |", false);
         assert!(
             strip_ansi_for_test(&header).contains("生成表格中"),
@@ -1127,9 +1116,8 @@ make_llm_call_publisher | 一致 | 同一条 on_call complete callback
 
     #[test]
     fn streamed_bare_table_without_leading_pipe_leaves_no_raw_header() {
-        // 复现截图 bug：无前导 `|` 的裸表头在流式路径下，行首（不含 `|` 的 token）会先被
-        // 逐字 echo，等换行识别成表头时若不回收这些物理行，原始 markdown 会泄漏在成品表
-        // 上方。修复后 consume_line 在切 PendingHeader 前用 cursor-up 回收已 echo 的行。
+        // Bare headers are echoed before the first pipe reveals a possible table.
+        // Reclaim that preview before drawing the table so its raw header is not duplicated.
         let _guard = env_guard();
         unsafe { std::env::set_var("COLUMNS", "96") };
 
@@ -1332,7 +1320,6 @@ make_llm_call_publisher | 一致 | 同一条 on_call complete callback
             stream.push_str(&renderer.write_chunk_for_test(chunk, false).unwrap());
         }
 
-        // 新契约：表格行全程静默缓冲，未落定的分块不得出现在屏幕上——不再逐字实时预览。
         let mut grid = VtGrid::new(72);
         grid.feed(&stream);
         let screen = grid.screen();
@@ -1648,8 +1635,7 @@ make_llm_call_publisher | 一致 | 同一条 on_call complete callback
         assert_ne!(super::width::raw_terminal_cols_with(None), 12345);
 
         let _guard = env_guard();
-        // A width no real terminal reports, so "the override was ignored" and
-        // "the local probe happened to match" cannot be confused.
+        // Use a large override value to distinguish it from the usual local width.
         unsafe { std::env::set_var("A_SERVE_TERM_COLS", "9999") };
         // Only a serve turn child reads the variable: a process that merely
         // inherited it keeps its own probe.

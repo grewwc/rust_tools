@@ -1,9 +1,4 @@
-// =============================================================================
-// Tool-Round Checkpoint & Read-Only Classification
-// =============================================================================
-// Extracted from orchestrator.rs during a logic-preserving split.
-// Tool-round checkpoint phase/level computation and read-only shell command classification.
-// =============================================================================
+// Tool-round checkpoint phases and shell-command progress classification.
 
 use super::*;
 
@@ -176,10 +171,10 @@ pub(super) fn tool_round_checkpoint_phase(
     }
 }
 
-/// 判断一条 shell 命令是否为纯只读取证（不改变世界）。解析不确定时返回 false
-/// （保守：宁可把只读误判为可能变更，也不把真实变更误判为只读）。
-/// 判定单个 shell 段是否只读。程序取段首 token 的 basename，`git` 再取真正的
-/// 子命令（跳过 `-C <path>` / `-c k=v` 等全局选项）。
+/// Classify a shell segment by program name and selected Git/Cargo options.
+/// Unknown commands return false. This is a progress heuristic, not a guarantee
+/// that arbitrary arguments, redirections, or subprocesses have no side effects.
+/// The program basename is used; Git's `-C` and `-c` values are skipped.
 pub(super) fn shell_segment_is_read_only(segment: &str) -> bool {
     let mut tokens = segment.split_whitespace();
     let Some(program) = tokens.next() else {
@@ -204,9 +199,8 @@ pub(super) fn shell_segment_is_read_only(segment: &str) -> bool {
         }
         return false;
     }
-    // `cargo check/test/build` 等验证命令不改源码：重复运行同一验证命令（相同源码、
-    // 相同结果）不构成实质进展，不应再被 round_has_mutation 计为 Mutation 而刷新
-    // no-progress 预算（f08171fc 循环正是靠反复 `cargo test` 逃逸升级）。
+    // Cargo verification is classified as read-only for progress accounting even
+    // though it can write build artifacts; repeated checks are not new source mutations.
     if program == "cargo" {
         let (subcommand, fix_flag, check_flag) = parse_cargo_tokens(tokens);
         return match subcommand {
@@ -277,16 +271,11 @@ pub(crate) fn command_is_cargo_verify(command: &str) -> bool {
     false
 }
 
-/// 命令是否为"无信息量探针"：所有实质段都是 `echo`。
+/// Identify commands whose substantive segments all use an `echo` program.
 ///
-/// 背景：`echo "integrate"` / `echo "x"` 这类命令只读、必成功、输出等于回显字面量，
-/// 本身不携带对任务的新信息。但 evidence 指纹按输出内容取哈希，模型每换一个 echo
-/// 字符串就产生一个"新证据"、刷新 no-progress 预算，使进展刹车（soft→ledger→hard）
-/// 永远攒不满窗口——这正是 muse-spark 死循环里 `echo` 反复刷新预算的逃逸通道。
-///
-/// 判据刻意最窄：要求**每个**实质段（跳过 `cd`/`export` 前导）都是裸 `echo`。
-/// 只要含任一非 echo 段（如 `echo hi && cargo check`、`cat f`）即返回 false，
-/// 交回常规证据记账——避免把真实只读探查（`cat version.txt`→内容）误判为无信息。
+/// Ignoring changing echo output keeps literal probes from refreshing the
+/// no-progress budget. Any non-echo segment uses normal evidence accounting.
+/// This only checks program names; it does not inspect echo arguments or expansions.
 pub(crate) fn command_is_low_information_probe(command: &str) -> bool {
     let mut saw_substantive = false;
     for segment in split_shell_segments_for_coarse(command) {
@@ -305,8 +294,8 @@ pub(crate) fn command_is_low_information_probe(command: &str) -> bool {
     saw_substantive
 }
 
-/// `cd` / `export` 只改变工作目录或环境，不写文件系统，本身无副作用。作为前导段
-/// 跳过，避免 `cd X && git status` 这类「游走 + 检查」命令被误判为变更。
+/// Ignore `cd` and `export` segments when classifying substantive command work.
+/// They alter the command's shell context rather than representing task progress.
 pub(super) fn shell_segment_is_nav_or_env(segment: &str) -> bool {
     let mut tokens = segment.split_whitespace();
     let Some(program) = tokens.next() else {
@@ -319,8 +308,8 @@ pub(super) fn shell_segment_is_nav_or_env(segment: &str) -> bool {
 }
 
 pub(crate) fn execute_command_is_read_only(command: &str) -> bool {
-    // 跳过前导 `cd`/`export` 段后，要求**所有**实质段都只读才算只读；任一实质段
-    // 可能变更即视为变更（安全方向：避免把真实改动误判为无进展而过早收口）。
+    // Every substantive segment must pass the read-only heuristic. Unknown work
+    // is treated as a possible mutation so it cannot cause premature convergence.
     let mut saw_substantive = false;
     for segment in split_shell_segments_for_coarse(command) {
         if shell_segment_is_nav_or_env(&segment) {
@@ -334,8 +323,9 @@ pub(crate) fn execute_command_is_read_only(command: &str) -> bool {
     saw_substantive
 }
 
-/// 明确只读的独立程序。刻意排除 `sed`/`awk`（可 `-i` 原地改写）与任何可能带副作用
-/// 的工具，保证「误判方向」永远偏向「可能变更」。
+/// Programs treated as read-only by the progress heuristic.
+/// Argument-level side effects are not checked; `sed` and `awk` are excluded
+/// because common invocations can rewrite files.
 pub(super) const READ_ONLY_COMMAND_PROGRAMS: &[&str] = &[
     "ls", "cat", "grep", "rg", "find", "fd", "head", "tail", "wc", "pwd", "echo", "stat", "tree",
     "file", "which", "type", "du", "df", "ps", "date", "env", "printenv", "sort", "uniq", "cut",
@@ -343,8 +333,9 @@ pub(super) const READ_ONLY_COMMAND_PROGRAMS: &[&str] = &[
     "cmp", "column",
 ];
 
-/// 明确只读的 git 子命令。刻意排除 `branch`/`tag`/`remote`/`config` 等可带副作用的
-/// 子命令（裸列出形式虽只读，但带参可变更；无法区分时按可能变更处理）。
+/// Git subcommands treated as read-only by the progress heuristic.
+/// Common mutating families such as `branch`, `tag`, `remote`, and `config`
+/// are excluded; argument-dependent effects of listed subcommands are not checked.
 pub(super) const GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
     "status",
     "log",

@@ -74,7 +74,7 @@ thread_local! {
         RefCell::new(None);
 }
 
-/// Trie holding all top-level commands starting with "/" and ":", replacing the previous linear starts_with filtering.
+/// Shared top-level command prefixes for "/" and ":" completion.
 static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
     let mut trie = Trie::new();
     for &cmd in &[
@@ -730,7 +730,7 @@ impl CommandCompleter {
             .collect()
     }
 
-    /// Name candidates of all loaded agents (with display).
+    /// Name candidates for primary agents, with descriptions for display.
     fn agent_name_candidates(token: &str) -> Vec<CompletionCandidate> {
         let candidates = if let Ok(guard) = AGENT_NAME_CANDIDATES.read()
             && let Some(candidates) = guard.as_ref()
@@ -877,8 +877,8 @@ impl CommandCompleter {
         candidates
     }
 
-    /// Output-path candidates of `/sessions export|markdown [output]`: the same
-    /// listing as file references, without the `@` prefix those carry.
+    /// Output-path candidates for session export and Markdown commands:
+    /// file-reference candidates with the `@` prefix removed.
     fn output_path_candidates(token: &str) -> Vec<CompletionCandidate> {
         Self::plain_candidates(
             complete_path_fragment(token, None)
@@ -1775,8 +1775,6 @@ impl CommandCompleter {
                         Some("--deep") if words.next().is_none() => &["--fast", "-f"],
                         _ => &[],
                     },
-                    // `/git` is handled by its own branch above (third-token
-                    // checkpoint names), so it has no arm here.
                     "/model" | ":model" => Self::model_subcommands(),
                     // `/effort <TAB>` -> reasoning-effort levels (same set as `/model effort <level>`).
                     "/effort" | ":effort" => Self::model_effort_levels(),
@@ -2052,8 +2050,10 @@ pub(in crate::ai::prompt) fn skill_token_filters(rest: &str) -> Option<Vec<Strin
     }
 }
 
-/// Locate the skill-reference token at end of line. Requires whitespace or line start before `@`, no
-/// whitespace inside the token (same boundary rules as `@file`), and content after `@` recognized by [`skill_token_filters`] as a skill reference.
+/// Locate the skill-reference token at end of line using the same boundary
+/// rules as `@file`: line start, whitespace, an opening bracket, or a quote.
+/// No whitespace is allowed inside the token, and its suffix must be
+/// recognized by [`skill_token_filters`].
 fn find_skill_reference_token(before: &str) -> Option<(usize, &str)> {
     let mut last_at = None;
     for (idx, ch) in before.char_indices() {
@@ -2195,9 +2195,8 @@ fn complete_cd_fragment(fragment: &str) -> Vec<CompletionCandidate> {
 }
 
 /// Directory-only `/cd`/`:cd` candidates as ready-to-insert strings (see
-/// [`complete_cd_fragment`] for the semantics). Runs against the calling
-/// process's own filesystem, which is exactly what the serve `/cd-candidates`
-/// route needs: the serve process's disk and cwd *are* the remote filesystem.
+/// [`complete_cd_fragment`] for the semantics). Uses the calling process's cwd;
+/// callers with a session-specific cwd should use [`cd_fragment_candidates_from`].
 pub(crate) fn cd_fragment_candidates(fragment: &str) -> Vec<String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     cd_fragment_candidates_from(fragment, &cwd)
@@ -3110,8 +3109,6 @@ mod tests {
 
     #[test]
     fn cd_completion_uses_remote_provider_when_installed() {
-        // Shares the process-global completion caches; serialize on the same
-        // lock as the other cache-backed tests.
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -3242,9 +3239,8 @@ mod tests {
 
     #[test]
     fn agent_candidates_fall_back_to_disk_scan_before_cache_is_filled() {
-        // On a fresh start where the driver has not called set_agent_manifests yet (cache is None),
-        // agent-name completion must synchronously scan out candidates, otherwise
-        // `/agent <prefix><Tab>` / `/agents <prefix><Tab>` before the first input of a new session hangs.
+        // Exercise candidate construction without reading or mutating the global
+        // cache; this is the helper used by the disk-scan fallback.
         let manifests = crate::ai::agents::load_all_agents();
         let candidates = CommandCompleter::agent_candidates_from_manifests(&manifests);
         assert!(
@@ -4006,9 +4002,8 @@ mod tests {
 
     #[test]
     fn skill_reference_completion_lists_skills() {
-        // This test compares two independent load_all_skills() snapshots (one inside complete_for_line,
-        // one for expected), while other cases rewrite the global HOME under ENV_LOCK. Without holding
-        // the lock, HOME could flip between the two snapshots and desync the candidate sets, so serialize with them.
+        // Serialize with tests that change HOME so the expected manifest snapshot
+        // and disk-scan completion fallback see the same skill directory.
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -4029,7 +4024,7 @@ mod tests {
 
     #[test]
     fn skill_reference_completion_triggers_on_short_prefix() {
-        // Same as above: comparing candidate count against two snapshots of load_all_skills().len() requires serializing with the HOME-rewriting cases.
+        // Serialize manifest reads with tests that change HOME.
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -4089,7 +4084,7 @@ mod tests {
         }
         let line = format!("@skill{take}");
         let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
-        // The target skill must be among the candidates, and all candidate names must pass smart matching (both unioned splits comply).
+        // The target must remain present, and every result must match the chosen filter.
         assert!(
             candidates
                 .iter()
@@ -4603,7 +4598,7 @@ mod tests {
                 let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
                 assert_eq!(candidates.len(), 1);
                 assert_eq!(candidates[0].replacement, "GPT-6.1-Sol");
-                // Three tokens already exceed the backend/model grammar.
+                // The model fills the final argument, so a fourth token has no candidates.
                 let line = "/use traecli GPT-5.5 ";
                 assert!(
                     CommandCompleter::complete_for_line(line, line.len())

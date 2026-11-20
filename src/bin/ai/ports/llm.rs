@@ -1,9 +1,7 @@
 // =============================================================================
 // LlmClient - LLM request port
 // =============================================================================
-// Previously `request/transport.rs`'s `do_request_messages` was tightly coupled to
-// driver/iteration, leaving no room to insert retry, circuit-breaking, logging, mock,
-// and other middleware. This trait decouples it.
+// Clients can be decorated for retry, logging, or tests without changing callers.
 use std::future::Future;
 use std::pin::Pin;
 

@@ -182,10 +182,9 @@ pub(crate) fn fuzzy_context_candidates(
     candidates
 }
 
-/// Context lines are a locating aid and should not cause a hard failure once the
-/// remove lines are precisely anchored. But to avoid mislocating common remove
-/// lines (such as `}`), fuzz application is allowed only when the candidate is
-/// unique or the remaining context can be scored uniquely.
+/// Removed lines must match at every candidate. Context scores prefer a unique
+/// location; a declared line number may resolve a tie or a near-best score.
+/// Remaining ambiguity is rejected to avoid selecting a repeated removed line.
 pub(crate) fn locate_hunk_with_fuzzy_context(
     orig_lines: &[String],
     hunk: &UnifiedHunk,
@@ -267,11 +266,9 @@ pub(crate) struct BestPartialMatch {
     pub(super) mismatches: Vec<(usize, String, String)>,
 }
 
-/// Finds the start position where the hunk's expected block matches best across
-/// the whole file. Called only on the error path after exact matching failed,
-/// using IgnoreIndent mode to tolerate indentation differences and focus on
-/// content differences. Returns None when no line in the file can match the
-/// expected block — the block does not exist at all.
+/// Scores candidate alignments for mismatch diagnostics after exact matching fails.
+/// Candidates use matching expected lines as anchors, with a cap on the number scored.
+/// The caller selects the match mode. Returns None when no candidate scores a matching line.
 pub(crate) fn find_best_partial_match(
     orig_lines: &[String],
     hunk: &UnifiedHunk,

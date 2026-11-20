@@ -25,7 +25,7 @@ pub(in crate::ai) fn emit_request_diagnostic(args: fmt::Arguments<'_>) -> bool {
 ///
 /// - TTY + foreground: redraws in place with `\r\x1b[2K` and is finally removed
 ///   by `clear()` leaving no trace, avoiding screen spam.
-/// - Non-TTY (pipe / logs) / background subagent: falls back to a plain
+/// - Non-TTY (pipe / logs) with output enabled: falls back to a plain
 ///   `eprintln!`, emitted at most once per change and only when the last output
 ///   was more than a set interval ago, keeping the line count bounded.
 ///
@@ -62,7 +62,7 @@ impl TransientStatusLine {
         })
     }
 
-    /// Updates the current line. On a TTY it redraws in place every time; on a
+    /// Redraws on a TTY unless the side-note composer owns the footer. On a
     /// non-TTY it only prints a line when the text changed and the last output
     /// was more than `MIN_NON_TTY_INTERVAL` ago, preventing log flooding.
     pub(in crate::ai) fn update(&mut self, text: &str) {

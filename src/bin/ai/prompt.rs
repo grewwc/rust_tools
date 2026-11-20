@@ -99,8 +99,8 @@ pub(super) struct PromptEditor {
     /// Background title-change subscription for the current foreground editor.
     session_title_update_subscription: u64,
     session_title_updates: Mutex<Receiver<SessionTitleUpdate>>,
-    /// One-shot notification after the first frame is drawn. Startup background
-    /// initialization can use it to avoid terminal first-screen rendering.
+    /// One-shot notification when the input loop is ready: after the first TUI
+    /// frame or before non-TTY input is read. Startup work can wait on this signal.
     first_render_notifier: Option<Sender<()>>,
     /// Once a DSR query times out, later untagged replies cannot be matched to
     /// new queries. Subsequent prompts stay on the query-free editing screen
@@ -265,7 +265,7 @@ impl PromptEditor {
         self.remote_checkpoint_status_label = label;
     }
 
-    /// Set the notification fired once the next input box's first frame is drawn.
+    /// Set the one-shot notification fired when the next input loop is ready.
     pub(in crate::ai) fn set_first_render_notifier(&mut self, notifier: Sender<()>) {
         self.first_render_notifier = Some(notifier);
     }

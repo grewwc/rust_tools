@@ -55,10 +55,8 @@ fn snapshot_done_chunk_does_not_duplicate_already_streamed_prefix() {
 
 #[test]
 fn reasoning_item_added_done_same_id_keeps_full_payload() {
-    // The gateway re-delivers .added (partial payload) and .done (complete payload) for the same
-    // reasoning resource: same id, different encrypted_content lengths (a real partial payload of
-    // >=256 delivered via .added is captured too). The accumulator must converge by id and keep the
-    // longest payload, otherwise the same resource id appearing twice triggers modelhub 400 (-4003 Duplicate item found).
+    // Updates with the same reasoning id must converge to one item. The terminal
+    // `.done` payload replaces the provisional `.added` payload even when shorter.
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
     let mut app = test_app();

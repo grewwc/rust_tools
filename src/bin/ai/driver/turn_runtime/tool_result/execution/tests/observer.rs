@@ -84,8 +84,8 @@ fn serve_tool_dispatch_closes_thinking_before_tool_frame() {
                 &mut observer,
                 &call,
             );
-            // End-of-stream finalize may have closed the same phase first;
-            // the publisher must swallow that duplicate.
+            // End-of-stream finalize closes the phase again; the publisher must
+            // swallow that duplicate.
             crate::ai::background::publish_serve_frame(
                 crate::ai::background::ServeLiveKind::ThinkingDone,
                 "",

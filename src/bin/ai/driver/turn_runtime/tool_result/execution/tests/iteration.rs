@@ -381,7 +381,7 @@ fn tool_round_serve_commit_gate_conditions() {
             16,
             true,
         ));
-        // Force-final before the retry marker exists still commits.
+        // Force-final before the no-tool retry is consumed still commits.
         assert!(should_commit_tool_round_body_for_serve(
             &Some("body".to_string()),
             true,

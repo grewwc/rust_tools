@@ -217,6 +217,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
       setItem: (key, value) => storage.set(key, value),
     },
     LIVE_STALL_MS: Number(/const LIVE_STALL_MS = (\d+)/.exec(script)[1]),
+    REPLAY_TAIL_EVENTS: Number(/const REPLAY_TAIL_EVENTS = (\d+)/.exec(script)[1]),
     runEpoch: 0, eventFailures: 0, confirmPollSeq: 0, eventStreamEnded: false, eventStreamFailed: false,
     turnRunningPid: 0, endedTurnPid: 0,
     remoteTurnPid: "", remoteTurnAt: 0, REMOTE_RUNNING_TTL_MS: 30000,
@@ -581,6 +582,8 @@ function coldHistoryHarness(savedRates, { phone = true } = {}) {
     assert.ok(from >= 0 && to > from, "missing cold history source: " + start);
     vm.runInContext(script.slice(from, to), context);
   }
+  vm.runInContext(script.slice(script.indexOf("function sideNoteInfo("),
+    script.indexOf("function sideNoteText(")), context);
   return {
     context, root, storage,
     mount(historyPayload, showAll = true) {
@@ -627,6 +630,11 @@ function retainedHistoryHarness(messages, options = {}) {
   c.document.visibilityState = "visible";
   const start = script.indexOf("function historyRowsOf(");
   vm.runInContext(script.slice(start, script.indexOf("// Scrolling to the top of the transcript", start)), c);
+  // `historyRowsOf` calls these runtime-metadata helpers, which live earlier in
+  // the page than the history slice. Evaluate the real source so a future
+  // side-note history fixture keeps exercising the page logic.
+  vm.runInContext(script.slice(script.indexOf("function sideNoteInfo("),
+    script.indexOf("function sideNoteText(")), c);
   return {
     ...h, root, historyCalls,
     visibleRates() {
@@ -645,10 +653,14 @@ function sessionIsolationHarness(messages, phone) {
   const h = retainedHistoryHarness(messages, { phone }), c = h.c;
   const newButton = {}, prompt = { value: "", style: {}, focus() {} }, lookup = c.$;
   Object.assign(c, {
-    $: (id) => id === "newbtn" ? newButton : id === "prompt" ? prompt : lookup(id),
+    $: (id) => id === "newbtn" ? newButton : id === "prompt" ? prompt
+      : id === "sessfilter" ? { value: "" } : lookup(id),
     promptComposing: false, pendingImages: [], MAX_LIVE_TURNS: 4,
     persistDraft() {}, restoreDraft() {}, resetQuestionNavigator() {}, restoreSkillPick() {}, restoreTeamPick() {},
     clearDraft() {}, loadSessions: async () => {}, loadSessionConfig() {},
+    sessionCreationPending: false, sessionViewMode: "list", sessFilter: "",
+    syncSessionCreationControls() {}, syncSessionSearchVisibility() {}, resetSessionSearch() {},
+    loadSessionGroups: async () => {},
     outputFollowSuspended: false, jumpingToBottom: false,
     addMsg(role, text, cls, parent = h.root) {
       const row = c.document.createElement("div"); row.className = "msg " + cls; row.textContent = text;
@@ -661,6 +673,10 @@ function sessionIsolationHarness(messages, phone) {
     ['  $("newbtn").onclick =', '  $("refresh").onclick =']]) {
     vm.runInContext(script.slice(script.indexOf(start), script.indexOf(end, script.indexOf(start))), c);
   }
+  vm.runInContext(script.slice(script.indexOf("async function createSessionInGroup("),
+    script.indexOf("function sessionListProjection(")), c);
+  vm.runInContext(script.slice(script.indexOf("function sessionCreationGroupId("),
+    script.indexOf("function syncSessionCreationControls(")), c);
   return { ...h, newButton, prompt };
 }
 
@@ -1355,7 +1371,7 @@ test("replayed phases paint visible status and separate thinking across tools", 
   assert.equal(h.status(), "Responding… · 0:00");
 });
 
-test("a reattach rebuilds fresh DOM from the retained log on every connection", async () => {
+test("a reattach rebuilds fresh DOM from the recent tail on every connection", async () => {
   const h = replayHarness();
   h.view.remove();
   const urls = [], statuses = [];
@@ -1373,7 +1389,7 @@ test("a reattach rebuilds fresh DOM from the retained log on every connection", 
       return { ok: true, body: { getReader: () => ({ async read() {
         if (!read) {
           read = true;
-          const events = url.includes("/events?after=0&client=") ? 'id: 41\nevent: thinking\ndata: {"text":"restored"}\n\n' : "";
+          const events = url.includes("/events?after=0&tail=200&client=") ? 'id: 41\nevent: thinking\ndata: {"text":"restored"}\n\n' : "";
           return { value: new TextEncoder().encode(events), done: false };
         }
         statuses.push(h.msgs.children.at(-1).children.at(-1).textContent);
@@ -1386,7 +1402,7 @@ test("a reattach rebuilds fresh DOM from the retained log on every connection", 
   await c.attachEvents();
   assert.deepEqual(statuses, ["Thinking… · 0:00", "Thinking… · 0:00"]);
   assert.equal(urls.length, 2);
-  assert.ok(urls.every((url) => url.includes("/events?after=0&client=")), "each connection replays from the start under this client");
+  assert.ok(urls.every((url) => url.includes("/events?after=0&tail=200&client=")), "each connection replays the recent tail under this client");
 });
 
 for (const headersOnly of [true, false]) test(`a stalled event stream reconnects without switching screens (headers=${headersOnly})`, async () => {
@@ -1399,7 +1415,7 @@ for (const headersOnly of [true, false]) test(`a stalled event stream reconnects
   h.fire(2000);
   await h.settle();
   assert.equal(h.requests.length, 2);
-  assert.ok(h.requests.every((r) => r.url.includes("/events?after=0&client=")), "only GET replay is retried, never the user POST");
+  assert.ok(h.requests.every((r) => r.url.includes("/events?after=0&tail=200&client=")), "only GET replay is retried, never the user POST");
   assert.equal(
     new URL(h.requests[0].url).searchParams.get("client"),
     new URL(h.requests[1].url).searchParams.get("client"),

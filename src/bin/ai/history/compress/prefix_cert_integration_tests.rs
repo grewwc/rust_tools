@@ -99,7 +99,7 @@ impl RequestConfig {
                 ContextCompressionStatus::Disabled,
             )
         } else {
-            // An empty B1 cache forces the unchanged full compression pipeline.
+            // An empty prefix reuse cache forces the full compression pipeline.
             compress_messages_for_context_with_outcome(
                 messages,
                 self.max_chars,
@@ -371,7 +371,7 @@ fn prefix_cert_request_policy_change_runs_full_pipeline() {
         let _ = assert_full_fallback(&fixture, changed);
     }
 
-    // A request cached before a cwd change must not return its old B2 policy.
+    // A request cached before a cwd change must not return its old certificate policy.
     fixture.restart();
     let (reused, _) = config.build(&fixture.path);
     assert!(config.certificate(&reused.messages).is_none());

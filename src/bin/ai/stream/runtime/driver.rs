@@ -62,19 +62,11 @@ pub(super) fn collected_tool_call_matches(
     }
 }
 
-/// Detect three consecutive, exactly-identical long fragments at the tail of the text (degenerate repetition loop).
-///
-/// Used for both reasoning_content and visible assistant output: under long tool-chain contexts the model may
-/// verbatim-repeat one sentence in the chain or body; continuing to read only drains the output budget and persists junk.
-/// Compares characters rather than bytes to handle Chinese correctly; the fragment must contain enough real content —
-/// letters, digits or Chinese characters — so separator lines, whitespace or Markdown punctuation are not misjudged as a degeneration loop.
-/// Number of trailing chars forming a degenerate verbatim repetition (one pattern repeated
-/// REASONING_REPEAT_COUNT times at the tail), or None when no such tail exists.
-///
-/// Same detection rules as the former boolean detector, but also returns the repeated tail length so
-/// callers can strip the looped junk before the partial text flows to retry/finalize. Runs on every
-/// stream chunk, so it only keeps a tail large enough to cover the largest candidate fragment,
-/// avoiding a long reasoning that degrades into repeatedly scanning the whole text as context grows.
+/// Return the character count of a verbatim repetition loop at the text tail.
+/// Only fragments with enough alphanumeric content count, excluding separator
+/// lines and Markdown punctuation. The bounded tail scan keeps per-chunk work
+/// independent of the full response length; callers can strip the returned tail
+/// before retrying or finalizing partial output.
 pub(super) fn degenerate_repetition_strip_len(text: &str) -> Option<usize> {
     let mut chars = text
         .chars()
@@ -321,9 +313,9 @@ pub(super) fn unseen_suffix_after_visible_overlap(existing: &str, incoming: &str
 /// `response.output_text.done` snapshot differ only in whitespace, still avoid re-appending the whole already-streamed
 /// snapshot as new content.
 ///
-/// Aligns existing and incoming character by character with "whitespace skippable" to find the incoming prefix already
-/// covered by existing, and returns the remaining incoming tail (original whitespace preserved). If all of incoming's visible
-/// characters are covered, returns `Some("")`; if the visible characters cannot align, returns `None`.
+/// Aligns visible characters to find the incoming prefix already covered by existing.
+/// The returned tail preserves incoming whitespace, including whitespace after the
+/// last matched visible character. Returns `None` when visible characters cannot align.
 pub(super) fn unseen_suffix_whitespace_tolerant(existing: &str, incoming: &str) -> Option<String> {
     let e: Vec<(usize, char)> = existing.char_indices().collect();
     let i: Vec<(usize, char)> = incoming.char_indices().collect();
@@ -367,8 +359,7 @@ pub(super) fn unseen_suffix_whitespace_tolerant(existing: &str, incoming: &str) 
         }
     }
 
-    // existing is exhausted; the bytes after last_matched_ii in incoming are the remaining (uncovered) tail.
-    // If incoming is fully matched too, start_byte == incoming.len(), returning an empty string.
+    // Preserve the original bytes after the last matched visible character.
     let start_byte = i
         .get(last_matched_ii)
         .map(|(b, _)| *b)

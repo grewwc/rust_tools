@@ -62,11 +62,8 @@ pub(super) fn terminal_display_width(s: &str) -> usize {
 
 /// Strip redundant U+FE0F (VS16) from visible text.
 ///
-/// When VS16 follows a base that already renders as 2-column emoji (e.g. ⚡
-/// U+26A1), the selector adds no width and keeping it would make
-/// `render_and_pad_cell` count one column too many, shifting table borders
-/// right. VS16 after a single-width text-presentation base (e.g. ⚠ U+26A0)
-/// is what expands it to 2 columns and must be kept.
+/// Preserve VS16 after a single-width base, where it supplies the extra column
+/// for emoji presentation; drop it after a base already counted as two columns.
 pub(super) fn strip_redundant_vs16(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_base: Option<char> = None;
@@ -223,7 +220,6 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
     let mut bold = false;
     let mut italic = false;
     let mut code = false;
-    // In the new implementation the math state is briefly true only inside the local paired-success branch; it is always false outside the loop.
     let mut math = false;
 
     fn apply_style(out: &mut String, base: &str, bold: bool, italic: bool, code: bool, math: bool) {
@@ -273,9 +269,7 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
     }
 
     while i < bytes.len() {
-        // Backtick `code`: open the style only when the paired closing backtick is found, otherwise emit literal characters.
-        // The old implementation blindly toggled `code = !code`; if the model emitted "use `cargo run to test"
-        // (a single unclosed backtick), the whole rest of the line got the code-block background.
+        // Require a closing backtick so an unfinished code span cannot style the rest of the line.
         if bytes[i] == b'`' && !math {
             if let Some(close) = find_unescaped_delim(s, i + 1, "`") {
                 let content = &s[i + 1..close - 1];
@@ -292,8 +286,7 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
             continue;
         }
 
-        // **bold**: also requires pairing. Models often emit unclosed "**Note:" or "5 ** 3",
-        // which the old implementation bolded for the entire following span.
+        // Require paired bold markers so unfinished emphasis stays literal.
         if !code && !math && bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
             if let Some(close) = find_unescaped_delim(s, i + 2, "**") {
                 let content = &s[i + 2..close - 2];
@@ -944,9 +937,7 @@ mod tests {
         }
         // A result cell containing an arrow: 3 visible chars (→ space x) should be 3 columns, not 4.
         assert_eq!(terminal_display_width("→ x"), 3);
-        // Emoji-presentation symbols (East Asian Wide) render at 2 columns.
-        // Verified against the OS `wcwidth`, which agrees with Unicode
-        // Emoji_Presentation=Yes for these codepoints.
+        // Emoji-presentation symbols (East Asian Wide) count as two columns.
         for ch in ['⚡', '☔', '☕', '✨', '⌚'] {
             assert_eq!(
                 terminal_cell_width(ch),
@@ -956,10 +947,7 @@ mod tests {
         }
         // Emoji-presentation char + digit = 3 columns (emoji 2 + digit 1).
         assert_eq!(terminal_display_width("⚡1"), 3);
-        // Text-presentation symbols stay single-width: warning/sun/cloud/phone/
-        // ballot-box/star/recycle/scissors/plane markers all render with a
-        // text font at 1 column (the OS `wcwidth` returns 1 for each), as do
-        // the Geometric Shapes rating/up-down triangles.
+        // Text-presentation symbols, including geometric triangles, count as one column.
         for ch in [
             '⚠', '☀', '☁', '☎', '☐', '☑', '★', '♻', '✂', '✈', '△', '▲', '▽', '▼',
         ] {
@@ -1127,7 +1115,6 @@ mod tests {
 
     #[test]
     fn standalone_dollar_sign_is_literal() {
-        // "$5 USD" must not be taken as a math start; the output must not trigger the math color \x1b[95m.
         let rendered = render_inline_md("price: $5 USD", "");
         assert!(!rendered.contains("\x1b[95m"));
         assert!(rendered.contains("$5 USD"));

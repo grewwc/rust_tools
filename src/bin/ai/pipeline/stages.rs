@@ -1,10 +1,7 @@
 // =============================================================================
 // stages - Pipeline Stage adapters for pluggable compression / stream filtering
 // =============================================================================
-// Exposes `ports::history::Compressor` and `ports::stream::StreamFilter` as
-// `pipeline::Stage`s so the driver can compose them via `Pipeline` / `HookRegistry` /
-// `Middleware`. Disabled by default (zero behavior change); only effective when explicitly
-// pushed.
+// Adapts compression and filter-chain bookkeeping to the stage interface.
 
 use std::{future::Future, path::PathBuf, pin::Pin};
 
@@ -115,11 +112,9 @@ impl Stage for CompressStage {
     }
 }
 
-/// Stream-filtering stage: inserts a filter chain before/after the ParseStream stage.
-/// Demonstrates "independent stages can plug in filters": actual chunk filtering happens via
-/// per-chunk `chain.apply` inside the `stream::runtime` loop; this Stage only occupies a slot
-/// in the Pipeline, records tags for observation/testing, and allows the chain to be replaced
-/// in the before/after hooks.
+/// Records before/after filter-chain sizes under [`StageKind::Decode`].
+/// [`Self::apply_before`] and [`Self::apply_after`] apply filters explicitly;
+/// stage execution leaves `ctx.messages` unchanged.
 pub struct DecodeStage {
     name: &'static str,
     before: FilterChain,
@@ -156,8 +151,7 @@ impl DecodeStage {
     pub fn after_len(&self) -> usize {
         self.after.len()
     }
-    /// Simulates applying the after chain to a piece of text in a Pipeline context (for
-    /// unit-testing chain behavior).
+    /// Applies the after chain to text outside stage execution.
     pub fn apply_after(&self, text: String) -> Option<String> {
         if self.after.is_empty() {
             Some(text)
@@ -198,8 +192,7 @@ impl Stage for DecodeStage {
         Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>,
     > {
         Box::pin(async move {
-            // Record a filter-chain fingerprint for driver/hook observation (zero behavior change:
-            // does not touch the live ctx.messages stream)
+            // Expose configured chain sizes without modifying context messages.
             if !self.before.is_empty() || !self.after.is_empty() {
                 ctx.tags.push(format!(
                     "decode:before={} after={}",
@@ -239,7 +232,6 @@ mod tests {
 
     #[tokio::test]
     async fn compress_stage_uses_injected_compressor() {
-        // Noop keeps messages unchanged
         let app = leak_app();
         let messages = vec![msg("user", "a"), msg("assistant", "b"), msg("user", "c")];
         let mut ctx = PipelineContext::new(app, messages.clone(), 0);

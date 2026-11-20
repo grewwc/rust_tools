@@ -1,8 +1,5 @@
-// The code-block palette (background, foreground, comment, keyword, string,
-// number, type, dim) is no longer hardcoded here: it lives in the active
-// `theme::current()` under the `code.*` keys, so a theme JSON can restyle
-// syntax highlighting without a recompile. `t()` below is the local alias
-// used throughout this file.
+// Syntax colors come from the active `theme::current()` palette so theme JSON
+// can restyle code blocks without recompiling.
 
 /// The active theme (code-block palette alias).
 fn t() -> &'static crate::ai::theme::Theme {
@@ -94,7 +91,7 @@ fn classify_identifier_color(ident: &str, lang: Option<&str>) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Keyword / type tables (sorted for potential binary_search)
+// Keyword / type tables
 // ---------------------------------------------------------------------------
 
 const PYTHON_KEYWORDS: &[&str] = &[
@@ -391,7 +388,6 @@ mod tests {
     #[test]
     fn test_highlight_comment_hash_not_for_rust() {
         let out = highlight_code_line("# not a comment in rust", Some("rust"));
-        // '#' is not a comment in rust, so the comment color should not appear
         assert!(!out.contains(t().code_comment));
     }
 
@@ -427,8 +423,6 @@ mod tests {
 
     #[test]
     fn test_highlight_number_does_not_swallow_x() {
-        // "10xyz" — old code consumed 'x' as part of the number.
-        // Now only digits/./_ are consumed after a digit start.
         let out = highlight_code_line("10xyz", Some("rust"));
         let number_region = out.split(t().code_foreground).next().unwrap_or("");
         assert!(

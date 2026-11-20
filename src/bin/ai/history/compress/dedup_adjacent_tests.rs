@@ -1,11 +1,7 @@
 //! `tool_call_id`-aware unit tests for `dedup_adjacent`.
 //!
-//! Historical bug: adjacent tool results were deduped when their text/signature
-//! matched, without comparing `tool_call_id`. Parallel tool calls (multiple
-//! tool_calls issued in the same assistant turn) often return identical content,
-//! so the second result was wrongly dropped, breaking the assistant
-//! tool_call <-> tool result pairing. After the fix, dedup only happens when
-//! `tool_call_id` also matches (a true duplicate).
+//! Parallel invocations may return identical text; deduplication must match
+//! `tool_call_id` to preserve assistant/tool pairing.
 
 use super::*;
 
@@ -48,7 +44,6 @@ fn drops_genuine_duplicate_with_same_call_id() {
     assert_eq!(messages[0].tool_call_id.as_deref(), Some("call_A"));
 }
 
-/// Different content should never be deduped (regression protection).
 #[test]
 fn keeps_adjacent_tool_results_with_different_content() {
     let mut messages = vec![

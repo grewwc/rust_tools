@@ -4,7 +4,7 @@
 // worker reports from its own talk inbox, and either re-assigns (rework) or
 // closes the room with a summary. Workers participate with `talk_send` back
 // to the host; absent (inactive) workers are woken by re-executing this
-// binary headlessly (`a --session <worker> "<brief>"`), whose report comes
+// binary headlessly (`a --session <worker> -- "<brief>"`), whose report comes
 // back through the same inbox — the host never parses child-process output.
 //
 // Shared-file rules mirror the talk mailbox and the discuss protocol: the
@@ -247,10 +247,8 @@ fn sanitize_room_for_id(room: &str) -> String {
     }
 }
 
-/// Fresh worker session id embedding the room (visible ownership in
-/// `session_list`, grouped by the `/ss workers` filter). Retried on
-/// collision; the id is only reserved here — the worker's sqlite is created
-/// later by its own woken process, never by us.
+/// Generate an unused worker session id containing the room name. Retry observed
+/// collisions; the worker's woken process later creates its database.
 fn spawn_worker_id(store: &SessionStore, room_part: &str, index: usize) -> Result<String, String> {
     for _ in 0..100 {
         let rand = &uuid::Uuid::new_v4().simple().to_string()[..8];
@@ -263,10 +261,9 @@ fn spawn_worker_id(store: &SessionStore, room_part: &str, index: usize) -> Resul
     Err("failed to generate a fresh worker session id (too many collisions)".to_string())
 }
 
-/// Parse a worker report's STATUS line: the first line starting with
-/// `STATUS:` (case-insensitive) decides (`done` / `failed` / `blocked`);
-/// anything else leaves the assignment untouched so prose-heavy reports
-/// never flip state by accident.
+/// Read the first `STATUS:` line anywhere in a report, matching case-insensitively.
+/// Its first word selects `done`, `failed`, or `blocked`; an unknown value returns
+/// `None`, leaving the assignment unchanged.
 pub(crate) fn parse_worker_status(body: &str) -> Option<AssignmentStatus> {
     for line in body.lines() {
         let trimmed = line.trim();
@@ -489,12 +486,6 @@ pub(crate) fn start_task(
     Ok(StartOutcome { state, deliveries })
 }
 
-/// Detached headless re-execution of this binary for one worker, with
-/// stdout/stderr to a per-round wake log for audit. Records the woken
-/// bookkeeping on success and returns the core note; callers add their own
-/// prefix. `exe_override` is a test hook; production passes `None` to re-exec
-/// itself.
-///
 /// The brief travels behind `--` as one verbatim element, so the woken
 /// child's CLI parser never re-interprets brief bytes (leading dashes,
 /// quotes, `--key=value`) as options: the turn sees exactly this text.
@@ -503,6 +494,9 @@ fn headless_cmd(exe: &Path, worker: &str, brief: &str) -> std::process::Command 
     cmd.arg("--session").arg(worker).arg("--").arg(brief);
     cmd
 }
+/// Re-execute one worker headlessly with a per-round wake log. Record wake
+/// bookkeeping on spawn success and return a note for the caller to label.
+/// `exe_override` supplies a test binary; production re-executes itself.
 fn spawn_headless(
     from_history_file: &Path,
     state: &mut TaskState,
@@ -631,9 +625,8 @@ pub(crate) fn release_dead_wakes(
 }
 
 /// First assignment or rework of one worker's slice. The first dispatch
-/// (a `Pending` assignment) keeps the current round; every re-dispatch after
-/// that is rework and bumps `round`, hard-refused once `round >= max_rounds`
-/// so a failing worker terminates instead of burning model calls.
+/// of a `Pending` assignment keeps the current round. Rework consumes the
+/// room-wide round budget and is refused at `max_rounds` to bound model calls.
 pub(crate) fn assign_task(
     store: &SessionStore,
     from_history_file: &Path,
@@ -716,10 +709,9 @@ pub(crate) fn assign_task(
     }
 }
 
-/// Drain this room's worker reports from the host inbox (requeuing other-room
-/// mail untouched), persist them to the transcript incrementally, and fold
-/// each report's STATUS line into its assignment. Shares the drain/requeue/
-/// incremental-persist semantics of the discuss collect path.
+/// Collect this room's worker reports and apply recognized STATUS values to
+/// matching assignments. Use the discuss collector's best-effort transcript
+/// persistence; assignment-state writes are also best-effort.
 pub(crate) fn collect_task(
     history_file: &Path,
     state: &mut TaskState,
@@ -766,11 +758,7 @@ pub(crate) fn close_task(
     Ok(talk::talk_room_file(from_history_file, &state.room))
 }
 
-/// Read-only progress snapshot of one room: round state, per-worker
-/// assignment/wake/liveness flags, uncollected room mail still in the host
-/// inbox, and the transcript tail. Never drains, wakes, or writes — safe to
-/// call any time, including right after a resume that left a `task_collect`
-/// behind.
+/// Assignment, reply, wake, and liveness details for one task worker.
 #[derive(Debug, Clone)]
 pub(crate) struct WorkerProgress {
     pub worker: String,
@@ -790,6 +778,8 @@ pub(crate) struct StatusEvent {
     pub preview: String,
 }
 
+/// Room progress, including worker details, uncollected inbox mail, and recent
+/// transcript events.
 #[derive(Debug, Clone)]
 pub(crate) struct RoomStatus {
     pub room: String,
@@ -839,9 +829,8 @@ fn preview_body(body: &str) -> String {
     }
 }
 
-/// Build the progress snapshot for `room`. Reads the room state, the room
-/// transcript, and the host inbox (peeked, never drained); the only files
-/// touched are the host's own.
+/// Build progress from host room files and a non-draining inbox peek; worker
+/// liveness comes from the shared session PID registry.
 pub(crate) fn room_status(history_file: &Path, room: &str) -> Result<RoomStatus, String> {
     let state = load_state(history_file, room).map_err(|e| {
         let known = list_rooms(history_file);

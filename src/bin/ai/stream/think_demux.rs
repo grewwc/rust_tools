@@ -58,19 +58,17 @@ impl ContentThinkDemuxer {
         self.mode == Mode::Passthrough
     }
 
-    /// 喂入一个 content chunk，返回 `(reasoning, content)` 两路文本。
-    /// 直通态是零拷贝语义的快速路径。
+    /// Feed a content chunk and return `(reasoning, content)` as owned strings.
+    /// Passthrough callers can bypass this method to avoid copying the chunk.
     pub(super) fn push(&mut self, chunk: &str) -> (String, String) {
         if self.mode == Mode::Passthrough {
             return (String::new(), chunk.to_string());
         }
 
-        // Capture: withhold content into buffer, search for </think>.
         self.buffer.push_str(chunk);
 
-        // 仅搜索新 chunk 与旧缓冲尾部的重叠区域（跨 chunk 标签）。
-        // old buffer 已搜过且未命中，</think> 只可能始于旧缓冲最后 CLOSE_TAG_LEN-1
-        // 字节并跨入新 chunk。
+        // Search the new text plus enough of the old tail to find a close tag
+        // split across chunks; earlier bytes have already been searched.
         let overlap = CLOSE_TAG_LEN - 1;
         let old_len = self.buffer.len() - chunk.len(); // push 前的合法字节边界
         let search_start = old_len.saturating_sub(overlap);

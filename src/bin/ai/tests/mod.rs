@@ -1,10 +1,8 @@
 //! Unit tests for the `ai` module, split into themed submodules.
 //!
-//! `mod tests;` in `src/bin/ai/mod.rs` resolves to this directory. Each submodule
-//! imports the `ai` module's internals via `use super::super::*` (the `tests`
-//! module is a descendant of `ai`, so the ancestor's private items are visible).
-//! Shared test helper functions live here and are reached from submodules via
-//! `use super::*;`.
+//! `mod tests;` in `src/bin/ai/mod.rs` resolves to this directory. Submodules can
+//! access their ancestor `ai` module's private items and the shared helpers here
+//! through `super`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool};

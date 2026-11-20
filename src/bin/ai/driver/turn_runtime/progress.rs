@@ -1,9 +1,4 @@
-// =============================================================================
-// Progress Budget
-// =============================================================================
-// Extracted from orchestrator.rs during a logic-preserving split.
-// Progress-budget helpers: tool-result progress classification, round target extraction and content fingerprinting.
-// =============================================================================
+// Tool-result classification, target tracking, and progress fingerprints.
 
 use super::*;
 
@@ -158,10 +153,8 @@ pub(super) fn extract_round_targets_inner(
 
     let mut targets = Vec::new();
     for tc in tool_calls.iter() {
-        // 写被拒（沙箱越界）的直接文件变更工具：即使在排除变更工具的 probe 通道里，
-        // 也要放行成一个稳定目标。否则「反复写同一个被拒路径」既不算进展、又不进入
-        // target 历史，任何 loop guard 都抓不到（见 write blocked 循环）。归一路径让
-        // 同一被拒目标跨轮稳定命中；成功写入仍按下方正常目标提取处理。
+        // Keep blocked direct writes as stable probe targets even when mutations are
+        // excluded; otherwise repeated attempts at the same denied path escape tracking.
         if is_direct_file_mutation_tool(&tc.function.name) {
             if let Some(ToolResultProgressStatus::BlockedOutsideWorkspace(path)) =
                 results_by_call_id.get(tc.id.as_str())
@@ -195,11 +188,8 @@ pub(super) fn extract_round_targets_inner(
         let Some(map) = args.as_object() else {
             continue;
         };
-        // url/selector：浏览器工具（navigate/get_text/click/type_text 等）读写的是
-        // 「当前页面」这一外部状态。它们不在 MUTATION_TOOL_NAMES 里，参数也不带
-        // path/query，若不纳入目标提取，则 navigate 新 URL、读取新 selector 这类真实
-        // 推进会被 assess_progress 一律判成「无进展」，导致正常的多步浏览 turn 在
-        // ~41 轮被 LowProgressHard 误停。把 url/selector 视作新目标即可正确记进展。
+        // Browser tools identify page state with URLs and selectors rather than paths.
+        // Track those targets so browsing new pages or regions counts as progress.
         for key in ["path", "file_path", "pattern", "query", "url", "selector"] {
             if let Some(s) = map.get(key).and_then(|v| v.as_str()) {
                 let target = if matches!(key, "path" | "file_path") {
@@ -287,9 +277,8 @@ pub(super) fn extract_round_evidence_fingerprints(
             continue;
         }
 
-        // 变更/调度工具由 round_has_mutation 单独判定。`execute_command` only
-        // starts commands now; only a provably read-only start counts as evidence,
-        // so a successful write operation is not recorded as new read output.
+        // Mutation and scheduling tools use separate progress accounting. Command
+        // output counts here only when the read-only heuristic accepts the command.
         let mut read_only_command: Option<String> = None;
         if MUTATION_TOOL_NAMES.contains(&tool_name) {
             if tool_name != "execute_command" {
@@ -304,20 +293,16 @@ pub(super) fn extract_round_evidence_fingerprints(
             if !execute_command_is_read_only(command) {
                 continue;
             }
-            // 无信息量探针（纯 `echo` 回显）不计入新证据：其输出恒等于回显字面量，
-            // 模型每换一个 echo 字符串就产生一个"新证据"刷新 no-progress 预算，使进展
-            // 刹车永远攒不满窗口（muse-spark 死循环的逃逸通道）。判据最窄——只有全 echo
-            // 段才跳过，含任何真实只读段（cat/grep/…）仍照常记账，不误伤正当探查。
+            // Changing an echo literal adds no task evidence; exclude commands made
+            // entirely of echo segments before hashing their output.
             if command_is_low_information_probe(command) {
                 continue;
             }
             read_only_command = Some(command.to_string());
         }
 
-        // cargo 验证命令（check/test/build 等）输出含易变编译进度/时长行：同一源码
-        // 下重复运行的结果只有时长抖动，若按原始文本指纹会被误判为「新证据」而刷新
-        // no-progress 预算（f08171fc 循环逃逸的同款通道）。归一化后再指纹，
-        // 使相同验证结果 → 相同指纹。
+        // Ignore Cargo progress and timing noise so repeated checks with the same
+        // retained result text cannot refresh the evidence budget.
         let fingerprint_text = match read_only_command.as_deref() {
             Some(command) if command_is_cargo_verify(command) => normalize_verify_output(text),
             _ => text.to_string(),
@@ -415,9 +400,9 @@ pub(super) fn extract_round_from_top_read_targets(
     let Some(tool_calls) = last_assistant.tool_calls.as_ref() else {
         return Vec::new();
     };
-    // 只统计「实际读到内容」的从头读：失败或被沙箱拦截的 execute_command/read_file
-    // 没有产出任何内容，不应计入重扫计数——否则被拒的 blocked 命令也会累计，触发
-    // 与真实翻页循环无关的 TargetRescan。与 extract_round_targets 共用同一结果分类。
+    // Failed or blocked calls cannot establish a rescan target. Other outcomes
+    // still use argument-based detection; exact returned coverage is handled
+    // separately by `extract_round_read_windows`.
     let results_by_call_id: FxHashMap<&str, ToolResultProgressStatus> = messages
         .iter()
         .filter(|message| message.role == "tool")
@@ -471,8 +456,8 @@ pub(super) fn extract_round_from_top_read_targets(
     out
 }
 
-/// 提取最近一轮被 write_file/apply_patch 直接修改的目标路径（修改后从头重读
-/// 属于合法验证，应清零重扫计数）。
+/// Path arguments declared by direct mutation calls, used for rescan resets.
+/// Failed calls are included; paths embedded in `apply_patch` text are not parsed.
 pub(super) fn extract_round_mutated_targets(
     messages: &[crate::ai::history::Message],
 ) -> Vec<String> {
@@ -658,11 +643,8 @@ pub(super) fn round_has_direct_mutation_tool(messages: &[crate::ai::history::Mes
     })
 }
 
-/// 稳定的「无进展」软阈值。免费探索区内返回 usize::MAX（永不触发）。
-///
-/// 旧逻辑会在长任务后段从 5 轮递减到 3 / 2 轮，导致任务越复杂、越接近收尾，
-/// 正常的同目标验证越容易被误判。真实 exact/coarse 重复已有独立 detector，因此这里
-/// 保持稳定阈值，不再仅因 turn 变长而提高提示频率。
+/// Keep the no-progress threshold stable after the free-exploration window.
+/// Longer turns do not lower it: exact/coarse repetition has separate detectors.
 pub(super) fn no_progress_soft_threshold(iteration: usize, free_explore_rounds: usize) -> usize {
     if iteration <= free_explore_rounds {
         return usize::MAX;

@@ -109,10 +109,8 @@ static TOOL_EXECUTION_OUTCOMES_CACHE: LazyLock<
 /// broken DB keeps the caller's retry-on-next-preview behavior.
 ///
 /// The revision is checked both before and after the table scan and the result
-/// is cached only when both agree. `history_revision` is monotonically
-/// increasing, so agreement proves the scan saw the latest committed state; a
-/// concurrent append racing the read merely delays caching by one preview and
-/// can never pin stale rows. The returned `Arc` lets repeated previews share one
+/// is cached only when both agree. An observed revision change during the scan
+/// prevents caching that result. The returned `Arc` lets repeated previews share one
 /// immutable snapshot instead of copying the whole table on every cache hit.
 pub(in crate::ai) fn read_tool_execution_outcomes_cached(
     path: &Path,
@@ -640,7 +638,7 @@ pub(super) fn clear_prompt_residency_meta(conn: &Connection) -> io::Result<()> {
     Ok(())
 }
 
-/// An outcome belongs only to the tool message with the same `tool_call_id`. After history replacement, compaction, or branch truncation,
+/// An outcome belongs only to the tool message with the same `tool_call_id`. After history replacement or branch truncation,
 /// side records that have lost their message owner are cleared immediately, so a deleted occurrence's state cannot pollute the retained history.
 pub(super) fn prune_orphan_tool_execution_outcomes(conn: &Connection) -> io::Result<()> {
     conn.execute(
@@ -671,13 +669,9 @@ pub(super) fn drop_ambiguous_tool_execution_outcomes(conn: &Connection) -> io::R
     .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(())
 }
-/// Return the model context layer: the latest replaceable compaction snapshot plus the projection of raw messages after the snapshot watermark.
-/// The read completes within a single SQLite snapshot transaction, so `source_message_id` exactly describes the canonical watermark
-/// that the returned value has consumed; concurrent appends naturally become the tail of the next read instead of being swallowed by the snapshot.
-///
-/// Cross-turn image summary: write the image summary of a user message containing images into the history metadata table.
+/// Store an image digest and its original image paths in `image_digests`.
 /// `message_key` is a stable fingerprint of the message content (see `request::image_message_fingerprint`),
-/// so the summary travels with the message: the next turn loads the history, retrieves it with the same fingerprint, and replaces the old images to avoid resending them.
+/// so later request projections can retrieve the digest without resending the old images.
 pub(in crate::ai) fn upsert_image_digest_sqlite(
     path: &Path,
     message_key: &str,
@@ -707,7 +701,7 @@ pub(in crate::ai) fn upsert_image_digest_sqlite(
 }
 
 /// Cross-turn image summary: read the persisted image summary by the message content fingerprint.
-/// Returns (summary text, original image path); None when the history DB lacks the table or the key (preserving the original-image semantics).
+/// Returns summary text and the original image path list; `None` when the table or key is absent.
 pub(in crate::ai) fn read_image_digest_sqlite(
     path: &Path,
     message_key: &str,

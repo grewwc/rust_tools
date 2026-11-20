@@ -20,12 +20,10 @@ fn degenerate_reasoning_repetition_detects_suffix_after_normal_progress() {
 
 #[test]
 fn degenerate_repetition_catches_visible_content_runaway() {
-    // Reproduces an incident: the model repeated the same phrase verbatim in its **visible output**
-    // until the budget was full, producing a giant junk message on disk and triggering a provider 400
-    // on the next turn. The degenerate guard must also apply to visible assistant text (previously it only covered reasoning_content).
+    // Repeated visible text can exhaust output budgets just like repeated reasoning.
     let phrase = "我再重新读一遍修复区域，以确保我掌握的是当前状态。";
     assert!(has_degenerate_repetition(&phrase.repeat(3)));
-    // Single-character repetition (e.g. the 80,000 repetitions of one character in the incident) must also match.
+    // A single-character loop can also satisfy the minimum fragment length.
     assert!(has_degenerate_repetition(&"再".repeat(64)));
 }
 
@@ -67,7 +65,6 @@ fn degenerate_repetition_strip_len_returns_tail_and_keeps_prefix() {
 
 #[test]
 fn degenerate_repetition_strip_len_cleans_visible_content_runaway() {
-    // The visible-content incident shape: real conclusion first, then the looped junk tail.
     let phrase = "我再重新读一遍修复区域，以确保我掌握的是当前状态。";
     let text = format!("先给出结论。{}", phrase.repeat(3));
     let strip = degenerate_repetition_strip_len(&text).expect("junk tail must be detected");

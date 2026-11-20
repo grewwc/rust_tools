@@ -1,9 +1,6 @@
 // =============================================================================
 // Pipeline - turn pipeline abstraction
 // =============================================================================
-// Splits the former 400+ line flat process in `driver/turn_runtime/orchestrator.rs`
-// into a composable chain of Stages, each depending only on the `ports::*`
-// abstractions so middleware can be inserted easily.
 
 pub(crate) mod context;
 pub(crate) mod hook;

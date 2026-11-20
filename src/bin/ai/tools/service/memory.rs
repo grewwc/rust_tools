@@ -248,20 +248,9 @@ fn maybe_downgrade_long_term_save(
     )
 }
 
-/// Determines whether a memory entry is exempt from the 30-day time-window GC / quota eviction.
-///
-/// The historical implementation only checked `priority == 255`:
-///   - Long-lived assets such as user preferences / coding_guideline / project_memory have priority 210/180,
-///     so they could be GC'd after 30 days without refresh, contradicting the intuition that "long-term memory should be kept".
-///
-/// New policy: priority==255 stays exempt (explicitly declared permanent memories such as safety_rules),
-/// and the following categories are also treated as long-lived assets, exempt regardless of priority:
-///   - Most guideline-like categories (safety/preference/user_preference/coding_guideline/
-///     best_practice/common_sense)
-///   - `project_memory`: project-level facts that the writeback path actively upserts; they must not be evicted by time
-///
-/// Note: self_note is a within-session reflection and is not part of the long-lived asset whitelist;
-/// it is not exempted from GC here either (it naturally falls under normal time-based eviction).
+/// Classify entries exempt from age/quota filtering. Guideline categories and `project_memory`
+/// supplement explicit permanent priority so durable facts do not require timestamp refresh.
+/// `self_note` has no category-based exemption.
 pub(crate) fn is_permanent_memory(entry: &AgentMemoryEntry) -> bool {
     if entry.priority.unwrap_or(100) == 255 {
         return true;
@@ -433,7 +422,7 @@ pub(crate) fn search_memo_candidates_scored(
     let visible: Vec<AgentMemoryEntry> =
         results.into_iter().filter(|e| viewer.can_see(e)).collect();
 
-    // Literal scoring (substring hits) is the only relevance signal.
+    // Score note/tag phrase matches plus expanded-token overlap across note, tags, and source.
     let lexical = |e: &AgentMemoryEntry| -> f64 {
         let mut score = 0.0_f64;
         if e.note.to_lowercase().contains(&qlc) {
@@ -521,7 +510,7 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
             return Ok("No entries".to_string());
         }
 
-        // Separate permanent entries (whitelist) - never deleted by GC
+        // Separate entries exempt from age filtering.
         let mut permanent: Vec<AgentMemoryEntry> = entries
             .iter()
             .filter(|e| is_permanent_memory(e))
@@ -535,11 +524,8 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
         let now = Utc::now();
         let cutoff_secs = max_days * 86400;
 
-        // Summary writeback: the original implementation dropped "expired deletable" entries outright, losing
-        // project-relevant facts that are not on the permanent whitelist (e.g. task_event entries older than 30 days).
-        // Now expired entries are grouped by (category, source), and each group is synthesized into 1 summary
-        // written back to the permanent area — marked with a "sum:" prefix, priority taken from the group's highest,
-        // so it will not be GC'd by the time window later (a summary is always newly created, timestamp = now).
+        // Summarize entries removed by the age filter so their category/source retain a bounded sample.
+        // Summaries get fresh timestamps but keep their categories, so later GC passes may expire them again.
         let mut evicted: Vec<AgentMemoryEntry> = Vec::new();
         deletable.retain(|e| {
             let keep = parse_rfc3339_ts(&e.timestamp)
@@ -557,8 +543,6 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
         };
         let summary_count = summaries.len();
 
-        // Sort deletable entries by priority (ascending) then by timestamp (ascending)
-        // This ensures low priority and old entries are deleted first
         deletable.sort_by(|a, b| {
             let prio_a = a.priority.unwrap_or(100);
             let prio_b = b.priority.unwrap_or(100);
@@ -569,10 +553,9 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
             })
         });
 
-        // Ensure minimum keep count (but never delete permanent entries)
+        // If age filtering leaves too few entries, reload a recent window from the store.
         let total_permanent = permanent.len();
         if deletable.len() + total_permanent + summary_count < min_keep {
-            // Need to restore some entries, but prefer higher priority ones
             let all_entries = store.recent(min_keep)?;
             let new_deletable: Vec<AgentMemoryEntry> = all_entries
                 .iter()
@@ -588,7 +571,6 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
             deletable = new_deletable;
         }
 
-        // Combine permanent + summaries (newly generated) + deletable
         let permanent_count = permanent.len();
         let mut final_entries = permanent;
         final_entries.extend(summaries);
@@ -626,21 +608,15 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
     })
 }
 
-/// Groups expired evicted entries by (category, source) and aggregates each group into one summary.
+/// Group expired entries by (category, source) and concatenate bounded note samples.
+/// Preserve category/source and the first nonempty tag set, add the summary tag, and
+/// raise the group's highest priority to the summary minimum. Fresh timestamps defer
+/// later age filtering; they do not make the summaries permanent.
 ///
-/// Summary design:
-///   - category keeps the original category (so it lands in the same recall bucket as the original entries)
-///   - tags take the first merged entry's tags plus "summary"
-///   - source keeps the original source
-///   - priority = the group's highest priority (preserving the original importance signal)
-///   - note = "[summary of N entries from <ts1> to <ts2>] " + truncated representative content
-///   - timestamp = current time (puts it in the "newest region" so it is not immediately GC'd by the time window again)
-///
-/// No external model calls — local concatenation only, to keep the GC path from blocking.
+/// Use local concatenation so GC never waits for an external model.
 fn build_gc_summaries(evicted: &[AgentMemoryEntry], max_days: i64) -> Vec<AgentMemoryEntry> {
     use std::collections::BTreeMap;
 
-    // (category, source) -> Vec<&entry>
     let mut groups: BTreeMap<(String, Option<String>), Vec<&AgentMemoryEntry>> = BTreeMap::new();
     for e in evicted {
         groups
@@ -656,7 +632,6 @@ fn build_gc_summaries(evicted: &[AgentMemoryEntry], max_days: i64) -> Vec<AgentM
             continue;
         }
         let count = items.len();
-        // Time range
         let mut ts_min = items[0].timestamp.as_str();
         let mut ts_max = items[0].timestamp.as_str();
         let mut max_prio: u8 = 0;
@@ -677,7 +652,6 @@ fn build_gc_summaries(evicted: &[AgentMemoryEntry], max_days: i64) -> Vec<AgentM
             }
         }
 
-        // Summary body: take the first 80 chars of each note, up to 5 entries, joined with "; "
         const PER_ITEM_CHARS: usize = 80;
         const MAX_SAMPLES: usize = 5;
         let mut samples: Vec<String> = Vec::new();
@@ -754,8 +728,7 @@ pub(crate) fn merge_subagent_whitelist(
         if !is_permanent_memory(&entry) {
             continue;
         }
-        // Reset the owner pid/pgid: the sub-agent may have already exited,
-        // and re-tagging the owner in the main store is meaningless; leaving None is fine.
+        // Clear child ownership so merged long-term entries remain visible after the child exits.
         let mut e = entry;
         e.owner_pid = None;
         e.owner_pgid = None;
@@ -793,8 +766,7 @@ pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
         }
         let total_before = entries.len();
 
-        // Step 1: strict dedup — entries whose note + category + tags + source are all identical:
-        // keep only the newest by timestamp (write back after reverse traversal).
+        // Deduplicate by note, category, source, and sorted tags, retaining the last stored occurrence.
         let mut seen: SkipSet<(String, String, Vec<String>, Option<String>)> = SkipSet::default();
         let mut deduped: Vec<AgentMemoryEntry> = Vec::with_capacity(entries.len());
         for e in entries.into_iter().rev() {
@@ -815,8 +787,6 @@ pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
         deduped.reverse();
         let exact_dedup_removed = total_before.saturating_sub(deduped.len());
 
-        // Step 2: semantic (cosine) dedup was removed together with the embedding
-        // chain; only strict exact dedup remains.
         let final_entries = deduped;
 
         write_memory_entries(&path, &final_entries)?;
@@ -1037,8 +1007,8 @@ pub(crate) fn update_memo_entry(
     })
 }
 
-/// Deletes one memo entry: matches by id first; if the entry has no id (legacy data),
-/// falls back to exact (timestamp, note) matching. Returns a description of the deletion result.
+/// Delete entries matching the target id; without an id (legacy data), remove only the
+/// first exact (timestamp, note) match. Returns a description of the deletion result.
 pub(crate) fn delete_memo_entry(target: &AgentMemoryEntry) -> Result<String, String> {
     let store = MemoryStore::from_env_or_config();
     let path = store.path().to_path_buf();
@@ -1080,7 +1050,7 @@ pub(crate) fn delete_memo_entry(target: &AgentMemoryEntry) -> Result<String, Str
     })
 }
 
-/// User explicitly saves a memory into the global memory store
+/// Prepare and save a scoped memory entry with a learning-quality assessment.
 pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
     let prepared = prepare_memory_save_entry(
         args,
@@ -1277,7 +1247,6 @@ mod tests {
 
         let list_after = execute_memory_list_json(&serde_json::json!({ "limit": 10 })).unwrap();
         let after: serde_json::Value = serde_json::from_str(&list_after).unwrap();
-        // id unchanged; content replaced; entry count unchanged.
         assert_eq!(after.as_array().unwrap().len(), 1);
         assert_eq!(after[0]["id"].as_str().unwrap(), id);
         assert_eq!(

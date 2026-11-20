@@ -103,8 +103,12 @@ pub(in crate::ai::driver::turn_runtime) const DEGENERATE_REPETITION_RETRY_NOTE_P
     "tool_followup:degenerate_repetition\n";
 pub(in crate::ai::driver::turn_runtime) const PROVIDER_CONTROL_LEAK_RETRY_NOTE_PREFIX: &str =
     "tool_followup:provider_control_leak\n";
+pub(in crate::ai::driver::turn_runtime) const CORRUPTED_REASONING_RETRY_NOTE_PREFIX: &str =
+    "tool_followup:corrupted_reasoning\n";
 pub(in crate::ai::driver::turn_runtime) const DEGENERATE_REPETITION_FINISH_REASON: &str =
     "degenerate_repetition";
+pub(in crate::ai::driver::turn_runtime) const CORRUPTED_REASONING_FINISH_REASON: &str =
+    "corrupted_reasoning";
 
 /// After detecting that this round's response was truncated or could not be fully
 /// validated, keep the visible text produced so far (if any) as partial progress and
@@ -113,6 +117,10 @@ pub(in crate::ai::driver::turn_runtime) const DEGENERATE_REPETITION_FINISH_REASO
 ///
 /// Idempotent: the same hint is never injected twice, so consecutive truncations do not
 /// stack duplicate notes.
+///
+/// A corrupted-reasoning stop is different: it injects an in-memory
+/// runtime-synthesized user `continue` turn so the next request regenerates
+/// automatically without persisting the discarded reasoning.
 pub(in crate::ai::driver::turn_runtime) fn append_truncation_retry_note(
     stream_result: &crate::ai::types::StreamResult,
     messages: &mut Vec<Message>,
@@ -128,6 +136,10 @@ pub(in crate::ai::driver::turn_runtime) fn append_truncation_retry_note(
         .finish_reason_value
         .as_deref()
         .is_some_and(|reason| reason == crate::ai::stream::PROVIDER_CONTROL_LEAK_FINISH_REASON);
+    let corrupted_reasoning = stream_result
+        .finish_reason_value
+        .as_deref()
+        .is_some_and(|reason| reason == CORRUPTED_REASONING_FINISH_REASON);
 
     // Keep the visible text the model already produced as "partial progress" so a retry
     // does not lose all context. Under truncation this text is usually a half-finished
@@ -163,6 +175,7 @@ pub(in crate::ai::driver::turn_runtime) fn append_truncation_retry_note(
                 content.starts_with(TRUNCATION_RETRY_NOTE_PREFIX)
                     || content.starts_with(DEGENERATE_REPETITION_RETRY_NOTE_PREFIX)
                     || content.starts_with(PROVIDER_CONTROL_LEAK_RETRY_NOTE_PREFIX)
+                    || content.starts_with(CORRUPTED_REASONING_RETRY_NOTE_PREFIX)
             }))
     });
 
@@ -178,6 +191,22 @@ pub(in crate::ai::driver::turn_runtime) fn append_truncation_retry_note(
             tool_call_id: None,
             reasoning_content: None,
         });
+        return;
+    }
+
+    if corrupted_reasoning {
+        // A runtime-synthesized user turn is the continuation signal the model already
+        // understands. The corrupted generation was never persisted, so "continue"
+        // asks it to regenerate from the last valid state without replaying garbage.
+        let continuation_pending = messages.last().is_some_and(|message| {
+            crate::ai::history::is_runtime_synthetic_user_message(message)
+                && message.content.as_str() == Some("continue")
+        });
+        if !continuation_pending {
+            messages.push(crate::ai::history::runtime_synthetic_user_message(
+                Value::String("continue".to_string()),
+            ));
+        }
         return;
     }
 

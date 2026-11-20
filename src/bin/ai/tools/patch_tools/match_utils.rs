@@ -67,14 +67,12 @@ pub(crate) fn strip_line_number_prefix(s: &str) -> &str {
 
 /// Anchored line-number-prefix stripping: using `actual` (the file's real line, which never
 /// contains a line-number column) as ground truth, decides whether `expected` (a patch line,
-/// possibly with a model-miscopied line-number column) is **exactly equal** to `actual` after
-/// removing the "digit column". If so, returns the de-columned content; otherwise returns
+/// possibly with a model-miscopied line-number column) matches `actual` after removing the
+/// "digit column", allowing trailing-whitespace differences. If so, returns the de-columned content; otherwise returns
 /// `expected` unchanged.
 ///
-/// Compared with enumerating separators, this is separator-agnostic (`\t` `|` `:` space `.`
-/// `)` are all compatible), and because it requires "the remainder to exactly equal the real
-/// line", it can almost never wrongly hit code lines that genuinely start with digits — even if
-/// it happens to, lines_match's multi-match (ambiguity) detection intercepts it.
+/// Comparing with the current file line avoids guessing separator shapes while retaining
+/// its indentation. This helper does not resolve ambiguity between matching file lines.
 pub(crate) fn strip_number_prefix_anchored<'a>(expected: &'a str, actual: &str) -> &'a str {
     // expected must start with "optional whitespace + digits", otherwise it cannot be
     // "line-number column + actual".
@@ -138,7 +136,7 @@ pub(crate) fn normalize_confusable_char(c: char) -> char {
 ///
 /// Only used for **locating decisions** in patch matching (lines_match); never participates in
 /// constructing output content.
-/// All handled characters are purely typographic differences that don't affect semantics:
+/// These locating tolerances do not imply semantic equivalence:
 /// - dash family (— – ― etc.) -> '-'
 /// - smart quotes (" " ' ' ‛ ‟) -> '"' / "'"
 /// - non-breaking spaces (NBSP U+00A0, NNBSP U+202F, etc.) -> regular space
@@ -236,8 +234,6 @@ pub(crate) fn lines_match_exact(actual: &str, expected: &str, mode: MatchMode) -
 /// - Context lines output actual (the original file content)
 /// - Remove lines are dropped after matching
 /// - Add lines use the patch content directly
-/// So when normalized matching succeeds, the file still receives the original file's Unicode
-/// characters — content is never "replaced with the wrong thing".
 pub(crate) fn lines_match(actual: &str, expected: &str, mode: MatchMode) -> bool {
     if lines_match_exact(actual, expected, mode) {
         return true;
@@ -279,7 +275,7 @@ pub(crate) fn hunk_expected_lines(hunk: &UnifiedHunk) -> Vec<&str> {
         .collect()
 }
 
-/// Counts, across the whole file, the positions (0-based line numbers) where the hunk's
+/// Collects, across the whole file, the positions (0-based line numbers) where the hunk's
 /// context+remove block can match.
 /// Used to detect "multiple matches" ambiguity, avoiding silently editing the wrong place.
 pub(crate) fn all_hunk_match_positions(

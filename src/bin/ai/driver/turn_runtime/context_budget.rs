@@ -459,12 +459,9 @@ fn apply_history_context_budget(
         ..ContextBudgetReport::default()
     };
 
-    // Size-gated tool-result offload is unconditional (independent of the
-    // soft target / allow_lossy): single results beyond the model's inline
-    // cap no longer occupy every request just because total context is under
-    // pressure. Under budget pressure, preserve only tool groups from the
-    // current user turn; older "recent" groups must not keep a multi-megabyte
-    // request alive after a new user message starts another turn.
+    // Run size-gated offload even below the soft target. When history exceeds
+    // the target, preserve only current-turn tool groups so older recent groups
+    // cannot keep an oversized request alive.
     let overflow_dir = {
         let store = crate::ai::history::SessionStore::new(app.config.history_file.as_path());
         store.session_assets_dir(&app.session_id)
@@ -520,11 +517,9 @@ fn apply_history_context_budget(
         }
     }
 
-    // Representative/index omission only runs under real token pressure.
-    // Without pressure the projection keeps its existing recoverable body
-    // text and only gains additive archive recall; recall excerpts are
-    // bounded and cannot push a fitting request over budget by themselves.
-    // Measure the live projection (the entry scan predates the spill pass).
+    // Representative omission requires lossy permission and size above the target.
+    // Recall uses remaining character headroom; measure live size because the
+    // entry scan predates spilling.
     let live_chars = crate::ai::history::messages_total_chars_pub(messages);
     let memory_projection = super::context_memory::apply_query_aware_memory_projection_with_context(
         messages,
@@ -565,12 +560,8 @@ fn apply_history_context_budget(
             .as_deref(),
     );
     *messages = compressed;
-    // mid_turn_compress inserts the compaction state note after the last user message (which is
-    // the current round's active region in tool-loop scenarios). But the request boundary requires
-    // the current user message to be the last item in the sent sequence, so here we move that note
-    // before the current user message: this keeps the user-last contract while still letting the
-    // model see "this round uses a compressed projection; do not mistake recoverable evidence for
-    // a full context" (see CONTEXT_COMPACTION_STATE).
+    // Keep the compaction note before the live user message without reordering
+    // the current turn's assistant/tool traffic.
     reposition_context_compaction_state_before_last_user(messages);
     report.after_chars = after_chars;
     report.changed = report.changed || after_chars < after_prepass_chars;
@@ -623,8 +614,8 @@ fn active_plan_text(app: &App) -> String {
 }
 
 /// Identity of everything before the plan pair's insertion point. Changes
-/// confined to the current-turn tail (e.g. spilling older tool groups) keep it,
-/// so they do not by themselves justify re-rendering the pair.
+/// confined to the current-turn tail keep it, so they do not by themselves
+/// justify re-rendering the pair.
 fn history_prefix_fingerprint(messages: &[Message]) -> Option<u64> {
     last_real_user_index(messages)
         .map(|user| super::context_metrics::projection_fingerprint(&messages[..user]))
@@ -744,11 +735,8 @@ impl ActivePlanProjection {
     }
 }
 
-/// mid_turn_compress inserts the `CONTEXT_COMPACTION_STATE` note after the last user
-/// message. The request boundary requires the current user message to be the last item in the
-/// sent sequence, so here we move the note **before** the last user message: this keeps the
-/// user-last contract while preserving the note's visibility to the model.
-/// The note content is moved verbatim, not rewritten (the single source stays in the compress module).
+/// Move the compaction-state note before the last real user message, keeping
+/// current-turn assistant/tool order intact and moving the note verbatim.
 fn reposition_context_compaction_state_before_last_user(messages: &mut Vec<Message>) {
     let Some(note_index) = messages
         .iter()
@@ -757,17 +745,12 @@ fn reposition_context_compaction_state_before_last_user(messages: &mut Vec<Messa
         return;
     };
     let Some(last_user_index) = last_real_user_index(messages) else {
-        // No user message: the request-boundary contract does not apply, leave as is.
         return;
     };
-    // Already before the last user message, no move needed.
     if note_index < last_user_index {
         return;
     }
-    // Move the note from `note_index` (after the last user message) to `last_user_index`
-    // with a single slice rotation (intermediate elements shift back by one). This is
-    // equivalent to `remove(note_index)` + `insert(last_user_index, note)` but performs
-    // one O(span) in-place shift instead of two O(n) shifts with reallocation.
+    // Rotate the span once instead of shifting the tail for both remove and insert.
     messages[last_user_index..=note_index].rotate_right(1);
 }
 
@@ -910,8 +893,8 @@ fn fill_segment_summary(report: &mut ContextBudgetReport, messages: &[Message]) 
 }
 
 fn classify_segments(messages: &[Message]) -> Vec<ContextSegment> {
-    // Synthetic user messages do not constitute a turn boundary: real user messages must keep
-    // Critical/Never protection, otherwise they would be downgraded to RecentUser and become offloadable.
+    // Synthetic user messages do not start a turn: protect the latest real user
+    // message rather than downgrading it to an offloadable RecentUser segment.
     let last_user_index = last_real_user_index(messages);
     let precision_tool_ids = precision_tool_call_ids(messages);
     messages
@@ -1034,10 +1017,8 @@ fn protected_messages_preserved(messages: &[Message], protected: &[ProtectedMess
     if protected.is_empty() {
         return true;
     }
-    // Protected messages (all `system` messages plus the last real user message) keep
-    // their relative positions across mid-turn compression (it truncates/folds in place
-    // and never reorders), so compare by position with borrowed references. This avoids
-    // a second `collect_protected_messages` deep clone of the system prompt.
+    // Compare protected messages in their preserved relative order with borrowed
+    // references, avoiding a second deep clone of the system prompt.
     let last_user_index = last_real_user_index(messages);
     let mut expected = protected.iter();
     for (index, message) in messages.iter().enumerate() {
@@ -1409,14 +1390,8 @@ mod tests {
             ..budget
         };
         let report = apply_measured_context_budget(&app, pressured, &mut messages);
-        // The token gate opened: the target shrank below the current size even
-        // though neither character size nor model name changed. But the
-        // mid-turn lossy pipeline (dedupe, structured tool trimming, group
-        // folding, reasoning cleanup) only acts on tool/agent traffic — a
-        // plain narration can only be shrunk by a cross-turn LLM summary, and
-        // the test env injects no model. Correct contract: the gate opens, the
-        // attempt finds nothing compressible, and the projection rolls back
-        // byte-for-byte (no change flags, content intact).
+        // Token pressure lowers the target even with the same character size and model;
+        // opening the gate does not guarantee that this projection can be reduced.
         assert!(report.target_chars < report.before_chars);
         assert_eq!(report.after_chars, report.before_chars);
         assert!(!report.changed);
@@ -1641,9 +1616,8 @@ mod tests {
 
         // The compaction state note is only injected when actual compression took effect.
         assert!(report.changed);
-        // The current user message is still the last item in the sent sequence (request-boundary contract).
+        // This fixture has no current-turn tool traffic, so the user remains last.
         assert_eq!(messages.last().unwrap(), &current_user);
-        // The compaction state note stays visible to the model and is moved before the last user message.
         let note_index = messages
             .iter()
             .position(crate::ai::history::compress::is_context_compaction_state)
@@ -2103,9 +2077,8 @@ mod tests {
         assert!(!tool_content.contains("tool_output_lines:"));
     }
 
-    /// Regression covering both paths: tool-dense history that already meets the budget after
-    /// regular compression never triggers the lossy LLM summary; only conversation-dense history
-    /// that still exceeds the threshold after compression calls the LLM and effectively shrinks the context.
+    /// Compare tool-dense history that fits the measured input allowance after
+    /// compression with conversation-dense history that still needs an LLM summary.
     #[tokio::test]
     async fn llm_summary_runs_only_when_post_compression_context_still_exceeds_threshold() {
         use std::io::{Read, Write};
@@ -2123,7 +2096,6 @@ mod tests {
                 match listener.accept() {
                     Ok((mut sock, _)) => {
                         let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-                        // Read the request headers
                         let mut buf = [0u8; 8192];
                         let mut header = Vec::new();
                         loop {
@@ -2136,7 +2108,6 @@ mod tests {
                                 break;
                             }
                         }
-                        // Read the full body (per Content-Length)
                         let head = String::from_utf8_lossy(&header).to_string();
                         let len: usize = head
                             .lines()
@@ -2186,8 +2157,7 @@ mod tests {
             }
         });
 
-        // 2. app: endpoint points at the mock; history_max_chars is pinned here so
-        // this test stays deterministic regardless of future production-default changes
+        // Pin the history limit so production-default changes do not alter this fixture.
         let history_file =
             std::env::temp_dir().join(format!("llm_summary_repro_{}.jsonl", uuid::Uuid::new_v4()));
         let mut app = test_app(history_file);
@@ -2195,7 +2165,7 @@ mod tests {
         app.config.history_max_chars = 90_000;
         app.session_id = format!("llm_summary_repro_{}", uuid::Uuid::new_v4());
 
-        // 3. Tool-dense, very long session: regular compression can safely stay under the threshold, so no lossy summary should run.
+        // Tool-heavy history should fit the measured input allowance after mechanical compression.
         let mut messages = vec![msg("system", "你是测试助手，请遵循项目规则。")];
         for turn in 0..4 {
             messages.push(msg("user", format!("第 {turn} 轮：请帮我检查代码")));
@@ -2217,7 +2187,7 @@ mod tests {
             "测试会话应远超 pre-request LLM 阈值，实际 {before}"
         );
 
-        // 4. First verify the gate stays closed once regular compression meets the threshold, preserving exact context.
+        // A fitting normalized request leaves the summary allowance unused.
         let mut work = messages.clone();
         let report = apply_pre_request_context_budget(&app, &app.current_model, &mut work);
         let llm_threshold = crate::ai::driver::turn_runtime::pre_request_llm_summary_threshold(
@@ -2244,9 +2214,8 @@ mod tests {
             llm_threshold
         );
 
-        // 5. Many small old user messages cannot be silently dropped by regular compression; when
-        //    the context still exceeds the threshold after compression, the LLM summary fallback
-        //    must actually run. Each segment stays below the user-original offload threshold to cover this path.
+        // Small old user messages avoid the user-original offload path, leaving
+        // a normalized request above its input allowance and opening the summary gate.
         let mut summary_work = vec![msg("system", "你是测试助手，请遵循项目规则。")];
         for turn in 0..440 {
             summary_work.push(msg(
@@ -2322,20 +2291,15 @@ mod tests {
 
     #[test]
     fn spill_keeps_changed_flag_under_lossy_pressure() {
-        // The unconditional size-gated spill runs before any lossy work and must
-        // keep `changed = true` even when the lossy path expands afterwards:
-        // decision logs rely on it to reflect that the projection was actually
-        // modified. Regression for the
-        // rollback branch overwriting the spill flag with the lossless/memory
-        // flags.
+        // Spilling is a committed projection change even if a later lossy candidate
+        // expands and is rolled back; decision logs must retain its changed flag.
         let history_file =
             std::env::temp_dir().join(format!("cb-spill-changed-{}.sqlite", uuid::Uuid::new_v4()));
         let app = test_app(history_file);
         let mut messages = vec![
             msg("system", "system prompt"),
-            // An oversized complete tool group outside the protected recent
-            // window: the unconditional spill must archive it regardless of
-            // budget, while the four recent groups stay raw.
+            // The first old tool group exceeds the inline cap; the other old groups
+            // are small enough to stay raw during the initial spill pass.
             assistant_tool_call("g1", "read_file"),
             tool_result("g1", &"y".repeat(70_000)),
             assistant_tool_call("g2", "read_file"),

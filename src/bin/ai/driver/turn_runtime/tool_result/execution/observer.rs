@@ -57,9 +57,6 @@ pub(in crate::ai::driver::turn_runtime) struct TerminalToolObserver<'a> {
     rendered_inline_tool_id: Option<String>,
 }
 
-// A typical terminal QR code is about 30–50 lines; keeping 64 lines shows one-shot
-// visual output such as QR-login in full while still bounding unbounded streamed output
-// such as build logs.
 impl<'a> TerminalToolObserver<'a> {
     fn new(app: &'a App) -> Self {
         Self {
@@ -119,9 +116,8 @@ impl<'a> TerminalToolObserver<'a> {
         self.command_line_pending = command_line_pending;
         self.active_stream_tool_call_id = Some(tool_call.id.clone());
         // `pty: true` is the caller's explicit request for interactive-terminal capability.
-        // Forward this path's output in full so menus, confirmation prompts, and login
-        // guides stay visible; ordinary piped commands remain silent so logs never flood
-        // the terminal.
+        // Forward this path's output through the fold window so menus, confirmation
+        // prompts, and login guides stay visible; ordinary piped logs remain hidden.
         self.render_full_pty_stream = execute_command_uses_pseudo_terminal(tool_call);
         // The streamed content is already rendered live; no extra label is needed.
     }
@@ -331,10 +327,8 @@ impl<'a> TerminalToolObserver<'a> {
     }
 }
 
-/// Streamed output is only shown in full when `execute_command` explicitly requests a
-/// PTY. A PTY is the opt-in signal for interactive CLIs (menus, confirmations, QR-login,
-/// etc.); regular commands keep going through visual-grid detection so build/search logs
-/// are not written to the terminal.
+/// An explicit PTY request bypasses visual-grid filtering so interactive prompts
+/// remain visible. Ordinary command streams must pass visual-grid detection.
 pub(in crate::ai::driver::turn_runtime) fn execute_command_uses_pseudo_terminal(
     tool_call: &ToolCall,
 ) -> bool {
@@ -526,16 +520,10 @@ pub(in crate::ai::driver::turn_runtime) fn streamed_tool_result_is_failure(
             && run_result.tool_result.content.starts_with("Exit code:"))
 }
 
-/// Step 5: per-round ToolExecutor adapter that bridges the port contract to real dispatch.
-///
-/// Holds all the context real dispatch needs; `&McpClient` is obtained inside `execute`
-/// from `SharedMcpClient`'s `routing_snapshot()` snapshot, so no lock is held across
-/// dispatch (avoiding a second `lock()` on the same `Mutex` deadlocking against the MCP
-/// branch in subagent `run_turn`/`tools/mod.rs`). The caller's `mcp_client` parameter is
-/// likewise a `routing_snapshot()` value in production (empty servers, routed from the
-/// same source as the real client through the shared `cached_server_prefixes` Arc, see
-/// orchestrator.rs:1093), equivalent to the snapshot routing result; real MCP execution
-/// always goes through `shared_mcp_client`.
+/// Per-round ToolExecutor adapter bridging the port contract to real dispatch.
+/// The routing snapshot carries no mutex guard, so dispatch can wait for a subagent
+/// that needs the same MCP client without holding its lock. Real MCP execution uses
+/// `shared_mcp_client`.
 pub(in crate::ai::driver::turn_runtime) struct RoundToolExecutorAdapter {
     pub(super) session_id: String,
     pub(super) shared_mcp_client: SharedMcpClient,
@@ -559,13 +547,9 @@ impl ToolExecutor for RoundToolExecutorAdapter {
         Box::pin(async move {
             let mut observer = TerminalToolObserver::new(app);
             let _streaming_guard = ToolExecutionStreamingGuard::new(&app.streaming);
-            // Do not hold the lock across dispatch: take a non-locking routing_snapshot for
-            // routing so a temporary MutexGuard does not outlive the whole let statement.
-            // Otherwise a foreground subagent running `run_turn` on another thread
-            // (`mcp_client.lock()` in prepare.rs) would never acquire this lock, while the
-            // parent thread blocks waiting for the subagent to return → cross-thread
-            // deadlock (symptom: subagent stuck in preparing context).
-            // See the mcp_snapshot test-helper comments in this file.
+            // Release the MCP mutex before dispatch: a foreground subagent may need
+            // the same client while this thread waits for its result. The snapshot
+            // retains routing information without retaining the guard.
             let snapshot = self.shared_mcp_client.lock().unwrap().routing_snapshot();
             // The permission middleware has already filtered this batch. Preserve
             // its order when a model-backed tool needs to await between calls.

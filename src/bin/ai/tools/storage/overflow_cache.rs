@@ -20,7 +20,7 @@
 //! remain based on the full scan.
 //!
 //! Bodies are shared as `Arc<str>`, so a cache hit is a reference-count bump
-//! instead of a full-text copy, and recency is a per-entry monotonic counter,
+//! instead of a full-text copy, and recency is a per-entry counter,
 //! so the hot read path is O(1) with a tiny critical section under the global
 //! lock (eviction scans for the oldest counter, but only on the cold insert
 //! path when a cap is exceeded).
@@ -71,15 +71,14 @@ struct CacheEntry {
     size: usize,
     /// Shared body: hits clone the `Arc`, never the text.
     content: Arc<str>,
-    /// Last-use stamp from the cache clock; higher means more recent. Unique
-    /// per touch, so it totally orders entries by recency.
+    /// Last-use stamp from the cache clock; eviction removes the lowest stamp.
     last_used: u64,
 }
 
 struct OverflowCache {
     entries: FxHashMap<PathBuf, CacheEntry>,
     total_bytes: usize,
-    /// Monotonic recency clock, advanced on every touch/insert.
+    /// Recency stamp counter, advanced on every touch/insert.
     clock: u64,
     max_entries: usize,
     max_total_bytes: usize,
@@ -123,8 +122,7 @@ impl OverflowCache {
     }
 
     /// Advances the recency clock, returning the stamp for this touch.
-    /// Wrapping is harmless: only the relative order of live stamps matters,
-    /// and two live entries can never share a stamp within 2^64 touches.
+    /// LRU eviction compares stamps numerically, so ordering can change after wraparound.
     fn tick(&mut self) -> u64 {
         self.clock = self.clock.wrapping_add(1);
         self.clock
@@ -265,8 +263,8 @@ fn global_copy_counter() -> Option<&'static AtomicUsize> {
 /// Stores `content` as the body of `path` at exactly `version`.
 ///
 /// Subject to the entry/byte caps and the 1 MiB per-file ceiling. The size
-/// ceiling is enforced before any copy is made — an oversized body is
-/// rejected without allocating — and the body copy happens outside the
+/// ceiling is enforced before copying body text, so oversized content is
+/// rejected without a body allocation. The body copy happens outside the
 /// global lock, which only performs lookup, eviction, and insertion.
 pub(crate) fn store_text(path: &Path, version: FileVersion, content: &str) {
     // The global cache always runs with the default per-file ceiling, so

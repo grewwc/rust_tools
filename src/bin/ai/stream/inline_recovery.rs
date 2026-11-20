@@ -81,10 +81,9 @@ pub(super) fn normalize_inline_tool_call_markup(text: &str) -> std::borrow::Cow<
 
 /// Cheap pre-check for [`normalize_inline_tool_call_markup`].
 ///
-/// The normalizer used to look only for the compact `<|` / `<｜` spellings.
-/// Some models instead render the namespace separator with spaces, including a
-/// space directly after `<` (`< | | DSML | | tool_calls>`), so that shortcut
-/// skipped normalization and leaked the raw marker to the terminal.
+/// Whitespace may separate `<` from the namespace bars, as in
+/// `< | | DSML | | tool_calls>`, so checking only compact `<|` / `<｜` spellings
+/// would skip markers that need normalization.
 fn contains_namespace_marker(text: &str) -> bool {
     for (lt, _) in text.match_indices('<') {
         let after = &text[lt + 1..];
@@ -144,8 +143,8 @@ impl InlineMarkupNormalizer {
         normalize_inline_tool_call_markup(&emit).into_owned()
     }
 
-    /// Flushes the remaining cache at end of stream (either a complete marker missing
-    /// its trailing `>`, or plain text).
+    /// Flushes buffered text at end of stream, discarding truncated DSML
+    /// namespace markers.
     pub(super) fn flush(&mut self) -> String {
         if self.pending.is_empty() {
             return String::new();
@@ -313,7 +312,7 @@ fn recover_json_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
 ///   - JSON body: `<function=read_file>{"path":"/x"}</function>`
 ///   - parameter-tag body: `<function=read_file><parameter=path>/x</parameter></function>`
 ///   - an optional outer `<tool_call>...</tool_call>` wrapper
-/// Returns as soon as any `<function=...>` block parses; returns None if all fail.
+/// Collects every successfully parsed block; returns None when no block parses.
 fn recover_hermes_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     let mut out: Vec<ToolCall> = Vec::new();
     let mut rest = text;
@@ -361,8 +360,7 @@ fn recover_hermes_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
 ///   - multiple `<invoke name="NAME"> ... </invoke>` blocks (parallel tool calls)
 ///   - parameters as a set of `<parameter name="key">value</parameter>` tags
 ///   - an optional outer `<function_calls>` / `<tool_calls>` wrapper
-///   - tags may carry a namespace prefix (e.g. `antml:invoke`)
-/// Returns as soon as any `<invoke ...>` block parses; returns None if all fail.
+/// Collects calls from every named `<invoke ...>` block; returns None if no call is recovered.
 fn recover_anthropic_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     let mut out: Vec<ToolCall> = Vec::new();
     let mut rest = text;
@@ -404,9 +402,9 @@ fn recover_anthropic_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
 /// Parses bare tool-name XML: `<execute_command>pwd</execute_command>`.
 /// Only takes effect for registered tool names on the allowlist, so ordinary
 /// HTML/XML tags are not mistaken for tool calls.
-/// Unlike Hermes / Anthropic, the tag name itself is the tool name; the body may be
-/// JSON arguments, or raw text for tools like `execute_command` that have exactly
-/// one required string parameter.
+/// Unlike Hermes / Anthropic, the tag name itself is the tool name. The body may
+/// contain JSON, Hermes parameter tags, or raw text routed by tool metadata or
+/// the sole required string parameter.
 fn recover_bare_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     let stripped = strip_inline_tool_call_wrappers(text);
     let mut rest = stripped.trim();
@@ -520,8 +518,8 @@ pub(super) fn parse_bare_xml_open_tag(tag: &str) -> Option<String> {
 }
 
 /// Parses a bare XML tool body. Prefers JSON objects / Hermes parameter tags;
-/// if the body is only raw text, it safely degrades only for tools with exactly
-/// one required string parameter, e.g.
+/// raw text maps to explicit raw-body parameter metadata or, when absent, the
+/// sole required string parameter, e.g.
 /// `<execute_command>pwd</execute_command>` → `{"command":"pwd"}`.
 pub(super) fn parse_bare_xml_tool_body(tool_name: &str, body: &str) -> Option<String> {
     let trimmed = body.trim();
@@ -616,8 +614,9 @@ pub(super) fn parse_hermes_function_body(body: &str) -> Option<String> {
 
 /// Strips common wrapper forms emitted by models: ```json ... ```, ``` ... ```,
 /// `<tool_call> ... </tool_call>`、`<|tool_call_begin|> ... <|tool_call_end|>`。
-/// Strips one layer only when the whole input is wrapped like this; otherwise
-/// returns it unchanged.
+/// Each form is stripped once in that order, allowing nested forms to be
+/// unwrapped. A matching closing delimiter ends the retained body; trailing
+/// text after it is discarded.
 fn strip_inline_tool_call_wrappers(text: &str) -> String {
     let mut s = text.trim().to_string();
     // markdown fenced code block
@@ -653,7 +652,6 @@ pub(super) fn normalize_tool_call_arguments(raw: &str) -> Option<String> {
     if trimmed.is_empty() {
         return Some("{}".to_string());
     }
-    // Standard path: the whole input is valid JSON.
     if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
         return Some(trimmed.to_string());
     }
@@ -666,7 +664,7 @@ pub(super) fn normalize_tool_call_arguments(raw: &str) -> Option<String> {
             return Some(args);
         }
     }
-    // Try to slice a JSON object prefix: starting at '{', find the last matching '}'.
+    // Recover a leading JSON object even when extra protocol text follows it.
     if trimmed.starts_with('{') {
         if let Some(end) = find_json_object_end(trimmed) {
             let candidate = &trimmed[..=end];
@@ -714,10 +712,9 @@ fn find_json_object_end(s: &str) -> Option<usize> {
 }
 
 /// Collects the valid tool calls for this turn. Returns
-/// `(tool call list, whether anything was dropped)`: a tool call whose arguments
-/// JSON is incomplete (typically a large `write_file` truncated by the output
-/// limit) and cannot be repaired is dropped with `dropped=true`, letting callers
-/// distinguish "truncated" from "no tool calls this turn".
+/// `(tool call list, whether anything was dropped)`. Unrepairable arguments set
+/// the flag so callers can distinguish discarded calls from a turn that emitted
+/// no tool calls.
 pub(super) fn collect_valid_tool_calls(
     builders: &mut rust_tools::cw::SkipMap<usize, ToolCallBuilder>,
 ) -> (Vec<ToolCall>, bool) {
@@ -737,10 +734,7 @@ pub(super) fn collect_valid_tool_calls(
             }
             let Some(arguments) = normalize_tool_call_arguments(&builder.arguments) else {
                 dropped = true;
-                // Print the truncated arguments fragment to ease debugging "why was it
-                // truncated".
-                // arguments can be large (large-file write_file); show only the first
-                // and last 300 chars.
+                // Keep a bounded preview of rejected arguments for diagnostics.
                 let raw = &builder.arguments;
                 let char_count = raw.chars().count();
                 let snippet = if char_count > 600 {
@@ -793,7 +787,6 @@ pub(super) fn ensure_tool_calls_section_open(
     let _ = clear_waiting_hint(state);
 
     if state.content.thinking_open && !crate::ai::background::serve_live_streaming() {
-        // If fold mode is active, render the fold ending first.
         if state.render.thinking_fold.active {
             let _ = finalize_thinking_fold(state);
         } else {

@@ -125,7 +125,6 @@ mod tests {
         let inner_calls = Arc::new(AtomicUsize::new(0));
         let outer_calls = Arc::new(AtomicUsize::new(0));
 
-        // Onion chain: outer counter -> inner counter -> real executor
         let executor: Box<dyn ToolExecutor> = CountingMiddleware {
             calls: Arc::clone(&outer_calls),
         }

@@ -9,11 +9,10 @@ pub(super) enum InternalToolCallStreamEvent {
     Begin(String),
     Args(String),
     End,
-    /// System-internal tool-protocol markers the model emits in visible body
-    /// text (e.g. `<function_results>`). The system itself never emits such
-    /// results — the deterministic fingerprint of a degenerate self-play loop. The
-    /// streamer strips the whole block from display; this event tells upper layers
-    /// the turn is degraded, so stop streaming and downgrade-retry (reuse the degenerate_repetition path) instead of persisting hallucinated text that would poison the next request. Unlike text-statistics thresholds this is a zero-false-positive signal: legitimate repeated code or wording never contains this marker.
+    /// Result-protocol tags encountered in assistant body text. The XML streamer
+    /// suppresses these tags; an opening tag also starts the result-block phase.
+    /// This event lets callers distinguish suppressed protocol output from an
+    /// empty answer.
     HallucinatedProtocolMarker,
 }
 
@@ -294,7 +293,7 @@ impl HermesXmlToolCallStreamer {
                             let mut keep = longest_marker_suffix_prefix(&self.pending, &candidates);
                             // When holding a potential marker prefix, also hold the whitespace right
                             // before it, so a split like `<tool_call>\n<func` never flashes the middle `\n`
-                            // first. The whitespace is only deferred by one frame; ordering is unchanged.
+                            // first. Keep it until the marker completes or the fragment becomes ordinary text.
                             if keep > 0 {
                                 let head = &self.pending[..self.pending.len() - keep];
                                 let trimmed = head.trim_end_matches([' ', '\t', '\r', '\n']);
@@ -355,9 +354,9 @@ impl HermesXmlToolCallStreamer {
 /// ```
 /// Unlike the Hermes form (`<function=NAME>` / `<parameter=key>`), this one uses
 /// a `name="..."` attribute, the outer wrapper tag is `function_calls` or `tool_calls`,
-/// and tags may carry a namespace prefix (e.g. `antml:invoke`). Some models
-/// (deepseek-v4-flash) emit tool calls in this format; unrecognized, they would be printed as plain text and the turn would be
-/// judged Completed and end right away — showing up as "it suddenly stopped and the tool never ran".
+/// and namespace prefixes are matched by their local names (e.g. `antml:invoke`).
+/// The streamer converts these blocks into tool-call events and keeps their
+/// markup out of visible text.
 #[derive(Default)]
 enum AnthropicXmlPhase {
     #[default]
@@ -373,9 +372,8 @@ enum AnthropicXmlPhase {
         force_string: bool,
         value: String,
     },
-    /// Swallowing a model-hallucinated "tool result" block until the matching closing tag or end of stream.
-    /// Nothing inside the block (nested tags, hallucinated result text, prose) is echoed. Upper layers stop
-    /// and downgrade-retry as soon as HallucinatedProtocolMarker arrives, so the block is usually swallowed only until that stop.
+    /// Suppress result-block content until a recognized result closing tag or
+    /// end of stream. Nothing is echoed while this phase is active.
     InResultBlock,
 }
 
@@ -396,9 +394,8 @@ enum AnthropicTagClass {
         force_string: bool,
     },
     ParamClose,
-    /// System-internal "tool result" protocol markers (`function_results` / `tool_result` etc.).
-    /// The system never emits these; seeing one means model hallucination. An open tag starts swallowing the whole block until the matching
-    /// closing tag (or end of stream); none of the hallucinated "result" text inside is echoed.
+    /// Result-protocol tags recognized by their local names. An opening tag
+    /// suppresses content until a recognized result closing tag or end of stream.
     ResultBlockOpen,
     /// Closing tag of the result block above; ends the whole-block swallow.
     ResultBlockClose,
@@ -406,10 +403,9 @@ enum AnthropicTagClass {
     Other,
 }
 
-/// Local names of model-hallucinated "tool result" protocol markers (no angle brackets or namespace prefix).
-/// Real system tool results never reach the assistant's visible body in this inline XML form — the moment the model
-/// emits one, it is the deterministic fingerprint of a fabricated "call → result" loop. An open tag triggers the whole-block swallow and
-/// also reports HallucinatedProtocolMarker for upper layers to downgrade-retry. The list covers singular/plural and common hallucinated variants.
+/// Local names of result-protocol tags, without angle brackets or namespaces.
+/// Opening and orphan closing tags emit `HallucinatedProtocolMarker`; opening
+/// tags also suppress the block's content.
 const HALLUCINATED_RESULT_TAG_NAMES: &[&str] = &[
     "function_results",
     "function_result",
@@ -504,13 +500,12 @@ impl AnthropicXmlToolCallStreamer {
                             };
                         }
                         AnthropicTagClass::ResultBlockOpen => {
-                            // Model-hallucinated "tool result" block: start the whole-block swallow and report the degeneration fingerprint.
                             self.phase = AnthropicXmlPhase::InResultBlock;
                             events.push(InternalToolCallStreamEvent::HallucinatedProtocolMarker);
                         }
                         AnthropicTagClass::ResultBlockClose => {
-                            // Orphan closing tag in Idle (repetition broke the pairing): the tag is already suppressed,
-                            // report the fingerprint anyway — ordinary body text never contains `</function_results>`.
+                            // An orphan closing tag still reports protocol output,
+                            // even without an opening tag to start a result block.
                             events.push(InternalToolCallStreamEvent::HallucinatedProtocolMarker);
                         }
                         // Wrapper / empty-name invoke / stray closing tag / Other: already handled, continue.
@@ -606,8 +601,8 @@ impl AnthropicXmlToolCallStreamer {
                     continue;
                 }
                 _ => {
-                    // InResultBlock: swallow everything inside the hallucinated "tool result" block until the matching closing
-                    // tag (`</function_results>` etc.); nested tags, result text, and prose inside are never echoed.
+                    // Suppress result-block content until a recognized closing
+                    // tag; nested tags and prose stay hidden while this phase is active.
                     let Some(lt) = self.pending.find('<') else {
                         // No tag start: it is all in-block text; discard.
                         self.pending.clear();
@@ -822,7 +817,7 @@ fn insert_anthropic_param(
 }
 
 /// Decide whether an unclosed `<...` fragment could still be a tag-name prefix (used for cross-chunk buffering decisions).
-/// A real tag name is a run of name characters; any whitespace or other character means this is not a tag start (prose).
+/// Whitespace or characters outside the accepted ASCII name set end the buffering heuristic.
 fn could_be_tag_name_prefix(after_lt: &str) -> bool {
     let body = after_lt.strip_prefix('<').unwrap_or(after_lt);
     let body = body.strip_prefix('/').unwrap_or(body);
@@ -1404,7 +1399,7 @@ mod tests {
         assert!(s.flush().is_empty(), "flush must reset the streamer");
     }
 
-    // ── Hallucinated "tool result" protocol markers (bug A/B fix) ──────────────────────────
+    // Hallucinated result-protocol markers.
 
     #[test]
     fn anthropic_streamer_swallows_hallucinated_result_block_and_signals() {
@@ -1446,7 +1441,6 @@ mod tests {
 
     #[test]
     fn anthropic_streamer_signals_on_orphan_result_close_tag() {
-        // Repetition breaking the pairing produces orphan closing tags; they are the same zero-false-positive fingerprint — suppress and report.
         let mut s = super::AnthropicXmlToolCallStreamer::new();
         let (cleaned, events) = s.push("尾部残留</function_results>之后");
         assert_eq!(cleaned, "尾部残留之后");
@@ -1455,7 +1449,6 @@ mod tests {
 
     #[test]
     fn anthropic_streamer_handles_namespaced_result_tag() {
-        // Hallucinated markers with a namespace prefix (e.g. `antml:`) also match by local name.
         let mut s = super::AnthropicXmlToolCallStreamer::new();
         let (cleaned, events) = s.push("x<tool_result>garbage</tool_result>y");
         assert_eq!(cleaned, "xy");
@@ -1464,7 +1457,7 @@ mod tests {
 
     #[test]
     fn anthropic_streamer_keeps_legit_html_and_normal_invoke_untouched() {
-        // Zero-false-positive regression: ordinary HTML is kept as-is and produces no hallucination signal.
+        // Standard HTML tags remain visible without a result-protocol signal.
         let mut s = super::AnthropicXmlToolCallStreamer::new();
         let (cleaned, events) = s.push("see <div>result</div> and <span>ok</span>");
         assert_eq!(cleaned, "see <div>result</div> and <span>ok</span>");

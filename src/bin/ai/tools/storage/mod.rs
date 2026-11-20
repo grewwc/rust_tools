@@ -21,10 +21,10 @@ pub(crate) mod temp_registry;
 pub(crate) mod text_utils;
 pub(crate) mod token_usage_store;
 
-/// 文件锁，用于并发访问 memory 文件
+/// Serializes in-process operations across all memory files.
 static MEMORY_FILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-/// 对 memory 文件执行操作，持有排他锁
+/// Runs a memory operation under the process mutex, with best-effort Unix flock.
 pub(crate) fn with_memory_file_lock<F, T>(path: &Path, f: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String>,
@@ -35,7 +35,6 @@ where
 
     #[cfg(unix)]
     {
-        // Unix: 使用 flock 进行文件级锁
         if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
             unsafe {
                 flock(file.as_raw_fd(), LOCK_EX);
@@ -48,6 +47,6 @@ where
         }
     }
 
-    // 回退：仅使用互斥锁
+    // Non-Unix platforms and failed opens rely on the process mutex alone.
     f()
 }

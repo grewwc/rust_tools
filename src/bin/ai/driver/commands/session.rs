@@ -133,9 +133,8 @@ pub(in crate::ai) fn restore_session_local_runtime_state(app: &mut App) -> std::
 /// and never fails the command.
 pub(in crate::ai) fn persist_session_runtime_state(app: &App) {
     let store = SessionStore::new(app.config.history_file.as_path());
-    // An ordinary kernel session is the default state, so leave the backend
-    // unset; only an explicit pick (always paired with agent-team) needs to
-    // survive as a stored value.
+    // An ordinary kernel session leaves the backend unset. A non-kernel backend
+    // or the `agent-team` session default marks a choice that must survive reopening.
     let explicit_backend = app.session_default_subagent_backend != BackendId::KERNEL
         || app
             .session_default_skills
@@ -241,9 +240,8 @@ pub(in crate::ai) fn current_prune_authorization(
 }
 
 /// Restores model prune counters from the current `session_history_file`.
-/// Sub-agents own an independent history and must not reuse the parent session's
-/// in-memory state from `App::clone`; resume must also restore from the child
-/// history.
+/// Sub-agents own independent history and must restore their own counters rather
+/// than inherit the parent's in-memory state, including on resume.
 pub(in crate::ai) fn restore_prune_marks_for_history(app: &mut App) -> std::io::Result<()> {
     app.prune_marks.clear();
     let mut prune_marks =
@@ -404,8 +402,6 @@ pub fn try_handle_clear_command(input: &str) -> bool {
         return false;
     }
 
-    // Clear screen: ANSI escape - clear the whole screen + move the cursor to
-    // the top-left
     use std::io::Write;
     print!("\x1b[2J\x1b[H");
     let _ = std::io::stdout().flush();
@@ -445,8 +441,8 @@ fn resolve_existing_session_selector(
 /// Maximum allowed days for `/sessions prune <days>` (~10k years). Far below
 /// `chrono`'s `Duration::days` and `DateTime` overflow thresholds, so illegal
 /// oversized input is stopped before a panic. The valid range is
-/// `1..=MAX_PRUNE_DAYS`: `0` would degrade into "delete all non-current
-/// sessions" and is rejected explicitly.
+/// `1..=MAX_PRUNE_DAYS`: `0` would let the age filter include sessions active
+/// earlier today and is rejected explicitly.
 pub(crate) const MAX_PRUNE_DAYS: i64 = 3_650_000;
 
 /// Selects sessions inactive for N days: those whose `modified_local` is earlier
@@ -487,9 +483,8 @@ pub(crate) fn select_sessions_with_prefix<'a>(
 /// Classifies a discuss/task worker session spawned by a host
 /// (`dc-<room>-m<N>-<rand>`, `task-<room>-w<N>-<rand>`). Returns the origin
 /// label and the room part for `/ss workers` grouping; `None` for regular
-/// sessions. Prefix-only on purpose: `/ss` is a display filter, and `/ss all`
-/// still shows everything, so a hand-made id that happens to collide only
-/// hides one row in the default view.
+/// sessions. Match the spawner's id shape for display filtering; `/ss all`
+/// remains available for manually named sessions with that shape.
 fn worker_session_room(id: &str) -> Option<(&'static str, String)> {
     let (rest, marker, label) = if let Some(rest) = id.strip_prefix("dc-") {
         (rest, "-m", "discuss")
@@ -520,7 +515,7 @@ fn worker_session_room(id: &str) -> Option<(&'static str, String)> {
 /// One `/ss` row: mark, id, mtime, size, summary. Shared by the default,
 /// `all`, `workers` and `archive` views so they stay byte-aligned.
 /// Archived sessions carry an explicit ` [archived]` suffix (visible in
-/// piped output too) and render dimmed on a terminal.
+/// piped output too); unmarked archived sessions render dimmed on a terminal.
 fn print_session_row(s: &SessionInfo, current_session_id: &str, max_id_len: usize, verbose: bool) {
     let mark = if s.id == current_session_id { "*" } else { " " };
     let time = s
@@ -817,8 +812,7 @@ pub fn try_handle_session_command(
             println!();
         }
         "list" | "ls" | "" | "verbose" | "workers" | "all" => {
-            // By default do not recursively stat each session's size (the assets
-            // recursion is the only heavy work of `/ss`); only explicit `verbose`
+            // By default do not recursively stat each session's size; explicit `verbose`
             // (`/ss verbose` or `/ss list verbose`) stats them in parallel.
             // Discuss/task worker sessions are hidden by default: `/ss workers`
             // shows them grouped by room, `/ss all` shows everything.
@@ -863,7 +857,6 @@ pub fn try_handle_session_command(
                 if sessions.is_empty() {
                     println!("No sessions.");
                 } else {
-                    // Compute the max ID length for alignment
                     let max_id_len = sessions.iter().map(|s| s.id.len()).max().unwrap_or(36);
                     for s in &sessions {
                         print_session_row(s, &app.session_id, max_id_len, verbose);
@@ -889,7 +882,6 @@ pub fn try_handle_session_command(
         "current" | "cur" | "curr" => {
             println!("session: {}", app.session_id);
             println!("history: {}", app.session_history_file.display());
-            // Show the session summary
             // Read only the current session's preview, avoiding a scan and stat
             // of all sessions.
             if let Ok(Some((summary, modified_local))) = store.read_session_preview(&app.session_id)
@@ -957,9 +949,8 @@ pub fn try_handle_session_command(
                 }
             };
             let message = message.as_str();
-            // Flag and message go through one lock + one transaction, so an
-            // interleaved concurrent `/mark`/`/unmark` or a crash mid-command
-            // can never persist "marked without message" / a stale message.
+            // Flag and message go through one lock + one transaction, so concurrent
+            // commands and crashes cannot expose a partially applied mark update.
             let message_update = if message.is_empty() {
                 MarkMessageUpdate::Keep
             } else {
@@ -978,8 +969,7 @@ pub fn try_handle_session_command(
             // trailing words are drained (never stored).
             let words: Vec<&str> = parts.collect();
             let target = match words.first() {
-                // `--` forces the current session (mirrors `/mark --`), so
-                // `/unmark last` can be escaped when "last" was a literal.
+                // `--` forces the current session, matching `/mark --`.
                 Some(first) if *first == "--" => app.session_id.clone(),
                 Some(first) if *first == "current" => app.session_id.clone(),
                 Some(first) => {
@@ -1127,7 +1117,6 @@ pub fn try_handle_session_command(
             crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
             switch_app_to_session(app, &store, id, true)?;
             println!("Switched session: {}", id);
-            // Show the session summary
             // Read only the target session's preview, avoiding a scan of all
             // sessions.
             if let Ok(Some((summary, _))) = store.read_session_preview(id) {
@@ -1161,7 +1150,6 @@ pub fn try_handle_session_command(
                 &app.session_id,
                 app.config.history_file.as_path(),
                 &app.active_persona.id,
-                // Save the current model for restoration
                 &app.current_model,
             ) {
                 Ok(entry) => {
@@ -1176,10 +1164,6 @@ pub fn try_handle_session_command(
             }
         }
         "close" => {
-            // /close: delete the current session and exit the interactive
-            // conversation (the opposite of /suspend's "keep and return to shell"
-            // — here the session is destroyed outright). Reuse the store (already
-            // constructed above).
             let current_id = app.session_id.clone();
             let deleted_path = app.session_history_file.clone();
             match store.delete_session(&current_id) {
@@ -1194,11 +1178,9 @@ pub fn try_handle_session_command(
                     eprintln!("[close] failed to delete session: {}", err);
                 }
             }
-            // The session is gone (or already was): drop any suspended bindings
-            // pointing at it so a later terminal key reuse cannot silently
-            // resurrect it. Match by session id only — bindings store either the
-            // base or the session history file depending on the writer, so a
-            // history-file filter would miss some of them. Best-effort.
+            // Drop suspended bindings even if deletion failed, preventing later
+            // terminal reuse from resuming this session. Match by id only because
+            // binding writers record different history paths. Best-effort.
             let _ = SuspendedSessionStore::new().remove_for_session(&current_id, None);
             crate::ai::driver::signal::request_shutdown(app.shutdown.as_ref());
         }
@@ -1479,7 +1461,6 @@ pub fn try_handle_session_command(
                 return Ok(true);
             };
             let archive_path = std::path::Path::new(file);
-            // Optional as=<id> specifies the session id after import
             let mut dst: Option<String> = None;
             for arg in parts.by_ref() {
                 if let Some(v) = arg.strip_prefix("as=") {
@@ -1560,11 +1541,9 @@ pub fn try_handle_session_command(
                 println!("invalid days: '{}'", days_str);
                 return Ok(true);
             };
-            // Lower bound is 1: `prune 0` puts the cutoff at now, i.e. delete all
-            // non-current sessions — contrary to the "clean up N days inactive"
-            // semantics and a collateral-damage footgun, so it is rejected
-            // outright. The upper bound prevents `Duration::days` / `DateTime`
-            // overflow panics; ~10k years suffices for any cleanup.
+            // Require at least one day of inactivity; a zero-day cutoff would
+            // include sessions active earlier today. The upper bound prevents
+            // `Duration::days` / `DateTime` overflow panics.
             if !(1..=MAX_PRUNE_DAYS).contains(&days) {
                 println!(
                     "days must be between 1 and {MAX_PRUNE_DAYS}. try: /sessions prune <days>"
@@ -1763,7 +1742,6 @@ pub fn try_handle_session_command(
             }
         }
         "branch" => {
-            // Usage: /sessions branch <keep_turns> [src=<id>] [as=<id>]
             let Some(keep_str) = parts.next() else {
                 println!(
                     "missing keep count. try: /sessions branch <keep_turns> [src=<id>] [as=<id>]"
@@ -2091,7 +2069,6 @@ mod tests {
         let root = test_history_root();
         let mut app = test_app(&root);
 
-        // The printed value is exactly the current session id.
         assert_eq!(render_current_session_id(&app), app.session_id);
         assert_eq!(render_current_session_id(&app), "sess-old");
         // Bare `/session` and `/session id` are consumed as local commands
@@ -2590,7 +2567,7 @@ mod tests {
         }
 
         let mut app = test_app(&root);
-        // Write one user message to make the session non-empty (otherwise the new
+        // Write one user message to make the session non-empty (otherwise the
         // empty-session protection rejects the suspension, because the main loop
         // deletes empty sessions on exit, leaving a dangling binding).
         let store = SessionStore::new(app.config.history_file.as_path());
@@ -2716,7 +2693,6 @@ mod tests {
         let app = test_app(&root);
         let store = SessionStore::new(app.config.history_file.as_path());
 
-        // Write test messages
         let src_path = store.session_history_file(&app.session_id);
         let original_messages = [
             Message {
@@ -2736,19 +2712,16 @@ mod tests {
         ];
         append_history_messages(&src_path, &original_messages).unwrap();
 
-        // Export to zip
         let archive_path = root.join("export.zip");
         store
             .export_session_archive(&app.session_id, &archive_path)
             .expect("export should succeed");
         assert!(archive_path.exists(), "archive file should exist");
 
-        // Import as a new session
         let dst_id = "imported-session".to_string();
         let result = store.import_session_archive(&archive_path, &dst_id);
         assert!(result.is_ok(), "import should succeed: {:?}", result.err());
 
-        // Verify the imported messages match the originals
         let imported_messages = store.read_all_messages(&dst_id).unwrap();
         assert_eq!(imported_messages.len(), original_messages.len());
         assert_eq!(imported_messages[0].role, "user");
@@ -3167,7 +3140,7 @@ mod tests {
         write_single_user_message(&store, &current);
 
         // Bare `/archive` toggles the current session (like `/mark`); the
-        // archived list lives under `/ss archive` now.
+        // archived list lives under `/ss archive`.
         assert!(try_handle_session_command(&mut app, "/archive").unwrap());
         assert!(store.read_session_archived(&current).unwrap());
         assert!(try_handle_session_command(&mut app, "/archive").unwrap());
@@ -3364,8 +3337,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Rolls the target session file's mtime back N days, to simulate "unread
-    /// for N days".
+    /// Backdate durable activity metadata and file mtime to simulate N days of inactivity.
     fn set_session_activity_days_ago(path: &std::path::Path, days: i64) {
         let activity_unix_ms = (Local::now() - Duration::days(days)).timestamp_millis();
         rusqlite::Connection::open(path)
@@ -3755,11 +3727,9 @@ mod tests {
         set_session_activity_days_ago(&store.session_history_file("sess-stale-a"), 40);
         set_session_activity_days_ago(&store.session_history_file("sess-stale-b"), 35);
 
-        // `0` (degenerates into deleting all non-current sessions), negatives,
-        // exactly past the upper bound, and huge values that would overflow
-        // chrono date arithmetic into a panic must all be rejected gracefully.
-        // Rolling back `1e8` days crosses `DateTime`'s lower bound — without the
-        // upper-bound guard, this line itself would panic.
+        // Zero, negatives, values just past the upper bound, and huge values
+        // must be rejected before date arithmetic. Subtracting `1e8` days would
+        // cross `DateTime`'s lower bound without the guard.
         let over_bound = (MAX_PRUNE_DAYS + 1).to_string();
         let max_i64 = i64::MAX.to_string();
         for bad in [

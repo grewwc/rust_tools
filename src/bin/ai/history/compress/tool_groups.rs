@@ -1,7 +1,7 @@
 //! Tool group folding.
 //!
 //! Fold earlier `assistant(tool_calls) + accompanying tool` groups in the message
-//! sequence into a single `internal_note` stub, keeping the most recent groups verbatim.
+//! sequence into one `internal_note` stub per group, keeping recent groups verbatim.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
@@ -194,18 +194,9 @@ pub(super) fn first_trim_candidate(messages: &[Message], budget: usize) -> Optio
             continue;
         }
 
-        // user/image placeholder stubs spilled to session files are not deleted:
-        // they are just pointers to archive files (original text stored on disk
-        // with zero compression); deleting them would leave the model with no
-        // leads. Whether ordinary user / image-bearing messages may be deleted is
-        // decided by the caller path; this function only reports candidates:
-        // - with_summary: drop + archive + summarize (returning the user
-        //   authorizes deletion; the summary carries the early goal, otherwise
-        //   30+ turns of plain-text dialogue would never converge into budget);
-        // - plain shrink / batch trim: user can only be OffloadOnly — spill to
-        //   disk first; on failure plain shrink must break (otherwise the same
-        //   user would be returned forever), and batch skips that user and keeps
-        //   scanning later candidates; never remove the original text.
+        // Keep spilled user/image pointers so archived originals remain locatable.
+        // This selector may return ordinary user content; the caller chooses
+        // removal with archiving and an optional summary, or offloading only.
         if is_preserved_user_or_image_stub(&value_to_string(&message.content)) {
             index += 1;
             continue;
@@ -631,10 +622,9 @@ mod cmd_alias_tests {
     }
 }
 
-/// Generate the result recall text for tool group folding. High-precision results
-/// must be archived before the original messages are removed; if archiving fails,
-/// return `None` so the caller keeps the whole group verbatim rather than
-/// demoting the only evidence to a single sentence.
+/// Plan recovery text and archive writes for tool group folding. Return `None`
+/// when high-precision evidence cannot be made recoverable, so the caller keeps
+/// the whole group. The fold plan commits writes only after acceptance.
 fn tool_result_recall_text(
     tool_call: &ToolCall,
     result_text: &str,
@@ -873,10 +863,9 @@ fn precision_grounding_tool_recall(
     }
 }
 
-/// When command output is folded, keep at least the exit status, key diagnostics,
-/// and tail conclusions. The full log is still archived by the caller to
-/// `file_path`; the job here is only to let the model decide the next step without
-/// re-running the command.
+/// Select the first output line, diagnostic lines, and a tail line if the signal
+/// limit allows. The caller plans the full-output archive; this bounded recall
+/// helps the model choose its next step without re-running the command.
 fn command_result_recall(result_text: &str) -> String {
     const MAX_SIGNALS: usize = 5;
     const MAX_CHARS: usize = 720;
@@ -922,15 +911,13 @@ fn push_command_signal(signals: &mut Vec<String>, line: &str) {
     }
 }
 
-/// Within a single turn: when the LLM-summary fallback runs, keep the verbatim
-/// count of recent tool groups inside the tail window (the current user turn);
-/// fold earlier same-turn tool groups into one-line stubs. This fixes compressor
-/// idling when all the bulk piles up inside one user turn with no cross-turn
-/// boundary to summarize.
+/// Keep recent tool groups verbatim within the current user turn during the
+/// LLM-summary fallback. Earlier same-turn groups may become evidence notes so
+/// compression can reclaim bulk without a cross-turn boundary.
 pub(super) const MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS: usize = 4;
 
 /// Return the message indices of all tool results in the most recent
-/// `keep_recent_groups` complete tool groups.
+/// `keep_recent_groups` groups with matching tool results.
 ///
 /// One assistant(tool_calls) may issue any number of parallel calls. The
 /// protection window must be computed per atomic group, not cut by tool message
@@ -947,8 +934,8 @@ pub(super) fn recent_tool_group_message_indices(
         .collect()
 }
 
-/// Return the tool result indices of the most recent `keep_recent_groups` complete
-/// tool groups, preserving group boundaries.
+/// Return the tool result indices of the most recent `keep_recent_groups` groups
+/// with matching results, preserving group boundaries even for partial batches.
 pub(super) fn recent_tool_result_groups(
     messages: &[Message],
     keep_recent_groups: usize,
@@ -992,11 +979,9 @@ pub(super) fn recent_tool_result_groups(
     groups.into_iter().rev().take(keep_recent_groups).collect()
 }
 
-/// Generate the single-line "recall anchor" for a folded stub: prefer extracting
-/// the `file_path:` pointer from spilled tool results (the model can re-run
-/// read_file from it), otherwise fall back to the first non-empty result line.
-/// Guarantees that folding early precision tool groups still leaves a recallable
-/// lead, avoiding amnesia-style repeated searches.
+/// Build a bounded recall anchor, preferring `original_*`, then
+/// `archive_file_path`, then `file_path` pointers before falling back to the
+/// first non-empty result line.
 fn tool_result_recall_one_liner(result_text: &str) -> String {
     if let Some(original_line) = result_text
         .lines()
@@ -1135,7 +1120,7 @@ fn group_reads_pending_patch_target(
 }
 
 /// Fold earlier `assistant(tool_calls) + accompanying tool` groups in the message
-/// sequence into a single `internal_note` stub, keeping the most recent
+/// sequence into one `internal_note` stub per group, keeping the most recent
 /// `keep_recent_groups` groups verbatim plus all non-tool-group messages
 /// (user / system / internal_note / plain-text assistant).
 ///
@@ -1143,8 +1128,8 @@ fn group_reads_pending_patch_target(
 /// **as one whole group** with a single stub, so the pairing breakage of "keeping
 /// assistant.tool_calls while dropping the accompanying tool responses" can never
 /// happen (the OpenAI protocol requires the two to be paired). Groups containing
-/// `is_non_compressible_tool` tools are folded too, but their `file_path:` recall
-/// anchor is kept inside the stub.
+/// precision tools can be folded once their results stay inline or recoverable
+/// through archives.
 ///
 /// Returns the purely in-memory [`ToolGroupFoldPlan`]; the caller must explicitly
 /// `commit` after deciding to adopt the candidate.
@@ -1180,14 +1165,9 @@ pub(super) fn plan_early_tool_groups(
         group_anchors[group_anchors.len() - keep_recent_groups]
     };
 
-    // Direction two: pending-patch targeted retention. Scan the history for target
-    // file paths whose most recent apply_patch failed with no later success on the
-    // same path; when the folder hits a read_file group reading those paths, it
-    // skips folding so the model can still see the original file content to
-    // construct exact patch context, avoiding the deadlock of "content offloaded →
-    // patch context mismatch → re-read → judged no progress → hard stop". The
-    // protection scope is naturally bounded: once the succeeded or failed
-    // apply_patch call itself is compressed out of history, the path is released.
+    // Keep reads of pending patch targets verbatim so retries can reconstruct
+    // exact patch context. Protection ends when a later patch succeeds or the
+    // relevant call leaves the projection.
     let pending_patch_paths = collect_pending_patch_paths(messages);
 
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
@@ -1219,8 +1199,7 @@ pub(super) fn plan_early_tool_groups(
                 idx += 1;
                 continue;
             }
-            // Collect the consecutive tool responses right after it that belong to
-            // this assistant, forming the complete group.
+            // Collect matching consecutive responses without crossing a protocol boundary.
             let mut group = vec![idx];
             let mut cursor = idx + 1;
             while cursor < messages.len() && messages[cursor].role == "tool" {

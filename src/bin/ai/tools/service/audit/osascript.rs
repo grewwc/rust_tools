@@ -7,9 +7,7 @@
 //! 1. **GUI input injection.** `keystroke "q" using command down` types into the
 //!    *frontmost* application, not into the process the script names; System
 //!    Events adds `key code`, `click`, `set frontmost` and `delete process` on
-//!    top. A cleanup attempt once quit an unrelated editor this way: the
-//!    command named a background test browser, the keystroke landed on
-//!    whatever the user was looking at.
+//!    top, reaching applications outside the session's registered processes.
 //! 2. **Application control.** `tell application "X" to quit` terminates a
 //!    process this session does not own; `delete` removes files the `rm` path
 //!    rules would reject.
@@ -25,10 +23,9 @@
 //!
 //! Two scans run over every script:
 //!
-//! - the **code** scan sees the script with string literals emptied, so a
-//!   verb is only matched where it is actually a command. A JavaScript snippet
-//!   like `execute javascript "el.click()"` therefore stays allowed, while
-//!   `keystroke "q"` is caught.
+//! - the **code** scan removes string and comment contents, then matches blocked
+//!   fragments. JavaScript inside `execute javascript "el.click()"` remains
+//!   data, while `keystroke "q"` leaves the blocked keyword visible.
 //! - the **literal** scan sees the whole script, so the *target* of a command
 //!   (`tell application "System Events" to ...`) is matched even though the app
 //!   name lives inside a string.
@@ -223,9 +220,8 @@ fn normalize_literal_scan(source: &str) -> String {
         .collect()
 }
 
-/// Normalize the script for the code scan: lowercased, without whitespace and
-/// without the content of string literals, so that a verb is only matched
-/// where it is a command rather than data.
+/// Normalize code for keyword-fragment checks: omit whitespace, comments and string
+/// contents, and lowercase ASCII so quoted JavaScript does not trigger verb checks.
 fn normalize_code_scan(source: &str) -> String {
     let mut out = String::new();
     let mut chars = source.chars().peekable();

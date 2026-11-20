@@ -63,8 +63,7 @@ impl FileStore {
     /// Validate a direct `write_file` target, including the OS-selected system temp directory and
     /// the classic Unix shared temp directories (`/tmp`, `/var/tmp`).
     ///
-    /// This is intentionally separate from the shared write check used by `apply_patch`: the
-    /// request is to make direct scratch writes convenient without widening patch targets.
+    /// Direct scratch writes may use system temp paths without widening `apply_patch` targets.
     pub(crate) fn validate_write_file_access(&self) -> Result<(), AiError> {
         self.validate_write_access_inner(true)
     }
@@ -86,10 +85,8 @@ impl FileStore {
             return Ok(());
         }
         let resolved = self.path.display();
-        // Tell the model explicitly "where it can write", not just "it cannot write here". The previous message only mentioned
-        // temp=true (scratch semantics); when the model's real goal is to write a final artifact to some specified
-        // directory it had no way to proceed and kept retrying the same out-of-bounds path. List all
-        // effective roots so an added project is just as discoverable as the cwd.
+        // List effective writable roots so the model can select a valid artifact path,
+        // including added projects outside the cwd.
         let roots = writable_roots_for_hint(allow_system_temp);
         let root_hint = if roots.is_empty() {
             "\nHint: for temporary/scratch files, use temp=true with a \
@@ -161,7 +158,7 @@ impl FileStore {
     /// Each call holds the shared kernel lock for a single bounded chunk (see the VFS safety note
     /// in `aios_kernel/src/local/vfs.rs`), so a caller streaming a large file never stalls other
     /// kernel tenants for the whole file. The tail is trimmed at a UTF-8 character boundary and
-    /// `next_offset` skips past it, exactly like `vfs_read_range`.
+    /// `next_offset` advances only by the returned bytes, matching `vfs_read_range`.
     pub(crate) fn read_range(
         &self,
         offset: u64,
@@ -301,7 +298,7 @@ impl FileStore {
     /// exist yet. Both paths use OS-level `create_new`, so a concurrent creator's file or symlink
     /// cannot be overwritten. Content is written after creation; a later I/O failure may leave a
     /// partial file. This differs from `write_all_with_before_hint(content, None)`,
-    /// where `None` means "before state unknown" and the write proceeds unconditionally; here the
+    /// where `None` skips compare-and-swap and the write proceeds unconditionally; here the
     /// absence of the file is the enforced precondition. The mutation-log entry records
     /// `before = None` (a brand-new file).
     pub(crate) fn write_new_file_if_absent(&self, content: &str) -> Result<(), AiError> {
@@ -334,10 +331,9 @@ impl FileStore {
                     )
                 })?;
             if let Err(write_err) = file.write_all(content.as_bytes()) {
-                // Mirror the kernel-bound create path: the file was created by this call,
-                // so a failed write can only leave a partial prefix of `content` behind.
-                // Remove it best-effort (only while it is still our own prefix) so the
-                // "absent" precondition is restored; a concurrently replaced file is kept.
+                // Mirror the kernel-bound cleanup of a failed create-only write. A remaining
+                // strict prefix is removed best-effort; content comparison cannot identify
+                // a concurrent replacement with the same prefix.
                 remove_partial_create_file(&self.path, content);
                 return Err(AiError::file(
                     self.path.display().to_string(),
@@ -459,17 +455,15 @@ fn try_vfs_write(path: &Path, content: &str) -> Option<Result<(), VfsError>> {
 /// Behavior-identical copy of the kernel's `remove_partial_create_file`
 /// (crates/aios_kernel/src/local/vfs.rs): best-effort cleanup for a `create_new` write
 /// that failed partway through `content`. Removes the file only while its current bytes
-/// are still a strict prefix of `content` (i.e. it can only be our own partial write);
-/// a file replaced by an external writer is left intact. Keep the two in sync.
+/// are a strict prefix of `content`; other content is left intact. This check does not
+/// prove file ownership or serialize external writers. Keep the two in sync.
 fn remove_partial_create_file(path: &Path, content: &str) {
     let current = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(_) => return,
     };
     if !content.as_bytes().starts_with(&current) || current.len() == content.len() {
-        // Either the file is not ours (not a prefix of what we wrote), or the write
-        // actually completed in full (current == content): both cases must be left for
-        // the regular compare-and-swap rollback to decide.
+        // Preserve non-prefix content and completed writes for regular compare-and-swap rollback.
         return;
     }
     let _ = fs::remove_file(path);
@@ -946,7 +940,8 @@ pub(crate) fn path_within_allowed_roots(path: &Path) -> bool {
     path_within_roots(path, &base, &roots)
 }
 
-/// Pure function: normalize `path` (relative paths resolve against `base`) and check whether it lies under any of `roots`.
+/// Normalize `path` (relative paths resolve against `base`) and check whether it lies under any
+/// of `roots`. An empty root list allows every path.
 pub(crate) fn path_within_roots(path: &Path, base: &Path, roots: &[PathBuf]) -> bool {
     if roots.is_empty() {
         return true;

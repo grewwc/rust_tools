@@ -211,18 +211,18 @@ pub(in crate::ai) fn strip_nested_prior_summary_prefixes(text: &str) -> String {
 /// per-message truncation / first_trim fallbacks.
 pub(in crate::ai) const MIN_KEEP_RECENT_TOOL_GROUPS: usize = 1;
 
-/// Floor on the protected verbatim tail once group folding converges, measured in
-/// billable chars across the messages retained for the current window. Group-count
+/// Target floor for billed chars across protected recent tool results when
+/// selecting a fold window. Group-count
 /// protection alone proved insufficient on read-heavy sessions: many large results
 /// still squeezed the window down until nearly everything except the last turn was
 /// a pointer stub, after which the model re-read files whose full text it had just
-/// received. This floor keeps roughly 6K tokens of fresh tool evidence resident
-/// whenever budget allows. It intentionally yields (folding proceeds past it) only
-/// at MIN_KEEP_RECENT_TOOL_GROUPS so overflow handling always terminates.
+/// received. This floor keeps a minimum amount of fresh tool evidence resident
+/// whenever a fitting candidate can preserve it. If none can, accept a fitting
+/// window below the floor; if no window fits, use the deepest reducing window.
 pub(in crate::ai) const MIN_PROTECTED_TAIL_CHARS: usize = 30_000;
 
-/// For assistant messages carrying tool_calls, how many recent turns keep full
-/// reasoning_content. Older tool-call reasoning is set to None (DeepSeek fills an
+/// How many recent assistant messages with unmarked tool-call reasoning keep it
+/// in full. Older tool-call reasoning is set to None (DeepSeek fills an
 /// empty-string placeholder via echo as a backstop), preventing historical
 /// reasoning text from accumulating monotonically over long sessions, slowing
 /// responses and squeezing the context budget.

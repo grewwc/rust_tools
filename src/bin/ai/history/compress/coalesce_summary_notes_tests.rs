@@ -1,9 +1,7 @@
-//! `coalesce_accumulated_summary_notes` 的单元测试。
+//! Regression coverage for merging legacy summary/archive notes.
 //!
-//! 覆盖压缩 bug 的 P1 修复：历史上因 `is_summary_message` 漏认
-//! `长期记忆摘要（压缩保留）` 前缀，每轮压缩重复插入「摘要 + 归档」note 对，
-//! 长 session 堆积几十对。折叠逻辑需无损收敛这些堆积 note，同时绝不触碰
-//! 正常历史。
+//! Preserve distinct summary bodies and archive paths while collapsing duplicates.
+//! Histories already satisfying the policy must remain unchanged.
 
 use super::*;
 

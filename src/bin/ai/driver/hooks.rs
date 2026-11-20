@@ -6,9 +6,8 @@
 //! - `ai.hooks.before_compression` / `ai.hooks.after_compression`
 //! - `ai.hooks.on_session_end`
 //!
-//! Hooks run best-effort: zero overhead when unconfigured; a failure only
-//! prints a warning and never interrupts the main flow. Since the underlying
-//! `RunCmdOptions` cannot inject environment variables, the event context is
+//! Unconfigured hooks skip command execution. Configured hooks run best-effort:
+//! failures only print a warning and never interrupt the main flow. Event context is
 //! prepended to the user command as a safely escaped `export VAR='...'` prefix.
 
 use crate::ai::config_schema::AiConfig;
@@ -74,7 +73,7 @@ impl Drop for CompressionHookGuard {
     }
 }
 
-/// Fire the hook for a lifecycle event. Returns immediately when unconfigured (zero overhead).
+/// Fire the configured hook for a lifecycle event, skipping empty commands.
 ///
 /// - `tool_name`: only meaningful for before/after tool events; passed as `AI_TOOL_NAME`.
 /// - `tool_ok`:   only meaningful for after tool events; passed as `AI_TOOL_OK` (`true`/`false`).

@@ -8,8 +8,8 @@ mod prefix_state_tests;
 
 #[test]
 fn sqlite_error_classifies_transient_failures_as_retryable() {
-    // BUSY/LOCKED and SQLITE_IOERR system I/O failures (e.g. FSTAT/SHMOPEN when
-    // concurrently opening the WAL for the first time) are transient and must map to WouldBlock so the caller can retry with a short backoff.
+    // Busy, locked, and system-I/O failures map to WouldBlock so callers can
+    // retry them with a bounded backoff.
     for result_code in [
         rusqlite::ffi::SQLITE_BUSY,
         rusqlite::ffi::SQLITE_LOCKED,
@@ -26,7 +26,7 @@ fn sqlite_error_classifies_transient_failures_as_retryable() {
         assert_eq!(io_error.kind(), io::ErrorKind::WouldBlock);
     }
 
-    // Non-transient failures (e.g. a read-only filesystem) must not be retried.
+    // Read-only database errors are not classified as retryable.
     let error = rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY),
         None,
@@ -260,7 +260,7 @@ fn turn_sequence_is_atomic_and_survives_history_clear() {
     clear_session_history_sqlite(&path).unwrap();
     assert_eq!(reserve_turn_index_sqlite(&path).unwrap(), 4);
 
-    // Each thread opens its own connection, covering the same transaction-contention paths across runtimes and processes.
+    // Independent thread reservations must be serialized by the shared session lock.
     let handles: Vec<_> = (0..8)
         .map(|_| {
             let path = path.clone();
@@ -465,9 +465,8 @@ fn staged_rollback_busy_live_wal_is_retryable_without_publication() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// P1 regression: `read_history_revision` must observe the write increment **across connections**.
-/// Every write path opens a new connection to read the version, mimicking build_context_history's cache-invalidation check.
-/// The old implementation used the connection-local `PRAGMA data_version`, which always returns a fixed value on new connections and cannot invalidate the cache.
+/// History writes must advance a revision visible to later connections.
+/// Cache invalidation must not rely on the connection-local `PRAGMA data_version`.
 #[test]
 fn history_revision_increments_across_fresh_connections() {
     let dir = std::env::temp_dir().join(format!(
@@ -500,7 +499,7 @@ fn history_revision_increments_across_fresh_connections() {
     let r4 = read_history_revision(&path).unwrap();
     assert!(r4 > r3, "truncate should bump: {r3} -> {r4}");
 
-    // clear deletes the meta first and then bumps, a structure unlike the other write paths, so it needs its own coverage.
+    // Clear removes transient metadata but must preserve and advance the revision counter.
     append_history_sqlite(&path, vec![msg("user", "again")]).unwrap();
     let r5 = read_history_revision(&path).unwrap();
     clear_session_history_sqlite(&path).unwrap();
@@ -750,7 +749,7 @@ fn stale_patch_targets_survive_history_replacement_and_clear_with_session() {
         Some(targets.clone())
     );
 
-    // replace_all_messages is the persisted-history compaction/rewrite path; the ledger must not be lost with the message shape.
+    // Canonical history replacement must retain the independent stale-patch ledger.
     replace_all_messages_sqlite(&path, &[msg("user", "after compression")]).unwrap();
     assert_eq!(
         read_stale_patch_targets_sqlite(&path).unwrap(),
@@ -2352,7 +2351,7 @@ fn wait_wake_coalesce_sqlite_is_noop_when_nothing_matches() {
     );
     assert!(!coalesce_repeated_wait_wake_notes_sqlite(&path, &other).unwrap());
 
-    // Non-internal_note message: the fast path does no IO.
+    // Non-internal_note messages skip database queries after acquiring the state lock.
     assert!(!coalesce_repeated_wait_wake_notes_sqlite(&path, &msg("user", "hello")).unwrap());
 
     // A real-result wake (parse returns None): no dedup.

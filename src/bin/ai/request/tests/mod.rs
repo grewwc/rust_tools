@@ -9,7 +9,5 @@ mod responses;
 mod session_budget;
 mod thinking;
 
-// `test_app` is used by request::transport's own test module via the path
-// `super::super::tests::test_app`; re-export it here so that path keeps
-// resolving after the helper moved into `common`.
+// Expose `test_app` for the test module in `request::transport`.
 pub(super) use common::test_app;

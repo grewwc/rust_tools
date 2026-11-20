@@ -124,20 +124,18 @@ fn truncate_user_file_references_to_fit(
     true
 }
 
-/// Char budget of the precision tail. The newest tool groups stay verbatim up to
-/// this size; anything older is still recoverable through the archive, so
-/// protecting it in place only freezes the ladder in a long single turn.
+/// Char budget for current-turn precision result protection. Traverse newest
+/// results first and include the result that exhausts the budget whole, even
+/// when that one result exceeds the quota.
 pub(in crate::ai) const PRECISION_TAIL_MAX_CHARS: usize = 120_000;
 
 pub(in crate::ai) fn current_turn_precision_tool_call_ids(
     messages: &[Message],
 ) -> rustc_hash::FxHashSet<String> {
     let mut out = rustc_hash::FxHashSet::default();
-    // Synthetic user messages do not form a turn boundary, but the tail budget
-    // does: walking newest groups first and stopping once the budget is spent
-    // keeps recent precision intact while leaving superseded results foldable.
-    // A single newest group larger than the budget stays protected whole:
-    // splitting one result is the lossy path's job, not this window's.
+    // Synthetic user messages do not form a turn boundary. Traverse newest
+    // precision results first, including the result that exhausts the budget,
+    // so recent evidence stays protected without pinning the entire turn.
     let current_turn_start = last_real_user_index(messages).unwrap_or(0);
     let mut id_to_name: rustc_hash::FxHashMap<&str, &str> = rustc_hash::FxHashMap::default();
     for message in messages.iter().skip(current_turn_start) {
@@ -242,17 +240,10 @@ pub(in crate::ai) fn upsert_context_compaction_state(messages: &mut Vec<Message>
     );
 }
 
-/// Mid-turn progressive compaction: reuse the first tiers of the cross-turn
-/// compaction pipeline inside the iteration loop. Only "lossless/weakly-lossy"
-/// operations; system messages untouched and the most recent keep_recent tool
-/// messages never deleted:
-///   1. dedup_repeated_tool_results — older results with the same (tool, args)
-///      folded into stubs
-///   2. prepare_tool_messages_structured — remote tool results trimmed by line to
-///      480 chars
-///   3. fold_tool_call_group_to_stub  — still over budget: fold the whole remote
-///      (assistant + tool) group
-/// Returns: (messages_after, before_chars, after_chars)
+/// Compact a request projection within a turn: cap accumulated evidence notes,
+/// trim unmarked reasoning, deduplicate results, prepare structured tool output,
+/// then use `shrink_messages_to_fit` if still over budget.
+/// Returns `(messages_after, before_chars, after_chars)`.
 pub(in crate::ai) fn mid_turn_compress(
     messages: Vec<Message>,
     soft_threshold: usize,
@@ -277,10 +268,8 @@ pub(in crate::ai) fn mid_turn_compress(
     // recoverable evidence stubs as a full context. Inserted before any trimming;
     // the later budget calculation folds this fixed overhead in.
     upsert_context_compaction_state(&mut out);
-    // 0. Clean up stale reasoning_content: multiple reasoning chains returned by
-    //    the LLM within one turn add nothing to later decisions, but some vendors
-    //    require historical reasoning to pair with tool_calls. Keep only the last
-    //    assistant's reasoning_content; set the rest to None.
+    // Trim unmarked reasoning according to `keep_only_recent_reasoning_content`;
+    // exact continuation state stays with its protocol messages.
     keep_only_recent_reasoning_content(&mut out);
     if messages_total_chars(&out) <= soft_threshold {
         let after = messages_total_chars(&out);
@@ -298,8 +287,8 @@ pub(in crate::ai) fn mid_turn_compress(
         let after = messages_total_chars(&out);
         return (out, before, after);
     }
-    // 2. Structured remote trimming: the middle of each tool result is folded by
-    //    line down to 480 chars per entry; the most recent 6 keep full text.
+    // 2. Structured tool preparation uses bounded summaries while protecting
+    //    the most recent KEEP_RECENT_TOOL_GROUPS tool groups.
     //    When overflow_dir is passed, large outputs of "non-compressible" tools
     //    like read_file/grep spill to the session file with zero compression and
     //    leave a head+tail preview stub (consistent with cross-turn compaction),
@@ -338,17 +327,15 @@ pub(in crate::ai) fn mid_turn_compress(
 }
 
 /// Minimum net decrease (chars) for an LLM summary to count as "effective
-/// compaction". Below this it is considered ineffective and `was_effective`
-/// returns false; the hard-budget backstop may still return a slightly smaller
+/// compaction". Below this the outcome's `effective` flag is false;
+/// the hard-budget backstop may still return a slightly smaller
 /// context result. Same order of magnitude as `summary_max_chars`: if the net
 /// decrease is smaller than the injected summary text itself, the compressor is
 /// spinning (typical symptom: "295K shrank to 294K and stopped").
 pub(in crate::ai) const MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS: usize = 4_000;
 
-/// Path C backstop: per-message cap for head+tail truncating a single oversized
-/// non-system message inside the tail window. Triggers only when progressive
-/// folding still leaves the context over `hard_target` — prefer truncation over
-/// letting the model 4xx.
+/// Initial per-field cap for emergency compaction. Further cuts may be needed
+/// to meet the total `hard_target`; user/system fields remain excluded.
 pub(in crate::ai) const PATH_C_PER_MSG_CAP: usize = 8_000;
 
 /// Minimum chars for mid-turn compaction step 2 to replace a non-compressible
@@ -360,32 +347,8 @@ pub(in crate::ai) const PATH_C_PER_MSG_CAP: usize = 8_000;
 /// per-result floor, while large task evidence keeps recovery and review anchors.
 pub(in crate::ai) const MID_TURN_SPILL_MIN_CHARS: usize = 6_000;
 
-/// Mid-turn LLM summary backstop: called when the lossless/weakly-lossy pipeline
-/// still leaves the context over threshold. Three complementary paths:
-///   - Path A (cross-turn summary): if conversation remains before the most recent
-///     `keep_recent_turns` user turns, call the LLM summarizer to compress that
-///     span into a single `internal_note` injected before the tail window; also
-///     fold older tool groups inside the tail window, so "bloat concentrated in
-///     the newest turn" can still shrink.
-///   - Path B+C (progressive folding): start from `keep_recent=4` (equivalent to
-///     the original Path B) and shrink the protection window step by step to 2→1,
-///     until compaction is effective or the context drops below `hard_target`.
-///     Fixes compressor spin when "all the bloat sits inside the protected tail
-///     window and early history has nothing left to fold".
-///   - Path C backstop (per-message truncation): when progressive folding still
-///     exceeds `hard_target`, head+tail truncate a single oversized non-system
-///     message in the tail window. This is the absolute last resort.
-/// All leading system / internal_note messages (agent instructions, tool lists,
-/// global guidance) are always kept verbatim. Returns
-/// `(messages_after, before, after, was_effective, llm_summary_inserted)`;
-/// `was_effective` is true only when the net decrease is >=
-/// [`MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS`]. false does not mean the returned
-/// messages are unchanged; the hard-budget backstop may produce a partial decrease
-/// below the effective threshold. `llm_summary_inserted` says whether Path A
-/// actually ran and injected a source-bound summary: false with `after < before`
-/// means the decrease came entirely from mechanical paths (fold/truncate/spill),
-/// letting the upper report distinguish "LLM summary executed" from "purely
-/// mechanical compaction" and avoid false reporting.
+/// Cap inherited folded evidence before hard-target checks, accounting for any
+/// archive pointer inserted by trimming.
 fn cap_mid_turn_llm_evidence(messages: Vec<Message>, overflow_dir: &Path) -> (Vec<Message>, usize) {
     let messages = trim_compressed_tool_evidence_to_inline_budget(messages, Some(overflow_dir));
     let after = messages_total_chars(&messages);
@@ -468,6 +431,11 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     )
 }
 
+/// Try a source-bound summary of older turns, then progressively fold tool groups.
+/// If still over budget, spill protected results before emergency field caps.
+/// Protected user/system text can leave the target unmet.
+/// `effective`, `summary_inserted`, and `model_called` are independent:
+/// a called summarizer can yield a rejected candidate.
 pub(in crate::ai) async fn mid_turn_llm_summarize_with_summarizer(
     app: &App,
     summarizer: &(impl HistoryMessageSummarizer + Sync + ?Sized),
@@ -592,16 +560,10 @@ pub(in crate::ai) async fn mid_turn_llm_summarize_with_summarizer(
                 //    better than the current best.
                 out.extend_from_slice(tail_plan.messages());
                 let after = messages_total_chars(&out);
-                // Commit the tail-window fold first and archive `earlier` only
-                // after the candidate is confirmed adopted: archive appends to
-                // overflow-history.md (non-idempotent), so archiving early and then
-                // failing the commit would leave `earlier` on disk while the
-                // context never adopted `out`, and the next compaction round would
-                // archive the same messages again -> orphan accumulation. The
-                // short-circuit `&&` guarantees the archive is never touched when
-                // commit fails; if commit succeeds but archiving fails, `best` is
-                // not updated and the context still keeps `earlier` — no data loss
-                // (only an idempotently hash-named fold file remains).
+                // Commit only after the candidate beats the current best. Fold
+                // and source writes precede the overflow append so a failed
+                // earlier commit cannot append an outgoing span. If a later
+                // write fails, keep `earlier` in context; committed files may remain.
                 if after < best_after
                     && tail_plan.commit()
                     && summary_plan.commit()
@@ -623,9 +585,8 @@ pub(in crate::ai) async fn mid_turn_llm_summarize_with_summarizer(
     }
 
     // === Path B+C: progressive tool-group folding ===
-    // Start from keep_recent=4 (equivalent to the original Path B) and shrink the
-    // protection window step by step to 2→1 (never to 0), until compaction is
-    // effective or the context drops below hard_target. Fixes the spin when "all
+    // Use progressive_fold_windows to narrow protection without reaching zero,
+    // stopping once the context fits hard_target. This handles cases where "all
     // the bloat sits inside the protected tail window". Folding chains on best
     // (the Path A result or the original messages): already-folded groups became
     // stubs (internal_notes) and will not match fold_early_tool_groups again, so
@@ -671,19 +632,13 @@ pub(in crate::ai) async fn mid_turn_llm_summarize_with_summarizer(
     }
 
     // === Path C backstop: budget-aware structure-preserving truncation ===
-    // Keep the assistant↔tool pairing of system/user messages and the most recent
-    // tool groups; compress only re-retrievable result bodies, reasoning, and
-    // oversized tool arguments. Unlike the old "8K per message", this keeps
-    // tightening against the total budget, so it converges even with many parallel
-    // tool results. If the untrimmable system/user content itself is over budget,
-    // return the smallest achievable result instead of corrupting the user's task
-    // text.
+    // Keep system/user messages and assistant↔tool pairing while shortening
+    // mutable fields against the total budget. When system/user content alone
+    // is too large, return the smallest achievable projection.
     let mut result = best.unwrap_or(messages);
-    // Before the Path C backstop, spill every current-turn result that forbids
-    // lossy compaction with zero compression: persist the original as a
-    // re-readable asset and replace it with a stub, so the immediately following
-    // `emergency_cap_messages_to_fit` cannot lossy-truncate that grounding
-    // evidence to 8K / ~160 chars, making the original unrecoverable.
+    // Spill eligible current-turn results before the emergency cap so successful
+    // archives leave recoverable stubs. Failed or ineligible spills retain the
+    // original fields for the hard-budget fallback.
     spill_protected_precision_to_fit(
         &mut result,
         hard_target,

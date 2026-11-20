@@ -459,8 +459,8 @@ pub(in crate::ai::driver::turn_runtime) fn final_citation_base_dirs(
     base_dirs
 }
 
-/// `Some(false)` is reserved for a locally provable bad citation. I/O failures and oversized
-/// files stay unknown so this gate never claims a citation is invalid without direct evidence.
+/// Missing paths and absent lines yield `Some(false)`. Other I/O failures and size limits
+/// stay unknown so this gate never claims a citation is invalid without direct evidence.
 pub(in crate::ai::driver::turn_runtime) fn citation_file_contains_line(
     path: &Path,
     line: u64,

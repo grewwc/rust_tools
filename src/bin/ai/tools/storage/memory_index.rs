@@ -1,17 +1,14 @@
-//! SQLite + FTS5 index layer (Option B).
+//! SQLite + FTS5 index layer.
 //!
 //! JSONL remains the source of truth; this module keeps a sidecar SQLite index for
 //! `agent_memory.jsonl`:
-//!   - `entries`        : structured mirror of AgentMemoryEntry + `hits / last_accessed` LFU counters
-//!   - `entries_fts`    : FTS5 full-text inverted index (virtual table, content=entries) for millisecond keyword recall
+//!   - `entries`        : indexed fields of AgentMemoryEntry + `hits / last_access` LFU counters
+//!   - `entries_fts`    : FTS5 table maintained alongside `entries` for keyword recall
 //!   - `meta`           : consistency metadata `schema_version` / `source_mtime` / `source_len`
 //!
-//! At startup call [`MemoryIndex::open_or_init`]: if the file mtime/len matches the last
-//! recorded values the index is immediately usable; otherwise the whole JSONL is
-//! re-ingested (rebuild). Rebuild runs on the caller's thread because only that path
-//! guarantees later search/recent calls never return stale data. Asynchronous rebuild
-//! by the daemon is left to `record_drift_async` on the write path: queue a background
-//! repair when the JSONL was updated but this process does not want to block.
+//! [`MemoryIndex::open_or_init`] checks the schema and source mtime/len and rebuilds
+//! synchronously on drift. MemoryStore caches opened indexes and performs best-effort
+//! synchronization after writes; JSONL remains authoritative when synchronization fails.
 //!
 //! Design points
 //!   - Never do "read JSONL -> write DB" outside of holding `with_memory_file_lock`,
@@ -40,8 +37,7 @@ pub(crate) struct MemoryIndex {
     db_path: PathBuf,
     /// JSONL source-of-truth path, e.g. `~/.config/rust_tools/agent_memory.jsonl`
     source_path: PathBuf,
-    /// SQLite connection; wrapped in a Mutex to support concurrent reads/writes from
-    /// multiple threads (rusqlite::Connection is not Send + Sync, but Mutex<Connection> is).
+    /// Mutex-guarded SQLite connection for serialized access across threads.
     conn: Mutex<Connection>,
 }
 
@@ -207,8 +203,7 @@ impl MemoryIndex {
             .map_err(|e| format!("clear entries_fts: {e}"))?;
 
         for entry in &entries {
-            // Entries without an id cannot be indexed reliably - skip them;
-            // the search path falls back to scanning the JSONL.
+            // Without an id, the entry cannot participate in FTS candidate lookup.
             let Some(id) = entry.id.as_deref() else {
                 continue;
             };
@@ -248,8 +243,7 @@ impl MemoryIndex {
         Ok(entries.len())
     }
 
-    /// Single incremental write - call only after `MemoryStore::append` has
-    /// successfully fsynced the JSONL.
+    /// Single incremental index write; call only after the JSONL append succeeds.
     pub(crate) fn upsert_entry(&self, entry: &AgentMemoryEntry) -> Result<(), String> {
         let Some(id) = entry.id.as_deref() else {
             return Ok(()); // no id: skip indexing entirely, matching rebuild
@@ -287,8 +281,7 @@ impl MemoryIndex {
             ],
         )
         .map_err(|e| format!("upsert entries: {e}"))?;
-        // FTS5 uses delete-then-insert: ON CONFLICT behavior is unfriendly
-        // under the contentless config.
+        // Replace the FTS row explicitly because updating entries does not maintain entries_fts.
         conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])
             .map_err(|e| format!("delete fts: {e}"))?;
         conn.execute(
@@ -318,10 +311,8 @@ impl MemoryIndex {
         self.write_source_signature()
     }
 
-    /// FTS5 full-text search; returns the id list sorted by
-    /// `bm25(entries_fts) + priority + recency + LFU`.
-    /// The caller then uses `MemoryStore::all()` or a later exact id read
-    /// to fetch the full entries.
+    /// FTS5 search ordered by inverted BM25 score, priority, and hit count.
+    /// Callers load full entries from canonical JSONL after selecting IDs.
     pub(crate) fn search_ids(&self, query: &str, limit: usize) -> Result<Vec<String>, String> {
         let conn = self
             .conn
@@ -382,8 +373,7 @@ impl MemoryIndex {
         Ok(())
     }
 
-    /// Fetch an entry's LFU counters (search aid; not widely used yet,
-    /// reserved for GC scoring).
+    /// Fetch an entry's hit count, returning zero when the id is absent.
     #[allow(dead_code)]
     pub(crate) fn hits_for(&self, id: &str) -> Result<i64, String> {
         let conn = self
@@ -403,9 +393,8 @@ impl MemoryIndex {
     }
 }
 
-/// FTS5 MATCH input needs basic escaping; here only alphanumerics / underscores /
-/// CJK characters plus whitespace are allowed, everything else is treated as a
-/// separator. We finally join tokens with spaces as an implicit OR query.
+/// Retain Unicode alphanumerics and underscores as tokens, append the FTS5 prefix
+/// wildcard, and join with spaces (implicit AND). Other characters separate tokens.
 fn sanitize_fts_query(q: &str) -> String {
     let mut out = String::new();
     let mut in_token = false;

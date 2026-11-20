@@ -675,7 +675,6 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
             backend_continue_from: prepared.backend_continue_from.clone(),
             // Snapshot now: background dispatch may run after this turn ends,
             // when the live driver context no longer carries the guard state.
-            // Kernel tasks never read it, so their payload keeps the old shape.
             active_skill_names: if implementation.execution_mode() == ExecutionMode::External {
                 crate::ai::driver::runtime_ctx::active_skill_names()
             } else {
@@ -776,8 +775,7 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
         ));
     }
 
-    // Complete the whole batch preflight first, so earlier children are not already started when a
-    // later entry has invalid arguments.
+    // Validate all task arguments before spawning any children.
     let prepared = tasks
         .iter()
         .enumerate()

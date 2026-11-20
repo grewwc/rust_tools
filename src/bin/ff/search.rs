@@ -165,7 +165,7 @@ fn scan_dir_blocking(
         let p = entry.path();
         if p.is_dir() {
             // Skip huge directories such as .git / target / node_modules to avoid a full recursive walk.
-            // The root directory itself does not go through this check, so the user can explicitly pass path="target" to search inside it.
+            // The root bypasses this check, so target remains searchable when passed as the root.
             let name = entry.file_name();
             if !rust_tools::commonw::is_skip_dir(&name.to_string_lossy()) {
                 subdirs.push(p);

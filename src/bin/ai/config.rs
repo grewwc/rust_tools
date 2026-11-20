@@ -71,22 +71,16 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     })
 }
 
-/// Fixed cross-turn live-history budget in chars when `ai.history.max_chars` is
-/// unset. Deriving the budget from the model window made large-window models
-/// (1M-token deepseek/minimax) keep ~2x more history resident every turn, which
-/// doubled per-request input tokens without a matching quality gain. A single
-/// fixed value keeps the compaction cadence identical across models and
-/// independent of the declared window.
+/// Default cross-turn history budget in characters when `ai.history.max_chars`
+/// is unset or invalid. A fixed budget prevents larger declared model windows
+/// from increasing the resident-history limit.
 const DEFAULT_HISTORY_MAX_CHARS: usize = 200_000;
 
-/// Cross-turn live-history budget in chars for `model`.
+/// Cross-turn history budget in characters.
 ///
-/// An explicit `ai.history.max_chars` always wins (0 keeps compression
-/// disabled). Otherwise every model uses the same fixed
-/// [`DEFAULT_HISTORY_MAX_CHARS`]: the budget no longer scales with the model
-/// window, so a large declared window cannot inflate resident history and the
-/// per-request token cost stays stable across models. The `model` argument is
-/// retained for call-site compatibility and a future per-model override.
+/// A valid `ai.history.max_chars` overrides [`DEFAULT_HISTORY_MAX_CHARS`]; zero
+/// disables compression. The unused model argument keeps call sites compatible
+/// while all models share the same default character budget.
 pub(super) fn history_max_chars_for_model(cfg: &configw::ConfigW, _model: &str) -> usize {
     cfg.get_opt(AiConfig::HISTORY_MAX_CHARS)
         .and_then(|v| v.parse::<usize>().ok())

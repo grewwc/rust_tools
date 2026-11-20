@@ -2,9 +2,8 @@ use super::*;
 
 /// After a successful spawn, writes a placeholder audit record (delivered_at=0); when the result
 /// is delivered, `record_delivered_task_evidence` overwrites the status fields for the same
-/// task_id, so the ledger can always answer "whether the current agent called a subagent, when,
-/// and with which agent/model". The audit write is best-effort: failure does not block the spawn
-/// itself.
+/// task_id. These records describe when the current agent spawned a subagent and which
+/// agent/model it selected. The write is best-effort: failure does not block the spawn.
 pub(super) fn record_subagent_spawn_audit(task_id: &str, prepared: &PreparedSubagentTask) {
     let Some(context) = crate::ai::driver::runtime_ctx::try_current() else {
         return;
@@ -85,10 +84,10 @@ fn task_evidence_history_file(entry: &AsyncTaskEntry) -> Option<PathBuf> {
         .filter(|path| !path.as_os_str().is_empty() && !entry.session_id.is_empty())
 }
 
-/// Every terminal producer commits the full result before attempting IPC. Publication failures
-/// retain a recovery payload in the parent ledger and return a visible error to the driver. If
-/// the channel's owner has already exited, the durable payload is the delivery path until a later
-/// foreground collects it, so no send to that stale channel is attempted.
+/// For a tracked task, attempt to persist the full result before sending it over IPC.
+/// IPC failures return a visible error; a saved result remains recoverable from the parent
+/// ledger. If the channel owner has exited and persistence succeeded, skip that channel
+/// and leave collection to a later foreground turn.
 pub(crate) fn publish_task_result(
     os: &mut dyn Kernel,
     task_id: Option<&str>,
@@ -201,9 +200,8 @@ pub(crate) fn publish_task_result(
     }
 }
 
-/// Reads the persisted evidence state (status + payload) for the given task_id in the current
-/// session. Returns None when there is no driver context or nothing has been persisted (a lenient
-/// semantic consistent with the persisting side).
+/// Read persisted evidence (status + payload) for the given session and task IDs.
+/// Returns None when there is no driver context or no persisted record.
 pub(super) fn read_persisted_task_evidence_status(
     session_id: &str,
     task_id: &str,
@@ -284,9 +282,9 @@ pub(super) fn collect_ready_task_batch(
 /// Drain a terminal result: persist evidence first, consume the channel, then release the IPC
 /// resources and terminate the kernel process. Returns `Ok(None)` while the task is still running.
 ///
-/// The registry entry is deliberately left untouched. Callers remove it after the kernel closure
-/// returns, including on the error path, so a failure while collecting a later task in the same
-/// batch cannot strand an entry whose channel has already been destroyed.
+/// The registry entry is deliberately left untouched. Callers remove each successfully
+/// collected entry after the kernel closure returns; failed collections keep their entries
+/// available for retry.
 pub(super) fn drain_task_result(
     os: &mut dyn Kernel,
     task_id: &str,
@@ -305,8 +303,8 @@ pub(super) fn drain_task_result(
                     format!("failed to read available task evidence for {task_id}: {error}")
                 })?
         {
-            // Display metadata is optional: an unreadable report degrades to the entry-derived
-            // fallback instead of blocking the durable payload below.
+            // A missing report falls back to entry-derived metadata; read errors
+            // propagate so collection can be retried.
             let report = crate::ai::history::read_task_evidence_report(
                 &history_file,
                 &entry.session_id,
@@ -435,12 +433,9 @@ pub(super) fn poll_owned_task_result(task_id: &str) -> Result<OwnedTaskPoll, Str
         registry.get_ref(&task_id.to_string()).cloned()
     };
     let Some(entry) = entry else {
-        // Entry missing: in the normal flow an entry is only removed after the
-        // task is polled to Terminal and its evidence is persisted. If this
-        // session already persisted evidence for the task (the only path for the
-        // H1 regression "polled but checkpoint not saved"), return an idempotent
-        // Terminal so the graph/team checkpoint can self-heal instead of hanging
-        // forever; without evidence this is still a genuine error.
+        // An earlier poll can persist evidence and remove the entry before a
+        // Team/Graph checkpoint is saved. Replay that terminal evidence so a
+        // later poll can rebuild the checkpoint; missing evidence remains an error.
         if let Some((status, payload)) =
             read_persisted_task_evidence_status(&current_session_id, task_id)?
         {
@@ -718,10 +713,8 @@ pub(super) fn select_subagent<'a>(
         ));
     }
 
-    // Contract-bound agents opt out of auto-selection: their prompt fixes the
-    // output shape (e.g. a machine-checked <audit_report>) and forbids edits, so
-    // a lexical score could otherwise hand them work they may not perform. They
-    // remain reachable through an explicit `agent` name handled above.
+    // Agents with constrained output or responsibilities can opt out of lexical
+    // selection while remaining available through an explicit `agent` name.
     let subagents: Vec<&AgentManifest> = subagents
         .into_iter()
         .filter(|agent| agent.auto_select)
@@ -736,10 +729,7 @@ pub(super) fn select_subagent<'a>(
 
     let task_text = format!("{description}\n{prompt}");
 
-    // Build the query n-gram set once plus one document set per candidate,
-    // then reuse the cached sets in every pairwise comparison instead of
-    // rebuilding them inside each scorer call. Each score is the same formula
-    // over the same set values as before, so results stay bit-identical.
+    // Cache n-gram sets because each candidate participates in multiple comparisons.
     let query_ngrams = char_ngram_set_from_text(&task_text);
     let doc_ngrams: Vec<FxHashSet<String>> = subagents
         .iter()
@@ -755,8 +745,6 @@ pub(super) fn select_subagent<'a>(
                 .then_with(|| agent_b.name.cmp(&agent_a.name))
         })
         .map(|(index, agent)| {
-            // Same Jaccard value over the same cached sets as any comparison,
-            // so the reported score matches what pre-refactor code reported.
             let score = char_ngram_jaccard(&query_ngrams, &doc_ngrams[index]);
             SelectedSubagent {
                 agent,

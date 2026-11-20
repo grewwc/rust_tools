@@ -39,9 +39,9 @@ pub(crate) fn try_apply_hunk_at(
 }
 
 /// Locates the application start (0-based) of a hunk under the given match mode.
-/// Returns `Ok(Some(pos))` for a unique successful location; `Ok(None)` when no
-/// position in the whole file matches (the caller may retry with a more lenient
-/// mode); `Err` when a position was found but is ambiguous or out of order.
+/// Returns `Ok(Some(pos))` when a declared or resolved position is accepted;
+/// `Ok(None)` when no position matches (the caller may retry with a more lenient
+/// mode); `Err` for unresolved ambiguity or out-of-order hunks.
 pub(crate) fn locate_hunk(
     orig_lines: &[String],
     hunk: &UnifiedHunk,
@@ -82,10 +82,9 @@ pub(crate) fn locate_hunk(
         return Ok(Some(nominal));
     }
 
-    // When the nominal position does not match, first check how many places across
-    // the whole file can match: multiple matches mean the context anchors are not
-    // unique, so report the candidate positions directly instead of falling back
-    // to fuzzy context and producing a confusing context mismatch.
+    // Search the whole file before considering fuzzy context. Accept a unique
+    // forward match or disambiguate with the declared line; unresolved ambiguity
+    // must fail rather than weaken the context anchors.
     let positions = all_hunk_match_positions(orig_lines, hunk, mode);
     let forward: Vec<usize> = positions.iter().copied().filter(|&p| p >= cursor).collect();
     if forward.len() > 1 {
@@ -96,10 +95,8 @@ pub(crate) fn locate_hunk(
             orig_lines, &forward, hunk_idx, hunk_total,
         ));
     }
-    // forward is already filtered to p >= cursor, so "hunks out of order" cannot
-    // happen here. Previously falling back to find_hunk_offset (a ±50 window) would
-    // falsely report context mismatch when the unique match fell outside the
-    // window; just use forward's unique result directly.
+    // A unique forward match is already in order; use it even when it is far
+    // from the declared line.
     if let Some(&offset) = forward.first() {
         Ok(Some(offset))
     } else if let Some(&earliest) = positions.first() {
@@ -149,12 +146,9 @@ pub(crate) fn apply_unified_patch_with_hints(
     let mut cursor = 0usize;
 
     for (hunk_idx, hunk) in active_hunks.iter().enumerate() {
-        // First try strict matching (only tolerating trailing whitespace). When
-        // strict matching cannot locate the hunk anywhere in the file, fall back
-        // once to a lenient mode that ignores leading indentation — aligned with
-        // `git apply --ignore-whitespace`, resolving context mismatches caused by
-        // the model not reproducing markdown/nested-list/code-block indentation
-        // exactly.
+        // Prefer required context with strict matching, then allow indentation drift.
+        // If neither locates the hunk, try fuzzy context while still requiring
+        // removed lines to match.
         let (apply_at, mode, context_policy) = match locate_hunk(
             &orig_lines,
             hunk,
@@ -224,11 +218,10 @@ pub(crate) fn apply_unified_patch(original: &str, patch: &str) -> Result<String,
     apply_unified_patch_with_hints(original, patch).map(|(content, _)| content)
 }
 
-/// A pure-insert hunk (only `+` lines, no context/remove lines) undergoes no
-/// content verification on a non-empty file; it is located only by the line number
-/// declared in `@@`. When one is hit, return a hint reminding the model that if the
-/// file changed after being read, it should re-verify the insert position with
-/// read_file.
+/// A pure-insert hunk (only `+` lines) has no content anchors in a non-empty file.
+/// Its position comes from the declared line or the current hunk cursor. Return
+/// a read_file hint because the intended position cannot be verified if the file
+/// changed after the model read it.
 pub(crate) fn pure_insert_hint(original: &str, hunks: &[UnifiedHunk]) -> Option<String> {
     if original.is_empty() {
         return None;
@@ -260,7 +253,6 @@ pub(crate) fn truncated_patch_hint(patch: &str) -> Option<&'static str> {
     }
     let lines: Vec<&str> = trimmed.lines().collect();
     let last = lines.last().unwrap().trim_end();
-    // 1) Starts with an envelope marker but is never closed
     let starts_envelope = lines
         .iter()
         .any(|line| line.trim_start().starts_with("*** Begin Patch"));
@@ -308,10 +300,9 @@ pub(crate) fn emit_stream_line(on_chunk: &mut ToolStreamWriter<'_>, line: &str) 
     on_chunk(rendered.as_bytes());
 }
 
-/// Strips code fences (```...``` or ~~~...~~~) the model often wraps around a
-/// patch. Strips only when the whole patch is wrapped in one pair (opening fence on
-/// the first line, bare closing fence on the last); fences inside the patch body
-/// are left untouched to avoid damaging real patch content.
+/// Strip an outer wrapper whose first line starts with a backtick or tilde
+/// fence and whose last non-empty line is a bare fence marker. Preserve
+/// interior fences and trim whitespace around the unwrapped patch.
 pub(crate) fn strip_code_fence(patch: &str) -> String {
     let lines: Vec<&str> = patch.lines().collect();
     if lines.len() < 3 {
@@ -334,8 +325,6 @@ pub(crate) fn strip_code_fence(patch: &str) -> String {
     if !is_close_fence || last_nonempty < 2 {
         return patch.to_string();
     }
-    // Strip the first/last fence lines, keep the middle content, and trim excess
-    // leading/trailing whitespace.
     lines[1..last_nonempty].join("\n").trim().to_string()
 }
 
@@ -346,7 +335,7 @@ pub(crate) fn diff_stats_for_write(write: &PreparedPatchWrite) -> (usize, usize,
             let after_lines = next.lines().count();
             match &write.before {
                 Some(before) => {
-                    // Count additions/removals by comparing line by line
+                    // Compare line multisets, so reordering alone does not count as a change.
                     use std::collections::hash_map::DefaultHasher;
                     use std::hash::{Hash, Hasher};
                     let mut before_set: Vec<u64> = before
@@ -549,9 +538,8 @@ pub(crate) fn prepare_patch_write(
         None
     };
     let (action, hints) = if matches!(envelope.op, PatchEnvelopeOp::Update | PatchEnvelopeOp::Add) {
-        // On the first encounter of a file, keep the disk-existence check so the
-        // single-section behavior is unchanged; repeated sections for the same file
-        // are handled by prepare_patch_action_from_content against in-memory state.
+        // Validate on-disk existence for the first section; repeated sections use
+        // prepare_patch_action_from_content with the accumulated in-memory content.
         let normalized_patch = normalize_patch_envelope(path, envelope)?;
         let original = before.as_deref().unwrap_or_default();
         apply_unified_patch_with_hints(original, &normalized_patch)
@@ -570,9 +558,8 @@ pub(crate) fn prepare_patch_write(
 /// Prepares a write from an already-split single-file unified diff section (used
 /// for the multi-file unified diff path). Unlike prepare_patch_write, the section
 /// carries its own `--- `/`+++ ` file headers and `@@` hunks, so no envelope
-/// normalization is applied — it is handed straight to apply_unified_patch
-/// (parse_unified_hunks skips non-`@@` lines), reusing the tolerant match
-/// semantics of unified diffs as-is.
+/// normalization is applied; apply_unified_patch_with_hints parses the section
+/// and uses the same matching rules as envelope patches.
 pub(crate) fn prepare_patch_write_from_section(
     path: &Path,
     store: &FileStore,
@@ -641,7 +628,7 @@ pub(crate) fn apply_prepared_patch_write(write: &PreparedPatchWrite) -> Result<(
             // write share one kernel-lock hold, so other writers using that kernel cannot
             // interleave. External processes do not participate in that lock.
             //
-            // A `None` `before` means Add File: the precondition is that the target does not
+            // A `None` `before` means the target was absent during preparation. It must not
             // exist, so the create-only CAS (`write_new_file_if_absent` → kernel
             // `vfs_write_if_unchanged` with expected=None) enforces absence instead of writing
             // unconditionally — a file created concurrently since preparation is never
@@ -653,7 +640,7 @@ pub(crate) fn apply_prepared_patch_write(write: &PreparedPatchWrite) -> Result<(
             .map_err(|err| err.to_string())
         }
         PreparedPatchAction::Delete => {
-            // Delete targets always carry a before snapshot (see DeleteFile validation).
+            // Delete targets carry a before snapshot from prepare_patch_action_from_content.
             // Conditional removal detects changed content; it is serialized with writers
             // using the same kernel, not arbitrary external processes.
             let expected = write.before.as_deref().ok_or_else(|| {

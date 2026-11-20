@@ -28,7 +28,7 @@ pub trait RequestMiddleware: Send + Sync {
 
 /// Folds a `Vec<Arc<dyn RequestMiddleware>>` into a single `LlmClient` (onion model).
 ///
-/// - `middlewares[0]` is the outermost layer (wrapped first), `middlewares.last()` sits
+/// - `middlewares[0]` is the outermost layer (entered first), `middlewares.last()` sits
 ///   closest to inner;
 /// - folding uses `rev().fold`, equivalent to
 ///   `middlewares[0].wrap(middlewares[1].wrap(...(inner)))`;
@@ -122,8 +122,7 @@ mod tests {
         }
     }
 
-    /// Retry middleware: calls inner repeatedly on failure (impossible with the old
-    /// FnOnce `next` signature).
+    /// Retry middleware: calls inner up to `max_attempts` times on failure.
     struct RetryMiddleware {
         max_attempts: usize,
     }
@@ -184,8 +183,6 @@ mod tests {
         let middleware_calls = Arc::new(AtomicUsize::new(0));
         let client_calls = Arc::new(AtomicUsize::new(0));
 
-        // Logging(Retry(Default))-style onion chain: outer counter -> inner counter
-        // -> real client.
         let client: Box<dyn LlmClient> = CountingMiddleware {
             calls: Arc::clone(&outer_calls),
         }
@@ -204,15 +201,11 @@ mod tests {
             let res = client.send(&mut app, mock_req(&msgs)).await;
             assert!(res.is_err(), "mock 固定失败，链应原样透传");
         }
-        // The three layers count independently: outer middleware, inner middleware,
-        // and the real client should each be called exactly 3 times.
         assert_eq!(outer_calls.load(Ordering::SeqCst), 3);
         assert_eq!(middleware_calls.load(Ordering::SeqCst), 3);
         assert_eq!(client_calls.load(Ordering::SeqCst), 3);
     }
 
-    /// Retry middleware can call inner multiple times (the old FnOnce signature
-    /// could not implement retry).
     #[tokio::test]
     async fn retry_middleware_calls_inner_multiple_times() {
         let inner_calls = Arc::new(AtomicUsize::new(0));

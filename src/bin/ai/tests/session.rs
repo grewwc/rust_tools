@@ -45,8 +45,7 @@ fn session_delete_cleans_up_overflow_history_file() {
     let _ = std::fs::remove_dir_all(store.session_assets_dir("__cleanup__"));
 }
 
-/// `temp_dir()` now shares its root with tool-overflow, landing under `session_assets_dir/tmp/`.
-/// Verifies that `delete_session` recursively cleans up `tmp/temp_registry.json` along with it.
+/// Session deletion must reclaim temporary files and their registry with the other assets.
 #[test]
 fn session_delete_cleans_up_temp_registry() {
     let session_id = format!("test-{}", uuid::Uuid::new_v4());

@@ -12,13 +12,12 @@
 //! `adapter_for` returns one adapter for all compatible endpoints, while the
 //! dialect further splits by endpoint into DashScope / official DeepSeek /
 //! everything else, so the dialect cannot be derived from the adapter alone.
-//! Apart from that subdivision, the wire output for every model in the model
-//! registry is byte-identical to the old per-adapter `thinking_fields`.
 //!
 //! The dialects:
 //! - [`EnableThinkingDialect`]: DashScope compatible-mode (Bailian) → `enable_thinking: bool`
 //! - [`DeepSeekThinkingDialect`]: DeepSeek (OpenCode Zen gateway / official api.deepseek.com) → `thinking: {"type":...}`
 //! - [`NoThinkingDialect`]: plain OpenAI / OpenRouter etc. → sends no fields
+//! - [`AnthropicThinkingDialect`]: Messages endpoints → adaptive thinking and `output_config.effort`
 //! - [`NoOffSwitchDialect`]: effort-only models with no reliable gateway off
 //!   switch (MiniMax M2.x ("MiMo") always-on reasoning; beam, whose gateway
 //!   rejects `reasoning_effort: "none"`) → sends no fields, declares
@@ -58,10 +57,9 @@ pub(in crate::ai) enum ThinkingOffCapability {
 /// Wire encoding dialect for the thinking switch. Zero-state singleton.
 pub(in crate::ai) trait ThinkingDialect: Sync {
     /// Encodes the logical switch `enable` into request-body fields. An empty
-    /// Map means this dialect sends no fields. `top_level_reasoning_effort`
-    /// indicates whether the request will ultimately send a top-level
-    /// `reasoning_effort`; only a few special dialects need it to adjust the
-    /// wire shape.
+    /// Map means this dialect sends no fields. The effort value is available
+    /// to dialects that place a tier beside the switch, such as Anthropic's
+    /// `output_config.effort`.
     fn fields(&self, enable: bool, top_level_reasoning_effort: Option<&str>) -> Map<String, Value>;
 
     /// Whether this dialect requires assistant tool-call messages to echo back
@@ -135,9 +133,9 @@ impl ThinkingDialect for EnableThinkingDialect {
     }
 
     fn reasoning_effort_reduces_thinking(&self) -> bool {
-        // Thinking is controlled solely by the `enable_thinking` boolean; the
-        // request body never carries an effort, so lowering effort has zero
-        // effect on the thinking-chain length.
+        // For models without a registry-declared effort wire placement,
+        // thinking is controlled solely by the boolean switch, so lowering
+        // effort cannot shorten the thinking chain.
         false
     }
 
@@ -293,7 +291,6 @@ impl ThinkingDialect for AnthropicThinkingDialect {
     }
 
     fn thinking_off_capability(&self) -> ThinkingOffCapability {
-        // `thinking: {"type": "disabled"}` is the explicit off switch.
         ThinkingOffCapability::RealSwitch
     }
 
@@ -349,26 +346,6 @@ fn is_beam_model(model: &str) -> bool {
     model.trim().to_ascii_lowercase().contains("beam")
 }
 
-/// Picks the thinking dialect by gateway (provider + endpoint) and model,
-/// decoupled from the provider auth / response-consumption axis. The dispatch
-/// strictly mirrors [`super::adapter_for`]:
-/// - OpenRouter endpoint → sends nothing (same as OpenAI, relies only on reasoning_effort)
-/// - Alibaba → `enable_thinking` (DashScope compatible-mode)
-/// - Compatible → DashScope endpoint uses `enable_thinking`; official DeepSeek
-///   endpoint (api.deepseek.com) uses the `thinking` object; MiniMax/beam models use
-///   [`NoOffSwitchDialect`]; everything else (e.g. internal modelhub, other
-///   OpenAI-compatible gateways) sends no thinking field, relying only on
-///   top-level `reasoning_effort`
-/// - OpenAi → DashScope endpoint uses `enable_thinking`; MiniMax/beam models use
-///   [`NoOffSwitchDialect`]; plain OpenAI endpoints send nothing
-/// - OpenCode → DeepSeek models use the `thinking` object; MiniMax/beam models use
-///   [`NoOffSwitchDialect`]; Anthropic Messages endpoints (`/v1/messages`)
-///   use [`AnthropicThinkingDialect`]; everything else sends nothing
-///
-/// Historically `Compatible` always used the DashScope dialect, so pure
-/// OpenAI-compatible endpoints mounted under the compatible provider (e.g.
-/// internal modelhub) received the unknown `enable_thinking` parameter and
-/// returned 400.
 /// Whether the endpoint speaks the Anthropic Messages wire (`/v1/messages`).
 /// The `thinking` object is valid on this wire regardless of the provider
 /// label under which the gateway is mounted.
@@ -376,6 +353,13 @@ fn is_anthropic_messages_endpoint(endpoint: &str) -> bool {
     endpoint.trim().to_ascii_lowercase().contains("/v1/messages")
 }
 
+/// Selects thinking fields by endpoint, provider, and model.
+///
+/// OpenRouter endpoints take precedence and send no thinking fields. Other
+/// Messages endpoints use [`AnthropicThinkingDialect`] regardless of provider.
+/// Chat-completions endpoints use provider, gateway, and model checks for
+/// DashScope, official DeepSeek, MiniMax, and beam. Endpoint checks keep plain
+/// compatible gateways from receiving DashScope-only `enable_thinking` fields.
 pub(in crate::ai) fn thinking_dialect_for(
     provider: ApiProvider,
     model: &str,

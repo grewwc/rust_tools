@@ -309,8 +309,8 @@ fn parse_server_info(text: &str) -> Result<ServerInfo, String> {
         .map_err(|err| format!("serve returned an unexpected info body: {err}"))
 }
 
-/// Fetch the server runtime info. `None` means "predates `/info` or
-/// unreachable": the caller keeps blank labels (today's behavior).
+/// Fetch the server runtime info. Request, status, or parsing failures return
+/// `None`, leaving the caller without `/info` header labels.
 fn fetch_server_info(
     client: &reqwest::blocking::Client,
     base: &str,
@@ -415,7 +415,7 @@ impl ServeTurnSelection {
 
     /// Refresh the input-box header after a local switch, mirroring
     /// `apply_remote_header` but driven by the client selection instead of a
-    /// fresh `GET /info` (the server has no session state to update).
+    /// fresh `GET /info`, which reports server-wide defaults rather than session picks.
     fn apply_header(&self, editor: &mut PromptEditor) {
         if !self.model.is_empty() {
             let label = models::model_display_label(&self.model);
@@ -871,8 +871,7 @@ fn print_serve_skills_list(entries: &[ServeSkillEntry], selected: &[String]) {
 /// Split a `/skills <names...> [question]` remainder against the server skill
 /// list: greedily collect consecutive leading tokens that match a skill name
 /// (case-insensitive, canonicalized to the manifest spelling, deduped, input
-/// order kept); the rest becomes the turn question, verbatim. Pure:
-/// unit-tested below.
+/// order kept); leading whitespace is trimmed from the remaining question.
 fn split_serve_skills_inline(
     known: &[ServeSkillEntry],
     arg: &str,
@@ -1277,10 +1276,9 @@ fn delete_remote_session(
 
 // --- Remote `/history`: previews render from `GET /sessions/{id}/history`
 // and rewinds truncate through `POST /sessions/{id}/rewind`, never through a
-// turn child. A turn child would dispatch `/history` as a local command
-// against server-side state: read-only forms only waste a model round-trip,
-// but `rewind` blocks on an interactive stdin confirm that has no writer on
-// the daemon side and hangs the session until restart. ---
+// turn child. Forwarding a preview would start an unnecessary child, and
+// a rewind's local stdin prompt would publish no serve confirmation request,
+// leaving the remote client unable to answer it. ---
 
 /// One row of `GET /sessions/{id}/history`, which serves the canonical
 /// message array 1:1, so an index here is a valid `POST /rewind`
@@ -1314,7 +1312,7 @@ const SERVE_HISTORY_FULL_COUNT: usize = 20;
 const SERVE_HISTORY_MAX_CHARS: usize = 160;
 
 /// Fetch the session's full canonical history. No `limit`: user ordinals
-/// (`u40`) count every stored user message, so a tail cut would renumber the
+/// (`u40`) count real user messages, so a tail cut would renumber the
 /// rows and invalidate rewind anchors. Network glue only; shaping below is
 /// pure and tested offline.
 fn fetch_remote_history(
@@ -1465,7 +1463,8 @@ fn fetch_serve_history_selected_conclusion(
 }
 
 /// Searchable text of one stored message, mirroring the local preview:
-/// plain strings verbatim, anything else as compact JSON.
+/// strings verbatim, message-reference arrays through `history::value_to_string`,
+/// and other values as compact JSON.
 fn serve_history_searchable_text(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(text) => text.clone(),
@@ -2276,8 +2275,8 @@ fn rewind_serve_history(
         println!("[history] Nothing to rewind.");
         return Ok(());
     }
-    // The confirm runs in this client, on this terminal: the turn child this
-    // replaces had nobody to answer it, which is what used to hang.
+    // Obtain approval on the client terminal before the daemon truncates
+    // the remote history.
     let confirm = crate::commonw::prompt::prompt_yes_or_no_interruptible(&format!(
         "Rewind from user input u{ordinal} and remove {removed} message(s)? (y/n): "
     ));
@@ -2832,7 +2831,7 @@ mod serve_history_tests {
 /// arrive, `delta` events (live body chunks) print without a trailing
 /// newline, thinking frames maintain the same width-wrapped multi-row tail as
 /// a local terminal and collapse to one `✓ thinking (N lines)` summary on
-/// close, subagent progress redraws one clamped live row in place instead of
+/// close, subagent progress redraws a bounded live block in place instead of
 /// appending scrollback, error events abort with the server detail, and the
 /// done event (or the end of the body) ends the turn.
 fn render_turn_stream(resp: reqwest::blocking::Response) -> Result<(), Box<dyn std::error::Error>> {
@@ -2865,8 +2864,8 @@ fn render_turn_stream_to(
 
 /// Same as [`render_turn_stream_to`], but `confirm` answers remote
 /// confirmation requests (`confirm_request` events) with a local y/n prompt
-/// and a `POST .../confirm` round-trip, so a serve-chat turn can approve the
-/// same gates (today `git commit` / `git push` / `git stash` / `git checkout` / `git switch`) as a local turn.
+/// and a `POST .../confirm` round-trip so a serve-chat turn can approve
+/// server-side gates.
 fn render_turn_stream_to_with_confirm(
     resp: reqwest::blocking::Response,
     out: &mut dyn std::io::Write,
@@ -2933,9 +2932,9 @@ fn render_turn_stream_to_with_width(
     // exactly like the local turn output. Piped output stays raw so
     // captures keep clean bytes.
     let mut markdown = MarkdownStreamRenderer::new_with_tty(tty);
-    // Body bytes already painted by `delta`. `replace` is authoritative and
-    // usually repeats them; a terminal cannot rewind the rows, so only the
-    // not-yet-rendered suffix is printed.
+    // Body bytes already painted by `delta`, used to detect an appended
+    // suffix. A non-empty replacement that rewrites the draft renders in full
+    // under a revision notice; prior terminal rows cannot be rewound.
     let mut streamed_body = String::new();
     // Whether a `replace` has committed a turn on this stream. The turn header
     // is also printed on stream retries, so only a header after a committed
@@ -3263,14 +3262,13 @@ fn render_turn_stream_to_with_width(
                 // (and it must not fall into the `_` arm's footer).
             }
             "replace" => {
-                // The daemon sends the accepted final body after the
-                // provisional `delta` stream. Render only the part beyond what
-                // was already painted (typically a final-gate suffix such as a
-                // runtime warning); an identical body is a no-op, and a body
-                // received without deltas renders in full. This event must
-                // never reach the observer-row arm below: that arm prints its
-                // payload verbatim, which leaks the `{"text":...}` envelope
-                // into the scrollback.
+                // The daemon sends the accepted final body after provisional
+                // deltas. Append its unseen suffix when it extends the draft;
+                // render a rewritten body in full under a revision notice.
+                // An identical non-empty body adds no prose, and a body received
+                // without deltas renders in full. Keep this event out of the
+                // observer-row arm, which would print its JSON envelope into
+                // the scrollback.
                 hide_answer_pending_status(&mut answer_pending_drawn, &mut line_open, tty, out);
                 answer_pending = false;
                 if tty {
@@ -3831,9 +3829,8 @@ fn flush_metrics_footers(
 /// Whether a stdout-derived row is the turn header printed by `print_info`
 /// (`request/transport.rs`): `[model (effort: …) · topic]`. The child paints
 /// it with theme colors, so detection strips ANSI escapes and matches the
-/// shape, not the raw bytes. Body text never reaches this path (it arrives
-/// as `delta` events), and the `[` + `(effort:` shape is specific to that
-/// header, so tool output cannot realistically collide.
+/// leading `[` and `(effort:` marker. Answer text follows the separate
+/// `delta` event path.
 fn is_turn_header_row(payload: &str) -> bool {
     if payload.contains("(remote)") {
         return false;
@@ -3843,11 +3840,11 @@ fn is_turn_header_row(payload: &str) -> bool {
     trimmed.starts_with('[') && trimmed.contains("(effort:")
 }
 
-/// Strip ANSI escape sequences for shape matching only; the display bytes
-/// are never rewritten. Handles CSI (`ESC [ … final`) plus the single-char
+/// Strip ANSI escape sequences for shape matching and piped metrics.
+/// Handles CSI (`ESC [ … final`) plus the single-char
 /// and OSC-style introducers so a half-kept sequence cannot leak into the
-/// match. Bare `\r` bytes are dropped: the server already turns interior
-/// overwrite controls into row breaks before SSE transport.
+/// match. Bare `\r` bytes are dropped to keep cursor controls out of plain
+/// text used for matching and piped metrics.
 fn strip_ansi_escapes(text: &str) -> String {
     let mut plain = String::with_capacity(text.len());
     let mut chars = text.chars();
@@ -3978,9 +3975,8 @@ fn clamp_observer_row(row: &str, tty: bool, width: usize) -> String {
         .join("\n")
 }
 
-/// Close the answer's open row at end-of-turn so the scrollback ends on a
-/// fresh line. Metrics summaries used to provide this trailing newline as a
-/// side effect; with them discarded the terminator is explicit.
+/// Finish an open output row before other output or stream cleanup.
+/// Do not rely on a later footer to supply the terminating newline.
 fn close_open_line(line_open: &mut bool, out: &mut dyn std::io::Write) {
     if *line_open {
         let _ = writeln!(out);
@@ -4750,10 +4746,9 @@ fn post_turn_stream(
     let _turn_scope = RemoteTurnScope::enter();
     let images = collect_image_uploads(prompt, history_file, session_id);
     {
-        // A bare `[[image:name]]` with no local file uploads nothing, and the
-        // server then fails the turn with a bare os-error-2. Warn here where
-        // the cause (usually a paste saved under a previous session before
-        // `/resume`/`/new`) is still actionable.
+        // An absent upload can come from an image pasted under a previous
+        // session before `/resume` or `/new`. Report the local asset directory
+        // so the user can re-paste the image in the current session.
         let uploaded: std::collections::HashSet<&str> = images
             .iter()
             .filter_map(|v| v.get("filename").and_then(|f| f.as_str()))
@@ -4777,11 +4772,10 @@ fn post_turn_stream(
             );
         }
     }
-    // Remote confirmations are answered on this terminal: opt the child into
-    // the confirm channel only when stdin can actually ask (see
-    // `serve_confirm_channel`). The daemon relays the answer into the child's
-    // stdin, so the same gates as a local turn (`git commit` / `git push` / `git stash` / `git checkout` / `git switch`)
-    // become approvable instead of failing closed.
+    // Remote confirmation requires an interactive client stdin. Opt the child
+    // into the channel only when `serve_confirm_channel` can build it; the
+    // daemon relays this terminal's answer into the child's stdin. Otherwise
+    // gates fail closed.
     let confirm_channel = serve_confirm_channel(client, base, token, session_id);
     let resp = auth(
         client.post(format!("{base}/sessions/{session_id}/turns/stream")),
@@ -4884,7 +4878,6 @@ fn serve_connection(
     let ca_cert = resolve_serve_ca_cert(&cli.serve_ca_cert, &ca_from_cfg);
     let client = build_serve_client(&ca_cert, Duration::from_secs(600))?;
 
-    // Fail fast with a copy-pasteable hint when the server is not up.
     let health = client.get(format!("{base}/healthz")).send();
     match health {
         Ok(resp) if resp.status().is_success() => {}
@@ -4960,9 +4953,8 @@ fn format_remote_session_row(
 }
 
 /// Print one `GET /sessions` listing as numbered rows (newest first) on
-/// stdout, so `--serve-sessions` output stays pipeable for scripts and later
-/// mobile clients; the interactive client passes its session id so the
-/// current row is marked, like the local REPL.
+/// stdout so `--serve-sessions` remains pipeable. The interactive client
+/// passes its session id to mark the current row, like the local REPL.
 fn print_remote_sessions(
     items: &[RemoteSession],
     empty_message: &str,
@@ -5079,8 +5071,8 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                         );
                         create_session(&client, &base, &token)?
                     }
-                    // Unreachable list: keep the bound id optimistically; the
-                    // per-input refresh heals or replaces it once reachable.
+                    // A temporary listing failure should not discard the binding;
+                    // keep the bound id optimistically.
                     Err(_) => binding.session_id,
                 }
             }
@@ -5121,9 +5113,9 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
     if let Some(entries) = refresh_serve_skills_quiet(&client, &base, &token) {
         apply_serve_skills_to_completion(&entries);
     }
-    // Last `/sessions` view and its rows: backs `/resume <number|id-prefix>`.
-    // The silent refresh below re-applies the view, so a filtered listing keeps
-    // the row numbers the user just saw.
+    // Last listing view and rows used by `/resume <number|id-prefix>`.
+    // Quiet refreshes preserve the view's filtering while replacing its
+    // candidate rows with the latest server listing.
     let mut listed_view = ServeSessionsArg::List;
     let mut listed: Vec<RemoteSession> = Vec::new();
     // Client-side per-turn selection, seeded from the server (`GET /info`)
@@ -5144,11 +5136,9 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
     let agent_manifests = agents::load_all_agents();
     loop {
         sigint_state.bind_session(&session_id);
-        // Silent live refresh before every input box: server-generated titles
-        // (they appear after the first turn) and fresh `/resume` completion
-        // candidates. The last explicit view is re-applied so its numbering
-        // stays valid. Failures keep the previous listing; the prompt is never
-        // blocked by this.
+        // Refresh server-generated titles and `/resume` candidates before
+        // each input box. Reapply the last explicit view; a failed refresh
+        // keeps the previous listing.
         if let Some(items) = refresh_listing_quiet(&client, &base, &token) {
             editor.set_session_topic(current_remote_title(&items, &session_id));
             let items = sessions_for_view(items, listed_view, &session_id);
@@ -5188,9 +5178,6 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
         if trimmed.is_empty() {
             continue;
         }
-        // Split the command word from its argument so `/resume <id>` works;
-        // anything else keeps the full text (prompts starting with `/` still
-        // send verbatim, exactly as before).
         let mut words = trimmed.splitn(2, char::is_whitespace);
         let cmd = words.next().unwrap_or("");
         let arg = words.next().unwrap_or("").trim();
@@ -5790,8 +5777,8 @@ mod tests {
 
     #[test]
     fn sse_empty_replace_reports_missing_final_answer() {
-        // An empty accepted body clears rejected prose, but the user must not
-        // be pointed at `/history last`: that can show an older turn's answer.
+        // An empty accepted body leaves no final answer; `/history last`
+        // could show an older turn, so the status must not point there.
         let body = "event: delta\ndata: {\"delta\": \"draft\"}\n\nevent: replace\ndata: {\"text\": \"\"}\n\nevent: done\ndata: \n\n";
         let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
         let mut buf = Vec::new();
@@ -6130,8 +6117,8 @@ mod tests {
     #[test]
     fn sse_multiline_subagent_progress_keeps_the_whole_block() {
         // axum splits embedded newlines into one `data:` line per status row.
-        // A one-task team has three rows; they must be joined into one event
-        // and painted together, preserving the identity and detail prefixes.
+        // The fixture's three status rows must be joined into one event and
+        // painted together, preserving the identity and detail prefixes.
         let body = "event: subagent_progress\ndata: subagents · 1 active\ndata: └─ [backend=traecli] worker · running 5s · task: audit\ndata:    ↳ progress: editing file\n\nevent: subagent_progress\ndata: subagents · 1 active\ndata: └─ [backend=traecli] worker · running 6s · task: audit\ndata:    ↳ progress: reviewing output\n\nevent: done\ndata: \n\n";
 
         let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
@@ -6959,11 +6946,16 @@ mod tests {
         assert!(!out.contains("context-budget: old"), "stale note retained");
         assert_eq!(out.matches("context-budget: latest").count(), 1);
         assert!(out.contains("  │ ordinary continuation\n"));
+        let latest_pos = out.find("context-budget: latest").unwrap();
+        let speed_pos = out.find("↳ speed").unwrap();
         assert!(
-            out.ends_with(&format!("{latest}\n")),
-            "final note lost ANSI or newline"
+            latest_pos < speed_pos,
+            "latest note must precede the metrics footer: {out:?}"
         );
-        assert!(!out.contains("↳ speed"));
+        assert!(
+            out.ends_with("↳ speed · dropped\n"),
+            "metrics footer must be the final row: {out:?}"
+        );
     }
 
     #[test]
@@ -7292,15 +7284,9 @@ mod tests {
 
     #[test]
     fn sse_tool_rows_keep_child_indent_verbatim() {
-        // Regression net for the serve-chat indent report: footer/message rows
-        // (tool status, long command echoes) must reach the terminal
-        // byte-identical to the child bytes the server forwarded: leading
-        // two-space indent, inline ANSI, and over-long rows included. The
-        // client preserves all source bytes when piped or when the row fits
-        // the TTY; the narrow-TTY behavior has a separate regression above.
-        // Metrics summaries (`↳ cache` /
-        // `↳ speed`) are dropped instead, so they can never tear the answer's
-        // open line or bury the answer tail; the tool rows stay byte-identical.
+        // Observer rows retain source indentation and ANSI styling when piped
+        // or when they fit the TTY. Narrow TTY truncation is covered by the
+        // observer-row tests above.
         let cache = "  \u{1b}[2m↳ cache · 4.1k/22.0k tokens · 19% hit\u{1b}[0m";
         let speed = "  \u{1b}[2m↳ speed · reasoning 1.6k tok @ 48.4 tok/s\u{1b}[0m";
         let done = "  \u{1b}[32m✓\u{1b}[0m read_file  \u{1b}[2m·\u{1b}[0m target";
@@ -7308,7 +7294,13 @@ mod tests {
         let long_cmd = format!("  │ $ {}", "cd /data00/x; ".repeat(20));
         assert!(long_cmd.chars().count() > 200);
         let failed = "  \u{1b}[31m✕\u{1b}[0m execute_command";
-        let expected = format!("ok\n{done}\n{running}\n{long_cmd}\n{failed}\n");
+        // Buffered metrics footers are flushed after the body delta, with ANSI
+        // stripped for piped output.
+        let cache_plain = "  ↳ cache · 4.1k/22.0k tokens · 19% hit";
+        let speed_plain = "  ↳ speed · reasoning 1.6k tok @ 48.4 tok/s";
+        let expected = format!(
+            "ok\n{cache_plain}\n{speed_plain}\n{done}\n{running}\n{long_cmd}\n{failed}\n"
+        );
         let body = format!(
             "event: delta\ndata: {{\"delta\": \"ok\"}}\n\ndata: {cache}\n\ndata: {speed}\n\ndata: {done}\n\ndata: {running}\n\ndata: {long_cmd}\n\ndata: {failed}\n\nevent: done\ndata: \n\n"
         );
@@ -7338,10 +7330,10 @@ mod tests {
                 "message row mangled or missing on TTY: {row:?}"
             );
         }
-        for dropped in [cache, speed] {
+        for footer in [cache, speed] {
             assert!(
-                !out.lines().any(|line| line == dropped),
-                "metrics footer leaked onto TTY: {dropped:?}"
+                out.lines().any(|line| line == footer),
+                "metrics footer missing on TTY: {footer:?}"
             );
         }
     }
@@ -7359,8 +7351,8 @@ mod tests {
 
     #[test]
     fn sse_tty_renders_table_through_shared_markdown_renderer() {
-        // Same table source as the piped case above, split across two chunks:
-        // on a TTY the body must render as a box table, not raw pipes.
+        // On a TTY, a table split across delta chunks must render with box
+        // borders rather than Markdown separators.
         let url = serve_body_once(
             "event: delta\ndata: {\"delta\": \"| a | b |\\n| --- | --- |\\n\"}\n\nevent: delta\ndata: {\"delta\": \"| 1 | 2 |\\n\"}\n\nevent: done\ndata: \n\n",
         );
@@ -7572,16 +7564,14 @@ mod tests {
     #[test]
     fn serve_sessions_arg_dispatch_mirrors_local_repl() {
         use ServeSessionsArg::*;
-        // Bare `/ss` and the list spellings keep the full listing.
+        // Bare `/ss` and list aliases select the default session view.
         for bare in ["", "list", "ls", "verbose"] {
             assert!(
                 matches!(classify_serve_sessions_arg(bare), List),
                 "{bare:?}"
             );
         }
-        // `current`/`cur`/`curr` show only the current session; `curr` is
-        // the spelling the reported serve-chat bug silently listed all
-        // sessions for.
+        // `current`/`cur`/`curr` show only the current session.
         for cur in ["current", "cur", "curr"] {
             assert!(
                 matches!(classify_serve_sessions_arg(cur), Current),
@@ -7770,8 +7760,7 @@ mod tests {
 
     #[test]
     fn parse_server_info_tolerates_thin_body() {
-        // Older servers have no `/info`: missing fields default to blank so
-        // the chat keeps its previous header behavior instead of failing.
+        // A partial `/info` body must still parse with blank header labels.
         let info = parse_server_info("{}").expect("parse");
         assert!(info.model.is_empty());
         assert!(info.model_label.is_empty());

@@ -64,10 +64,8 @@ fn mid_turn_compress_preserves_latest_user_message() {
 
 #[test]
 fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present() {
-    // Regression test: once mid-turn compression receives an overflow_dir, large outputs of "incompressible"
-    // tools like read_file must spill with zero compression into the session file + leave a preview stub, actually reducing the character count.
-    // Historical bug: mid-turn passed None overflow_dir, so such outputs could be neither pruned nor spilled;
-    // they just piled up in the context verbatim, shaving only a few K per turn (the user-reported "compression does nothing").
+    // An overflow sink allows large read results to leave the projection while
+    // preserving their original bytes in an archive with a recall stub.
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-midturn-overflow-{}", uuid::Uuid::new_v4()));
     let mut messages = vec![Message {
@@ -110,8 +108,7 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
         });
     }
 
-    // Real user turn boundary: read_file results after it belong to the current turn, protected by
-    // precision and kept in full as the most recent tool group, verifying "the current turn is not collateral damage".
+    // This user boundary distinguishes previous-turn outputs from current-turn outputs.
     messages.push(Message {
         role: "user".to_string(),
         content: Value::String("continue".to_string()),
@@ -161,19 +158,10 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
         "mid-turn compression with overflow_dir must shrink payload \
          (before={reported_before}, after={reported_after})"
     );
-    // Contract: after an incompressible read_file result is compressed, a readable file_path recall anchor must remain,
-    // and the session archive file it points to must really exist with the full text saved zero-compression. The recall anchor has two legal
-    // shapes depending on the compression path hit (both carry a `file_path:` pointing at the archive; assert the recall contract, not the
-    // literal wording of one path):
-    //   - spill stub：`Output preserved for tool `read_file` ... - file_path: ...`
-    //   - fold note ：`compressed_tool_round: ... - read_file => - archive_file_path: ...`
-    //     (secondary folding deliberately renames the internal overflow path to `archive_file_path` so it cannot pose as
-    //     the plain `file_path` primary lead; the `- original_file_path:` in the same note points at the source
-    //     file, not the archive, and must not be treated as the archive pointer.)
-    //
-    // Note: do not use substring splitting like `split("file_path: ").nth(1)` — in the fold note
-    // `- original_file_path:` comes before `- archive_file_path:`, so substring splitting would mistake the
-    // source file path for the archive path (historical bug: read src/lib.rs at only 1305 bytes).
+    // Archived read results must retain a locator to the complete bytes.
+    // Spill stubs use file_path; folded notes may use archive_file_path.
+    // Match the whole field prefix rather than splitting on "file_path: ":
+    // original_file_path identifies the source file rather than its archive.
     let resolve_archive = |raw: &str| {
         crate::ai::tools::storage::file_store::session_asset_for_alias(raw, &overflow_dir)
             .unwrap_or_else(|| {
@@ -228,10 +216,8 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
 
 #[test]
 fn large_image_does_not_evict_tool_history_from_budget() {
-    // Regression test: one large base64 image must not squeeze the agent's tool results (working memory)
-    // out of the context. Historical bug: value_len_chars billed by base64 text length,
-    // so a ~900K-char image ballooned messages_total_chars and the compression pipeline
-    // deleted tool results every turn -> agent amnesia -> repeating the same exploration over and over.
+    // Image payloads need an image budget estimate rather than their base64
+    // string length so they do not force unrelated tool evidence out of context.
     let huge_base64 = "A".repeat(900_000);
     let image_content = serde_json::json!([
         {
@@ -271,8 +257,8 @@ fn large_image_does_not_evict_tool_history_from_budget() {
         },
     ];
 
-    // soft_threshold 36K: if the image were still billed by base64 length (900K), it would be judged over budget and
-    // trigger compression, deleting tool results. After the fix the image counts only ~1K, keeping the total well under the threshold.
+    // The image estimate should keep this fixture below the soft threshold,
+    // leaving both its payload and the tool evidence untouched.
     let (compressed, before, after) = mid_turn_compress(messages, 36_000, None, None);
     assert!(
         before <= 36_000,
@@ -638,8 +624,7 @@ fn mid_turn_compress_keeps_small_reference_docs_and_still_folds_big_results() {
     // One genuinely large result: this is what the routine tier should fold.
     messages.push(read_file_call("big"));
     messages.push(tool_output("big", format!("big\n{}", "y".repeat(30_000))));
-    // Real user turn boundary: everything after it belongs to the current turn /
-    // recent window and stays in full.
+    // Mark the boundary between old reference reads and current-turn results.
     messages.push(Message {
         role: "user".to_string(),
         content: Value::String("continue".to_string()),
@@ -712,12 +697,9 @@ fn mid_turn_compress_keeps_small_reference_docs_and_still_folds_big_results() {
 
 #[test]
 fn mid_turn_compress_spills_reads_outside_the_precision_tail() {
-    // One user turn can accumulate many tool groups. `read_file` forbids lossy
-    // compaction, but its results are still recoverable through the archive, so
-    // only the newest 120K precision tail must stay verbatim. Merging the wider
-    // lossless policy set into the inline protection set made every read
-    // ineligible for the lossless spill and the group fold, so the ladder could
-    // never shrink a long single turn.
+    // A long user turn still needs lossless spilling for older read results.
+    // Keep inline precision protection separate from archive retention so
+    // earlier groups can shrink while the newest evidence stays verbatim.
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-midturn-long-turn-{}", uuid::Uuid::new_v4()));
     let mut messages = vec![

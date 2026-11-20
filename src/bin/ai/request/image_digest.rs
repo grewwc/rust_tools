@@ -1,26 +1,21 @@
 //! Vision-model (VL) image digest protocol.
 //!
-//! Background: within a single turn's tool-call loop, `messages` is one persistent
-//! array carried through the whole turn, so base64 images inlined in user messages
-//! get replayed verbatim on every request. For servers like Doubao/Ark that bill
-//! TPM by the actual multimodal wire payload, consecutive tool calls keep counting
-//! the same large image into the 60s window and trigger 429 rate limiting (the
-//! local budget underestimates at a nominal 1024 chars, so the preflight gate
-//! cannot catch it).
+//! Repeated image input during tool-call loops can exhaust the provider's TPM
+//! window even when local nominal image estimates leave room for more requests.
 //!
-//! Approach: in the first round, send the full original image to the model and ask
-//! it to emit a fixed-format "image digest"; in later rounds, replace the image
-//! parts in the request projection's `messages` with that text digest (plus the
-//! original image path), so base64 is never replayed again. The canonical
-//! `turn_messages` (persisted history) always keeps the original image; only the
-//! request projection is rewritten — honoring the History-truthfulness invariant.
+//! Send the original image with a digest instruction, then replace its image
+//! parts in the request projection once a digest is available. The digest keeps
+//! the original path so exact visual followups can reopen the image. Canonical
+//! `turn_messages` retain the original; only the request projection is rewritten.
 //!
-//! The digest is obtained via two paths:
-//! 1. Piggyback: parse the digest out of the first tool-call response's
+//! Digests are obtained through:
+//! 1. Piggyback: parse the digest out of the first response's
 //!    `assistant_text` / `reasoning_content` (the model emits it as instructed).
 //! 2. Fallback: if the first round did not yield one, send one dedicated
 //!    tool-disabled request before entering the next round to force obtaining
 //!    the digest (see [`describe_image_for_digest`]).
+//! 3. Backfill: retry old messages without persisted digests when their original
+//!    image assets are still readable.
 
 use std::{
     hash::{Hash, Hasher},
@@ -167,7 +162,7 @@ the user to resend it unless that `read_file` call fails.]\nOriginal image path:
 /// Replaces the image parts in a user message's content within the request
 /// projection with a text digest.
 ///
-/// - Drops all image_url parts and the injected instruction part;
+/// - Drops inline and referenced image parts and the injected instruction part;
 /// - Keeps the remaining parts (context reminder, the user's actual question, etc.);
 /// - Appends one digest text part (including the original image path).
 ///
@@ -294,10 +289,9 @@ pub(crate) fn backfill_batch<'a>(
 /// Cross-turn image digest: after loading history, replaces old image messages
 /// that have a persisted digest with the digest text.
 /// Only the request projection (history just loaded in the prepare phase)
-/// changes; the canonical database is untouched; messages without a persisted
-/// digest keep their original image (first-send semantics) and are reported in
-/// `ImageDigestLoadOutcome::pending`, so the turn can retry persisting a digest instead of
-/// re-sending that image on every later turn.
+/// changes; the canonical database is untouched. Messages without a persisted
+/// digest retain their images. Those with readable referenced assets are reported
+/// in `ImageDigestLoadOutcome::pending` for a later backfill retry.
 pub(crate) fn replace_old_images_with_persisted_digests(
     history_file: &Path,
     messages: &mut [Message],
@@ -339,10 +333,9 @@ pub(crate) fn replace_old_images_with_persisted_digests(
 /// Fallback: sends one dedicated, tool-disabled, one-shot VL request to force
 /// obtaining the image digest.
 ///
-/// Called only when the piggyback path failed to parse a digest from the
-/// first-round response. Must use a VL model that can see images (the caller
-/// passes this turn's actual model), not `control_model_for_aux_tasks` (the aux
-/// model may be a text-only intent model that cannot see images).
+/// Used when the first-round piggyback path yields no digest and for historical
+/// backfill. The caller must pass an image-capable model; the auxiliary control
+/// model may be text-only and unable to describe the source image.
 ///
 /// Returns the digest text: prefer the body between the sentinels; if the model
 /// did not wrap it in the expected format, the whole response is the digest (this
@@ -385,9 +378,6 @@ pub(crate) async fn describe_image_for_digest(
         },
     ];
 
-    // Tools disabled, non-streaming (consistent with summarize_history_via_model:
-    // the two falses are stream / enable_thinking, and all of
-    // tools/tool_choice/reasoning are None).
     let mut request_body = build_request_body(
         model, &messages, false, false, None, None, None, None, None, None, None,
     );
@@ -456,8 +446,7 @@ mod tests {
 
     #[test]
     fn parse_digest_reads_from_reasoning_like_text() {
-        // Reproduce a failed session: the assistant's visible text is empty and
-        // the digest landed in reasoning.
+        // A digest can arrive in reasoning while the assistant's visible text is empty.
         let reasoning = format!("我先看图。{DIGEST_BEGIN}\ncode: fn main() {{}}\n{DIGEST_END}");
         assert_eq!(
             parse_digest(&reasoning).as_deref(),

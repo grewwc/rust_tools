@@ -7,7 +7,6 @@ use super::*;
 
 #[test]
 fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_versions() {
-    // Regression test: break the "repeated full re-read" amnesia loop.
     // When the same file is read repeatedly with **byte-identical content**, only one full copy should be kept,
     // with the redundant duplicates folded into back-reference stubs (lossless). Versions whose content truly changes (the file was edited)
     // must each be kept in full — identical signatures must never wrongly fold them into stubs and lose the real differences.
@@ -54,7 +53,7 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
     }
 
     // overflow_dir=None: isolate the dedup behavior so the single retained full copy is not further offloaded
-    // to a disk stub (the 480-char offload threshold is an orthogonal path covered by dedicated tests).
+    // to an archive stub; archive offloading is covered separately.
     let compressed = compress_messages_for_context(messages, 200_000, 256, 400, None, None);
 
     let full_identical = compressed
@@ -116,7 +115,6 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
 
 #[test]
 fn dedup_skips_byte_identical_overflow_archived_stubs() {
-    // Regression test (real case session c0ad15e6, msg 471/472):
     // when a tool result's content **is itself already an overflow archive stub** (`[context-overflow-truncated]`
     // or `[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]`), it is not a "full result", just a recall pointer to the
     // original text on disk. Byte-identical dedup registers the first seen in reverse order as canonical; when a copy is

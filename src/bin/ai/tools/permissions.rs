@@ -12,7 +12,7 @@ use crate::ai::types::{App, ToolCall, ToolResult};
 /// Permission level for a tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolPermission {
-    /// Always prompt user before executing.
+    /// Require user confirmation before executing.
     Ask,
     /// Execute without prompting.
     Allow,
@@ -38,7 +38,7 @@ impl ToolPermission {
 pub struct ToolPermissions {
     /// Per-tool overrides (tool_name -> permission).
     overrides: SkipMap<String, ToolPermission>,
-    /// Default permission for unknown tools.
+    /// Fallback when neither an exact override nor a pattern matches.
     default: ToolPermission,
     /// Patterns with wildcards (e.g. "execute_*" → Deny).
     patterns: Vec<(String, ToolPermission)>,
@@ -54,7 +54,7 @@ impl ToolPermissions {
         }
     }
 
-    /// Set the default permission for unknown tools.
+    /// Set the fallback for tools matched by no override or pattern.
     pub fn with_default(mut self, perm: ToolPermission) -> Self {
         self.default = perm;
         self
@@ -65,7 +65,7 @@ impl ToolPermissions {
         self.overrides.insert(name.to_string(), perm);
     }
 
-    /// Add a wildcard pattern (simple glob: `*` matches any suffix).
+    /// Add a prefix pattern ending in `*`; other patterns match exactly.
     pub fn set_pattern(&mut self, pattern: &str, perm: ToolPermission) {
         self.patterns.push((pattern.to_string(), perm));
     }
@@ -108,7 +108,7 @@ impl Default for ToolPermissions {
     }
 }
 
-/// Match a tool name against a simple glob pattern where `*` matches any suffix.
+/// Match a trailing `*` as any suffix; all other characters are literal.
 fn matches_pattern(pattern: &str, name: &str) -> bool {
     if let Some(prefix) = pattern.strip_suffix('*') {
         name.starts_with(prefix)
@@ -152,10 +152,7 @@ impl ToolPermissions {
             if entry.is_empty() {
                 continue;
             }
-            // Split on the last ':' so a (hypothetical) tool name containing ':'
-            // keeps the trailing token as the policy. Tool names are verb-first
-            // snake_case and MCP names use `mcp_<server>_` prefixes, so neither
-            // contains ':' today; rsplit is a defensive choice.
+            // The last ':' separates the policy, leaving any earlier colons in the name.
             let Some((pattern, policy_token)) = entry.rsplit_once(':') else {
                 warnings.push(format!(
                     "ignored tool-permission rule '{entry}' (want pattern:policy)"
@@ -210,9 +207,9 @@ fn denied_tool_result(tool_call: &ToolCall, policy_note: &str) -> ToolResult {
 /// merged back in the original request order so the parallel result vectors stay
 /// positionally consistent with what a full inner dispatch would produce.
 ///
-/// `Ask` requires an interactive stdin; in a non-TTY foreground (or any context
-/// without a terminal) it fails closed and is treated as `Deny`, matching the
-/// fail-closed posture of the `git commit` gate.
+/// `Ask` uses a local terminal or a serve confirmation channel. When neither
+/// is available, or the answer is declined or interrupted, the decision fails
+/// closed to `Deny`.
 pub(crate) struct PermissionMiddleware {
     permissions: Arc<ToolPermissions>,
 }
@@ -322,7 +319,6 @@ impl ToolExecutor for PermissionExecutor {
                 }
             }
 
-            // Dispatch the allowed subset (if any) through the inner chain.
             let inner_out = if allowed.is_empty() {
                 ToolExecOutput::default()
             } else {
@@ -379,9 +375,8 @@ impl ToolExecutor for PermissionExecutor {
                 }
             }
 
-            // Flatten, dropping slots the inner executor never produced (e.g. a
-            // cancelled tail). Each vector is filtered independently but they
-            // stay mutually consistent because they are keyed on the same slots.
+            // Drop slots omitted by the inner executor, such as a cancelled tail.
+            // Alignment relies on the inner output vectors covering the same calls.
             let merged_results: Vec<ToolResult> = results_by_slot.into_iter().flatten().collect();
             let merged_executed: Vec<ToolCall> = executed_by_slot.into_iter().flatten().collect();
             let merged_cached: Vec<bool> = cached_by_slot.into_iter().flatten().collect();

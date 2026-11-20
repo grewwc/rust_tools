@@ -17,9 +17,9 @@ pub(crate) struct RequestBody<'a> {
     pub(crate) model: String,
     pub(crate) messages: &'a [Message],
     pub(crate) stream: bool,
-    /// 思考开关的线缆字段，由 `thinking` 方言模块决定具体 key 与形状
-    /// （`enable_thinking: bool` / `thinking: {"type":...}` / 或空）。
-    /// 核心层只持有 provider 无关的 Map，wire 编码完全归属方言。
+    /// Thinking controls resolved by `reasoning::resolve_reasoning_wire_controls_from_parts`
+    /// using the provider adapter. Flatten the resulting map so provider-specific
+    /// keys appear at the top level of the request.
     #[serde(flatten)]
     pub(crate) thinking: Map<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -28,8 +28,8 @@ pub(crate) struct RequestBody<'a> {
     pub(crate) tools: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tool_choice: Option<Value>,
-    /// OpenAI / OpenRouter / OpenCode 兼容协议的推理强度顶层字段。
-    /// DashScope compatible provider 使用下方的嵌套 `reasoning.effort`。
+    /// Top-level effort selected by the resolved wire controls. Nested effort,
+    /// when required, is carried in `reasoning` instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,8 +39,9 @@ pub(crate) struct RequestBody<'a> {
     /// 必须显式声明，否则 token 用量无法统计、`/usage` 会漏计。非流式时为 None。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stream_options: Option<Value>,
-    /// 单次响应最大输出 token 数（来自模型注册表 models/ 的 `max_output_tokens`）。
-    /// 缺省不下发，沿用 provider 默认补全上限；显式指定可缓解长输出被截断。
+    /// Output cap derived from the registry's `max_output_tokens`, clamped to
+    /// the remaining context window by the builder and adjustable for retries.
+    /// Omitted when the registry declares no output cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_tokens: Option<u32>,
     /// Responses reasoning items keyed by stable replay owner, spliced before
@@ -94,9 +95,8 @@ pub(crate) struct RequestBody<'a> {
 pub(crate) struct StreamChunk {
     #[serde(default, deserialize_with = "vec_or_default")]
     pub(crate) choices: Vec<StreamChoice>,
-    /// OpenAI-compatible usage block. Only present on the final chunk
-    /// (and only if `stream_options: { include_usage: true }` was requested,
-    /// though many providers include it unconditionally).
+    /// Provider usage snapshot; chunk placement and `stream_options` requirements
+    /// vary by provider.
     #[serde(default)]
     pub(crate) usage: Option<StreamUsage>,
     /// Some providers echo the model name on every chunk.
@@ -108,9 +108,9 @@ pub(crate) struct StreamChunk {
 /// (all optional / default=0) so that varied providers do not break parsing.
 ///
 /// Field-name compatibility: providers diverge on naming. Besides the canonical
-/// OpenAI `prompt_tokens` / `completion_tokens`, we accept the Anthropic-style
-/// `input_tokens` / `output_tokens` (and a few common spellings) via serde
-/// `alias`, so that non-OpenAI-shaped responses are not silently counted as 0.
+/// OpenAI `prompt_tokens` / `completion_tokens`, we accept `input_tokens` with
+/// Anthropic cache slices added, plus `output_tokens` and other spellings via
+/// serde aliases, so that non-OpenAI-shaped responses are not counted as 0.
 /// After deserialization, always call [`StreamUsage::normalized`] to fill in
 /// components that the provider omitted but can be derived from `total_tokens`.
 #[derive(Debug, Default, Clone, Deserialize)]

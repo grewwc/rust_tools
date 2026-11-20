@@ -12,11 +12,8 @@ fn test_parse_thinking_gate_output_bool() {
 
 #[test]
 fn thinking_disabled_override_forces_thinking_off() {
-    // Once truncation fallback sets thinking_disabled_override, resolve_thinking
-    // must short-circuit to false even when the model supports thinking — the
-    // last resort for suppressing the reasoning chains of always-thinking models
-    // (GLM via enable_thinking). Synthetic inputs mirror a thinking-capable
-    // switch-dialect model whose default effort would otherwise enable thinking.
+    // The truncation override takes precedence over model capability and default
+    // effort. This switch-based fixture would otherwise enable thinking.
     let enabled = super::super::thinking::resolve_thinking_static(
         true,
         None,
@@ -31,9 +28,8 @@ fn thinking_disabled_override_forces_thinking_off() {
 
 #[test]
 fn default_effort_short_circuits_thinking_on() {
-    // Models with a declared default reasoning effort always think — the
-    // short-circuit that bypasses both the local heuristic and the model gate.
-    // (Previously pinned via the DashScope DeepSeek key; same branch.)
+    // With auto-thinking enabled and no disabling override, a default effort
+    // settles thinking without a question-shape decision.
     let enabled = super::super::thinking::resolve_thinking_static(
         false,
         None,
@@ -121,7 +117,7 @@ fn effort_off_omits_effort_for_switch_dialects() {
 fn effort_off_on_unsupported_dialect_is_a_noop() {
     // Unsupported-capability dialects (MiniMax M2.x, beam) have no reliable
     // off switch: `/effort off` must NOT change the thinking decision (it
-    // stays whatever auto-detection decides) and must NOT emit
+    // continues through the normal thinking policy) and must NOT emit
     // `reasoning_effort:"none"` (an unverified value the gateway may ignore
     // or reject).
     let baseline = super::super::thinking::resolve_thinking_static(
@@ -173,8 +169,7 @@ fn reasoning_effort_display_label_reflects_explicit_off() {
         ),
         "off"
     );
-    // Unsupported (beam; the registry currently carries no MiniMax entry):
-    // the honest "off (unsupported)" instead of a success-sounding "off".
+    // The display must distinguish an off request from supported wire control.
     assert_eq!(
         super::super::reasoning::reasoning_effort_display_label_from_parts(
             Some(None),
@@ -185,9 +180,7 @@ fn reasoning_effort_display_label_reflects_explicit_off() {
         ),
         "off (unsupported)"
     );
-    // No override: the declared default applies ("max" here, as on the Volcano
-    // DeepSeek entry), or "server default" when the model declares none (never
-    // the misleading "auto").
+    // No override uses the declared default, or "server default" when none exists.
     assert_eq!(
         super::super::reasoning::reasoning_effort_display_label_from_parts(
             None,
@@ -198,9 +191,8 @@ fn reasoning_effort_display_label_reflects_explicit_off() {
         ),
         "max"
     );
-    // Intentionally-unregistered probe: exercises the no-default fallback
-    // branch (every registry entry currently declares a default). Key literal
-    // stays — it tests the registry-miss fallback itself.
+    // An unregistered model exercises the server-default fallback without
+    // depending on registry contents.
     let app2 = test_app();
     assert_eq!(
         super::super::reasoning::reasoning_effort_display_label(
@@ -241,11 +233,8 @@ fn effort_defaults_to_registry_when_no_override() {
 
 #[test]
 fn sharp_agent_implies_low_effort_from_live_agent() {
-    // Regression: the sharp `low` used to be written into the override at CLI
-    // parse, so a live `/agent sharp` never picked it up while `/agent build`
-    // (and startup fallbacks to build) kept a stale `low`. It is now derived
-    // from the live agent at resolve time, so no switch path can go stale.
-    // Live `/agent sharp` with no explicit override.
+    // Derive sharp's implied effort from the current agent so switching agents
+    // cannot retain its default.
     assert_eq!(
         super::super::reasoning::resolve_reasoning_effort_from_parts(
             None,
@@ -365,9 +354,8 @@ fn strip_system_reminders_passthrough_when_absent() {
 
 #[test]
 fn reminder_polluted_greeting_decides_locally() {
-    // Simulate a "hi" inflated by system-reminders: after stripping, it should
-    // hit the local short-circuit (Casual + short) instead of falling to the
-    // slow model gate.
+    // Stripping runtime reminders restores a simple greeting to the local
+    // no-thinking decision.
     let polluted = format!(
         "<system-reminder>{}</system-reminder>\n\nhi",
         "x".repeat(2000)

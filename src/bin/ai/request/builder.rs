@@ -1,9 +1,9 @@
 //! Request body construction and token budget estimation.
 //!
-//! Construction logic extracted from request/mod.rs:
+//! This module handles:
 //! - Image/text content construction (multimodal support)
 //! - Request body assembly (model/messages/tools/thinking/stream/max_tokens, etc.)
-//! - Prompt token estimation and max_tokens clamping (keep prompt + output within the window)
+//! - Prompt token estimation and output-cap resolution
 
 use std::{
     fs,
@@ -62,14 +62,11 @@ pub(crate) fn build_content(
 
 /// Builds the PERSISTED form of a user message's content, keeping the write-time
 /// provenance boundary between the user's own words and referenced/attached
-/// artifacts: each image becomes a `reference` part (kind=image, name + path)
-/// instead of inline base64, and each text-extractable attachment (text file /
-/// PDF) becomes a `reference` part (kind=file, name + path) instead of inline
-/// content. Long-term history keeps this form so any later reader (another
-/// session debugging this one, /history rendering, compression summaries) can
-/// tell real user content apart from references instead of mistaking inline
-/// attachment data for the user's own words. `materialize_references` restores
-/// the inline form for requests.
+/// artifacts: images become `reference` parts with session-relative asset keys,
+/// and text attachments become `reference` parts containing their write-time
+/// text snapshot. Long-term history keeps this form so later readers can
+/// distinguish the user's own words from attachment data.
+/// `materialize_references` restores the inline form for requests.
 pub(crate) fn build_reference_content(
     model: &str,
     question: &str,
@@ -331,7 +328,7 @@ pub(super) struct PromptCounts {
     messages: BillableCounts,
     tools: BillableCounts,
     reasoning: BillableCounts,
-    /// Sum of per-item `ceil(encrypted bytes / 4)`. The per-item ceiling is
+    /// Sum of per-item `ceil(billable decoded bytes / 4)`. The per-item ceiling is
     /// kept because rounding the sum once can differ from summing rounded
     /// items, and the published estimate must not drift.
     reasoning_encrypted_lower: usize,
@@ -404,10 +401,9 @@ pub(super) fn measure_request_prompt_from_definitions(
 /// Encrypted reasoning replay spliced before Responses assistant turns.
 /// Only items keyed by a projected message's replay owner reach the wire
 /// (see `protocol::responses_input`); entries for compressed-away rounds are
-/// not billed. `encrypted_content` is base64 of an opaque payload: following
-/// codex (`context_manager/history.rs`), decoded bytes ~= 3/4 of the encoded
-/// length, minus a fixed envelope, at ~4 bytes per token (2 for the upper
-/// bound). Every other field (summary text, ids, type) is charged as ordinary
+/// not billed. Estimate decoded payload bytes as 3/4 of the base64 length,
+/// minus a fixed envelope, at ~4 bytes per token (2 for the upper bound).
+/// Every other field (summary text, ids, type) is charged as ordinary
 /// compact JSON. Returns the JSON counts plus both per-item encrypted sums.
 fn reasoning_item_counts(
     messages: &[Message],
@@ -505,7 +501,8 @@ fn json_string_char_len(text: &str) -> usize {
 
 /// Estimates prompt tokens for tool schemas. Definitions (name/description/JSON Schema) are
 /// sent and counted on every request and can be large with many tools/MCP. Uses the same
-/// weights on the serialized characters. `None` / empty tool sets contribute 0.
+/// weights on the serialized characters. `None` contributes 0; supplied values
+/// include JSON delimiters.
 fn estimate_tools_tokens(tools: Option<&Value>) -> usize {
     tools.map_or(0, |tools| compact_json_counts(tools).tokens())
 }
@@ -590,8 +587,8 @@ pub(super) fn estimate_request_prompt_tokens(
 }
 
 /// Pessimistic twin of [`estimate_request_prompt_tokens`]: same inputs,
-/// projected from the same counts walk. Stored on the wire body next to the
-/// lower estimate (via `PromptTokenFeedback`) as the interval's upper bound.
+/// projected from the same counts walk. Stored on `RequestBody` next to the
+/// lower estimate for `PromptTokenFeedback`; these estimates are not serialized.
 pub(super) fn estimate_request_prompt_upper(
     messages: &[Message],
     tools: Option<&Value>,
@@ -718,8 +715,8 @@ pub(super) fn resolve_wire_enable_search_from_parts(
     adapter_for(adapter_kind, endpoint).enable_search_field(enable_search)
 }
 
-/// Assembles the HTTP request body (`RequestBody`), adding thinking / reasoning /
-/// search / stream_options / max_tokens per model capabilities and clamping max_tokens to fit the window.
+/// Assemble request controls from model capabilities. Output sizing uses an
+/// estimated context clamp with a minimum floor and an optional explicit override.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_request_body<'a>(
     model: &'a str,
@@ -820,10 +817,8 @@ pub(super) fn build_request_body_from_parts_with_replay_owners<'a>(
     // Explicitly request streaming usage: some adapters (DashScope compatible-mode) omit
     // usage by default and require stream_options.include_usage for token accounting.
     let stream_options = stream.then(|| json!({ "include_usage": true }));
-    // Send max_tokens only when the model declares max_output_tokens; clamp to the remaining
-    // context window so prompt + requested output cap cannot overflow it (the cause of GLM's
-    // repeated truncation/retry loop with long contexts). Models without max_output_tokens
-    // still omit this field, preserving their wire behavior.
+    // Send max_tokens only when the model declares max_output_tokens. The initial
+    // clamp retains a minimum output floor; it does not prove the prompt fits.
     // Compute the raw estimate once. Transport may calibrate it against a
     // compatible request snapshot, but keeps this uncalibrated baseline for
     // the next response's growth calculation. Reasoning replay is included
@@ -842,9 +837,8 @@ pub(super) fn build_request_body_from_parts_with_replay_owners<'a>(
             .unwrap_or(est_prompt);
         clamp_with_estimated_prompt_from_parts(inputs.context_window, current, model_max)
     });
-    // Adapt to zero-output truncation: after completion=0 + finish_reason=length, the
-    // orchestrator lowers max_tokens_override. Replace the clamp result with that value
-    // so the next request avoids the server's empty-response rejection of oversized max_tokens.
+    // With a registry output cap, accept an explicit override verbatim; main
+    // transport re-clamps it against the calibrated request budget.
     let max_tokens = match (max_tokens, max_tokens_override) {
         (Some(_), Some(override_val)) => Some(override_val),
         (mt, _) => mt,

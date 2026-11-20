@@ -50,8 +50,8 @@ fn builtin_audit_agents_request_progress_checkpoints() {
             "{name} must request AUDIT_CHECKPOINT progress records"
         );
     }
-    // Anything that is not an audit agent keeps the default, so the task path does not
-    // append the audit protocol to its prompt.
+    // The build agent keeps audit checkpoints disabled so delegated development
+    // tasks do not inherit the reviewer's progress format.
     let (name, source) = *BUILTIN_AGENTS
         .iter()
         .find(|(name, _)| *name == "build.agent")
@@ -66,8 +66,8 @@ fn builtin_audit_agents_request_progress_checkpoints() {
 
 #[test]
 fn manifest_json_without_the_progress_flag_keeps_loading() {
-    // The manifest is `Deserialize`, and every other field defaults on absence, so this flag
-    // must follow: a manifest written before it existed still has to load.
+    // Missing optional fields must retain their defaults so stored manifests
+    // without `audit_checkpoints` still deserialize.
     let (_, source) = BUILTIN_AGENTS
         .iter()
         .find(|(name, _)| *name == "audit.agent")
@@ -511,8 +511,8 @@ fn project_instruction_docs_without_home_skip_user_config_dir() {
 
 #[test]
 fn project_instruction_docs_cache_invalidates_on_content_change() {
-    // This test locks in the cache semantics: whenever the file's mtime/len changes, it
-    // must be re-read from disk so the cache can never expose stale instructions to the LLM.
+    // Changing an instruction file's length or modification time must force a
+    // reread so the next prompt uses the updated content.
     let root = temp_dir("project_docs_cache");
     fs::create_dir_all(root.join(".git")).unwrap();
     let agents_md = root.join("AGENTS.md");
@@ -840,8 +840,7 @@ fn resident_scoped_instructions_outrank_new_observed_targets_but_not_pending_mut
         "observed rules only fill the remaining budget"
     );
 
-    // A pending mutation still outranks resident rules, so preflight can
-    // always unblock it.
+    // Pending mutation rules consume budget before resident rules.
     let docs = load_scoped_project_instruction_docs_for_target_tiers_from(
         &root,
         std::slice::from_ref(&required_target),
@@ -884,10 +883,8 @@ fn target_scoped_instruction_docs_ignore_paths_outside_project() {
 
 #[test]
 fn project_instruction_docs_budget_truncates_and_omits_in_order() {
-    // The total budget applies in vector order: a doc that partially fits is
-    // truncated with a trailing `…` (reported on stderr), and docs beyond the
-    // budget are omitted entirely (also reported on stderr). The returned
-    // vector is what the prompt sees; this test pins that behavior.
+    // Budget applies in vector order: a document that partially fits keeps a
+    // prefix plus an ellipsis, and later documents are omitted.
     let docs = vec![
         ProjectInstructionDoc {
             path: "/tmp/budget_a.md".into(),

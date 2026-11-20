@@ -993,9 +993,9 @@ fn folded_prune_partially_answered_anchor_keeps_its_recent_window_slot() {
         anchors.push(messages.len());
         messages.extend(raw_group(&format!("complete-{index}"), &["read_file"]));
     }
-    // The newest anchor produced one response and never received the other. It did
-    // hold evidence, so it keeps its slot: dropping the slot would evict the oldest
-    // protected group in favour of an anchor whose surviving result stays prunable.
+    // The newest anchor has one surviving result, so it consumes a recent slot.
+    // Ignoring it would protect an older complete group while exposing newer
+    // evidence to pruning.
     let mut partial = raw_group("partial", &["read_file", "read_file"]);
     let unanswered = partial.pop().expect("second response");
     assert_eq!(unanswered.tool_call_id.as_deref(), Some("partial-1"));
@@ -1203,9 +1203,8 @@ fn folded_source_ids_stay_nameable_for_marks() {
     let meta = provenance(&note).expect("fixture note carries provenance");
     let source = raw[1].tool_call_id.clone().expect("raw result id");
 
-    // Only the folded projection is left: the raw results are gone, while the
-    // offloaded stub renders each constituent id, so a mark naming one must still
-    // resolve instead of being read as prose.
+    // Only the folded projection remains. Its provenance retains constituent call
+    // IDs, so a mark naming one must resolve instead of being parsed as prose.
     let nameable = llm_prune::nameable_prune_ids(std::slice::from_ref(&note));
     let (ids, remaining) =
         llm_prune::parse_prune_from_hidden_meta(&format!("prune:{source}"), &nameable);

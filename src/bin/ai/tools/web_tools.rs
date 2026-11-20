@@ -103,7 +103,7 @@ fn execute_web_fetch(args: &Value) -> Result<String, String> {
 }
 
 /// Parse the comma-separated provider list from config, falling back to the
-/// built-in default when the key is absent, empty, or lists no usable entry.
+/// built-in default when the key is absent or contains no non-empty entries.
 fn provider_list(config_key: &str, default: &str) -> Vec<String> {
     let raw = configw::get_config(config_key, default);
     let mut providers: Vec<String> = raw
@@ -191,8 +191,8 @@ fn execute_web_search_with_provider(
     }
 }
 
-/// Run a search against an HTML endpoint and turn the result page into
-/// markdown entries. Used when the Jina-style services are unreachable.
+/// Run a configured HTML search endpoint and turn its result page into
+/// markdown entries.
 fn execute_html_search(query: &str, template: &str) -> Result<String, String> {
     if !template.contains(SEARCH_QUERY_PLACEHOLDER) {
         return Err(format!(
@@ -260,9 +260,8 @@ fn percent_encode_component(value: &str) -> String {
 
 /// Longest prefix of `text` that holds at most `max_chars` characters.
 ///
-/// The cut has to land on a UTF-8 character boundary: a byte offset that
-/// splits a multi-byte character panics, and Chinese result pages hit that
-/// case on nearly every entry.
+/// The cut must land on a UTF-8 character boundary to avoid panicking on
+/// multibyte text.
 fn char_prefix(text: &str, max_chars: usize) -> &str {
     match text.char_indices().nth(max_chars) {
         Some((offset, _)) => &text[..offset],
@@ -272,9 +271,8 @@ fn char_prefix(text: &str, max_chars: usize) -> &str {
 
 /// Extract search results from a result page into markdown entries.
 ///
-/// Result pages differ per engine, but every mainstream one puts a linked
-/// heading (`h2`/`h3`) in the result block, so a heading anchor plus the
-/// first following paragraph is a workable engine-agnostic shape.
+/// Use linked headings and the first following paragraph as a common result
+/// shape across search engines.
 fn extract_search_results(html: &str) -> String {
     let mut entries = String::new();
     let mut seen: Vec<String> = Vec::new();
@@ -379,9 +377,9 @@ fn decode_bing_redirect(url: &str) -> String {
     url.to_string()
 }
 
-/// Try every configured reader provider in order; when all fail and direct
-/// fetch is enabled, fall back to fetching the target URL directly from this
-/// machine (restricted to public hosts) and stripping HTML to text.
+/// A `direct` entry skips reader services; otherwise try them in order. If no
+/// reader succeeds and direct fetch is enabled, validate the initial target,
+/// fetch it from this machine, and strip HTML to text.
 fn fetch_with_providers_and_direct(
     target: &Url,
     providers: &[String],
@@ -399,8 +397,8 @@ fn fetch_with_providers_and_direct_with(
     direct_fetcher: impl Fn(&Url) -> Result<DownloadedBody, String>,
 ) -> Result<String, String> {
     let mut errors = Vec::new();
-    // A `direct` entry means "skip the reader services": the reader is
-    // unreachable and paying its timeout on every request is pure latency.
+    // A `direct` entry skips reader services so direct fetch avoids their
+    // timeouts.
     let direct_only = providers
         .iter()
         .any(|entry| entry.trim().eq_ignore_ascii_case(PROVIDER_DIRECT));
@@ -551,10 +549,9 @@ struct DownloadedBody {
     download_incomplete: bool,
 }
 
-/// Fetch the target URL directly from this machine (no reader service) and
-/// convert the HTML payload to plain text. Only public hosts are allowed:
-/// private, link-local, reserved, and metadata addresses are rejected so the
-/// agent cannot be tricked into probing internal networks.
+/// Validate the initial target before fetching and converting HTML to text.
+/// The address check covers only that target; `fetch_and_strip` resolves hosts
+/// independently and follows redirects.
 fn execute_direct_fetch(target: &Url) -> Result<DownloadedBody, String> {
     validate_direct_target(target)?;
     fetch_and_strip(target)

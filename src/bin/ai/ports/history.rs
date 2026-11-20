@@ -1,9 +1,6 @@
 // =============================================================================
 // HistoryStore - history storage port (dependency inversion)
 // =============================================================================
-// Previously the driver called concrete functions in `crate::ai::history::{blob, sqlite::*}`
-// directly, making it impossible to insert cross-cutting logic such as audit/encryption/mock.
-// Decoupled via a trait now; the driver depends only on the abstraction.
 use std::{
     io,
     path::{Path, PathBuf},
@@ -200,8 +197,7 @@ pub(crate) trait HistoryStore: Send + Sync {
     fn load_messages(&self, history_file: &Path) -> io::Result<Vec<Message>>;
 }
 
-/// Default implementation: delegates to the concrete functions in the existing `history` module,
-/// keeping behavior 100% identical.
+/// Adapts the `history` module to [`HistoryStore`].
 pub(crate) struct DefaultHistoryStore;
 
 impl HistoryStore for DefaultHistoryStore {
@@ -485,9 +481,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
         }];
-        // Step 6: the trait's default implementation ignores source_model and degrades to
-        // `append_messages`, with zero breakage for custom stores that do not care about model
-        // provenance.
+        // Stores that do not track model provenance can use the trait's default append.
         store
             .append_messages_for_model(Path::new("unused"), &msgs, "some-model")
             .unwrap();

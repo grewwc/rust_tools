@@ -966,6 +966,66 @@ fn stream_error_truncation_skips_shrink_note_and_partial_text() {
 }
 
 #[test]
+fn corrupted_reasoning_note_replaces_partial_text_and_previous_hints() {
+    let mut messages = vec![
+        Message {
+            role: "user".to_string(),
+            content: Value::String("continue the task".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(format!(
+                "{}stale truncation hint",
+                TRUNCATION_RETRY_NOTE_PREFIX
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+    let result = crate::ai::types::StreamResult {
+        outcome: crate::ai::types::StreamOutcome::Truncated,
+        tool_calls: Vec::new(),
+        assistant_text: String::new(),
+        hidden_meta: String::new(),
+        reasoning_text: "garbled reasoning that must not be persisted".to_string(),
+        reasoning_items: Vec::new(),
+        skip_response_drain: true,
+        truncated_by_length: false,
+        stream_error: false,
+        response_reconciled: false,
+        response_server_mismatch: false,
+        finish_reason_value: Some(CORRUPTED_REASONING_FINISH_REASON.to_string()),
+        usage_prompt_tokens: 0,
+        usage_cached_prompt_tokens: 0,
+        usage_completion_tokens: 0,
+        usage_reasoning_tokens: 0,
+    };
+
+    append_truncation_retry_note(&result, &mut messages, 1);
+
+    assert_eq!(messages.len(), 2, "the stale hint must be replaced");
+    assert_eq!(messages[1].role, "user");
+    assert_eq!(messages[1].content.as_str(), Some("continue"));
+    assert!(
+        crate::ai::history::is_runtime_synthetic_user_message(&messages[1]),
+        "the continuation turn must stay identifiable as runtime-synthesized"
+    );
+    assert!(
+        !messages.iter().any(|message| {
+            message
+                .content
+                .as_str()
+                .is_some_and(|content| content.contains("garbled reasoning"))
+        }),
+        "corrupted reasoning must not reach the request body"
+    );
+}
+
+#[test]
 fn runtime_synthetic_user_auto_image_followup_is_multimodal() {
     let mut app = test_app_with_tools(&[]);
     let dir = std::env::temp_dir().join(format!("tool-followup-{}", uuid::Uuid::new_v4()));

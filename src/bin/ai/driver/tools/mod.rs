@@ -82,7 +82,8 @@ pub(super) struct ExecuteToolCallsResult {
     pub(super) executed_tool_calls: Vec<ToolCall>,
     pub(super) tool_results: Vec<ToolResult>,
     pub(super) cached_hits: Vec<bool>,
-    /// 每个真实执行调用的结构化状态与环境签名；与展示正文解耦并单独持久化。
+    /// Structured outcomes and environment signatures for dispatched calls,
+    /// persisted separately from display text.
     pub(super) execution_outcomes: Vec<Option<ToolExecutionOutcome>>,
     /// 本轮是否有任何工具执行失败（`RunOneResult.ok == false`）。
     /// 结构化信号，供下游 reflection/evolution 判定 turn 质量时使用，
@@ -264,7 +265,7 @@ fn builtin_arg_validator(name: &str, schema: &Value) -> Option<Arc<jsonschema::V
 /// changed schema compiles a fresh validator, and two tools publishing the same
 /// schema share one. The text is the key instead of a hash of it because a
 /// collision would silently validate arguments against another tool's contract.
-/// `None` marks a known-unusable schema so its fail-open is logged once.
+/// Cached `None` entries mark unusable schemas and suppress repeated compile warnings.
 static MCP_ARG_VALIDATORS: LazyLock<
     Mutex<std::collections::HashMap<String, Option<Arc<jsonschema::Validator>>>>,
 > = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -425,10 +426,10 @@ fn unknown_builtin_arg_keys(args: &Value, schema: &Value) -> Vec<String> {
 /// use; an invalid instance fails closed with a retryable error. Builtin
 /// validation runs on a normalized copy of the args
 /// (provider-materialized `null` optionals dropped, `BUILTIN_ARG_ALIASES`
-/// resolved); the service still receives the original args. Builtin
-/// validators are compiled once per tool name; MCP validators are compiled once
-/// per distinct schema text (server schemas can change on reconnect, so a name
-/// alone would pin a stale contract).
+/// resolved). Dispatch canonicalizes accepted aliases in the service args;
+/// null removal affects only the validation copy. Builtin validators are cached
+/// per tool name; MCP validators are cached per schema text within the cache bound
+/// because reconnecting servers can change a tool's contract.
 fn validate_tool_call_args(
     mcp_client: &McpClient,
     tool_call: &ToolCall,
@@ -483,11 +484,8 @@ fn validate_tool_call_args(
                 None => Ok(()),
             }
         }
-        // MCP schemas are server-supplied and can change on reconnect, so the
-        // compiled validator is cached under the schema text itself: a changed
-        // schema misses and recompiles, an unchanged one is reused.
-        // Validated against the raw args — no local normalization — so the
-        // gate can never bless arguments the server itself would reject.
+        // Validate raw MCP arguments so builtin normalization cannot alter
+        // the server's schema semantics.
         ToolRoute::Mcp { .. } => match mcp_arg_validator(&tool_call.function.name, &schema) {
             Some(validator) => reject_invalid_tool_args(tool_call, &validator, args),
             None => Ok(()),
@@ -777,10 +775,8 @@ fn execute_prepared_tool_call(
             server_name,
             tool_name,
         } => {
-            // `mcp_client` is the routing_snapshot passed in by the orchestrator
-            // (empty servers; used only for routing/schema). Real execution must
-            // go through the shared live client, otherwise call_tool reports
-            // "Server not found" in the empty servers map.
+            // Execute through the shared live client: the prepared route comes
+            // from a routing snapshot without server handles.
             let guard = shared_mcp_client
                 .lock()
                 .map_err(|_| "Shared MCP client poisoned".to_string())?;
@@ -949,7 +945,6 @@ fn print_run_status(
         .as_deref()
         .is_some_and(|obs| obs.tool_status_rendered_inline(tool_call))
     {
-        // The status was already merged into the command line; nothing to print.
         return;
     }
     let name = &tool_call.function.name;
@@ -1553,10 +1548,9 @@ fn parallel_safe_batch_len(mcp_client: &McpClient, tool_calls: &[ToolCall]) -> u
     len
 }
 
-/// 并行执行一批只读工具，结果按输入顺序返回。每个线程使用独立的、无 observer
-/// 的 `run_one`（只读工具不产生流式输出），共享的 `mcp_client` / `session_id`
-/// 均为不可变引用，安全跨 `thread::scope` 线程共享。observer 的 started/finished
-/// 回调仍由调用方按顺序触发，以保持原有契约。
+/// Run read-only calls on scoped threads and return results in input order.
+/// Publish dispatched/started callbacks before workers run without observers;
+/// the caller publishes finished callbacks in input order after joining.
 fn run_parallel_readonly_batch(
     mcp_client: &McpClient,
     shared_mcp_client: &SharedMcpClient,

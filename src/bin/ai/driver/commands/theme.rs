@@ -1,6 +1,6 @@
 //! `/theme` — live terminal theme switching.
 //!
-//! The switch is session-scoped and applies immediately: it sets an in-memory
+//! The switch is process-wide and applies immediately: it sets an in-memory
 //! override in `theme.rs` (which also survives the turn-boundary `refresh()`),
 //! so the next terminal output already uses the new palette. Nothing is
 //! written to the config file — set `ai.theme` in config to persist a choice.
@@ -54,7 +54,7 @@ pub fn try_handle_theme_command(input: &str) -> Result<bool, Box<dyn Error>> {
         );
         return Ok(true);
     }
-    // `/theme file <path>`: load a custom theme JSON for this session.
+    // `/theme file <path>`: load a custom theme JSON into the process-wide override.
     let mut words = arg.split_whitespace();
     if words.next() == Some("file") {
         let path = arg["file".len()..].trim();
@@ -88,7 +88,7 @@ fn apply_name(name: &str) -> Result<bool, Box<dyn Error>> {
 
 /// Print a sample of the terminal UI painted with a palette. Without a name
 /// the active theme is previewed; with a name the palette is resolved but the
-/// session keeps its current theme.
+/// active theme stays unchanged.
 fn print_theme_preview(name: Option<&str>) -> Result<bool, Box<dyn Error>> {
     let (label, resolved) = match name {
         Some(name) => match theme::theme_from_name(name) {

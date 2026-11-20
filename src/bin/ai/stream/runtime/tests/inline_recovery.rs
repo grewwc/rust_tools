@@ -71,7 +71,6 @@ fn collect_valid_tool_calls_collapses_malformed_names_and_arguments() {
 
 #[test]
 fn recover_inline_tool_calls_handles_bare_object() {
-    // Simulate qwen3.7-max emitting a tool call as content.
     let raw = r#"{"name":"read_file","arguments":{"path":"/tmp/x"}}"#;
     let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
     assert_eq!(calls.len(), 1);
@@ -104,7 +103,7 @@ fn recover_inline_tool_calls_handles_tool_call_xml_wrapper() {
 
 #[test]
 fn recover_inline_tool_calls_handles_hermes_xml_json_body() {
-    // The Hermes/Qwen XML shape the model actually emitted in the screenshot (body is JSON).
+    // Hermes-style XML may carry the argument object as a JSON body.
     let raw = "<tool_call>\n<function=read_file>\n{\"path\":\"/tmp/x\"}\n</function>\n</tool_call>";
     let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
     assert_eq!(calls.len(), 1);
@@ -176,7 +175,6 @@ fn recover_inline_tool_calls_rejects_plain_text() {
 
 #[test]
 fn recover_inline_tool_calls_handles_anthropic_xml_parameter_tags() {
-    // The Anthropic style deepseek-v4-flash actually emits: <invoke name=...>/<parameter name=...>.
     let raw = r#"<function_calls><invoke name="read_file"><parameter name="path">/tmp/x</parameter><parameter name="limit">200</parameter></invoke></function_calls>"#;
     let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
     assert_eq!(calls.len(), 1);
@@ -219,7 +217,7 @@ fn recover_inline_tool_calls_matches_anthropic_string_attr_by_exact_name() {
 
 #[test]
 fn recover_inline_tool_calls_handles_anthropic_xml_namespaced_tags() {
-    // With a namespace prefix (antml:) and no outer wrapper.
+    // A bare invoke is accepted without an outer wrapper.
     let raw = r#"<invoke name="list_agents"></invoke>"#;
     let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
     assert_eq!(calls.len(), 1);
@@ -230,7 +228,6 @@ fn recover_inline_tool_calls_handles_anthropic_xml_namespaced_tags() {
 #[test]
 fn recover_inline_tool_calls_respects_anthropic_xml_string_attr() {
     // DSML `string="true"`: the value must stay a string even when it looks like a JSON scalar.
-    // Covers the output shape the user reported from deepseek with MCP tools enabled.
     let raw = r#"<tool_calls><invoke name="enable_tools"><parameter name="operation" string="true">enable</parameter><parameter name="tools" string="false">["mcp_excel_open_workbook"]</parameter></invoke></tool_calls>"#;
     let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
     assert_eq!(calls.len(), 1);

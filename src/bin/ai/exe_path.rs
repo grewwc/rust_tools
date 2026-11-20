@@ -34,8 +34,7 @@ fn resolve_executable(exe: PathBuf) -> io::Result<PathBuf> {
         return Ok(exe);
     }
     let Some(markerless) = strip_deleted_suffix(&exe) else {
-        // Not a deleted-binary path: keep the previous behavior and let the
-        // exec report whatever is wrong with it.
+        // Without the deletion marker, let the exec report path errors.
         return Ok(exe);
     };
     if markerless.is_file() {

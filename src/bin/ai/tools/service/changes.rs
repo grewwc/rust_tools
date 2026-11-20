@@ -28,12 +28,9 @@ inventory::submit!(ToolRegistration {
         name: "open_diff",
         description: "",
         execute: execute_open_diff,
-        // User-triggered only (opens a diff in an external editor); lazy via
-        // `enable_tools` instead of a resident `core` schema every turn.
     }
 });
 
-// ── show_changes ───────────────────────────────────────────────────────
 pub(crate) fn handle_show_changes(args: &Value) -> Value {
     let path_filter = args
         .get("path")
@@ -59,7 +56,6 @@ pub(crate) fn handle_show_changes(args: &Value) -> Value {
         .map(|v| v.max(0) as usize)
         .unwrap_or(120);
 
-    // Read the current session context.
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
     let is_git_repo = changes::is_inside_git_work_tree(&cwd);
@@ -87,7 +83,6 @@ pub(crate) fn handle_show_changes(args: &Value) -> Value {
 
     let mut text = text_raw;
     if !path_filter.is_empty() {
-        // Filter the summary by path substring.
         let mut filtered_lines = Vec::new();
         for line in text.lines() {
             if line.contains(path_filter) {
@@ -174,7 +169,6 @@ pub(crate) fn handle_show_changes(args: &Value) -> Value {
     result
 }
 
-// ── open_diff ──────────────────────────────────────────────────────────
 pub(crate) fn handle_open_diff(args: &Value) -> Value {
     let editor_str = args.get("editor").and_then(Value::as_str).unwrap_or("auto");
     let patch_file_arg = args.get("patch_file").and_then(Value::as_str);
@@ -227,7 +221,6 @@ pub(crate) fn handle_open_diff(args: &Value) -> Value {
             };
             if matches!(kind, EditorKind::Vscode | EditorKind::Cursor) {
                 let g = &grouped[0];
-                // Prepare temporary before/after files.
                 if let Some(res) = try_open_single_file_diff(g, &kind) {
                     return match res {
                         Ok(cmd) => json!({
@@ -292,7 +285,6 @@ pub(crate) fn handle_open_diff(args: &Value) -> Value {
                 "is_git_repo": is_git_repo,
             });
         }
-        // Open the explicit patch path with the resolved viewer.
         let kind = if editor_str.eq_ignore_ascii_case("auto") {
             changes::configured_editor()
         } else {
@@ -337,8 +329,8 @@ pub(crate) fn handle_open_diff(args: &Value) -> Value {
     };
     match changes::open_changes(requested_kind.clone()) {
         Ok(cmd) => {
-            // open_changes already wrote the patch. Retain the resolved viewer and
-            // prefer its returned path without writing the patch again.
+            // open_changes already wrote the patch; retain the resolved viewer
+            // without writing the patch again.
             let resolved = requested_kind.unwrap_or_else(changes::configured_editor);
             // Infer the patch destination from session assets or the temp fallback.
             let patch_path = crate::ai::tools::storage::file_store::current_session_assets_dir()
@@ -754,7 +746,6 @@ fn open_patch_path_with_editor(
         EditorKind::Cursor => ("cursor", vec![patch_str.clone()]),
         EditorKind::Idea => ("idea", vec!["diff".to_string(), patch_str.clone()]),
         EditorKind::Git => {
-            // Git difftool requires repository context for the explicit patch.
             return Err("git difftool requires a git work tree; use code/cursor/open".to_string());
         }
         EditorKind::SystemOpen => {

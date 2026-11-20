@@ -1,7 +1,5 @@
 //! Session startup / resume: suspended session preview, selection prompt,
 //! and startup session choice resolution.
-//!
-//! Extracted from `driver/mod.rs` (review Finding #1, Phase 2).
 
 use std::io::IsTerminal;
 use std::path::PathBuf;

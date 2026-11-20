@@ -199,12 +199,9 @@ fn now_ts() -> u64 {
         .unwrap_or(0)
 }
 
-// history file -> session assets dir: shares the same session assets root as `plan_state` / `checkpoint`.
-// `history_file` is always `SessionStore::session_history_file(id)` (i.e. `<sessions_root>/<id>.sqlite`),
-// so `parent` is sessions_root and `{stem}.assets` is `SessionStore::session_assets_dir(id)`.
-// The old implementation used `"{file_name}.assets"` (including the `.sqlite` suffix), producing
-// `"<id>.sqlite.assets"`, which diverged from plan's `"<id>.assets"` and dropped notes. The new
-// implementation uniformly uses `file_stem`.
+// Use the history file's stem so side notes share the `<id>.assets`
+// namespace used by plan state and checkpoints. Including the history
+// extension would split those consumers across different assets directories.
 pub(crate) fn assets_dir_for_history(history_file: &Path) -> PathBuf {
     let parent = history_file.parent().unwrap_or_else(|| Path::new("."));
     let stem = history_file
@@ -228,7 +225,7 @@ pub fn side_note_file(history_file: &Path, target: Option<&str>) -> PathBuf {
     dir.join(name)
 }
 
-/// Whether the target queue currently contains at least one side-note.
+/// Whether the target queue file is nonempty.
 ///
 /// This is a boundary snapshot: callers use it to decide whether a serve child
 /// must stay alive for another model iteration. The subsequent drain remains
@@ -511,7 +508,7 @@ pub fn current_target_id() -> Option<String> {
             return Some(t);
         }
     }
-    // Fall back to env vars: supports process isolation or external injection; both namings accepted.
+    // Fall back to environment aliases for process isolation or external injection.
     for key in ["AIOS_SUBAGENT_TASK_ID", "SUBAGENT_TASK_ID", "AIOS_TASK_ID"] {
         if let Ok(v) = std::env::var(key) {
             let t = v.trim().to_string();
@@ -640,7 +637,6 @@ mod tests {
         let notes = drain_side_notes(&hist, None);
         assert_eq!(notes.len(), 2);
         assert_eq!(notes[0].content, "hello");
-        // should be empty after drain
         assert!(drain_side_notes(&hist, None).is_empty());
         assert!(!has_pending_side_notes(&hist, None));
         let _ = std::fs::remove_dir_all(&dir);

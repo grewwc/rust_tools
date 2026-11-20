@@ -96,7 +96,7 @@ fn reply_token_spans(question: &str) -> Vec<std::ops::Range<usize>> {
                 .map_or(&question[..index], |(_, line)| line);
             let fenced = run >= 3 && line_start.len() <= 3 && line_start.chars().all(|c| c == ' ');
             let fence_tail = question[index + run..].split('\n').next().unwrap_or("");
-            // Markdown fence tails allow spaces, tabs, and the CR of CRLF only.
+            // Markdown closing fence tails allow spaces, tabs, and the CR of CRLF only.
             let closing_fence =
                 fenced && fence_tail.chars().all(|ch| matches!(ch, ' ' | '\t' | '\r'));
             if code_delimiter.is_some_and(|(mark, count, is_fence)| {

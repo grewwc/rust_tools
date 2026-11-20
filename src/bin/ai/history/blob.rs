@@ -24,7 +24,6 @@ pub(in crate::ai) fn build_message_arr(
         Err(err) => return Err(err.into()),
     };
 
-    // Split and filter out empty trailing line (caused by trailing newline)
     let mut lines: Vec<&str> = history.split(NEWLINE).collect();
     if lines.last().map_or(false, |s| s.is_empty()) {
         lines.pop();
@@ -68,10 +67,9 @@ pub(in crate::ai) fn append_history_messages(path: &Path, messages: &[Message]) 
     append_history(path, &blob)
 }
 
-/// Writes this round's raw messages together with the model that produced them to the
-/// canonical history.
-/// `source_model` serves only as provenance for reasoning-request projections; it never
-/// rewrites message bodies.
+/// Append raw messages with the write batch's `source_model` provenance in SQLite.
+/// Display and reasoning projections use this metadata without rewriting message
+/// bodies. The legacy text backend stores messages without model provenance.
 pub(in crate::ai) fn append_history_messages_for_model(
     path: &Path,
     messages: &[Message],
@@ -153,8 +151,8 @@ pub(in crate::ai) fn delete_history_artifacts(path: &Path) -> io::Result<()> {
     remove_one(Path::new(&format!("{base}-wal")))?;
     remove_one(Path::new(&format!("{base}-shm")))?;
     remove_one(Path::new(&format!("{base}-journal")))?;
-    // Every history-deletion entry point eventually reaches here; also reclaim the in-process
-    // revision cache so stale entries do not keep accumulating under per-session/sub-agent paths.
+    // Reclaim the in-process revision cache entry so stale entries do not keep
+    // accumulating under per-session/sub-agent paths.
     super::sqlite::remove_history_revision_cache_entry(path);
     Ok(())
 }
@@ -218,19 +216,12 @@ fn parse_history_line(line: &str) -> Option<Message> {
     })
 }
 
-/// Wake-note dedup (plan 1): for the same process and the same batch of task_ids, only the
-/// latest TASK_WAIT_TIMEOUT "still waiting" wake note is kept. Callers invoke this function
-/// right before appending an introspection note:
+/// Remove earlier TASK_WAIT_TIMEOUT wake notes with the same process and
+/// normalized task_ids from the last `WAKE_NOTE_DEDUP_SCAN` messages. The caller
+/// appends the latest note afterwards; notes outside the scan window remain.
 ///
-/// - The note is not a "still waiting" wake note (a normal question, a real-result wake, or a
-///   non-internal_note): returns `Ok(false)` without touching the file, and the caller appends
-///   as usual;
-/// - It is such a wake note: deletes every old waiting note with the same identity
-///   (pid, task_ids) within the last `WAKE_NOTE_DEDUP_SCAN` messages, returns `Ok(true)`;
-///   the caller then appends the latest one at the tail, so the whole waiting chain keeps only
-///   the newest progress snapshot in history.
-///
-/// Read/rebuild failures return `Ok(false)` on a best-effort basis and never block normal appends.
+/// Returns `Ok(true)` only when a matching note was removed. Other note forms
+/// and unmatched identities return `Ok(false)`; read and rewrite errors propagate.
 pub(in crate::ai) fn coalesce_repeated_wait_wake_notes(
     path: &Path,
     note: &Message,
@@ -294,9 +285,9 @@ pub(in crate::ai) fn coalesce_repeated_wait_wake_notes(
 }
 
 /// Atomically replace the whole history file: write to a unique temp file in the same directory,
-/// fsync it, then rename over the target. A crash at any point leaves either the previous complete
-/// history or no file — never a truncated canonical history (which `fs::write`'s in-place truncate
-/// could produce). Every text-backend full rewrite (replace/truncate/compaction/wake-note
+/// fsync it, then rename over the target. Before the rename, an existing target stays intact;
+/// a successful rename publishes the complete replacement, avoiding `fs::write`'s in-place
+/// truncation. Every text-backend full rewrite (replace/truncate/compaction/wake-note
 /// coalescing) funnels through here; the SQLite backend needs no equivalent because its
 /// replace/truncate run inside a transaction and are protected by the state lock.
 pub(in crate::ai) fn atomic_write_history(path: &Path, contents: &[u8]) -> io::Result<()> {

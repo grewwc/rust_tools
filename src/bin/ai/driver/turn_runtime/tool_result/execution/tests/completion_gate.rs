@@ -926,12 +926,9 @@ fn completion_evidence_gate_accepts_piped_check_with_success_sentinel() {
 
 #[test]
 fn completion_evidence_gate_warns_on_piped_check_without_success_sentinel() {
-    // `cargo check 2>&1 | tail -5` output is an error message: the check really ran,
-    // but the output cannot confirm success, which counts as a “failed known check”
-    // (provable fact). Claiming completion here deserves an honest Warn, not a
-    // Reopen — the model already tried the check, and pushing it to “run the check”
-    // again would produce repeated output; warning + internal note is enough to drive
-    // the next round toward convergence.
+    // An explicit cargo error survives the presentation-only pipe. Warn for the
+    // observed failure rather than reopening to request work already attempted;
+    // absence of a success sentinel alone would not establish failure.
     let mutation = test_tool_call(
         "call_write",
         "write_file",
@@ -1003,11 +1000,8 @@ fn completion_evidence_gate_allows_command_level_mutation_with_same_command_chec
 
 #[test]
 fn completion_evidence_gate_warns_after_failed_check_even_with_later_activity() {
-    // apply_patch → known check failure (cargo check output does not confirm success)
-    // → later benign command (ls). The benign call resets activity to true, but the
-    // failure is provable fact and must not be silently allowed: the gate should Warn
-    // (an honest warning, not classification uncertainty, so no false repetition)
-    // rather than Allow.
+    // A known failed check followed by a benign command must still Warn:
+    // later activity does not erase the failure evidence.
     let mutation = test_tool_call(
         "call_patch",
         "apply_patch",

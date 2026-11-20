@@ -49,8 +49,8 @@ struct Host {
     completed: Option<(i32, Instant)>,
     completion_delivered: bool,
     started: Instant,
-    /// When the worker last had zero attached frontends (or `None` while a
-    /// frontend is attached / no worker exists). Drives idle reaping.
+    /// When the active worker last had no connected peers (or `None` while a
+    /// peer is connected / no active worker exists). Drives idle reaping.
     idle_since: Option<Instant>,
     /// How long a completed or frontend-less host/worker pair is retained.
     /// `COMPLETED_RETENTION` in production; shortened in tests.
@@ -109,11 +109,9 @@ impl Host {
                 if peer.role != Role::Attached && peer.since.elapsed() > CONNECT_TIMEOUT { peer.alive = false; }
             }
             self.peers.retain(|peer| peer.alive);
-            // A worker with no attached frontend for the retention window is
-            // an abandoned session: its client is gone (closed terminal or
-            // killed shell) and without reaping the host+worker pair would
-            // leak forever, waiting on a dead PTY. Reap it like a normal
-            // completion, so re-attach stays possible until this point.
+            // With no connected peers for the retention window, reap the host
+            // and worker to bound the lifetime of abandoned sessions.
+            // Re-attachment remains possible until the window expires.
             let idle = self.worker.is_some() && self.completed.is_none() && self.peers.is_empty();
             if idle && self.idle_since.is_none() { self.idle_since = Some(Instant::now()); }
             if !idle { self.idle_since = None; }
@@ -305,8 +303,8 @@ impl Host {
 
     fn read_worker(&mut self) {
         let Some(worker) = &mut self.worker else { return; };
-        // Failed input only detaches that frontend; output is still drained and
-        // the worker is never stopped or restarted on a transport error.
+        // Discard failed worker input while continuing to drain output; an input
+        // transport error does not stop or restart the worker.
         if worker.input.flush(&mut worker.master).is_err() { worker.input = Queue::default(); }
         let mut chunks = Vec::new();
         let mut eof = false;

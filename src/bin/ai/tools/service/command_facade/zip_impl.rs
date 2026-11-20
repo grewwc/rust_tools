@@ -290,8 +290,8 @@ fn excluded(name: &str, options: &Options) -> bool {
         .any(|pattern| wildcard_match(pattern, name))
 }
 
-/// Whether `path` is the archive being written. Both sides are canonicalized
-/// when possible so `./out.zip` and `out.zip` compare equal during an update.
+/// Whether `path` is the archive being written. Paths with matching file names
+/// are canonicalized when possible so `./out.zip` and `out.zip` compare equal.
 fn is_archive_path(path: &Path, archive: &Path) -> bool {
     if path == archive {
         return true;

@@ -110,7 +110,7 @@ fn should_submit_immediately(line: &str) -> bool {
     let Some(second) = tokens.next() else {
         return false;
     };
-    // 这些子命令本身完整：选中后立即执行（与之前 `/model <name>` 行为一致）。
+    // Informational subcommands require an explicit submit after selection.
     if matches!(second, "current" | "help" | "list") {
         return false;
     }
@@ -120,7 +120,6 @@ fn should_submit_immediately(line: &str) -> bool {
     if second == "effort" {
         return tokens.next().is_some();
     }
-    // 其余视为模型名，立即提交。
     true
 }
 

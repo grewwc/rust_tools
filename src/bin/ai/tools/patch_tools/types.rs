@@ -17,8 +17,8 @@ pub(crate) enum PatchEnvelopeOp {
     Update,
     Add,
     Delete,
-    /// Inline substring replacement: use `anchor:` to locate the line, then exactly replace
-    /// `old:` with `new:` within that line.
+    /// Inline substring replacement: use `anchor:` to locate the line, then replace the
+    /// unique `old:` match with `new:` within that line.
     /// Does not go through the unified-diff path; handled directly by `apply_inline_replace`.
     ReplaceInLine,
 }

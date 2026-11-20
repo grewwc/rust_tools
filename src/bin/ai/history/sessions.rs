@@ -224,8 +224,8 @@ pub(in crate::ai) struct SessionTitle {
 
 /// Per-session runtime defaults stored in the session's meta table, so they
 /// belong to the session itself: changing one session never leaks into another,
-/// and reopening a session restores its picks. `None` means the built-in
-/// default for that field; an empty skill set means no sticky skills.
+/// and reopening a session restores its picks. `None` means no session override
+/// for that field; an empty skill set means no sticky skills.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(in crate::ai) struct SessionServeConfig {
     pub model: Option<String>,
@@ -236,7 +236,7 @@ pub(in crate::ai) struct SessionServeConfig {
     /// Kernel model `/subagent kernel <model>` selects for kernel subagents.
     pub subagent_kernel_model: Option<String>,
     pub default_skills: Vec<String>,
-    /// Append-only session directory grants; defaults and CLI roots are not stored here.
+    /// Session directory grants; defaults and CLI roots are not stored here.
     pub additional_write_roots: Vec<PathBuf>,
     /// Read-time diagnostics are not persisted as session configuration.
     pub additional_write_root_warnings: Vec<String>,
@@ -328,9 +328,8 @@ impl SessionStore {
             };
             jobs.push((id, path, file_modified));
         }
-        // Parallel reads are gathered back on the main thread by index and
-        // inserted into the SkipMap in original order, keeping the same
-        // ordering as the serial version.
+        // Collect by job index so each metadata result stays associated with
+        // the session inserted into the SkipMap.
         let mut metadata_results = Self::read_session_list_metadata_parallel(&jobs);
 
         let mut sessions: Box<SkipMap<(u64, String), SessionInfo>> =
@@ -370,7 +369,7 @@ impl SessionStore {
                 .and_then(DateTime::<Utc>::from_timestamp_millis)
                 .map(|time| time.with_timezone(&Local))
                 .or_else(|| file_modified.map(DateTime::<Local>::from));
-            // Prefer the LLM-generated title (stored in the meta table),
+            // Prefer the persisted title (stored in the meta table),
             // falling back to the first message's summary. Stored titles need
             // only a display cap; do not clean user-chosen wording again.
             let summary = generated_title
@@ -410,8 +409,7 @@ impl SessionStore {
     /// Read list metadata (title, first request, activity time) of many
     /// session databases in parallel.
     ///
-    /// Keeps `list_sessions`'s original fault-tolerance semantics: a failed
-    /// read of one database yields `None` and the caller falls back to the
+    /// A failed read of one database yields `None` and the caller falls back to the
     /// file mtime; one corrupt or old-format session never blocks the whole
     /// list. Static striding avoids atomic-counter contention, and
     /// `std::thread::scope` lets threads borrow `jobs` without copying.
@@ -515,8 +513,8 @@ impl SessionStore {
     }
 
     /// Compute the total bytes of a single session, for commands like
-    /// `/ss current` that only show one session's size, without scanning and
-    /// stat-ing all sessions.
+    /// `/ss current` that only show one session's size, without walking other
+    /// sessions' asset and checkpoint trees.
     pub(in crate::ai) fn session_total_size(&self, session_id: &str) -> io::Result<u64> {
         let derived_history_size = *self
             .derived_session_history_artifact_sizes()?
@@ -531,17 +529,11 @@ impl SessionStore {
 
     /// Fill in `size_bytes` for the listed sessions in parallel.
     ///
-    /// `list_sessions` no longer computes sizes for performance: recursively
-    /// stat-ing every session's assets is the main bottleneck (~2.6s on this
-    /// machine). Only commands that display sizes (e.g. `/ss list`) call this
-    /// method, dispatching each session's stat to its own thread and using
-    /// all cores to bring wall-clock time down to a few hundred milliseconds.
-    /// Results are cached in `<root>/.sizes-cache.json` keyed by a top-level
-    /// directory fingerprint: the fingerprint reads only the direct children
-    /// of assets / checkpoints (name, type, length, mtime), so added,
-    /// deleted, or rewritten files all show up in it; when the fingerprint is
-    /// unchanged the cache is reused and later `/ss` calls do not re-walk
-    /// multi-hundred-MB overflow directories.
+    /// Compute sizes only for callers that display them, avoiding recursive
+    /// asset walks during ordinary listing. Results are cached in
+    /// `<root>/.sizes-cache.json` using `dir_two_level_fingerprint`; unchanged
+    /// fingerprints reuse the cached recursive totals. SQLite and derived history
+    /// file sizes are measured on every call.
     pub(in crate::ai) fn attach_session_sizes(
         &self,
         sessions: &mut [SessionInfo],
@@ -576,9 +568,8 @@ impl SessionStore {
                         scope.spawn(move || {
                             let assets_dir = self.session_assets_dir(&id);
                             let checkpoints_dir = self.checkpoints_dir(&id);
-                            // Skip the recursive walk when the top-level
-                            // fingerprint hits the cache; on walk failure
-                            // record 0 and do not write the cache, as before.
+                            // Reuse the recursive total when the two-level fingerprint
+                            // matches; walk failures return zero without caching it.
                             let (assets_size, checkpoints_size, recompute) = match (
                                 Self::dir_two_level_fingerprint(&assets_dir),
                                 Self::dir_two_level_fingerprint(&checkpoints_dir),
@@ -672,11 +663,9 @@ impl SessionStore {
     /// fingerprint; a missing directory yields `Ok("-")`. Compared with a
     /// recursive walk, the fingerprint reads are proportional to "top-level
     /// entry count + direct-subdirectory entry count".
-    /// Known edge: rewriting a file at depth >= 3 changes no ancestor
-    /// directory mtime, which the two-level fingerprint cannot see; this
-    /// repository's actual layout (assets two levels deep, checkpoints
-    /// published atomically via rename) is unaffected, and any add/delete
-    /// still heals the cache through directory mtime signals.
+    /// In-place rewrites at depth >= 3 and deeper add/delete operations can
+    /// leave all recorded metadata unchanged. Such changes become visible only
+    /// after another recorded change forces a recursive size walk.
     fn dir_two_level_fingerprint(path: &Path) -> io::Result<String> {
         let entries = match fs::read_dir(path) {
             Ok(entries) => entries,
@@ -976,7 +965,7 @@ impl SessionStore {
             let _ = self.remove_session_size_cache_entry(session_id);
             // Reclaim the in-process state-lock map entry: subagent paths reclaim it in
             // `delete_subagent_history`, but a deleted main session would otherwise leave its
-            // entry (keyed by the never-reused session path) in the global map for the rest of
+            // entry (keyed by the session path) in the global map for the rest of
             // the process lifetime — unbounded growth across create/delete cycles. The on-disk
             // `.sqlite.state.lock` file is deliberately kept: unlinking it after releasing the
             // flock would let a concurrent waiter that already opened the old inode lock a
@@ -1232,7 +1221,7 @@ impl SessionStore {
     }
 
     /// Whether the user marked the session as important via `/mark`.
-    /// A missing or unreadable session is treated as unmarked.
+    /// A missing session or absent mark is unmarked; database-open errors propagate.
     pub(in crate::ai) fn read_session_marked(&self, session_id: &str) -> io::Result<bool> {
         Self::validate_session_id(session_id)?;
         let path = self.session_history_file(session_id);
@@ -1267,7 +1256,7 @@ impl SessionStore {
     }
 
     /// Whether the user formally archived the session via `/archive`.
-    /// A missing or unreadable session is treated as active.
+    /// A missing session or absent flag is unarchived; database-open errors propagate.
     pub(in crate::ai) fn read_session_archived(&self, session_id: &str) -> io::Result<bool> {
         Self::validate_session_id(session_id)?;
         let path = self.session_history_file(session_id);
@@ -1387,7 +1376,7 @@ impl SessionStore {
         message_count_sqlite_read_only(&path)
     }
 
-    /// Copy the full state while holding the source and destination session
+    /// Copy the full state while holding the source and destination checkpoint
     /// locks, and let the caller keep modifying the new branch afterwards.
     /// Multi-session locks are acquired in directory order so two forks in
     /// opposite directions cannot wait on each other.
@@ -1548,7 +1537,6 @@ impl SessionStore {
                 let options = zip::write::SimpleFileOptions::default()
                     .compression_method(zip::CompressionMethod::Deflated);
 
-                // manifest.json
                 let manifest = json!({
                     "version": 1u32,
                     "session_id": session_id,
@@ -1558,13 +1546,11 @@ impl SessionStore {
                     .map_err(|e| io::Error::other(e.to_string()))?;
                 zip.write_all(serde_json::to_vec_pretty(&manifest)?.as_slice())?;
 
-                // session.sqlite
                 zip.start_file("session.sqlite", options)
                     .map_err(|e| io::Error::other(e.to_string()))?;
                 let mut sqlite_file = File::open(&snapshot)?;
                 std::io::copy(&mut sqlite_file, &mut zip)?;
 
-                // assets/ (optional)
                 let assets_dir = self.session_assets_dir(session_id);
                 if assets_dir.is_dir() {
                     add_dir_to_zip(&mut zip, &assets_dir, "assets", options)?;
@@ -1593,7 +1579,7 @@ impl SessionStore {
 
         validate_archive_entries(&mut archive)?;
 
-        // Read the manifest (optional, only for validation)
+        // Parse the optional manifest without enforcing its contents.
         let manifest = {
             let mut buf = Vec::new();
             match archive.by_name("manifest.json") {
@@ -1604,7 +1590,7 @@ impl SessionStore {
                 Err(_) => None,
             }
         };
-        let _ = manifest; // Only for validation; the original id is not enforced
+        let _ = manifest; // The destination ID comes from `dst_id`; parsed metadata is ignored.
 
         let dst_sqlite = self.session_history_file(dst_id);
         let dst_assets = self.session_assets_dir(dst_id);
@@ -1965,7 +1951,7 @@ pub(in crate::ai) fn generate_session_summary(first_prompt: &str) -> String {
         return "(空会话)".to_string();
     }
 
-    // Strip the agent prefix (e.g. "a ", "a:", "agent:", etc.)
+    // Strip the agent prefix (e.g. "a ", "a:").
     let text = strip_agent_prefix(&text);
 
     // Handle merged multi-message input (separated by \n---\n)
@@ -2069,11 +2055,8 @@ fn truncate_summary(s: &str, max_len: usize) -> String {
 /// Shared filler-prefix list for session title cleaning (request shells /
 /// question words).
 ///
-/// Historically `strip_request_filler_prefixes` and `strip_filler_prefixes`
-/// each maintained a nearly identical array, and the former was missing
-/// 如何/怎么/怎样, so "如何实现 X" was cleaned differently on the LLM-title
-/// path versus the fallback-summary path. This single source of truth is
-/// shared by both.
+/// Both `strip_request_filler_prefixes` and `strip_filler_prefixes` use this
+/// list so model titles and fallback summaries apply the same prefix rules.
 ///
 /// Order is match priority: the strip loops greedily match in array order,
 /// so long compound prefixes must come before their shorter substrings (e.g.
@@ -2126,7 +2109,7 @@ const SESSION_TITLE_FILLER_PREFIXES: &[&str] = &[
 /// Rules: match `<think>` / `</think>` case-insensitively; remove a complete
 /// pair as a whole; for an unclosed `<think>` (open without close), truncate
 /// to the content before that `<think>` (the chain of thought usually trails,
-/// and the text before it is the answer). Non-think text is kept verbatim.
+/// and the text before it is the answer). Non-think text is preserved apart from outer whitespace.
 pub(in crate::ai) fn strip_think_tags(text: &str) -> String {
     // Locate tag bytes directly on the original string with ASCII
     // case-insensitive matching, avoiding a `to_lowercase()` copy that would
@@ -2498,8 +2481,8 @@ mod tests {
 
     #[test]
     fn terminal_resume_echo_is_stripped_from_title_sources() {
-        // The exact capture shape that produced the "单会话仍要确认" title: the
-        // user's real question followed by the echoed resume-selection prompt.
+        // A real question followed by the echoed resume-selection prompt must
+        // retain the question as the title source.
         let noisy = "修复一个 \"/bg\" 相关的问题。为什么一个terminal，只挂了一个session，还要确认？\n\
 [resume] 当前 terminal 有 1 个挂起 session：\n\
   1. 6ebee611-40ca-4c15-9361-81d2de4e8c62  persona=default  modified=2026-09-17 15:03  suspended=2026-09-17 15:03\n\
@@ -2595,7 +2578,6 @@ mod tests {
         store.attach_session_sizes(&mut sessions).unwrap();
         assert_eq!(sessions[0].size_bytes, 180);
 
-        // Clean up the temp directory.
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2630,7 +2612,6 @@ mod tests {
             SessionStore::load_session_size_cache(&store.root.join(SESSION_SIZE_CACHE_FILE));
         assert!(!cache.contains_key(&session_id));
 
-        // Clean up the temp directory.
         let _ = fs::remove_dir_all(&root);
     }
 

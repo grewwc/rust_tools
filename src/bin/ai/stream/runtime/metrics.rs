@@ -21,28 +21,14 @@ pub(super) const FINISH_REASON_GRACE_MS: u64 = 750;
 /// A model whose gateway hides long stretches of work behind silence without opening an output item may widen
 /// this default per model (`stream_silence_timeout_secs` in the model registry).
 pub(super) const STREAM_IDLE_TIMEOUT_SECS: u64 = 45;
-/// Silence allowance while the provider holds an open output item (`response.output_item.added` without its
-/// matching `.done`).
-///
-/// An open item is the provider's own declaration that work is under way, and both shapes this wire produces can
-/// then stay completely quiet: hidden thinking streams no content at all (measured 111s of total wire silence
-/// inside one reasoning item, and ~285s before the first output item, on muse-spark-1.3 at xhigh effort), and a
-/// large tool-argument payload is generated server-side before it is delivered (a 20KB `write_file` argument
-/// arrives as a single late delta).
-///
-/// Only that declared state gets the allowance: with no item open, silence is still cut by the connection bound
-/// above, so a dead connection is normally discovered in seconds rather than minutes. Inside an open item a dead
-/// connection is indistinguishable from a slow provider — no bytes arrive either way — so this is the accepted
-/// cost of not discarding healthy generations; `MAX_TOOL_ARG_BYTES` and the tool-argument stall bound below stay
-/// as the runaway guards for tool calls.
+/// Silence allowance while the provider holds an output item open. Declared work
+/// may stay silent, including hidden reasoning or tool arguments delivered as a
+/// single late delta. Without an open item, `STREAM_IDLE_TIMEOUT_SECS` still applies;
+/// byte limits and the tool-argument stall timer bound calls that never finish.
 pub(super) const STREAM_DECLARED_ITEM_TIMEOUT_SECS: u64 = 300;
-/// Tool-call argument stall timeout: an absolute bound on how long one tool call may stay open, even if the provider
-/// keeps trickling argument deltas (the silence allowance only catches total silence; a server sending one small
-/// delta every few minutes refreshes the meaningful-progress timer forever, leaving the terminal stuck on
-/// "receiving `tool` arguments…" — observed incident: an apply_patch call whose arguments never completed for 13+
-/// minutes). Generating the arguments of a large artifact is legitimate work that can take minutes, so this is a
-/// backstop against a stream that never finishes, not a normal-path timeout; `MAX_TOOL_ARG_BYTES` remains the primary
-/// runaway guard. On expiry the open call is dropped and the attempt replays through the truncation path.
+/// Absolute time limit for tool arguments that never finish, even while deltas
+/// keep the silence timer alive. Large artifacts can take time to generate, so
+/// `MAX_TOOL_ARG_BYTES` remains a separate growth bound.
 pub(super) const STREAM_TOOL_ARGS_STALL_TIMEOUT_SECS: u64 = 180;
 /// First-chunk timeout: the request was sent but the server never sends the first byte (queued, stuck gateway, ...).
 /// A stream that produced nothing yet gets this window: unlike a stall after work has been delivered, there is nothing
@@ -54,11 +40,8 @@ pub(super) const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 180;
 /// fold (redraws with a 0-line window) so conclusions/questions restated at the tail of thinking are not shown twice
 /// alongside the final answer in the terminal.
 pub(super) const DEFAULT_THINKING_MAX_VISIBLE_LINES: usize = 2;
-/// Physical rows the live fold window reserves outside its body budget: the anchored header (1), the fold-summary
-/// marker (1), and one row of headroom so the cursor never sits on the very bottom row. Bounding the body to
-/// `viewport_rows - this` keeps the whole window (header + body) inside the visible viewport, so the relative-cursor
-/// erase (`\x1b[nA`) in `erase_fold_body` always reaches the top body row instead of being clamped at the viewport
-/// top once the window scrolls into scrollback — the root cause of stacked `… more` / `… N earlier lines` markers.
+/// Reserve viewport rows for the header, summary marker, and cursor headroom.
+/// Reducing the body budget helps keep relative cursor erasure above scrollback.
 pub(super) const FOLD_VIEWPORT_RESERVED_ROWS: usize = 3;
 /// Indentation for folded thinking/subagent bodies: header/footer use 2 spaces, body is indented one more level.
 pub(super) const THINKING_FOLD_BODY_INDENT: &str = "    ";
@@ -67,16 +50,13 @@ pub(super) const THINKING_FOLD_BODY_INDENT_WIDTH: usize = 4;
 /// a missing terminal flag or a one-column width/char-width drift cannot trigger an implicit wrap that was not counted
 /// in cursor-up, leaving residue from the old window under the `✓`.
 pub(super) const FOLD_REWRITE_RIGHT_MARGIN_COLS: usize = 2;
-/// Shortest repeated fragment and decision count for reasoning-stream degeneration. Only reasoning is checked, so
-/// legitimately repeated body the model was asked to produce (tables, code, test data) is not misjudged as degeneration.
+/// Fragment-size bounds for the character-based repetition detector.
 pub(super) const MIN_REASONING_REPEAT_CHARS: usize = 16;
 pub(super) const MAX_REASONING_REPEAT_CHARS: usize = 512;
 pub(super) const REASONING_REPEAT_COUNT: usize = 3;
 pub(super) const DEGENERATE_REPETITION_FINISH_REASON: &str = "degenerate_repetition";
-/// Cap on accumulated streaming tool-call arguments (total across all tool calls in one turn).
-/// Once the model opens a tool call it should close quickly; if arguments keep growing until the cap is hit (e.g.
-/// an endless loop concatenating the same body in apply_patch), the output has degenerated. Existing degeneration
-/// detection only covers reasoning/assistant text, not tool arguments; this total cap is a backstop against infinite waits and memory growth.
+/// Bound accumulated tool-call arguments across the turn to prevent unbounded
+/// memory growth when argument generation never finishes.
 pub(super) const MAX_TOOL_ARG_BYTES: usize = 1 << 20; // 1 MiB
 
 /// When `ai.prompt_cache.show_metrics` (default on) is set and this request hit the prompt

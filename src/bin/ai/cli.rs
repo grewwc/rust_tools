@@ -44,36 +44,25 @@ pub(super) struct ParsedCli {
     /// turn continues with notebook retrieval Q&A.
     pub(super) interactive: bool,
     /// Session-level override of the reasoning effort tier. Semantics:
-    /// - `None`: not set; follow the model default from the model registry
-    ///   ([models/](../../../../models));
-    /// - `Some(Some(level))`: force this tier (minimal/low/medium/high);
-    /// - `Some(None)`: user explicitly disabled it ("off"). This is upgraded to
-    ///   "thinking off": dialects with a real off-switch (DashScope
-    ///   `enable_thinking`, DeepSeek `thinking`) turn thinking off on the wire
-    ///   (`request::thinking::resolve_thinking`), and effort-only dialects send
-    ///   `reasoning_effort: "none"` (`request::reasoning::resolve_reasoning_effort`).
+    /// - `None`: resolve the default from the active agent and model registry;
+    /// - `Some(Some(level))`: request that `ReasoningEffort` tier;
+    /// - `Some(None)`: request thinking off. `request::thinking::resolve_thinking`
+    ///   uses real wire switches; `request::reasoning::resolve_reasoning_effort`
+    ///   emits "none" for thinking-enabled models whose dialect supports it.
+    ///   Models without an off control keep their normal thinking policy.
     ///
     /// Both `/model effort <x>` and `--reasoning-effort` write to this field.
     pub(super) reasoning_effort_override: Option<Option<ReasoningEffort>>,
-    /// Fallback switch for truncation retries: when `true`, the current request
-    /// force-disables thinking, ignoring the model default and automatic detection.
-    /// For always-thinking models (e.g. GLM via `enable_thinking`), merely lowering
-    /// `reasoning_effort` cannot stop the chain of thought from filling the output
-    /// budget; after several consecutive truncations this flag is set to give the
-    /// whole thinking budget to visible content. Takes effect only within the turn
-    /// and is uniformly restored at turn end.
+    /// Recovery override that bypasses normal thinking detection for this turn.
+    /// The dialect's declared off capability controls the wire effect. Restored
+    /// at turn end.
     pub(super) thinking_disabled_override: bool,
-    /// Adaptive `max_tokens` override for truncation retries. On detecting a
-    /// "zero-output truncation" (`completion=0` + `finish_reason=length`), the
-    /// server rejected the current `max_tokens` value (typically: relay/compat
-    /// layers return empty responses for very large max_tokens).
-    /// This field then records max_tokens halved, and the next request retries
-    /// with the smaller value until the server accepts it. Takes effect only
-    /// within the turn and is uniformly restored at turn end.
-    /// - `None`: not set; use the normal value computed by
-    ///   `clamp_max_tokens_for_prompt`;
-    /// - `Some(n)`: use `n` as the max_tokens cap (still bounded by the clamp's
-    ///   remaining window).
+    /// Adaptive `max_tokens` override for truncation retries. An empty,
+    /// length-limited response with no text or tool calls and zero reported
+    /// completion tokens triggers an adjustment for the next attempt. The
+    /// override is restored at turn end.
+    /// - `None`: use the cap computed from the model and prompt budget;
+    /// - `Some(n)`: replace that cap when the model declares an output limit.
     pub(super) max_tokens_override: Option<u32>,
     /// Whether to search only memo-category records.
     /// Enabled via `--note-search` / `-ns`, for quickly finding content the user
@@ -86,7 +75,7 @@ pub(super) struct ParsedCli {
     /// Whether `--note` / `-n` was passed (even without text, e.g. to save only a
     /// clipboard image).
     pub(super) note_flag: bool,
-    /// Memo entry ID to delete, via `--note-delete` / `-nd <id>`.
+    /// Query used to match memos for deletion, via `--note-delete` / `-nd`.
     pub(super) note_delete: Option<String>,
     /// Memo to edit, via `--note-edit` / `-ne <description>`: AI matches it, then
     /// it is rewritten in an editor.
@@ -101,7 +90,6 @@ pub(super) struct ParsedCli {
     pub(super) distill_dry_run: bool,
     /// With `--distill-session`: max entries to distill (default: 20).
     pub(super) distill_limit: usize,
-    /// --generate-completions
     pub(super) generate_completions: bool,
     /// Whether to run in background mode (`--background` / `-bg`).
     /// In background mode the terminal is detached, full output is written to
@@ -472,8 +460,8 @@ fn is_reserved_command_flag(tok: &str, reserved: &[&str]) -> bool {
 /// `a --model /sessions list`, `/sessions` is the model value. The claim rules
 /// mirror terminalw's pairing: a pending value flag waits for the next
 /// non-`-` token, a bool claims nothing, and an inline `=` value settles the
-/// pending key. When no command start is found the caller leaves argv
-/// untouched, which is exactly terminalw's own parse path.
+/// pending key. When no command start is found, `protect_slash_command_args`
+/// leaves its input unchanged.
 fn find_command_start(argv: &[String], kinds: &FastMap<String, CliOptionKind>) -> Option<usize> {
     let mut expecting_value = false;
     for (i, tok) in argv.iter().enumerate() {
@@ -893,10 +881,8 @@ pub(super) fn try_parse_cli_args(args: impl Iterator<Item = String>) -> Result<P
     let mut argv = normalize_cli_argv(head, &kinds);
     let add_dirs = extract_add_dir_args(&mut argv)?;
 
-    // Parse arguments with terminalw.
     parser.parse_argv(&argv, &[]);
 
-    // Build the ParsedCli struct.
     let mut cli = ParsedCli::default();
     cli.add_dirs = add_dirs;
 
@@ -905,7 +891,6 @@ pub(super) fn try_parse_cli_args(args: impl Iterator<Item = String>) -> Result<P
     cli.version = parser.contains_flag_strict("version");
     cli.interactive = parser.contains_flag_strict("interactive");
 
-    // Handle model.
     if parser.contains_flag_strict("model") {
         let val = parser.flag_value_or_default("model");
         if !val.trim().is_empty() {
@@ -913,7 +898,6 @@ pub(super) fn try_parse_cli_args(args: impl Iterator<Item = String>) -> Result<P
         }
     }
 
-    // Handle agent.
     if parser.contains_flag_strict("agent") {
         let val = parser.flag_value_or_default("agent");
         if !val.trim().is_empty() {
@@ -931,7 +915,6 @@ pub(super) fn try_parse_cli_args(args: impl Iterator<Item = String>) -> Result<P
     cli.new_session = parser.contains_flag_strict("new-session");
     cli.resume = parser.contains_flag_strict("resume");
 
-    // Handle session.
     if parser.contains_flag_strict("session") {
         let val = parser.flag_value_or_default("session");
         cli.session = Some(val);
@@ -965,15 +948,12 @@ pub(super) fn try_parse_cli_args(args: impl Iterator<Item = String>) -> Result<P
         }
     }
 
-    // Handle files.
     if parser.contains_flag_strict("files") {
         cli.files = parser.flag_value_or_default("files");
     }
 
-    // Handle consolidate-knowledge.
     cli.consolidate_knowledge = parser.contains_flag_strict("consolidate-knowledge");
 
-    // Handle distill-session.
     if parser.contains_flag_strict("distill-session") {
         let val = parser.flag_value_or_default("distill-session");
         // Record presence even when empty: the driver then fails fast with a
@@ -988,19 +968,15 @@ pub(super) fn try_parse_cli_args(args: impl Iterator<Item = String>) -> Result<P
         }
     }
 
-    // Handle generate-completions.
     cli.generate_completions = parser.contains_flag_strict("generate-completions");
 
-    // Handle background / -bg.
     cli.background = parser.contains_flag_strict("background");
 
-    // Handle --stop <session-id>.
     if parser.contains_flag_strict("stop") {
         let val = parser.flag_value_or_default("stop");
         cli.stop_session = Some(val.trim().to_string());
     }
 
-    // Handle --serve / --serve-chat / --serve-bind.
     cli.serve = parser.contains_flag_strict("serve");
     cli.serve_chat = parser.contains_flag_strict("serve-chat");
     cli.serve_sessions = parser.contains_flag_strict("serve-sessions");
@@ -1038,34 +1014,26 @@ pub(super) fn try_parse_cli_args(args: impl Iterator<Item = String>) -> Result<P
         );
     }
 
-    // Handle list-tools.
     cli.list_tools = parser.contains_flag_strict("list-tools");
 
-    // Handle list-mcp-tools.
     cli.list_mcp_tools = parser.contains_flag_strict("list-mcp-tools");
 
-    // Handle list-skills.
     cli.list_skills = parser.contains_flag_strict("list-skills");
 
-    // Handle list-agents.
     cli.list_agents = parser.contains_flag_strict("list-agents");
 
-    // Handle no-skills.
     cli.no_skills = parser.contains_flag_strict("no-skills");
 
-    // Handle pure mode. `--pure` is a shortcut for `--agent pure` unless an
-    // explicit `--agent` value already wins; `--no-pure` suppresses the
-    // `ai.prompt.pure_mode` startup default (and the `--pure` shortcut, so an
-    // explicit opt-out can never be defeated by a stale shell alias).
+    // `--pure` selects the pure agent unless `--agent` already supplied a
+    // value. `--no-pure` suppresses both the persisted startup default and the
+    // shortcut, including when the shortcut comes from a shell alias.
     cli.no_pure = parser.contains_flag_strict("no-pure");
     if !cli.no_pure && parser.contains_flag_strict("pure") && cli.agent.is_none() {
         cli.agent = Some("pure".to_string());
     }
 
-    // Handle note-search.
     cli.note_search = parser.contains_flag_strict("note-search");
 
-    // Handle note.
     if parser.contains_flag_strict("note") {
         cli.note_flag = true;
         let val = parser.flag_value_or_default("note");
@@ -1074,24 +1042,20 @@ pub(super) fn try_parse_cli_args(args: impl Iterator<Item = String>) -> Result<P
         }
     }
 
-    // Handle note-delete.
     if parser.contains_flag_strict("note-delete") {
         let val = parser.flag_value_or_default("note-delete");
         cli.note_delete = Some(val.trim().to_string());
     }
 
-    // Handle note-edit.
     if parser.contains_flag_strict("note-edit") {
         let val = parser.flag_value_or_default("note-edit");
         cli.note_edit = Some(val.trim().to_string());
     }
 
-    // Handle mcp-config.
     if parser.contains_flag_strict("mcp-config") {
         cli.mcp_config = parser.flag_value_or_default("mcp-config");
     }
 
-    // Handle reasoning-effort.
     if parser.contains_flag_strict("reasoning-effort") {
         let raw = parser.flag_value_or_default("reasoning-effort");
         let trimmed = raw.trim();
@@ -1500,9 +1464,7 @@ fn generate_bash(
     println!("      /history|:history)");
     // First argument completes subcommands plus stored session ids
     // (`a /history <session> last <N>`); deeper positions complete the
-    // display verbs again. Session ids come from the default sessions dir
-    // (best-effort: non-default `--history-file` roots still complete in
-    // the interactive REPL).
+    // display verbs again. Session ids come from the default sessions dir.
     println!("        if [ \"$COMP_CWORD\" -eq 2 ]; then");
     println!("          local _a_hist_sess=''");
     println!("          for _a_hist_f in \"$HOME\"/.history_file.sessions/*.sqlite; do");
@@ -1863,10 +1825,8 @@ fn generate_zsh(
     println!("        ;;");
     println!("  esac");
     println!();
-    // _arguments: flags + the first position arg is an internal command.
-    // Expand the array members as candidates via ($_a_internal_cmds); an early
-    // version wrote (_a_internal_cmds) instead, which made the literal string
-    // "_a_internal_cmds" the only candidate, leaving /usa<tab> unresponsive.
+    // `_arguments` needs the array expansion inside its candidate specification;
+    // otherwise it completes the literal variable name.
     println!("  _arguments $_a_args ':first command:(($_a_internal_cmds))'");
     println!("}}");
     println!();
@@ -1975,9 +1935,6 @@ end
         "complete -c a -n '__fish_seen_subcommand_from /model :model' -a '{}' -d 'model selector'",
         model_selector_words().replace('\'', "\\'")
     );
-    // Values of `--model`/`-m`: model selector. fish's `-a` already prefix-filters,
-    // so segmented matching like bash/zsh is not possible, but prefix scenarios
-    // such as `a --model dee<TAB>` work.
     println!(
         "complete -c a -l model -r -a '{}' -d 'model selector'",
         model_selector_words().replace('\'', "\\'")
@@ -1992,9 +1949,6 @@ end
     println!(
         "complete -c a -n '__fish_seen_subcommand_from effort' -a 'minimal low medium high xhigh max auto off' -d 'reasoning effort'"
     );
-    // skill/agent name completion: fish's `-a` can only match by prefix and cannot
-    // do the two-stage smart matching of bash/zsh (platform limitation), so only
-    // the names themselves are completed here.
     println!(
         "complete -c a -n '__fish_seen_subcommand_from /skills :skills /skill :skill' -a '{}' -d 'skill name'",
         skill_names().replace('\'', "\\'")

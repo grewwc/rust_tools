@@ -1,6 +1,4 @@
 //! MCP lifecycle: preload task management and initialization.
-//!
-//! Extracted from `driver/mod.rs` (review Finding #1, Phase 2).
 
 use std::sync::atomic::Ordering;
 

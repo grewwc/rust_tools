@@ -31,7 +31,8 @@ use super::{
     persistence::{persist_pending_turn_messages, persist_pending_turn_messages_for_model},
     prepare::{TurnQuestionOrigin, prepare_turn},
     tool_result::{
-        DEGENERATE_REPETITION_FINISH_REASON, FinalGateState, append_empty_response_retry_note,
+        CORRUPTED_REASONING_FINISH_REASON, DEGENERATE_REPETITION_FINISH_REASON, FinalGateState,
+        append_empty_response_retry_note,
         audit_evidence_gate_action, completion_evidence_state, completion_tool_result_succeeded,
         handle_iteration_execution_for_model, is_evidence_gated_audit_agent,
         tool_call_is_successful_mutation_candidate,
@@ -177,6 +178,12 @@ const PROVIDER_CONTROL_LEAK_MAX_ATTEMPTS: usize = 2;
 /// turn: the original generation + ONE corrective retry carrying the dedicated
 /// `tool_followup:degenerate_repetition` note, then finalize honestly with the collected reasoning.
 const DEGENERATE_REPETITION_MAX_ATTEMPTS: usize = 2;
+/// Retry cap for consecutive corrupted-reasoning stops (decoded replacement/control characters
+/// or leaked special-token placeholders). Like degenerate repetition, this is content-triggered
+/// corruption: the effort/max_tokens ladder cannot fix it, so it gets one corrective retry and
+/// then finalizes honestly. The original generation + one retry keeps a transient provider
+/// decode failure recoverable without looping on a provider that keeps emitting garbage.
+const CORRUPTED_REASONING_MAX_ATTEMPTS: usize = 2;
 /// Ratio threshold of reasoning to completion tokens: at or above it, the truncation is classified
 /// as "reasoning ate the budget", where lowering reasoning_effort directly shortens the chain of
 /// thought and frees budget for visible text; below it, the truncation is mostly caused by overly
@@ -345,6 +352,10 @@ struct TurnRetryState {
     /// budget from consecutive_truncations: the effort ladder cannot fix content-triggered loops,
     /// so this caps retries independently (see DEGENERATE_REPETITION_MAX_ATTEMPTS).
     consecutive_degenerate_repetitions: usize,
+    /// Consecutive corrupted-reasoning stops (decoded garbage or leaked tokenizer placeholders).
+    /// Independent budget from the truncation ladder for the same reason: retrying with more
+    /// tokens or lower effort does not make a corrupt token stream decodable.
+    consecutive_corrupted_reasoning: usize,
     saved_effort_override: Option<Option<crate::ai::provider::ReasoningEffort>>,
     saved_thinking_disabled: bool,
     saved_max_tokens_override: Option<u32>,
@@ -359,6 +370,7 @@ impl TurnRetryState {
             consecutive_stream_errors: 0,
             consecutive_provider_control_leaks: 0,
             consecutive_degenerate_repetitions: 0,
+            consecutive_corrupted_reasoning: 0,
             saved_effort_override: app.cli.reasoning_effort_override,
             saved_thinking_disabled: app.cli.thinking_disabled_override,
             saved_max_tokens_override: app.cli.max_tokens_override,
@@ -3246,6 +3258,10 @@ async fn run_turn_body_round(
                     .is_some_and(|reason| {
                         reason == crate::ai::stream::PROVIDER_CONTROL_LEAK_FINISH_REASON
                     });
+                let is_corrupted_reasoning = stream_result
+                    .finish_reason_value
+                    .as_deref()
+                    .is_some_and(|reason| reason == CORRUPTED_REASONING_FINISH_REASON);
 
                 if is_provider_control_leak {
                     retry.consecutive_provider_control_leaks += 1;
@@ -3263,6 +3279,36 @@ async fn run_turn_body_round(
                     crate::ai::driver::print::print_tool_note_line(
                         "stream",
                         "provider control markers leaked into reasoning; discarding the response and retrying once",
+                    );
+                } else if is_corrupted_reasoning {
+                    // Content-triggered corruption: the provider's token stream decoded
+                    // into non-text. More tokens or lower effort cannot fix it, so it gets
+                    // one automatic continuation retry and then an honest stop instead of
+                    // the effort/max_tokens ladder.
+                    retry.consecutive_corrupted_reasoning += 1;
+                    retry.consecutive_truncations = 0;
+                    retry.consecutive_degenerate_repetitions = 0;
+                    retry.consecutive_stream_errors = 0;
+                    if retry.consecutive_corrupted_reasoning
+                        >= CORRUPTED_REASONING_MAX_ATTEMPTS
+                    {
+                        // The last automatic continuation carries no answer when the
+                        // retry also corrupts; drop it so the turn does not end on a
+                        // dangling synthetic user message.
+                        if messages.last().is_some_and(|message| {
+                            crate::ai::history::is_runtime_synthetic_user_message(message)
+                                && message.content.as_str() == Some("continue")
+                        }) {
+                            messages.pop();
+                        }
+                        output.assistant_text =
+                            "[Model output was stopped: the reasoning stream decoded into invalid text (replacement or control characters) on repeated attempts. Those generations were discarded instead of being persisted; the runtime already retried automatically. Please retry this request or switch models for the next turn.]"
+                                .to_string();
+                        break 'turn Ok(None);
+                    }
+                    crate::ai::driver::print::print_tool_note_line(
+                        "stream",
+                        "reasoning stream decoded into invalid text; discarding the response and retrying with a continuation turn",
                     );
                 } else if is_degenerate_repetition {
                     // Separate failure mode from output-length truncation: the model looped on one
@@ -3627,6 +3673,7 @@ async fn run_turn_body_round(
             } else {
                 retry.consecutive_truncations = 0;
                 retry.consecutive_provider_control_leaks = 0;
+                retry.consecutive_corrupted_reasoning = 0;
                 // Not a truncation: restore the max_tokens downgraded due to zero output.
                 if retry.max_tokens_downgraded {
                     app.cli.max_tokens_override = retry.saved_max_tokens_override;

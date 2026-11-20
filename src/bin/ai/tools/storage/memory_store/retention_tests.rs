@@ -51,9 +51,8 @@ fn read_entries(path: &Path) -> Vec<AgentMemoryEntry> {
         .collect()
 }
 
-/// P0-1 regression: the original double-delete bug wrongly removed the entry right after a priority=255 one once the quota was full;
-/// build a "low-priority + permanent" mix here and assert that after enforce all priority=255
-/// entries survive and the quota is pressed back under max_entries.
+/// Low-value pruning removes every matching ID while keeping entries that fail
+/// the age or priority filters.
 #[test]
 fn prune_low_value_removes_matching_ids_in_one_pass() {
     let path = unique_path("prune_batch");
@@ -87,8 +86,8 @@ fn prune_low_value_removes_matching_ids_in_one_pass() {
     write_lines(&path, &all);
 
     let store = MemoryStore::for_tests_with_path(path.clone());
-    // tool_stat with no general tags scores 0.1 < 0.2; safety_rules and
-    // priority >= 200 are exempt, so exactly the three old-* entries go.
+    // Old tool_stat entries fall below the score threshold; priority >= 200
+    // and the recent timestamp keep the two survivors out of the removal set.
     let removed = store.prune_low_value_memories(0.2, 365).unwrap();
     assert_eq!(removed, 3);
 
@@ -108,7 +107,7 @@ fn prune_low_value_removes_matching_ids_in_one_pass() {
 fn enforce_max_entries_keeps_all_permanent_entries() {
     let path = unique_path("enforce_perm");
     let mut all = Vec::new();
-    // 100 ordinary low-priority entries, ordered old to new
+    // Ordinary entries provide enough removable rows to exceed the quota.
     for i in 0..100 {
         all.push(entry(
             "tool_stat",
@@ -143,8 +142,7 @@ fn enforce_max_entries_keeps_all_permanent_entries() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// P0-2 regression: after rotate the new main file may contain only priority=255 entries,
-/// while the archive file contains all original entries.
+/// Rotation retains permanent entries in the main file and archives the complete source.
 #[test]
 fn rotate_preserves_permanent_entries_in_main_file() {
     let path = unique_path("rotate_perm");
@@ -205,9 +203,8 @@ fn rotate_preserves_permanent_entries_in_main_file() {
     }
 }
 
-/// P0 regression: -ns memo retrieval (include_archives=true) must scan all archives,
-/// not truncated by keep_last_archives; it must also handle `.jsonl.bak` files left by legacy migration.
-/// Otherwise historical memos moved out by rotation or migration become permanently unretrievable.
+/// Explicit archive retrieval scans every rotated archive and legacy migration backup,
+/// bypassing configured recent-archive limits so older memos remain retrievable.
 #[test]
 fn entries_by_category_include_archives_scans_all_archives() {
     let path = unique_path("memo_arch_scan");
@@ -279,7 +276,6 @@ fn entries_by_category_include_archives_scans_all_archives() {
         "最旧归档和旧迁移备份中的 memo 都必须可检索"
     );
 
-    // Cleanup
     let _ = std::fs::remove_file(&path);
     for p in archive_paths {
         let _ = std::fs::remove_file(p);

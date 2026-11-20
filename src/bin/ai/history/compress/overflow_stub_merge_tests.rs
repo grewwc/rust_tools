@@ -1,11 +1,8 @@
-//! user/image 外溢 stub 合并与批量裁剪回归测试（问题 1-4 修复验证）。
+//! Regression coverage for merging preserved user/image pointers and batch trimming.
 //!
-//! 覆盖：
-//! - `merge_old_user_overflow_stubs`：保护尾窗之外的旧 stub 折叠为单条目录指针，
-//!   占位开销从 O(N) 收敛到 O(1)；最近轮次的 stub 保持逐条指针（问题 1）。
-//! - `trim_removable_messages_batch`：user 候选跳过而非 break，其后的可裁候选仍
-//!   被批量移除，user 原文永不删除（问题 2 + 3）。
-//! - 批量裁剪不再把 internal note 追加进 overflow-history.md（问题 4）。
+//! Older pointers may merge into directory locators while recent user boundaries
+//! remain intact. Batch trimming skips user inputs and archives internal notes
+//! in content-addressed files to avoid duplicate overflow appends.
 
 use super::*;
 
@@ -46,8 +43,8 @@ fn old_merged_stub(count: usize, dir: &str) -> Message {
     )
 }
 
-/// 问题 1：合并目录指针不能冒充 user，也不能吞掉后续摘要仍需依赖的
-/// 最近 2/3 个真实 user 边界。
+/// A merged pointer stays runtime metadata and preserves recent real-user
+/// boundaries for later summarization.
 #[test]
 fn merge_old_user_overflow_stubs_collapses_old_stubs_keeps_recent() {
     let dir = "/sessions/test-session/assets";
@@ -208,7 +205,7 @@ fn repeated_merge_absorbs_new_stubs_into_one_pointer() {
     );
 }
 
-/// 问题 1：stub 数量不足阈值时不合并（保留逐条指针以便精确召回）。
+/// Keep individual pointers below the merge threshold for precise recall.
 #[test]
 fn merge_old_user_overflow_stubs_keeps_below_threshold() {
     let dir = "/sessions/test-session/assets";
@@ -231,8 +228,8 @@ fn merge_old_user_overflow_stubs_keeps_below_threshold() {
     assert_eq!(value_to_string(&messages[3].content), "最近");
 }
 
-/// 问题 2 + 3：batch 遇到 user 候选时跳过继续而不是 break——
-/// 其后的可裁候选仍被批量移除；user 原文永不删除。
+/// Batch trimming skips user inputs and continues scanning later candidates;
+/// original user text remains intact.
 #[test]
 fn batch_skips_user_candidates_instead_of_breaking() {
     let mut messages = vec![
@@ -275,8 +272,8 @@ fn batch_archives_internal_notes_deduplicated() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    // 足够多的 user 轮次让 keep_recent 降到 1（否则尾部窗口保护全部消息，
-    // batch 不会裁剪——与修复无关的既有语义）。
+    // Earlier turns exceed the small tail budget, narrowing protection so the
+    // leading note and assistant body are eligible for batch trimming.
     let mut messages = vec![
         note("compressed_tool_round: 1 tool calls (folded for context budget)"),
         msg("assistant", &"可裁的正文消息".repeat(50)),
@@ -322,9 +319,8 @@ fn batch_archives_internal_notes_deduplicated() {
 
 #[test]
 fn batch_uses_low_budget_three_turn_tail_before_crossing_48k() {
-    // 构造总字符 > 48K 但最近三轮尾窗 ≤ 40K 的场景：
-    // 预算 40K ≤ 48K 时应保护 3 轮而非 2 轮。
-    // 每条 assistant 用唯一前缀标记，避免 any(len==N) 被其他消息满足。
+    // Early text exceeds the base-size threshold; the three recent turns still
+    // fit the low budget. Unique prefixes identify each protected assistant reply.
     let mut messages = vec![
         msg("user", &"x".repeat(20_000)),
         msg("assistant", &"o".repeat(20_000)),

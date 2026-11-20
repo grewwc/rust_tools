@@ -123,14 +123,10 @@ pub(crate) fn collect_task_wait_wakeup_results(
     }))
 }
 
-/// Consecutive `task_wait` calls that found every referenced task already delivered (the
-/// "all completed" no-op path). Once results are delivered, waiting is over: PARKED /
-/// BUDGET-ELAPSED legitimately ask the model to re-call `task_wait` to keep waiting, and a stuck
-/// model can wrongly extend that instruction to this terminal case (observed: an 11-round wait
-/// loop on an already-delivered task). After `TASK_WAIT_NOOP_ERROR_THRESHOLD` consecutive no-op
-/// calls for the same key, the tool escalates the soft hint into an error so the loop is broken
-/// by a distinct signal. Any real wait (pending tasks still running) resets the count for that
-/// key.
+/// Escalate repeated waits on already-delivered tasks to an error after
+/// `TASK_WAIT_NOOP_ERROR_THRESHOLD` consecutive no-op calls for the same key. This prevents
+/// PARKED / BUDGET-ELAPSED retry guidance from sustaining a loop after delivery.
+/// Any real wait (pending tasks still running) resets the count for that key.
 pub(super) const TASK_WAIT_NOOP_ERROR_THRESHOLD: u32 = 3;
 
 pub(super) static TASK_WAIT_NOOP_COUNTS: LazyLock<Mutex<FxHashMap<TaskWaitKey, u32>>> =
@@ -244,13 +240,8 @@ pub(crate) fn wake_expired_task_waits() {
         return;
     }
 
-    // Wake each expired owner one by one; meanwhile record the wait keys whose owner process no
-    // longer exists or has terminated. wake_process only returns an owner in the Waiting state to
-    // Ready (when not Waiting the owner is already scheduled, so a lost wake-up is harmless), but
-    // once the owner is Terminated the wake-up misses entirely and its wait state stays in the
-    // global table forever with expired=true — leaking memory and leaving no cleanup path beyond
-    // next_task_wait_wakeup_delay. These orphan keys are collected here and then deleted in bulk
-    // to self-heal.
+    // Wake each live owner once. Remove wait keys for missing or terminated owners so expired
+    // entries do not remain in the global table; next_task_wait_wakeup_delay skips expired states.
     let orphaned = with_os_kernel(|os| {
         let mut woken: SkipSet<u64> = SkipSet::default();
         let mut orphaned: Vec<TaskWaitKey> = Vec::new();
@@ -340,19 +331,14 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         return Err("task_ids array cannot be empty".to_string());
     }
 
-    // Wait budget for this single task_wait call. See the DEFAULT_TASK_WAIT_TIMEOUT_SECS comment —
-    // a timeout only means this call did not get the result; the subagent keeps running and no
-    // resources are released.
+    // The wait budget is retained across cooperative parks for the same key. Budget exhaustion
+    // does not cancel subagents or release their result resources.
     let agent_team_mode = is_agent_team_mode();
     let (timeout_secs, wait_policy) = parse_task_wait_options(args, agent_team_mode)?;
 
-    // wait_policy: "any" | "all", default "any", so the foreground is not held up by the slowest
-    // task.
-    // - all  — return only after every pending task completes (for when results must be
-    //          aggregated);
-    // - any  — return as soon as any pending task completes, the rest keep running and can be
-    //          collected by further task_wait calls (for fan-out where results are gathered as
-    //          they arrive).
+    // Any returns a ready batch without waiting for the slowest task. All continues while tasks
+    // are pending, subject to budget exhaustion or cooperative suspension; agent-team mode
+    // delivers ready results immediately for either policy.
     let current_owner_pid = current_task_owner_pid()?;
     let registry = lock_task_registry();
     let mut foreign_session_task_ids = Vec::new();
@@ -445,12 +431,8 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     // delivered by the ledger are dropped here.
     let task_ids = task_ids_filtered;
     if task_ids.is_empty() {
-        // Repeatedly waiting on already-delivered ids is a no-op: the results were already surfaced
-        // by an earlier task result tool call. PARKED / BUDGET-ELAPSED instruct re-calling
-        // task_wait to keep waiting, and a stuck model may wrongly extend that instruction to this
-        // terminal case. Count consecutive no-op calls for this key and escalate to an error after
-        // TASK_WAIT_NOOP_ERROR_THRESHOLD so the loop is broken with a distinct signal instead of an
-        // ever-softer hint.
+        // Escalate repeated waits on delivered ids so PARKED / BUDGET-ELAPSED retry guidance
+        // cannot sustain a no-op loop.
         let wait_key = task_wait_key(
             &current_session_id,
             current_owner_pid,
@@ -513,33 +495,12 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             }
         }
     }
-    // The closure borrows wait_policy / registry / pending / ready / finished by reference by
-    // default; no `move` is added, so code after the closure (e.g. `if !pending.is_empty()`) can
-    // still access them.
     let wait_result = with_os_kernel(|os| {
         for tid in &task_ids {
             let entry = entries.get(tid).expect("validated");
-            // ⚠️ This block previously marked a task TIMEOUT and destroyed its channel/futex as
-            // soon as `entry.started_at.elapsed() >= timeout_secs` — that was a bug:
-            // `started_at` is the spawn time, not the start of this task_wait call. If the main
-            // agent first calls task_wait long after spawning, every task would be **immediately**
-            // reported as TIMEOUT and its result_channel destroyed, permanently losing the real
-            // subagent result while the main agent naturally concludes "subagent is stuck".
-            //
-            // Current behavior: only look at whether a ready payload exists on the channel; if
-            // not, uniformly take the pending branch. The per-call task_wait budget is governed by
-            // the real wall-clock deadline in TASK_WAIT_STATES; the driver run_loop wakes the
-            // owner process when it expires, and only the next task_wait returns BUDGET ELAPSED.
-            // Budget exhaustion also **never destroys the channel/futex**, so the main agent can
-            // keep calling task_wait to wait longer.
-            // Wall-clock total-lifetime check: if a subagent still has no result past
-            // SUBAGENT_WALL_CLOCK_TIMEOUT (typically stuck in a single tool execution that never
-            // returns), terminate it proactively and write a timeout terminal result, so the
-            // immediately following read_task_result reads a result and the main agent does not
-            // spin in a "timeout -> wait again -> timeout" loop. Unlike the historical bug that
-            // compared started_at against the per-call timeout_secs, this uses an independent
-            // total-lifetime cap far larger than a single wait budget, and writes a failure result
-            // instead of destroying the channel, so no result is lost.
+            // TASK_WAIT_STATES controls the wait budget, not the task lifetime. Enforce
+            // SUBAGENT_WALL_CLOCK_TIMEOUT separately and publish a terminal result before
+            // collection; wait-budget exhaustion leaves result resources alive.
             if entry.started_at.elapsed() > SUBAGENT_WALL_CLOCK_TIMEOUT {
                 write_terminal_subagent_result(
                     os,
@@ -571,12 +532,9 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 .map(|(tid, _)| tid.clone())
                 .collect::<Vec<_>>();
             let wait_sources = task_wait_sources(os, &pending_ids, &entries)?;
-            // `task_wait`'s `wait_policy=all` is tool-layer semantics: all task results must be
-            // collected before returning. The underlying park cannot use `WaitPolicy::All` to wait
-            // on every event source, because the sources also include the cancel futex used to
-            // interrupt the current process, which never completes on the normal path. So we wait
-            // for "any task event" to wake us, then re-scan all task states; if everything is not
-            // collected yet, the model can call task_wait again with the same task_ids.
+            // Park on any task event and re-scan the batch, even for wait_policy=all. Waiting on
+            // all event sources would also require the cancellation futex, which does not become
+            // ready on normal completion.
             let wait = epoll_wait_many(
                 os,
                 &format!("task_wait:{}", pending_ids.join(",")),
@@ -600,13 +558,8 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                     None => pending.push((tid.clone(), entry.pid)),
                 }
             }
-            // Tasks are still pending after the re-scan and the wait really suspended (a
-            // cooperative yield, not budget exhaustion), so return PARKED with the partial results
-            // collected so far. Terminal wording like "BUDGET ELAPSED" must **never** be used
-            // here: a suspend returns synchronously within milliseconds (it does not really wait
-            // the full timeout_secs), otherwise the model would misread "timeout right after
-            // starting to wait" as "subtask stuck" and give up early to fall back to manual
-            // analysis.
+            // Report cooperative suspension as PARKED while tasks remain pending, preserving
+            // the retained wait budget. BUDGET ELAPSED is reserved for an expired deadline.
             if !pending.is_empty() && wait.suspended && !(return_on_ready && !ready.is_empty()) {
                 record_report_wait(
                     TaskWaitReturnReason::Parked,
@@ -707,7 +660,6 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         return Ok(ready.join("\n\n---\n\n"));
     }
     if !pending.is_empty() {
-        // Surface partial progress instead of dropping it on the floor.
         let mut parts = Vec::new();
         if !ready.is_empty() {
             parts.push(ready.join("\n\n---\n\n"));

@@ -11,7 +11,7 @@ use super::table::{
 
 /// 解析后的 HTML 表格。
 pub(super) struct HtmlTable {
-    /// 表头行（若第一行含 `<th>` 则提取为表头，否则为空）。
+    /// First row when it contains `<th>` and no nonempty data cells; otherwise empty.
     pub header: Vec<String>,
     /// 数据行（已展开 rowspan/colspan）。
     pub rows: Vec<Vec<String>>,
@@ -46,13 +46,10 @@ pub(super) fn contains_open_table_tag(line: &str) -> bool {
 
 /// Case-insensitive scan for the `</table>` closing tag.
 ///
-/// Deliberately looser than [`contains_open_table_tag`]: an extra match only finalizes the buffer
-/// early, and the partial buffer then falls back to raw text, while a *missed* match keeps
-/// buffering — and swallowing — the rest of the message. Skipping code spans here could therefore
-/// only make things worse.
+/// Closing tags are accepted even inside code spans to avoid buffering the rest
+/// of the message when the closer appears there.
 pub(super) fn contains_close_table_tag(line: &str) -> bool {
-    // Case-insensitive byte scan: `to_lowercase().contains()` allocated a whole
-    // lowercase copy per line on the table-detection hot path.
+    // Scan bytes to avoid allocating a lowercase copy for each buffered line.
     line.as_bytes()
         .windows(b"</table>".len())
         .any(|w| w.eq_ignore_ascii_case(b"</table>"))
@@ -102,12 +99,9 @@ fn closing_backtick_run(bytes: &[u8], from: usize, run: usize) -> Option<usize> 
     None
 }
 
-/// True when byte offset `at` sits inside a paired backtick code span of this line. Pairing is
-/// line-local, like the inline renderer, which only styles a span when it finds the closing
-/// backtick on the same line — but this scanner matches CommonMark run lengths (so a double
-/// backtick can carry a single one), while `render_inline_md` pairs a backtick with the next
-/// backtick character. The two only diverge on mixed run lengths, where the text is shown plain
-/// either way.
+/// True when byte offset `at` sits inside a paired backtick code span of this line.
+/// Delimiter runs must have equal lengths, so a double-backtick span may contain
+/// a single backtick. Unpaired runs stay literal and do not hide later tags.
 fn inside_code_span(bytes: &[u8], at: usize) -> bool {
     let mut i = 0;
     while i < at {
@@ -139,7 +133,7 @@ pub(super) fn parse_html_table(html: &str) -> Option<HtmlTable> {
         return None;
     }
 
-    // 第一行全部是 `<th>` → 表头；否则全部为数据行。
+    // Empty data cells may accompany headers, but nonempty data cells prevent promotion.
     let first_row_all_header = rows[0]
         .iter()
         .all(|c| c.is_header || c.text.trim().is_empty());
@@ -324,8 +318,8 @@ fn parse_attr_int(tag: &str, attr: &str) -> Option<usize> {
     value.trim().parse::<usize>().ok()
 }
 
-/// 去除 HTML 标签，保留纯文本内容。`<br>` 转换为换行。
-/// 解码常见 HTML 实体。
+/// Strip tags and decode common HTML entities, collapsing whitespace to spaces.
+/// `<br>` separates words rather than preserving line breaks.
 fn strip_html_tags(html: &str) -> String {
     let mut result = String::with_capacity(html.len());
     let lower = html.to_lowercase();
@@ -349,7 +343,7 @@ fn strip_html_tags(html: &str) -> String {
                 i += gt + 1;
                 continue;
             } else {
-                // 未闭合的 < ，保留为字面量
+                // Stop at an unterminated tag; the remaining input is discarded.
                 break;
             }
         }
@@ -596,7 +590,6 @@ mod tests {
 </table>"#;
         let table = parse_html_table(html).unwrap();
         let rendered = render_html_table("", &table);
-        // 应该包含边框和内容
         assert!(rendered.contains("部门"));
         assert!(rendered.contains("研发部"));
         assert!(rendered.contains("张三"));

@@ -221,9 +221,9 @@ pub(super) fn preview_anchor(idx: usize, line: &str, tag: Option<&'static str>) 
     }
 }
 
-/// Body-line budget of a hunk header: (old-side lines, new-side lines) summed over the
-/// header's ranges. A header without parsable ranges counts as unbounded, so such a hunk
-/// ends at the next header instead of swallowing the rest of the payload.
+/// Body-line budget of a hunk header: (old-side lines, new-side lines) summed over
+/// its `-` and `+` range tokens. Without range tokens the budget is unbounded,
+/// so subsequent lines remain in the open hunk.
 fn hunk_line_budget(header: &str) -> (usize, usize) {
     let mut old = 0usize;
     let mut new = 0usize;
@@ -250,9 +250,8 @@ fn hunk_line_budget(header: &str) -> (usize, usize) {
     }
 }
 
-/// Structural key-line predicate, applied to the marker-stripped body. Matching the
-/// raw line never sees an added line (`+    /// x` does not start with `///`), so the
-/// index filled up with unchanged context and hid what the change actually did.
+/// Apply the structural key-line predicate after stripping diff markers so
+/// added declarations and doc comments remain eligible for recall anchors.
 pub(crate) fn is_key_line(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     lower.starts_with("fn ")
@@ -292,18 +291,11 @@ pub(crate) fn is_key_line(body: &str) -> bool {
         || lower.contains(": warning")
 }
 
-/// Extract structured key lines from text content to provide recall anchors for the
-/// overflow stub.
+/// Extract structural and diagnostic lines as recall anchors for an overflow stub.
 ///
-/// Recognized line types (kept consistent with `line_trim_middle`'s mid-segment sampling):
-/// - Rust/code structure: `fn`/`pub fn`/`impl`/`struct`/`trait`/`enum`/`#[`/`mod`
-/// - Doc comments: `//!`/`///`
-/// - Errors/warnings: `error`/`failed`/`panic`/`exception`/`timeout`/`warning`
-/// - Markers: `TODO`/`FIXME`
-///
-/// Diff content keeps its marker as an explicit tag, so an unchanged context line is
-/// never read as part of the change. Each line is truncated to 200 chars to keep the
-/// stub compact. At most `max` lines are kept.
+/// Diff lines keep explicit addition, removal, or context tags. Bodies are
+/// shortened when needed while labels and tags stay intact; at most `max`
+/// lines are kept.
 pub(super) fn extract_key_lines(content: &str, max: usize) -> Vec<String> {
     let tags = diff_line_tags(content);
     let mut result = Vec::with_capacity(max);

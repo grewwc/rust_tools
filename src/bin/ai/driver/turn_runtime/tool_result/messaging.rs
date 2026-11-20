@@ -328,8 +328,8 @@ fn working_checkpoint_message_for_plan(
 /// Refresh the working checkpoint after a `plan_update` changed a step status.
 ///
 /// The plan-time marker already points at this file, so a status change rewrites it in place
-/// instead of appending another internal note. Without persisted plan state this is a no-op,
-/// so a refresh can never leave a checkpoint that contradicts the state file.
+/// instead of appending another internal note. Without persisted plan state this is a no-op.
+/// A failed rewrite leaves the previous checkpoint in place; the plan state remains authoritative.
 fn refresh_working_checkpoint_after_plan_update(app: &App, tool_call: &ToolCall) {
     if tool_call.function.name != "plan_update" {
         return;
@@ -1025,12 +1025,13 @@ pub(super) fn append_tool_result_messages_for_model(
         // `assistant_msg` is not used after this push, so move it instead of cloning.
         messages.push(assistant_msg);
     }
-    // canonical history 永远保存 provider 原始消息；模型专属状态只存在于请求投影。
+    // Canonical history retains full narration and eligible encrypted replay state;
+    // the request projection may cap narration and sanitize replay markers.
     turn_messages.push(raw_assistant);
 
-    // 侧信道：把本轮捕获的 reasoning items 挂到「首个 tool_call id」上，供
-    // Responses 协议回放时在对应 function_call 前原样 splice。仅内存态、不落盘。
-    // 空时不写入——拿不到 encrypted_content 自动退化为不回放，零 regression。
+    // Associate captured reasoning items with the first call in the turn-local
+    // Responses replay side channel. Eligible durable replay state is recorded
+    // separately by recorded_reasoning_content; an empty list adds no entry here.
     if !stream_reasoning_items.is_empty() {
         if let Some(first_call_id) = exec_result
             .executed_tool_calls
@@ -1261,9 +1262,8 @@ fn build_code_inspection_working_memory(findings: &[RepoInspectionFinding]) -> O
     let mut note = String::from(CODE_INSPECTION_MEMORY_PREFIX);
     note.push('\n');
     note.push_str("Already inspected in this turn; treat these as known context and re-read a file only when it changed or the earlier result was unusable:\n");
-    // Only the most recent inspections are listed; older ones are already in the
-    // conversation. The cap keeps the note inside `truncate_note`'s character budget, so a
-    // long note cannot drop the newest entries.
+    // Keep a small recent set to bound the working-memory note; truncate_note
+    // applies the final character cap.
     for finding in findings.iter().rev().take(6).rev() {
         note.push_str(&finding.rendered);
         note.push('\n');
@@ -1938,8 +1938,8 @@ mod tests {
         let first_marker = first_message.content.as_str().unwrap_or_default();
         let first_path = checkpoint_path_from_marker(first_marker);
 
-        // 回归断言：checkpoint 必须落在 config.history_file 对应的资产根下，
-        // 不能因为 session_history_file 指向嵌套路径而偏移到 `<root>/<id>.sessions/`。
+        // A normal session shares its assets root with SessionStore. Creating a new
+        // store from session_history_file would introduce a nested .sessions tree.
         let expected_dir = SessionStore::new(app.config.history_file.as_path())
             .session_assets_dir(&app.session_id)
             .join("context-checkpoints");
@@ -2344,13 +2344,11 @@ mod tests {
 
     #[test]
     fn smart_truncate_falls_back_to_sentence_boundary() {
-        // cap=80, lower=80*6/7≈68. 句号位置：22 / 49 / 71 / 后续。
+        // Several sentence boundaries before the cap exercise the last-boundary choice.
         let text = "Step one finished ok. Step two searched repo. Step three is running. \
              Step four extends well beyond the cap.";
         let out = smart_truncate_to_sentence(text, 80);
         assert!(out.contains("[truncated: "), "expected marker, got: {out}");
-        // 应切到位置 71（"is running."）之后，包含 "is running."；
-        // 不应留下半句 "Step four"
         assert!(
             out.contains("is running."),
             "expected boundary fallback to '. ', got: {out}"

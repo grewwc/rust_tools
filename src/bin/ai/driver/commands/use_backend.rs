@@ -5,8 +5,8 @@ use crate::ai::{
 };
 
 fn ensure_agent_team_sticky(config: &mut SessionServeConfig) {
-    // Keep the first stored spelling and drop later case variants so the sticky
-    // selection stays a set even if the persisted vector already holds duplicates.
+    // Keep the first stored spelling of agent-team while dropping its later
+    // case variants; leave other sticky skills untouched.
     let mut seen = false;
     config.default_skills.retain(|name| {
         if name.eq_ignore_ascii_case("agent-team") {
@@ -156,8 +156,8 @@ pub(crate) fn apply_subagent_preference(
 pub(crate) fn format_use_state(config: &SessionServeConfig, kernel_model: &str) -> String {
     let backend = effective_subagent_backend(config);
     let mut output = format!("Session default subagent backend: {}\n", backend.as_str());
-    // Both model slots persist independently of the active backend, so print
-    // any set slot and keep a later backend switch predictable.
+    // Keep the kernel preference visible across backend switches. When the
+    // registry supplies a worker backend and label, also show its resolved model.
     if let Some(model) = config.subagent_kernel_model.as_deref() {
         output.push_str(&format!(
             "Kernel subagent model: {}\n",

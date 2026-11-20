@@ -1,4 +1,4 @@
-//! Serve-mode HTTP request/response types and pure helpers shared by
+//! Serve-mode HTTP request/response types, shared state, and helpers used by
 //! the route modules (see `mod.rs`).
 
 #[cfg(feature = "serve")]
@@ -46,8 +46,8 @@ pub(crate) struct ServeState {
     /// pending native or confirmation request.
     pub(crate) events: Arc<SessionEventBus>,
     /// Session id -> the one browser client that currently has the session
-    /// open. The lease lives as long as that client's event stream does, so a
-    /// second tab fails closed instead of attaching a second view.
+    /// open. Heartbeats renew the claim until release or expiry; read-only
+    /// event followers do not need this browser open slot.
     pub(crate) open_sessions: Arc<std::sync::Mutex<HashMap<String, OpenSession>>>,
 }
 
@@ -191,7 +191,6 @@ impl Default for SessionEventLog {
     }
 }
 
-/// Enough to rebuild the current turn's visible progress, never the whole reply.
 #[cfg(feature = "serve")]
 const MAX_EVENT_RECORDS: usize = 2000;
 #[cfg(feature = "serve")]
@@ -520,9 +519,9 @@ pub(crate) struct HistoryQuery {
     #[serde(default)]
     pub(crate) count: Option<usize>,
     /// serve-chat `/history last [N]`: 1-based N-th-most-recent assistant
-    /// conclusion (no tool calls, non-empty searchable text). Mutually
-    /// exclusive with the other view params; not found returns 400 with the
-    /// local error wording.
+    /// conclusion selected by `is_serve_assistant_conclusion` in `history.rs`.
+    /// This view takes precedence over user-conclusion and role/count views;
+    /// not found returns 400 with the local error wording.
     #[serde(default)]
     pub(crate) conclusion: Option<usize>,
     /// serve-chat `/history u<N>`: 1-based real-user ordinal whose final
@@ -540,20 +539,19 @@ pub(crate) struct TurnReq {
     /// Some(text) = extract-only question; title generation must use this text.
     #[serde(default)]
     pub(crate) title_seed: Option<String>,
-    /// Per-turn model override for serve-chat `/model` switching. `None`
-    /// (or absent, for old clients) keeps the server default reported by
-    /// `GET /info`; `Some(id)` is forwarded as the child `--model` flag so
-    /// the turn resolves through the same registry path as the local REPL.
+    /// Per-turn model override for serve-chat `/model` switching. Absent values
+    /// inherit the session's stored model, then the server default from
+    /// `GET /info`. An explicit value is forwarded as the child `--model` flag.
     #[serde(default)]
     pub(crate) model: Option<String>,
-    /// Per-turn agent override for serve-chat `/agent` switching. Forwarded
-    /// as the child `--agent` flag; absent keeps the `"build"` fallback.
+    /// Per-turn agent override, forwarded as the child `--agent` flag.
+    /// Absent values inherit the session's stored agent, then child defaults.
     #[serde(default)]
     pub(crate) agent: Option<String>,
     /// Per-turn reasoning-effort override for serve-chat `/effort`
     /// switching (`minimal|low|medium|high|xhigh|max|off`, case-insensitive).
-    /// Absent (cleared) keeps the server default; forwarded as the child
-    /// `--reasoning-effort` flag.
+    /// Absent values inherit the session's stored effort, then child defaults;
+    /// explicit values are forwarded as the child `--reasoning-effort` flag.
     #[serde(default)]
     pub(crate) reasoning_effort: Option<String>,
     /// Client-uploaded images for `[[image:name]]` placeholders in `prompt`.
@@ -613,9 +611,9 @@ pub(crate) struct TurnOverrides {
     pub(crate) add_dirs: Vec<PathBuf>,
 }
 
-/// Validate one free-form model/agent override: non-empty after trim, short,
-/// and never flag-shaped (a `--x` value would confuse the child CLI parser,
-/// which only claims non-`-` tokens for `--model`/`--agent` values).
+/// Normalize a free-form model/agent override: blank input becomes `None`;
+/// non-blank values must be short and never flag-shaped (the child CLI parser
+/// only claims non-`-` tokens for `--model`/`--agent` values).
 pub(crate) fn sanitize_turn_name_override(
     value: Option<String>,
     field: &str,
@@ -671,10 +669,9 @@ pub(crate) fn sanitize_turn_effort_override(
     }
 }
 
-/// Validate one skill name for per-turn forcing: a kebab-case identifier
-/// (ASCII letters/digits/`-`/`_`, the same shape skill manifests use), never
-/// flag-shaped (it is spliced into the child prompt, where a `--x` token
-/// could confuse downstream parsing).
+/// Validate one skill name for per-turn forcing: an ASCII letter/digit/`-`/`_`
+/// identifier, never flag-shaped (it is spliced into the child prompt, where
+/// a `--x` token could confuse downstream parsing).
 fn validate_turn_skill_value(trimmed: String) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("skills entry is empty".to_string());
@@ -818,9 +815,8 @@ pub(crate) fn push_turn_args(
     cmd.arg("--").arg(prompt);
 }
 
-/// One field of a `POST /sessions/{id}/config` update. `None` (field absent)
-/// keeps the stored value; `Some(None)` (field present but blank) clears it;
-/// `Some(Some(v))` sets it.
+/// Request body for `POST /sessions/{id}/config`. Absent model/agent/effort
+/// fields keep their stored values; blank strings clear them.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct SessionConfigReq {
     #[serde(default)]

@@ -139,12 +139,10 @@ fn task_evidence_handoff_messages(ledger: &str) -> [Message; 2] {
 /// through `session_read` at the recorded canonical index.
 const SESSION_ORIGIN_MAX_CHARS: usize = 2_000;
 
-/// Session-origin anchor for long sessions. Compression replaces old turns with
-/// lossy summaries, so after enough turns the opening exchange is no longer in
-/// the projection verbatim. When (and only when) the first real user message is
-/// absent from `history` byte-for-byte, project it from canonical history as a
-/// fixed Fact: exact, independent of compression and of the current question.
-/// The text never changes once the session starts, so it is prompt-cache stable.
+/// Recover the opening exchange when its user text is absent from the projection.
+/// This bounded canonical-history excerpt is reference data, independent of the
+/// current question. Omit it when an identical anchor already replays in a
+/// persisted request reminder.
 fn session_origin_fact(
     history_file: &Path,
     session_id: &str,
@@ -216,7 +214,7 @@ pub(in crate::ai::driver) fn assemble_effective_question(
     effective_question
 }
 
-/// Cover every turn without changing thinking policy or adding a model call.
+/// Add final-review guidance without changing thinking policy or making a model call.
 /// The guard keeps this behavior section stable across the turn's tool rounds.
 fn inject_integrated_critic(
     skill_turn: &mut skill_runtime::SkillTurnGuard,
@@ -544,9 +542,6 @@ pub(super) async fn prepare_turn(
         );
     }
 
-    // The critic gate must observe the full user input the model actually
-    // receives, not just the short question body after @file is stripped. Text
-    // attachments, OCR content, and native images are all artifact-backed inputs.
     let has_images = !app.attached_image_files.is_empty();
     // Failed-placeholder pass-through (all images carry error): when image
     // parsing fails, the [IMAGE PARSE FAILED: ...] hint must also be injected
@@ -661,11 +656,6 @@ pub(super) async fn prepare_turn(
         skill_turn.push_section(skill_runtime::ContextKind::Behavior, &block);
     }
 
-    // The C3 complex-task auto-hint was removed: the build agent's Core Workflow
-    // Plan / Verify steps already cover the same "plan first, then act"
-    // guidance, and re-injecting it would contradict the "prefer acting over
-    // describing" rule in the Autonomous Execution section. `detect_complex_task`
-    // remains only for tests to observe shape signals.
 
     if let Some(warning) = task_recovery_warning {
         skill_turn.push_section(skill_runtime::ContextKind::Behavior, &warning);
@@ -688,21 +678,9 @@ pub(super) async fn prepare_turn(
         tool_call_id: None,
         reasoning_content: None,
     });
-    // User redirection notice: if the most recent assistant message in history
-    // is still a tool-call batch (i.e. the agent ended inside the tool loop last
-    // turn without a final text reply -- possibly a stuck loop, an interruption,
-    // or a quota hit), inject a pure runtime-owned header notice pointing at the
-    // real role=user message at the end of the request. Never copy the user's
-    // original wording into a system-like note (that would cross the trust
-    // boundary), and never drop the "a new user message redirected the task"
-    // signal, or long tool-only history would make the model continue last
-    // turn's unfinished loop.
-    //
-    // The notice has a system-like role, and both [`first_trim_candidate`] and
-    // the fold path exempt it, so mid-turn compression never drops it; it sits
-    // right after system, the model reads it early, and starts this turn with a
-    // "redirected" stance instead of treating the whole stale tool history as
-    // the launch point.
+    // When the last historical assistant message is a tool-call batch, point
+    // the model at the current user input so it does not resume a stale tool plan.
+    // Keep the notice runtime-owned and avoid quoting user text into it.
     let prev_assistant_in_tool_loop = history
         .iter()
         .rev()
@@ -726,29 +704,14 @@ pub(super) async fn prepare_turn(
     if let Some(ledger) = task_evidence_ledger {
         messages.extend(task_evidence_handoff_messages(&ledger));
     }
-    // Per-turn context reminder (Current Date / Code Discovery, …) used to be
-    // injected as a synthetic user+assistant pair
-    // between `history` and the current user message. Because the reminder
-    // text changes every turn, that pair sat right between two cache-stable
-    // segments and caused providers to lose the prompt-cache hit on
-    // everything from the reminder onward. Fold it into the **current**
-    // user message instead: the current message is always a cache miss
-    // anyway, so reminder churn no longer truncates the cached prefix.
-    // Real user messages record the reminder in their runtime side channel;
-    // generated audit followups retain it inline alongside their origin marker.
-    // Both forms replay byte-identically, so later turns resend this message
-    // exactly as the model saw it and the cached prefix extends.
+    // Attach the per-turn reminder to the current user message to keep earlier
+    // history bytes stable for prefix caching. Persist its side channel for real
+    // user messages and keep it inline for synthetic audit followups, preserving
+    // the form replayed on later turns.
     let context_reminder = skill_turn.context_reminder();
-    // Two content forms of the same user turn:
-    // - `user_content`: the request projection with inline images and structured
-    //   file/reply references, which normalization expands for the wire.
-    // - `persisted_user_content`: the PERSISTED form (`reference` parts with
-    //   immutable session-asset keys, no source paths or base64) written to
-    //   long-term history. Keeping the reference boundary at write time means
-    //   any later reader of history
-    //   (another session debugging this one, /history rendering, compression
-    //   summaries) can tell the user's own words apart from attached images
-    //   instead of mistaking inline image data for real user content.
+    // The request copy materializes images; canonical history keeps immutable
+    // session-asset references so later reads and summaries can distinguish
+    // user text from attached content.
     let mut persisted_user_content = request::build_reference_content(
         next_model,
         &persisted_question_text,
@@ -782,14 +745,9 @@ pub(super) async fn prepare_turn(
             reasoning_content: None,
         });
     }
-    // VL image digest protocol: if the request projection's user message
-    // contains inline images, inject a fixed "image handling protocol"
-    // instruction asking the model to produce a reusable image digest this very
-    // turn. Later turns swap the image parts for digest text (see
-    // request::image_digest / the orchestrator's replacement logic), avoiding
-    // repeated base64 replay inside the tool loop that would trip Doubao/Ark's
-    // 429 TPM throttling. Only the request projection (messages) changes;
-    // canonical turn_messages keep the raw images.
+    // Request-only digest instructions let later requests substitute digest text
+    // for materialized images. Canonical turn_messages retain image references
+    // and do not store the injected handling protocol.
     if request::content_has_image(&request_user_message.content)
         && let Value::Array(parts) = &mut request_user_message.content
     {
@@ -826,13 +784,9 @@ pub(super) async fn prepare_turn(
         turn_messages.push(original_user);
     }
     messages.push(request_user_message);
-    // A wake-up resume turn's prompt is a system-generated notice, not active
-    // user input. Persist it as an internal_note so it is skipped in /history
-    // user and history-compression user-turn counting, and gets normalized to
-    // the system role (not user) on later turn loads, so the model never misreads
-    // it as a repeated user question. Note: the messages array sent to the API
-    // still keeps role:user (for compatibility); only the persistence track
-    // (turn_messages) changes its role.
+    // Ordinary scheduler resume notices persist as internal notes so history does
+    // not count them as new user turns. The current request keeps its user role;
+    // generated audit followups retain their synthetic origin and role.
     turn_messages.push(persisted_user_turn_message(
         user_message,
         &persisted_question_text,
@@ -962,9 +916,7 @@ pub(super) fn refresh_verification_reminder(
     true
 }
 
-/// C3: complex-task detection -- a lightweight heuristic based purely on
-/// structural signals. When it hits, only a Policy hint is injected encouraging
-/// the agent to break the task down; the Thinking engine is never force-activated.
+/// Test-only structural heuristic for complex question shapes.
 #[cfg(test)]
 fn detect_complex_task(question: &str) -> bool {
     QuestionShape::analyze(question).is_complex_task()
@@ -1784,8 +1736,7 @@ mod tests {
 
         assert!(effective_question.contains("[Attached Image Content via mcp_ocr_extract]"));
         assert_default_critic(&effective_question, &[]);
-        // Native vision models produce no OCR text, but the images themselves
-        // are still artifact-backed inputs.
+        // Default critic guidance also covers an image question without OCR text.
         assert_default_critic("描述这张图", &[]);
     }
 
@@ -1835,7 +1786,7 @@ mod tests {
             ..message("assistant", text(""))
         };
         assert_default_critic("continue", &[tool_call_only]);
-        // A missing assistant body no longer disables the self-check.
+        // An absent assistant body does not disable the self-check.
         assert_default_critic("continue", &[message("assistant", Value::Null)]);
         assert_default_critic(
             "are you sure?",

@@ -44,7 +44,7 @@ fn read_first_user_prompt_from_conn(conn: &Connection) -> io::Result<Option<Stri
         return Ok(meta);
     }
 
-    // The cached first message may be an image/text archival protocol message. Keep scanning forward for the first real user request,
+    // The cached first message may be an image/text archival protocol message. Collect opening user text beyond those pointers,
     // so an existing session is not wrongly shown as `new session` after the internal protocol messages are filtered out.
     let mut stmt = conn
         .prepare("SELECT content FROM messages WHERE role='user' ORDER BY id ASC")
@@ -66,10 +66,11 @@ fn read_first_user_prompt_from_conn(conn: &Connection) -> io::Result<Option<Stri
     Ok((!prompts.is_empty()).then(|| prompts.join("\n---\n")))
 }
 
-/// The session's opening exchange from canonical history: the first real user
-/// message and the first assistant text reply after it, both verbatim, plus the
-/// canonical message index of that user message. Runtime-synthetic users,
-/// archive stubs, and tool-call-only assistant messages are skipped structurally.
+/// Display text for the opening canonical user message and first following
+/// assistant reply, plus the user's canonical message index. Initial user
+/// selection skips runtime-synthetic users and archive stubs; after selection,
+/// any later user row ends the search. Assistant rows with nonempty decoded
+/// tool calls are skipped.
 /// Compression never rewrites the canonical table, so this stays exact however
 /// long the session grows.
 pub(in crate::ai) fn read_session_origin_sqlite(
@@ -161,8 +162,8 @@ fn read_latest_message_activity_unix_ms(conn: &Connection) -> Option<i64> {
 
 /// Read the title, first user request, and activity time for the `/ss` list in a single read-only connection.
 ///
-/// The two metadata items keep the list layer's original fault-tolerance semantics: a failure in one query does not affect the other, nor does it let
-/// a corrupted or old-format session block the whole list.
+/// Queries fall back independently, so missing or old-format fields do not block
+/// the remaining list metadata.
 pub(in crate::ai) fn read_session_list_metadata_sqlite(
     path: &Path,
 ) -> io::Result<SessionListMetadata> {
@@ -239,8 +240,8 @@ pub(in crate::ai) fn write_session_archived_sqlite(path: &Path, archived: bool) 
     })
 }
 
-/// Message part of an atomic mark write (`/mark` / `/unmark`): `Keep` leaves any
-/// an existing mark message untouched (bare `/mark`), `Set` upserts it
+/// Message part of an atomic mark write (`/mark` / `/unmark`): `Keep` leaves an
+/// existing mark message untouched (bare `/mark`), `Set` upserts it
 /// (`/mark <message>`), `Clear` removes it (`/unmark`).
 pub(in crate::ai) enum MarkMessageUpdate<'a> {
     Keep,
@@ -253,8 +254,7 @@ pub(in crate::ai) enum MarkMessageUpdate<'a> {
 /// committing the flag and the message in separate transactions would let a crash
 /// between the two commits (or a concurrent command interleaving between them)
 /// leave "marked without message" or "unmarked with a stale message" behind.
-/// Both keys live in the meta table, so they survive clear-history and are copied
-/// by fork / import (which copy the whole SQLite file).
+/// Fork and import copy both meta keys with the SQLite file; clear-history removes them.
 pub(in crate::ai) fn write_session_mark_sqlite(
     path: &Path,
     marked: bool,
@@ -314,7 +314,7 @@ pub(in crate::ai) fn read_session_mark_message_sqlite(path: &Path) -> io::Result
     Ok(message.filter(|message| !message.trim().is_empty()))
 }
 
-/// Read the source of the session title (`model` / `fallback`); when missing, the caller treats it as legacy data.
+/// Read the session title's origin (`model`, `user`, or `fallback`); when missing, the caller treats it as legacy data.
 pub(in crate::ai) fn read_session_title_origin_sqlite(path: &Path) -> io::Result<Option<String>> {
     let conn = open_history_db(path)?;
     let origin: Option<String> = conn
@@ -368,7 +368,7 @@ fn read_meta_optional(conn: &Connection, key: &str) -> Option<String> {
 }
 
 /// Read the session's persisted runtime config from the meta table. Missing
-/// keys mean the built-in default for that field.
+/// string keys return `None`, leaving the caller to choose the effective default.
 pub(in crate::ai) fn read_session_serve_config_sqlite(
     path: &Path,
 ) -> io::Result<SessionServeConfig> {
@@ -565,7 +565,7 @@ pub(in crate::ai) fn add_session_write_root_sqlite(
     })
 }
 
-/// Remove one stored grant. An absent grant reports `removed = false` without a write.
+/// Remove one stored grant. An absent grant reports `removed = false` without changing the grant set.
 pub(in crate::ai) fn remove_session_write_root_sqlite(
     path: &Path,
     root: &Path,

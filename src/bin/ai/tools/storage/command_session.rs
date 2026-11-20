@@ -3,7 +3,7 @@
 //! A one-shot tool call cannot keep a build, REPL, or interactive prompt alive
 //! between model rounds. This module owns a small, bounded registry of child
 //! processes: `start` yields partial output plus a session id, later calls poll
-//! the same child or write to its stdin. Sessions are reaped on idle/limit so a
+//! the same child or write to its stdin. Idle sessions are reaped so a
 //! forgotten process cannot live for the whole daemon lifetime.
 
 use std::collections::HashMap;
@@ -36,7 +36,7 @@ const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const REAPER_INTERVAL: Duration = Duration::from_secs(30);
 /// Maximum bytes retained per stream; older bytes are dropped from the buffer.
 const MAX_BUFFER_BYTES: usize = 128 * 1024;
-/// Maximum bytes returned to the model in one poll.
+/// Maximum buffered bytes read from each stream in one poll.
 const MAX_RETURN_BYTES: usize = 16_000;
 /// Polling interval while a session has produced nothing yet.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -65,8 +65,9 @@ impl StreamBuffer {
         }
     }
 
-    /// Return bytes after `cursor`, bounded by [`MAX_RETURN_BYTES`]. The
-    /// returned cursor is the absolute stream position consumed.
+    /// Consume at most [`MAX_RETURN_BYTES`] buffered bytes after `cursor`.
+    /// The text may include a dropped-output notice; the returned cursor is the
+    /// absolute stream position consumed.
     fn since(&self, cursor: u64) -> (String, u64) {
         let first_available = self.dropped;
         let start = cursor.max(first_available);
@@ -121,9 +122,9 @@ impl Session {
             }
             let status = self.child.try_wait().ok().flatten();
             if let Some(status) = status {
-                // The child closing its pipes is not the same as the reader
-                // threads having consumed them. Drain before rendering so the
-                // final bytes are not dropped with the session entry.
+                // Child exit does not mean the reader threads have consumed
+                // the pipes. Give them a bounded chance to drain remaining
+                // bytes before rendering the final snapshot.
                 self.drain_readers();
                 self.stdout.lock().unwrap().exited = Some(status);
                 self.stderr.lock().unwrap().exited = Some(status);
@@ -207,7 +208,7 @@ impl Session {
         #[cfg(unix)]
         unsafe {
             // `setsid` makes the child a session leader, so its pid is also
-            // the process-group id. Killing the group reaps shell
+            // the process-group id. Killing the group also signals shell
             // grandchildren that a direct child kill would leave behind.
             libc::kill(-(self.pgid as libc::pid_t), libc::SIGKILL);
         }
@@ -217,9 +218,8 @@ impl Session {
 
     /// Reap a killed child without ever blocking shutdown indefinitely. A child
     /// in uninterruptible I/O can survive SIGKILL for an unbounded time; after
-    /// the deadline the process-group kill and parent-death signal remain the
-    /// backstops, and the zombie is left to process exit rather than stalling
-    /// every later session in the drain loop.
+    /// the deadline, return so one unreaped child cannot stall every later
+    /// session in the cleanup loop.
     fn wait_bounded(&mut self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
@@ -250,10 +250,9 @@ impl Drop for Session {
     }
 }
 
-/// Global id -> session map. The global lock is only held for lookup /
-/// insert / remove; all waiting on child output happens under the
-/// per-session lock so one session's 30s yield never blocks other sessions,
-/// the reaper, or shutdown.
+/// Global id -> session map. Output waits use per-session locks so unrelated
+/// sessions and registry lookups remain available. Shutdown may still wait for
+/// a session lock held by an active poll.
 static SESSIONS: LazyLock<Mutex<HashMap<String, Arc<Mutex<Session>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static REAPER: Once = Once::new();
@@ -566,7 +565,7 @@ pub(crate) fn shutdown_all() {
 
 /// Best-effort variant for forced-exit paths that must not block on a lock held
 /// by an in-flight tool call. Sessions that lose the `try_lock` race are left
-/// to the process group teardown; this is strictly better than not trying.
+/// to the process group teardown.
 pub(crate) fn shutdown_all_best_effort() {
     let removed: Vec<Arc<Mutex<Session>>> = match SESSIONS.try_lock() {
         Ok(mut sessions) => sessions.drain().map(|(_, session)| session).collect(),
@@ -695,10 +694,9 @@ pub(crate) mod tests {
             .to_string()
     }
 
-    /// Poll until `want` appears or the deadline passes. Shell spawn latency
-    /// (`bash -lc` sources login profiles) varies wildly across machines, so
-    /// timing-sensitive assertions must poll with generous deadlines instead
-    /// of assuming one short yield is enough.
+    /// Poll until `want` appears or the deadline passes. Process startup latency
+    /// varies across machines, so timing-sensitive assertions use generous
+    /// deadlines instead of assuming one short yield is enough.
     fn poll_until(session_id: &str, want: &str, deadline_ms: u64) -> String {
         let deadline = Instant::now() + Duration::from_millis(deadline_ms);
         let mut combined = String::new();

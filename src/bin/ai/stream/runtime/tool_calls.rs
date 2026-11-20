@@ -1,7 +1,7 @@
 use super::*;
-/// Update the tool-argument stall timer: starts it when a tool call opens, resets it once no
-/// tool call is open or the provider already declared how the response ended. See
-/// `STREAM_TOOL_ARGS_STALL_TIMEOUT_SECS`.
+/// Track the argument stall window while collected tool calls remain and the
+/// response has no terminal status. Keep its original start time across deltas;
+/// clear it when the collection is empty or the response has a terminal status.
 pub(super) fn update_tool_args_open_at(
     state: &StreamContentState,
     open_at: Option<Instant>,
@@ -28,11 +28,9 @@ pub(super) fn tool_args_stream_stalled(
 
 /// Track an open `function_call` output item from the Responses item events.
 ///
-/// The provider declaring a tool call in progress means that call's arguments are being generated server-side, and
-/// this wire can deliver the whole payload as one late delta (a 20KB `write_file` argument) with no event in
-/// between, so that silence must not be read as a stalled connection. Reasoning items carry the same open/closed
-/// state in their own parse result, which also resolves an `.added` line whose item status is already terminal;
-/// only chunks can come from a `function_call` item here, so the two paths cannot double count.
+/// Declared work may stay silent until arguments arrive as a single delta.
+/// Only chunk-shaped parse results reach this path; reasoning items use their
+/// own lifecycle events, so the two paths cannot double count.
 pub(super) fn note_function_call_item_lifecycle(
     event_type: Option<&str>,
     parsed: &super::state::ParsedStreamPayload,
@@ -174,14 +172,10 @@ pub(super) fn process_external_tool_calls_delta(
     meaningful_progress
 }
 
-/// Incrementally resolves cumulative keys for chat-completions tool calls whose
-/// `index` is missing. If everything fell onto the default key 0, parallel tool
-/// calls would merge into one; instead group by id: reuse the key of an existing
-/// builder with the same id, otherwise synthesize a stable key in
-/// [10000, usize::MAX) from a hash of the id (real provider indexes are single
-/// digits, so no collision). Parameter-continuation deltas with neither id nor
-/// index attach to the most recent call without an index; if there is none, fall
-/// back to the old-behavior key 0.
+/// Resolve chat-completions tool calls without an explicit `index`. Reuse a
+/// builder with the same nonempty id; otherwise derive a stable key from the
+/// id's wrapping hash. Id-less continuations use the last synthesized key,
+/// falling back to zero when none exists.
 pub(super) fn resolve_indexless_tool_call_key(state: &mut StreamContentState, id: &str) -> usize {
     if !id.is_empty() {
         for (key, builder) in state.tool_calls_map.iter() {
@@ -218,8 +212,8 @@ pub(super) fn append_tool_call_arguments(
     }
 }
 
-/// Consume internal tool-call stream events. The return value indicates whether this batch detected a hallucinated
-/// internal tool-protocol marker (`HallucinatedProtocolMarker`) — the caller then stops the stream and retries downgraded.
+/// Consume internal tool-call events, returning `(hallucinated_marker_seen,
+/// meaningful_progress)` for the caller's stream control decisions.
 pub(super) fn process_internal_tool_calls(
     app: &mut App,
     markers: &StreamMarkers,
@@ -271,10 +265,8 @@ pub(super) fn process_internal_tool_calls(
             InternalToolCallStreamEvent::End => {
                 if state.render.current_printing_index == Some(state.content.internal_tool_call_idx)
                 {
-                    // The streaming phase no longer prints tool name/arguments (open_tool_call_line and
-                    // write_tool_call_arguments_stream are no-ops), so only the color needs resetting here.
-                    // Never use println! — it would insert a blank line between the `✓` and the following output
-                    // (the external delta tool path never prints this line anyway).
+                    // Argument text is hidden and the receive hint owns its row. Reset color
+                    // without adding a newline before subsequent output.
                     if runtime_ctx::terminal_output_enabled() {
                         print!("\x1b[0m");
                     }

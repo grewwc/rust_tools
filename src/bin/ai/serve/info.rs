@@ -129,7 +129,7 @@ pub(crate) async fn serve_app_manifest() -> Response {
     )
 }
 
-/// Public maskable icon referenced by both the manifest and the document head.
+/// Public SVG app icon.
 pub(crate) async fn serve_app_icon() -> Response {
     public_app_asset(APP_ICON_SVG, "image/svg+xml", "public, max-age=86400")
 }
@@ -255,17 +255,7 @@ fn public_app_asset(
 // Note: /healthz is intentionally public (liveness only, no session data).
 // All session/skill/agent routes enforce check_auth.
 
-/// Runtime info for remote clients (`GET /info`, authed): the exact
-/// model/agent/reasoning-effort labels the next turn will run with, so a
-/// remote input header can mirror the local REPL instead of guessing from
-/// the client's own flags. The turn child is spawned as bare
-/// `--session <id> <prompt>` with no `--model`/`--agent` passthrough, so
-/// client-side flags never reach it — only server-side truth is displayed.
-/// The `models`/`agents`/`efforts` option lists drive the mobile client's
-/// dropdowns; an empty per-turn override keeps meaning "server default".
-/// Per-session picks are not global: they live in each session's persisted
-/// config (`GET`/`POST /sessions/{id}/config`) and are folded into turns
-/// server-side, so `/info` reports only the server defaults and option lists.
+/// A selectable model registry entry for remote clients.
 #[derive(Debug, Serialize)]
 pub(crate) struct ServerModelOption {
     /// Value to send back as the per-turn override (registry handle).
@@ -273,6 +263,9 @@ pub(crate) struct ServerModelOption {
     /// Human-readable label for the dropdown row.
     label: String,
 }
+/// Server defaults and selectable options returned by `GET /info`.
+/// Session picks are reported by `GET /sessions/{id}/config` and override
+/// these defaults when preparing a turn.
 #[derive(Debug, Serialize)]
 pub(crate) struct ServerInfo {
     model: String,
@@ -293,18 +286,8 @@ pub(crate) async fn server_info(
     if let Err(e) = check_auth(&state, &headers) {
         return e.into_response();
     }
-    // Mirror `models::initial_model` minus its CLI-override branch: the
-    // child CLI carries no `--model`, so the config default (resolved
-    // through the registry, falling back to the registry default) is what
-    // the turn uses.
     let model = default_turn_model();
-    // Mirror `driver/mod.rs` App construction: the child CLI carries no
-    // `--agent`, so the hardcoded `"build"` fallback is what the turn uses.
     let agent = "build".to_string();
-    // Mirror `request::reasoning::reasoning_effort_display_label` for the
-    // serve case: no CLI effort override exists server-side and the agent is
-    // never `"sharp"`, so the registry default (or "server default") is the
-    // displayed tier.
     let reasoning_effort = super::models::default_reasoning_effort(&model)
         .map(|e| e.as_str().to_string())
         .unwrap_or_else(|| "server default".to_string());

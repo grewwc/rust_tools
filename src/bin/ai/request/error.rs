@@ -102,7 +102,7 @@ pub(crate) const REQUEST_RETRY_429_BASE_MS: u64 = 4_000;
 /// window, possibly tens of thousands); sleeping as-is would stall the process
 /// for a long time. Clamp to this bound and yield quickly via key rotation.
 pub(crate) const REQUEST_RETRY_429_MAX_MS: u64 = 10_000;
-/// Timeout for a streaming request to receive the response headers (first byte).
+/// Timeout for a streaming request to receive the response headers.
 ///
 /// The main `app.client` only keeps `connect_timeout` (no overall
 /// `.timeout()`, which would kill long streaming body reads). But
@@ -123,8 +123,8 @@ pub(crate) struct RequestRetryPolicy {
     pub(crate) max_attempts: usize,
     pub(crate) max_attempts_429: usize,
     pub(crate) header_timeout_secs: u64,
-    /// Maximum number of hedged backup sends (including primary). Beyond this,
-    /// the last send no longer sets an internal timeout and relies on the outer
+    /// Maximum number of sends, including the primary. After dispatching all
+    /// backups, the transport waits for pending responses under the outer
     /// `header_timeout_secs` backstop.
     pub(crate) hedged_max_sends: usize,
 }
@@ -143,11 +143,7 @@ impl RequestRetryPolicy {
         (self.header_timeout_secs / 9).clamp(3, 15)
     }
 
-    /// Total number of hedged backup sends for the primary request.
-    /// Server long tails occasionally hit bad instances consecutively; one more
-    /// backup further reduces tail latency.
-    /// Note: with true concurrent hedging, a long-tail scenario can have up to
-    /// `hedged_max_sends` concurrent connections.
+    /// Maximum number of concurrent sends, including the primary.
     pub(crate) fn hedged_max_sends(&self) -> usize {
         self.hedged_max_sends
     }
@@ -189,11 +185,9 @@ pub(crate) fn config_forces_thinking() -> bool {
     config_bool_is_true(cfg.get_opt(AiConfig::MODEL_THINKING))
 }
 
-/// Effective endpoint for the model's request: the registry endpoint (models/*.json,
-/// including per-model overrides in ~/.config/rust_tools/models/). `app.config.endpoint`
-/// is a test-only fallback that production leaves empty (the old `ai.model.endpoint`
-/// config key was removed), so this always matches the endpoint used for the
-/// wire-dialect decisions in the request builder.
+/// Resolve the endpoint through `models::endpoint_for_model`, using the model's
+/// registry endpoint or adapter default. `app.config.endpoint` is a fixture
+/// fallback for unregistered models, keeping request and wire-dialect routing aligned.
 pub(crate) fn endpoint_for_request_model(app: &App, model: &str) -> String {
     models::endpoint_for_model(model, &app.config.endpoint)
 }
@@ -461,7 +455,7 @@ fn context_overflow_body_markers(lower_text: &str) -> bool {
 /// around the body (see `is_retryable_status_with_body` — "upstream" 400s are
 /// otherwise treated as transient and laddered up to 12 attempts).
 ///
-/// Two families:
+/// Recognized families:
 /// - context-overflow rejections (same phrasing as
 ///   [`is_context_overflow_error`]); the only cure is shrinking the context,
 ///   which the driver's reactive compaction path can do as soon as the error
@@ -493,12 +487,9 @@ pub(crate) fn is_deterministic_status_error(status: StatusCode, body: &str) -> b
 /// succeed, but dropping replayed items does, so the transport drops replay
 /// tiers and retries.
 ///
-/// The message alone is the discriminator: it is unique to this rejection,
-/// while the `modelhub_err_code_-4003` code it sometimes carries also covers
-/// deterministic "Duplicate item found" rejections, which this repair cannot
-/// cure. Requiring the code is what let a relay that omits it (inner
-/// `code: null`, outer `InvalidParameter`) bypass the repair entirely, so the
-/// code is treated as an optional corroborating signal rather than a gate.
+/// Match the resource phrase alone. The `modelhub_err_code_-4003` code also
+/// appears on "Duplicate item found" rejections and may be absent from relayed
+/// responses, so it cannot identify this repair.
 pub(crate) fn is_cross_resource_replay_rejection(err: &RequestError) -> bool {
     match err.kind {
         RequestErrorKind::Status(status) if status.as_u16() == 400 => {
@@ -529,7 +520,7 @@ pub(crate) fn should_rotate_key(err: &RequestError) -> bool {
             if matches!(status.as_u16(), 401 | 403 | 429) {
                 return true;
             }
-            // Non-standard HTTP status codes also check the body for account-level error signals
+            // Other HTTP statuses may carry account-level errors in the body.
             is_account_error_body(&err.message)
         }
         RequestErrorKind::Cancelled
@@ -574,11 +565,9 @@ pub(crate) fn is_rate_limited_stream_error(err: &str) -> bool {
 
 /// Decides whether an error occurring mid-stream is worth retrying.
 ///
-/// Stream errors (`provider stream error: ...`) happen after the response
-/// headers have been returned, during body transfer, and are usually transient
-/// server-side issues (backend cancellation, upstream RPC failure, internal
-/// errors, etc.). Retrying the whole request + stream once for these errors
-/// significantly reduces the user-perceived failure rate.
+/// Provider errors reported during body transfer may be transient. The driver
+/// uses this classification to retry the whole request and stream within its
+/// retry limits.
 pub(crate) fn is_retryable_stream_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     is_rate_limited_stream_error(err)
@@ -600,12 +589,8 @@ pub(crate) fn is_retryable_stream_error(err: &str) -> bool {
         || lower.contains("503")
         || lower.contains("504")
         || lower.contains("risk_control")
-        // Backend/gateway output-buffer pressure aborts a response that is already
-        // streaming (real shape: "ClientError: Backend buffer overflow." from the
-        // DashScope compatible-mode relay). Because the response had started, this is
-        // server-side body-transfer backpressure rather than a malformed request, and a
-        // fresh attempt usually succeeds; classifying it as fatal instead ends the turn
-        // with "[Response parsing failed; please retry]".
+        // Output-buffer pressure can abort an otherwise valid stream. Treat
+        // buffer overflow/full and backpressure markers as transient transfer failures.
         || lower.contains("buffer overflow")
         || lower.contains("buffer full")
         || lower.contains("backpressure")
@@ -728,7 +713,7 @@ mod tests {
             reqwest::StatusCode::BAD_REQUEST,
             r#"{"error":{"type":"invalid_request_error","message":"messages with role 'tool' must be a response to a preceding message with 'tool_calls'"}}"#
         ));
-        // Real incident shape: the relay wrapped an overflow rejection in
+        // A relay can wrap an overflow rejection in
         // "upstream" wording, which `is_retryable_status_with_body` reads as
         // transient; the classifier must still call it deterministic so the
         // ladder is skipped and reactive compaction runs immediately.
@@ -751,7 +736,7 @@ mod tests {
 
     #[test]
     fn is_cross_resource_replay_rejection_matches_the_resource_phrase() {
-        // Real incident shape: Azure rejects a replayed Responses item that was
+        // Azure rejects a replayed Responses item that was
         // created under another resource behind the same gateway.
         let cross_resource = r#"{"error":{"code":"modelhub_err_code_-4003","message":"The requested item was created under a different Azure OpenAI resource. Use the same resource that created the item to access it."}}"#;
         assert!(is_cross_resource_replay_rejection(&RequestError::status(
@@ -761,8 +746,8 @@ mod tests {
 
         // Same phrase without the gateway code: a relay that wraps the inner
         // body as a string and answers with outer code `InvalidParameter` while
-        // the inner `code` is null. This shape bypassed the repair and turned a
-        // recoverable cross-resource rejection into an abandoned turn.
+        // the inner `code` is null. Matching the message keeps this shape eligible
+        // for replay repair.
         let relayed_null_code = r#"{"error":{"message":"{\n  \"error\": {\n    \"message\": \"The requested item was created under a different Azure OpenAI resource. Use the same resource that created the item to access it.\",\n    \"type\": \"invalid_request_error\",\n    \"param\": null,\n    \"code\": null\n  }\n}","type":"BadRequest","param":"","code":"InvalidParameter"}}"#;
         assert!(is_cross_resource_replay_rejection(&RequestError::status(
             StatusCode::BAD_REQUEST,
@@ -816,10 +801,8 @@ mod tests {
 
     #[test]
     fn backend_buffer_overflow_stream_error_is_retryable() {
-        // Real incident shape: the DashScope compatible-mode relay aborted a live
-        // stream with `ClientError: Backend buffer overflow.` after the response had
-        // already produced ~2k thinking tokens. No existing pattern matched it, so the
-        // turn was abandoned instead of retried.
+        // Buffer pressure can interrupt a live stream after valid output has begun;
+        // retry classification must still allow a fresh request.
         assert!(is_retryable_stream_error(
             "provider stream error: ClientError: Backend buffer overflow."
         ));

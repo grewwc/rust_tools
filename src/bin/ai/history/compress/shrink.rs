@@ -3,30 +3,12 @@
 
 use super::*;
 
-/// The next escalation when `first_tool_call_group` refuses to fold (all
-/// remaining foldable groups contain non-compressible tools like `read_file`,
-/// which it rejects by policy) but the budget is still exceeded: use
-/// [`fold_early_tool_groups`] to progressively fold those groups "outside the
-/// protected tail window" into single-line `compressed_tool_round` notes (each
-/// carrying a file_path recall anchor the model can read back with read_file).
-///
-/// This reuses **the same** battle-tested folding function as Path B+C of
-/// `mid_turn_llm_summarize`, just moved earlier into the regular/persisted
-/// compaction path — fixing the root cause of "tool-heavy sessions (few user
-/// turns x hundreds of read_file calls) never folding tool groups inside
-/// `compress_messages_for_context` / `shrink_*`, leaving the whole history unable
-/// to converge into the budget".
-///
-/// Returns whether an "effective fold" happened (net char decrease). `keep_recent`
-/// tightens progressively from [`KEEP_RECENT_TOOL_GROUPS`] down to
-/// [`MIN_KEEP_RECENT_TOOL_GROUPS`] (=1), keeping the most recent tool groups
-/// verbatim as much as possible and widening the folding scope step by step only
-/// while still over budget; every step must produce a net decrease to avoid
-/// spinning without progress. **Never tightens to 0**: a window of 0 would fold
-/// the most recent tool interaction into a stub too, leaving the model with no
-/// structured tool context at all; the remaining excess is handled by the later
-/// `first_trim_candidate` / `truncate_mutable_messages_to_fit` backstops in the
-/// while loop.
+/// Plan progressive folding of older tool groups while keeping recent groups
+/// intact. Precision results remain inline or recoverable through archives.
+/// Prefer a fitting window that meets the protected-tail floor, then any fitting
+/// window, then the deepest reducing window. Commit only the selected plan.
+/// Windows stop at [`MIN_KEEP_RECENT_TOOL_GROUPS`], preserving a recent group;
+/// later trimming handles any remaining excess. Return whether billed chars fell.
 pub(in crate::ai) fn fold_noncompressible_tool_groups_to_fit(
     messages: &mut Vec<Message>,
     max_chars: usize,
@@ -47,8 +29,8 @@ pub(in crate::ai) fn fold_noncompressible_tool_groups_to_fit(
     //      matters more than the floor once the floor cannot hold,
     //   3. otherwise the deepest reducing window, so bounded progress and the
     //      historical deep-fold endpoint are preserved even when nothing fits.
-    // Plans are pure functions of the messages, so candidates are recorded as
-    // window sizes and re-planned exactly once before committing.
+    // Keep at most one candidate plan; re-plan only if the selected window
+    // differs from the remembered candidate.
     let mut floor_safe_fitting_keep: Option<usize> = None;
     let mut fitting_keep: Option<usize> = None;
     let mut deepest_reducing_keep: Option<usize> = None;
@@ -59,9 +41,8 @@ pub(in crate::ai) fn fold_noncompressible_tool_groups_to_fit(
     // Plan reuse: a plan is a pure function of the unchanged messages, so the
     // last reducing candidate can be committed directly when its window is the
     // chosen one instead of being discarded and re-planned afterwards. This
-    // caps the ladder at one live plan (one whole-history clone) instead of a
-    // clone per rung plus a final re-plan; every selection decision below is
-    // evaluated exactly as before.
+    // retains one candidate between rungs rather than a whole-history clone
+    // for every window; selection does not depend on which plan is retained.
     let mut last_reducing_plan: Option<(usize, ToolGroupFoldPlan)> = None;
     for &keep_recent in progressive_fold_windows().iter() {
         if anchor_count <= keep_recent {
@@ -128,7 +109,7 @@ pub(in crate::ai) fn fold_noncompressible_tool_groups_to_fit(
 }
 
 /// Billable chars across the tool-result messages of the most-recent
-/// `keep_recent` complete tool groups - i.e. the verbatim structured evidence
+/// `keep_recent` groups with matching results - i.e. the structured evidence
 /// kept outside folding under that window size (assistant anchors excluded,
 /// matching what recent_tool_group_message_indices returns).
 pub(in crate::ai) fn protected_tail_message_chars(
@@ -141,12 +122,9 @@ pub(in crate::ai) fn protected_tail_message_chars(
         .sum()
 }
 
-/// Batch-remove trimmable ordinary messages and archive them in a single flush.
-/// The old implementation re-entered the outer loop and ran `sync_data` after
-/// every single removal, so a tool-heavy history amplified hundreds of assistant
-/// messages into hundreds of synchronous writes. Here the whole batch is trimmed
-/// on a candidate copy first; if archiving fails the candidate is not adopted and
-/// the original messages stay unchanged.
+/// Batch-remove trimmable messages on a candidate copy. Ordinary messages share
+/// one archive flush when a sink is available; internal notes use separate
+/// content-addressed files. Archive failure leaves the input unchanged.
 pub(in crate::ai) fn trim_removable_messages_batch(
     messages: &mut Vec<Message>,
     max_chars: usize,
@@ -260,12 +238,9 @@ pub(in crate::ai) fn shrink_messages_to_fit(
 
     redact_images_except_last(&mut messages, 1);
     dedup_adjacent(&mut messages);
-    // dedup must run before offload: offload moves over-threshold old read_file
-    // bodies to disk and replaces them with a stub carrying a **unique temp
-    // path**; once that happens, byte-identical duplicates can no longer be folded
-    // because their paths differ. Do content-level dedup first, folding redundant
-    // bodies into back-reference stubs, then offload the few versions truly worth
-    // keeping.
+    // Dedup raw results before offloading: archived stubs are not full-result
+    // candidates, so content dedup deliberately skips them. Spill only the
+    // surviving result versions.
     dedup_repeated_tool_results(&mut messages, protected_tool_call_ids);
     prepare_tool_messages_structured(
         &mut messages,
@@ -294,7 +269,7 @@ pub(in crate::ai) fn shrink_messages_to_fit(
     // historical bloat of "hundreds of early read_file previews accumulating
     // monotonically". This runs before the budget check so sessions not yet over
     // budget also keep converging already-spilled stubs. The tail-window turn
-    // count is bounded by the max_chars byte cap: when a tool-heavy session's tail
+    // count is bounded by the max_chars char budget: when a tool-heavy session's tail
     // window grows too large it shrinks automatically, exposing older stubs to age
     // folding.
     let keep_recent_turns = keep_recent_user_turns_when_trimming(&messages, max_chars);
@@ -324,20 +299,8 @@ pub(in crate::ai) fn shrink_messages_to_fit(
     }
 
     while messages_total_chars(&messages) > max_chars {
-        // Fold all unprotected tool groups over budget in one batch (both
-        // compressible and non-compressible go through [`fold_early_tool_groups`]).
-        // The old implementation folded only one group per iteration in the
-        // `first_tool_call_group` + single-group fold loop, and only fell through
-        // to the batch fold of `fold_noncompressible_tool_groups_to_fit` after
-        // nothing foldable remained. Bug A kept the per-group savings tiny
-        // (assistant.content had already been sanitized to `""`/`null`, so the
-        // folded stub was nearly as large as the original group) -> the outer while
-        // needed dozens of iterations to converge, each round also injecting an
-        // `<empty>` empty-checkpoint note that polluted the context (see the 22
-        // consecutive `compressed_tool_round` <empty> stubs in the e75fc2e5
-        // session dump). Now each round first uses one `fold_early_tool_groups`
-        // batch to collect every foldable group at once, finishing the shrink
-        // within a few outer iterations.
+        // Fold older tool groups in one selected batch before removing individual
+        // messages. Precision and compressible tools use the same group planner.
         if fold_noncompressible_tool_groups_to_fit(
             &mut messages,
             max_chars,
@@ -425,7 +388,7 @@ pub(in crate::ai) fn prev_alive_user(alive: &[bool], from: isize) -> isize {
 /// Single-pass replacement for the sequential per-drop rounds in
 /// [`shrink_messages_to_fit_with_summary`]. The old path called
 /// `first_trim_candidate` plus `Vec::remove` once per dropped message — an
-/// O(n) rescan (including the 48K-threshold base and the byte-capped
+/// O(n) rescan (including the 48K-threshold base and the char-capped
 /// tail-window recompute inside `keep_recent_user_turns_when_trimming`) and an
 /// O(n) memmove per drop, i.e. O(n²) on long histories. This helper collects
 /// every candidate those rounds would have dropped in one scan and splices
@@ -440,7 +403,7 @@ pub(in crate::ai) fn prev_alive_user(alive: &[bool], from: isize) -> isize {
 ///   equivalent to the sequential recompute on the shrinking sequence;
 /// - `keep_recent_user_turns` has at most two values during the stretch
 ///   (totals only decrease, so the 48K base flips at most 2 -> 3); the
-///   byte-cap component depends only on the protected tail sums, which are
+///   char-cap component depends only on the protected tail sums, which are
 ///   invariant under prefix deletions, hence both variants are precomputed
 ///   from `keep_recent_user_turns_when_trimming`'s own formula;
 /// - `fold_noncompressible_tool_groups_to_fit` cannot flip from false to true
@@ -467,7 +430,7 @@ pub(in crate::ai) fn drop_trim_candidates_batch(
     // every message via a full `messages_total_chars` rescan each round.
     let chars: Vec<usize> = messages.iter().map(message_billable_chars).collect();
     // `keep_recent_user_turns_when_trimming` recomputed per round is equivalent
-    // to this two-entry table: the byte-cap loop reads only the protected tail
+    // to this two-entry table: the char-cap loop reads only the protected tail
     // sums (invariant under our deletions), and the 48K base depends only on
     // `total`, which moves downwards across the threshold at most once.
     let tail_chars = |keep: usize| -> usize {
@@ -688,9 +651,8 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
 
     profile_compression_stage!("redact_images", redact_images_except_last(&mut messages, 1));
     profile_compression_stage!("dedup_adjacent", dedup_adjacent(&mut messages));
-    // dedup before offload: same rationale as shrink_messages_to_fit — avoid
-    // byte-identical duplicate read_file bodies each being offloaded into a
-    // unique-temp-path stub and losing the chance to fold.
+    // Dedup raw results before offloading, as in shrink_messages_to_fit;
+    // already-archived stubs cannot serve as full-result dedup candidates.
     profile_compression_stage!(
         "dedup_repeated_tool_results",
         dedup_repeated_tool_results(&mut messages, protected_tool_call_ids)
@@ -737,7 +699,7 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
     // single-line anchors (symmetric with shrink_messages_to_fit). Converges the
     // monotonic accumulation of early read_file previews; the file_path recall
     // anchor is kept. The tail-window turn count is likewise bounded by the
-    // max_chars byte cap (see keep_recent_user_turns_when_trimming).
+    // max_chars char budget (see keep_recent_user_turns_when_trimming).
     let keep_recent_turns = profile_compression_stage!(
         "tail_window",
         keep_recent_user_turns_when_trimming(&messages, max_chars)
@@ -787,11 +749,8 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
     // `messages_total_chars(&messages)` every round, but avoids repeatedly
     // O(n)-rescanning the whole message sequence across loop iterations.
     while total > max_chars {
-        // Fold all unprotected tool groups over budget in one batch (both
-        // compressible and non-compressible go through [`fold_early_tool_groups`])
-        // — same rationale as [`shrink_messages_to_fit`], avoiding a single-group
-        // fold loop that iterates dozens of rounds injecting `<empty>`
-        // empty-checkpoint notes (see the e75fc2e5 session dump).
+        // Use the same group-fold planner as shrink_messages_to_fit before
+        // collecting removable individual messages.
         if profile_compression_stage!(
             "fold_tool_groups",
             fold_noncompressible_tool_groups_to_fit(

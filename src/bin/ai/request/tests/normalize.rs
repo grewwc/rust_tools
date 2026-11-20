@@ -13,11 +13,9 @@ fn normalization_text_message(role: &str, text: impl Into<String>) -> Message {
 
 #[test]
 fn normalize_messages_keeps_model_derived_notes_out_of_system_role() {
-    // Internal notes that appear AFTER the first conversational message
-    // must remain in their original positions (with role normalized to
-    // "system") so that older prompt-cache prefixes stay valid when new
-    // notes are appended. Only notes that sit at the very top, before
-    // any user/assistant/tool message, get folded into the first system.
+    // Model-derived summaries use user/assistant handoffs even before the first
+    // conversational message. The runtime working-memory note keeps its position
+    // as a system note, leaving summary content out of the authoritative system role.
     let messages = vec![
         Message {
             role: "system".to_string(),
@@ -742,11 +740,9 @@ fn normalize_messages_preserves_tool_result_when_tool_call_args_are_malformed() 
 
     let normalized = normalize_messages_for_request(&messages);
 
-    // Bad JSON args no longer cause the tool_call to be dropped/degraded: the
-    // assistant's tool_call and the real tool result must both be kept, with
-    // args repaired into a valid JSON object (preserving the original text) to
-    // pass provider validation. This way the model still sees the real execution
-    // result and does not mistakenly re-run the same tool.
+    // Wrap malformed arguments in valid JSON while retaining their original text
+    // and the real tool result, so provider validation does not force needless
+    // re-execution of an already attempted tool call.
     assert_eq!(normalized.len(), 5);
     assert_eq!(normalized[2].role, "assistant");
     let calls = normalized[2].tool_calls.as_ref().expect("tool_calls kept");

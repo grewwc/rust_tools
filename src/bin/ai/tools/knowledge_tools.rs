@@ -49,12 +49,12 @@
 /// ```
 /// 工具把删除和新增合成为一次原子重写，避免“先删后增”中途失败导致丢数。
 ///
-/// ## 无损保证
-/// 模型只能看到条目的截断预览（`read_all` 每条最多 500 字），因此合并多条
-/// 已有条目时，必须通过 `save_entries[].source_ids` 指明被合并的源条目 ID。
-/// 工具会把源条目的**完整原文**追加到新条目（`--- 原文保留（合并来源）---`
-/// 之后），并自动把这些源 ID 并入删除集合（合并条目取代它们，避免重复并存）。
-/// 整理绝不压缩/丢失内容——只有显式 `delete_ids` 才算删除。
+/// ## Source preservation
+/// `read_all` exposes at most 500 characters per entry. Use
+/// `save_entries[].source_ids` to preserve source notes during a merge.
+/// `execute_consolidation` appends each known source's note with surrounding
+/// whitespace trimmed, then includes its ID in the deletion set.
+/// Entries named only in `delete_ids` are removed without source preservation.
 ///
 /// ## 整理原则（Agent 自行判断）
 /// - **保留**：仍有参考价值的决策、偏好、项目信息、安全规则
@@ -161,7 +161,6 @@ fn execute_knowledge_forget(args: &Value) -> Result<String, String> {
 
     let store = MemoryStore::from_env_or_config();
 
-    // Delete from memory_store
     let deleted = store
         .delete_by_id(id)
         .map_err(|e| format!("Failed to delete memory entry: {e}"))?
@@ -259,8 +258,7 @@ fn execute_knowledge_search(args: &Value) -> Result<String, String> {
 }
 
 /// Cap a note's displayed length so a single long knowledge entry cannot
-/// dominate the tool result. Keeps the head and an explicit truncation marker;
-/// the full note remains retrievable via `knowledge_list`.
+/// dominate the tool result. Keeps the head and an explicit truncation marker.
 fn truncate_for_output(note: &str, max_chars: usize) -> String {
     if note.chars().count() <= max_chars {
         return note.to_string();
@@ -344,7 +342,6 @@ fn execute_knowledge_list(args: &Value) -> Result<String, String> {
         return Ok("Knowledge base is empty. Use knowledge_save to add entries.".to_string());
     }
 
-    // Show most recent first
     let start = entries.len().saturating_sub(limit);
     let recent: &[AgentMemoryEntry] = &entries[start..];
 
@@ -447,8 +444,8 @@ fn read_all_entries() -> Result<String, String> {
             let entry_id = entry.id.as_deref().unwrap_or("N/A");
             let ts = &entry.timestamp;
             let prio = entry.priority.unwrap_or(100);
-            // 截断过长的内容用于预览；落库时合并会保留完整原文
-            // （见 execute_consolidation 的 source_ids 无损合并），预览截断不丢失内容。
+            // Preview truncation leaves the stored note untouched; consolidation
+            // reads source notes from storage.
             let preview: String = if entry.note.chars().count() > 500 {
                 entry.note.chars().take(500).collect::<String>()
                     + &format!(
@@ -485,7 +482,6 @@ fn read_all_entries() -> Result<String, String> {
 fn execute_consolidation(args: &Value) -> Result<String, String> {
     let store = MemoryStore::from_env_or_config();
 
-    // 收集待删除的 ID
     let mut delete_ids: Vec<String> = args["delete_ids"]
         .as_array()
         .map(|arr| {
@@ -495,7 +491,6 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
         })
         .unwrap_or_default();
 
-    // 收集待保存的新条目
     let save_entries_raw: Vec<&Value> = args["save_entries"]
         .as_array()
         .map(|arr| arr.iter().collect())
@@ -508,15 +503,13 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
     let mut report = String::new();
     report.push_str("📦 Consolidation report:\n");
 
-    // 无损合并：模型只看到截断预览（read_all 每条最多 500 字），save_entries[].source_ids
-    // 指明该新条目合并了哪些源条目；落库时把源条目的完整原文拼进新条目，绝不压缩/丢失内容。
+    // Read source notes from storage because `read_all` exposes truncated previews.
     let all_entries = store.all()?;
     let originals: std::collections::HashMap<&str, &AgentMemoryEntry> = all_entries
         .iter()
         .filter_map(|entry| entry.id.as_deref().map(|id| (id, entry)))
         .collect();
 
-    // 构建待保存的新条目
     let mut new_entries: Vec<AgentMemoryEntry> = Vec::new();
     let mut preserved_count = 0usize;
     for entry_val in &save_entries_raw {
@@ -538,8 +531,9 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
             .map(|p| p as u8)
             .unwrap_or(150);
 
-        // 无损合并：模型摘要在前，全部源条目原文在后；源 ID 自动并入删除集合，
-        // 由合并条目取代它们，避免"旧条目 + 合并条目"并存。
+        // Append non-empty source notes after the summary, trimming surrounding
+        // whitespace. Add known source IDs to the deletion set so the merged entry
+        // replaces them.
         let mut note = content.to_string();
         if let Some(source_ids) = entry_val["source_ids"].as_array() {
             let mut preserved_originals: Vec<String> = Vec::new();

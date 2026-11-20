@@ -1,4 +1,4 @@
-/// Quote a value for use inside a POSIX shell single-quoted context.
+/// Quote a value as one POSIX shell word, escaping embedded single quotes.
 pub(crate) fn shell_single_quote(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('\'');

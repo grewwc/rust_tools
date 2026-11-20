@@ -1,7 +1,5 @@
 //! Agent routing: skill manifest loading, primary agent activation,
 //! hot-reload, and runtime manifest initialization.
-//!
-//! Extracted from `driver/mod.rs` (review Finding #1, Phase 2).
 
 use std::sync::Arc;
 
@@ -294,7 +292,7 @@ pub(super) fn install_runtime_manifests(
     *manifests_loaded = true;
 }
 
-/// Re-activate the default agent after a `--agent` value failed to resolve.
+/// Re-activate the default agent when a requested or restored agent is unavailable.
 /// Startup presets `current_agent` from `cli.agent` so the first screen shows
 /// the requested agent; without this fallback the label would keep a name
 /// that has no active manifest behind it.

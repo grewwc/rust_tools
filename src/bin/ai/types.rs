@@ -39,11 +39,9 @@ pub(super) struct AppConfig {
     pub(super) api_key: String,
     pub(super) base_history_file: PathBuf,
     pub(super) history_file: PathBuf,
-    /// Test-only loopback hook: always empty in production since the
-    /// `ai.model.endpoint` config key was removed (the model registry is the single
-    /// endpoint authority; see config_schema.rs). Kept for fixtures that route an
-    /// unregistered model name to a local mock server (mid_turn_llm.rs,
-    /// context_budget.rs).
+    /// Endpoint fallback for unregistered model names.
+    /// `load_config` in `config.rs` leaves it empty; registered models use their
+    /// own endpoint or adapter default through `endpoint_for_model` in `models.rs`.
     pub(super) endpoint: String,
     pub(super) vl_default_model: String,
     pub(super) history_max_chars: usize,
@@ -81,7 +79,7 @@ impl App {
             forced_skill_source: self.forced_skill_source,
             scoped_preflight_required: self.scoped_preflight_required.clone(),
             // This state belongs only to the next user message in the foreground;
-            // `App` clones are also used for DriverContext, subagents, and
+            // `App` forks also serve driver snapshots, subagents, and
             // background tasks, which must not inherit this continuation.
             pending_skill_continuation: None,
             forced_question: self.forced_question.clone(),
@@ -96,18 +94,13 @@ impl App {
             os: self.os.clone(),
             agent_reload_counter: self.agent_reload_counter,
             observers: Vec::new(),
-            // Same policy as `observers`: process-level tool middleware strategy
-            // does not propagate through clone (subagents/background are independent).
+            // Process-local tool middleware does not propagate into app forks.
             tool_middlewares: Vec::new(),
-            // Same policy as `tool_middlewares`: process-level LLM request
-            // middleware strategy does not propagate through clone.
+            // LLM request middleware follows the same process-local policy.
             llm_middlewares: Vec::new(),
-            // Same policy as `observers`/`tool_middlewares`: stage/global hook
-            // callbacks do not propagate through clone (subagents/background are
-            // independent). The stream filter chain is the exception: it is a
-            // content-transformation policy whose output lands in parent history and
-            // subagent payloads, so forked turns must apply the parent's chain too
-            // (see HookRegistry::inherit_stream_filters).
+            // Stage/global hook callbacks stay process-local. Stream filters carry
+            // the content-transformation policy into forked turns because their
+            // output reaches parent history and subagent payloads.
             hooks: {
                 let mut hooks = HookRegistry::new();
                 hooks.inherit_stream_filters(&self.hooks);
@@ -153,21 +146,10 @@ impl App {
         app
     }
 
-    /// Child work (subagents / background tasks) is an independent reasoning
-    /// context and must not inherit the foreground session's reasoning-effort
-    /// controls:
-    /// - `reasoning_effort_override`: the user's `/effort off` (Some(None)) is
-    ///   upgraded to "thinking off" on the wire (`request::thinking::resolve_thinking`
-    ///   / `request::reasoning::resolve_reasoning_effort`). Inheriting it would
-    ///   silently disable thinking for delegated tasks, which previously only
-    ///   omitted the effort field and left child thinking intact. A child can
-    ///   still opt into a tier explicitly via the `reasoning_effort` task arg.
-    /// - `thinking_disabled_override`: turn-scoped truncation-ladder state
-    ///   (documented as restored at turn end); a child must never see it.
-    /// Agent-implied defaults (e.g. the sharp agent's `low`, derived from the
-    /// live `current_agent` at resolve time) intentionally survive: the child
-    /// runs under the same agent identity, and an explicit `reasoning_effort`
-    /// task arg still wins over the implication.
+    /// Child work has an independent reasoning context. The foreground's
+    /// `reasoning_effort_override = Some(None)` disables thinking, so inheriting
+    /// it would suppress delegated reasoning. Also clear turn-scoped
+    /// `thinking_disabled_override` so the child resolves its own defaults.
     fn reset_child_reasoning_controls(app: &mut Self) {
         app.cli.reasoning_effort_override = None;
         app.cli.thinking_disabled_override = false;
@@ -232,8 +214,8 @@ pub(super) struct App {
     pub(super) os: SharedKernel,
     pub(super) agent_reload_counter: Option<usize>,
     pub(super) observers: Vec<Box<dyn crate::ai::driver::observer::TurnObserver>>,
-    /// Tool execution middleware chain (Step 5: built per turn via
-    /// `build_tool_executor_chain`; empty chain = zero behavior change).
+    /// Tool execution middleware chain, built per turn via
+    /// `build_tool_executor_chain`; an empty chain leaves tool execution unchanged.
     /// Shared via `Arc`: `dyn` middleware is not Clone, and the Arc refcount can be
     /// safely copied when building the chain each turn.
     pub(super) tool_middlewares: Vec<Arc<dyn ToolMiddleware>>,
@@ -243,12 +225,10 @@ pub(super) struct App {
     /// Shared via `Arc`: like `tool_middlewares`, safely copyable per request
     /// chain build.
     pub(super) llm_middlewares: Vec<Arc<dyn RequestMiddleware>>,
-    /// Process-level hook registry (Step 3: driver turn lifecycle hooks).
+    /// Process-level hook registry for the driver turn lifecycle.
     /// Empty registry = zero behavior change; turn start/end fire in `run_turn`.
     pub(super) hooks: HookRegistry,
     /// Pending/observed prompt usage bound to its normalized request identity.
-    /// Retaining the optional field keeps App construction sites defaulting to
-    /// no feedback; a bare token count is no longer sufficient for calibration.
     pub(super) last_known_prompt_tokens: Option<super::request::PromptTokenFeedback>,
     /// Prompt cache hit token count returned by the server on the last request.
     /// Used only for TPM, after the companion request snapshot confirms an
@@ -274,24 +254,16 @@ pub(super) struct App {
     /// LLM-guided context pruning counters (tool_call_id → consecutive mark count)
     pub(super) prune_marks: FxHashMap<String, u8>,
 
-    /// Current-turn in-memory side channel: full `reasoning` output items captured
-    /// via the Responses protocol (including encrypted_content), keyed by the
-    /// "first tool_call id" of the assistant message carrying tool_calls. On
-    /// replay they are spliced verbatim before the corresponding function_call so
-    /// the model keeps the previous hop's reasoning context.
+    /// Current-turn Responses reasoning items (including encrypted content),
+    /// keyed by the replay owner described by `ReasoningItemMap`.
     ///
-    /// Deliberately not placed in the `Message` struct: reasoning items are only
-    /// useful for same-turn tool-chain replay and are stripped across turns by
-    /// sqlite; putting them in the shared `Message` would pollute 295 literals and
-    /// require `#[serde(skip)]` to keep them off disk. A turn-level bypass map
-    /// (same pattern as `prune_marks`) is naturally turn-aligned, purely
-    /// in-memory, and physically impossible to persist.
+    /// Kept beside `Message` so provider-specific replay data stays separate from
+    /// the common message schema.
     pub(super) turn_reasoning_items: ReasoningItemMap,
 
     /// Per-tool-call failure flag for the current turn, keyed by `tool_call_id`.
-    /// Same turn-scoped side-channel rationale as `turn_reasoning_items`: the
-    /// Messages dialect reads it to emit Anthropic `tool_result.is_error`, and
-    /// putting it in `Message` would pollute the hundreds of literals there.
+    /// Kept outside `Message` like `turn_reasoning_items`; the Messages dialect
+    /// uses the flags to emit Anthropic `tool_result.is_error`.
     pub(super) turn_tool_errors: FxHashMap<String, bool>,
 
     /// Runtime ledger of stale `apply_patch` targets: the set of target file paths
@@ -301,7 +273,7 @@ pub(super) struct App {
     ///
     /// Semantics: a failed patch means the model's view of the file is stale;
     /// re-patching before re-fetching ground truth (successful read/write/patch)
-    /// will just fail again, which is why guard [`patch_retry_requires_fresh_read`]
+    /// risks using the same stale view, so guard [`patch_retry_requires_fresh_read`]
     /// rejects it.
     ///
     /// Why a dedicated ledger instead of scanning `messages`: history compression
@@ -334,7 +306,7 @@ impl App {
     #[allow(dead_code)]
     pub(super) fn unregister_observer(&mut self, name: &str) -> bool {
         if name == "anonymous" {
-            // Refuse to mass-remove anonymous observers; must use typed handle.
+            // Anonymous observers have no distinct name to target for removal.
             return false;
         }
         let len_before = self.observers.len();

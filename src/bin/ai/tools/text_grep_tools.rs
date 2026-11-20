@@ -17,7 +17,7 @@ const MAX_WALK_FILES: usize = 10_000;
 /// How many snippets to keep per file at most (top N after relevance sorting).
 const MAX_SNIPPETS_PER_FILE: usize = 3;
 
-/// System-level directory blocklist: search roots inside these prefixes are
+/// System-level directory blocklist: canonicalized roots inside these prefixes are
 /// always rejected, to avoid accidentally scanning the whole disk. Only explicit
 /// "system/platform" directories are listed; `/var`, `/private`, and `/tmp` are
 /// deliberately excluded, because macOS temp dirs live under `/var/folders/...`
@@ -45,7 +45,7 @@ const FORBIDDEN_ROOT_PREFIXES: &[&str] = &[
 /// trigger a full-disk scan at 100% CPU. `root` must already be absolute (the
 /// caller joins cwd first).
 pub(crate) fn validate_search_root(root: &Path, cwd: &Path) -> Result<(), String> {
-    // 1. Reject the filesystem root (`/` or a Windows drive root).
+    // 1. Reject the filesystem root `/`.
     let component_count = root.components().count();
     if component_count <= 1 {
         return Err(format!(
@@ -106,8 +106,8 @@ pub(crate) struct ContentSearchOptions<'a> {
     pub(crate) context_lines: usize,
     /// Maximum number of matched lines returned (across all files).
     pub(crate) max_results: usize,
-    /// Optional file-name glob filter (supports comma-separated patterns and
-    /// `*.{ts,tsx}` brace expansion).
+    /// Optional file-name or relative-path glob filter (supports comma-separated
+    /// patterns and `*.{ts,tsx}` brace expansion).
     pub(crate) file_pattern: Option<&'a str>,
     /// Optional extension whitelist. None = no extension filtering; Some = only
     /// these extensions.
@@ -135,10 +135,11 @@ struct FileHits {
     file_score: i64,
     /// Matched lines (line_index, score), sorted by relevance descending.
     scored: Vec<ScoredLine>,
-    /// **All** matched line indices in the file (ascending), so rendering can
+    /// Matched line indices collected before snippet capping (ascending), so rendering can
     /// mark `>` correctly. Note `scored` keeps only the top-N snippets, but other
     /// hits that fall inside a context window must also be marked `>`; otherwise
-    /// they would be wrongly shown as ordinary context lines.
+    /// they would be wrongly shown as ordinary context lines. Collection stops
+    /// at the global result limit.
     all_match_indices: Vec<usize>,
     /// Raw file content. Kept only for files with hits; context rendering borrows
     /// slices by line start instead of allocating a String for every scanned line.
@@ -1034,7 +1035,7 @@ mod tests {
         assert!(msg.contains("Refusing to search"), "{}", msg);
     }
 
-    // Bug 1 regression: when one file has more hits than MAX_SNIPPETS_PER_FILE(3),
+    // When one file has more hits than MAX_SNIPPETS_PER_FILE,
     // truncated hits falling inside the context window must still be marked `>`
     // instead of being shown as ordinary context lines.
     #[test]
@@ -1060,7 +1061,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // Bug 2 regression: a literal file_pattern without wildcards must match
+    // A literal file_pattern without wildcards must match
     // exactly, never via ends_with.
     #[test]
     fn test_glob_literal_pattern_exact_only() {
@@ -1075,7 +1076,7 @@ mod tests {
         assert!(!glob_match_simple("*.rs", "foo.txt"));
     }
 
-    // Bug 3 regression: the `?` wildcard matches exactly one character.
+    // The `?` wildcard matches exactly one character.
     #[test]
     fn test_glob_question_mark_single_char() {
         assert!(glob_match_simple("foo?bar", "fooXbar"));

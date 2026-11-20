@@ -1,9 +1,8 @@
     use super::*;
     #[test]
     fn model_silence_timeout_is_resolved_from_the_registry() {
-        // The per-model allowance travels through the registry accessor: every declared entry resolves
-        // to its declared value, and a model without an entry keeps the runtime default instead of
-        // failing. Nothing pins a model name, so registry churn cannot break this test.
+        // Read timeout overrides through the registry accessor so fixtures do not
+        // depend on a particular model name.
         let registry = crate::ai::model_names::all();
         assert!(
             !registry.is_empty(),
@@ -32,8 +31,8 @@
 
     impl ScriptedSse {
         /// Spawn a loopback server that emits `events` as `data: <event>\n\n`
-        /// SSE frames, then blocks until the response is dropped. Each entry is a
-        /// raw payload: a JSON chunk body, or "[DONE]" for the terminator.
+        /// SSE frames. Each entry is a raw payload: a JSON chunk body, or "[DONE]".
+        /// Hold the socket open until shutdown or timeout so markers drive completion.
         fn spawn(events: Vec<String>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
@@ -50,8 +49,7 @@
                 for event in &events {
                     write_http_chunk(&mut stream, &format!("data: {event}\n\n")).unwrap();
                 }
-                // Keep the socket open until the test drops the response, matching
-                // the finish_reason-grace behavior of real providers.
+                // Keep the socket open for the finish-reason grace window.
                 let _ = done_rx.recv_timeout(Duration::from_secs(2));
             });
             Self {
@@ -78,8 +76,7 @@
     }
 
     /// Drive `stream_response` against a scripted event list and return the parsed
-    /// result. Centralizes the env-lock, os-globals, and interrupt hygiene the
-    /// existing loopback tests each repeat.
+    /// result. Serialize access to shared environment and interrupt state for socket tests.
     async fn drive(events: Vec<String>) -> crate::ai::types::StreamResult {
         let _signal_guard = crate::ai::test_support::ENV_LOCK
             .lock()
@@ -246,9 +243,8 @@
         ));
     }
 
-/// Width source for these tests: they run without a TTY, so `raw_terminal_cols()` falls back to
-/// `COLUMNS`. Mutating the process environment is `unsafe` in edition 2024; each test holds `ENV_LOCK`
-/// for the whole width-sensitive section, so no other test observes the value.
+/// Set the `COLUMNS` fallback for width-sensitive tests. Callers must hold
+/// `ENV_LOCK` while changing and using this process-wide environment value.
 fn set_test_columns(cols: &str) {
     unsafe {
         std::env::set_var("COLUMNS", cols);
@@ -261,12 +257,8 @@ fn clear_test_columns() {
     }
 }
 
-/// Rows of a live region are wrapped at the live terminal width, not at an artificially narrowed bound,
-/// so a long logical row still shows as much text as the terminal can hold. An artificial bound (live
-/// rows capped at 100 columns) kept the stored row count resize-proof but cut every long row short on
-/// wide terminals; the resize case is handled on the erase side instead, by recomputing the footprint
-/// from the stored text (`live_region_fold_header_erase_covers_re_wrapped_rows`,
-/// `live_region_waiting_hint_erase_covers_re_wrapped_rows`).
+/// Live rows use the current terminal width. Resize handling recomputes the erase
+/// footprint from stored text, allowing wide terminals to display long rows.
 #[test]
 fn live_region_rows_wrap_at_the_live_terminal_width() {
     let _guard = crate::ai::test_support::ENV_LOCK

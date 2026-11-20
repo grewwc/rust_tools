@@ -22,8 +22,8 @@ use crate::ai::history::{SessionStore, build_message_arr_with_models};
 use crate::ai::mcp::{McpClient, SharedMcpClient};
 use crate::ai::types::App;
 
-/// One model response in the script. A tool-call turn is followed by another
-/// request; a final turn ends the turn.
+/// One scripted model response. Tool calls continue the loop; final text can
+/// finish the turn once the runtime's final-response gates accept it.
 enum ScriptedTurn {
     ToolCall {
         id: String,
@@ -289,8 +289,8 @@ struct ConfigPathGuard {
 impl ConfigPathGuard {
     fn set(path: &std::path::Path) -> Self {
         let previous = std::env::var_os("CONFIGW_PATH");
-        // `ENV_LOCK` in the tests serializes every reader of this process-global
-        // variable; configw reads it synchronously before/at each turn boundary.
+        // Callers hold `ENV_LOCK` while this guard changes the process-global
+        // configuration path and refreshes configw.
         unsafe { std::env::set_var("CONFIGW_PATH", path) };
         crate::commonw::configw::refresh();
         Self { previous }
@@ -350,9 +350,7 @@ impl TurnFixture {
         app.config.base_history_file = root.path().join("history.sqlite");
         app.config.history_file = root.path().join("history.sqlite");
         app.session_id = "scripted-e2e".to_string();
-        // One-shot mode skips background title generation (which would otherwise
-        // consume an extra scripted response), while an explicit session keeps the
-        // turn persisted for the history assertions.
+        // An explicit session keeps the one-shot turn persisted for history assertions.
         app.cli.session = Some(app.session_id.clone());
         let store = SessionStore::new(&app.config.history_file);
         app.session_history_file = store.session_history_file(&app.session_id);
@@ -573,8 +571,8 @@ async fn loop_detector_note_reaches_next_request_without_extra_gate_reopen() {
     );
 
     let fifth = request_messages(&requests[4]);
-    // The persisted role is internal_note; request normalization projects that
-    // provenance as a system message, so assert on the note body, not the role.
+    // Runtime notes use internal_note before normalization, which projects them
+    // as system content; assert on the note body rather than its role.
     let saw_loop_note = fifth
         .iter()
         .any(|message| text_content(message).contains("[loop-detected]"));
@@ -641,8 +639,8 @@ async fn provider_control_leak_discards_tools_and_retries_only_once() {
         "no tool from either malformed response may execute or persist: {history:#?}"
     );
 }
-/// Number of leading messages two request bodies share byte for byte: the part
-/// of the second request a provider prefix cache can serve from the first.
+/// Number of equal leading message values shared by two request bodies,
+/// used to check stability of the message prefix.
 fn shared_message_prefix(previous: &[Value], next: &[Value]) -> usize {
     previous
         .iter()
@@ -676,8 +674,6 @@ async fn cross_turn_requests_extend_the_previous_request_prefix() {
         ScriptedTurn::final_text("Turn two done."),
     ]);
 
-    // Both questions name a code artifact, so the integrated critic gate is on
-    // for both turns and does not mask the behavior under test.
     for question in [
         "Inspect `src/driver/turn.rs`.",
         "Inspect `src/driver/turn.rs` once more.",

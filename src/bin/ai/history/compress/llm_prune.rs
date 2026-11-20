@@ -13,15 +13,14 @@
 //!
 //! 1. Evidence messages keep their order and tool-call pairing; only obsolete
 //!    runtime protocol notes are removed.
-//! 2. The existing `compress/mod.rs` / `context_budget.rs` logic is not modified.
-//! 3. Pruning is **lossless and recallable**: the full pruned tool result is first written to the session asset, and the inline text
+//! 2. Pruning is **lossless and recallable**: the full pruned tool result is first written to the session asset, and the inline text
 //!    is replaced only by a recall stub carrying `file_path`; the model can `read_file` the full original at any time.
-//! 4. **Never prune when there is no archive directory (`overflow_dir=None`)**: prefer not compressing over doing
+//! 3. **Never prune when there is no archive directory (`overflow_dir=None`)**: prefer not compressing over doing
 //!    an irreversible content drop.
-//! 5. Reclamation only touches the temporary `messages` projection used per model request; persistence uses the separate
+//! 4. Reclamation only touches the temporary `messages` projection used per model request; persistence uses the separate
 //!    canonical `turn_messages`, so offloading never pollutes the real history.
-//! 6. The most recent `KEEP_RECENT_TOOL_GROUPS` groups of tool results are always protected, to avoid wrongly pruning results the current round still needs.
-//! 7. Tools whose policy defers to session state (`ToolPrunePolicy::AfterIntegration`, i.e. subagent
+//! 5. The most recent `KEEP_RECENT_TOOL_GROUPS` groups of tool results are always protected, to avoid wrongly pruning results the current round still needs.
+//! 6. Tools whose policy defers to session state (`ToolPrunePolicy::AfterIntegration`, i.e. subagent
 //!    results) become eligible only while [`PruneAuthorization`] proves the durable ledger recorded
 //!    every task the result refers to as integrated. An unreadable ledger authorizes nothing, so those
 //!    results stay inline rather than being unloaded on an unverified assumption.
@@ -73,9 +72,9 @@ fn needed_marks(content_chars: usize) -> u8 {
     }
 }
 
-/// Per-id variant of [`needed_marks`] for display: marks still required before
-/// this id offloads. For ids not found in `messages` (not an active candidate)
-/// this falls back to [`PRUNE_THRESHOLD`].
+/// Per-id mark threshold for legacy compatibility; this is the total required
+/// count, not the number of additional marks needed. Ids without a raw tool
+/// result in `messages` fall back to [`PRUNE_THRESHOLD`].
 pub(crate) fn needed_marks_for(messages: &[Message], tool_call_id: &str) -> u8 {
     messages
         .iter()
@@ -94,11 +93,10 @@ const PRESSURE_RECLAIM_MIN_TOTAL_CHARS: usize = 65_536;
 /// Bound the number of successful replacements at a request boundary.
 const PRESSURE_RECLAIM_MAX_ITEMS: usize = 8;
 
-/// Per-request cap on reclaimed characters. The largest candidate is always
-/// included (so one oversized item can never block reclamation); capping every
-/// request bounds how much of the projection prefix — and with it the prompt
-/// cache — a single request rewrites, and successive requests converge until
-/// no eligible backlog remains.
+/// Per-request cap on original characters selected for offload. The first
+/// successful offload may exceed it so one oversized item cannot block progress.
+/// The cap limits projection-prefix rewrites and prompt cache invalidation;
+/// later requests can continue draining eligible evidence.
 const PRESSURE_RECLAIM_MAX_CHARS: usize = 32_768;
 
 /// Stable header used only to recognize and remove legacy protocol notes.
@@ -107,10 +105,9 @@ pub(crate) const PRUNE_PROTOCOL_PROMPT: &str = "\n## Context Management Protocol
 /// Returns whether messages of this role are protected (never pruned).
 fn is_protected_role(role: &str) -> bool {
     !matches!(role, "tool")
-    // tool is not protected; all other roles are
 }
 
-/// Same as above, written more clearly.
+/// Only tool results carrying a tool-call id can enter the raw offload path.
 fn is_prunable_message(msg: &Message) -> bool {
     msg.role == "tool" && msg.tool_call_id.is_some()
 }
@@ -195,9 +192,8 @@ pub(crate) fn parse_prune_from_hidden_meta(
     (prune_ids, remaining)
 }
 
-/// Marker some models emit instead of the documented overflow channel (a `prune:`
-/// line inside `<meta:self_note>`); accepting it keeps a mark written in this shape
-/// from being dropped without a trace.
+/// Compatibility marker for prune directives accepted alongside `prune:` lines
+/// by [`parse_prune_from_hidden_meta`].
 const EMBEDDED_PRUNE_OPEN: &str = "<<<prune:";
 
 /// Closing marker of [`EMBEDDED_PRUNE_OPEN`].
@@ -245,7 +241,7 @@ fn normalize_id_token(token: &str) -> &str {
 /// that cannot be an id must never be reported as one: quoting the protocol
 /// otherwise turns whole sentences into "rejected marks".
 fn id_shape_matches(token: &str) -> bool {
-    /// Longer than any provider-issued tool_call_id; keeps a runaway token bounded.
+    /// Bound unrecognized id-shaped tokens; known request ids bypass this limit.
     const MAX_ID_CHARS: usize = 128;
     !token.is_empty()
         && token.len() <= MAX_ID_CHARS
@@ -334,8 +330,7 @@ pub(crate) fn parse_embedded_prune_directives(
     (ids, cleaned)
 }
 
-/// Directive-looking text that no accepted form parses, so the runtime can quote it
-/// back to the model instead of dropping the attempt silently.
+/// Collect unparsed directive-looking text for bounded compatibility diagnostics.
 ///
 /// Recognizes the two shapes of an attempted mark left in the text: a line starting
 /// with the `<<<prune:` marker whose span did not parse (missing closer, prose in the
@@ -378,36 +373,21 @@ pub(crate) fn unrecognized_prune_fragments(
     fragments
 }
 
-/// Updates the pruning counters ("tolerate silent rounds + monotonic
-/// accumulation" semantics).
+/// Update legacy prune counters with silence-tolerant accumulation.
 ///
-/// - `current_marks`: this session's prune counter table (tool_call_id →
-///   accumulated count)
-/// - `prune_ids`: the tool_call_ids the model marked this round
-/// - `active_prunable_tool_ids`: the tool_call_ids actually present in this
-///   round's messages and eligible for pruning
+/// - `current_marks`: stored cumulative counts by evidence id
+/// - `prune_ids`: ids marked in this response
+/// - `active_prunable_tool_ids`: ids whose counters the caller permits retaining,
+///   including ids of already-offloaded results
 ///
-/// Logic:
-/// 1. **Silent rounds never touch counters**: when the model produces no valid
-///    prune instruction this round (no id in `prune_ids` hits an active id),
-///    the whole table stays unchanged (only stale entries that left the context
-///    / are protected get cleaned up), so "back-to-back tool calls with an
-///    intermediate round that wrote no self_note" does not wrongly clear
-///    previously accumulated counts.
-/// 2. Ids marked this round get +1 (monotonic accumulation). **Existing
-///    unmarked entries stay unchanged, no decay**: each round the model usually
-///    marks "results it just finished using that have now gone stale" (a
-///    different id each round); applying decay to unmarked items would zero
-///    them before reaching the threshold, making the mechanism almost never
-///    fire under the most typical usage — exactly the hidden failure of the
-///    earlier decay version. Accumulation only grows, until the id actually
-///    leaves the context or is excluded by the protection policy.
-/// 3. Clean up entries no longer in the current context or excluded by the
-///    protection policy.
+/// Count each supplied id at most once per response, provided it is in the
+/// caller's retained-id set. Valid marks increment with saturation; silent
+/// rounds and unmarked ids retain their positive counts so later marks can
+/// reach the threshold. Drop zero counts and ids outside the retained set
+/// so stale counters cannot accumulate.
 ///
-/// Returns whether the mark map actually changed (counter increment, new entry,
-/// or removed entry), so callers can persist without cloning the whole map just
-/// to detect a diff.
+/// Return whether a counter or membership changed, allowing callers to persist
+/// only when necessary without cloning the map to detect changes.
 pub(crate) fn update_prune_marks(
     current_marks: &mut FxHashMap<String, u8>,
     prune_ids: &[String],
@@ -431,8 +411,7 @@ pub(crate) fn update_prune_marks(
         *count = updated;
     }
 
-    // Clean up entries with a zero count, no longer in the current context, or
-    // excluded by the protection policy.
+    // Discard zero counts and ids outside the caller's retained-id set.
     let len_before_cleanup = current_marks.len();
     current_marks.retain(|id, v| *v > 0 && active_prunable_tool_ids.contains(id));
     changed |= current_marks.len() != len_before_cleanup;
@@ -442,7 +421,8 @@ pub(crate) fn update_prune_marks(
 /// Collects the evidence ids eligible for lossless runtime reclamation.
 ///
 /// Protection policy:
-/// - Results of the most recent complete tool group keep their full text.
+/// - The most recent `KEEP_RECENT_TOOL_GROUPS` raw or folded groups with results
+///   stay protected, including partially answered raw groups.
 /// - Results of tools whose registration policy declares `prune: Never` (e.g.
 ///   `plan`) are never pruned.
 ///   Note `read_file` / retrieval-like tools, though "not lossy-compressible",
@@ -565,7 +545,7 @@ pub(crate) fn retained_prune_ids_authorized(
 }
 
 /// Fail-closed entry point kept for tests: it authorizes no conditional result,
-/// so production callers must use [`update_prune_marks_for_messages_authorized`].
+/// so production callers must use [`retained_prune_ids_authorized`].
 #[cfg(test)]
 pub(crate) fn retained_prune_ids(messages: &[Message]) -> FxHashSet<String> {
     retained_prune_ids_authorized(messages, &PruneAuthorization::default())
@@ -643,15 +623,11 @@ fn protected_tool_call_ids(
     protected
 }
 
-/// Explains why a marked id was not accepted this round, so the driver can
-/// surface actionable terminal feedback instead of silently dropping the mark
-/// (unexplained rejections make the model repeat useless marks). Returns
+/// Explain why a legacy prune mark is ineligible in the current projection. Returns
 /// `None` when the id is actually prunable.
 ///
-/// Deliberately per-id (rebuilds the small indexes on each call): rejections
-/// are rare (usually 0-2 per round), so clarity beats batching here. The
-/// checks mirror [`active_prunable_tool_ids_authorized`] but are ordered for message
-/// quality (why exactly, not merely that it is ineligible).
+/// Rebuild indexes per id. The checks mirror [`active_prunable_tool_ids_authorized`]
+/// but report a specific protection or size reason before generic ineligibility.
 pub(crate) fn explain_rejected_prune_mark_authorized(
     messages: &[Message],
     tool_call_id: &str,
@@ -728,8 +704,7 @@ pub(crate) fn explain_rejected_prune_mark(
     explain_rejected_prune_mark_authorized(messages, tool_call_id, &PruneAuthorization::default())
 }
 
-/// Pruning statistics of a single `apply_pruning` call, for the caller to
-/// print a terminal notice.
+/// Offload statistics from one pruning or automatic reclamation pass.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct PruneReport {
     /// Number of tool results or folded groups offloaded and inline-replaced
@@ -739,15 +714,14 @@ pub(crate) struct PruneReport {
     pub(crate) freed_chars: usize,
     /// Tool names involved (deduplicated, in first-appearance order).
     pub(crate) tools: Vec<String>,
-    /// Subset of `pruned_count` that the runtime reclaimed under context
-    /// pressure without a model mark (see [`reclaim_under_pressure_authorized`]),
-    /// so a caller can attribute the offload honestly in its notice.
+    /// Subset of `pruned_count` reclaimed automatically without a model mark
+    /// (see [`reclaim_under_pressure_authorized`]), so callers can distinguish
+    /// automatic reclamation from legacy mark replay.
     pub(crate) pressure_count: usize,
 }
 
 impl PruneReport {
-    /// Folds another report into this one, so a request that both applied model
-    /// marks and reclaimed under pressure presents a single aggregate.
+    /// Combine reports while preserving the first appearance of each tool name.
     pub(crate) fn merge(&mut self, other: PruneReport) {
         self.pruned_count += other.pruned_count;
         self.freed_chars += other.freed_chars;
@@ -760,7 +734,7 @@ impl PruneReport {
     }
 }
 
-/// Applies pruning to the messages array (lossless, recallable offload).
+/// Apply legacy prune marks to a request projection through lossless, recallable offloads.
 ///
 /// Tool messages whose accumulated marks reach the per-result threshold
 /// (`PRUNE_THRESHOLD`, or a single mark for results at or above
@@ -775,8 +749,8 @@ impl PruneReport {
 /// irreversible dropping. A single entry whose archive write fails also keeps
 /// its original text and is skipped.
 ///
-/// Messages protected by `protected_tool_call_ids` (the most recent complete
-/// tool group, and tools whose registration policy declares `prune: Never`,
+/// Messages protected by `protected_tool_call_ids` (the recent raw/folded group
+/// window, and tools whose registration policy declares `prune: Never`,
 /// e.g. `plan`) are never pruned, avoiding wrongfully pruning results needed
 /// this round or task-roadmap anchors.
 ///
@@ -1036,8 +1010,7 @@ pub(crate) fn ensure_prune_protocol_prompt_authorized(
     remove_prune_protocol_prompt(messages)
 }
 
-/// Fail-closed entry point kept for tests: it authorizes no conditional result,
-/// so production callers must use [`ensure_prune_protocol_prompt_authorized`].
+/// Test wrapper for legacy note cleanup; authorization does not affect removal.
 #[cfg(test)]
 pub(crate) fn ensure_prune_protocol_prompt(
     messages: &mut Vec<Message>,
@@ -1371,12 +1344,8 @@ mod tests {
         assert_eq!(marks.get("call_2"), Some(&2));
     }
 
-    /// Realistic distribution check: each round the model marks **different**
-    /// ids ("just used this round, newly stale") and never re-marks the same old
-    /// id. Under monotonic accumulation each id's count only grows, so after
-    /// several rounds the threshold is truly reached and pruning fires; under
-    /// the old decay semantics the counts would be zeroed before reaching the
-    /// threshold and never fire.
+    /// Marks on different ids must not decay earlier counters. Subsequent marks
+    /// on the same ids can then reach the threshold.
     #[test]
     fn test_update_prune_marks_distinct_ids_accumulate_monotonically() {
         let mut marks = FxHashMap::default();
@@ -1399,10 +1368,8 @@ mod tests {
         assert!(marks.values().any(|v| *v >= PRUNE_THRESHOLD));
     }
 
-    /// A silent round (no valid prune marks this round) must not zero existing
-    /// counters — this is the core fix of the new semantics over the old
-    /// "consecutive" one: intermediate rounds of back-to-back tool calls no
-    /// longer wrongly clear previously accumulated counts.
+    /// Silent rounds must preserve accumulated marks so an intermediate tool
+    /// round without a note does not reset the threshold's progress.
     #[test]
     fn test_update_prune_marks_silent_round_preserves_counts() {
         let mut marks = FxHashMap::default();
@@ -1635,8 +1602,7 @@ mod tests {
     fn test_apply_pruning_never_touches_user_or_assistant() {
         let overflow_dir = make_overflow_dir();
         let mut marks = FxHashMap::default();
-        // Even when user/assistant messages carry a matching "tool_call_id",
-        // they are not pruned
+        // Marks for tool calls must not affect user or assistant messages.
         marks.insert("call_1".to_string(), PRUNE_THRESHOLD);
         marks.insert("call_2".to_string(), PRUNE_THRESHOLD);
 
@@ -1698,7 +1664,7 @@ mod tests {
 
     /// Decoupling invariant: `read_file` declares `lossy_compress: Never` but
     /// `prune: Allow`, so although it is "not lossy-compressible", its stale old
-    /// results may still be pruned under LLM guidance. `plan` declares
+    /// results remain eligible for lossless offload. `plan` declares
     /// `prune: Never` and never becomes a pruning candidate.
     #[test]
     fn test_active_prunable_allows_read_file_but_protects_plan() {
@@ -1723,8 +1689,6 @@ mod tests {
 
         let ids = active_prunable_tool_ids(&messages);
 
-        // read_file is now prunable (it would have been excluded under the old
-        // behavior).
         assert!(ids.contains("call_read"));
         // plan remains protected by its registration policy and is never pruned.
         assert!(!ids.contains("call_plan"));
@@ -1900,8 +1864,6 @@ mod tests {
 
     #[test]
     fn test_prune_threshold_is_reasonable() {
-        // Ensure the threshold is neither 0 (would fire every round) nor above
-        // 10 (too conservative)
         assert!(PRUNE_THRESHOLD >= 1);
         assert!(PRUNE_THRESHOLD <= 10);
     }
@@ -2238,8 +2200,7 @@ mod tests {
     fn test_subagent_result_is_eligible_only_after_integration() {
         let messages = subagent_conversation(&["task_a"]);
 
-        // Un-integrated delivery: live state, so neither a candidate nor
-        // advertised to the model.
+        // An unintegrated delivery is live evidence and cannot be offloaded.
         assert!(
             !active_prunable_tool_ids_authorized(&messages, &PruneAuthorization::default())
                 .contains("call_sub")
@@ -2339,7 +2300,7 @@ mod tests {
         std::fs::remove_dir_all(&overflow_dir).ok();
     }
 
-    // ---- pressure reclaim: runtime-side offloading without a model mark ----
+    // ---- Automatic reclamation without a model mark ----
 
     /// Even a single small eligible result must shrink without model consent.
     #[test]
@@ -2499,11 +2460,11 @@ mod tests {
         std::fs::remove_dir_all(&overflow_dir).ok();
     }
 
-    /// Pressure never widens eligibility: the recent-results window, `prune:
+    /// Automatic reclamation never widens eligibility: the recent-results window, `prune:
     /// Never` tools, and un-integrated subagent deliveries stay inline while
     /// the runtime reclaims around them.
     ///
-    /// Every protected item is larger than the largest eligible candidate, so
+    /// Each protected result asserted below exceeds the largest eligible candidate, so
     /// a hole in any single protection would move that item to the front of the
     /// selection and fail its assertion instead of hiding behind the cap.
     #[test]
@@ -2583,8 +2544,7 @@ mod tests {
         std::fs::remove_dir_all(&overflow_dir).ok();
     }
 
-    /// The lossless floor outranks the pressure trigger: with no archive
-    /// directory nothing is reclaimed, however large the backlog is.
+    /// Without an archive directory nothing is reclaimed, however large the backlog is.
     #[test]
     fn test_pressure_reclaim_requires_an_archive_directory() {
         let mut messages = vec![

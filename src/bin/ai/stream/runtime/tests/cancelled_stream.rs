@@ -2,8 +2,7 @@ use super::*;
 
 #[test]
 fn cancelled_stream_result_finalizes_active_thinking_fold() {
-    // On cancel with an active fold window, it must be finalized (finalize→reset), preventing a partial
-    // thinking remnant with a new header stacked under it on the next retry (cross-turn root cause of duplicated headers + large blank areas).
+    // Cancellation must reset the active fold so a later turn cannot reuse its partial window.
     let mut state = StreamProcessingState::new();
     {
         let fold = &mut state.render.thinking_fold;
@@ -22,7 +21,6 @@ fn cancelled_stream_result_finalizes_active_thinking_fold() {
     assert!(result.skip_response_drain);
     assert_eq!(result.assistant_text, "partial body");
     assert_eq!(result.reasoning_text, "partial reasoning");
-    // After finalize the fold state is reset: no longer active, window rows zeroed, no orphan window left behind.
     assert!(!state.render.thinking_fold.active);
     assert_eq!(state.render.thinking_fold.window_rows, 0);
     assert!(state.render.thinking_fold.recent_lines.is_empty());

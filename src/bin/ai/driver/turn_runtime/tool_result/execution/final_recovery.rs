@@ -204,23 +204,13 @@ pub(in crate::ai::driver::turn_runtime) const REASONING_ONLY_SYNTHESIS_RETRY_NOT
 /// requests up to max_iterations.
 pub(in crate::ai::driver::turn_runtime) const REASONING_ONLY_POST_SYNTHESIS_MAX_RETRIES: usize = 2;
 
-/// Marker and cap for the completion gate's dedicated quota on reopening the current
-/// turn due to unintegrated subagent evidence.
-///
-/// Background: while task evidence remains unintegrated, the completion gate bounces the
-/// round back (reopen) and asks the model to `task_integrate`. But that veto was originally
-/// bounded only by `iteration < max_iterations` (4096), and each reopen cleared the old
-/// prompt marker with no accumulated count. When the subagent hit an **unintegratable**
-/// dead end such as TIMED_OUT, or the model kept refusing to call `task_integrate`, the turn
-/// would reopen forever and spin to the hard cap (one amplifier of the muse-spark dead loop).
-/// Here a persistent count marker records the reopen count within one turn; beyond the cap
-/// we stop reopening and fall back to the same degraded path as `iteration >= max_iterations`
-/// (attaching a warning and letting the ledger finalize).
+/// Persistent turn-local marker for subagent-evidence reopens. It survives request
+/// projection cleanup so unintegratable results cannot drive retries to the iteration
+/// cap. Once the dedicated budget is exhausted, finalization keeps the evidence and
+/// attaches a warning.
 pub(in crate::ai::driver::turn_runtime) const TASK_EVIDENCE_REOPEN_MARKER: &str =
     "[task-evidence-reopen-count]";
-/// Maximum number of reopens within one turn for “unintegrated evidence / unclosed subagent”.
-/// Set to 3: enough chances for the model to call `task_integrate` once it has the ledger,
-/// yet well before the iteration hard cap, avoiding infinite spinning on dead ends.
+/// Bound subagent-evidence reopens while allowing another chance to call `task_integrate`.
 pub(in crate::ai::driver::turn_runtime) const TASK_EVIDENCE_REOPEN_MAX: usize = 3;
 
 /// Count the completion-gate reopen markers already injected into the current `messages`.
@@ -298,16 +288,10 @@ pub(in crate::ai::driver::turn_runtime) enum FinalRecoveryAction {
     Warn,
 }
 
-/// Decide whether the final response merely regurgitates a context note the runtime
-/// injected, verbatim, without giving a real answer: after stripping the
-/// `[Runtime warning]` section the runtime appended post-hoc, the remaining visible body
-/// starts with one of [`INJECTED_CONTEXT_ECHO_SENTINELS`]. Such responses are worthless
-/// to the user and leak internal prompts to the terminal (especially common with weak
-/// models after a completion-evidence gate reopen).
-///
-/// Stay conservative: only handle the case where the whole body is an injected note. If
-/// the model quotes/discusses a sentinel in the body (sentinel not at the start, or
-/// followed by its own text) it is not an echo and is left to the other gates.
+/// Detect a final body beginning with an injected-context sentinel after stripping an
+/// appended runtime warning. This is a prefix check: additional model text after the
+/// sentinel does not exempt the response. Sentinels quoted elsewhere in the body do
+/// not trigger this gate.
 pub(in crate::ai::driver::turn_runtime) fn looks_like_injected_context_echo(
     final_text: &str,
 ) -> bool {

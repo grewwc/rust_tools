@@ -37,7 +37,7 @@ pub(crate) fn is_agent_team_mode() -> bool {
     })
 }
 
-/// Only quiet task-wait deadlines emit this marker; terminal events retain their existing path.
+/// Recognize compact `task_wait` summaries; terminal results use the collection format.
 pub(crate) fn is_agent_team_wait_deadline_message(message: &str) -> bool {
     message.starts_with(TASK_WAIT_DEADLINE_PREFIX)
 }

@@ -5,9 +5,9 @@
 // registry. The registry serves audit tracking; temp files are cleaned up by the runtime at
 // session end.
 //
-// The registry persists as a JSON file at `<temp_dir>/temp_registry.json` (`temp_dir` prefers
-// `~/.history_file.sessions/<session>.assets/tmp/`, same origin as tool-overflow and outside
-// the project; fallback is the system temp dir), so it survives restarts after a session ends.
+// The registry persists at `runtime_ctx::temp_dir()/temp_registry.json`, using session
+// assets with DRIVER_CTX or a system-temp directory otherwise. Registration state remains
+// available across process restarts while that directory is retained.
 // =============================================================================
 
 use std::path::PathBuf;

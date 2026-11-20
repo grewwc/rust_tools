@@ -192,10 +192,9 @@ fn resolve_file_path_arg(args: &Value) -> Result<&str, String> {
         .ok_or_else(|| "Missing file_path".to_string())
 }
 
-/// Normalizes file_path when temp=true: rejects absolute paths and out-of-bounds parent references, keeping only the file name.
-///
-/// This avoids `PathBuf::join` replacing the whole base when given an absolute path, writing the file into the
-/// project source tree while still registering it in the temp registry. The model only passes a relative file name (e.g. `script.py`).
+/// For `temp=true`, reject absolute paths and keep only the filename of relative paths.
+/// This prevents `PathBuf::join` from replacing the session temp base or retaining
+/// directory components that could point outside it.
 fn temp_file_name(file_path: &str) -> Result<std::path::PathBuf, String> {
     let p = std::path::Path::new(file_path);
     if p.is_absolute() {
@@ -257,10 +256,9 @@ fn execute_read_file_with_assets(
 
     let offset = args["offset"].as_u64().unwrap_or(1) as usize;
     let char_offset = args["char_offset"].as_u64().unwrap_or(0) as usize;
-    // Default window is intentionally small (200 lines): a large default pushes
-    // every unread-file call past the mid-turn spill threshold and forces an
-    // overflow fold. Callers page with offset/limit; the truncation notice
-    // below guarantees the continuation point, so no content is lost.
+    // Keep the default window small to limit mid-turn overflow pressure.
+    // Callers can page with offset/limit; the notice below reports the
+    // continuation point from the lines actually shown.
     let limit = args["limit"].as_u64().unwrap_or(200) as usize;
     // Numbered lines by default (grounding axis); with use_line_numbers=false, return raw content,
     // so the result can feed directly into apply_patch as exact source text or into other tools.
@@ -301,9 +299,8 @@ fn execute_read_file_with_assets(
     };
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
-    // An out-of-bounds offset or an empty file must not silently return an empty string: the model misreads "empty result"
-    // as "file is empty" and draws wrong conclusions (a past session re-read an archive file as empty and retried repeatedly).
-    // Here the two abnormal cases are distinguished explicitly; the normal paging path keeps its original behavior.
+    // Distinguish an empty file from an out-of-bounds offset so an empty result
+    // cannot be mistaken for proof that the file has no content.
     if total == 0 {
         return Ok(
             "... [note: file is empty (0 lines); read_file returned no lines. \
@@ -377,9 +374,8 @@ const WINDOW_CAP_CHARS: usize = MAX_READ_FILE_RESULT_CHARS;
 /// whole file nor loads it entirely into memory.
 pub(crate) const FULL_READ_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Chunk size for the windowed reader: bounds how long each read holds the global kernel lock
-/// (~1 MiB of page-cache IO is sub-millisecond on SSD), so one big read can no longer stall every
-/// other tenant of the shared kernel.
+/// Bound each `FileStore::read_range` call so large reads release the shared
+/// kernel lock between chunks.
 pub(crate) const WINDOW_READ_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// When this read did not reach end-of-file, append an explicit note telling the model that more lines remain
@@ -388,7 +384,8 @@ pub(crate) const WINDOW_READ_CHUNK_BYTES: usize = 1024 * 1024;
 /// `shown_end` must be the **actually rendered line number** (`start + shown_lines`), not derived from the requested
 /// `limit` — otherwise, when the char cap truncates early, the continuation `offset` points to the wrong place and middle
 /// lines get silently skipped. `size_capped` means this truncation was triggered by the char cap (not exhausted lines);
-/// `truncated_mid_line` means the last line was cut mid-line due to size (the rest is discarded).
+/// `truncated_mid_line` means the last shown line was cut; `next_char_offset`
+/// locates its remaining text for a subsequent read.
 fn append_truncation_notice(
     mut rendered: String,
     start: usize,
@@ -400,8 +397,7 @@ fn append_truncation_notice(
 ) -> String {
     let remaining = total.map(|t| t.saturating_sub(shown_end));
     // When the exact total is known and everything was shown, there is nothing to continue with.
-    // (The windowed reader reports `total: None` only when it knows more lines exist past the
-    // scanned window, in which case a notice is always required.)
+    // A missing total leaves completeness unknown, so the notice is still required.
     if let Some(rem) = remaining {
         if rem == 0 && !truncated_mid_line {
             return rendered;
@@ -461,8 +457,8 @@ fn append_truncation_notice(
 struct WindowedRead {
     /// Raw window lines (no display prefixes), joined by '\n'.
     content: String,
-    /// Exact line count of the whole file when the scan reached end-of-file; `None` when the file
-    /// continues past the window (exact count unknown).
+    /// Exact line count of the whole file when the scan reached end-of-file;
+    /// `None` when the scan did not establish a total.
     total_lines: Option<usize>,
     /// Number of logical lines retained in the window.
     line_count: usize,
@@ -975,13 +971,10 @@ fn strip_window_line_number_layer(
 
 /// Single-write size cap for the `write_file` tool, in bytes (`content.len()`).
 ///
-/// A single write may take at most a quarter of the streaming layer's per-turn total
-/// tool-argument budget (1 MiB, `MAX_TOOL_ARG_BYTES`), covers anything a model can legitimately
-/// emit in one response (32K-128K output tokens are roughly 64-256KB of text), and fails fast
-/// with an actionable error instead of stalling the response stream (45s no-progress cut plus
-/// degenerate retry loop) on multi-megabyte generations. Measured in bytes to match the stream
-/// cap and the on-disk size. The cap lives at the tool boundary only: `FileStore::write_all`
-/// stays unbounded so internal flows (patch application, mutation restore) are unaffected.
+/// Reject large model-generated writes before filesystem side effects, using the
+/// same byte measure as tool-argument limits and on-disk content. The tool boundary
+/// owns this cap; internal `FileStore::write_all` calls can still apply patches or
+/// restore recorded mutations.
 const MAX_WRITE_FILE_BYTES: usize = 256 * 1024;
 
 /// Reject oversized `write_file` content before any filesystem side effect.
@@ -1449,9 +1442,8 @@ mod tests {
             output.chars().count()
         );
 
-        // Parse the continuation offset from the note and verify it points to "the line after the last actually displayed line",
-        // and that continuing fetches the immediately following content (no skipped lines). Wide-line files that hit the char cap
-        // are truncated "mid-line"; continuation resumes from the same line's breakpoint via offset + char_offset, never skipping ahead.
+        // Continue at the last displayed line's character breakpoint so the
+        // remainder of that line is returned before any later lines.
         let marker = "Continue same line: offset=";
         let idx = output.find(marker).expect("mid-line continue present");
         let rest = &output[idx + marker.len()..];
@@ -1912,9 +1904,8 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// Builds `count` lines of 17 bytes each ("0123456789abcdef\n"). 246723 lines ≈ 4.19 MiB,
-    /// i.e. just below FULL_READ_MAX_BYTES (whole-file path); 246724 lines pushes just above it
-    /// (windowed path).
+    /// Builds fixed-width lines for testing the `FULL_READ_MAX_BYTES` boundary.
+    /// Adjacent line counts can select either the whole-file or windowed reader.
     fn big_grid_content(count: usize) -> String {
         let mut s = String::with_capacity(count * 17);
         for _ in 0..count {
@@ -2068,9 +2059,8 @@ mod tests {
     #[test]
     fn test_read_file_windowed_multibyte_crlf_across_chunk_boundaries() {
         let path = make_temp_path("big_utf8");
-        // "日本語\r\n" is 11 bytes per line; 400_000 lines ≈ 4.4 MiB > FULL_READ_MAX_BYTES. 1 MiB
-        // chunks cut through both the multibyte chars and the CRLF pairs, exercising the tail
-        // char-boundary trim and the CRLF normalization across chunk boundaries.
+        // Multibyte CRLF rows put this fixture above `FULL_READ_MAX_BYTES`,
+        // selecting the windowed reader while keeping a short rendered page.
         let mut content = String::with_capacity(400_000 * 11);
         for _ in 0..400_000 {
             content.push_str("日本語\r\n");
@@ -2103,8 +2093,7 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("overflow-history.md");
-        // Numbered lines mirroring a rendered read_file snapshot; ~17 bytes per line × 450_000
-        // lines ≈ 7 MiB, so the windowed path (and its strip gate) is exercised.
+        // Enough numbered rows to select the windowed reader and exercise its strip gate.
         let mut content = String::new();
         for i in 1..=450_000 {
             content.push_str(&format!("{:>6}\tvalue {i}\n", i));

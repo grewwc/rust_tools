@@ -19,9 +19,8 @@ use rusqlite::{Connection, Error as RusqliteError, ErrorCode, OpenFlags};
 // commit's frames.
 pub(super) const HISTORY_WAL_SIZE_LIMIT_BYTES: i64 = 4 * 1024 * 1024;
 
-// History connections are pooled so that every read/write avoids
-// `Connection::open` + PRAGMA setup, and so that `prepare_cached`'s statement
-// cache is genuinely reused across calls.
+// Pooling history connections amortizes `Connection::open` + PRAGMA setup
+// and reuses `prepare_cached`'s statement cache across calls.
 //
 // Safety:
 // - The pools are shared by all threads, but a connection is removed from the
@@ -29,13 +28,11 @@ pub(super) const HISTORY_WAL_SIZE_LIMIT_BYTES: i64 = 4 * 1024 * 1024;
 //   callers ever use the same `Connection` concurrently. `HistoryConnection` is
 //   `!Send`, so a checked-out handle cannot migrate to another thread either.
 // - Read paths do not hold the per-session `Mutex` (concurrent writers still write
-//   through their own connections), but every read opens a fresh
-//   `conn.transaction()` and commits within the same call: WAL's per-transaction
-//   snapshot always sees the latest committed state, so a reused connection never
-//   reads stale data.
+//   through their own connections). Each read uses a new transaction or statement
+//   snapshot, so caching a connection does not pin an earlier read snapshot.
 // - The `(dev, ino, len)` fingerprint has a single job: verify before reuse that
 //   the underlying file was not renamed/replaced wholesale. File replacement
-//   operations (rollback/compact/reset) change the inode, in which case we drop
+//   operations (rollback/reset) change the inode, in which case we drop
 //   the old connection and reopen, matching the semantics of opening a fresh one.
 //
 // Both pools are bounded per process, never per thread: the runtime runs many
@@ -134,8 +131,9 @@ fn file_identity(_metadata: &fs::Metadata) -> Option<FileIdentity> {
 /// A connection checked out from the process-wide write pool.
 ///
 /// It dereferences to [`Connection`], so call sites keep using the normal
-/// rusqlite API. Dropping it returns the connection to the cache when the file
-/// is still the same one and no transaction is open; otherwise it is closed.
+/// rusqlite API. Dropping it rolls back any open transaction and returns the
+/// connection to the cache if the file identity still matches; a failed rollback
+/// or identity check closes it.
 pub(super) struct HistoryConnection {
     path: PathBuf,
     identity: Option<FileIdentity>,
@@ -260,9 +258,10 @@ pub(super) fn open_history_db_with_busy_timeout(
     // compaction read/write paths). It must therefore never retry with a blocking
     // sleep — that would stall a tokio worker. Transient I/O failures (such as
     // SQLITE_IOERR_FSTAT when concurrently opening the WAL for the first time) are
-    // uniformly reported as `WouldBlock` and left to the async call site's
+    // reported as `WouldBlock`, as are all busy, locked, and system-I/O errors,
+    // and left to the async call site's
     // non-blocking retry loop (`tokio::time::sleep`); purely synchronous call sites
-    // rely on SQLite's own busy_timeout. Non-transient errors propagate unchanged.
+    // rely on SQLite's own busy_timeout. Other errors propagate unchanged.
     try_open_history_db(path, busy_timeout)
 }
 
@@ -314,7 +313,7 @@ fn fresh_connection(path: &Path, busy_timeout: Duration) -> Result<Connection, i
 
 /// Runs a read-only operation on a cached history connection. Connections come
 /// from a small process-wide pool and automatically reconnect when the
-/// underlying file's inode/size changes (rollback/compact/reset and other
+/// underlying file's inode/size changes (rollback/reset and other
 /// replacement operations), giving the same semantics as opening a fresh
 /// connection each time while saving the per-turn open + PRAGMA and statement
 /// recompilation costs.

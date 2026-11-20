@@ -124,7 +124,7 @@ pub(in crate::ai) fn prepare_subagent_history(
 
 /// The text history backend cannot use SQLite Online Backup. Write a
 /// temporary file in the same directory and then rename it, so the sub-agent
-/// never observes half of the parent history; when the parent file does not
+/// never observes a partially staged copy; when the parent file does not
 /// exist yet, inheritance is equivalent to an empty history.
 fn publish_text_subagent_history(
     parent: &Path,
@@ -257,10 +257,10 @@ pub(in crate::ai) fn preserve_subagent_history(path: &Path) -> Option<PathBuf> {
     if let Err(error) = std::fs::remove_file(path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
-        // The rename/copy fallback branches already moved the original away, so NotFound is
-        // expected there; any other failure leaves a stale, uncheckpointed DB at the original
+        // A successful rename makes NotFound expected; backup and copy leave removal to this
+        // step. Any other failure leaves a stale, uncheckpointed DB at the original
         // path that the sidecar cleanup below no longer protects. Surface it instead of silently
-        // discarding it; the preserved snapshot itself is already complete at this point.
+        // discarding it; the preserved main file already exists at this point.
         eprintln!(
             "[Warning] preserved subagent history at {} but failed to remove the original {}: {error}",
             preserved.display(),
@@ -471,7 +471,7 @@ struct ContextHistoryCacheKey {
     file_len: Option<u64>,
     modified_unix_ms: Option<u128>,
     /// The write version of the history DB (`meta.history_revision`),
-    /// incremented within every write transaction. In WAL mode the main
+    /// advanced by canonical history and context-projection changes. In WAL mode the main
     /// file's len/mtime can stay unchanged for a long time, so relying on
     /// file metadata alone would let the cache wrongly hit deleted or
     /// rewritten history. This revision is a strong invalidation signal
@@ -533,9 +533,9 @@ pub(in crate::ai) fn is_system_like_role(role: &str) -> bool {
     types::is_system_like_role(role)
 }
 
-/// Canonical message list with per-message source-model provenance (the model
-/// that produced each message), for display paths that attribute content to its
-/// origin. SQLite history carries the model column; legacy blob history has none.
+/// Canonical messages with the `source_model` recorded for their write batch,
+/// for display paths that show model provenance. SQLite carries this side
+/// metadata; legacy blob history has none.
 pub(in crate::ai) fn build_message_arr_with_models(
     history_file: &Path,
 ) -> Result<Vec<(Message, Option<String>)>, Box<dyn std::error::Error>> {
@@ -556,7 +556,7 @@ pub(in crate::ai) fn build_message_arr_with_models(
 /// and never participate in rewind write-back.
 ///
 /// Each message is returned alongside its persisted `source_model` provenance
-/// so the view can label content by its producing model. Messages expanded
+/// so the view can label content by its recorded model. Messages expanded
 /// from overflow archives carry `None`: the archives do not persist a
 /// per-message model, so their provenance is unknown rather than inherited
 /// from the stub (see `archive::expand_overflow_archives`).
@@ -975,8 +975,6 @@ pub(in crate::ai) fn invalidate_context_history_cache_for(history_file: &std::pa
     cache.retain(|entry| entry.key.history_file != history_file);
 }
 
-/// Clear the entire context history cache. Used in extreme scenarios (e.g.
-/// cleanup tasks, unit tests).
 #[allow(dead_code)]
 pub(in crate::ai) fn clear_context_history_cache() {
     if let Ok(mut cache) = CONTEXT_HISTORY_CACHE.lock() {
@@ -1193,8 +1191,8 @@ async fn compact_session_history_with_app_inner(
     let _hooks = crate::ai::driver::hooks::CompressionHookGuard::new();
     // Use exactly the same mechanical compression strategy as the next
     // `build_context_history` call and write the result back into the context
-    // snapshot. Raw messages exist only in the canonical layer and are never
-    // overwritten by compression.
+    // snapshot for SQLite, leaving canonical messages intact. The legacy text
+    // backend replaces its file because it has no separate projection store.
     let outcome = compress::compress_messages_for_context_with_outcome(
         messages.clone(),
         app.config.history_max_chars,
@@ -1203,8 +1201,8 @@ async fn compact_session_history_with_app_inner(
         Some(overflow_dir),
         cwd,
     );
-    // A failed recovery write is the only reason to keep the previous
-    // snapshot: the removed span has no archive to point at, so the next
+    // Keep the previous snapshot when recovery evidence could not be archived:
+    // the removed span has no archive to point at, so the next
     // boundary must read canonical history again and retry. An unmet budget is
     // not a failure (`Complete` never promises that protected messages fit
     // inside `history_max_chars`, and `Disabled` keeps every message as is),
@@ -2477,7 +2475,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(app.config.history_file.parent().unwrap());
     }
 
-    /// Recovery storage failing is the one outcome that must not replace the
+    /// Recovery storage failure must not replace the
     /// snapshot, and repairing it must let the unchanged history persist on the
     /// next attempt.
     #[tokio::test]
@@ -2541,7 +2539,6 @@ mod tests {
         // returns None without error.
         assert!(preserve_subagent_history(&history).is_none());
 
-        // Returns None when the file does not exist.
         assert!(preserve_subagent_history(&dir.join("missing.jsonl")).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);

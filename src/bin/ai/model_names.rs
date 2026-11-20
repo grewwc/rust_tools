@@ -9,9 +9,8 @@ use rust_tools::cw::SkipSet;
 use super::provider::{ApiProvider, ModelQualityTier, ReasoningEffort};
 use super::request_protocol::RequestProtocolDialect;
 
-/// Default `true` for opt-in capability flags. Matches the `models.rs` fallback
-/// used when a registry entry omits the field, so minimal user configs keep
-/// working instead of failing to parse.
+/// Default tool support to enabled, matching `models::tools_enabled` in
+/// `models.rs` so minimal registry entries retain tool access.
 fn default_true() -> bool {
     true
 }
@@ -233,7 +232,8 @@ pub struct ModelDef {
     /// answer is printed twice"). Off by default: undeclared model behavior is completely unchanged.
     #[serde(default)]
     pub reasoning_in_content: bool,
-    /// Subagent model selection priority (higher wins). Within a tier, models are sorted by this value descending.
+    /// Subagent model preference (higher wins). Primary selection first favors
+    /// candidates that satisfy the target quality tier.
     /// Defaults to 0; users can override it in ~/.config/rust_tools/models/ (or the legacy single-file
     /// ~/.config/rust_tools/models.json) to adjust preference without recompiling.
     #[serde(default)]
@@ -317,12 +317,9 @@ where
     }
 }
 
-/// Process-global snapshot of the model registry (built-in `models/` plus the
-/// user registry). The registry is re-read whenever either directory's
-/// modification time changed, so a model file edited after startup is picked
-/// up without a restart; while the directories are untouched the parsed result
-/// is reused. The snapshot is shared across threads, so every caller observes
-/// one stable set of `ModelDef` allocations.
+/// Shared model-registry snapshot. `registry_state` reloads it when the stamps
+/// from `registry_stamp` change. Previous allocations stay live across reloads
+/// so callers can retain the returned `&'static ModelDef` references.
 struct RegistryState {
     user_models: Vec<ModelDef>,
     builtin_models: Vec<ModelDef>,
@@ -349,10 +346,9 @@ fn empty_registry_state() -> &'static RegistryState {
 static REGISTRY: LazyLock<Mutex<&'static RegistryState>> =
     LazyLock::new(|| Mutex::new(empty_registry_state()));
 
-/// Identity of the on-disk registry inputs: the newest file mtime in each
-/// directory, or `None` when the directory cannot be listed. Re-reading only
-/// when this changes keeps steady-state lookups free of directory scans while
-/// still observing added, removed, and rewritten model files.
+/// Reload stamps are the newest JSON-file modification times in each directory,
+/// or the legacy user file's time when its directory is absent. Computing the
+/// stamps scans the directories; unchanged stamps reuse the parsed registry.
 
 fn registry_stamp() -> Option<(Option<SystemTime>, Option<SystemTime>)> {
     let builtin_stamp = dir_stamp(&builtin_config_dir());
@@ -561,12 +557,9 @@ fn load_models_from_file(path: &Path) -> Option<Vec<ModelDef>> {
     }
 }
 
-/// Load-time validation: hard errors for values that cannot work (the caller
-/// fails the file so misconfigurations surface at startup, not mid-task),
-/// warnings only for merely suspicious ones. In particular the
-/// silent-truncation pairing (`max_output_tokens` must stay below the
-/// effective window, see the `clamp_max_tokens_for_prompt` guard) is rejected
-/// here instead of truncating every long response.
+/// Reject unusable declared values before publishing a registry snapshot.
+/// Empty keys, zero limits, and output caps at or above an explicitly declared
+/// context window are errors; suspicious values only produce warnings.
 fn validate_model_def(model: &ModelDef, path: &Path) -> Result<(), String> {
     if model.key.trim().is_empty() {
         return Err("model with empty `key` will never resolve; check for a typo".to_string());
@@ -629,9 +622,9 @@ fn validate_model_def(model: &ModelDef, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Read all `*.json` model files in the directory (sorted by filename for a deterministic load order).
-/// With `strict` true, any file read/parse failure returns `None` (used by the built-in registry to
-/// exit immediately instead of silently degrading); with false, bad files are skipped and loading continues (user registry).
+/// Load JSON model files in filename order for deterministic indexing.
+/// With `strict` set, any file read, parse, or validation error fails the load;
+/// otherwise invalid files are skipped. Both registry loaders use strict mode.
 fn load_models_from_dir(dir: &Path, strict: bool) -> Option<Vec<ModelDef>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -679,9 +672,8 @@ fn load_models_from_dir(dir: &Path, strict: bool) -> Option<Vec<ModelDef>> {
 }
 
 fn load_user_models() -> Result<Vec<ModelDef>, String> {
-    // New-format directory takes precedence; fall back to the legacy single-file override when absent.
-    // Fail fast like the builtin registry: a broken user file exits with the
-    // file-specific reason already printed, instead of silently skipping it.
+    // The directory takes precedence over the legacy single file. Propagate
+    // load failures so the cache can retain the previous registry snapshot.
     let dir = user_config_dir();
     if dir.is_dir() {
         return load_models_from_dir(&dir, true).ok_or_else(|| {
@@ -740,12 +732,9 @@ fn build_builtin_key_index(models: &[ModelDef]) -> SkipMap<String, usize> {
     index
 }
 
-/// Phase 2 of key-index building: insert backward-compat `name-adapter`
-/// aliases only when they do not collide with an already-inserted key or
-/// handle. A registry entry keyed `example-model-alibaba` must not
-/// be hijacked by another entry's legacy alias of the same shape (e.g. a
-/// token-plan twin whose `name` is `example-model` under the
-/// `alibaba` adapter); keys always win over aliases.
+/// Insert legacy `name-adapter` aliases only when they do not collide with
+/// handles, keys, or declared aliases already in the index. This keeps a legacy
+/// alias from hijacking another entry's explicit identifier.
 fn insert_legacy_aliases_after_keys(index: &mut SkipMap<String, usize>, models: &[ModelDef]) {
     for (i, m) in models.iter().enumerate() {
         if let Some(legacy) = legacy_adapter_handle(m) {

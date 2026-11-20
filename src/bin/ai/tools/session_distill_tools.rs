@@ -1,10 +1,9 @@
 //! Session-distill agent tool: distill a session archive zip into knowledge.
 //!
-//! Kept separate from `knowledge_tools.rs` on purpose: knowledge_* tools are
-//! small CRUD operations on the live store, while this is a file-driven
-//! pipeline (zip in, up to N entries out) that only runs when the user
-//! explicitly asked to distill an archive. It stays out of the resident
-//! schema (`groups: ["knowledge"]` only) and loads via `enable_tools`.
+//! Kept separate from `knowledge_tools.rs`: archive distillation needs an
+//! asynchronous file pipeline rather than a single live-store operation.
+//! The tool description reserves it for explicit user requests. It is outside
+//! the default resident schema and loads via the knowledge group or `enable_tools`.
 
 use serde_json::Value;
 

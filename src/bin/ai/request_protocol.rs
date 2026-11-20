@@ -11,8 +11,7 @@ pub(crate) enum RequestProtocolDialect {
     Responses,
     /// Anthropic Messages API wire (`/v1/messages`): `x-api-key` auth, a
     /// `messages` array with content blocks, and `message_*` / `content_block_*`
-    /// SSE events. Used by Anthropic-native models served through gateways that
-    /// only expose this protocol (e.g. OpenCode Zen serving claude-opus-5-5).
+    /// SSE events.
     Messages,
 }
 

@@ -40,19 +40,11 @@ pub(in crate::ai) fn cap_raw_tool_results_for_context(
     )
 }
 
-/// Prefixes of all "auto-compaction summary" notes. The writer side (which
-/// generates summary notes) and the recognizer side (duplicate guard, sqlite
-/// resume points, request-side grouping) **must share this one list**; otherwise
-/// the two sides split apart — "prefixes written are not recognized". Historically
-/// `长期记忆摘要（压缩保留）` was never registered and thus bypassed the
-/// duplicate guard, causing a summary note to be re-inserted every turn, the
-/// context budget to creep up continuously, and the compaction pipeline to spin
-/// on every turn. When adding a new summary prefix, change only this list.
-///
-/// Note: entries must be bare prefixes "after leading whitespace is stripped";
-/// detection uniformly goes through [`is_summary_note_text`], which `trim_start`s
-/// first and then checks `starts_with` one by one, so full-width/half-width
-/// colons only need to be listed once each.
+/// Prefix registry for automatic compaction summaries. Detection callers in
+/// guards, persistence, and request normalization share [`is_summary_note_text`]
+/// so emitted summaries are recognized consistently.
+/// Entries exclude leading whitespace; detection applies `trim_start` before
+/// matching. Register any newly emitted summary prefix here.
 pub(in crate::ai) const SUMMARY_NOTE_PREFIXES: &[&str] = &[
     "对话摘要（自动压缩",
     "历史摘要（自动压缩",
@@ -117,25 +109,12 @@ pub(in crate::ai) const KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MIN: usize = 2;
 
 pub(in crate::ai) const KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX: usize = 3;
 
-/// Number of "recent user-turn" tail-window turns to fully exempt from
-/// trimming/spilling/folding.
-///
-/// The base rule (pick one by total size) is unchanged: <=48K -> 3 turns,
-/// otherwise 2 — zero behavior change for normal sessions.
-///
-/// **Byte-cap escape valve** (active when `budget > 0`): the protected tail window
-/// is a "full exemption zone" and must not itself exceed the entire history
-/// budget. Tool-heavy agentic sessions (few user turns x hundreds of tool calls
-/// per turn) can balloon the tail window to MB scale and **structurally prevent
-/// convergence** — even hundreds of tool groups inside the window are all
-/// exempted. In that case shrink the protected turn count step by step, exposing
-/// tool groups "from the second-to-last turn and earlier" to the fold/spill paths
-/// to restore convergence. **Floor invariant: never below 1 turn** — the newest
-/// user turn and its tool groups are always kept verbatim (the group-level
-/// protection of `KEEP_RECENT_TOOL_GROUPS` remains the backstop).
-///
-/// `budget == 0` means the caller explicitly sets no cap (old behavior kept), for
-/// reuse in contexts without a budget.
+/// Tail window of real user turns used by trimming fallbacks. Choose the base
+/// window by total billed chars; when that tail exceeds a nonzero budget,
+/// reduce the retained turn count so older turns become eligible.
+/// Never reduce below one user turn. Separate tool-group windows may still fold
+/// or offload older groups within that turn.
+/// `budget == 0` disables this reduction.
 pub(in crate::ai) fn keep_recent_user_turns_when_trimming(
     messages: &[Message],
     budget: usize,
@@ -231,8 +210,8 @@ pub(in crate::ai) fn compressed_tool_evidence_inline_chars_limit() -> usize {
 /// `history/mod.rs`.
 pub(in crate::ai) const MAX_INCREMENTAL_SUMMARY_INLINE_CHARS: usize = 8_000;
 
-/// Keep only the `self_note:` entries among the most recent `keep_recent`
-/// internal_notes. Other internal_notes (cache hints, loop-breakers, history
+/// Keep only the most recent `keep_recent` self_note entries.
+/// Other internal_notes (cache hints, loop-breakers, history
 /// summaries) are outside the pruning scope.
 pub(in crate::ai) fn trim_self_notes_to_recent(
     messages: Vec<Message>,
@@ -532,10 +511,8 @@ fn compress_messages_for_context_full(
         )
     };
 
-    // Prune the self_note sliding cap before large-block compaction, so the
-    // self_notes accumulated over thousands of turns (already written to
-    // MemoryStore; the copy in messages is just a redundant backup) do not bloat
-    // monotonically. MemoryStore still keeps every record.
+    // Limit inline self_note copies before larger compaction. This pass changes
+    // only the message projection; MemoryStore manages durable memory retention.
     let messages = trim_self_notes_to_recent(messages, MAX_SELF_NOTES_IN_MESSAGES);
 
     // Converge duplicate summary/archive notes piled up by past duplicate-guard
@@ -624,7 +601,7 @@ fn compress_messages_for_context_full(
 /// Char cap applied to "assistant narration carrying tool_calls" in the persisted
 /// history.
 ///
-/// The folder [`tool_groups::fold_tool_call_group_to_stub`] uses the visible
+/// The folder [`tool_groups::plan_tool_call_group_fold`] uses the visible
 /// narration before this turn's tool calls as the source of
 /// `assistant_checkpoint`. Except for continuation state the model protocol
 /// explicitly requires replaying, full reasoning_content is never persisted and
@@ -676,11 +653,8 @@ pub(in crate::ai) fn is_persisted_reasoning_replay(reasoning: &str) -> bool {
         || reasoning.starts_with(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX)
 }
 
-/// Runtime master switch for cross-turn encrypted reasoning replay. On by
-/// default; setting `AIOS_DISABLE_ENCRYPTED_REPLAY=1` short-circuits persistence
-/// and request-side rebuild, for A/B experiments reproducing the "pre-fix"
-/// behavior (encrypted reasoning lost across turns/resume). Experimental
-/// scaffolding only; default product behavior is unchanged.
+/// Runtime switch for cross-turn encrypted reasoning replay. Enabled unless
+/// `AIOS_DISABLE_ENCRYPTED_REPLAY` has a nonempty value other than "0".
 pub(in crate::ai) fn encrypted_reasoning_replay_runtime_enabled() -> bool {
     std::env::var("AIOS_DISABLE_ENCRYPTED_REPLAY")
         .map(|v| v.trim().is_empty() || v == "0")
@@ -797,17 +771,13 @@ fn sanitize_owned_message_for_persisted_history(
         return sanitized;
     }
 
-    // The persisted history keeps only the assistant facts truly needed across
-    // turns:
+    // Preserve bounded narration and protocol continuation state across turns:
     // - Unmarked `reasoning_content` is hidden reasoning and is never copied
     //   into visible body text. Marked continuation state stays intact; when
     //   the provider only needs the field shape, requests fill an empty string.
-    // - Assistant narration carrying tool_calls must not be emptied: otherwise
-    //   the checkpoint of [`tool_groups::fold_tool_call_group_to_stub`] sees no
-    //   text at all and collapses into
-    //   "assistant_checkpoint: <empty; no persisted decision before these tool calls>"，
-    //   leaving the model amnesic after compaction, re-gathering evidence from
-    //   the same turn.
+    // - Preserve visible tool-call narration so `tool_groups::plan_tool_call_group_fold`
+    //   can use it as a checkpoint. If no narration was emitted, the folder
+    //   reconstructs tool activity from calls instead of copying hidden reasoning.
     //
     if sanitized
         .tool_calls
@@ -889,19 +859,12 @@ pub(in crate::ai) fn sanitize_persisted_history_messages(messages: Vec<Message>)
         .collect()
 }
 
-/// Converge the multiple summary/archive notes piled up by past duplicate-guard
-/// breakage.
+/// Merge legacy summary bodies and duplicate archive pointers while preserving
+/// source-bound increments.
 ///
-/// Background: the `长期记忆摘要（压缩保留）` prefix was once not registered in
-/// `is_summary_message`, so every compaction round re-inserted a "summary +
-/// archive" note pair at the top; a long session could pile up dozens of pairs,
-/// polluting the context budget and inflating `total_chars` until the compaction
-/// pipeline spun on every turn.
-///
-/// Folding policy (lossless):
+/// Folding policy:
 /// - **Legacy summary notes**: dedupe and concatenate each body (header stripped)
-///   in original order into **one** note, put back where the first summary sat.
-///   The "initial goal" each evicted round recorded is therefore fully kept.
+///   in original order into **one** note at the first legacy summary/archive slot.
 /// - **Archive-pointer notes**: keep only one when contents are identical, keep
 ///   all when they differ, placed right after the merged summary — avoids losing
 ///   back-references to other archive files when importing/migrating sessions.
@@ -927,7 +890,7 @@ pub(in crate::ai) fn coalesce_accumulated_summary_notes(messages: Vec<Message>) 
         return messages;
     }
 
-    // Merge all summary bodies and dedupe archive pointers with identical
+    // Merge legacy summary bodies and dedupe archive pointers with identical
     // content; both keep their original order.
     let mut merged_bodies: Vec<String> = Vec::new();
     let mut seen_summary_bodies = rustc_hash::FxHashSet::<String>::default();

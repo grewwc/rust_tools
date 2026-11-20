@@ -27,10 +27,9 @@ pub(in crate::ai::request) struct ResponsesReasoningReplayStats {
 }
 
 impl RequestProtocolDialect {
-    /// Serializes the request into wire bytes. chat-completions goes straight through `to_vec`,
-    /// avoiding a `to_value` deep clone of the whole request before a second serialization (the
-    /// waste grows with history/tool schemas); the responses dialect still needs to build a Value
-    /// first, then serialize.
+    /// Serialize ordinary chat-completions requests directly to avoid deep
+    /// cloning history and tool schemas. Cache breakpoints, Responses, and
+    /// Messages require an intermediate `Value` before serialization.
     pub(super) fn build_http_body(self, request: &RequestBody<'_>) -> Vec<u8> {
         match self {
             Self::ChatCompletions if request.explicit_cache_breakpoints => {
@@ -54,14 +53,14 @@ impl RequestProtocolDialect {
     }
 }
 
-/// Anthropic Messages API body: a top-level `system` string, a `messages` array
+/// Anthropic Messages API body: a top-level `system` field, a `messages` array
 /// of content-block messages, `tools` as `{name, description, input_schema}` and
 /// a required `max_tokens`. History roles map onto Anthropic user/assistant
 /// blocks; OpenAI-shaped tool calls become `tool_use` blocks and tool results
 /// become `tool_result` blocks inside a user message. Extended thinking is
 /// merged in from `request.thinking` (produced by the thinking dialect) and the
-/// assistant thinking chain is replayed as `thinking` blocks, so vision and
-/// thinking stay available on this dialect instead of being silently dropped.
+/// assistant thinking chain is replayed as `thinking` blocks on tool rounds.
+/// Vision and thinking content remain available in this dialect.
 fn build_messages_request_body(request: &RequestBody<'_>) -> Value {
     let max_tokens = request.max_tokens.unwrap_or(4096);
     let mut body = serde_json::Map::new();
@@ -238,7 +237,7 @@ fn messages_image_block(item: &Value) -> Option<Value> {
 }
 
 /// Assistant message → content blocks: text plus `tool_use` blocks for each tool
-/// call (the JSON-encoded arguments become the `input` object; unparseable
+/// call (the JSON-encoded arguments become the `input` value; unparseable
 /// arguments are wrapped so the wire stays valid JSON).
 fn messages_assistant_message(message: &Message) -> Value {
     let mut blocks: Vec<Value> = Vec::new();
@@ -284,9 +283,9 @@ fn messages_assistant_message(message: &Message) -> Value {
     json!({"role": "assistant", "content": blocks})
 }
 
-/// OpenAI-compatible `tools` array (function shape) → Anthropic
-/// `{name, description, input_schema}`. Non-function tools (e.g. web_search) are
-/// dropped; the Messages dialect keeps search off for now.
+/// Convert nested OpenAI `function` data or flat definitions with a `name` into
+/// Anthropic `{name, description, input_schema}`. Entries without a string name
+/// are omitted; no built-in search is added.
 fn messages_tools(tools: Option<&Value>) -> Option<Value> {
     let converted = tools
         .and_then(Value::as_array)
@@ -333,8 +332,6 @@ pub(crate) fn build_http_body_for_request_from_parts(
     endpoint: &str,
     request: &mut RequestBody<'_>,
 ) -> Vec<u8> {
-    // Step 4: provider differences converge into the Adapter hook -- fired uniformly on every
-    // request path before serialization.
     crate::ai::provider::adapter_for(adapter, endpoint).adapt_request(request);
     dialect.build_http_body(request)
 }
@@ -668,14 +665,8 @@ fn responses_input(
             .as_ref()
             .filter(|calls| !calls.is_empty())
         {
-            // A Responses API tool round is a flat sequence of output items. Replay it in the
-            // order the provider streamed it: reasoning items (if this turn's side channel
-            // captured them, keyed by the first tool_call id — spliced verbatim so the model keeps
-            // the previous hop's reasoning context), then the narration message item the model
-            // produced before dispatching the tool, then the function_call items. The narration is
-            // preserved on the chat-completions wire (driver/turn_runtime/tool_result/messaging.rs
-            // persists it, truncated to 800 chars), so dropping it here would make Responses lose
-            // the model's intermediate conclusions across tool hops.
+            // Keep narration between any replayed reasoning and function-call items.
+            // Dropping it would lose the assistant's intermediate conclusions across tool hops.
             let narration_items = responses_message_content(message);
             if !narration_items.is_empty() {
                 // The Responses API rejects empty output_text, so only emit the message item when

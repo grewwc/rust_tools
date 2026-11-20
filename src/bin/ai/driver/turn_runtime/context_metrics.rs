@@ -64,11 +64,9 @@ fn advance_cycle(cycle: &mut u64, replaced: bool) -> u64 {
 }
 
 pub(super) fn projection_fingerprint(messages: &[Message]) -> u64 {
-    // This fingerprint only answers "did the projection change?" inside one
-    // process, and it runs up to four times per request (compaction start and
-    // finish plus the plan-prefix checks). Hash the message fields directly
-    // instead of running every value through JSON escaping first; the layout
-    // still mirrors `serde_json::to_value(messages)` shape for shape.
+    // This fingerprint tracks projection changes within one process. Hash message
+    // fields directly to avoid serializing large projections for repeated budget
+    // and plan-prefix checks.
     let mut hasher = rustc_hash::FxHasher::default();
     4u8.hash(&mut hasher);
     messages.len().hash(&mut hasher);
@@ -257,8 +255,8 @@ pub(super) struct ContextRequestMetrics {
     pub(super) after_budget: Option<CurrentRequestBudget>,
     #[serde(default)]
     pub(super) compaction_cycle: u64,
-    /// Verbatim message prefix shared with the previous sent request; the first
-    /// divergent index attributes provider prompt-cache misses.
+    /// Verbatim prefix shared with the previous sent request, used to locate
+    /// changes that may limit provider prompt-cache reuse.
     #[serde(default)]
     pub(super) prefix_reuse: Option<crate::ai::request::PrefixReuse>,
     pub(super) provider_overflows: usize,
@@ -347,7 +345,7 @@ mod tests {
             projection_fingerprint(&base.clone())
         );
         // Message boundaries, JSON value kinds, and absent-vs-empty fields must
-        // stay distinguishable after dropping the serialization pass.
+        // remain distinguishable.
         assert_ne!(
             projection_fingerprint(&base),
             projection_fingerprint(&[

@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Shell segmentation (split chained commands on `&&` / `||` / `;` / `|` / `\n`)
+// Shell segmentation (split chained commands on `&&` / `||` / `;` / `|` / `&` / `\n`)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,11 +20,10 @@ fn ampersand_is_redirection_operator(bytes: &[u8], index: usize) -> bool {
         || (index + 1 < bytes.len() && bytes[index + 1] == b'>')
 }
 
-/// Split the whole command into independent segments using unquoted
-/// `&&` / `||` / `;` / `|` / `\n` as separators. Separators inside single/double
-/// quotes do not trigger a split; newlines inside a single-quoted heredoc body
-/// are skipped too (heredoc body content is literal and must not be consumed by
-/// the splitting logic).
+/// Split the command at unquoted `&&` / `||` / `;` / `|` / `&` / `\n` separators.
+/// Quoted and escaped separators do not trigger a split. Heredoc bodies are
+/// skipped regardless of delimiter quoting, so their contents do not become
+/// command segments.
 pub(crate) fn split_unquoted_command_segments(command: &str) -> Vec<ShellSegment> {
     let bytes = command.as_bytes();
     let mut segments = Vec::new();
@@ -86,7 +85,6 @@ pub(crate) fn split_unquoted_command_segments(command: &str) -> Vec<ShellSegment
                 i += 1;
             }
             b'\\' if i + 1 < bytes.len() => {
-                // Backslash escape outside quotes: keep both bytes
                 current.push(b as char);
                 current.push(bytes[i + 1] as char);
                 i += 2;
@@ -101,7 +99,6 @@ pub(crate) fn split_unquoted_command_segments(command: &str) -> Vec<ShellSegment
                     i += 1;
                 }
             }
-            // Two-char operators `&&` / `||`
             b'&' if i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
                 push_current(&mut segments, &mut current, current_join);
                 current_join = ShellJoin::And;
@@ -116,7 +113,6 @@ pub(crate) fn split_unquoted_command_segments(command: &str) -> Vec<ShellSegment
                 current.push('&');
                 i += 1;
             }
-            // Single-char separators
             b';' | b'|' | b'&' => {
                 push_current(&mut segments, &mut current, current_join);
                 current_join = ShellJoin::Other;

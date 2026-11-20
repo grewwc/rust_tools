@@ -14,8 +14,8 @@
 //   - App: Main application state holding all runtime information
 //   - run(): Async entry point, initializes everything and starts run_loop
 //   - run_loop(): Main event loop that handles:
-//     1. Scheduler ticks (advance_tick for background processes)
-//     2. Background process execution (pop_all_ready)
+//     1. Scheduler notifications and deadline wakeups
+//     2. Background process dispatch (dispatch_background_batch)
 //     3. Foreground input handling (input::next_question)
 //     4. Running turns (turn_runtime::run_turn)
 // =============================================================================
@@ -102,15 +102,10 @@ fn current_task_pid() -> Option<u64> {
 
 /// Number of background subagent tokio tasks currently dispatched and not yet finished.
 ///
-/// Background subagents run on worker threads via `tokio::spawn` and stream to the
-/// terminal with `println!` (raw `\n`). The interactive input box (multiline TUI) turns
-/// on raw mode, which disables the TTY's ONLCR, so a raw `\n` no longer gets a `\r`
-/// appended and each subagent output line shifts right (staircase misalignment).
-///
-/// Use this counter before opening the input box to tell whether background subagents
-/// are still running: as long as it is > 0, do not enter the raw-mode input box; let the
-/// scheduler loop keep ticking so subagents output normally in cooked mode, avoiding
-/// garbled concurrent terminal writes (without losing any subagent output).
+/// Keep the interactive input box closed while this is nonzero so the scheduler
+/// can dispatch and collect background work before normal input resumes.
+/// Background terminal output is suppressed; `SubagentStatusLine` reports progress
+/// at scheduler safe points.
 static BG_SUBAGENT_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER_NOTIFY: Notify = Notify::const_new();
 const SCHEDULER_TICK_DURATION: Duration = Duration::from_millis(10);
@@ -276,11 +271,6 @@ pub(super) fn format_rlimit_termination_result(verdict: RlimitVerdict) -> String
 }
 
 /// Default max LLM iterations allowed per turn (prevents infinite loops).
-/// 4096 was too high: with no mid-turn governance between "stop only on byte-exact
-/// repetition" and "run to the cap", a single turn could pile up hundreds of thousands
-/// of characters of context. The mid-turn circuit breaker (the orchestrator's iteration
-/// soft limit) already handles timely convergence, so this hard cap just needs to clamp
-/// to a more reasonable magnitude.
 const DEFAULT_MAX_ITERATIONS: usize = 64 * 64;
 
 /// Max iterations for subagent (executor) processes
@@ -346,19 +336,7 @@ fn restore_consumed_suspended_session(entry: Option<&SuspendedSessionEntry>, fal
     }
 }
 
-/// Main entry point for AIOS.
-/// Initializes all components and starts the run_loop.
-///
-/// Initialization steps:
-///   1. Parse CLI arguments
-///   2. Load config
-///   3. Create session store and session ID
-///   4. Setup signal handlers (Ctrl+C)
-///   5. Initialize HTTP client
-///   6. Create local kernel (process OS)
-///   7. Load skills and MCP clients
-///   8. Load and activate agents
-///   9. Enter run_loop
+/// Parse CLI arguments and delegate runtime initialization to `run_with_cli`.
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = cli::try_parse_cli_args(std::env::args())?;
     run_with_cli(cli).await
@@ -374,8 +352,6 @@ pub(in crate::ai) async fn run_with_cli(
     crate::ai::tools::task_tools::backends::backend_registry();
     aios_kernel::kernel::register_current_pid_provider(current_task_pid);
 
-    // The cli has already been parsed by the caller (run() or the background entry),
-    // so use it directly here.
 
     // Purely local commands (help, list tools/skills/agents) do not call the LLM and
     // must be handled before ensure_models_available / load_config: otherwise, when the
@@ -386,10 +362,7 @@ pub(in crate::ai) async fn run_with_cli(
         return Ok(());
     }
 
-    // --version: print the version and exit (purely local, no LLM). Must be
-    // handled here, before startup proceeds: otherwise the flag is treated as a
-    // prompt and a full model session starts (slow, and pointless for a version
-    // query). Mirrors the `re` tool's `--version` handling.
+    // Version queries must not depend on models or configuration.
     if cli.version {
         println!("{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -585,13 +558,11 @@ pub(in crate::ai) async fn run_with_cli(
     let os_arc = new_local_kernel();
     crate::ai::tools::os_tools::init_os_tools_globals(os_arc.clone());
 
-    // Build the tool-permission middleware from config. Empty rules => no
-    // middleware installed (zero-config path stays all-allow). This install site
-    // is reached by every `run_with_cli` entry, including a re-exec'd background
-    // daemon (`-bg`), so the background process DOES enforce the policy. Only
-    // in-process subagents skip it: `App::clone` resets the middleware vectors,
-    // so agent-spawned helpers inherit no gate. Note a background daemon's stdin
-    // is `/dev/null`, so any `ask` rule fails closed to deny there.
+    // Build process-local tool permissions from config. Empty rules install no
+    // middleware. Re-executed background daemons pass through this setup;
+    // `App::fork_for_subagent` (`src/bin/ai/types.rs`) clears middleware vectors
+    // for in-process helpers. An `ask` rule fails closed when neither a terminal
+    // nor a serve confirmation channel is available.
     let tool_middlewares = {
         let cfg = configw::get_all_config();
         let rules = cfg
@@ -680,8 +651,8 @@ pub(in crate::ai) async fn run_with_cli(
     if let Some(notice) = startup_notice {
         println!("{notice}");
     }
-    // Handle --note-delete / -nd: the model matches a knowledge-base entry from the
-    // input text and deletes it after confirmation.
+    // Handle --note-delete / -nd: find matching memos and let the user confirm
+    // which entries to delete.
     if let Some(query) = app.cli.note_delete.clone() {
         return runtime_ctx::PERSONA_MEMORY_PATH
             .scope(
@@ -691,8 +662,8 @@ pub(in crate::ai) async fn run_with_cli(
             .await;
     }
 
-    // Handle --note-edit / -ne: the model matches a knowledge-base entry from the input
-    // text, rewrites it in the editor, and saves.
+    // Handle --note-edit / -ne: use the model to match memos, then let the user
+    // edit the selected entry before tidying and saving.
     if let Some(query) = app.cli.note_edit.clone() {
         return runtime_ctx::PERSONA_MEMORY_PATH
             .scope(
@@ -764,10 +735,8 @@ pub(in crate::ai) async fn run_with_cli(
         ctx.tools = super::tools::tool_definitions_for_groups(&[super::tools::ToolGroup::Core]);
     }
 
-    // Hold manifests behind an Arc: every foreground turn / background subagent
-    // dispatch hands DriverContext a snapshot. Previously Arc::new(x.to_vec()) /
-    // Arc::new(x.clone()) deep-copied every agent+skill prompt body. With an Arc these
-    // snapshots become cheap pointer clones; reload just replaces the Arc wholesale.
+    // Share manifest snapshots with foreground turns and background dispatches
+    // without copying prompt bodies; reload replaces the Arc.
     let mut skill_manifests: Arc<Vec<SkillManifest>> = Arc::new(Vec::new());
     let mut agent_manifests: Arc<Vec<AgentManifest>> = Arc::new(Vec::new());
 
@@ -1011,25 +980,11 @@ fn ensure_session_work_lease(
     Ok(())
 }
 
-/// Main event loop for AIOS.
-/// Coordinates execution of both foreground and background processes.
+/// Coordinate foreground turns, background dispatches, and interactive input.
+/// Wait on scheduler notifications and deadlines while foreground work is parked.
 ///
-/// Loop structure per iteration:
-///   1. Scheduler tick: advance_tick() to wake sleeping processes
-///   2. Agent hot-reload: check for new agents every 5 ticks
-///   3. Shutdown check: exit if shutdown flag is set
-///   4. Background execution:
-///      - spawn async tasks for each
-///      - wait for all to complete
-///   5. Foreground input:
-///      - get next question from input::next_question()
-///      - handle interactive commands
-///      - run turn via turn_runtime::run_turn()
-///   6. Termination check: exit if quit requested
-///
-/// one_shot_mode: When CLI args provided and `--interactive` is not set
-///   - runs once and exits
-///   - deletes session after completion
+/// Automatically created one-shot sessions are deleted on exit; explicitly named
+/// sessions are retained.
 async fn run_loop(
     app: &mut App,
     mcp_client: &SharedMcpClient,
@@ -1264,16 +1219,10 @@ async fn run_loop(
             continue;
         }
 
-        // Ctrl+G side-note window: no turn is running — either the foreground
-        // process is parked (e.g. after `task_wait` PARKED) waiting for subagent
-        // output, or background subagents are still in flight and the interactive
-        // input box must stay closed (it enters raw mode, so subagent streamed
-        // `\n` output lacks `\r` and shifts right line by line; one-shot mode has
-        // no input box, so its background wait needs no listener). The turn-scoped
-        // listener is gone, so keep the wait-window listener alive: create it ONCE
-        // when the window starts, keep it across every `scheduler_clock.wait`
-        // wakeup, and let the two explicit drops (the `fg_proc` pop above and the
-        // fall-through below) release it before a turn or the input box.
+        // Keep one Ctrl+G listener alive while the foreground is parked or
+        // interactive input is deferred for background work. Retain it across
+        // scheduler wakeups, then release it before a turn or the input box
+        // acquires stdin.
         let pending_foreground = has_pending_foreground_process(app);
         if pending_foreground && parked_foreground_wait_guard.is_none() {
             parked_foreground_wait_guard = Some(signal::ParkedForegroundWaitGuard::enter());
@@ -1532,7 +1481,7 @@ async fn run_loop(
         // Dispatch commands that do not depend on skill/agent manifests first
         // (/usage, /help, /model, ...). When matched and no forced_question is
         // injected (no need to continue the LLM flow), skip the expensive manifest
-        // scan — bringing read-only commands like `a /usage` from ~1s down to ~0.1s.
+        // scan for read-only commands.
         // Commands like /goal that inject a forced_question and continue the
         // conversation still need the manifests loaded.
         let allow_commands = commands::command_routing_allowed(&reply_selectors);

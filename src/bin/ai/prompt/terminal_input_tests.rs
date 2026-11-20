@@ -64,8 +64,8 @@ struct PtyEditor {
     output: Vec<u8>,
     root: PathBuf,
     columns: u16,
-    /// Cursor queries already answered. Each query gets exactly one reply;
-    /// queries below the caller's withheld index stay unanswered on purpose.
+    /// Index of the next query to answer. Queries skipped by `answer_queries_from`
+    /// stay unanswered so the harness can force timeouts.
     answered: usize,
 }
 
@@ -251,10 +251,9 @@ impl PtyEditor {
     /// the child commanded for it. Queries below `first` are left unanswered
     /// so they time out, which is what a stalled-link test needs.
     ///
-    /// `verified_cursor_row` only accepts a reply landing exactly on the row it
-    /// moved to, and that row comes from a per-process counter, so a canned
-    /// reply can never satisfy it: the harness has to echo back what the child
-    /// actually asked for, like a real terminal would.
+    /// `verified_cursor_row` checks the commanded probe rows before reading
+    /// the restored cursor row. Echoing each commanded position makes the harness
+    /// follow the probe sequence rather than assume fixed coordinates.
     fn answer_queries_from(&mut self, first: usize) {
         self.answered = self.answered.max(first);
         while self.answered < self.query_count() {

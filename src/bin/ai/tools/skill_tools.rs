@@ -12,14 +12,8 @@ use crate::ai::tools::common::{
     ToolRegistration, ToolRetryPolicy, ToolRetryPolicyRegistration, ToolSpec, short_path,
 };
 
-/// Skill change actions requested by the model via the `activate_skill` / `deactivate_skill` tools (to be
-/// read and applied by the driver on the next iteration).
-///
-/// Tools are pure functions `fn(&Value) -> Result<String, String>` with no access to `App`, so this follows
-/// the `enable_tools.rs` bridging pattern of "tool writes global state → driver reads it". Only a tiny
-/// pending-activation slot is needed, hence a single `RwLock<FastMap>` instead of a full state struct. Multiple skills
-/// can be activated at once: `Add` appends to the active set and `Remove` removes from it. Multiple calls within one turn
-/// accumulate into a queue in call order, and the driver applies all of them at once (no "last write wins").
+/// Tools queue skill changes per `(session_id, turn_id)` because they do not
+/// receive the driver's `App`. The driver drains each queue in call order.
 
 /// A skill change action requested by the model. The driver reads it on the next iteration and applies it to the current active set.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,8 +123,8 @@ pub(crate) fn execute_deactivate_skill(args: &Value) -> Result<String, String> {
     ))
 }
 
-/// Mark the current skill as waiting for user input. The tool result only lets the model continue generating a user-facing question;
-/// the real cross-turn state is saved by the driver at the end of the turn, keeping session state out of the tool layer.
+/// Record this turn's explicit user-input boundary. The driver saves any active
+/// skill continuation at the end of a successful, uninterrupted turn.
 pub(crate) fn execute_request_user_input(args: &Value) -> Result<String, String> {
     let question = args["question"].as_str().unwrap_or("").trim();
     if question.is_empty() {
@@ -153,9 +147,8 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_activate_skill,
-        // Skill discovery/activation is a low-frequency capability: it does not ship in the per-turn core set by default; the model enables it on demand via
-        // `enable_tools`, trimming per-turn tools schema tokens. The builtin group is kept
-        // so it can still be enabled dynamically.
+        // Skill activation loads on demand via `enable_tools`, keeping its schema
+        // out of the default core set.
     }
 });
 
@@ -165,7 +158,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_deactivate_skill,
-        // A low-frequency control tool like activate_skill: not resident by default, enabled on demand via enable_tools.
     }
 });
 
@@ -216,7 +208,7 @@ fn render_skill_catalog(skills: &[SkillManifest], query: &str, limit: usize) -> 
     let total = matches.len();
     let shown = total.min(limit);
     let mut out = format!("Installed skills ({shown} shown of {total}):\n");
-    // Count parent skill -> child skill edges, used to annotate parent skills
+    // Record which skills have children for the catalog labels.
     let mut parent_has_children: FastSet<String> = FastSet::default();
     for s in skills.iter() {
         if let Some(p) = s.parent.as_deref() {
@@ -252,7 +244,6 @@ fn render_skill_catalog(skills: &[SkillManifest], query: &str, limit: usize) -> 
         "This catalog is metadata only and does not activate a skill. Call `activate_skill(name=...)` only when one listed skill clearly and materially helps the current task.",
     );
     if parent_has_children.is_empty() {
-        // No extra hint when there are no child skills
     } else {
         out.push_str(" Sub-skills can be activated independently via `activate_skill`; parent skills list their sub-skills in `load_skill`.");
     }
@@ -294,13 +285,13 @@ inventory::submit!(ToolRetryPolicyRegistration {
 });
 
 /// Collect the file listing (relative paths) under `resource_path` for `load_skill` / resource tool display.
-/// `subdir` must be a safe relative path (only a single-level category or empty); internally validated against traversal and canonicalized to stay inside base.
+/// When the base can be canonicalized, a nonempty `subdir` must name an allowed
+/// category whose canonical directory is still inside the base.
 fn collect_resource_files(resource_path: &str, subdir: Option<&str>) -> Vec<String> {
     use std::path::Path;
     let base = Path::new(resource_path);
-    // First verify base exists and is canonicalizable (front-running check against symlink attacks)
+    // Resolve the base before checking a requested category's containment.
     let Ok(canonical_base) = std::fs::canonicalize(base) else {
-        // Return empty when base is missing or unresolvable (the caller already handles a missing resource_path)
         if !base.is_dir() {
             return Vec::new();
         }
@@ -313,29 +304,24 @@ fn collect_resource_files(resource_path: &str, subdir: Option<&str>) -> Vec<Stri
     let target_base = match subdir {
         Some(s) if !s.trim().is_empty() => {
             let cleaned = s.trim().trim_matches('/').replace('\\', "/");
-            // Strict validation: no `..`, absolute paths, or multi-level traversal containing `/`
             if cleaned.is_empty() || cleaned.contains("..") || Path::new(&cleaned).is_absolute() {
                 return Vec::new();
             }
-            // category must be a single segment from the common resource dirs
             if cleaned.contains('/') {
                 return Vec::new();
             }
-            // Whitelist validation (consistent with the docs)
             const ALLOWED_CATEGORIES: &[&str] = &["references", "examples", "scripts"];
             if !ALLOWED_CATEGORIES.contains(&cleaned.as_str()) {
                 return Vec::new();
             }
             let joined = base.join(&cleaned);
-            // Canonical check: if the target exists it must still be inside base; if missing, treat as a legitimately empty dir
+            // Reject category symlinks that resolve outside the resource directory.
             match std::fs::canonicalize(&joined) {
                 Ok(canonical_joined) if !canonical_joined.starts_with(&canonical_base) => {
                     return Vec::new();
                 }
                 Ok(canonical_joined) => canonical_joined,
                 Err(_) => {
-                    // When the target is missing, check that the joined parent is still inside base (blocks `references/../etc`-style constructs)
-                    // already covered by the `..` check; treat missing as empty here
                     return Vec::new();
                 }
             }
@@ -419,7 +405,6 @@ fn render_loaded_skill_with_all(skill: &SkillManifest, all: &[SkillManifest]) ->
             out.push('\n');
         }
     }
-    // Only expose the resource dir when the skill actually bundles resources, listing files like references/examples/scripts.
     if let Some(resource_path) = skill.resource_path.as_deref()
         && !resource_path.trim().is_empty()
     {
@@ -439,8 +424,8 @@ fn render_loaded_skill_with_all(skill: &SkillManifest, all: &[SkillManifest]) ->
             }
             out.push_str("Use `read_skill_resource(name, path)` or `read_file` with the absolute resource directory to read any file.\n");
         }
-        // List child skills (passed in by the caller as all, avoiding duplicated full IO)
     }
+    // Reuse the caller's catalog to avoid another full skill load.
     let children: Vec<&SkillManifest> = all
         .iter()
         .filter(|s| s.parent.as_deref() == Some(skill.name.as_str()))
@@ -503,7 +488,7 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-// ===== New: tools for reading skill resources =====
+// ===== Tools for reading skill resources =====
 
 fn resolve_skill_for_resource(name: &str) -> Result<SkillManifest, String> {
     let name = name.trim();
@@ -600,7 +585,6 @@ pub(crate) fn execute_list_skill_resources(args: &Value) -> Result<String, Strin
         total
     );
     for rel in files.iter().take(shown) {
-        // Try to infer the size
         let abs = std::path::Path::new(resource_path).join(rel);
         let size = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
         out.push_str(&format!("- {rel} ({size} bytes)\n"));
@@ -752,7 +736,7 @@ fn yaml_quote(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// Shared skill name sanitization core: lowercase, keep alnum/`-`/`_`/` .`, convert the rest to `-`, collapse `--`, trim `-`/` .`.
+/// Shared skill name sanitization core: lowercase, keep ASCII alnum/`-`/`_`/`.`, convert the rest to `-`, collapse `--`, trim `-`/`.`.
 fn sanitize_skill_basename(name: &str) -> String {
     let mut out = String::with_capacity(name.len() + 8);
     for ch in name.chars() {
@@ -775,7 +759,7 @@ fn sanitize_skill_basename(name: &str) -> String {
 
 fn safe_skill_file_name(name: &str) -> String {
     let base = sanitize_skill_basename(name);
-    // Use strip_suffix for an exact check; trim_end_matches would wrongly strip whole character sets
+    // Match the complete extension so embedded dots remain part of the basename.
     if base.to_ascii_lowercase().ends_with(".skill") {
         base
     } else {
@@ -1618,8 +1602,8 @@ fn remove_package_paths(
 }
 
 /// Incremental package update: copy the existing package to a temp dir, apply
-/// removals, overlay new resources, upsert listed subskills, then atomically
-/// publish. Unlisted files and subskills are preserved.
+/// removals, overlay new resources, and upsert listed subskills. Keep the previous
+/// package as a backup until publication; unlisted files and subskills are preserved.
 #[allow(clippy::too_many_arguments)]
 fn execute_save_skill_package_merge(
     dir: &std::path::Path,
@@ -1794,7 +1778,6 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
     let package_dir_name = safe_skill_dir_name(&name);
     let package_dir = dir.join(&package_dir_name);
     let legacy_file = dir.join(safe_skill_file_name(&name));
-    // Resolve the optional complex-package capabilities up front
     let resources = parse_resources_arg(args, "")?;
     let subskills = parse_subskills_arg(args)?;
     let remove_paths = parse_remove_paths_arg(args)?;
@@ -1893,7 +1876,6 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
                 &remove_subskills,
             );
         }
-        // Fall through to the full-rebuild path below.
     }
     if !has_package_features {
         if !remove_paths.is_empty() || !remove_subskills.is_empty() {
@@ -1925,7 +1907,7 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
     }
 
     // ===== Package layout: `skills_dir/<package_dir>/SKILL.md` + resources + subskills =====
-    // Upfront validation: child skill dedup and cycle detection
+    // Reject duplicate child names/directories and direct self-parent links.
     {
         use rustc_hash::FxHashSet;
         let mut seen_names: FxHashSet<String> = FxHashSet::default();
@@ -2030,7 +2012,7 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
             return Err(e);
         }
     };
-    // Atomic publish: if the target exists, back it up before replacing, so a crash inside the remove+rename window cannot lose data
+    // Back up the existing package so a failed publish can restore it.
     if package_dir.exists() {
         let backup = dir.join(format!(".bak-{}-{}", package_dir_name, std::process::id()));
         if backup.exists() {
@@ -2397,7 +2379,7 @@ mod tests {
     use crate::ai::skills::SkillManifest;
     use std::sync::{LazyLock, Mutex};
 
-    // activate_skill tests share one global pending-activation slot; serialize to avoid concurrent pollution.
+    // Tests without TURN_IDENTITY share its default key; serialize access to that queue.
     static ACTIVATION_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
@@ -2421,7 +2403,6 @@ mod tests {
     #[test]
     fn activate_skill_queues_existing_skill() {
         let _g = ACTIVATION_TEST_GUARD.lock().unwrap();
-        // Take a builtin skill name that actually exists.
         let skills = crate::ai::skills::load_all_skills();
         let Some(name) = skills.first().map(|s| s.name.clone()) else {
             return;
@@ -2430,7 +2411,6 @@ mod tests {
         assert!(out.contains(&name));
         let actions = take_pending_skill_action();
         assert_eq!(actions, vec![PendingSkillAction::Add(name.clone())]);
-        // take should clear the slot.
         assert!(take_pending_skill_action().is_empty());
     }
 
@@ -2589,7 +2569,6 @@ mod tests {
         assert!(out.contains("source: /tmp/demo/SKILL.md"));
         assert!(out.contains("## prompt"));
         assert!(out.contains("line one\nline two"));
-        // Expose the dir only when bundled resources exist
         assert!(out.contains("Bundled resource directory: /tmp/demo/resources"));
     }
 

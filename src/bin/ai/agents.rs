@@ -446,10 +446,9 @@ fn load_scoped_project_instruction_docs_for_target_priority_from(
 /// Budgeted scoped-instruction selection over three priority tiers:
 /// `required` (paused mutations that must be unblocked), `carried` (the
 /// directories already resident in the system prompt), then `observed`
-/// (targets touched in the current turn). Each tier is fully considered
-/// before the next: a pending mutation is never starved, and resident
-/// documents keep their bytes when new targets compete for the budget — only
-/// a pending mutation can displace them.
+/// (targets touched in the current turn). Each tier is considered before the
+/// next, so newly observed targets cannot consume budget ahead of required
+/// or resident documents.
 fn load_scoped_project_instruction_docs_for_target_tiers_from(
     cwd: &Path,
     required_targets: &[PathBuf],
@@ -544,12 +543,6 @@ fn load_scoped_project_instruction_docs_for_target_tiers_from(
         .chain(observed_candidates)
     {
         if used >= TARGET_SCOPED_INSTRUCTION_MAX_TOTAL_CHARS {
-            // Report on stderr: the user needs to know a scoped instruction file
-            // was dropped because the tier budget ran out (debugging aid).
-            // eprintln!(
-            //     "[project-instructions] omitted {} (budget exhausted: {used}/{} chars)",
-            //     doc.path, TARGET_SCOPED_INSTRUCTION_MAX_TOTAL_CHARS
-            // );
             break;
         }
         let remaining = TARGET_SCOPED_INSTRUCTION_MAX_TOTAL_CHARS - used;
@@ -558,12 +551,6 @@ fn load_scoped_project_instruction_docs_for_target_tiers_from(
             continue;
         }
         if content.chars().count() != doc.content.chars().count() {
-            // eprintln!(
-            //     "[project-instructions] truncated {} (kept {}/{} chars)",
-            //     doc.path,
-            //     content.chars().count(),
-            //     doc.content.chars().count()
-            // );
         }
         used += content.chars().count();
         selected.push(ProjectInstructionDoc {
@@ -583,14 +570,9 @@ fn instruction_doc_depth(doc: &ProjectInstructionDoc) -> usize {
     Path::new(&doc.path).components().count()
 }
 
-/// 用 (path, len, mtime) 指纹缓存项目指令文档，避免每个 turn 都重新做磁盘
-/// I/O + truncate。实测中 AGENTS.md / CLAUDE.md 在一个会话里几乎不会变化，
-/// 但 build_system_prompt 每个 turn / 每个 iteration 都要拿一次它们，单
-/// 次最大 16KB×ancestors，token 与 syscall 都不便宜。
-///
-/// 缓存语义保证：只要任一参与文件的 (len, mtime) 发生变化，或扫描范围里
-/// 出现/消失了文件，就重新加载。命中时返回的是上次构建好的 Vec 的 clone，
-/// 内容与未缓存路径完全一致。
+/// Metadata fingerprint for reusing loaded instruction documents without
+/// rereading their contents. Paths, lengths, and modification times are compared
+/// in discovery order; content changes that preserve them are not detected.
 type ProjectInstructionFingerprint = Vec<(PathBuf, u64, Option<SystemTime>)>;
 
 struct ProjectInstructionCacheEntry {
@@ -609,9 +591,8 @@ fn fingerprint_project_instruction_files(cwd: &Path) -> ProjectInstructionFinger
     for dir in project_instruction_search_scope(cwd) {
         for name in PROJECT_INSTRUCTION_FILENAMES {
             let path = dir.join(name);
-            // 注意：与 load_project_instruction_docs_uncached 保持完全一致的发现顺序；
-            // 这里不做 canonicalize（原实现仅对去重做 canonicalize，发现顺序仍按
-            // path），fingerprint 比较的是"扫描看到的文件序列+元数据"。
+            // Keep metadata in scan order for fingerprint comparison. Instruction loading
+            // separately deduplicates canonical paths and prioritizes same-family config copies.
             let Ok(meta) = fs::metadata(&path) else {
                 continue;
             };
@@ -776,14 +757,6 @@ fn push_instruction_doc(
     }
     let content = truncate_instruction_doc(trimmed, PROJECT_INSTRUCTION_MAX_DOC_CHARS);
     if content.chars().count() != trimmed.chars().count() {
-        // Report on stderr only: the prompt keeps its existing `…` marker, and
-        // the user needs to know the file was cut short (debugging aid).
-        // eprintln!(
-        //     "[project-instructions] truncated {} (kept {}/{} chars)",
-        //     canonical_key,
-        //     content.chars().count(),
-        //     trimmed.chars().count()
-        // );
     }
     if !content.is_empty() {
         docs.push(ProjectInstructionDoc {
@@ -795,9 +768,7 @@ fn push_instruction_doc(
 
 /// Applies a total character budget across the candidate docs in order. Earlier
 /// docs keep their bytes first; docs beyond the budget are omitted entirely and
-/// a doc that only partially fits is truncated with a trailing `…`. Omissions
-/// and truncations are reported on stderr so the user can tell why an
-/// instruction file had no effect.
+/// a doc that only partially fits keeps the remaining prefix plus a trailing `…`.
 fn limit_project_instruction_docs(
     candidates: Vec<ProjectInstructionDoc>,
     max_chars: usize,
@@ -806,10 +777,6 @@ fn limit_project_instruction_docs(
     let mut used = 0usize;
     for doc in candidates {
         if used >= max_chars {
-            // eprintln!(
-            //     "[project-instructions] omitted {} (budget exhausted: {used}/{max_chars} chars)",
-            //     doc.path
-            // );
             continue;
         }
         let budget = max_chars - used;
@@ -818,12 +785,6 @@ fn limit_project_instruction_docs(
             continue;
         }
         if content.chars().count() != doc.content.chars().count() {
-            // eprintln!(
-            //     "[project-instructions] truncated {} (kept {}/{} chars)",
-            //     doc.path,
-            //     content.chars().count(),
-            //     doc.content.chars().count()
-            // );
         }
         used += content.chars().count();
         docs.push(ProjectInstructionDoc {
@@ -882,9 +843,9 @@ fn project_instruction_search_scope_with_boundary(
     // User-supplied per-project instructions: `~/.config/rust_tools/<project-name>/`
     // (AGENTS.md / agents.md / ...), where `<project-name>` is the leaf name of the project
     // root. Insert right after the project root so these are treated as project-level docs
-    // (loaded before deeper repo-local files and not starved by the total instruction budget).
-    // On a same-family conflict the config copy loads first (priority); both files are kept
-    // before the project-root copy of the same family (see `discover_project_instruction_docs`).
+    // and consume budget before deeper repo-local files. On a same-family conflict,
+    // `discover_project_instruction_docs` loads the config copy before the project-root
+    // copy while retaining both.
     let project_root = scope.first().map(PathBuf::as_path).unwrap_or(cwd);
     if let Some(cfg_dir) = project_config_instruction_dir(project_root)
         && !scope.iter().any(|dir| dir == &cfg_dir)
@@ -1186,8 +1147,8 @@ fn ensure_seeded_agents_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Loads agents from a directory, annotated with the given discovery level.
-/// The level is used for logging and precedence resolution in `load_all_agents`.
+/// Loads front-matter agent files, skipping dotfiles. The discovery level is
+/// used for logging; `load_all_agents` applies precedence when merging them.
 fn load_agents_from_dir_with_level(dir: &Path, level: DiscoveryLevel) -> Vec<AgentManifest> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else {

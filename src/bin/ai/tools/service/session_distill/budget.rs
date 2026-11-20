@@ -29,8 +29,8 @@ impl RequestBudget {
             .and_then(|definition| definition.context_window_tokens)
             .filter(|tokens| *tokens > 0)
             .ok_or_else(|| format!("distill model {model:?} has no declared context window"))?;
-        // do_request_text_streaming does not send max_tokens or honor the CLI
-        // override. Reserve the full declared output maximum, not the main chat
+        // do_request_text_streaming leaves max_tokens unset in RequestBody and does not
+        // apply the CLI override. Reserve the full declared output maximum, not the main chat
         // builder's dynamically clamped allowance. Unknown provider defaults
         // cannot safely be replaced by a guessed output allowance.
         let output = models::max_output_tokens(model)

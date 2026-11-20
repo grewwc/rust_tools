@@ -129,8 +129,8 @@ impl McpServerConnection {
         result.map_err(|e| self.decorate_transport_error(e))
     }
 
-    /// Replace the live transport after a timeout/desync. The seed metadata is
-    /// cleared so a failed re-initialization cannot leave stale tools visible.
+    /// Replace the live transport after a timeout or desynchronization. Once
+    /// transport creation succeeds, clear discovery metadata before re-initialization.
     pub(in crate::ai) fn restart(&mut self) -> Result<(), String> {
         self.shutdown_and_reap();
         self.transport = build_transport(&self.name, &self.config)?;

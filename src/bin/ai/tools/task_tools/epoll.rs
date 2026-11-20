@@ -102,26 +102,13 @@ pub(super) fn wait_many_snapshot(
     Ok((ready, pending, event_ids))
 }
 
-/// Combines the kernel's epoll / channel / futex / event primitives at the agent layer to
-/// implement a "wait for any of several sources to complete" semantic across **multiple wait
-/// source kinds**, primarily serving the `task_wait` tool.
+/// Wait on heterogeneous channel, event, and futex sources using the requested policy.
+/// A snapshot returns immediately when Any or All is already satisfied. Otherwise,
+/// Any uses `epoll_wait`, while All uses `wait_on_events` over the pending event IDs.
 ///
-/// **Design positioning**: this function does *not* re-implement the kernel's wait primitives; it
-/// assembles several low-level APIs (`epoll_create` / `epoll_ctl` / `epoll_wait` /
-/// `wait_on_events`) to the agent's business semantics:
-/// 1. Build a short-lived epoll set for channel/futex-style wait sources, then `epoll_wait` for
-///    the ready set;
-/// 2. For event-style wait sources, call `wait_on_events` directly;
-/// 3. Normalize both kinds of results into `EpollWaitManyOutcome`.
-///
-/// **Future lowering suggestion**: once the kernel gains native syscall support for
-/// `Vec<WaitManySource>` (similar to a hybrid of epoll_pwait2 + EVENTFD), this function can become
-/// a thin wrapper around a single syscall. Until that migration, this function keeps the current
-/// multi-step composite implementation; any behavior change **must keep task_wait regression-free
-/// in the following scenarios**:
-/// - all sources ready: return immediately (epoll_wait is not called);
-/// - all sources pending: decide whether to actually suspend according to `wait_policy`;
-/// - mixed ready + pending: return only the ready set, without adding extra blocking.
+/// The short-lived epoll set is destroyed before returning. Suspension is exposed
+/// through `EpollWaitManyOutcome` and the restored yield flag so the scheduler can resume work.
+/// A mixed ready/pending set satisfies Any; All continues waiting on the pending sources.
 pub(crate) fn epoll_wait_many(
     os: &mut dyn Kernel,
     label: &str,

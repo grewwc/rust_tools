@@ -1439,7 +1439,8 @@ for (const phone of [false, true]) test("group padding and title toggle once whi
     assert.equal(create.getAttribute("aria-label"), create.title);
   }
   const phoneCSS = css.slice(css.indexOf("@media (max-width:700px)"));
-  assert.match(phoneCSS, /#sessions \.session-group-toggle, #sessions \.session-group-new, #sessions \.session-group-menu \{ min-height:44px; \}/);
+  assert.match(phoneCSS, /#sessions \.session-group-toggle, #sessions \.session-group-new, #sessions \.session-group-menu, #sessions \.session-group-more \{ min-height:44px; \}/);
+  assert.match(css, /#sessions \.session-group-more \{[^}]*min-width:38px;[^}]*font-size:11px;/);
   assert.match(phoneCSS, /#sessions \.session-group-menu \{ flex:0 0 44px; min-width:44px; padding:2px; \}/);
   assert.match(phoneCSS, /#sessions \.session-group-status \{ gap:2px; \}/);
   assert.match(phoneCSS, /#sessions \.session-group-badge \{[^}]*font-size:9px; line-height:14px;/);

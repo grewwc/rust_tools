@@ -6,7 +6,6 @@ use super::super::*;
 #[test]
 fn execute_command_blocks_dangerous_programs() {
     assert!(tools::validate_execute_command("rm -rf /").is_err());
-    // assert!(tools::validate_execute_command("mv a b").is_err());
     assert!(tools::validate_execute_command("sudo ls").is_err());
 }
 
@@ -22,7 +21,7 @@ fn execute_command_blocks_git_destructive_to_uncommitted() {
     // checkout: pure branch switch; git protects uncommitted changes, allow
     assert!(tools::validate_execute_command("git checkout main").is_ok());
     assert!(tools::validate_execute_command("git checkout -b feature/x").is_ok());
-    // checkout: -B force-resets and switches branches, discarding uncommitted changes
+    // checkout: -B resets an existing branch as part of switching to it
     assert!(tools::validate_execute_command("git checkout -B main").is_err());
     assert!(tools::validate_execute_command("git checkout --force-create main").is_err());
     // checkout: no -- but the path heuristic judges it a file (has an extension)
@@ -45,7 +44,7 @@ fn execute_command_blocks_git_destructive_to_uncommitted() {
         tools::validate_execute_command("git restore --staged --source=HEAD src/main.rs").is_ok()
     );
 
-    // reset: --hard/--merge/--keep discard uncommitted changes
+    // reset: reject modes that rewrite the worktree
     assert!(tools::validate_execute_command("git reset --hard").is_err());
     assert!(tools::validate_execute_command("git reset --hard HEAD~1").is_err());
     assert!(tools::validate_execute_command("git reset --merge").is_err());
@@ -62,7 +61,7 @@ fn execute_command_blocks_git_destructive_to_uncommitted() {
     // clean: dry-run and friends do not actually delete, allow
     assert!(tools::validate_execute_command("git clean -n").is_ok());
 
-    // switch: force branch switch discards uncommitted changes
+    // switch: reject forced switching and branch resets
     assert!(tools::validate_execute_command("git switch -f main").is_err());
     assert!(tools::validate_execute_command("git switch --force main").is_err());
     assert!(tools::validate_execute_command("git switch --discard-changes main").is_err());

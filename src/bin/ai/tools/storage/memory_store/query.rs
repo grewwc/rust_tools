@@ -9,8 +9,8 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::SystemTime;
 impl MemoryStore {
-    /// Apply "delete + add" changes in batch. Prepare all target content first, then commit under the same main-file lock;
-    /// on mid-way failure the already-committed files are restored, so the current file and rotated archives are never partially updated.
+    /// Stage delete/add rewrites, then commit each file under the main-file lock.
+    /// On failure, attempt to restore earlier files and report any rollback failures.
     /// JSONL remains the source of truth; the SQLite index is fully rebuilt best-effort after a successful write-back.
     pub(crate) fn apply_batch_update(
         &self,
@@ -300,11 +300,9 @@ impl MemoryStore {
     ) -> Result<Vec<(AgentMemoryEntry, f64)>, String> {
         let query_lc = query.to_lowercase();
 
-        // Fast path: first use SQLite FTS5 to get the candidate id set (O(log N) MATCH),
-        // then go back to the JSONL to load the candidate entries exactly and run the existing BM25 + text-similarity scoring.
-        // This reduces search from "full-file scan + full-file tokenize" to "hit lines + tokenize",
-        // with output format / score weights / ordering logic unchanged.
-        // When FTS is unavailable or candidates are too few, fall back to the original scan path with fully equivalent behavior.
+        // Use FTS5 to bound the entries tokenized for BM25 scoring. JSONL files are still
+        // scanned to load candidate records. Restrict candidates only when FTS returns
+        // at least limit IDs; otherwise score the full scanned corpus.
         let fts_candidate_cap = limit.saturating_mul(20).max(60).min(400);
         let fts_ids: Option<std::collections::HashSet<String>> = memory_index_for(&self.path)
             .and_then(|idx| match idx.search_ids(&query_lc, fts_candidate_cap) {
@@ -401,9 +399,8 @@ impl MemoryStore {
                 bm25 += idf * (tfv * (k1 + 1.0)) / denom;
             }
             bm25_vals.push(bm25);
-            // Ranking is BM25-only here: the character-similarity re-scoring
-            // (compute_similarity) was removed because it re-weighted the same
-            // token space BM25 already scores. The priority boost applies below.
+            // BM25 handles token relevance; avoid character-similarity re-scoring of the
+            // same token space. Apply the priority boost after normalization below.
             scored.push((bm25, idx));
         }
         let max_bm25 = bm25_vals.iter().cloned().fold(0.0f64, f64::max);
@@ -418,7 +415,7 @@ impl MemoryStore {
         let cap = limit.saturating_mul(10).min(200).max(limit);
         let mut top_idx: Vec<(f64, usize)> =
             scored.iter().take(cap).map(|(s, i)| (*s, *i)).collect();
-        // Priority boost: scale the blended score by entry priority so that
+        // Priority boost: scale the normalized BM25 score by entry priority so that
         // explicitly high-value knowledge (High 100-200, Permanent 255) ranks
         // above same-relevance low-priority entries. Default 100 → ×1.0;
         // permanent 255 → ~×1.8; low 0 → ~×0.5.
@@ -432,8 +429,8 @@ impl MemoryStore {
         for (s, i) in top_idx {
             out.push((docs[i].0.clone(), s));
         }
-        // Count LFU for hit entries; failures are traced only. Count only the top-N (already truncated to limit),
-        // not the cap=200 intermediate set, so low-scoring fringe entries do not inflate their hits.
+        // Record LFU hits only for the final returned entries, so intermediate candidates
+        // do not inflate hit counts. Failures are traced without failing the search.
         if let Some(idx) = memory_index_for(&self.path) {
             let ids: Vec<String> = out.iter().filter_map(|(e, _)| e.id.clone()).collect();
             if !ids.is_empty() {

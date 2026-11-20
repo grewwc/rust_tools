@@ -10,10 +10,9 @@ pub(crate) fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, Strin
     let mut saw_envelope_marker = false; // whether any envelope marker (*** Begin Patch / *** Update File: etc.) was seen
     while let Some(line) = iter.next() {
         patch_line_no += 1;
-        // Malformed envelope signal: when parse_patch_envelopes returns None because the first
-        // line is not `*** Begin Patch`, the text would mistakenly fall into the unified-diff
-        // path. Record whether any envelope opening/section marker was seen, to decide below
-        // whether to silently tolerate a trailing `*** End Patch`.
+        // A malformed envelope may reach the unified-diff parser. Remember its
+        // opening/section markers so a trailing envelope marker is not silently
+        // tolerated against an independently supplied file_path.
         if line == "*** Begin Patch" || is_patch_section_header(line) {
             saw_envelope_marker = true;
         }
@@ -28,15 +27,9 @@ pub(crate) fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, Strin
             continue;
         };
         let rest = rest.trim();
-        // A canonical `*** Begin Patch` envelope (Codex/OpenAI style) uses a bare `@@` or
-        // `@@ <context title> @@` as the hunk separator, without `-N,M +N,M` line numbers. Only
-        // when the header looks like `-N` do we parse a nominal line number; otherwise
-        // old_start=0, letting locate_hunk's full-file search uniquely locate the hunk, avoiding
-        // a spurious "invalid hunk header" for the canonical envelope format.
-        // Models often write "insert at the start of the file" as `@@ -0,0 +1,3 @@`: in git
-        // semantics -0 means "insert before line 1", so we normalize to old_start=1 rather than
-        // treating it as having no nominal line number and running a full-file search, which
-        // would later report a misleading "declared line 0".
+        // Bare or titled hunk separators have no nominal line; content-bearing
+        // hunks are located by their text. Numeric non-positive starts become line 1,
+        // so `@@ -0,0 +1,3 @@` denotes insertion at the beginning.
         let old_start = match rest.strip_prefix('-') {
             Some(after) => after
                 .split_whitespace()
@@ -53,16 +46,9 @@ pub(crate) fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, Strin
             if next.starts_with("@@") {
                 break;
             }
-            // Tolerate mixed formats: models often mistakenly append envelope tail markers such as
-            // `*** End Patch` at the end of a pure unified-diff hunk. These markers are not part of
-            // unified-diff content; when encountered we end the current hunk (letting the outer
-            // loop skip them), avoiding a false "invalid hunk line" error.
-            // But if an envelope opening/section marker was already detected
-            // (saw_envelope_marker), this is a malformed envelope that fell into the unified-diff
-            // path, where the target file is decided by file_path, not by the envelope
-            // declaration — silently applying could write to the wrong file. So we do NOT break;
-            // the line falls into the `_ =>` branch below to report a "mixed formats" error and
-            // let the model rebuild, never silently writing to the wrong file.
+            // Ignore a stray closing marker in otherwise unified-diff input. If an
+            // opening/section marker was seen, reject the mixed format instead: applying
+            // it using file_path could disregard the envelope's declared target.
             if (next == "*** End Patch" || next == "*** End of File") && !saw_envelope_marker {
                 break;
             }
@@ -71,9 +57,8 @@ pub(crate) fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, Strin
             if l.starts_with("\\ No newline at end of file") {
                 continue;
             }
-            // Blank lines (including lines reduced to just `\r` under CRLF): models often write an
-            // empty context line with no leading space at all. Treat it as an empty context line,
-            // consistent with `git apply`'s tolerance.
+            // Treat bare blank lines as empty context, since model-written hunks may
+            // omit the leading space.
             if l == "" || l == "\r" {
                 lines.push(UnifiedLine::Context(String::new()));
                 continue;
@@ -89,11 +74,8 @@ pub(crate) fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, Strin
                 '-' => lines.push(UnifiedLine::Remove(body.to_string())),
                 '+' => lines.push(UnifiedLine::Add(body.to_string())),
                 _ => {
-                    // Special-case envelope-style markers: this means unified diff and Begin/End
-                    // Patch formats are mixed. Tail markers (*** End Patch / *** End of File) were
-                    // already tolerated via break above; what lands here is an opening or section
-                    // marker like *** Begin Patch / *** Update File:, indicating the patch
-                    // structure is confused — report a clear error guiding the model to rebuild.
+                    // Report envelope markers as mixed formats rather than file content;
+                    // closing markers also reach here after a detected opening/section marker.
                     if l.starts_with("*** ") {
                         return Err(format!(
                             "invalid hunk line at patch line {patch_line_no}: detected mixed \
@@ -111,13 +93,9 @@ pub(crate) fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, Strin
                 }
             }
         }
-        // Strip trailing empty context lines: the hunk body loop only ends when the next `@@` is
-        // reached, so blank lines between hunks or at the end of the patch (separators/trailing)
-        // get swallowed into the current hunk as trailing empty context lines, demanding an empty
-        // line at the corresponding position of the original file for no reason and causing a
-        // patch that should match to report context mismatch. A genuine interior blank line is
-        // always followed by more content lines of this hunk, so it won't be wrongly removed; only
-        // purely trailing empty context lines are stripped here.
+        // Strip trailing empty context lines so blank separators between hunks or
+        // after the patch do not require extra blank lines in the target. Interior
+        // blank context lines are retained.
         while matches!(lines.last(), Some(UnifiedLine::Context(s)) if s.is_empty()) {
             lines.pop();
         }
@@ -228,10 +206,9 @@ pub(crate) fn record_diff_target(paths: &mut Vec<String>, path: Option<String>) 
     }
 }
 
-/// Collects all file targets in a complete unified diff. `diff --git` and adjacent `---`/`+++`
-/// file headers are cross-checked and deduplicated; therefore a standard multi-file diff,
-/// quoted paths with spaces, and subsequent file headers after the first hunk are never silently
-/// mistaken for a single-file patch.
+/// Collect candidate targets from `diff --git` and adjacent `---`/`+++` headers,
+/// deduplicating their paths. Retain conflicting paths so callers can reject a
+/// patch that does not resolve to one target.
 pub(crate) fn parse_unified_diff_header_target(patch: &str) -> UnifiedDiffHeaderTarget {
     let lines: Vec<&str> = patch.lines().collect();
     let mut parsed = UnifiedDiffHeaderTarget::default();
@@ -302,13 +279,11 @@ pub(crate) fn file_path_from_unified_diff_header(patch: &str) -> Option<String> 
 
 /// Splits a multi-file unified diff (git diff output or model-written) by file into
 /// (target path, that file's diff fragment).
-/// Fragments keep their original text (including their own file headers and hunks); target paths
-/// are resolved with the same semantics as parse_unified_diff_header_target (`diff --git` takes
-/// precedence; without a `diff --git` header, split by adjacent `--- `/`+++ ` pairs that are
-/// followed by a hunk header, so add/remove lines in the hunk body that look like file headers
-/// are not treated as file boundaries).
-/// Returns Err when any fragment cannot be resolved to a unique target path — when the structure
-/// is unreliable, report the error explicitly rather than silently writing to the wrong file.
+/// Fragments retain their file headers and hunks, with line endings normalized to `\n`.
+/// Use `diff --git` headers as section boundaries when present; otherwise use
+/// `---`/`+++` pairs followed by a hunk, so header-shaped content does not become
+/// a file boundary. Each fragment must resolve to one target through
+/// parse_unified_diff_header_target or the split fails.
 pub(crate) fn split_unified_diff_by_file(patch: &str) -> Result<Vec<(String, String)>, String> {
     let lines: Vec<&str> = patch.lines().collect();
     let has_git_headers = lines.iter().any(|line| line.starts_with("diff --git "));
@@ -465,11 +440,9 @@ pub(crate) fn is_patch_section_header(line: &str) -> bool {
         || line.starts_with("*** Delete File: ")
 }
 
-/// Patch control markers that must start a top-level section. `is_patch_section_header` only
-/// recognizes headers written as `*** <Kind>: <path>`, so a malformed variant (a missing path
-/// or a missing colon, for example a bare `*** Replace in line:`) stays inside the body of the
-/// enclosing section. Treated as body text such a line is folded into a context line, and the
-/// envelope is then reported as producing no changes, hiding the real format error.
+/// Recognize control markers even when their headers are malformed.
+/// normalize_patch_envelope_body rejects such markers inside a section rather
+/// than padding them into context and hiding a structural error.
 pub(crate) fn patch_section_marker_kind(line: &str) -> Option<&'static str> {
     const MARKERS: [&str; 7] = [
         "*** Begin Patch",
@@ -581,11 +554,8 @@ pub(crate) fn normalize_patch_envelope_body(envelope: &PatchEnvelope) -> Result<
     }
     Ok(match envelope.op {
         PatchEnvelopeOp::ReplaceInLine => {
-            // ReplaceInLine does not go through the unified-diff path; it is handled directly by
-            // apply_inline_replace. Reaching here means the dispatch logic in
-            // execute_apply_patch has a bug — return an explicit error early rather than letting
-            // this be processed as a unified diff (which would treat anchor:/old:/new: as context
-            // lines).
+            // ReplaceInLine bypasses normalization through apply_inline_replace in replace_utils.rs.
+            // Fail here rather than reinterpret anchor:/old:/new: fields as context.
             return Err(
                 "internal error: ReplaceInLine envelope should be handled by \
                  apply_inline_replace, not normalize_patch_text"
@@ -593,11 +563,8 @@ pub(crate) fn normalize_patch_envelope_body(envelope: &PatchEnvelope) -> Result<
             );
         }
         PatchEnvelopeOp::Update => {
-            // The Update format of *** Begin Patch allows omitting the hunk header (Cursor/Aider
-            // style); models often write only +/-/space-prefixed lines without a hunk header. If
-            // the body contains no hunk header at all, synthesize one so parse_unified_hunks can
-            // recognize it. old_start=0 means no nominal position; locate_hunk will skip nominal
-            // matching and search the whole file directly.
+            // Supply a numeric hunk header when the Update body omits one; the
+            // parser needs a header before it can recognize context and edit lines.
             let has_hunk_header = envelope.body_lines.iter().any(|l| l.starts_with("@@"));
             // Even when a hunk header exists, models often write context lines as bare text; pad
             // such bare lines into context lines within the envelope to avoid pointless invalid

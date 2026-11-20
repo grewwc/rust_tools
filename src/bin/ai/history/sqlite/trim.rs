@@ -88,7 +88,6 @@ fn remap_session_asset_paths_sqlite_unlocked(
         let Some(text) = content.as_str() else {
             continue;
         };
-        // Checkpoint markers keep their original rewrite rules (behavior frozen).
         let (after_checkpoint, checkpoint_changed) =
             match remap_context_checkpoint_marker(text, source_assets, target_assets) {
                 Some(remapped) => (remapped, true),
@@ -241,7 +240,8 @@ fn clear_session_history_sqlite_unlocked(path: &Path) -> io::Result<()> {
 }
 
 /// Keep only the first `keep` rows of the messages table (ascending by id). Used for session branching:
-/// copy the full sqlite then roll back to the given message count. `keep == 0` is equivalent to clear.
+/// copy the full SQLite file, then roll back to the given message count. `keep == 0` clears messages
+/// and projections while retaining other session metadata, unlike clear-history.
 pub(in crate::ai) fn truncate_messages_sqlite(path: &Path, keep: usize) -> io::Result<()> {
     with_session_state_lock(path, || truncate_messages_sqlite_unlocked(path, keep))
 }
@@ -253,8 +253,8 @@ fn truncate_messages_sqlite_unlocked(path: &Path, keep: usize) -> io::Result<()>
         Err(err) => return Err(err),
     };
     init_history_schema(&conn)?;
-    // Transaction wrapper: DELETE + bump revision commit atomically, so a crash in the middle cannot leave
-    // the inconsistent “messages deleted but revision unchanged” state (the context cache serving a wrongly empty result).
+    // Deletes and revision changes commit atomically, so cached context cannot
+    // remain valid after its canonical rows are removed.
     let tx = conn
         .transaction()
         .map_err(|e| io::Error::other(e.to_string()))?;
@@ -300,10 +300,9 @@ fn truncate_messages_sqlite_unlocked(path: &Path, keep: usize) -> io::Result<()>
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
-/// Keep the messages table down to the first `keep_turns` complete user turns.
+/// Keep the first `keep_turns` intervals bounded by persisted `role='user'` rows.
 ///
-/// A user turn starts at a `role='user'` message and ends before the next user message; truncating at the next user message
-/// keeps an assistant tool call and its following tool result on the same side.
+/// Runtime-synthetic user messages also count as boundaries here.
 pub(in crate::ai) fn truncate_messages_to_user_turns_sqlite(
     path: &Path,
     keep_turns: usize,

@@ -3,7 +3,6 @@ pub(crate) fn format_char_with_code_point(ch: char) -> String {
     format!("{ch:?} (U+{:04X})", ch as u32)
 }
 
-/// Describes the position and Unicode code point of the first differing character
 /// Formats a char for mismatch diagnostics, rendering invisible characters
 /// (space, tab) visibly so the difference cannot be collapsed by a display layer
 /// or mistaken for an empty prefix in the model's view of the two lines.
@@ -41,6 +40,7 @@ pub(crate) fn first_char_mismatch(
     }
 }
 
+/// Describes the position and Unicode code point of the first differing character
 /// between two lines of text, making it easy to spot "looks-alike" differences
 /// such as smart quotes or full/half-width characters.
 pub(crate) fn describe_first_char_mismatch(expected: &str, actual: &str) -> Option<String> {
@@ -129,11 +129,6 @@ pub(crate) fn render_pasteable_current_block(
 }
 
 /// Constructs a "hunks out of order" error with diagnostics.
-///
-/// Previously this error returned only the bare string `"hunks out of order"` — no
-/// line numbers, no indication of which hunk, no current text, no fix suggestion, so
-/// the model could only guess blindly (in real sessions this caused 4 consecutive
-/// failures).
 ///
 /// Unified diffs require hunks to be ordered by **ascending** file line number;
 /// `apply_unified_patch` locates each hunk with a monotonically increasing `cursor`.
@@ -361,9 +356,8 @@ pub(crate) fn describe_context_mismatch(
                 ));
             }
         }
-        // A directly pasteable block of current text: covers the best-match region
-        // (with a little extra margin before/after) so the model can rebuild the
-        // patch in place without re-reading the whole file.
+        // Include the available current text at the best-match start for the expected block
+        // so the model can rebuild the patch without reading the whole file.
         let block =
             render_pasteable_current_block(orig_lines, best.pos, best.total.max(expected.len()));
         if !block.is_empty() {

@@ -2,17 +2,15 @@
 
 use super::*;
 
-/// Query for the read-only preview route: one media path, either relative to
-/// the workspace root or absolute inside an allowed root.
+/// Query for the read-only preview route: a media path relative to the session
+/// workspace or assets directory, or absolute within either root.
 #[derive(Debug, Deserialize)]
 pub(crate) struct FileQuery {
     pub(crate) path: String,
 }
 
-/// Media extensions the preview route serves. Everything else (sources,
-/// configs, dotfiles, keys) stays invisible to remote clients even inside an
-/// allowed root: the route exists so a phone can display media the assistant
-/// produced, not browse the server's filesystem.
+/// Media extensions the preview route serves. Other extensions are rejected
+/// even inside an allowed root; the route is for media previews.
 pub(crate) const PREVIEW_MEDIA_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "mp3", "wav", "m4a", "aac", "ogg",
     "flac", "opus",
@@ -125,7 +123,7 @@ pub(crate) fn resolve_preview(raw: &str, roots: &[PathBuf]) -> Result<PreviewFil
     })
 }
 
-/// `GET /sessions/{id}/file?path=...` (authed): one image from the workspace
+/// `GET /sessions/{id}/file?path=...` (authed): one media file from the workspace
 /// root or this session's assets dir, fetched by the mobile page for inline
 /// previews. Read-only and media-only by construction (see `resolve_preview`);
 /// the client sends its bearer token in a `fetch` header, so the token never

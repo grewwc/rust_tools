@@ -1,9 +1,7 @@
-//! Lexical similarity library for memory / knowledge search.
+//! Lexical tokenization and vector cosine similarity for knowledge search.
 //!
-//! Scope: exact-term, character-level matching only — there is no semantic
-//! (embedding) layer in this codebase anymore. These primitives feed the BM25
-//! term space in `memory_store.rs` and the token-coverage bonus in
-//! `service/memory.rs`.
+//! [`tokenize`] supplies lexical search terms; [`cosine_similarity`] compares
+//! dense embedding vectors.
 //!
 //! Tokenization strategy (dependency-free, standard for CJK + Latin text):
 //!   - Han (CJK) runs become **character bigrams** (`搜索算法` → `搜索 索算
@@ -14,10 +12,8 @@
 //!   - Common function words (stopwords) are dropped from both sides so they
 //!     cannot inflate similarity.
 //!
-//! `norm_text` preserves word boundaries (single spaces) instead of stripping
-//! all whitespace: the previous version removed every space, which merged
-//! distinct words ("rust tools" → "rusttools") and fabricated cross-word
-//! bigrams.
+//! `norm_text` preserves word boundaries with single spaces so distinct words
+//! stay separate and Han bigrams do not cross whitespace.
 
 use rustc_hash::FxHashSet;
 
@@ -93,7 +89,6 @@ pub fn tokenize(s: &str) -> Vec<String> {
             }
             latin.push(ch);
         } else {
-            // Whitespace / punctuation: flush both runs.
             if !latin.is_empty() {
                 push_token(std::mem::take(&mut latin), &mut tokens);
             }
@@ -167,8 +162,7 @@ const STOPWORDS_ZH_BIGRAM: &[&str] = &[
     "以前",
 ];
 
-/// English function words. Deliberately excludes negation ("not" is included,
-/// "no" is not) and content words.
+/// English function words. The list drops "not" but keeps "no".
 const STOPWORDS_EN: &[&str] = &[
     "a", "about", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by", "can",
     "could", "did", "do", "does", "for", "from", "had", "has", "have", "he", "her", "his", "i",

@@ -142,13 +142,11 @@ pub(super) fn read_line_with_timeout_buf<R: std::io::Read>(
                         .map_err(|e| format!("MCP response is not valid UTF-8: {}", e))?;
                     return Ok(line);
                 }
-                // 缓冲区有数据但不完整（没有换行符），复制到 buf 后继续
                 buf.extend_from_slice(available);
                 let consumed = available.len();
                 stdout.consume(consumed);
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                // 管道暂无新数据，等待 fd 可读
                 let now = Instant::now();
                 if now >= deadline {
                     return Err(format!("MCP response timeout after {} ms", timeout_ms));

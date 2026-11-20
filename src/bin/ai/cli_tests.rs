@@ -717,7 +717,7 @@ fn parse_cli_args_sharp_shortcut_selects_sharp_agent() {
     assert_eq!(cli.agent.as_deref(), Some("sharp"));
     assert!(cli.reasoning_effort_override.is_none());
 
-    // A non-sharp agent never gets the low-effort default.
+    // Parsing a non-sharp agent leaves the effort override unset.
     let cli = super::parse_cli_args(
         ["a".to_string(), "--agent".to_string(), "build".to_string()].into_iter(),
     );

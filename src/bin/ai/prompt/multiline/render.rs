@@ -133,14 +133,12 @@ fn popup_layout_config(
     _has_status_msg: bool,
     has_model_label: bool,
 ) -> PopupLayoutConfig {
-    // top_margin always stays 0. Do not put stable decorative horizontal rules inside the prompt viewport:
-    // on terminal resize / reflow / re-anchoring, such full-line decorations easily get pushed into scrollback,
-    // and after the width is restored they keep stacking like "a few extra horizontal lines". The divider is
-    // removed entirely here, keeping only the necessary model/help info to avoid ghost artifacts.
+    // Decorative horizontal rules can reflow into scrollback during a resize.
+    // Keep them out of the prompt viewport to avoid accumulating ghost rows.
     let top_margin: u16 = 0;
     let top_rule_lines: u16 = 0;
-    // While the completion panel is active, compress the bottom help to 1 line and hide model/session info,
-    // giving the height to the candidate list first; on small terminals this significantly reduces the "only 1 candidate visible" case.
+    // Hide identity and topic rows while the completion panel is active so
+    // candidates get the available height.
     let help_lines: u16 = 1;
     let model_header_lines = if has_completion_panel || !has_model_label {
         0
@@ -176,8 +174,8 @@ fn popup_layout_config(
 struct PopupGeometry {
     popup: Rect,
     chunks: [Rect; 6],
-    /// Content area inside the input box border (chunks[1] inset by one cell on
-    /// every side); the textarea widget renders here.
+    /// Content area after the input bar and blank gutter in `chunks[1]`;
+    /// the textarea widget renders here.
     textarea_inner: Rect,
 }
 
@@ -416,7 +414,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
     // textarea growth does not move it through the editing region.
     if chunks[3].height > 0 {
         let header_area = chunks[3];
-        // Compact identity line: " model (agent; reasoning)|checkpoint". The verbose
+        // Compact identity line: model (agent; reasoning; backend)|checkpoint. The verbose
         // "agent:/model:/reasoning:" labels cost ~20 columns and fold the
         // viewport on narrow terminals, so only the values are painted.
         let mut spans = Vec::new();
@@ -440,8 +438,8 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        // Parenthesized agent/reasoning suffix. Parentheses and the separator
-        // stay dim so the two values keep their own colors.
+        // Parenthesized agent/reasoning/backend suffix. Parentheses and separators
+        // stay dim so the values keep their own colors.
         if !agent_label.is_empty()
             || !reasoning_effort_label.is_empty()
             || !backend_label.is_empty()
@@ -545,7 +543,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
 
     let char_count = current_content.chars().count();
 
-    // Set alignment
     textarea.set_alignment(Alignment::Left);
     // Keep the existing input color and current-line underline, but apply them
     // only to actual characters so blank cells cannot participate in reflow.
@@ -578,7 +575,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
     // widget's internal screen map.
     let visual_cursor_position = textarea.rendered_cursor_position();
 
-    // Render the completion panel
     if let Some(panel) = completion_panel {
         // The scroll window must use the panel's **actually visible row count** (chunk height minus the top/bottom
         // borders), not a fixed COMPLETION_WINDOW: on short terminals the layout squeezes the panel to fewer rows
@@ -620,10 +616,8 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
         f.render_widget(Paragraph::new(items).block(panel_block), chunks[2]);
     }
 
-    // Get cursor position
     let (cursor_row, cursor_col) = textarea.cursor();
 
-    // Status bar info: character count + cursor position
     let status_info = if char_count > MAX_INPUT_CHARS {
         format!(
             " Chars: {} (exceeded) | Ln {}, Col {} ",
@@ -647,7 +641,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
         )
     };
 
-    // Render the help line
     let help_lines = if completion_panel.is_some() {
         vec![Line::from(vec![
             Span::styled("移动：", Style::default().fg(Color::DarkGray)),
@@ -951,7 +944,7 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
     let mut width: usize = 0;
 
     for ch in text.chars() {
-        // For characters where unicode-width returns 0, conservatively estimate width 1
+        // Characters without a known display width use a one-column estimate.
         let ch_w = UnicodeWidthChar::width_cjk(ch).unwrap_or(1);
 
         if width + ch_w > target {
@@ -1034,8 +1027,8 @@ mod tests {
             Span::styled("glm-5.2-super-relay", Style::default().fg(Color::Green)),
             Span::styled(" | reasoning: max", Style::default().fg(Color::Blue)),
         ]);
-        // Reserving the marker's columns shows one character less than an
-        // unmarked hard cut would within the same budget.
+        // Reserving the marker's columns leaves less room for text than an
+        // unmarked hard cut within the same budget.
         let truncated = truncate_line_to_width(&line, 10);
         let rendered_text = truncated
             .spans
@@ -1062,7 +1055,6 @@ mod tests {
 
     #[test]
     fn test_truncate_cjk() {
-        // Test CJK truncation
         let result = truncate_with_ellipsis("已补全为 /agent", 10);
         assert!(result.ends_with('…'));
         assert!(display_width(&result) <= 10);
@@ -1083,7 +1075,6 @@ mod tests {
 
     #[test]
     fn test_truncate_unicode() {
-        // Test assorted Unicode characters
         let result = truncate_with_ellipsis("日本語テスト", 8);
         assert!(result.ends_with('…'));
         assert!(display_width(&result) <= 8);
@@ -1198,8 +1189,8 @@ mod tests {
         );
     }
 
-    /// The session title has its own row and the only chrome field that can
-    /// exceed the reflow budget. A hard cut leaves a partial CJK phrase that
+    /// A long session title has its own row and must show truncation.
+    /// A hard cut leaves a partial CJK phrase that
     /// reads as a typo, so the row has to end with the marker.
     #[test]
     fn title_row_marks_a_truncated_topic_with_an_ellipsis() {
@@ -1255,8 +1246,8 @@ mod tests {
             dense.contains(&head),
             "title row drops the topic head: {title_row:?}"
         );
-        // Reserve the marker inside the 116-column budget before fitting wide
-        // characters; an odd remaining column cannot fit another wide glyph. The
+        // Reserve the marker and left indent before fitting wide characters;
+        // a leftover single column cannot fit another wide glyph. The
         // whitespace-filtered row must end there, not at the topic end. (The
         // tail of the first copy repeats mid-row, so absence is unassertable.)
         assert_eq!(
@@ -1278,8 +1269,7 @@ mod tests {
         );
     }
 
-    /// A typical session title (14 CJK characters, 28 columns) fits inside the
-    /// 120-column budget next to the 35-column prefix, so it renders verbatim.
+    /// A typical session title fits its dedicated row and renders verbatim.
     #[test]
     fn model_line_shows_a_typical_topic_in_full() {
         let mut terminal = Terminal::with_options(
@@ -1438,25 +1428,16 @@ mod tests {
             0,
             viewport_area.width,
         );
-        // Measure with the renderer's width table, not the CJK one: `↵`
-        // counts two columns under width_cjk but renders as one (both the
-        // test backend and xterm advance a single cell), leaving a blank
-        // cell the CJK measurement would mistake for paint. The truncate
-        // budget still counts two, so production keeps the full margin.
-        // The model row is ASCII at this width (the long topic is fully cut),
-        // so its painted width is exact: it must hold the full edge margin.
-        // This is the reported bug's row — a variable-length topic that used
-        // to paint into the last column and fold on narrowing.
+        // The identity row is ASCII, so the renderer's width table measures
+        // its painted edge without continuation-cell ambiguity.
         let model_painted = UnicodeWidthStr::width(model_row.trim_end());
         assert!(
             model_painted as u16 + CHROME_EDGE_MARGIN <= viewport_area.width,
             "identity row touches the edge and would fold on narrowing: painted={model_painted} width={} {model_row:?}",
             viewport_area.width,
         );
-        // The title row carries CJK, whose continuation cells read back as
-        // spaces, so display-column math cannot measure it. Assert on content
-        // chars instead: 17 wide chars fit the 34-column text budget, plus
-        // the marker. The edge margin is checked cell by cell below.
+        // CJK continuation cells read back as spaces. Count content characters
+        // here and check the reserved edge cells directly below.
         let title_dense: String = title_row.chars().filter(|ch| !ch.is_whitespace()).collect();
         let title_head: String = topic.chars().take(10).collect();
         assert!(
@@ -1485,12 +1466,8 @@ mod tests {
                 "title row touches the last column: x={x} {title_row:?}"
             );
         }
-        // The help row carries CJK, and joining backend cells overcounts every
-        // CJK by one column against the renderer's own accounting, so a tight
-        // bound is unmeasurable here. Keep the repo's loose overflow guard
-        // (same form as the wide-terminal test above): allow exactly one
-        // phantom column per wide char. The margin itself is enforced by the
-        // shared truncation call site, reviewed alongside the model row.
+        // Buffer rows include continuation blanks for wide characters. Add
+        // their count when checking this row's display width.
         let help_painted = UnicodeWidthStr::width(help_row.trim_end());
         let wide = help_row
             .chars()
@@ -1505,7 +1482,7 @@ mod tests {
 
     #[test]
     fn textarea_row_range_excludes_the_chrome_slots() {
-        // Empty-input production shape: 2 textarea rows plus model/title/help chrome.
+        // A five-row viewport leaves two textarea rows above model/title/help.
         let lines = vec![String::new()];
         let (start, len) = textarea_row_range(5, &lines, None, false, true);
         assert!(len >= 1, "empty input still reserves textarea rows");
@@ -1513,8 +1490,7 @@ mod tests {
             start.saturating_add(len) <= 5,
             "range escapes the viewport: start={start} len={len}"
         );
-        // The chrome rows surround the textarea, so the span is a strict
-        // interior slice, never the whole box.
+        // The textarea span must leave the dedicated chrome rows outside it.
         assert!(
             start >= 1 || start.saturating_add(len) < 5,
             "span covers the chrome rows too: start={start} len={len}"
@@ -1561,8 +1537,8 @@ mod tests {
             live_row.contains('…'),
             "title was not truncated: {live_row:?}"
         );
-        // Continuation cells read back as spaces, so count content chars:
-        // 17 wide chars fit the 34-column live budget, plus the marker.
+        // Continuation cells read back as spaces, so count content characters
+        // rather than treating the joined buffer row as plain text.
         let live_dense: String = live_row.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert!(
             live_dense.chars().count() <= 19,
@@ -1721,7 +1697,7 @@ mod tests {
             .map(|y| buffer_row(terminal.backend(), y, viewport_area.x, viewport_area.width))
             .collect::<Vec<_>>()
             .join("\n");
-        // Compact identity format: "model (agent; reasoning)|topic".
+        // The identity row shows model and agent/reasoning values without labels.
         assert!(rendered.contains("(build; max)"));
         assert!(rendered.contains("glm-5.2-super-relay"));
         assert!(!rendered.contains("agent:"));
@@ -1900,9 +1876,8 @@ mod tests {
 
     #[test]
     fn cjk_cursor_position_matches_popup_inner_left_plus_width() {
-        // Under CJK input, the cursor should land at the popup's inner left edge on the textarea's first line plus the text's display width.
-        // The previous hand-computation used width_cjk, which disagrees with tui-textarea's internal width,
-        // shifting the cursor to the right (1 column per CJK character).
+        // Use the widget's rendered caret position for CJK text rather than
+        // duplicating its cursor mapping in the prompt renderer.
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::with_options(
             backend,
@@ -1914,7 +1889,6 @@ mod tests {
         // 4 CJK characters, width 2 each, total display width 8
         let content = "你好世界";
         let mut textarea = TextArea::from(vec![content.to_string()]);
-        // Move the cursor to the end of the four-character CJK text.
         textarea.move_cursor(CursorMove::End);
         let mut viewport_area = Rect::ZERO;
         let mut cursor_offset = None;

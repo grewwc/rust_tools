@@ -1,16 +1,12 @@
 //! `/cd` — move the session to another working directory without restarting.
 //!
-//! The session working directory *is* the process working directory: file
-//! tools, instruction discovery, sandbox write roots and the next turn's
-//! system prompt all resolve paths through `runtime_ctx::effective_cwd()`
-//! (which falls back to `std::env::current_dir()`), and `execute_command`
-//! children inherit it. Switching therefore only has to move the process —
-//! nothing else is captured at startup, so the change is live from this turn's
-//! output on.
+//! The local command changes the process working directory. Consumers of
+//! `runtime_ctx::effective_cwd()` observe the new directory unless a
+//! task-local `SUBAGENT_CWD` override is active.
 //!
-//! Sub-agents spawned with `inherit.cwd == false` stay isolated: their
-//! `SUBAGENT_CWD` scratch scope wins over the process directory, so `/cd`
-//! never moves them.
+//! Sub-agents with a scoped `SUBAGENT_CWD` keep their directory across
+//! process-wide `/cd` changes. This includes an isolated scratch workspace
+//! and an explicitly inherited parent directory.
 
 use std::{
     path::{Path, PathBuf},
@@ -20,9 +16,8 @@ use std::{
 use crate::ai::driver::runtime_ctx;
 use crate::commonw::utils::expanduser;
 
-/// Destination of the shell-like `/cd -` form: the directory the session was in
-/// before the last successful `/cd`. Session-scoped in the strictest sense — it
-/// lives in the process and disappears when `a` exits.
+/// Process-local destination for `/cd -`: the directory before the last
+/// successful process-wide switch, retained until the process exits.
 static PREVIOUS_CWD: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
 
 /// A parsed `/cd`/`:cd` command, before any directory state is touched.
@@ -111,11 +106,8 @@ pub(crate) struct CwdOutcome {
 /// this process and return the message lines it would print, without printing
 /// anything.
 ///
-/// Serve mode uses this: the session working directory is the serve process's
-/// working directory (turn children inherit it at spawn), so the switch must
-/// happen in the serve process, but its output must come back over HTTP
-/// instead of leaking into the server's terminal. Returns `None` when `input`
-/// is neither a `/cd` nor a `/pwd` command.
+/// Returns captured stdout/stderr so callers can relay the result over a
+/// channel. Returns `None` when `input` is neither a `/cd` nor `/pwd` command.
 pub(crate) fn run_cwd_command(input: &str) -> Option<CwdOutcome> {
     let outcome = match parse_cwd_command(input)? {
         CwdCommand::Show => current_dir_outcome(),
@@ -192,8 +184,8 @@ fn apply_dir_outcome(dir: &Path) -> CwdOutcome {
     if let Ok(mut guard) = PREVIOUS_CWD.lock() {
         *guard = Some(previous.clone());
     }
-    // Read the directory back from the OS so the printed path is the one tools
-    // will resolve against (absolute, symlinks resolved by getcwd).
+    // Resolve through effective_cwd so the report follows the same
+    // task-local override as path-consuming tools.
     let now = runtime_ctx::effective_cwd().unwrap_or_else(|_| dir.to_path_buf());
     CwdOutcome {
         stdout: format!(
@@ -268,8 +260,7 @@ mod tests {
             parse_cwd_command(":pwd -"),
             Some(CwdCommand::UnexpectedPwdArgs(_))
         ));
-        // Near-misses are not commands: they must keep falling through to the
-        // model instead of printing a directory.
+        // Near-misses stay unclaimed by the cwd parser.
         assert!(parse_cwd_command("/pwdx").is_none());
         assert!(parse_cwd_command("pwd").is_none());
     }

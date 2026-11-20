@@ -265,7 +265,7 @@ pub(in crate::ai::driver::turn_runtime) fn read_only_tool_signature(
 
     let mut args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
         .unwrap_or_else(|_| serde_json::Value::String(tool_call.function.arguments.clone()));
-    // P3: execute_command is only replayable within the same turn when the command can be
+    // execute_command is only replayable within the same turn when the command can be
     // proven read-only — results of mutating commands (cargo test, git commit, etc.) must
     // not be treated as reusable evidence, or state changes would be masked.
     // The read-only check includes cargo-verify subcommands (needed for evidence-fingerprint
@@ -284,8 +284,8 @@ pub(in crate::ai::driver::turn_runtime) fn read_only_tool_signature(
             object.insert("command".to_string(), serde_json::Value::String(command));
         }
     }
-    // P3: normalize read_file paths so `./x` and `x` count as the same read (aligned with
-    // the P1-1 evidence fingerprints).
+    // Normalize read_file paths so `./x` and `x` count as the same read, using
+    // the same path normalization as progress evidence fingerprints.
     if tool_call.function.name == "read_file" {
         if let Some(obj) = args.as_object_mut() {
             for key in ["file_path", "path", "filePath"] {

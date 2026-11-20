@@ -1,6 +1,6 @@
 use super::*;
 
-/// Registry of asynchronous subtasks, keyed by task_id (a UUID string); values are
+/// Registry of asynchronous subtasks, keyed by opaque task_id; values are
 /// [`AsyncTaskEntry`].
 ///
 /// This is **parallel storage** to the AIOS kernel process table: the two are linked through the
@@ -124,9 +124,8 @@ pub(crate) fn with_task_entry_by_pid<R>(
     None
 }
 
-/// Read-only snapshot used by the foreground status bar. Only exposes the fields needed for
-/// display; the subagent body text is still returned exclusively through `task_wait` /
-/// `task_status`, keeping background tasks from contending for the terminal.
+/// Read-only status-bar snapshot with only display fields. Full task bodies remain
+/// in the collection/evidence tools, so background tasks do not write directly to the terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SubagentTerminalStatus {
     pub(crate) task_id: String,
@@ -362,7 +361,7 @@ pub(crate) fn task_backend_id(task_id: &str) -> BackendId {
         .unwrap_or(BackendId::KERNEL)
 }
 
-/// Remove a task entry from the registry once its result has been consumed.
+/// Remove a task entry and its effort label after collection or task teardown.
 pub(crate) fn remove_task_entry(task_id: &str) -> Option<AsyncTaskEntry> {
     lock_unpoisoned(&TASK_REASONING_EFFORT_REGISTRY).remove(&task_id.to_string());
     let mut registry = lock_task_registry();
@@ -374,7 +373,8 @@ pub(crate) fn insert_task_entry_for_test(task_id: String, entry: AsyncTaskEntry)
     let mut registry = lock_task_registry();
     registry.insert(task_id, entry);
 }
-/// channel. Re-exported so every collection path produces identical output.
+/// Format a stored task result through the shared renderer.
+/// Re-exported so every collection path produces identical output.
 pub(crate) fn format_finished_task(entry: &AsyncTaskEntry, result: StoredTaskResult) -> String {
     format_task_result(entry, result, None)
 }

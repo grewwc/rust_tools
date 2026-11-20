@@ -35,8 +35,8 @@ pub(crate) fn shell_c_option_present(program: &str, tokens: &[String]) -> bool {
         // Clustered short options can also carry `-c` / `-e` (e.g. `bash -lc`,
         // `perl -le`, `node -pe`). Match only single-dash tokens longer than 2
         // chars: long options like `--norc`, and `-c` / `-e` already exactly
-        // matched, are not hit (note tokens are lowercased, so `-C` noclobber gets
-        // conflated with `-c` — a pre-existing false positive).
+        // matched, are not hit. The caller lowercases tokens, conflating `-C`
+        // (noclobber) with `-c`.
         let grouped = !tok.starts_with("--") && tok.len() > 2;
         if is_shell && (tok == "-c" || tok == "--command" || (grouped && tok.contains('c'))) {
             return true;
@@ -56,8 +56,7 @@ pub(crate) fn shell_c_option_present(program: &str, tokens: &[String]) -> bool {
 /// - `Ok(None)`: no `-c` option (e.g. `python3 script.py` / `python3 -m mod`), no
 ///   code string involved.
 /// - `Ok(Some(code))`: a literal code string was extracted.
-/// - `Err`: `-c` is present but the code string cannot be statically obtained
-///   (missing / empty / from shell variable expansion), fail-closed.
+/// - `Err`: a detected `-c` option has no following code argument.
 pub(crate) fn python_c_argument(tokens: &[String]) -> Result<Option<String>, String> {
     let mut i = 1usize;
     while i < tokens.len() {
@@ -214,8 +213,7 @@ pub(crate) fn validate_python_code(code: &str) -> Result<(), String> {
         "shutil.rmtree",
         "shutil.move",
         "shutil.chown",
-        // Path(...) method-call forms (`.unlink()` etc.); `).replace(` also covers
-        // os.replace.
+        // Method calls on constructed objects, such as `Path(...).unlink()`.
         ").unlink(",
         ").rmdir(",
         ").rename(",

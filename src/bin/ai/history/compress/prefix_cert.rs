@@ -1,5 +1,5 @@
-//! Versioned, snapshot-persistable evidence of a B1 identity projection.
-//! The digest binds the admitted prefix, while the original B1 extension proof
+//! Versioned, snapshot-persistable evidence of a cached identity projection.
+//! The digest binds the admitted prefix, while `PrefixReuseCache` extension checks
 //! decides whether a canonical tail can reuse it without changing any bytes.
 
 use std::fmt::Write;
@@ -16,7 +16,7 @@ use super::{
     messages_total_chars, retained_turn_start, user_input_turn_count,
 };
 
-/// Increment when B1 admission, extension, or retention-window rules change.
+/// Increment when cache admission, extension, or retention-window rules change.
 pub(in crate::ai) const PROOF_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,7 +30,7 @@ pub(in crate::ai) struct PrefixCertificatePolicy {
 }
 
 impl PrefixCertificatePolicy {
-    /// Normalize only path components, matching B1's lexical Path equality.
+    /// Normalize only path components, matching `PrefixReuseKey`'s lexical path equality.
     /// Parent components stay intact; no filesystem lookup or lossy conversion
     /// can change the cache key's meaning.
     pub(in crate::ai) fn new(
@@ -105,7 +105,7 @@ pub(in crate::ai) struct PrefixCertificate {
     pub(in crate::ai) prefix_message_count: usize,
     pub(in crate::ai) prefix_sha256: String,
     pub(in crate::ai) chars: usize,
-    /// B1's bounded projection-memory estimate, including both cache-key paths.
+    /// Bounded projection-memory estimate, including both cache-key paths.
     pub(in crate::ai) bytes: usize,
     pub(in crate::ai) real_user_turns: usize,
     pub(in crate::ai) trim_start: usize,
@@ -114,7 +114,7 @@ pub(in crate::ai) struct PrefixCertificate {
     pub(in crate::ai) older_recent_split: Option<usize>,
 }
 
-/// Certify only the exact current entry of the process-local B1 cache.
+/// Certify only the exact current entry of the process-local `prefix_reuse` cache.
 pub(in crate::ai) fn prefix_certificate_from_cache(
     messages: &[Message],
     policy: &PrefixCertificatePolicy,
@@ -128,7 +128,7 @@ pub(in crate::ai) fn prefix_certificate_from_cache(
         }
         let metrics = (entry.chars, entry.bytes, entry.user_turns, entry.boundaries);
         // Even an admitted entry may have expired guidance. An empty extension
-        // checks all B1 reuse gates while preserving the cached prefix exactly.
+        // checks all prefix reuse gates while preserving the cached prefix exactly.
         if cache.try_reuse(messages, &key)? != metrics.0 {
             return None;
         }
@@ -140,7 +140,7 @@ pub(in crate::ai) fn prefix_certificate_from_cache(
         || real_user_turns != user_input_turn_count(messages)
         || boundaries != retention_boundaries(messages, chars)
     {
-        // Noncanonical path spelling can compare equal as a B1 key but have a
+        // Noncanonical path spelling can compare equal as a `PrefixReuseKey` but have a
         // different memory estimate. Do not manufacture a replacement estimate.
         return None;
     }
@@ -208,11 +208,9 @@ impl PrefixCertificate {
             return None;
         }
 
-        // The versioned digest binds the prefix's completed admission proof,
-        // including independent note windows and pure no-op passes. A local
-        // entry reuses the ORIGINAL B1 extension proof: total budgets, real-user
-        // limits, both retention boundaries, and full-input guidance filtering.
-        // Its extension is disposable; neither the certificate nor CACHE moves.
+        // A local entry reuses the process cache's extension checks: total budgets,
+        // real-user limits, retention boundaries, and full-input guidance filtering.
+        // Its extension is disposable; neither the certificate nor CACHE advances.
         let mut cache = PrefixReuseCache {
             entry: Some(PrefixReuseEntry {
                 key: policy.reuse_key()?,

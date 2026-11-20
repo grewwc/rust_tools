@@ -33,7 +33,6 @@ fn extract_export_markdown_arg(input: &str) -> &str {
 }
 
 fn execute_export_markdown(app: &App, arg: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // 1) Determine the output path
     let target_path = if arg.is_empty() {
         default_export_markdown_path()
     } else {
@@ -45,7 +44,6 @@ fn execute_export_markdown(app: &App, arg: &str) -> Result<(), Box<dyn std::erro
         }
     };
 
-    // 2) Fetch the last assistant conclusion
     let text = match input::last_assistant_conclusion_text(app)? {
         Some(t) => t,
         None => {
@@ -59,7 +57,6 @@ fn execute_export_markdown(app: &App, arg: &str) -> Result<(), Box<dyn std::erro
         return Ok(());
     }
 
-    // 3) Write the file
     if let Some(parent) = target_path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -105,7 +102,6 @@ mod tests {
         assert!(is_export_markdown_command(":export-md"));
         assert!(is_export_markdown_command(":export-md foo.md"));
 
-        // Cases that must not match
         assert!(!is_export_markdown_command("/export"));
         assert!(!is_export_markdown_command(":export foo.md"));
         assert!(!is_export_markdown_command("/export-md_foo"));

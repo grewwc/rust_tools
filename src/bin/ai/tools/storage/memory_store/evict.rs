@@ -16,15 +16,8 @@ impl MemoryStore {
                 return Ok(false);
             }
 
-            // Fix P0-2: the original implementation used `rename` + `File::create` directly, freezing even entries in the
-            // category whitelist (permanent entries: safety_rules / reflection self_note / coding_guideline /
-            // user_preference / project_memory ...) into the archive, after which they default
-            // out of recall — effectively discarding the core rules of "long-term memory".
-            //
-            // Now all entries are read out first: whitelist entries stay in the new main file, the rest go to the archive:
-            //   - new main file = original content ∩ {is_permanent_memory}
-            //   - archive file = original content (unchanged, same as the old implementation)
-            // That way long-term assets are never lost, regardless of whether the recall layer enables search_archives.
+            // Archive the complete source while retaining is_permanent_memory entries in the
+            // main file, so default current-file recall keeps durable rules available.
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read memory file before rotate: {}", e))?;
 
@@ -56,7 +49,7 @@ impl MemoryStore {
             std::fs::rename(&path, &new_name)
                 .map_err(|e| format!("Failed to rotate file: {}", e))?;
 
-            // Rebuild the main file: write back all priority=255 entries (original timestamp order preserved)
+            // Retain is_permanent_memory entries in the main file in their original order.
             let mut head = String::new();
             for entry in &permanent {
                 if let Ok(s) = serde_json::to_string(*entry) {
@@ -171,12 +164,8 @@ impl MemoryStore {
                 pa.cmp(&pb).then_with(|| a.timestamp.cmp(&b.timestamp))
             });
 
-            // Fix P0-1: the original implementation used `while … { remove(i); if … { remove(i); } }`
-            // deleting twice at the same index — the second remove actually deleted the next entry that had already "shifted up",
-            // and it never checked the permanent-entry skip, so whitelist entries could be hit by mistake. Changed to a single remove +
-            // leaving i unchanged (after remove(i) the next entry lands at i), with permanent whitelist entries skipped.
-            //
-            // The target field now only serves "stop as soon as the quota is met"; it no longer triggers a second deletion.
+            // Deleting leaves the next entry at i; advance i only when preserving a permanent entry.
+            // Stop once the entry quota is met.
             let target = max_entries.saturating_sub(min_keep);
             let mut removed = 0usize;
             let mut skipped_permanent = 0usize;
@@ -203,13 +192,12 @@ impl MemoryStore {
                 }
             }
 
-            // Fix P1-1: the original `fs::write(&path, output)` was truncate-then-write,
-            // leaving an incomplete main file on a mid-way crash. Switched to tmp+rename for filesystem-level atomicity.
+            // Replace the main file atomically so readers do not see a partial quota rewrite.
             atomic_write_file(&self.path, output.as_bytes()).map_err(|e| {
                 format!("Failed to write memory file after quota enforcement: {}", e)
             })?;
 
-            // The file was fully rewritten: trigger an index rebuild to stay consistent; the rebuild wraps a transaction internally and failures are only traced.
+            // Rebuild the index after the rewrite; a rebuild failure does not fail quota enforcement.
             if let Some(idx) = memory_index_for(&self.path) {
                 let _ = idx.rebuild_from_source();
             }
@@ -231,7 +219,7 @@ impl MemoryStore {
         })
     }
 
-    /// Batch-delete memory entries (atomic: read once → filter → write back).
+    /// Batch-delete matching IDs from current memory and rotated archives via `apply_batch_update`.
     /// Returns the number of entries actually deleted.
     pub(crate) fn delete_by_ids(&self, ids: &[&str]) -> Result<usize, String> {
         if ids.is_empty() {

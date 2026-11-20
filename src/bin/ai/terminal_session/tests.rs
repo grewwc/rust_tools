@@ -1,6 +1,6 @@
-//! Offline tests for the terminal client/host pair. Every test uses its own
-//! PTY pair (host + client share it) and its own temp registry root, so no
-//! real terminal, real `a` process, or the real registry is touched.
+//! Offline tests for terminal clients, hosts, and display buffering.
+//! Host fixtures use temporary registries and shell workers; I/O fixtures use
+//! PTYs or pipes so they do not touch the real terminal or registry.
 
 use super::client::{
     AttachEnd, DisplayBacklog, MAX_DISPLAY_BACKLOG, attach, eligible, maybe_run_impl, reattach_hint,
@@ -105,7 +105,7 @@ fn write_all(fd: RawFd, bytes: &[u8]) {
     }
 }
 
-/// Non-blocking drain of `fd` into `out`; stops at the first WouldBlock.
+/// Drain a nonblocking fd until a read returns no data or an error.
 fn drain_fd(fd: RawFd, out: &mut Vec<u8>) {
     let mut chunk = [0u8; 8192];
     loop {
@@ -563,10 +563,8 @@ fn stalled_terminal_does_not_freeze_client() {
 
 #[test]
 fn second_stall_notice_reports_only_second_round_drops() {
-    // A previous stall must not leak into the next notice: the dropped counter
-    // resets when the notice is emitted, so a second stall reports only its
-    // own bytes (before the fix, both rounds were summed into the second
-    // notice, e.g. "7 MB dropped" when the second round only dropped 2 MB).
+    // Each queued notice settles its stall's dropped-byte count, so later
+    // stalls report only their own drops.
     let mut fds = [0i32; 2];
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
     let (read_fd, write_fd) = (fds[0], fds[1]);
@@ -591,10 +589,8 @@ fn second_stall_notice_reports_only_second_round_drops() {
         drain_fd(read_fd, &mut output);
         output
     };
-    // Each round keeps a small frame so the backlog is non-empty and pump
-    // runs to the truncation branch (a lone dropped frame leaves `bytes`
-    // empty; the notice is still emitted because attach calls pump every
-    // poll, but this test must drive it explicitly).
+    // Keep a small frame so drain_all invokes pump; its loop skips an empty
+    // backlog even when a drop notice is pending.
     let kept = vec![b'a'; 1024];
     // Round 1: one big frame dropped while the terminal is stalled.
     let first_dropped = vec![b'b'; 5 * 1024 * 1024];

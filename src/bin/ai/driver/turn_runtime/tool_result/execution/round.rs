@@ -139,11 +139,8 @@ fn build_first_use_tool_guidance_messages(
 pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round_with_gate(
     app: &mut App,
     source_model: &str,
-    // Since Step 5, real dispatch is handled by RoundToolExecutorAdapter, which locks
-    // shared_mcp_client to obtain `&McpClient`; this parameter is kept for compatibility
-    // with existing callers. In production it is a routing_snapshot() value — routing
-    // through the shared `cached_server_prefixes` is equivalent to the real client, and
-    // real MCP execution goes through shared_mcp_client.
+    // RoundToolExecutorAdapter obtains its routing snapshot from shared_mcp_client;
+    // this unused parameter preserves the existing caller signature.
     _mcp_client: &McpClient,
     shared_mcp_client: &SharedMcpClient,
     tool_call_execution: &ToolCallExecution,
@@ -210,8 +207,8 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round_with_gate(
     let mut exec_result = if let Some(reason) = rejection_reason {
         reject_tool_calls(&tool_calls, reason)
     } else {
-        // Step 5: build the per-round ToolExecutor chain with real dispatch as the inner
-        // adapter; an empty middleware chain is the identity — zero behavior change.
+        // Wrap real dispatch in the configured middleware chain; an empty chain
+        // delegates directly to the adapter.
         let adapter = RoundToolExecutorAdapter {
             session_id: app.session_id.clone(),
             shared_mcp_client: shared_mcp_client.clone(),
@@ -236,8 +233,8 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round_with_gate(
             execution_outcomes,
             had_error,
         } = output;
-        // Assistant messages injected by middleware (always empty with the current empty
-        // chain): the field is kept; mounting is left for future middleware capability.
+        // Middleware assistant messages are returned by the port but are not
+        // appended to turn history by this path.
         let _unwired_assistant_messages = assistant_messages;
         ExecuteToolCallsResult {
             executed_tool_calls,

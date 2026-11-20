@@ -2,7 +2,7 @@
 //!
 //! Uses an auxiliary model to decide whether the current request should
 //! activate a registered skill:
-//! - `select_skill_via_model`: public entry point; chunked routing + confidence threshold
+//! - `select_skill_via_model`: entry point; chunked routing + confidence threshold
 //! - `select_skill_candidate_via_model`: single-chunk candidate selection
 //! - `parse_router_output` / `extract_router_content`: parse the auxiliary model's JSON response
 //! - `strip_json_fence`: strip ```json fences
@@ -81,10 +81,8 @@ async fn select_skill_candidate_via_model(
 
     let mut system_prompt = include_str!("prompts/router.md").to_string();
 
-    // `include_str!` keeps the template bytes verbatim and the template ends with
-    // `<available_skills>` (no trailing newline), so add the separator BEFORE appending
-    // the skill list; otherwise the first skill glues onto the opening tag. A guard
-    // placed after the loop could never fire (every skill line ends with `\n`).
+    // Separate the opening tag from the first skill entry. Adding a newline
+    // after the loop cannot repair that boundary.
     if !system_prompt.ends_with('\n') {
         system_prompt.push('\n');
     }

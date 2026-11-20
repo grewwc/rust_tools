@@ -86,9 +86,8 @@ pub(super) fn first_alibaba_vl_model_name() -> Option<String> {
 }
 
 /// Attribute-based discovery: finds the first registry **key** whose model
-/// definition satisfies `predicate`. Returns `None` when no entry matches so
-/// each caller decides; callers in registry-coupled tests must hard-fail
-/// (panic/expect naming the missing model class) instead of skipping.
+/// definition satisfies `predicate`. Returns `None` when no entry matches;
+/// callers decide how to handle a missing fixture.
 pub(super) fn first_model_key_where(
     predicate: impl Fn(&crate::ai::model_names::ModelDef) -> bool,
 ) -> Option<String> {
@@ -109,12 +108,9 @@ pub(super) fn first_model_key_for_adapter(
 ) -> Option<String> {
     first_model_key_where(|m| m.adapter == adapter)
 }
-/// Finds a MiniMax ("MiMo" / "MiniMax") model key from the registry. MiniMax is
-/// not an `ApiProvider` variant — the thinking dialect dispatch keys off the
-/// model name (`contains("mimo") || contains("minimax")`), so a stale hardcoded
-/// key resolves to the default adapter/endpoint and never reaches the MiniMax
-/// branch. Returning the registry key keeps the sub-case honest: it exercises
-/// the MiniMax off-switch path only when such a model is actually present.
+/// Find a registry key by the `mimo`/`minimax` name markers used by thinking
+/// dispatch. An unregistered name would resolve to the default adapter and
+/// endpoint rather than the intended fixture.
 pub(super) fn first_minimax_model_key() -> Option<String> {
     first_model_key_where(|m| {
         let name = m.name.to_ascii_lowercase();

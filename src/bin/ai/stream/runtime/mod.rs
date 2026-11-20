@@ -39,12 +39,14 @@ mod driver;
 mod fold_render;
 mod hints;
 mod metrics;
+mod quality;
 mod tool_calls;
 
 pub(super) use driver::*;
 pub(super) use fold_render::*;
 pub(super) use hints::*;
 use metrics::*;
+pub(super) use quality::*;
 use tool_calls::*;
 
 // Slices under runtime/ still address their old sibling modules via `super::state` and
@@ -835,6 +837,11 @@ fn finalize_stream_response(
         .finish_reason_value
         .as_deref()
         .is_some_and(|reason| reason == PROVIDER_CONTROL_LEAK_FINISH_REASON);
+    let corrupted_reasoning = state
+        .content
+        .finish_reason_value
+        .as_deref()
+        .is_some_and(|reason| reason == CORRUPTED_REASONING_FINISH_REASON);
 
     let outcome = if stream_error {
         StreamOutcome::Truncated
@@ -845,6 +852,10 @@ fn finalize_stream_response(
     } else if provider_control_leak {
         // A leaked provider envelope makes the whole response structurally ambiguous.
         // Never execute even otherwise-valid calls accumulated before the leak.
+        StreamOutcome::Truncated
+    } else if corrupted_reasoning {
+        // The reasoning channel decoded into non-text or leaked tokenizer
+        // placeholders. Nothing from this response is trustworthy.
         StreamOutcome::Truncated
     } else if !tool_calls.is_empty() {
         StreamOutcome::ToolCall
@@ -1956,6 +1967,30 @@ fn process_stream_payload(
             state.content.finish_reason_value =
                 Some(PROVIDER_CONTROL_LEAK_FINISH_REASON.to_string());
             state.content.tool_calls_map.clear();
+            return Ok(StreamPayloadOutcome::stop_with_progress());
+        }
+
+        // A provider can decode its token stream into non-text (replacement or
+        // control characters) or leak special-token placeholders such as
+        // `< | box | >` / `place__holder__no__114`. Those are machine-decidable
+        // corruption, not a semantic judgement. Stop before the junk reaches
+        // history and let the turn loop retry once.
+        if state.content.assistant_text.trim().is_empty()
+            && state.content.tool_calls_map.is_empty()
+            && state
+                .content
+                .reasoning_corruption
+                .observe(&state.content.reasoning_text)
+        {
+            state.content.finish_reason_seen = true;
+            state.content.finish_reason_value =
+                Some(CORRUPTED_REASONING_FINISH_REASON.to_string());
+            if runtime_ctx::terminal_output_enabled() {
+                let _ = finalize_live_folds_before_diagnostic(state);
+                side_note_input::print_output_stderr_line(
+                    "\n  ⚠ 检测到模型推理输出乱码（解码损坏或泄漏特殊 token），停止当前响应并自动重试…",
+                );
+            }
             return Ok(StreamPayloadOutcome::stop_with_progress());
         }
 

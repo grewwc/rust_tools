@@ -2,8 +2,8 @@
 //!
 //! Final cleanup of `messages` before sending a request:
 //! - `agent_tools_for_request`: assembles tools/tool_choice fields based on model capabilities
-//! - `strip_unavailable_tool_hints_from_messages`: removes hints referencing unregistered tools
-//! - `normalize_messages_for_request`: merges system messages, injects internal notes, truncates tokens
+//! - `strip_unavailable_tool_hints_from_messages`: removes hints for registered tools absent from this request
+//! - `normalize_messages_for_request`: merges system messages, projects internal notes, repairs tool pairing
 //! - `normalize_message_content_for_text_only_model`: degrades content for text-only models
 //! - `normalize_messages_for_model`: model-specific message normalization
 
@@ -248,12 +248,9 @@ const REQUEST_CONTEXT_CHECKPOINT_LIMIT: usize = 8;
 /// The checkpoint marker is the short index the model uses to relocate the
 /// archived body text after compression; the writer is always
 /// `role=internal_note` (see `history::compress::is_context_checkpoint_marker`).
-/// This is a prompt-injection channel crossing the trust boundary, so the role
-/// check here is mandatory: request normalization collects these markers and
-/// injects them into a standalone `system` message, and matching only on the
-/// content prefix would escalate any user/tool/assistant body text starting
-/// with `[context_checkpoint ` into a system instruction. Only legitimate
-/// `internal_note` markers are recognized; their behavior is unchanged.
+/// The role check keeps user/tool/assistant text with the same prefix from
+/// being extracted into the checkpoint index. Only internal-note markers are
+/// collected, and they are projected as assistant-derived navigation context.
 fn is_context_checkpoint_marker(message: &Message) -> bool {
     is_internal_note_role(&message.role)
         && message
@@ -572,9 +569,8 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
                 )
             })
             .collect::<Vec<_>>();
-        // Apply the existing shared cap before separating runtime policy from
-        // assistant-derived tool context. Ordinary runtime-only prefixes keep
-        // exactly the same grouped bytes and truncation as before.
+        // Apply the shared payload cap before separating runtime policy from
+        // assistant-derived tool context so both groups share one budget.
         let blob = fragments
             .iter()
             .map(|(_, _, text)| text.as_str())
@@ -673,12 +669,10 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         mut tool_call: crate::ai::types::ToolCall,
     ) -> crate::ai::types::ToolCall {
         let raw_args = tool_call.function.arguments.trim();
-        // args must be a valid JSON object string for provider validation. Never discard
-        // the entire tool_call because its args are malformed: the tool has already run
-        // and produced a real result. Dropping it breaks assistant/tool pairing and reduces
-        // real results to preview notes, weakening read_file/execute_command evidence and
-        // encouraging redundant calls. Repair malformed JSON into a valid object while
-        // preserving the original text, satisfying validation without losing pairing or results.
+        // Keep valid JSON arguments; wrap malformed text in an object rather
+        // than dropping a call whose tool result must remain paired. Retain
+        // the malformed text inside the wrapper so the original evidence
+        // remains available.
         let normalized_arguments = if raw_args.is_empty() {
             "{}".to_string()
         } else if serde_json::from_str::<Value>(raw_args).is_ok() {
@@ -774,10 +768,8 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
     }
 
     /// Trims trailing whitespace off the end of array content blocks in place.
-    /// The end of the content is the last text-bearing block: it gets
-    /// `trim_end`, and blocks that become empty are removed so an
-    /// all-whitespace tail cannot linger behind an image block. Returns whether
-    /// any block remains.
+    /// Trailing text-bearing blocks are trimmed and removed if they become
+    /// empty. A non-text block ends the scan. Returns whether any block remains.
     fn trim_trailing_array_content(items: &mut Vec<Value>) -> bool {
         loop {
             let empty_text = match items.last_mut() {
@@ -876,8 +868,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         }
 
         let mut out = Vec::with_capacity(messages.len());
-        // Consuming scan: every message is moved (never re-cloned) into `out`;
-        // the peekable cursor replaces the old index window over `messages[..]`.
+        // Consume matched messages without cloning; keep previews for unmatched tool evidence.
         let mut consumed = messages.into_iter().peekable();
         while let Some(mut message) = consumed.next() {
             if message.role == "tool" {
@@ -901,8 +892,6 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
                 .as_ref()
                 .is_some_and(|calls| !calls.is_empty());
             if !has_effective_tool_calls {
-                // Pass through unchanged, including a `Some(empty)` tool_calls
-                // value: the old loop only specialized on non-empty lists.
                 out.push(message);
                 continue;
             };
@@ -1022,9 +1011,8 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
             }
             let mut note =
                 std::mem::replace(&mut request_messages[idx], moved_out_message_placeholder());
-            // Marker detection must see the original role/content, before the
-            // content is rewritten below (mirrors the old clone-then-check
-            // order on the untouched source message).
+            // Marker detection must see the original role/content before the
+            // content is rewritten below.
             let checkpoint = is_context_checkpoint_marker(&note);
             note.content = normalize_system_like_content_for_request(&note.content);
             let text = note.content.as_str().unwrap_or_default();
@@ -1136,8 +1124,8 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         }
     }
     merged_notes.sort_by_key(|&(index, kind, _)| {
-        // Compressed rounds used to be generic notes; retain their relative
-        // budget priority with other generic notes when splitting provenance.
+        // Compressed rounds share the budget priority of generic notes, so
+        // separate provenance does not grant them a larger prefix allowance.
         (
             if kind == InternalNoteKind::CompressedToolRound {
                 InternalNoteKind::Generic
@@ -1156,9 +1144,6 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         &mut request_messages[first_system_idx],
         moved_out_message_placeholder(),
     );
-    // Checkpoint detection must see the ORIGINAL message (role not yet
-    // rewritten to system): checking the rewritten copy would miss the legal
-    // marker and skip its blanking step.
     let first_is_checkpoint_marker = is_context_checkpoint_marker(&merged_first);
     merged_first.role = ROLE_SYSTEM.to_string();
     merged_first.content = normalize_system_like_content_for_request(&merged_first.content);
@@ -1262,12 +1247,9 @@ evidence before relying on them.\n",
         if is_context_checkpoint_marker(&request_messages[idx])
             || is_query_memory_index_note(&request_messages[idx])
         {
-            // Checkpoint markers are centrally projected into the request
-            // prefix with a cap; the runtime memory index note is projected
-            // verbatim (its JSON must stay byte-exact). Neither may be
-            // truncated mid-stream or grow with the session; persisted history
-            // keeps the full record and later requests only carry what the
-            // projection emits.
+            // These notes were already projected into the prefix block:
+            // checkpoint counts are capped and memory-index JSON stays intact.
+            // Skip their original positions to avoid duplicating navigation context.
             continue;
         }
         if idx < first_body_idx {

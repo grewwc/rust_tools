@@ -146,9 +146,8 @@ fn deferred_rate_refresh_is_gated_and_throttled() {
 /// place the arrival rate of a large payload (apply_patch / execute_command / task / …) shows.
 #[test]
 fn tool_call_rate_hint_reports_argument_throughput() {
-    // Hermetic width: sibling fold tests narrow the process-global COLUMNS to 60
-    // while holding ENV_LOCK. Without the lock this assertion can observe that
-    // width mid-run and truncate the expected row, so pin a wide terminal here.
+    // Hold the environment lock while selecting a wide COLUMNS fallback;
+    // concurrent fold tests otherwise change the width used by this assertion.
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());

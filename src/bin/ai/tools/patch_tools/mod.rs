@@ -47,7 +47,6 @@ inventory::submit!(ToolStreamingRegistration {
 });
 
 fn apply_patch_status_target(args: &Value) -> Option<String> {
-    // Prefer the file_path / path arguments
     for key in &["file_path", "path"] {
         if let Some(p) = args
             .get(*key)
@@ -57,7 +56,6 @@ fn apply_patch_status_target(args: &Value) -> Option<String> {
             return Some(short_path(p));
         }
     }
-    // Otherwise extract the first target file from the patch text
     let patch = args.get("patch").and_then(|v| v.as_str())?;
     extract_first_patch_target(patch).map(|s| short_path(&s))
 }
@@ -87,14 +85,10 @@ inventory::submit!(ToolDisplayRegistration {
     },
 });
 
-// The apply_patch result is the only precise evidence of "which file did I just modify" for the
-// current turn, and failure diagnostics echo the entire current file text (so the model can
-// rebuild the patch without re-reading). Once lossily compressed or truncated, the model cannot
-// see whether the patch landed, and will repeatedly suspect the tool was never called and retry
-// in place — hence lossy compression is forbidden, and apply_patch consumes high-precision inline
-// budget to enter the current-turn protected set. Consistent with execute_command semantics:
-// stale patch results can still be pruned by the model explicitly marking them outdated, so the
-// context won't grow monotonically.
+// Preserve precise patch results and diagnostics so the model can identify
+// affected files and rebuild rejected hunks. Results cannot be lossily
+// compressed and count toward the protected inline budget; obsolete results
+// may still be explicitly pruned.
 inventory::submit!(ToolHistoryPolicyRegistration {
     name: "apply_patch",
     policy: ToolHistoryPolicy {
@@ -387,9 +381,8 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
     if let Some(envelopes) =
         parse_patch_envelopes(&patch).map_err(|err| append_truncated_patch_hint(&patch, err))?
     {
-        // Each section inside an envelope (single-file or multi-file) already declares its own target path, so `file_path` is
-        // redundant. Models often redundantly pass `file_path` for multi-file envelopes; instead of hard-erroring and wasting a round,
-        // silently ignore it and use the envelope path (the envelope path is the authoritative source).
+        // Use each envelope section's declared path; file_path cannot represent all
+        // targets of a multi-file envelope and is ignored in this branch.
         if initial_file_path.is_some() {
             emit("note: ignoring redundant file_path arg; using paths from Begin Patch envelope");
         }
@@ -477,10 +470,10 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
     }
 
     let header_target = parse_unified_diff_header_target(&patch);
-    // Multi-file unified diff (git diff output or hand-written by the model): split by file and prepare each one,
-    // then commit only after all succeed — matching the batch semantics of the Begin Patch envelope (atomic, same-path stacking).
-    // Note: multiple sections for the same file (two `diff --git a/x b/x`) dedupe to paths.len()==1 after header parsing,
-    // so use the split section count (>1) or the count of distinct parsed paths (>1) as the criterion — both take the split path.
+    // Prepare all sections before committing, stacking repeated paths in memory.
+    // Use the envelope branch's commit/rollback path; rollback can be incomplete.
+    // Header targets are deduplicated, so repeated same-file sections must be
+    // recognized by section count as well as distinct-path count.
     let split_sections = split_unified_diff_by_file(&patch);
     let multi_file_sections = match &split_sections {
         Ok(sections) if sections.len() > 1 || header_target.paths.len() > 1 => Some(sections),

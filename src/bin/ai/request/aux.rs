@@ -1,7 +1,6 @@
-//! 辅助 LLM 任务：历史摘要、会话标题生成、token 用量落账。
+//! Auxiliary LLM requests for history summaries and session titles.
 //!
-//! 这些函数共享主链路的 `build_request_body` / auth 基础设施，但不参与主 turn
-//! 流式，因此独立为子模块，降低 `mod.rs` 的认知负担。
+//! Usage accounting is shared with the main request path.
 
 use std::time::{Duration, Instant};
 
@@ -44,18 +43,15 @@ pub(crate) struct AuxRequestContext<'a> {
     pub(crate) session_id: &'a str,
 }
 
-/// 辅助请求（标题/摘要）的 API key 轮换候选列表。
-///
-/// 与主请求链路（transport.rs）一致：primary key 解析后，再经
-/// adapter.collect_api_keys 收集 provider 专属命名 key（如 opencode.api_key_xxx）。
-/// 此前辅助请求只用 primary key，命名 key 配置下会回退到全局 api_key，该 key 对
-/// 网关失效时 401 静默失败 → session 无标题/无摘要（f319d490 / 9833f002）。
+/// Provider key candidates for title and summary requests.
+/// Resolve the model's primary key, then collect provider-specific candidates
+/// through the same adapter hook used by the main request path.
 fn aux_request_key_candidates(model: &str, endpoint: &str, global_fallback: &str) -> Vec<String> {
     let primary = models::api_key_for_model(model, global_fallback);
     adapter_for(models::model_adapter(model), endpoint).collect_api_keys(&primary)
 }
 
-/// Send an auxiliary LLM request (POST chat/completions) with key rotation until one succeeds.
+/// Send an auxiliary HTTP request with key rotation until one succeeds.
 ///
 /// Each key gets its own timeout so one hung key cannot stall a background
 /// auxiliary task. `overall_deadline` optionally bounds the whole rotation so
@@ -494,12 +490,11 @@ fn is_preserved_content_message(text: &str) -> bool {
 fn session_title_dialog_lines(messages: &[crate::ai::history::Message]) -> Vec<String> {
     messages
         .iter()
-        // 工具结果常常很长、且不等于用户想解决的问题。只给标题模型用户意图和
-        // 最终回答，避免工具输出抢占有限的标题上下文窗口。
+        // Tool results can consume the title's small context budget; use
+        // user/assistant dialogue to keep it focused on the conversation.
         .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
-        // 子代理证据交接等运行时合成的 user 消息不是真实轮次（AGENTS.md 不变式
-        // 12），若当成「用户: ...」喂给标题模型，多 skill/子代理会话的转录会被
-        // 交接内容污染，导致模型回退到「帮我/请…」式低质量标题而被过滤。
+        // Exclude synthetic user handoffs so evidence deliveries do not read
+        // as new user intent in the title transcript.
         .filter(|message| !is_runtime_synthetic_user_message(message))
         .filter(|message| {
             !message
@@ -526,8 +521,6 @@ fn session_title_dialog_lines(messages: &[crate::ai::history::Message]) -> Vec<S
         .collect()
 }
 
-/// 把会话标题生成的静默失败写入决策日志，替代被注释掉的 eprintln。
-/// 标题任务在后台 spawn 中执行，eprintln 不可见；决策日志是唯一可观测渠道。
 /// Record a failed title request in the decision log, so a transport failure is
 /// distinguishable from "model answered but the quality filter rejected it".
 fn record_title_failure(ctx: &AuxRequestContext<'_>, reason: &str, detail: &str) {
@@ -766,8 +759,7 @@ mod session_title_tests {
     #[test]
     fn title_transcript_strips_terminal_resume_echo() {
         // The terminal's resume-selection prompt echoed into the first user
-        // message must not reach the title model (it produced the abstract
-        // "单会话仍要确认" title from exactly this capture shape).
+        // message must not reach the title model.
         let messages = vec![Message {
             role: "user".to_string(),
             content: Value::String(
@@ -794,11 +786,9 @@ mod session_title_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn summary_request_uses_only_the_preferred_provider_key() {
-        // Regression: with a named provider key configured (`opencode.api_key_*`), auxiliary
-        // requests (title/summary) must offer the same key candidates as the main request.
-        // Using only the primary key fell back to the global api_key, which fails against the
-        // gateway with a silent 401 (sessions ended up without titles/summaries).
-        // The model is taken from the registry so entry renames cannot break the test.
+        // Named provider keys precede the global fallback. Summary requests use
+        // only the preferred candidate, so a failure cannot trigger a second send.
+        // Select the model from the registry to survive entry renames.
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -928,10 +918,8 @@ pub(crate) async fn generate_session_title_with_context(
         return None;
     }
 
-    // Only the user's intent and the assistant's final answer feed the title.
-    // Image parts stay out of it so unrelated UI text inside a screenshot
-    // cannot skew the title; an image-only request relies on the text the user
-    // typed alongside it.
+    // Use user/assistant dialogue without tool calls as title input.
+    // Omit image_url parts so screenshot content cannot skew the title.
     let dialog = session_title_dialog_lines(messages);
 
     if dialog.is_empty() {
@@ -982,10 +970,8 @@ pub(crate) async fn generate_session_title_with_context(
     let http_body =
         super::protocol::build_http_body_for_request(&title_model, &endpoint, &mut request_body);
 
-    // Rotate keys exactly like the main request path (`collect_api_keys`):
-    // under a named-key configuration (`opencode.api_key_xxx`) using only the
-    // primary key silently fails with a gateway 401 and the session title
-    // stays on the fallback forever. The last key's error is what gets logged.
+    // Try provider key candidates in adapter priority order so named keys can
+    // precede the global fallback. If all fail, log the last error.
     let text = match send_aux_chat_request_with_key_rotation(
         ctx,
         &title_model,
@@ -1047,11 +1033,9 @@ pub(crate) async fn generate_session_title_with_context(
     Some(result)
 }
 
-/// AIOS bridge: take a parsed OpenAI-compatible `StreamUsage` (plus the
-/// requested model name and latency) and hand it to the kernel's LLM device
-/// for accounting. This is the single chokepoint where agent-land meets
-/// `/dev/llm`; every LLM call site must route through here instead of
-/// dropping usage on the floor.
+/// Submit parsed `StreamUsage` and model/latency information to the kernel's
+/// LLM device. Shared by foreground and auxiliary request paths; callers
+/// without an `App` can use [`charge_llm_usage_via_kernel`].
 ///
 /// The kernel takes care of:
 ///   - converting prompt/completion tokens to cost_micros (via `llm_price`)

@@ -1,9 +1,10 @@
-//! `/usage` 交互命令：查看 LLM token 用量统计。
+//! `/usage` interactive command: inspect LLM token-usage statistics.
 //!
-//! 数据来源是内核 LLM 设备的审计账本，由 agent 落库到独立的 `token_usage` 表
-//! （见 [`crate::ai::tools::storage::token_usage_store`]）。本命令只做只读查询展示。
+//! The agent persists the kernel LLM device's audit ledger in the independent
+//! `token_usage` table (see [`crate::ai::tools::storage::token_usage_store`]).
+//! This command queries and displays that data.
 //!
-//! 输出优化：大数字带千位分隔符，超过 1M 的自动缩写为 K/M/B 单位。
+//! Numeric output uses K/M/B suffixes for values of 1,000 or more.
 
 use crate::ai::tools::storage::token_usage_store as store;
 
@@ -21,7 +22,7 @@ fn print_usage_help() {
     println!();
 }
 
-/// 格式化数字：≥1B 用 B，≥1M 用 M，≥1K 用 K，否则带千位分隔符。
+/// Use K/M/B suffixes from 1,000 upward; smaller values remain decimal.
 fn format_number(n: u64) -> String {
     if n >= 1_000_000_000 {
         let b = n as f64 / 1_000_000_000.0;
@@ -51,7 +52,6 @@ fn format_number(n: u64) -> String {
             format!("{:.2}K", k)
         }
     } else {
-        // < 1K：带千位分隔符
         let s = n.to_string();
         let mut out = String::new();
         for (i, c) in s.chars().rev().enumerate() {
@@ -73,7 +73,8 @@ fn format_cache_ratio(cached: u64, input: u64) -> String {
     format!("{:.0}%", (cached.min(input) as f64 / input as f64) * 100.0)
 }
 
-/// 把秒数解析成时间窗口；返回 `Some(None)`=全部历史，`Some(Some(secs))`=最近 secs 秒，`None`=无法解析。
+/// Parse a named window or an hour/day span. `Some(None)` selects all history,
+/// `Some(Some(secs))` selects a lookback, and `None` rejects the input.
 fn parse_window(arg: &str) -> Option<Option<u64>> {
     let a = arg.trim().to_ascii_lowercase();
     match a.as_str() {
@@ -141,7 +142,6 @@ fn print_models_breakdown(window: Option<u64>) {
     let label = window_label(window);
     match store::query_by_model(window) {
         Some(mut rows) if !rows.is_empty() && rows.iter().any(|r| r.calls > 0) => {
-            // 按 calls 逆序排列（用户需求：模型按照调用量逆序排列）。
             rows.sort_by(|a, b| b.calls.cmp(&a.calls));
             println!("  [{} models]  sorted by calls ↓", label);
             println!(

@@ -6,8 +6,7 @@
 //! entry, so the child's real cwd — and therefore `effective_cwd()`, every
 //! relative path in file/shell tools, MCP children spawned by the child, and
 //! the system prompt's working-directory line — is per session. Sessions
-//! without an entry use the daemon's own cwd, which keeps the no-`/cd` case
-//! byte-identical to before.
+//! without an entry use the daemon's own cwd.
 //!
 //! The map is also persisted next to the session store (`serve-cwds.json`):
 //! the daemon re-execs itself on `--serve-restart`, and without persistence
@@ -76,9 +75,6 @@ fn save_cwds(state: &ServeState) {
     {
         let _ = std::fs::create_dir_all(parent);
     }
-    // Unique per thread: concurrent `/cd` switches in different sessions
-    // serialize on the map lock above, but each still needs its own
-    // temporary file so their renames cannot cross.
     let tmp = path.with_extension(format!("json.tmp-{:?}", std::thread::current().id()));
     // The guard stays alive across the write: a second switch serializes its
     // own (newer) snapshot afterwards instead of racing this one to disk.
@@ -105,10 +101,9 @@ pub(crate) fn session_cwd(state: &ServeState, id: &str) -> PathBuf {
     }
 }
 
-/// Apply a `/cd`/`:cd` line to the session's virtual cwd without touching the
-/// daemon process. Returns the message lines the local switch would print, so
-/// the HTTP response reads identically. `None` when the line is not a cd
-/// command.
+/// Apply `/cd`, `:cd`, or `/pwd` to the session's virtual cwd without changing
+/// the daemon's process cwd. Returns the local command's message lines, or
+/// `None` when the line is not a recognized cwd command.
 pub(crate) fn run_session_cd(state: &ServeState, id: &str, command: &str) -> Option<CwdOutcome> {
     let outcome = match parse_cwd_command(command)? {
         CwdCommand::Show => show_outcome(state, id),
@@ -188,10 +183,9 @@ fn switch_outcome(state: &ServeState, id: &str, target: &str) -> CwdOutcome {
     apply_switch(state, id, &resolved)
 }
 
-/// Record the switch in the map. The stored path is canonicalized so the
-/// printed value is the absolute, symlink-resolved directory the next turn
-/// child's tools will resolve against (the property `getcwd` gives the local
-/// switch).
+/// Store the canonical directory path when available so the display and the
+/// next child's working directory use the same spelling. If canonicalization
+/// fails, retain the supplied path.
 fn apply_switch(state: &ServeState, id: &str, dir: &Path) -> CwdOutcome {
     let now = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let previous = session_cwd(state, id);

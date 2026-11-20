@@ -5,9 +5,9 @@
 // pieces required to spawn a sub-agent's `run_turn` from inside a tool
 // invocation.
 //
-// It is set up once per foreground/background turn in `driver::run_loop`
-// and inherited by every nested `tokio::spawn` that participates in
-// sub-agent dispatch (see `task_tools::spawn_subagent_kernel_task`).
+// Each driver turn receives a scoped snapshot. Sub-agent dispatch explicitly
+// scopes it into spawned tasks; task-local values are not inherited by
+// `tokio::spawn`.
 //
 // Holding `Arc<DriverContext>` keeps the structure cheap to clone while
 // still letting tools synthesise a fresh `task_app` for the spawned
@@ -289,9 +289,8 @@ pub(crate) type SubagentWrapUpSignal = Arc<AtomicBool>;
 
 /// Snapshot of the live runtime that a sub-agent dispatch needs.
 ///
-/// All fields are independently cloneable so that downstream consumers can
-/// take what they need without holding a long-lived borrow on the
-/// foreground turn.
+/// Shared runtime handles and an `App` prototype let dispatch prepare a child
+/// without retaining a borrow of the parent's foreground turn.
 pub(crate) struct DriverContext {
     /// Prototype `App` cloned from the parent turn. Mutate the clone, never
     /// the prototype.
@@ -346,8 +345,8 @@ impl DriverContext {
     }
 }
 
-/// Record the skills active for the current turn. No-op outside a driver turn
-/// (tests and one-shot calls), where no subagent dispatch can happen anyway.
+/// Record the active skills in the current driver context; no-op when
+/// `DRIVER_CTX` is not scoped.
 pub(crate) fn set_active_skill_names(names: Vec<String>) {
     let _ = DRIVER_CTX.try_with(|ctx| {
         if let Ok(mut active) = ctx.active_skill_names.write() {
@@ -405,8 +404,9 @@ tokio::task_local! {
     /// current execution phase here so the spawning tool's heartbeat
     /// line can surface it. Absence means "no parent is showing a heartbeat".
     pub(crate) static SUBAGENT_PHASE: SubagentPhaseSlot;
-    /// Stable task id for background async tasks. The progress publisher uses it to persist the unified snapshot at low frequency and wake the
-    /// corresponding parent process; an in-process foreground runner can still show heartbeats via the shared slot.
+    /// Stable task id for background async tasks. Progress publication uses it
+    /// for snapshot persistence and scheduler status refreshes; foreground
+    /// runners can show progress through the shared slot.
     pub(crate) static SUBAGENT_TASK_ID: String;
     /// Set when a foreground parent's wait is about to hit its hard timeout; the subagent consumes it once to request immediate wrap-up.
     pub(crate) static SUBAGENT_WRAP_UP_SIGNAL: SubagentWrapUpSignal;
@@ -419,9 +419,9 @@ tokio::task_local! {
     /// exhausting resources — `task_spawn` refuses to delegate further once `MAX_SUBAGENT_SPAWN_DEPTH`
     /// is exceeded.
     pub(crate) static SUBAGENT_DEPTH: usize;
-    /// The current turn's (session_id, turn_id) tuple. The driver run_loop enters it before each
-    /// turn's scheduling; DecisionLog / feedback write paths read it to attribute tool call
-    /// results back to the right (session, turn). Downstream sees ("", 0) when unset.
+    /// The current turn's `(session_id, turn_id)` tuple, scoped by `run_turn`.
+    /// Decision-log and feedback paths use it to attribute tool results; readers
+    /// fall back to `("", 0)` when no turn identity is scoped.
     pub(crate) static TURN_IDENTITY: (String, usize);
     /// Decision-log target fixed for the current turn.
     ///
@@ -574,8 +574,8 @@ pub(crate) fn publish_subagent_activity_to_slot(
     }
 }
 
-/// The most recent work plan successfully persisted. Phase changes only update `phase`, never losing this
-/// task-level progress available for parent display.
+/// Keep the latest checkpoint summary and excerpt available for parent display.
+/// Phase changes update `phase` without replacing this checkpoint.
 pub(crate) fn publish_subagent_checkpoint_summary(summary: &str, body: &str) {
     let Ok(slot) = SUBAGENT_PHASE.try_with(|slot| slot.clone()) else {
         return;
@@ -899,10 +899,9 @@ pub(crate) fn effective_cwd() -> std::io::Result<PathBuf> {
 // Agents often need to write temp/intermediate files while working (scripts, snippet output, dumps, etc.).
 // `temp_dir()` provides a unified, per-session isolated temp directory, created on demand.
 //
-// Prefer the session assets dir (same source as tool-overflow) at
-// `~/.history_file.sessions/<session>.assets/tmp/` — outside the project and isolated per session,
-// so the workspace stays clean. When DRIVER_CTX is unavailable (tests / one-shot calls), fall back to
-// `<std::env::temp_dir()/.agent_tmp/<session>/` (system temp dir; does not pollute the project).
+// Prefer the session assets directory resolved by `SessionStore`, keeping
+// temporary files with the session's other assets. Without a driver context,
+// use `<std::env::temp_dir()/.agent_tmp/<session>/`.
 //
 // Files written into this dir via `write_file(temp=true)` are recorded in a persistent registry
 // (`storage::temp_registry`) for audit tracking. Temp files are cleaned up by the runtime when the session ends.
@@ -912,11 +911,11 @@ pub(crate) fn effective_cwd() -> std::io::Result<PathBuf> {
 /// Return the current session's temp dir path, creating the directory on demand. Used by `write_file(temp=true)`
 /// and other flows that need to write temp files.
 ///
-/// Prefers `<sessions_root>/<session>.assets/tmp/` (same source as tool-overflow,
-/// outside the project); falls back to `<std::env::temp_dir()/.agent_tmp/<session>/` when `DRIVER_CTX` is unavailable.
+/// Prefers `<sessions_root>/<session>.assets/tmp/` via `SessionStore`; without
+/// a driver context, uses `<std::env::temp_dir()/.agent_tmp/<session>/`.
 pub(crate) fn temp_dir() -> std::io::Result<PathBuf> {
-    // Prefer the session assets dir (same source as tool-overflow) so temp files live in
-    // the per-session isolated ~/.history_file.sessions/<id>.assets/tmp/ outside the project.
+    // Use SessionStore's assets root so temp files stay beside this session's
+    // overflow archives.
     if let Some(ctx) = try_current() {
         let history_file = ctx.app_proto.config.history_file.clone();
         let session_id = ctx.app_proto.session_id.clone();

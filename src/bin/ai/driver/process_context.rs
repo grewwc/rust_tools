@@ -1,7 +1,5 @@
 //! Process context helpers: history path generation, background subagent
 //! context resolution, wake-up prompt construction, and turn quota finalization.
-//!
-//! Extracted from `driver/mod.rs` (review Finding #1, Phase 2).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -169,13 +167,10 @@ pub(super) fn wakeup_task_guidance(
     Some(lines.join("\n"))
 }
 
-/// 一轮 turn 执行成功后对目标进程的 quota 收尾逻辑。
-/// 行为与改造前完全一致：扣减 `quota_turns` 一次，如果归零则准备 "Max LLM quota reached"
-/// 终止理由；如果进程已经处于 Waiting/Sleeping/Stopped 则保持其挂起状态、不触发终止。
-///
-/// 返回 `(should_terminate, termination_result)`，由调用方决定是否真的调用
-/// `terminate_and_cleanup`，从而保留 foreground / background 各自后续的特殊处理
-/// （如 round-robin requeue 等）。
+/// Return `(should_terminate, termination_result)` after charging one turn.
+/// Preserve waiting, sleeping, and stopped processes; queue an exceeded-limit
+/// warning in their mailbox instead of terminating them.
+/// The caller owns termination and foreground/background requeue handling.
 pub(super) fn finalize_turn_quota(
     os: &mut dyn aios_kernel::kernel::Kernel,
     pid: u64,

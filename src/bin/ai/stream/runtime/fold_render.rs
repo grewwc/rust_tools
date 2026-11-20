@@ -1,11 +1,8 @@
 use super::*;
 use crate::ai::stream::render::markdown::{TerminalWidthSnapshot, raw_terminal_cols};
-/// Physical-row budget the live fold body may occupy so the whole window (header + body) stays inside the visible
-/// viewport. Returning `usize::MAX` disables clamping (non-tty / unknown height), preserving the previous behavior
-/// exactly. On a real terminal this is `viewport_rows - FOLD_VIEWPORT_RESERVED_ROWS`, floored at 1 so an extremely
-/// short pane still shows one body row. In normal terminals this budget dwarfs `max_visible_lines`, so the effective
-/// window size — and every rendered byte — is unchanged; it only tightens when the viewport genuinely cannot hold
-/// the configured window, which is exactly the case that used to leak stacked markers.
+/// Limit the live fold body to the viewport, leaving `FOLD_VIEWPORT_RESERVED_ROWS`
+/// for the surrounding display. An unknown height disables clamping; a short
+/// terminal still gets at least one body row.
 pub(super) fn fold_body_viewport_row_budget() -> usize {
     let viewport = io::stdout().is_terminal().then(raw_terminal_rows);
     fold_body_row_budget_for(viewport)
@@ -20,8 +17,8 @@ pub(super) fn fold_body_row_budget_for(viewport_rows: Option<usize>) -> usize {
     }
 }
 
-/// Folded rendering of thinking content: maintain a rewritable window starting at the first line,
-/// always showing only the most recent N lines in the terminal and folding the rest into one summary line.
+/// Maintain a rewritable window of recent thinking lines. Older lines get a
+/// summary marker when a visible body remains; a zero-line window is header-only.
 pub(super) fn write_thinking_content_folded(
     content: &str,
     state: &mut StreamProcessingState,
@@ -357,8 +354,8 @@ pub(super) fn replace_thinking_fold_header(
     write_thinking_fold_completion_header(out, fold, line_count)
 }
 
-/// After rendering the body the cursor rests on the last physical line, not on an extra blank line; redraws therefore only need to move up
-/// `rows - 1`; returning to the line start before erasing to the screen bottom covers reflow lines produced by a narrowed window.
+/// The cursor rests on the last rendered row, so move up `rows - 1` before clearing
+/// the recorded window row by row. Clearing only those rows preserves the composer.
 pub(super) fn erase_fold_body(out: &mut impl Write, rows: usize) -> io::Result<()> {
     if rows == 0 {
         return Ok(());
@@ -409,7 +406,7 @@ pub(super) fn finalize_fold(
     out.flush()
 }
 
-/// Fold-finalize writer implementation; extracted behind a writer so regression tests can verify terminal cursor sequences precisely.
+/// Render the final fold state through a writer so tests can inspect cursor sequences without a terminal.
 pub(super) fn finalize_fold_to(
     out: &mut impl Write,
     fold: &mut super::state::ThinkingFoldState,
@@ -489,13 +486,6 @@ fn render_final_fold_frame_to(
             fold.footer_label,
         )?;
     } else if final_body_rows > 0 {
-        // The collapsed window ends on the one-line summary marker (the body
-        // is rendered without a trailing newline so streaming redraws do not
-        // scroll). Finalize is terminal: release the cursor onto a fresh line,
-        // otherwise the next output — the deferred-body "generating…" hint or
-        // the final answer echoed by the driver — concatenates onto the marker
-        // row ("… N earlier lines   ⠋ generating…"). With zero body rows the
-        // completion header already ends with CRLF, so no extra blank line.
         out.write_all(b"\r\n")?;
     }
     Ok(())
@@ -528,7 +518,7 @@ pub(super) fn thinking_fold_visible_lines(fold: &super::state::ThinkingFoldState
     visible
 }
 
-/// Physical rows the written rows of a fold region occupy on a terminal `cols` columns wide.
+/// Physical rows occupied by the stored fold body at the current terminal width.
 pub(super) fn thinking_fold_rendered_body_rows(fold: &super::state::ThinkingFoldState) -> usize {
     fold.rendered_body_lines
         .iter()

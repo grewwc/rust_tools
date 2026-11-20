@@ -118,8 +118,8 @@ pub(super) fn start_skill_manifest_watcher(
     let (event_tx, event_rx) = mpsc::sync_channel(SKILL_WATCH_EVENT_QUEUE_SIZE);
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
         if let Ok(event) = result {
-            // If the event queue is full, dropping events is fine; they still merge
-            // into a single reload afterwards.
+            // Keep the notification callback nonblocking. When the queue is full,
+            // drop this event; retained relevant events still trigger a full rescan.
             let _ = event_tx.try_send(event);
         }
     })
@@ -158,8 +158,8 @@ pub(super) fn start_skill_manifest_watcher(
 
 #[allow(clippy::too_many_arguments)]
 fn run_skill_manifest_watcher(
-    // The watcher must be held inside the thread; otherwise it stops receiving
-    // filesystem events once `start` returns.
+    // The watcher must stay alive in the worker thread so returning from
+    // `start_skill_manifest_watcher` does not stop filesystem events.
     _watcher: RecommendedWatcher,
     event_rx: Receiver<Event>,
     latest_update: LatestSkillManifestSlot,

@@ -51,7 +51,7 @@ pub(super) const TOOL_RESULT_FOLD_MIN_CHARS: usize = 4_096;
 const LEGACY_PRESERVED_TOOL_OVERFLOW_STUB_PREFIX: &str =
     "Output preserved for non-compressible tool `";
 
-/// Large results remain compressible; task stubs retain their review anchors.
+/// Size eligibility is shared across tools; callers check policy and stub protection.
 pub(super) fn tool_result_can_fold(_tool_name: &str, text: &str) -> bool {
     text.chars().count() > TOOL_RESULT_FOLD_MIN_CHARS
 }
@@ -93,9 +93,8 @@ fn task_evidence_object<'a>(value: &'a Value, task_id: &str) -> Option<&'a Value
 /// The review block is appended to preserved stubs, which bypass the physical
 /// tool-result cap, and a result may name arbitrarily many task ids. Aggregation
 /// therefore stops at the first of these bounds and records how many tasks were
-/// left out. Worst case is 8 KiB of review lines plus one marker line, which
-/// stays well below the 64 KiB raw-result hard cap even together with the stub
-/// header, fingerprint, and preview.
+/// left out. The character bound leaves room for the stub header, fingerprint,
+/// and preview under the raw-result cap.
 const TASK_EVIDENCE_REVIEW_MAX_TASKS: usize = 16;
 const TASK_EVIDENCE_REVIEW_MAX_LINES: usize = 3 * TASK_EVIDENCE_REVIEW_MAX_TASKS;
 const TASK_EVIDENCE_REVIEW_MAX_CHARS: usize = 8 * 1024;
@@ -271,10 +270,10 @@ pub(super) fn normalize_internal_notes_for_summary_model(messages: &mut Vec<Mess
     *messages = super::summary_delta_messages(messages);
 }
 
-/// Prepare tool messages for a tighter budget: results that compress by line are
-/// trimmed down to `max_chars_per_msg`, while non-compressible results
-/// (`read_file`, `execute_command`, ...) that exceed both `max_chars_per_msg` and
-/// `spill_min_chars` spill to `overflow_dir` as preview stubs.
+/// Attempt structured summaries for eligible results that allow lossy compression.
+/// Non-compressible results outside the protected windows may spill as preview
+/// stubs when they exceed the shared floor and `max_chars_per_msg` and reach
+/// `spill_min_chars`.
 ///
 /// `spill_min_chars = 0` uses the shared per-result floor. Large task evidence
 /// keeps its delivery locator and review excerpt in the replacement stub.
@@ -296,8 +295,8 @@ pub(super) fn prepare_tool_messages_structured(
     // refuses to fold an already-archived stub, so the "reuse the canonical
     // full result" pointer the model needs would never be written.
     let mut newest_identical: rustc_hash::FxHashMap<u64, usize> = rustc_hash::FxHashMap::default();
-    // The canonical copy may itself be protected (and therefore absent from
-    // `indices`), so index every tool result, not only the spill candidates.
+    // Protected results still serve as canonical copies for older byte-identical
+    // results, so they must participate in this index.
     for (idx, message) in messages.iter().enumerate() {
         if message.role != "tool" {
             continue;
@@ -346,7 +345,7 @@ pub(super) fn prepare_tool_messages_structured(
         if let Some(name) = tool_name
             && is_non_compressible_tool(name)
         {
-            // The most recent complete tool group is never spilled: files and
+            // Results in the protected recent-group window are not spilled: files and
             // retrieval results read just now must remain fully visible in the
             // next request, otherwise the model sees an "evicted, please
             // re-read" stub and immediately re-issues the same read_file —
@@ -399,17 +398,9 @@ pub(super) fn prepare_tool_messages_structured(
                         "prepare_preserved_stub",
                         build_preserved_tool_overflow_stub(&path, name, &text, &recall_lines)
                     );
-                    // Anti-bloat: spilling must actually free space. Small
-                    // results (e.g. a few hundred bytes of grep output) often
-                    // become larger as a stub with a full preview, which only
-                    // inflates usage and forces the model to read the archive
-                    // back — the exact cause of "read results kept being
-                    // archived as stubs". On bloat, keep the original text and
-                    // delete only the file created this time (a reused asset
-                    // belongs to another message's spill; deleting it would
-                    // leave that message's stub dangling). Consistent with the
-                    // guards in enforce_protected_precision_
-                    // group_budget / spill_protected_precision_to_fit.
+                    // Keep the original text if its stub would not shrink it.
+                    // An asset reused from the invocation may back another message's
+                    // stub, so rejecting this replacement must not delete that asset.
                     if stub.chars().count() >= text.chars().count() {
                         if !reused_existing {
                             let _ = std::fs::remove_file(&path);
@@ -423,7 +414,7 @@ pub(super) fn prepare_tool_messages_structured(
         }
 
         if protected_indices.contains(&idx) {
-            // Ordinary tool results of the most recent complete tool group keep
+            // Ordinary tool results in the protected recent-group window keep
             // their full text, avoiding damage to near-end context.
             continue;
         }
@@ -438,14 +429,12 @@ pub(super) fn prepare_tool_messages_structured(
     }
 }
 
-/// Applies a non-bypassable physical cap to tool results in the request
-/// context.
+/// Spills older tool results that exceed the physical request-context cap.
 ///
 /// The canonical history always keeps the original text; only the request-side
-/// copy is modified here. Ordinary near-end results stay raw and are spilled
-/// only past the absolute cap, preventing the canonical tail after the SQLite
-/// snapshot watermark from bypassing the current-turn projection and pushing
-/// oversized output into the model again.
+/// copy is modified here. The protected recent-group window stays raw even
+/// above the cap. Older results spill only above both the cap and the shared
+/// size floor, including results replayed after the SQLite snapshot watermark.
 pub(in crate::ai) fn cap_oversized_tool_results_for_context(
     messages: &mut [Message],
     hard_cap_chars: usize,
@@ -456,16 +445,15 @@ pub(in crate::ai) fn cap_oversized_tool_results_for_context(
     if hard_cap_chars == 0 {
         return 0;
     }
-    // The protected tail window (most recent complete tool groups) stays raw
+    // The protected tail window (most recent groups with results) stays raw
     // even when a result exceeds the inline cap; only older results spill.
     let protected = recent_tool_group_message_indices(messages, keep_recent_groups);
 
     // Cheap pre-scan (no index building, no string cloning): if no unprotected
     // result exceeds the cap there is nothing to do. This keeps the per-request
     // spill pass O(messages) instead of O(total argument bytes) for ordinary
-    // sessions. Preserved stubs are always far below the cap (bounded ~2K vs
-    // 64K), so the length check alone cannot classify a stub as oversized;
-    // the defensive stub check stays in the main loop below.
+    // sessions. The main loop separately excludes preserved stubs: exceeding a
+    // caller's size cap must not turn an archive pointer into new evidence.
     let mut has_oversized = false;
     for idx in tool_message_indices(messages) {
         if keep_recent_groups > 0 && protected.contains(&idx) {
@@ -513,7 +501,7 @@ pub(in crate::ai) fn cap_oversized_tool_results_for_context(
         // When reading back an asset already archived for this session
         // (read_file / execute_command cat pointing at a direct child of
         // tool-overflow-compressed/), reuse the existing file instead of
-        // minting another randomly named one — otherwise "spill → read-back →
+        // writing another copy — otherwise "spill → read-back →
         // spill again" would generate a new archive on every read-back, with
         // the model forever re-reading along new pointers: an unbounded chain.
         // Consistent with Path C's reuse logic.
@@ -633,7 +621,7 @@ pub(super) fn enforce_protected_precision_group_budget(
             // When reading back an asset already archived for this session
             // (read_file pointing at a direct child of
             // tool-overflow-compressed/), reuse the existing file instead of
-            // minting another randomly named one — otherwise "spill → read-back
+            // writing another copy — otherwise "spill → read-back
             // → spill again" would generate a new archive on every read-back,
             // forming an unbounded chain where the model never gets stable
             // content. Consistent with Path C's reuse logic.
@@ -673,11 +661,9 @@ pub(super) fn enforce_protected_precision_group_budget(
             // larger stub is bloat, not compression — it inflates budget usage
             // and hides the real result from the model (an amplifying factor in
             // loops). On bloat, delete the just-written file and keep the
-            // original text, consistent with Path C's anti-bloat guard.
-            // Delete only files created this time: a reused asset belongs to
-            // another message's spill, and deleting it would leave that
-            // message's stub dangling (past sessions saw archive files deleted
-            // by mistake).
+            // original text. An asset reused from the invocation may back
+            // another message's stub, so rejecting this replacement must not
+            // delete that asset.
             let stub_chars = stub.chars().count();
             if stub_chars >= text_len {
                 if wrote_new {
@@ -760,9 +746,7 @@ pub(super) fn spill_protected_precision_to_fit(
     // sequence per candidate: the only mutation inside this loop is the content
     // swap on a single message (`messages[idx].content`), so the authoritative
     // `messages_total_chars` sum changes by exactly that message's billable
-    // delta. This mirrors the running-total pattern used by
-    // `shrink_messages_to_fit_with_summary` in `compress/mod.rs`. Candidate
-    // selection order and spilled stub contents are untouched.
+    // delta.
     let mut total = super::messages_total_chars(messages);
     let mut spilled = 0usize;
     for (idx, tool_name, existing_asset_path, _) in candidates {
@@ -821,10 +805,9 @@ pub(super) fn spill_protected_precision_to_fit(
     spilled
 }
 
-/// Character length of the model-visible text of a message content value,
-/// without building an intermediate `String`. Mirrors `value_to_string`'s
-/// text extraction (string passthrough; array items only for objects whose
-/// `type` is `text`).
+/// Measure raw string or text-array payload size without allocating a `String`.
+/// Text fields are counted before whitespace normalization; rendered separators
+/// and attachment markers from `value_to_string` are excluded.
 fn content_char_len(content: &Value) -> usize {
     if let Some(s) = content.as_str() {
         return s.chars().count();
@@ -891,7 +874,7 @@ fn preserved_tool_overflow_read_file_path(arguments: &str, overflow_dir: &Path) 
 
 /// Uniformly recognizes direct file paths that "read this session's archived
 /// asset", so both main paths and Path C can reuse the existing archive
-/// instead of minting a new uuid file on every read-back and making the model
+/// instead of copying the content on every read-back and making the model
 /// re-read endlessly along new pointers.
 ///
 /// - `read_file`: the `file_path` / `path` / `filePath` fields;
@@ -903,8 +886,7 @@ fn preserved_tool_overflow_read_file_path(arguments: &str, overflow_dir: &Path) 
 ///   at bytes that never contained it. `read_file` needs no such gate: it
 ///   can only window or re-render the file itself, so its output stays
 ///   recoverable from the reused file (and the stub records the range).
-/// Other tools return no paths (reuse semantics do not apply; behavior matches
-/// the old `read_file` guard).
+/// Other tools return no paths because reuse semantics are not defined for them.
 fn preserved_tool_overflow_path_in_arguments(
     tool_name: &str,
     arguments: &str,
@@ -1000,8 +982,7 @@ fn archived_asset_bare_name_from_raw(raw_path: &str, preserved_dir: &Path) -> Op
 
 /// Recognizes paths that "read this session's archived asset" inside the
 /// `command` string of execute_command. Matches absolute paths of archive
-/// direct children, paths relative to effective_cwd, or bare file names (the
-/// name contains a uuid and is essentially unique).
+/// direct children, paths relative to effective_cwd, or bare file names.
 ///
 /// A filename match alone only proves the command *mentioned* the archive,
 /// not that the result *is* the archive: `awk`/`diff`/multi-input `cat` and
@@ -1076,22 +1057,12 @@ fn archived_asset_path_in_command(
     None
 }
 
-/// Output of "read/retrieval" tools is zero-compressed (no trimming, no dedup
-/// folding, no whole-group deletion); over the threshold it only gets
-/// "zero-compression spilled to the session file + a pointer stub". Such
-/// output is expensive to reproduce, and once compressed away the model
-/// re-runs the same retrieval again and again (the classic amnesia /
-/// spinning-in-place symptom).
+/// Whether the tool's registered history policy forbids lossy compression.
+/// Unregistered tools use the default `Allow` policy.
 ///
-/// This now consults the history-retention policy declared by the tool itself
-/// (`ToolHistoryPolicyRegistration`, see each tool's registration file) instead
-/// of hard-coding a tool-name list here. Unregistered tools allow lossy
-/// compression by default; only tools that explicitly declare
-/// `lossy_compress: Never` (`read_file` / retrieval tools / `execute_command`)
-/// return true. `plan` no longer forbids lossy compression: the latest version
-/// is fully preserved by the recent-tool-group protection window, while older
-/// versions may be summary-compressed to free context. Note this is orthogonal
-/// to "whether LLM trimming is allowed" — see `llm_prune.rs`.
+/// Lossless archiving and byte-identical deduplication remain possible, keeping
+/// expensive read/retrieval output recoverable without repeating the tool.
+/// Pruning uses the independent prune policy in `llm_prune.rs`.
 pub(super) fn is_non_compressible_tool(tool_name: &str) -> bool {
     !crate::ai::tools::registry::common::tool_history_policy(tool_name).allows_lossy_compress()
 }
@@ -1130,18 +1101,18 @@ pub(super) fn plan_noncompressible_tool_result_for_fold(
     ))
 }
 
-/// Immediate stable archive used by the LLM-prune path; independent of fold's
+/// Immediate stable archive used by lossless reclamation; independent of fold's
 /// two-phase planning. The file name is deterministically derived from
 /// `(tool_call_id, content)` (not a random uuid + timestamp), matching the
 /// content addressing of the `spilled-` / `folded-` archive naming strategies.
 ///
-/// LLM-guided pruning (`llm_prune::apply_pruning`) operates on the temporary
+/// Reclamation in `llm_prune.rs` operates on the temporary
 /// `messages` projection rebuilt before each model request, so the same
 /// canonical tool message gets pruned again whenever a later turn rebuilds the
 /// projection. Random file names would mint a fresh copy every turn and change
 /// the stub text each time, which breaks the prompt cache from that point on
 /// and grows disk copies monotonically. With a deterministic name, archiving is
-/// idempotent: an existing file is skipped and the stub text stays stable across
+/// idempotent: a matching-size file is reused and the stub text stays stable across
 /// turns. Hashing the content into the name keeps that idempotence honest when
 /// the same call id is replayed with different content — the write then targets
 /// a distinct file instead of blindly reusing stale bytes.
@@ -1183,8 +1154,8 @@ pub(super) fn write_preserved_tool_overflow_file_stable(
     let file_name = format!("pruned-{safe_tool}-{safe_id}-{}.txt", &digest[..12]);
     let path = dir.join(file_name);
     // Idempotent for identical content: the same (id, content) maps to the same
-    // path, so an existing file is never rewritten and the stub text (and the
-    // prompt cache prefix) stays stable across turns.
+    // path. Matching-size files are reused, keeping the stub text and prompt
+    // cache prefix stable across turns; truncated files are rebuilt atomically.
     // Use atomic temp+fsync+rename via `PlannedArchiveWrite::commit` instead of
     // bare `fs::write`. A bare write truncates the target in-place; a crash
     // mid-write leaves a truncated file that forever satisfies `exists()` and is
@@ -1214,18 +1185,12 @@ fn sanitize_overflow_name_component(raw: &str) -> String {
 }
 
 /// The immediate (non-speculative) spill path. The file name is derived
-/// deterministically from `(tool_call_id, content)` (rather than a random uuid
-/// + timestamp): the same canonical tool result gets re-spilled every time a
-/// later turn rebuilds the projection, and random naming would make "each
-/// compaction round mints a new copy" bloat without bound (measured: one
-/// session produced 368 archive files for only 211 unique contents), with the
-/// model's read-back pointer drifting every round so it never gets stable
-/// content. With deterministic naming the same result maps idempotently to the
-/// same file: if it exists it is reused without rewriting, and the stub text
-/// stays stable across rounds (consistent with the `folded-` fold and
-/// `pruned-` prune archive naming schemes). fold must not call this function;
-/// fold's writes are committed together via `PlannedArchiveWrite` once a
-/// candidate is adopted.
+/// deterministically from `(tool_call_id, content)`, so rebuilding a projection
+/// reuses the same archive and stable stub for the same canonical result.
+/// Matching-size files are reused; truncated files are rebuilt atomically.
+/// This matches the `folded-` and `pruned-` naming schemes. Folding must instead
+/// plan writes through `PlannedArchiveWrite`, committing them together only
+/// once a candidate is adopted.
 fn write_preserved_tool_overflow_file(
     overflow_dir: &Path,
     tool_call_id: Option<&str>,
@@ -1238,8 +1203,8 @@ fn write_preserved_tool_overflow_file(
     let identity = format!("{}\0{content}", tool_call_id.unwrap_or(""));
     let digest = content_sha256_hex(identity.as_bytes());
     let path = dir.join(format!("spilled-{safe_tool}-{}.txt", &digest[..24]));
-    // Idempotent: the content does not change across rounds; if it exists it is
-    // not rewritten (also keeping the prompt cache stable).
+    // The same invocation id and content map to the same file; matching-size
+    // files are reused to keep the prompt cache stable.
     // Atomicity rationale is documented on `write_preserved_tool_overflow_file_stable`:
     // bare `fs::write` can leave a truncated content-addressed file that forever
     // satisfies `exists()` and is never rebuilt. Deduplication + truncated
@@ -1290,14 +1255,9 @@ pub(super) fn build_preserved_tool_overflow_stub_with_archive(
     recall_lines: &[String],
 ) -> String {
     let archive_display = path.map(stub_archive_display_path);
-    // The full text is still spilled to disk to control context size, but the
-    // stub keeps a head+tail preview so later turns own a "recall anchor" — the
-    // model can judge whether it really needs to read_file again, avoiding the
-    // "amnesia / endless re-reading" that follows when early-read code is moved
-    // away. The notice wording stays neutral: it clearly says "read only if the
-    // full content is needed", preventing the LLM from unconditionally
-    // re-reading on sight of a file_path and looping spill → re-read → spill
-    // again forever.
+    // An archive-backed stub keeps a preview so the model can judge whether
+    // it needs the full content before reading again. Without an archive,
+    // task review anchors and canonical history provide recovery instead.
     let mut out = preserved_tool_overflow_stub_header(archive_display.as_deref(), tool_name, true);
     if let Some(fingerprint) = stub_fingerprint_line(full_content) {
         out.push('\n');
@@ -1393,9 +1353,9 @@ pub(super) fn stub_fingerprint_line(full_content: &str) -> Option<String> {
     Some(format!("- fingerprint: {}", parts.join(" ")))
 }
 
-/// Pick the first head-region line with real alphanumeric signal as the gist,
-/// whitespace-collapsed and clamped on char boundaries. Returns `None` when the
-/// head region holds only decoration (separators, bare JSON braces, ...).
+/// Pick the first head-region line with enough distinct characters as the gist,
+/// whitespace-collapsed and clamped on char boundaries. Returns `None` when no
+/// scanned line passes the diversity threshold.
 fn extract_fingerprint_gist(content: &str) -> Option<String> {
     content
         .lines()
@@ -1446,11 +1406,10 @@ pub(super) fn extract_fingerprint_keywords(content: &str) -> Vec<String> {
     ];
     let mut candidates: Vec<(String, i32)> = Vec::new();
     // Case-insensitive dedup via a membership set (not a linear scan of
-    // `candidates`): this runs on the full raw overflow body (up to the 64K
-    // hard cap) and is rebuilt every turn during reprojection, so an
-    // O(tokens × distinct) scan is a hot-path cost. Insertion order into
-    // `candidates` is unchanged, and the stable sort below keeps appearance
-    // order as the score tiebreak, so output stays byte-identical.
+    // `candidates`): this runs on the full raw overflow body during reprojection,
+    // so scanning all prior candidates per token would be a hot-path cost.
+    // First occurrences enter `candidates` in appearance order; the stable
+    // score sort preserves that order for ties, making output deterministic.
     let mut seen: FxHashSet<String> = FxHashSet::default();
     for raw in
         content.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '.' | '-')))
@@ -1565,10 +1524,8 @@ fn read_file_range_summary(args: &Value) -> Option<(&'static str, String)> {
     }
 }
 
-/// Maximum size accepted as a preserved stub. Fresh stubs are bounded by the
-/// header, fingerprint, an 8 KiB review block, the recall hint, and a preview
-/// of at most 20 key lines plus a handful of probes (roughly 17 KiB worst
-/// case). Anything larger is treated as raw tool output and stays subject to
+/// Maximum character count accepted as a preserved stub. Anything larger is
+/// treated as raw tool output and stays subject to
 /// `cap_oversized_tool_results_for_context`; without this bound a forged
 /// marker/`file_path` pair could exempt an arbitrarily large result.
 const PRESERVED_TOOL_OVERFLOW_STUB_MAX_CHARS: usize = 24_000;
@@ -1648,23 +1605,12 @@ pub(super) fn is_preserved_tool_overflow_stub(text: &str) -> bool {
     false
 }
 
-/// Collapses the head+tail preview body of an already-spilled tool overflow
-/// stub into a "single-line recall anchor" (keeping only the `file_path:`
-/// pointer + the read-back notice, dropping `Preview (...)` and everything
-/// after it).
+/// Remove an aged overflow stub's preview while retaining its recovery locator,
+/// original invocation lines, task reviews, fingerprint, and read-back notice.
+/// This reduces repeated preview overhead without losing the full-result pointer.
 ///
-/// Old stubs' previews accumulate monotonically in long sessions (real case:
-/// 800 stubs × ~1KB ≈ 849KB), while `file_path` is the only information the
-/// model needs for an exact read-back — the preview is just a "first recall
-/// anchor", and once the stub has drifted away from the current work focus the
-/// preview body's marginal value approaches 0. After collapsing, each entry
-/// shrinks from ~1KB to ~200 chars with zero loss of recall ability (the
-/// original can still be read back with read_file).
-///
-/// Returns `None` on parse failure (file_path or tool name not found), leaving
-/// the original untouched — it is never corrupted. Stubs already in anchor
-/// shape (no `Preview (` section) also return `None`, guaranteeing idempotence
-/// and no stub→stub churn.
+/// Returns `None` for unrecognized stubs, missing tool names, or stubs without a
+/// `Preview (` section, so already-collapsed anchors remain unchanged.
 pub(super) fn collapse_overflow_stub_to_anchor(text: &str) -> Option<String> {
     if !is_preserved_tool_overflow_stub(text) {
         return None;
@@ -1720,11 +1666,10 @@ pub(super) fn collapse_overflow_stub_to_anchor(text: &str) -> Option<String> {
     Some(out)
 }
 
-/// Path C's final hard-budget stage may only strip an overflow stub's preview
-/// and recall notice; the sole asset pointer must never be handed to generic
-/// head+tail truncation. The returned minimal stub still keeps the protocol
-/// marker, tool name, and `file_path`, so the original evidence can still be
-/// read back precisely.
+/// Minimize a preserved stub without losing its recovery locator. Keep the
+/// protocol marker, tool name, `file_path` or canonical-history recovery line,
+/// task reviews, and fingerprint; generic head+tail truncation must never cut
+/// the only recovery pointer.
 pub(super) fn minimize_overflow_stub_to_pointer(text: &str) -> Option<String> {
     if !is_preserved_tool_overflow_stub(text) {
         return None;
@@ -1801,7 +1746,7 @@ pub(super) fn is_preserved_tool_overflow_content(content: &Value) -> bool {
 }
 
 /// Age-folds the preview body of overflow stubs "outside the protected tail
-/// window" into single-line anchors. Applies only to already-spilled tool
+/// window" into compact recall anchors. Applies only to already-spilled tool
 /// stubs (`is_preserved_tool_overflow_stub`) and never touches original tool
 /// results; stubs inside the tail window keep their full head+tail preview
 /// (the current work focus still needs its recall context).
@@ -1828,9 +1773,9 @@ pub(super) fn age_out_overflow_stub_previews(
     }
 }
 
-/// Generates a head+tail preview for spilled content. Short content is kept in
-/// full; long content keeps a few leading/trailing lines with the middle folded
-/// into a placeholder line that states the omitted line count.
+/// Generate a bounded preview for spilled content. Short content keeps every
+/// line with a per-line length limit; longer content adds head/tail lines,
+/// structural key lines, and middle probes with an omitted-line count.
 pub(super) fn build_overflow_content_preview(content: &str) -> String {
     // Kept small on purpose: the stub is only a recall anchor (line numbers
     // come from key_lines below); the full text stays in the archive.
@@ -1892,8 +1837,8 @@ pub(super) fn build_overflow_content_preview(content: &str) -> String {
             total - HEAD_LINES - TAIL_LINES
         ));
         // Probe the omitted middle instead of leaving it invisible: the first
-        // and last omitted lines are always included, so no gap between
-        // samples exceeds `middle_len / (MID_PROBES - 1)` lines.
+        // and last omitted lines are included, with probes spaced evenly
+        // between them.
         let middle_start = HEAD_LINES;
         let middle_end = total - TAIL_LINES;
         let middle_len = middle_end - middle_start;
@@ -1912,8 +1857,8 @@ pub(super) fn build_overflow_content_preview(content: &str) -> String {
                 middle_start + k * (middle_len - 1) / (probes - 1)
             };
             let anchor = preview_anchor(idx, lines[idx], tags.get(idx).copied().flatten());
-            // key_lines prints the same `  L<no>: [tag] ` anchors; a probe that
-            // would duplicate one adds nothing.
+            // Key lines and probes share anchor prefixes; a probe that would
+            // duplicate one adds nothing.
             let anchor_prefix = format!("  {}", anchor.prefix);
             if out.contains(&anchor_prefix) {
                 continue;
@@ -2399,12 +2344,12 @@ fn drop_request_reminder(message: &mut Message) {
 }
 
 /// Proactively moves oversized old user / image messages (before the protected
-/// tail window) into session temp files, replacing them in place with compact
+/// tail window) into session assets, replacing them in place with compact
 /// stubs. The originals stay zero-compressed on disk but no longer occupy each
 /// request's payload.
 ///
-/// This complements the budget-driven in-loop spill: ever since images are
-/// billed nominally at [`IMAGE_BUDGET_CHARS`] in the budget, a single large
+/// This complements the budget-driven in-loop spill: images are
+/// billed nominally at [`super::IMAGE_BUDGET_CHARS`] in the budget, so a single large
 /// image no longer triggers `messages_total_chars > max_chars` by itself, so
 /// the in-loop spill would never be called. This pass instead spills "whenever
 /// an old message's raw size exceeds the threshold, regardless of budget",
@@ -3107,13 +3052,10 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
     };
     // Newest-first budget reservation: the tail (current work + pending
     // tasks) carries this fragment's latest correction and unanswered work,
-    // so it claims budget before older history and tool lines — previously
-    // old turns filled the budget first and the newest intent could miss the
-    // draft entirely. Build order follows survival priority (tail, head,
-    // tools) while emit order stays readable (head, tools, tail). Each
-    // section owns its vector and cap, and 2 chars cover the inter-section
-    // separators, so the total fits max_chars by construction; the trailing
-    // summarize_text is only a safety net.
+    // so it claims budget before older history and tool lines. Build order
+    // follows survival priority (tail, head, tools), while emit order stays
+    // readable (head, tools, tail). The final summarize_text caps the rendered
+    // output, including section headings and separators.
     let tail_cap = max_chars / 2;
     let tool_reserve = reserved_tool_chars.min(max_chars.saturating_sub(tail_cap + 2));
     // Pending tasks first (unanswered turns are the most critical), then the

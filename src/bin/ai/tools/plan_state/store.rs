@@ -6,10 +6,8 @@
 //!
 //! Layer responsibilities: `model` is pure data (no I/O, no rendering), `store` is
 //! persistence only, `render` produces user-facing text. `update_plan_step` enriches
-//! the "step not found" error with the full rendered plan so it is self-healing:
-//! after context compression folds the plan-creation turns away, the model has no
-//! other way to learn the real step numbers (regression: hallucinated step 6/5
-//! updates in a muse-spark session that ended with a fabricated plan narrative).
+//! "step not found" error with the full rendered plan and its persisted path so
+//! step numbers remain discoverable after the plan-creation turn leaves the context.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -140,8 +138,7 @@ pub(crate) fn update_plan_step(
         // absolute plan-state.json path) to make the error self-healing. The pointer
         // must NOT suggest calling `plan` to "view": `plan` only creates/replaces the
         // plan and requires `steps`, so a view call would either fail or silently
-        // replace the plan (regression: an earlier hint told the model to "re-view"
-        // via `plan`).
+        // replace the plan.
         Err(msg) => {
             return Err(format!(
                 "{msg}\nCurrent plan:\n{}Plan state persists at {} (plan-state.json, session assets) and survives context compression; read it with read_file if you need the current steps later. `plan` only creates or replaces the plan — use `plan_update` for status changes.\n",
@@ -217,15 +214,15 @@ mod tests {
         );
         assert!(err.contains("Current plan:"), "{err}");
         // Real step numbers and statuses are listed, so the model can pick one instead
-        // of guessing (regression: hallucinated step 6/5 after compression).
+        // of guessing.
         assert!(err.contains("Step 1. [read_file] Read (done)"), "{err}");
         assert!(err.contains("Step 2. [apply_patch] Patch"), "{err}");
         assert!(err.contains("3 step(s) planned."), "{err}");
         // Persistence pointer: the plan survives compression at plan-state.json.
         assert!(err.contains("plan-state.json"), "{err}");
         // The recovery pointer must stay read-only: `plan` only creates/replaces the
-        // plan (regression: a hint telling the model to "re-view" via `plan` would
-        // fail on bare calls or silently replace the plan with guessed steps).
+        // plan, so using it for inspection could fail on missing arguments or
+        // replace the plan.
         assert!(err.contains("read_file"), "{err}");
         assert!(!err.contains("re-view"), "{err}");
 

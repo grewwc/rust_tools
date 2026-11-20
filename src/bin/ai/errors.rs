@@ -3,7 +3,7 @@ use std::fmt;
 /// Error types for the `a` binary.
 ///
 /// This enum provides structured errors that callers can match on
-/// programmatically, replacing the pervasive `Result<T, String>` pattern.
+/// programmatically.
 #[derive(Debug)]
 pub enum AiError {
     /// Tool execution failed

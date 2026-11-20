@@ -13,13 +13,9 @@ use super::LAST_ACTIVITY_META_KEY;
 /// In-process cache of `history_revision`, invalidated by file metadata
 /// fingerprints (main DB len/mtime, WAL sidecar len/mtime).
 ///
-/// `read_history_revision` runs `Connection::open` + an SQL query on every call
-/// (per-turn context cache validation + session list refresh call it several
-/// times), yet many reads happen between writes. We therefore
-/// cache the result keyed by file metadata fingerprints: any write from this
-/// process or an external one changes the len/mtime of the main DB or the WAL
-/// sidecar, so a fingerprint mismatch triggers a re-query, with semantics
-/// identical to having no cache.
+/// Revision queries incur `Connection::open` + SQL, yet many reads happen
+/// between writes. Reuse the result while the file metadata fingerprint is
+/// unchanged; changes to the main DB or WAL length/mtime trigger a re-query.
 ///
 /// **WAL is critical**: the history DB runs in WAL mode, so commits only touch the
 /// `-wal` sidecar and the main DB len/mtime can stay unchanged before a checkpoint.
@@ -52,8 +48,7 @@ fn history_file_fingerprint(path: &Path) -> ((u64, Option<SystemTime>), (u64, Op
 /// `PRAGMA data_version` cannot replace it: it is a **connection-local** comparison
 /// value — each freshly opened `Connection` treats it only as "has the DB been
 /// changed by another connection since I opened", and a new connection's initial
-/// reading does not vary with external writes (a new connection consistently
-/// returns 2 in practice), so it cannot serve as a cross-connection cache
+/// reading does not track external writes, so it cannot serve as a cross-connection cache
 /// invalidation signal. When the meta table or key is missing (an old DB that
 /// has never had a revision written), 0 is returned, consistent with "never
 /// modified". Connection or query failures return None and are not cached.
@@ -111,7 +106,7 @@ pub(in crate::ai) fn history_revision_cache_contains(path: &Path) -> bool {
         .is_ok_and(|cache| cache.contains_key(path))
 }
 
-/// Records the most recent message write time; consecutive writes within the same
+/// Records logical session activity time; consecutive touches within the same
 /// millisecond stay monotonically increasing.
 pub(super) fn touch_session_activity(conn: &Connection) -> io::Result<()> {
     let now_ms = SystemTime::now()
@@ -161,8 +156,8 @@ pub(super) fn history_generation(conn: &Connection) -> io::Result<i64> {
     .map_err(|error| io::Error::other(error.to_string()))
 }
 
-/// Any operation that rewrites the canonical messages must invalidate derived
-/// snapshots.
+/// Discard derived snapshots when canonical changes invalidate their source range,
+/// and advance the generation to fence stale writers.
 pub(super) fn invalidate_context_snapshot(conn: &Connection) -> io::Result<()> {
     clear_context_snapshot_compression_state(conn)?;
     conn.execute("DELETE FROM context_messages", [])

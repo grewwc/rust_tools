@@ -1,11 +1,10 @@
 //! Phone actions executed by the `a serve` Android shell.
 //!
 //! The turn child has no Android APIs. It publishes one action request over the
-//! serve live FIFO; the web page answers by running the request through the
-//! shell's JavaScript bridge and posts one JSON line back to `/confirm`, which
-//! the child reads here. The tool therefore blocks for exactly as long as the
-//! user takes to grant a permission or pick a notes app, and fails closed when
-//! no Android client is attached.
+//! serve live FIFO; the web page runs it through the shell's JavaScript bridge
+//! and posts one JSON line back to `/confirm`. Completion depends on the native
+//! action and any user interaction; the request fails when the serve confirmation
+//! channel is unavailable or interrupted.
 
 use serde_json::{Value, json};
 
@@ -34,12 +33,10 @@ const PHONE_ACTIONS: &str = "now, calendar_read, calendar_add, sms, alarm, alarm
     app_list, app_open, photo_index, photo_search, photo_open, file_import, file_read, file_save, phone_search, \
     screen_capture, screen_stop, camera_capture, camera_stop";
 
-/// Camera budget for one response.
+/// Camera preview state for the session key returned by `current_turn_key`.
 ///
-/// The preview takes over the phone screen, so reopening it after a frame has
-/// been captured is never what the user asked for. One response therefore gets
-/// one captured frame, and at most two preview openings when the first attempt
-/// returns no frame.
+/// The preview takes over the phone screen, so a captured frame blocks reopening
+/// while that key remains in the shared slot. A failed capture allows one retry.
 static CAMERA_TURN: std::sync::Mutex<Option<CameraTurn>> = std::sync::Mutex::new(None);
 
 struct CameraTurn {
@@ -54,7 +51,7 @@ fn current_turn_key() -> String {
         .unwrap_or_default()
 }
 
-/// Why another camera preview must stay closed in this turn, if it must.
+/// Reason another camera preview is blocked for the supplied session key.
 fn camera_block_reason(turn: &str) -> Option<&'static str> {
     let state = CAMERA_TURN.lock().ok()?;
     let entry = state.as_ref()?;
@@ -178,8 +175,7 @@ fn parse_local_minute(value: &str) -> Option<(i64, i64, i64, i64, i64)> {
     Some((year, month, day, hour, minute))
 }
 
-/// A dialable string: digits plus the separators every dialer accepts. The
-/// number is never dialled or messaged directly, only pre-filled.
+/// Check the phone-number character allowlist; at least one digit is required.
 fn is_dialable(value: &str) -> bool {
     !value.is_empty()
         && value.chars().any(|c| c.is_ascii_digit())
@@ -912,7 +908,7 @@ mod tests {
         assert!(camera_block_reason(captured).unwrap().contains("already captured"));
         note_camera_attempt(captured, true);
         assert!(camera_block_reason(captured).unwrap().contains("already captured"));
-        // A new response starts with a fresh budget.
+        // A different session key starts with a fresh budget.
         assert_eq!(camera_block_reason("phone-tools-camera-next"), None);
 
         let failing = "phone-tools-camera-failing";
@@ -1399,8 +1395,7 @@ mod tests {
             "location": "会议室 A",
             "description": "带合同",
         }));
-        // Absolute timestamps and near-miss formats must not reach the phone:
-        // the Android side would silently reinterpret them in local time.
+        // Reject near-miss formats rather than letting another parser infer their meaning.
         for bad in [
             "2026-10-21 15:00",
             "2026-10-21T15:00:00",

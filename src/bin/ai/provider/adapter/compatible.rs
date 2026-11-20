@@ -1,26 +1,11 @@
-//! 「Compatible」通用适配器。
+//! Generic compatible adapter with DashScope defaults.
 //!
-//! 历史上本适配器专门服务 DashScope compatible-mode（阿里云百炼），所以默认
-//! wire 形状是：
-//! - 嵌套 `reasoning: { effort }`（无顶层 `reasoning_effort`）
-//! - 透传 `enable_search`
-//! - 思考开关由 `thinking` 方言模块以 `enable_thinking: bool` 发送
+//! [`CompatibleAdapter`] passes through `enable_search` and nests effort under
+//! `reasoning`. [`compatible_wire_shapes`] selects these defaults for DashScope
+//! endpoints and top-level `reasoning_effort` for other compatible endpoints.
 //!
-//! 但模型注册表（models/）里也把大量「纯 OpenAI 兼容」端点（如内部 modelhub、其他
-//! 第三方 OpenAI 兼容网关）挂在 `adapter: "compatible"` 下。这些端点严格遵循
-//! OpenAI 协议，只接受顶层 `reasoning_effort`，不识别 `enable_thinking` /
-//! `enable_search` / 嵌套 `reasoning`，发送这些字段会直接 400
-//! （`unknown_parameter: 'enable_thinking'`）。
-//!
-//! 因此本文件提供两组静态 helper：
-//! - [`dashscope_defaults`]：DashScope compatible-mode 的默认 wire 形状；
-//! - [`openai_compatible_defaults`]：纯 OpenAI 兼容端点的默认 wire 形状。
-//!
-//! 具体使用哪一组，由调用方
-//! （`super::super::request::reasoning::resolve_reasoning_wire_controls`）
-//! 按 provider + endpoint 判定，和 [`super::thinking::thinking_dialect_for`] 的
-//! 分支保持一一对应。trait 本身仍保留 DashScope 默认，以维持对「未显式传 endpoint」
-//! 场景的向后兼容。
+//! Endpoint-specific shapes keep DashScope extension fields out of requests to
+//! other gateways. Thinking-switch fields belong to [`super::thinking`].
 
 use serde_json::{Value, json};
 
@@ -42,12 +27,10 @@ impl ProviderAdapter for CompatibleAdapter {
     }
 
     fn reasoning_top_level<'a>(&self, _effort: Option<&'a str>) -> Option<&'a str> {
-        // 默认（DashScope）不发顶层 reasoning_effort。
         None
     }
 
     fn reasoning_nested(&self, effort: Option<&str>) -> Option<Value> {
-        // 默认（DashScope）发嵌套 reasoning: { effort }。
         effort.map(|effort| json!({ "effort": effort }))
     }
 
@@ -65,10 +48,10 @@ impl ProviderAdapter for CompatibleAdapter {
     }
 }
 
-/// endpoint 是否命中 DashScope compatible-mode。
+/// Matches DashScope compatible-mode endpoints.
 ///
-/// 注意：和 [`super::thinking::is_dashscope_endpoint`] 保持一致，两处使用
-/// 相同判定规则；若扩展更多兼容网关，在同一处加条件即可。
+/// The thinking dialect reuses this predicate to keep its endpoint selection
+/// consistent with [`compatible_wire_shapes`].
 pub(in crate::ai) fn is_dashscope_endpoint(endpoint: &str) -> bool {
     endpoint
         .trim()
@@ -76,14 +59,13 @@ pub(in crate::ai) fn is_dashscope_endpoint(endpoint: &str) -> bool {
         .contains("dashscope.aliyuncs.com")
 }
 
-/// compatible 端点的 wire 形状：根据 endpoint 返回三元组
-/// `(enable_search, top_level_effort, nested_reasoning)`。
+/// Selects compatible wire fields by endpoint as
+/// `(enable_search, top_level_effort, nested_reasoning)`.
 ///
-/// - DashScope 端点 → (透传 requested, None, Some({effort}))
-/// - 其他 OpenAI 兼容端点 → (None, Some(effort), None)
+/// DashScope preserves search and nests an effort when supplied. Other
+/// endpoints omit search and forward the effort at the top level.
 ///
-/// 注意：思考开关字段（`enable_thinking` / `thinking` 对象）不在此处理，
-/// 由 [`super::thinking::thinking_dialect_for`] 负责。
+/// Thinking-switch fields belong to [`super::thinking::thinking_dialect_for`].
 pub(in crate::ai) fn compatible_wire_shapes<'a>(
     endpoint: &str,
     requested_enable_search: Option<bool>,

@@ -35,10 +35,8 @@ impl ContextLimits {
             output_reserve_tokens: output,
             safety_margin_tokens: safety,
             input_allowance_tokens: input,
-            // 70% of the input allowance: lossy mechanical compression starts
-            // earlier than the previous 80%, while the LLM summary gate keys
-            // off the input allowance itself (see apply_request_budget), so
-            // this ratio only tunes the cheaper mechanical passes.
+            // Keep the mechanical compression target below the input allowance,
+            // which separately gates LLM summarization.
             soft_target_tokens: input.saturating_mul(7).saturating_div(10),
         }
     }
@@ -83,10 +81,8 @@ fn default_chars_per_token_milli() -> usize {
     super::prompt_feedback::DEFAULT_CHARS_PER_TOKEN_MILLI
 }
 
-/// Conservative default for externally deserialized budgets (tests, future
-/// persisted snapshots) that do not carry a model-derived inline cap: the
-/// smallest model line (128K window -> 32K chars). Zero would be wrong — it
-/// would classify every tool result as oversized and spill all of them.
+/// Nonzero fallback for budgets deserialized without a model-derived inline cap.
+/// Zero would classify every nonempty tool result as oversized and spill it.
 fn default_tool_inline_cap_chars() -> usize {
     32_000
 }
@@ -153,8 +149,8 @@ impl CurrentRequestBudget {
     }
 }
 
-/// Minimum output-token reserve so a model with a tiny declared `max_output`
-/// (or none) still leaves room for a complete reply.
+/// Preferred output-token reserve. Undeclared caps use minimum headroom;
+/// retry overrides can lower the reserve for models with declared caps.
 fn preferred_output_reserve_tokens(model_max: Option<u32>, output_override: Option<u32>) -> usize {
     // Keep enough headroom for a useful completion while allowing the request
     // builder to clamp the provider's larger wire ceiling against the actual

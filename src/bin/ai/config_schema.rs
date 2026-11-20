@@ -1,7 +1,6 @@
 /// Centralized configuration schema for the AI agent.
 ///
-/// All configuration keys are defined here as constants to avoid
-/// scattered string literals across the codebase.
+/// Shared configuration keys are constants for reuse across modules.
 ///
 /// Usage:
 /// ```rust
@@ -13,11 +12,9 @@ pub struct AiConfig;
 
 impl AiConfig {
     // ── Model ──────────────────────────────────────────────
-    // `ai.model.endpoint` was removed: the model registry (models/*.json plus
-    // per-model overrides in ~/.config/rust_tools/models/) is the single endpoint
-    // authority. A global override diverged from the wire-dialect decisions in
-    // request/builder.rs (which have no override), producing mismatched thinking /
-    // reasoning_effort fields against the actual request URL.
+    // Model entries and adapter defaults determine endpoints through
+    // `endpoint_for_model` in `models.rs`. A global override could pair an
+    // endpoint with the wrong request wire profile.
     /// Subagent model selection inherits the parent agent's current model by
     /// default. Set to "false" or "0" to use the auto-selection logic instead
     /// (model registry subagent_priority / task difficulty classification).
@@ -211,9 +208,9 @@ impl AiConfig {
     ///
     /// Scope: a background daemon (`-bg`) is a freshly re-exec'd process that
     /// re-runs `driver::run_with_cli`, so it DOES install this policy from config
-    /// (it is a full user-initiated agent run). Only in-process subagents do not
-    /// inherit it — `App::clone` resets the middleware vectors, so agent-spawned
-    /// helpers run with no permission gate.
+    /// (it is a full user-initiated agent run). In-process app forks reset the
+    /// middleware vectors in `App::fork_baseline` (`types.rs`), so they do not
+    /// inherit this gate.
     pub const TOOLS_PERMISSIONS: &str = "ai.tools.permissions";
     /// Default policy for tools not matched by any rule in
     /// `ai.tools.permissions`. One of `allow` / `ask` / `deny`. Defaults to
@@ -276,15 +273,13 @@ impl AiConfig {
     pub const OUTPUT_POSTPROCESS_COMMAND: &str = "ai.output.postprocess_command";
 
     // ── Theme (terminal rendering) ─────────────────────────
-    /// Terminal color theme name. Resolved to `~/.config/rust_tools/themes/
-    /// <name>.json` (user override) first, then to a built-in theme embedded
-    /// from `src/bin/ai/builtin_themes/` (`default`, `monokai`, `light`,
-    /// `dracula`, `one-dark`, `tokyo-night`, `nord`, `catppuccin`).
+    /// Terminal color theme name. Resolves `~/.config/rust_tools/themes/<name>.json`
+    /// first, then a built-in listed by `BUILTIN_THEME_NAMES` in `theme.rs`.
     /// Theme JSON uses VSCode-style flat `colors` keys (see `theme.rs`).
     /// Empty = the built-in default palette.
     pub const THEME: &str = "ai.theme";
-    /// Absolute path to a custom theme JSON file. Takes precedence over
-    /// `ai.theme` when set and readable. Supports `~` expansion.
+    /// Path to a custom theme JSON file. Takes precedence over `ai.theme` when
+    /// it loads successfully. Supports `~` expansion.
     pub const THEME_FILE: &str = "ai.theme.file";
 
     // ── Token usage stats ──────────────────────────────────

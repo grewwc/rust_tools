@@ -574,9 +574,8 @@ fn recover_team_owner(team: &mut TeamState) -> Result<(), String> {
         return Ok(());
     }
 
-    // After an app restart the kernel task registry no longer exists. Restore orphaned
-    // running items to pending; attempts are already billed and the budget is not rolled
-    // back, so resume can re-dispatch without treating an interrupted execution as success.
+    // Requeue orphaned runs only while the attempt budget permits. Attempts stay
+    // billed so owner recovery cannot treat interrupted execution as successful.
     recover_orphaned_team_tasks(team);
     team.owner_pid = owner_pid;
     team.updated_at_unix_ms = now_unix_ms();
@@ -1098,14 +1097,9 @@ pub(super) fn collect_team_results(team: &mut TeamState) -> Result<Vec<String>, 
                 } else {
                     result.output.as_str()
                 };
-                // A failed history integration must not propagate: poll_owned_task_result
-                // already consumed the TASK_REGISTRY entry and persisted the evidence. If
-                // `?` propagated here, the checkpoint would not be saved, the task on disk
-                // would stay Running, and the next advance would hang forever because the
-                // task is no longer in the registry (even cancel_team would fail at
-                // collect_team_results).
-                // So integration is best-effort: the terminal state is already committed
-                // in place and a failure only appends a note.
+                // Preserve the terminal result when evidence integration fails. Report
+                // the error in notes and let the caller persist the team transition;
+                // returning early would leave the checkpoint's task marked Running.
                 if let Err(error) =
                     integrate_runtime_result(&runtime_task_id, &result.status, summary)
                 {
@@ -1138,12 +1132,9 @@ pub(super) fn collect_team_results(team: &mut TeamState) -> Result<Vec<String>, 
                 team.updated_at_unix_ms = now;
             }
             Err(error) => {
-                // Mid-round errors must never propagate: when poll fails (task lost /
-                // ownership changed), mark the task failed in place and clear the task
-                // reference. If `?` propagated, the checkpoint would not be saved, the
-                // task on disk would still carry runtime_task_id, and the next advance
-                // would re-poll the same lost task and hang forever (even cancel_team
-                // would fail at collect_team_results).
+                // Mark the task failed and clear its runtime reference when polling
+                // fails, allowing the caller to persist the transition. Returning
+                // early would leave a Running checkpoint that retries the lost task.
                 let now = now_unix_ms();
                 let member_id = team
                     .tasks
@@ -2135,7 +2126,6 @@ pub(super) mod tests {
         input.max_tasks = MAX_TEAM_TASKS + 1;
         assert!(validate_budget(input).is_err());
 
-        // max_total_attempts must be >= max_tasks and <= 4096
         let mut input = TeamBudgetInput {
             max_parallel: 2,
             max_tasks: 8,

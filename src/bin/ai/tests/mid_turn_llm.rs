@@ -333,8 +333,8 @@ async fn automatic_compaction_preserves_replay_without_model_summary() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Regression: when the older tool groups already saved more than 4K, we must not return early while still above hard_target.
-/// The latest full tool group (especially parallel results and large arguments) must keep its paired structure and converge within the total budget.
+/// Early folding must not return while the projection remains above hard_target.
+/// Preserve the latest tool-call/result pair while shrinking the projection to fit.
 #[tokio::test]
 async fn mid_turn_llm_summary_reaches_hard_target_after_effective_early_folding() {
     let root =
@@ -537,12 +537,10 @@ async fn assert_path_a_preserves_raw_archive_pointer(status: &str) {
 
 #[tokio::test]
 async fn mid_turn_llm_summary_path_a_runs_when_old_user_turns_folded_away() {
-    // Regression test: after persistent compression, earlier user messages are replaced by internal_note summaries,
-    // and the visible role=="user" boundary in the projection is fewer than keep_recent_turns (=2). retained_turn_start
-    // returning 0 makes Path A get skipped wholesale, so leftover assistant(tool_calls)/tool records (protected by protocol
-    // pairing, impossible to delete one by one) can never be reclaimed by the LLM semantic summary and the context only grows.
-    // After the fix: split_at falls back to the first user message position, system-like summary/archive markers are still
-    // preserved by preserved_system_end, and the old conversation segment between them can be summarized by Path A normally.
+    // Earlier user turns may already be folded into internal notes, leaving
+    // tool pairs before the retained user-turn window. Summarize those pairs
+    // while preserving existing notes and recent turns; prior summaries must
+    // not become fresh summarizer input.
     let draft = "Goals:\n- Reclaim the earlier tool output without resummarizing prior memory.";
     let mut fixture = SummaryFixture::new("200 OK", draft).await;
     let app = &fixture.app;

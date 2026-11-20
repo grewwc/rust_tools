@@ -208,7 +208,7 @@ fn folded_group_archive_uses_short_content_hash_name() {
             locator.starts_with("session-asset:folded-tool-groups/"),
             "{locator}"
         );
-        // ... and still resolve to a real file (old absolute forms keep working).
+        // The alias must still resolve to the archived file.
         assert!(resolve_stub_locator_for_test(&dir, &locator).is_file());
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -1127,7 +1127,7 @@ fn folded_command_failure_keeps_diagnostics_and_full_output_pointer() {
     let mut messages = vec![msg("system", "s"), msg("user", "修复编译失败")];
     messages.push(assistant_call("command", "execute_command"));
     messages.push(tool_result("command", &command_output));
-    // Push the command outside the latest four groups, modeling LLM summarization after many reads/searches in one turn.
+    // Push the command outside the latest four groups for structural folding after many reads/searches in one turn.
     for i in 0..4 {
         let id = format!("later-{i}");
         messages.push(assistant_call(&id, "text_grep"));
@@ -1209,7 +1209,6 @@ fn keeps_only_recent_tool_call_reasoning_across_turns() {
 
     keep_only_recent_reasoning_content(&mut messages);
 
-    // Locate tool-call reasoning by tool_call id.
     let tc_reasoning = |id: &str| -> Option<String> {
         messages
             .iter()

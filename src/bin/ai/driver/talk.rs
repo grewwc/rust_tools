@@ -216,7 +216,7 @@ pub(crate) fn take_room_card_skills(body: &mut String) -> Vec<String> {
     }
 }
 
-/// Whether this session's inbox currently holds at least one message.
+/// Whether this session's inbox file is nonempty.
 ///
 /// Boundary snapshot only: callers use it to decide whether another model
 /// iteration (or a next user input) is needed. The subsequent drain is the
@@ -300,7 +300,7 @@ pub fn push_talk(
         room: room.clone(),
     };
     let line = serde_json::to_string(&msg).map_err(|e| format!("encode talk message: {e}"))?;
-    // Append-only write; single-line append atomicity avoids concurrent truncation.
+    // Open in append mode so sending never truncates existing inbox content.
     use std::io::Write;
     let mut f = fs::OpenOptions::new()
         .create(true)
@@ -349,9 +349,9 @@ pub fn push_talk(
 /// Drain and clear this session's inbox. Called at iteration boundaries; the
 /// caller injects the returned messages immediately.
 ///
-/// Drain uses an atomic rename: senders append while the drain side renames the
-/// old file to a temp file and reads it, so messages pushed during the
-/// "read-then-truncate" window are not dropped.
+/// Move the current inbox aside before reading it. Senders opening the path
+/// after the rename append to a new inbox. A sender that already holds the
+/// renamed file open can race the drain; append and drain are not locked.
 pub fn drain_talk(history_file: &Path) -> Vec<TalkMessage> {
     let file = talk_inbox_file(history_file);
     // uuid suffix: two drains of the same inbox in one process must not share
@@ -374,8 +374,8 @@ pub fn drain_talk(history_file: &Path) -> Vec<TalkMessage> {
         if !file.exists() {
             return Vec::new();
         }
-        // Fallback path: rename can fail on cross-device moves etc.; degrade to
-        // atomic truncation (a tiny race remains, but only on cross-device).
+        // If rename fails, read the inbox and replace it with an empty file.
+        // Concurrent appends between the read and replacement can be discarded.
         match fs::read_to_string(&file) {
             Ok(c) => {
                 let empty_tmp = file.with_extension(format!(
@@ -412,11 +412,9 @@ fn parse_talk_lines(content: &str) -> Vec<TalkMessage> {
     out
 }
 
-/// Put undisplayed messages back into the inbox. Used when a consumer (e.g.
-/// `talk_read` display cap) shows only a prefix of a drain: the remainder is
-/// re-appended so it is shown on the next read instead of being lost. New mail
-/// that arrived meanwhile stays ahead of the requeued tail; order within the
-/// requeued suffix is preserved.
+/// Best-effort append of undisplayed messages for a later read.
+/// Serialize them in their existing order and append after any newer mail
+/// already queued while the original messages were being displayed.
 pub fn requeue_talk(history_file: &Path, msgs: &[TalkMessage]) {
     if msgs.is_empty() {
         return;

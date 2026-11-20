@@ -3,17 +3,13 @@ use std::time::Duration;
 /// `/audit` is an explicitly requested deep audit; it allows a longer foreground wait than an
 /// ordinary delegated subagent.
 pub(crate) const AUDIT_SUBAGENT_HARD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-/// Reserve wrap-up time so the audit does not lose collected conclusions at the hard timeout.
-/// Two minutes was too short: a long model request could not be interrupted before the hard
-/// timeout aborted it, losing up to fifteen minutes of work. Five minutes lets the wrap-up signal
-/// interrupt a request mid-flight and force a final conclusion.
+/// Request wrap-up before the hard timeout so the child has time to return
+/// partial conclusions.
 pub(crate) const AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME: Duration = Duration::from_secs(5 * 60);
 
-/// Hard timeout for `/audit --fast`: the current session model with high reasoning and a bounded
-/// step count normally finishes a quick audit in a few minutes; eight minutes caps foreground use.
+/// Hard timeout for `/audit --fast`, limiting foreground occupancy.
 pub(crate) const FAST_AUDIT_SUBAGENT_HARD_TIMEOUT: Duration = Duration::from_secs(8 * 60);
-/// Wrap-up reserve for a fast audit: three minutes is enough to interrupt a request and produce a
-/// final conclusion while preserving the foreground runner's wrap-up guarantee.
+/// Reserve time for a fast audit to respond to the wrap-up signal before timeout.
 pub(crate) const FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME: Duration = Duration::from_secs(3 * 60);
 
 const SUBAGENT_FINAL_ANSWER_MARKER: &str = "[Subagent final answer]\n";
@@ -90,7 +86,7 @@ fn previous_turn_artifact(records: &[crate::ai::history::StoredMessage]) -> Stri
     out
 }
 
-/// Parse `/audit` before the model loop; enhanced lead orchestration requires `--deep`.
+/// Parsed `/audit` modes; enhanced lead orchestration requires `--deep`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AuditCommand {
     Run {
@@ -208,7 +204,7 @@ pub(crate) fn inject_self_generated_audit_note(
     });
 }
 
-/// Legacy bare-command detection deliberately matches the recorded audit spawn call.
+/// Detect recorded audit-agent spawn attempts without inspecting their results.
 pub(crate) fn turn_spawned_audit_subagent(turn_messages: &[crate::ai::history::Message]) -> bool {
     turn_messages.iter().any(|message| {
         message.tool_calls.as_ref().is_some_and(|tool_calls| {
@@ -235,7 +231,7 @@ pub(crate) fn turn_spawned_audit_subagent(turn_messages: &[crate::ai::history::M
 }
 
 /// Only a matched successful `task_spawn` result proves an audit child started.
-/// Preflight errors, missing results, and failed children do not suppress the bare-command fallback.
+/// Preflight errors, missing results, and failed spawn entries do not suppress the bare-command fallback.
 pub(crate) fn turn_successfully_spawned_audit_subagent(
     turn_messages: &[crate::ai::history::Message],
 ) -> bool {
@@ -305,11 +301,8 @@ pub(crate) fn terminal_audit_result(payload: &str) -> String {
         return format!("[audit] {error}");
     }
 
-    // Fallback: a subagent that answers inline with zero tool calls produces no marker (see
-    // finalize.rs `format_subagent_result_for_parent`, which returns the final text unchanged when
-    // tool evidence is empty). Inline answers are common because the audit prompt already injects
-    // the mutation log / git diff. Strip the foreground-subagent payload header and parent reminder
-    // tail, then show the actual conclusion instead of reporting "no final answer".
+    // Without a final-answer marker, strip known payload headers and the parent
+    // reminder before showing the remaining body.
     let stripped = strip_subagent_payload_header(payload);
     let body = strip_parent_reminder(&stripped);
     if !body.is_empty() && body != SUBAGENT_NO_FINAL_TEXT_SENTINEL {
@@ -325,9 +318,8 @@ pub(crate) fn terminal_audit_result(payload: &str) -> String {
 /// conclusion, so fall back to the generic notice instead of showing the placeholder.
 const SUBAGENT_NO_FINAL_TEXT_SENTINEL: &str = "(subagent did not produce any final assistant text)";
 
-/// Full audit payload for the lead-agent fix loop: unlike the terminal view
-/// (which hides timeout-recovery evidence), the fixer needs every collected
-/// fact. Only the parent-reminder suffix is stripped.
+/// Preserve captured task evidence for the lead's fix loop; remove only the
+/// trailing parent-summary reminder.
 pub(crate) fn audit_report_for_fix(payload: &str) -> String {
     strip_parent_reminder(payload).trim().to_string()
 }
@@ -345,9 +337,8 @@ fn strip_parent_reminder(text: &str) -> &str {
 /// `[Task: …] STATUS after …s` line, and the selection explanation's
 /// `agent_reason=` / `model_reason=` lines (see `sync_task::format_subagent_output`
 /// and `task_tools::build_selection_explanation`). Only consecutive known metadata
-/// lines at the start are skipped; audit conclusions (prose / markdown) do not
-/// start with those prefixes, so they are never swallowed. If the header format
-/// changes later, the worst case is a few extra displayed header lines.
+/// lines at the start are skipped; the first line with any other prefix ends
+/// header stripping.
 fn strip_subagent_payload_header(payload: &str) -> String {
     const HEADER_PREFIXES: &[&str] = &["[task_id=", "[Task: ", "agent_reason=", "model_reason="];
     let mut lines = payload.lines().peekable();
@@ -534,7 +525,7 @@ pub(crate) struct ForegroundAuditInvocation {
     pub(crate) wrap_up_lead_time: Option<Duration>,
 }
 
-/// Build every scope against the same inventory snapshot, retaining the existing timeout policy.
+/// Build all scopes from one frozen audit context with per-invocation timeouts.
 pub(crate) fn foreground_audit_invocations(
     instruction: &str,
     scopes: &[String],
@@ -940,7 +931,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
         };
-        // Either audit agent spawned through task_spawn is detected.
+        // Recorded spawn attempts for either audit agent are detected.
         assert!(turn_spawned_audit_subagent(&[msg(vec![call(
             "task_spawn",
             r#"{"tasks":[{"agent":"audit-fast"},{"agent":"build"}]}"#

@@ -171,7 +171,6 @@ pub(in crate::ai::prompt::multiline) fn handle_multiline_event(
                     Ok(EventLoopAction::Continue)
                 }
                 (KeyCode::F(8), _) => {
-                    // F8：一键清空输入框中的所有内容。
                     replace_textarea_content(textarea, "");
                     recent_text_input.take();
                     *status_msg = Some("Cleared all input.".to_string());
@@ -217,7 +216,6 @@ pub(in crate::ai::prompt::multiline) fn handle_multiline_event(
                     Ok(EventLoopAction::Continue)
                 }
                 (KeyCode::Delete, modifiers) if modifiers.is_empty() => {
-                    // 显式处理 Delete 键：按字符删除光标后一个字符。
                     delete_char_forward(textarea);
                     Ok(EventLoopAction::Continue)
                 }
@@ -412,7 +410,6 @@ fn backspace_delete_char(textarea: &mut TextArea<'_>) {
     let mut lines = textarea.lines().to_vec();
 
     if col > 0 {
-        // 删除当前行中光标前的一个字符（按字符索引，非字节）
         let line = &mut lines[row];
         let mut chars: Vec<char> = line.chars().collect();
         if col <= chars.len() {
@@ -421,9 +418,8 @@ fn backspace_delete_char(textarea: &mut TextArea<'_>) {
             textarea.set_lines(lines, (row, col - 1));
         }
     } else if row > 0 {
-        // 光标在行首，合并到上一行末尾
-        // 注意：textarea 的 cursor 列是字符索引，不是字节索引。
-        // 必须用 chars().count() 而非 len()（后者返回字节数）。
+        // TextArea cursor columns count characters, so a byte length would
+        // place the cursor incorrectly after joining Unicode lines.
         let prev_line_char_count = lines[row - 1].chars().count();
         let merged = format!("{}{}", lines[row - 1], lines[row]);
         lines[row - 1] = merged;
@@ -441,14 +437,12 @@ fn delete_char_forward(textarea: &mut TextArea<'_>) {
     let line_len = lines[row].chars().count();
 
     if col < line_len {
-        // 删除光标后的一个字符
         let line = &mut lines[row];
         let mut chars: Vec<char> = line.chars().collect();
         chars.remove(col);
         *line = chars.into_iter().collect();
         textarea.set_lines(lines, (row, col));
     } else if row + 1 < lines.len() {
-        // 光标在行尾，合并下一行
         let next_line = lines.remove(row + 1);
         lines[row].push_str(&next_line);
         textarea.set_lines(lines, (row, col));

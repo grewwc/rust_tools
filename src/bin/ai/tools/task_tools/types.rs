@@ -84,7 +84,7 @@ impl Default for InheritOptions {
         // history or memory. Narrow tasks get their necessary context passed explicitly by the
         // parent agent in the prompt, avoiding token bloat, attention drift, and a subagent
         // polluting the main memory file. Callers can still explicitly pass `inherit: "all"` or
-        // `inherit: "history,cwd,skills"` to restore the old behavior.
+        // `inherit: "history,cwd,skills"` to share broader parent context.
         Self {
             history: false,
             memory: false,
@@ -260,8 +260,8 @@ pub(crate) struct SubagentHandoff {
 ///    `selection_explanation`, `model`) have no place in the kernel process table;
 /// 2. The agent layer needs to query under the stable string key task_id, while the kernel uses
 ///    numeric pids;
-/// 3. The kernel's `created_at_tick` is a logical tick and cannot be converted back to wall-clock
-///    time for the LRU decision in `prune_completed_tasks`.
+/// 3. The kernel's `created_at_tick` is a logical tick; `started_at` measures real elapsed time
+///    for lifetime caps and progress/status reporting.
 ///
 /// **Invariant**: the `pid` in this registry must always correspond to the same process in the
 /// kernel process table; results must first be persisted to the evidence ledger by `task_wait` /
@@ -285,11 +285,8 @@ pub(crate) struct AsyncTaskEntry {
     /// Descriptive text; unlike kernel `Process.goal`, which carries the TASK_GOAL_PREFIX prefix
     /// and the full prompt.
     pub(crate) description: String,
-    /// Logical name of the subagent (used to look up the registered AgentManifest, e.g. `"build"`);
-    /// shares its source with the kernel `Process.name`, but the kernel-side name is display-only.
-    /// Note the distinction: `plan` is a tool name, not an agent name (no `plan` subagent is
-    /// registered in this repo), so `agent_name` must not be set to `"plan"` — that would point the
-    /// dispatch at a manifest that does not exist.
+    /// Name of the selected AgentManifest. The kernel `Process.name` also displays it,
+    /// while task dispatch resolves this field against the agent registry.
     pub(crate) agent_name: String,
     /// Execution backend for this task. `None` is the in-process kernel
     /// runner; external backends carry their registered ID so the status line can
@@ -308,8 +305,7 @@ pub(crate) struct AsyncTaskEntry {
     /// interrupted immediately by a Tokio abort, so timeout/cancel must set this flag first, letting
     /// the command runner kill the actual OS process group.
     pub(crate) cancel_stream: Arc<AtomicBool>,
-    /// Wall-clock start time, used by the `prune_completed_tasks` LRU; it cannot be replaced by the
-    /// kernel `created_at_tick`.
+    /// Start instant used for elapsed-time reporting and the subagent wall-clock cap.
     pub(crate) started_at: Instant,
     pub(crate) last_progress_notification_at: Option<Instant>,
     pub(crate) last_progress_persisted_at: Option<Instant>,

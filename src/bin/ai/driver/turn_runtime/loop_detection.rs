@@ -1,13 +1,9 @@
-// =============================================================================
-// Tool-Loop Detection
-// =============================================================================
-// Extracted from orchestrator.rs during a logic-preserving split.
-// Tool-round signature extraction, coarse shell-command signatures and the loop / target-rescan detectors used by the turn supervisor.
-// =============================================================================
+// Tool-round signatures and loop detectors used by the turn supervisor.
 
 use super::*;
 
-/// 变更类工具：调用这些动作（或产出 final text）即视为本轮有实质动作、算进展。
+/// Tools eligible for progress-as-mutation accounting; `round_has_mutation`
+/// applies command, delivery, and success checks before counting them.
 pub(super) const MUTATION_TOOL_NAMES: &[&str] = &[
     "apply_patch",
     "write_file",
@@ -20,8 +16,8 @@ pub(super) const MUTATION_TOOL_NAMES: &[&str] = &[
     "execute_command",
 ];
 
-/// 提取最近一轮 assistant 消息中的 (tool_name, args_json) 签名集合。
-/// 任何一个签名与窗口内某轮完全一致即认为有循环倾向。
+/// Collect normalized `(tool_name, args_json)` signatures from the last assistant
+/// message. Sorting makes the whole call list independent of call order.
 pub(super) fn extract_round_tool_signatures(
     messages: &[crate::ai::history::Message],
 ) -> Option<Vec<String>> {
@@ -647,8 +643,8 @@ pub(super) fn detect_tool_loop(history: &[Vec<String>], window: usize) -> bool {
         return true;
     }
 
-    // 除 A-A-A-A 外，模型还会以 A-B-A-B 或 A-B-C-A-B-C 的方式规避逐轮
-    // 去重。只识别恰好填满当前窗口的短周期，避免把正常的长任务误判成循环。
+    // Recognize short repeating cycles as well as identical rounds. Restrict
+    // periods to two or three rounds to avoid treating long tasks as cycles.
     for period in 2..=3 {
         let cycle = &tail[..period];
         if cycle.iter().any(Vec::is_empty) {
@@ -660,11 +656,8 @@ pub(super) fn detect_tool_loop(history: &[Vec<String>], window: usize) -> bool {
                 return true;
             }
         } else {
-            // 窗口不能整除周期（如 soft 窗口 4 vs 周期 3）：退化为
-            // 「若干完整周期 + 一个周期前缀」也判为循环。这补上了 3 周期在
-            // soft 检查里永远不触发（4 % 3 != 0 被跳过）、导致第 6 轮被无预警
-            // 直接 hard-stop 的洞：A-B-C-A-B-C 会在第 4 轮（A-B-C-A 匹配
-            // 周期 [A,B,C] 的前缀）先拿到 Soft 预警，维持 soft→hard 升级不变量。
+            // A partial final cycle still establishes repetition, allowing a soft
+            // window shorter than two full cycles to notice a three-round pattern.
             if tail.iter().zip(cycle.iter().cycle()).all(|(a, b)| a == b) {
                 return true;
             }
@@ -685,13 +678,10 @@ pub(super) fn detect_execute_command_coarse_loop(history: &[Vec<String>], window
     signature_set_is_execute_command_only(&tail[0])
 }
 
-/// 目标级重复检测：窗口内每一轮都触碰了**同一个**目标资源即命中。
+/// Detect a target shared by every round in the trailing window.
 ///
-/// 这是对整轮签名比较的补位。`detect_tool_loop` 要求整轮签名集合相等（或短周期
-/// 循环），模型只要在每轮里多穿插一个不同的陪衬工具（今天读 A+搜 X、明天读 A+搜 Y、
-/// 后天读 A+列目录），整轮签名就各不相等而逃逸，但真正的低收益重复是「A 被反复读」。
-/// 这里改为求窗口内各轮目标集合的**交集**：只要存在一个目标在每一轮都出现，就判定
-/// 为该目标被反复取证。空轮（无目标）不参与，避免误判。
+/// Comparing target intersections catches repetition hidden by changing side calls.
+/// Any empty round suppresses detection for the entire window.
 pub(super) fn detect_target_repeat_loop(history: &[Vec<String>], window: usize) -> bool {
     if window < 2 || history.len() < window {
         return false;
@@ -715,15 +705,11 @@ pub(super) fn is_direct_file_mutation_tool(name: &str) -> bool {
     matches!(name, "apply_patch" | "write_file")
 }
 
-/// 判断最近一轮 assistant 是否调用了变更类工具（apply_patch/write_file）。
+/// Whether the round contains a tool action counted as mutation progress.
 ///
-/// `execute_command` 是双关工具：`git status`/`git log`/`ls` 等只读取证命令不改变
-/// 世界，却曾被无差别计为 Mutation 进展，导致模型反复刷同一批 git 检查就能不断
-/// 刷新 no-progress 预算、永不收敛。因此对 execute_command 额外判定：只有**非只读**
-/// 命令才算 Mutation 动作。
-///
-/// `task_wait` / `task_status` 也是双关工具：只有真正交付了子任务结果时才算推进。
-/// 空轮询、PARKED、BUDGET-ELAPSED、already-collected 提示和无任务状态都不算实质动作。
+/// Command intent counts when the read-only heuristic rejects it. Direct writes
+/// require a mutation candidate and either a success result or a missing result.
+/// Wait/status tools count only when their result contains a task-output marker.
 pub(super) fn round_has_mutation(messages: &[crate::ai::history::Message]) -> bool {
     let Some(last_assistant) = messages.iter().rev().find(|m| m.role == "assistant") else {
         return false;
@@ -747,14 +733,13 @@ pub(super) fn round_has_mutation(messages: &[crate::ai::history::Message]) -> bo
         }
         match name {
             "execute_command" => {
-                // Only starting a command can change the workspace. Session
-                // control is a separate `command_session` tool and is not a
-                // mutation tool, so it never reaches this branch.
+                // Command-session control uses a separate tool; this branch classifies
+                // the submitted command's mutation intent.
                 let Ok(args) =
                     serde_json::from_str::<serde_json::Value>(tc.function.arguments.as_str())
                 else {
-                    // Malformed arguments are conservatively treated as a
-                    // mutation candidate, matching the previous fail-safe.
+                    // Treat malformed arguments as a mutation candidate so uncertain
+                    // work cannot be mistaken for read-only exploration.
                     return true;
                 };
                 crate::ai::tools::service::execute_command_arg(&args)
@@ -765,13 +750,9 @@ pub(super) fn round_has_mutation(messages: &[crate::ai::history::Message]) -> bo
                 .get(tc.id.as_str())
                 .is_some_and(|text| task_tool_result_delivered_task_output(text)),
             "write_file" | "apply_patch" => {
-                // 直接文件变更工具只有**写入成功**才算推进。失败（沙箱越界、
-                // 上下文不匹配、路径错误等）不改变世界，却曾无差别计为 Mutation，
-                // 每次重试都会清零 no-progress 预算，使进展预算 loop guard 永远
-                // 攒不满窗口——模型可对同一个被拒路径反复 write_file / apply_patch
-                // 而不被收口（见 write blocked 循环）。结果缺失（None）保守计为
-                // 推进，避免把真实改动误判为无进展而过早停。temp write / dry-run
-                // 只改 session 临时态，不得让纯只读广度刹车永久失效。
+                // Require a mutation candidate and a successful result so repeated
+                // rejected writes do not reset the progress budget. Missing results
+                // conservatively count as progress to avoid stopping after an unobserved edit.
                 if !tool_call_is_successful_mutation_candidate(tc) {
                     return false;
                 }
@@ -788,8 +769,9 @@ pub(super) fn round_has_mutation(messages: &[crate::ai::history::Message]) -> bo
     })
 }
 
-/// 纯只读广度硬停只应被真实项目修改关闭；plan / task 生命周期等虽然算任务进展，
-/// 但不能把后续无限串行扫描伪装成「读+改」实现任务。
+/// Project-mutation intent for the breadth guard, excluding plan/task lifecycle
+/// progress. Command effects are inferred from arguments; direct writes count
+/// on success or a missing result.
 pub(super) fn round_has_project_mutation(messages: &[crate::ai::history::Message]) -> bool {
     let Some(last_assistant) = messages.iter().rev().find(|m| m.role == "assistant") else {
         return false;

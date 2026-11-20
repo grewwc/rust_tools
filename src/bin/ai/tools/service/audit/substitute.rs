@@ -147,7 +147,7 @@ struct SubMarker {
 }
 
 /// Shell reserved words whose presence makes the command compound (loops,
-/// conditionals, `case`) or reorders execution (`!`). Substitution output in
+/// conditionals, `case`) or alters command evaluation (`!`, `time`). Substitution output in
 /// their condition/list positions would be executed as a command or fed into
 /// a loop variable, which the per-segment audit cannot see, so such commands
 /// are never materialized.
@@ -403,28 +403,6 @@ pub(crate) struct SafeShellSubstitution {
     pub(crate) kind: SafeShellSubstitutionKind,
 }
 
-/// Recognize and classify harmless substitutions in a restricted outer command.
-/// Classification does not prove eager evaluation is safe: callers must also
-/// reject substitutions flagged `after_command_separator` before reading files
-/// or running inner commands.
-///
-/// - The outer command must use the restricted grammar (see
-///   `restricted_outer_shell_words`). Every active substitution must form a
-///   complete word: a double-quoted `"$(inner)"` / `` "`inner`" ``, a bare
-///   `$(inner)` / `` `inner` ``, or the whole value of a simple `NAME=...`
-///   assignment. Anything else — partial-word fusions, `for ... in` list
-///   elements — is left raw so the position guard can reject it.
-/// - An assignment value is safe to materialize because the replacement is a
-///   quoted literal and every later `$NAME` reference is expanded to that same
-///   literal before validation, so an assigned `rm` still reaches the program
-///   blacklist as `rm`.
-/// - If `inner` is `cat /absolute/path/literal`, take the file-read path (no
-///   shell execution).
-/// - Otherwise, if `inner` itself passes `validate_execute_command` (i.e. is
-///   judged harmless by the existing blacklist), treat it as an executable
-///   harmless command substitution.
-/// - If any substitution fails both categories above, the whole thing is
-///   unsafe; return empty so the upper injection validation can block it.
 /// A shell variable name: `[A-Za-z_][A-Za-z0-9_]*`.
 fn is_shell_name(name: &str) -> bool {
     let mut chars = name.chars();
@@ -469,6 +447,27 @@ fn exact_substitution_shape<'a>(
     }
 }
 
+/// Classify substitutions eligible for restricted outer-command materialization.
+/// Classification does not prove eager evaluation is safe: callers must also
+/// reject substitutions flagged `after_command_separator` before reading files
+/// or running inner commands.
+///
+/// - The outer command must use the restricted grammar (see
+///   `restricted_outer_shell_words`). Every active substitution must form a
+///   complete word: a double-quoted `"$(inner)"` / `` "`inner`" ``, a bare
+///   `$(inner)` / `` `inner` ``, or the whole value of a simple `NAME=...`
+///   assignment. Anything else — partial-word fusions, `for ... in` list
+///   elements — is left raw so the position guard can reject it.
+/// - An assignment value is safe to materialize because the replacement is a
+///   quoted literal and every later `$NAME` reference is expanded to that same
+///   literal before validation, so an assigned `rm` still reaches the program
+///   blacklist as `rm`.
+/// - If `inner` is `cat /absolute/path/literal`, take the file-read path (no
+///   shell execution).
+/// - Other inner commands must pass `validate_execute_command`; execution and
+///   confirmation gates remain the caller's responsibility.
+/// - If any substitution fails classification, return empty so the position
+///   guard can reject the raw command.
 pub(crate) fn safe_shell_substitutions(command: &str) -> Vec<SafeShellSubstitution> {
     let Some((words, markers, first_separator)) = restricted_outer_shell_words(command) else {
         return Vec::new();
@@ -665,13 +664,11 @@ pub(crate) fn validate_no_injection_surface(command: &str) -> Result<(), String>
         }
         // Command substitution `$(`
         if b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
-            // Arithmetic expansion `$(( ... ))` executes no commands and is
-            // harmless (typical: `echo $((RANDOM % 20))`); it must not be falsely
-            // killed by the command-substitution rule. Push the arithmetic depth
-            // and keep scanning inward — genuinely nested command substitutions
-            // (like the `$(` inside `$(( $(whoami) ))`) still get caught in later
-            // iterations, while the trailing `))` and inner grouping parens are
-            // correctly allowed by the arith_depth branch below.
+            // Arithmetic grouping is distinct from command substitution, as in
+            // `echo $((RANDOM % 20))`. Keep scanning inside the expansion so
+            // nested `$(...)` is rejected rather than hidden by arithmetic syntax.
+            // Grouping parentheses and the closing `))` are handled by
+            // `arith_depth` below.
             if i + 2 < bytes.len() && bytes[i + 2] == b'(' {
                 arith_depth += 1;
                 i += 3;
@@ -796,7 +793,6 @@ pub(crate) fn expand_tilde_and_home(arg: &str) -> Result<String, String> {
     }
 }
 
-/// Validate a single command segment against the program/argument blacklist.
 /// True when `b` terminates a shell word for the purpose of locating which word
 /// contains a command substitution (control operators and unquoted whitespace;
 /// quote, `$`, `=`, and pathname-expansion characters stay part of the word).
@@ -874,12 +870,13 @@ fn is_literal_seq_substitution(inner: &str) -> bool {
 /// variable escapes per-segment analysis entirely:
 /// `for cmd in $(printf rm); do $cmd -rf target; done` and
 /// `cmd=$(printf rm); $cmd -rf target` split into individually innocent
-/// segments while the shell executes the banned program. Shell variables are
-/// not tracked, so only two positions pass: a `for ... in` list word holding
-/// exactly `$(seq FIRST LAST)` with literal integer bounds (provably numeric
-/// output), and a complete double-quoted word `"$(...)"` / `` "`...`" `` in an
-/// argument of a pure-data program (`echo`/`printf`/`seq`/`date`, which
-/// command.rs materializes before execution). Every other form is rejected.
+/// segments while the shell executes the banned program. This guard does not
+/// track shell variables, so only two positions pass: a complete loop-list word
+/// running `seq` with one to three literal integer bounds, or a complete
+/// double-quoted word `"$(...)"` / `` "`...`" `` in an argument of a pure-data
+/// program (`echo`/`printf`/`seq`/`date`). Other shapes may be materialized earlier
+/// by `materialize_safe_shell_substitutions` in `service/command.rs`; remaining
+/// raw forms are rejected here.
 pub(crate) fn check_substitution_at(
     command: &str,
     marker_at: usize,
@@ -939,9 +936,8 @@ pub(crate) fn check_substitution_at(
     while word_end < bytes.len() && !is_substitution_word_boundary(bytes[word_end]) {
         word_end += 1;
     }
-    // Exact-word shapes. Only a complete double-quoted word `"$(...)"` /
-    // `` "`...`" `` is materialized by command.rs; any other form reaches the
-    // shell raw, where its output undergoes word-splitting and glob expansion.
+    // Restricted commands may materialize bare, quoted, and assignment forms
+    // before validation. These checks constrain substitutions that remain raw.
     let bare_exact = word_start == marker_at && word_end == close + 1;
     let quoted_exact = marker_at == word_start + 1
         && word_end == close + 2

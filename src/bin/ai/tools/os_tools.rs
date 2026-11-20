@@ -8,24 +8,14 @@ use serde_json::Value;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 
-/// Global AIOS kernel handle, injected by the driver at startup via [`init_os_tools_globals`].
+/// Global AIOS kernel handle injected by the driver via [`init_os_tools_globals`].
 ///
-/// **Synchronous semantics**: `GLOBAL_OS` and [`crate::ai::types::App::os`] hold
-/// **the same `Arc<Mutex<Box<dyn Kernel>>>`** (i.e. `SharedKernel`); they are just two ways
-/// to obtain the same kernel handle:
-/// - `App.os`: used by driver flows (foreground / background loop, turn_runtime)
-/// - `GLOBAL_OS`: used by tool implementations (in `os_tools.rs` etc.) because tools have no
-///   `App` reference
+/// The stored `SharedKernel` shares its inner mutex with [`crate::ai::types::App::os`].
+/// Release that kernel lock before invoking a tool that locks it again;
+/// re-locking a `std::sync::Mutex` on the same thread may deadlock or panic.
 ///
-/// Since both wrap the same `Arc<Mutex<...>>`, the two paths take the same lock **exclusively**; this means
-/// there is no true deadlock from "two different locks", but it **can trigger `std::sync::Mutex` re-entrant deadlock**
-/// (calling into a tool that does `GLOBAL_OS.lock()` from the same thread while holding
-/// `app.os.lock()` will block or panic immediately). All synchronous callers must release
-/// the `app.os` lock guard before invoking a tool.
-///
-/// Hot paths should go through [`task_tools::with_os_kernel`](crate::ai::tools::task_tools),
-/// which prefers the reference in `DRIVER_CTX` over this static, reducing
-/// indirect lookups.
+/// Task tools use `with_os_kernel` in `task_tools/spawn.rs` to prefer `DRIVER_CTX`
+/// and avoid locking this global handle when a driver context is available.
 pub static GLOBAL_OS: LazyLock<Mutex<Option<SharedKernel>>> = LazyLock::new(|| Mutex::new(None));
 
 pub fn init_os_tools_globals(os: SharedKernel) {
@@ -61,7 +51,6 @@ fn parse_capabilities(args: &Value) -> Option<ProcessCapabilities> {
     })
 }
 
-// 1. spawn_process
 
 fn execute_spawn_process(args: &Value) -> Result<String, String> {
     let name = args["name"]
@@ -149,7 +138,6 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-// 2. wait_process
 
 fn execute_wait_process(args: &Value) -> Result<String, String> {
     let pid = args["pid"]
@@ -208,7 +196,6 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-// 3. send_ipc_message
 
 fn execute_send_ipc(args: &Value) -> Result<String, String> {
     let pid = args["pid"]
@@ -262,7 +249,6 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-// 4. read_mailbox
 
 fn execute_read_mailbox(_args: &Value) -> Result<String, String> {
     if let Ok(guard) = GLOBAL_OS.lock() {
@@ -295,7 +281,6 @@ inventory::submit!(ToolParallelPolicyRegistration {
     policy: ToolParallelPolicy::Serial,
 });
 
-// 5. env tools
 
 fn execute_set_env(args: &Value) -> Result<String, String> {
     let key = args["key"].as_str().ok_or("Missing 'key'")?;
@@ -509,7 +494,6 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-// --- Process Group ---
 
 fn execute_set_process_group(args: &Value) -> Result<String, String> {
     let pid = args["pid"].as_u64().ok_or("Missing 'pid'.")?;
@@ -567,7 +551,6 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-// --- Shared Memory IPC ---
 
 fn execute_shm_create(args: &Value) -> Result<String, String> {
     let key = args["key"].as_str().ok_or("Missing 'key'.")?;
@@ -697,7 +680,6 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-// --- Working Directory ---
 
 fn execute_set_working_dir(args: &Value) -> Result<String, String> {
     let dir = args["dir"].as_str().ok_or("Missing 'dir'.")?;
@@ -720,7 +702,6 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-// --- Daemon Process ---
 
 fn execute_spawn_daemon(args: &Value) -> Result<String, String> {
     let name = args["name"].as_str().ok_or("Missing 'name'.")?;

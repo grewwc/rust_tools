@@ -1,15 +1,15 @@
 //! Read-recall service: the `list_read_files` tool.
 //!
-//! The session read registry (storage::read_registry) records every model-issued
-//! `read_file` call. This tool turns it into a recall list, so after several
+//! The session read registry (storage::read_registry) records successful text
+//! reads from `read_file` on a best-effort basis. This tool provides a recall list, so after several
 //! turns or context compression the model can answer "which files did I already
 //! read, and at what path" — e.g. when the user says a file was updated and it
 //! must re-read the same path — instead of re-locating files with
 //! find/execute_command.
 //!
 //! Each entry reports whether the file changed on disk since the last read
-//! (mtime > last-read time). Both sides use millisecond precision, so a
-//! modification right after the read is detected.
+//! (mtime > last-read time), compared at millisecond precision. Modifications
+//! within the same millisecond are not detected.
 
 use std::path::PathBuf;
 

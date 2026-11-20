@@ -72,8 +72,8 @@ fn session_title_seed_for_process(
 
 static SESSION_TITLE_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
     LazyLock::new(|| Mutex::new(FastSet::default()));
-/// In-flight dedup mirroring the title task: overlapping turns must not run persisted
-/// post-turn compression for the same session concurrently.
+/// Within this process, overlapping turns must not run persisted post-turn
+/// compression for the same session concurrently.
 static SESSION_COMPACTION_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
     LazyLock::new(|| Mutex::new(FastSet::default()));
 
@@ -182,10 +182,9 @@ fn prepare_critical_premises_delivery<'a>(
     )
 }
 
-/// The model occasionally echoes internal_note entries from the request projection verbatim. Runtime
-/// notes intended only for the model must stay in canonical history but must not be printed to the
-/// terminal as user-visible answers. For already-streamed answers, only append hints that the runtime
-/// explicitly marked as user-visible are painted.
+/// Hide local fallback bodies that echo notes intended for the model while
+/// retaining the original answer in canonical history. Recorded responses render
+/// only an explicitly user-visible suffix to avoid repeating streamed text.
 fn terminal_final_text_to_render(
     final_assistant_text: &str,
     final_assistant_recorded: bool,
@@ -355,9 +354,8 @@ fn format_full_subagent_result_for_parent(
 
     let mut output = truncate_chars(&evidence_block, SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS);
     if evidence_block.chars().count() > SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS {
-        // Never truncate silently: the parent must be able to tell a complete
-        // evidence set from a bounded one, and the durable ledger keeps the full
-        // delivered payload for one-call recovery.
+        // Mark block truncation explicitly. The recovery pointer addresses the
+        // delivered payload; individual tool results above are already excerpts.
         output.push_str(&format!(
             "\n[evidence truncated: showing {} of {} characters. Recover the full delivered \
              payload with {recovery_hint}.]",
@@ -583,10 +581,9 @@ fn spawn_background_compaction(app: &App, at_boundary: bool) {
     );
 }
 
-/// Persisted-compression dispatch at finalize. Live interactive turns outside serve children go through
-/// the background (so the prompt returns without blocking); one-shot runs, soon-to-exit processes,
-/// subagents, and serve children take the foreground `.await` path, ensuring the snapshot is persisted
-/// before the owning history's lifetime ends.
+/// Interactive turns outside serve children dispatch persisted compaction to the
+/// background. One-shot, exiting, subagent, and serve-child turns await the
+/// attempt before the owning history's lifetime ends.
 async fn dispatch_finalize_compaction(app: &App, at_boundary: bool, run_in_background: bool) {
     if run_in_background {
         spawn_background_compaction(app, at_boundary);
@@ -656,9 +653,8 @@ fn session_title_source(
 fn has_session_title_source(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
         message.role == "user"
-            // Runtime-synthesized user messages such as subagent evidence handoffs are not real turns
-            // (AGENTS.md invariant 12) and must not seed the title; otherwise multi-subagent sessions
-            // like agent-team would treat the handoff content as user intent and pollute title generation.
+            // Synthetic handoffs carry derived evidence rather than new user intent,
+            // so they must not seed title generation.
             && !is_runtime_synthetic_user_message(message)
             // A user message that only captured the terminal's resume-selection
             // prompt echo (no real intent) must not seed title generation.
@@ -704,7 +700,7 @@ fn should_generate_model_session_title(
             !fallback_title.is_empty()
                 && normalize_generated_session_title(&existing.text) == fallback_title
         }
-        // Model-set titles are authoritative; never regenerate over them.
+        // A model title that passed the quality check does not need regeneration.
         SessionTitleOrigin::Model => false,
         // Unreachable: User was returned above. Kept for exhaustive matching.
         SessionTitleOrigin::User => false,
@@ -849,16 +845,12 @@ pub(super) async fn finalize_turn(
                 crate::ai::background::mark_serve_output_complete();
             }
         }
-        // Task boundary detection: no tool calls in this turn means the agent has delivered its answer —
-        // a natural "task complete" cut point. Trigger the summary with the more aggressive threshold
-        // (160 turns) instead of waiting until the conversation piles up to the hard cap (200 turns).
+        // Tool-free turns use the more aggressive boundary compaction policy.
         let had_tool_calls = turn_messages
             .iter()
             .any(|m| m.role == "tool" || m.tool_calls.as_ref().map_or(false, |c| !c.is_empty()));
-        // In goal mode, run_loop uses this flag to decide whether the goal is complete:
-        // no tool calls at the end of a round = the agent delivered its final result.
+        // The goal loop also consumes this flag describing the whole turn's tool traffic.
         app.last_turn_had_tool_calls = had_tool_calls;
-        // println!();
 
         let mut first_observer_emitted = false;
         let mut poisoned: Vec<String> = Vec::new();
@@ -902,11 +894,9 @@ pub(super) async fn finalize_turn(
             }
         }
         let _ = poisoned;
-        // Serve children must persist the history snapshot before exiting, including
-        // resumed turns. The parent accepts holding its per-session turn lock until
-        // this foreground compaction completes.
-        // `at_boundary` = no tool calls this round (answer delivered), using
-        // the more aggressive threshold.
+        // Serve children await the snapshot attempt while holding the parent's
+        // session turn lock, including resumed turns. Tool-free turns select the
+        // boundary policy.
         let serve_child = crate::ai::background::is_serve_child();
         dispatch_finalize_compaction(
             app,
@@ -919,14 +909,9 @@ pub(super) async fn finalize_turn(
             ),
         )
         .await;
-        // Try to generate an LLM summary title for the current conversation (when none exists and there is enough context).
-        // Interactive foreground turns must not wait here on a background quality task.
-        // Runs after the user-visible output (and the serve early-done marker
-        // above): title generation prints nothing and observers don't consult
-        // it, so this order is unobservable to single-machine runs but keeps
-        // the SSE turn from idling behind the title LLM call. Stays in this
-        // arm so no-response turns keep skipping title generation, as before.
-        // The serve parent remains responsible for title generation and recovery.
+        // Run title bookkeeping after visible output so it cannot delay delivery.
+        // Interactive turns detach the work; serve children leave model title
+        // generation and recovery to the parent.
         if should_run_post_turn_title(serve_child) {
             maybe_generate_session_title(
                 app,
@@ -1006,9 +991,6 @@ pub(super) async fn maybe_generate_session_title_for_input(app: &App, user_input
 }
 
 async fn generate_session_title_if_missing(app: &App, title_seed: &SessionTitleSeed) {
-    // SessionStore takes the base history file and derives `<stem>.sessions/` from it.
-    // Passing the parent directory of the current session sqlite would append an extra `.sessions`
-    // layer, leaving the title task unable to read the current session's messages.
     let store = session_title_store(&app.config.history_file);
 
     let Some(all_messages) = session_title_source(title_seed, |pending_user_input| {
@@ -1038,16 +1020,10 @@ async fn generate_session_title_if_missing(app: &App, title_seed: &SessionTitleS
         return;
     }
 
-    // Serve-spawned children hold the server's per-session lock until they
-    // exit, so a model title round-trip here (the whole first-turn
-    // `total_ms - done_ms` tail in the serve log) would stall the next turn
-    // even though `done` already streamed. This covers both turn endpoints
-    // (SSE with or without a live FIFO, and plain turns), which all set
-    // `A_SERVE_CHILD`. Any child fallback below uses the same submitted title
-    // policy as the daemon; disabled turns never reach this point. The daemon
-    // generates the model title after the child exits and releases the lock
-    // (`generate_session_title_outside_turn`), and opening the session locally
-    // upgrades it the same way.
+    // Serve children hold the session lock until exit, so an auxiliary model call
+    // here could delay the next turn after visible completion. The daemon uses
+    // `generate_session_title_outside_turn` for model titles; children may write
+    // only a fallback under the submitted title policy.
     let model_title = if crate::ai::background::is_serve_child() {
         None
     } else {
@@ -1056,9 +1032,8 @@ async fn generate_session_title_if_missing(app: &App, title_seed: &SessionTitleS
             .map(|title| normalize_generated_session_title(&title))
     };
 
-    // The model returned a title but the quality filter rejected it — a silent "request made, no result"
-    // path that must be recorded in the decision log; otherwise a transport failure and a low-quality
-    // fallback are indistinguishable (both surface as a long-lived fallback title).
+    // Log rejected model titles separately from transport failures so a retained
+    // fallback does not hide which stage failed.
     if let Some(title) = model_title.as_deref()
         && (title.is_empty() || is_low_quality_session_title(title))
     {
@@ -1090,7 +1065,8 @@ async fn generate_session_title_if_missing(app: &App, title_seed: &SessionTitleS
         return;
     }
 
-    // On failure, write only the fallback and never overwrite an existing qualified title; the model is retried on the next completing round.
+    // On failure, keep a qualified existing title and write a fallback only when
+    // eligible; later title-generation dispatches can retry the model.
     if !fallback_title.is_empty()
         && should_write_fallback_session_title(current.as_ref(), &fallback_title)
     {
@@ -1107,18 +1083,12 @@ async fn generate_session_title_if_missing(app: &App, title_seed: &SessionTitleS
     }
 }
 
-/// Generate and persist the model session title for a served session.
+/// Generate a served session's model title outside the child holding the turn lock.
 ///
-/// The serve daemon calls this both at the start of a turn — in parallel with
-/// the turn child, using the submitted `title_seed` policy — and once the child was reaped and its
-/// per-session lock released, as a retry when the parallel attempt failed. See
-/// the `is_serve_child` branch in `generate_session_title_if_missing` for why
-/// the child itself must not make this request. The request never needed that
-/// lock (only the child's session writes do), so running it outside the child
-/// never stands in any turn's way.
-///
-/// Best-effort: any failure keeps the child's fallback title and the next turn
-/// end retries. Returns true when a model title was written.
+/// The daemon can call this alongside the turn or after the child exits for
+/// recovery. The submitted title policy determines the source. Failed or
+/// rejected requests leave the existing title unchanged; returns true only
+/// when a model title is written.
 pub(crate) async fn generate_session_title_outside_turn(
     history_file: &std::path::Path,
     session_id: &str,
@@ -1181,7 +1151,7 @@ where
             }
             Err(_) => return None,
         };
-        // Legacy behavior appends a pending prompt only when it is not already stored.
+        // Avoid appending a pending prompt when it already matches the stored tail.
         let pending = pending_user_input
             .map(str::trim)
             .filter(|input| !input.is_empty())
@@ -1201,8 +1171,8 @@ where
     if !should_generate_model_session_title(existing.as_ref(), &fallback_title) {
         return false;
     }
-    // One request per session at a time: turns that end back to back must not
-    // each pay a model round-trip for the same title.
+    // Deduplicate title requests within this process so adjacent turns do not
+    // each pay a model round-trip for the same session.
     if !mark_session_title_generation_started(session_id) {
         return false;
     }
@@ -1237,16 +1207,14 @@ where
         .is_ok()
 }
 
-/// Issue the title request for [`generate_session_title_outside_turn`]; split
-/// out so the in-flight marker is cleared on every exit path.
+/// Issue the title request for [`generate_session_title_outside_turn`]; the
+/// caller clears the in-flight marker after this helper returns.
 async fn request_outside_turn_title(
     session_id: &str,
     current_model: &str,
     config: &crate::ai::types::AppConfig,
     messages: &[Message],
 ) -> Option<String> {
-    // Same client shape as the turn path (driver/mod.rs): a bare reqwest client
-    // plus the aux timeouts applied per request.
     let Ok(client) = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
@@ -2226,8 +2194,7 @@ mod tests {
             ),
             Some("[Runtime warning] Completion is unverified.".to_string())
         );
-        // The unstreamed fallback bypasses the streaming projection, so the machine
-        // payload must be replaced there too.
+        // Fallback rendering must hide the audit envelope as the streaming path does.
         let unstreamed_audit = terminal_final_text_to_render(
             "审计完成。\n\n<audit_report>{\"findings\":[]}</audit_report>",
             false,
@@ -2554,8 +2521,8 @@ mod tests {
             text: "用户手动指定的标题".to_string(),
             origin: SessionTitleOrigin::User,
         };
-        // A long user title is classified "low quality" by the raw-fragment
-        // heuristics, but an explicit user choice must stay authoritative.
+        // Explicit user titles stay authoritative even when they resemble long
+        // auto-generated fragments.
         let long_user_title = SessionTitle {
             text: "这是一个用户手动设置的很长标题，远远超过四十个字符的上限".to_string(),
             origin: SessionTitleOrigin::User,

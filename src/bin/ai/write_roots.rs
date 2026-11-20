@@ -280,7 +280,7 @@ fn resolve_for_removal(directory: &Path, cwd: &Path) -> Result<PathBuf, String> 
         .unwrap_or_else(|_| crate::ai::path_utils::normalize_lexical(&absolute)))
 }
 
-/// Keep absent grants stored so a temporarily unavailable mount can return later.
+/// Filter effective grants without deleting configured roots so unavailable mounts can return later.
 pub(in crate::ai) fn available_roots<'a>(
     roots: impl IntoIterator<Item = &'a PathBuf>,
 ) -> (Vec<PathBuf>, Vec<String>) {

@@ -143,14 +143,11 @@ impl PlanState {
         bounded
     }
 
-    /// Renders the full plan text (plan / plan_update share the same rendering path).
+    /// Full plan output for `plan`; updates use render_update_delta.
     ///
-    /// The format stays consistent with the legacy `execute_plan`; only when non-pending
-    /// steps exist does it append a `Progress: x/y steps done` line plus a per-step status
-    /// suffix (including an optional note). `compact_plan_update_echo` (mod.rs) extracts
-    /// step/progress lines using this function's line format, so changing this format
-    /// requires updating its matching logic in sync (the
-    /// `compact_echo_stays_in_sync_with_render_format` test locks in that coupling).
+    /// `compact_plan_update_echo` in `mod.rs` extracts step/progress lines from
+    /// this format. Keep its matching logic and
+    /// `compact_echo_stays_in_sync_with_render_format` synchronized with layout changes.
     pub(crate) fn render(&self) -> String {
         let total = self.steps.len();
         let has_progress = self.has_progress();
@@ -188,7 +185,6 @@ impl PlanState {
             .iter()
             .filter(|s| !s.parallelizable && s.delegate)
             .count();
-        // Delegation/parallel orchestration hint copy lives in `delegation_guidance` (separate from structural rendering).
         formatted.push_str(&delegation_guidance(
             delegated,
             parallel_delegated,
@@ -200,17 +196,11 @@ impl PlanState {
 
     /// Model-facing result of one `plan_update`.
     ///
-    /// Carries what a status flip changes without re-echoing the whole plan: the aggregate
-    /// progress line, the steps that are not terminal yet (pending/running) with their reasons,
-    /// the steps that failed with their reasons, and — when the flip closed a step out — that
-    /// step with its reason on a line of its own. Every step appears at most once. Reasons stay
-    /// attached because after context compression nothing re-injects the full plan
-    /// automatically (the model would have to remember to read `plan-state.json`): the most
-    /// recent delta lives in the compression tail window and survives it, so it must stay a
-    /// self-contained roadmap. A failure is unfinished work (retry, re-plan, or an explicit
-    /// skip), not a closed chapter, so failed steps stay in every later delta too, while
-    /// completed/skipped steps other than the changed one and the plan-time orchestration
-    /// footer stay out.
+    /// Include progress, pending/running and failed steps with their reasons, and
+    /// the changed step when it became done/skipped. Each step appears once, so the
+    /// delta remains useful when earlier tool output leaves the context.
+    /// Failed steps remain outstanding; older done/skipped steps and plan-time
+    /// orchestration guidance are omitted.
     pub(crate) fn render_update_delta(&self, step: u64) -> String {
         let mut formatted = String::new();
         if !self.summary.is_empty() {
@@ -327,7 +317,7 @@ fn render_steps_with_reasons<'a>(steps: impl IntoIterator<Item = &'a PlanStepSta
     rendered
 }
 
-/// Renders one step headline, e.g. `Step 2. [apply_patch] Patch [delegate] (running, note: xx)`.
+/// Renders one step headline, e.g. `Step 2. [apply_patch] [delegate] Patch (running, note: xx)`.
 ///
 /// Shared by the full render, the update delta, and the recovery snapshot so all three keep
 /// a single line format. Parallel steps keep their `  || ` marker.
@@ -383,8 +373,8 @@ fn render_status_suffix(status: StepStatus, note: Option<&str>) -> String {
 }
 
 /// Delegation/parallel orchestration hint copy (operation suggestions visible to the model),
-/// separate from structural plan rendering. Gives orchestration advice only when delegated
-/// steps exist; without delegation, it suggests proceeding but considering delegation.
+/// separate from structural plan rendering. Delegated steps get spawning and collection
+/// advice; without delegation, it suggests proceeding but considering delegation.
 fn delegation_guidance(
     delegated: usize,
     parallel_delegated: usize,
@@ -594,12 +584,10 @@ mod tests {
         let remaining = delta.split("Remaining steps:\n").nth(1).unwrap();
         assert!(remaining.contains("Step 2. [apply_patch] Patch (running, note: editing)"));
         assert!(remaining.contains("Step 3. [execute_command] Check"));
-        // Terminal steps are only counted in the progress line, never re-listed.
+        // The completed step stays out of the remaining list.
         assert!(!remaining.contains("Step 1."));
-        // Every remaining step keeps its reason: the most recent delta must stay a
-        // self-contained roadmap after compression (nothing re-injects the full plan), so the
-        // reasons of the work still ahead stay visible. Terminal steps' reasons and the
-        // plan-time footer stay out.
+        // Each delta carries reasons for work still ahead. Older completed steps'
+        // reasons and the plan-time footer stay out.
         assert!(delta.contains("  Reason: Fix the writer\n"));
         assert!(!delta.contains("Reason: Locate the writer"));
         assert!(delta.contains("  Reason: Prove the fix\n"));

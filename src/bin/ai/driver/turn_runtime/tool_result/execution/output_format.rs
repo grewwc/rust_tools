@@ -26,8 +26,8 @@ pub(in crate::ai::driver::turn_runtime) fn is_terminal_visual_grid_line(line: &s
         >= VISUAL_OUTPUT_MIN_BLOCK_GLYPHS_PER_ROW
 }
 
-/// Only at least three consecutive block-glyph grid rows count as visual output, so
-/// progress bars or plain text cannot trigger a false positive.
+/// Require consecutive grid-like rows to reduce false positives from isolated
+/// progress bars.
 pub(in crate::ai::driver::turn_runtime) fn contains_terminal_visual_grid(text: &str) -> bool {
     let mut consecutive_rows = 0;
     for line in text.lines() {

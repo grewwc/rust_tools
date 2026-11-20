@@ -11,9 +11,8 @@ pub(super) const HISTORY_SCHEMA_VERSION: i32 = 5;
 
 pub(super) fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
     // Several operations run per turn and each one opens (or reuses) a
-    // connection. Replaying ten CREATE IF NOT EXISTS statements, five failing
-    // ALTER TABLE probes, and a sqlite_master query on every call costs more
-    // than the actual work; the version marker is the fast path.
+    // connection. Replaying schema DDL and redundant ALTER TABLE probes on
+    // every call costs more than a version lookup; the marker is the fast path.
     //
     // The marker is only trusted when it matches exactly: a lower value means a
     // database written by an older build, and a higher one means a database this

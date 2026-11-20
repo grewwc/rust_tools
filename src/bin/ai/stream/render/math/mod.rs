@@ -54,13 +54,9 @@ fn replace_named_spacing_commands(s: &str) -> String {
 
 /// Converts a single line of TeX math content into a Unicode string.
 ///
-/// Processing steps:
-/// 1. Remove `\left`/`\right` sizing prefixes
-/// 2. Recursively handle structural commands such as `\frac`, `\sqrt`
-/// 3. Replace symbol commands like Greek letters and operators
-/// 4. Handle `^` superscripts / `_` subscripts
-/// 5. Clean up braces, keeping escaped literals
-/// 6. Handle the `\text{}` and `\boxed{}` environment commands
+/// Structural replacements run before symbol substitution to preserve brace
+/// grouping. Inline commands and scripts are resolved before unescaped braces
+/// are removed; escaped literal braces are restored last.
 pub(in crate::ai::stream) fn render_math_tex_to_unicode(s: &str) -> String {
     let mut t = replace_named_spacing_commands(s);
     t = strip_sizing_commands(&t);
@@ -80,8 +76,8 @@ pub(in crate::ai::stream) fn render_math_tex_to_unicode(s: &str) -> String {
 
 /// Renders a complete multi-line math block (handling environments like `\begin{aligned}`).
 ///
-/// The caller (`markdown.rs`) should accumulate all lines between `$$`/`\[` and
-/// `$$`/`\]` and pass them into this function in one go.
+/// `MarkdownStreamRenderer` in `markdown/mod.rs` supplies buffered math content
+/// without the surrounding math delimiters or code fences.
 pub(in crate::ai::stream) fn render_math_block(lines: &[String]) -> String {
     let mut out = Vec::new();
     let mut env_buf: Option<(String, Vec<String>)> = None; // (env_name, accumulated_lines)

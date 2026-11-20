@@ -87,8 +87,8 @@ pub(crate) fn is_registered_pgid(session_id: &str, pgid: u32) -> bool {
         .is_some_and(|pgids| pgids.contains(&pgid))
 }
 
-/// 清理指定会话登记的所有后台进程组：先 `SIGTERM` 给存活组一次优雅退出的机会，
-/// 短暂等待后对仍存活的组补 `SIGKILL`。返回实际发出终止信号的进程组数量。
+/// Removes the session's registered groups and, on Unix, attempts SIGTERM then SIGKILL.
+/// Returns the number of groups found alive before signalling; non-Unix returns zero.
 pub(crate) fn kill_session(session_id: &str) -> usize {
     let session_id = owner_key(session_id);
     let pgids: Vec<u32> = {

@@ -523,8 +523,8 @@ pub fn try_handle_checkpoint_command(
                     }
                 }
             } else if let Some(target) = previous_detached {
-                // Resolved straight from the stored previous pointer, so the
-                // target trivially exists; the check below is skipped for it.
+                // Follow the stored detached target; this pointer read does not
+                // verify that the checkpoint still exists.
                 target
             } else {
                 raw_target
@@ -535,10 +535,10 @@ pub fn try_handle_checkpoint_command(
                 println!("Failed to create branch '{new_branch}': {err}");
                 return Ok(true);
             }
-            // Validate the target before preserving anything: a failed switch
-            // must have zero side effects (no save and no HEAD move).
-            // `latest`, `HEAD`, and `-` resolve straight from stored state
-            // above, so their targets trivially exist and skip this check.
+            // Validate explicit target names before preserving live work so a
+            // missing target does not create a checkpoint or move HEAD.
+            // `latest` and `HEAD` come from the listing; `-` follows the stored
+            // previous checkout and also bypasses this existence check.
             if !latest_requested && !head_requested && !previous_requested {
                 let exists = match store.checkpoint_exists(&name) {
                     Ok(exists) => exists,
@@ -972,14 +972,11 @@ fn effective_head<'a>(
     checkpoints.first().map(|cp| cp.name.as_str())
 }
 
-/// Tree preview of the session checkpoints: the live history on top, the HEAD
-/// pointer (always resolved, never dangling), then every checkpoint depth-first
-/// with the HEAD target marked inline like git decoration. Linear
-/// save-after-save links render flat with no indent and no connector;
-/// branch lines appear only at real forks. The newest row also carries
-/// `[latest]`, so it stays identifiable when several saves share the same
-/// displayed second. History counts stay out on purpose: counting messages
-/// inside every checkpoint would mean opening every snapshot on each listing.
+/// Show live history, branch pointers, and commits in child-before-parent order.
+/// Commit lanes reflect ancestry, while branch labels are movable decorations.
+/// Mark a resolved HEAD inline and the newest save with `[latest]`; an unborn
+/// branch gets a separate HEAD line. Omit per-checkpoint message counts because
+/// they require opening every snapshot during listing.
 fn print_tree(app: &App, store: &CheckpointStore) -> Result<(), Box<dyn std::error::Error>> {
     let checkpoints = store.list()?;
     let branches = store.list_branches()?;
@@ -1006,12 +1003,10 @@ fn print_tree(app: &App, store: &CheckpointStore) -> Result<(), Box<dyn std::err
     // Live is working state, not a commit or an extra edge in the graph.
     let live_detail = live_tree_detail(live_len, base.as_deref());
     println!("  {}  {}", "@ live".green().bold(), live_detail.dimmed());
-    // The table row below shows HEAD with `→` + `[HEAD]`; a second pointer
-    // line would repeat the same name twice. HEAD never dangles: it falls
-    // back to the live base, then to the newest checkpoint, so the extra
-    // line only exists when there is no row to mark (no checkpoints yet).
-    // A best-effort write heals a missing or dangling stored pointer so the
-    // next command reads it back directly.
+    // Show HEAD on its commit row when resolved. An unborn branch needs a
+    // separate HEAD line even if other checkpoints exist. Heal a missing or
+    // dangling detached pointer best-effort; attached branch pointers are not
+    // rewritten by the listing.
     let head = if active_branch.is_some() && stored_head.is_none() {
         None
     } else {
@@ -1272,7 +1267,7 @@ fn checkpoint_message_subject(message: Option<&str>) -> Option<String> {
     Some(short)
 }
 
-/// One printable branch-pointer row for the `Branches` block in `print_tree`.
+/// One printable row for the branch-pointer block in `print_tree`.
 /// `target` is the checkpoint name, or `(unborn)` when the branch has no
 /// checkpoint yet; `target_gone` means the named checkpoint object is gone.
 struct BranchRow {
@@ -1539,10 +1534,9 @@ pub(in crate::ai) fn restore_and_refresh_runtime(
     refresh_runtime_after_rollback(app)
 }
 
-/// Rebuild history-derived runtime state after an in-place rollback so the
-/// next turn does not act on deleted messages. User-pinned state (attached
-/// images, forced skills, enabled tools) is intentionally left untouched;
-/// only the ledger rebuilt from the restored messages plus prune marks is reset.
+/// Rebuild context caches, write roots, patch targets, and prune marks after
+/// rollback so the next turn uses restored history. Attached images, forced
+/// skills, and enabled tools are intentionally left untouched.
 fn refresh_runtime_after_rollback(app: &mut App) -> std::io::Result<()> {
     crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
     let session_store = SessionStore::new(app.config.history_file.as_path());

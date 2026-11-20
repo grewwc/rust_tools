@@ -10,21 +10,17 @@ fn test_memory_importance_score() {
     assert_eq!(importance.generality, 0.5);
     assert!(!importance.user_validated);
 
-    // Initial score
     let initial_score = importance.score();
     assert!(initial_score > 0.0 && initial_score < 1.0);
 
-    // Add a reference
     for _ in 0..10 {
         importance.increment_frequency();
     }
     assert_eq!(importance.frequency, 10);
 
-    // User confirmation
     importance.mark_user_validated();
     assert!(importance.user_validated);
 
-    // Score should increase
     let new_score = importance.score();
     assert!(new_score > initial_score);
 }

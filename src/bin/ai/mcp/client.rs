@@ -43,9 +43,8 @@ pub(in crate::ai) struct McpClient {
     // orchestrator every turn, and deep-cloning the whole tool/resource/prompt
     // cache is expensive (more so as tool schemas grow). Arc::clone is O(1),
     // and the cache is replaced wholesale, never modified in place. The RwLock
-    // lets a restart refresh the cache through `&self` (`restart_connection`
-    // and `call_tool` only have `&self`), keeping the snapshot consistent with
-    // the live tool set without changing caller signatures.
+    // lets `rebuild_metadata_cache` replace caches through `&self` after a
+    // tool-call restart without changing caller signatures.
     cached_tool_definitions: RwLock<Arc<Vec<ToolDefinition>>>,
     cached_resources: RwLock<Arc<Vec<(String, McpResource)>>>,
     cached_prompts: RwLock<Arc<Vec<(String, McpPrompt)>>>,
@@ -345,7 +344,6 @@ impl McpClient {
             .get_str_ref(server_name)
             .ok_or_else(|| format!("Server not found: {}", server_name))?;
 
-        // First attempt
         let mut conn = conn_cell
             .lock()
             .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
@@ -421,20 +419,13 @@ impl McpClient {
             Err(err) => return Err(err),
         }
 
-        // unreachable
     }
 
-    /// Shared-client tool-call entry point: never performs blocking IO while
-    /// holding the `SharedMcpClient` outer lock. The old
-    /// `McpClient::call_tool(&self, ...)` required the caller to already hold
-    /// the outer lock (`guard.call_tool`), which kept it held throughout
-    /// the blocking transport request/read and `restart_connection`,
-    /// blocking other servers' `tool_definitions` / `is_available`. This
-    /// method instead holds the outer lock only briefly for the `servers`
-    /// lookup and `next_id` allocation, then releases it and does IO while
-    /// holding only the per-server `Mutex<McpServerConnection>`; on `restart`
-    /// it follows the outer-lock -> inner-lock order (releasing the inner lock
-    /// before reacquiring it) to avoid an inner-lock -> outer-lock deadlock.
+    /// Shared-client tool-call entry point. Tool requests release the outer lock
+    /// before blocking I/O and hold only the per-server connection lock.
+    /// Restart and discovery acquire the outer lock before the per-server lock
+    /// and hold both during I/O. Releasing the per-server lock before acquiring
+    /// the outer lock preserves this order and avoids deadlocks.
     pub(in crate::ai) fn call_tool_on_shared(
         shared: &SharedMcpClient,
         server_name: &str,
@@ -562,9 +553,8 @@ impl McpClient {
 
     /// Returns an `Arc` snapshot of the cached tool definitions, avoiding a
     /// full `Vec<ToolDefinition>` clone (O(n)) while holding the
-    /// `SharedMcpClient` outer lock. This shortens the outer-lock hold time of
-    /// `tool_definitions` and eases lock contention with `call_tool`'s blocking
-    /// IO.
+    /// `SharedMcpClient` outer lock, leaving conversion work to callers after
+    /// they release it.
     pub(in crate::ai) fn cached_tool_definitions_arc(&self) -> Arc<Vec<ToolDefinition>> {
         Arc::clone(
             &self

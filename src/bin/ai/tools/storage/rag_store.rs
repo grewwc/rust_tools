@@ -213,7 +213,8 @@ impl RagStore {
             store.semantic_search(&qv, category, limit.saturating_mul(2))
         };
 
-        // A write may race query embedding after ensure_fresh. Never return the old note.
+        // Recheck vectors against a canonical snapshot after query embedding,
+        // filtering revisions changed since ensure_fresh.
         let by_id = self.canonical_by_id()?;
         sem.retain(|(entry, _)| vector_is_current(entry, &by_id));
 

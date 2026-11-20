@@ -1,12 +1,9 @@
 //! Remote confirmation and text input for serve turn children.
 //!
-//! A serve turn child has no terminal: the user watches the turn from the web
-//! client (`serve/app.html`) on another device. When a tool needs explicit
-//! confirmation (today `git commit` / `git push` / `git stash` / `git checkout` / `git switch`) or a free-text answer,
-//! the child publishes a request frame on the
-//! serve live FIFO, which the daemon relays to the client and answers by
-//! writing one line into the child's stdin. The child reads that line back
-//! here, so the gate behaves like a local prompt whose keyboard is the phone.
+//! A serve turn child has no terminal. When a tool needs explicit confirmation
+//! or a free-text answer, the child publishes a request frame on the serve live
+//! FIFO. The daemon relays it to the client and writes one answer line into the
+//! child's stdin, which this module reads.
 //!
 //! Frame payloads are JSON: `{"id":<u64>,"prompt":"..."}` for the request and
 //! `{"id":<u64>}` for the resolution. A confirm answer is `yes` / `no`; an
@@ -48,8 +45,8 @@ pub(crate) fn active() -> bool {
 
 /// Ask the serve client to confirm `prompt`, blocking until it answers.
 ///
-/// `Some(true)` approves, `Some(false)` declines, and `None` means the channel
-/// closed (daemon gone or turn torn down); callers treat that as canceled.
+/// `Some(true)` approves and `Some(false)` declines. `None` means the channel
+/// is inactive or stdin reached EOF/failed; callers treat it as canceled.
 pub(crate) fn confirm(prompt: &str) -> Option<bool> {
     if !active() {
         return None;
@@ -69,8 +66,8 @@ pub(crate) fn confirm(prompt: &str) -> Option<bool> {
 }
 
 /// Ask the serve client for a free-text answer to `prompt`, blocking until it
-/// answers. `Some(text)` is the client's answer (non-empty); `None` means the
-/// channel closed (daemon gone or turn torn down) or the client canceled.
+/// answers. `Some(text)` is the client's non-empty answer; `None` means the
+/// channel is inactive, stdin reached EOF/failed, or the client canceled.
 pub(crate) fn input(prompt: &str) -> Option<String> {
     if !active() {
         return None;
@@ -134,8 +131,8 @@ fn request_payload(id: u64, prompt: &str) -> String {
     }
 }
 
-/// Read the daemon's one-line decision from stdin. EOF is `None`; an
-/// unrecognized line keeps waiting, matching the local prompt's re-ask.
+/// Read the daemon's one-line decision from stdin. EOF or a read error returns
+/// `None`; unrecognized lines are ignored while waiting for a valid decision.
 fn read_answer() -> Option<bool> {
     let stdin = std::io::stdin();
     let mut line = String::new();
@@ -155,7 +152,7 @@ fn read_answer() -> Option<bool> {
 
 /// Read the daemon's one-line answer to an input question from stdin. EOF and
 /// the cancel marker (`\u{1e}`, written by the daemon when the client cancels)
-/// are `None`; an empty line keeps waiting, matching the confirm re-ask.
+/// are `None`; empty lines are ignored while waiting for an answer.
 fn read_input() -> Option<String> {
     let stdin = std::io::stdin();
     let mut line = String::new();

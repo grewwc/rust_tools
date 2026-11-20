@@ -5,13 +5,12 @@
 //! override that preference. All task control block
 //! semantics (task registry, result channel, futex, evidence ledger,
 //! cancellation) stay owned by the existing `task_spawn` / `task_wait` layer.
-//! This runner retries backend failures and resumes any captured session.
+//! This runner retries transient backend failures, resuming a captured session
+//! when available.
 //!
-//! CLI surface tracked: traecli 0.213.x. The non-interactive entry is the
-//! `exec` subcommand with `--json` (JSONL events on stdout); the pre-0.2xx
-//! top-level `-p --output-format stream-json` flags no longer exist.
+//! The runner expects JSONL events from `exec --json` on stdout.
 //!
-//! Isolation contract (verified against the installed binary):
+//! Isolation contract:
 //! - Runs persist sessions (deliberately not `--ephemeral`) with `-C <cwd>` as
 //!   working root, so follow-up tasks can resume them via
 //!   `backend_continue_from`. Sessions live in TraeCLI's own store
@@ -28,11 +27,10 @@
 //! - `exec` never prompts the user. Blocked actions surface as tool errors
 //!   the agent sees and self-reports in its final message, which flows back
 //!   as the subagent result. CLI-level failures print `Error: ...` to stderr
-//!   with a non-zero exit, surfaced via the stderr-tail fallback below.
-//! - `exec --help` and `exec resume --help` advertise only a single stdin
-//!   prompt, with no live input queue. Main-agent side-notes are retained in
-//!   the parent task queue after completion/cancellation and prepended when
-//!   a continuation is dispatched. This does not use the TUI's Tab queue.
+//!   with a non-zero exit, surfaced via the stderr-head fallback below.
+//! - Main-agent side-notes are retained in the parent task queue after
+//!   completion/cancellation and prepended when a continuation is dispatched.
+//!   The runner sends each prompt once through stdin.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -60,7 +58,7 @@ use super::registry::lock_unpoisoned;
 pub(crate) struct TraeCliOutcome {
     pub(crate) result: String,
     pub(crate) is_error: bool,
-    /// `thread_id` from the `thread.started` event (ephemeral runs emit one).
+    /// `thread_id` reported by the `thread.started` event.
     pub(crate) session_id: Option<String>,
     /// Count of `turn.completed` events.
     pub(crate) num_turns: Option<u64>,
@@ -240,7 +238,7 @@ fn push_effort_arg(args: &mut Vec<String>, spec: &ExternalSubagentSpec) {
 }
 
 /// Attach the parent turn's original images to the child's first request.
-/// Codex's `exec` accepts one `-i/--image <FILE>` per image; resume runs
+/// TraeCLI's `exec` accepts one `-i/--image <FILE>` per image; resume runs
 /// already carry them in the persisted session, so only the path hint is
 /// re-sent there.
 fn push_image_args(args: &mut Vec<String>, spec: &ExternalSubagentSpec) {
@@ -545,9 +543,9 @@ async fn run_traecli_subagent_with_session(
     unreachable!("the last failed attempt returns its error")
 }
 
-/// A backend that never emits its first JSON event has not started a turn.
-/// This is deliberately much shorter than the parent wall-clock budget: the
-/// parent should not wait ten minutes to learn that the CLI is wedged.
+/// Bound startup silence separately from the parent's wall-clock timeout so
+/// an unresponsive CLI reports failure promptly. Any nonempty stdout line
+/// disables this watchdog.
 const TRAECLI_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const TRAECLI_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TRAECLI_MAX_RETRIES: usize = 2;
@@ -560,8 +558,7 @@ const TRAECLI_RETRY_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// permissions, or working directory is wrong on the first attempt, and the
 /// auth/config/argument markers below are CLI-level diagnostics that would
 /// repeat identically. Startup timeouts, provider disconnects, rate limits,
-/// and unclassified non-zero exits remain retryable; unknown errors are also
-/// retried because a transient cause is more likely than a deterministic one.
+/// and unclassified non-zero exits remain retryable.
 fn is_permanent_traecli_error(error: &str) -> bool {
     if error.starts_with("failed to spawn traecli:") {
         return true;
@@ -778,7 +775,7 @@ fn run_traecli_blocking_with_evidence(
     );
     // A descendant can inherit the child's stdio and keep a pipe open after
     // the direct child exits. Joining a reader/writer thread blocked on that
-    // pipe would hang the task, so detached threads are dropped instead.
+    // pipe would hang the task, so unfinished threads are detached instead.
     drop(stdin_handle);
     let stderr_text = take_stderr_snapshot(stderr_handle, &stderr_shared);
     if let Some(outcome) = parse_stream_json_output(&stdout_text) {
@@ -812,9 +809,9 @@ fn run_traecli_blocking_with_evidence(
         return Ok(outcome);
     }
 
-    // No parseable events: surface whatever the CLI printed. Errors normally
+    // No result-bearing events: surface whatever the CLI printed. Errors normally
     // land on stderr (`Error: ...`, non-zero exit), but keep the first
-    // non-JSON stdout line as a hint in case the shape changes.
+    // stdout line without an object prefix as a hint if the event shape changes.
     let stderr_tail = truncate_head(stderr_text.trim(), 2000);
     let hint = stdout_hint(&stdout_text);
     let result = if status.success() {
@@ -1210,7 +1207,7 @@ fn normalize_cwd(cwd: &Path) -> PathBuf {
     }
 }
 
-/// First non-empty, non-JSON line of stdout, if any.
+/// First nonempty stdout line that does not start with `{`, if any.
 fn stdout_hint(output: &str) -> Option<String> {
     output
         .lines()
@@ -1230,9 +1227,8 @@ fn truncate_head(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// Read the stderr snapshot without waiting forever for a pipe held open by a
-/// descendant process. Normal children close stderr on exit, so the thread
-/// finishes within one poll; otherwise the partial snapshot is used.
+/// Use a bounded grace period for the stderr collector because descendants may
+/// keep the pipe open. Its buffer is published only after `read_to_string` returns.
 fn take_stderr_snapshot(
     mut handle: Option<std::thread::JoinHandle<()>>,
     shared: &Arc<Mutex<String>>,
@@ -1384,7 +1380,7 @@ pub(crate) fn prepare_traecli_continuation(
     .map(|continuation| continuation.into_parts())
 }
 
-/// TraeCLI reports `thread_id` as a lowercase UUID (8-4-4-4-12 hex).
+/// Accept UUID-shaped backend session IDs with either hex casing.
 pub(super) fn looks_like_session_id(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 36 {

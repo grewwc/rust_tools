@@ -121,10 +121,6 @@ pub(crate) async fn list_session_activity(
 /// the kernel backend.
 fn session_config_response(config: &SessionServeConfig) -> serde_json::Value {
     let kernel_model = config.model.clone().unwrap_or_else(default_turn_model);
-    // A stored canonical choice is reported as-is. Without one, an agent-team
-    // session reports the TraeCLI default its mobile picker shows; an ordinary
-    // session reports empty so each client keeps its own initial picker
-    // selection while the runtime uses the kernel default.
     let subagent_backend = match BackendId::canonical_stored(config.subagent_backend.as_deref()) {
         Some(backend) => backend.as_str(),
         None if agent_team_sticky(config) => effective_subagent_backend(config).as_str(),
@@ -162,9 +158,8 @@ mod tests {
             };
             let runtime_backend = BackendId::from_stored(stored);
             let response = session_config_response(&config);
-            // An ordinary session reports no stored choice, so the mobile
-            // picker keeps its own TraeCLI default while the runtime stays on
-            // the kernel backend.
+            // Unset or unrecognized backends leave the wire field empty;
+            // canonical stored choices are reported verbatim.
             assert_eq!(response["subagent_backend"], expected_wire);
             assert!(response["output"].as_str().unwrap().starts_with(&format!(
                 "Session default subagent backend: {}\n",
@@ -281,9 +276,8 @@ pub(crate) async fn list_sessions(
         .include
         .as_deref()
         .and_then(|id| all.iter().find(|item| item.id == id).cloned());
-    // Preserve newest-first store order while allowing clients to fetch
-    // consecutive pages. Offset is applied before limit, and an explicitly
-    // selected older session is appended without consuming that page.
+    // Page the selected order after filtering. An explicitly included session
+    // is appended only on the first page, without consuming a page slot.
     let offset = q.offset.unwrap_or(0).min(all.len());
     all.drain(..offset);
     if let Some(limit) = q.limit {
@@ -343,9 +337,8 @@ pub(crate) async fn create_session(
             .into_response();
     }
     let id = uuid::Uuid::new_v4().to_string();
-    // Sessions are created lazily: the id is allocated here, the persisted
-    // files appear on the first turn (`--session <id>` one-shot). Until then
-    // GET history 404s, matching CLI one-shot semantics.
+    // Allocate the id without creating its session history. A turn, title
+    // update, or config update can materialize it; until then GET history returns 404.
     debug_assert!(SessionStore::validate_session_id(&id).is_ok());
     if let Some(group_id) = &req.group_id
         && let Err(err) = assign_session_group(&state, &id, Some(group_id))
@@ -588,8 +581,8 @@ pub(crate) async fn set_session_title(
 
 /// Read the session's persisted serve-mode config (`GET /sessions/{id}/config`):
 /// the model/agent/reasoning-effort picks and subagent defaults for this session.
-/// An empty field means "server default"; a session that does not exist yet
-/// reads as all-defaults. `output` mirrors the local `/use` state text.
+/// Empty model/agent/effort fields mean no session override; an unmaterialized
+/// session reads as defaults. `output` mirrors the local `/use` state text.
 pub(crate) async fn get_session_config(
     State(state): State<ServeState>,
     headers: HeaderMap,

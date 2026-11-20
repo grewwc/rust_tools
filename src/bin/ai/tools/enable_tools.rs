@@ -17,12 +17,8 @@ struct TurnEnableState {
     pending_mcp_enable: Vec<String>,
     active_tool_names: Vec<String>,
     available_mcp_tools: Vec<ToolDefinition>,
-    /// Whether the current turn's active agent/skills declare the
-    /// executor tool group. Set by the driver when the skill turn
-    /// guard is built; gates visibility of heavy execution primitives in the
-    /// `enable_tools` catalog (hidden for agents that never declare the group).
-    // Set when the current agent/skills declare a group that gates hidden
-    // tools (see `registry::common::group_gates_hidden_tools`).
+    /// Whether active agent/skills declare a group that gates hidden tools.
+    /// Set by driver turn setup to align hidden-tool catalog visibility.
     hidden_group_declared: bool,
 }
 
@@ -275,10 +271,8 @@ pub(crate) fn settle_task_lifecycle_mount() {
     }
 }
 
-/// 清空 explicit-enabled tool 列表。
-/// 由 session 切换 / clear-history 等流程调用，避免上一 session 启用过的 tool
-/// 永久焊接到后续所有 session 的请求 tools 数组（每个 schema 几百~上千 token，
-/// 还会让 prompt cache 失效）。
+/// Clear foreground explicit-enable state for this session so lifecycle resets drop
+/// schemas retained across turns.
 pub(crate) fn clear_explicitly_enabled_tools(session_id: &str) {
     if let Ok(mut s) = STATE.write() {
         s.explicit.remove(&(session_id.to_string(), None));
@@ -311,17 +305,14 @@ pub(crate) fn clear_task_family_explicitly_enabled_tools(session_id: &str) {
     }
 }
 
-/// 在 turn 末调用：把"本 turn 被实际调用过"的 explicit tool 计数清零，
-/// 其它 explicit tool 计数 +1；超过 `EXPLICIT_TOOL_DEMOTE_AGE` 就从 explicit
-/// list 中 demote。
-///
-/// 这是对"enable_tools 一旦启用就永久挂载"行为的温和约束：用就保留，闲置就降级。
+/// At turn end, reset the idle age of explicitly enabled tools used in that turn;
+/// demote other names when their age reaches `EXPLICIT_TOOL_DEMOTE_AGE`.
+/// Auto-mounted task lifecycle schemas remain governed by task settlement.
 pub(crate) fn age_unused_explicit_tools<I, S>(used_in_turn: I)
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    // 把 used_in_turn 收成 SkipSet，O(log n) 查询；调用方可能传 Vec/HashSet/迭代器。
     let used: SkipSet<String> = used_in_turn
         .into_iter()
         .map(|s| s.as_ref().to_string())
@@ -530,11 +521,9 @@ fn available_tools_not_active() -> Vec<(String, String)> {
     result
 }
 
-/// Every enable-able member of `group`, in registration order.
-///
-/// Membership comes from the `groups` array in `tool_descriptions/<tool>.json`,
-/// the same source the group-shortcut catalog line counts, so an expansion
-/// loads exactly what the catalog advertises.
+/// Members of `group` carrying the builtin enable-ability flag, in registration order.
+/// Catalog counts and shortcut expansion share the `groups` metadata in
+/// `tool_descriptions/<tool>.json`.
 fn group_members(group: ToolGroup) -> Vec<String> {
     let mut members = Vec::new();
     for reg in inventory::iter::<ToolRegistration> {
@@ -601,10 +590,8 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                 };
                 lines.push(format!("  - {}: {}{}", name, short, loading));
             }
-            // One-line group catalog: the model can load a whole tool family
-            // by passing the group name to 'enable' instead of listing every
-            // member. Counts cover enable-able members only, matching what
-            // the expansion actually loads.
+            // Count group members separately from inactive-tool rows; enabling a shortcut
+            // expands its members, then applies the context gates below.
             let mut group_counts: std::collections::BTreeMap<&str, usize> = Default::default();
             for reg in inventory::iter::<ToolRegistration> {
                 if registration_may_be_dynamically_enabled(reg) {
@@ -629,12 +616,9 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                     "Group shortcuts (a group name may be passed to 'enable'): {}",
                     parts.join(", ")
                 ));
-                // A shortcut name can also be a registered tool. Such a
-                // name never shows up in the enumeration above — either because
-                // it is active already or because 'enable' resolves it as the
-                // tool — so the model reads the reply as "this family is
-                // unavailable". The catalog is the last output before that call,
-                // so name the collision here.
+                // A shortcut may also be a registered tool name. Name the collision so the model
+                // knows enabling it resolves both the tool and the family, even if that tool is
+                // already active.
                 let collided: Vec<&str> = group_counts
                     .keys()
                     .copied()
@@ -1195,7 +1179,7 @@ mod tests {
 
     #[test]
     fn task_group_shortcut_loads_the_async_family() {
-        // `task` is only a group shortcut now: enabling it must expand to the
+        // `task` is only a group shortcut: enabling it must expand to the
         // async subagent family instead of resolving to a single tool.
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
@@ -1229,9 +1213,8 @@ mod tests {
 
     #[test]
     fn task_and_knowledge_tools_remain_dynamically_enabled() {
-        // task 编排系列与 knowledge 记忆系列已从 core 组降级为 builtin-only：
-        // 默认不随每轮常驻（省 token），但必须仍在 enable_tools 目录中可见、
-        // 可按需启用，保证模型能渐进式发现，而不是"隐形"。
+        // Task orchestration and knowledge tools use lazy loading to reduce resident schemas,
+        // while remaining discoverable by name through `enable_tools`.
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -1564,15 +1547,14 @@ mod tests {
         }
         assert!(explicit_enabled_tool_names().contains(&"task_wait".to_string()));
 
-        // Re-enabling after aging must reset the idle counter; otherwise the
-        // next four idle turns would demote it despite the explicit request.
+        // Re-enabling resets prior idle age so the next partial idle window keeps the tool resident.
         enable_task_wait();
         for _ in 0..(EXPLICIT_TOOL_DEMOTE_AGE - 1) {
             age_unused_explicit_tools(Vec::<String>::new());
         }
         assert!(explicit_enabled_tool_names().contains(&"task_wait".to_string()));
 
-        // Without another enable, the fourth idle turn demotes it.
+        // The next idle turn reaches the demotion threshold.
         age_unused_explicit_tools(Vec::<String>::new());
         assert!(!explicit_enabled_tool_names().contains(&"task_wait".to_string()));
     }

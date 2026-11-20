@@ -385,12 +385,8 @@ const TRUNCATED_MARKER: &str = "[truncated ";
 /// snapshots, it never misjudges the truncation edge as a deletion.
 const MAX_DIFF_BYTES: usize = 64 * 1024;
 
-/// Cap for one before/after side of `entry_diff`: content beyond this is never
-/// scanned when building the diff. Without it a full rewrite of a multi-GB file
-/// materialized a complete `+ …` diff for the entire new content in memory
-/// before the 64 KiB output cap applied (P2 regression). 1 MiB is far above
-/// real-world per-write sizes and the largest diff fixture in the test suite
-/// (~48 KiB), so the common path is unaffected.
+/// Bound each input to `entry_diff` before allocating line vectors and diff text.
+/// Capping only the output would still materialize the whole diff for a large rewrite.
 const MAX_DIFF_INPUT_BYTES: usize = 1024 * 1024;
 
 /// Initial file presence, independent of whether its contents were captured.
@@ -555,8 +551,8 @@ fn cap_diff_input(s: &str) -> (&str, bool) {
 /// scanned, so a large rewrite cannot materialize an O(file) diff; the result is
 /// then a truthful leading partial and a truncation line is appended so a
 /// partial diff is never mistaken for a complete one — or for "unchanged".
-/// Returns None only when there is truly nothing to show (new empty file, both
-/// absent, or unchanged content within the scanned window).
+/// Identical uncapped line sequences produce no diff. Identical capped prefixes
+/// still report that the remaining content was not compared.
 pub(crate) fn entry_diff(before: Option<&str>, after: Option<&str>) -> Option<String> {
     let (b, b_capped) = match before {
         Some(s) => {
@@ -655,7 +651,6 @@ fn cap_diff(mut out: String) -> String {
     while end > 0 && !out.is_char_boundary(end) {
         end -= 1;
     }
-    // Cut at the closest newline to keep the final line complete.
     while end > 0 && out.as_bytes()[end - 1] != b'\n' {
         end -= 1;
     }
@@ -2794,8 +2789,7 @@ accept connections); prefer starting the work with `yield_time_ms` and polling i
 
     #[test]
     fn entry_diff_bounds_huge_content_instead_of_building_full_diff() {
-        // Regression (P2): a multi-MB write used to materialize a full `+ line`
-        // diff for the whole content in memory before the 64 KiB cap applied.
+        // An output cap alone would still allocate a diff for the entire write.
         let mut big = String::new();
         for i in 0..200_000 {
             big.push_str(&format!("line {i}\n"));
@@ -2835,8 +2829,7 @@ accept connections); prefer starting the work with `yield_time_ms` and polling i
 
     #[test]
     fn entry_diff_single_line_huge_rewrite_is_bounded() {
-        // Pathological case from the P2 report: one multi-MB line (minified
-        // JSON / single-line log). The whole line must not be copied.
+        // A large single line exercises truncation without a complete line to retain.
         let line = "x".repeat(3 * 1024 * 1024);
         let d = entry_diff(None, Some(&line)).unwrap();
         assert!(d.len() < 200 * 1024, "bounded: {} bytes", d.len());

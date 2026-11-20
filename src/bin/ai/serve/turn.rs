@@ -4,7 +4,8 @@
 
 use super::*;
 
-/// Model a serve turn runs with when the client sent no per-turn override.
+/// Server-default model, used when neither the turn nor its session specifies
+/// a model.
 ///
 /// Mirrors `models::initial_model` minus its CLI-override branch: the child CLI
 /// carries no `--model`, so the config default (resolved through the registry,
@@ -56,9 +57,8 @@ pub(crate) fn spawn_session_title_task(
 /// Ask the in-flight turn child for `session_id` to stop early by delivering
 /// SIGINT to it. The child is the same one-shot binary the local REPL runs, so
 /// it takes the local first-Ctrl+C path (cancel the stream, finalize the
-/// partial turn) instead of being killed. `false` means no turn child is
-/// registered: the turn already finished, which is a normal answer for an
-/// interrupt that raced the end of the stream.
+/// partial turn) instead of being killed. `false` means no registered child
+/// could be signalled, including a child that exited before signal delivery.
 pub(crate) fn interrupt_active_turn(
     active_turns: &std::sync::Mutex<HashMap<String, u32>>,
     session_id: &str,
@@ -84,7 +84,7 @@ pub(crate) fn interrupt_active_turn(
 /// session's turn child is signalled, so turns on other sessions keep running.
 /// A turn parked on a confirmation question is unblocked as well, by closing
 /// the pipe that its answer would travel on (see [`dismiss_pending_confirm`]).
-/// `{"interrupted": false}` means no turn was running.
+/// `{"interrupted": false}` means no turn child was successfully signalled.
 pub(crate) async fn post_interrupt(
     State(state): State<ServeState>,
     headers: HeaderMap,
@@ -108,8 +108,8 @@ pub(crate) async fn post_interrupt(
         .into_response()
 }
 
-/// Removes the session's entry from the active-turn registry when the turn
-/// child is reaped, so an interrupt can only ever reach a live process.
+/// Removes this turn's registry entry after the child is reaped and its output
+/// is drained, so completed turns no longer remain interrupt targets.
 pub(crate) struct ActiveTurnGuard {
     map: Arc<std::sync::Mutex<HashMap<String, u32>>>,
     session_id: String,
@@ -303,10 +303,10 @@ pub(crate) fn conflict(msg: String) -> (StatusCode, Json<serde_json::Value>) {
 /// stream can still offer to stop a turn that is running here. `turn` is the
 /// active child pid (0 when idle): a page that saw the previous turn's
 /// terminal event uses it to tell that turn's child reap lag apart from a
-/// newly started turn. `remote` is the owner pid of a turn running in another
-/// process, or `true` when its held lease has no readable pid marker
-/// (a terminal or a `/bg` session): such a turn has no local event log,
-/// so the page can only report it and refresh history when it ends.
+/// newly started turn. `remote` is the diagnostic owner string for work held
+/// by another process, or `true` when its lease has no readable owner marker.
+/// Such work has no local event log, so the page reports activity and refreshes
+/// history when it ends.
 pub(crate) async fn get_confirm(
     State(state): State<ServeState>,
     headers: HeaderMap,
@@ -373,9 +373,13 @@ pub(crate) async fn get_confirm(
 pub(crate) struct EventsQuery {
     #[serde(default)]
     pub(crate) after: u64,
-    /// Accepted for compatibility with clients that identify themselves. The
-    /// event stream is read-only, so any authenticated client may follow a
-    /// session; ownership is enforced only where a request mutates it.
+    /// Replay only the most recent `tail` records instead of the whole
+    /// retained log. Reattaching to a long-running turn otherwise rebuilds
+    /// every progress step the page already left behind.
+    #[serde(default)]
+    pub(crate) tail: Option<usize>,
+    /// Accepted for client compatibility; event streams do not claim the
+    /// browser open slot.
     #[serde(default)]
     #[allow(dead_code)]
     pub(crate) client: String,
@@ -406,12 +410,10 @@ pub(crate) async fn stream_session_events(
     if SessionStore::validate_session_id(&id).is_err() {
         return bad_request(format!("invalid session id: {id}")).into_response();
     }
-    // Read-only follower: attach regardless of who owns the session. Refusing a
-    // second viewer here is what left a phone without live events (no rate, no
-    // subagent progress) whenever another browser already held the session.
-    // Writes stay single-owner: `open_session`, `heartbeat_session` and
-    // `release_session` still verify the claiming token.
-    let Some((backlog, running, log)) = state.events.snapshot(&id, query.after) else {
+    // Any authenticated client may follow the read-only event stream.
+    // Browser open claims are managed separately by `open_session`,
+    // `heartbeat_session`, and `release_session`.
+    let Some((mut backlog, running, log)) = state.events.snapshot(&id, query.after) else {
         // Nothing to attach to: this session has no event log because no turn
         // ever ran, or the log was retired. Close the stream with the same
         // terminal marker the turn stream uses, so a client can tell "no live
@@ -424,11 +426,23 @@ pub(crate) async fn stream_session_events(
             .keep_alive(axum::response::sse::KeepAlive::default())
             .into_response();
     };
+    // Keep the cursor at the newest retained record when shortening the
+    // backlog; otherwise the live tail would replay the same records again.
+    let next_seq = match query.tail {
+        Some(limit) => {
+            let latest = backlog.last().map(|record| record.seq).unwrap_or(query.after);
+            if backlog.len() > limit {
+                backlog.drain(..backlog.len() - limit);
+            }
+            latest
+        }
+        None => query.after,
+    };
     let stream = stream::unfold(
         AttachState {
             log,
             pending: backlog.into(),
-            next_seq: query.after,
+            next_seq,
             done: !running,
             emitted_done: false,
         },
@@ -532,10 +546,9 @@ pub(crate) struct ConfirmAnswerReq {
     pub(crate) text: Option<String>,
 }
 
-/// `POST /sessions/{id}/confirm` (authed): answer the pending question, which
-/// the child receives as one `yes`/`no` line on stdin. `409` means the id no
-/// longer names a pending question (answered on another device, superseded, or
-/// the turn ended); clients treat that as terminal, not as a retry.
+/// `POST /sessions/{id}/confirm` (authed): answer the pending confirmation
+/// or text-input question over the child's stdin. `409` reports a stale
+/// question, an invalid input answer, or an unavailable answer channel.
 pub(crate) async fn post_confirm(
     State(state): State<ServeState>,
     headers: HeaderMap,

@@ -63,7 +63,7 @@ struct RecoveryIndex {
 }
 
 /// Uses an absolute floor because even a small fraction of a large request can be expensive.
-/// The projection itself still requires validated recovery targets and strict net savings.
+/// Projection still requires parseable recovery locators and strict net savings.
 pub(super) fn has_projectable_recoverable_memory(messages: &[Message]) -> bool {
     let recoverable_chars = messages
         .iter()
@@ -75,14 +75,14 @@ pub(super) fn has_projectable_recoverable_memory(messages: &[Message]) -> bool {
     recoverable_chars >= MIN_RECOVERABLE_MEMORY_CHARS
 }
 
-/// Shrinks only old, derived metadata whose exact source is already archived.
+/// Project older derived metadata that carries recovery locators.
 ///
-/// All canonical messages remain untouched outside this request projection. Non-candidate messages
-/// are copied byte-for-byte and in order; the current real-user tail is never considered. Omitted
-/// entries and stale memory-index notes from earlier projections are replaced by one merged
-/// hierarchical path index (their targets are unioned, so nothing becomes unreachable). Any
-/// validation or net-savings failure returns without changing `messages`, apart from removing
-/// superseded markers that point to the same mutable checkpoint path.
+/// Canonical history stays outside this request-only projection. Survivors retain
+/// their bytes and order, and the current real-user tail is preserved. Omitted
+/// entries and earlier index targets are merged into one path index. Validation
+/// checks projection structure and locator round-tripping without proving archive
+/// contents or existence. Failed validation or insufficient savings leaves messages
+/// unchanged, apart from checkpoint marker deduplication.
 pub(super) fn apply_query_aware_memory_projection(
     messages: &mut Vec<Message>,
     target_chars: usize,
@@ -735,10 +735,9 @@ fn parse_checkpoint_target(value: &str) -> Option<(String, usize)> {
 }
 
 fn insert_target(targets: &mut BTreeSet<RecoveryTarget>, value: &str, directory: bool) {
-    // Absolute runtime paths and validated `session-asset:` aliases are both
-    // recoverable; anything else (relative paths, model-invented pointers) is
-    // dropped. Aliases resolve against the runtime assets dir at read time,
-    // never against a root taken from message content.
+    // Accept absolute paths and syntactically valid session-asset aliases.
+    // Alias resolution and archive-root containment are checked when reading;
+    // locator syntax alone does not establish provenance or source existence.
     if !Path::new(value).is_absolute() && parse_session_asset_alias(value).is_none() {
         return;
     }
@@ -846,14 +845,11 @@ const MAX_RECALL_FILES: usize = 128;
 const MAX_RECALL_FILE_BYTES: usize = 256 * 1024;
 const MAX_RECALL_SCAN_BYTES: usize = 2 * 1024 * 1024;
 
-/// Sparse indexes still need recall on a task switch, even when compression is
-/// unnecessary. This predicate performs no filesystem IO.
+/// Sparse indexes still need recall on a task switch, even without compression.
 ///
-/// Only internal notes (memory index / recoverable pointers) and assistant
-/// recall bodies can satisfy it, so tool and user messages — the projection's
-/// largest payloads — are rejected by role without materializing their text.
-/// Plain-string content is inspected in place; structured (array) content keeps
-/// the [`value_to_string`] rendering that strips image payloads.
+/// Role checks avoid materializing tool/user payloads. Plain strings are borrowed;
+/// structured content uses [`value_to_string`]. Pointer parsing may check
+/// filesystem existence to disambiguate checkpoint paths containing brackets.
 pub(super) fn has_archive_recall_sources(messages: &[Message]) -> bool {
     let Some(user) = last_real_user_index(messages) else {
         return false;
@@ -923,10 +919,8 @@ fn refresh_archive_recall(
     let budget = (target_chars / 16)
         .min(MAX_RECALL_CHARS)
         .min(target_chars.saturating_sub(base_chars));
-    // Recall is deterministic for a fixed query, target set, and budget. The
-    // target drifts with per-request token calibration, so quantize the budget:
-    // otherwise small drifts would re-select excerpts and rewrite a pair that
-    // sits before the current user message on every request.
+    // Quantize calibration-driven budget drift so small changes do not re-select
+    // excerpts and rewrite the recall pair before the current user message.
     let budget = budget / RECALL_BUDGET_QUANTUM * RECALL_BUDGET_QUANTUM;
     // Recall deliberately excludes previous user/assistant answers: on A -> B
     // -> A, stale topic B must not compete with the live request for topic A.
@@ -1611,10 +1605,8 @@ mod tests {
         )
     }
 
-    /// Mirror of the rebuild loop in [`refresh_archive_recall`]: the pair of
-    /// helpers below pins [`projection_matches`] against it scenario by
-    /// scenario, so the clone-skipping fast path can never disagree with the
-    /// rebuild it replaces.
+    /// Rebuild the recall projection independently for parity checks against
+    /// [`projection_matches`] across the scenarios below.
     fn rebuild_like_refresh(
         messages: &[Message],
         user: usize,

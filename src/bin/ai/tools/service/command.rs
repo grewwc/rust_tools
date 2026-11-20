@@ -118,7 +118,7 @@ fn execute_inner_shell_command(inner: &str, cwd: Option<&str>) -> Result<String,
     if stdout.contains('\0') {
         return Err(format!("substitution '{inner}' output contains NUL bytes"));
     }
-    // bash's $(...) strips all trailing newlines; replicate that behavior.
+    // Remove trailing line endings before quoting stdout for the outer command.
     Ok(stdout
         .trim_end_matches(|c| c == '\n' || c == '\r')
         .to_string())
@@ -135,16 +135,15 @@ fn execute_inner_shell_command(inner: &str, cwd: Option<&str>) -> Result<String,
 /// shell decides whether the earlier segment even runs, so
 /// `echo fresh > f && cat "$(cat f)"` must not read `f` early.
 ///
-/// A simple `NAME=$(...)` assignment becomes `NAME='<literal>'`, and every
-/// later `$NAME` / `${NAME}` reference is expanded to that same literal, so a
-/// value that names a blocked program still reaches the blacklist.
+/// A simple `NAME=$(...)` assignment becomes `NAME='<literal>'`, and bindable
+/// `$NAME` / `${NAME}` word references expand to that literal, so a value that
+/// names a blocked program still reaches the blacklist.
 fn materialize_safe_shell_substitutions(
     command: &str,
     cwd: Option<&str>,
 ) -> Result<String, String> {
     let substitutions = super::audit::safe_shell_substitutions(command);
     if substitutions.is_empty() {
-        // Fast path: nothing to materialize; return the command unchanged.
         return Ok(command.to_string());
     }
     if substitutions
@@ -180,7 +179,7 @@ fn materialize_safe_shell_substitutions(
             super::audit::SafeShellSubstitutionKind::Command { inner } => {
                 // The inner command must pass the full gate too: re-run
                 // validate first (guards against relaxed classification), then
-                // the git confirmation gate (commit/stash/checkout/switch, fail-closed). The
+                // the Git confirmation gate. The
                 // audit classifier only proves the inner command passed
                 // validate; it does not intercept confirm-gated git commands.
                 // Without this, `echo "$(git commit -am x)"` would commit
@@ -199,11 +198,8 @@ fn materialize_safe_shell_substitutions(
             assigned.push((name.to_string(), contents));
             replacement
         } else if substitution.bare {
-            // Unquoted substitution output is word-split by the shell: render
-            // each whitespace-separated piece as its own quoted word so the
-            // materialized command matches shell word-splitting without
-            // re-parsing output as command structure. Empty output removes
-            // the word entirely, matching the shell.
+            // Split bare substitution output into quoted words so values cannot
+            // become shell syntax during materialization. Empty output removes the word.
             let pieces: Vec<String> = contents
                 .split_whitespace()
                 .map(shell_single_quote)
@@ -324,9 +320,9 @@ fn plan_assignment_references<'a>(
     if assignments.is_empty() {
         return Ok(Vec::new());
     }
-    // Another substitution's text runs in the inner command this layer executes
-    // separately, where the materialized variable is unset; the shell would read
-    // the outer value instead, so the two disagree.
+    // Substitutions run separately and cannot observe earlier materialized
+    // assignments from this command. Reject references that would depend on
+    // the outer shell's assignment order.
     for span in spans {
         let text = &command[span.start..span.end];
         for (name, _, _) in &assignments {
@@ -336,8 +332,8 @@ fn plan_assignment_references<'a>(
                      materializes separately; use a literal value"
                 ));
             }
-            // Arithmetic contexts reference variables without a `$`, so the
-            // check above misses them; the inner shell has no such variable.
+            // Arithmetic contexts can read names without `$`; the check above
+            // would miss dependencies on another materialized assignment.
             if arithmetic_mentions(text, name) {
                 return Err(format!(
                     "command substitution text reads `{name}` inside an arithmetic \
@@ -363,9 +359,9 @@ fn plan_assignment_references<'a>(
     let mut span = 0;
     while i < bytes.len() {
         if span < spans.len() && i == spans[span].start {
-            // A materialized substitution is a whole word. It keeps assignment
-            // semantics only while no command word precedes it; after one it is
-            // a temporary environment assignment that does not persist.
+            // A materialized assignment must be a standalone assignment segment.
+            // Reject it after a command word; the command-word branch below also
+            // rejects prefix assignments whose values would be temporary.
             let assigned_name = spans[span].assignment;
             if let Some(name) = assigned_name {
                 if command_word_seen {
@@ -618,10 +614,9 @@ fn arithmetic_write_target(word: &str) -> Option<&str> {
     is_shell_name(name).then_some(name)
 }
 
-/// Reject an arithmetic update of a materialized variable in any word
-/// position: `L++`/`++L` are arithmetic statements in some shells and command
-/// names in others, and `let L++` always mutates. Either way the value a later
-/// reference reads is no longer the materialized literal, so nothing expands.
+/// Reject arithmetic-shaped updates of materialized variables in any word
+/// position. Forms such as `let L++` can mutate the value that later references
+/// were planned to read, so the materializer rejects them before expansion.
 fn check_arithmetic_write(word: &str, assignments: &[(&str, usize, usize)]) -> Result<(), String> {
     let literal = word_literal(word).unwrap_or(word);
     let Some(name) = arithmetic_write_target(literal) else {
@@ -692,8 +687,8 @@ fn is_shell_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Insert a value inside a double-quoted shell string so only printable
-/// characters can affect the shell: `\`, `"`, `` ` ``, and `$` are escaped.
+/// Append a literal value inside an existing double-quoted shell string.
+/// Escape `\`, `"`, `` ` ``, and `$` to prevent additional shell expansion.
 fn push_double_quoted_value(out: &mut String, value: &str) {
     for ch in value.chars() {
         if matches!(ch, '\\' | '"' | '`' | '$') {
@@ -814,13 +809,6 @@ fn arithmetic_mentions(text: &str, name: &str) -> bool {
 /// metadata** in the middle: total count, shown count, and an explicit warning
 /// that the omitted middle may contain the lines the caller is looking for —
 /// "not seen" does not mean "not present".
-///
-/// Background: the `execute_command` success path used to truncate silently
-/// with `... (truncated)`, so the model could not tell whether its target
-/// match was cut off in the hidden part and kept retrying near-identical
-/// greps (the repeated calls in history.json come from this). With counts and
-/// a paging hint, the retry motive changes from guessing with incomplete
-/// information to converging on evidence.
 pub(super) fn truncate_chars(content: &str, max_chars: usize) -> String {
     let total_chars = content.chars().count();
     if total_chars <= max_chars {
@@ -852,7 +840,7 @@ Do not re-run near-identical variants; narrow the query instead (e.g. `grep -c` 
 }
 
 // =========================================================================
-// Execution logic (validation moved to the audit module)
+// Execution logic (command validation lives in the audit module)
 // =========================================================================
 
 /// `git stash` subactions that are read-only — they touch neither the working
@@ -984,13 +972,9 @@ fn format_command_result(output: CommandRunResult, timeout_secs: u64) -> String 
     };
 
     if output.stalled {
-        // PTY interactive command stalled: the process is alive but produced
-        // no output for a long time, which almost certainly means it waits for
-        // human input (QR scan, password, menu) the agent cannot provide; when
-        // output is buffered by a pipe (e.g. `| tail`) nothing shows at all.
-        // Give an explicit diagnosis plus any captured partial output (often
-        // the QR code) instead of letting the model misread this as a plain
-        // timeout and blindly retry the same command.
+        // A no-output stall may be waiting for human input or buffering output.
+        // Include captured output so the caller can distinguish it from an
+        // ordinary timeout before retrying.
         let partial = if combined.trim().is_empty() {
             "(no output was captured before termination)".to_string()
         } else {
@@ -1025,9 +1009,8 @@ fn format_command_result(output: CommandRunResult, timeout_secs: u64) -> String 
         .expect("completed command must carry a status");
     if status.success() {
         let combined = combined.trim();
-        // Empty output with successful exit: say so explicitly so the model
-        // does not misread "command succeeded, zero matches" as "the call did
-        // not take effect" and retry the same grep repeatedly.
+        // Make a successful empty result explicit so the caller can distinguish
+        // it from a command that did not run before deciding whether to retry.
         if combined.is_empty() {
             "(command succeeded with exit code 0 and produced no output)".to_string()
         } else {
@@ -1046,14 +1029,10 @@ fn format_command_result(output: CommandRunResult, timeout_secs: u64) -> String 
     }
 }
 
-/// True when the effective program of any command segment is `sleep`.
-///
-/// `sleep` is not blocked (it is occasionally necessary, e.g. waiting for a
-/// server to accept connections), but it burns the whole turn on dead time: the
-/// agent cannot do anything else while the command runs. Detection reuses the
-/// audit segment splitter and wrapper unwrapping (`nohup sleep 30 &` still
-/// hits, `command sleep 5` hits), so data arguments like `grep sleep file` or
-/// `man sleep` do not.
+/// Detect direct or wrapped `sleep` programs, including simple shell `-c` bodies.
+/// Synchronous execution occupies the tool call until completion; commands
+/// started with `yield_time_ms` can return a session to poll. The audit splitter
+/// and wrapper parser distinguish programs from data arguments such as `grep sleep file`.
 fn contains_sleep(command: &str) -> bool {
     super::audit::split_unquoted_segments(command)
         .iter()
@@ -1130,8 +1109,8 @@ where
     super::audit::validate_execute_command(&command)
         .map_err(|reason| format!("Command blocked: {reason}"))?;
 
-    // Confirm-gated git subcommands (commit/stash/checkout/switch) ask the user first
-    // (fail-closed in non-interactive environments).
+    // Confirm-gated Git subcommands ask the user first; without a terminal
+    // or a serve confirmation channel, the command is rejected.
     confirm_git_confirm_gated_if_needed(&command)?;
 
     // `execute_command` is a facade: when a simple command names a program that
@@ -1555,7 +1534,7 @@ mod tests {
 
     #[test]
     fn execute_command_blocks_git_commit_inside_substitution_without_terminal() {
-        // P0 regression: without a TTY, `echo "$(git commit ...)"` must be
+        // Without a TTY, `echo "$(git commit ...)"` must be
         // rejected fail-closed; command substitution must not silently bypass
         // the confirmation gate.
         let err = execute_command(&json!({
@@ -1683,9 +1662,9 @@ mod tests {
 
     #[test]
     fn execute_command_materializes_assignment_value_and_expands_references() {
-        // The `L=$(pipeline); ... "$L" ... "$((L-1))"` shape: the assignment
-        // becomes a literal and every later reference is expanded, so the audit
-        // validates the concrete value instead of blocking the variable.
+        // The assignment becomes a literal and ordinary variable references expand
+        // before auditing. Read-only arithmetic still evaluates in the outer shell
+        // against that assigned value.
         let result = execute_command(&json!({
             "command": r#"L=$(printf 'x:42\n' | grep 'x:42' | cut -d: -f2); echo "line=$L"; echo "range=$((L-14)),$(($L+2))""#,
             "pty": false,
@@ -1824,9 +1803,8 @@ mod tests {
 
     #[test]
     fn execute_command_rejects_arithmetic_write_to_materialized_variable() {
-        // `L++` mutates the variable in shells that evaluate it and is a
-        // (missing) command in others; either way the value read afterwards is
-        // not the materialized literal, so the command must not be rewritten.
+        // Arithmetic-shaped commands are rejected conservatively, since forms
+        // such as `let L++` could invalidate later literal reference expansion.
         for command in [
             r#"L=$(printf 1); L++; echo "$L""#,
             r#"L=$(printf 1); L--; echo "$L""#,
@@ -1897,10 +1875,9 @@ mod tests {
 
     #[test]
     fn execute_command_rejects_bare_arithmetic_reference_in_substitution_text() {
-        // The substitution body runs in a separate shell that never sees the
-        // materialized variable, so an arithmetic reference there would read an
-        // unset value instead of the literal. Both substitutions sit in the
-        // first segment, where materialization is allowed.
+        // Separate substitution shells cannot observe this command's other
+        // materialized assignments. Both substitutions sit in the first
+        // segment, where materialization is allowed.
         for command in [
             r#"L=$(printf 5) B=$(echo $((L+1))); echo "$B""#,
             r#"L=$(printf 5) B=$(echo $((L++))); echo "$B""#,

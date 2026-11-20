@@ -1,5 +1,5 @@
 // =============================================================================
-// PipelineContext - pipeline context (replaces the driver's ad-hoc 7+ parameter passing)
+// PipelineContext - shared pipeline state
 // =============================================================================
 use crate::ai::{history::Message, types::App};
 

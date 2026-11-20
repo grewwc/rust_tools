@@ -4,20 +4,18 @@
 // Explicit commands such as `/audit` and attached-image parsing run one
 // subagent inside the active turn's runtime, instead of routing it through the
 // kernel scheduler like `task_spawn`. This lets the command block on a single
-// subagent without forking a subprocess and without relying on the outer driver
-// loop to make progress (which it cannot, because the outer driver loop is
-// currently awaiting this call). No model-facing tool reaches this runner.
+// subagent without relying on the outer driver loop to make progress, because
+// that loop is awaiting this call. The selected backend may run in-process or
+// use an external worker. No model-facing tool reaches this runner.
 //
 // Execution model:
 //   1. Read `DRIVER_CTX` to obtain a snapshot of the parent runtime
 //      (`app_proto`, `mcp_client`, skill / agent manifests).
 //   2. Run pre-flight (subagent + model selection, inherit parsing) via
 //      `task_tools::prepare_subagent_task`.
-//   3. Build a `task_app` cloned from `app_proto`, applying the inherit
+//   3. Fork a `task_app` from `app_proto`, applying the inherit
 //      flags. Activate the chosen subagent on the clone.
-//   4. `tokio::spawn` `run_turn` for the sub-agent, wrapped in a fresh
-//      `DRIVER_CTX` scope so nested sub-agents inherit the same context
-//      bridge.
+//   4. Run the selected backend in `tokio::spawn` under a fresh `DRIVER_CTX`.
 //   5. Block on a `oneshot::Receiver` via `Handle::current().block_on` to
 //      surface the sub-agent's terminal status to the caller.
 // =============================================================================
@@ -50,8 +48,8 @@ struct SyncSubagentHistoryGuard {
     path: PathBuf,
     memory_path: Option<PathBuf>,
     cwd_dir: Option<PathBuf>,
-    /// Set before a hard timeout: on Drop, preserve the subagent history (rename instead of
-    /// delete) so the parent can extract pre-timeout evidence.
+    /// Retain failed or timed-out subagent history on Drop so the parent can
+    /// recover partial evidence.
     preserve_on_drop: Arc<AtomicBool>,
 }
 
@@ -94,8 +92,7 @@ impl SyncSubagentHistoryGuard {
 impl Drop for SyncSubagentHistoryGuard {
     fn drop(&mut self) {
         if self.preserve_on_drop.load(Ordering::Acquire) {
-            // Hard timeout: preserve the history the subagent has already written (rename instead
-            // of delete) for the parent to extract pre-timeout evidence.
+            // Keep a recovery snapshot of the history written before failure or timeout.
             match history::preserve_subagent_history(&self.path) {
                 Some(preserved) => {
                     eprintln!(
@@ -104,8 +101,7 @@ impl Drop for SyncSubagentHistoryGuard {
                     );
                 }
                 None => {
-                    // History file missing (the subagent has not written anything yet); clean up
-                    // as before.
+                    // No preserved snapshot is available; clean up remaining child artifacts.
                     if let Err(error) = history::delete_subagent_history(&self.path) {
                         eprintln!(
                             "[Warning] failed to clean up sync subagent history {}: {error}",
@@ -220,8 +216,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     })?;
 
     let (mut task_app, parent_agent_team_mode) = fork_sync_subagent_with_parent_policy(&ctx);
-    // Driver-internal dispatch options (the retired `task` tool schema had neither field, and
-    // `task_spawn` does not forward them):
+    // Dispatch overrides:
     // - `image_files`: attaches images directly to the sub-agent's first user message so a VL
     //   model sees them in the first round, avoiding the redundant read_file-then-re-attach
     //   base64 round trip;
@@ -312,8 +307,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     } else {
         None
     };
-    // Set by the parent before a hard timeout; on guard Drop the sub-agent history is preserved
-    // (renamed, not deleted).
+    // Set before aborting so the guard retains subagent history for recovery.
     let preserve_history_on_timeout = Arc::new(AtomicBool::new(false));
     let history_cleanup =
         SyncSubagentHistoryGuard::new(child_history.clone(), preserve_history_on_timeout.clone())
@@ -613,11 +607,8 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     let guarded = async move {
         let mut history_cleanup = history_cleanup;
         let outcome = wrapped.await;
-        // A subagent whose turn failed never reached `finalize_turn`, so the result slot stays
-        // empty and the parent would otherwise see only the error. Preserve its history (rename
-        // on Drop instead of delete) so the parent can extract the pre-failure evidence. Without
-        // this, a failure late in a long investigation (e.g. the forced wrap-up request rejected
-        // by the provider) deleted the whole history and wasted all collected work.
+        // Retain history on execution failure so the parent can recover partial evidence
+        // even when the child did not publish a final answer.
         if outcome.is_err() {
             history_cleanup
                 .preserve_on_drop
@@ -647,10 +638,8 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     let _foreground_guard =
         crate::ai::driver::signal::ForegroundSubagentGuard::register(subagent_cancel.clone());
 
-    // Wait for the sub-agent, driven only by three events (no more 50ms polling):
-    //   1. the sub-agent oneshot returns;
-    //   2. the sub-agent's cancel/shutdown wakes us via REQUEST_INTERRUPT_NOTIFY;
-    //   3. the hard timeout expires.
+    // Wait on result delivery, interrupt notifications, and the hard timeout.
+    // Heartbeat and optional wrap-up deadlines also wake the wait loop.
     //
     // The atomic flag is only a condition check, not a wake-up mechanism; every normal path that
     // writes cancel/shutdown must call signal_request_interrupt()/request_shutdown() to send Notify.
@@ -668,8 +657,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     });
     if join_result.is_err() {
         subagent_cancel.store(true, Ordering::Release);
-        // Hard timeout: set the flag first so guard Drop preserves the history (rename instead
-        // of delete), then abort.
+        // Preserve recovery evidence before aborting; the guard observes this flag on Drop.
         preserve_history_on_timeout.store(true, Ordering::Release);
         subagent_handle.abort();
     }
@@ -681,12 +669,8 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     let duration = started.elapsed();
     let elapsed_secs = duration.as_secs_f64();
 
-    // After a hard timeout or a subagent failure that never reached `finalize_turn`, the guard
-    // has already renamed the sub-agent history aside (Drop runs when the spawned task finishes);
-    // extract the pre-failure work product and publish it to the result slot, so long
-    // investigations are not lost. Previously the timeout path returned an empty result and the
-    // FAILED path deleted the history outright, so a failure after many minutes of work showed
-    // nothing to the parent.
+    // Recover partial work only after the spawned task has exited and its guard has
+    // attempted to preserve history. Missing snapshots still produce a diagnostic.
     let failure_phase = phase_slot
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
@@ -931,13 +915,7 @@ async fn wait_for_sync_task_completion_with_wrap_up(
     }
 }
 
-/// After a hard timeout or a subagent failure that never reached `finalize_turn`, extracts the
-/// work product the sub-agent already wrote to its (preserved) history and publishes it to the
-/// result slot. The parent then sees a pre-failure evidence excerpt plus the preserved file path
-/// in the failure result instead of an empty one (previously the timeout path discarded all the
-/// work, and the failed path deleted the history entirely).
-/// Records carried into the timeout recovery payload, and the per-record character cap: a
-/// checkpoint is a one-line, report-shaped summary, never quoted code.
+/// Maximum number of published audit checkpoints retained in a recovery payload.
 const TIMEOUT_RECOVERY_MAX_CHECKPOINTS: usize = 6;
 
 /// Appends the audit progress protocol to a subagent prompt that does not carry it yet, so an
@@ -957,12 +935,11 @@ const TIMEOUT_RECOVERY_MAX_CHECKPOINT_CHARS: usize = 600;
 
 /// Collects the `AUDIT_CHECKPOINT:` records already published by a sub-agent that was cut short.
 ///
-/// The audit progress protocol has the auditor emit one report-shaped record per verified
-/// finding, so these records are the partial *findings* the parent can merge; the raw tail
-/// excerpt stays beneath them as context. Only published message content is scanned — a draft
-/// the auditor left in its reasoning is not evidence the parent may merge. Records come out
-/// oldest first, duplicates collapse, and only the newest few survive so a runaway auditor
-/// cannot flood the recovery payload.
+/// Recover report-shaped records for findings and completed branches alongside
+/// the raw tail excerpt. Only published assistant content is scanned; reasoning
+/// drafts are excluded. These records remain assistant-authored evidence.
+/// Duplicates move to the newest position, and only the newest few survive so a
+/// runaway auditor cannot flood the recovery payload.
 fn extract_audit_checkpoint_records(messages: &[history::Message]) -> Vec<String> {
     let mut records: Vec<String> = Vec::new();
     for message in messages {
@@ -1009,6 +986,8 @@ fn extract_audit_checkpoint_records(messages: &[history::Message]) -> Vec<String
     records
 }
 
+/// Fill an empty result slot with bounded evidence from preserved child history.
+/// Include a diagnostic when recovery cannot read that history.
 fn publish_recovery_evidence(
     child_history: &Path,
     result_slot: &runtime_ctx::SubagentResultSlot,
@@ -1079,8 +1058,8 @@ fn format_timeout_recovery_payload(
     let extraction = extraction_error
         .map(|error| format!("\nhistory_extraction_error: {error}"))
         .unwrap_or_default();
-    // The published checkpoints are partial findings, so they lead the raw excerpt: a parent
-    // that merges them gets the cut-short audit's conclusions without re-reading the tail.
+    // Put published checkpoints before raw context so the parent can locate
+    // partial findings and coverage gaps.
     let checkpoint_section = if checkpoints.is_empty() {
         String::new()
     } else {
@@ -1126,9 +1105,8 @@ fn print_heartbeat_line(elapsed: Duration, phase: &str) {
     let _ = std::io::stdout().flush();
 }
 
-/// Clears the current heartbeat line (if any). Called when the subagent starts emitting output,
-/// when the task ends, or when it is cancelled, ensuring the heartbeat never lingers or sticks
-/// to the same line as later real output.
+/// Clear the heartbeat on result delivery or cancellation so it does not share
+/// a line with subsequent foreground output.
 fn clear_heartbeat_line(show_heartbeat: bool, heartbeat_visible: &mut bool) {
     if show_heartbeat && *heartbeat_visible {
         // Same ownership rule as `print_heartbeat_line`: never clear while the

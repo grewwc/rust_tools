@@ -119,9 +119,8 @@ fn reserve_turn_index_sqlite_unlocked(path: &Path) -> io::Result<usize> {
     tx.commit().map_err(|e| io::Error::other(e.to_string()))?;
     usize::try_from(current).map_err(io::Error::other)
 }
-/// Cheaply count the number of messages with role='user' in the current history DB.
-/// This lets boundary compact “count first, then decide whether to do a full read” on the hot path,
-/// avoiding deserializing tens of thousands of messages (including large tool outputs) at the end of every turn.
+/// Count persisted `role='user'` rows without decoding message bodies. This
+/// includes runtime-synthetic users; `user_input_turn_count` counts real turns.
 pub(in crate::ai) fn count_user_turns_sqlite(path: &Path) -> io::Result<usize> {
     if !path.exists() {
         return Ok(0);
@@ -150,12 +149,10 @@ pub(in crate::ai) fn count_user_turns_sqlite(path: &Path) -> io::Result<usize> {
     Ok(count.max(0) as usize)
 }
 
-/// Cheaply measure the payload size of persisted messages, so history-to-disk compaction still triggers when the user-turn count is low
-/// but tool output has grown large. The sqlite file size cannot be used: WAL/free pages are not
-/// reclaimed right after messages are replaced, which would make every turn misjudge the budget as exceeded.
-/// This counts raw stored bytes per field, so it is NOT comparable to the in-memory char budget: images bill a
-/// nominal `IMAGE_BUDGET_CHARS` in memory (see `compress::billable`) but their full base64 here. Use this only
-/// for sqlite-side size gating, never against request-side thresholds.
+/// Measure stored text fields with SQLite `length(TEXT)`, avoiding file-size
+/// measurements that include WAL and free pages. JSON encoding and full image
+/// payloads count here, so this differs from request billing in `compress::billable`
+/// and must not be compared directly with request-side thresholds.
 pub(in crate::ai) fn total_message_chars_sqlite(path: &Path) -> io::Result<usize> {
     if !path.exists() {
         return Ok(0);
@@ -287,8 +284,8 @@ pub(in crate::ai) fn replace_all_messages_sqlite(
     })
 }
 
-/// Wake-note dedup (approach 1): for the same process and the same set of task_ids, only the latest
-/// TASK_WAIT_TIMEOUT “still waiting” wake note is kept. The caller calls this before appending an introspection note:
+/// For the same process and set of task_ids, remove earlier TASK_WAIT_TIMEOUT
+/// “still waiting” notes from the scanned tail before the caller appends the latest note:
 /// it deletes all old waiting notes within the last `WAKE_NOTE_DEDUP_SCAN` messages whose identity matches the note about to be appended
 /// (the caller then appends the latest one at the tail); returns `Ok(false)` for non-“still waiting” wake notes or when nothing matches.
 pub(in crate::ai) fn coalesce_repeated_wait_wake_notes_sqlite(
@@ -304,7 +301,7 @@ fn coalesce_repeated_wait_wake_notes_sqlite_unlocked(
     path: &Path,
     note: &Message,
 ) -> io::Result<bool> {
-    // fast path: no IO at all for wake notes that are not “still waiting”
+    // Skip database queries for notes that are not “still waiting”.
     if note.role != ROLE_INTERNAL_NOTE {
         return Ok(false);
     }
@@ -733,7 +730,7 @@ pub(in crate::ai) fn read_all_messages_sqlite_read_only(path: &Path) -> io::Resu
     read_canonical_messages(&conn)
 }
 
-/// Git-style quick hash check: return the canonical message count without
+/// Return the canonical message count without
 /// deserializing rows, so callers can skip full content comparison when
 /// counts already differ (the common dirty-switch case).
 pub(in crate::ai) fn message_count_sqlite_read_only(path: &Path) -> io::Result<usize> {
@@ -757,7 +754,7 @@ fn read_canonical_messages(conn: &Connection) -> io::Result<Vec<Message>> {
 }
 
 /// Read the full canonical message list together with each message's persisted
-/// `source_model` provenance (the model that produced the content). Display-only
+/// `source_model` provenance recorded for its write batch. Display-only
 /// consumers (`/history` view, replay attribution) use this; the shared `Message`
 /// type deliberately does not carry the model, so it travels as a parallel value.
 pub(in crate::ai) fn read_all_messages_with_models_sqlite(

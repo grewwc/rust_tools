@@ -104,7 +104,8 @@ fn print_model_list(app: &App) {
 ///
 /// - empty → show the current effective effort and override state
 /// - `auto|clear|default|reset` → clear the override (use the agent/model default)
-/// - `off|none|no|false|disable|disabled` → force the effort field off entirely
+/// - `off|none|no|false|disable|disabled` → request thinking off where the gateway
+///   supports it
 /// - a tier name → set the override to that tier
 ///
 /// Returns `true` because a recognized effort command always consumes the input line.
@@ -262,7 +263,6 @@ pub fn try_handle_model_command(
         return Ok(true);
     }
 
-    // /model effort [<value>]
     if let Some(rest) = remainder.strip_prefix("effort") {
         return handle_effort_arg(app, rest);
     }
@@ -275,12 +275,9 @@ pub fn try_handle_model_command(
         return Ok(true);
     }
 
-    // Supports inline questions: `/model <selector> [<question>...]`, where the
-    // question may follow the selector on a new line (consistent with
-    // `/skills <name>... <question>`). The model selector is a single token:
-    // try to match the whole input first (preserving the existing
-    // whitespace-normalized selector behavior); on a miss, take the first token
-    // as the selector and the remaining text as this turn's question.
+    // Prefer matching the whole input as a selector. When it does not resolve,
+    // a known first token selects the model and the rest becomes a question,
+    // preserving internal whitespace and newlines.
     let mut selector = raw;
     let mut inline_question: Option<String> = None;
     if let Some(first) = raw.split_whitespace().next()

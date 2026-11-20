@@ -1,7 +1,7 @@
 //! HTTP transport layer: request sending, retries, timeouts, authentication.
 //!
-//! Extracted from `request/mod.rs`; its sole responsibility is "send the request and get the response",
-//! kept separate from request-construction logic such as message normalization, tool schema building, and thinking dialect.
+//! Coordinates normalized request projections, prompt budgets, HTTP sends,
+//! retries, and provider authentication.
 
 use std::time::{Duration, Instant};
 
@@ -66,9 +66,8 @@ const RETRY_BODY_SNIPPET_CHARS: usize = 200;
 /// Collapses an error-response body into a single-line snippet for status
 /// retry warnings: whitespace runs become single spaces so the diagnostic
 /// stays on one terminal line, then hard-truncates to `max_chars` with an
-/// ellipsis. The body is the only signal telling transient gateway failures
-/// apart from deterministic rejections, and it is never persisted — without
-/// the snippet every 400 looks identical in the terminal.
+/// ellipsis. Including the body helps distinguish transient gateway failures
+/// from deterministic rejections in terminal diagnostics.
 fn retry_body_snippet(body: &str, max_chars: usize) -> String {
     let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= max_chars {
@@ -145,9 +144,8 @@ fn maybe_emit_responses_reasoning_replay_diagnostic(
     {
         return;
     }
-    // Encrypted reasoning items are replayed through an in-memory side channel only within the current turn's tool chain; earlier turns
-    // can no longer be replayed faithfully, and history checkpoints / tool evidence carry the semantic fidelity. Diagnostics only count
-    // the current turn after the latest user message, so every request does not emit noise about old history.
+    // Count only the current turn's tool groups; historical replay markers may
+    // already have been reconstructed into reasoning_items.
     // Synthetic user messages (evidence handoff, image followup) do not form a turn boundary.
     let current_turn_start = crate::ai::history::last_real_user_index(messages).unwrap_or(0);
     let stats = super::protocol::responses_reasoning_replay_stats(
@@ -157,12 +155,6 @@ fn maybe_emit_responses_reasoning_replay_diagnostic(
     if stats.tool_call_groups == 0 || stats.missing_groups == 0 {
         return;
     }
-    // super::emit_request_diagnostic(format_args!(
-    //     "[Info] responses reasoning replay: replayed {}/{} assistant tool-call groups; {} group(s) missing encrypted reasoning items, falling back to function_call replay.",
-    //     stats.replayed_groups,
-    //     stats.tool_call_groups,
-    //     stats.missing_groups
-    // ));
 }
 
 /// Hedged send with TPM preflight.
@@ -556,8 +548,8 @@ pub(crate) async fn preview_request_budget(
     budget
 }
 
-/// Owns the wire projection so measurement can borrow it without borrowing App
-/// across the mutable transport path. Both preview and send build tools once.
+/// Owns the send path's wire projection so measurement can borrow it without
+/// borrowing App across the mutable transport path.
 struct RequestProjection {
     messages: Vec<Message>,
     tools: Option<Value>,
@@ -660,9 +652,9 @@ async fn prepare_projection_core_with_thinking(
         &app.turn_reasoning_items,
         &mut spliced_replay_keys,
     );
-    // The final wire projection decides reasoning_content replay semantics by model capability: GLM keeps the
-    // tool-call assistant's original text, DeepSeek only fills the empty field shape, and all other models strip it.
-    // Unlike this turn's enable_thinking gate, this must be unified before every request.
+    // Normalize replay for every request by dialect and model capability.
+    // Echo dialects retain provider text and required field shapes; exact replay
+    // is limited to same-model tool rounds. Other models strip hidden reasoning.
     normalize_reasoning_content_replay_for_model(model, &mut normalized_messages);
     let reasoning_effort = resolve_reasoning_effort(app, model).map(|e| e.as_str());
     ProjectionCore {
@@ -836,7 +828,7 @@ async fn do_request_messages_with_tool_mode(
     // payload, but dropping replayed items changes it. The provider does not
     // name the offending item, so each rejection drops one more replay tier
     // (persisted, then live) and resends the same projection. The tier count
-    // bounds a request to three sends; the last result is what the caller sees.
+    // allows at most two payload repairs; each send can also rotate keys or retry.
     // Dropped owners are recorded in the rejected-replay ledger only when a
     // resend without them is accepted, so a repair that never gets through
     // leaves innocent groups of the dropped tiers replayable.
@@ -1499,7 +1491,6 @@ pub(crate) fn print_info(app: &App, model: &str) {
         }
     };
 
-    // Print the current session summary
     let store = SessionStore::new(&app.config.history_file);
     let summary = store
         .read_session_title(&app.session_id)
@@ -1546,7 +1537,7 @@ pub(crate) fn print_info(app: &App, model: &str) {
     let _ = crate::ai::stream::side_note_input::write_output_line(&mut out, &header);
 }
 
-/// Make an LLM request expecting a JSON response (used for intent recognition, knowledge-base Q&A, etc.).
+/// Send an auxiliary LLM request and deserialize its HTTP response body as JSON.
 ///
 /// `skip_reasoning_effort`: when `true`, force-omit the `reasoning_effort` field;
 /// the field is ignored even when the model configures it by default. Suited to lightweight workloads such as knowledge-base Q&A.
@@ -1600,7 +1591,7 @@ pub async fn do_request_json(
         )
         .await
         .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
-        // Non-streaming auxiliary request: 60s timeout per attempt
+        // Bound the response-header wait independently of body parsing below.
         let send_future = async {
             let resp = apply_request_auth(
                 app.client.post(&endpoint),
@@ -1746,15 +1737,8 @@ pub async fn do_request_json(
     }
 }
 
-/// Streaming aggregation request: issues a `stream: true` request, accumulates `delta.content` chunk by chunk,
-/// and finally returns the concatenated full text.
-///
-/// Compared with non-streaming [`do_request_json`], the streaming path returns response headers immediately and data arrives
-/// incrementally per chunk, so it **cannot** be blown up by waiting for the server to finish the whole body.
-/// The guard here is a per-chunk idle timeout: keep reading as long as data keeps arriving; only `STREAM_RESPONSE_HEADER_TIMEOUT_SECS`
-/// consecutive seconds without any chunk count as a hang.
-///
-/// Suited to auxiliary tasks like knowledge curation that only need the final complete JSON, without live terminal rendering.
+/// Accumulate one SSE payload's text and latest usage from chat-completions or
+/// Responses events.
 pub(super) fn apply_aux_stream_payload(
     payload: &str,
     event_type: Option<&str>,
@@ -1868,6 +1852,9 @@ fn apply_responses_stream_event(
     false
 }
 
+/// Send an auxiliary streaming request and return accumulated text without live
+/// rendering. Header waits use the request retry policy; an idle timeout bounds
+/// waits between chunks.
 pub async fn do_request_text_streaming(
     app: &App,
     model: &str,
@@ -1899,10 +1886,8 @@ pub async fn do_request_text_streaming(
                 .header("Content-Type", "application/json")
                 .body(request_body.clone())
         };
-        // Wait for response headers: handshake + server starting to respond. This step is fast when streaming.
-        // Use a hedged backup: if the primary produces no response within a short window, dispatch a backup request automatically.
-        // Consistent with the non-streaming path, the header wait timeout comes from retry_policy.header_timeout_secs
-        // (auto subagents use 30s instead of the hardcoded 90s); the chunk idle timeout still uses the fixed constant.
+        // Header waits use the request retry policy and may dispatch a hedged
+        // backup. The chunk idle timeout below is independent of this timeout.
         let mut response = match tokio::time::timeout(
             Duration::from_secs(retry_policy.header_timeout_secs),
             send_with_budgeted_hedged_backup(
@@ -1984,7 +1969,6 @@ pub async fn do_request_text_streaming(
             }
         };
 
-        // Read and aggregate delta.content chunk by chunk.
         let mut content = String::new();
         let mut buffer: Vec<u8> = Vec::new();
         let mut sse_event_data = String::new();
@@ -2083,10 +2067,8 @@ pub async fn do_request_text_streaming(
             let latency_ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
             let _ = charge_llm_usage_to_kernel(app, model_for_pricing, &usage, latency_ms);
         } else if !(idle_timed_out && content.is_empty()) {
-            // The stream completed without any usage chunk even though the
-            // request asked for stream_options.include_usage: the provider
-            // dropped the accounting data. The about-to-retry idle-timeout path
-            // is excluded because usage loss is expected when the stream died.
+            // No usage was parsed from this stream. An idle timeout with no
+            // content is excluded because accounting data may not have arrived.
             super::emit_request_diagnostic(format_args!(
                 "[Warning] {}流式辅助请求未返回 usage (model={})：本次调用未计入 token 统计，/usage 将缺失此调用",
                 retry_scope_tag(),
@@ -2151,7 +2133,7 @@ mod retry_ladder_tests {
             1,
             12
         ));
-        // Same body without the deterministic verdict stays on the ladder.
+        // A plain upstream 400 stays on the retry ladder.
         assert!(should_retry_status_in_ladder(
             StatusCode::BAD_REQUEST,
             r#"{"error":{"message":"upstream request failed"}}"#,

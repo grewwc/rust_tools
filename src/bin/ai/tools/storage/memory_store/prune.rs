@@ -20,7 +20,7 @@ impl MemoryStore {
         let now = chrono::Utc::now();
 
         for entry in entries {
-            // Permanent and high-priority memories are not deleted
+            // Keep every entry with priority >= 200, regardless of age or score.
             if entry.priority.unwrap_or(100) >= 200 {
                 continue;
             }
@@ -71,9 +71,8 @@ impl MemoryStore {
                 atomic_write_file(&self.path, output.as_bytes())
                     .map_err(|e| format!("Failed to write memory file: {e}"))?;
 
-                // Same index handling as before: delete each removed id and
-                // refresh the signature; failures only affect drift detection
-                // on the next index open.
+                // Synchronize removals in the cached index best-effort; failures do not fail pruning.
+                // Refresh the source signature after this rewrite.
                 if let Some(idx) = memory_index_for(&self.path) {
                     for id in &ids_to_remove {
                         let _ = idx.delete_id(id);

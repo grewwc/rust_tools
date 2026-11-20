@@ -60,18 +60,16 @@ pub(crate) use lexer::effective_chain_uses_xargs;
 
 /// Validate the safety of one complete command (including chained `&&` / `||`).
 ///
-/// This is the audit module's single public entry point; `execute_command` just
-/// calls it.
+/// This is the audit module's entry point for complete commands, called by
+/// `execute_command` before execution.
 pub(crate) fn validate_execute_command(command: &str) -> Result<(), String> {
     let command = command.trim();
     if command.is_empty() {
         return Err("empty command".to_string());
     }
 
-    // First line of defense: block shell injection surfaces (unvalidated command
-    // substitution, backticks, subshell grouping). `$(...)` / `<(...)` pass only
-    // after their inner command passes the same validation; letting unvalidated
-    // substitutions through would render the segment blacklist pointless.
+    // Validate substitution bodies before checking argument positions and segment blacklists.
+    // Unvalidated substitutions could bypass the program checks.
     validate_no_injection_surface(command)?;
 
     // Second line of defense: split the chained command into segments and run the
@@ -456,7 +454,8 @@ mod tests {
         // `$()` output is unverifiable, so it must not land in a position the
         // audit semantically checks: `git "pu$(printf sh)"` would run `git
         // push` at runtime, `bash "$(printf -- '-c')" ...` would re-interpret
-        // code, and `rm -rf "$(printf '*')"` would glob-expand out of scope.
+        // code, and dynamically generated `rm` targets cannot be checked against
+        // the session temp directory.
         let err = validate(r#"git "pu$(printf sh)""#).unwrap_err();
         assert!(err.contains("command substitution"), "got: {err}");
         for cmd in [
@@ -505,8 +504,6 @@ mod tests {
 
     #[test]
     fn detects_literal_file_read_substitution_for_any_simple_outer_command() {
-        // The FileRead branch of safe_shell_substitutions (replaced the removed
-        // safe_file_read_substitutions)
         let substitutions = safe_shell_substitutions(
             r#"curl --data "$(cat /tmp/request.json)" https://example.test/api"#,
         );
@@ -539,7 +536,7 @@ mod tests {
             safe_shell_substitutions(r#"echo "$(cat /tmp/a)" "$(cat /tmp/b)""#).len(),
             2
         );
-        // Control operators are now accepted as separators: whole-word
+        // Control operators are accepted as separators: whole-word
         // substitutions in chains still materialize (the materialized command
         // is re-audited before execution).
         assert_eq!(
@@ -550,12 +547,9 @@ mod tests {
             safe_shell_substitutions(r#"echo "$(cat /tmp/dsl.json)" && id"#).len(),
             1
         );
-        // Complete-word or embedded `$()` are only allowed end-to-end for
-        // pure-data programs (`echo`): the inner command is validated (`cat`
-        // of a literal absolute path) and the program name is unaffected.
-        // For any other program the raw audit is fail-closed without
-        // materialization — production executes the safe FileRead whole-word
-        // form via command.rs materialization before this audit runs.
+        // Whole-word FileRead substitutions can pass the raw audit for pure-data programs
+        // such as `echo`. Other programs require `service/command.rs` materialization
+        // before this audit runs.
         assert!(validate(r#"echo "$(cat /tmp/dsl.json)""#).is_ok());
         assert!(validate(r#"bytedcli --dsl "prefix$(cat /tmp/dsl.json)""#).is_err());
         assert!(validate(r#"bytedcli --dsl "$(cat /tmp/dsl.json)suffix""#).is_err());
@@ -603,8 +597,6 @@ mod tests {
 
     #[test]
     fn allows_subcommand_patterns_that_resemble_blocked_programs() {
-        // `git rm` is now blocked by BLOCKED_GIT_SUBCOMMANDS (unrecoverable
-        // deletion).
         assert!(validate("git rm file.txt").is_err());
         assert!(validate("git mv old.txt new.txt").is_ok());
         assert!(validate("docker rm my_container").is_ok());
@@ -615,12 +607,8 @@ mod tests {
 
     #[test]
     fn allows_git_push_forms_at_audit_level() {
-        // `git push` is no longer hard-blocked here: like `git stash`, the
-        // whole push family is gated by user confirmation in
-        // `service/command.rs`, which prompts on an interactive terminal and
-        // fails closed otherwise. The audit layer must therefore let every
-        // form through so the confirmation gate downstream is the single
-        // decision point.
+        // `confirm_gated_git_subcommand` in `service/command.rs` owns user confirmation
+        // for `git push`, so the audit lets these forms reach that gate.
         assert!(validate("git push").is_ok());
         assert!(validate("git push origin main").is_ok());
         assert!(validate("git push --force").is_ok());
@@ -660,11 +648,8 @@ mod tests {
 
     #[test]
     fn allows_git_stash_forms_at_audit_level() {
-        // `git stash` is no longer hard-blocked here: the whole stash family is
-        // gated by user confirmation in `service/command.rs` (same as `git
-        // commit`), which prompts on an interactive terminal and fails closed
-        // otherwise. The audit layer must therefore let every form through so
-        // the confirmation gate downstream is the single decision point.
+        // `confirm_gated_git_subcommand` in `service/command.rs` handles stash confirmation;
+        // direct list/show subactions bypass the gate, while mutating forms require confirmation.
         assert!(validate("git stash").is_ok());
         assert!(validate("git stash list").is_ok());
         assert!(validate("git stash pop").is_ok());
@@ -777,7 +762,6 @@ mod tests {
         assert!(validate(r#"find . -name "-delete" -print"#).is_ok());
         assert!(validate(r#"find . -name "-exec" -print"#).is_ok());
         assert!(validate(r#"find . -printf "-delete\n""#).is_ok());
-        // `git rm` is now blocked by BLOCKED_GIT_SUBCOMMANDS.
         assert!(validate("git rm file.txt").is_err());
         assert!(validate("docker rm container").is_ok());
         assert!(validate("npm rm pkg").is_ok());
@@ -1122,8 +1106,7 @@ mod tests {
 
     #[test]
     fn tilde_escape_to_parent_dir_blocked() {
-        // cwd=/Users/bytedance/rust_tools -> ~/.. walks up to /Users/bytedance ->
-        // /Users -> /
+        // Tilde expansion starts at the user's home; `..` escapes that directory.
         assert!(validate("cp foo.txt ~/../..").is_err());
         assert!(validate("cp foo.txt ~/..").is_err());
     }
@@ -1174,10 +1157,8 @@ mod tests {
         assert!(validate("python3 -c 'import socket; socket.socket()'").is_err());
         assert!(validate("python3 -c 'ctypes.CDLL(None).system(\"id\")'").is_err());
         assert!(validate("python3 -c 'Path(\"x\").unlink()'").is_err());
-        // Every import form of dangerous modules (from-import / aliasing /
-        // sys.modules). Plain `import os` / `import shutil` are allowed for
-        // read-only use, so the remaining blocked forms are exactly those that
-        // expose bare or renamed dangerous calls.
+        // Plain `import os` / `import shutil` allow read-only attribute use. Alias imports
+        // are rejected because renamed calls would bypass checks for the original module name.
         assert!(validate("python3 -c 'from os import system; system(\"rm -rf /\")'").is_err());
         assert!(validate("python3 -c 'import os as o; o.system(\"id\")'").is_err());
         assert!(validate("python3 -c 'from os import *'").is_err());
@@ -1246,7 +1227,7 @@ mod tests {
         assert!(validate("env python3 -c 'print(1)'").is_ok());
         assert!(validate("nohup env python3 -c 'print(1)'").is_ok());
         assert!(validate("env env python3 -c 'print(1)'").is_ok());
-        // Wrappers can no longer bypass validation via `-c`.
+        // Wrapper payloads also undergo interpreter validation.
         let err = validate("env python3 -c 'os.system(\"id\")'").unwrap_err();
         assert!(err.contains("blocked primitive"), "got: {err}");
         assert!(validate("xargs python3 -c 'os.system(\"id\")'").is_err());
@@ -1308,9 +1289,8 @@ mod search_scope_tests {
 
     #[test]
     fn incident_shape_global_name_hunt_is_blocked() {
-        // The test_llm vs. AeolusLLM request.txt incident: a whole-disk
-        // bare-name hunt (absolute root outside the cwd, piped to head) must
-        // be rejected before it can pick the wrong duplicate.
+        // Reject whole-disk bare-name searches before they can select an unrelated duplicate
+        // outside the current directory.
         let err = blocked(
             "find /Users/bytedance -maxdepth 4 -name request.txt -o -maxdepth 4 \
              -name response.txt 2>/dev/null | head -20",
@@ -1591,9 +1571,8 @@ mod kill_target_tests {
 
     #[test]
     fn kill_of_descendant_in_registered_group_is_allowed() {
-        // The test process itself: register its process group, then kill its
-        // own pid. The pid is not the pgid, so this exercises the `ps`
-        // pgid-resolution path end to end.
+        // Register the test process's group and validate a kill targeting its pid.
+        // When the pid differs from the pgid, this exercises `ps` group resolution.
         let pid = std::process::id();
         let pgid = process_group_of(pid).expect("ps must resolve the test process pgid");
         process_registry::register(TEST_SESSION, pgid);
@@ -1661,8 +1640,7 @@ mod kill_target_tests {
         )
         .unwrap_err();
         assert!(err.contains("System Events"), "got: {err}");
-        // `keystroke` types into the frontmost application on its own, without
-        // naming System Events.
+        // Reject GUI input verbs even when the script does not name System Events.
         let err = validate_execute_command("osascript -e 'keystroke \"q\" using command down'")
             .unwrap_err();
         assert!(err.contains("GUI scripting is blocked"), "got: {err}");
@@ -1708,8 +1686,7 @@ mod kill_target_tests {
 
     #[test]
     fn pkill_matching_external_process_is_denied() {
-        // `.` matches every process's command line (including pgrep's own
-        // caller), and none of them is registered in this session.
+        // A pattern matching every command line includes external processes and must be rejected.
         let err = validate_pattern_kill(
             &tokens(&["pkill", "-f", "."]),
             TEST_SESSION,
@@ -1725,19 +1702,9 @@ mod kill_target_tests {
 
     #[test]
     fn pkill_matching_registered_process_is_allowed() {
-        // `pkill -f` is allowed when every process its pattern matches was
-        // started by this agent session. The target is a process this test
-        // spawns rather than the test process itself: `pgrep` never matches
-        // its own parent, so a pattern built from this process's own command
-        // line would resolve to nothing at all.
-        //
-        // The child carries a unique marker in its command line, so the
-        // pattern matches exactly that one process. A bare `pkill -f <binary
-        // path>` would instead match every process whose command line
-        // contains that path — including orphans leaked by earlier test
-        // runs, which are not registered and are rightly refused as external
-        // processes — so the outcome would depend on what else happens to be
-        // running on the machine.
+        // Use a spawned child with a unique command-line marker so the pattern selects
+        // one registered process independently of other test runs or platform-specific
+        // ancestor filtering in `pgrep`.
         use std::os::unix::process::CommandExt as _;
         // The timestamp keeps the marker unique per run, so a leftover target
         // from an earlier run cannot be matched again after the pid is reused.
@@ -1804,14 +1771,13 @@ mod kill_target_tests {
 
     #[test]
     fn kill_is_no_longer_blanket_blocked() {
-        // Without a session context every kill fails closed, but with the
-        // target-verification message, not the old blanket block.
+        // Without a session context, signal targets cannot be verified.
         let err = validate_execute_command("kill 4242").unwrap_err();
         assert!(
             err.contains("not a process started by this agent session"),
             "got: {err}"
         );
-        // Wrappers run the same verification instead of a blanket block.
+        // Wrappers use the same target verification.
         let err = validate_execute_command("env kill 4242").unwrap_err();
         assert!(
             err.contains("not a process started by this agent session"),
@@ -1955,8 +1921,7 @@ mod rm_target_tests {
 
     #[test]
     fn rm_is_no_longer_blanket_blocked() {
-        // Outside a session context every rm fails closed, but with the
-        // temp-dir verification message rather than a blanket program block.
+        // A path outside the fallback temp directory is still denied without a session context.
         let err = validate_execute_command("rm -rf /tmp/x").unwrap_err();
         assert!(err.contains("outside the session temp dir"), "got: {err}");
     }

@@ -13,11 +13,10 @@ use crate::ai::pipeline::{PipelineContext, StageKind};
 use crate::ai::types::App;
 
 impl App {
-    /// 触发钩子的统一入口：临时取出注册表，避免 `&mut App`（被 PipelineContext 持有）
-    /// 与 `fire_* (&self)` 的借用冲突；无论成败都归还，保证已注册钩子不丢失。
-    /// `messages` 提供时借入 ctx 并在触发后写回调用方（before_request 用，避免
-    /// mem::take 导致请求上下文丢失）；`f` 负责具体 fire_* 调用与 stage 推进。
-    /// 钩子失败只记录不中断 turn；空注册表 = 零行为变化。
+    /// Temporarily take the registry to avoid borrowing it alongside
+    /// `PipelineContext`'s `&mut App`. Move request messages into the context
+    /// and restore them and the registry after the callback, including on `Err`.
+    /// Log hook errors without aborting the turn.
     fn fire_hooks<F>(
         &mut self,
         label: &'static str,

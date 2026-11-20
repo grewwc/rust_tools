@@ -51,8 +51,6 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(program);
-    // All later comparisons use the basename uniformly, so `/bin/rm` and `rm`
-    // are treated alike.
     let program = program_basename;
     validate_env_origin_marker_unsets(command_tokens, raw_command_tokens)?;
     let extra_blocked = config_blocked_commands();
@@ -166,8 +164,6 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
         "reboot",
         "launchctl",
         "systemctl",
-        // "service",
-        // "diskutil",
         "mount",
         "umount",
         "ln",
@@ -231,19 +227,14 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
         return validate_kill_targets(program, raw_command_tokens);
     }
 
-    // `rm` is allowed only against files inside this session's private temp
-    // dir (everything there is session-owned by construction); deleting
-    // anything else — project or user files — stays blocked. See
-    // `validate_rm_targets` below for the per-target verification.
+    // Scope `rm` targets to the session temp directory; project file deletion uses `apply_patch`.
+    // See `validate_rm_targets` below for the lexical path checks.
     if program == "rm" {
         return validate_rm_targets(raw_command_tokens);
     }
 
-    // Safety policy: block destructive/privilege-escalating `git` subcommands
-    // (see `BLOCKED_GIT_SUBCOMMANDS`).
-    // `git` itself is not in denied_programs (subcommands like status/log/diff are
-    // harmless and necessary); only the listed subcommands are hard-blocked.
-    // Global option variants (`git -C /repo rm`) hit too.
+    // Validate blocked `git` subcommands and destructive option forms.
+    // Global options must not hide a blocked subcommand such as `git -C /repo rm`.
     if program == "git" {
         if let Some(reason) = blocked_git_subcommand(command_tokens) {
             return Err(reason.to_string());
@@ -274,13 +265,9 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
              run the literal command directly instead"
         ));
     }
-    // The code string of `python -c '...'` is likewise executed as a program, but
-    // it can be validated statically (validate_python_code): clean strings pass,
-    // hits on dangerous primitives are blocked — more usable than blanket
-    // blocking and no weaker than the original guarantee. fail-closed when the
-    // code string cannot be extracted (missing / shell variable expansion).
-    // Other interpreters (perl / ruby / node / php / awk / lua) have no matching
-    // scanner and stay blocked as before.
+    // Extract literal `python -c` code for `validate_python_code` in `audit/wrapper.rs`.
+    // Block matches for dangerous primitives or code that cannot be extracted. Other
+    // interpreters have no matching scanner, so their inline code remains blocked.
     if is_python_program(program) {
         match python_c_argument(command_tokens) {
             Ok(Some(code)) => validate_python_code(&code)?,
@@ -312,13 +299,8 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
         }
     }
 
-    // Global-search scope confinement: `find` / `grep -r` / `locate` and
-    // absolute glob patterns must stay inside the allowed search roots
-    // (effective cwd, or `ai.sandbox.allowed_roots` when configured). Without
-    // this, a bare-name hunt like `find /Users/bytedance -name request.txt`
-    // can hit several unrelated directories that each contain a same-named
-    // file, and the agent picks the wrong (e.g. stale) copy. See the section
-    // before `validate_find_scope` for the full rationale.
+    // Validate tool-specific search scopes to avoid selecting unrelated copies in a broad
+    // bare-name search. See the section before `validate_find_scope` for the rules.
     {
         let base_dir = crate::ai::driver::runtime_ctx::effective_cwd()
             .map_err(|err| format!("failed to resolve current directory: {err}"))?;
@@ -666,10 +648,8 @@ fn validate_scp(raw_tokens: &[String]) -> Result<(), String> {
                             "scp option '-{option}' can execute a local program or load arbitrary ssh/sftp configuration and is blocked"
                         ));
                     }
-                    // Plain copy flags. `-A`/`-R`/`-T`/`-s` are deliberately
-                    // not listed: agent forwarding, remote-to-remote pivots,
-                    // filename-check bypass, and legacy modes are not needed
-                    // for a plain copy.
+                    // Plain copy flags. `-A` / `-R` / `-T` / `-s` are outside this allowlist;
+                    // `-O` is handled separately with stricter remote-path checks.
                     '3' | '4' | '6' | 'B' | 'C' | 'p' | 'q' | 'r' | 'v' => {}
                     // Legacy SCP protocol. Its remote path is interpolated
                     // unquoted into a remote shell command, so whitespace is
@@ -953,14 +933,10 @@ fn hex_value(byte: u8) -> Option<u8> {
 // Kill-target verification (kill / pkill / killall)
 // =========================================================================
 //
-// The kill family is not blanket-blocked: the agent routinely needs to stop
-// services it started itself (`python app.py &` -> `kill <pid>` /
-// `pkill -f app.py`). The guarantee the sandbox can give instead: every
-// process the invocation would signal must belong to a background process
-// group this session registered via `execute_command` (see
-// `tools::storage::process_registry`). Targets are resolved with `pgrep` /
-// `ps` at validation time, so only live, verifiably-ours processes pass;
-// anything unverifiable fails closed.
+// The kill family requires targets to match session-registered process groups.
+// Pattern targets are resolved with `pgrep`; individual pids may be resolved to
+// pgids with `ps`. These checks happen at validation time and do not serialize
+// later process changes. Registration lives in `storage/process_registry.rs`.
 
 fn is_kill_program(program: &str) -> bool {
     matches!(
@@ -973,13 +949,9 @@ fn is_kill_program(program: &str) -> bool {
 // detached app launches
 // =========================================================================
 //
-// `open -n` asks LaunchServices for an additional instance of an app. That
-// process is detached from the session: it is re-parented to launchd (ppid 1)
-// and gets its own process group, so the sandbox can never prove it belongs to
-// this session and can never terminate it later — the exact situation that
-// once pushed a cleanup attempt towards a GUI keystroke. Apps started through
-// the normal background path (`cmd &`) keep the session's process group and
-// stay registrable, so the rejection points the caller there instead.
+// `open -n` delegates a new app instance to LaunchServices, outside the session's
+// registered process groups. Launch the app binary through the normal background
+// command path so it can be registered and terminated.
 
 /// Reject `open` variants that launch a detached new app instance.
 fn validate_open_launch(program: &str, raw_tokens: &[String]) -> Result<(), String> {
@@ -1024,10 +996,8 @@ fn xargs_kill_blocked_message() -> String {
         .to_string()
 }
 
-/// Largest plausible signal number. `kill -<n>` reads `n` as a signal when it
-/// is a valid signal number and as a process group otherwise; real pids are
-/// far larger than any signal, so values up to this bound are parsed as
-/// signal options and larger negative values as process-group targets.
+/// Parser cutoff for negative numeric tokens: values up to this bound are treated as signal
+/// options; larger values are process-group targets while option parsing is active.
 const MAX_SIGNAL_NUMBER: i64 = 128;
 
 fn validate_kill_targets(program: &str, raw_tokens: &[String]) -> Result<(), String> {
@@ -1040,9 +1010,9 @@ fn validate_kill_targets(program: &str, raw_tokens: &[String]) -> Result<(), Str
     }
 }
 
-/// `kill [options] pid...`: options (`-<signal>`, `-s`/`-n <signal>`,
-/// `--signal=...`, `-l`, `-L`, `-t`, `--`) are skipped; every remaining token
-/// must be a literal integer pid (negative = process group).
+/// Parse options and literal pid targets. Negative numeric tokens above `MAX_SIGNAL_NUMBER`
+/// are group targets only while option parsing is active; negative tokens after `--` are rejected.
+/// Redirection targets are skipped.
 pub(crate) fn validate_kill_pids(raw_tokens: &[String], session_id: &str) -> Result<(), String> {
     let mut targets: Vec<i64> = Vec::new();
     let mut options_ended = false;
@@ -1124,7 +1094,7 @@ fn redirection_target_is_next_token(token: &str) -> bool {
 pub(crate) enum PgrepMode {
     /// `pkill`: pattern matches process name (or full command line with `-f`).
     Pkill,
-    /// `killall`: process names only (mirrored as `pgrep -x`).
+    /// `killall`: resolve names as `pgrep` patterns; `-e` requests exact matching.
     Killall,
 }
 
@@ -1178,8 +1148,7 @@ pub(crate) fn validate_pattern_kill(
             PgrepMode::Killall => "killall: no process name given".to_string(),
         });
     }
-    // Resolve each pattern to the exact pid set the kill would signal (pgrep
-    // and pkill share their matching engine) and verify every pid.
+    // Resolve each pattern with `pgrep` and verify every returned pid before allowing the command.
     for pattern in &patterns {
         for pid in resolve_pattern_pids(&filters, pattern, program)? {
             if !kill_target_verified(pid as i64, session_id) {
@@ -1299,13 +1268,10 @@ fn kill_target_denied_message(target: i64) -> String {
 // rm target verification
 // =========================================================================
 //
-// `rm` is not blanket-blocked: the agent routinely needs to clean up files it
-// created (build outputs, downloaded archives, scratch files). The guarantee
-// the sandbox can give instead: every path the invocation would delete must
-// resolve inside the session's private temp dir (`runtime_ctx::temp_dir()`),
-// where every file is session-owned by construction. Anything else — project
-// files, user files, system paths — stays blocked; delete project files with
-// `apply_patch`'s `*** Delete File:` envelope instead.
+// Scope command-line deletion targets lexically to `runtime_ctx::temp_dir()` so
+// scratch cleanup uses `rm` and project deletion uses `apply_patch`'s
+// `*** Delete File:` envelope. The prefix check does not establish file ownership
+// or resolve symlinks.
 
 /// Message for `xargs rm`: stdin items would append extra deletion targets the
 /// sandbox cannot see on the command line.
@@ -1315,13 +1281,9 @@ fn xargs_rm_blocked_message() -> String {
         .to_string()
 }
 
-/// `rm [options] path...`: options (`-f`, `-r`, `-R`, `-d`, `-i`, `-v`,
-/// `--force`, `--recursive`, ...) and the `--` separator are skipped (none of
-/// them takes an operand, so the skip is unambiguous); every remaining token
-/// must resolve inside the session temp dir. Glob metacharacters in a target
-/// are safe only because the lexical prefix is verified first:
-/// `normalize_path` collapses `..` before the prefix check, and shell globbing
-/// cannot escape the directory the pattern is anchored in.
+/// Skip options and `--`, then lexically confine remaining targets to the session temp dir.
+/// `normalize_path` collapses `..` components; it does not resolve symlinks or model every
+/// shell expansion.
 pub(crate) fn validate_rm_targets(raw_tokens: &[String]) -> Result<(), String> {
     let temp_root = crate::ai::driver::runtime_ctx::temp_dir()
         .map_err(|err| format!("cannot resolve session temp dir: {err}"))?;
@@ -1372,31 +1334,22 @@ pub(crate) fn validate_rm_targets(raw_tokens: &[String]) -> Result<(), String> {
 // Search-scope confinement
 // =========================================================================
 //
-// Why this exists: an agent searching for a *relative* file name (e.g. the
-// user said "the request is in request.txt") can escalate to a whole-disk hunt
-// (`find /Users/bytedance -name request.txt`) and then pick the wrong copy
-// when several directories contain a same-named file (a real incident: a stale
-// `self-dev/test_llm/request.txt` was picked over the workspace copy). The
-// checks below keep name searches inside the allowed roots:
+// Broad searches for a relative file name can select an unrelated same-named
+// file. Apply the following tool-specific checks:
 //
-// - `find`: every search root must lie inside the allowed roots; a bare
-//   relative `-name` / `-path` target (no glob metacharacters) must exist as a
-//   direct child of one of the search roots, otherwise the search would roam
-//   unrelated directories.
+// - `find`: confine search roots; literal relative name/path patterns must resolve
+//   to an existing path when joined to a search root.
 // - `grep -r` / `rg` / `ag` / `ack`: recursive search paths must lie inside
 //   the allowed roots. Non-recursive `grep file` single-file reads are not
 //   affected.
-// - `locate`: a whole-disk name index; bare names must exist in the cwd, and
-//   pattern searches are rejected outright.
+// - `locate`: reject relative glob patterns and relative names absent from the cwd.
 // - glob patterns (`/Users/*/request.txt`): the literal path prefix before the
 //   first metacharacter must lie inside the allowed roots. Bare relative globs
 //   (`*.rs`, `src/*.rs`) can only match inside the cwd and stay allowed.
 //
-// The allowed roots are the same as for file writes
-// (`file_store::path_within_allowed_roots`): `ai.sandbox.allowed_roots` when
-// configured, else `effective_cwd()`, always plus the session temp dir, the
-// skills dir and the rust_tools config dir. Like the rest of this module this
-// is static best-effort: shell variable expansion inside paths is not tracked.
+// Root checks use `path_within_allowed_roots` in `storage/file_store.rs`, including
+// session `--add-dir` roots and runtime-managed directories. Like the rest of this
+// module, this is static best-effort: shell variable expansion inside paths is not tracked.
 
 /// True when `arg` contains a glob / brace-expansion metacharacter.
 pub(crate) fn has_glob_metachar(arg: &str) -> bool {
@@ -1526,11 +1479,9 @@ fn validate_find_scope(
         resolved_roots.push(resolved);
     }
 
-    // A bare relative target (`-name request.txt`, `-path ./sub/request.txt`,
-    // no glob metacharacters) must exist as a direct child of one of the search
-    // roots. When it does not, the search would roam unrelated directories that
-    // happen to contain a same-named file, and the agent can pick the wrong
-    // (e.g. stale) copy.
+    // A literal relative target (`-name request.txt`, `-path ./sub/request.txt`) must resolve
+    // to an existing path when joined to a search root. This avoids broad name searches
+    // selecting unrelated copies.
     let mut i = 1usize;
     while i < command_tokens.len() {
         let tok = command_tokens[i].as_str();
@@ -1691,19 +1642,18 @@ fn validate_grep_scope(
             ));
         }
     }
-    // Recursive `grep` reads every file it walks and has no ignore support, so
-    // a root above build output costs minutes and buries the answer in matches
-    // from object files and binaries. `rg` / `ag` / `ack` honour ignore files
-    // and stay unrestricted.
+    // Recursive `grep` does not honor repository ignore files, so build output can bury
+    // source matches in generated files. `rg` / `ag` / `ack` skip this extra check because
+    // they honor ignore files by default.
     if matches!(program, "grep" | "egrep" | "fgrep") {
         validate_grep_heavy_dirs(program, command_tokens, path_args, base_dir)?;
     }
     Ok(())
 }
 
-/// Directories a recursive `grep` should never walk: build output and
-/// dependency trees hold the object files, archives and binaries that dominate
-/// the walk while containing no source. The names cover the common ecosystems
+/// Directory names checked for expensive recursive `grep` walks. Build output and
+/// dependency trees can dominate results; searching them explicitly remains allowed.
+/// The names cover the common ecosystems
 /// (Rust, JS/TS, Python, JVM, .NET, Apple, Dart, Zig, vendored Go/PHP
 /// dependencies, Haskell, OCaml/Elixir) and stay tunable through
 /// `AiConfig::SANDBOX_SEARCH_SKIP_DIRS`. VCS internals are left out on purpose
@@ -1779,8 +1729,8 @@ pub(crate) fn merge_heavy_search_dirs(configured: &str) -> Vec<String> {
 }
 
 /// Heavy directory names present at or below `root`, sorted and deduplicated.
-/// A matched directory is never descended into, and symlinked directories are
-/// skipped because a `grep -r` walk does not follow them either.
+/// Matched directories are not descended into; child symlink directories are skipped
+/// during this bounded scan.
 fn heavy_dirs_under(root: &std::path::Path, names: &[String]) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     let mut pending = vec![(root.to_path_buf(), 0usize)];
@@ -1813,8 +1763,8 @@ fn heavy_dirs_under(root: &std::path::Path, names: &[String]) -> Vec<String> {
     found
 }
 
-/// True when the command already excludes `dir` from the search, either
-/// attached (`--exclude-dir=target`) or spaced (`--exclude-dir target`).
+/// Heuristic match for exclusion-option values containing `dir`, in attached or spaced form.
+/// File contents and glob semantics are not evaluated.
 fn grep_excludes_dir(command_tokens: &[String], dir: &str) -> bool {
     let excluding_options = ["--exclude", "--exclude-dir", "--exclude-from"];
     let mut spaced_value = false;
@@ -1906,9 +1856,8 @@ pub(crate) fn summarize_dirs(names: &[String]) -> String {
     listed.join(", ")
 }
 
-/// `locate` searches a whole-disk name index; reject it unless the bare name
-/// already exists in the current directory (in which case `find` would work
-/// too and needs no index).
+/// For relative `locate` patterns, reject globs and names absent under `base_dir`.
+/// Absolute patterns pass without an existence check.
 fn validate_locate_scope(
     raw_command_tokens: &[String],
     base_dir: &std::path::Path,

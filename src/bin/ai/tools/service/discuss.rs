@@ -1,12 +1,11 @@
 // Host-side discuss/argue tool services: `discuss_start` / `discuss_collect` /
 // `discuss_broadcast` / `discuss_end` / `discuss_status`.
 //
-// The host orchestrates member sessions over the talk mailbox; every function
-// below touches only the host's own files (room state, room transcript, member
-// inboxes via `push_talk`). A member's sqlite database is written solely by
-// that member's own process. All four stay on the fail-closed defaults:
-// serial execution, no retry (`discuss_collect` drains the host inbox and must
-// never be replayed).
+// The host orchestrates member sessions over the talk mailbox, updating its
+// room state/transcript and sending mail to member inboxes via `push_talk`.
+// A member's sqlite database is written solely by that member's own process.
+// All five tools stay on the fail-closed defaults: serial execution, no retry;
+// `discuss_collect` drains the host inbox and must never be replayed.
 use serde_json::Value;
 
 use super::{arg_bool, arg_str, arg_string_list, arg_u64};
@@ -265,9 +264,8 @@ mod tests {
 
     #[test]
     fn both_members_and_member_count_are_rejected_with_a_clear_error() {
-        // The observed production failure: an empty `members` placeholder next
-        // to `member_count` must report the either/or violation, not a
-        // confusing per-item "members[0] must not be empty".
+        // With member_count, an empty member string must report the either/or
+        // violation before per-item validation.
         let err =
             execute_discuss_start(&json!({"topic": "t", "member_count": 3, "members": [""]}))
                 .unwrap_err();

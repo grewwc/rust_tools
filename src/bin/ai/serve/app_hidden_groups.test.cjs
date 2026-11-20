@@ -407,6 +407,33 @@ test("temporary Open fetches the group's own first and second pages without chan
   assert.match(html, /\$\("refresh"\)\.onclick = async \(\) => \{ resetTemporarySessionGroups\(\);/);
 });
 
+test("visible group paging loads older group rows without moving the global cursor", async () => {
+  const work = Array.from({ length: 25 }, (_, i) => ({ id: "work-" + i, summary: "Work " + i, group_id: "visible", size_bytes: 1024 }));
+  const h = await setup({ items: [...work, items()[2]], cachedItems: [work[24], work[23], work[22], items()[2]] });
+  run(h, "sessionsTotal = 26; sessionsPageOffset = 4; sessionsHasMore = true");
+  h.context.renderSessionList(h.context.lastItems);
+  assert.equal(h.row("work-13"), undefined);
+  const before = globalState(h);
+
+  await click(h, h.elements.sesslist, "More");
+  await settle();
+  const first = groupPageRequests(h).at(-1);
+  assert.equal(first.searchParams.get("group"), "visible");
+  assert.equal(first.searchParams.get("offset"), "0");
+  assert.equal(first.searchParams.get("limit"), "12");
+  assert.ok(h.row("work-13"));
+  assert.equal(pageState(h, "visible").offset, 12);
+  assert.equal(pageState(h, "visible").hasMore, true);
+  assert.deepEqual(globalState(h), before);
+
+  await click(h, h.elements.sesslist, "More");
+  await settle();
+  assert.equal(groupPageRequests(h).at(-1).searchParams.get("offset"), "12");
+  assert.ok(h.row("work-1"));
+  assert.equal(pageState(h, "visible").offset, 24);
+  assert.deepEqual(globalState(h), before);
+});
+
 test("temporary rows merge by ID with the global page and Unassigned uses the group query contract", async () => {
   const h = await setup();
   await h.context.openSessionGroupManager("hidden");

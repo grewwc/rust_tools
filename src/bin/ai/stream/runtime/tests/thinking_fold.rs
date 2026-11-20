@@ -211,10 +211,8 @@ fn reasoning_summary_done_snapshot_does_not_duplicate_thinking() {
 
 #[test]
 fn content_part_summary_text_events_never_replay_streamed_reasoning() {
-    // gpt-5.5/5.6's Responses API re-sends already-streamed reasoning summaries via the summary_text
-    // of content_part.added / content_part.done. These events are snapshot re-sends rather than model
-    // increments and must be deduped by unseen suffix, otherwise reasoning_text accumulates twice,
-    // polluting degenerate detection and possibly triggering duplicate thinking rendering.
+    // Responses content-part events resend reasoning summary snapshots after
+    // deltas. Deduplication prevents those summaries from being accumulated twice.
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
     let mut app = test_app();
@@ -335,9 +333,8 @@ fn thinking_fold_window_counts_current_line_inside_visible_budget() {
 
 #[test]
 fn thinking_fold_zero_window_is_pure_summary() {
-    // 0-row window = summary only: neither completed body lines nor the in-flight line enter the visible window.
-    // `finalize_fold` temporarily uses this semantics when thinking wraps up, so trailing recap
-    // conclusions/questions do not duplicate the final answer on screen (streaming still shows max_visible_lines).
+    // A zero-row body is empty; completion keeps its summary in the header so
+    // thinking does not repeat the final answer.
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -634,9 +631,8 @@ fn thinking_fold_window_without_hidden_lines_has_no_fold_marker() {
 
 #[test]
 fn thinking_fold_window_body_excludes_anchored_header() {
-    // The header is stripped from body rendering and anchored separately: `render_thinking_fold_window`
-    // only produces body content (fold summary + visible lines), never the header. This is the core
-    // invariant of the "orphan header stacking" fix — body may be erased and redrawn repeatedly via cursor-up, while the header lands once and is never erased.
+    // The body excludes the header; redraws handle the header as a separate
+    // part of the same erase span.
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -734,9 +730,9 @@ fn thinking_fold_erase_rows_follow_current_terminal_reflow_of_previous_body() {
     }
 }
 
-/// Models only what the fold's own writer emits: SGR is ignored, and `\r`, `\n`, CSI A/B/K plus
-/// DECAWM auto-wrap cover the rest. The writer ends every row with CRLF, so `resize` re-wraps each
-/// row on its own, exactly as a reflowing terminal does with hard-wrapped rows.
+/// Grid for fold cursor sequences with one cell per character. Ignores SGR and
+/// handles CR/LF, CSI A/B/K, and autowrap. Resize rewraps each stored row
+/// independently, preserving row order.
 struct ReflowGrid {
     cols: usize,
     cells: Vec<Vec<char>>,
@@ -804,8 +800,8 @@ impl ReflowGrid {
         }
     }
 
-    /// Terminal reflow: every row on screen is re-wrapped at `cols`, rows keep their order, and the
-    /// cursor stays at the end of the row it was on.
+    /// Rewrap each stored row at `cols`, keeping the cursor at the end of its
+    /// corresponding reflowed row.
     fn resize(&mut self, cols: usize) {
         let cursor_row = self.row;
         // A terminal reflows the rows it has drawn; the blank tail below stays blank.
@@ -856,10 +852,9 @@ impl ReflowGrid {
     }
 }
 
-/// A terminal that reflows the rows it has already drawn when it narrows and reports the new width only
-/// afterwards — the VS Code/xterm.js ordering that strands fold rows. Once the new width is known, the
-/// fold must erase the whole reflowed region on every frame, stranding nothing, and must not eat the
-/// transcript row above it.
+/// Emulator width can reflect reflow before the kernel size changes. The next
+/// frame must use it to reclaim the complete fold without erasing the preceding
+/// transcript.
 #[test]
 fn thinking_fold_reclaims_rows_stranded_by_a_resize_reported_after_the_reflow() {
     let _guard = crate::ai::test_support::ENV_LOCK
@@ -887,11 +882,9 @@ fn thinking_fold_reclaims_rows_stranded_by_a_resize_reported_after_the_reflow() 
     }
     assert_eq!(grid.text().matches("○ thinking").count(), 1, "steady state");
 
-    // The panel narrows: the terminal reflows what it has drawn, and the new winsize reaches this
-    // process only after the next frame has already been written at the old width.
+    // The emulator reflows before the local width fallback is updated.
     grid.resize(60);
-    // The frame queries the emulator before measuring: it sees the reflowed width while ioctl still
-    // reports the old one, so its erase must cover the region outright.
+    // A cached emulator width covers reflow while the local fallback is stale.
     crate::ai::stream::side_note_input::set_scripted_true_width(Some(60));
     let mut bytes = Vec::new();
     thinking_fold_redraw_to(&mut bytes, Some("~1002 tok @ 102 tok/s"), fold).unwrap();
@@ -932,9 +925,8 @@ fn thinking_fold_reclaims_rows_stranded_by_a_resize_reported_after_the_reflow() 
     crate::ai::stream::side_note_input::set_scripted_true_width(None);
 }
 
-/// L=0 timing: the reflow and the winsize update both land between frames, so no frame ever
-/// renders against a stale width. The next frame already knows the new width, its own span
-/// covers the whole region, and without any stale-width correction nothing may reach above it.
+/// A resize reported between frames needs no lag handling. Erasure must cover
+/// the reflowed fold while preserving the transcript row above it.
 #[test]
 fn thinking_fold_resize_reported_between_frames_does_not_erase_the_transcript() {
     let _guard = crate::ai::test_support::ENV_LOCK
@@ -982,8 +974,8 @@ fn thinking_fold_resize_reported_between_frames_does_not_erase_the_transcript() 
     );
 }
 
-/// L>=2 timing: the winsize update arrives only after TWO frames have already rendered against
-/// the stale width. Each frame queries the emulator's reflowed width first, so neither may strand a row.
+/// Cached emulator width must keep successive redraws correct while the local
+/// width fallback still reports the size from before the resize.
 #[test]
 fn thinking_fold_reclaims_every_header_stranded_by_multiple_lag_frames() {
     let _guard = crate::ai::test_support::ENV_LOCK
@@ -1010,8 +1002,8 @@ fn thinking_fold_reclaims_every_header_stranded_by_multiple_lag_frames() {
     }
     assert_eq!(grid.text().matches("○ thinking").count(), 1, "steady state");
 
-    // Reflow first; the winsize update lands only after a second stale frame, so two frames
-    // render against the old width and each of them under-erases.
+    // Keep the local width fallback stale for two frames; the cached emulator
+    // width must already provide the reflowed size.
     grid.resize(60);
     crate::ai::stream::side_note_input::set_scripted_true_width(Some(60));
     for rate in ["~1002 tok @ 102 tok/s", "~1003 tok @ 103 tok/s"] {
@@ -1396,8 +1388,8 @@ fn thinking_fold_terminal_grid_refresh_does_not_accumulate_headers() {
     assert!(failures.is_empty(), "orphan headers: {}", failures.join(", "));
 
     // Fixed viewport: no resize and no unrelated writes inside the live fold.
-    // Run with non-TTY stdout so COLUMNS/LINES, rather than an inherited ioctl
-    // size, drive the production wrapping and viewport-budget functions.
+    // Use non-TTY stdout so COLUMNS/LINES supply the geometry checked below
+    // rather than an inherited ioctl size.
     const ROWS: usize = 15;
     const COLS: usize = 140;
     unsafe {
@@ -1413,9 +1405,8 @@ fn thinking_fold_terminal_grid_refresh_does_not_accumulate_headers() {
         "run this fixture with piped stdout"
     );
 
-    // A timeout warning is ordinary output, not part of the fold footprint.
-    // Model both orderings with real renderer bytes: the old warning-first
-    // order must reproduce an orphan, while finalize-first preserves output.
+    // A timeout warning must follow finalization; writing it first shifts the
+    // cursor and leaves the live header outside the erase footprint.
     for warning_first in [true, false] {
         for body in ["", "short reasoning\nsecond line"] {
             for start_row in [0, ROWS - 2] {
@@ -1469,8 +1460,8 @@ fn thinking_fold_terminal_grid_refresh_does_not_accumulate_headers() {
         multiline.push(format!("{chunk}{}", if frame % 3 == 2 { "\n" } else { "" }));
     }
     let mut trailing_newlines = multiline.clone();
-    // Replace the long tail with short logical lines, then empty lines and an
-    // idle frame: exercise both expanding and shrinking the physical footprint.
+    // Append short lines, blanks, and an idle frame to exercise both expanding
+    // and shrinking the physical footprint.
     trailing_newlines.extend(
         ["short-a\n", "short-b\n", "short-c\n", "\n", "\n", ""]
             .map(str::to_string),

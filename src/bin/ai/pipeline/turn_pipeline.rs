@@ -48,8 +48,8 @@ impl TurnPipeline for DefaultTurnPipeline {
     ) -> Pin<
         Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>,
     > {
-        // Fire global before hooks, run the Pipeline (executing stages in
-        // sequence, including per-stage hooks), then fire global after hooks.
+        // Fire the Prepare before hooks, run per-stage hooks with the pipeline,
+        // then fire the Finalize after hooks. Errors skip later callbacks.
         // `Stage::execute` / `Pipeline::execute` decouple ctx's borrow lifetime
         // from `PipelineContext`'s internal lifetime (separate `'a`/`'b`), so we
         // can execute each segment with safe sequential `&mut` reborrows, no raw

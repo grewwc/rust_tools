@@ -3,7 +3,7 @@
 // memo-type knowledge base
 // =============================================================================
 // An interactive counterpart of `a -n <text>`:
-//   /memo              -- save the previous assistant turn's body text as a memo
+//   /memo              -- refine and save the previous assistant turn's body text
 //   /memo <text>       -- have the model refine the given text and save it as a memo
 // =============================================================================
 
@@ -23,8 +23,8 @@ fn report_status(msg: &str) {
     }
 }
 
-/// Extract the argument after an exact `/memo` or `:memo` prefix.
-/// Only accepts an exact `memo` or `memo ` prefix to avoid matching things like `/memorial`.
+/// Extract the argument after `/memo` or `:memo` followed by a space, tab,
+/// or end of input, rejecting prefix lookalikes such as `/memorial`.
 pub(crate) fn memo_command_args(input: &str) -> Option<&str> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -43,7 +43,7 @@ pub(crate) fn memo_command_args(input: &str) -> Option<&str> {
     Some(rest.trim())
 }
 
-/// Return `Ok(true)` when the input is a `/memo` command and run the save asynchronously.
+/// Recognize `/memo` or `:memo` and await its save operation.
 pub(crate) async fn try_handle_memo_command(
     app: &mut App,
     input: &str,
@@ -58,11 +58,9 @@ pub(crate) async fn try_handle_memo_command(
 async fn execute_memo_save(app: &mut App, arg: String) -> Result<(), Box<dyn std::error::Error>> {
     let store = MemoryStore::from_env_or_config();
 
-    // 1) Determine the raw text to save
     let raw_text = if !arg.is_empty() {
         arg
     } else {
-        // No argument: take the previous assistant turn's conclusion body
         match last_assistant_conclusion(app)? {
             Some(text) => text,
             None => {
@@ -79,7 +77,8 @@ async fn execute_memo_save(app: &mut App, arg: String) -> Result<(), Box<dyn std
         return Ok(());
     }
 
-    // 2) Have the model tidy up the content so it is more suitable as a knowledge-base memo
+    // Refinement is best-effort; retain the original text if the model cannot
+    // produce a nonempty note.
     print_status("[memo] 正在整理内容...");
     let model = crate::ai::models::initial_model(&app.cli);
     let messages = vec![
@@ -113,7 +112,6 @@ async fn execute_memo_save(app: &mut App, arg: String) -> Result<(), Box<dyn std
 
     clear_status();
 
-    // 3) Save to the memo category in the knowledge base
     let now = chrono::Local::now().to_rfc3339();
     let entry = AgentMemoryEntry {
         id: Some(format!("mem_{}", uuid::Uuid::new_v4().simple())),

@@ -46,10 +46,9 @@ fn response_completed_event_does_not_block_late_snapshot_text() {
 
 #[test]
 fn hidden_thinking_item_projects_active_state_without_extending_liveness() {
-    // The Responses wire streams no content for hidden thinking: the provider opens a reasoning
-    // item and then goes quiet for a long stretch (measured 111s on muse-spark xhigh). That silence
-    // is expected work in progress, so a provider-held open item selects the long allowance. The
-    // lifecycle events themselves carry no visible content and therefore must not restart the timer.
+    // An open reasoning item selects the declared-work allowance even while no
+    // text arrives. Lifecycle events carry no visible progress and must not
+    // restart the progress timer.
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
     let mut app = test_app();
@@ -148,10 +147,8 @@ fn silence_window_selection_uses_the_connection_bound_once_output_arrived() {
 
 #[test]
 fn open_function_call_item_selects_the_declared_item_allowance() {
-    // Incident shape (muse-spark-1.3, single-file artifact): the model streams one narration sentence, closes
-    // the message item, opens a `function_call` item and then generates ~20KB of arguments server-side, sending
-    // nothing until that payload is ready. Tracking only reasoning items left that silence to the connection
-    // bound, which cut the response 45s after the narration and replayed the whole generation.
+    // Function calls declare work while their arguments are generated, so they
+    // need the open-item allowance as well as reasoning items.
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
     let mut app = test_app();
@@ -205,9 +202,8 @@ fn open_function_call_item_selects_the_declared_item_allowance() {
 
 #[test]
 fn replayed_content_part_added_does_not_duplicate_visible_text() {
-    // User-visible "conclusion printed twice": a compatibility gateway re-delivers the full text of
-    // content_part.added (output_text) after the output_text.delta increments. Rendering as-is in
-    // Append mode duplicates the body; ReplayedChunk must compute the unseen suffix for content and render only the new part.
+    // A full content-part snapshot can follow delta fragments. Append only the
+    // unseen suffix so the already-committed prefix is not duplicated.
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
     let mut app = test_app();
@@ -765,10 +761,8 @@ fn inline_tool_call_fallback_does_not_persist_protocol_as_hidden_meta() {
 
 #[test]
 fn process_stream_payload_halts_and_downshifts_on_hallucinated_result_marker() {
-    // Reproduces this incident: the model fabricated a "tool call -> tool result" sequence in its
-    // visible body, emitting `<function_results>` protocol markers the system never generates. Requirements:
-    // (1) the hallucinated result block is stripped whole and never persisted; (2) the stream stops
-    // (should_stop=true); (3) degenerate_repetition finish_reason is set to take the downgrade-retry path, keeping hallucinated body text from poisoning the next request.
+    // Fabricated result envelopes must be removed from assistant text and stop
+    // the stream with the retryable degenerate-repetition finish reason.
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
     let mut app = test_app();
@@ -834,10 +828,8 @@ fn done_sentinel_is_recorded_as_provider_declared_end() {
 
 #[test]
 fn text_without_any_end_marker_escalates_to_truncated() {
-    // The "model output suddenly stops" case: visible text arrived but the
-    // stream ended with no finish_reason, no `response.completed`, no `[DONE]`.
-    // It must stay retryable so the turn continues instead of finishing on a
-    // half answer; any declared end stays Completed (next test).
+    // Without a provider end marker, keep the partial answer retryable rather
+    // than treating an interrupted stream as complete.
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
     state.content.assistant_text = "格式对齐了。现在创建内置文件".to_string();
@@ -871,9 +863,8 @@ fn text_with_done_sentinel_stays_completed() {
     );
 }
 
-// Single-shot verdict through the streaming scanner: a fresh scanner observing
-// the whole text at once must agree with the former whole-text check, so the
-// assertions below keep pinning the same behavior.
+// Use a fresh scanner for whole-text fixtures so they can be compared with
+// incremental observations of the same text.
 fn reasoning_contains_provider_control_leak(reasoning: &str) -> bool {
     ProviderControlLeakScanner::new().observe(reasoning)
 }
@@ -1014,8 +1005,8 @@ fn provider_control_leak_chunked_delivery_matches_single_shot() {
                 "two-chunk verdict must match single-shot"
             );
         }
-        // The real delivery shape: 20-byte fragments, with the verdict latched
-        // at the first report because the stream stops there.
+        // Observe growing prefixes in small byte increments, latching the first
+        // detection as the stream does when it stops.
         let mut scanner = ProviderControlLeakScanner::new();
         let mut verdict = false;
         for end in (20..=text.len())

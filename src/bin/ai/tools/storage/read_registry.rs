@@ -1,8 +1,8 @@
 // =============================================================================
 // Session read registry
 // =============================================================================
-// Every model-issued `read_file` call is recorded here: the path as passed, the
-// resolved absolute path, and the last-read time. The `list_read_files` tool
+// Successful `read_file` text reads are recorded here on a best-effort basis:
+// the requested path, resolved absolute path, and last-read time. `list_read_files`
 // turns this into a recall list, so after several turns or context compression
 // the model can answer "which files did I already read, and at what path"
 // instead of re-locating files with find/execute_command.
@@ -12,10 +12,9 @@
 // the same file are NOT merged (paths are normalized lexically, not
 // canonicalized), matching temp_registry behavior.
 //
-// Persists as JSON at `<temp_dir>/read_registry.json` (`temp_dir` prefers
-// `~/.history_file.sessions/<session>.assets/tmp/`, same origin as
-// temp_registry; fallback is the system temp dir isolated by session id), so it
-// survives session suspension/resume in a new process.
+// Persists at `runtime_ctx::temp_dir()/read_registry.json`, using session assets
+// with DRIVER_CTX or a session-scoped system-temp directory otherwise. The registry
+// survives process restarts while that directory is retained.
 // =============================================================================
 
 use std::path::{Path, PathBuf};
@@ -34,9 +33,8 @@ pub(crate) struct ReadEntry {
     pub(crate) original: String,
     /// Resolved absolute path (dedup key).
     pub(crate) abs: String,
-    /// UNIX epoch milliseconds of the most recent read (millisecond precision so
-    /// the `changed` status in list_read_files cannot miss a modification that
-    /// lands in the same wall-clock second as the read).
+    /// UNIX epoch milliseconds of the most recent read, compared with file mtime by
+    /// `list_read_files`. Edits within the same millisecond are indistinguishable.
     pub(crate) last_read: u64,
 }
 
@@ -163,7 +161,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         isolated_scope(|| {
             // Fabricate a registry with known timestamps to make ordering
-            // deterministic (register() uses wall-clock seconds).
+            // deterministic (register() uses wall-clock milliseconds).
             let (_, registry_path) = registry_paths().unwrap();
             let entries = vec![
                 ReadEntry {

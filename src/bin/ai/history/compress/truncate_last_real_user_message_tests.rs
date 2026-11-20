@@ -1,11 +1,9 @@
 //! Reactive-overflow rescue for the current user message.
 //!
-//! Covers `truncate_last_real_user_message_to_fit`: when mid-turn compression
-//! can no longer shrink the projection (its policies never touch user
-//! messages), the middle of the last real user message is offloaded to the
-//! session overflow archive and replaced with a head+tail preview stub, so a
-//! turn whose oversized body is the user's own text can still converge instead
-//! of failing outright.
+//! Rescue oversized current user text after a provider overflow. Preserve the
+//! full original in the trusted session archive before replacing inline text
+//! with a preview or pointer; file snapshots may be cut without flattening
+//! their array.
 
 use super::*;
 
@@ -543,8 +541,8 @@ fn byte_length_cache_does_not_hide_a_char_shorter_preview() {
         },
     ];
     let before = crate::ai::history::messages_total_chars_pub(&messages);
-    // A two-char cut is byte-neutral: 3998 chars plus the three-byte ellipsis is
-    // still 4000 bytes, so a byte-length staleness check cannot see the edit.
+    // A two-char cut can be byte-neutral: 3997 ASCII bytes plus a three-byte
+    // ellipsis still occupy 4000 bytes, hiding the edit from a byte-length check.
     let max_chars = before - 2;
     let met = truncate_mutable_messages_to_fit(
         &mut messages,

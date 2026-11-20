@@ -7,9 +7,6 @@ fn openai_image_content_uses_object_image_url_shape() {
     // The contract "images are sent in the {image_url:{url:...}} object shape"
     // can only be verified when the model registry (models/) contains an
     // OpenAi-provider model with is_vl=true.
-    // When no such model exists in the real environment (e.g. the registry only
-    // has a Compatible VL), this contract cannot be verified and the test is
-    // simply skipped.
     let Some(model) = first_openai_vl_model_name() else {
         eprintln!(
             "[test] skipping openai_image_content_uses_object_image_url_shape: \

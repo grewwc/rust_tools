@@ -292,7 +292,7 @@ pub(super) fn attach(
                 // reached the point where it emits the drop notice, so queue
                 // it behind the remaining data and pump once. A terminal that
                 // recovers right now still sees it; one that stays stalled
-                // loses it with the process, as before.
+                // loses it when the process exits.
                 if !backlog.is_empty() {
                     backlog.queue_notice();
                     let _ = backlog.pump(stdout_fd);
@@ -656,9 +656,8 @@ fn write_fd(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Best-effort stderr notice that never blocks: the terminal itself may be
-/// wedged (e.g. a stalled SSH link), so give the fd a short writability
-/// window and drop the notice if it does not fit.
+/// Best-effort stderr notice: briefly wait for writability, then try one write.
+/// Skip the notice when a stalled terminal is not writable.
 fn notice(text: &str) {
     let fd = libc::STDERR_FILENO;
     let mut pfd = pollfd(fd, libc::POLLOUT);

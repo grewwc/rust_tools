@@ -308,8 +308,9 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessions .session-group-badge.waiting::before { content:"?"; width:auto; height:auto; background:none; font-size:9px; line-height:1; }
 #sessions .session-group-menu { flex:0 0 24px; min-height:28px; min-width:24px; padding:2px; border:0; background:transparent; color:var(--dim); }
 #sessions .session-group-new { flex:0 0 auto; min-height:28px; min-width:44px; padding:2px 4px; border:0; background:transparent; color:var(--dim); font-size:11px; white-space:nowrap; }
-#sessions .session-group-new:active, #sessions .session-group-menu:active { background:var(--tint-3); }
-#sessions .session-group-toggle:focus-visible, #sessions .session-group-new:focus-visible, #sessions .session-group-menu:focus-visible { outline:2px solid var(--acc-focus); outline-offset:2px; }
+#sessions .session-group-more { flex:0 0 auto; min-height:28px; min-width:38px; padding:2px 4px; border:0; background:transparent; color:var(--dim); font-size:11px; white-space:nowrap; }
+#sessions .session-group-new:active, #sessions .session-group-menu:active, #sessions .session-group-more:active { background:var(--tint-3); }
+#sessions .session-group-toggle:focus-visible, #sessions .session-group-new:focus-visible, #sessions .session-group-menu:focus-visible, #sessions .session-group-more:focus-visible { outline:2px solid var(--acc-focus); outline-offset:2px; }
 @media (hover:hover) {
   #sessions .session-group-toggle:hover { color:var(--fg); }
   #sessions .session-group-new:hover:not(:disabled), #sessions .session-group-menu:hover { background:var(--surface-hover); }
@@ -1452,7 +1453,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #sessions li .rnm { min-height:44px; font-size:16px; -webkit-user-select:text; user-select:text; }
   #sessions li.session-group-head { gap:2px; padding:0 2px; margin:8px 0 2px; border-radius:0; }
   #sessions li.session-group-head:first-child { margin-top:0; }
-  #sessions .session-group-toggle, #sessions .session-group-new, #sessions .session-group-menu { min-height:44px; }
+  #sessions .session-group-toggle, #sessions .session-group-new, #sessions .session-group-menu, #sessions .session-group-more { min-height:44px; }
   #sessions .session-group-toggle { padding:2px; column-gap:4px; font-size:12px; }
   #sessions .session-group-status { gap:2px; }
   #sessions .session-group-badge { padding:1px 3px; font-size:9px; line-height:14px; letter-spacing:-.02em; }
@@ -1952,6 +1953,11 @@ let historyLoadSeq = 0;
 // holds one open until its stream ends, so the cap keeps session polling and
 // image fetches from starving behind streaming turns.
 const MAX_LIVE_TURNS = 4;
+// Reattaching to a long-running turn replays its retained event log into a
+// fresh progress view. Cap that replay to the recent tail; canonical history
+// owns the older rows, and replaying the whole log re-renders every step the
+// page already left behind.
+const REPLAY_TAIL_EVENTS = 200;
 // Guards one send's own setup (creating the session, waiting for its POST to be
 // accepted); the per-session entry takes over from there, so a turn in another
 // session never waits behind this one.
@@ -8884,17 +8890,24 @@ let sessionGroupPageEpoch = 0;
 function sessionGroupPageKey(id) {
   return JSON.stringify([store.base, id, sessFilter.trim(), sessionMarkedFilter(), sessionArchiveFilter()]);
 }
+function sessionGroupPageRevealed(id) {
+  if (id === null) return true;
+  const group = orderedSessionGroups().find((candidate) => candidate.id === id);
+  return !!group && sessionGroupVisible(group);
+}
 function sessionGroupRenderedItems(items = lastItems) {
-  if (sessionViewMode === "list" || !sessionGroupTemporaryOpen.size) return items;
-  const merged = items.slice(), known = new Set(items.map((item) => item.id));
+  if (sessionViewMode === "list") return items;
+  let merged = items;
   for (const id of [...orderedSessionGroups().map((group) => group.id), null]) {
-    if (!sessionGroupTemporaryOpen.has(sessionGroupTemporaryKey(id))) continue;
+    if (!sessionGroupPageRevealed(id)) continue;
     const page = sessionGroupPages.get(sessionGroupPageKey(id));
-    for (const item of page?.items || []) {
-      if (sessionGroupId(item) !== id || known.has(item.id)) continue;
-      known.add(item.id);
-      merged.push(item);
-    }
+    if (!page || !page.loaded) continue;
+    if (merged === items) merged = items.slice();
+    // A loaded group page is the authoritative newest-first order for that
+    // group. Keep its rows instead of appending around the global page, which
+    // may interleave an older group row after newer page rows.
+    merged = merged.filter((item) => sessionGroupId(item) !== id);
+    merged.push(...page.items);
   }
   return merged;
 }
@@ -9057,7 +9070,7 @@ function appendSessionGroupHeader(ul, group, items) {
   status.appendChild(running);
   status.appendChild(waiting);
   for (const child of [arrow, name, status]) toggle.appendChild(child);
-  const header = { head, toggle, status, running, waiting, items, rows: [] };
+  const header = { head, toggle, status, running, waiting, items, rows: [], more: null };
   sessionGroupHeaders.set(id, header);
   const toggleGroup = () => {
     const collapsed = toggle.getAttribute("aria-expanded") === "true";
@@ -9091,6 +9104,20 @@ function appendSessionGroupHeader(ul, group, items) {
     menu.onclick = (event) => { event.stopPropagation(); openSessionGroupMenu(group); };
     head.appendChild(menu);
   }
+  const more = document.createElement("button");
+  more.type = "button";
+  more.className = "session-group-more";
+  more.hidden = true;
+  more.textContent = "More";
+  more.setAttribute("aria-label", "Load more sessions in " + (group?.name || "Unassigned"));
+  if (group && !group.hidden) {
+    more.hidden = false;
+    more.onclick = (event) => { event.stopPropagation(); loadSessionGroupPage(id, false); };
+  } else {
+    more.onclick = (event) => event.stopPropagation();
+  }
+  head.appendChild(more);
+  header.more = more;
   ul.appendChild(head);
   return header;
 }
@@ -9316,7 +9343,7 @@ async function loadSessionGroupPage(id, more = false) {
   state.error = "";
   renderSessionList(lastItems);
   const current = () => base === store.base && epoch === sessionGroupPageEpoch && key === sessionGroupPageKey(id)
-    && sessionGroupTemporaryOpen.has(sessionGroupTemporaryKey(id)) && sessionGroupPages.get(key) === state && state.seq === seq;
+    && sessionGroupPageRevealed(id) && sessionGroupPages.get(key) === state && state.seq === seq;
   try {
     const offset = more ? state.offset : 0;
     const page = await fetchSessionGroupPage(id, offset);
@@ -9335,17 +9362,39 @@ async function loadSessionGroupPage(id, more = false) {
 }
 function appendSessionGroupPageControl(ul, id) {
   const state = sessionGroupPages.get(sessionGroupPageKey(id));
-  if (!state || !state.loading && !state.error && !state.hasMore) return;
+  const header = sessionGroupHeaders.get(id);
+  const group = sessionGroups.find((candidate) => (candidate.id || null) === id);
+  if (header?.more && group && !group.hidden) {
+    const more = header.more;
+    if (!state) return;
+    if (!state.loading && !state.error && !state.hasMore) {
+      more.hidden = true;
+      more.onclick = (event) => event.stopPropagation();
+      return;
+    }
+    more.hidden = false;
+    more.disabled = state.loading;
+    more.textContent = state.loading ? "Loading…" : state.error ? "Retry" : "More";
+    more.title = state.error ? "Retry loading group sessions" : "Load more in " + sessionGroupName(id);
+    more.setAttribute("aria-busy", String(state.loading));
+    more.onclick = (event) => {
+      event.stopPropagation();
+      loadSessionGroupPage(id, state.loaded && state.hasMore);
+    };
+    return;
+  }
+  if (!state && !sessionsHasMore) return;
+  if (state && !state.loading && !state.error && !state.hasMore) return;
   const row = document.createElement("li"), button = document.createElement("button");
   row.className = "session-more";
   const status = document.createElement("span");
-  status.textContent = state.error || (!state.loaded && state.loading ? "Loading group sessions…" : "");
+  status.textContent = state?.error || (!state?.loaded && state?.loading ? "Loading group sessions…" : "");
   row.appendChild(status);
   button.type = "button";
-  button.textContent = state.loading ? "Loading…" : state.error ? "Retry group sessions" : "Load more in " + sessionGroupName(id);
-  button.disabled = state.loading;
-  button.setAttribute("aria-busy", String(state.loading));
-  button.onclick = () => loadSessionGroupPage(id, state.loaded && state.hasMore);
+  button.textContent = state?.loading ? "Loading…" : state?.error ? "Retry group sessions" : "Load more in " + sessionGroupName(id);
+  button.disabled = !!state?.loading;
+  button.setAttribute("aria-busy", String(!!state?.loading));
+  button.onclick = () => loadSessionGroupPage(id, !!state?.loaded && state.hasMore);
   row.appendChild(button);
   ul.appendChild(row);
   sessionGroupHeaders.get(id)?.rows.push(row);
@@ -9472,6 +9521,9 @@ async function createSessionInGroup(groupId = null) {
     syncStopButton();
     await loadSessionGroups();
     await loadSessions({ preserveSelection: true });
+    if (sessionViewMode === "group" && sessionGroupPages.has(sessionGroupPageKey(groupId)) && sessionGroupPageRevealed(groupId)) {
+      await loadSessionGroupPage(groupId, false);
+    }
     loadSessionConfig();
   } catch (e) {
     if (base === store.base) addMsg("err", "create session failed: " + e.message, "asst err");
@@ -9901,7 +9953,7 @@ function renderSessionList(items, errText, { preserveScroll = true, followNewest
       if (!bucket.items.length && (groupId !== null || markedOnly || sessArchivedOnly) && !sessionGroupTemporaryOpen.has(sessionGroupTemporaryKey(groupId))) continue;
       entries.push(bucket);
       for (const s of bucket.items) entries.push({ s, groupId });
-      if (sessionGroupTemporaryOpen.has(sessionGroupTemporaryKey(groupId))) entries.push({ pageControl: true, groupId });
+      if (groupId !== null && sessionGroupPageRevealed(groupId)) entries.push({ pageControl: true, groupId });
     }
   }
   for (const entry of entries) {
@@ -12229,8 +12281,11 @@ async function attachEvents() {
   armSilence(); // Covers both response headers and a reader that never resolves.
   armProgress();
   try {
-    // This connection builds a fresh view; a cursor from a discarded view
-    // would skip the very events needed to reconstruct its state.
+    // This connection builds a fresh view from the recent tail. The retained
+    // log can hold thousands of progress records; replaying all of them makes
+    // switching back to a long-running turn re-render every earlier step.
+    // Canonical history owns the older rows, so the tail only needs enough
+    // records to restore the current phase and open cards.
     // The endpoint hands its live slot to one token and answers 409 to every
     // other, so an anonymous attach is a new identity on each reconnect: a
     // refresh or resumed stream would be refused, dropping the rates and
@@ -12243,7 +12298,7 @@ async function attachEvents() {
         localStorage.setItem("serve.client", clientToken);
       }
     } catch (_) {}
-    const eventsUrl = base + "/sessions/" + sid + "/events?after=0&client=" +
+    const eventsUrl = base + "/sessions/" + sid + "/events?after=0&tail=" + REPLAY_TAIL_EVENTS + "&client=" +
       encodeURIComponent(clientToken);
     const res = await fetch(eventsUrl, {
       headers: headers(false), signal: controller.signal,

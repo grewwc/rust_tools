@@ -107,28 +107,10 @@ pub(super) fn ensure_top_level_task_orchestration(tool_name: &str) -> Result<(),
         "{tool_name} is only available to top-level agents. This subagent is a leaf task; complete the assigned work directly instead of waiting on, inspecting, or cancelling parent-owned subagent tasks."
     ))
 }
-/// Called by the scheduler every epoch: scans TASK_REGISTRY for subagents still running past the
-/// wall-clock total-lifetime cap, terminates their processes, and writes a timeout terminal
-/// result.
-///
-/// Complements the wall-clock check inside `task_wait`: task_wait only triggers when the main
-/// agent actively calls it; this function proactively scans every epoch of the driver run_loop,
-/// so even if the main agent is busy elsewhere (not calling task_wait for a long time), a stuck
-/// subagent process is still terminated promptly instead of occupying scheduler resources
-/// forever.
-///
-/// Resource semantics: only kill the process + write the terminal result; the channel/futex are
-/// **not** destroyed and the entry is **not** removed from the registry — those are left to the
-/// collector (task_wait's ready path) to avoid double release. After the process is killed,
-/// `is_task_pending` returns false, so a later epoch scanning the same entry skips it and does not
-/// kill it again.
-///
-/// Lock ordering: three steps to avoid forming a lock cycle with task_wait (registry -> kernel) —
-/// 1. Lock only TASK_REGISTRY to collect the candidates, then release immediately;
-/// 2. Holding no lock, abort the Tokio task actually running the subagent;
-/// 3. Lock only the kernel (via with_os_kernel) to kill + write the result.
-/// The registry and the kernel are never held simultaneously (GLOBAL_OS and App.os are the same
-/// lock; see the reentrant-deadlock warning in os_tools.rs).
+/// Reap tasks past the total-lifetime cap independently of foreground `task_wait` calls.
+/// Signal cancellation and request Tokio abort before writing terminal timeout results.
+/// Collectors retain responsibility for result channels, completion futexes, and registry removal.
+/// Registry locks are released before kernel calls to avoid lock cycles.
 pub(crate) fn reap_timed_out_subagents() {
     // Step 1: hold only the registry lock to collect timed-out candidates (pid / channel /
     // futex), then release immediately.
@@ -153,8 +135,8 @@ pub(crate) fn reap_timed_out_subagents() {
     if candidates.is_empty() {
         return;
     }
-    // Step 2: holding no lock, stop the real Tokio Future first so it cannot write a result
-    // concurrently with the timeout terminal state.
+    // Signal cancellation and request abort before taking the kernel lock; abort does not wait
+    // for the worker Future to finish.
     for (_, _, _, _, _, abort_handle, cancel_stream) in &candidates {
         cancel_stream.store(true, Ordering::Release);
         if let Some(handle) = abort_handle {
@@ -534,8 +516,7 @@ pub(super) fn execute_task_integrate(args: &Value) -> Result<String, String> {
 /// re-guessing (the `[task_id=...]` markers in earlier results may be off-screen).
 pub(super) fn missing_task_id_error(history_file: &std::path::Path, session_id: &str) -> String {
     let mut message = "Each task integration requires a non-empty task_id".to_string();
-    // Use the full audit plus the same delivered-but-unintegrated filter as
-    // `read_unintegrated_task_evidence` (which is not re-exported at history level).
+    // Apply the delivered-but-unintegrated predicate to full spawn-audit records.
     match crate::ai::history::read_task_spawn_audit(history_file, session_id) {
         Ok(records) => {
             let ids: Vec<&str> = records
@@ -678,9 +659,8 @@ pub(crate) fn discard_tasks_for_session(session_id: &str) {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .retain(|key, _| key.session_id != session_id);
-    // Same session-scoped cleanup for the task_wait no-op escalation counter: keys keyed by a
-    // deleted session's id can never be bumped or reset again, so drop them to avoid accumulating
-    // dead entries in the long-lived process.
+    // Drop no-op counters with session state so a deleted session does not leave entries
+    // in the long-lived process.
     TASK_WAIT_NOOP_COUNTS
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
@@ -789,13 +769,9 @@ fn execute_task_cancel_with_progress(
             already_finished.push(tid);
             continue;
         }
-        // Only cancel subagents that are still running. Tasks that already ended (completed
-        // normally / failed / process terminated) are neither killed nor given a terminal result —
-        // otherwise a "cancelled" message would be appended to the channel and the channel
-        // destroyed, masking/discarding the subagent's real result and making a later task_wait
-        // read a bogus cancelled state. Cleanup of channel/futex/registry for already-ended tasks
-        // is left to the collector (task_wait's ready / failure path, or a task_wait after
-        // task_status).
+        // Recheck terminal state under the kernel lock before cancellation so results published
+        // after preflight remain intact. Finished tasks keep their real result and resources
+        // for `task_wait` / `task_status` collection.
         let was_pending = with_os_kernel(|os| {
             if !task_state_snapshot(os, entry.result_channel_id, entry.pid)?.1 {
                 return Ok(false);
@@ -926,12 +902,8 @@ pub(super) fn execute_full_task_status(
         "{:<37} {:<8} {:<14} {:<model_width$} {:<17} {:<11} {}",
         "TaskID", "PID", "Agent", "Model", "Effort", "State", "Description"
     )];
-    // For subtasks that already wrote their result back to the channel, **consume and clean up**
-    // the body directly and append it after the table. Otherwise, even if the model sees
-    // state=completed, it can only get the output by calling task_wait again; worse, if it treats
-    // "seen completed in task_status" as handled, it would bypass the collection guard and leave
-    // registry entries and channel/futex resources behind. Since the result is already returned
-    // to the model here, treat it as collected.
+    // Collect ready results into the response so seeing "completed" in the status table also
+    // delivers the payload and lets normal collection release result resources.
     let mut completed_outputs: Vec<String> = Vec::new();
     let mut finished_ids: Vec<String> = Vec::new();
     let mut printed_progress = false;

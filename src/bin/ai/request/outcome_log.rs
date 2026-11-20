@@ -9,14 +9,13 @@
 //! Design constraints (mirroring the stream-side writer):
 //! - Best-effort: recording never influences the request; failures are dropped.
 //! - Bounded: error bodies are truncated, tool-name lists are capped, and the
-//!   file rotates past 8 MiB. Message *contents* are never copied (canonical
+//!   file rotates past 8 MiB. Message *contents* are never logged (canonical
 //!   history already persists them); only counts and sizes are recorded.
-//! - No secrets: API keys travel in headers and are never part of the logged
-//!   fields; the endpoint URL carries no credentials.
-//! - Layering: `request` must not depend on `stream`, so the tiny
-//!   append/rotate boilerplate is duplicated here instead of shared. Both
-//!   writers append whole lines with `O_APPEND`, so concurrent writers cannot
-//!   interleave bytes inside a line.
+//! - Payload: request headers are excluded; endpoint URLs and error bodies are
+//!   recorded as supplied by the caller.
+//! - Layering: keep request and stream outcome writers independent. The
+//!   append/rotate helpers mirror the stream-side writer; append mode preserves
+//!   existing bytes, and `APPEND_LOCK` serializes this module's appends within a process.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -180,7 +179,7 @@ fn tool_summary(tools: Option<&Value>) -> (usize, Vec<String>) {
     (items.len(), names)
 }
 
-/// `(message count, content chars)`; contents are measured, never copied.
+/// `(message count, content chars)`; only aggregate counts enter the log.
 fn message_stats(messages: &[Message]) -> (usize, usize) {
     let mut chars = 0;
     for message in messages {

@@ -6,11 +6,9 @@ use super::super::*;
 use crate::ai::provider::{ALIBABA_DEFAULT_ENDPOINT, OPENCODE_DEFAULT_ENDPOINT, ApiProvider};
 use serde_json::Value;
 
-/// Synthetic pre-resolved inputs for wire-behavior assertions (see the header
-/// comment in `request_body.rs`): the (adapter, request_model, endpoint,
-/// effort_wire) quad mirrors what the old registry entry resolved to, per the
-/// `thinking_dialect_for` dispatch in
-/// `src/bin/ai/provider/adapter/thinking.rs`.
+/// Pre-resolved inputs keep wire assertions independent of registry renames.
+/// `resolve_reasoning_wire_controls_from_parts` in `request/reasoning.rs`
+/// combines provider dialect selection with explicit effort wire placement.
 fn synthetic_inputs(
     request_model: &str,
     endpoint: &str,
@@ -87,9 +85,8 @@ fn opencode_deepseek_entries_exist() {
 
 #[test]
 fn deepseek_request_body_uses_thinking_object() {
-    // Mirrors the old plaintext OpenCode DeepSeek entry: OpenCode adapter,
-    // DeepSeek request name on the OpenCode endpoint → the DeepSeek thinking
-    // object dialect.
+    // OpenCode dispatch selects the DeepSeek thinking object for a DeepSeek
+    // request model.
     const REQUEST_MODEL: &str = "synthetic-deepseek-v4";
     let messages = user_hi();
     let inputs = synthetic_inputs(
@@ -141,9 +138,8 @@ fn deepseek_request_body_uses_thinking_object() {
 
 #[test]
 fn non_deepseek_request_body_omits_thinking_object() {
-    // Mirrors the old qwen3.8-max entry: Alibaba adapter on DashScope → the
-    // enable_thinking dialect, which never emits the DeepSeek `thinking`
-    // object.
+    // Alibaba on DashScope uses `enable_thinking` and omits the DeepSeek
+    // `thinking` object.
     let messages = user_hi();
     let inputs = synthetic_inputs(
         "synthetic-qwen",
@@ -212,13 +208,9 @@ fn deepseek_tool_call_messages_echo_empty_reasoning_content() {
 
 #[test]
 fn opencode_deepseek_tool_call_messages_echo_even_without_thinking_gate() {
-    // The mirrored OpenCode DeepSeek entries declare exact replay; the DeepSeek
-    // thinking dialect still requires echoing reasoning_content on tool-call
-    // assistant messages, so normalize fills "" even when the thinking gate is
-    // off. The thinking object then reflects the off gate, while the
-    // registry-declared top_level effort tier is still placed (the official
-    // API documents [none, low, high, max] and the disabled thinking object
-    // takes precedence, so carrying the tier is harmless).
+    // DeepSeek assistant messages retain the `reasoning_content` echo shape
+    // even when the thinking gate is off. Explicit top-level effort placement
+    // is tested separately from the disabled thinking object.
     const TAG: &str = "synthetic-deepseek-v4";
     let messages = vec![Message {
         role: "assistant".to_string(),
@@ -305,9 +297,6 @@ fn deepseek_non_tool_call_assistant_messages_echo_reasoning_shape() {
         },
     ];
 
-    // The gateway requires reasoning_content on assistant tool-call messages;
-    // plain assistant messages keep the same shape so the echo contract holds
-    // across the turn (mirrors the old plaintext OpenCode DeepSeek entry).
     normalize_reasoning_content_replay_from_parts(
         TAG,
         true,
@@ -323,10 +312,9 @@ fn deepseek_non_tool_call_assistant_messages_echo_reasoning_shape() {
 
 #[test]
 fn deepseek_flagged_model_replays_own_exact_blob_and_fills_missing_shape() {
-    // Mirrors the old deepseek-v4.1-flash-opencode entry: OpenCode adapter,
-    // DeepSeek name, exact replay. Own tagged blob decodes to the original
-    // text; missing shape fills ""; foreign blobs clear to "" (never leak
-    // verbatim into the DeepSeek echo field).
+    // Declared exact replay decodes the model's own tagged blob. Missing or
+    // foreign state becomes the required empty echo shape, keeping internal
+    // markers out of the provider field.
     const TAG: &str = "synthetic-deepseek-v4";
     const FOREIGN_TAG: &str = "synthetic-glm";
     let tool_call = || Message {
@@ -407,9 +395,8 @@ fn deepseek_flagged_model_replays_own_exact_blob_and_fills_missing_shape() {
 
 #[test]
 fn reasoning_content_replay_is_exact_only_for_declared_models() {
-    // Synthetic tags mirror the old keys: exact-replay GLM (glm-5.3, OpenCode
-    // adapter — no DeepSeek echo), non-replay OpenAI-family, DeepSeek echo
-    // dialect.
+    // Synthetic tags cover declared exact replay without a DeepSeek echo,
+    // a model without replay, and the DeepSeek echo dialect.
     const GLM_TAG: &str = "synthetic-glm";
     const GPT_TAG: &str = "synthetic-gpt";
     const DEEPSEEK_TAG: &str = "synthetic-deepseek-v4";
@@ -479,11 +466,9 @@ fn reasoning_content_replay_is_exact_only_for_declared_models() {
     );
     assert_eq!(untagged[0].reasoning_content, None);
 
-    // The DeepSeek echo dialect does not decode exact blobs, but it must echo
-    // the field shape: an exact-tagged blob from another model clears to "",
-    // while plain untagged reasoning passes through. This prevents the
-    // internal marker from leaking while keeping the chain-of-thought echo
-    // the gateway requires.
+    // A foreign exact-replay blob clears to the required empty echo shape;
+    // untagged reasoning passes through. Internal markers must not reach the
+    // provider's reasoning field.
     let mut switched_to_deepseek = vec![projected.clone()];
     normalize_reasoning_content_replay_from_parts(
         DEEPSEEK_TAG,
@@ -533,8 +518,8 @@ fn reasoning_content_replay_is_exact_only_for_declared_models() {
 /// side-channel is rebuilt from history before normalize; see transport.rs).
 #[test]
 fn encrypted_replay_blob_cleared_when_switching_to_shape_only_model() {
-    // Mirrors the old muse-spark encrypted-replay entry: OpenCode adapter on a
-    // Responses endpoint (no DeepSeek echo), no exact plaintext replay.
+    // The Responses origin does not need a DeepSeek `reasoning_content` echo
+    // field; encrypted replay uses a separate input-item channel.
     const ORIGIN_TAG: &str = "synthetic-muse-spark";
     const DEEPSEEK_TAG: &str = "synthetic-deepseek-v4";
     let items = vec![json!({"id": "rs_1"})];
@@ -600,8 +585,6 @@ fn encrypted_replay_blob_cleared_when_switching_to_shape_only_model() {
 /// otherwise "off" is silently dropped and the model keeps reasoning.
 #[test]
 fn dashscope_alibaba_provider_honors_enable_thinking_gate() {
-    // Mirrors the old "first Alibaba adapter entry": Alibaba adapter on the
-    // DashScope compatible-mode endpoint.
     let messages = user_hi();
     let inputs = synthetic_inputs(
         "synthetic-qwen-gate",
@@ -637,10 +620,8 @@ fn dashscope_alibaba_provider_honors_enable_thinking_gate() {
 /// blow the aux task timeout.
 #[test]
 fn dashscope_aux_requests_disable_thinking_regardless_of_provider() {
-    // Triples mirror the old qwen3.8-max / qwen3.8-flash-alibaba /
-    // deepseek-v4.1-flash entries: Alibaba adapter on DashScope — including a
-    // DeepSeek-named model, which must still get `enable_thinking:false` (the
-    // Alibaba arm ignores the model name).
+    // Alibaba dispatch uses `enable_thinking` even for DeepSeek request names;
+    // the model name does not override the adapter's switch dialect.
     for (request_model, endpoint) in [
         ("synthetic-qwen-max", ALIBABA_DEFAULT_ENDPOINT),
         ("synthetic-qwen-flash", ALIBABA_DEFAULT_ENDPOINT),
@@ -675,8 +656,8 @@ fn dashscope_aux_requests_disable_thinking_regardless_of_provider() {
     );
     assert!(deepseek.get("enable_thinking").is_none());
 
-    // NoOffSwitchDialect members (MiniMax / beam: always-on reasoning) send no
-    // thinking fields at all — there is no reliable gateway off switch.
+    // NoOffSwitchDialect members send no thinking fields because the adapter
+    // declares no reliable off switch.
     let mut mimo = json!({"model": "synthetic-mimo-wire"});
     apply_aux_thinking_fields_from_parts(
         ApiProvider::OpenCode,
@@ -706,9 +687,6 @@ fn dashscope_aux_requests_disable_thinking_regardless_of_provider() {
 
 #[test]
 fn openai_request_body_omits_nonstandard_flags() {
-    // Synthetic OpenAI-family triple (the registry currently declares no
-    // OpenAi-adapter entry, so the old test always skipped silently; the wire
-    // shape below now executes unconditionally).
     let messages = user_hi();
     let inputs = synthetic_inputs("synthetic-gpt", OPENAI_ENDPOINT, ApiProvider::OpenAi, None);
 
@@ -739,8 +717,6 @@ fn openai_request_body_omits_nonstandard_flags() {
 
 #[test]
 fn alibaba_request_body_keeps_extension_flags() {
-    // Mirrors the old qwen3.8-max entry: Alibaba adapter on DashScope with a
-    // declared top_level effort wire.
     let messages = user_hi();
     let inputs = synthetic_inputs(
         "synthetic-qwen",

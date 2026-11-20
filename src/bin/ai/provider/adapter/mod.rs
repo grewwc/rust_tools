@@ -1,14 +1,8 @@
 //! Provider behavior adaptation layer.
 //!
-//! Converges the previously scattered "branch by provider" logic from
-//! `request.rs` / `models.rs` / `stream/normalize.rs` / `stream/runtime.rs` /
-//! `driver/reflection/background.rs` into a set of zero-state static singletons
-//! (template method + override).
-//!
-//! The main pipeline keeps its free-function skeleton; only at the divergence
-//! points does it call this module's hooks, so every provider's external wire
-//! behavior (request-body serialization, streaming parse results, auth headers)
-//! is byte-identical across providers.
+//! Zero-state adapter singletons share defaults and override provider-specific
+//! request fields, stream parsing, and credential selection. The request and
+//! stream pipelines call these hooks at provider-dependent boundaries.
 //!
 //! This module only carries the cross-provider public contract: the
 //! [`ProviderAdapter`] trait and the [`adapter_for`] dispatch. Each concrete
@@ -16,8 +10,7 @@
 //! `openai` / `openrouter` / `opencode`).
 //!
 //! The wire encoding of the thinking switch is an axis orthogonal to the
-//! provider, moved into the [`thinking`] submodule ([`thinking_dialect_for`]);
-//! provider adapters no longer participate in thinking-field encoding.
+//! provider, handled by the [`thinking`] submodule ([`thinking_dialect_for`]).
 
 mod alibaba;
 pub(in crate::ai) mod compatible;
@@ -122,8 +115,8 @@ pub(crate) trait ProviderAdapter: Send + Sync {
     }
 
     /// Parses a single provider-specific streaming payload. Defaults to the
-    /// generic loose parse and prints detailed diagnostic logs on failure;
-    /// OpenCode overrides with a looser parse and shorter logs.
+    /// shared loose parser with detailed diagnostics on failure; OpenCode
+    /// handles end markers and customizes failure diagnostics.
     fn parse_provider_chunk(&self, payload: &str) -> ParsedStreamPayload {
         match try_parse_stream_chunk_loose(payload) {
             Some(chunk) => ParsedStreamPayload::Chunk(chunk),

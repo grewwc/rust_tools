@@ -48,9 +48,8 @@ fn print_history_help() {
 /// shares between fds 0 and 1, so a temporary `O_NONBLOCK` here would also make
 /// concurrent render writes fail with `EAGAIN`. Flushing needs no mode change
 /// and cannot block on a partial line the way a canonical-mode read would.
-/// Unlike the old non-blocking drain, `TCIFLUSH` also discards a partially
-/// typed canonical-mode line; that matches this function's contract of clearing
-/// pending input before the next prompt.
+/// `TCIFLUSH` also discards a partially typed canonical-mode line, matching the
+/// contract of clearing pending input before the next prompt.
 pub(crate) fn clear_stdin_buffer() {
     use std::io::IsTerminal;
     if !io::stdin().is_terminal() {
@@ -227,9 +226,8 @@ struct HistoryPreviewItem {
     user_ordinal: Option<usize>,
     message_id: Option<i64>,
     archive_only: bool,
-    /// The model that produced this message, persisted as `source_model`
-    /// provenance in sqlite history; `None` for legacy blob history or messages
-    /// written before the column existed.
+    /// Persisted `source_model` metadata, identifying the producing model for
+    /// assistant messages. Legacy or unattributed messages may have no value.
     source_model: Option<String>,
 }
 
@@ -470,8 +468,8 @@ fn is_history_session_selector(token: &str) -> bool {
 
 /// Parses `/history <session-id> ...` without touching the current session.
 /// `last [N]` replays the Nth most recent assistant conclusion with markdown
-/// rendering (same as `/history last [N]`); other forms show a message
-/// preview. Single-message text-only replay uses the explicit `replay` form.
+/// rendering (same as `/history last [N]`); other forms select a message
+/// preview to show, export, or copy. Text-only replay uses the explicit `replay` form.
 /// Mutations are rejected here so cross-session history stays read-only.
 fn parse_other_session_history_command(
     session_id: String,
@@ -528,8 +526,8 @@ fn parse_other_session_history_command(
 
 /// Resolves a `/history <session-id>` selector to its persisted history file.
 /// Accepts an exact id, the `current` alias, or a unique id prefix; anything
-/// else reports the closest matches so a short id remains usable. (`last`
-/// stays a current-session replay verb and never reaches this resolver.)
+/// else reports a missing or ambiguous selector, listing matching prefixes
+/// when ambiguous. (`last` stays a current-session replay verb.)
 fn resolve_other_session_history_file(
     app: &App,
     selector: &str,
@@ -608,8 +606,8 @@ fn parse_history_preview_options(
     let mut action = HistoryAction::Show;
     let mut idx = 0usize;
     // A bare `/history` is a quick peek; a role-filtered query wants every
-    // match, so it defaults to the cap. `full` keeps its own small count, and
-    // an explicit count always wins.
+    // match, so it defaults to the cap unless `full` or an explicit count has
+    // set the preview size during parsing.
     let mut role_filtered = false;
     let mut explicit_count = false;
 
@@ -857,8 +855,7 @@ fn render_history_message_at(app: &App, nth_back: usize) -> Result<(), Box<dyn E
             if let Some(model) = source_model {
                 println!("[history] This message was produced by model: {model}");
             }
-            // Same display-only post-processing as the live turn path, so a
-            // replay renders exactly what the turn painted.
+            // Apply the current display-only postprocessor, as for live turns.
             let text = super::turn_runtime::postprocess_terminal_text(text);
             crate::ai::stream::render_markdown_block(&text)?;
             Ok(())
@@ -935,8 +932,8 @@ fn render_other_session_message_at(
     }
 }
 
-/// 渲染 `/history replay` 的输出：只取最后一轮 assistant 的结论文本，
-/// 跳过 tool_calls（工具调用步骤）与 reasoning_content（thinking）。
+/// Render `/history replay` as the latest assistant conclusion text, skipping
+/// tool-call messages and reasoning, even if the latest turn has no conclusion.
 fn render_history_replay(app: &App) -> Result<String, Box<dyn Error>> {
     Ok(match last_assistant_conclusion_text(app)? {
         Some(text) => text,
@@ -1037,7 +1034,7 @@ fn render_history_preview_for_path(
     Ok(out.trim_end().to_string())
 }
 
-/// Reads the last assistant conclusion from an explicit history file.
+/// Reads the `nth_back`-most-recent assistant conclusion from an explicit history file.
 fn assistant_conclusion_text_at_path(
     history_file: &Path,
     nth_back: usize,
@@ -1404,7 +1401,7 @@ fn default_history_export_path(app: &App) -> PathBuf {
 pub(in crate::ai) const IMAGE_PLACEHOLDER_PREFIX: &str = "[[image:";
 pub(in crate::ai) const IMAGE_PLACEHOLDER_SUFFIX: &str = "]]";
 
-/// Bare filenames referenced by `[[image:name]]` placeholders in `prompt`,
+/// Names or paths referenced by `[[image:name]]` placeholders in `prompt`,
 /// in order of first appearance, deduplicated. The prompt itself is left
 /// untouched. Serve-chat clients reuse this to upload pasted images with the
 /// turn: a remote server shares no filesystem with the client, so the files
@@ -1528,7 +1525,7 @@ pub(crate) fn extract_forced_skill_references(question: &mut String) -> Vec<Stri
     }
 
     if !selected.is_empty() {
-        // 清理因移除 token 可能残留的多余空白。
+        // Trim outer whitespace left after removing skill references.
         *question = rewritten.trim().to_string();
     }
     selected
@@ -2240,8 +2237,6 @@ mod tests {
         assert_eq!(
             parse_local_command("/history grep panic").unwrap(),
             Some(LocalCommand::ShowHistory(HistoryPreviewOptions {
-                // A keyword search narrows the set, so it returns every match
-                // up to the cap instead of the short default peek.
                 count: HISTORY_PREVIEW_DEFAULT_COUNT,
                 role_filter: HistoryRoleFilter::All,
                 full: false,
@@ -3316,7 +3311,6 @@ mod tests {
                 .as_ref()
                 .is_some_and(|ctx| ctx.tools.is_empty())
         );
-        // rewind 后显式工具启用列表应被清空。
 
         let remaining = history::build_message_arr(usize::MAX, history_path.as_path()).unwrap();
         assert_eq!(remaining.len(), 2);
@@ -3599,7 +3593,7 @@ mod tests {
                 }
             }
         }
-        // Empty histories retain the old target-specific errors.
+        // Empty histories return the same target-specific errors as the full-load reference.
         let mut app = test_app();
         app.session_history_file = dir.join("empty.sqlite");
         for target in [
@@ -3745,7 +3739,7 @@ mod tests {
             "[history] Rewound from u2: remove · removed 2 message(s); kept 3 message(s)."
         );
         assert_eq!(app.stale_patch_targets, expected);
-        // Truncation still keeps the current file's prefix, as before the fix.
+        // Truncation keeps the current file's prefix; stale-target recovery uses the plan-time snapshot.
         assert_eq!(
             history::build_message_arr(usize::MAX, &history_path).unwrap(),
             messages[..keep]
@@ -3893,8 +3887,6 @@ mod tests {
 
     #[test]
     fn room_badge_absent_without_parseable_rooms() {
-        // No tempfile dependency in this project; reuse the existing
-        // std::env::temp_dir + uuid pattern.
         let dir =
             std::env::temp_dir().join(format!("badge_test_{}", uuid::Uuid::new_v4().simple()));
         let history_file = dir.join("history.sqlite");
@@ -4048,8 +4040,6 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
         editor.set_current_reasoning_effort_label(reasoning_effort_label);
         editor.set_current_backend_label(backend_label);
         editor.set_session_id(app.session_id.clone());
-        // Derive the session topic from the first user message. A session with
-        // no user messages is displayed as "new session".
         // SessionStore derives `<stem>.sessions/` from the base history file;
         // passing the current session file's parent would create a nested path
         // and hide an already-generated title.

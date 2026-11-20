@@ -619,8 +619,8 @@ fn archive_context_snapshot(conn: &Connection, path: &Path) -> io::Result<()> {
             .map_err(|error| sqlite_error(path, "clear context_snapshot_history", error))?;
         return Ok(());
     }
-    // History watermarks increase monotonically; an equivalent or newer range
-    // is not an older fallback.
+    // The ring keeps increasingly covered prefixes; repeated or older watermarks
+    // do not add an earlier rewind boundary.
     // A row without a payload cannot be promoted (for example one written by a
     // build that predates payloads); drop it first so it neither blocks a new
     // archive nor takes a ring slot.
@@ -708,10 +708,8 @@ fn read_archived_context_messages(
 
 /// Serialize one ring entry into a single gzip payload.
 ///
-/// A projection repeats message JSON structure and consecutive boundaries often
-/// share text, so one compressed payload is several times smaller than storing
-/// the same rows again. The ring is only read as a whole during a rewind, which
-/// makes a single payload a good fit.
+/// Compress repeated JSON structure within each projection. Rewinds read an
+/// entire entry, so one compressed payload fits that access pattern.
 fn encode_context_history_payload(messages: &[ArchivedContextMessage]) -> io::Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     // Stream serialization straight into the gzip encoder instead of
@@ -732,7 +730,7 @@ fn decode_context_history_payload(payload: &[u8]) -> io::Result<Vec<ArchivedCont
 ///
 /// Archived projections that cover removed rows can never serve a later rewind
 /// and are dropped. The promoted row itself stays in the ring: it still covers
-/// only surviving rows, so a deeper rewind can reuse it. Returns whether a
+/// only surviving rows and remains eligible for later cutoffs that cover it. Returns whether a
 /// projection was restored.
 pub(super) fn promote_context_snapshot_from_history(
     conn: &Connection,
@@ -1020,9 +1018,8 @@ pub(in crate::ai) fn read_latest_history_summary_before_id_sqlite(
         let Some(text) = message.content.as_str() else {
             continue;
         };
-        // Summary-prefix recognition uniformly goes through compress::is_summary_note_text (the single source of truth).
-        // Previously three prefixes were hardcoded here, missing `长期记忆摘要（压缩保留）`, so the fast path
-        // could not find the summary continuation point produced by the overflow path and fell back to a full slow re-compaction every turn.
+        // Use the shared summary recognizer so all supported formats can serve
+        // as a continuation point.
         if is_summary_note_text(text) {
             return Ok(Some(message));
         }
@@ -1030,9 +1027,8 @@ pub(in crate::ai) fn read_latest_history_summary_before_id_sqlite(
     Ok(None)
 }
 
-/// Read the most recent context checkpoint markers before the sliding window. They are the only
-/// index for the body assets and must not silently vanish from the request context just because the SQLite fast path only loads recent turns.
-/// The request normalization layer still restricts the final projection to the most recent 8 entries.
+/// Read earlier context-checkpoint markers so a recent-turn window retains
+/// recovery locators for body assets that it would otherwise exclude.
 pub(in crate::ai) fn read_context_checkpoint_markers_before_id_sqlite(
     history_file: &Path,
     before_message_id: i64,

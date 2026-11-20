@@ -263,7 +263,7 @@ static BACKENDS: LazyLock<BackendRegistry> = LazyLock::new(|| {
     BackendRegistry::new(backends).expect("invalid subagent backend registry")
 });
 
-/// Force static validation at startup, without querying models or launching a CLI.
+/// Return the lazily initialized registry without querying models or launching a CLI.
 pub(crate) fn backend_registry() -> &'static BackendRegistry {
     &BACKENDS
 }

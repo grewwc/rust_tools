@@ -50,7 +50,6 @@ pub fn try_handle_goal_command(
 
     let rest = trimmed["/goal".len()..].trim();
 
-    // /goal status -- show the state
     if rest.eq_ignore_ascii_case("status") {
         match &app.goal_mode {
             None => println!("Goal mode: {}", "off".dimmed()),
@@ -62,7 +61,6 @@ pub fn try_handle_goal_command(
         return Ok(true);
     }
 
-    // /goal exit / off / stop -- exit goal mode
     if rest.eq_ignore_ascii_case("exit")
         || rest.eq_ignore_ascii_case("off")
         || rest.eq_ignore_ascii_case("stop")
@@ -77,7 +75,6 @@ pub fn try_handle_goal_command(
         return Ok(true);
     }
 
-    // /goal <content> -- set the goal directly and enter goal mode
     if !rest.is_empty() {
         app.goal_mode = Some(rest.to_string());
         let prompt = build_goal_prompt(rest);
@@ -207,7 +204,6 @@ mod tests {
         assert!(try_handle_goal_command(&mut app, "/goal exit").unwrap());
         assert!(app.goal_mode.is_none());
 
-        // Also test off/stop/quit
         app.goal_mode = Some("some goal".to_string());
         assert!(try_handle_goal_command(&mut app, "/goal off").unwrap());
         assert!(app.goal_mode.is_none());
@@ -254,7 +250,7 @@ mod tests {
 
     #[test]
     fn idle_goal_exits_only_on_natural_completion() {
-        // Natural completion (not interrupted) -> exit goal mode and notify.
+        // An active interactive goal may exit when the turn was not interrupted.
         assert!(should_exit_goal_on_idle(true, false, false));
         // Interrupted by Ctrl+C -> keep goal mode; do not report a false completion.
         assert!(!should_exit_goal_on_idle(true, false, true));

@@ -444,7 +444,7 @@ fn prepare_subagent_task_auto_selects_model_and_fallback() {
         "rt_subagent_model_{}.configw",
         uuid::Uuid::new_v4().simple()
     ));
-    // 默认已改为继承主 agent 模型；显式关闭继承，强制走自动选择路径。
+    // Disable parent-model inheritance so this fixture exercises automatic selection.
     std::fs::write(&cfg_path, "ai.subagent.model_inherit = false\n").unwrap();
     let old_cfg = std::env::var_os("CONFIGW_PATH");
     unsafe { std::env::set_var("CONFIGW_PATH", &cfg_path) };
@@ -1329,9 +1329,8 @@ fn auto_selection_errors_when_every_subagent_opts_out() {
 
 #[test]
 fn selection_explanation_mentions_quality_tier_for_auto_model_choice() {
-    // 之前这里硬编码 "qwen3-max"；该模型已经从模型注册表移除。
-    // 改为从真实条目中找一个 Alibaba+flagship 的模型，确保解释里出现
-    // "flagship" 和 "alibaba" 这两个 tier/adapter 关键字。
+    // Choose by adapter and tier so model registry changes do not invalidate
+    // the attribution assertions.
     use crate::ai::provider::{ApiProvider, ModelQualityTier};
     let model = crate::ai::model_names::all()
         .iter()
@@ -1883,7 +1882,7 @@ fn task_wait_escalates_repeated_noop_wait_on_delivered_task_to_error() {
         },
     )
     .unwrap();
-    // DriverContext is not Clone, so rebuild it per call (all fields are cheap Arc clones).
+    // Each sync_scope consumes its context; construct a fresh one for each poll.
     let make_context = || {
         DriverContext::new(
             app.clone(),
@@ -3931,7 +3930,7 @@ fn subagent_progress_update_never_wakes_parked_parent() {
             .unwrap();
         let channel = os.channel_create(Some(child_pid), 1, "pending-result".to_string());
         let futex = os.futex_create(0, "pending-complete".to_string());
-        // 让 owner 真正进入 Waiting：等待一个永不完成的独立事件（模拟 task_wait park）。
+        // Park the owner on the child's completion futex to model task_wait.
         os.set_current_pid(Some(owner_pid));
         let park_event = os.futex_event_id(futex).expect("futex has an event id");
         os.wait_on_events(vec![park_event], WaitPolicy::All, None)
@@ -4112,9 +4111,8 @@ fn wake_expired_task_waits_reaps_orphaned_state_when_owner_gone() {
 
 #[test]
 fn side_note_target_validation_accepts_stopped_subagent() {
-    // Regression: SIGSTOP pauses a subagent (Stopped) but does not finish it; a
-    // side-note sent during the pause must queue normally and become visible
-    // after SIGCONT instead of being rejected as "already finished".
+    // A stopped subagent is still pending, so target validation must accept it
+    // before and after SIGCONT and reject it only once it terminates.
     let _env_guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -4211,8 +4209,8 @@ fn side_note_target_validation_accepts_stopped_subagent() {
     assert!(remove_task_entry(&task_id).is_some());
 }
 
-/// A targeted side-note must land in the queue the subagent drains, which is
-/// the child's own history file, not the lead's.
+/// Kernel side-notes resolve to the child's history file so the child can
+/// drain its own queue.
 #[test]
 fn side_note_target_resolves_child_history_file() {
     let _env_guard = crate::ai::test_support::ENV_LOCK

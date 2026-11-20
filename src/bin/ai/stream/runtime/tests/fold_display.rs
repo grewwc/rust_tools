@@ -267,12 +267,8 @@ fn subagent_fold_redraw_preserves_body_and_footer() {
 
 #[test]
 fn thinking_fold_header_anchored_once_and_window_rows_track_body_only() {
-    // The header is reprinted on every redraw (each redraw erases one extra
-    // row above the body and redraws the header there, so a resize reflow that
-    // outruns the app's view of the width cannot leave permanent stacked
-    // markers); window_rows still counts only body physical rows (excluding
-    // the header), so cursor-up erasure targets the visible body area and
-    // never drifts when the window scrolls into scrollback.
+    // Redraws replace the header together with the body, while `window_rows`
+    // records only physical body rows for later erasure.
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -305,8 +301,6 @@ fn thinking_fold_header_anchored_once_and_window_rows_track_body_only() {
 
 #[test]
 fn fold_body_row_budget_disables_clamp_when_viewport_unknown() {
-    // Non-tty / pipe / test: viewport height is unknown, so clamping must be disabled (usize::MAX) to
-    // preserve the exact previous behavior — no rendered byte changes off a real terminal.
     assert_eq!(fold_body_row_budget_for(None), usize::MAX);
 }
 
@@ -327,10 +321,8 @@ fn fold_body_row_budget_leaves_headroom_for_header_marker_and_cursor() {
 
 #[test]
 fn short_viewport_clamps_fold_window_so_header_plus_body_stay_visible() {
-    // Regression: with a configured window larger than the viewport can hold, the live window must be clamped
-    // to `viewport - reserved` body rows so `header + window_rows` never exceeds the viewport. Otherwise the
-    // window top scrolls into scrollback, the relative-cursor erase can no longer reach it, and every redraw
-    // leaks a stacked `… more` / `… N earlier lines` marker (the screenshot failure).
+    // Clamp the visible body so the header and marker fit within this viewport.
+    // Relative cursor erasure cannot reclaim rows that have scrolled into scrollback.
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -359,7 +351,8 @@ fn short_viewport_clamps_fold_window_so_header_plus_body_stay_visible() {
     let (window, rows) = render_thinking_fold_window(fold);
     fold.max_visible_lines = configured; // model-facing config must be restored untouched
 
-    // Body rows are bounded by the budget, and the whole window (header + body) fits the viewport with headroom.
+    // Content rows use the budget; an additional marker row still leaves room
+    // for the header in this viewport.
     assert!(
         rows <= budget + 1, // budget body rows + at most one fold-marker row
         "clamped window body rows {rows} exceed budget {budget}"

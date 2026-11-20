@@ -52,13 +52,12 @@ pub(super) enum ModelQualityTier {
 pub(super) enum ReasoningEffort {
     /// Explicit lowest tier: sends `reasoning_effort: "none"` (`reasoning: {"effort":"none"}` on
     /// the Responses wire). Differs from "omit the field" (`override = Some(None)`, where the
-    /// server default takes over and keeps thinking on): `None` is the true reasoning floor,
-    /// used by gpt-5.x in place of the removed `minimal`. It is emitted by the truncation
+    /// server default takes over). It is emitted by the truncation
     /// ladder's last-resort force-off fallback (`thinking_disabled_override`, see
     /// `request::reasoning::apply_thinking_force_off_effort`) and by the internal attached-image
     /// parse dispatch; the graduated ladder itself deliberately never sends it (orchestrator.rs)
-    /// because an explicit none during convergence retries would castrate reasoning instead of
-    /// shrinking it.
+    /// because an explicit none during convergence retries would disable reasoning instead of
+    /// reducing its effort.
     None,
     Minimal,
     Low,
@@ -83,8 +82,8 @@ impl ReasoningEffort {
         }
     }
 
-    /// Parses a string from the CLI / `/model effort` command. Only recognizes the five
-    /// tier literals case-insensitively; control semantics like `off`/`none`/`auto` are left to the caller.
+    /// Parses a string from the CLI / `/model effort` command. Recognizes tier literals
+    /// case-insensitively; control semantics like `off`/`none`/`auto` are left to the caller.
     pub(super) fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "minimal" | "min" => Some(Self::Minimal),
@@ -211,35 +210,31 @@ mod tests {
     fn reasoning_effort_none_is_explicit_low_bound_not_user_parseable() {
         // `None` is the explicit lowest tier, sending `reasoning_effort: "none"`.
         assert_eq!(ReasoningEffort::None.as_str(), "none");
-        // But `"none"` as user/config input keeps the "omit the field" control semantics,
-        // and does not map to the `None` tier, which is only used internally by the truncation downgrade ladder.
+        // The caller handles `"none"` as a control input rather than parsing it as a tier.
         assert_eq!(ReasoningEffort::parse("none"), None);
     }
 
     #[test]
     fn model_def_reasoning_effort_field_optional() {
-        // Defaults to None when the field is absent
         let def: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true}"#,
         )
         .unwrap();
         assert!(def.reasoning_effort.is_none());
 
-        // Deserializes correctly with the field present (new name)
+        // Canonical field name.
         let def2: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"default_reasoning_effort":"high"}"#,
         )
         .unwrap();
         assert_eq!(def2.reasoning_effort, Some(ReasoningEffort::High));
 
-        // xhigh tier deserializes correctly
         let def_xhigh: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"default_reasoning_effort":"xhigh"}"#,
         )
         .unwrap();
         assert_eq!(def_xhigh.reasoning_effort, Some(ReasoningEffort::XHigh));
 
-        // max as the highest tier deserializes correctly
         let def_max: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"default_reasoning_effort":"max"}"#,
         )
@@ -267,7 +262,6 @@ mod tests {
         .unwrap();
         assert_eq!(def5.reasoning_effort, Some(ReasoningEffort::Low));
 
-        // Invalid values error out
         let bad: Result<ModelDef, _> = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"default_reasoning_effort":"bogus"}"#,
         );
@@ -276,7 +270,6 @@ mod tests {
 
     #[test]
     fn model_def_max_output_tokens_field_optional() {
-        // When the field is absent, defaults to None and the request omits max_tokens (historical behavior).
         let def: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true}"#,
         )

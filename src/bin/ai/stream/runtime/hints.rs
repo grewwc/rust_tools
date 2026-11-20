@@ -187,13 +187,9 @@ pub(super) fn show_deferred_body_buffering_hint(state: &mut StreamProcessingStat
 /// flowing; a stalled stream keeps the last written rate.
 pub(super) const LIVE_RATE_HINT_REFRESH_MS: u64 = 500;
 
-/// Real-time output-throughput text for the deferred-body "generating…" hint.
-/// While `defer_assistant_body` withholds the final answer from the terminal until
-/// the completion/citation gates accept it, this in-place rewrite is the only
-/// place the live rate is visible. Called on each committed output chunk and
-/// throttled by `DEFERRED_HINT_RATE_REFRESH_MS`; rows whose text is unchanged are
-/// not repainted, so there is no flicker. The `~` prefix marks the estimate as
-/// heuristic; the exact server-reported numbers are printed at stream end by
+/// Update the "generating…" hint's output throughput while the body is deferred.
+/// Uses `LIVE_RATE_HINT_REFRESH_MS` and avoids repainting unchanged rows. Counts
+/// are estimates (marked `~`); final provider metrics are emitted by
 /// `maybe_print_token_throughput_metrics`.
 pub(super) fn refresh_deferred_body_rate_hint(state: &mut StreamProcessingState) -> io::Result<()> {
     // Never clobber the tool-call hint, and never draw a fresh row under a line

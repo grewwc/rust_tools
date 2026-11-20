@@ -1,5 +1,4 @@
-/// Unified knowledge entry — replaces AgentMemoryEntry.
-/// Single data structure for all knowledge/memory storage.
+//! Knowledge entries and a guard against storing environment-local paths.
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path};
 
@@ -187,7 +186,7 @@ impl KnowledgeEntry {
         self.priority.unwrap_or(100)
     }
 
-    /// Create a search text from all fields
+    /// Build searchable text from category, note, tags, source, and image path.
     pub fn search_text(&self) -> String {
         let mut text = format!("{}: {}", self.category, self.note);
         if !self.tags.is_empty() {
@@ -238,7 +237,7 @@ impl KnowledgeEntry {
     }
 }
 
-/// Alias for backward compatibility during migration
+/// Compatibility alias for [`KnowledgeEntry`].
 pub type AgentMemoryEntry = KnowledgeEntry;
 
 #[cfg(test)]

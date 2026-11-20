@@ -52,12 +52,10 @@ mod types;
 mod verification;
 mod wait;
 
-// `collect` items are `pub(super)` (task_tools-tree visible), so the re-export
-// visibility must match exactly: broader would not re-export (warning), and it
-// would leak `AgentManifest` (private to the tree) into a public interface.
 pub(crate) use backend::*;
 pub(crate) use cascade::*;
 pub(crate) use collect::publish_task_result;
+// Keep collect's internal helpers within the task_tools module tree.
 pub(in crate::ai::tools::task_tools) use collect::*;
 pub(crate) use dispatch::*;
 pub(crate) use epoll::*;

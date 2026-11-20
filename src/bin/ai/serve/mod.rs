@@ -1,9 +1,9 @@
-//! Serve mode: local HTTP(S) API with parity to the CLI personal assistant.
+//! Serve mode: HTTP(S) API for the CLI personal assistant.
 //!
-//! v1 scope: HTTP on loopback, Bearer auth (optional), session list/history,
-//! one-shot turns via subprocess (same binary, `--session <id>`), session
-//! fork/delete, skills/agents listing. Turn execution reuses the existing
-//! one-shot path so behavior stays identical to `a --session <id> "<prompt>"`.
+//! Turns re-execute this binary in one-shot mode to reuse the driver, with
+//! JSON responses or SSE output. Session lifecycle, history, and runtime
+//! catalogs are exposed through authenticated routes; authentication may be
+//! omitted only for a loopback bind.
 
 #[cfg(feature = "serve")]
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
@@ -102,9 +102,6 @@ pub(crate) use transfer::*;
 pub(crate) use turn::*;
 pub(crate) use types::*;
 
-/// Run one turn by re-executing this binary in one-shot mode. This keeps serve
-/// behavior identical to the local assistant without duplicating the driver.
-///
 /// Error detail is capped so a large dump (possibly containing local paths)
 /// never floods the API response.
 const MAX_TURN_ERROR_CHARS: usize = 4096;
@@ -658,8 +655,6 @@ fn stream_child_turn(
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
-            // Every turn re-execs the daemon's own binary, so a spawn failure
-            // here is most often that file having been replaced.
             send(error_event(format!(
                 "cannot start turn process: {err}; if the daemon binary was replaced, restart it with `a --serve-restart`"
             )));
@@ -851,15 +846,8 @@ fn setup_live_fifo(_session_id: &str) -> Option<LiveFifo> {
     None
 }
 
-/// Serve-live frame kinds, mirroring `background::ServeLiveKind`
-/// discriminants (1 = delta, 2 = thinking start, 3 = thinking chunk,
-/// 4 = thinking done, 5 = output complete, 6 = confirmation request,
-/// 7 = confirmation resolved, 8 = subagent progress, 9 = input request,
-/// 10 = input resolved, 11 = assistant body pending, 12 = tool lifecycle,
-/// 13 = committed body, 14/15/16 = chunked committed body start/chunk/end,
-/// 17 = server-computed live thinking rate, 18/19 = model-backed history
-/// compression start/done, 23 = terminal-independent throughput metric,
-/// 24 = reasoning text with phase and byte offset, 25 = request error detail).
+/// Decoded serve-live events. Wire kinds are defined by `ServeLiveKind` in
+/// `background.rs`.
 #[derive(Debug, PartialEq, Eq)]
 #[cfg(feature = "serve")]
 enum ServeLiveEvent {
@@ -1417,8 +1405,7 @@ fn forward_live_event(
     let mut sse = match event {
         ServeLiveEvent::ConfirmRequest(payload) => {
             let Some((id, prompt)) = parse_confirm_request(&payload) else {
-                // A fragment of a split payload names no question; dropping it
-                // must not end the turn, which the fallback mapping would do.
+                // A malformed payload cannot identify a question; drop it.
                 return;
             };
             let token = NEXT_CONFIRM_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1738,7 +1725,7 @@ struct CdCommandRequest {
     command: String,
 }
 
-/// Query for `GET /cd-candidates`: the fragment typed after `/cd`, as-is.
+/// Query for `GET /sessions/{id}/cd-candidates`: the fragment after `/cd`, as-is.
 #[derive(Debug, Deserialize)]
 #[cfg(feature = "serve")]
 struct CdCandidatesQuery {
@@ -1945,7 +1932,6 @@ pub(in crate::ai) async fn run_serve(
         cwds: Arc::new(std::sync::Mutex::new(restored_cwds)),
         groups: Arc::new(std::sync::Mutex::new(restored_groups)),
         // One entry per touched session; bounded by session count in practice.
-        // Idle eviction is deferred to a later multi-instance pass.
         locks: Arc::new(Mutex::new(HashMap::new())),
         open_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),

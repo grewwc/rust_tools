@@ -22,7 +22,7 @@ pub(in crate::ai::driver::turn_runtime) enum CompletionEvidenceGateAction {
 
 #[derive(Default)]
 pub(in crate::ai::driver::turn_runtime) struct CompletionEvidenceState {
-    /// Whether any change occurred in the session (tool-level or command-level). Kept
+    /// Whether any change was observed in this turn (tool-level or command-level). Kept
     /// for downstream consumers such as checkpoint-phase hints; the gate decision only
     /// uses `successful_tool_level_mutation` (see below), because command-level “changes”
     /// are intent classification and may misjudge read-only commands as changes.
@@ -42,11 +42,8 @@ pub(in crate::ai::driver::turn_runtime) struct CompletionEvidenceState {
     /// asserting “no check observed” would be false and would tempt the model to
     /// defensively restate its conclusions.
     pub(super) successful_post_mutation_activity: bool,
-    /// Whether a known check failure occurred after the mutation (e.g. cargo check output
-    /// that does not confirm success). This is provable fact, not classification
-    /// uncertainty; a failure is not cleared by later benign calls. When set, the gate
-    /// goes Warn — the model claimed completion after a known check failure, and an
-    /// honest warning causes no false repeat.
+    /// Whether a known check failed after the mutation. Later benign calls do not
+    /// clear the failure; the gate warns regardless of the final response's wording.
     pub(super) successful_post_mutation_failed_check: bool,
 }
 
@@ -192,9 +189,8 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
             // silently Allows — it proves the model did post-mutation work, so injecting
             // an “no check observed” assertion would be false and would tempt the model
             // to restate conclusions.
-            // Conversely, a known check failure (e.g. cargo check output that does not
-            // confirm success) is provable fact recorded separately; later benign calls
-            // must not clear it.
+            // Conversely, output reporting a known check failure is recorded separately;
+            // later benign calls must not clear it.
             if had_mutation_before_command {
                 if command_has_failed_known_check {
                     state.successful_post_mutation_failed_check = true;

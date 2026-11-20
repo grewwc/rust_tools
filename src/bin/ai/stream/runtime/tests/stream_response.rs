@@ -885,6 +885,72 @@ async fn stream_response_marks_reasoning_only_early_stop_as_truncated() {
 }
 
 #[tokio::test]
+async fn stream_response_stops_corrupted_reasoning_before_visible_output() {
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request_buf = [0u8; 1024];
+        let _ = stream.read(&mut request_buf);
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .unwrap();
+        // Screenshot-shaped corruption: leaked special-token placeholders and
+        // replacement characters arrive on the reasoning channel before any
+        // visible text or tool call.
+        write_http_chunk(
+            &mut stream,
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"< | box | > < /box > < | place__holder__no__114 | > \\ufffd\\ufffd\"}}]}\n\n",
+        )
+        .unwrap();
+        let _ = stream.write_all(b"0\r\n\r\n");
+        let _ = stream.flush();
+    });
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut response = client
+        .post(format!("http://{addr}/chat"))
+        .send()
+        .await
+        .unwrap();
+    let mut app = test_app();
+    init_os_tools_globals(app.os.clone());
+    crate::ai::driver::signal::clear_request_interrupt();
+    let mut current_history = String::new();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        stream_response(&mut app, &mut response, &mut current_history, None),
+    )
+    .await
+    .expect("corrupted reasoning must stop the stream promptly")
+    .unwrap();
+
+    assert_eq!(result.outcome, StreamOutcome::Truncated);
+    assert_eq!(
+        result.finish_reason_value.as_deref(),
+        Some("corrupted_reasoning")
+    );
+    assert!(result.assistant_text.trim().is_empty());
+    assert!(!result.stream_error);
+    // The partial reasoning stays only in this diagnostic result; the turn
+    // loop discards it and injects the corrective retry note.
+    assert!(result.reasoning_text.contains("place__holder__no__114"));
+
+    drop(response);
+    server.join().unwrap();
+    crate::ai::driver::signal::clear_request_interrupt();
+    if let Ok(mut guard) = GLOBAL_OS.lock() {
+        *guard = None;
+    }
+}
+
+#[tokio::test]
 async fn stream_response_keeps_reading_delayed_chunks_after_finish_reason() {
     let _signal_guard = crate::ai::test_support::ENV_LOCK
         .lock()

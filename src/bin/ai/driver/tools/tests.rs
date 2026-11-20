@@ -210,7 +210,6 @@ fn parallel_batch_caps_at_max_concurrency() {
 fn parallel_batch_not_formed_for_single_readonly_call() {
     let mcp = McpClient::new();
     let calls = vec![tool_call("knowledge_search"), tool_call("write_file")];
-    // Only 1 parallel-safe call exists, so the caller falls back to the sequential path (batch_len == 1 < 2).
     assert_eq!(parallel_safe_batch_len(&mcp, &calls), 1);
 }
 
@@ -858,9 +857,8 @@ fn overflow_stub_argument_guard_catches_minimal_stubs() {
 
 #[test]
 fn overflow_stub_argument_guard_catches_transcribed_stubs() {
-    // Stringified stub as a model transcribed it after seeing the compressor's
-    // pointer in context (observed for apply_patch and write_file in production
-    // sessions): must be rejected centrally, not reach the tool's own parser.
+    // Stringified archive markers must be rejected centrally before they reach
+    // individual tool parsers.
     let mcp = McpClient::new();
     let string_stub = tool_call_with_args(
         "apply_patch",
@@ -870,7 +868,7 @@ fn overflow_stub_argument_guard_catches_transcribed_stubs() {
         .expect_err("stringified stub arguments must be rejected");
     assert!(err.content.contains("context-overflow pointer stub"));
     assert!(err.content.contains("/tmp/archive.md"));
-    // Legacy runtime shape (JSON bool marker + numeric original_chars) is caught too.
+    // A JSON bool marker with numeric original_chars is caught too.
     let runtime_stub = tool_call_with_args(
         "write_file",
         r#"{"_context_overflow_truncated": true, "original_chars": 900, "archive_file_path": "/tmp/a.md", "preview": "xyz"}"#,
@@ -890,9 +888,8 @@ fn overflow_stub_argument_guard_catches_transcribed_stubs() {
     assert!(super::prepare_tool_call(&mcp, &real, None).is_ok());
     let recovery = tool_call_with_args("apply_patch", r#"{"patch_file": "/tmp/x.patch"}"#);
     assert!(super::prepare_tool_call(&mcp, &recovery, None).is_ok());
-    // A marker key that is not true-ish (e.g. a nested value named like the
-    // marker with boolean false) must not trip the stub guard: it is rejected
-    // as an undeclared argument instead, never as a pointer stub.
+    // A false marker must not trip the stub guard; it is still rejected as an
+    // undeclared top-level argument.
     let benign = tool_call_with_args(
         "apply_patch",
         r#"{"_context_overflow_truncated": false, "patch": "x"}"#,
@@ -908,10 +905,8 @@ fn overflow_stub_argument_guard_catches_transcribed_stubs() {
 
 #[test]
 fn plan_update_not_found_gets_plan_specific_hint() {
-    // "Step 6 not found in the active plan." matches both the plan branch and the
-    // generic "not found" branch; the plan branch must win (it is ordered first), or
-    // the model receives a misleading file-path hint after context compression folded
-    // the plan-creation turns (regression: hallucinated step 6/5 updates).
+    // Plan-not-found errors must reach the plan-specific branch before the
+    // generic path branch so the hint repairs the plan step number.
     let err = "Step 6 not found in the active plan.";
     let hint = super::remediation_hint("plan_update", err, None).unwrap();
     assert!(
@@ -1105,9 +1100,8 @@ fn schema_gate_rejects_silent_divergence_beyond_read_file() {
 #[test]
 fn execute_command_session_control_is_split_into_command_session() {
     let mcp = McpClient::new();
-    // The old combined tool must no longer accept session-control fields; a
-    // model that carries them over gets a precise schema error instead of a
-    // misleading "write_stdin requires session_id" runtime failure.
+    // Session control belongs to `command_session`; `execute_command` must
+    // reject its fields at the schema gate.
     let legacy = tool_call_with_args(
         "execute_command",
         r#"{"command": "ls", "pty": false, "session_id": ""}"#,
@@ -1232,11 +1226,10 @@ fn schema_gate_rejects_out_of_range_integers_before_dispatch() {
 
 /// Registered contract for every builtin integer argument: (tool, path,
 /// minimum, maximum, why). `path` uses `.` for object fields and `[]` for
-/// array items (for example, `days[]` or `steps[].step`). A `None` bound is intentional only with a reason:
-/// fail-closed service parsing (`as_u64().ok_or`, loud on any bad value, so
-/// there is no silent-default hole) or signed semantics (`as_i64`, where
-/// negatives are valid). The test below walks the whole registry, so a new
-/// integer parameter fails until its author registers it here.
+/// array items (for example, `days[]` or `steps[].step`). A missing minimum
+/// requires fail-closed parsing or signed semantics; a missing maximum may
+/// reflect an unclamped service. The test below walks grouped builtin schemas,
+/// so a new integer parameter fails until its author registers it here.
 const INT_BOUND_REGISTRY: &[(&str, &str, Option<i64>, Option<i64>, &str)] = &[
     (
         "execute_command",
@@ -1785,13 +1778,8 @@ fn builtin_integer_schemas_match_registered_bounds() {
 
 #[test]
 fn search_overflow_description_stays_in_sync_with_implementation() {
-    // Drift guard between the model-facing tool description (the contract the
-    // model reads when choosing a query) and the implementation's actual
-    // behavior. When the case_sensitive default flipped to false, the
-    // description still advertised true and still advised retrying with
-    // case_sensitive=false; that drift silently changed how the model searched
-    // without any build failure. This test pins the description to the
-    // implementation contract so the same class of drift fails the build.
+    // Compare the documented default with the parser constant and pin the
+    // expected hit-reason legend so drift fails this test.
     let raw = include_str!("../../tool_descriptions/search_overflow.json");
     let schema: serde_json::Value =
         serde_json::from_str(raw).expect("search_overflow.json must stay valid JSON");
@@ -1854,7 +1842,7 @@ fn search_overflow_description_stays_in_sync_with_implementation() {
     );
 
     // The parameter set is a stable model-facing contract: silently adding or
-    // removing a parameter must fail the build rather than change the surface
+    // removing a parameter must fail this test rather than change the surface
     // the model can call.
     let keys: std::collections::BTreeSet<String> = schema["parameters"]["properties"]
         .as_object()

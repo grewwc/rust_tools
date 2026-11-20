@@ -113,15 +113,9 @@ fn manifest_tools_keep_skill_discovery_lazy() {
 
 #[test]
 fn skill_declaring_task_group_eagerly_loads_only_the_task_family() {
-    // Regression guard: task* were moved out of core (lazy builtin-only) so the
-    // default turn stays slim, but agent-team / audit_own_changes hard-require the
-    // task family in their flows (delegation / spawning the audit subagent). Their
-    // manifests declare the narrow `task` group so expansion loads exactly that
-    // family. Heavy non-flow orchestration tools (`manage_team`, `run_agent_graph`)
-    // live in the narrow `agent_team` group instead of `builtin`: `[core, task]`
-    // stays slim (the broad `builtin` tag means "nearly the whole registry",
-    // ~15KB of unrelated schemas), while the agent-team skill opts into them by
-    // declaring `agent_team` in its manifest.
+    // A [core, task] declaration keeps the task family resident without importing
+    // agent_team orchestration or unrelated builtin schemas. Each declared group
+    // must expand independently of the other families.
     let names_for = |groups: Vec<String>| {
         manifest_tool_definitions(&groups, &[])
             .expect("non-empty manifest groups should resolve tool definitions")
@@ -512,9 +506,8 @@ fn executor_group_agent(name: &str) -> AgentManifest {
 
 #[test]
 fn executor_group_defers_process_primitives_but_keeps_core_editing() {
-    // Executor-group manifests use tool_groups: [core, executor]. Execution primitives (process/IPC/shm/env)
-    // are lazy by default and stay out of the resident tool set; apply_patch/write_file (core∩executor) are kept,
-    // so editing capability is preserved with zero loss.
+    // The executor-group fixture keeps apply_patch, write_file, and read_file
+    // resident while deferring process/IPC/shared-memory/env schemas.
     let build_agent = executor_group_agent("build");
     let tools = builtin_tools_for_skill(&[], Some(&build_agent));
     let names = tools
@@ -561,12 +554,9 @@ fn executor_group_defers_process_primitives_but_keeps_core_editing() {
 
 #[test]
 fn manifest_groups_union_explicit_tools_keeps_delegation_subset_resident() {
-    // build.agent declares [core] plus a whitelist of the task family
-    // (task_spawn/task_wait/task_status/task_integrate/
-    // task_cancel) to keep delegation tools visible without paying for the
-    // whole 11-tool group in every turn. The loader must merge group
-    // expansion with explicitly named tools (previously mutually exclusive
-    // branches), and the unlisted heavy/admin tools stay lazy.
+    // Merge group expansion with explicit tool pins: this fixture keeps a
+    // delegation subset resident without loading the full task or agent_team
+    // groups. Unlisted lifecycle/admin tools stay lazy.
     let mut agent = agent("build", Vec::new());
     agent.tool_groups = vec!["core".to_string()];
     agent.tools = vec![
@@ -728,7 +718,7 @@ fn declares_hidden_group_only_true_for_executor_agents() {
     let build_agent = executor_group_agent("build");
     assert!(declares_hidden_group(&[], Some(&build_agent)));
 
-    // plan/explore use an explicit tools list without any executor group.
+    // A read-only fixture with explicit tools has no executor-group declaration.
     let mut plan_agent = agent("plan", Vec::new());
     plan_agent.mode = AgentMode::All;
     plan_agent.tool_groups = Vec::new();
@@ -740,17 +730,13 @@ fn declares_hidden_group_only_true_for_executor_agents() {
 
 #[test]
 fn lazy_load_measurably_shrinks_build_agent_tool_payload() {
-    // Quantify, via the production serialization path, the actual per-request tools-token savings of
-    // lazy-loading culling of execution primitives: tools in the request body is compact JSON of Vec<ToolDefinition>, and
-    // request/builder.rs's estimate_tools_tokens counts serde_json::to_string characters / 2 (conservative conversion,
-    // CHARS_PER_TOKEN_CONSERVATIVE) into each turn's prompt. Compare:
-    //   baseline = the executor group fully expanded via tool_groups (pre-lazy-loading behavior)
-    //   optimized = current builtin_tools_for_skill (after lazy loading, deferred primitives culled)
+    // Compare compact JSON sizes of the fully expanded and deferred fixture tool
+    // sets. The local ratio estimates token savings from serialized character
+    // counts rather than measuring provider token usage.
     const CHARS_PER_TOKEN_CONSERVATIVE: usize = 2;
     let build_agent = executor_group_agent("build");
 
-    // baseline: expand [core, executor] fully with no deferred filtering
-    // (the pre-lazy-load behavior).
+    // Expand the same groups without deferred filtering for the baseline.
     let groups = [ToolGroup::Core, ToolGroup::Executor];
     let baseline_tools =
         ensure_required_baseline_tools(crate::ai::tools::tool_definitions_for_groups(&groups));
@@ -782,9 +768,6 @@ fn lazy_load_measurably_shrinks_build_agent_tool_payload() {
         pct,
     );
 
-    // The optimization must genuinely shrink the payload: culled primitive count == deferred catalog size, and the token
-    // savings must be significant (conservative lower bound 800 tok/turn, measured ~1.1–1.2k). If anyone ever adds these
-    // primitives back to core or removes the filter, this assertion goes red immediately.
     let deferred_count = crate::ai::tools::deferred_eager_load_tool_summaries().len();
     assert_eq!(
         baseline_tools.len() - optimized_tools.len(),
@@ -823,11 +806,8 @@ fn system_prompt_only_mentions_tools_available_this_turn() {
 
 #[test]
 fn system_prompt_keeps_subagent_orchestration_lazy_without_task_tools() {
-    // Sharp-style turns (core tools only, no pinned task_* tools) must not
-    // carry the subagent-orchestration prose: resident task tools inject the
-    // delegation criteria and subagent lifecycle guidance, which directly
-    // fights a decisive single-pass agent. Task tools stay discoverable via
-    // enable_tools instead.
+    // Omit orchestration guidance when the fixture has no resident task tools;
+    // they remain discoverable through enable_tools.
     let mut core_only = SkipSet::new(16);
     for name in ["read_file", "apply_patch", "enable_tools", "plan"] {
         core_only.insert(name.to_string());
@@ -1117,8 +1097,7 @@ fn session_issue_likely_covers_debugging_intents_in_both_languages() {
         );
     }
     // Accepted over-injection, pinned: a general knowledge question about
-    // history matches too. A missed debug session costs more than ~500
-    // carried characters, so the gate stays broad on purpose.
+    // history matches too; the broad gate avoids missing relevant session guidance.
     assert!(session_issue_likely("history of Rust"));
 }
 
@@ -1153,8 +1132,7 @@ fn skill_authoring_referenced_routes_save_and_update_intents() {
 
 #[test]
 fn session_id_referenced_detects_uuid_shaped_ids_only() {
-    // Hits: a bare UUID (with or without session keywords) is an unambiguous
-    // reference to a concrete runtime session.
+    // UUID-shaped candidates trigger this detector with or without session keywords.
     for question in [
         "ddb7e6be-7076-43b3-898f-8370e64312da 这个会话现在有几条消息？",
         "how many messages does ddb7e6be-7076-43b3-898f-8370e64312da have?",
@@ -1166,8 +1144,7 @@ fn session_id_referenced_detects_uuid_shaped_ids_only() {
             "session id reference missed: {question}"
         );
     }
-    // Misses: no UUID-shaped token (a hex test-store id has no dashes, and
-    // plain words/hashes must not route the turn to the session tools).
+    // These samples contain no UUID-shaped token; keyword routing remains separate.
     for question in [
         "write a fizzbuzz",
         "explain Rust lifetimes",
@@ -1424,7 +1401,6 @@ fn system_prompt_uses_criterion_based_parallel_delegation() {
     assert!(prompt.contains(
         "delegated steps without it run one at a time via `task_spawn` followed by `task_wait`"
     ));
-    // No longer mandates delegation for every substantive step.
     assert!(!prompt.contains("on every substantive step"));
     assert!(prompt.contains("distinct, bounded goal"));
     assert!(prompt.contains("latency or context-isolation benefit outweighs handoff overhead"));
@@ -1436,8 +1412,8 @@ fn system_prompt_uses_criterion_based_parallel_delegation() {
     assert!(prompt.contains("never run dependent steps concurrently"));
     assert!(prompt.contains("do not delegate merely to create parallelism"));
     assert!(prompt.contains("net benefit is marginal or uncertain"));
-    // The parent keeps final decisions, tightly coupled edits, and end-to-end
-    // synthesis.
+    // The parent keeps final decisions and synthesis; a skill requiring
+    // delegation assigns a tightly coupled edit to one worker.
     assert!(prompt.contains(
         "Keep final decisions and end-to-end synthesis in the parent; when an active skill requires delegation, hand a tightly coupled edit to exactly one worker instead of doing it in the parent."
     ));
@@ -1494,10 +1470,8 @@ fn system_prompt_does_not_require_status_as_a_finishing_ritual() {
 
 #[test]
 fn system_prompt_routes_single_delegation_to_task_spawn() {
-    // The Async Subagent Orchestration section is the single authority for
-    // task routing. A SINGLE delegated subtask must use task_spawn followed by
-    // task_wait; the Planning section must not repeat that rule (dedup keeps
-    // token cost down without losing guidance).
+    // Keep delegation routing in the async section to avoid duplicate prompt
+    // text; the rule applies to single subtasks as well as batches.
     let mut available = SkipSet::new(16);
     available.insert("task_spawn".to_string());
     available.insert("task_wait".to_string());
@@ -1507,11 +1481,8 @@ fn system_prompt_routes_single_delegation_to_task_spawn() {
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
 
-    // Canonical home: Async Subagent Orchestration section (task branch).
     assert!(prompt.contains("Use `task_spawn` for every delegation"));
-    // The Planning section no longer duplicates the routing rule...
     assert!(!prompt.contains("synchronous `task`"));
-    // ...but still keeps its own unique plan/delegate guidance.
     assert!(prompt.contains(
         "Simple tasks: act directly (unless an active skill requires delegation). Complex ones: call `plan` first — before the first tool call"
     ));
@@ -1582,9 +1553,8 @@ fn system_prompt_forbids_guessing_without_sufficient_evidence() {
 
 #[test]
 fn system_prompt_requires_self_contained_comments() {
-    // Comments rule lives in correctness_guardrails (always-precedence
-    // section), not in an agent/skill manifest — it must render for every
-    // session regardless of active agent or skill.
+    // The standard prompt carries the comment rule in correctness_guardrails,
+    // so non-pure agent and skill overlays inherit it.
     let available = SkipSet::new(16);
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
@@ -1921,10 +1891,8 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
 
 #[test]
 fn system_prompt_resists_sycophancy() {
-    // The intellectual-honesty block must render for every session: the
-    // model must earn agreement by evidence, not grant it because the user
-    // holds the view. Assert it is present on the default interactive path,
-    // in goal mode, and on a skill turn (no mode may drop it).
+    // Default, goal, and skill variants of the standard prompt keep the
+    // intellectual-honesty block so agreement remains evidence-based.
     let available = SkipSet::new(16);
     let default_prompt = build_system_prompt(
         None,
@@ -1967,10 +1935,8 @@ fn system_prompt_resists_sycophancy() {
 
 #[test]
 fn system_prompt_scope_discipline_bullets_have_no_leaked_indentation() {
-    // Regression: the non-goal Scope Discipline block once dropped the
-    // `\n\` line-continuation on two bullets, baking ~13 spaces of source
-    // indentation into the rendered prompt. Assert every rendered line is
-    // left-trimmed (no leading whitespace leaks from the source literal).
+    // Pin investigation and change-authorization bullet indentation so source
+    // whitespace cannot leak into these instructions.
     let available = SkipSet::new(16);
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
@@ -1982,7 +1948,7 @@ fn system_prompt_scope_discipline_bullets_have_no_leaked_indentation() {
         prompt.contains("\n- **Change authorization.** Edit only files the current task requires")
     );
     assert!(prompt.contains("\n- For broad requests, define investigation boundaries"));
-    // Guard against the exact defect: no bullet prefixed by leading spaces.
+    // Reject the source-indentation patterns below for the pinned bullets.
     assert!(!prompt.contains("\n             - **Change authorization.**"));
     assert!(!prompt.contains("\n             - For broad requests, define"));
 }
@@ -2005,10 +1971,9 @@ fn system_prompt_defines_an_end_to_end_behavior_contract() {
 
 #[test]
 fn system_prompt_links_task_convergence_criteria_to_plan_when_available() {
-    // When plan is available: task_convergence injects the "write acceptance
-    // criteria into the plan" bridge line; the planning block injected under
-    // the same condition carries the plan_update usage notes, and the two
-    // together close the plan → execute → accept loop.
+    // When plan is visible, convergence adds the acceptance-criteria bridge and
+    // the planning section keeps roadmap guidance. Step-status details live in
+    // tool metadata.
     let mut available = SkipSet::new(16);
     available.insert("plan".to_string());
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
@@ -2156,8 +2121,8 @@ fn ask_protocol_lives_in_tool_description_not_prose() {
         &PromptContext::default(),
     )
     .render_system_prompt();
-    // The prose guidance block was removed; the ask protocol now travels as
-    // request_user_input tool metadata, injected by build_skill_turn_guard.
+    // request_user_input metadata carries the ask protocol, so ordinary prompt
+    // composition needs no separate asking_the_user block.
     assert!(!interactive.contains("<asking_the_user>"));
 
     let goal = build_system_prompt(
@@ -2213,7 +2178,7 @@ fn request_user_input_injection_matrix() {
     let humanizer = skill("humanizer", "Rewrite text naturally");
     let skills: &[&SkillManifest] = &[&humanizer];
 
-    // Skill turns always inject (cross-turn handoff), even under goal mode.
+    // Top-level skill turns inject the continuation handoff, including in goal mode.
     assert!(super::should_inject_request_user_input(
         skills, &None, false
     ));
@@ -2224,7 +2189,7 @@ fn request_user_input_injection_matrix() {
     ));
     // Ordinary interactive turns inject the explicit ask protocol.
     assert!(super::should_inject_request_user_input(&[], &None, false));
-    // Goal mode and background turns deliberately disable asking.
+    // Ordinary goal/background turns omit the tool.
     assert!(!super::should_inject_request_user_input(
         &[],
         &Some("g".to_string()),
@@ -2390,16 +2355,9 @@ fn hidden_mcp_tool_catalog_omits_prompt_when_everything_is_loaded() {
 
 #[test]
 fn narrow_skill_whitelist_still_lets_model_discover_explicitly_requested_mcp_tools() {
-    // Scenario: the user explicitly asks to "write a doc with MCP
-    // tools", but the active skill's narrow tools: whitelist replaces the
-    // tool set with a single dedicated tool, and the default agent carries
-    // disable_mcp_tools (no mcp_* pre-mounted). Before the fix: the narrow
-    // whitelist squeezed out enable_tools too, the hidden MCP catalog gate
-    // (has_tool("enable_tools")) closed with it, and all three MCP discovery
-    // paths were severed, making the request physically impossible to serve.
-    // After the fix: enable_tools is restored as an always-on baseline, the
-    // catalog gate holds again, and the model can discover and enable
-    // mcp_example_*.
+    // A narrow skill tool list must retain baseline discovery so unloaded MCP
+    // tools remain reachable through enable_tools. This fixture supplies an
+    // empty loaded MCP set and checks catalog eligibility and rendered names.
     let mut narrow_skill = skill("example-upload", "Upload markdown into example docs");
     narrow_skill.tools = vec!["write_file".to_string()];
 
@@ -2423,8 +2381,7 @@ fn narrow_skill_whitelist_still_lets_model_discover_explicitly_requested_mcp_too
         "read_file must stay as a baseline read-only capability to read the user-named test.md"
     );
 
-    // 2) The default agent's disable_mcp_tools => no mcp_* is pre-mounted
-    // this turn.
+    // 2) Simulate a turn with no MCP schemas resident.
     let all_mcp_tools = vec![
         tool("mcp_example_doc_create_from_markdown"),
         tool("mcp_example_docs_get_text_by_url"),
@@ -3012,12 +2969,10 @@ fn escape_xml_attr_escapes_all_five_special_chars() {
         escape_xml_attr("a&b<c>d\"e'f"),
         "a&amp;b&lt;c&gt;d&quot;e&apos;f"
     );
-    // Ordinary path preserved as-is
     assert_eq!(
         escape_xml_attr("/src/bin/ai/AGENTS.md"),
         "/src/bin/ai/AGENTS.md"
     );
-    // Empty string is safe
     assert_eq!(escape_xml_attr(""), "");
 }
 
@@ -3683,9 +3638,8 @@ fn explicit_tool_lists_keep_baseline_entries_available() {
     // Basic read-only / retrieval capabilities should be re-added as the resident baseline, so a narrow-whitelist skill cannot
     // cull the most basic reading tools like read_file and leave the main Agent unable to read user-named files.
     assert!(names.contains(&"read_file".to_string()));
-    // Task orchestration / knowledge memory series have been moved out of the baseline: under narrow-whitelist skills they are no longer
-    // auto-re-added, but the main Agent can still progressively discover and enable them via the resident enable_tools,
-    // so delegation of subagents is never truly lost.
+    // Task orchestration and knowledge tools stay outside the resident baseline;
+    // they remain discoverable through enable_tools.
     assert!(!names.contains(&"task_spawn".to_string()));
     assert!(!names.contains(&"task_wait".to_string()));
     assert!(!names.contains(&"task_status".to_string()));
@@ -3739,7 +3693,6 @@ fn multi_skill_any_disable_builtin_tools_disables_all() {
 
 #[test]
 fn multi_skill_any_disable_mcp_tools_disables_all() {
-    // select_mcp_tools checks disable_mcp_tools: any skill disabling it returns empty
     let mcp_tool = tool("mcp_server_a_lookup");
     let mut skill_a = skill("alpha", "alpha skill");
     skill_a.mcp_servers.push("server_a".to_string());
@@ -3763,9 +3716,8 @@ fn multi_skill_merges_mcp_servers_deduplicated() {
 
 #[test]
 fn manifest_tools_cannot_pin_driver_injected_control_tools() {
-    // The driver owns request_user_input's per-turn availability (goal mode,
-    // background, and subagent turns suppress it) and injects it by name.
-    // A skill listing it must not add a second definition.
+    // The driver owns request_user_input's availability and injects it by name.
+    // A manifest pin must neither grant it nor duplicate the driver's definition.
     let defs = manifest_tool_definitions(
         &[],
         &["request_user_input".to_string(), "read_file".to_string()],

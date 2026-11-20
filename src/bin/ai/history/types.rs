@@ -50,10 +50,10 @@ pub(in crate::ai) struct SkillActivationEvent {
 /// their origin and do not form real user turn boundaries. Side-notes receive
 /// the same retention protection as user input during compression.
 ///
-/// `Message` has no separate metadata field yet, so the runtime-only origin side
-/// channel is stored in `reasoning_content`, which user messages never use. This
-/// field is persisted and rebuilt with canonical history, cleared in the first step
-/// of request normalization, and must never reach the provider payload.
+/// `Message` has no separate metadata field, so the runtime-only origin side
+/// channel is stored in `reasoning_content`; user messages do not carry model
+/// reasoning. This field is persisted and rebuilt with canonical history,
+/// cleared in the first step of request normalization, and must never reach the provider payload.
 /// Do not switch to a content prefix: real users can type arbitrary text, and
 /// recognizing by content would forge turn boundaries.
 pub(super) const RUNTIME_SYNTHETIC_USER_ORIGIN: &str = "runtime-origin:synthetic-user:v1";
@@ -234,6 +234,8 @@ pub(in crate::ai) struct Message {
     /// Some servers (e.g. DeepSeek thinking-mode) require echoing back the previous
     /// assistant turn's reasoning_content verbatim, otherwise they return a
     /// 400 invalid_request_error.
+    /// Runtime messages also store internal metadata here; request normalization
+    /// removes it through `clear_runtime_message_metadata` before serialization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::ai) reasoning_content: Option<String>,
 }
@@ -331,8 +333,8 @@ pub(in crate::ai) fn parse_still_waiting_wake_identity(text: &str) -> Option<(u6
         return None;
     }
 
-    // 4) extract the first task_ids=[...] (on the TASK_WAIT_TIMEOUT lead line,
-    //    taking precedence over progress-snapshot content)
+    // 4) Extract the first task_ids occurrence in the mailbox; later progress
+    //    snapshots do not override it.
     const IDS_MARKER: &str = "task_ids=[";
     let idx = mailbox.find(IDS_MARKER)?;
     let after = &mailbox[idx + IDS_MARKER.len()..];
@@ -519,7 +521,6 @@ mod tests {
         // Without synthetic messages this is equivalent to rposition(role == "user").
         let plain = vec![user("a"), assistant(), user("b")];
         assert_eq!(last_real_user_index(&plain), Some(2));
-        // Empty list.
         assert_eq!(last_real_user_index(&[]), None);
     }
 

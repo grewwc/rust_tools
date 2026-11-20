@@ -1,10 +1,7 @@
 //! Terminal color theme.
 //!
-//! The terminal renderer used to hardcode ANSI escape strings as `const`s.
-//! Since those colors were duplicated in ~13 modules, restyling the terminal
-//! required editing Rust source. This module turns the palette into a data
-//! model loaded from a VSCode-style JSON theme file (hot-reloaded at each
-//! turn boundary), so styling changes are a config edit, not a recompile.
+//! Palettes load from a VSCode-style JSON file. `refresh()` reloads the active
+//! palette, so configured colors can change without recompiling.
 //!
 //! # Theme JSON format (VSCode-like keys, opencode-style values)
 //!
@@ -91,12 +88,11 @@ pub(in crate::ai) const RESET: &str = "\x1b[0m";
 pub(in crate::ai) const BOLD: &str = "\x1b[1m";
 pub(in crate::ai) const DIM: &str = "\x1b[2m";
 
-/// Resolved terminal palette. All ANSI strings are `&'static str` because each
-/// theme instance is built and leaked once per resolution; `refresh()`
-/// replaces the cached instance (the previous one stays leaked, see below).
+/// Resolved terminal palette. Owned color strings are leaked by `leak` so its
+/// `&'static str` slots remain valid across `refresh()` and callers can retain them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Theme {
-    // ── Accents: UI / status text (previously `ACCENT_*` consts) ──────────
+    // ── Accents: UI / status text ────────────────────────────────────────
     pub(crate) accent_primary: &'static str,
     pub(crate) accent_tool_name: &'static str,
     pub(crate) accent_secondary: &'static str,
@@ -112,11 +108,9 @@ pub(crate) struct Theme {
     pub(crate) accent_danger: &'static str,
     pub(crate) accent_marked: &'static str,
     pub(crate) accent_rule: &'static str,
-    /// Echoed user input after submit: the theme's bright signature warm hue
-    /// (amber/yellow on dark themes, deep purple on light) — deliberately NOT
-    /// the white/gray markdown body colors, so the user's own text stays
-    /// visible and distinguishable from assistant output. The `❯` marker in
-    /// `prompt/multiline/multiline_ui.rs` keeps the submit boundary.
+    /// Color of echoed user input after submission, kept separate from
+    /// `markdown_body` so themes can distinguish user text from assistant prose.
+    /// The prompt marker uses the separate `accent_prompt` slot.
     pub(crate) accent_submitted: &'static str,
     /// Left emphasis bar for echoed user input after submit. A theme that sets
     /// `accent.submittedBar` uses that color; a theme that changes other colors
@@ -129,14 +123,14 @@ pub(crate) struct Theme {
     /// hue. A theme that does not set `accent.prompt` inherits its resolved
     /// `accent.primary`.
     pub(crate) accent_prompt: &'static str,
-    // ── Markdown prose (previously `MARKDOWN_*` consts in render/mod.rs) ───
+    // ── Markdown prose ──────────────────────────────────────────────────
     pub(crate) markdown_body: &'static str,
     pub(crate) markdown_strong: &'static str,
     pub(crate) markdown_heading: &'static str,
     pub(crate) markdown_accent: &'static str,
     pub(crate) markdown_code_fg: &'static str,
     pub(crate) markdown_math: &'static str,
-    // ── Code block syntax (previously `MONOKAI_*` consts in render/code.rs) ─
+    // ── Code block syntax ───────────────────────────────────────────────
     pub(crate) code_background: &'static str,
     pub(crate) code_foreground: &'static str,
     pub(crate) code_comment: &'static str,
@@ -260,9 +254,6 @@ impl Theme {
         // success fallback only applies once the theme actually changed a color.
         // Resolving here, after the loop, keeps the bar independent of key order.
         if !submitted_bar_overridden && t != Theme::default_theme() {
-            // Resolve after all theme keys are applied, so a partial theme that
-            // customizes `accent.success` automatically gives its user-input
-            // bar the same color regardless of JSON object iteration order.
             t.accent_submitted_bar = t.accent_success;
         }
         // The prompt marker follows the theme's primary hue when the theme
@@ -422,11 +413,8 @@ impl Theme {
     }
 }
 
-/// The process-wide active theme. Resolved lazily on first use, then replaced
-/// by `refresh()` at turn boundaries so config changes apply live. Instances
-/// are leaked: fields are `&'static str` so call sites can format them without
-/// borrowing, and a refresh leaks one small (~300 B) palette, which is
-/// negligible for a rare re-theming event.
+/// Cached active theme. Each refresh retains the previous palette and its color
+/// strings so existing `&'static` references remain valid.
 static CURRENT_THEME: Mutex<Option<&'static Theme>> = Mutex::new(None);
 
 /// The active theme for the current process. Cheap after first access.
@@ -528,9 +516,9 @@ pub(crate) fn user_themes_dir() -> PathBuf {
     PathBuf::from(expanduser("~/.config/rust_tools/themes").as_ref())
 }
 
-/// Every theme name `/theme` can switch to: built-ins plus the `*.json` stems
-/// in the user override dir (a user file shadows the built-in of the same
-/// name). Sorted for stable display.
+/// Theme names advertised to `/theme`: built-ins plus `*.json` stems in the
+/// user override directory. User files are not validated here; resolution tries
+/// them before same-name built-ins. Sorted for stable display.
 pub(crate) fn available_theme_names() -> Vec<String> {
     let mut names: Vec<String> = BUILTIN_THEME_NAMES.iter().map(|s| s.to_string()).collect();
     if let Ok(entries) = fs::read_dir(user_themes_dir()) {
@@ -663,10 +651,8 @@ fn ansi256_rgb(idx: u8) -> (u8, u8, u8) {
     }
 }
 
-/// Each resolved theme instance owns its strings and leaks them to get
-/// `&'static str` fields; this keeps call-site ergonomics identical to the
-/// old consts (`format!` / `push_str` without borrowing). `refresh()` leaks
-/// one small instance per re-theming event.
+/// Retain dynamically resolved color strings for `'static` palette slots.
+/// Existing strings remain valid when `refresh()` replaces the active palette.
 fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
@@ -882,7 +868,6 @@ mod tests {
             let json = builtin_theme_json(name).unwrap_or_else(|| panic!("{name} must be registered"));
             let t = Theme::from_json(json).unwrap_or_else(|| panic!("{name} must parse"));
             assert_ne!(t.code_background, Theme::default_theme().code_background);
-            // every key resolves to a non-empty ANSI string (catches typos)
             let all = [
                 t.accent_primary, t.accent_tool_name, t.accent_secondary, t.accent_command,
                 t.accent_muted, t.accent_input, t.accent_success, t.accent_emphasized_output,

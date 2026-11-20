@@ -24,7 +24,7 @@ use rustc_hash::FxHashMap;
 ///   and other non-guidance categories
 ///
 /// ## Search mechanism
-/// - BM25 keyword search + text similarity (lexical level)
+/// - BM25 keyword ranking with priority boost and optional FTS5 candidate filtering
 /// - Archive file search support (configurable)
 /// - Automatic dedup and GC
 use std::io::Write;
@@ -76,10 +76,9 @@ fn memory_index_for(source_path: &Path) -> Option<Arc<MemoryIndex>> {
     }
 }
 
-/// Evict the cached index for a memory file whose lifecycle has ended, closing
-/// its SQLite connection. Callers that delete the jsonl/db pair must use this;
-/// a retained index would otherwise keep the deleted database (and its
-/// `-wal`/`-shm` sidecars) open until the process exits.
+/// Drop the registry's reference to a memory index whose file lifecycle has ended.
+/// The connection closes when remaining Arc owners release it; callers deleting
+/// the JSONL/DB pair must evict the cached reference to avoid retaining sidecars.
 pub(crate) fn remove_memory_index_entry(source_path: &Path) {
     let Some(reg) = MEMORY_INDEX_REGISTRY.get() else {
         return;
@@ -141,8 +140,8 @@ pub(crate) fn trace_memory_event(location: &'static str, msg: &str, fields: &[(&
     }
 }
 
-/// Atomically write content to `path`: write to a tmp file in the same directory, fsync, then rename.
-/// If the process crashes midway, only the pre-rename old file remains; no half-written JSONL is ever produced.
+/// Write to a same-directory temporary file, flush, attempt fsync, then rename.
+/// The destination stays intact until rename succeeds; a crash can leave the temporary file behind.
 fn atomic_write_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
@@ -189,8 +188,8 @@ pub(crate) struct AgentMemoryEntry {
     pub(crate) note: String,
     pub(crate) tags: Vec<String>,
     pub(crate) source: Option<String>,
-    /// Priority level: 0-255. Higher = more important. 255 = permanent (never delete).
-    /// Default: 100 (normal priority). Low: 0-49, Normal: 50-99, High: 100-200, Permanent: 255
+    /// Retention/ranking priority (0-255), used in scoring and quota ordering.
+    /// A value of 255 is protected by automatic quota/GC policies; the default is 100.
     #[serde(default = "default_priority")]
     pub(crate) priority: Option<u8>,
     #[serde(default)]

@@ -280,8 +280,7 @@ mod tests {
     }
 }
 
-/// Synchronously connect a single MCP server (extracted from
-/// McpClient::connect_server).
+/// Connect and initialize a server, then discover its tools, resources, and prompts.
 fn connect_single_server(
     name: &str,
     config: &McpServerConfig,
@@ -302,8 +301,6 @@ fn connect_single_server(
     Ok(conn)
 }
 
-// The functions below are extracted from McpClient and use a dedicated
-// AtomicU64 counter.
 fn initialize_server(
     conn: &mut McpServerConnection,
     next_id: &std::sync::atomic::AtomicU64,

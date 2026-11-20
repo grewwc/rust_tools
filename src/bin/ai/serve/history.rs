@@ -3,9 +3,8 @@
 use super::*;
 use crate::ai::history::{Message, StoredMessage};
 
-/// Server-side cap for the serve-chat `?count` view param. The client clamps
-/// to its own max (20) before sending, so this only guards against a
-/// malformed or oversized request turning a preview into a full dump.
+/// Server-side cap for history preview counts. The `questions` navigator
+/// view is exempt so it can request older committed questions.
 const SERVE_HISTORY_VIEW_COUNT_CAP: usize = 100;
 
 /// Searchable history content: strings stay verbatim and structured content
@@ -256,12 +255,9 @@ pub(crate) async fn read_history(
         )
             .into_response();
     }
-    // serve-chat preview views are bounded tails, so `?role` + `?count`
-    // filter and tail-cut here and only the subset travels. Each user row
-    // carries its global `user_ordinal` (counted before filtering, like the
-    // client) so `u<N>` markers stay exact on a partial response. Absent
-    // params (grep fetches, the mobile client) keep the unfiltered path
-    // below.
+    // Filter before applying the optional count tail cut. Real user rows carry
+    // their global `user_ordinal` so `u<N>` stays exact in partial responses;
+    // requests without either view parameter take the unfiltered path below.
     if q.role.is_some() || q.count.is_some() {
         let mut rows: Vec<serde_json::Value> = Vec::new();
         let mut user_ordinal = 0usize;

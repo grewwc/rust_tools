@@ -65,10 +65,8 @@ pub(crate) fn execute_talk_read(args: &Value) -> Result<String, String> {
     }
     let total = msgs.len();
     let mut out = String::new();
-    // Whole-message cap: show a prefix that fits, then requeue the rest back
-    // into the inbox so nothing drained is ever lost to truncation. A single
-    // message always fits (send-side body limit is far below this cap), so at
-    // least the first message is shown.
+    // Keep messages whole: always show the first, then stop before adding a message
+    // that would exceed the byte cap. Requeue the rest for the next read.
     let mut shown = 0;
     for (i, m) in msgs.iter().enumerate() {
         let room = m.room.as_deref().unwrap_or("-");

@@ -2,21 +2,18 @@ use serde_json::Value;
 
 use super::{compress::value_to_string, types::Message};
 
-/// Default hard cap: avoids building a 100MB+ intermediate string before
-/// truncating in extremely long sessions. Callers (such as
-/// summarize_history_via_model) assemble the entire markdown in memory even
-/// when they only want 12K, so a bounded accumulation here is a necessary
-/// safety net.
+/// Default byte threshold for starting another message, limiting accumulation
+/// across long sessions. Whole messages are appended intact, so one large
+/// message can exceed this threshold.
 const MESSAGES_TO_MARKDOWN_HARD_CAP: usize = 256 * 1024;
 
 pub(in crate::ai) fn messages_to_markdown(messages: &[Message], session_id: &str) -> String {
     messages_to_markdown_capped(messages, session_id, MESSAGES_TO_MARKDOWN_HARD_CAP)
 }
 
-/// Explicit export variant with a character budget. Appending stops as soon as
-/// the budget is exhausted and the number of dropped messages is noted at the
-/// end. Unit tests and scenarios such as the `/sessions markdown` export that
-/// need a larger budget can call this function directly.
+/// Export with a byte budget checked before each message. Whole messages and
+/// the omission note can take the output beyond the budget. Callers needing a
+/// larger export can provide their own budget.
 pub(in crate::ai) fn messages_to_markdown_capped(
     messages: &[Message],
     session_id: &str,

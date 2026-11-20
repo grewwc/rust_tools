@@ -1,14 +1,8 @@
 // =============================================================================
-// McpPort - MCP call port (decouples the driver from a direct dependency on the mcp crate)
+// McpPort - MCP discovery and tool execution port
 // =============================================================================
-// The driver previously talked to MCP processes directly through `crate::ai::mcp::*`,
-// which forced tests to spawn real processes and left no way to intercept middleware.
-// Extracting the port gives:
-// - backend: `LiveMcpPort` is the production adapter; tests can inject mock / recording /
-//   circuit-breaking middleware;
-// - upstream: the driver is injected via `&dyn McpPort` and can be replaced with mock /
-//   recording / circuit-breaking middleware;
-// - compatibility: `McpError` is passed through unchanged so callers handle it uniformly.
+// Production and in-memory adapters share discovery, call, and availability
+// operations so tests can supply tool catalogs without spawning servers.
 
 use std::collections::HashMap;
 
@@ -38,12 +32,9 @@ pub trait McpPort: Send + Sync {
 /// - `tool_definitions` briefly holds the outer lock only to `Arc::clone` the cache (O(1)),
 ///   then releases it;
 /// - `is_available` briefly holds the outer lock for a single `get_str_ref` lookup;
-/// - `call_tool` delegates to `McpClient::call_tool_on_shared`; the outer lock is used only
-///   to clone the `Arc<Mutex<Connection>>` and allocate `next_id`, and is never held across
-///   the blocking `writeln`/`read` or `restart_connection` calls, so cross-server
-///   `tool_definitions`/`is_available` are not blocked for long.
-/// This type is the correct replacement for `DefaultMcpPort`: if "Default = production",
-/// use this type when wiring it in.
+/// - `call_tool` delegates to `McpClient::call_tool_on_shared`, which releases the
+///   outer lock before tool-request I/O. Restart and discovery hold the outer
+///   lock and then the per-server lock, so they can block other metadata lookups.
 pub struct LiveMcpPort {
     client: SharedMcpClient,
 }
@@ -84,11 +75,8 @@ impl McpPort for LiveMcpPort {
         tool: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        // The outer lock never spans blocking I/O: delegate to `call_tool_on_shared`,
-        // which holds the outer lock only briefly to clone the per-server
-        // `Arc<Mutex<Connection>>` and allocate a request id; during `send_request_to_conn`
-        // only the per-server inner lock is held. On restart, follow the outer -> inner
-        // locking order to avoid deadlocks.
+        // Tool-request I/O holds only the per-server lock. Restart paths acquire
+        // the outer lock first to preserve the outer -> inner lock order.
         McpClient::call_tool_on_shared(&self.client, server, tool, args)
             .map(|content| serde_json::json!({ "content": content }))
             .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as _)
@@ -105,7 +93,7 @@ impl McpPort for LiveMcpPort {
     }
 }
 
-/// In-memory implementation for tests / recording.
+/// In-memory tool catalog with synthetic call results for tests.
 pub struct InMemoryMcpPort {
     tools: HashMap<String, Vec<McpToolDef>>,
 }

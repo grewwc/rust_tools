@@ -22,7 +22,7 @@ pub(crate) struct ToolSpec {
     pub(crate) execute: fn(&Value) -> Result<String, String>,
 }
 
-/// Registry entry submitted via `inventory!` to register a tool
+/// Registry entry submitted via `inventory::submit!` to register a tool
 /// at compile time for runtime discovery.
 pub(crate) struct ToolRegistration {
     pub(crate) spec: ToolSpec,
@@ -44,11 +44,6 @@ pub(crate) struct ToolStreamingRegistration {
 
 inventory::collect!(ToolStreamingRegistration);
 
-/// Terminal echo configuration: controls whether a tool call's arguments /
-/// output are printed to the terminal. Defaults to all `false`; only tools
-/// with high user-visibility value (e.g. `plan`) opt in explicitly. Submitted
-/// via a separate `ToolDisplayRegistration` without touching the existing
-/// `ToolSpec`, keeping backward compatibility.
 
 /// Terminal echo content transform: compresses the full tool result into
 /// compact echo text. Signature `fn(full result, call args) -> echo text`;
@@ -61,6 +56,8 @@ pub(crate) type ToolDisplayTransform = fn(&str, &Value) -> String;
 /// `None` means the tool carries no inline target.
 pub(crate) type ToolStatusTarget = fn(&Value) -> Option<String>;
 
+/// Controls terminal echo of call arguments and results. Tools opt in through
+/// `ToolDisplayRegistration`; the default echoes neither.
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct ToolDisplayConfig {
     /// Whether to print tool call arguments to the terminal.
@@ -81,7 +78,7 @@ pub(crate) struct ToolDisplayConfig {
 
 /// Keep only the last two path segments (directory + file name), truncating over-long paths.
 pub(crate) fn short_path(p: &str) -> String {
-    // Prefer the last two segments: /a/b/c/foo.rs → b/foo.rs
+    // Prefer the last two segments: /a/b/c/foo.rs → c/foo.rs
     let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
     let short = if parts.len() >= 2 {
         format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
@@ -668,14 +665,9 @@ pub(crate) fn get_builtin_tool_definitions() -> Vec<ToolDefinition> {
     tool_definitions_for_groups(&[super::tool_groups::ToolGroup::Builtin])
 }
 
-/// Whether a registered tool is a "deferred eager-load heavy execution
-/// primitive", i.e. it carries the `hidden` metadata flag. These tools
-/// (process / IPC / shared-memory / environment primitives) have large schemas
-/// and low usage, so they are not resident in each turn's request; the model
-/// enables them on demand via `enable_tools`, shrinking per-turn tools-schema
-/// tokens. The same flag also excludes them from the default catalog
-/// (`tool_metadata::tool_is_hidden`), so `hidden` is the single source of
-/// truth for both eager-load deferral and default-agent visibility.
+/// Whether `hidden` metadata defers a tool's eager schema loading. Enabling a
+/// hidden tool also requires its manifest-declared gating group; see
+/// `agent_may_enable_tool` in `tools/enable_tools.rs`.
 pub(crate) fn tool_defers_eager_load(name: &str) -> bool {
     super::tool_metadata::tool_is_hidden(name)
 }
@@ -1094,9 +1086,8 @@ fn execute_tool_call_with_args_impl(
 
 /// Run a tool implementation, turning a panic into an ordinary tool error.
 ///
-/// A panicking tool must not take the turn down with it: the model can read an
-/// error result and decide what to do next, whereas an unwinding panic aborts
-/// the process that runs the turn and loses every tool result of that turn.
+/// Contain unwinding tool panics so the turn can retain its other results and
+/// the model can respond to the error.
 fn run_tool_guarded<F>(tool_name: &str, run: F) -> Result<String, String>
 where
     F: FnOnce() -> Result<String, String>,
@@ -1121,7 +1112,7 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     "unknown panic payload".to_string()
 }
 
-/// Tier A1: write tool call results into the DecisionLog (write-only; downstream consumption is a separate PR).
+/// Record a tool invocation outcome in the session decision log.
 fn record_tool_decision(name: &str, success: bool, message: &str) {
     record_tool_decision_with_time(name, success, message, 0);
 }

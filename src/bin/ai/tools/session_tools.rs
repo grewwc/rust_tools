@@ -6,9 +6,8 @@
 //! through the read-only sqlite open (no migration, no journal switch), asset
 //! search is a plain bounded `fs` walk, and session ids are validated before
 //! they touch any path. No lock, cache, or derived file is created, so the
-//! "session lifecycle is user-owned" invariant stays intact. Members of the
-//! `session` group are lazy (loaded via `enable_tools`), keeping them out of
-//! every turn's resident schema.
+//! "session lifecycle is user-owned" invariant stays intact. The `session`
+//! group is loaded on demand.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -118,10 +117,9 @@ fn content_to_text(content: &Value) -> String {
     }
 }
 
-/// Render one message as one or two lines: the `[role] body` line (tool calls
-/// replace an empty body) plus, when present, a `reasoning:` line with the
-/// message's persisted `reasoning_content`. Both lines are capped by
-/// `MAX_MESSAGE_CHARS`.
+/// Render the role and body, substituting tool calls for an empty body.
+/// Append persisted reasoning when present. Limit each content excerpt to
+/// `MAX_MESSAGE_CHARS` bytes at a UTF-8 boundary.
 fn render_message(
     role: &str,
     content: &Value,
@@ -167,7 +165,7 @@ fn model_reasoning(message: &crate::ai::history::Message) -> Option<&str> {
 /// Resolve the `[start, end)` message window for `session_read`: with an
 /// explicit `from` (canonical message index, 0-based, oldest first) the window
 /// starts there and pages forward by `limit`; without it the most recent
-/// `limit` messages are shown, preserving the pre-paging behavior. An
+/// `limit` messages are shown. An
 /// out-of-range `from` is an error so a stale index cannot silently render an
 /// empty page.
 fn message_window(len: usize, from: Option<usize>, limit: usize) -> Result<(usize, usize), String> {
@@ -192,7 +190,8 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…(+{} chars)", &s[..end], s[end..].chars().count())
 }
 
-/// A ~`SNIPPET_WINDOW`-char window centered on the first match of `needle`.
+/// Excerpt around the first match of a lowercase `needle`, with more context
+/// after the match; the window uses byte offsets adjusted to UTF-8 boundaries.
 fn snippet_around(text: &str, needle: &str) -> String {
     let lower = text.to_lowercase();
     match lower.find(needle) {
@@ -232,7 +231,7 @@ fn truncate_output(out: &str) -> String {
 
 /// Keep inspected-session text visibly separate from the current conversation.
 /// Escaping only the protocol-opening byte preserves readable evidence while
-/// making every XML/DSML tool-call marker inert in a later assistant response.
+/// keeping verbatim copies of XML/DSML tool-call markers inert.
 fn wrap_session_snapshot(tool: &str, session_id: &str, body: &str) -> String {
     const SNAPSHOT_END: &str = "=== END SESSION TOOL SNAPSHOT ===";
     let prefix = format!(
@@ -263,7 +262,7 @@ protocol_encoding: Each quoted line starts with '| '; ASCII '<' inside quoted da
     format!("{prefix}{body}{suffix}")
 }
 
-/// Extensions that are never worth text-searching.
+/// Exclude known binary formats and bookkeeping files from asset search.
 fn is_textish(path: &Path) -> bool {
     const SKIP: &[&str] = &[
         "png", "jpg", "jpeg", "gif", "webp", "ico", "pdf", "zip", "sqlite", "sqlite-wal",
@@ -393,7 +392,7 @@ fn execute_session_list(args: &Value) -> Result<String, String> {
 
 /// `session_read`: view one session's context. `mode=digest` (default) shows a
 /// header (title / prompt / size / checkpoints) plus messages; `mode=raw`
-/// renders messages only. Without `from`, the most recent `limit` messages are
+/// omits that detail header. Without `from`, the most recent `limit` messages are
 /// shown; `from` pages forward from a canonical message index.
 fn execute_session_read(args: &Value) -> Result<String, String> {
     let session_id = args["session_id"]
@@ -676,7 +675,6 @@ mod tests {
         // has no index 0 to page from.
         let err = message_window(0, Some(0), 4).unwrap_err();
         assert!(err.contains("out of range"), "{err}");
-        // Out-of-range `from` is an error, not a silent empty page.
         let err = message_window(10, Some(10), 4).unwrap_err();
         assert!(err.contains("out of range") && err.contains("10 messages"), "{err}");
     }

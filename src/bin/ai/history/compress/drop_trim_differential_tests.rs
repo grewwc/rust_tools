@@ -7,7 +7,7 @@
 //! so this file pins it with deterministic shapes covering:
 //! - both keep regimes (total above/below the 48K base) and the 2->3 flip
 //!   mid-stretch;
-//! - the byte-cap (protected tail exceeding `max_chars` forces keep down);
+//! - the char-budget cap (protected tail exceeding `max_chars` forces keep down);
 //! - deletion of real users below the window (the boundary-drift path);
 //! - preserved user stubs, checkpoint markers, tool results, assistant
 //!   tool-call messages and leading protected system messages (skip predicates).
@@ -104,13 +104,10 @@ fn batch_drop_loop(
     (dropped, dropped_internal_notes)
 }
 
-/// Copy of `drop_trim_candidates_batch` with ONLY the boundary-drift line
-/// removed: on deleting a below-boundary user the boundary ordinal stays put
-/// (which is the "obviously correct" physical interpretation). This variant
-/// exists solely to prove the drift is load-bearing: it trims MORE than the
-/// sequential loop (it keeps deleting candidates below the physical boundary
-/// after `user_count` drops to `keep`, which sequential protects by
-/// recomputing `retained_turn_start == 0`).
+/// Comparison variant that leaves the boundary ordinal unchanged after removing
+/// an earlier user. It demonstrates why boundary drift matters: this variant
+/// keeps trimming after the sequential loop's recomputed window protects the
+/// whole input. Fixtures here contain no side notes, which production also protects.
 fn drop_trim_candidates_batch_exact(
     messages: &mut Vec<Message>,
     max_chars: usize,
@@ -319,11 +316,9 @@ fn run_case(name: &str, messages: Vec<Message>, max_chars: usize) {
     assert_eq!(seq_total, bat_total, "{name}: total differ");
 }
 
-/// Build a history: `head` protected system messages, then `big_block` long
-/// plain assistant messages (each ~1200 chars, all candidates) so the total
-/// reliably exceeds the 48K keep base and stays high through several
-/// removals, then `users` real users separated by `gap` plain assistants,
-/// then `tail` plain assistants.
+/// Build a protected system prefix, a block of repeated assistant text, real
+/// users separated by short assistant gaps, and trailing assistant messages.
+/// The block size controls how much droppable text precedes the user window.
 fn build_history(
     head: usize,
     big_block: usize,
@@ -350,9 +345,8 @@ fn build_history(
     out
 }
 
-/// big_block = 60 => ~72K total (keep=2 until it crosses 48K mid-stretch);
-/// big_block = 30 => ~36K total (keep=3 throughout). Covers the boundary-drift
-/// shapes in both keep regimes plus the 48K 2->3 flip.
+/// Exercise different leading-block sizes and user-gap shapes against the
+/// sequential boundary recomputation.
 #[test]
 fn batch_drop_matches_sequential_drift_shapes() {
     for big in [60usize, 30] {
@@ -371,7 +365,7 @@ fn batch_drop_matches_sequential_drift_shapes() {
 }
 
 /// Keep=2 -> 3 crossing via a single huge early user message, plus the
-/// byte-cap path (protected tail exceeding `max_chars` forces keep down to 1).
+/// char-budget path (protected tail exceeding `max_chars` forces keep down to 1).
 #[test]
 fn batch_drop_matches_sequential_48k_cross_and_byte_cap() {
     let mut m = build_history(1, 10, 4, 2, 2);
@@ -383,8 +377,7 @@ fn batch_drop_matches_sequential_48k_cross_and_byte_cap() {
     run_case("byte-cap-keep1", m, 400);
 }
 
-/// Shape that actually deletes below-boundary USERS mid-stretch (keep=2,
-/// total stays above 48K): six users with huge contents. This is the case
+/// Shape that deletes earlier real users with large bodies. This is the case
 /// where the boundary drift matters - it must match sequential, and the
 /// non-drifting ("exact") boundary must NOT (it keeps trimming below the
 /// physical boundary after user_count drops to keep, which sequential
@@ -396,13 +389,13 @@ fn batch_drop_drift_is_load_bearing_for_keep2_user_deletion() {
         m.push(msg(
             "user",
             &long_text(&format!("user-{u}-payload-"), 2_000),
-        )); // ~22K chars
+        )); // 30K chars
         m.push(msg("assistant", &format!("assistant-{u}")));
     }
     m.push(msg("assistant", "tail-0"));
     m.push(msg("assistant", "tail-1"));
 
-    // Sanity: total > 48K so keep=2 throughout (even after deleting users).
+    // The initial total selects the above-threshold base window.
     let total = messages_total_chars(&m);
     assert!(
         total > KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS,
@@ -441,9 +434,9 @@ fn batch_drop_drift_is_load_bearing_for_keep2_user_deletion() {
     );
 }
 
-/// Skip predicates parity: preserved user stub (counted as a real user, never
-/// deletable), checkpoint marker, assistant tool-call message and tool result
-/// are all skipped identically by both paths.
+/// Compare both paths on preserved user stubs, checkpoint-like assistant text,
+/// and tool protocol messages. User stubs and tool messages are skipped;
+/// assistant text remains ordinary removable content.
 #[test]
 fn batch_drop_matches_sequential_special_messages() {
     let mut m = build_history(1, 20, 4, 1, 1);

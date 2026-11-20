@@ -86,21 +86,17 @@ pub(in crate::ai) use wire_parse::{
     ParsedStreamPayload, ResponseTerminalStatus, try_parse_anthropic_event,
     try_parse_stream_chunk_from_value, try_parse_stream_chunk_loose,
 };
-// External re-exports (build_content is called from several places in the driver)
 #[allow(unused_imports)]
 pub(crate) use builder::{
     build_content, build_reference_content, clamp_max_tokens_for_prompt,
     materialize_image_references, materialize_references,
 };
 
-// Transport layer: HTTP request sending, retry, timeout, auth
 pub(crate) use transport::preview_request_budget;
 pub use transport::{do_request_json, do_request_text_streaming};
 pub(super) use transport::{do_request_messages, do_request_messages_without_tools, print_info};
 
-// The private use statements below exist only for the `tests` submodule to
-// access via `use super::*;`. The function bodies have moved to `transport.rs`;
-// mod.rs itself no longer uses these items directly.
+// These private imports let the `tests` submodule access helpers via `use super::*`.
 #[cfg(test)]
 #[allow(unused_imports)]
 use std::time::{Duration, Instant};

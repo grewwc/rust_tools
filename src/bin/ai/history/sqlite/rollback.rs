@@ -13,14 +13,9 @@ use super::{
 
 const CHECKPOINT_LIVE_ROLLBACK_META_KEY: &str = "checkpoint_live_rollback_transaction_v1";
 
-/// Reads the live DB's three monotonic counters before a rollback:
-/// `history_generation`, `history_revision`, `turn_seq`. A rollback uses
-/// `backup_sqlite` to overwrite the live path with the whole checkpoint DB, which
-/// would restore all three counters to their old checkpoint-time values and break
-/// the "monotonic across rollbacks" invariant. This function reads the live values
-/// before the overwrite so that
-/// `rebase_metadata_after_rollback` raises them back above the live values after the overwrite.
-/// When the database is missing or the meta row is absent, each counter reads 0, matching the “never modified” baseline.
+/// Live counters captured by `read_live_rollback_metadata` before replacing a DB.
+/// `rebase_metadata_after_rollback` uses them while preparing the replacement,
+/// so checkpoint counters cannot regress live state after publication.
 pub(in crate::ai) struct LiveRollbackMetadata {
     pub(in crate::ai) generation: i64,
     pub(in crate::ai) revision: i64,
@@ -125,7 +120,7 @@ pub(in crate::ai) fn read_live_rollback_metadata(path: &Path) -> io::Result<Live
 /// SQLite snapshot, so retain the projection and stamp it with the rebased
 /// generation. Clear orphan context rows and the archived rewind ring.
 ///
-/// Raise the three monotonic counters above their pre-rollback live values,
+/// Rebase the three counters against their pre-rollback live values,
 /// guaranteeing:
 /// - `history_generation` is strictly greater than the live value -> any
 ///     stale snapshot write still holding an old generation is rejected by fencing (the
@@ -151,8 +146,8 @@ pub(super) fn rebase_metadata_after_rollback(
         // Rewind fallbacks are not carried across a checkpoint restore.
         tx.execute("DELETE FROM context_snapshot_history", [])
             .map_err(|e| io::Error::other(e.to_string()))?;
-        // Each counter takes MAX(checkpoint value, live value) then +1 (generation/revision must strictly
-        // increase; turn_seq can simply take the live value, since it is the “next number to allocate”).
+        // Generation/revision become max(checkpoint, live + 1); turn_seq becomes
+        // max(checkpoint, live) so already allocated turn numbers cannot be reused.
         let bump_gen = live_generation
             .checked_add(1)
             .ok_or_else(|| io::Error::other("history generation overflow"))?
@@ -232,7 +227,7 @@ pub(in crate::ai) fn restore_sqlite_after_rollback(
 /// Like [`restore_sqlite_after_rollback`], but atomically stamps the published
 /// replacement DB with a rollback transaction identifier. The stamp is part of
 /// the same replacement DB that is renamed into place, making crash recovery
-/// idempotent even when later asset restoration or cleanup fails.
+/// idempotent when later cleanup fails.
 pub(in crate::ai) fn restore_sqlite_after_rollback_with_transaction(
     checkpoint: &Path,
     live_path: &Path,
@@ -372,8 +367,7 @@ fn try_clone_staged_sqlite(_source: &Path, _target: &Path) -> bool {
 
 /// Create a consistent snapshot with the SQLite Online Backup API and write it to the target via atomic replacement.
 /// Copying the WAL main file directly would miss pages not yet checkpointed; the backup API reads both the main DB and the WAL
-/// from the same SQLite snapshot. The source opens read-only so a rollback never drops transient sidecars into the checkpoint
-/// directory (which used to bump its mtime and steal the `[latest]` tag). After the main DB replacement succeeds, the old
+/// from the same SQLite snapshot. The source opens read-only; after the main DB replacement succeeds, the old
 /// sidecar files are removed so a stale WAL/SHM cannot mix with the new main DB.
 pub(in crate::ai) fn backup_sqlite(source: &Path, target: &Path) -> io::Result<()> {
     if !source.exists() {
@@ -853,7 +847,7 @@ fn quiesce_and_remove_sqlite_sidecars(path: &Path) -> io::Result<()> {
     remove_sqlite_sidecars(path)
 }
 
-/// Copy the parent session's history DB to a standalone per-process file for a sub-agent.
+/// Copy the parent session's history DB to an independent child history file.
 ///
 /// The `inherit.history` semantics are “the sub-agent may read the parent session's context, but writes must not flow back into the parent DB”.
 /// Reusing the parent DB's canonical file directly would let the sub-agent's internal prompt/tool traces pollute the parent session
@@ -864,14 +858,12 @@ fn quiesce_and_remove_sqlite_sidecars(path: &Path) -> io::Result<()> {
 pub(in crate::ai) fn fork_history_for_subagent(parent: &Path, child: &Path) -> io::Result<()> {
     with_session_state_lock(child, || match fs::metadata(parent) {
         Ok(_metadata) => {
-            // Ensure the child file's parent directory exists, or the temporary file for `backup_sqlite` would fail to be created.
             if let Some(dir) = child.parent() {
                 fs::create_dir_all(dir)?;
             }
             backup_sqlite(parent, child)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            // The parent session has no history file, so the sub-agent starts from a blank history.
             reset_history_for_subagent_unlocked(child)
         }
         Err(error) => Err(error),
@@ -895,10 +887,9 @@ fn reset_history_for_subagent_unlocked(child: &Path) -> io::Result<()> {
     let result = (|| {
         let conn = open_history_db(&temporary)?;
         let initialized = init_history_schema(&conn);
-        // The staged file is renamed into place below, so it must be fully
-        // closed rather than returned to the connection cache — including when
-        // schema initialization fails, or the cached handle would keep the
-        // temp file's inode open after the cleanup below unlinks it.
+        // This staged DB supplies Online Backup and is then removed. Close it
+        // before backup and cleanup, including schema-initialization failures,
+        // so the write cache cannot keep its inode and sidecars alive.
         conn.close();
         initialized?;
         backup_sqlite(&temporary, child)

@@ -4,9 +4,8 @@ use super::super::*;
 
 #[test]
 fn tty_tool_output_fold_window_keeps_latest_visible_lines() {
-    // Assert the body/marker exists verbatim; widen COLUMNS so it does not run
-    // concurrently with the COLUMNS=12 clamp case and read a leaked narrow width,
-    // truncating the output.
+    // Serialize COLUMNS changes and use a wide terminal so marker/body assertions
+    // are not affected by the separate narrow-width clamp case.
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -35,11 +34,9 @@ fn tty_tool_output_fold_window_keeps_latest_visible_lines() {
 
     let (window, _) = render_tty_tool_output_fold_window(&fold);
     assert_eq!(window.matches("lines folded").count(), 1);
-    // Compare the **exact** body sequence after stripping ANSI and the `  │ ` prefix
-    // per line, rather than `contains("line-1")`: visible lines like line-10..line-19
-    // all contain "line-1" as a substring, so substring assertions would falsely fail
-    // (test fragility exposed after raising MAX_VISIBLE from 8 to 64). The exact
-    // sequence simultaneously proves line-1 was folded and the rest kept in order.
+    // Compare the exact body sequence after removing ANSI and the gutter:
+    // substring checks for line-1 also match line-10 and cannot establish
+    // which rows remain.
     let body_tokens = window
         .lines()
         .map(|line| crate::ai::driver::print::sanitize_for_terminal(line))

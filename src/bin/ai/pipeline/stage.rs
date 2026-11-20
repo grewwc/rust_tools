@@ -50,9 +50,8 @@ impl Pipeline {
     ) -> Pin<
         Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>,
     > {
-        // 迭代语义：每个 stage 触发 before → 主体 → after，任一返回 Err 立即短路并向上传播。
-        // 旧 CPS 中 after 是否触发取决于 stage 是否调用 next 续体（隐式、易漏）；迭代式在
-        // stage 边界统一触发，错误路径可预期。
+        // A failed before hook or stage skips that stage's after hooks;
+        // any error stops the remaining stages.
         Box::pin(async move {
             for stage in &self.stages {
                 let kind = stage.kind();

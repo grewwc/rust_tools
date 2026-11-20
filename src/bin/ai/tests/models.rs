@@ -40,9 +40,7 @@ fn determine_vl_model_supports_selector_and_fuzzy_name() {
 
 #[test]
 fn tools_default_flag_is_respected_per_model_entry() {
-    // This used to hardcode the tools_enabled behavior of qwen3.5-flash / qwen3-max; both models
-    // have been removed from the model registry. Scan the real entries instead and verify that
-    // models::tools_enabled stays aligned with ModelDef.tools_default_enabled, keeping the "config is truth" invariant.
+    // Registry entries define tool defaults; avoid hardcoding individual models.
     for def in model_names::all() {
         assert_eq!(
             models::tools_enabled(&def.name),

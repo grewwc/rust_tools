@@ -20,8 +20,7 @@ pub(crate) trait PromptBuilder: Send + Sync {
     fn build(&self, app: &App, req: PromptBuildRequest) -> PromptBuildOutput;
 }
 
-/// 默认实现：透传（保留现有 `prompt::build_system_prompt` 等逻辑，
-//  后续在 `prompt` crate 中实现真实组装时仅替换此 impl）
+/// Pass-through builder: returns the request's messages without assembling a prompt.
 pub(crate) struct DefaultPromptBuilder;
 
 impl PromptBuilder for DefaultPromptBuilder {

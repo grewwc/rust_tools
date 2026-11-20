@@ -9,13 +9,8 @@ pub fn resolve_model_for_input(
     _has_usable_ocr_for_images: bool,
     _question: &mut String,
 ) -> String {
-    // Resolution order:
-    // 1) A trailing " -d" forces the default DeepSeek model (and strips the suffix).
-    // 2) A trailing " -<digit>" selects one of the built-in models (and strips the suffix).
-    // 3) Otherwise, keep the current model.
-    // Image attachments no longer force a VL model switch — OCR text extraction
-    // (a subagent parse run in driver/mod.rs before this function) provides text
-    // for the current model.
+    // Keep the session's selected model; attachment parsing is handled separately
+    // and does not alter this choice.
     app.current_model.clone()
 }
 
@@ -25,9 +20,7 @@ pub fn attachment_forced_model(
     _vl_default_model: &str,
     _has_usable_ocr_for_images: bool,
 ) -> Option<String> {
-    // Text-only models with image attachments stay on the current model.
-    // A subagent image parse (run in driver/mod.rs before this function) handles
-    // extracting readable text for the LLM.
+    // Image attachments do not force a model switch; parsing is handled separately.
     None
 }
 
@@ -174,11 +167,6 @@ fn attached_image_parse_route(vl_model: &str) -> AttachedImageParseRoute {
     }
 }
 
-/// When a non-VL model receives attached images, prefer dispatching a synchronous
-/// subagent pinned to a VL model; fall back to static OCR when no VL model is available,
-/// so image attachments are not degraded to plain-text filenames.
-/// The returned OcrExtraction reuses the precomputed_ocr injection pipeline to feed the
-/// parsed result to the main agent.
 const IMAGE_PARSE_SUBAGENT_HARD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Dispatch arguments for the attached-image parse subagent.
@@ -239,8 +227,11 @@ pub(in crate::ai) async fn parse_attached_images_via_subagent(
     parse_attached_images_for_input(mcp_client, vl_model, image_files)
 }
 
-/// The image parser dispatches and waits synchronously. Live side-note delivery
-/// uses the same route without replacing the running turn's image attachments.
+/// Prefer a synchronous VL subagent, falling back to OCR when the selected
+/// model cannot accept images. Return parsed content or an explicit failure
+/// notice through `OcrExtraction` so the main model can retain its selection.
+/// Live side-note delivery uses the same route without replacing the running
+/// turn's image attachments.
 pub(in crate::ai) fn parse_attached_images_for_input(
     mcp_client: &SharedMcpClient,
     vl_model: &str,
@@ -536,7 +527,7 @@ mod tests {
 
     #[test]
     fn failed_image_parse_extraction_marks_every_image_and_exposes_reason() {
-        // P1-a regression: on subagent dispatch failure / empty text we must return a placeholder
+        // On subagent dispatch failure / empty text we must return a placeholder
         // marked with error instead of silently Ok(None), so the prepare stage can inject the
         // [IMAGE PARSE FAILED: ...] notice.
         let files = vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()];

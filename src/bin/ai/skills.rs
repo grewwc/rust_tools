@@ -10,7 +10,7 @@
 //   - Support tools, tool_groups, mcp_servers
 //
 // Key differences from agents:
-//   - Skills are invoked via tool calls, not conversation
+//   - Model-facing tools and explicit user commands can activate skills
 //   - Lower priority in skill matching wins ties
 //   - Don't have model/temperature (use agent's settings)
 //   - No routing tags or disabled/hidden flags
@@ -140,7 +140,6 @@ impl SkillManifest {
             if !prompt.is_empty() {
                 prompt.push_str("\n\n");
             }
-            // Avoid extra clone when prompt is already allocated
             prompt.push_str(self.prompt.as_str());
         }
 
@@ -189,8 +188,8 @@ pub(super) fn delegation_required(active_names: &[String], manifests: &[SkillMan
 /// runtime and stay behind; the header tells the runner to use its own tools.
 /// Only skills in `active_names` are rendered: external backends must receive
 /// the instructions the parent actually runs with, not the whole catalog.
-/// Returns `None` when no active skill carries body text, so callers omit the
-/// block.
+/// Returns `None` when no active skill other than `agent-team` has body text
+/// or a description.
 pub(super) fn render_external_skill_context(
     skills: &[SkillManifest],
     active_names: &[String],
@@ -657,21 +656,17 @@ fn is_ignored_package_entry_name(name: &str) -> bool {
     name.starts_with('.') || name == "__MACOSX"
 }
 
-/// Maximum directory depth for collection drill-down. A collection layout
-/// unzips to at most `<collection>/skills/<pkg>` (3 levels); 4 leaves headroom
-/// while avoiding unbounded recursion on abnormally deep trees.
+/// Bound collection traversal so deeply nested directory or ZIP layouts cannot
+/// trigger unbounded recursion.
 const MAX_SKILL_PACKAGE_DEPTH: usize = 4;
 
 /// Child-skill container directory names. Only the `subskills` allowlist is
 /// used, avoiding collisions with the collection layout `skills/<pkg>`.
-/// `skills` was once included, which misjudged `<collection>/skills/<pkg>`
-/// content as child skills.
 const SUBSKILL_CONTAINER_DIRS: &[&str] = &["subskills"];
 
-/// 尝试从文件系统布局推断子 skill 的父名。
-/// 约定：`parent/subskills/child/SKILL.md` ⇒ 父名为 parent 的 skill 名（取 manifest 中 `name`）。
-/// 若无法解析父 manifest（缺失或非法），则返回 `None`，调用方应要求子 skill 显式声明 `parent`，
-/// 避免回退到目录名与 manifest.name 不一致而产生孤儿 parent。
+/// Infer a child package's parent from the manifest in `parent/subskills/child`.
+/// Missing or invalid parent manifests return `None`; directory names are not
+/// used as a fallback because they may differ from the declared skill name.
 fn infer_parent_from_filesystem(resource_root: &Path) -> Option<String> {
     let container = resource_root.parent()?;
     let container_name = container.file_name()?.to_str()?;
@@ -722,8 +717,7 @@ fn collect_subskills_for_parent(parent_root: &Path) -> Vec<(PathBuf, PathBuf)> {
         rust_tools::sortw::stable_sort_by(&mut children, |a, b| a.cmp(b));
         for child in children {
             if let Some(manifest) = find_skill_manifest_in_package_dir(&child) {
-                // 子 skill 去重：同一父下同名目录已通过 manifest name 去重由上层处理，
-                // 此处按路径收集，后续 load_all_skills 按 name 去重。
+                // Collect by path; `load_all_skills` deduplicates manifests by name.
                 out.push((child, manifest));
             }
         }
@@ -731,20 +725,12 @@ fn collect_subskills_for_parent(parent_root: &Path) -> Vec<(PathBuf, PathBuf)> {
     out
 }
 
-/// 收集 `root` 下的所有 skill 包，返回每个包的 `(resource_root, manifest_path)`。
-///
-/// - 若 `root` 自身就是一个包（直接含 manifest），返回它本身**外加**其子 skill：
-///   仅扫描 `subskills` 容器下的直接子包；`references/*.skill`
-///   等仍不会被误判为 skill（原有保证保留）。
-/// - Otherwise treat `root` as a "collection" (layout
-///   `<collection>/skills/<pkg>/SKILL.md`), drilling down level by level to
-///   collect all **top-level** packages; stop descending once a directory is a
-///   package.
-///
-/// 磁盘目录集合与解压后的 zip 集合通过同一条逻辑处理，无需对 `skills/` 之类的容器
-/// 名做硬编码判断。
+/// Collect `(resource_root, manifest_path)` pairs from a package or collection.
+/// A package contributes itself and direct packages under `subskills`; other
+/// resource directories are not searched. Collections are searched up to
+/// `MAX_SKILL_PACKAGE_DEPTH`, stopping at each package before adding its direct
+/// subskills. Directory and extracted ZIP collections use the same path.
 fn collect_skill_packages(root: &Path) -> Vec<(PathBuf, PathBuf)> {
-    // 单包短路：root 直接是一个包，返回自身 + 其子 skill（若有）。
     if let Some(manifest) = find_skill_manifest_in_package_dir(root) {
         let mut out = vec![(root.to_path_buf(), manifest)];
         out.extend(collect_subskills_for_parent(root));
@@ -753,7 +739,6 @@ fn collect_skill_packages(root: &Path) -> Vec<(PathBuf, PathBuf)> {
     }
     let mut out = Vec::new();
     collect_skill_packages_recursive(root, MAX_SKILL_PACKAGE_DEPTH, &mut out);
-    // 为每个已发现的父包追加其子 skill
     let parents = out.clone();
     for (parent_root, _) in parents {
         out.extend(collect_subskills_for_parent(&parent_root));

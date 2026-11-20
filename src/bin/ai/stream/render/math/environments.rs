@@ -8,7 +8,7 @@ use super::symbols::replace_symbolic_tex_once;
 
 /// 处理单行内的环境级命令（`\boxed`、`\text`），返回处理后的字符串。
 ///
-/// 在内联数学中，`\boxed{3.37}\text{年}` 应渲染为 `⌈3.37⌉ 年`。
+/// Adjacent `\boxed{3.37}\text{年}` commands render as `⌈3.37⌉年`.
 /// 这些命令只能出现在 TeX 转 Unicode 的最后阶段——在结构变换和符号替换之后、
 /// 清除花括号之前——否则花括号参数会被提前剥离导致命令失去参数。
 pub(super) fn replace_inline_environment_commands(s: &str) -> String {
@@ -49,7 +49,6 @@ fn replace_text_command(s: &str) -> Option<String> {
         let after = i + needle.len();
         if after < bytes.len() && bytes[after] == b'{' {
             if let Some((_content, end)) = read_group_braced(s, after) {
-                // content 包含花括号内的原始内容（含未处理的 TeX）
                 let mut out = String::with_capacity(s.len());
                 out.push_str(&s[..i]);
                 // 对 text 内容做基本的 TeX→Unicode 转换（符号替换 + 脚本）
@@ -107,7 +106,7 @@ fn replace_boxed_inline(s: &str) -> Option<String> {
     None
 }
 
-/// 对单行 TeX 做完整的 TeX→Unicode 转换（结构 + 符号 + 脚本）。
+/// Apply sizing, structural, symbol, and script transforms to one TeX line.
 fn render_math_single_line(s: &str) -> String {
     let mut t = super::structural::strip_sizing_commands(s);
     t = super::structural::replace_structural_tex(t);
@@ -132,12 +131,8 @@ pub(super) fn detect_end_env(line: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// 渲染整个 `\begin{aligned}...\end{aligned}` 块为对齐的 Unicode 文本。
-///
-/// 协议：
-/// - `lines` 包含 `\begin{aligned}` 到 `\end{aligned}` 之间的所有行
-/// - 每行用 `\\` 结束（最后一行可能没有）
-/// - `&` 标记对齐点：左列右对齐，右列左对齐
+/// Render `aligned` content split by source lines or `\\` row separators.
+/// `&` separates columns; all but the last column are right-aligned.
 pub(super) fn render_aligned_block(lines: &[String]) -> String {
     let mut rows: Vec<Vec<String>> = Vec::new();
 

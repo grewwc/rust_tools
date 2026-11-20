@@ -15,7 +15,7 @@ fn recover_inline_tool_calls_normalizes_namespaced_xml_prefix() {
 
 #[test]
 fn recover_inline_tool_calls_normalizes_fullwidth_dsml_prefix() {
-    // Per debug.md, DeepSeek actually emits the fullwidth-vertical-bar variant: <｜｜DSML｜｜...>.
+    // Normalize fullwidth DSML tags before parsing their XML body.
     let raw = r#"<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="apply_patch"><｜｜DSML｜｜parameter name="file_path">/tmp/x</｜｜DSML｜｜parameter><｜｜DSML｜｜parameter name="patch">---</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>"#;
     let calls = recover_inline_tool_calls(raw).expect("should recover fullwidth-DSML tool calls");
     assert_eq!(calls.len(), 1);
@@ -25,10 +25,8 @@ fn recover_inline_tool_calls_normalizes_fullwidth_dsml_prefix() {
     assert_eq!(args["patch"], "---");
 }
 
-/// Reproduces the session bc1f2e88 failure: a reasoner with a prefilled `<think>` template writes
-/// the chain of thought into the content channel, ending only with a dangling `</think>`. With the
-/// splitter armed, leaked reasoning before `</think>` must go into reasoning_text (rendered in the
-/// thinking fold); only the real answer after `</think>` enters assistant_text, so the final answer is never output twice.
+/// Armed content demuxing routes text before `</think>` to reasoning and commits
+/// only the following answer to assistant text.
 #[test]
 fn armed_demuxer_splits_leaked_reasoning_from_visible_content() {
     let markers = StreamMarkers::new();
@@ -228,8 +226,6 @@ fn output_text_snapshot_can_finish_a_partially_streamed_demux_capture() {
     assert_eq!(state.content.reasoning_text, "reasoning");
 }
 
-/// Reverse assertion: for a normal model without the splitter armed (using the separate reasoning_content
-/// field), behavior is unchanged — a literal `</think>` in content lands verbatim in the visible body and is never swallowed.
 #[test]
 fn stream_filters_rewrite_visible_content_before_commit() {
     // Filter: rewrite "secret" into "[REDACTED]".
@@ -244,8 +240,8 @@ fn stream_filters_rewrite_visible_content_before_commit() {
     }
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
-    // Step 6: inject the filter chain and verify that `process_stream_payload`'s visible-content commit
-    // point applies the filters (the rewrite lands in assistant_text / history, the original text does not appear).
+    // Apply the filter chain at the visible-content commit boundary so only the
+    // rewritten text reaches history.
     state.filters = crate::ai::ports::stream::FilterChain::new().push(RedactFilter);
     let mut app = test_app();
     let mut current_history = String::new();
@@ -285,23 +281,6 @@ fn unarmed_demuxer_leaves_content_untouched() {
     assert!(state.content.reasoning_text.is_empty());
 }
 
-// =============================================================================
-// Golden wire→parse harness
-// =============================================================================
-// Regression guard for the SSE wire-shape → StreamResult contract. Unlike the
-// process_stream_payload unit tests above (which feed one payload at a time), and
-// unlike the ad-hoc loopback tests earlier in this file, this harness scripts a
-// full multi-event SSE response over a real loopback socket and drives the real
-// `stream_response` state machine end to end. It is the deterministic, offline
-// core of the "golden transcript" idea: fixtures describe the exact bytes a
-// provider would stream; assertions pin the parsed outcome. No network, no live
-// model — so it is safe to run in CI and catches regressions in chunk framing,
-// tool-call assembly, finish_reason handling, and reasoning demux.
-//
-// Reusability: `ScriptedSse::spawn(events)` takes a list of raw SSE `data:`
-// payloads (JSON strings, or the literal "[DONE]") and serves them over a real
-// loopback socket; `drive(events)` runs the parser and returns the StreamResult.
-// New golden cases only add fixtures; the harness is fixed.
 #[test]
 fn transactional_serve_body_glued_thinking_close_becomes_pending() {
     use crate::ai::background::ServeLiveKind;

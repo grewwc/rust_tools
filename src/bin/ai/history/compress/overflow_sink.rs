@@ -1,4 +1,4 @@
-//! Overflow-archive helpers (extracted from compress/mod.rs).
+//! Overflow archives and transactional plans for capped inline note windows.
 
 use std::path::{Path, PathBuf};
 
@@ -28,13 +28,12 @@ impl PlannedArchiveWrite {
         &self.content
     }
 
-    /// Atomically persist the planning-phase archive to disk. The path contains a
-    /// content fingerprint, so an already-existing file can be reused directly;
-    /// even if concurrent writers write temp files at the same time, only one
-    /// deterministic target file ends up remaining.
+    /// Commit a planned archive via a temporary file and rename. Existing targets
+    /// use a length check; metadata failures leave them in place. Concurrent
+    /// writers share the deterministic final path.
     pub(super) fn commit(&self) -> bool {
         if self.path.is_file() {
-            // Content-addressed idempotence: reuse if the existing file is intact.
+            // Content-addressed reuse checks length, not content integrity.
             // Legacy bare `fs::write` could leave a truncated file that still
             // satisfies `exists()` / `is_file()` but is shorter than the expected
             // content (crash mid-write). That stale partial file must not be
@@ -65,11 +64,7 @@ impl PlannedArchiveWrite {
                     return true;
                 }
             }
-            // If we reach here, the existing file was size-mismatched. Either it
-            // was removed (now !is_file()) or remove failed and it still exists
-            // but is stale. In both cases we must not return early; fall through
-            // to the atomic write path which will `rename` over the stale file.
-            // No early return.
+            // Recreate missing or size-mismatched targets through the atomic write path.
         }
         let Some(parent) = self.path.parent() else {
             return false;
@@ -118,12 +113,10 @@ pub(super) struct OverflowSink {
     /// `start_batch`; everything from here on is the stable batch payload used
     /// for sha256 fingerprint dedup in `flush`.
     payload_offset: usize,
-    /// Hex sha256 fingerprints of payloads already known to be archived, kept
-    /// as a persistent sidecar index next to the history file. Checking this
-    /// tiny index instead of scanning the ever-growing archive keeps every
-    /// flush O(payload) regardless of archive size. Entries are recorded only
-    /// AFTER their payload landed in the archive, so a crash between the two
-    /// degrades to one duplicate append rather than dropping evidence.
+    /// Hex SHA-256 fingerprints of archived payloads, mirrored in a sidecar index.
+    /// Each sink loads the index once rather than scanning the full archive body.
+    /// Entries are recorded after the payload append, so a crash between the two
+    /// costs a duplicate append rather than dropping evidence.
     seen_payloads: rustc_hash::FxHashSet<String>,
     seen_payloads_loaded: bool,
 }
@@ -140,8 +133,8 @@ impl OverflowSink {
         }
     }
 
-    /// Sidecar next to the history file listing hex sha256 digests of every
-    /// payload previously appended there, one per line.
+    /// Sidecar next to the history file listing SHA-256 digests of known appended
+    /// payloads, one per line.
     fn fingerprint_index_path(&self) -> PathBuf {
         PathBuf::from(format!("{}.fingerprints", self.path.to_string_lossy()))
     }
@@ -273,9 +266,8 @@ impl OverflowSink {
         }
         let digest = content_sha256_hex(payload.as_bytes());
         if self.seen_payloads.contains(&digest) {
-            // Trust an index hit only if the archive it describes is still
-            // readable. `exists()` alone is insufficient: an in-place truncate
-            // leaves the file present but empty, so require a non-zero length.
+            // Trust an index hit only if the archive still has nonzero length.
+            // An in-place truncate leaves the file present but empty.
             let archive_readable = std::fs::metadata(&self.path)
                 .map(|meta| meta.len() > 0)
                 .unwrap_or(false);
@@ -432,8 +424,9 @@ pub(in crate::ai) fn compressed_tool_evidence_exceeds_inline_budget(messages: &[
 
 /// Folded tool-group notes are a short-term recall window for older evidence, not
 /// a ledger that stays fully inlined forever. Keep the most recent contiguous
-/// window that fits a fixed char budget; older notes are archived with zero
-/// compression first and removed from messages only after the write succeeds.
+/// window within a fixed char budget, retaining the newest note even if it alone
+/// exceeds the cap. Older notes are archived with zero compression first and
+/// removed from messages only after the write succeeds.
 /// This keeps long tool chains from crowding the context with hundreds of ~1 KiB
 /// notes.
 pub(super) fn trim_compressed_tool_evidence_to_inline_budget(

@@ -56,7 +56,7 @@ const EMPTY_VIEWPORT_HEIGHT: u16 = 3 + VIEWPORT_CHROME_LINES;
 /// `render::COMPLETION_WINDOW`.
 const PANEL_COMPLETION_WINDOW: u16 = 12;
 /// Fallback chrome while the completion panel is active: the minimum textarea
-/// lines(1) plus the compressed help line(1) = 2. The input area's left-edge
+/// lines(1) plus the help line(1) = 2. The input area's left-edge
 /// marker bar occupies a column, not a row, so it adds nothing here.
 /// The completion state hides model/session info, giving height priority to the
 /// candidate list.
@@ -101,9 +101,9 @@ fn content_viewport_height(terminal_rows: u16, current_height: u16, lines: &[Str
 }
 
 /// Viewport height needed while the completion panel is active: extra space for
-/// the panel while keeping the textarea's line count unchanged. Desired panel
+/// the panel while reserving at least the minimum textarea height. Desired panel
 /// lines = min(candidates, PANEL_COMPLETION_WINDOW) + top/bottom borders(2),
-/// plus PANEL_CHROME_LINES (minimum textarea lines + compressed help line).
+/// plus PANEL_CHROME_LINES (minimum textarea lines + help line).
 /// When this does not exceed base_height (height without a panel), use
 /// base_height directly so a tiny panel never shrinks the viewport.
 fn viewport_height_with_completion(
@@ -131,10 +131,8 @@ type MultilineTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 /// submit the textarea.
 const CPR_ESCAPE_GRACE: Duration = Duration::from_millis(250);
 
-/// How long a timed-out DSR reply may still be expected in the input stream.
-/// Past this the reply was lost with the connection (an SSH drop discards it in
-/// transit), so the guard stops deferring Escapes for it and recovery stops
-/// waiting for it.
+/// Bound how long a timed-out DSR reply is tracked. After this window, stop
+/// deferring Escapes and blocking recovery for a reply presumed lost.
 const CPR_REPLY_WINDOW: Duration = Duration::from_secs(10);
 
 /// Upper bound on unaccounted replies kept in the guard queue. Every timed-out
@@ -147,20 +145,17 @@ const SSH_INPUT_BATCH_IDLE: Duration = Duration::from_millis(2);
 const SSH_INPUT_BATCH_WINDOW: Duration = Duration::from_millis(12);
 const MAX_SSH_INPUT_BATCH_EVENTS: usize = 1024;
 
-/// A main-screen probe is only safe once no *recent* reply is outstanding: an
-/// older reply would already have been delivered, so an answer arriving now is
-/// the probe's own.
+/// Minimum age of the newest outstanding query before another probe.
+/// This reduces overlap with delayed replies to earlier queries.
 const CPR_PROBE_QUIET_PERIOD: Duration = Duration::from_secs(2);
 
 /// Crossterm emits a key if ESC arrives in its own read. After a query timeout,
 /// briefly defer that ambiguous key so a fragmented CPR cannot submit the
-/// textarea. `pending_cpr_replies` holds one entry per timed-out query whose
-/// reply may still be in the input stream: the first inline query, its retry,
-/// and every failed recovery probe. Each entry is removed when its reply is
-/// actually observed, so every orphan gets swallowed and a real Escape only
-/// pays the grace once per outstanding reply. Entries expire after
-/// `CPR_REPLY_WINDOW`, because a reply that late was lost with the connection
-/// and deferring forever would tax every later Escape submission.
+/// textarea. `pending_cpr_replies` tracks unaccounted query replies across
+/// inline retries and recovery probes. Entries are removed when their replies
+/// are observed or expire after `CPR_REPLY_WINDOW`. While entries remain,
+/// ambiguous Escapes wait up to `CPR_ESCAPE_GRACE`; expiration bounds that
+/// delay when replies are lost.
 fn read_prompt_event(
     pending: &mut VecDeque<Event>,
     pending_cpr_replies: &mut VecDeque<Instant>,
@@ -273,7 +268,7 @@ fn read_ssh_input_batch(
     Ok(batch)
 }
 
-/// Drops replies that can no longer arrive, oldest first.
+/// Drop expired reply-tracking entries, oldest first.
 fn prune_expired_cpr_replies(pending: &mut VecDeque<Instant>, now: Instant) {
     while pending
         .front()
@@ -352,9 +347,8 @@ impl PromptScreen {
         self.queries_disabled && !self.alternate && self.replies_settled(now)
     }
 
-    /// True while no *recent* reply is outstanding, i.e. a query answer arriving
-    /// now belongs to that query. An older outstanding reply was either already
-    /// delivered or lost with the link, so it no longer competes.
+    /// Allow probing after the newest outstanding query has aged past
+    /// `CPR_PROBE_QUIET_PERIOD`, so recent queries get time to finish first.
     fn replies_settled(&mut self, now: Instant) -> bool {
         prune_expired_cpr_replies(&mut self.pending_cpr_replies, now);
         self.pending_cpr_replies
@@ -540,7 +534,7 @@ fn draw_alternate_tail<B: Backend>(
     }
     let style = Style::default().add_modifier(Modifier::DIM);
     let first_row = bottom_row - rows.len() as u16;
-    // One cell per grapheme column: trailing columns of a wide glyph are left
+    // One cell per character; trailing columns of a wide glyph are left
     // out of the iterator (the terminal advances over them), because the
     // backend prints every cell it is handed.
     let mut cells: Vec<(u16, u16, Cell)> = Vec::new();
@@ -644,18 +638,15 @@ fn tracked_cursor_query<T, E>(
     result
 }
 
-/// Probe round trips a fresh anchor may spend before giving up.
+/// Maximum low/high probe attempts before a fresh anchor gives up.
 const VERIFIED_ANCHOR_ATTEMPTS: u8 = 3;
 
 /// The two rows the next anchor probe commands for itself.
 ///
-/// Both rows slide by one per probe and do not repeat within a screen height,
-/// because the probe accepts a pair of replies as its own: a pair left unread by
-/// an earlier probe commanded the same two rows under a fixed pair, and the
-/// reply read after it would then be that probe's pinned answer — a row the
-/// cursor was moved to, not the row it lives on. Anchoring the box on that row
-/// is what leaves blank rows above the box, or clears printed output when the
-/// stale row is higher up the screen.
+/// The row pair advances and cycles across the screen. Reusing a fixed pair
+/// could accept replies left unread by an earlier probe, leaving the next
+/// read to consume that probe's pinned row instead of the caller's cursor.
+/// Such an anchor can leave blank prompt rows or clear printed output.
 ///
 /// The counter is a function-local static because it belongs to this one probe;
 /// no other module state should have to know about it.
@@ -671,16 +662,13 @@ fn anchor_probe_rows(last_screen_row: u16) -> (u16, u16) {
     (low, low + 1)
 }
 
-/// Reads the cursor row in a way that a reply left over from an earlier query
-/// cannot spoof.
+/// Validate the cursor row with commanded probes on multi-row screens.
 ///
-/// `ESC[6n` replies carry no tag, so a single answer cannot be told apart from
-/// a stale one. This protocol instead pins the cursor to two rows it commands
-/// itself — rows no earlier probe commanded — and requires both replies to land
-/// exactly on those rows; only then has every earlier reply been read, and the
-/// following query is trusted.
-/// The caller's cursor is put back with `restore` on every exit path, so the
-/// probes never move where the box is drawn afterwards.
+/// CPR replies carry no tag. Check the low/high replies against the current
+/// pair before trusting a query at the restored cursor position. Rotating
+/// the pair helps reject replies left unread by earlier probes.
+/// Restore is attempted after each saved probe attempt so the probes do
+/// not determine where the prompt is anchored.
 fn verified_cursor_row(
     query_row: &mut impl FnMut() -> io::Result<u16>,
     save: &mut impl FnMut() -> io::Result<()>,
@@ -698,9 +686,8 @@ fn verified_cursor_row(
     for _ in 0..VERIFIED_ANCHOR_ATTEMPTS {
         save()?;
         let (low_row, high_row) = anchor_probe_rows(last_screen_row);
-        // Both probe answers are collected before anything is propagated, so a
-        // query that times out still reaches `restore` below instead of leaving
-        // the caller's cursor parked on a probe row.
+        // Attempt the probes inside a closure so even a query timeout reaches
+        // `restore` before it is returned to the caller.
         let probe = (|| -> io::Result<(u16, u16)> {
             set_row(low_row)?;
             let low = tracked_cursor_query(pending, &mut *query_row)?;
@@ -720,9 +707,9 @@ fn verified_cursor_row(
             Err(err) => return Err(err),
         };
         if low == low_row && high == high_row {
-            // Nothing older than the two probes answered them, so the reply
-            // stream is drained. Retire any old accounting before the final
-            // query, whose own reply must remain guarded if it times out.
+            // Treat matching probe coordinates as validation of this attempt.
+            // Retire old accounting before the final query, whose own timeout
+            // must remain guarded.
             pending.clear();
             return tracked_cursor_query(pending, query_row);
         }
@@ -990,9 +977,9 @@ fn prepare_fixed_viewport_at<B: Backend>(
 
 /// Whether a rebuild must verify the DSR reply stream before trusting its row.
 ///
-/// A fresh anchor is the box top itself, and the deferred reflow rebuild has no
-/// frame waiting on it. Height rebuilds (which run on every panel change) and the
-/// keystroke-driven reflow rebuild accept the single round trip.
+/// Fresh anchors use the queried row as the box top. Height and keystroke-driven
+/// rebuilds normally accept a single round trip; `verify_anchor` requests
+/// probe validation for either rebuild mode.
 fn reply_stream_is_verified(
     cursor_offset_row: u16,
     mode: ViewportRebuildMode,
@@ -1001,18 +988,14 @@ fn reply_stream_is_verified(
     verify_anchor || (cursor_offset_row == 0 && mode == ViewportRebuildMode::ReserveMissingRows)
 }
 
-/// Runs the inline-anchor build, verifying the DSR reply stream first when this
-/// is a fresh anchor, unless the caller accepts a single round trip.
+/// Run the inline-anchor build with reply verification for fresh anchors
+/// and for rebuilds whose caller sets `verify_anchor`.
 ///
-/// A fresh anchor (`cursor_offset_row == 0`) is taken as the box top directly,
-/// so a reply left over from an earlier query anchors the box on the row that
-/// earlier query reported — in practice the previous prompt's parked bottom row
-/// — and the exit clear then strands blank rows above the submitted preview. A
-/// rebuild instead recovers its top as `parked row - offset`, where the same
-/// stale reply only shifts the box inside rows that are already reserved, which
-/// is why a rebuild normally keeps one round trip. `verify_anchor` buys the same
-/// protection for a rebuild whose reply was parked by the box the terminal is
-/// still re-wrapping.
+/// Fresh anchors use the queried row as the box top, so a stale reply can
+/// strand old prompt rows above a later clear. Rebuilds normally subtract
+/// the existing parked offset and use a single query to keep redraws fast.
+/// `verify_anchor` enables probe validation when the caller needs to check
+/// the reply stream again.
 fn prepare_anchored_viewport(
     backend: &mut CrosstermBackend<io::Stdout>,
     terminal_size: Size,
@@ -1450,8 +1433,8 @@ mod width_reflow_geometry_tests {
     /// the former textarea-only offset left one blank row above the prompt.
     #[test]
     fn chrome_wraps_count_for_anchor_placement() {
-        // Five-row box narrowed 40 -> 20: rows 1-2 are the (empty) textarea,
-        // rows 3-4 are full-width chrome.
+        // Five-row box narrowed 40 -> 20: three blank rows followed by two
+        // full-width chrome rows.
         let previous_area = Rect::new(0, 7, 40, 5);
         let widths = [0, 0, 0, 40, 40];
         assert_eq!(reflowed_extra_rows(previous_area, &widths, 20), 1);
@@ -2900,13 +2883,13 @@ mod width_reflow_geometry_tests {
 
 /// Parks the hardware cursor at the viewport's bottom row, hidden.
 ///
-/// The visible editing caret is drawn into the buffer as a styled cell (see
-/// render.rs), so it reflows with the text and needs no tracking. The hardware
-/// cursor is parked at column zero on the box's bottom row. The live anchor
-/// follows that row through terminal reflow. Recovering the old top subtracts
-/// `height - 1` plus the extra wraps of all rows BEFORE the bottom row; the
-/// bottom row's own trailing wraps are below the anchor. The resulting local
-/// clear removes the entire visible old frame without scrolling the transcript.
+/// The visible caret is a styled buffer cell drawn by
+/// `render_multiline_popup_with_checkpoint` in `render.rs`. The hidden cursor
+/// anchors the box at column zero on its bottom row. Protected cursor groups
+/// keep a `height - 1` offset during resize; unprotected frames also count wraps
+/// above the bottom row through `reflowed_anchor_offset` before clearing.
+/// The bottom row's trailing wraps are below the anchor and do not contribute
+/// to that offset.
 fn park_reflow_anchor<B: Backend>(
     terminal: &mut Terminal<B>,
     viewport_area: Rect,
@@ -3029,8 +3012,6 @@ fn clear_fixed_viewport<B: Backend>(
     Ok(true)
 }
 
-/// Forces every cell of the current frame to be written back to the terminal.
-///
 /// Forces every cell that can carry ink in the current frame to be written back
 /// to the terminal, and returns the per-row width record that follows from it.
 ///
@@ -3087,10 +3068,9 @@ fn resize_redraw_after_idle(
 /// of leaving the earlier sightings standing. A geometry that matches the applied
 /// one still asks for no rebuild. The idle poll uses this window for the final
 /// reconciliation. `PromptResizeState` bypasses it for explicit resize events
-/// and foreground redraws that observe changed geometry. A live width within
-/// one column of the applied width still
-/// asks for no rebuild either (see `live_size_matches_applied`): that is the
-/// emulator's async re-wrap timing, not a real resize.
+/// and foreground redraws that observe changed geometry. Width differences
+/// within the tolerance in `live_size_matches_applied` also request no rebuild,
+/// preventing jitter from moving the prompt.
 fn resize_rebuild_is_due(
     settle: &mut ResizeSettle,
     now: Instant,
@@ -3137,14 +3117,10 @@ impl ResizeSettle {
 
 /// Live-geometry jitter tolerance for rebuild decisions.
 ///
-/// VS Code/xterm.js can briefly report a width one column off the applied
-/// geometry without any real reflow (async re-wrap timing). Re-anchoring for
-/// that phantom size moves the box without moving the transcript and strands
-/// the drawn caret; repeated phantom rebuilds accumulate into the slow upward
-/// idle drift. A real one-column resize re-wraps at most one column of ink,
-/// so painting it at the old width until a larger move arrives is harmless,
-/// while a spurious re-anchor is not. Height differences always reflect panel
-/// changes and are never ignored.
+/// VS Code/xterm.js can report a width one column off the applied geometry
+/// while reflow is settling. Ignore that small width difference to avoid
+/// repeatedly re-anchoring the prompt; the paint path handles emulator width
+/// separately. Height differences always require a rebuild.
 fn live_size_matches_applied(live: Size, applied: Size) -> bool {
     live == applied || (live.height == applied.height && live.width.abs_diff(applied.width) <= 1)
 }
@@ -3197,8 +3173,9 @@ fn submitted_input_preview_lines(content: &str) -> Vec<String> {
 /// ╰───────────╯
 /// ```
 ///
-/// The box hugs the content (one padding cell per side) and never exceeds the
-/// terminal width: overlong lines wrap inside the box instead of being cut.
+/// The box hugs the content (one padding cell per side). Overlong lines wrap
+/// inside the box; below the minimum box width, its borders may extend past
+/// the terminal edge.
 /// Widths are display cells (`unicode_width`, ambiguous counted as one like
 /// the box-drawing characters themselves), so CJK input keeps the borders
 /// aligned; tabs are expanded because a raw tab would break the padding math.
@@ -3211,9 +3188,8 @@ fn submitted_input_preview_lines(content: &str) -> Vec<String> {
 fn submitted_input_preview_lines_with_width(content: &str, term_cols: usize) -> Vec<String> {
     // Two borders plus one padding cell per side.
     const OVERHEAD: usize = 4;
-    // Keeps at least one dash after the `❯` title on the top border. The floor
-    // applies even on absurdly narrow terminals so the box stays aligned (it
-    // may overflow the visible width there, where everything is broken anyway).
+    // Keep a dash after the `❯` title so the frame stays aligned even when
+    // the terminal is narrower than the minimum box width.
     const MIN_INNER: usize = 3;
     let max_inner = term_cols.saturating_sub(OVERHEAD).max(MIN_INNER);
     let mut rows: Vec<String> = Vec::new();
@@ -3339,11 +3315,8 @@ impl PromptEditor {
             let mut pending_tab_completion: Option<PendingTabCompletion> = None;
             let mut completion_panel: Option<CompletionPanel> = None;
             let mut recent_text_input: Option<RecentTextInput> = None;
-            // Record how many completion candidates the current viewport already
-            // accommodates: None means no panel (base height).
-            // When the panel appears/disappears or the candidate count changes,
-            // resize the viewport accordingly so the panel gets enough height
-            // while the textarea's line count stays unchanged.
+            // Track the candidate count used to fit this viewport. Panel changes
+            // recompute its height while reserving the minimum textarea and help rows.
             let mut fitted_completion_items: Option<usize> = None;
             // When the input gets shorter, force one frame write-back to wipe
             // characters left by desync between the ratatui buffer and the real
@@ -3721,8 +3694,8 @@ impl PromptEditor {
                             ));
                         }
                     } else {
-                        // Nothing left to settle: either no rebuild is pending or
-                        // a foreground path already consumed the notification.
+                        // Restart settling when there is no pending rebuild or
+                        // queued events still need to be drained.
                         resize_state.settle.restart();
                     }
                     // Keep the active fallback visible and responsive. A cursor
@@ -3850,14 +3823,11 @@ impl PromptEditor {
         }
         drop(terminal);
         self.cursor_position_queries_disabled = screen.queries_disabled;
-        // Carry the unaccounted replies into later prompts: an orphan ESC only
-        // surfaces on the next standalone Escape, which a non-Escape submission
-        // (F2 / Alt+Enter) can precede.
+        // Preserve reply tracking across prompts because a non-Escape submit
+        // can finish this prompt before a delayed CPR arrives.
         self.pending_cpr_replies = std::mem::take(&mut screen.pending_cpr_replies);
         drop(screen);
         let _ = execute!(io::stdout(), cursor::Show);
-        // Restore the default cursor shape: the editor switched it to a thin bar
-        // via DECSCUSR while active.
         let _ = execute!(io::stdout(), cursor::SetCursorStyle::DefaultUserShape);
         let _ = execute!(io::stdout(), DisableBracketedPaste);
         let _ = disable_raw_mode();
@@ -4216,7 +4186,8 @@ mod tests {
     }
 
     /// Real-output fixture for an external PTY/emulator driver. Run only this
-    /// ignored test with --nocapture --test-threads=1 and answer its CPR queries.
+    /// ignored test with RUST_TOOLS_REFLOW_FIXTURE=1, --nocapture and
+    /// --test-threads=1, and answer its CPR queries.
     /// Resize the PTY and emulator before sending `r`; `q` clears the last frame.
     #[test]
     #[ignore]
@@ -4589,7 +4560,7 @@ mod tests {
         let eligible = [start, start + std::time::Duration::from_secs(3600)]
             .map(|now| screen.can_recover_at_prompt_start(now));
         let still_disabled = screen.queries_disabled;
-        // No alternate screen was actually entered; keep Drop query-free too.
+        // No alternate screen was entered; prevent Drop from emitting a leave.
         screen.alternate = false;
         assert_eq!(eligible, [false, false]);
         assert!(still_disabled);
@@ -4862,7 +4833,7 @@ mod tests {
     fn only_fresh_anchors_and_deferred_rebuilds_verify_the_reply_stream() {
         use super::{ViewportRebuildMode, reply_stream_is_verified};
 
-        // A fresh anchor is taken as the box top, so one reply is never trusted.
+        // Fresh anchors request verification because the queried row becomes the box top.
         assert!(reply_stream_is_verified(
             0,
             ViewportRebuildMode::ReserveMissingRows,
@@ -4932,11 +4903,8 @@ mod tests {
         let narrowed = Size::new(60, 24);
         let start = Instant::now();
         let mut settle = super::ResizeSettle::default();
-        // A foreground redraw can beat the queued Resize event, and the emulator
-        // re-wraps its scrollback after the size it announces. Rebuilding on that
-        // first sight computes the clear from the pre-reflow layout and paints the
-        // box where the coming re-wrap then moves it, leaving the previous frame
-        // on screen above the new one.
+        // The settling helper waits after seeing new geometry. Foreground redraws
+        // bypass this helper for their immediate frame through `PromptResizeState`.
         assert!(!super::resize_rebuild_is_due(
             &mut settle,
             start,
@@ -4990,7 +4958,7 @@ mod tests {
             Size::new(78, 24),
             applied
         ));
-        // Height moves are always real.
+        // Height changes are always significant for rebuild decisions.
         assert!(!super::live_size_matches_applied(
             Size::new(80, 25),
             applied
@@ -5090,8 +5058,8 @@ mod tests {
         .unwrap();
         assert_eq!(initial_area, Rect::new(0, 12, 10, 5));
 
-        // Height shrink 17 -> 10: the terminal keeps the editing caret visible
-        // at the bottom, which puts the box top at row 5.
+        // Height shrink 17 -> 10: simulate the parked hardware cursor at the
+        // bottom row, which puts the recovered box top at row 5.
         backend.resize(10, 10);
         backend.set_cursor_position(Position::new(0, 9)).unwrap();
         for row in 0..5 {
@@ -5279,8 +5247,8 @@ mod tests {
     #[test]
     fn width_reflow_rebuild_clears_old_viewport_copy_and_keeps_transcript() {
         // Narrowing reflow: the transcript re-wraps and grows, and the old
-        // viewport (with the parked caret) is pushed down by the same amount.
-        // Rebuilding from the DSR-reported caret position must place the box
+        // viewport (with the parked hardware cursor) is pushed down by the same amount.
+        // Rebuilding from the DSR-reported cursor position must place the box
         // exactly below the taller transcript, wipe the reflowed copy of the
         // old viewport (no ghost rows), and keep every transcript row on screen
         // without growing scrollback.
@@ -5299,7 +5267,7 @@ mod tests {
 
         // Emulator applied the narrowing reflow: the transcript now wraps to
         // five rows, the old viewport content moved to rows [5,9), and the
-        // caret (parked at viewport offset 3) landed on row 8.
+        // hardware cursor (parked at viewport offset 3) landed on row 8.
         backend.resize(12, 10);
         for row in 0..5 {
             let output = Cell::new("K");
@@ -5359,7 +5327,7 @@ mod tests {
 
         // Emulator applied the widening reflow: the transcript now wraps to
         // three rows, the old viewport content moved up to rows [3,7), and the
-        // caret (offset 3) landed on row 6.
+        // hardware cursor (offset 3) landed on row 6.
         backend.resize(12, 10);
         for row in 0..3 {
             let output = Cell::new("K");
@@ -5398,9 +5366,6 @@ mod tests {
 
     #[test]
     fn clear_row_range_blanks_only_the_requested_rows() {
-        // The viewport clear is bounded to rows the box will actually repaint.
-        // Clearing beyond that range is what used to erase the transcript above
-        // a mis-anchored box, turning a positioning error into data loss.
         let mut backend = TestBackend::new(10, 8);
         for row in 1..7 {
             let filler = Cell::new("K");
@@ -5697,7 +5662,7 @@ mod tests {
 
     #[test]
     fn submitted_input_preview_expands_tabs_before_measuring() {
-        // "a\tb" becomes "a    b" (7 cells) so the borders stay aligned.
+        // "a\tb" becomes "a    b" (6 cells) so the borders stay aligned.
         let out = submitted_input_preview_lines_with_width("a\tb", 80);
         assert_eq!(out.len(), 3);
         assert!(
@@ -5816,8 +5781,8 @@ mod tests {
         let terminal = RefCell::new(ScriptedAnchor::new([9, 9], 17));
         let (row, calls) = run_verified_anchor(&terminal, 23);
 
-        // The first attempt mismatched (9 where it commanded row 0), so the row
-        // comes from the verified second attempt — never the stale 9.
+        // The stale pair repeats row 9, so it cannot match consecutive probe
+        // rows. The next attempt returns the restored cursor row.
         assert_eq!(row.unwrap(), 17);
         assert_eq!(terminal.borrow().queries, 5);
         // Both attempts put the cursor back, including the rejected one.

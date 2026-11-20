@@ -10,15 +10,14 @@ use super::context::{PipelineContext, StageKind};
 use crate::ai::ports::stream::{FilterChain, StreamFilter};
 use std::collections::HashMap;
 
-/// Hook callback signature: synchronous and fallible; for async, use
-/// block_on / the middleware chain.
+/// Synchronous, fallible hook callback.
 pub type HookFn = Box<
     dyn Fn(&mut PipelineContext<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
         + Send
         + Sync,
 >;
 
-/// Metadata for a single registered hook (for debugging and deduplication).
+/// Callback and name for a registered hook.
 pub struct HookEntry {
     pub name: &'static str,
     pub func: HookFn,
@@ -183,7 +182,7 @@ impl HookRegistry {
         Ok(())
     }
 
-    /// Quick construction of an empty registry compatible with legacy shell hooks.
+    /// Whether no stage hooks, global hooks, or stream filters are registered.
     pub fn is_empty(&self) -> bool {
         self.before.is_empty()
             && self.after.is_empty()
@@ -255,7 +254,6 @@ mod tests {
         let mut ctx = PipelineContext::new(app, vec![], 0);
         reg.fire_before(&mut ctx, StageKind::Prepare).unwrap();
         assert_eq!(ctx.tags, vec!["a", "b"]);
-        // The leaked App is never reclaimed, avoiding zeroed Drop UB.
     }
 
     #[test]

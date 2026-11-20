@@ -179,7 +179,7 @@ pub(super) fn extract_chunk_events_streaming(
     (events, all_tool_events)
 }
 
-/// 在可见 assistant 正文首次落盘前才关闭 thinking，忽略不产生正文的协议噪声。
+/// Close thinking before emitting visible assistant content; protocol-only chunks leave it open.
 fn close_thinking_before_visible_content(
     events: &mut Vec<StreamTextEvent>,
     thinking_open: &mut bool,
@@ -875,9 +875,8 @@ mod tests {
 
     #[test]
     fn streaming_extract_emits_thinking_even_when_chunk_also_carries_content() {
-        // 复现「有时完全不输出 thinking」：部分 provider 的 message 快照经
-        // merge_reasoning 折叠后，单个 chunk 会同时带 content 与 reasoning_content。
-        // 旧的互斥分支会整段丢掉 thinking 显示；修复后二者都应被输出。
+        // A chunk may contain both reasoning_content and content; emitting its
+        // answer must preserve reasoning from the same chunk.
         let chunk = StreamChunk {
             choices: vec![StreamChoice {
                 delta: StreamDelta {
@@ -1117,9 +1116,8 @@ mod tests {
 
     #[test]
     fn spaced_ascii_dsml_marker_is_recovered_not_leaked() {
-        // The same model can emit ASCII bars with a space after `<`:
-        // `< | | DSML | | tool_calls>`. The old guard recognized only `<|` /
-        // `<｜`, so this form reached the visible body unparsed.
+        // Namespace bars may be ASCII and spaced after `<`; normalization and
+        // wrapper classification must still suppress this markup.
         let full = "< | | DSML | | calls>\n\
                     < | | DSML | | invoke name=\"mcp_browser_get_text\">\n\n\
                     </ | | DSML | | invoke>\n\
@@ -1189,8 +1187,7 @@ mod tests {
 
     #[test]
     fn truncated_spaced_dsml_marker_is_dropped_at_flush() {
-        // The reported second line is truncated at `invoke name=`. A protocol
-        // prefix that never closes must not be flushed as answer text.
+        // An unclosed DSML invoke prefix must not become answer text at flush.
         let mut normalizer = super::super::inline_recovery::InlineMarkupNormalizer::new();
         let emitted = normalizer.push("< | | DSML | | calls>\n< | | DSML | | invoke name=");
         assert_eq!(emitted, "<calls>\n");

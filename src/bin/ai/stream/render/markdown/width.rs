@@ -1,6 +1,5 @@
 //! Terminal width / measurement helpers for live-region and code-block preview
-//! rendering. Pure measurement functions over terminal geometry; the streaming
-//! state machine lives in the parent `markdown` module.
+//! rendering. The streaming state machine lives in the parent `markdown` module.
 
 use crate::ai::stream::extract::strip_ansi_codes;
 use crate::ai::stream::render::inline::terminal_cell_width;
@@ -48,8 +47,8 @@ impl Drop for TerminalWidthSnapshot {
 /// (xterm.js reflows immediately, while the new PTY winsize can reach this process one or more redraws
 /// later), so the erase side must never assume one physical row per logical row: it recomputes the
 /// footprint from the stored plain text at the current width instead
-/// (`thinking_fold_rendered_body_rows` / `thinking_fold_header_rendered_rows` and the waiting-hint
-/// erase in `stream/runtime.rs`).
+/// (`thinking_fold_rendered_body_rows` / `thinking_fold_header_rendered_rows` in
+/// `runtime/fold_render.rs`, and `clear_waiting_hint` in `runtime/hints.rs`).
 pub(super) fn live_region_cols() -> usize {
     raw_terminal_cols()
 }
@@ -102,11 +101,10 @@ pub(in crate::ai) fn clamp_line_to_terminal_row_with_reserve(
     out
 }
 
-/// 按当前终端宽度把单个逻辑行拆成多条可见行，并为行首装饰预留列宽。
+/// Wrap a logical line at the live terminal width, reserving columns for a prefix.
 ///
-/// Unlike [`clamp_line_to_terminal_row_with_reserve`] this never truncates content; callers usually
-/// re-apply the same prefix/indent to every returned segment so manually wrapped rows stay in one
-/// block.
+/// Callers can reapply the prefix to each row. A character wider than the available
+/// width becomes `?` to preserve the one-physical-row invariant.
 pub(in crate::ai) fn wrap_line_to_terminal_rows_with_reserve(
     line: &str,
     reserve_cols: usize,
@@ -178,12 +176,7 @@ pub(in crate::ai) fn live_preview_cursor_rows_at(line: &str, cols: usize) -> usi
     lines
 }
 
-/// 终端可用列数（已扣除右侧安全边距）。
-///
-/// 大多数终端开启 DECAWM（auto-margin）：当输出列号 == 列数时会触发隐式换行，
-/// 对全角字符（CJK / emoji）更敏感，会让代码块/表格的边框贴边或被截断，进而
-/// 让 cursor up + clear 重写时对不上行数，出现"残留色块 / 残留边框"。
-/// 这里统一保留 4 列安全边距，下限 20 防止极窄终端崩盘。
+/// Right-side margin for code-block previews to reduce autowrapping at the terminal edge.
 const RIGHT_MARGIN: usize = 4;
 const MIN_PREVIEW_WIDTH: usize = 20;
 
@@ -203,10 +196,8 @@ pub(in crate::ai) fn raw_terminal_cols() -> usize {
 /// precedence over the local probes is testable without touching the process
 /// environment.
 pub(super) fn raw_terminal_cols_with(override_cols: Option<usize>) -> usize {
-    // Explicit width override: a serve turn child renders rows for a client
-    // that owns the real terminal, while the child's own stdout is a pipe and
-    // every local probe below (ioctl, COLUMNS) reports a width that terminal
-    // never had.
+    // A serve turn child has piped stdout, so use the client's display width
+    // instead of inferring it from local terminal probes or environment variables.
     if let Some(cols) = override_cols {
         return cols;
     }
@@ -244,13 +235,11 @@ pub(super) fn raw_terminal_cols_with(override_cols: Option<usize>) -> usize {
     80
 }
 
-/// 终端可见视口的物理行数（**实时**行高）。
+/// Current viewport height, preferring the live ioctl size over `LINES`.
 ///
-/// 与 [`raw_terminal_cols`] 同源：`a` 是常驻进程，`LINES` 环境变量只是启动那一刻
-/// 的快照，面板被拖矮后往往比真实高度大。折叠预览窗靠相对光标（`\x1b[nA`）就地
-/// 重绘，而 `CUU` 在视口顶部会被终端钳制、够不到已滚入 scrollback 的旧行；因此
-/// 必须用实时行高把窗口高度钳制在视口内，真实 tty 一律以 ioctl 为准，`LINES`
-/// 仅作非 tty（测试 / 管道）回退。
+/// `LINES` may be stale after a resize. Fold redraws must fit in the viewport
+/// because cursor-up cannot reach rows that have scrolled into scrollback.
+/// Use `LINES` only when ioctl cannot provide a usable height.
 pub(in crate::ai) fn raw_terminal_rows() -> usize {
     #[cfg(unix)]
     {

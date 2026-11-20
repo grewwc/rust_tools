@@ -1,21 +1,9 @@
-//! ThinkingOrchestrator - thinking-guidance subsystem (not registered in production).
+//! Thinking guidance driven by explicit `think:` tags and retained observer state.
 //!
-//! **Production dead path**: `App.observers` is always empty in production (`observers: Vec::new()`
-//! in `driver/mod.rs`), so this module is exported only under `#[cfg(test)]` and constructed only
-//! by test helpers. `on_prepare_rich` / `on_finalize` / `on_tool_result` are never called on the
-//! production path.
-//!
-//! Consequently, the `<think:begin_*>` / `<think:reset_thinking/>` tags defined here are neither
-//! announced to the model in production (the `[Thinking Protocol]` injection does not run) nor
-//! consumed (`apply_think_tags` does not run).
-//!
-//! The hidden introspection channel that actually works in production is
-//! `<meta:self_note>` / `<context_checkpoint>`, parsed by `stream/extract.rs` and persisted via
-//! `record_hidden_self_note` - unrelated to this module. The `think:` prefix used by this module's
-//! tags exists precisely to distinguish them from that channel.
-//!
-//! To be explicitly re-wired once the JSON control protocol is decoupled from the main answer
-//! (see the comment in `driver/mod.rs`).
+//! `ThinkingOrchestrator` is exported for test helpers; production startup
+//! constructs `App` with an empty observer list, leaving this protocol inactive.
+//! The `think:` namespace is distinct from the stream layer's hidden self-note
+//! and checkpoint channel.
 use rust_tools::cw::SkipSet;
 
 use crate::ai::driver::observer::{
@@ -91,19 +79,8 @@ impl ThinkingOrchestrator {
             return ThinkingDecision::default();
         }
 
-        // We do NOT try to guess whether the question needs TreeOfThoughts /
-        // Verification / GoalDirected by keyword matching — that is just
-        // substring-based pseudo-understanding. Instead:
-        //
-        //   * If the LLM explicitly requested a mode via a <think:begin_*>
-        //     think-tag in a previous turn, that mode is already established
-        //     and its state (thought_tree / verification / goal_manager) is
-        //     present.
-        //   * on_prepare activates whatever state currently exists; we do not
-        //     destroy or auto-create state here.
-        //
-        // This method now only computes derived artifacts from the current
-        // active_modes, without altering them.
+        // Only explicit tags or retained state activate modes; question keywords
+        // do not. Derive guidance without creating or discarding active mode state.
         let _ = question;
         let inject = self.build_system_prompt_injection();
 
@@ -184,7 +161,7 @@ impl ThinkingOrchestrator {
         // Explicit tag extraction — not keyword guessing. The LLM controls
         // thinking state lifecycle by emitting these literal tags.
 
-        // <think:reset_thinking/> — clear all thinking state
+        // Clear transient modes and tree/verification state while retaining goals.
         if text.contains("<think:reset_thinking/>") || text.contains("<think:reset_thinking />") {
             self.thought_tree = None;
             self.verification = None;
@@ -193,7 +170,6 @@ impl ThinkingOrchestrator {
             self.current_tree_node_id = None;
         }
 
-        // <think:begin_tree_of_thoughts>...</think:begin_tree_of_thoughts>
         if let Some(root_thought) = extract_tag(text, "think:begin_tree_of_thoughts") {
             if self.thought_tree.is_none() {
                 self.thought_tree = Some(ThoughtTree::new(&root_thought, 4, 3));
@@ -202,7 +178,6 @@ impl ThinkingOrchestrator {
             self.active_modes.insert(ThinkingMode::TreeOfThoughts);
         }
 
-        // <think:begin_verification>...</think:begin_verification>
         if let Some(hypothesis) = extract_tag(text, "think:begin_verification") {
             if self.verification.is_none() {
                 self.verification = Some(VerificationWorkflow::new(hypothesis));
@@ -211,7 +186,6 @@ impl ThinkingOrchestrator {
             self.active_modes.insert(ThinkingMode::VerificationLoop);
         }
 
-        // <think:begin_goal>...</think:begin_goal>
         if let Some(goal_desc) = extract_tag(text, "think:begin_goal") {
             if self.goal_manager.active_goal().is_none() {
                 let goal_id = self.goal_manager.create_goal(goal_desc);
@@ -225,8 +199,8 @@ impl ThinkingOrchestrator {
     fn build_system_prompt_injection(&mut self) -> Option<String> {
         let mut parts = Vec::new();
 
-        // Advertise the think-tag protocol only once per conversation.
-        // After the first injection, the LLM already knows the protocol.
+        // Advertise the protocol once per orchestrator instance to avoid
+        // repeating the same instructions.
         if !self.protocol_injected {
             self.protocol_injected = true;
             parts.push(include_str!("prompts/thinking_protocol.md").to_string());
@@ -348,7 +322,7 @@ impl ThinkingOrchestrator {
         }
     }
 
-    // -- P3: context-budget-aware delegation reminder -----------------------------
+    // Context-budget delegation threshold.
     //
     // When the conversation is already long (turn_index above the threshold) and the agent has
     // task tools, inject a reminder: delegate the remaining focused, bounded sub-steps (serial or
@@ -547,7 +521,7 @@ impl TurnObserver for ThinkingOrchestrator {
             ));
         }
 
-        // P3: context-budget awareness -- when the turn count exceeds the threshold, remind the
+        // Once the turn count reaches the threshold, remind the
         // model to delegate remaining independent sub-tasks.
         if !self.context_budget_nudge_injected {
             if let Some(nudge) =
@@ -573,12 +547,9 @@ impl TurnObserver for ThinkingOrchestrator {
         // because the LLM emits them in its reply, not in the user question.
         self.apply_think_tags(&ctx.final_text);
 
-        // Deadlock guard: the thinking subsystem (validation / thought tree / goal decomposition)
-        // on_finalize does not parse the LLM's JSON reply, so advance_step / add_branch /
-        // decompose_active are never invoked and the workflow would stay stuck in its initial
-        // state. A stagnation_turns counter tracks consecutive turns without progress and resets
-        // after exceeding the threshold, preventing repeated injection of the same prompt from
-        // wasting tokens.
+        // Count finalizations with active modes to bound repeated guidance.
+        // Begin/reset tags reset this counter; tool-result updates leave it
+        // unchanged. Finalization does not interpret structured workflow replies.
         const MAX_STAGNATION_TURNS: usize = 3;
         if !self.active_modes.is_empty() {
             self.stagnation_turns += 1;
@@ -624,9 +595,8 @@ impl TurnObserver for ThinkingOrchestrator {
     }
 
     fn on_conversation_end(&mut self) {
-        // Only clear state after successful persist. If persist fails,
-        // keep the current in-memory state so the user doesn't lose goal
-        // progress across conversation boundaries.
+        // Keep state when configured goal persistence fails; otherwise reset
+        // transient thinking state and reload the goal manager.
         if self.goal_manager.persist_goals().is_ok() {
             self.thought_tree = None;
             self.verification = None;
@@ -739,13 +709,11 @@ mod tests {
         assert!(orch.goal_manager.active_goal().is_none());
     }
 
-    // -- P3 unit tests --------------------------------------------------------------
 
     #[test]
     fn context_budget_nudge_only_after_threshold() {
         let orch = ThinkingOrchestrator::new();
         let tools = vec!["task_spawn".to_string()];
-        // Below threshold -> not injected
         assert!(orch.build_context_budget_nudge(5, &tools).is_none());
         // Threshold reached and task_spawn available -> injected; serial/parallel sub-steps may
         // be delegated, but not the whole branch.

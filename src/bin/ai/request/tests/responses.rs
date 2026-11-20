@@ -158,7 +158,7 @@ fn responses_request_body_replays_plain_and_tool_turns_in_order_and_counts_each_
         Some(&empty_payloads),
         Some(spliced.message_owners()),
     );
-    // Each 4000-byte base64 payload bills ceil((3000 - 650) / 4) tokens;
+    // Each 4000-byte base64 payload adds ceil((3000 - 650) / 4) to the lower estimate;
     // the upper bound uses divisor 2. The unprojected owner is never billed.
     assert_eq!(
         request.estimated_prompt_tokens - empty_counts.lower_tokens(),
@@ -657,8 +657,6 @@ fn responses_request_body_replays_reasoning_items_before_function_call() {
 
 #[test]
 fn responses_request_body_degrades_to_bare_function_call_without_reasoning_items() {
-    // Side-channel miss (no encrypted_content available): degrade to flat
-    // function_call, zero regression.
     let messages = vec![Message {
         role: "assistant".to_string(),
         content: Value::String(String::new()),
@@ -711,9 +709,8 @@ fn responses_request_body_degrades_to_bare_function_call_without_reasoning_items
 
 #[test]
 fn responses_request_body_replays_tool_round_narration_before_function_call() {
-    // P2 regression: assistant narration (the text the model produced before dispatching a
-    // tool) was dropped on the Responses wire, while chat-completions keeps it. It must be
-    // replayed as a message item ahead of the function_call items.
+    // Preserve tool-round narration as a message item before function_call items
+    // so the Responses projection retains the assistant's visible context.
     let messages = vec![Message {
         role: "assistant".to_string(),
         content: Value::String("Let me read the file first.".to_string()),

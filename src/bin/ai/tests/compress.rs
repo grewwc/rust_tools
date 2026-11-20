@@ -155,8 +155,8 @@ fn history_compression_inserts_summary_and_keeps_recent() {
     append_history(&path, &blob).unwrap();
 
     let messages = build_message_arr(100, &path).unwrap();
-    // Source metadata needs more room than the legacy 200-character prose note.
-    // The larger cap still requires compression and retains all four recent turns.
+    // Reserve source metadata alongside four recent turns while keeping the
+    // budget small enough to require compression.
     let budget = 4_000;
     assert!(messages_total_chars_pub(&messages) > budget);
     let outcome = compress_messages_for_context_with_outcome(
@@ -187,11 +187,8 @@ fn history_compression_inserts_summary_and_keeps_recent() {
 
 #[test]
 fn history_compression_summarizes_when_keep_last_exceeds_turns_but_budget_overflows() {
-    // Reproduces the "agent forgets earlier questions after ~30 turns" bug:
-    // with a large `keep_last` (e.g. CLI default 256) but a much smaller
-    // `max_chars` budget, the older-segment summary path was never taken,
-    // and early user turns got silently dropped from the head of the list.
-    // The shrink path must retain the initial goal and a readable source span.
+    // When keep_last exceeds the turn count, budget pressure must still
+    // preserve the initial goal and an archived source span.
     let dir = CompressionTempDir::new();
     let path = dir.0.join("history.sqlite");
     let long = "y".repeat(10);
@@ -208,8 +205,8 @@ fn history_compression_summarizes_when_keep_last_exceeds_turns_but_budget_overfl
     // summary and its archive pointer; uniform small turns can leave no headroom.
     let budget = 4_000;
     assert!(messages_total_chars_pub(&messages) > budget);
-    // Raise only the summary allowance: the source locator and provenance must
-    // fit alongside complete entries, while the original total cap stays strict.
+    // The summary allowance must fit its source locator, provenance, and
+    // complete entries within the total budget.
     let outcome = compress_messages_for_context_with_outcome(
         messages.clone(),
         budget,
@@ -252,7 +249,7 @@ fn overflow_history_file_preserves_dropped_messages_and_placeholder_in_context()
 
     let messages = build_message_arr(100, &path).unwrap();
     // A dominant first turn leaves enough space after removal for the summary,
-    // the archive locator and an unchanged recent tail under the original cap.
+    // the archive locator and an unchanged recent tail under the cap.
     let budget = 4_500;
     assert!(messages_total_chars_pub(&messages) > budget);
     let outcome = compress_messages_for_context_with_outcome(
@@ -402,7 +399,7 @@ fn history_compression_without_summary_archives_removed_dialogue_and_keeps_recen
         );
         assert_eq!(outcome.status, ContextCompressionStatus::Complete);
         // Budget-only shrinking selects raw turns before adding its pointer.
-        // The compact v2 pointer now fits in the remaining room for both
+        // The compact v2 pointer fits in the remaining room for both
         // fixtures (keep_last=256 retains more turns but still fits), so both
         // must report budget_met=true without discarding the protected tail.
         assert!(outcome.budget_met(), "keep_last={keep_last}");
@@ -605,9 +602,8 @@ fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files()
 
 #[test]
 fn overflow_stub_recall_anchor_survives_compaction() {
-    // Reproduce a "tool-heavy session (few user turns × hundreds of read_file calls)": many early
-    // read_file groups + one near-end user turn. After compression assert (1) total billable drops sharply and converges
-    // into budget, and (2) every read_file's file_path recall anchor is still findable in the output (zero amnesia).
+    // A tool-heavy projection must shrink within budget while preserving a
+    // recovery pointer and the original read targets.
 
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-recall-anchor-{}", uuid::Uuid::new_v4()));
@@ -619,9 +615,8 @@ fn overflow_stub_recall_anchor_survives_compaction() {
         reasoning_content: None,
     }];
 
-    // 60 early read_file groups, each result 4000 chars. That is below the 6K
-    // per-result spill threshold, so the early groups fold as one recoverable
-    // group instead of becoming individual spill stubs.
+    // Distinct contents and targets prevent repeated-read deduplication from
+    // masking the group-compaction behavior.
     for i in 0..60usize {
         let id = format!("call_{i}");
         messages.push(Message {
@@ -661,7 +656,6 @@ fn overflow_stub_recall_anchor_survives_compaction() {
         compress_messages_for_context(messages, budget, 256, 400, Some(overflow_dir.clone()), None);
     let after = messages_total_chars_pub(&compressed);
 
-    // The total drops sharply and converges into budget (tool-heavy sessions no longer stall structurally).
     assert!(
         after < before,
         "compaction must reduce total billable ({after} !< {before})"
@@ -671,8 +665,6 @@ fn overflow_stub_recall_anchor_survives_compaction() {
         "tool-heavy history must converge under budget ({after} > {budget})"
     );
 
-    // Collect all output text after compression and verify every early read_file's file_path is still recallable:
-    // either the src/file_N.rs path survives in a stub/anchor, or the spill temp-file path appears in some note.
     let joined: String = compressed
         .iter()
         .filter_map(|m| m.content.as_str().map(str::to_string))

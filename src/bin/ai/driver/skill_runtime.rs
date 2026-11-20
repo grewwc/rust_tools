@@ -20,13 +20,12 @@ use super::{DEFAULT_MAX_ITERATIONS, EXECUTOR_MAX_ITERATIONS};
 
 type ToolDef = ToolDefinition;
 
-/// Runtime context passed into build_system_prompt to enable conditional rendering.
-/// Currently has goal_mode and is_background; extensible later with task_type / persona etc.
+/// Runtime context for conditional sections in `build_system_prompt`.
 #[derive(Clone, Default)]
 pub(super) struct PromptContext {
     /// Some(_) means goal mode is active; the value is the goal description text.
     pub goal_mode: Option<String>,
-    /// Background mode (-bg): the terminal is detached, so do not inject "ask the user" guidance.
+    /// Whether the CLI runs in detached background mode (`-bg`).
     pub is_background: bool,
 }
 
@@ -70,7 +69,7 @@ impl SystemPromptBuilder {
         }
     }
 
-    /// Replaces the content of the first section carrying `label` in place,
+    /// Replaces the content of the first section matching `kind` and `label` in place,
     /// keeping its position so the rendered prompt only changes inside that
     /// section; appends when no such section exists yet.
     fn replace_labeled(&mut self, kind: ContextKind, label: &str, content: impl Into<String>) {
@@ -93,12 +92,9 @@ impl SystemPromptBuilder {
     }
 
     fn render_system_prompt(&self) -> String {
-        // Render grouped by semantic category: all sections of the same kind
-        // (identity/behavior/capability/policy) merge into one tag pair, keeping insertion order within the group, so identity sections
-        // appended "after build_system_prompt" (e.g. persona) are not pushed to the end of the prompt but cluster with the generic identity;
-        // behavior/policy no longer split into multiple clusters by push timing, reducing tag noise and making the priority
-        // hierarchy clearer to the model. Fact sections are not rendered in the system prompt (they go through the context reminder injected into the current
-        // user message), so they are not in the whitelist and are naturally excluded.
+        // Group by semantic kind while preserving insertion order within each
+        // group, so late identity additions still precede behavior and policy.
+        // Facts render separately through render_context_reminder.
         const RENDER_ORDER: [(ContextKind, &str); 4] = [
             (ContextKind::Identity, "identity"),
             (ContextKind::Behavior, "behavior"),
@@ -238,8 +234,7 @@ pub(super) struct SkillTurnGuard {
     matched_skill_names: Vec<String>,
     /// Sections pushed after the guard was built (turn-preparation facts,
     /// critic and observer guidance), in push order. A mid-turn rebuild
-    /// replays them onto the fresh guard so the turn keeps the same
-    /// instructions and the same system-prompt bytes.
+    /// replays caller-supplied guidance onto the fresh guard in the same order.
     turn_sections: Vec<(ContextKind, Option<String>, String)>,
     /// Directories whose target-scoped instruction documents the section
     /// currently renders (seeded from storage, updated on every load).
@@ -269,17 +264,10 @@ impl SkillTurnGuard {
     pub(super) fn context_reminder(&mut self) -> Option<String> {
         if self.cached_context_reminder.is_none() {
             let mut parts: Vec<String> = Vec::new();
-            // "End-of-context pointer" for active skills: in long contexts (multi-turn dialogue + tool loops) the system
-            // prompt sits at the very front, where skill instructions get diluted by the long middle; injecting a short pointer at the
-            // start of the last user message re-anchors "the skill list in effect at turn start (snapshot)"
-            // near the request (recency position), so the model still follows the skill contract
-            // in long contexts. The pointer deliberately says "at turn start" rather than "for this turn": the user message is
-            // built only once at turn start, while mid-turn activate_skill/deactivate_skill
-            // can change the effective set, so the snapshot wording keeps the pointer never false; the currently effective set is always governed by the
-            // system prompt's `<skill_instructions>` (rebuilt each iteration, authoritative, cache-friendly)
-            // This pointer only enters the request projection (turn_messages does not contain the reminder), and the current user
-            // message is already a cache miss anyway, so the upstream prompt cache is not broken. Injected only when
-            // there are active skills.
+            // Point back to the skill contract near the current request. The
+            // names describe the turn-start snapshot: activate_skill and
+            // deactivate_skill can change the set after the user message is
+            // assembled. The current system prompt governs the effective set.
             if !self.matched_skill_names.is_empty() {
                 let mut pointer = String::new();
                 if self.matched_skill_names.len() == 1 {
@@ -496,13 +484,9 @@ fn activate_skill_context(
         let prev_max_iterations = std::mem::replace(&mut ctx.max_iterations, max_iterations);
         restore = Some((prev_tools, prev_max_iterations));
     }
-    // max_iterations is the per-turn iteration cap (TurnSupervisor.iteration resets to 0 each turn),
-    // while the kernel's max_tool_calls is cumulative over the process lifetime (tool_calls_used is never reset).
-    // Mapping the per-turn max_iterations onto the cumulative max_tool_calls would make long sessions hit the
-    // cumulative tool-call ceiling first (build=2048 / executor=128), force-wrapping the turn
-    // even without any single-turn overrun, showing up as "tool limit reached for this turn". The per-turn iteration cap is already enforced by
-    // execution.rs's `iteration >= max_iterations` check, and the process-level turn cap is enforced by max_turns
-    // (from quota_turns), so we no longer override max_tool_calls here and keep it unlimited.
+    // max_iterations applies per turn. Do not copy it into the kernel's
+    // process-wide max_tool_calls quota: calls accumulate across turns and
+    // would end otherwise valid long sessions.
     restore
 }
 
@@ -656,15 +640,10 @@ fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option
             .iter()
             .filter_map(|name| ToolGroup::from_name(name))
             .collect();
-        // When expanding via tool_groups, drop the deferred heavy execution
-        // primitives (tools carrying the `hidden` metadata flag: process / IPC
-        // / shm / env primitives). Their schemas are large and usage rare, so
-        // they do not ride along in every turn's request; the model enables
-        // them on demand via `enable_tools`, shrinking per-turn tools tokens.
-        // Tools named explicitly via `tools:` (below) are never dropped:
-        // naming a tool pins it as resident. Core tools like apply_patch /
-        // write_file are never marked hidden, so editing capability is
-        // unaffected.
+        // Group expansion defers lazy group schemas, configured task lifecycle
+        // schemas, and tools marked for deferred eager loading to reduce request
+        // size. Explicit `tools:` entries below bypass this deferral, except for
+        // driver-injected control tools.
         for tool in super::super::tools::tool_definitions_for_groups(&groups) {
             if super::super::tools::registry::common::tool_has_lazy_group_schema(
                 &tool.function.name,
@@ -684,7 +663,7 @@ fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option
         }
     }
     if !tools.is_empty() {
-        // Explicitly named tools pin a tool into every turn even when its
+        // Eligible explicitly named tools pin a schema into every turn even when its
         // group is also declared, bypassing the deferred-eager-load pruning
         // above (a manifest listing a name opts that tool in).
         for tool in super::super::tools::get_tool_definitions_by_names(tools) {
@@ -767,7 +746,8 @@ fn builtin_tools_for_skill(
     skills: &[&SkillManifest],
     active_agent: Option<&AgentManifest>,
 ) -> Vec<ToolDef> {
-    // If any active skill disables builtin, disable builtin entirely (most-restrictive)
+    // A skill's builtin disable flag wins over the other manifests; native
+    // phone actions are governed separately by the client.
     if skills.iter().any(|s| s.disable_builtin_tools) {
         return append_native_tools(filter_subagent_hidden_tools(Vec::new()));
     }
@@ -802,12 +782,9 @@ fn builtin_tools_for_skill(
 }
 
 /// Whether the driver injects the `request_user_input` control tool for this
-/// turn. Present whenever a human is attached to an interactive turn: skills
-/// need it for the cross-turn continuation handoff, and ordinary turns get the
-/// explicit ask protocol (tool metadata) instead of a prose guidance block.
-/// Goal mode demands autonomous progress and background turns have no attached
-/// terminal, and subagent turns have no attached user, so all three
-/// deliberately disable asking and never inject the tool.
+/// turn. Top-level skill turns need the continuation handoff, including in goal
+/// or background mode. Ordinary turns receive the explicit ask protocol only
+/// outside those modes. Subagent turns never receive the tool.
 fn should_inject_request_user_input(
     skills: &[&SkillManifest],
     goal_mode: &Option<String>,
@@ -1039,16 +1016,9 @@ fn build_hidden_execution_primitive_catalog(
     )
 }
 
-/// Lazily-loaded subagent orchestration family: task-group tools (group
-/// `["builtin", "task"]`) are not part of the default `core` turn schema, and
-/// unlike executor primitives they are not covered by `tool_defers_eager_load`
-/// (which only defers tools carrying the `hidden` metadata flag), so without
-/// this catalog the model has no prompt-level awareness that subagent tools
-/// exist and can be enabled on demand — broad multi-branch tasks silently
-/// degrade to serial
-/// parent work. Mirrors `build_hidden_execution_primitive_catalog`.
-/// Top-level agents only: the task family is hidden from subagents
-/// (`SUBAGENT_DEPTH > 0`), so the nudge must never reach them.
+/// Advertise unloaded task-family tools so top-level agents can discover
+/// orchestration without loading every schema. Includes configured lazy
+/// agent-team groups and task lifecycle tools; subagents receive no catalog.
 fn build_hidden_task_tool_catalog(available_tools: &Box<SkipSet<String>>) -> Option<String> {
     if crate::ai::driver::runtime_ctx::current_subagent_depth() != 0 {
         return None;
@@ -1340,12 +1310,9 @@ fn session_context_prompt(session_id: &str) -> String {
 
 /// Relevance gate for the session-debugging walkthrough: decides whether the
 /// turn injects the session-context guidance (session id + standard session
-/// tools). Matching is deliberately broad
-/// substring — a missed debug session costs more than the ~500 carried
-/// characters of an occasional over-injection (a general "history of X"
-/// knowledge question also matches `history`; accepted). Chinese is matched
-/// literally here alongside English; this keyword list is the one place where
-/// non-English prompt text is intentional.
+/// tools). Broad substring matches accept occasional over-injection to avoid
+/// missing relevant session guidance (a general "history of X" question also
+/// matches). Non-English text is intentional in these keyword matches.
 fn session_issue_likely(question: &str) -> bool {
     let lowered = question.to_lowercase();
     [
@@ -1364,14 +1331,9 @@ fn session_issue_likely(question: &str) -> bool {
     .any(|kw| lowered.contains(kw))
 }
 
-/// Deterministic session-id detection: a UUID-shaped token in the user question
-/// is an unambiguous reference to a concrete runtime session. Unlike the
-/// keyword gate above, this needs no vocabulary, so a bare id like
-/// `ddb7e6be-7076-43b3-898f-8370e64312da` (with no "session"/"会话" words)
-/// still routes the turn to the session tools. Session store ids are
-/// 1-128 ASCII letters/digits/`-`/`_`; the dominant real-world form is a UUID,
-/// which is what this matches. Non-UUID ids (e.g. `test-session-<hex>`) are
-/// still caught by `session_issue_likely` via the "session" keyword.
+/// Treat UUID-shaped tokens as session-id candidates to route bare references
+/// without a keyword. This heuristic can also match UUIDs from other domains;
+/// descriptive non-UUID references rely on `session_issue_likely`.
 fn session_id_referenced(question: &str) -> bool {
     static SESSION_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
@@ -1380,8 +1342,8 @@ fn session_id_referenced(question: &str) -> bool {
     SESSION_ID_RE.is_match(question)
 }
 
-/// Deterministic skill-authoring detection: the user turn explicitly asks to
-/// save, create, or update a skill. Such turns auto-load the lazy `skills`
+/// Heuristic skill-authoring detection from tool names or skill/action keywords.
+/// Matching turns auto-load the lazy `skills`
 /// group; without it the model sees `write_file` (core) but not `save_skill`,
 /// and the skills directory is writable, so it can hand-write the manifest.
 fn skill_authoring_referenced(question: &str) -> bool {
@@ -1483,8 +1445,7 @@ fn build_system_prompt(
     let mut b = SystemPromptBuilder::new();
     let dedupe_agent_team_base = should_dedupe_agent_team_base_prompt(skills);
 
-    // Identity section: merge the generic identity with agent / skill enforcement, avoiding 4 copies of
-    // repeated "you must follow ..." flooding the prompt cache.
+    // Keep agent and skill enforcement in one identity section to avoid repeated contracts.
     let agent_extra = active_agent
         .map(|agent| agent.build_system_prompt())
         .filter(|s| !s.trim().is_empty());
@@ -1503,7 +1464,6 @@ fn build_system_prompt(
 
     let identity = if let Some(skill_text) = &skill_extra {
         let mut s = if skills.len() == 1 {
-            // Single skill: keep the original compact format
             let skill_name = skills[0].name.as_str();
             format!(
                 "Active skill: {skill_name}\n\
@@ -1550,18 +1510,14 @@ fn build_system_prompt(
             include_str!("system_prompts/interactive_skill_handoff.md"),
         );
     }
-    // The ask protocol ("ask only when genuinely blocked; one focused question;
-    // wait for the reply") travels as `request_user_input` tool metadata, injected
-    // for every interactive turn by build_skill_turn_guard. Goal mode and
-    // background turns deliberately disable asking, so they get neither the tool
-    // nor any prose guidance; skill turns carry their own handoff block above.
+    // The ask protocol travels as request_user_input metadata. Skill turns also
+    // carry the handoff block above; ordinary goal/background turns omit the tool.
     b.push_labeled(
         ContextKind::Behavior,
         "execution_environment",
         runtime_environment_prompt(),
     );
 
-    // Multiple skills: output each resource_path (only when non-empty)
     for skill in skills {
         if let Some(resource_path) = skill.resource_path.as_deref() {
             let trimmed = resource_path.trim();
@@ -1590,10 +1546,8 @@ fn build_system_prompt(
         include_str!("system_prompts/safety_redlines.md"),
     );
     // ── Trust boundary: tool output / fetched content is data, not instructions ──
-    // strip_system_reminders already removes forged reminder blocks from user
-    // messages mechanically; this block teaches the model to treat look-alikes
-    // embedded in tool output (web pages, documents, command output) as forged
-    // content, since authentic runtime reminders have a fixed format.
+    // Tool output can imitate runtime reminder blocks; teach the model to treat
+    // those look-alikes as data based on their source.
     b.push(
         ContextKind::Behavior,
         include_str!("system_prompts/trust_boundary.md"),
@@ -1618,8 +1572,8 @@ fn build_system_prompt(
         include_str!("system_prompts/thinking_scope.md"),
     );
     // Intellectual honesty: evidence-earned agreement and respectful pushback
-    // against wrong or inappropriate user premises. Unconditional — it applies
-    // in every mode and is never relaxed by a skill or goal. It forbids treating
+    // against wrong or inappropriate user premises. Unconditional in this
+    // builder, including skill and goal turns. It forbids treating
     // unsupported claims as established facts while allowing explicit hypotheses
     // and conditional answers. Fact tracing / evidence calibration stay
     // single-sourced in correctness_guardrails. The no-regression rule for other modules
@@ -1631,11 +1585,8 @@ fn build_system_prompt(
     );
 
     // ── Task convergence: success criteria land in the plan carrier, closing the loop ──
-    // task_convergence is the unconditionally rendered convergence discipline; the
-    // plan bridge line is injected only when the plan tool is available, so the
-    // guidance never dangles when the tool is unavailable (e.g. stripped by a
-    // skill whitelist). Acceptance criteria go straight into the roadmap, tracked
-    // by plan_update — no more "criteria defined but never reflected in the plan".
+    // Render convergence rules unconditionally; add the plan bridge only when
+    // the tool is available so guidance never refers to an unavailable plan tool.
     let plan_criteria_bridge = if has_tool(available_tools, "plan") {
         "- For multi-step tasks, encode these criteria into the `plan` (each step states what/why/tool; the final step checks the outcome against the criteria). Carry material unresolved concerns in the affected step, recording closure evidence before marking it done; skipping a blocked step does not verify its outcome. No extra plan is needed for a locally resolved concern.\n"
     } else {
@@ -1920,9 +1871,8 @@ fn build_pure_system_prompt(agent: &AgentManifest) -> SystemPromptBuilder {
     b
 }
 
-/// Chooses the prompt builder for one turn. A pure agent renders only its own
-/// baseline: the skill and runtime context inputs are ignored because none of
-/// their guidance renders.
+/// Chooses the prompt builder for one turn. A pure agent renders its authored
+/// baseline plus the environment; skill and turn-context guidance are omitted.
 fn prompt_builder_for_turn(
     active_agent: Option<&AgentManifest>,
     skills: &[&SkillManifest],
@@ -1961,24 +1911,17 @@ fn build_skill_turn_guard(
 
     let mut builtin_tools = builtin_tools_for_skill(skills, active_agent.as_ref());
     // Externally downloaded skills cannot pre-declare this runtime's ask/handoff
-    // protocol via manifest tool lists; the driver injects request_user_input by
-    // name for every interactive turn. Skill turns need the cross-turn
-    // continuation handoff; ordinary turns get the explicit ask protocol in place
-    // of prose-only guidance. Goal mode, background, and subagent turns
-    // deliberately disable asking (subagent turns have no attached user), so
-    // none of them injects the tool.
+    // protocol via manifest tool lists. The driver injects it for top-level skill
+    // handoffs and ordinary interactive turns per should_inject_request_user_input.
     if should_inject_request_user_input(skills, &app.goal_mode, app.cli.background) {
         builtin_tools.extend(crate::ai::tools::get_tool_definitions_by_names(&[
             "request_user_input".to_string(),
         ]));
     }
-    // Deterministic session-tool routing: a user message referencing a concrete
-    // session id (UUID-shaped) auto-loads the `session` group (inspection plus talk mailbox) into the
-    // resident tool set for top-level turns, so the model never has to remember
-    // `enable_tools` before it can answer a session question (a real failure
-    // mode: it probes the filesystem instead). Subagent and disabled-builtin
-    // turns keep the lazy behavior; the keyword gate below still injects the
-    // guidance for vaguer session/history wording.
+    // UUID-shaped references load session inspection and mailbox tools for
+    // top-level turns with a nonempty tool set, avoiding an extra discovery step.
+    // Subagents retain lazy routing; keyword matching below still controls
+    // guidance for vaguer session/history references.
     if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0
         && !builtin_tools.is_empty()
         && session_id_referenced(question)
@@ -2078,10 +2021,8 @@ fn build_skill_turn_guard(
     {
         builder.push(ContextKind::Capability, catalog);
     }
-    // For executor agents the heavy execution primitives are deferred out of
-    // the resident set by manifest_tool_definitions; add an on-demand enable
-    // hint here so the model can still sense them (read-only agents never
-    // declare the group, so nothing is injected).
+    // A declared hidden-gating group enables the deferred-execution catalog,
+    // independently of the current iteration cap.
     if !pure_mode
         && has_tool(&available_tools, "enable_tools")
         && hidden_group_declared
@@ -2089,9 +2030,8 @@ fn build_skill_turn_guard(
     {
         builder.push(ContextKind::Capability, catalog);
     }
-    // Task-family tools are lazy for every top-level turn (not just executor
-    // agents); advertise them so the model loads subagent tools exactly when the
-    // task warrants parallelism. Gated internally on top-level depth.
+    // Advertise unloaded task-family tools for top-level turns so orchestration
+    // remains discoverable without resident schemas.
     if !pure_mode
         && has_tool(&available_tools, "enable_tools")
         && let Some(catalog) = build_hidden_task_tool_catalog(&available_tools)
@@ -2186,8 +2126,8 @@ pub(super) fn rebuild_skill_turn_with_existing_selection(
     question: &str,
     preferred_skill_names: &[String],
 ) -> SkillTurnGuard {
-    // For iteration > 1, keep the previous turn's skills by name only; no more text-similarity re-routing.
-    // If the model needs to switch, it can request explicitly via activate_skill.
+    // Rebuild the current turn's selection by name; do not infer a new selection
+    // from the question text.
     let skills: Vec<&SkillManifest> = preferred_skill_names
         .iter()
         .filter_map(|name| skill_manifests.iter().find(|s| &s.name == name))
@@ -2195,12 +2135,9 @@ pub(super) fn rebuild_skill_turn_with_existing_selection(
     build_skill_turn_guard(app, mcp_client, &skills, question)
 }
 
-/// Path taken when the model explicitly requests a skill via the `activate_skill` tool: match by name
-/// directly and force-activate its prompt + tool set, skipping auto-routing's scoring/threshold/gating.
-///
-/// "Don't abuse it" is enforced by the tool side (the name must really exist, and the description requires "clearly matches" before calling) plus
-/// the name validation here. After a hit, the active set is kept within the turn by the per-iteration rebuild
-/// (`refresh_skill_turn_for_iteration` only adjusts by pending action and does not re-score).
+/// Activate named manifests and their prompts/tools. Unknown names are skipped;
+/// return None when no manifest resolves. The returned guard records the
+/// resolved names for later rebuilds.
 pub(super) fn force_activate_named_skill(
     app: &mut App,
     mcp_client: &McpClient,
@@ -2208,7 +2145,6 @@ pub(super) fn force_activate_named_skill(
     question: &str,
     requested_names: &[String],
 ) -> Option<SkillTurnGuard> {
-    // Resolve each name into a manifest one by one (skipping misses)
     let skills: Vec<&SkillManifest> = requested_names
         .iter()
         .filter_map(|name| skill_manifests.iter().find(|s| &s.name == name))
@@ -2366,9 +2302,8 @@ pub(super) fn prepare_skill_for_turn(
         }
     }
 
-    // Consume the explicit continuation created by `request_user_input` exactly once. Re-resolving manifests by name here both
-    // avoids treating deleted/renamed external skills as valid state and does not fall back to
-    // the old text-similarity-based cross-turn sticky routing.
+    // Consume the request_user_input continuation once and resolve current
+    // manifests by name so deleted or renamed skills do not remain active.
     if let Some(continuation) = app.pending_skill_continuation.take() {
         let requested_names = continuation.skill_names;
         // Restore only skills that still resolve: one deleted/renamed skill in the set must not sink the whole
@@ -2426,8 +2361,8 @@ mod pure_prompt_tests {
     use super::*;
     use serde_json::json;
 
-    /// Every tool that gates a guidance section, so a mode's omissions are the
-    /// mode's own decision rather than a missing tool precondition.
+    /// Tools sufficient to render the standard guidance sections, so omissions
+    /// reflect the mode rather than a missing section precondition.
     const FULL_TOOL_SET: &[&str] = &[
         "request_user_input",
         "enable_tools",
@@ -2516,8 +2451,8 @@ mod pure_prompt_tests {
             );
         }
 
-        // Guidance that steers a general agent rather than preventing a wrong
-        // answer, so pure mode drops it.
+        // Pure mode omits the standard profile's separate guidance blocks;
+        // its authored baseline owns the core behavior contract.
         for dropped in [
             "<tool_usage>",
             "<correctness_guardrails>",
@@ -2661,9 +2596,8 @@ mod pure_prompt_tests {
 
     #[test]
     fn pure_mode_ignores_scoped_project_instructions() {
-        // A file under the project's scoped-instruction directory: the loader
-        // only collects documents for targets below the effective working
-        // directory, and `driver/AGENTS.md` supplies a real document here.
+        // This target has a real scoped document in driver/AGENTS.md, so the
+        // standard prompt can detect missing instructions.
         let target = std::env::current_dir()
             .expect("test working directory")
             .join("src/bin/ai/driver/skill_runtime.rs");
@@ -2702,8 +2636,7 @@ mod pure_prompt_tests {
         );
     }
 
-    /// FNV-1a, so the snapshot is stable across toolchains and dependency
-    /// versions instead of depending on `Hash`'s randomised state.
+    /// FNV-1a gives prompt snapshots a fixed algorithm independent of randomized hashers.
     fn stable_hash(bytes: &[u8]) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for byte in bytes {

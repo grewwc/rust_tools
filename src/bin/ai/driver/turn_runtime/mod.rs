@@ -1,24 +1,7 @@
-// =============================================================================
-// AIOS Turn Runtime - Core Execution Engine
-// =============================================================================
-// This module handles the core execution loop where the LLM repeatedly calls tools.
+// Turn runtime: preparation, model requests, tool execution, and finalization.
 //
-// The turn execution follows this flow:
-//   1. Prepare: Build messages, select skills, initial request
-//   2. Iterate: LLM generates response with potential tool calls
-//   3. Execute: Run each tool call and collect results
-//   4. Finalize: Build final response and persist history
-//
-// Submodules:
-//   - prepare: Prepare turn (build messages, select skills)
-//   - iteration: Execute one LLM turn (call LLM, execute tools)
-//   - orchestrator: run_turn() - main turn coordination
-//   - tool_result: Handle tool execution results
-//   - finalize: Build final response, persist history
-//   - types: Outcome types (TurnOutcome, etc)
-//   - debug: Hang/debug reporting
-//   - persistence: SQLite history management
-// =============================================================================
+// `orchestrator::run_turn` coordinates the phases implemented by `prepare`,
+// `iteration`, `tool_result`, and `finalize`.
 
 mod context_budget;
 mod context_memory;
@@ -41,8 +24,6 @@ pub(super) use orchestrator::run_turn;
 // body through the same display-only post-processing as the live turn path
 // (finalize.rs).
 pub(in crate::ai) use output_postprocess::postprocess_terminal_text;
-// Earlier steps declared checkpoint/progress as orchestrator-private submodules, but execution.rs references them as
-// `turn_runtime::checkpoint|progress`; these re-exports restore turn_runtime-level visibility.
 pub(crate) use orchestrator::{checkpoint, progress};
 #[cfg(test)]
 use persistence::persist_pending_turn_messages;
@@ -123,13 +104,10 @@ impl CompressionReport {
             .push(format!("{}: {before} → {after} chars", label.into()));
     }
 
-    /// `effective` only means the net savings reached the summary-effective threshold; when false, the hard-budget fallback may
-    /// still have shrunk and replaced the request context, so it must not be misreported as skipped.
-    /// `llm_summary_inserted` says whether this compression actually ran and injected `[mid-turn-summary]`.
-    /// When false and `after < before`, the reduction came entirely from mechanical paths (folding/truncation/offload),
-    /// reported as "skipped (no LLM summary), mechanical-only", so purely mechanical compression is not
-    /// misreported as "an LLM summary ran" (users previously saw `pre-request LLM ... chars` when in fact
-    /// no LLM was triggered — an observability bug).
+    /// `effective` reports whether net savings reached the summary threshold; the
+    /// hard-budget fallback can still shrink context when it is false.
+    /// `llm_summary_inserted` tracks whether a summary was installed, so reductions
+    /// from folding, truncation, or offload are reported as mechanical work.
     pub(super) fn record_llm_summary_attempt(
         &mut self,
         label: impl Into<String>,
@@ -210,12 +188,10 @@ pub(crate) async fn generate_session_title_outside_turn(
 
 const MAX_TOOL_RESULT_INLINE_CHARS: usize = 32_000;
 const TOOL_OVERFLOW_PREVIEW_CHARS: usize = 800;
-/// Number of head preview characters in the first overflow stub.
-/// Matches the information density of the head-8-line preview in mid-turn compression stubs.
 const TOOL_OVERFLOW_HEAD_CHARS: usize = 800;
-/// Medium-large output threshold: tool results above this but below the overflow threshold are trimmed line-wise
-/// ("head + key hits + tail") only for non-precise overview tools, avoiding the full 32KB entering context.
-/// Precise evidence tools such as grep/read_file(_lines) never take this lossy path.
+/// Medium-sized overview results use a line-wise "head + key hits + tail"
+/// preview before they reach the overflow cap. Precision evidence tools
+/// bypass this lossy path.
 const MAX_TOOL_RESULT_LINE_TRIM_CHARS: usize = 8_000;
 
 /// Per-result inline (not offloaded to file) character cap, computed dynamically from the model context window.
@@ -234,25 +210,16 @@ pub(crate) fn max_tool_result_inline_chars(model: &str) -> usize {
         .clamp(MAX_TOOL_RESULT_INLINE_CHARS, 64_000)
 }
 
-/// Character floors for the window-derived compaction thresholds below.
-///
-/// The thresholds default to a dynamic value from `app.config.history_max_chars` (see
-/// [`mid_turn_compress_soft_threshold`] / [`mid_turn_compress_hard_threshold`]).
-/// These two constants only act as floor guards (so a user-set too-small history_max_chars cannot cause
-/// compaction to trigger on a single tool result and no-op repeatedly). In-turn compaction itself
-/// runs only at the request boundary, gated by measured token pressure.
+/// Character floors for the history-limit and window-derived compaction targets.
+/// They prevent tiny history limits from repeatedly targeting a single tool
+/// result. Request-boundary compaction still requires measured token pressure.
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_SOFT_FLOOR: usize = 36_000;
-/// Mid-turn LLM summary hard-threshold floor: if content still exceeds this after lossless/weak-loss compression, an LLM summary
-/// fallback runs (one model call, followed by a single merged compression status line).
+/// Lower bound for the hard character target; token-pressure gates decide whether to summarize.
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_HARD_FLOOR: usize = 80_000;
 
-/// Soft threshold: min 36K, otherwise history_max_chars * 1.5.
-/// history_max_chars is a fixed default when unset (see
-/// `config::history_max_chars_for_model`; 200K chars for every model).
-///
-/// But character thresholds and the model token window are different units: a heavily loaded prompt may be far below
-/// the 400K character threshold yet already close to the model token window. [`token_window_char_ceiling`] gives
-/// the model's "safe character budget"; taking the min of both ensures compression triggers earlier as the window nears.
+/// Soft character target derived from the history limit and capped by the
+/// model-window heuristic. Measured token pressure decides when to compress;
+/// this target is not a provider token count.
 pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_soft_threshold(
     model: &str,
     history_max_chars: usize,
@@ -264,13 +231,9 @@ pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_soft_threshold(
         .min(token_window_char_ceiling(model))
 }
 
-/// Hard threshold: min 80K, otherwise history_max_chars * 3.5.
-/// history_max_chars defaults to 200K, giving a 700K hard threshold, far beyond the lossless soft
-/// threshold; it is capped at the model's context window ([`llm_summary_char_threshold`]) and in
-/// practice intercepted by normalize_messages_for_request before the model returns 4xx.
-/// It leaves a clear gap above the soft threshold so LLM summary does not trigger repeatedly at the soft boundary.
-/// Gated by the LLM summary character threshold — LLM summary only runs when the context approaches the model's actual context window
-/// (see [`llm_summary_char_threshold`]), not prematurely at 60% of the window.
+/// Hard character target with more headroom than the soft target, capped by
+/// [`llm_summary_char_threshold`]. Summary admission also requires measured
+/// input pressure and the turn's remaining LLM-summary allowance.
 pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_hard_threshold(
     model: &str,
     history_max_chars: usize,
@@ -284,11 +247,9 @@ pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_hard_threshold(
 pub(in crate::ai::driver::turn_runtime) use crate::ai::history::compress::{
     MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS, MID_TURN_LLM_SUMMARY_MAX_CHARS,
 };
-/// Pre-request LLM summary threshold: before each LLM request is sent, if lossless + weak-loss compression still leaves
-/// content above this threshold, the LLM summary fallback runs (compressing earlier conversation into a single internal_note).
-/// Gated by the LLM summary character threshold — LLM summary only runs when the context approaches the model's actual context window,
-/// avoiding frequent LLM summary calls far below the window cap (the old design gated at 0.6 of the window,
-/// which made small-window models trigger LLM summary repeatedly at 76K chars without any effect).
+/// Pre-request character target for the last-resort summary pass.
+/// [`llm_summary_budget::LlmSummaryBudget`] admits model calls from measured
+/// input pressure; this character heuristic alone cannot trigger a summary.
 pub(in crate::ai::driver::turn_runtime) fn pre_request_llm_summary_threshold(
     model: &str,
     history_max_chars: usize,
@@ -299,14 +260,10 @@ pub(in crate::ai::driver::turn_runtime) fn pre_request_llm_summary_threshold(
         .min(llm_summary_char_threshold(model))
 }
 
-/// LLM summary character threshold: `context_window_tokens * CHARS_PER_TOKEN`.
+/// Window-derived character estimate, bounded below by the hard floor.
 ///
-/// Unlike [`token_window_char_ceiling`] (0.6 window, used to trim early during lossless compression),
-/// this threshold means "history has filled the model's actual context window" — only then is an LLM summary
-/// (expensive, one extra model call) truly necessary. A 100K token model defaults to 200K characters.
-///
-/// `CHARS_PER_TOKEN = 2` is already conservative (Chinese ≈ 1-2 chars/token, English ≈ 3-4),
-/// so no extra fraction is multiplied, avoiding a too-low threshold that makes LLM summary spin uselessly on small-window models.
+/// The characters-per-token conversion is a sizing heuristic; normalized
+/// request tokens and the shared summary budget govern summary admission.
 pub(in crate::ai::driver::turn_runtime) fn llm_summary_char_threshold(model: &str) -> usize {
     const CHARS_PER_TOKEN: usize = 2;
     crate::ai::models::context_window_tokens(model)
@@ -314,10 +271,9 @@ pub(in crate::ai::driver::turn_runtime) fn llm_summary_char_threshold(model: &st
         .max(MID_TURN_COMPRESS_HARD_FLOOR)
 }
 
-/// "Safe character budget" derived from the model token window: `window * chars_per_token * fraction`.
-/// - `chars_per_token = 2`: same conservative conversion as the max_tokens clamp on the [`request`] side.
-/// - `fraction = 0.6`: only ~60% of the window goes to the history prompt, leaving the rest for the system prompt,
-///   this turn's user message, tool schemas, and model output, so the compression threshold never hugs the top of the window.
+/// Reserve part of the model window when deriving the early-compaction
+/// character target, leaving headroom for request overhead and output.
+/// This conversion does not measure the normalized request's token usage.
 pub(in crate::ai::driver::turn_runtime) fn token_window_char_ceiling(model: &str) -> usize {
     const CHARS_PER_TOKEN: usize = 2;
     let window = crate::ai::models::context_window_tokens(model);
@@ -380,9 +336,8 @@ mod tests {
 
     #[test]
     fn llm_summary_mechanical_only_reduction_is_not_reported_as_llm() {
-        // User-observed problem: in single-turn sessions with huge tool output, the LLM summary was actually skipped
-        // (no old conversation to summarize), yet once the net reduction reached the effective threshold it was reported as `... LLM ... chars`,
-        // looking like an LLM call. This verifies that mechanical-only reduction is marked as skipped (no LLM summary).
+        // Savings above the effective threshold still count as mechanical work
+        // when no LLM summary was installed.
         let mut report = CompressionReport::default();
         report.record_llm_summary_attempt(
             "pre-request LLM (limit 180000)",

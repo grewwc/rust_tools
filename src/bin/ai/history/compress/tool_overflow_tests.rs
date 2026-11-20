@@ -128,7 +128,7 @@ fn mid_turn_spill_floor_keeps_small_results_inline() {
 
     assert_eq!(value_to_string(&messages[1].content), doc);
     // Exercise each fallback, including whole-group folding with no retention
-    // window. A small but spillable preview-shaped read must stay verbatim.
+    // window. A result below the shared size floor must stay verbatim.
     super::prepare_tool_messages_structured(
         &mut messages,
         480,
@@ -760,7 +760,7 @@ fn task_evidence_review_lines_bound_many_task_ids() {
     assert_eq!(emitted_tasks + remaining, task_count);
 
     // The same bound keeps a freshly built stub recognizable and well under the
-    // 64 KiB physical cap.
+    // raw-result character cap.
     let stub = build_preserved_tool_overflow_stub(
         Path::new("/tmp/many-tasks.txt"),
         "task_wait",
@@ -966,7 +966,7 @@ fn overflow_preview_probes_the_omitted_middle_without_format_assumptions() {
     // Deterministic: identical content yields a byte-identical preview.
     assert_eq!(preview, build_overflow_content_preview(&doc));
 
-    // Short content keeps the legacy head+tail-only shape.
+    // Content that fits the head/tail window needs no middle probes.
     let short_preview = build_overflow_content_preview("a\nb\nc\nd\ne\nf");
     assert!(!short_preview.contains("middle_samples"), "{short_preview}");
     assert_eq!(short_preview.lines().count(), 7);
@@ -1444,8 +1444,7 @@ fn precision_budget_never_expands_small_results_into_larger_stubs() {
         false,
     );
 
-    // A small result (100 chars) bloats when swapped for a stub with a long
-    // path: the original text must stay inline.
+    // The small result stays below the shared floor while its large groupmate spills.
     assert_eq!(value_to_string(&messages[1].content), "s".repeat(100));
     // The large result is spilled into a stub, and the stub is strictly
     // shorter than the original.
@@ -1457,23 +1456,16 @@ fn precision_budget_never_expands_small_results_into_larger_stubs() {
 
 #[test]
 fn enforce_group_budget_reuses_reread_archive_asset_instead_of_rearchiving() {
-    // When a read_file result that read back an archived asset (no longer
-    // protected after crossing turns) enters group spilling again, the
-    // existing archive file must be reused (the stub points at the same
-    // file) instead of minting a randomly named new one — otherwise "spill
-    // → read-back → spill again" generates a new archive on every
-    // read-back, forming an unbounded chain where the model never gets
-    // stable content.
+    // When a read_file result reads an archived asset and the group budget
+    // forces another spill, reuse that file so read-backs keep a stable pointer
+    // without accumulating duplicate archives.
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-precision-group-reuse-{}", uuid::Uuid::new_v4()));
     // 1) Generate an archive asset via Path C
     let mut messages = vec![
         assistant_call("spill", "read_file"),
-        // Leave ample headroom in the payload: the fingerprint adds a fixed
-        // ~16-byte overhead to the stub, and if the original and stub sizes
-        // were extremely close the anti-bloat guard (stub>=original) could
-        // flip, making this test about reuse semantics rather than byte
-        // coincidence.
+        // Leave ample payload headroom so the stub-size guard cannot obscure
+        // the archive-reuse check.
         tool_result("spill", &"x".repeat(8_000)),
         assistant_call("recent", "read_file"),
         tool_result("recent", "recent result"),
@@ -1617,14 +1609,9 @@ fn prepare_structured_reuses_reread_archive_asset_instead_of_rearchiving() {
 
 #[test]
 fn prepare_structured_spill_is_deterministic_across_reprojections() {
-    // P1 regression: when the same canonical tool result is spilled in two
-    // independent projections, it must map to the same deterministic
-    // archive file rather than minting a randomly named new copy every
-    // round (the old behavior caused unbounded bloat within one session:
-    // 368 files for only 211 unique contents). Using **different**
-    // overflow_dirs for the two projections would hide idempotence, so the
-    // same dir is reused to simulate round-by-round compaction of one
-    // session.
+    // Independent projections of the same canonical result must reuse one
+    // archive and stable stub. Use the same overflow directory so duplicate
+    // archive creation remains observable.
     let overflow_dir = std::env::temp_dir().join(format!(
         "ai-prepare-deterministic-spill-{}",
         uuid::Uuid::new_v4()
@@ -1685,18 +1672,12 @@ fn prepare_structured_spill_is_deterministic_across_reprojections() {
 
 #[test]
 fn prepare_structured_keeps_small_multiline_result_inline() {
-    // P2 regression: a few-hundred-byte multi-line grep result (over
-    // max_chars_per_msg but still small) becomes larger when swapped for a
-    // stub with a full head/tail preview. The anti-bloat guard must keep
-    // the original inline and write no archive file — otherwise the model
-    // sees "evicted, please re-read" and reads back repeatedly (session
-    // 9f4d0fae's "read results kept being archived as stubs" was exactly
-    // this path: a 673-char grep swapped for a larger stub).
+    // A multiline precision result below the shared floor stays inline even
+    // when it exceeds the per-message summary budget, avoiding unnecessary
+    // archive read-backs.
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-prepare-small-inline-{}", uuid::Uuid::new_v4()));
-    // 20 lines × ~30 chars ≈ 600 chars: over max_chars_per_msg=480, but the
-    // preview contains the whole body verbatim, so the stub cannot be
-    // smaller than the original.
+    // The fixture exceeds max_chars_per_msg=480 but remains below the shared floor.
     let grep_like = (0..20)
         .map(|i| format!("src/bin/ai/mod.rs:{i}: use crate::ai::x;"))
         .collect::<Vec<_>>()
@@ -1724,8 +1705,7 @@ fn prepare_structured_keeps_small_multiline_result_inline() {
         !is_preserved_tool_overflow_stub(&content),
         "不应被换成 stub"
     );
-    // No archive file is written (on bloat the new file is deleted; here it
-    // should never have been written at all).
+    // The size floor prevents the archive write entirely.
     let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
     let archived = std::fs::read_dir(&archive_dir)
         .map(|d| d.count())
@@ -2017,7 +1997,7 @@ fn path_c_snapshots_mutable_session_temp_asset_instead_of_reusing_it() {
 
 #[test]
 fn path_c_spills_aggregated_task_wait_result_losslessly() {
-    // task_wait forbids lossy compression but occupies no inline budget;
+    // task_wait forbids lossy compression but does not count toward the precision inline budget;
     // Path C's global fallback must spill it losslessly with a file pointer
     // left behind, rather than excluding it from candidates and letting
     // later lossy truncation lose the aggregate truth.
@@ -2312,8 +2292,6 @@ fn user_msg(text: &str) -> Message {
     }
 }
 
-/// Builds a stub in its "first spill" shape (with a multi-line Preview
-/// body), for fold testing.
 /// Resolves a stub `- file_path:` value to an on-disk archive path: absolute
 /// (legacy) stubs directly, typed aliases and bare names against the temp overflow dir
 /// (see `stub_archive_display_path`).
@@ -2331,6 +2309,7 @@ fn resolve_stub_archive_path(raw: &str, overflow_dir: &std::path::Path) -> std::
     overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR).join(raw)
 }
 
+/// Build a stub with a preview body for fold testing.
 fn overflow_stub_with_preview(file_path: &str, tool_name: &str) -> String {
     let full = (0..40)
         .map(|i| format!("line {i}: some content"))
@@ -2346,15 +2325,10 @@ fn collapse_overflow_stub_to_anchor_drops_preview_keeps_file_path() {
     assert!(stub.contains("Preview ("));
 
     let anchor = collapse_overflow_stub_to_anchor(&stub).expect("should collapse");
-    // The preview body is discarded.
     assert!(!anchor.contains("Preview ("));
-    // The file_path is kept.
     assert!(anchor.contains("- file_path: /tmp/session/read-abc.txt"));
-    // The tool name is kept (the new format uses "Output preserved for
-    // tool").
     assert!(anchor.contains("Output preserved for tool `read_file`"));
-    // read_file-type archives carry the context-budget notice (instead of the
-    // old leading "use read_file").
+    // Collapsed read archives retain the budget notice without preview guidance.
     assert!(anchor.contains("Archived snapshot of an earlier read"));
     assert!(anchor.contains("folded out of inline context for budget reasons"));
     assert!(
@@ -2364,7 +2338,6 @@ fn collapse_overflow_stub_to_anchor_drops_preview_keeps_file_path() {
     // Still a valid stub (prefix unchanged); the downstream compaction
     // chain keeps recognizing it via the stub exemption.
     assert!(is_preserved_tool_overflow_stub(&anchor));
-    // The size drops sharply.
     assert!(anchor.len() < stub.len());
 }
 
@@ -2456,8 +2429,7 @@ fn fingerprint_skips_degenerate_gist() {
 #[test]
 fn fingerprint_keywords_dedup_case_insensitively_and_stay_deterministic() {
     // Mixed-case repeats of the same token must collapse to one keyword,
-    // keeping the first-seen casing; the set-based dedup must not perturb
-    // ordering vs. the previous linear scan.
+    // keeping the first-seen casing and deterministic keyword order.
     let content = "sched_ctx SCHED_CTX Sched_Ctx root_idx ROOT_IDX payloadxyz\n";
     let keys = extract_fingerprint_keywords(content);
     let sched = keys
@@ -2481,7 +2453,7 @@ fn fingerprint_keywords_dedup_case_insensitively_and_stay_deterministic() {
 #[test]
 fn age_out_overflow_stub_previews_is_idempotent() {
     let stub = overflow_stub_with_preview("/tmp/session/read-xyz.txt", "read_file");
-    // Two user turns place the stub outside the protected tail window
+    // Later user turns place the stub outside the protected tail window
     // (before retained_turn_start).
     let mut messages = vec![
         user_msg("q1"),

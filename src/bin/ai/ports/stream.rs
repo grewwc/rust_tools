@@ -76,9 +76,8 @@ impl Default for FilterChain {
     }
 }
 
-/// Decorator: wraps `StreamDecoder` with a `FilterChain` applied around it.
-/// Demonstrates the "port decorator" shape: the driver can inject a decoder with filters for composable parsing,
-/// without changing the internal state machine of `stream::stream_response`.
+/// Decoder wrapper that stores filter chains for callers to use separately.
+/// `decode` delegates without applying either chain.
 pub(crate) struct FilteredStreamDecoder<D: StreamDecoder> {
     inner: D,
     before: FilterChain,
@@ -121,9 +120,7 @@ impl<D: StreamDecoder> StreamDecoder for FilteredStreamDecoder<D> {
                 + 'a,
         >,
     > {
-        // Pre-filtering could be simulated before the real network; this only demonstrates decorator pass-through:
-        // actual chunk-level filtering is applied per chunk via FilterChain inside the parse loop of stream::runtime.
-        // To keep zero behavior change, an empty default chain is equivalent to direct delegation.
+        // The stored chains are not applied here; decoding delegates directly to inner.
         let _before = &self.before;
         let _after = &self.after;
         self.inner

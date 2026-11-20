@@ -1,7 +1,7 @@
 //! Reasoning/thinking-mode control + prompt-cache breakpoint injection.
 //!
-//! Reasoning-related logic extracted from request/mod.rs:
-//! - thinking wire-field parsing (per-provider-adapter field differences)
+//! This module handles:
+//! - provider-specific thinking wire controls
 //! - `reasoning_content` echo completion for thinking models
 //! - thinking-off injection for auxiliary/background requests
 //! - prompt-cache breakpoint injection (`cache_control`)
@@ -117,13 +117,12 @@ pub(super) fn resolve_reasoning_wire_controls_from_parts<'a>(
 }
 
 /// Normalize the assistant `reasoning_content` replay policy by model capability:
-/// - Models that must echo the field back (DeepSeekThinkingDialect) keep the
-///   field shape on **every** replayed assistant message, including non-tool-call
-///   turns and empty reasoning: an own exact-replay blob decodes back to the
-///   original provider text, foreign/encrypted markers are cleared to an empty
-///   string, and a missing field is filled with an empty string — a missing
-///   field is rejected by the gateway with 400 "The `reasoning_content` in the
-///   thinking mode must be passed back", while an empty string passes.
+/// - Echo dialects (DeepSeek and Anthropic Messages) keep the field on every
+///   replayed assistant message, including non-tool-call turns and empty
+///   reasoning. Same-model exact-replay markers decode to the original provider
+///   text; other persisted markers become an empty string, and missing fields
+///   are filled with an empty string. DeepSeek requires the field shape, while
+///   the Messages builder uses the text for tool-round thinking replay.
 /// - Models declaring exact replay (GLM) only replay the original provider text
 ///   for tool-call rounds (by decoding the internal marker) to preserve
 ///   cross-tool-call continuity; non-tool-call messages strip hidden reasoning.
@@ -476,10 +475,9 @@ impl SplicedReplayKeys {
 /// is turn-scoped, cleared each turn, and lost on process exit. Across turns or
 /// after a Ctrl+C resume, it can only be recovered from the encoded blob
 /// persisted in `reasoning_content`. This function scans the current request
-/// projection (already pruned naturally by compression, so it only replays
-/// "recent non-folded turns", matching exact-replay's replay scope) and decodes
-/// each marked assistant turn whose source model matches the current model
-/// back into items, attaching them to its stable replay owner.
+/// projection and decodes each marked assistant turn whose source model matches
+/// the current model, attaching the items to its stable replay owner. Messages
+/// removed by projection compression do not participate in replay.
 ///
 /// Only fills keys missing from `live`: the in-memory side channel (freshest
 /// capture of the current turn) wins; persisted decoding only fills historical
@@ -563,11 +561,10 @@ pub(super) fn reconstruct_encrypted_reasoning_items_for_model_recorded(
 /// staged in `spliced`, not recorded: the rejection does not name the
 /// offending item, so a dropped tier may hold innocent groups, and only an
 /// accepted resend proves dropping it was needed ([`commit_dropped_replay_tiers`]).
-/// A resend that fails for any reason leaves the ledger untouched and the staged
-/// owners die with the request. Returns the dropped tier and owner count, or
-/// `None` once no spliced tier remains and the rejection is final. Each call
-/// consumes one tier and nothing re-adds spliced owners within a request, so a
-/// request makes at most one send per tier plus the original.
+/// If the request ends without an accepted resend, the ledger stays untouched
+/// and the staged owners die with the request. Returns the dropped tier and
+/// owner count, or `None` once no spliced tier remains. Each call consumes one
+/// tier, so replay repair can rebuild the request at most once per tier.
 pub(super) fn drop_next_rejected_replay_tier(
     reasoning_items: &mut ReasoningItemMap,
     spliced: &mut SplicedReplayKeys,
@@ -640,9 +637,9 @@ pub(super) fn commit_dropped_replay_tiers(
 /// owner (a first tool call id or plain-turn marker digest) of the tiers whose
 /// drop let a resend through, for the session + endpoint identity + model, and
 /// reconstruction skips it, live or persisted, in every later attempt. Items
-/// captured after the repair carry new call ids or markers and stay replayable, so a
-/// resource change costs at most two extra rejected round-trips per endpoint
-/// instead of one per turn.
+/// captured after the repair carry new call ids or markers and stay replayable.
+/// Retained ledger entries prevent later attempts from resending the dropped
+/// owners to the endpoint that rejected them.
 ///
 /// The endpoint identity in the key is what keeps a rejection from disabling
 /// valid reasoning: the same owner is only suppressed while requests route to
@@ -687,10 +684,8 @@ impl RejectedReplayKeys {
     }
 }
 
-/// Cheap upper bound; the ledger only holds owners of tiers the repair dropped,
-/// so reaching it means several resource changes in one process. Evicting the
-/// oldest entry keeps the newest rejections and only risks repeating the
-/// repair once for a long-gone owner.
+/// Bound the process ledger's owner count. Evicting the oldest entry keeps
+/// recent rejections and may require repair again if an evicted owner returns.
 const REJECTED_REPLAY_KEYS_MAX_ENTRIES: usize =
     crate::ai::history::ENCRYPTED_REASONING_REPLAY_REJECTIONS_MAX_ENTRIES;
 
@@ -1584,10 +1579,9 @@ mod encrypted_replay_reconstruct_tests {
     fn non_encrypted_model_is_untouched() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let items = vec![json!({"encrypted_content":"ENC"})];
-        // Even if history carries an encrypted marker, models without the
-        // encrypted-replay flag never rebuild (they return the live map
-        // as-is). Cover both the explicitly-unregistered tag and a registered
-        // entry that does not declare the flag.
+        // Models without the encrypted-replay flag skip persisted decoding,
+        // even when history carries a marker. Cover both an unregistered tag
+        // and a registered entry that does not declare the flag.
         let registered_plain = crate::ai::model_names::all()
             .iter()
             .find(|m| !m.reasoning_encrypted_replay)
@@ -2402,9 +2396,8 @@ mod force_off_effort_tests {
 
     #[test]
     fn force_off_passes_effort_through_for_unsupported_dialects() {
-        // MiniMax always-on reasoning and beam (whose gateway rejects "none"
-        // with 400) have no off mechanism: the force-off fallback must keep
-        // the current tier instead of emitting the bogus "none".
+        // MiMo and beam use NoOffSwitchDialect, so the force-off fallback
+        // keeps the current tier.
         assert_eq!(
             apply_thinking_force_off_effort(
                 true,

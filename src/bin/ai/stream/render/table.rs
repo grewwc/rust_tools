@@ -366,8 +366,7 @@ fn split_table_segments(s: &str) -> Vec<String> {
                         continue;
                     }
                     _ => {
-                        // A single $ inside a $$ segment (peek is not $), or an unknown state:
-                        // treat it literally, do not close, and fall through to current.push(ch)
+                        // A lone `$` cannot match a `$$` closing delimiter.
                     }
                 }
             }
@@ -422,15 +421,12 @@ fn pad_cell(s: &str, width: usize, align: TableAlign) -> String {
 /// unclosed markers verbatim as literal characters, making the real width exceed the estimate and misaligning table borders.
 fn render_and_pad_cell(cell_line: &str, width: usize, align: TableAlign, base: &str) -> String {
     let mut rendered = render_inline_md(cell_line, base);
-    // Strip redundant VS16 from the rendered text. When VS16 follows a base
-    // that already renders as 2-col emoji, keeping VS16 in the string would
-    // add an extra column in the terminal.
+    // Normalize redundant emoji selectors before measuring rendered table text.
     // Only rebuild when a VS16 is actually present (rare).
     if rendered.contains('\u{fe0f}') {
         rendered = strip_redundant_vs16(&rendered);
     }
-    // ANSI escapes are only present when styling spans produced them; otherwise
-    // measure the display width directly to avoid an extra full copy per cell.
+    // Measure visible text rather than ANSI style sequences.
     let actual_w = if rendered.contains('\x1b') {
         terminal_display_width(strip_ansi_codes(&rendered).as_str())
     } else {
@@ -500,9 +496,8 @@ pub(super) fn compute_table_widths(
 
     if sum > avail {
         let mut excess = sum - avail;
-        // Reduce the widest column first, one unit at a time (same semantics as
-        // the previous re-scan loop), but bucket columns by width so each unit of
-        // excess costs O(1) instead of a full O(cols) re-scan (O(excess·cols)).
+        // Bucket columns by width so shrinking the widest columns avoids a full
+        // column scan for each cell of excess width.
         let max_w = widths.iter().copied().max().unwrap_or(0);
         let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); max_w + 1];
         for (i, &w) in widths.iter().enumerate() {
@@ -696,9 +691,7 @@ pub(super) fn render_table_row(
 }
 
 fn terminal_width() -> usize {
-    // Matches markdown.rs::preview_terminal_width: keep a 4-column right safety margin so the
-    // table │ borders never sit flush against the terminal's right edge, which would trigger
-    // automatic wrapping and break the box-drawing layout.
+    // Leave a right margin to reduce automatic wrapping of table borders.
     const RIGHT_MARGIN: usize = 4;
     const MIN_WIDTH: usize = 20;
 
@@ -707,10 +700,8 @@ fn terminal_width() -> usize {
 }
 
 fn raw_cols() -> usize {
-    // Matches markdown.rs::raw_terminal_cols: prefer a live ioctl query and use COLUMNS only as
-    // a non-tty fallback. After a resident process is narrowed inside a panel, COLUMNS is a stale
-    // snapshot; computing table width from it overflows the real panel, gets hard-wrapped by the
-    // terminal, and misaligns the │ borders.
+    // Prefer a live ioctl query: COLUMNS can be stale after a panel resize and
+    // cause table borders to wrap. Use it only when the live query is unavailable.
     // The explicit override comes first: a serve turn child renders tables for
     // the client that displays them, and its own stdout is a pipe.
     if let Some(cols) = super::term_cols_override() {
@@ -770,13 +761,8 @@ mod tests {
 
     #[test]
     fn parse_table_row_handles_unpaired_backticks() {
-        // An odd number of three backticks must not leave in_code stuck at true, otherwise the
-        // trailing | can no longer be recognized as a column separator.
-        // Before the fix: split_table_segments toggled in_code on every backtick; after ``` the
-        //   in_code flag was true and later | characters were treated as literals, so the whole
-        //   row parsed as a single cell.
-        // After the fix: in_code is entered only when a paired backtick exists; unpaired ` is
-        //   treated as a literal.
+        // Only paired backticks hide pipes; an unmatched backtick must leave the
+        // trailing column boundary visible.
         assert_eq!(
             parse_table_row("| context 行漏前导空格 | ❌ invalid hunk line: ``` |"),
             vec!["context 行漏前导空格", "❌ invalid hunk line: ```"]
@@ -824,7 +810,6 @@ mod tests {
         let cells = parse_table_row("| $$a$b$$ | c |");
         assert_eq!(cells.len(), 2);
         assert_eq!(cells[1], "c");
-        // In $$a$b$$, the $ is a literal inside the $$ span; the whole run is one math span
         assert_eq!(cells[0], "$$a$b$$");
     }
 
@@ -957,11 +942,7 @@ mod tests {
         let w2 = visible_width("💧湿度");
         let w3 = visible_width("🍃空气质量");
 
-        // The width model always adds +1 for U+FE0F, widening a base character that needs VS16 to
-        // render as emoji to 2 columns, matching real terminals. 🌧️ = U+1F327(unicode-width=1) +
-        // U+FE0F(+1) = 2 columns; "天气" is 4 columns, totaling 6. The old code counted VS16 as 0
-        // columns, so 🌧️ measured 1 column — one narrower than the terminal. That was the root
-        // cause of tables being hard-wrapped with header residue piling up.
+        // VS16 expands the single-width 🌧 base to two columns; the CJK text adds four.
         assert_eq!(w1, 6);
         assert_eq!(w2, 6); // 💧(2) + 湿(2) + 度(2)
         assert_eq!(w3, 10); // 🍃(2) + 空气质量(8)
@@ -1058,9 +1039,7 @@ mod tests {
         assert_eq!(visible, "────  ");
     }
 
-    /// Reproduce the exact table from the screenshot: 3 columns, emoji in first
-    /// column of each data row. Verify that every `│` separator sits at the same
-    /// column position across all rendered lines (header + data rows).
+    /// Emoji in the first column must not shift separators relative to the header.
     #[test]
     fn screenshot_table_borders_align_with_emoji_first_column() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
