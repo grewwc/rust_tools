@@ -2332,6 +2332,143 @@ test("a later pending input follows the previous turn's finished answer", async 
   assert.equal(h.root.lastElementChild, live);
 });
 
+test("settled non-persisted commands keep their submission boundary as answers arrive", async () => {
+  const prefix = [{ role: "user", content: "old prompt" }, { role: "assistant", content: "progress" }];
+  const h = indexedHistoryHarness();
+  await h.context.loadHistory({ messages: prefix, histTotal: prefix.length });
+  const anchor = h.root.lastElementChild.dataset;
+  const commandRow = h.context.addUserBubble("/subagent traecli", undefined, h.root);
+  const input = {
+    row: commandRow, prompt: "/subagent traecli", minIndex: prefix.length,
+    afterHistoryKey: anchor.canonicalIdentity, afterHistoryIndex: Number(anchor.canonicalIndex),
+    settled: false,
+  };
+  h.context.pendingUserInputs.set("s", [input]);
+  const messages = [...prefix, { role: "assistant", content: "later progress" }];
+  await h.context.loadHistory({ messages, histTotal: messages.length });
+  input.settled = true;
+  messages.push({ role: "assistant", content: "final reply" });
+  await h.context.loadHistory({ messages, histTotal: messages.length });
+  assert.deepEqual(renderedKeys(h.root), ["old prompt", "progress", "/subagent traecli", "later progress", "final reply"]);
+  const mounted = h.root.children.slice();
+  await h.context.loadHistory({ messages, histTotal: messages.length });
+  assert.deepEqual(h.root.children, mounted, "refresh keeps the same command and reply nodes in order");
+  assert.equal(renderedNodes(h.root).filter((node) => node === commandRow).length, 1);
+});
+
+test("a settled non-persisted command follows its acknowledged pending predecessor", async () => {
+  const prefix = [{ role: "user", content: "old prompt" }, { role: "assistant", content: "old reply" }];
+  const h = indexedHistoryHarness();
+  await h.context.loadHistory({ messages: prefix, histTotal: prefix.length });
+  const anchor = h.root.lastElementChild.dataset;
+  const first = {
+    row: h.context.addUserBubble("new prompt", undefined, h.root), prompt: "new prompt", minIndex: 2,
+    afterHistoryKey: anchor.canonicalIdentity, afterHistoryIndex: Number(anchor.canonicalIndex),
+    settled: true,
+  };
+  const command = {
+    row: h.context.addUserBubble("/subagent traecli", undefined, h.root), prompt: "/subagent traecli", minIndex: 2,
+    afterHistoryKey: anchor.canonicalIdentity, afterHistoryIndex: Number(anchor.canonicalIndex),
+    afterInput: first, settled: true, submittedIndex: 2,
+  };
+  h.context.pendingUserInputs.set("s", [first, command]);
+  const messages = [...prefix, { role: "user", content: "new prompt" }, { role: "assistant", content: "final reply" }];
+  await h.context.loadHistory({ messages, histTotal: messages.length });
+  assert.deepEqual(renderedKeys(h.root), ["old prompt", "old reply", "new prompt", "/subagent traecli", "final reply"]);
+  assert.equal(h.context.pendingUserInputs.get("s")[0], command);
+});
+
+test("a settled non-persisted command uses its surviving anchor after history indices shrink", async () => {
+  const prefix = [
+    { role: "user", content: "earlier prompt" }, { role: "assistant", content: "earlier reply" },
+    { role: "user", content: "current prompt" }, { role: "assistant", content: "progress" },
+  ];
+  const h = indexedHistoryHarness();
+  await h.context.loadHistory({ messages: prefix, histTotal: prefix.length });
+  const anchor = h.root.lastElementChild.dataset;
+  const command = {
+    row: h.context.addUserBubble("/subagent traecli", undefined, h.root), prompt: "/subagent traecli", minIndex: 4,
+    afterHistoryKey: anchor.canonicalIdentity, afterHistoryIndex: Number(anchor.canonicalIndex),
+    settled: true, submittedIndex: 4,
+  };
+  h.context.pendingUserInputs.set("s", [command]);
+  const messages = [...prefix.slice(2), { role: "assistant", content: "final reply" }];
+  await h.context.loadHistory({ messages, histTotal: messages.length });
+  assert.deepEqual(renderedKeys(h.root), ["current prompt", "progress", "/subagent traecli", "final reply"]);
+});
+
+test("a settled non-persisted command stays before a later canonical prompt", async () => {
+  const prefix = [{ role: "user", content: "old prompt" }, { role: "assistant", content: "progress" }];
+  const h = indexedHistoryHarness();
+  await h.context.loadHistory({ messages: prefix, histTotal: prefix.length });
+  const anchor = h.root.lastElementChild.dataset;
+  const command = {
+    row: h.context.addUserBubble("/subagent traecli", undefined, h.root), prompt: "/subagent traecli", minIndex: 2,
+    afterHistoryKey: anchor.canonicalIdentity, afterHistoryIndex: Number(anchor.canonicalIndex),
+    settled: true, submittedIndex: 2,
+  };
+  h.context.pendingUserInputs.set("s", [command]);
+  const messages = [...prefix, { role: "assistant", content: "final reply" }];
+  await h.context.loadHistory({ messages, histTotal: messages.length });
+  const nextAnchor = h.root.lastElementChild.dataset;
+  const next = {
+    row: h.context.addUserBubble("next prompt", undefined, h.root), prompt: "next prompt", minIndex: 3,
+    afterHistoryKey: nextAnchor.canonicalIdentity, afterHistoryIndex: Number(nextAnchor.canonicalIndex),
+    afterInput: command, settled: true, submittedIndex: 3,
+  };
+  h.context.pendingUserInputs.set("s", [command, next]);
+  messages.push({ role: "user", content: "next prompt" }, { role: "assistant", content: "next reply" });
+  await h.context.loadHistory({ messages, histTotal: messages.length });
+  assert.deepEqual(renderedKeys(h.root), ["old prompt", "progress", "/subagent traecli", "final reply", "next prompt", "next reply"]);
+  assert.equal(h.context.pendingUserInputs.get("s").length, 1);
+  assert.equal(h.context.pendingUserInputs.get("s")[0], command);
+  assert.equal(renderedNodes(h.root).includes(next.row), false, "the canonical user row replaces its optimistic row");
+  const mounted = h.root.children.slice();
+  await h.context.loadHistory({ messages, histTotal: messages.length });
+  assert.deepEqual(h.root.children, mounted);
+  assert.equal(renderedNodes(h.root).filter((node) => node === command.row).length, 1);
+});
+
+test("a settled real prompt canonicalizes after a delayed history snapshot", async () => {
+  const prefix = [{ role: "user", content: "repeat" }, { role: "assistant", content: "old reply" }];
+  const h = indexedHistoryHarness();
+  await h.context.loadHistory({ messages: prefix, histTotal: prefix.length });
+  const anchor = h.root.lastElementChild.dataset;
+  const input = {
+    row: h.context.addUserBubble("repeat", undefined, h.root), prompt: "repeat", minIndex: 2,
+    afterHistoryKey: anchor.canonicalIdentity, afterHistoryIndex: Number(anchor.canonicalIndex),
+    settled: true, submittedIndex: 2,
+  };
+  h.context.pendingUserInputs.set("s", [input]);
+  const messages = [...prefix, { role: "assistant", content: "late progress" }];
+  await h.context.loadHistory({ messages, histTotal: messages.length });
+  assert.deepEqual(renderedKeys(h.root), ["repeat", "old reply", "repeat", "late progress"]);
+  assert.equal(h.context.pendingUserInputs.get("s")[0], input, "an older identical prompt cannot acknowledge the input");
+  messages.push({ role: "user", content: "repeat" }, { role: "assistant", content: "new reply" });
+  await h.context.loadHistory({ messages, histTotal: messages.length });
+  assert.deepEqual(renderedKeys(h.root), ["repeat", "old reply", "late progress", "repeat", "new reply"]);
+  assert.equal(h.context.pendingUserInputs.has("s"), false);
+  assert.equal(renderedNodes(h.root).includes(input.row), false);
+  const mounted = h.root.children.slice();
+  await h.context.loadHistory({ messages, histTotal: messages.length });
+  assert.deepEqual(h.root.children, mounted);
+});
+
+test("a settled submission index invalidated by a full rewind still reconciles", async () => {
+  const h = indexedHistoryHarness({ messages: [
+    { role: "user", content: "restored prompt" }, { role: "assistant", content: "reply" },
+  ] });
+  const input = {
+    row: h.context.addUserBubble("restored prompt", undefined, h.root), prompt: "restored prompt", minIndex: 9,
+    afterHistoryKey: "removed-anchor", afterHistoryIndex: 8, settled: true, submittedIndex: 9,
+  };
+  h.context.pendingUserInputs.set("s", [input]);
+  await h.context.loadHistory();
+  assert.deepEqual(renderedKeys(h.root), ["restored prompt", "reply"]);
+  assert.equal(h.context.pendingUserInputs.has("s"), false);
+  assert.equal(renderedNodes(h.root).includes(input.row), false);
+});
+
 for (const drift of ["grew", "shrank"]) test(`pending placement follows its history anchor when the count ${drift}`, async () => {
   const user = { key: "pending user" }, live = { key: "live box" };
   const oldPrompt = { role: "user", content: "old prompt" };

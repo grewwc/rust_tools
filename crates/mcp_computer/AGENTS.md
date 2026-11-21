@@ -49,9 +49,11 @@ src/backend/unsupported.rs # every call reports a clear "no backend on this OS" 
 3. **Screenshots return a path.** Follow shared **Text delivery** in
    `crates/mcp_stdio/AGENTS.md`; `a`'s image-aware `read_file` shows the saved frame
    to a vision model. `frame.rs` binds each `frame_id` to its capture scope; unchanged
-   probe files are deleted. A kept HiDPI frame is stored at one pixel per point
-   (the report's click formula always describes the stored file); the
-   `frame_id` digest and OCR use the native pixels. Kept frames are scratch:
+   probe files are deleted. A kept HiDPI frame is downscaled to one pixel per
+   point when the pixel→point mapping is available; without it (`store_for_model`,
+   `src/frame.rs`) native dimensions are kept — the report's click formula always
+   describes the stored file; the `frame_id` digest and OCR use the native
+   pixels. Kept frames are scratch:
    `a`'s `read_file` copies an image into the session's assets before showing
    it, so the session owns what the model saw and this server only prunes its
    own frames by age — never by count, since every `a` process runs its own
@@ -60,20 +62,26 @@ src/backend/unsupported.rs # every call reports a clear "no backend on this OS" 
    line matches, and for window captures it activates and verifies the exact
    window — before the fresh OCR frame and again immediately before input.
    An activation failure returns without a click; `find_text` never activates.
-4. **Helper error boundary.** Each backend's `sanitize` scans helper stderr
-   before forwarding it; apply shared **Error wording** in
-   `crates/mcp_stdio/AGENTS.md` at this boundary.
+4. **Helper error boundary.** Each backend's `sanitize` scans helper stderr and
+   replaces the six phrases of its local `TRANSPORT_TRIGGERS` list
+   (`src/backend/linux.rs`, `src/backend/macos/mod.rs`) before forwarding;
+   that list is a subset of the host's trigger set (`is_transport_error` /
+   `is_protocol_desync_error` / `is_user_interrupt_error` in
+   `src/bin/ai/mcp/client.rs`), so other trigger phrases pass through unchanged.
 5. **Backend calls run under `with_timeout` on a blocking thread.** Capture and
    injection block (subprocess + sleeps), so `tools.rs` goes through `spawn_blocking`:
-   run inline they would hold the server's only executor thread and the per-op cap
-   from `op_timeout_ms` (`src/tools.rs`) could never fire. Shared timeout ordering
-   is defined in `crates/mcp_stdio/AGENTS.md`.
+   run inline they would stall the server's dispatch future — and its
+   `with_timeout` — so the per-op cap from `op_timeout_ms` (`src/tools.rs`) could
+   never fire (`src/main.rs` runs Tokio's default multi-thread runtime). Shared
+   timeout ordering is defined in `crates/mcp_stdio/AGENTS.md`.
    On timeout the helper is left running to completion — the cap bounds what the
    model waits for, not the platform.
-6. **Permissions are reported, not assumed.** `screen_info` states whether
-   Accessibility (input injection) and Screen Recording (capture) are granted,
-   because an empty capture from a missing grant is otherwise indistinguishable
-   from an empty screen.
+6. **Permissions are reported, not assumed.** On macOS, `screen_info`
+   (`src/backend/macos/screen.rs`) states whether Accessibility (input
+   injection) and Screen Recording (capture) are granted, because an empty
+   capture from a missing grant is otherwise indistinguishable from an empty
+   screen; the Linux backend's `screen_info` (`src/backend/linux.rs`) reports
+   displays, pointer, windows, and session instead.
 
 ## Build / verify
 

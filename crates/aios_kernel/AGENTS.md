@@ -43,7 +43,9 @@ Crate targets: `cargo check -p aios_kernel`,
    `crate::types::{FastMap, FastSet}` (`src/types.rs`), also exported by `src/lib.rs`.
 5. **`LocalOS` state is guarded by the caller** via
    `SharedKernel = Arc<Mutex<Box<dyn Kernel + Send>>>` - kernel methods must
-   not block or await.
+   not block or await, except the `VfsOps` file operations, which call
+   blocking `std::fs` while the mutex is held (SAFETY/PERF note in
+   `src/local/vfs.rs`).
 6. **Process-table lifecycle.** Removing a process reattaches surviving children
    to an existing live foreground when available. A replacement foreground uses
    `KernelInternal::adopt_process_resources` to validate the exited owner and

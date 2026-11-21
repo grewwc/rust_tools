@@ -57,6 +57,8 @@ mod checkpoint;
 #[cfg(feature = "serve")]
 mod commands;
 #[cfg(feature = "serve")]
+mod compression;
+#[cfg(feature = "serve")]
 mod files;
 #[cfg(feature = "serve")]
 mod history;
@@ -468,8 +470,7 @@ async fn post_turn_sse(
     // reaped. Falls back to the line pump when the FIFO cannot be set up —
     // never fails the turn for streaming plumbing.
     let live_fifo = setup_live_fifo(&id);
-    let (raw_tx, mut raw_rx) = mpsc::channel::<Result<ServeSse, std::convert::Infallible>>(128);
-    let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(128);
+    let (client_tx, rx) = mpsc::channel::<Result<ServeSse, std::convert::Infallible>>(128);
     // Publish every event to the session log before forwarding it to the
     // originating client, and keep draining after that client goes away so a
     // reconnecting page can replay what it missed. The log is bound only once
@@ -504,12 +505,10 @@ async fn post_turn_sse(
         {
             Ok(context) => context,
             Err(error) => {
-                let log = bus.begin(&bus_session);
+                let sink = TurnEventSink::new(bus.begin(&bus_session), client_tx);
                 for event in [error_event(error), done_event()] {
-                    log.publish(&event.kind, &event.data);
-                    let _ = tx.send(Ok(event.into_event())).await;
+                    sink.send(event);
                 }
-                log.finish();
                 return;
             }
         };
@@ -521,23 +520,11 @@ async fn post_turn_sse(
             title_model.clone(),
             title_seed.clone(),
         );
-        let event_log = bus.begin(&bus_session);
+        let tx = TurnEventSink::new(bus.begin(&bus_session), client_tx);
         let turn_metadata =
             history::ServeTurnMetadata::new(SessionStore::new(&history_file), bus_session.clone());
-        tokio::spawn(async move {
-            let mut client_alive = true;
-            while let Some(item) = raw_rx.recv().await {
-                if let Ok(event) = &item {
-                    event_log.publish(&event.kind, &event.data);
-                }
-                if client_alive && tx.send(item.map(ServeSse::into_event)).await.is_err() {
-                    client_alive = false;
-                }
-            }
-            event_log.finish();
-        });
         for warning in warnings {
-            let _ = raw_tx.send(Ok(ServeSse::new("", warning))).await;
+            tx.send(ServeSse::new("", warning));
         }
         let child_title_seed = title_seed.clone();
         let child_history_file = history_file.clone();
@@ -547,7 +534,7 @@ async fn post_turn_sse(
                 child_history_file,
                 prompt,
                 overrides,
-                raw_tx,
+                tx,
                 live_fifo,
                 active_turns,
                 confirms,
@@ -567,11 +554,64 @@ async fn post_turn_sse(
         spawn_session_title_task(history_file, title_session_id, title_model, title_seed);
     });
     let stream = stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|event| (event, rx))
+        rx.recv()
+            .await
+            .map(|event| (event.map(ServeSse::into_event), rx))
     });
     Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
+}
+
+/// Maximum post-reap drain time, even if descendants keep writing to a pipe.
+#[cfg(feature = "serve")]
+const TURN_PIPE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Publish independently of client consumption. Serialize publication and
+/// enqueueing so the live stream has the same order as the retained log.
+#[cfg(feature = "serve")]
+#[derive(Clone)]
+struct TurnEventSink(Arc<TurnEventSinkInner>);
+
+#[cfg(feature = "serve")]
+struct TurnEventSinkInner {
+    log: Arc<SessionEventLog>,
+    client: std::sync::Mutex<Option<mpsc::Sender<Result<ServeSse, std::convert::Infallible>>>>,
+}
+
+#[cfg(feature = "serve")]
+impl TurnEventSink {
+    fn new(
+        log: Arc<SessionEventLog>,
+        client: mpsc::Sender<Result<ServeSse, std::convert::Infallible>>,
+    ) -> Self {
+        Self(Arc::new(TurnEventSinkInner {
+            log,
+            client: std::sync::Mutex::new(Some(client)),
+        }))
+    }
+
+    fn send(&self, event: ServeSse) {
+        let mut client = self.0.client.lock().unwrap_or_else(|err| err.into_inner());
+        self.0.log.publish(&event.kind, &event.data);
+        if let Some(sender) = client.as_ref() {
+            if sender.try_send(Ok(event)).is_err() {
+                // Once full or closed, detach permanently. Letting a slow
+                // receiver repeatedly free one slot would reintroduce
+                // backpressure. Reconnects use the bounded session log.
+                *client = None;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "serve")]
+impl Drop for TurnEventSinkInner {
+    fn drop(&mut self) {
+        // All pipe workers have joined before the last producer is dropped.
+        // No forwarding task or network receiver can delay log completion.
+        self.log.finish();
+    }
 }
 
 /// Blocking child-turn pump: runs the one-shot turn (same binary, same flags
@@ -579,15 +619,16 @@ async fn post_turn_sse(
 /// is still running: live-FIFO frames become `delta` / `thinking*` events
 /// (one per arrival, chunk granularity), stdout lines become message events.
 /// An output-complete frame sends `done` immediately while draining continues
-/// until the child is reaped. Stderr is drained on a side thread so a chatty
-/// child can never block on a full pipe.
+/// until the child is reaped. Both pipes are drained on side threads and the
+/// child is reaped independently, so neither a chatty child nor a tool-spawned
+/// descendant that inherited a pipe can hold the turn open.
 #[cfg(feature = "serve")]
 fn stream_child_turn(
     session_id: String,
     history_file: PathBuf,
     prompt: String,
     overrides: TurnOverrides,
-    tx: mpsc::Sender<Result<ServeSse, std::convert::Infallible>>,
+    tx: TurnEventSink,
     mut live_fifo: Option<LiveFifo>,
     active_turns: Arc<std::sync::Mutex<HashMap<String, u32>>>,
     confirms: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<ConfirmSlot>>>>>,
@@ -604,7 +645,7 @@ fn stream_child_turn(
     let timing = TurnSendTiming::default();
     let send = |event: ServeSse| {
         timing.stamp_first(t0);
-        let _ = tx.blocking_send(Ok(event));
+        tx.send(event);
     };
     let send_done = || {
         timing.stamp_done(t0);
@@ -688,14 +729,18 @@ fn stream_child_turn(
     } else {
         None
     };
-    let stderr_handle = child.stderr.take().map(|stderr| {
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut tail = String::new();
-            let _ = std::io::BufReader::new(stderr).read_to_string(&mut tail);
-            tail
-        })
-    });
+    // A tool can leave a background process holding the child's pipe write
+    // ends, so stdout EOF is not a reliable "child finished" signal. Drain
+    // both pipes on side threads and reap the child independently below; the
+    // readers get a bounded grace to finish after the reap.
+    let pipe_workers = TurnPipeWorkers::start(
+        &mut child,
+        &tx,
+        &child_done,
+        timing.clone(),
+        t0,
+        TURN_PIPE_DRAIN_GRACE,
+    );
     // The FIFO pump runs on its own thread: it owns the read end and stops
     // once the child is reaped and the pipe is drained (joined below).
     #[cfg(unix)]
@@ -723,23 +768,15 @@ fn stream_child_turn(
         });
     #[cfg(not(unix))]
     let fifo_handle: Option<std::thread::JoinHandle<()>> = None;
-    if let Some(stdout) = child.stdout.take() {
-        use std::io::BufRead;
-        for line in std::io::BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-        {
-            send(ServeSse::new("", clean_sse_line(&line)));
-        }
-    }
     let (status, stderr_tail) = reap_and_drain_turn_child(&mut child, &mut active_turn, || {
         child_done.store(true, Ordering::SeqCst);
+        // Nonblocking readers observe the reap signal even without a newline
+        // or EOF. Join them: no detached worker may retain a producer or fd.
+        let stderr_tail = pipe_workers.join();
         if let Some(handle) = fifo_handle {
             let _ = handle.join();
         }
-        stderr_handle
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default()
+        stderr_tail
     });
     // The pump may have ended the turn early via OutputComplete; only the
     // first `done` wins. A late failure still surfaces its detail as an
@@ -783,6 +820,157 @@ fn reap_and_drain_turn_child<T>(
     let drained = drain();
     drop(active_turn.take());
     (status, drained)
+}
+
+/// Pipe read ends are exclusively owned by their workers. Nonblocking reads
+/// and bounded polls make the reap signal observable without EOF; a deadline
+/// also bounds draining a descendant that continuously writes.
+#[cfg(all(feature = "serve", unix))]
+fn drain_turn_pipe(
+    mut reader: impl std::io::Read + std::os::fd::AsRawFd,
+    child_done: &std::sync::atomic::AtomicBool,
+    grace: std::time::Duration,
+    transient_eof: bool,
+    mut consume: impl FnMut(&[u8]),
+) -> std::io::Result<()> {
+    let fd = reader.as_raw_fd();
+    // SAFETY: the owned reader keeps fd valid for both fcntl calls. Only this
+    // worker reads the descriptor; O_NONBLOCK does not affect its write end.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut deadline = None;
+    let mut buf = [0u8; 8192];
+    loop {
+        let reaping = child_done.load(std::sync::atomic::Ordering::SeqCst);
+        if reaping {
+            let end = deadline.get_or_insert_with(|| std::time::Instant::now() + grace);
+            if std::time::Instant::now() >= *end {
+                return Ok(());
+            }
+        }
+        match reader.read(&mut buf) {
+            Ok(0) if !transient_eof || reaping => return Ok(()),
+            Ok(0) => {
+                // A FIFO writer opens lazily; a pipe EOF is never transient.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+            Ok(n) => {
+                consume(&buf[..n]);
+                continue;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if reaping {
+                    // All currently buffered bytes are drained. Do not wait
+                    // for a descendant to close its retained write end.
+                    return Ok(());
+                }
+            }
+            Err(err) => return Err(err),
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: polls one valid owned descriptor, with a bounded wait.
+        let ready = unsafe { libc::poll(&mut pfd, 1, 200) };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "serve", unix))]
+struct TurnPipeWorkers {
+    stdout: Option<std::thread::JoinHandle<()>>,
+    stderr: Option<std::thread::JoinHandle<String>>,
+}
+
+#[cfg(all(feature = "serve", unix))]
+impl TurnPipeWorkers {
+    fn start(
+        child: &mut std::process::Child,
+        tx: &TurnEventSink,
+        child_done: &Arc<std::sync::atomic::AtomicBool>,
+        timing: TurnSendTiming,
+        t0: std::time::Instant,
+        grace: std::time::Duration,
+    ) -> Self {
+        let stdout = child.stdout.take().map(|reader| {
+            let tx = tx.clone();
+            let done = Arc::clone(child_done);
+            std::thread::spawn(move || {
+                let emit = |line: &[u8]| {
+                    timing.stamp_first(t0);
+                    tx.send(ServeSse::new(
+                        "",
+                        clean_sse_line(&String::from_utf8_lossy(line)),
+                    ));
+                };
+                let mut pending = Vec::new();
+                let result = drain_turn_pipe(reader, &done, grace, false, |bytes| {
+                    for part in bytes.split_inclusive(|byte| *byte == b'\n') {
+                        pending.extend_from_slice(part);
+                        if pending.last() == Some(&b'\n') {
+                            pending.pop();
+                            if pending.last() == Some(&b'\r') {
+                                pending.pop();
+                            }
+                            emit(&pending);
+                            pending.clear();
+                        }
+                    }
+                });
+                // A final unterminated line belongs to the exited turn too.
+                if !pending.is_empty() {
+                    emit(&pending);
+                }
+                if let Err(err) = result {
+                    tx.send(error_event(format!("cannot read turn stdout: {err}")));
+                }
+            })
+        });
+        let stderr = child.stderr.take().map(|reader| {
+            let done = Arc::clone(child_done);
+            std::thread::spawn(move || {
+                // Keep enough bytes for the final character-based error tail,
+                // including a boundary codepoint split across read chunks.
+                let limit = MAX_TURN_ERROR_CHARS * 4 + 4;
+                let mut tail = Vec::new();
+                let result = drain_turn_pipe(reader, &done, grace, false, |bytes| {
+                    tail.extend_from_slice(bytes);
+                    if tail.len() > limit {
+                        tail.drain(..tail.len() - limit);
+                    }
+                });
+                let mut text = String::from_utf8_lossy(&tail).into_owned();
+                if let Err(err) = result {
+                    eprintln!("[serve] cannot read turn stderr: {err}");
+                    if text.is_empty() {
+                        text = format!("cannot read turn stderr: {err}");
+                    }
+                }
+                text
+            })
+        });
+        Self { stdout, stderr }
+    }
+
+    fn join(self) -> String {
+        if let Some(handle) = self.stdout {
+            let _ = handle.join();
+        }
+        self.stderr
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default()
+    }
 }
 
 /// Per-turn live-chunk FIFO: created by the SSE endpoint before spawning the
@@ -1382,7 +1570,7 @@ fn live_event(event: ServeLiveEvent) -> Option<ServeSse> {
 fn forward_live_event(
     event: ServeLiveEvent,
     turn_done: &std::sync::atomic::AtomicBool,
-    tx: &mpsc::Sender<Result<ServeSse, std::convert::Infallible>>,
+    tx: &TurnEventSink,
     timing: &TurnSendTiming,
     t0: std::time::Instant,
     confirm: Option<&std::sync::Mutex<ConfirmSlot>>,
@@ -1393,7 +1581,7 @@ fn forward_live_event(
         if !turn_done.swap(true, std::sync::atomic::Ordering::SeqCst) {
             timing.stamp_done(t0);
             let done = metadata.map_or_else(done_event, |metadata| metadata.done_event());
-            let _ = tx.blocking_send(Ok(done));
+            tx.send(done);
         }
         return;
     }
@@ -1481,65 +1669,30 @@ fn forward_live_event(
         }
         metadata.decorate_input_event(&mut sse);
     }
-    let _ = tx.blocking_send(Ok(sse));
+    tx.send(sse);
 }
 
 /// Forward live-FIFO frames as SSE events until the child is reaped and the
 /// pipe is drained. Mirrors the `attach_live_session` reader: an EOF while
 /// the child is still alive is transient (its writer opens on demand at the
 /// first chunk), so it sleeps instead of spinning; after the child exits EOF
-/// is terminal.
+/// is terminal. Continuously writing descendants are bounded by the same
+/// post-reap deadline as the stdout/stderr readers.
 #[cfg(unix)]
 #[cfg(feature = "serve")]
 fn pump_live_fifo(
     reader: std::fs::File,
     child_done: &std::sync::atomic::AtomicBool,
     turn_done: &std::sync::atomic::AtomicBool,
-    tx: &mpsc::Sender<Result<ServeSse, std::convert::Infallible>>,
+    tx: &TurnEventSink,
     timing: TurnSendTiming,
     t0: std::time::Instant,
     confirm: Option<Arc<std::sync::Mutex<ConfirmSlot>>>,
     mut metadata: Option<history::ServeTurnMetadata>,
 ) {
-    use std::os::fd::AsRawFd;
-    let fd = reader.as_raw_fd();
-    // Held for the whole pump: dropping it would close the read end early.
-    let _owned = reader;
     let mut decoder = ServeFrameDecoder::default();
-    let mut buf = [0u8; 8192];
-    loop {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: polls one valid open fifo fd with a bounded timeout; the
-        // fd outlives this loop via `_owned` above.
-        let ready = unsafe { libc::poll(&mut pfd, 1, 200) };
-        if ready < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            break;
-        }
-        // SAFETY: reads at most `buf.len()` bytes from the fifo into `buf`.
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if n < 0 {
-            let kind = std::io::Error::last_os_error().kind();
-            if kind != std::io::ErrorKind::Interrupted && kind != std::io::ErrorKind::WouldBlock {
-                break;
-            }
-            continue;
-        }
-        if n == 0 {
-            if child_done.load(std::sync::atomic::Ordering::SeqCst) {
-                break;
-            }
-            // Transient EOF (writer not opened yet): back off, don't spin.
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            continue;
-        }
-        for event in decoder.push(&buf[..n as usize]) {
+    let result = drain_turn_pipe(reader, child_done, TURN_PIPE_DRAIN_GRACE, true, |bytes| {
+        for event in decoder.push(bytes) {
             forward_live_event(
                 event,
                 turn_done,
@@ -1550,6 +1703,9 @@ fn pump_live_fifo(
                 metadata.as_mut(),
             );
         }
+    });
+    if let Err(err) = result {
+        eprintln!("[serve] cannot read turn FIFO: {err}");
     }
     // EOF and read/poll failures must both settle a partial reasoning phase.
     for event in decoder.finish() {
@@ -2047,7 +2203,8 @@ pub(in crate::ai) async fn run_serve(
             "/sessions/{id}/cd-candidates",
             get(get_session_cd_candidates),
         )
-        .with_state(state);
+        .with_state(state)
+        .layer(axum::middleware::from_fn(compression::gzip));
     if let Some(tls) = tls.as_ref() {
         let server = tls::TlsServer::bind(&bind, tls).await?;
         // Record this process in the global serve state file so

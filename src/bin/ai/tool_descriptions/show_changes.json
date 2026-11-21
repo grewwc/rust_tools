@@ -1,22 +1,74 @@
 {
   "name": "show_changes",
-  "description": "Show all file changes recorded in the current session (plus optional git diff fallback). Returns a compact summary with per-file status and a unified diff snippet. Use this before concluding a task to verify modifications. Includes the persistent session mutation revision and current/stale command verification gaps. Checks cover only the recorded command scope, not semantic correctness; request verification_details for provenance and evidence locators.",
+  "description": "Show recorded session file changes and command verification. Supports mutation windows via `since_seq`/`until_seq` (inclusive persistent seq), `since`/`until` (RFC3339, YYYY-MM-DD, or relative ago such as 30m/2h/1d), `turn_id`/`task_id`, and entry-level `path` filtering; summary, patch, changed-file counts, and the filtered Git inventory use the same window. `changed_files` counts session mutation groups, while `changed_paths` also lists Git inventory paths. `mode=history` returns a per-mutation timeline with seq, timestamp, provenance, file version, and diff, paginated by `after_seq`/`history_limit`. Time/seq/provenance filters apply only to session mutation records and suppress the Git fallback, because Git changes have no recorded seq/ts; a `path`-only filter still applies to the Git inventory and fallback by substring. Returns the persistent session revision and current/stale command verification gaps. Checks cover only the recorded command scope, not semantic correctness; request verification_details for provenance and evidence locators.",
   "parameters": {
     "type": "object",
     "properties": {
       "path": {
         "type": "string",
-        "description": "Optional file path filter \u2014 when set, only changes touching this path (substring match) are shown."
+        "description": "Optional entry-level substring filter over recorded mutation paths. It also filters the summary, patch, changed_files, and Git inventory."
+      },
+      "since_seq": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Inclusive lower bound on mutation seq (the persistent mutation version). Combine with until_seq for a closed range."
+      },
+      "until_seq": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Inclusive upper bound on mutation seq."
+      },
+      "since": {
+        "type": "string",
+        "description": "Inclusive lower time bound for recorded mutations: RFC3339, YYYY-MM-DD (UTC midnight), or a relative duration ago such as 30m, 2h, 1d, or 1w."
+      },
+      "until": {
+        "type": "string",
+        "description": "Inclusive upper time bound for recorded mutations, using the same forms as `since`."
+      },
+      "turn_id": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Only mutations recorded for this turn id."
+      },
+      "task_id": {
+        "type": "string",
+        "description": "Only mutations recorded for this task id."
+      },
+      "mode": {
+        "type": "string",
+        "enum": [
+          "summary",
+          "history"
+        ],
+        "description": "`summary` (default) renders the net windowed change summary; `history` returns a per-mutation timeline with seq, timestamp, provenance, per-file version, and diff."
+      },
+      "after_seq": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "History cursor: return mutations whose seq is greater than this value. Use history_page.next_after_seq for the next page."
+      },
+      "history_limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100,
+        "description": "Maximum history entries per page (default 20; values are clamped to 1..=100)."
+      },
+      "history_diff_lines": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 100,
+        "description": "Maximum diff lines per history entry (default 20; 0 omits diffs; values are clamped to 0..=100)."
       },
       "include_git": {
         "type": "boolean",
-        "description": "When true (default), include `git diff`/`git status` as fallback when the session mutation log is empty. Set false to show only explicit session writes/patches."
+        "description": "When true (default), include Git inventory. The Git diff fallback is used only when the session mutation log is empty. Time/seq/provenance filters suppress it; a path-only filter still applies to the Git inventory and fallback by substring. With a time/seq filter, Git paths are marked by coverage.git_scope and are not time-filtered."
       },
       "limit_snippet": {
         "type": "integer",
         "minimum": 0,
         "maximum": 4000,
-        "description": "Maximum characters of the change summary to include (default 120 means 9600 characters; 0 disables this truncation, but the summary itself is still capped at 14,000 characters and the git fallback at 32,768 diff bytes). "
+        "description": "Maximum characters of the rendered text, in units of 80 characters (default 120 means 9600 characters; 0 disables this truncation, but the summary is still capped at 14,000 characters and the Git fallback at 32,768 diff bytes)."
       },
       "verification_details": {
         "type": "boolean",
@@ -35,7 +87,7 @@
       "verification_max_bytes": {
         "type": "integer",
         "minimum": 0,
-        "description": "Maximum pretty-printed verification.checks array bytes per page (default 8192; 0 disables the byte cap). Nonzero budgets are normalized to at least 2 bytes for the empty array; checks_page.max_bytes reports the effective cap. An oversized next observation is omitted whole, with next_check_bytes and a hint to lift this cap."
+        "description": "Maximum pretty-printed verification.checks array bytes per page (default 8192; 0 disables the byte cap). Nonzero budgets are normalized to fit the empty array. An oversized next observation is omitted whole, with next_check_bytes and a hint to lift this cap."
       },
       "verification_full": {
         "type": "boolean",

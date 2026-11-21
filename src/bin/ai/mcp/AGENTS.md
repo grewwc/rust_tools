@@ -39,9 +39,11 @@ contract lives in `crates/mcp_stdio/AGENTS.md`; this guide owns the host side.
    one `mcpServers` entry is skipped with a warning; it must not take down
    every other configured server.
 10. **A restart invalidates the cached schemas.** The tool/resource/prompt
-    cache is rebuilt after a connection restart, otherwise the catalog keeps
-    serving pre-restart schemas while the live connection holds a new
-    generation. Rebuild outside the per-server lock (outer → inner order).
+    cache is rebuilt only when a restart completes, including re-discovery
+    (`restart_connection` in `client.rs`); the `reset_server` path returns
+    directly, and a restart or discovery failure leaves the catalog serving
+    pre-restart schemas. Rebuild outside the per-server lock (outer → inner
+    order).
 11. **Streamable HTTP session state.** Capture `Mcp-Session-Id` from responses,
     replay it on every POST, and send `MCP-Protocol-Version` after initialize.
     A 404 means the session is gone and restart is required.

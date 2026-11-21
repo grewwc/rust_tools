@@ -15,7 +15,7 @@ Shared transport, text delivery, error wording, and timeout contracts live in
 
 ```text
 src/main.rs   # PdfServer + impl McpServer (protocol loop via mcp_stdio::run)
-src/tools.rs  # tools_list + handle_tools_call dispatch + parse_pdf tool
+src/tools.rs  # tools_list_result + handle_tools_call dispatch + parse_pdf tool
 ```
 
 ## Build / Test
@@ -30,6 +30,9 @@ checking metadata and extracted text.
 
 1. **Wrapper boundary.** `parse_pdf_tool` (`src/tools.rs`) owns the MCP wrapper;
    shared result/error/timeout behavior belongs to `crates/mcp_stdio/AGENTS.md`.
+   The `with_timeout` wrapper cannot interrupt parsing: the parse future has no
+   await points, so a slow parse exceeds the cap without error and the response
+   arrives late.
 2. Error strings start with `open_failed` / `parse_failed` /
    `extract_text_failed` via `pdf_err_kind` (`src/tools.rs`) to mirror
    `PdfParseError`, so hosts can distinguish "file unreadable" from

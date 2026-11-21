@@ -10951,6 +10951,27 @@ function pendingHistoryFloor(input, history, msgs, baseIndex, total) {
     && message.role === "user" && !isRuntimeSyntheticUser(message));
   return next < 0 ? total : baseIndex + next;
 }
+function pendingSubmissionFloor(input, history, total) {
+  // Runtime commands can finish without persisting a user row. Their display
+  // boundary is the submission point, not the end of the preceding turn used
+  // to avoid acknowledging an older identical prompt.
+  const anchors = [
+    [input.afterHistoryKey, input.afterHistoryIndex],
+    [input.afterInput?.historyIdentity, input.afterInput?.historyIndex],
+  ];
+  const boundaries = [];
+  for (const [identity, index] of anchors) {
+    if (!identity) continue;
+    const row = history.rows.find((row) => row.identity === identity && row.historyIndex === index)
+      || history.rows.findLast((row) => row.identity === identity);
+    if (row) boundaries.push(row.historyIndex + 1);
+  }
+  // Older pending entries can have neither identity nor submission index.
+  // Leave that boundary unknown rather than treating the match floor as one.
+  // A shorter history with no surviving anchor also invalidates the old index.
+  return boundaries.length ? Math.max(...boundaries)
+    : input.submittedIndex == null || input.submittedIndex > total ? null : input.submittedIndex;
+}
 // A turn the user has left whose feed is gone: its box is retired here, and
 // that session picks the turn up from history when it is opened again.
 function dropBackgroundTurn(box, why) {
@@ -11157,14 +11178,17 @@ async function loadHistory(prefetched, canCommit = () => true) {
           const question = actual.replace(/\s+/g, " ");
           return !!commandText && !!question && commandText.endsWith(" " + question);
         };
+        const submissionFloor = input.settled ? pendingSubmissionFloor(input, history, canonicalHistoryTotal) : null;
         let found = msgs.findIndex((message, index) => baseIndex + index >= floor && matches(message));
         if (found < 0 && input.settled) {
-          // The floor only separates this input from an older identical one. Once
-          // the turn was accepted this input is certainly persisted, so a page
-          // count that drifted above the store (for example a session rewound by
-          // another client) must not strand the local row at the tail: its own
-          // message is the newest row carrying this text.
-          for (let i = msgs.length - 1; i >= 0; i--) if (matches(msgs[i])) { found = i; break; }
+          // Rewinds can invalidate a numeric match floor. Recover the newest
+          // matching row, but never cross a known submission boundary or reuse
+          // an already acknowledged row: completion alone does not prove that
+          // this input was persisted.
+          const recoveryFloor = Math.max(acknowledgedThrough, submissionFloor ?? 0);
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            if (baseIndex + i >= recoveryFloor && matches(msgs[i])) { found = i; break; }
+          }
         }
         if (found >= 0) {
           input.historyIndex = baseIndex + found;
@@ -11174,7 +11198,8 @@ async function loadHistory(prefetched, canCommit = () => true) {
           revokePreviews(input.row);
         } else {
           input.minIndex = floor;
-          input.beforeKey = history.rows.find((row) => row.historyIndex >= floor)?.key || null;
+          const displayFloor = submissionFloor ?? floor;
+          input.beforeKey = history.rows.find((row) => row.historyIndex >= displayFloor)?.key || null;
           pending.push(input);
         }
       }
@@ -13193,12 +13218,12 @@ async function send() {
   removeTranscriptPlaceholder();
   const userBubble = addLiveUserBubble(text.trim() ? text : "(images only)", prompt, sid, rewindFloor);
   const pendingInputs = pendingUserInputs.get(sid) || [];
-  // `settled` flips once the turn's POST is accepted: from then on this input
-  // is in canonical history, so an exact text match anywhere in the transcript
-  // belongs to it. Before that, a match may still be an older identical input.
+  // `settled` marks stream completion, not canonical history persistence:
+  // standalone runtime commands may never get a user-history row. Keep the
+  // submission anchor until a matching canonical row actually acknowledges it.
   const userInput = {
     row: userBubble.parentNode, prompt, minIndex: rewindFloor, settled: false,
-    ...pendingInputAnchor($("msgs")), afterInput: pendingInputs.at(-1) || null,
+    submittedIndex: rewindFloor, ...pendingInputAnchor($("msgs")), afterInput: pendingInputs.at(-1) || null,
   };
   pendingInputs.push(userInput);
   pendingUserInputs.set(sid, pendingInputs);

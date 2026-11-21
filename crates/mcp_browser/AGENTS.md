@@ -63,11 +63,13 @@ contracts without claiming site behavior.
    session. `AttachGuard` (`src/attach.rs`) also blocks chromiumoxide's automatic
    `Target.closeTarget` on foreign targets after initialization failures and
    rejects whole-browser closure. Keep the guard on every live attach path.
-3. **Profile protection.** Only auto-generated temporary profiles may have
-   singleton files removed or directories reclaimed. An explicit
-   `MCP_BROWSER_USER_DATA_DIR` retains its singleton files and contents; log
-   preservation instead of changing a user profile's lock state. Startup GC
-   checks that the temporary profile owner is dead.
+3. **Profile protection.** Startup GC (`gc_stale_profiles`, `src/browser.rs`)
+   reclaims temp-dir entries matching the `mcp_browser-profile-<pid>` pattern
+   whose owner PID is dead — pattern-based, so an explicit
+   `MCP_BROWSER_USER_DATA_DIR` pointing at a matching directory can still be
+   deleted. Other explicit profile directories retain their contents across
+   sessions; `purge_singleton_locks` (`src/browser.rs`) removes singleton
+   locks only for auto-generated profiles and never for a user-set directory.
 4. **Sequential session, continuously polled handler.** `BrowserServer` owns a
    mutable `Session`; the CDP `Handler` must keep being polled for calls to make
    progress. `switch_tab` changes the automation target without activating a
@@ -99,8 +101,13 @@ contracts without claiming site behavior.
    `unknown` with the inspection reason, and `unavailable` for self-launched
    headless mode. A pending/unknown result asks the model to return control to
    the user.
-9. **Error wording.** CDP construction and `translate_err`
-   (`src/applescript.rs`) follow the shared error wording contract.
+9. **Error wording.** The shared error wording contract is only partially met:
+   CDP construction errors embed the underlying message (`src/browser.rs`) and
+   unknown AppleScript errors pass through unchanged via `translate_err`
+   (`src/applescript.rs`), so a returned error containing a host restart
+   trigger phrase (`is_transport_error` / `is_protocol_desync_error` /
+   `is_user_interrupt_error` in `src/bin/ai/mcp/client.rs`) can still restart
+   the host connection.
 
 ## Tool contracts
 
@@ -119,6 +126,9 @@ close_browser. Additional names are switch_tab, close_tab, and snapshot.
 - `evaluate_js` returns JSON text on both drivers: strings stay quoted,
   objects/arrays are serialized, and undefined becomes null. Runtime and
   serialization exceptions produce errors. Multi-line code retains its lines.
+  The result passes through `cap_text` (`src/tools.rs`): oversized values are
+  cut and a truncation marker appended, so only sub-cap results are guaranteed
+  valid JSON.
 - `list_tabs` reports stable ids plus readable indices and URLs. CDP ids are
   target ids; AppleScript ids combine window and tab ids and survive tab
   reordering. `switch_tab(id)` selects the automation target. `close_tab(id)`
@@ -190,6 +200,9 @@ should be focused. `replace_text` (`src/snapshot.rs`) and `tool_press_key`
 
 ## Host registration
 
-Host tool family: `mcp_browser_*`. Shared configuration is described in
-**Host registration** in the mcp_stdio guide. Tool additions require the client
-to refresh tools/list; no client-side changes are part of this crate.
+Host tool family: `mcp_<mcpServers key>_*` — the host derives the prefix from
+the arbitrary `mcpServers` config key (`src/bin/ai/mcp/client.rs`), so
+`mcp_browser_*` requires the key `browser`, not `mcp_browser`. Shared
+configuration is described in **Host registration** in the mcp_stdio guide.
+Tool additions require the client to refresh tools/list; no client-side changes
+are part of this crate.

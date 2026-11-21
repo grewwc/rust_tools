@@ -9,7 +9,7 @@ Standalone stdio JSON-RPC **MCP server** driving real Microsoft Excel via AppleS
 ```text
 src/main.rs   # #[tokio::main(flavor = "multi_thread")]; ExcelServer + impl McpServer; no session state
 src/osa.rs    # osascript wrapper + AppleScript templates — every Excel quirk lives here
-src/tools.rs  # tools_list + handle_tools_call dispatch + tools + CSV helpers
+src/tools.rs  # tools_list_result + handle_tools_call dispatch + tools + CSV helpers
 ```
 
 Shared transport, text delivery, error wording, and timeout contracts live in
@@ -36,8 +36,11 @@ diagnostic). The three that cost the most when broken:
 ## Invariants (do not break)
 
 1. **No session / no shutdown hook.** Excel owns state across one-shot `osascript -e` calls; `main` holds no state; idempotent `open_workbook` (reuse-if-open) stitches calls.
-2. **Raw AppleScript diagnostics.** Preserve `-50`/`-10003` verbatim while
-   obeying shared **Error wording** in `crates/mcp_stdio/AGENTS.md`.
+2. **Raw AppleScript diagnostics.** `run_osascript` (`src/osa.rs`) returns
+   Excel/osascript stderr verbatim — including the `-50`/`-10003` codes, e.g.
+   `execution error: ... (-50)`. The shared **Error wording** in
+   `crates/mcp_stdio/AGENTS.md` is not applied at this boundary, so a host
+   restart trigger phrase inside a raw diagnostic still reaches the host.
 3. **Large ranges use CSV export.** Export large ranges to disk under shared
    **Text delivery** in `crates/mcp_stdio/AGENTS.md`.
 4. **Persist via `export_csv`, not `save_workbook`.** Sandboxed `save workbook as` → systemic `-50` in non-interactive context (not a syntax bug — do not re-attempt); `export_csv` reads range then Rust writes file; `save_workbook` stays EXPERIMENTAL.
@@ -49,5 +52,7 @@ diagnostic). The three that cost the most when broken:
 - Tool schemas belong to `tools_list_result` (`src/tools.rs`); expose workbook
   operations rather than raw AppleScript. Reads/writes are in-memory;
   `export_csv` persists and `save_workbook` remains experimental.
-- Host tool family: `mcp_excel_*`; shared configuration is described in
-  **Host registration** in `crates/mcp_stdio/AGENTS.md`.
+- Host tool family: `mcp_<mcpServers key>_*` — the host derives the prefix from
+  the arbitrary `mcpServers` config key (`src/bin/ai/mcp/client.rs`), so
+  `mcp_excel_*` requires the key `excel`, not `mcp_excel`. Shared configuration
+  is described in **Host registration** in `crates/mcp_stdio/AGENTS.md`.

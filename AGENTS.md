@@ -5,7 +5,8 @@ Root-level overview, repo-wide invariants, and verification policy.
 Rust 2024 workspace: utility library + CLI binaries. Primary product is `a`, an
 LLM-based AI agent runtime (AIOS) with process scheduling, agent/skill routing,
 tool registry, and MCP integration. macOS-first (`objc2*` dependencies are
-macOS-only); core library cross-platform.
+macOS-only); core library cross-platform apart from a Unix-only permissions
+helper in `commonw::secret` (`src/commonw/secret.rs`).
 
 ## Instruction hierarchy
 

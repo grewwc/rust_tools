@@ -12,17 +12,20 @@ Tools guide owns schemas and execution for the `knowledge_*` family.
 1. **Public vs internal tools.** Registry knowledge tools follow the existing
    `knowledge_*` family, including `knowledge_save` and `knowledge_consolidate`
    (see **Names & paths** in `src/bin/ai/tools/AGENTS.md`); there are no separate
-   `memory_*` tools — agent-internal memory uses the same `knowledge_*` tools
-   scoped by `MemoryOwnerScope` (e.g. the `agent_memory_save` path in
-   `tools/service/memory.rs`).
+   `memory_*` tools — agent-internal memory uses the same `knowledge_*` tools.
+   The registered `knowledge_save` tool is fixed to the Global scope
+   (`execute_knowledge_save` in `tools/knowledge_tools.rs`); the scoped
+   `agent_memory_save` path (`execute_memory_save` in `tools/service/memory.rs`,
+   `MemoryOwnerScope::Scoped`) is exercised only by test callers.
 2. **Consolidation contract.** `knowledge_consolidate` is a two-phase flow:
-   `read_all` then `execute`. Merges are lossless: `execute` `save_entries[].source_ids`
-   must list every source entry being consolidated, and the tool appends each source's
-   full original note to the merged entry while auto-deleting those sources (their
-   content is fully preserved in the merged entry). Content is discarded only for
-   entries removed via `delete_ids` without being listed in any
-   `save_entries[].source_ids` — consolidation never silently compresses or drops
-   original content.
+   `read_all` then `execute`. `execute` appends each listed source's full original
+   note (blank notes are skipped) to the merged entry while auto-deleting those
+   sources. Preservation is bounded by the `read_all` view (`store.all()`):
+   `source_ids` outside that view are reported as unknown and never appended,
+   while `delete_ids` are deleted across rotation archives even when their
+   content was never visible to `read_all`. Content is otherwise discarded only
+   for entries removed via `delete_ids` without a `save_entries[].source_ids`
+   listing — consolidation never silently compresses or drops listed sources.
 3. **Semantic search is derived; automatic recall is restricted.** The vector
    index is a pure derived artifact of the canonical memory store, rebuilt lazily
    on first use (or when the configured embedding model changed — see the model

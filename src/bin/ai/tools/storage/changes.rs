@@ -547,7 +547,27 @@ fn to_rel(path: &str, cwd: Option<&Path>) -> String {
     path.to_string()
 }
 
+/// Render a recorded path relative to the effective working directory.
+pub(crate) fn display_rel(path: &str) -> String {
+    to_rel(path, cwd_for_display().as_deref())
+}
+
+/// Render one mutation as a self-contained diff snippet, reusing the same
+/// snapshot/capped-diff rules as the grouped summary.
+pub(crate) fn entry_snippet(entry: &MutationEntry, max_lines: usize) -> Option<String> {
+    let grouped = grouped_changes_entries(std::iter::once(entry));
+    grouped.first().and_then(|change| file_snippet(change, max_lines))
+}
+
 pub(crate) fn grouped_changes(entries: &[MutationEntry]) -> Vec<FileChange> {
+    grouped_changes_entries(entries.iter())
+}
+
+/// Group an arbitrary iterator of mutation references so callers can query a
+/// filtered window without cloning recorded snapshots.
+pub(crate) fn grouped_changes_entries<'a>(
+    entries: impl IntoIterator<Item = &'a MutationEntry>,
+) -> Vec<FileChange> {
     let cwd = cwd_for_display();
     let mut grouped: Vec<FileChange> = Vec::new();
     for e in entries {
@@ -697,12 +717,23 @@ pub(crate) fn diff_snippet(
 
 /// Derive a combined display patch from grouped mutation records.
 pub fn mutation_patch(entries: &[MutationEntry]) -> Option<String> {
-    let grouped = grouped_changes(entries);
+    mutation_patch_entries(entries.iter())
+}
+
+/// Patch a filtered mutation window without cloning its snapshots.
+pub(crate) fn mutation_patch_entries<'a>(
+    entries: impl IntoIterator<Item = &'a MutationEntry>,
+) -> Option<String> {
+    let grouped = grouped_changes_entries(entries);
+    mutation_patch_grouped(&grouped)
+}
+
+fn mutation_patch_grouped(grouped: &[FileChange]) -> Option<String> {
     if grouped.is_empty() {
         return None;
     }
     let mut out = String::new();
-    for g in &grouped {
+    for g in grouped {
         out.push_str(&format!("diff -- {} {}\n", g.rel, g.rel));
         if g.before_unavailable() {
             // Do not invent an empty preimage or apply later incremental diffs
@@ -876,13 +907,24 @@ pub fn format_session_summary_with_git(include_git_extra: bool) -> String {
         if !include_git_extra {
             return "当前会话无文件变更（include_git=false，仅统计 mutation log）。".to_string();
         }
-        return fallback_git_summary();
+        return fallback_git_summary(None);
     }
     let grouped = grouped_changes(&entries);
+    format_grouped_summary(&grouped, include_git_extra, None)
+}
+
+/// Render grouped changes under an optional caller-supplied window header.
+/// `None` keeps the legacy session-wide header.
+pub(crate) fn format_grouped_summary(
+    grouped: &[FileChange],
+    include_git_extra: bool,
+    header: Option<&str>,
+) -> String {
     let cwd = cwd_for_display();
     let log_path = crate::ai::tools::storage::mutation_log::log_path();
-    let mut out =
-        String::from("以下是本会话通过 write_file / apply_patch 改动的文件（按首次改动顺序）。\n");
+    let mut out = String::from(header.unwrap_or(
+        "以下是本会话通过 write_file / apply_patch 改动的文件（按首次改动顺序）。\n",
+    ));
     const CAP: usize = 14_000;
     let mut truncated = false;
     for (i, g) in grouped.iter().enumerate() {
@@ -937,7 +979,7 @@ pub fn format_session_summary_with_git(include_git_extra: bool) -> String {
     out
 }
 
-fn fallback_git_summary() -> String {
+pub(crate) fn fallback_git_summary(path_filter: Option<&str>) -> String {
     let cwd = match crate::ai::driver::runtime_ctx::effective_cwd() {
         Ok(p) => p,
         Err(_) => return "当前会话无工具级变更记录，且无法确定工作目录。".to_string(),
@@ -945,26 +987,99 @@ fn fallback_git_summary() -> String {
     if !is_inside_git_work_tree(&cwd) {
         return "当前会话无工具级变更记录，且不在 git 仓库内（无可回退的 git 差异）".to_string();
     }
-    let status = git_output(&cwd, &["status", "--porcelain=v1"]).unwrap_or_default();
-    if status.trim().is_empty() {
-        return "当前会话无工具级变更记录，且 git 工作区干净（无未提交改动）".to_string();
+    let raw_status = match git_output(&cwd, &["status", "--porcelain=v1", "-z"]) {
+        Some(status) => status,
+        None => return "当前会话无工具级变更记录，且读取 git status 失败。".to_string(),
+    };
+    if raw_status.is_empty() {
+        return match path_filter {
+            Some(path) => format!(
+                "当前会话无工具级变更记录，且 git 工作区无匹配 `{path}` 的未提交改动"
+            ),
+            None => {
+                "当前会话无工具级变更记录，且 git 工作区干净（无未提交改动）".to_string()
+            }
+        };
     }
+
+    // Git pathspecs are prefixes/globs, not substrings. Filter the status records
+    // in Rust first, then hand Git the exact matched paths so a filename fragment
+    // such as `target` still selects `src/target.rs`.
+    let (status, diff_paths) = match path_filter {
+        None => {
+            let status = git_output(&cwd, &["status", "--porcelain=v1"])
+                .unwrap_or_else(|| raw_status.replace('\0', "\n"));
+            (status, Vec::new())
+        }
+        Some(filter) => {
+            let parsed = match parse_status_paths(raw_status.as_bytes()) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return format!("当前会话无工具级变更记录，且 Git 状态解析失败：{error}");
+                }
+            };
+            let mut lines = Vec::new();
+            let mut paths = Vec::new();
+            for (path, label) in parsed {
+                if !path.to_string_lossy().contains(filter) {
+                    continue;
+                }
+                let code = label.strip_prefix("git status: ").unwrap_or(&label);
+                lines.push(format!("{code} {}", path.display()));
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+            if lines.is_empty() {
+                return format!(
+                    "当前会话无工具级变更记录，且 git 工作区无匹配 `{filter}` 的未提交改动"
+                );
+            }
+            (lines.join("\n"), paths)
+        }
+    };
     const MAX_DIFF_BYTES: usize = 32_768;
-    let diff = git_output(&cwd, &["diff", "HEAD", "--no-color"]).unwrap_or_default();
+    let path_args: Vec<String> = diff_paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    let mut diff_args = vec!["--literal-pathspecs", "diff", "HEAD", "--no-color"];
+    if !path_args.is_empty() {
+        diff_args.push("--");
+        diff_args.extend(path_args.iter().map(String::as_str));
+    }
+    let diff = git_output(&cwd, &diff_args).unwrap_or_default();
     let mut sections = vec![format!("## git status --porcelain\n{status}")];
     if diff.len() <= MAX_DIFF_BYTES {
         if !diff.trim().is_empty() {
             sections.push(format!("## git diff HEAD\n{diff}"));
         }
     } else {
-        let stat = git_output(&cwd, &["diff", "HEAD", "--stat", "--no-color"]).unwrap_or_default();
+        let mut stat_args = vec![
+            "--literal-pathspecs",
+            "diff",
+            "HEAD",
+            "--stat",
+            "--no-color",
+        ];
+        if !path_args.is_empty() {
+            stat_args.push("--");
+            stat_args.extend(path_args.iter().map(String::as_str));
+        }
+        let stat = git_output(&cwd, &stat_args).unwrap_or_default();
         sections.push(format!(
             "## git diff HEAD --stat\n（完整 diff 超过 {MAX_DIFF_BYTES} 字节，仅展示统计）\n{stat}"
         ));
     }
-    let mut out = String::from(
-        "（本会话无工具级 mutation log，以下为工作区未提交改动，可能含并发需求的改动）\n\n",
-    );
+    let mut out = match path_filter {
+        Some(path) => format!(
+            "（本会话无工具级 mutation log，以下为工作区中路径包含 `{path}` 的未提交改动，可能含并发需求的改动）\n\n"
+        ),
+        None => {
+            "（本会话无工具级 mutation log，以下为工作区未提交改动，可能含并发需求的改动）\n\n"
+                .to_string()
+        }
+    };
     out.push_str(&sections.join("\n\n"));
     out
 }

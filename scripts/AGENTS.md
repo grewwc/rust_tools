@@ -19,18 +19,25 @@ header (`scripts/prompt_eval.py`). Bait set:
 `scripts/prompt_eval_cases.jsonl`; recorded runs: `scripts/prompt_eval_runs/`.
 
 - `--selftest` / `--score` / `--dry-run` / `--compare` are offline (no model
-  calls). `--record` spends one agent turn per case (`--repeat N`: N turns),
-  so run it deliberately.
+  calls). `--record` replays each case's prompts (one agent turn per prompt;
+  multi-turn cases spend more), and `--repeat N` runs every case N times. The
+  current bait set of 41 cases needs 44 agent turns per round, so run it
+  deliberately.
 - A run that read the bait set's scoring keys or named its own case is
   **contaminated** (NOT MEASURABLE — never search the bait set from inside a
-  recorded run); a run without a final answer is **incomplete** and excluded.
+  recorded run); only a nonzero exit code (timeout or crash) marks a run
+  **incomplete** and excluded — an empty transcript with exit 0 is still scored.
 
 ## cleanup_test_files.sh
 
-One-off helper that removes temporary test files (e.g. `test_*.rs`) left in the
-repo root; details in the script header.
+One-off historical helper: it removes a hardcoded list of test sources/binaries
+and moves `test_memory_feature.sh` into `scripts/`, under a hardcoded
+`/Users/bytedance/rust_tools` path. None of those files exist at the repo root
+today, so the move fails under `set -e`.
 
 ## test_memory_feature.sh
 
-Opt-in smoke script for memory / knowledge-base retrieval; its supported command
-sequence and invocation live in the `scripts/test_memory_feature.sh` header.
+Opt-in smoke script for memory / knowledge-base retrieval: runs `cargo check
+--bin a`, then exercises save/recent/search via the `/memory` CLI command
+(stale — the runtime command is now `/memo`) and prints retrieval config hints.
+It hardcodes `cd /Users/bytedance/rust_tools`, and its header documents no usage.

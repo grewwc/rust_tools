@@ -23,7 +23,7 @@ routing, commands, observation, and terminal output.
    or stale results only in model-visible content; guidance lives in
    `system_prompts/tool_result_evidence.md`.
 8. **Runtime environment is prompt context.** Base prompt includes OS/arch/shell/`effective_cwd`; keep cwd distinct from project root. Foreground owns the terminal — background subagents publish via task IPC only, never write live ANSI to stdout/stderr (one compact status line at scheduler safe points is allowed).
-9. **Interactive handoffs are explicit, one-shot.** `request_user_input` preserves active skill(s) for exactly the next normal turn; in non-skill turns the tool call is the explicit ask and the turn simply ends with the question. An explicit skill pin overrides the continuation; `activate_skill`/`deactivate_skill` manage the ordered active set, which continuation preserves whole.
+9. **Interactive handoffs are explicit, one-shot.** `request_user_input` records the active skill set for exactly the next normal turn; in non-skill turns the tool call is the explicit ask and the turn simply ends with the question. The continuation is honored only when no explicit pin, scheduler resume, or session-default promotion applies: `prepare_skill_for_turn` in `skill_runtime.rs` discards `pending_skill_continuation` whenever forced skills are non-empty (explicit pins, or session defaults promoted when no pin/resume is present), so skills selected during the turn can be lost there; scheduler wakeups instead restore the pre-suspension set from `resume_skill_names`.
 10. **Persist the actual response model.** Auto fallback doesn't rewrite `app.current_model`; projection/provenance use the model that produced each response. Provenance is per message and never inferred: `Message` carries no model (`source_model` travels beside it), overflow archives persist bodies only, so expanded messages report unknown instead of inheriting the stub's model, and `/history` labels assistant rows only.
 11. **Mutation preflight.** Load target-scoped instructions root-to-deep before
     first write and prioritize paused mutation over observed targets. Target
@@ -38,23 +38,31 @@ routing, commands, observation, and terminal output.
     and write outside these roots. User-only grant expansion is not an implemented
     security guarantee. Keep preflight grace separate from
     tool/kernel quotas. Reasoning control needs a parsed control channel; redirect
-    notes never quote user content.
+    notes never quote user content. Pure mode deliberately skips scoped-instruction
+    injection and reports nothing missing: `build_skill_turn_guard` seeds resident
+    scoped-instruction dirs only outside pure mode, and the guard's
+    `push_scoped_project_instructions` returns "nothing missing" in pure mode
+    without consulting `scoped_project_instructions_missing`.
 12. **Final-response gates.** Quality gates share one bounded reopen; the
     unsettled-plan gate has an independent bounded reopen and binds only a
     plan written this turn (or resume/goal-mode turns); older plans project as
-    non-binding carried context. Settled plans allow final answers directly. Final wording never controls gate
-    decisions. Consequential claims state their basis and scope where they
+    non-binding carried context. Settled plans allow final answers directly. Gates
+    key on gate-specific evidence: the completion gate consults only the tool record
+    (the final's wording is never classified), while the citation gate evaluates the
+    citations in the final text. Consequential claims state their basis and scope where they
     stand, limitations sit next to the claim they limit, and a claim backed by
     only part of a set describes that part. Simple common-knowledge answers
     stay plain, with no added citations, qualifiers, or steps.
     - **Completion.** After a provable `apply_patch`/`write_file` mutation, tool
       records alone decide: command intent and temp-only effects do not count;
       provable zero post-mutation activity reopens once, then warns.
-      Non-mutation action promises keep the dangling gate.
-    - **Citation.** Reopen once only for locally provable bad `path:line`
-      citations; inaccessible/oversized files remain unknown, and a second invalid
-      final receives an unverified-citation warning.
-13. **Scheduler is event-driven.** Foreground wakes via scheduler notifier (completion, shutdown, deadlines, `task_wait` budget) — no polling sleeps. Progress events are display-only (`notify_scheduler` for status line, never `wake_process`).
+      Command-level changes are intent classification and never trigger the gate;
+      non-mutation action promises have no gate of their own.
+    - **Citation.** Reopen once for locally provably bad `path:line` citations;
+      for relative paths, one base that proves the line absent flags the citation
+      even when other base-dir verdicts stay unknown (`unvalidated_final_response_citations_with_bases`
+      in `final_citations.rs`). A second invalid final receives an unverified-citation warning.
+13. **Scheduler is event-driven.** Foreground wakes via scheduler notifier (completion, shutdown, deadlines, `task_wait` budget) — no polling sleeps, except a recurring one-second wake while background subagents are in flight to refresh elapsed/last-activity status (`SchedulerClock::wait` in `mod.rs`). Progress events are display-only (`notify_scheduler` for status line, never `wake_process`).
 14. **Terminal & offloading.** Withhold `Completed` bodies until final gates accept;
     previews are display-only. Before requests, reclaim eligible old tool evidence
     from transient context within bounded limits, preserving recent, protected,

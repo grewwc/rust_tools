@@ -4433,6 +4433,7 @@ fn live_done_timestamps_match_persisted_final_answer_and_replay() {
     metadata.decorate_input_event(&mut raw);
     assert_eq!(raw.data, r#"{"text": "raw legacy progress"}"#);
     let (tx, mut rx) = mpsc::channel(8);
+    let tx = TurnEventSink::new(Arc::new(SessionEventLog::default()), tx);
     let done = AtomicBool::new(false);
     let timing = super::TurnSendTiming::default();
     let t0 = std::time::Instant::now();
@@ -5916,6 +5917,7 @@ fn live_fifo_pump_forwards_frames_and_ends_turn_early() {
     let mut fifo = setup_live_fifo("test-pump").expect("fifo setup");
     let reader = fifo.reader.take().expect("reader");
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+    let tx = TurnEventSink::new(Arc::new(SessionEventLog::default()), tx);
     let child_done = Arc::new(AtomicBool::new(false));
     let turn_done = Arc::new(AtomicBool::new(false));
     let pump_done = Arc::clone(&child_done);
@@ -6242,4 +6244,292 @@ fn reply_reference_serve_identity_survives_missing_timestamp_and_requires_commit
                 .is_none()
         );
     }
+}
+
+/// Backpressure detaches a client permanently without delaying publication;
+/// even a client that later frees a slot cannot hold the turn open again.
+#[tokio::test]
+async fn stalled_turn_client_is_detached_without_blocking_the_turn() {
+    let (tx, mut rx) = mpsc::channel(1);
+    let log = Arc::new(SessionEventLog::default());
+    let sink = TurnEventSink::new(Arc::clone(&log), tx);
+    sink.send(ServeSse::new("", "first"));
+    sink.send(ServeSse::new("", "second"));
+    assert_eq!(rx.recv().await.unwrap().unwrap().data, "first");
+    sink.send(ServeSse::new("", "third"));
+    assert!(rx.recv().await.is_none(), "a stalled client stays detached");
+    let (events, running) = log.since(0);
+    assert!(running, "client detachment does not finish a live turn");
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.data.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second", "third"]
+    );
+    drop(sink);
+    assert!(!log.since(0).1, "the final producer finishes the log");
+}
+
+/// Executed in a subprocess only; a descendant retains both write ends while
+/// its parent exits with an error. It expires on its own without being killed.
+#[cfg(unix)]
+#[test]
+fn turn_stream_pipe_child_fixture() {
+    use std::io::Write;
+    const FIXTURE: &str = "ai::serve::tests::turn_stream_pipe_child_fixture";
+    let Ok(mode) = std::env::var("A_SERVE_PIPE_FIXTURE") else {
+        return;
+    };
+    if mode == "descendant" {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        std::process::exit(0);
+    }
+    let mut stdout = std::io::stdout();
+    stdout.write_all("héllo\r\n".as_bytes()).unwrap();
+    // Split one codepoint between writes to exercise incremental decoding.
+    stdout.write_all(&[0xe4]).unwrap();
+    stdout.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    stdout.write_all(&[0xbd, 0xa0, b'\n']).unwrap();
+    stdout.write_all(b"partial").unwrap();
+    stdout.flush().unwrap();
+    let mut stderr = std::io::stderr();
+    stderr
+        .write_all(&vec![b'x'; MAX_TURN_ERROR_CHARS * 8])
+        .unwrap();
+    stderr
+        .write_all("原始错误: failed without newline".as_bytes())
+        .unwrap();
+    stderr.flush().unwrap();
+    if mode == "retained" {
+        let _descendant = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", FIXTURE, "--nocapture"])
+            .env("A_SERVE_PIPE_FIXTURE", "descendant")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+    }
+    std::process::exit(7);
+}
+
+#[cfg(unix)]
+#[test]
+fn turn_stream_retained_writers_finish_workers_and_event_log() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    for mode in ["eof", "retained"] {
+        let (tx, mut rx) = mpsc::channel(128);
+        let log = Arc::new(SessionEventLog::default());
+        let sink = TurnEventSink::new(Arc::clone(&log), tx);
+        let child_done = Arc::new(AtomicBool::new(false));
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ai::serve::tests::turn_stream_pipe_child_fixture",
+                "--nocapture",
+            ])
+            .env("A_SERVE_PIPE_FIXTURE", mode)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let workers = TurnPipeWorkers::start(
+            &mut child,
+            &sink,
+            &child_done,
+            TurnSendTiming::default(),
+            Instant::now(),
+            Duration::from_millis(50),
+        );
+        assert_eq!(child.wait().unwrap().code(), Some(7));
+        let reaped_at = Instant::now();
+        child_done.store(true, Ordering::SeqCst);
+        let stderr = workers.join();
+        assert!(
+            reaped_at.elapsed() < Duration::from_secs(1),
+            "{mode}: inherited pipes must not delay worker joins until EOF"
+        );
+        assert!(
+            stderr.ends_with("原始错误: failed without newline"),
+            "{mode}: captured error must survive early shutdown"
+        );
+        assert!(
+            stderr.len() <= MAX_TURN_ERROR_CHARS * 4 + 6,
+            "stderr retention is bounded"
+        );
+        // Joining means the stdout producer was released, not abandoned.
+        assert_eq!(Arc::strong_count(&sink.0), 1);
+        sink.send(error_event(last_chars(&stderr, MAX_TURN_ERROR_CHARS)));
+        sink.send(done_event());
+        drop(sink);
+        let (events, running) = log.since(0);
+        assert!(
+            !running,
+            "{mode}: log must finish before a next turn starts"
+        );
+        for expected in ["héllo", "你", "partial"] {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.event.is_empty() && event.data == expected),
+                "{mode}: missing decoded stdout {expected:?}"
+            );
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == "error" && event.data.contains("原始错误"))
+        );
+        assert_eq!(events.last().unwrap().event, "done");
+        while rx.try_recv().is_ok() {}
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)),
+            "{mode}: no worker retains the client sender"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn turn_stream_continuous_fifo_drain_has_deadline() {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+    let mut fifo = setup_live_fifo("continuous-drain").unwrap();
+    let reader = fifo.reader.take().unwrap();
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fifo.path)
+        .unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let writer_thread = std::thread::spawn(move || {
+        // The pipe stays saturated: the consumer below is deliberately slow.
+        writer.write_all(&[b'x'; 4096]).unwrap();
+        ready_tx.send(()).unwrap();
+        loop {
+            match writer.write_all(&[b'x'; 4096]) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => break,
+                Err(err) => panic!("writer failed: {err}"),
+            }
+        }
+    });
+    ready_rx.recv().unwrap();
+    let child_done = AtomicBool::new(true);
+    let start = Instant::now();
+    let mut bytes_read = 0;
+    drain_turn_pipe(
+        reader,
+        &child_done,
+        Duration::from_millis(50),
+        true,
+        |bytes| {
+            bytes_read += bytes.len();
+            std::thread::sleep(Duration::from_millis(2));
+        },
+    )
+    .unwrap();
+    assert!(bytes_read > 0, "buffered data is drained before shutdown");
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "a busy descendant cannot extend the deadline"
+    );
+    writer_thread.join().unwrap();
+    // Reader ownership was released, so the writer observed BrokenPipe.
+    assert!(fifo.path.exists(), "the inode outlives its joined reader");
+}
+
+#[test]
+fn turn_stream_live_and_replay_order_match() {
+    let (tx, mut rx) = mpsc::channel(128);
+    let log = Arc::new(SessionEventLog::default());
+    let sink = TurnEventSink::new(Arc::clone(&log), tx);
+    let workers = (0..2)
+        .map(|worker| {
+            let sink = sink.clone();
+            std::thread::spawn(move || {
+                for index in 0..50 {
+                    sink.send(ServeSse::new("delta", format!("{worker}:{index}")));
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let (events, running) = log.since(0);
+    assert!(running, "the owner keeps the turn log running");
+    assert_eq!(events.len(), 100);
+    for event in events {
+        let live = rx.try_recv().unwrap().unwrap();
+        assert_eq!(live.kind, event.event);
+        assert_eq!(
+            live.data, event.data,
+            "parallel publishers have identical live/replay order"
+        );
+    }
+    drop(sink);
+    assert!(!log.since(0).1);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn turn_stream_fifo_retained_writer_does_not_delay_completion() {
+    use crate::ai::background::ServeLiveKind;
+    use std::io::Write;
+    let mut fifo = setup_live_fifo("retained-writer").unwrap();
+    let reader = fifo.reader.take().unwrap();
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fifo.path)
+        .unwrap();
+    writer
+        .write_all(&test_frame(ServeLiveKind::Delta, "你好".as_bytes()))
+        .unwrap();
+    writer
+        .write_all(&test_frame(ServeLiveKind::OutputComplete, b""))
+        .unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    let log = Arc::new(SessionEventLog::default());
+    let sink = TurnEventSink::new(Arc::clone(&log), tx);
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        pump_live_fifo(
+            reader,
+            &AtomicBool::new(true),
+            &AtomicBool::new(false),
+            &sink,
+            TurnSendTiming::default(),
+            std::time::Instant::now(),
+            None,
+            None,
+        );
+        drop(sink);
+        finished_tx.send(()).unwrap();
+    });
+    let finished = finished_rx.recv_timeout(std::time::Duration::from_secs(1));
+    // Always release the fixture writer before joining, including on failure.
+    drop(writer);
+    handle.join().unwrap();
+    assert!(finished.is_ok(), "a retained writer must not require EOF");
+    assert!(
+        !log.since(0).1,
+        "the joined FIFO released the last log producer"
+    );
+    let delta = rx.try_recv().unwrap().unwrap();
+    assert_eq!(delta.kind, "delta");
+    assert!(delta.data.contains("你好"));
+    assert_eq!(rx.try_recv().unwrap().unwrap().kind, "done");
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
 }

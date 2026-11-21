@@ -21,9 +21,12 @@ HTTP/SSE surface lives in `mod.rs`.
 3. **Model turns are child processes.** The `/dirs add|ls|del` family (with
    `/add-dir <DIR>` as an add alias) is intercepted in the daemon;
    session grants live in `SessionServeConfig` and cwd/grants are read under the
-   session lock before forwarding roots to a child. `run_one_shot_turn` (`mod.rs`) spawns model turns, so a
-   panicking tool aborts the turn and every tool result in it, while the daemon
-   survives. Tool implementations must turn panics into ordinary tool errors.
+   session lock before forwarding roots to a child. `run_one_shot_turn` (`mod.rs`)
+   spawns model turns, so under the release build (`panic = "abort"` in
+   `Cargo.toml`) a panicking tool aborts the turn child and every tool result in
+   it, while the daemon survives; in unwind builds `run_tool_guarded`
+   (`tools/registry/common.rs`) converts the panic into an ordinary tool error
+   instead. Tool implementations must turn panics into ordinary tool errors.
 4. **Health follows the TLS setting.** `serve_url` (`ctl.rs`) prefixes `https://`
    when a certificate is configured and `http://` otherwise, and `--serve-status`
    prints that URL as `bind=`. Probe `<bind>/healthz` with the same scheme;

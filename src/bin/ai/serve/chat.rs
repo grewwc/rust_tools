@@ -5582,6 +5582,89 @@ mod tests {
         assert_eq!(resolve_serve_ca_cert("", " /cfg/ca.pem "), "/cfg/ca.pem");
     }
 
+    #[test]
+    fn serve_gzip_client_advertises_and_decodes_json_and_live_sse() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::{BufRead, Read};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (release, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for sse in [false, true] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+                let mut advertised = false;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("accept-encoding") {
+                            advertised = value.split(',').any(|value| value.trim() == "gzip");
+                        }
+                    }
+                }
+                assert!(
+                    advertised,
+                    "the production serve client must advertise gzip"
+                );
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+                if !sse {
+                    encoder
+                        .write_all(br#"{"ok":true,"message":"decoded JSON"}"#)
+                        .unwrap();
+                    let bytes = encoder.finish().unwrap();
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).unwrap();
+                    socket.write_all(&bytes).unwrap();
+                } else {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+                    encoder.write_all(b"data: first\n\n").unwrap();
+                    encoder.flush().unwrap();
+                    let first = std::mem::take(encoder.get_mut());
+                    write!(socket, "{:x}\r\n", first.len()).unwrap();
+                    socket.write_all(&first).unwrap();
+                    socket.write_all(b"\r\n").unwrap();
+                    socket.flush().unwrap();
+                    // The second event and gzip footer cannot be sent until
+                    // BufReader has decoded the complete first event.
+                    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                    encoder.write_all(b"data: second\n\n").unwrap();
+                    let last = encoder.finish().unwrap();
+                    write!(socket, "{:x}\r\n", last.len()).unwrap();
+                    socket.write_all(&last).unwrap();
+                    socket.write_all(b"\r\n0\r\n\r\n").unwrap();
+                }
+            }
+        });
+        let client = build_serve_client("", Duration::from_secs(5)).unwrap();
+        let response = client.get(format!("{base}/json")).send().unwrap();
+        assert!(!response.headers().contains_key("content-encoding"));
+        assert!(!response.headers().contains_key("content-length"));
+        let text = response.text().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            serde_json::json!({"ok": true, "message": "decoded JSON"})
+        );
+
+        let response = client.get(format!("{base}/events")).send().unwrap();
+        let mut reader = std::io::BufReader::new(response);
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        reader.read_line(&mut first).unwrap();
+        assert_eq!(first, "data: first\n\n");
+        release.send(()).unwrap();
+        let mut rest = String::new();
+        reader.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "data: second\n\n");
+        server.join().unwrap();
+    }
+
     /// Serve one canned HTTP response body, then return its URL. Keeps the
     /// SSE framing tests offline (loopback only, one connection).
     fn serve_body_once(body: &'static str) -> String {
