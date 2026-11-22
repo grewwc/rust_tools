@@ -1,0 +1,47 @@
+---
+name: code
+version: 1.0.0
+description: "Engineering standards for implementing features, fixing bugs, and refactoring code: establish scope, design maintainable architecture, check compatibility, handle credible corner cases, and verify observable behavior."
+author: rust_tools
+priority: 0
+model_invocable: true
+---
+## Contract and scope
+
+Before editing, state the intended outcome, the module that owns the behavior, and an observable example of behavior before and after the change. Read project instructions from the repository root through the target directory. Apply the project's existing scope and change-impact discipline, correctness guardrails, and task-convergence guidance for scope, evidence, and completion decisions.
+
+Keep implementation within the affected contracts and their necessary dependents. Scale planning to coupling and consequences: a local correction may need a short explanation; shared state or interfaces need explicit invariants and compatibility decisions. Identify the smallest unresolved fact that could change the implementation and settle it before relying on it. Preserve others' existing edits.
+
+## Architecture and maintainability
+
+Put behavior in its owning layer. Before adding a path, identify who owns its inputs, configuration, state transitions, and failures. Maintain one source of truth for configuration and durable state; derive temporary views rather than storing a second authoritative copy. Make invariants and failure boundaries explicit enough to tell which component must reject, propagate, or recover from an error.
+
+Keep modules cohesive and expose testable boundaries around meaningful behavior. Follow existing dependency direction and registration conventions. Introduce an abstraction only for variation demonstrated by current callers or requirements; describe the variation it represents. For a consequential structural choice, record why the resulting ownership and data flow are simpler to maintain than the supported alternatives.
+
+Choose between a local correction and structural change using the observed failure, affected contracts, regression risk, and maintenance cost. Avoid speculative refactors, unrelated optimizations, and new indirection that merely relocates complexity.
+
+## Impact and compatibility
+
+For every changed shared contract, record this chain:
+
+`changed contract → previously accepted inputs/guarantees → affected consumers → verification`
+
+Search usages across the whole workspace, including producers, callers, adapters, tests, and generated or embedded consumers. Inspect the relevant public API, configuration, serialization, persisted-state, and platform branches. Consider accepted inputs and existing state even when no current workspace producer emits them. Mark branches or external consumers you cannot inspect as unresolved; absence from a local search does not establish compatibility.
+
+Preserve accepted inputs and existing state unless the requested change authorizes a different contract. Where a migration is necessary, state how existing data remains readable or transitions without loss. Close each affected dependent with matching evidence: compilation for type relationships, a focused test for exercised behavior, or an explicit derivation from inspected contracts. Keep untested runtime premises visible.
+
+## Corner cases and recovery
+
+Derive credible cases from the changed contract: empty, invalid, and boundary inputs; missing resources; duplicates or repeated execution; partial failure; and concurrency or cancellation when relevant. For each material case, name the expected outcome and the boundary responsible for it. Do not add branches for scenarios the contract cannot encounter.
+
+Choose boundary validation, a clear error, or one simple bounded recovery proportional to the failure. Retry only when the failure is transient and repeating the operation is safe; bound attempts and define what happens when they are exhausted. Preserve durable state across partial failure, release resources, and make cleanup safe after incomplete or repeated execution.
+
+Never convert an unknown failure into success, stack cascading fallbacks, duplicate authoritative state, or build a recovery framework for an easily recoverable error. When repeated fallbacks are needed, reassess the normal data flow and repair the supported cause instead of layering another exception.
+
+## Implementation and verification
+
+Use the narrowest appropriate visibility. Write English comments that explain decisions and invariants to a future reader; avoid narrating obvious operations or referencing the conversation. Use the project's existing collection and registration conventions. Follow its local formatting and verification policy, and select the narrowest required checks.
+
+Prefer existing focused tests that exercise the changed contract. For a fix, require the same relevant scenario to fail on the prior artifact and pass on the final artifact under matching inputs and configuration. If reproduction is unavailable, state why, identify the alternative evidence, and limit the fix claim accordingly. Never weaken, skip, or delete tests to obtain a green result. Verify a CLI or configuration flag through its observable effect on effective configuration, arguments, or output.
+
+Follow `audit_own_changes` for applicable review and save obligations. Report the changed contracts, checked dependents, exact checks and results, and unresolved assumptions. Bind each verification claim to the artifact and behavior actually checked.

@@ -318,6 +318,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     let _ = crate::ai::driver::commands::session::restore_prune_marks_for_history(&mut task_app);
 
     let mut audit_checkpoints = false;
+    let mut agent_prompt = None;
     if let Some(agent) =
         agents::find_agent_by_name(ctx.agent_manifests.as_ref(), &prepared.agent_name)
     {
@@ -328,6 +329,9 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
             ));
         }
         audit_checkpoints = agent.audit_checkpoints;
+        let prompt = agent.build_system_prompt();
+        let prompt = prompt.trim();
+        agent_prompt = (!prompt.is_empty()).then(|| prompt.to_string());
         let capped_agent = task_tools::capped_subagent_manifest(agent);
         super::super::activate_primary_agent(&mut task_app, &capped_agent);
     }
@@ -491,6 +495,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
                                 task_skill_manifests_for_spawn.as_slice(),
                                 &runtime_ctx::active_skill_names(),
                             ),
+                            agent_prompt,
                             resume_session,
                             side_note_files,
                             reasoning_effort: backend_reasoning_effort,
@@ -1194,6 +1199,95 @@ fn subagent_history_path(base: &std::path::Path, task_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_dispatch_passes_selected_agent_prompt() {
+        use crate::ai::mcp::McpClient;
+        use task_tools::external_backend_test_support::{
+            PromptCaptureBackend, isolate_dispatch_test, selected_agent_manifests,
+        };
+
+        if isolate_dispatch_test(
+            "ai::driver::tools::sync_task::tests::sync_dispatch_passes_selected_agent_prompt",
+        ) {
+            return;
+        }
+        let _env_guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let backend = PromptCaptureBackend::new();
+        for requested_agent in [Some("prompt-worker"), None] {
+            let expected_name = requested_agent.unwrap_or("build");
+            let app = backend.app();
+            app.os.lock().unwrap().begin_foreground(
+                "parent".into(),
+                "capture selected agent".into(),
+                10,
+                8,
+                None,
+            );
+            let manifests = selected_agent_manifests();
+            let selected = manifests
+                .iter()
+                .find(|agent| agent.name == expected_name)
+                .unwrap();
+            let agent_prompt = selected.build_system_prompt().trim().to_string();
+            let other_prompt = manifests
+                .iter()
+                .find(|agent| agent.name != expected_name)
+                .unwrap()
+                .prompt
+                .trim()
+                .to_string();
+            let mut args = serde_json::json!({
+                "description": "Capture selected agent",
+                "prompt": "Perform the requested task.",
+                "model": app.current_model,
+                "backend": "traecli",
+                "backend_model": "test-model",
+                "inherit": "cwd,skills,memory",
+            });
+            if let Some(agent) = requested_agent {
+                args["agent"] = serde_json::json!(agent);
+            }
+            let context = DriverContext::from_app_snapshot(
+                &app,
+                Arc::new(std::sync::Mutex::new(McpClient::new())),
+                Arc::new(Vec::new()),
+                manifests,
+            );
+            runtime_ctx::TURN_IDENTITY
+                .scope(
+                    (app.session_id.clone(), 0usize),
+                    runtime_ctx::DRIVER_CTX.scope(
+                        context,
+                        runtime_ctx::SUBAGENT_CWD.scope(backend.root.clone(), async {
+                            let prepared = task_tools::prepare_subagent_task(&args).unwrap();
+                            assert_eq!(prepared.agent_name, expected_name);
+                            let result = super::execute_sync_task_with_pre_timeout_wrap_up(
+                                "capture-agent-prompt",
+                                &args,
+                                Duration::from_secs(5),
+                                None,
+                            )
+                            .unwrap();
+                            assert!(result.content.contains("COMPLETED"), "{}", result.content);
+                            assert!(result.content.contains(expected_name), "{}", result.content);
+                            let captured = backend.captured_prompt();
+                            let expected_prefix = format!(
+                                "## Agent instructions\n<agent_instructions>\n{agent_prompt}\n</agent_instructions>\n"
+                            );
+                            assert!(captured.starts_with(&expected_prefix), "{captured}");
+                            assert!(captured.contains(&prepared.prompt), "{captured}");
+                            assert!(!captured.contains(&other_prompt), "{captured}");
+                            assert_eq!(captured.matches("## Agent instructions\n").count(), 1);
+                        }),
+                    ),
+                )
+                .await;
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sync_task_parent_policy_captures_parent_before_fork_and_scopes_child() {

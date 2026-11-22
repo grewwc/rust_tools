@@ -878,6 +878,130 @@ mod tests {
     };
     use crate::ai::tools::task_tools::SubagentTerminalStatus;
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_dispatch_passes_selected_agent_prompt() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use crate::ai::driver::runtime_ctx::{self, DriverContext};
+        use crate::ai::mcp::McpClient;
+        use crate::ai::tools::task_tools::{
+            self,
+            external_backend_test_support::{
+                PromptCaptureBackend, isolate_dispatch_test, selected_agent_manifests,
+            },
+        };
+
+        if isolate_dispatch_test(
+            "ai::driver::background_dispatch::tests::background_dispatch_passes_selected_agent_prompt",
+        ) {
+            return;
+        }
+        let _env_guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let backend = PromptCaptureBackend::new();
+        for requested_agent in [Some("prompt-worker"), None] {
+            let expected_name = requested_agent.unwrap_or("build");
+            let mut app = backend.app();
+            let owner_pid = app.os.lock().unwrap().begin_foreground(
+                "parent".into(),
+                "capture selected agent".into(),
+                10,
+                8,
+                None,
+            );
+            let mcp = Arc::new(Mutex::new(McpClient::new()));
+            let mut skills = Arc::new(Vec::new());
+            let mut manifests = selected_agent_manifests();
+            let selected = manifests
+                .iter()
+                .find(|agent| agent.name == expected_name)
+                .unwrap();
+            let agent_prompt = selected.build_system_prompt().trim().to_string();
+            let other_prompt = manifests
+                .iter()
+                .find(|agent| agent.name != expected_name)
+                .unwrap()
+                .prompt
+                .trim()
+                .to_string();
+            let context = DriverContext::from_app_snapshot(
+                &app,
+                mcp.clone(),
+                skills.clone(),
+                manifests.clone(),
+            );
+            runtime_ctx::TURN_IDENTITY
+                .scope(
+                    (app.session_id.clone(), 0usize),
+                    runtime_ctx::DRIVER_CTX.scope(
+                        context,
+                        runtime_ctx::SUBAGENT_CWD.scope(backend.root.clone(), async {
+                            let mut args = serde_json::json!({
+                                "description": "Capture selected agent",
+                                "prompt": "Perform the requested task.",
+                                "model": app.current_model,
+                                "backend": "traecli",
+                                "backend_model": "test-model",
+                                "inherit": "cwd,skills,memory",
+                            });
+                            if let Some(agent) = requested_agent {
+                                args["agent"] = serde_json::json!(agent);
+                            }
+                            let prepared = task_tools::prepare_subagent_task(&args).unwrap();
+                            assert_eq!(prepared.agent_name, expected_name);
+                            let spawned = task_tools::spawn_subagent_kernel_task(&prepared).unwrap();
+                            let goal = {
+                                let os = app.os.lock().unwrap();
+                                task_tools::decode_os_task_goal(&os.get_process(spawned.pid).unwrap().goal)
+                                    .unwrap()
+                            };
+                            assert_eq!(goal.agent_name, expected_name);
+                            let mut manifests_loaded = true;
+                            super::dispatch_background_batch(
+                                &mut app,
+                                &mcp,
+                                &mut skills,
+                                &mut manifests,
+                                &mut manifests_loaded,
+                                1,
+                            );
+                            tokio::time::timeout(Duration::from_secs(5), async {
+                                loop {
+                                    if app
+                                        .os
+                                        .lock()
+                                        .unwrap()
+                                        .futex_load(spawned.completion_futex_addr)
+                                        .unwrap()
+                                        != 0
+                                    {
+                                        break;
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                }
+                            })
+                            .await
+                            .expect("fake TraeCLI background task should complete");
+                            let captured = backend.captured_prompt();
+                            let expected_prefix = format!(
+                                "## Agent instructions\n<agent_instructions>\n{agent_prompt}\n</agent_instructions>\n"
+                            );
+                            assert!(captured.starts_with(&expected_prefix), "{captured}");
+                            assert!(captured.contains(&prepared.prompt), "{captured}");
+                            assert!(!captured.contains(&other_prompt), "{captured}");
+                            assert_eq!(captured.matches("## Agent instructions\n").count(), 1);
+                            app.os.lock().unwrap().set_current_pid(Some(owner_pid));
+                            task_tools::discard_tasks_for_session(&app.session_id);
+                        }),
+                    ),
+                )
+                .await;
+        }
+    }
+
     fn activity_snapshot(phase: &str, latest: &str, sequence: u64) -> SubagentProgressSnapshot {
         let slot = new_subagent_progress_slot();
         publish_subagent_activity_to_slot(&slot, phase, latest);
@@ -2151,6 +2275,11 @@ pub(super) fn dispatch_background_batch(
                 continue;
             }
         };
+        let agent_prompt = task_agent.and_then(|agent| {
+            let prompt = agent.build_system_prompt();
+            let prompt = prompt.trim();
+            (!prompt.is_empty()).then(|| prompt.to_string())
+        });
         if let Some(agent) = task_agent {
             let capped_agent = capped_subagent_manifest(agent);
             activate_primary_agent(&mut task_app, &capped_agent);
@@ -2304,6 +2433,7 @@ pub(super) fn dispatch_background_batch(
                                     task_skills.as_slice(),
                                     &active_skill_names,
                                 ),
+                                agent_prompt,
                                 resume_session,
                                 side_note_files,
                                 reasoning_effort: backend_reasoning_effort,

@@ -406,9 +406,17 @@ impl TurnFixture {
     }
 
     async fn run_loop(&mut self, question: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.run_loop_with_skill_loading(question, false).await
+    }
+
+    async fn run_loop_with_skill_loading(
+        &mut self,
+        question: &str,
+        load_skills: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         self.app.cli.args = vec![question.to_string()];
         self.app.cli.model = Some(self.model.clone());
-        self.app.cli.no_skills = true;
+        self.app.cli.no_skills = !load_skills;
         self.app.shutdown.store(false, Ordering::Relaxed);
         let mut skills = Arc::new(Vec::new());
         let mut agents = Arc::new(Vec::new());
@@ -442,6 +450,89 @@ fn request_messages(request: &Value) -> &[Value] {
 
 fn text_content(message: &Value) -> &str {
     message["content"].as_str().unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skills_pin_trailing_question_answers_and_survives_next_turn() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let question = "自动补全加上了吗？\n请检查 WebUI（包括手机端和电脑端）的 skills 系列自动补全。";
+    let next_question = "再检查一下手机端。";
+    let replies = [
+        "会为 WebUI 的 skills 系列添加自动补全。",
+        "手机端也会包含 skills 自动补全。",
+    ];
+    let mut fixture = TurnFixture::new(
+        replies
+            .iter()
+            .map(|reply| ScriptedTurn::final_text(reply))
+            .collect(),
+    );
+    let skills_dir = fixture.root.path().join("skills");
+    std::fs::write(
+        fixture.root.path().join("configW"),
+        format!("ai.skills.dir={}\n", skills_dir.display()),
+    )
+    .expect("isolate the user skill directory");
+    crate::commonw::configw::refresh();
+    assert_eq!(crate::ai::skills::skills_dir(), skills_dir);
+    let code_prompt = crate::ai::skills::builtin_skill_body("code").expect("builtin code skill");
+    let project = fixture.root.path().to_path_buf();
+
+    for (index, input) in [
+        format!("/skills pin code\n {question} \n"),
+        next_question.to_string(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD
+            .scope(
+                project.clone(),
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    fixture.run_loop_with_skill_loading(input, true),
+                ),
+            )
+            .await
+            .expect("pinned-skill run_loop timed out")
+            .expect("pinned-skill run_loop failed");
+        assert_eq!(fixture.app.session_default_skills, ["code"]);
+        assert!(fixture.app.forced_question.is_none());
+
+        let requests = fixture.server.requests();
+        assert_eq!(requests.len(), index + 1, "each input must produce a reply");
+        let messages = request_messages(&requests[index]);
+        assert!(text_content(&messages[0]).contains(code_prompt.trim()));
+        let sent = messages
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "user")
+            .expect("question sent to the model");
+        let sent_question = crate::ai::history::value_to_string(&sent["content"]);
+        let expected_question = [question, next_question][index];
+        assert!(sent_question.contains(expected_question), "{sent_question}");
+        assert!(!sent_question.contains("/skills pin code"));
+        assert!(fixture.history().iter().any(|(message, _)| {
+            message.role == "assistant"
+                && crate::ai::history::value_to_string(&message.content) == replies[index]
+        }));
+    }
+
+    let events =
+        crate::ai::history::read_skill_activation_events_sqlite(&fixture.app.session_history_file)
+            .expect("read pinned skill activation events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.source == "session-default"
+                && event.injected_skill.as_deref() == Some("code")
+                && event.outcome == "injected")
+            .count(),
+        2,
+        "the pinned skill must be injected on both turns"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

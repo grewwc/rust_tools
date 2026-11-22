@@ -342,6 +342,9 @@ pub(crate) struct ExternalSubagentSpec {
     /// gated by `inherit.skills` and scoped to the active set at dispatch).
     /// Backends present it as instructions.
     pub(crate) skills: Option<String>,
+    /// Merged system and body instructions from the selected agent manifest.
+    /// Empty instructions are omitted; backends inject them only on fresh runs.
+    pub(crate) agent_prompt: Option<String>,
     /// Resume target for session continuity: a backend session id resolved at
     /// dispatch time from `backend_continue_from`, whose deferred side-notes
     /// have already been prepended to `prompt`. `None` starts a fresh run.
@@ -455,6 +458,127 @@ pub(crate) fn backend_session_footer_for(backend: &dyn Backend, session: &str) -
         .unwrap_or_else(|| backend_session_footer(session))
 }
 
+#[cfg(all(test, unix))]
+pub(crate) mod external_backend_test_support {
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use crate::ai::{agents::AgentManifest, types::App};
+
+    pub(crate) fn terminal_test_script(body: &str) -> PathBuf {
+        let script = std::env::temp_dir().join(format!(
+            "traecli-terminal-{}.sh",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        script
+    }
+
+    /// Keep fake backend environment changes out of concurrent tests.
+    pub(crate) fn isolate_dispatch_test(test_name: &str) -> bool {
+        const CHILD_ENV: &str = "RUST_TOOLS_AGENT_PROMPT_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated dispatch test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "the isolated dispatch test must execute its assertions"
+        );
+        true
+    }
+
+    /// Install under ENV_LOCK inside an isolated dispatch test.
+    pub(crate) struct PromptCaptureBackend {
+        pub(crate) root: PathBuf,
+        script: PathBuf,
+        previous_binary: Option<OsString>,
+    }
+
+    impl PromptCaptureBackend {
+        pub(crate) fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "traecli-agent-prompt-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let script = terminal_test_script(
+                r#"/bin/cat > "$0.prompt"
+/bin/echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'"#,
+            );
+            let previous_binary = std::env::var_os("TRAECLI_BIN");
+            unsafe { std::env::set_var("TRAECLI_BIN", &script) };
+            Self {
+                root,
+                script,
+                previous_binary,
+            }
+        }
+
+        pub(in crate::ai) fn app(&self) -> App {
+            let mut app = crate::ai::middleware::test_util::test_app();
+            app.session_id = format!("agent-prompt-{}", uuid::Uuid::new_v4().simple());
+            app.config.base_history_file = self.root.join("history.sqlite");
+            app.config.history_file = self.root.join("history.sqlite");
+            app.session_history_file = self.root.join("lead.sqlite");
+            app.current_agent = "build".to_string();
+            app
+        }
+
+        pub(crate) fn captured_prompt(&self) -> String {
+            std::fs::read_to_string(format!("{}.prompt", self.script.display())).unwrap()
+        }
+    }
+
+    impl Drop for PromptCaptureBackend {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous_binary {
+                    Some(value) => std::env::set_var("TRAECLI_BIN", value),
+                    None => std::env::remove_var("TRAECLI_BIN"),
+                }
+            }
+            let _ = std::fs::remove_file(&self.script);
+            let _ = std::fs::remove_file(format!("{}.prompt", self.script.display()));
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    pub(in crate::ai) fn selected_agent_manifests() -> Arc<Vec<AgentManifest>> {
+        Arc::new(
+            ["build", "prompt-worker"]
+                .into_iter()
+                .map(|name| {
+                    serde_json::from_value(serde_json::json!({
+                        "name": name,
+                        "description": format!("Selected {name} prompt fixture"),
+                        "mode": "all",
+                        "tool_groups": ["core"],
+                        "system_prompt": format!(" \n{name} system instructions.\t "),
+                        "prompt": format!("  {name} body instructions.\n  Preserve this indentation.\n "),
+                    }))
+                    .unwrap()
+                })
+                .collect(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,6 +642,7 @@ mod tests {
             workspace_allowed: false,
             model: None,
             skills: Some(oversized),
+            agent_prompt: None,
             resume_session: None,
             side_note_files: Vec::new(),
             reasoning_effort: None,
@@ -539,6 +664,7 @@ mod tests {
             workspace_allowed: false,
             model: None,
             skills: Some("x".repeat(1024)),
+            agent_prompt: None,
             resume_session: None,
             side_note_files: Vec::new(),
             reasoning_effort: None,

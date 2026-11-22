@@ -825,7 +825,7 @@ for (const phone of [true, false]) test((phone ? "phone" : "desktop") + " sessio
   assert.equal(meta["white-space"], "nowrap");
   if (phone) {
     assert.equal(bar.display, "grid");
-    assert.equal(bar["grid-template-columns"], "minmax(0,1fr) auto");
+    assert.equal(bar["grid-template-columns"], "minmax(0,1fr) auto auto");
     assert.equal(bar["flex-shrink"], "0");
     assert.equal(title["grid-column"], "1");
     assert.equal(title["grid-row"], "1");
@@ -842,7 +842,13 @@ for (const phone of [true, false]) test((phone ? "phone" : "desktop") + " sessio
     assert.equal(cwd["max-width"], "none");
     assert.deepEqual(cssRule(phoneCss, "#sessmeta"), { display: "none" });
     assert.equal(meta.display, "none");
-    assert.equal(responsiveRule("#questionbtn", true)["grid-column"], "2");
+    const rename = responsiveRule("#sessrename", true);
+    assert.equal(rename["grid-column"], "2");
+    assert.equal(rename["grid-row"], "1 / 3");
+    assert.equal(rename["align-self"], "center");
+    assert.equal(rename.width, "44px");
+    assert.equal(rename.display, undefined);
+    assert.equal(responsiveRule("#questionbtn", true)["grid-column"], "3");
     assert.equal(responsiveRule("#questionbtn", true)["grid-row"], "1 / 3");
     assert.equal(responsiveRule("#questionbtn.show", true).display, "grid");
   } else {
@@ -1277,6 +1283,13 @@ test("phone chrome and card spacing stay compact with readable text and full tou
   assert.equal(cssRule(phoneCss, "#sesscwd")["font-size"], "11px");
   assert.equal(cssRule(phoneCss, "#sesscwd")["line-height"], "1.3");
   assert.equal(cssRule(phoneCss, "#sessmeta").display, "none");
+  for (const selector of ["#sessrename", "#questionbtn"]) {
+    const control = responsiveRule(selector, true);
+    assert.equal(control.width, "44px");
+    assert.equal(control["min-width"], "44px");
+    assert.equal(control.height, "44px");
+    assert.equal(control.padding, "0");
+  }
   assert.deepEqual(cssRule(phoneCss, "#msgs"), { padding: "8px", gap: "6px", "scroll-padding-block": "8px" });
   assert.equal(cssRule(phoneCss, "#chat")["min-height"], "0");
   assert.equal(cssRule(phoneCss, ".turn").gap, "4px");

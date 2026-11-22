@@ -15,6 +15,135 @@ fn recent_skill_name(app: &App) -> Option<&str> {
         .map(|memory| memory.skill_name.as_str())
 }
 
+fn current_skill_lines(app: &App) -> Vec<String> {
+    let pending = pending_skill_names(app);
+    let mut lines = Vec::new();
+    if !pending.is_empty() {
+        lines.push(format!(
+            "current skills: {} (pending for next turn)",
+            pending.join(", ")
+        ));
+    } else if let Some(name) = recent_skill_name(app) {
+        lines.push(format!("current skill: {name} (recent active skill)"));
+    }
+    if !app.session_default_skills.is_empty() {
+        lines.push(format!(
+            "Pinned (session default): {}",
+            app.session_default_skills.join(", ")
+        ));
+    }
+    if lines.is_empty() {
+        lines.push("No active skill.".to_string());
+    }
+    lines
+}
+
+fn resolve_skill_names(
+    requested_names: &[&str],
+    skill_manifests: &[SkillManifest],
+) -> (Vec<String>, Vec<String>) {
+    let mut names: Vec<String> = Vec::new();
+    let mut not_found = Vec::new();
+    for requested in requested_names {
+        if let Some(skill) = skill_manifests
+            .iter()
+            .find(|skill| skill.name.eq_ignore_ascii_case(requested))
+        {
+            if !names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&skill.name))
+            {
+                names.push(skill.name.clone());
+            }
+        } else {
+            not_found.push((*requested).to_string());
+        }
+    }
+    (names, not_found)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SkillPinChanges {
+    added: Vec<String>,
+    already_pinned: Vec<String>,
+    not_found: Vec<String>,
+}
+
+fn pin_skill_names(
+    app: &mut App,
+    requested_names: &[&str],
+    skill_manifests: &[SkillManifest],
+) -> SkillPinChanges {
+    let (names, not_found) = resolve_skill_names(requested_names, skill_manifests);
+    let mut changes = SkillPinChanges {
+        not_found,
+        ..SkillPinChanges::default()
+    };
+    for name in names {
+        if app
+            .session_default_skills
+            .iter()
+            .any(|stored| stored.eq_ignore_ascii_case(&name))
+        {
+            changes.already_pinned.push(name);
+        } else {
+            app.session_default_skills.push(name.clone());
+            changes.added.push(name);
+        }
+    }
+    changes
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SkillUnpinChanges {
+    removed: Vec<String>,
+    not_pinned: Vec<String>,
+    agent_team_refused: bool,
+}
+
+fn unpin_skill_names(app: &mut App, requested_names: &[&str]) -> SkillUnpinChanges {
+    let mut changes = SkillUnpinChanges::default();
+    let mut seen: Vec<&str> = Vec::new();
+    for requested in requested_names {
+        if seen.iter().any(|name| name.eq_ignore_ascii_case(requested)) {
+            continue;
+        }
+        seen.push(requested);
+        if requested.eq_ignore_ascii_case("agent-team") {
+            changes.agent_team_refused = true;
+            continue;
+        }
+        if let Some(stored) = app
+            .session_default_skills
+            .iter()
+            .find(|name| name.eq_ignore_ascii_case(requested))
+            .cloned()
+        {
+            app.session_default_skills
+                .retain(|name| !name.eq_ignore_ascii_case(requested));
+            changes.removed.push(stored);
+        } else {
+            changes.not_pinned.push((*requested).to_string());
+        }
+    }
+    changes
+}
+
+fn is_session_default_skill_action(name: &str) -> bool {
+    name.eq_ignore_ascii_case("pin") || name.eq_ignore_ascii_case("unpin")
+}
+
+// Phone composers send multi-line input as one command string, so a newline
+// ends the pin/unpin skill-name arguments.
+fn split_pin_trailing_question(arguments: &str) -> (&str, Option<&str>) {
+    let Some((names, question)) = arguments.split_once('\n') else {
+        return (arguments, None);
+    };
+    let names = names.strip_suffix('\r').unwrap_or(names);
+    let question = question.trim();
+    (names, (!question.is_empty()).then_some(question))
+}
+
 pub fn try_handle_skills_command(
     app: &mut App,
     input: &str,
@@ -39,9 +168,15 @@ pub fn try_handle_skills_command(
         return Ok(false);
     }
     let action = parts.next().unwrap_or("list");
-    // Collect the remaining tokens at once: both `use` and implicit selection
-    // need to consume the full argument list.
-    let rest_tokens: Vec<&str> = parts.collect();
+    let (rest_tokens, trailing_question): (Vec<&str>, Option<&str>) =
+        if matches!(action, "pin" | "unpin") {
+            let action_and_arguments = normalized.trim_start()[cmd.len()..].trim_start();
+            let (names, question) =
+                split_pin_trailing_question(&action_and_arguments[action.len()..]);
+            (names.split_whitespace().collect(), question)
+        } else {
+            (parts.collect(), None)
+        };
 
     match action {
         "help" | "h" | "--help" => {
@@ -49,11 +184,18 @@ pub fn try_handle_skills_command(
             println!();
             println!("  /skills              list all available skills");
             println!("  /skills list         list all available skills");
-            println!("  /skills current      show pending/recent skill selection");
-            println!("  /skills use <name>...  force the specified skills on the next turn");
-            println!("  /skills <name>...      shorthand for /skills use (also accepts a");
+            println!("  /skills current      show pending/recent and pinned skills");
+            println!("  /skills use <name>...  force the specified skills on the next turn only");
+            println!("  /skills pin <name>...  pin skills as defaults for this session");
+            println!("  /skills unpin <name>... remove pinned session defaults");
+            println!("  /skills <name>...      one-turn shorthand for /skills use (also accepts a");
             println!("                         trailing question: /skills <name>... <question>)");
             println!("  /skills help         show this help");
+            println!();
+            println!(
+                "Pinned defaults persist when this session is reopened; explicit picks add for one turn."
+            );
+            println!("Use /reset to unpin agent-team and leave the /use <backend> mode.");
             println!();
         }
         "list" | "ls" | "" => {
@@ -68,6 +210,10 @@ pub fn try_handle_skills_command(
                         .iter()
                         .any(|name| name.eq_ignore_ascii_case(&s.name));
                     let is_recent = recent.is_some_and(|name| name.eq_ignore_ascii_case(&s.name));
+                    let is_pinned = app
+                        .session_default_skills
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&s.name));
                     let mark = if is_pending || is_recent { "*" } else { " " };
                     let mut extras = Vec::new();
                     if !s.description.trim().is_empty() {
@@ -79,6 +225,9 @@ pub fn try_handle_skills_command(
                     if is_recent {
                         extras.push("[recent]".to_string());
                     }
+                    if is_pinned {
+                        extras.push("[pinned]".to_string());
+                    }
                     if extras.is_empty() {
                         println!("{}  {}", mark, s.name);
                     } else {
@@ -88,16 +237,51 @@ pub fn try_handle_skills_command(
             }
         }
         "current" | "cur" => {
-            let pending = pending_skill_names(app);
-            if !pending.is_empty() {
-                println!(
-                    "current skills: {} (pending for next turn)",
-                    pending.join(", ")
-                );
-            } else if let Some(name) = recent_skill_name(app) {
-                println!("current skill: {name} (recent active skill)");
+            for line in current_skill_lines(app) {
+                println!("{line}");
+            }
+        }
+        "pin" => {
+            if rest_tokens.is_empty() {
+                println!("Usage: /skills pin <skill-name> [<skill-name>...]");
             } else {
-                println!("No active skill.");
+                let changes = pin_skill_names(app, &rest_tokens, skill_manifests);
+                for missing in &changes.not_found {
+                    println!("Skill '{missing}' not found.");
+                }
+                if !changes.added.is_empty() {
+                    println!(
+                        "Pinned skills for this session: {}",
+                        changes.added.join(", ")
+                    );
+                }
+                if !changes.already_pinned.is_empty() {
+                    println!("Already pinned: {}", changes.already_pinned.join(", "));
+                }
+                if !changes.added.is_empty() {
+                    super::session::persist_session_runtime_state(app);
+                }
+            }
+        }
+        "unpin" => {
+            if rest_tokens.is_empty() {
+                println!("Usage: /skills unpin <skill-name> [<skill-name>...]");
+            } else {
+                let changes = unpin_skill_names(app, &rest_tokens);
+                if changes.agent_team_refused {
+                    println!(
+                        "Skill 'agent-team' is required by /use <backend>; use /reset to leave the mode."
+                    );
+                }
+                if !changes.removed.is_empty() {
+                    println!("Unpinned: {}", changes.removed.join(", "));
+                }
+                if !changes.not_pinned.is_empty() {
+                    println!("Not pinned: {}", changes.not_pinned.join(", "));
+                }
+                if !changes.removed.is_empty() {
+                    super::session::persist_session_runtime_state(app);
+                }
             }
         }
         "use" | "select" | "switch" => {
@@ -121,20 +305,7 @@ pub fn try_handle_skills_command(
             // Resolve the names one by one (case-insensitive, deduplicated);
             // unmatched names get their own hint, and one invalid name should
             // not sink the whole set.
-            let mut names: Vec<String> = Vec::new();
-            let mut not_found: Vec<String> = Vec::new();
-            for skill_name in &rest_tokens {
-                if let Some(skill) = (**skill_manifests)
-                    .iter()
-                    .find(|s| s.name.eq_ignore_ascii_case(skill_name))
-                {
-                    if !names.iter().any(|n| n == &skill.name) {
-                        names.push(skill.name.clone());
-                    }
-                } else {
-                    not_found.push((*skill_name).to_string());
-                }
-            }
+            let (names, not_found) = resolve_skill_names(&rest_tokens, skill_manifests);
             for missing in &not_found {
                 println!("Skill '{missing}' not found.");
             }
@@ -179,7 +350,9 @@ pub fn try_handle_skills_command(
             if names.is_empty() {
                 println!("Unknown /skills subcommand: {action}");
                 println!();
-                println!("Usage: /skills [list|current|use <name>...|help]");
+                println!(
+                    "Usage: /skills [list|current|use <name>...|pin <name>...|unpin <name>...|help]"
+                );
                 println!();
                 println!("Available skills:");
                 for s in &**skill_manifests {
@@ -210,6 +383,9 @@ pub fn try_handle_skills_command(
             }
         }
     }
+    if let Some(question) = trailing_question {
+        app.forced_question = Some(question.to_string());
+    }
     Ok(true)
 }
 
@@ -237,10 +413,9 @@ fn resolve_implicit_selection<'m>(
 
     let mut iter = tokens.iter();
     while let Some(token) = iter.next() {
-        if let Some(skill) = skill_manifests
-            .iter()
-            .find(|s| s.name.eq_ignore_ascii_case(token))
-        {
+        if let Some(skill) = skill_manifests.iter().find(|s| {
+            !is_session_default_skill_action(&s.name) && s.name.eq_ignore_ascii_case(token)
+        }) {
             push_name(&skill.name, &mut names);
             continue;
         }
@@ -248,10 +423,9 @@ fn resolve_implicit_selection<'m>(
         let mut consumed_as_skill = false;
         if let Some(pos) = token.find(|c: char| !is_ident(c)) {
             let prefix = &token[..pos];
-            if let Some(skill) = skill_manifests
-                .iter()
-                .find(|s| s.name.eq_ignore_ascii_case(prefix))
-            {
+            if let Some(skill) = skill_manifests.iter().find(|s| {
+                !is_session_default_skill_action(&s.name) && s.name.eq_ignore_ascii_case(prefix)
+            }) {
                 push_name(&skill.name, &mut names);
                 rest_tokens.push(&token[pos..]);
                 consumed_as_skill = true;
@@ -279,8 +453,9 @@ fn resolve_implicit_selection<'m>(
 ///
 /// Accepts `/skills`, `:skills`, `/skill` and `:skill` heads with an optional
 /// `use`/`select`/`switch` keyword. Read-only views (`list`, `current`,
-/// `help`, ...) and a bare head with no names return `None` so those lines
-/// stay question text. Names come back raw in input order; validation stays
+/// `help`, ...), session-default commands (`pin`, `unpin`), and a bare head
+/// with no names return `None` so those lines stay question text. Names come
+/// back raw in input order; validation stays
 /// with turn activation, which resolves each name against the manifests and
 /// reports unknown ones without sinking the whole set.
 pub(crate) fn parse_embedded_skills_line(line: &str) -> Option<Vec<String>> {
@@ -312,10 +487,11 @@ pub(crate) fn parse_embedded_skills_line(line: &str) -> Option<Vec<String>> {
         .filter(|word| !word.is_empty())
         .collect();
     let first_is_reserved = names.first().is_some_and(|name| {
-        matches!(
-            name.to_ascii_lowercase().as_str(),
-            "list" | "ls" | "current" | "cur" | "help" | "h" | "--help"
-        )
+        is_session_default_skill_action(name)
+            || matches!(
+                name.to_ascii_lowercase().as_str(),
+                "list" | "ls" | "current" | "cur" | "help" | "h" | "--help"
+            )
     });
     if names.is_empty() || first_is_reserved {
         return None;
@@ -325,7 +501,13 @@ pub(crate) fn parse_embedded_skills_line(line: &str) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SkillManifest, resolve_implicit_selection};
+    use super::{
+        SkillManifest, SkillPinChanges, current_skill_lines, pin_skill_names,
+        resolve_implicit_selection, split_pin_trailing_question, try_handle_skills_command,
+        unpin_skill_names,
+    };
+    use crate::ai::types::{ForcedSkillSource, PendingSkillContinuation, SkillBiasMemory};
+    use std::sync::Arc;
 
     fn skill(name: &str) -> SkillManifest {
         SkillManifest {
@@ -361,6 +543,296 @@ mod tests {
     fn resolve(input: &str) -> (Vec<String>, Option<String>) {
         let tokens: Vec<&str> = input.split_whitespace().collect();
         resolve_implicit_selection(&tokens, &manifests())
+    }
+
+    #[test]
+    fn split_pin_trailing_question_without_newline_preserves_arguments() {
+        for arguments in ["", "code docs-review", " \tcode 请检查 \t"] {
+            assert_eq!(split_pin_trailing_question(arguments), (arguments, None));
+        }
+    }
+
+    #[test]
+    fn split_pin_trailing_question_lf_keeps_remaining_lines() {
+        assert_eq!(
+            split_pin_trailing_question("code\n请检查\nbytedcli 自动补全。"),
+            ("code", Some("请检查\nbytedcli 自动补全。"))
+        );
+    }
+
+    #[test]
+    fn split_pin_trailing_question_crlf_keeps_remaining_lines() {
+        assert_eq!(
+            split_pin_trailing_question("code\r\n请检查\r\n后续问题"),
+            ("code", Some("请检查\r\n后续问题"))
+        );
+    }
+
+    #[test]
+    fn split_pin_trailing_question_without_prose_has_no_question() {
+        for arguments in ["code\n", "code\r\n", "code\n \t\r\n"] {
+            assert_eq!(split_pin_trailing_question(arguments), ("code", None));
+        }
+    }
+
+    #[test]
+    fn split_pin_trailing_question_preserves_name_spacing_and_trims_question() {
+        assert_eq!(
+            split_pin_trailing_question(" \tcode docs-review \t\r\n \t请检查\n后续问题 \r\n"),
+            (" \tcode docs-review \t", Some("请检查\n后续问题"))
+        );
+    }
+
+    #[test]
+    fn pin_trailing_question_dispatches_pin_and_unpin_without_consuming_prose() {
+        let _env = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("skills-pin-question-{}", uuid::Uuid::new_v4()));
+        let cases = [
+            (" CODE-REVIEW code-review missing", None, true),
+            (
+                " CODE-REVIEW code-review missing\n bytedcli 请检查\n第二行 ",
+                Some("bytedcli 请检查\n第二行"),
+                true,
+            ),
+            (
+                " CODE-REVIEW code-review missing\r\n bytedcli 请检查\r\n第二行 ",
+                Some("bytedcli 请检查\r\n第二行"),
+                true,
+            ),
+            (" CODE-REVIEW code-review missing\n \t\r\n", None, true),
+            (
+                "\n bytedcli 请检查\n第二行 ",
+                Some("bytedcli 请检查\n第二行"),
+                false,
+            ),
+            (
+                "\r\n bytedcli 请检查\r\n第二行 ",
+                Some("bytedcli 请检查\r\n第二行"),
+                false,
+            ),
+        ];
+        for action in ["pin", "unpin"] {
+            for (arguments, question, has_names) in cases {
+                let mut app = crate::ai::driver::tests::test_app("build");
+                app.config.history_file = root.join("history.sqlite");
+                app.session_id = "pin-question".to_string();
+                app.session_default_skills = vec!["bytedcli".to_string()];
+                if action == "unpin" {
+                    app.session_default_skills.push("code-review".to_string());
+                }
+                let mut expected = app.session_default_skills.clone();
+                if has_names {
+                    expected = if action == "pin" {
+                        vec!["bytedcli".to_string(), "code-review".to_string()]
+                    } else {
+                        vec!["bytedcli".to_string()]
+                    };
+                }
+                app.forced_skills = vec!["docs-review".to_string()];
+                app.forced_skill_source = Some(ForcedSkillSource::SkillsCommandNextTurn);
+                app.forced_question = Some("pending question".to_string());
+                let mut available = Arc::new(manifests());
+                let input = format!("/skills {action}{arguments}");
+                assert!(try_handle_skills_command(&mut app, &input, &mut available).unwrap());
+                assert_eq!(app.session_default_skills, expected, "{input}");
+                assert_eq!(
+                    app.forced_question.as_deref(),
+                    question.or(Some("pending question")),
+                    "{input}"
+                );
+                assert_eq!(app.forced_skills, ["docs-review"]);
+                assert_eq!(
+                    app.forced_skill_source,
+                    Some(ForcedSkillSource::SkillsCommandNextTurn)
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pin_resolves_canonical_names_and_applies_known_subset() {
+        let mut app = crate::ai::driver::tests::test_app("build");
+        app.session_default_skills = vec!["CODE-REVIEW".to_string()];
+        app.forced_skills = vec!["bytedcli".to_string()];
+        app.forced_skill_source = Some(ForcedSkillSource::SkillsCommandNextTurn);
+        app.pending_skill_continuation = Some(PendingSkillContinuation {
+            skill_names: vec!["docs-review".to_string()],
+        });
+
+        let changes = pin_skill_names(
+            &mut app,
+            &[
+                "Docs-Review",
+                "docs-review",
+                "Code-Review",
+                "ByteDcli",
+                "missing",
+            ],
+            &manifests(),
+        );
+        assert_eq!(changes.added, ["docs-review", "bytedcli"]);
+        assert_eq!(changes.already_pinned, ["code-review"]);
+        assert_eq!(changes.not_found, ["missing"]);
+        assert_eq!(
+            app.session_default_skills,
+            ["CODE-REVIEW", "docs-review", "bytedcli"]
+        );
+        assert_eq!(app.forced_skills, ["bytedcli"]);
+        assert_eq!(
+            app.forced_skill_source,
+            Some(ForcedSkillSource::SkillsCommandNextTurn)
+        );
+        assert_eq!(
+            app.pending_skill_continuation.as_ref().unwrap().skill_names,
+            ["docs-review"]
+        );
+
+        let repeated = pin_skill_names(
+            &mut app,
+            &["DOCS-REVIEW", "docs-review", "BYTEDCLI", "code-review"],
+            &manifests(),
+        );
+        assert!(repeated.added.is_empty());
+        assert_eq!(
+            repeated.already_pinned,
+            ["docs-review", "bytedcli", "code-review"]
+        );
+        assert!(repeated.not_found.is_empty());
+        assert_eq!(
+            app.session_default_skills,
+            ["CODE-REVIEW", "docs-review", "bytedcli"]
+        );
+    }
+
+    #[test]
+    fn unpin_removes_case_variants_and_reports_not_pinned() {
+        let mut app = crate::ai::driver::tests::test_app("build");
+        app.session_default_skills = vec![
+            "code-review".to_string(),
+            "DOCS-REVIEW".to_string(),
+            "docs-review".to_string(),
+            "bytedcli".to_string(),
+            "retired-skill".to_string(),
+        ];
+        let names = ["docs-review", "DOCS-REVIEW", "missing", "RETIRED-SKILL"];
+        let changes = unpin_skill_names(&mut app, &names);
+        assert_eq!(changes.removed, ["DOCS-REVIEW", "retired-skill"]);
+        assert_eq!(changes.not_pinned, ["missing"]);
+        assert!(!changes.agent_team_refused);
+        assert_eq!(app.session_default_skills, ["code-review", "bytedcli"]);
+
+        let repeated = unpin_skill_names(&mut app, &names);
+        assert!(repeated.removed.is_empty());
+        assert_eq!(
+            repeated.not_pinned,
+            ["docs-review", "missing", "RETIRED-SKILL"]
+        );
+        assert_eq!(app.session_default_skills, ["code-review", "bytedcli"]);
+    }
+
+    #[test]
+    fn unpin_refuses_agent_team_and_still_removes_other_names() {
+        let mut app = crate::ai::driver::tests::test_app("build");
+        app.session_default_skills = vec!["AGENT-TEAM".to_string(), "code-review".to_string()];
+        app.forced_skills = vec!["bytedcli".to_string()];
+        app.pending_skill_continuation = Some(PendingSkillContinuation {
+            skill_names: vec!["docs-review".to_string()],
+        });
+        let changes = unpin_skill_names(&mut app, &["agent-team", "CODE-REVIEW", "AgEnT-TeAm"]);
+        assert!(changes.agent_team_refused);
+        assert_eq!(changes.removed, ["code-review"]);
+        assert!(changes.not_pinned.is_empty());
+        assert_eq!(app.session_default_skills, ["AGENT-TEAM"]);
+        assert_eq!(app.forced_skills, ["bytedcli"]);
+        assert_eq!(
+            app.pending_skill_continuation.as_ref().unwrap().skill_names,
+            ["docs-review"]
+        );
+
+        let repeated = unpin_skill_names(&mut app, &["agent-team"]);
+        assert!(repeated.agent_team_refused);
+        assert!(repeated.removed.is_empty());
+        assert_eq!(app.session_default_skills, ["AGENT-TEAM"]);
+    }
+
+    #[test]
+    fn pin_and_unpin_without_arguments_leave_runtime_state_unchanged() {
+        let mut app = crate::ai::driver::tests::test_app("build");
+        app.session_default_skills = vec!["code-review".to_string()];
+        app.forced_skills = vec!["bytedcli".to_string()];
+        app.forced_skill_source = Some(ForcedSkillSource::SkillsCommandNextTurn);
+        app.pending_skill_continuation = Some(PendingSkillContinuation {
+            skill_names: vec!["docs-review".to_string()],
+        });
+        let mut available = Arc::new(vec![skill("pin"), skill("unpin"), skill("code-review")]);
+        assert_eq!(
+            pin_skill_names(&mut app, &[], &available),
+            SkillPinChanges::default()
+        );
+        for command in ["/skills pin", "/skills unpin"] {
+            assert!(try_handle_skills_command(&mut app, command, &mut available).unwrap());
+            assert_eq!(app.session_default_skills, ["code-review"]);
+            assert_eq!(app.forced_skills, ["bytedcli"]);
+            assert_eq!(
+                app.forced_skill_source,
+                Some(ForcedSkillSource::SkillsCommandNextTurn)
+            );
+            assert_eq!(
+                app.pending_skill_continuation.as_ref().unwrap().skill_names,
+                ["docs-review"]
+            );
+            assert!(app.forced_question.is_none());
+        }
+    }
+
+    #[test]
+    fn pin_and_unpin_are_reserved_in_implicit_selection() {
+        let available = vec![skill("pin"), skill("unpin"), skill("code-review")];
+        for action in ["pin", "PIN", "unpin", "UNPIN", "pin请检查", "unpin请检查"] {
+            let (names, rest) = resolve_implicit_selection(&[action, "code-review"], &available);
+            assert!(names.is_empty(), "{action} must not select a manifest");
+            assert_eq!(rest, Some(format!("{action} code-review")));
+        }
+        let (names, rest) =
+            resolve_implicit_selection(&["code-review", "pin", "unpin"], &available);
+        assert_eq!(names, ["code-review"]);
+        assert_eq!(rest.as_deref(), Some("pin unpin"));
+    }
+
+    #[test]
+    fn current_reports_pinned_defaults_after_existing_selection_lines() {
+        let mut app = crate::ai::driver::tests::test_app("build");
+        assert_eq!(current_skill_lines(&app), ["No active skill."]);
+        app.session_default_skills = vec!["code-review".to_string(), "docs-review".to_string()];
+        assert_eq!(
+            current_skill_lines(&app),
+            ["Pinned (session default): code-review, docs-review"]
+        );
+
+        app.forced_skills = vec!["bytedcli".to_string()];
+        assert_eq!(
+            current_skill_lines(&app),
+            [
+                "current skills: bytedcli (pending for next turn)",
+                "Pinned (session default): code-review, docs-review",
+            ]
+        );
+        app.forced_skills.clear();
+        app.last_skill_bias = Some(SkillBiasMemory {
+            skill_name: "bytedcli".to_string(),
+            question: String::new(),
+        });
+        assert_eq!(
+            current_skill_lines(&app),
+            [
+                "current skill: bytedcli (recent active skill)",
+                "Pinned (session default): code-review, docs-review",
+            ]
+        );
     }
 
     #[test]
@@ -480,6 +952,10 @@ mod tests {
             "/skills current",
             "/skills help",
             "/skills use",
+            "/skills pin",
+            "/skills pin code-review",
+            ":skills PIN code-review",
+            "/skills unpin code-review",
             "just some prose",
             "/task fix bug",
         ] {

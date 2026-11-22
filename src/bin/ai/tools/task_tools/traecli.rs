@@ -190,8 +190,8 @@ pub(crate) fn build_traecli_args(spec: &ExternalSubagentSpec) -> Vec<String> {
 }
 
 /// Prompt bytes written to the child's stdin. Fresh runs prepend the inherited
-/// skill overlay; resume runs send only the follow-up because the persisted
-/// session already holds the original prompt and skills.
+/// skills and selected agent instructions; resume runs send only the follow-up
+/// because the persisted session already holds the original instructions.
 fn prompt_payload(spec: &ExternalSubagentSpec) -> String {
     let resuming = spec
         .resume_session
@@ -265,18 +265,32 @@ fn append_original_image_paths(mut prompt: String, image_files: &[String]) -> St
     prompt
 }
 
-/// Final prompt text: parent skill context first (mirroring the kernel path,
-/// where skills are system-prompt overlays above the task), then the task.
+/// Final prompt text: parent skills, selected agent instructions, then the
+/// unchanged task envelope.
 fn full_prompt(spec: &ExternalSubagentSpec) -> String {
-    match spec
+    let mut sections = Vec::with_capacity(3);
+    if let Some(skills) = spec
         .skills
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(skills) => format!("{skills}\n\n{}", spec.prompt),
-        None => spec.prompt.clone(),
+        sections.push(skills.to_string());
     }
+    if let Some(agent_prompt) = spec
+        .agent_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        sections.push(
+            include_str!("prompts/traecli_agent_instructions.md")
+                .trim()
+                .replace("{agent_prompt}", agent_prompt),
+        );
+    }
+    sections.push(spec.prompt.clone());
+    sections.join("\n\n")
 }
 
 /// Scan full `exec --json` stdout: the last non-empty `agent_message` wins,
@@ -1400,6 +1414,8 @@ pub(super) fn looks_like_session_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::super::backend::external_backend_test_support::terminal_test_script;
     use super::*;
     use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext, TURN_IDENTITY};
     use crate::ai::mcp::McpClient;
@@ -1690,6 +1706,7 @@ mod tests {
             workspace_allowed: true,
             model: None,
             skills: None,
+            agent_prompt: None,
             resume_session: None,
             side_note_files: Vec::new(),
             reasoning_effort: None,
@@ -1848,21 +1865,6 @@ mod tests {
             read_only_sandbox_hint(&spec, true, &["socket() failed: ECONNRESET"]),
             None
         );
-    }
-
-    #[cfg(unix)]
-    fn terminal_test_script(body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
-        let script = std::env::temp_dir().join(format!(
-            "traecli-terminal-{}.sh",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
-        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).unwrap();
-        script
     }
 
     #[test]
@@ -3038,6 +3040,169 @@ sleep 2.5
         assert!(prompt.starts_with("<parent_skills>"));
         assert!(prompt.ends_with("do work"));
         assert!(!build_traecli_args(&spec).iter().any(|a| a == "do work"));
+    }
+
+    #[cfg(unix)]
+    fn captured_prompt_payload(spec: &ExternalSubagentSpec) -> String {
+        let _process_guard = lock_unpoisoned(&PROCESS_TEST_LOCK);
+        let script = terminal_test_script(
+            r#"/bin/cat > "$0.prompt"
+/bin/echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'"#,
+        );
+        let outcome = run_traecli_blocking_with(
+            spec,
+            Arc::new(AtomicBool::new(false)),
+            script.to_str().unwrap(),
+            Duration::from_secs(2),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(outcome.result, "ok");
+        let prompt_file = PathBuf::from(format!("{}.prompt", script.display()));
+        let captured = std::fs::read_to_string(&prompt_file).unwrap();
+        std::fs::remove_file(script).unwrap();
+        std::fs::remove_file(prompt_file).unwrap();
+        captured
+    }
+
+    #[cfg(unix)]
+    fn expected_agent_section(agent_prompt: &str) -> String {
+        format!(
+            "## Agent instructions\n<agent_instructions>\n{agent_prompt}\n\
+             </agent_instructions>\n\
+             Apply these instructions using your own tools. Active parent skills take\n\
+             precedence where they differ; follow your runtime policies and project instructions."
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_payload_orders_skills_agent_task_images_and_checkpoint() {
+        let mut spec = test_spec();
+        spec.skills = Some(" \n<parent_skills>Follow the active skill.</parent_skills>\n ".into());
+        spec.agent_prompt =
+            Some(" \nAgent system.\n\n  Agent body with {literal} braces.\n ".into());
+        spec.image_files = vec!["/tmp/original-a.png".into(), "/tmp/original b.png".into()];
+        let schema = serde_json::json!({"type": "object", "required": ["answer"]});
+        let task = crate::ai::tools::task_tools::wrap_subagent_prompt(
+            "Inspect images",
+            "Preserve the task's quoted \"instructions\" and {braces}.",
+            Some(&schema),
+        );
+        spec.prompt = append_original_image_paths(format!(" \n{task}"), &spec.image_files);
+        spec.phase_slot = Some(crate::ai::driver::runtime_ctx::new_subagent_progress_slot());
+        let expected = format!(
+            "<parent_skills>Follow the active skill.</parent_skills>\n\n{}\n\n{}\n\n\
+             During long-running work, publish saved findings in a separate progress message \
+             using this format:\n<context_checkpoint>\nsummary: Short finding summary\n\
+             Checkpoint body with the evidence gathered so far.\n</context_checkpoint>\n\
+             Keep each checkpoint concise. Send the final answer separately after finishing.",
+            expected_agent_section("Agent system.\n\n  Agent body with {literal} braces."),
+            spec.prompt,
+        );
+        assert_eq!(prompt_payload(&spec), expected);
+        assert_eq!(captured_prompt_payload(&spec), expected);
+        assert!(expected.contains(&task));
+        assert!(
+            expected
+                .contains("\n\n## Original images\n- /tmp/original-a.png\n- /tmp/original b.png\n")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_payload_omits_missing_or_blank_agent() {
+        for agent in [None, Some(""), Some(" \n\t\r ")] {
+            for skills in [None, Some(" \nActive skills.\n "), Some(" \n\t ")] {
+                let mut spec = test_spec();
+                spec.agent_prompt = agent.map(str::to_string);
+                spec.skills = skills.map(str::to_string);
+                spec.prompt = " \nTask envelope stays untouched.\n ".into();
+                let expected = match skills.map(str::trim).filter(|value| !value.is_empty()) {
+                    Some(skills) => format!("{skills}\n\n{}", spec.prompt),
+                    None => spec.prompt.clone(),
+                };
+                assert_eq!(prompt_payload(&spec), expected);
+                assert_eq!(captured_prompt_payload(&spec), expected);
+                assert!(!expected.contains("<agent_instructions>"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_payload_preserves_long_agent_prompt() {
+        let agent_prompt = format!(
+            "{}TRAILING_AGENT_SENTINEL_终点🦀",
+            "检查🦀 {literal}\n  Keep indentation.\n\n".repeat(32_768)
+        );
+        let mut spec = test_spec();
+        spec.agent_prompt = Some(format!(" \n{agent_prompt}\n\t "));
+        let expected = format!(
+            "{}\n\n{}",
+            expected_agent_section(&agent_prompt),
+            spec.prompt
+        );
+        let captured = captured_prompt_payload(&spec);
+        assert!(
+            captured == expected,
+            "long prompt bytes differ: captured={}, expected={}",
+            captured.len(),
+            expected.len(),
+        );
+        assert!(captured.contains("TRAILING_AGENT_SENTINEL_终点🦀\n</agent_instructions>"));
+        assert_eq!(prompt_payload(&spec), captured);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_payload_injects_agent_once_and_preserves_quoted_task_text() {
+        let agent_prompt =
+            "Use \"quoted\" names, `tools`, {agent_prompt}, and $literal.\n\n  Keep indentation.";
+        let mut spec = test_spec();
+        spec.agent_prompt = Some(format!(" \n{agent_prompt}\n "));
+        spec.skills = Some(" Active skills. ".into());
+        spec.prompt =
+            format!(" \nThe task quotes the manifest verbatim:\n{agent_prompt}\nTask sentinel.\n ");
+        let original = spec.clone();
+        let expected = format!(
+            "Active skills.\n\n{}\n\n{}",
+            expected_agent_section(agent_prompt),
+            spec.prompt
+        );
+        for _ in 0..2 {
+            let payload = prompt_payload(&spec);
+            assert_eq!(payload, expected);
+            assert_eq!(captured_prompt_payload(&spec), expected);
+            assert_eq!(payload.matches("## Agent instructions\n").count(), 1);
+            assert_eq!(payload.matches("<agent_instructions>\n").count(), 1);
+            assert_eq!(payload.matches(agent_prompt).count(), 2);
+            assert!(payload.ends_with(&original.prompt));
+            assert_eq!(spec.prompt, original.prompt);
+            assert_eq!(spec.agent_prompt, original.agent_prompt);
+            assert_eq!(spec.skills, original.skills);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_payload_resume_does_not_reinject_agent() {
+        let mut spec = test_spec();
+        spec.resume_session = Some(" \nrecorded-session\t ".into());
+        spec.skills = Some("Do not repeat active skills.".into());
+        spec.agent_prompt = Some("Do not repeat selected agent instructions.".into());
+        spec.prompt = " \nFollow up with \"quoted\" task text.\n ".into();
+        spec.image_files = vec!["/tmp/original-a.png".into(), "/tmp/original b.png".into()];
+        let expected = format!(
+            "{}\n\n## Original images\n- /tmp/original-a.png\n- /tmp/original b.png\n\
+             Use your image viewer on these paths when you need the original again.",
+            spec.prompt,
+        );
+        let captured = captured_prompt_payload(&spec);
+        assert_eq!(captured, expected);
+        assert_eq!(prompt_payload(&spec), expected);
+        assert!(!captured.contains("Do not repeat"));
+        assert!(!captured.contains("<agent_instructions>"));
     }
 
     #[test]

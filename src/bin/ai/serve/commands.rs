@@ -140,7 +140,7 @@ pub(crate) const SERVE_COMMANDS: &[ServeCommand] = &[
     },
     ServeCommand {
         name: "skills",
-        usage: "[name]...",
+        usage: "[list|current|use|pin|unpin|help] [name]...",
         description: "List skills or activate them for the next message",
         group: "session",
     },

@@ -50,6 +50,7 @@ const BUILTIN_SKILLS: &[(&str, &str)] = &[
         "audit_own_changes.skill",
         include_str!("builtin_skills/audit_own_changes.skill"),
     ),
+    ("code.skill", include_str!("builtin_skills/code.skill")),
     (
         "agent-team.skill",
         include_str!("builtin_skills/agent-team.skill"),

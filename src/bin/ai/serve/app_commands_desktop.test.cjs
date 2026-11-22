@@ -55,11 +55,15 @@ function node(tag = "div") {
   });
   return element;
 }
-function harness({ width = 701, catalog = commands, media = "known", respond } = {}) {
+function harness({ width = 701, catalog = commands, media = "known", respond, skills = [
+  { name: "review" }, { name: "release" }, { name: "中文🚀" }, { name: "wwc_skill_sync" },
+] } = {}) {
   const prompt = node("textarea"), elements = { prompt, cmdmenu: node(), cmdoptions: node(), cmdempty: node() };
   elements.cmdmenu.hidden = true;
   elements.cmdmenu.appendChild(elements.cmdoptions);
   elements.cmdmenu.appendChild(elements.cmdempty);
+  elements.oskill = node("button");
+  elements.skillvalue = node();
   for (const [id, names] of [["omodel", ["model-one", "model-two"]], ["oagent", ["build", "review"]], ["oeffort", ["high", "xhigh"]]]) {
     elements[id] = node("select");
     elements[id].options = ["", ...names].map((value) => ({ value, textContent: value }));
@@ -92,14 +96,14 @@ function harness({ width = 701, catalog = commands, media = "known", respond } =
   const context = vm.createContext({
     $, document, window, promptComposing: false, composingText: "", sessionId: "s-one",
     store: { base: "http://server-one", token: "" },
-    skillCatalog: [{ name: "review" }, { name: "release" }, { name: "中文🚀" }, { name: "wwc_skill_sync" }],
+    skillCatalog: skills, skillLoadRequest: null, skillLoadEpoch: 0,
     lastItems: [{ id: "s-one" }, { id: "s-two" }],
     TEAM_FIELDS: { backend: { kernel: "teamkernel", traecli: "teamtraecli" } },
     workerModels: null, workerModelsBase: "", workerModelsState: "idle",
     api: async (url, opts) => {
       calls.push([url, opts]);
       const body = url === "/commands" ? catalog : respond ? await respond(url) :
-        url === "/subagent-models" ? { models: ["worker-one", "worker-two"] } : { candidates: ["src/", "scripts/"] };
+        url === "/skills" ? skills : url === "/subagent-models" ? { models: ["worker-one", "worker-two"] } : { candidates: ["src/", "scripts/"] };
       return { json: async () => body };
     },
     setPromptValue(value) { if (context.promptComposing) return false; effects.push(["value", value]); prompt.value = value; return true; },
@@ -111,6 +115,7 @@ function harness({ width = 701, catalog = commands, media = "known", respond } =
     send() { effects.push(["send"]); }, sendSideNote() { effects.push(["side-note"]); },
     pauseHistoryRetry() {}, abortEvents() {}, updateExecutionModel() {}, syncStopButton() {},
     resetQuestionNavigator() {}, restoreSkillPick() {}, restoreTeamPick() {},
+    skillPickKey: () => "skill-draft", setSkillPick() {},
     historyLoadSeq: 0, ensureTranscriptOwner() {},
     syncPickTrigger() {}, syncOvrSummary() {}, note(text) { effects.push(["note", text]); },
     openPickPop(kind) { effects.push(["picker", kind]); },
@@ -120,6 +125,7 @@ function harness({ width = 701, catalog = commands, media = "known", respond } =
   vm.runInContext(between("async function persistPicks()", "function fillSelect("), context);
   vm.runInContext(between("let modelSheetReturnFocus", "// Skills are pending next-turn choices"), context);
   vm.runInContext(between("function skillCharBoundary(", "function rankSkillMatches("), context);
+  vm.runInContext(between("function loadSkills()", "// Slash-command completion."), context);
   vm.runInContext(between("// Slash-command completion.", "async function loadInfo()"), context);
   if (typeof context.wireDesktopCommandCompletion === "function") context.wireDesktopCommandCompletion();
   vm.runInContext(between("function insertPromptText(", "// --- native phone actions"), context);
@@ -144,6 +150,7 @@ function harness({ width = 701, catalog = commands, media = "known", respond } =
 async function ready(options) { const h = harness(options); await h.context.loadCommands(); return h; }
 async function settle() { await new Promise((resolve) => setImmediate(resolve)); }
 const values = (h) => h.elements.cmdoptions.children.map((row) => row.textContent);
+const candidates = (h) => Array.from(vm.runInContext("commandMatches", h.context), (item) => item.replacement ?? item.name);
 
 test("desktop single slash candidate stays open and repeated Tab is idempotent", async () => {
   const h = await ready({ catalog: [commands[0]] }); h.type("/");
@@ -191,7 +198,7 @@ test("skills parameters cycle names and preserve completed parameters", async ()
   const h = await ready(); h.type("/skills re");
   assert.match(values(h)[0], /review/); h.key("Tab"); assert.equal(h.prompt.value, "/skills review ");
   h.key("Tab"); assert.equal(h.prompt.value, "/skills release ");
-  h.type("/skills review re"); h.key("Tab"); assert.equal(h.prompt.value, "/skills review release ");
+  h.type("/skills use review re"); h.key("Tab"); assert.equal(h.prompt.value, "/skills use review release ");
 });
 test("skills parameters fuzzy-match names like terminal completion", async () => {
   const h = await ready(); h.type("/skills sync");
@@ -203,6 +210,88 @@ test("skills offers subcommand literals at the first argument position", async (
   const h = await ready(); h.type("/skills us");
   assert.match(values(h)[0], /^use/);
   h.key("Tab"); assert.equal(h.prompt.value, "/skills use ");
+});
+for (const action of ["pin", "unpin"]) test("desktop skills offers the " + action + " literal with an older server usage hint", async () => {
+  const h = await ready(); h.type("/skills " + action.slice(0, -1));
+  assert.deepEqual(candidates(h), [action]);
+  h.key("Tab"); assert.equal(h.prompt.value, "/skills " + action + " ");
+});
+for (const action of ["use", "pin", "unpin", "select", "switch"]) test("desktop skills completes names after " + action, async () => {
+  const h = await ready(); h.type("/skills " + action + " re");
+  assert.deepEqual(candidates(h), ["review", "release"]);
+  h.key("Tab"); assert.equal(h.prompt.value, "/skills " + action + " review ");
+  h.key("Tab"); assert.equal(h.prompt.value, "/skills " + action + " release ");
+  h.type("/skills " + action + " REVIEW re");
+  assert.deepEqual(candidates(h), ["release"]);
+  h.key("Tab"); assert.equal(h.prompt.value, "/skills " + action + " REVIEW release ");
+});
+for (const width of [320, 700, 701]) for (const action of ["pin", "use", "unpin"]) test(width + "px skills name collision after " + action + " preserves actual name dedupe", async () => {
+  const h = await ready({ width, skills: [{ name: action }, { name: action + "-guide" }, { name: "review" }] });
+  const prefix = action.slice(0, -1), line = "/skills " + action + " " + prefix;
+  h.type(line + "\nquestion", line.length);
+  assert.deepEqual(candidates(h), [action, action + "-guide"]);
+  assert.equal(h.key("Tab").prevented, true);
+  assert.equal(h.prompt.value, "/skills " + action + " " + action + "\nquestion");
+  h.type("/skills " + action + " review " + prefix);
+  assert.deepEqual(candidates(h), [action, action + "-guide"]);
+  h.type("/skills " + action + " " + action + "-guide " + prefix);
+  assert.deepEqual(candidates(h), [action]);
+  for (const picked of [action, action.toUpperCase()]) {
+    h.type("/skills " + action + " review " + picked + " " + prefix);
+    assert.deepEqual(candidates(h), [action + "-guide"]);
+  }
+});
+for (const action of ["list", "current", "help", "review"]) test("desktop skills stops name suggestions after " + action, async () => {
+  const h = await ready(); h.type("/skills " + action + " re");
+  assert.deepEqual(candidates(h), []);
+  assert.equal(h.elements.cmdempty.hidden, false);
+  assert.equal(h.key("Tab").prevented, undefined);
+  assert.equal(h.prompt.value, "/skills " + action + " re");
+});
+test("desktop skills implicit names rank prefixes before fuzzy matches and suppress duplicates", async () => {
+  const h = await ready({ skills: [{ name: "wwc_review" }, { name: "review" }, { name: "REVIEW" }, { name: "release" }, { name: "pin" }] });
+  h.type("/skills re"); assert.deepEqual(candidates(h), ["review", "release", "wwc_review"]);
+  h.type("/skills pin REVIEW re"); assert.deepEqual(candidates(h), ["release", "wwc_review"]);
+  h.type("/skills "); assert.equal(candidates(h).filter((name) => name === "pin").length, 1);
+});
+test("desktop skills updated usage hints keep literals unique and metavars hidden", async () => {
+  const catalog = commands.map((command) => command.name === "skills"
+    ? { ...command, usage: "[list|current|use|pin|unpin|help] [name]..." } : command);
+  const h = await ready({ catalog }); h.type("/skills ");
+  assert.deepEqual(candidates(h).slice(0, 6), ["list", "current", "use", "pin", "unpin", "help"]);
+  assert.equal(new Set(candidates(h)).size, candidates(h).length);
+  assert.equal(candidates(h).includes("name"), false);
+  h.type("/skills list re"); assert.deepEqual(candidates(h), []);
+});
+test("desktop skills delayed catalog arrival refreshes an open empty menu", async () => {
+  let resolve;
+  const pending = new Promise((yes) => { resolve = yes; });
+  const h = await ready({ skills: [], respond: (url) => { assert.equal(url, "/skills"); return pending; } });
+  h.type("/skills pin co"); assert.deepEqual(candidates(h), []);
+  assert.equal(h.elements.cmdmenu.hidden, false);
+  const loading = h.context.loadSkills();
+  resolve([{ name: "code", description: "Review code" }]); await loading;
+  assert.deepEqual(candidates(h), ["code"]);
+  h.key("Tab"); assert.equal(h.prompt.value, "/skills pin code ");
+});
+test("desktop skills reload immediately drops stale names and frozen cycles", async () => {
+  let resolve;
+  const pending = new Promise((yes) => { resolve = yes; });
+  const h = await ready({ respond: () => pending }); h.type("/skills use re"); h.key("Tab");
+  assert.ok(h.state());
+  const loading = h.context.loadSkills();
+  assert.equal(h.state(), null); assert.deepEqual(candidates(h), []);
+  assert.equal(h.key("Tab").prevented, undefined);
+  resolve([{ name: "release" }]); await loading;
+  assert.deepEqual(candidates(h), ["release"]);
+});
+test("desktop delayed skills catalog cannot reopen an escaped menu", async () => {
+  let resolve;
+  const pending = new Promise((yes) => { resolve = yes; });
+  const h = await ready({ skills: [], respond: () => pending }); h.type("/skills pin co");
+  const loading = h.context.loadSkills(); h.key("Escape");
+  resolve([{ name: "code" }]); await loading;
+  assert.equal(h.elements.cmdmenu.hidden, true); assert.equal(h.prompt.value, "/skills pin co");
 });
 test("agent parameters fuzzy-match names", async () => {
   const h = await ready(); h.type("/agent eview");
@@ -273,11 +362,14 @@ test("cd handles spaces and UTF-16 fragments without touching later lines", asyn
   assert.equal(h.prompt.selectionStart, "intro🚀\n/cd 中文🚀 folder/".length);
   assert.match(h.calls[1][0], /frag=%E4%B8%AD%E6%96%87%F0%9F%9A%80%20f$/);
 });
-for (const width of [320, 700]) test(width + "px retains the old accept-and-close behavior and parameters", async () => {
+for (const width of [320, 700]) test(width + "px retains accept-and-close behavior and completes skills parameters", async () => {
   const h = await ready({ width }); h.type("/a"); h.key("Tab");
   assert.equal(h.prompt.value, "/audit "); assert.equal(h.elements.cmdmenu.hidden, true);
   assert.equal(h.key("Tab").prevented, undefined);
-  h.type("/skills re"); assert.equal(h.elements.cmdmenu.hidden, true);
+  h.type("/skills re"); assert.equal(h.elements.cmdmenu.hidden, false);
+  assert.deepEqual(candidates(h), ["review", "release"]);
+  assert.equal(h.key("Tab").prevented, true); assert.equal(h.prompt.value, "/skills review ");
+  assert.equal(h.elements.cmdmenu.hidden, true);
   h.type("\n/a"); assert.equal(h.elements.cmdmenu.hidden, true);
 });
 for (const media of ["missing", "throws"]) test("unknown media environment " + media + " retains the old path", async () => {

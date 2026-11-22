@@ -1249,7 +1249,7 @@ impl CommandCompleter {
 
     /// Subcommand literals of `/skills` / `/skill`.
     fn skills_subcommands() -> &'static [&'static str] {
-        &["list", "current", "use", "help"]
+        &["list", "current", "use", "pin", "unpin", "help"]
     }
 
     /// Subcommand literals of `/theme` / `:theme` (theme names complete

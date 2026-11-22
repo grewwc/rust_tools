@@ -332,6 +332,101 @@ fn use_command_sticky_skill_survives_turns_and_explicit_selection_adds_to_it() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn pinned_session_default_survives_turns_and_explicit_selection_adds_to_it() {
+    use crate::ai::types::ForcedSkillSource;
+
+    let _env = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let root = std::env::temp_dir().join(format!("pinned-default-skills-{}", uuid::Uuid::new_v4()));
+    let mut app = super::super::tests::test_app("build");
+    app.config.history_file = root.join("history.sqlite");
+    app.session_id = "pinned-default".to_string();
+    let store = crate::ai::history::SessionStore::new(&app.config.history_file);
+    store.ensure_root_dir().unwrap();
+    app.session_history_file = store.session_history_file(&app.session_id);
+    app.session_default_skills = vec!["code".to_string()];
+    let manifests = [
+        skill_with_prompt(
+            "code",
+            "pinned workflow",
+            "Pinned coding workflow instructions.",
+        ),
+        skill_with_prompt(
+            "replacement",
+            "explicit workflow",
+            "Explicit review workflow instructions.",
+        ),
+    ];
+    let mcp_client = McpClient::new();
+
+    for question in ["first ordinary request", "second unrelated request"] {
+        let mut guard =
+            super::prepare_skill_for_turn(&mut app, &mcp_client, &manifests, question).unwrap();
+        assert_eq!(guard.matched_skill_names(), ["code"]);
+        assert!(
+            guard
+                .system_prompt()
+                .contains("Pinned coding workflow instructions.")
+        );
+        assert_eq!(app.session_default_skills, ["code"]);
+        assert!(app.forced_skills.is_empty());
+    }
+
+    let mut question = "@skills:replacement inspect this change".to_string();
+    app.forced_skills = super::super::input::extract_forced_skill_references(&mut question);
+    app.forced_skill_source = Some(ForcedSkillSource::InlineReference);
+    assert_eq!(question, "inspect this change");
+    let mut guard =
+        super::prepare_skill_for_turn(&mut app, &mcp_client, &manifests, &question).unwrap();
+    assert_eq!(guard.matched_skill_names(), ["replacement", "code"]);
+    assert!(
+        guard
+            .system_prompt()
+            .contains("Pinned coding workflow instructions.")
+    );
+    assert!(
+        guard
+            .system_prompt()
+            .contains("Explicit review workflow instructions.")
+    );
+    assert_eq!(app.session_default_skills, ["code"]);
+    assert!(app.forced_skills.is_empty());
+    assert!(app.forced_skill_source.is_none());
+    drop(guard);
+
+    let mut guard =
+        super::prepare_skill_for_turn(&mut app, &mcp_client, &manifests, "next ordinary request")
+            .unwrap();
+    assert_eq!(guard.matched_skill_names(), ["code"]);
+    assert!(
+        guard
+            .system_prompt()
+            .contains("Pinned coding workflow instructions.")
+    );
+    assert!(
+        !guard
+            .system_prompt()
+            .contains("Explicit review workflow instructions.")
+    );
+    drop(guard);
+
+    let events =
+        crate::ai::history::read_skill_activation_events_sqlite(&app.session_history_file).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.source == "session-default")
+            .count(),
+        3
+    );
+    assert!(events.iter().any(|event| event.source == "@skills"
+        && event.requested_skill == "replacement"
+        && event.outcome == "injected"));
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn use_command_sticky_defaults_preserve_resumed_explicit_skill() {
     let manifests = [

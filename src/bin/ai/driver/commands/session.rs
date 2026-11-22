@@ -2297,6 +2297,78 @@ mod tests {
     }
 
     #[test]
+    fn skills_pin_handler_persists_session_defaults_on_reopen() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let manifest = crate::ai::skills::parse_skill_front_matter(
+            "---\nname: code\nversion: 1.0.0\n---\nCoding workflow.\n",
+        )
+        .unwrap();
+        let mut manifests = Arc::new(vec![manifest]);
+        assert!(
+            super::super::skills::try_handle_skills_command(
+                &mut app,
+                "/skills pin CODE code missing",
+                &mut manifests,
+            )
+            .unwrap()
+        );
+        assert_eq!(app.session_default_skills, ["code"]);
+        assert_eq!(app.forced_skills, ["example-upload-md"]);
+        let stored = store.read_session_serve_config(&app.session_id).unwrap();
+        assert_eq!(stored.default_skills, ["code"]);
+
+        // No-op commands must not persist unrelated in-memory runtime picks.
+        app.current_model = "unsaved-model".to_string();
+        for command in [
+            "/skills pin CODE",
+            "/skills pin missing",
+            "/skills pin",
+            "/skills unpin missing",
+            "/skills unpin agent-team",
+            "/skills unpin",
+            "/skills list",
+            "/skills current",
+        ] {
+            assert!(
+                super::super::skills::try_handle_skills_command(&mut app, command, &mut manifests,)
+                    .unwrap()
+            );
+            assert_eq!(
+                store.read_session_serve_config(&app.session_id).unwrap(),
+                stored
+            );
+        }
+
+        let mut reopened = test_app(&root);
+        restore_session_local_runtime_state(&mut reopened).unwrap();
+        assert_eq!(reopened.session_default_skills, ["code"]);
+        assert_ne!(reopened.current_model, "unsaved-model");
+        assert!(
+            super::super::skills::try_handle_skills_command(
+                &mut reopened,
+                "/skills unpin CoDe",
+                &mut manifests,
+            )
+            .unwrap()
+        );
+        assert!(
+            store
+                .read_session_serve_config(&app.session_id)
+                .unwrap()
+                .default_skills
+                .is_empty()
+        );
+        restore_session_local_runtime_state(&mut reopened).unwrap();
+        assert!(reopened.session_default_skills.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn session_config_subagent_backends_roundtrip_canonical_ids_and_legacy_defaults() {
         use crate::ai::tools::task_tools::BackendId;
 

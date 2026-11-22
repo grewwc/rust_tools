@@ -11,6 +11,11 @@ const start = script.indexOf("// Slash-command completion.");
 const end = script.indexOf("async function loadInfo()");
 assert.ok(start >= 0 && end > start, "command completion block is present");
 const block = script.slice(start, end);
+function between(from, to) {
+  const first = script.indexOf(from), last = script.indexOf(to, first);
+  assert.ok(first >= 0 && last > first, "missing source slice: " + from);
+  return script.slice(first, last);
+}
 
 function node(tag = "div") {
   const element = {
@@ -40,7 +45,7 @@ function node(tag = "div") {
   return element;
 }
 
-function harness(commands) {
+function harness(commands, { skills = [] } = {}) {
   const prompt = node("textarea");
   prompt.value = "";
   prompt.selectionStart = 0;
@@ -54,6 +59,8 @@ function harness(commands) {
     cmdmenu: node("div"),
     cmdoptions: node("div"),
     cmdempty: node("div"),
+    oskill: node("button"),
+    skillvalue: node("span"),
   };
   elements.cmdmenu.hidden = true;
   elements.cmdempty.hidden = true;
@@ -64,7 +71,9 @@ function harness(commands) {
   const context = {
     promptComposing: false,
     store: { base: "http://serve" },
-    api: async () => ({ json: async () => commands }),
+    api: async (url) => ({ json: async () => url === "/skills" ? skills : commands }),
+    skillCatalog: skills, skillLoadRequest: null, skillLoadEpoch: 0,
+    restoreSkillPick() {}, skillPickKey: () => "skill-draft", setSkillPick() {},
     $: (id) => elements[id],
     document,
     setPromptValue: (value) => { prompt.value = value; return true; },
@@ -72,6 +81,8 @@ function harness(commands) {
     persistDraft() {},
   };
   vm.createContext(context);
+  vm.runInContext(between("function skillCharBoundary(", "function rankSkillMatches("), context);
+  vm.runInContext(between("function loadSkills()", "// Slash-command completion."), context);
   vm.runInContext(block, context);
   const type = (value, caret = value.length) => {
     prompt.value = value;
@@ -86,9 +97,16 @@ const catalog = [
   { name: "audit", usage: "[instruction]", description: "Run the audit subagent" },
   { name: "archive", usage: "[id]", description: "Toggle the session archive flag" },
   { name: "cd", usage: "[dir]", description: "Change the working directory" },
+  { name: "skills", usage: "[name]...", description: "Select skills" },
 ];
+const skills = [{ name: "code" }, { name: "code-review" }, { name: "wwc_skill_sync" }];
+const candidates = (h) => Array.from(vm.runInContext("commandMatches", h.context), (item) => item.replacement ?? item.name);
+const key = (h, name, fields = {}) => {
+  const event = { key: name, preventDefault() { this.prevented = true; }, ...fields };
+  return { handled: h.context.commandKeydown(event), event };
+};
 
-test("commandContext only accepts a first-token command word", () => {
+test("commandContext preserves first-token rules for commands other than skills", () => {
   const { context } = harness(catalog);
   const fragment = context.commandContext("/au", 3);
   assert.equal(fragment.start, 0);
@@ -238,6 +256,157 @@ test("command menu disables animation for reduced motion", () => {
     html,
     /@media \(prefers-reduced-motion:reduce\) \{ #cmdmenu \{ animation:none; \} \}/,
   );
+});
+
+for (const action of ["pin", "unpin"]) test("phone skills offers the " + action + " literal at argument zero", async () => {
+  const h = harness(catalog, { skills }); await h.context.loadCommands();
+  h.type("/skills " + action.slice(0, -1));
+  assert.deepEqual(candidates(h), [action]);
+  assert.equal(key(h, "Tab").handled, true);
+  assert.equal(h.prompt.value, "/skills " + action + " ");
+  assert.equal(h.elements.cmdmenu.hidden, true);
+});
+for (const action of ["use", "pin", "unpin", "select", "switch"]) test("phone skills completes names after " + action, async () => {
+  const h = harness(catalog, { skills }); await h.context.loadCommands();
+  h.type("/skills " + action + " co"); assert.deepEqual(candidates(h), ["code", "code-review"]);
+  h.type("/skills " + action + " CODE co"); assert.deepEqual(candidates(h), ["code-review"]);
+  assert.equal(key(h, "Enter").handled, true);
+  assert.equal(h.prompt.value, "/skills " + action + " CODE code-review ");
+});
+for (const action of ["pin", "use", "unpin"]) test("phone skills name collision after " + action + " preserves actual name dedupe", async () => {
+  const h = harness(catalog, { skills: [{ name: action }, { name: action + "-guide" }, { name: "review" }] });
+  await h.context.loadCommands();
+  const prefix = action.slice(0, -1), line = "/skills " + action + " " + prefix;
+  h.type(line + "\nquestion", line.length);
+  assert.deepEqual(candidates(h), [action, action + "-guide"]);
+  assert.equal(key(h, "Tab").handled, true);
+  assert.equal(h.prompt.value, "/skills " + action + " " + action + "\nquestion");
+  assert.equal(h.elements.cmdmenu.hidden, true);
+  h.type("/skills " + action + " review " + prefix);
+  assert.deepEqual(candidates(h), [action, action + "-guide"]);
+  h.type("/skills " + action + " " + action + "-guide " + prefix);
+  assert.deepEqual(candidates(h), [action]);
+  for (const picked of [action, action.toUpperCase()]) {
+    h.type("/skills " + action + " review " + picked + " " + prefix);
+    assert.deepEqual(candidates(h), [action + "-guide"]);
+  }
+});
+for (const action of ["list", "current", "help", "code"]) test("phone skills has no name candidates after " + action, async () => {
+  const h = harness(catalog, { skills }); await h.context.loadCommands();
+  h.type("/skills " + action + " co");
+  assert.deepEqual(candidates(h), []); assert.equal(h.elements.cmdempty.hidden, false);
+  for (const name of ["Tab", "Enter"]) {
+    const result = key(h, name); assert.equal(result.handled, false); assert.equal(result.event.prevented, undefined);
+  }
+  assert.equal(key(h, "Escape").handled, true); assert.equal(h.elements.cmdmenu.hidden, true);
+  assert.equal(h.prompt.value, "/skills " + action + " co");
+});
+test("phone skills implicit names rank prefix before fuzzy and suppress duplicates", async () => {
+  const h = harness(catalog, { skills: [{ name: "wwc_skill_sync" }, { name: "sync-code" }, { name: "SYNC-code" }, { name: "pin" }] });
+  await h.context.loadCommands();
+  h.type("/skills sync"); assert.deepEqual(candidates(h), ["sync-code", "wwc_skill_sync"]);
+  h.type("/skills pin SYNC-code sync"); assert.deepEqual(candidates(h), ["wwc_skill_sync"]);
+  h.type("/skills ");
+  assert.equal(candidates(h).filter((name) => name === "pin").length, 1);
+  assert.deepEqual(candidates(h).slice(0, 6), ["list", "current", "use", "pin", "unpin", "help"]);
+});
+test("phone skills tap replaces only the argument token and preserves the question", async () => {
+  const h = harness(catalog, { skills }); await h.context.loadCommands();
+  for (const [value, before, expected] of [
+    ["/skills pin co\nquestion", "/skills pin co", "/skills pin code\nquestion"],
+    ["/skills pin coXXX code-review\nquestion", "/skills pin co", "/skills pin code code-review\nquestion"],
+    ["/skills pin \nquestion", "/skills pin ", "/skills pin code\nquestion"],
+    ["  :skills unpin coXXX\tcode-review\r\nquestion🚀", "  :skills unpin co", "  :skills unpin code\tcode-review\r\nquestion🚀"],
+  ]) {
+    h.type(value, before.length);
+    const row = h.elements.cmdoptions.children.find((item) => item.textContent === "code");
+    assert.ok(row, "code is offered for " + value);
+    const pointer = { preventDefault() { this.prevented = true; } };
+    row.onpointerdown(pointer); assert.equal(pointer.prevented, true);
+    row.onpointerenter(); assert.equal(row.attrs["data-active"], "true");
+    assert.equal(row.onclick(), true);
+    assert.equal(h.prompt.value, expected);
+    assert.equal(h.prompt.selectionStart, expected.indexOf("code") + "code".length);
+    assert.equal(h.prompt.selectionEnd, h.prompt.selectionStart);
+    assert.equal(h.document.activeElement, h.prompt); assert.equal(h.elements.cmdmenu.hidden, true);
+  }
+});
+for (const name of ["Tab", "Enter"]) test("phone skills arrow navigation and " + name + " accept the active name", async () => {
+  const h = harness(catalog, { skills }); await h.context.loadCommands(); h.type("/skills pin co");
+  assert.equal(key(h, "ArrowDown").handled, true);
+  assert.equal(h.prompt.attrs["aria-activedescendant"], "cmdopt-1");
+  const result = key(h, name); assert.equal(result.handled, true); assert.equal(result.event.prevented, true);
+  assert.equal(h.prompt.value, "/skills pin code-review "); assert.equal(h.elements.cmdmenu.hidden, true);
+});
+test("phone skills never opens completion on a second line or across token selections", async () => {
+  const h = harness(catalog, { skills }); await h.context.loadCommands();
+  h.type("/skills pin co\n/skills pin co", "/skills pin co".length);
+  assert.equal(h.elements.cmdmenu.hidden, false);
+  for (const value of ["/skills pin co\n/skills pin co", "/skills pin co\n/skills", "\n/skills pin co"]) {
+    h.type(value); assert.equal(h.elements.cmdmenu.hidden, true); assert.equal(key(h, "Tab").handled, false);
+  }
+  h.type("/skills pin co code-review\nquestion", "/skills pin co".length);
+  h.prompt.selectionEnd = "/skills pin co code-review".length; h.context.refreshCommandMenu();
+  assert.equal(h.elements.cmdmenu.hidden, true);
+  h.prompt.selectionEnd = h.prompt.value.length; h.context.refreshCommandMenu();
+  assert.equal(h.elements.cmdmenu.hidden, true);
+});
+for (const guard of ["promptComposing", "isComposing", "keyCode"]) test("phone skills IME " + guard + " suppresses completion acceptance", async () => {
+  const h = harness(catalog, { skills }); await h.context.loadCommands(); h.type("/skills pin co");
+  if (guard === "promptComposing") h.context.promptComposing = true;
+  const fields = guard === "isComposing" ? { isComposing: true } : guard === "keyCode" ? { keyCode: 229 } : {};
+  for (const name of ["Tab", "Enter", "ArrowDown", "Escape"]) {
+    const result = key(h, name, fields); assert.equal(result.handled, false); assert.equal(result.event.prevented, undefined);
+  }
+  assert.equal(h.prompt.value, "/skills pin co"); assert.equal(h.prompt.attrs["aria-activedescendant"], "cmdopt-0");
+  if (guard === "promptComposing") {
+    assert.equal(h.elements.cmdoptions.children[0].onclick(), false);
+    assert.equal(h.prompt.value, "/skills pin co");
+    h.context.refreshCommandMenu(); assert.equal(h.elements.cmdmenu.hidden, true);
+  }
+});
+test("phone skills delayed catalog arrival refreshes the open candidates", async () => {
+  const h = harness(catalog); await h.context.loadCommands(); h.type("/skills unpin co");
+  assert.equal(h.elements.cmdmenu.hidden, false); assert.equal(h.elements.cmdempty.hidden, false);
+  let resolve;
+  h.context.api = async (url) => { assert.equal(url, "/skills"); return { json: () => new Promise((yes) => { resolve = yes; }) }; };
+  const loading = h.context.loadSkills(); await commandSettle();
+  resolve([{ name: " code " }, { name: "CODE" }, { name: "code-review" }]); await loading;
+  assert.deepEqual(candidates(h), ["code", "code-review"]); assert.equal(h.elements.cmdempty.hidden, true);
+  assert.equal(key(h, "Tab").handled, true); assert.equal(h.prompt.value, "/skills unpin code ");
+});
+test("phone skills reload immediately drops stale candidates", async () => {
+  const h = harness(catalog, { skills }); await h.context.loadCommands(); h.type("/skills pin co");
+  assert.deepEqual(candidates(h), ["code", "code-review"]);
+  let resolve;
+  h.context.api = async () => ({ json: () => new Promise((yes) => { resolve = yes; }) });
+  const loading = h.context.loadSkills();
+  assert.deepEqual(candidates(h), []); assert.equal(key(h, "Tab").handled, false);
+  await commandSettle(); resolve([{ name: "copy" }]); await loading;
+  assert.deepEqual(candidates(h), ["copy"]);
+});
+test("phone delayed skills load respects Escape, second-line edits, IME and removed prompts", async () => {
+  for (const action of ["escape", "second-line", "composition", "removed"]) {
+    const h = harness(catalog); await h.context.loadCommands(); h.type("/skills pin co");
+    let resolve;
+    h.context.api = async () => ({ json: () => new Promise((yes) => { resolve = yes; }) });
+    const loading = h.context.loadSkills(); await commandSettle();
+    if (action === "escape") key(h, "Escape");
+    else if (action === "second-line") h.type("/skills pin co\nquestion");
+    else if (action === "composition") h.context.promptComposing = true;
+    else delete h.elements.prompt;
+    resolve([{ name: "code" }]); await loading;
+    if (action !== "removed") assert.equal(h.elements.cmdmenu.hidden, true, action);
+    assert.equal(h.prompt.value.includes("pin code"), false, action);
+  }
+});
+test("phone skills argument sources require the command in the server catalog", async () => {
+  const h = harness(catalog.filter((command) => command.name !== "skills"), { skills });
+  await h.context.loadCommands(); h.type("/skills co");
+  assert.equal(h.elements.cmdmenu.hidden, true); assert.equal(key(h, "Tab").handled, false);
+});
+test("phone completion retains 44px pointer targets", () => {
+  assert.match(html, /\.cmdrow \{[^}]*min-height:44px;/);
 });
 
 function loadCommandPreludeFixtures() {

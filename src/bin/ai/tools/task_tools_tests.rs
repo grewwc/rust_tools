@@ -4427,6 +4427,7 @@ fn side_note_target_queues_external_backend_for_continuation() {
                         workspace_allowed: true,
                         model: Some("test-model".into()),
                         skills: None,
+                        agent_prompt: None,
                         resume_session,
                         side_note_files,
                         reasoning_effort: None,
