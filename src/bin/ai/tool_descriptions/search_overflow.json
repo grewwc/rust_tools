@@ -1,7 +1,7 @@
 {
   "name": "search_overflow",
-  "description": "Search archived session content; return verbatim excerpts with paths and line numbers. For a recent original result, use order:'recent', kind:'evidence', match:'phrase' and text from that result.",
-  "first_use_guidance": "Search only offloaded session content; scan every retained file fully. Evidence is a source tier, not verification: exclude recognized history checkpoint/summary prefixes; unmarked continuations may remain. Cross-root duplicate lines collapse after trim/whitespace normalization; raw totals stay unchanged. The footer reports shown/raw lines, shown/matching files, scanned files, active controls, duplicates and hidden lines. Complete answers keep a one-line footer. Truncation adds top files and up to two narrowing calls/edits; lower max_results if context was dropped. Zero kind hits: retry kind:'all'. Markers: >> phrase/regex, >t typed term, >b CJK fragment (verify full wording); two spaces = context. Long lines show ...; read_file gets full text/context. A miss means not found under these filters, not proof it never existed.",
+  "description": "Search archived session content; return verbatim excerpts with paths and line numbers. For a recent original result, use order:'recent', kind:'evidence', match:'phrase' and text from that result. Use cursor:'start' for JSON pages, then pass next_cursor with the same query, filters and max_results.",
+  "first_use_guidance": "Search only offloaded session content; scan every retained file fully. Evidence is a source tier, not verification: exclude recognized history checkpoint/summary prefixes; unmarked continuations may remain. Cross-root duplicate lines collapse after trim/whitespace normalization; raw totals stay unchanged. The footer reports shown/raw lines, shown/matching files, scanned files, active controls, duplicates and hidden lines. Complete answers keep a one-line footer. Truncation adds top files and up to two narrowing calls/edits; lower max_results if context was dropped. Zero kind hits: retry kind:'all'. Markers: >> whole-query phrase hit (or regex), >t typed-term hit, >b CJK-fragment hit (verify full wording); two spaces = context; matching ignores case by default. Long lines show ...; read_file gets full text/context. Cursor pages return output, has_more and next_cursor when continuation can advance. Archive changes invalidate the cursor; restart with cursor:'start'. Context can overlap across pages, but matched lines do not repeat. Relevance keeps file-grouped pages, so concatenated ordering can differ from a larger call. A miss means not found under these filters, not proof it never existed.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -42,11 +42,11 @@
       },
       "is_regex": {
         "type": "boolean",
-        "description": "Default false. true uses query as one regex; case_sensitive applies unless regex inline flags override it."
+        "description": "Default false. true uses query as one regex, searched case-insensitively by default; case_sensitive applies unless regex inline flags override it."
       },
       "case_sensitive": {
         "type": "boolean",
-        "description": "Default false (ignore case); true narrows to exact casing."
+        "description": "default: false (ignore case); true narrows to exact casing."
       },
       "context_lines": {
         "type": "integer",
@@ -59,6 +59,11 @@
         "minimum": 1,
         "maximum": 200,
         "description": "Matching lines across all files; default 50, range 1-200. Raising it raises the per-file ceiling."
+      },
+      "cursor": {
+        "type": "string",
+        "maxLength": 256,
+        "description": "Use 'start' to request JSON pages: output holds the legacy excerpts, has_more reports remaining matches or text truncation, and next_cursor is present only when continuation can advance. Pass the opaque next_cursor unchanged. It binds normalized query, order, match, kind, scope, file_pattern, context_lines, is_regex, case_sensitive and max_results, plus every filtered candidate file version and content, including zero-hit files. Changed parameters or archives error without a partial page. Omitted or empty cursor keeps the existing plain-text result. Each page remains bounded by max_results and the excerpt output limit."
       }
     },
     "required": [

@@ -50,12 +50,16 @@
 
 #[cfg(not(unix))]
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use rust_tools::commonw::{FastMap as FxHashMap, FastSet as FxHashSet};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::ai::history::compress::{
     CONTEXT_CHECKPOINT_MARKER_PREFIX, QUERY_MEMORY_INDEX_PREFIX, SOURCE_DIR, is_summary_note_text,
@@ -74,7 +78,7 @@ use crate::ai::tools::storage::overflow_cache;
 mod archive_files;
 
 fn read_archive_text(archive: &archive_files::ArchiveRoot, path: &Path) -> Option<Arc<str>> {
-    read_archive_text_versioned(archive, path).map(|(content, _)| content)
+    read_archive_text_versioned(archive, path, true).map(|(content, _)| content)
 }
 
 /// Same as `read_archive_text`, plus the file/session-root version the content
@@ -84,6 +88,7 @@ fn read_archive_text(archive: &archive_files::ArchiveRoot, path: &Path) -> Optio
 fn read_archive_text_versioned(
     archive: &archive_files::ArchiveRoot,
     path: &Path,
+    use_cache: bool,
 ) -> Option<(Arc<str>, overflow_cache::FileVersion)> {
     // Always open through the session-bound safe path (O_NOFOLLOW on every
     // component) before touching the cache: a body must never be served for a
@@ -107,8 +112,12 @@ fn read_archive_text_versioned(
             root_dev,
             root_ino,
         };
-        if let Some(cached) = overflow_cache::cached_text(path, version) {
-            return Some((cached, version));
+        // Cursor snapshots read fresh bodies: rapid rewrites can share every
+        // metadata field on filesystems whose timestamp updates are coalesced.
+        if use_cache {
+            if let Some(cached) = overflow_cache::cached_text(path, version) {
+                return Some((cached, version));
+            }
         }
         // Preserve full-file manual search semantics. Output is bounded
         // separately; scan work and resident hit metadata are not bounded by
@@ -161,6 +170,13 @@ thread_local! {
 
 /// Hard ceiling of matched lines returned (mirrors the shared engine cap).
 const MAX_MATCHES: usize = 200;
+const CURSOR_VERSION: u8 = 1;
+const MAX_CURSOR_LENGTH: usize = 256;
+const CURSOR_BITMAP_BYTES: usize = MAX_MATCHES.div_ceil(8);
+const CURSOR_BODY_BYTES: usize = 1 + 32 + 32 + 8 + CURSOR_BITMAP_BYTES;
+const INVALID_CURSOR: &str = "Invalid search_overflow cursor; restart with cursor='start'.";
+const CURSOR_MISMATCH: &str = "search_overflow cursor parameters changed; repeat the original query, filters, context_lines, and max_results, or restart with cursor='start'.";
+const STALE_CURSOR: &str = "search_overflow cursor stale: archive changed or unavailable; restart without cursor or with cursor='start'.";
 /// Soft reservation ceiling for one file, preserving room for other candidates.
 /// Its budget-derived value and lifting behavior keep surplus hits selectable.
 const MAX_SNIPPETS_PER_FILE: usize = 12;
@@ -219,6 +235,14 @@ enum SearchScope {
 }
 
 impl SearchScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::History => "history",
+            Self::ToolOutputs => "tool_outputs",
+        }
+    }
+
     /// Parses the caller-supplied scope. Unknown values are rejected instead
     /// of widening to the full corpus: a typo'd scope would otherwise scan
     /// everything (slow) and drown the answer in out-of-scope noise.
@@ -369,6 +393,147 @@ struct OverflowSearchParams<'a> {
     file_pattern: Option<&'a str>,
     scope: SearchScope,
     options: SearchOptions,
+    cursor: Option<CursorInput>,
+}
+
+enum CursorInput {
+    Start,
+    Resume(SearchCursor),
+}
+
+/// The offset names the first unseen candidate in the fixed-page-size stream.
+/// Grouped rendering can emit later candidates before an output-budget stop;
+/// the bounded bitmap remembers those emissions without skipping the gap.
+#[derive(Clone, Default)]
+struct CursorPosition {
+    offset: usize,
+    emitted: [u8; CURSOR_BITMAP_BYTES],
+}
+
+impl CursorPosition {
+    fn contains(&self, index: usize) -> bool {
+        index < MAX_MATCHES && self.emitted[index / 8] & (1 << (index % 8)) != 0
+    }
+
+    fn insert(&mut self, index: usize) {
+        self.emitted[index / 8] |= 1 << (index % 8);
+    }
+
+    fn advance(&mut self, page_size: usize) {
+        let count = (0..page_size)
+            .take_while(|&index| self.contains(index))
+            .count();
+        let previous = self.clone();
+        self.offset += count;
+        self.emitted.fill(0);
+        for index in count..page_size {
+            if previous.contains(index) {
+                self.insert(index - count);
+            }
+        }
+    }
+}
+
+struct SearchCursor {
+    query: [u8; 32],
+    archive: [u8; 32],
+    position: CursorPosition,
+}
+
+impl SearchCursor {
+    fn encode(&self) -> String {
+        let mut bytes = Vec::with_capacity(CURSOR_BODY_BYTES + 32);
+        bytes.push(CURSOR_VERSION);
+        bytes.extend_from_slice(&self.query);
+        bytes.extend_from_slice(&self.archive);
+        bytes.extend_from_slice(&(self.position.offset as u64).to_le_bytes());
+        bytes.extend_from_slice(&self.position.emitted);
+        let checksum = Sha256::digest(&bytes);
+        bytes.extend_from_slice(&checksum);
+        URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    fn decode(raw: &str) -> Result<Self, String> {
+        if raw.len() > MAX_CURSOR_LENGTH {
+            return Err(INVALID_CURSOR.into());
+        }
+        let bytes = URL_SAFE_NO_PAD.decode(raw).map_err(|_| INVALID_CURSOR)?;
+        if bytes.len() != CURSOR_BODY_BYTES + 32 {
+            return Err(INVALID_CURSOR.into());
+        }
+        if bytes[0] != CURSOR_VERSION {
+            return Err(
+                "Unsupported search_overflow cursor version; restart with cursor='start'.".into(),
+            );
+        }
+        if Sha256::digest(&bytes[..CURSOR_BODY_BYTES])[..] != bytes[CURSOR_BODY_BYTES..] {
+            return Err(INVALID_CURSOR.into());
+        }
+        let query = bytes[1..33].try_into().map_err(|_| INVALID_CURSOR)?;
+        let archive = bytes[33..65].try_into().map_err(|_| INVALID_CURSOR)?;
+        let offset = u64::from_le_bytes(bytes[65..73].try_into().map_err(|_| INVALID_CURSOR)?);
+        let emitted = bytes[73..CURSOR_BODY_BYTES]
+            .try_into()
+            .map_err(|_| INVALID_CURSOR)?;
+        Ok(Self {
+            query,
+            archive,
+            position: CursorPosition {
+                offset: usize::try_from(offset).map_err(|_| INVALID_CURSOR)?,
+                emitted,
+            },
+        })
+    }
+}
+
+fn parse_cursor(args: &Value) -> Result<Option<CursorInput>, String> {
+    match args.get("cursor") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) if raw.is_empty() => Ok(None),
+        Some(Value::String(raw)) if raw == "start" => Ok(Some(CursorInput::Start)),
+        Some(Value::String(raw)) => {
+            SearchCursor::decode(raw).map(|cursor| Some(CursorInput::Resume(cursor)))
+        }
+        Some(_) => Err(INVALID_CURSOR.into()),
+    }
+}
+
+fn query_fingerprint(params: &OverflowSearchParams<'_>) -> [u8; 32] {
+    Sha256::digest(
+        serde_json::json!([
+            params.query,
+            params.is_regex,
+            params.case_sensitive,
+            params.options.order.as_str(),
+            params.options.match_mode.as_str(),
+            params.options.kind.as_str(),
+            params.scope.as_str(),
+            params
+                .file_pattern
+                .map(str::trim)
+                .filter(|pattern| !pattern.is_empty()),
+            params.context_lines,
+            params.max_results.max(1),
+        ])
+        .to_string()
+        .as_bytes(),
+    )
+    .into()
+}
+
+fn cursor_position(params: &OverflowSearchParams<'_>) -> CursorPosition {
+    match &params.cursor {
+        Some(CursorInput::Resume(cursor)) => cursor.position.clone(),
+        _ => CursorPosition::default(),
+    }
+}
+
+fn complete_output(params: &OverflowSearchParams<'_>, output: String) -> String {
+    if params.cursor.is_some() {
+        serde_json::json!({"output": output, "has_more": false}).to_string()
+    } else {
+        output
+    }
 }
 
 /// Parses tool arguments into the normalized search parameters, without the
@@ -404,6 +569,7 @@ fn parse_search_params<'a>(args: &'a Value) -> Result<OverflowSearchParams<'a>, 
             Some(raw) => SearchScope::parse(raw)?,
         },
         options,
+        cursor: parse_cursor(args)?,
     })
 }
 
@@ -986,10 +1152,11 @@ fn scan_one_file(
     root_idx: usize,
     file: &Path,
     query: &CompiledQuery,
+    use_cache: bool,
 ) -> PerFileScan {
     // Unreadable, unsafe, or non-UTF-8 files were not searched;
     // exclude them from the corpus size used by IDF.
-    let Some((content, version)) = read_archive_text_versioned(archive, file) else {
+    let Some((content, version)) = read_archive_text_versioned(archive, file, use_cache) else {
         return PerFileScan {
             scan: None,
             df_contrib: None,
@@ -1055,6 +1222,7 @@ fn scan_candidates(
     candidates: &[(usize, PathBuf)],
     query: &CompiledQuery,
     parallel: bool,
+    use_cache: bool,
 ) -> ScanAggregate {
     let mut aggregate = ScanAggregate {
         scans: Vec::new(),
@@ -1066,7 +1234,7 @@ fn scan_candidates(
         for &(root_idx, ref file) in candidates {
             fold_scan_result(
                 &mut aggregate,
-                scan_one_file(archive, root_idx, file, query),
+                scan_one_file(archive, root_idx, file, query, use_cache),
             );
         }
         return aggregate;
@@ -1080,7 +1248,9 @@ fn scan_candidates(
                 scope.spawn(move || {
                     chunk
                         .iter()
-                        .map(|&(root_idx, ref file)| scan_one_file(archive, root_idx, file, query))
+                        .map(|&(root_idx, ref file)| {
+                            scan_one_file(archive, root_idx, file, query, use_cache)
+                        })
                         .collect::<Vec<PerFileScan>>()
                 })
             })
@@ -1103,20 +1273,17 @@ fn run_overflow_search(
     run_overflow_search_inner(assets_dir, params, None)
 }
 
-fn run_overflow_search_inner(
-    assets_dir: &Path,
+struct CandidateCorpus {
+    roots: Vec<(usize, PathBuf)>,
+    candidates: Vec<(usize, PathBuf)>,
+    files_excluded_by_pattern: usize,
+    files_excluded_by_kind: usize,
+}
+
+fn collect_candidate_corpus(
+    archive: &archive_files::ArchiveRoot,
     params: &OverflowSearchParams<'_>,
-    force_parallel: Option<bool>,
-) -> Result<String, String> {
-    if params.options.match_mode == MatchMode::Phrase && params.is_regex {
-        return Err("match='phrase' requires is_regex=false; use match='any' for a regex.".into());
-    }
-    let Some(archive) = archive_files::ArchiveRoot::new(assets_dir) else {
-        return Ok(format!(
-            "No matches found: the session archive root is missing or unavailable; nothing was scanned.\n{}",
-            search_footer(&[], params, 0, 0, 0, assets_dir, false)
-        ));
-    };
+) -> CandidateCorpus {
     let mut roots: Vec<PathBuf> = Vec::new();
     if params.scope != SearchScope::ToolOutputs {
         roots.push(archive.path().join("overflow-history.md"));
@@ -1146,21 +1313,6 @@ fn run_overflow_search_inner(
         .filter(|root| root.exists())
         .enumerate()
         .collect();
-    if roots.is_empty() {
-        return Ok(format!(
-            "No matches found in the session archive for query: '{}'. Nothing was scanned: this session has no archive content yet, since files appear here only after content is moved out of context.\n{}",
-            params.query,
-            search_footer(&[], params, 0, 0, 0, archive.path(), false)
-        ));
-    }
-
-    let query = CompiledQuery::compile(params)?;
-    let patterns = &query.patterns;
-
-    // Pass A: scan every file once, collecting raw hits plus document
-    // frequencies feeding the IDF weights. Candidates are collected up front
-    // so the scan can be split over non-overlapping contiguous slices when
-    // the corpus is large enough for threads to pay off.
     let mut candidates: Vec<(usize, PathBuf)> = Vec::new();
     // Counted separately so a zero-hit answer can say whether the corpus was
     // empty, filtered away, or unreadable instead of implying absence.
@@ -1189,16 +1341,178 @@ fn run_overflow_search_inner(
             candidates.push((*root_idx, file));
         }
     }
+    CandidateCorpus {
+        roots,
+        candidates,
+        files_excluded_by_pattern,
+        files_excluded_by_kind,
+    }
+}
 
+fn fingerprint_bytes(hash: &mut Sha256, bytes: &[u8]) {
+    hash.update((bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
+}
+
+/// Hash every filtered candidate's safe-open version and fresh content, even
+/// when it has no hits or is not UTF-8. Content hashes distinguish rewrites
+/// whose timestamps alias. Refuse pagination when a candidate cannot be read.
+/// Repeating discovery/versioning after rendering detects additions, removals,
+/// and changes during the request without retaining archive bodies or state.
+fn archive_fingerprint(
+    archive: &archive_files::ArchiveRoot,
+    corpus: &CandidateCorpus,
+) -> Result<[u8; 32], String> {
+    let mut hash = Sha256::new();
+    fingerprint_bytes(&mut hash, archive.path().as_os_str().as_encoded_bytes());
+    let (root_dev, root_ino) = archive.root_identity();
+    hash.update(root_dev.to_le_bytes());
+    hash.update(root_ino.to_le_bytes());
+    hash.update((corpus.roots.len() as u64).to_le_bytes());
+    for (index, root) in &corpus.roots {
+        hash.update((*index as u64).to_le_bytes());
+        fingerprint_bytes(&mut hash, root.as_os_str().as_encoded_bytes());
+    }
+    let mut candidates: Vec<_> = corpus.candidates.iter().collect();
+    candidates.sort();
+    hash.update((candidates.len() as u64).to_le_bytes());
+    for (root_idx, path) in candidates {
+        hash.update((*root_idx as u64).to_le_bytes());
+        fingerprint_bytes(&mut hash, path.as_os_str().as_encoded_bytes());
+        let (file, version) = archive.open_versioned(path).ok_or(STALE_CURSOR)?;
+        hash.update(version.len.to_le_bytes());
+        let (negative, duration) = match version.mtime.duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => (false, duration),
+            Err(error) => (true, error.duration()),
+        };
+        hash.update([u8::from(negative)]);
+        hash.update(duration.as_secs().to_le_bytes());
+        hash.update(duration.subsec_nanos().to_le_bytes());
+        hash.update(version.dev.to_le_bytes());
+        hash.update(version.ino.to_le_bytes());
+        hash.update(version.ctime_sec.to_le_bytes());
+        hash.update(version.ctime_nsec.to_le_bytes());
+        if !file.metadata().map_err(|_| STALE_CURSOR)?.is_file() {
+            return Err(STALE_CURSOR.into());
+        }
+        let mut content_hash = Sha256::new();
+        let mut buffer = [0u8; 16 * 1024];
+        let mut bytes_read = 0u64;
+        // Concurrent appends must invalidate the snapshot rather than extend
+        // hashing indefinitely beyond the descriptor's observed length.
+        let mut reader = file.take(version.len.saturating_add(1));
+        loop {
+            let count = reader.read(&mut buffer).map_err(|_| STALE_CURSOR)?;
+            if count == 0 {
+                break;
+            }
+            bytes_read = bytes_read.checked_add(count as u64).ok_or(STALE_CURSOR)?;
+            content_hash.update(&buffer[..count]);
+        }
+        let (_, after) = archive.open_versioned(path).ok_or(STALE_CURSOR)?;
+        if after != version || bytes_read != version.len {
+            return Err(STALE_CURSOR.into());
+        }
+        hash.update(content_hash.finalize());
+    }
+    Ok(hash.finalize().into())
+}
+
+fn verify_archive_fingerprint(
+    assets_dir: &Path,
+    params: &OverflowSearchParams<'_>,
+    expected: [u8; 32],
+) -> Result<(), String> {
+    let archive = archive_files::ArchiveRoot::new(assets_dir).ok_or(STALE_CURSOR)?;
+    let corpus = collect_candidate_corpus(&archive, params);
+    if archive_fingerprint(&archive, &corpus)? != expected {
+        return Err(STALE_CURSOR.into());
+    }
+    Ok(())
+}
+
+fn run_overflow_search_inner(
+    assets_dir: &Path,
+    params: &OverflowSearchParams<'_>,
+    force_parallel: Option<bool>,
+) -> Result<String, String> {
+    if params.options.match_mode == MatchMode::Phrase && params.is_regex {
+        return Err("match='phrase' requires is_regex=false; use match='any' for a regex.".into());
+    }
+    let query_hash = query_fingerprint(params);
+    if let Some(CursorInput::Resume(cursor)) = &params.cursor {
+        if cursor.query != query_hash {
+            return Err(CURSOR_MISMATCH.into());
+        }
+    }
+    let Some(archive) = archive_files::ArchiveRoot::new(assets_dir) else {
+        if matches!(params.cursor, Some(CursorInput::Resume(_))) {
+            return Err(STALE_CURSOR.into());
+        }
+        return Ok(complete_output(
+            params,
+            format!(
+                "No matches found: the session archive root is missing or unavailable; nothing was scanned.\n{}",
+                search_footer(&[], params, 0, 0, 0, assets_dir, false)
+            ),
+        ));
+    };
+    let corpus = collect_candidate_corpus(&archive, params);
+    if corpus.roots.is_empty() {
+        if matches!(params.cursor, Some(CursorInput::Resume(_))) {
+            return Err(STALE_CURSOR.into());
+        }
+        return Ok(complete_output(
+            params,
+            format!(
+                "No matches found in the session archive for query: '{}'. Nothing was scanned: this session has no archive content yet, since files appear here only after content is moved out of context.\n{}",
+                params.query,
+                search_footer(&[], params, 0, 0, 0, archive.path(), false)
+            ),
+        ));
+    }
+    let archive_hash = if params.cursor.is_some() {
+        Some(archive_fingerprint(&archive, &corpus)?)
+    } else {
+        None
+    };
+    if let Some(CursorInput::Resume(cursor)) = &params.cursor {
+        if Some(cursor.archive) != archive_hash {
+            return Err(STALE_CURSOR.into());
+        }
+    }
+    let CandidateCorpus {
+        roots,
+        candidates,
+        files_excluded_by_pattern,
+        files_excluded_by_kind,
+    } = corpus;
+    let pattern_filter = params.file_pattern.map(str::trim).filter(|p| !p.is_empty());
+    let query = CompiledQuery::compile(params)?;
+    let patterns = &query.patterns;
+
+    // Pass A scans the full corpus; cursors limit selection/rendering only.
     let parallel = force_parallel.unwrap_or_else(|| parallel_scan_enabled(candidates.len()));
     let ScanAggregate {
         mut scans,
         df,
         files_seen,
         files_unreadable,
-    } = scan_candidates(&archive, &candidates, &query, parallel);
+    } = scan_candidates(
+        &archive,
+        &candidates,
+        &query,
+        parallel,
+        params.cursor.is_none(),
+    );
 
     if scans.is_empty() {
+        if matches!(params.cursor, Some(CursorInput::Resume(_))) {
+            return Err(STALE_CURSOR.into());
+        }
+        if let Some(hash) = archive_hash {
+            verify_archive_fingerprint(assets_dir, params, hash)?;
+        }
         // A bare "No matches found" invites unwarranted absence claims: the
         // caller cannot distinguish an empty corpus or a filtered-away corpus
         // from a genuine miss. Report what was probed and which terms came up
@@ -1240,10 +1554,13 @@ fn run_overflow_search_inner(
             }
         };
         if files_seen == 0 {
-            return Ok(format!(
-                "No matches found in the session archive for query: '{}'. Nothing was scanned: 0 archive file(s) under the probed roots ({probed}){pattern_note}{kind_note}{unreadable_note}{scope_note}. Archived files appear only after content is moved out of context; canonical session history is not searched here.\n{}",
-                params.query,
-                search_footer(&[], params, 0, 0, files_seen, archive.path(), false)
+            return Ok(complete_output(
+                params,
+                format!(
+                    "No matches found in the session archive for query: '{}'. Nothing was scanned: 0 archive file(s) under the probed roots ({probed}){pattern_note}{kind_note}{unreadable_note}{scope_note}. Archived files appear only after content is moved out of context; canonical session history is not searched here.\n{}",
+                    params.query,
+                    search_footer(&[], params, 0, 0, files_seen, archive.path(), false)
+                ),
             ));
         }
         let mut terms: Vec<&str> = patterns
@@ -1302,10 +1619,13 @@ fn run_overflow_search_inner(
             MatchMode::Phrase => "no line contained the whole query as a literal substring",
             MatchMode::All => "the single regex pattern did not match",
         };
-        return Ok(format!(
-            "No matches found in the session archive for query: '{}'. {files_seen} file(s) were searched and {match_note} (terms: {listed}{expansion_note}{pattern_note}{kind_note}{unreadable_note}{scope_note}).{case_note} This archive holds only content moved out of context; canonical session history is not searched here.\n{}",
-            params.query,
-            search_footer(&[], params, 0, 0, files_seen, archive.path(), false)
+        return Ok(complete_output(
+            params,
+            format!(
+                "No matches found in the session archive for query: '{}'. {files_seen} file(s) were searched and {match_note} (terms: {listed}{expansion_note}{pattern_note}{kind_note}{unreadable_note}{scope_note}).{case_note} This archive holds only content moved out of context; canonical session history is not searched here.\n{}",
+                params.query,
+                search_footer(&[], params, 0, 0, files_seen, archive.path(), false)
+            ),
         ));
     }
 
@@ -1409,7 +1729,30 @@ fn run_overflow_search_inner(
     });
 
     collapse_duplicate_lines(&mut scored_files);
-    render_selection(scored_files, params, &query, files_seen, &archive)
+    let rendered = render_selection(scored_files, params, &query, files_seen, &archive)?;
+    let Some(archive_hash) = archive_hash else {
+        return Ok(rendered.output);
+    };
+    verify_archive_fingerprint(assets_dir, params, archive_hash)?;
+    let mut position = cursor_position(params);
+    for &index in &rendered.emitted {
+        position.insert(index - position.offset);
+    }
+    position.advance(params.max_results.max(1));
+    let has_more = position.offset < rendered.total_candidates || rendered.budget_exhausted;
+    let mut result = serde_json::json!({"output": rendered.output, "has_more": has_more});
+    if position.offset < rendered.total_candidates && !rendered.emitted.is_empty() {
+        result["next_cursor"] = SearchCursor {
+            query: query_hash,
+            archive: archive_hash,
+            position,
+        }
+        .encode()
+        .into();
+    } else if has_more {
+        result["continuation_hint"] = "No further matching line fits this page's output budget; narrow the search or use read_file.".into();
+    }
+    Ok(result.to_string())
 }
 
 fn collapse_duplicate_lines(files: &mut [ScoredFile]) {
@@ -1784,6 +2127,24 @@ fn render_line_window(line: &str, first_match: Option<usize>) -> String {
 
 // ─── Fair-share selection & rendering ────────────────────────────────────────
 
+struct RenderedSearch {
+    output: String,
+    budget_exhausted: bool,
+    emitted: Vec<usize>,
+    total_candidates: usize,
+}
+
+/// Counts JSON-escaped characters, excluding the enclosing string quotes.
+fn json_escaped_len(s: &str) -> usize {
+    s.chars()
+        .map(|c| match c {
+            '"' | '\\' | '\u{08}' | '\u{0c}' | '\n' | '\r' | '\t' => 2,
+            c if c < '\u{20}' => 6,
+            _ => 1,
+        })
+        .sum()
+}
+
 /// Selects files/lines with the active order, then renders verbatim excerpts.
 /// Relevance uses fair-share visibility; recent order drains newest files first.
 ///
@@ -1797,7 +2158,7 @@ fn render_line_window(line: &str, first_match: Option<usize>) -> String {
 /// Per-file caps reserve room while another file is below both ceilings.
 /// The ceiling uses `MAX_SNIPPETS_PER_FILE` or the budget-derived per-file
 /// share, whichever is larger; it lifts together with the root cap.
-/// `context_lines` controls excerpt expansion. The returned flag lets
+/// `context_lines` controls excerpt expansion. The returned outcome lets
 /// `render_selection` retry without context when the render budget runs out.
 fn render_with_context(
     files: &mut Vec<ScoredFile>,
@@ -1806,7 +2167,7 @@ fn render_with_context(
     files_seen: usize,
     archive: &archive_files::ArchiveRoot,
     context_lines: usize,
-) -> Result<(String, bool), String> {
+) -> Result<RenderedSearch, String> {
     let patterns = &query.patterns;
     files.sort_by(|a, b| {
         let recency = b
@@ -1828,8 +2189,32 @@ fn render_with_context(
     struct Candidate {
         file_pos: usize,
         line_index: usize,
+        stream_index: usize,
     }
 
+    let position = cursor_position(params);
+    let total_candidates: usize = files.iter().map(|file| file.scored.len()).sum();
+    let max_results = params.max_results.max(1);
+    if params.cursor.is_some()
+        && (max_results > MAX_MATCHES
+            || position.offset > total_candidates
+            || (0..MAX_MATCHES).any(|index| {
+                position.contains(index)
+                    && index >= max_results.min(total_candidates.saturating_sub(position.offset))
+            }))
+    {
+        return Err(INVALID_CURSOR.into());
+    }
+    // Reservations depend only on the bound page size. Extending the collection
+    // limit therefore preserves the selection prefix, even when caps lift.
+    let selection_limit = if params.cursor.is_some() {
+        position
+            .offset
+            .saturating_add(max_results)
+            .min(total_candidates)
+    } else {
+        max_results
+    };
     let mut per_file_cursor = vec![0usize; files.len()];
     let mut file_consumed = vec![0usize; files.len()];
     let mut root_consumed: FxHashMap<usize, usize> = FxHashMap::default();
@@ -1845,7 +2230,6 @@ fn render_with_context(
     };
     // A degenerate request of zero results is clamped to one so real matches
     // are never misreported as "No matches found".
-    let max_results = params.max_results.max(1);
     let fair_share = (max_results / roots_with_hits.len().max(1)).max(1);
     let soft_cap_per_root = fair_share * FAIR_SHARE_MULTIPLE;
     // Per-file ceiling: the historical snippet cap, raised to the per-file
@@ -1866,13 +2250,14 @@ fn render_with_context(
         // Recency is a strict order: relevance reservations must not interleave
         // older files while the newest file still has matching lines.
         for (file_pos, file) in files.iter().enumerate() {
-            for &(line_index, _) in file.scored.iter().take(max_results - chosen.len()) {
+            for &(line_index, _) in file.scored.iter().take(selection_limit - chosen.len()) {
                 chosen.push(Candidate {
                     file_pos,
                     line_index,
+                    stream_index: chosen.len(),
                 });
             }
-            if chosen.len() == max_results {
+            if chosen.len() == selection_limit {
                 break;
             }
         }
@@ -1886,7 +2271,7 @@ fn render_with_context(
         // capped root cannot stall the answer even when a second root is capped at
         // the same time. Equal-score ties rotate across files because each pass
         // re-visits files in stable global relevance order.
-        while chosen.len() < max_results {
+        while chosen.len() < selection_limit {
             // A file that is neither drained nor over a ceiling is what the
             // ceilings reserve room for. Computed once per pass: a file that
             // exhausts its candidates mid-pass only delays the lift by one pass.
@@ -1898,7 +2283,7 @@ fn render_with_context(
 
             let mut settled = 0usize;
             for file_pos in 0..files.len() {
-                if chosen.len() >= max_results {
+                if chosen.len() >= selection_limit {
                     break;
                 }
                 let file = &files[file_pos];
@@ -1922,6 +2307,7 @@ fn render_with_context(
                 chosen.push(Candidate {
                     file_pos,
                     line_index,
+                    stream_index: chosen.len(),
                 });
             }
             if settled == files.len() {
@@ -1930,15 +2316,33 @@ fn render_with_context(
         }
     }
 
+    // Duplicate collapse and fair-share ordering precede the page boundary.
+    // Context expansion sees only this page's previously unseen candidates.
+    chosen.retain(|candidate| {
+        candidate.stream_index >= position.offset
+            && !position.contains(candidate.stream_index - position.offset)
+    });
     if chosen.is_empty() {
-        return Ok((
-            format!(
+        return Ok(RenderedSearch {
+            output: format!(
                 "No matches found in the session archive for query: '{}'",
                 params.query
             ),
-            false,
-        ));
+            budget_exhausted: false,
+            emitted: Vec::new(),
+            total_candidates,
+        });
     }
+    let selected_positions: FxHashMap<(usize, usize), usize> = chosen
+        .iter()
+        .map(|candidate| {
+            (
+                (candidate.file_pos, candidate.line_index),
+                candidate.stream_index,
+            )
+        })
+        .collect();
+    let mut emitted = Vec::new();
 
     // Emit grouped by file in the active order, expanding context windows
     // around chosen lines; two-character markers (`>>`/`>t`/`>b`) explain why
@@ -1954,6 +2358,15 @@ fn render_with_context(
     // Excerpt rendering stops before the truncation notice and the footer would
     // no longer fit.
     let render_budget = MAX_OUTPUT_CHARS.saturating_sub(FOOTER_RESERVE_CHARS);
+    let cursor_mode = params.cursor.is_some();
+    let output_len = |s: &str| {
+        if cursor_mode {
+            // The footer and output assertion still require the raw byte budget.
+            json_escaped_len(s).max(s.len())
+        } else {
+            s.len()
+        }
+    };
     let mut budget_exhausted = false;
 
     for (file_pos, file) in files.iter_mut().enumerate() {
@@ -1974,27 +2387,36 @@ fn render_with_context(
         // describe text that is really present in the answer.
         let mut chunk = String::new();
         let mut chunk_matches = 0usize;
+        let mut chunk_emitted = Vec::new();
         let mut chunk_complete = true;
 
         // The scan retains hit metadata and interned normalized matching text.
         // Re-read only files selected for excerpts, loading one rendering body
         // at a time instead of retaining every full body in the scan results.
-        let Some((content, version)) =
-            read_archive_text_versioned(archive, Path::new(&file.scan.display_path))
-        else {
+        let Some((content, version)) = read_archive_text_versioned(
+            archive,
+            Path::new(&file.scan.display_path),
+            params.cursor.is_none(),
+        ) else {
+            if params.cursor.is_some() {
+                return Err(STALE_CURSOR.into());
+            }
             // A concurrent deletion or unsafe/unreadable path can invalidate the
             // scan. Keep an absolute-path pointer instead of fabricating an excerpt.
             chunk.push_str(&format!(
                 "... [file unreadable during excerpt rendering: {}; use read_file for surrounding context] ...\n\n",
                 &file.scan.display_path
             ));
-            if out.len() + chunk.len() > render_budget {
+            if output_len(&out) + output_len(&chunk) > render_budget {
                 budget_exhausted = true;
                 break;
             }
             out.push_str(&chunk);
             continue;
         };
+        if params.cursor.is_some() && version != file.scan.version {
+            return Err(STALE_CURSOR.into());
+        }
         let content_lines: Vec<&str> = content.lines().collect();
         let n_lines = content_lines.len();
         if n_lines == 0 {
@@ -2012,7 +2434,7 @@ fn render_with_context(
                 "... [file empty during excerpt rendering: {}; use read_file for surrounding context] ...\n\n",
                 &file.scan.display_path
             ));
-            if out.len() + chunk.len() > render_budget {
+            if output_len(&out) + output_len(&chunk) > render_budget {
                 budget_exhausted = true;
                 break;
             }
@@ -2038,7 +2460,7 @@ fn render_with_context(
                     "... [file changed during search: {}; its current content no longer matches; use read_file for the current text] ...\n\n",
                     &file.scan.display_path
                 ));
-                if out.len() + chunk.len() > render_budget {
+                if output_len(&out) + output_len(&chunk) > render_budget {
                     budget_exhausted = true;
                     break;
                 }
@@ -2060,7 +2482,7 @@ fn render_with_context(
                     "... [file changed during search: {}; previously selected lines no longer match; use read_file for the current text] ...\n\n",
                     &file.scan.display_path
                 ));
-                if out.len() + chunk.len() > render_budget {
+                if output_len(&out) + output_len(&chunk) > render_budget {
                     budget_exhausted = true;
                     break;
                 }
@@ -2081,7 +2503,7 @@ fn render_with_context(
             lis.len(),
             &file.scan.display_path
         );
-        if out.len() + header.len() > render_budget {
+        if output_len(&out) + output_len(&header) > render_budget {
             budget_exhausted = true;
             break;
         }
@@ -2147,7 +2569,7 @@ fn render_with_context(
                 };
                 let window = render_line_window(line, hit.map(|hit| hit.first_match));
                 let rendered = format!("{:>7}{} {}\n", li + 1, marker, window);
-                if out.len() + chunk.len() + rendered.len() > render_budget {
+                if output_len(&out) + output_len(&chunk) + output_len(&rendered) > render_budget {
                     // Whole lines only: cutting the rendered text afterwards
                     // could remove the matching text while still counting the
                     // line as shown.
@@ -2158,6 +2580,7 @@ fn render_with_context(
                 chunk.push_str(&rendered);
                 if is_match {
                     chunk_matches += 1;
+                    chunk_emitted.push(selected_positions[&(file_pos, li)]);
                 }
             }
         }
@@ -2166,12 +2589,13 @@ fn render_with_context(
                 "... [{} more matching line(s) in this file not shown; narrow the query, raise max_results, or use file_pattern/scope] ...\n",
                 hidden_here
             );
-            if out.len() + chunk.len() + hint.len() <= render_budget {
+            if output_len(&out) + output_len(&chunk) + output_len(&hint) <= render_budget {
                 chunk.push_str(&hint);
             }
         }
         chunk.push('\n');
         out.push_str(&chunk);
+        emitted.extend(chunk_emitted);
         if chunk_matches > 0 {
             shown_files += 1;
             shown_matches += chunk_matches;
@@ -2207,7 +2631,12 @@ fn render_with_context(
         out.len() <= MAX_OUTPUT_CHARS,
         "the excerpt budget must leave room for the notice and the footer"
     );
-    Ok((out, budget_exhausted))
+    Ok(RenderedSearch {
+        output: out,
+        budget_exhausted,
+        emitted,
+        total_candidates,
+    })
 }
 
 /// Renders the selected excerpts, dropping context lines and retrying once
@@ -2223,8 +2652,8 @@ fn render_selection(
     query: &CompiledQuery,
     files_seen: usize,
     archive: &archive_files::ArchiveRoot,
-) -> Result<String, String> {
-    let (out, budget_exhausted) = render_with_context(
+) -> Result<RenderedSearch, String> {
+    let rendered = render_with_context(
         &mut files,
         params,
         query,
@@ -2232,11 +2661,12 @@ fn render_selection(
         archive,
         params.context_lines,
     )?;
-    if !budget_exhausted || params.context_lines == 0 {
-        return Ok(out);
+    if !rendered.budget_exhausted || params.context_lines == 0 {
+        return Ok(rendered);
     }
-    let (bare, _) = render_with_context(&mut files, params, query, files_seen, archive, 0)?;
-    Ok(format!("{bare}{CONTEXT_DROP_NOTE}"))
+    let mut bare = render_with_context(&mut files, params, query, files_seen, archive, 0)?;
+    bare.output.push_str(CONTEXT_DROP_NOTE);
+    Ok(bare)
 }
 
 inventory::submit!(ToolRegistration {
@@ -2272,7 +2702,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     },
 });
 
-mod tests {
+mod search_overflow_tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
@@ -2331,6 +2761,7 @@ mod tests {
             file_pattern: None,
             scope: SearchScope::All,
             options: SearchOptions::default(),
+            cursor: None,
         }
     }
 
@@ -2389,6 +2820,332 @@ mod tests {
                 std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
             )
             .unwrap();
+    }
+
+    fn cursor_page(dir: &Path, args: &Value) -> Value {
+        let p = parse_search_params(args).unwrap();
+        serde_json::from_str(&run_overflow_search(dir, &p).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn cursor_page_stays_under_inline_cap_when_escaped() {
+        let dir = make_temp_dir();
+        seed_archive(&dir);
+        let line = format!("needle {}\n", "\\".repeat(593));
+        fs::write(
+            dir.join("tool-overflow-compressed").join("escaped.txt"),
+            line.repeat(64),
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "query": "needle",
+            "cursor": "start",
+            "context_lines": 0,
+            "max_results": 50,
+        });
+        let out = run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert!(
+            out.len() <= 32_000,
+            "cursor page must fit the driver inline cap; got {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn cursor_pages_preserve_membership_for_both_orders_and_context_overlap() {
+        let dir = make_temp_dir();
+        let history = dir.join("overflow-history.md");
+        fs::write(&history, "alpha history-0\nalpha history-1\n").unwrap();
+        set_mtime(&history, 3_000);
+        let tools = dir.join("tool-overflow-compressed");
+        fs::create_dir_all(&tools).unwrap();
+        for (file_index, name) in ["a.txt", "b.txt"].iter().enumerate() {
+            let content = (0..6)
+                .map(|index| format!("alpha {name}-{index}\n"))
+                .collect::<String>();
+            let path = tools.join(name);
+            fs::write(&path, content).unwrap();
+            set_mtime(&path, 2_000 - file_index as u64 * 1_000);
+        }
+        let folded = dir.join("folded-tool-groups");
+        fs::create_dir_all(&folded).unwrap();
+        fs::write(folded.join("copies.md"), "alpha a.txt-0\nalpha history-0\n").unwrap();
+        for order in ["relevance", "recent"] {
+            for context_lines in [0, 2] {
+                let mut args = serde_json::json!({"query": "alpha", "order": order, "context_lines": context_lines, "max_results": 7});
+                let legacy =
+                    run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap();
+                args["cursor"] = "start".into();
+                let first = cursor_page(&dir, &args);
+                assert_eq!(first["output"].as_str().unwrap(), legacy);
+                assert_eq!(first["has_more"], true);
+                let token = first["next_cursor"].as_str().unwrap();
+                assert!(token.len() <= MAX_CURSOR_LENGTH);
+                let decoded = URL_SAFE_NO_PAD.decode(token).unwrap();
+                assert!(!String::from_utf8_lossy(&decoded).contains(dir.to_str().unwrap()));
+                args["cursor"] = token.into();
+                let second = cursor_page(&dir, &args);
+                assert_eq!(second["has_more"], false);
+                assert!(second.get("next_cursor").is_none());
+                let mut combined: Vec<_> = [
+                    first["output"].as_str().unwrap(),
+                    second["output"].as_str().unwrap(),
+                ]
+                .into_iter()
+                .flat_map(matched_text)
+                .collect();
+                assert_eq!(combined.len(), 14);
+                assert_eq!(combined.iter().copied().collect::<FxHashSet<_>>().len(), 14);
+                let mut full_args = args.clone();
+                full_args.as_object_mut().unwrap().remove("cursor");
+                full_args["max_results"] = MAX_MATCHES.into();
+                let full =
+                    run_overflow_search(&dir, &parse_search_params(&full_args).unwrap()).unwrap();
+                let mut expected = matched_text(&full);
+                if order == "recent" {
+                    assert_eq!(combined, expected);
+                }
+                combined.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(combined, expected, "{order}, context_lines={context_lines}");
+                assert_eq!(shown_count(second["output"].as_str().unwrap()), 7);
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cursor_preserves_legacy_text_and_complete_or_empty_pages() {
+        let dir = make_temp_dir();
+        let path = dir.join("overflow-history.md");
+        fs::write(&path, "alpha oldest\nalpha newest\n").unwrap();
+        let mut args = serde_json::json!({"query": "alpha", "context_lines": 0, "max_results": 2});
+        let legacy = run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap();
+        let expected = format!(
+            "### 2 match(es) in {}\n      2>t alpha newest\n      1>t alpha oldest\n\n[archive search] showed 2 matching line(s) across 1/1 file(s) (corpus total 2, files scanned 1); order=relevance match=any kind=all; 0 duplicate line(s) collapsed; hidden=0. {SURROUNDING_CONTEXT_HINT}{MARKER_LEGEND}",
+            path.canonicalize().unwrap().display()
+        );
+        assert_eq!(legacy, expected);
+        args["cursor"] = "".into();
+        assert_eq!(
+            run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap(),
+            expected
+        );
+        args["cursor"] = "start".into();
+        let page = cursor_page(&dir, &args);
+        assert_eq!(page["output"].as_str().unwrap(), expected);
+        assert_eq!(page["has_more"], false);
+        assert_eq!(page.as_object().unwrap().len(), 2);
+        args["query"] = "absent".into();
+        let empty = cursor_page(&dir, &args);
+        assert_eq!(empty["has_more"], false);
+        assert!(empty.get("next_cursor").is_none());
+        assert!(
+            empty["output"]
+                .as_str()
+                .unwrap()
+                .contains("No matches found")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cursor_rejects_changed_parameters_and_malformed_tokens() {
+        let dir = make_temp_dir();
+        fs::write(
+            dir.join("overflow-history.md"),
+            "alpha one\nalpha two\nalpha three\n",
+        )
+        .unwrap();
+        let mut args = serde_json::json!({"query": "alpha", "order": "relevance", "match": "any", "kind": "all", "scope": "all", "file_pattern": "*", "context_lines": 0, "max_results": 2, "cursor": "start"});
+        let first = cursor_page(&dir, &args);
+        let token = first["next_cursor"].as_str().unwrap();
+        args["cursor"] = token.into();
+        for (key, value) in [
+            ("query", Value::from("beta")),
+            ("order", "recent".into()),
+            ("match", "all".into()),
+            ("kind", "evidence".into()),
+            ("scope", "history".into()),
+            ("file_pattern", "overflow-history.md".into()),
+            ("context_lines", 1.into()),
+            ("max_results", 3.into()),
+            ("is_regex", true.into()),
+            ("case_sensitive", true.into()),
+        ] {
+            let mut changed = args.clone();
+            changed[key] = value;
+            assert_eq!(
+                run_overflow_search(&dir, &parse_search_params(&changed).unwrap()).unwrap_err(),
+                CURSOR_MISMATCH,
+                "{key}"
+            );
+        }
+        let mut normalized = args.clone();
+        normalized["file_pattern"] = " * ".into();
+        assert_eq!(cursor_page(&dir, &normalized)["has_more"], false);
+        let mut corrupt = URL_SAFE_NO_PAD.decode(token).unwrap();
+        *corrupt.last_mut().unwrap() ^= 1;
+        for raw in [
+            "!".to_string(),
+            "AQ".to_string(),
+            token[..token.len() - 1].to_string(),
+            "a".repeat(MAX_CURSOR_LENGTH + 1),
+            URL_SAFE_NO_PAD.encode(corrupt),
+        ] {
+            let bad = serde_json::json!({"query": "alpha", "cursor": raw});
+            assert_eq!(parse_search_params(&bad).err().unwrap(), INVALID_CURSOR);
+        }
+        let mut unknown = URL_SAFE_NO_PAD.decode(token).unwrap();
+        unknown[0] = CURSOR_VERSION + 1;
+        let unknown_args =
+            serde_json::json!({"query": "alpha", "cursor": URL_SAFE_NO_PAD.encode(unknown)});
+        assert!(
+            parse_search_params(&unknown_args)
+                .err()
+                .unwrap()
+                .contains("Unsupported")
+        );
+        let mut out_of_range = SearchCursor::decode(token).unwrap();
+        out_of_range.position.offset = usize::MAX;
+        args["cursor"] = out_of_range.encode().into();
+        assert_eq!(
+            run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap_err(),
+            INVALID_CURSOR
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cursor_rejects_candidate_version_changes_and_changes_during_rendering() {
+        let dir = make_temp_dir();
+        fs::write(
+            dir.join("overflow-history.md"),
+            "alpha one\nalpha two\nalpha three\n",
+        )
+        .unwrap();
+        let tools = dir.join("tool-overflow-compressed");
+        fs::create_dir_all(&tools).unwrap();
+        let zero_hit = tools.join("zero.txt");
+        fs::write(&zero_hit, "nothing here\n").unwrap();
+        set_mtime(&zero_hit, 1_000);
+        let mut args = serde_json::json!({"query": "alpha", "context_lines": 0, "max_results": 2, "cursor": "start"});
+        let first = cursor_page(&dir, &args);
+        args["cursor"] = first["next_cursor"].clone();
+        fs::write(&zero_hit, "missing data\n").unwrap();
+        set_mtime(&zero_hit, 2_000);
+        assert_eq!(
+            run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap_err(),
+            STALE_CURSOR
+        );
+        args["cursor"] = "start".into();
+        let fresh = cursor_page(&dir, &args);
+        args["cursor"] = fresh["next_cursor"].clone();
+        let preserved_mtime = fs::metadata(&zero_hit).unwrap().modified().unwrap();
+        fs::write(&zero_hit, "nothing here\n").unwrap();
+        fs::File::open(&zero_hit)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(preserved_mtime))
+            .unwrap();
+        assert_eq!(
+            run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap_err(),
+            STALE_CURSOR
+        );
+        args["cursor"] = "start".into();
+        let fresh = cursor_page(&dir, &args);
+        args["cursor"] = fresh["next_cursor"].clone();
+        let new_file = tools.join("new.txt");
+        fs::write(&new_file, "also absent\n").unwrap();
+        assert_eq!(
+            run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap_err(),
+            STALE_CURSOR
+        );
+        fs::remove_file(&new_file).unwrap();
+        args["cursor"] = "start".into();
+        let fresh = cursor_page(&dir, &args);
+        args["cursor"] = fresh["next_cursor"].clone();
+        let changed_path = zero_hit.clone();
+        RENDER_HOOK.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move || {
+                fs::write(&changed_path, "changed during rendering\n").unwrap();
+            }))
+        });
+        assert_eq!(
+            run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap_err(),
+            STALE_CURSOR
+        );
+        args["cursor"] = "start".into();
+        let fresh = cursor_page(&dir, &args);
+        args["cursor"] = fresh["next_cursor"].clone();
+        fs::remove_file(&zero_hit).unwrap();
+        assert_eq!(
+            run_overflow_search(&dir, &parse_search_params(&args).unwrap()).unwrap_err(),
+            STALE_CURSOR
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cursor_text_truncation_retains_sparse_emissions_without_skipping_matches() {
+        let dir = make_temp_dir();
+        let tools = dir.join("tool-overflow-compressed");
+        fs::create_dir_all(&tools).unwrap();
+        let mut expected = Vec::new();
+        for file_index in 0..6 {
+            let mut content = String::new();
+            for line_index in 0..8 {
+                let id = format!("needle file-{file_index} line-{line_index}");
+                content.push_str(&format!("{id} {}\n", "好".repeat(1_000)));
+                expected.push(id);
+            }
+            let path = tools.join(format!("file-{file_index}.txt"));
+            fs::write(&path, content).unwrap();
+            set_mtime(&path, 1_000 + file_index);
+        }
+        let mut args = serde_json::json!({"query": "needle", "context_lines": 0, "max_results": 48, "cursor": "start"});
+        let mut collected = Vec::new();
+        let mut complete = false;
+        for page_index in 0..8 {
+            let page = cursor_page(&dir, &args);
+            let output = page["output"].as_str().unwrap();
+            assert!(output.len() <= MAX_OUTPUT_CHARS);
+            assert_eq!(shown_count(output), rendered_marker_lines(output));
+            collected.extend(matched_text(output).into_iter().map(|line| {
+                line.split_whitespace()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }));
+            if !page["has_more"].as_bool().unwrap() {
+                assert!(page.get("next_cursor").is_none());
+                complete = true;
+                break;
+            }
+            let token = page["next_cursor"].as_str().unwrap();
+            if page_index == 0 {
+                assert!(output.contains("output truncated at character limit"));
+                assert!(
+                    SearchCursor::decode(token)
+                        .unwrap()
+                        .position
+                        .emitted
+                        .iter()
+                        .any(|&byte| byte != 0),
+                    "file-grouped truncation must exercise the sparse bitmap"
+                );
+            }
+            args["cursor"] = token.into();
+        }
+        assert!(
+            complete,
+            "continuation must finish within the bounded fixture"
+        );
+        assert_eq!(collected.len(), expected.len());
+        collected.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(collected, expected);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3186,7 +3943,9 @@ mod tests {
         std::os::unix::fs::symlink(outside.join("external.md"), &path).unwrap();
         let needle = params("needle");
         let query = CompiledQuery::compile(&needle).unwrap();
-        let out = render_selection(vec![file], &needle, &query, 1, &archive).unwrap();
+        let out = render_selection(vec![file], &needle, &query, 1, &archive)
+            .unwrap()
+            .output;
         assert!(!out.contains("external_secret_body"), "{out}");
         assert!(
             out.contains("file unreadable during excerpt rendering"),

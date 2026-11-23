@@ -1894,12 +1894,16 @@ fn search_overflow_description_stays_in_sync_with_implementation() {
         .collect();
     let expected: std::collections::BTreeSet<String> = [
         "query",
+        "order",
+        "match",
+        "kind",
         "scope",
         "file_pattern",
         "is_regex",
         "case_sensitive",
         "context_lines",
         "max_results",
+        "cursor",
     ]
     .into_iter()
     .map(str::to_string)
