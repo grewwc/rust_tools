@@ -3008,6 +3008,82 @@ test("replayed final text replaces provisional deltas", () => {
   assert.equal(h.status(), "Processing… · 0:00");
 });
 
+function visibleAssistantAnswers(root) {
+  return [...root.querySelectorAll(".msg.asst.md")].filter((node) => !node.hidden && node.textContent);
+}
+
+for (const phone of [false, true]) {
+  test(`replay answer ownership: committed tool narration belongs to canonical history (phone=${phone})`, async () => {
+    const text = "I will implement the two recommended changes";
+    const call = { id: "call_narration", function: { name: "exec", arguments: "{}" } };
+    const messages = [
+      { role: "assistant", message_id: 51, content: text, tool_calls: [call] },
+      { role: "tool", message_id: 52, content: "done", tool_call_id: call.id },
+    ];
+    const h = retainedHistoryHarness(messages, { phone }), c = h.c;
+    await c.loadHistory();
+    const pending = c.attachEvents();
+    await h.settle();
+    await h.frame("event: tool\ndata: " + JSON.stringify({ id: call.id, name: "exec", phase: "started" }) + "\n\n"
+      + "event: tool\ndata: " + JSON.stringify({ id: call.id, phase: "finished", output: "done", ok: true }) + "\n\n"
+      + "event: replace\ndata: " + JSON.stringify({ text }) + "\n\n");
+    assert.equal(visibleAssistantAnswers(h.root).length, 1, "history and replay must share the assistant owner");
+    assert.equal(c.recoveredView.box.querySelectorAll(".md").filter((node) => !node.hidden).length, 0);
+    assert.equal(h.root.querySelectorAll("details").length, 1, "canonical tool card must remain singular");
+    await h.frame("event: replace\ndata: " + JSON.stringify({ text }) + "\n\n");
+    assert.equal(visibleAssistantAnswers(h.root).length, 1, "repeated commits retain their owner");
+    await h.frame("event: answer_pending\ndata: \n\n"
+      + "event: replace\ndata: " + JSON.stringify({ text }) + "\n\n");
+    assert.equal(visibleAssistantAnswers(h.root).length, 2, "a round without thinking may repeat the same text");
+    await h.frame("event: thinking_start\ndata: \n\n"
+      + "event: replace\ndata: " + JSON.stringify({ text }) + "\n\n");
+    assert.equal(visibleAssistantAnswers(h.root).length, 3, "thinking also releases the previous tool owner");
+    await h.frame("event: done\ndata: \n\n");
+    await pending;
+    assert.equal(c.recoveredView, null);
+    assert.equal(h.root.querySelectorAll(".recovered").length, 0);
+    assert.equal(visibleAssistantAnswers(h.root).length, 1);
+  });
+
+  test(`replay answer ownership: message IDs work without timestamps or text comparison (phone=${phone})`, async () => {
+    const messages = [{ role: "assistant", message_id: 61, content: "canonical body" }];
+    const h = retainedHistoryHarness(messages, { phone }), c = h.c;
+    await c.loadHistory();
+    const pending = c.attachEvents();
+    await h.settle();
+    await h.frame("event: replace\ndata: " + JSON.stringify({ text: "projected body", message_id: 61 }) + "\n\n");
+    assert.equal(visibleAssistantAnswers(h.root).length, 1, "body projections must not break identity ownership");
+    await h.frame("event: delta\ndata: " + JSON.stringify({ delta: "canonical body", message_id: 62 }) + "\n\n");
+    assert.equal(visibleAssistantAnswers(h.root).length, 2, "a new message ID releases the provisional bubble");
+    assert.equal(visibleAssistantAnswers(h.root).at(-1).textContent, "canonical body", "another message must not inherit prior prose");
+    await h.frame("event: replace\ndata: " + JSON.stringify({ text: "canonical body", message_id: 62 }) + "\n\n");
+    assert.equal(visibleAssistantAnswers(h.root).length, 2, "equal text with another message ID is a new answer");
+    await h.frame("event: replace\ndata: " + JSON.stringify({ text: "canonical body", message_id: 62 }) + "\n\n");
+    assert.equal(visibleAssistantAnswers(h.root).length, 2, "consecutive replaces share one replay bubble");
+    await h.frame("event: done\ndata: \n\n");
+    await pending;
+  });
+
+  test(`replay answer ownership: canonical history takes over an already visible commit (phone=${phone})`, async () => {
+    const messages = [], text = "current partial answer";
+    const call = { id: "call_late", function: { name: "exec", arguments: "{}" } };
+    const h = retainedHistoryHarness(messages, { phone }), c = h.c;
+    await c.loadHistory();
+    const pending = c.attachEvents();
+    await h.settle();
+    await h.frame("event: tool\ndata: " + JSON.stringify({ id: call.id, name: "exec", phase: "finished", output: "done", ok: true }) + "\n\n"
+      + "event: replace\ndata: " + JSON.stringify({ text }) + "\n\n");
+    assert.equal(visibleAssistantAnswers(h.root).length, 1, "an unpersisted commit must remain visible");
+    messages.push({ role: "assistant", message_id: 71, content: text, tool_calls: [call] },
+      { role: "tool", message_id: 72, content: "done", tool_call_id: call.id });
+    await c.loadHistory();
+    assert.equal(visibleAssistantAnswers(h.root).length, 1, "history refresh must retire the replay answer immediately");
+    assert.equal(c.recoveredView.box.querySelectorAll(".md").filter((node) => !node.hidden).length, 0);
+    await h.frame("event: done\ndata: \n\n");
+    await pending;
+  });
+}
+
 test("EOF without the done event follows server history instead of declaring completion", () => {
   assert.match(script, /if \(!finished && !turnError\) \{[\s\S]*?stream ended before completion[\s\S]*?goStale/);
   assert.match(script, /const goStale = \(msg\) => \{[\s\S]*?staleSession = sessionId;[\s\S]*?staleDone = false;[\s\S]*?startStaleFollow\(\);/,

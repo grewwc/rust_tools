@@ -10912,6 +10912,10 @@ function renderHistoryRow(row, parent) {
       // together in one row across refreshes.
       const group = document.createElement("div");
       group.className = "turn";
+      if (snapshot.text) group._historyAssistant = {
+        messageId: m.message_id, toolCallIds: (m.tool_calls || []).map((call) => call.id),
+        sessionId, base: executionBase(),
+      };
       // A persisted assistant message without tool calls is the terminal answer
       // for the preceding task sequence. Old or truncated running task cards
       // before it must not keep the composer in stop mode after a reload.
@@ -11431,6 +11435,7 @@ async function loadHistory(prefetched, canCommit = () => true) {
       updateQuestionButton();
       if (typeof mountTranscriptScroll === "function") mountTranscriptScroll(forSession, follow, root);
       attachLiveBox();
+      if (eventSession === forSession) recoveredView?.reconcileHistory();
       if (!follow && !appendOnly) root.scrollTop = oldScrollTop;
       // A rebuilt transcript can clamp the old offset and queue a scroll event.
       // Compare that event with the new layout before following its live edge.
@@ -12047,6 +12052,21 @@ function recoveredProgressView(sid = sessionId) {
   let think = null;
   let thinking = "";
   let answer = "";
+  let answerToolCallId = null;
+  const reconcileHistory = () => {
+    if (!answerBubbles.some((candidate) => candidate._replayAnswerSource && !candidate._replayHistoryOwned)) return;
+    const owners = Array.from($("msgs").querySelectorAll(".turn"))
+      .map((node) => node._historyAssistant)
+      .filter((owner) => owner?.sessionId === sid && owner.base === base);
+    for (const candidate of answerBubbles) {
+      const source = candidate._replayAnswerSource;
+      if (!source || candidate._replayHistoryOwned || !owners.some((owner) => source.messageId != null
+        ? owner.messageId === source.messageId : owner.toolCallIds.includes(source.toolCallId))) continue;
+      candidate._replayHistoryOwned = true;
+      candidate.hidden = true;
+      candidate.innerHTML = "";
+    }
+  };
   let tokenRate = "", closed = false;
   let tokenRates = new Map();
   const setTokenRate = (sample) => {
@@ -12068,12 +12088,17 @@ function recoveredProgressView(sid = sessionId) {
     if (answer.trim()) {
       sealedAnswerText = answer;
       rememberRate("turn", sid, answer, lastOutputRate);
-      bubble.dataset.segmentSealed = "1";
-      bubble.hidden = false;
-      bubble.innerHTML = renderMarkdown(answer, false);
-      decorateAndLoad(bubble);
-      addAnswerCopy(bubble, answer);
-      if (bubble._messageTimeSource) setMessageTimestamp(bubble, bubble._messageTimeSource);
+      if (!bubble._replayHistoryOwned) {
+        bubble.dataset.segmentSealed = "1";
+        bubble.hidden = false;
+        bubble.innerHTML = renderMarkdown(answer, false);
+        decorateAndLoad(bubble);
+        addAnswerCopy(bubble, answer);
+        if (bubble._messageTimeSource) setMessageTimestamp(bubble, bubble._messageTimeSource);
+      } else {
+        bubble.remove();
+        answerBubbles.pop();
+      }
     } else {
       bubble.remove();
       answerBubbles.pop();
@@ -12083,7 +12108,10 @@ function recoveredProgressView(sid = sessionId) {
     outputRate.reset();
     activity.anchor(phaseBubble);
   };
-  const ensureAnswerBubble = () => {
+  const ensureAnswerBubble = (source = null) => {
+    const id = source?.message_id;
+    if (bubble?._replayAnswerSource?.messageId != null && Number.isSafeInteger(id) && id > 0
+      && bubble._replayAnswerSource.messageId !== id) sealAnswerSegment();
     if (bubble) return;
     bubble = document.createElement("div");
     bubble.className = "msg asst md";
@@ -12117,8 +12145,9 @@ function recoveredProgressView(sid = sessionId) {
     // decoration wait until the segment is sealed or the reply finishes.
     if (bubble) {
       if (timeSource && typeof timeSource === "object") bubble._messageTimeSource = { ...timeSource, source_session_id: sid };
-      bubble.hidden = !answer;
-      bubble.innerHTML = renderMarkdown(answer, false);
+      reconcileHistory();
+      bubble.hidden = !answer || Boolean(bubble._replayHistoryOwned);
+      if (!bubble._replayHistoryOwned) bubble.innerHTML = renderMarkdown(answer, false);
       if (bubble.parentNode?._executionGroups && bubble.parentNode.querySelectorAll("details").length) {
         bubble.parentNode._executionGroups.sync();
       }
@@ -12127,6 +12156,7 @@ function recoveredProgressView(sid = sessionId) {
     paintPhase();
   };
   const endThinking = (newRound = false, outcome = null) => {
+    if (newRound) answerToolCallId = null;
     const phaseStartedAt = newRound ? Date.now() : null;
     const status = outcome ? thinkingStatusOf(outcome) : "interrupted";
     if (!think && outcome && status !== "completed") think = createThinkingFold(box, phaseBubble);
@@ -12149,7 +12179,10 @@ function recoveredProgressView(sid = sessionId) {
     box,
     endThinking,
     sealAnswerSegment,
+    reconcileHistory,
+    answerPending() { sealAnswerSegment(); answerToolCallId = null; },
     thinkingText(text, rate = null) {
+      answerToolCallId = null;
       sealAnswerSegment();
       thinking += text;
       if (thinkStartedAt === null) thinkStartedAt = Date.now();
@@ -12164,8 +12197,25 @@ function recoveredProgressView(sid = sessionId) {
       activity.setPhase("Thinking…");
       paintPhase();
     },
-    delta(text, timeSource = null) { endThinking(); ensureAnswerBubble(); answer += text; outputRate.observe(text); paintAnswer(timeSource); },
-    replace(text, timeSource = null) { endThinking(); ensureAnswerBubble(); answer = text; outputRate.replace(text); paintAnswer(timeSource); },
+    delta(text, timeSource = null) {
+      answerToolCallId = null;
+      endThinking(); ensureAnswerBubble(timeSource);
+      if (Number.isSafeInteger(timeSource?.message_id) && timeSource.message_id > 0) {
+        bubble._replayHistoryOwned = false;
+        bubble._replayAnswerSource = { messageId: timeSource.message_id };
+      }
+      answer += text; outputRate.observe(text); paintAnswer(timeSource);
+    },
+    replace(text, timeSource = null) {
+      endThinking(); ensureAnswerBubble(timeSource);
+      // Tool-round narration is committed after its tools finish. Their call
+      // IDs bind the body to its canonical assistant row when replace events
+      // have no message ID. A new model round clears the tool association.
+      bubble._replayHistoryOwned = false;
+      bubble._replayAnswerSource = Number.isSafeInteger(timeSource?.message_id) && timeSource.message_id > 0
+        ? { messageId: timeSource.message_id } : answerToolCallId ? { toolCallId: answerToolCallId } : null;
+      answer = text; outputRate.replace(text); paintAnswer(timeSource);
+    },
     rate(value) {
       const valueSample = rateSampleOf(value);
       if (!valueSample) return;
@@ -12178,7 +12228,13 @@ function recoveredProgressView(sid = sessionId) {
       paintPhase();
     },
     tool(event) {
-      endThinking(); sealAnswerSegment(); activity.setPhase("Processing…");
+      endThinking();
+      if (bubble && !bubble._replayAnswerSource && event?.id) {
+        bubble._replayAnswerSource = { toolCallId: event.id };
+        reconcileHistory();
+      }
+      sealAnswerSegment(); activity.setPhase("Processing…");
+      answerToolCallId = event?.id || null;
       const stored = Array.from($("msgs").querySelectorAll(".msg")).some((node) => {
         const call = node._historyToolCall;
         return call && call.id === event?.id && call.sessionId === sid && call.base === base;
@@ -12195,6 +12251,10 @@ function recoveredProgressView(sid = sessionId) {
     phase(text, waiting) { activity.setPhase(text, waiting); paintPhase(); },
     finish(reason = "ended", source = null) {
       if (bubble && source) bubble._messageTimeSource = { ...source, source_session_id: sid };
+      if (bubble && Number.isSafeInteger(source?.message_id) && source.message_id > 0) {
+        bubble._replayAnswerSource = { messageId: source.message_id };
+      }
+      reconcileHistory();
       closed = true;
       clearInterval(phaseTimer);
       endThinking();
@@ -12202,14 +12262,14 @@ function recoveredProgressView(sid = sessionId) {
       const measured = outputRate.text(true);
       const rate = tokenRate || (measured ? "output " + measured : "") || lastOutputRate;
       rememberRate("turn", sid, answer.trim() ? answer : sealedAnswerText || lastThinkingText, rate);
-      if (bubble && answer.trim()) {
+      if (bubble && answer.trim() && !bubble._replayHistoryOwned) {
         bubble.innerHTML = renderMarkdown(answer);
         decorateAndLoad(bubble);
         addAnswerCopy(bubble, answer);
         if (bubble._messageTimeSource) setMessageTimestamp(bubble, bubble._messageTimeSource);
       }
       const last = answerBubbles.at(-1);
-      if (last) {
+      if (last && !last._replayHistoryOwned) {
         setAnswerRate(last, rate);
         if (answer.trim()) last.dataset.taskReset = "true";
       }
@@ -12254,7 +12314,7 @@ function withParsedExecutionEvent(event, update) {
 
 function dispatchAnswerEvent(event, view, policy, field, method) {
   const deliver = (text, source) => {
-    if (source?.created_at != null || source?.timestamp != null) view[method](text, source);
+    if (source?.message_id != null || source?.created_at != null || source?.timestamp != null) view[method](text, source);
     else view[method](text);
   };
   // Live historically preserves malformed answer bytes; replay ignores them
@@ -12323,6 +12383,7 @@ const EXECUTION_EVENT_HANDLERS = Object.freeze({
   replace(event, view, policy) { dispatchAnswerEvent(event, view, policy, "text", "replace"); },
   answer_pending(event, view) {
     // Buffered prose may precede more tool calls; it is not a final reply.
+    view.answerPending?.();
     view.phase("Processing response…");
   },
   confirm_request(event, view, policy) {
