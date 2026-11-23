@@ -21,6 +21,7 @@ use crate::ai::{
     mcp::{McpClient, SharedMcpClient},
     ports::ToolExecOutput,
     tools as builtin_tools,
+    tools::decision_receipts::VerifiedDecision,
     tools::os_tools::GLOBAL_OS,
     tools::registry::common::{
         ToolParallelPolicy, ToolRetryPolicy, tool_parallel_policy, tool_retry_policy,
@@ -85,9 +86,9 @@ pub(super) struct ExecuteToolCallsResult {
     /// Structured outcomes and environment signatures for dispatched calls,
     /// persisted separately from display text.
     pub(super) execution_outcomes: Vec<Option<ToolExecutionOutcome>>,
-    /// 本轮是否有任何工具执行失败（`RunOneResult.ok == false`）。
-    /// 结构化信号，供下游 reflection/evolution 判定 turn 质量时使用，
-    /// 替代旧版扫描 assistant 答案文本找 "error"/"failed" 的脆弱做法。
+    /// Turn-only failures for irreversible calls rejected before execution.
+    pub(super) pre_dispatch_error_ids: FastSet<String>,
+    /// Whether any tool failed, independent of the text of its result.
     pub(super) had_error: bool,
 }
 
@@ -100,6 +101,7 @@ impl ExecuteToolCallsResult {
             tool_results,
             cached_hits,
             execution_outcomes,
+            pre_dispatch_error_ids,
             had_error,
         } = self;
         ToolExecOutput {
@@ -108,6 +110,7 @@ impl ExecuteToolCallsResult {
             executed_tool_calls,
             cached_hits,
             execution_outcomes,
+            pre_dispatch_error_ids,
             had_error,
         }
     }
@@ -1048,6 +1051,36 @@ fn subagent_tool_phase(tool_name: &str, args: &Value) -> String {
     }
 }
 
+fn rejected_decision(tool_call: &ToolCall, content: String) -> RunOneResult {
+    RunOneResult {
+        tool_result: ToolResult {
+            task_report: None,
+            tool_call_id: tool_call.id.clone(),
+            content,
+        },
+        ok: false,
+        executed: false,
+        cached: false,
+    }
+}
+
+fn verify_prepared_decision(
+    tool_call: &ToolCall,
+    prepared: &mut PreparedToolCall,
+) -> Result<Option<VerifiedDecision>, RunOneResult> {
+    if !matches!(prepared.route, ToolRoute::Builtin) {
+        return Ok(None);
+    }
+    // `decision_receipt` is intentionally not registered here: it bootstraps verification.
+    let Some(policy) = builtin_tools::registry::common::irreversible_tool(&tool_call.function.name)
+    else {
+        return Ok(None);
+    };
+    builtin_tools::decision_receipts::verify_before_dispatch(policy, &mut prepared.args)
+        .map(Some)
+        .map_err(|content| rejected_decision(tool_call, content))
+}
+
 /// Model-backed distillation uses the same preflight and budget as synchronous tools.
 pub(super) async fn run_session_distill(
     app: &crate::ai::types::App,
@@ -1056,7 +1089,7 @@ pub(super) async fn run_session_distill(
     tool_call: &ToolCall,
     allowed_tool_names: &FastSet<String>,
 ) -> RunOneResult {
-    let prepared = match prepare_tool_call(mcp_client, tool_call, Some(allowed_tool_names)) {
+    let mut prepared = match prepare_tool_call(mcp_client, tool_call, Some(allowed_tool_names)) {
         Ok(prepared) => prepared,
         Err(tool_result) => {
             return RunOneResult {
@@ -1071,6 +1104,9 @@ pub(super) async fn run_session_distill(
         return result;
     }
     if let Some(result) = process_tool_denial(tool_call) {
+        return result;
+    }
+    if let Err(result) = verify_prepared_decision(tool_call, &mut prepared) {
         return result;
     }
     if let Err(result) = reserve_current_process_tool_call_budget(tool_call) {
@@ -1174,8 +1210,18 @@ fn run_one_inner(
         return (prepared.route, result);
     }
 
+    let side_note = tool_call.function.name == "send_side_note";
+    if !side_note && let Some(result) = process_tool_denial(tool_call) {
+        return (prepared.route, result);
+    }
+    // Check at the individual dispatch, after permissions and earlier batch calls.
+    let decision = match verify_prepared_decision(tool_call, &mut prepared) {
+        Ok(decision) => decision,
+        Err(result) => return (prepared.route, result),
+    };
+
     // Handle lead-agent side notes directly, without an MCP round trip.
-    if tool_call.function.name == "send_side_note" {
+    if side_note {
         let res = crate::ai::tools::service::side_note::handle_send_side_note(
             &tool_call.id,
             &prepared.args,
@@ -1192,27 +1238,25 @@ fn run_one_inner(
         return (prepared.route, run_result);
     }
 
-    if let Some(result) = process_tool_denial(tool_call) {
-        return (prepared.route, result);
-    }
-
-    prepared.cache_file_fingerprints =
-        collect_tool_cache_file_fingerprints(&tool_call.function.name, &prepared.args);
-    if let Some(tool_result) = load_cached_tool_result_with_fingerprints(
-        session_id,
-        tool_call,
-        &prepared.args,
-        &prepared.cache_file_fingerprints,
-    ) {
-        return (
-            prepared.route,
-            RunOneResult {
-                tool_result,
-                ok: true,
-                executed: false,
-                cached: true,
-            },
-        );
+    if decision.is_none() {
+        prepared.cache_file_fingerprints =
+            collect_tool_cache_file_fingerprints(&tool_call.function.name, &prepared.args);
+        if let Some(tool_result) = load_cached_tool_result_with_fingerprints(
+            session_id,
+            tool_call,
+            &prepared.args,
+            &prepared.cache_file_fingerprints,
+        ) {
+            return (
+                prepared.route,
+                RunOneResult {
+                    tool_result,
+                    ok: true,
+                    executed: false,
+                    cached: true,
+                },
+            );
+        }
     }
 
     let progress = subagent_tool_phase(&tool_call.function.name, &prepared.args);
@@ -1248,9 +1292,19 @@ fn run_one_inner(
         observer.on_tool_started(tool_call);
     }
 
-    let result = execute_with_safe_retry(&prepared.route, &tool_call.function.name, || {
-        execute_prepared_tool_call(shared_mcp_client, tool_call, &prepared, observer)
-    });
+    let result = if let Some(decision) = decision {
+        // The start callback and dispatch setup can run after the first check.
+        // Re-resolve and bind the observed identity to the actual executor here.
+        let authorized = match decision.authorize_execution(&prepared.args) {
+            Ok(authorized) => authorized,
+            Err(content) => return (prepared.route, rejected_decision(tool_call, content)),
+        };
+        builtin_tools::registry::common::execute_authorized_tool_call(&tool_call.id, authorized)
+    } else {
+        execute_with_safe_retry(&prepared.route, &tool_call.function.name, || {
+            execute_prepared_tool_call(shared_mcp_client, tool_call, &prepared, observer)
+        })
+    };
     let run_result = finalize_execution_result(
         session_id,
         tool_call,
@@ -1306,6 +1360,7 @@ fn execute_tool_calls_inner(
     let mut tool_results = Vec::with_capacity(tool_calls.len());
     let mut cached_hits = Vec::with_capacity(tool_calls.len());
     let mut execution_outcomes = Vec::with_capacity(tool_calls.len());
+    let mut pre_dispatch_error_ids = FastSet::default();
     let mut had_error = false;
     let execution_cwd = crate::ai::driver::runtime_ctx::effective_cwd()
         .map(|path| path.to_string_lossy().into_owned())
@@ -1398,13 +1453,18 @@ fn execute_tool_calls_inner(
 
         executed_tool_calls.push(tool_call.clone());
         cached_hits.push(run_result.cached);
-        execution_outcomes.push(Some(tool_execution_outcome(
-            session_id,
-            &execution_cwd,
-            &route,
-            tool_call,
-            run_result.ok,
-        )));
+        // Receipt rejection is per call: preserve the aligned error result but
+        // omit its execution outcome. Unrelated siblings keep their normal dispatch.
+        let rejected_irreversible = matches!(route, ToolRoute::Builtin)
+            && !run_result.executed
+            && builtin_tools::registry::common::irreversible_tool(&tool_call.function.name)
+                .is_some();
+        if rejected_irreversible && !run_result.ok {
+            pre_dispatch_error_ids.insert(tool_call.id.clone());
+        }
+        execution_outcomes.push((!rejected_irreversible).then(|| {
+            tool_execution_outcome(session_id, &execution_cwd, &route, tool_call, run_result.ok)
+        }));
         notify_tool_finished(&mut observer, tool_call, &run_result);
         print_run_status(tool_call, &run_result, &observer);
         crate::ai::driver::hooks::run_lifecycle_hook(
@@ -1444,6 +1504,7 @@ fn execute_tool_calls_inner(
         tool_results,
         cached_hits,
         execution_outcomes,
+        pre_dispatch_error_ids,
         had_error,
     })
 }
@@ -1758,6 +1819,9 @@ fn store_tool_cache_result(
 /// Do not reuse this for retry or parallel policy: side effects are not
 /// encoded in tool names. Those decisions live in explicit registry metadata.
 fn is_cacheable_tool_name(name: &str) -> bool {
+    if builtin_tools::registry::common::irreversible_tool(name).is_some() {
+        return false;
+    }
     let lower = name.to_ascii_lowercase();
     let mutating = [
         "create",

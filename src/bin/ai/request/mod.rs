@@ -62,6 +62,35 @@ pub(in crate::ai) use logging::request_diagnostics_enabled;
 pub(in crate::ai) use outcome_log::append_request_failure;
 pub(in crate::ai) use prompt_feedback::hash_message;
 pub(crate) use prompt_feedback::{PrefixReuse, PromptTokenFeedback};
+#[cfg(test)]
+pub(in crate::ai) fn messages_wire_for_test(
+    messages: &[crate::ai::history::Message],
+    tool_errors: &rustc_hash::FxHashMap<String, bool>,
+) -> Vec<u8> {
+    crate::ai::request_protocol::RequestProtocolDialect::Messages.build_http_body(&RequestBody {
+        model: "messages-test".into(),
+        messages,
+        stream: true,
+        thinking: serde_json::Map::new(),
+        enable_search: None,
+        tools: None,
+        tool_choice: None,
+        reasoning_effort: None,
+        reasoning: None,
+        stream_options: None,
+        max_tokens: None,
+        reasoning_items: None,
+        reasoning_replay_owners: None,
+        reasoning_encrypted_replay: false,
+        estimated_prompt_tokens: 0,
+        estimated_prompt_tokens_upper: 0,
+        message_counts: Default::default(),
+        prompt_cache_key: None,
+        explicit_cache_breakpoints: false,
+        tool_errors: Some(tool_errors),
+    })
+}
+
 pub(crate) use protocol::extract_response_text;
 #[cfg(test)]
 use protocol::responses_reasoning_replay_stats;

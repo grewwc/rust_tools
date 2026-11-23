@@ -61,6 +61,10 @@ pub(crate) struct CurrentRequestBudget {
     /// never invert.
     #[serde(default)]
     pub(crate) prompt_tokens_upper: usize,
+    /// Display only: aggregate usage cannot isolate the locators' real cost.
+    /// Gates, projection selection, and compression targets use `prompt_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) receipt_adjusted_display_tokens: Option<usize>,
     pub(crate) source: PromptCountSource,
     pub(crate) limits: ContextLimits,
     /// Inline cap for a single tool result under this budget's model. Kept
@@ -101,6 +105,8 @@ impl CurrentRequestBudget {
         Self {
             prompt_tokens,
             prompt_tokens_upper,
+            receipt_adjusted_display_tokens: previous
+                .and_then(|prior| current.receipt_adjusted_context_tokens(prior)),
             source: if compatible {
                 PromptCountSource::CompatibleActualPlusEstimatedGrowth
             } else {
@@ -241,6 +247,7 @@ mod tests {
         let budget = CurrentRequestBudget {
             prompt_tokens: usize::MAX,
             prompt_tokens_upper: usize::MAX,
+            receipt_adjusted_display_tokens: None,
             source: PromptCountSource::NormalizedEstimate,
             limits,
             inline_cap_chars: 32_000,

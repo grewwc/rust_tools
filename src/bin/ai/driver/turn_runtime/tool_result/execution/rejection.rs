@@ -62,6 +62,7 @@ pub(in crate::ai::driver::turn_runtime) fn reject_tool_calls(
         // a shorter one would silently drop every rejection message and leave
         // the model with unanswered tool calls.
         execution_outcomes: vec![None; tool_calls.len()],
+        pre_dispatch_error_ids: Default::default(),
         had_error: true,
     }
 }

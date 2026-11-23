@@ -4,6 +4,99 @@ use super::super::*;
 use super::common::*;
 
 #[test]
+fn decision_receipt_gate_sets_messages_wire_error_without_persisting_an_outcome() {
+    use crate::ai::request::messages_wire_for_test;
+    use crate::ai::types::{StreamOutcome, StreamResult};
+    use serde_json::json;
+
+    let _env = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let root = std::env::temp_dir().join(format!("receipt-wire-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let mut app = test_app_with_tools(&["delete_skill"]);
+    app.config.history_file = root.join("history.sqlite");
+    app.session_history_file = root.join("receipt-wire.sqlite");
+    let mcp = McpClient::new();
+    let shared_mcp = Arc::new(std::sync::Mutex::new(McpClient::new()));
+    let mut messages = Vec::new();
+    let mut turn_messages = Vec::new();
+    let mut persisted = 0;
+    let mut had_error = false;
+    handle_tool_call_round(
+        &mut app,
+        "",
+        &mcp,
+        &shared_mcp,
+        &ToolCallExecution {
+            stream_result: StreamResult {
+                outcome: StreamOutcome::ToolCall,
+                tool_calls: vec![test_tool_call(
+                    "reject",
+                    "delete_skill",
+                    json!({"name": ""}),
+                )],
+                assistant_text: String::new(),
+                hidden_meta: String::new(),
+                reasoning_text: String::new(),
+                reasoning_items: Vec::new(),
+                skip_response_drain: true,
+                truncated_by_length: false,
+                stream_error: false,
+                response_reconciled: false,
+                response_server_mismatch: false,
+                finish_reason_value: None,
+                usage_prompt_tokens: 0,
+                usage_cached_prompt_tokens: 0,
+                usage_completion_tokens: 0,
+                usage_reasoning_tokens: 0,
+            },
+            allowed_tool_names: ["delete_skill".to_string()].into_iter().collect(),
+        },
+        &mut messages,
+        &mut turn_messages,
+        false,
+        &mut persisted,
+        1,
+        None,
+        &HashMap::new(),
+        &mut had_error,
+    )
+    .unwrap();
+    assert!(had_error);
+    assert!(persisted > 0);
+    assert!(
+        crate::ai::history::read_tool_execution_outcomes_sqlite(&app.session_history_file)
+            .unwrap()
+            .is_empty()
+    );
+
+    // The driver assigns a fresh occurrence ID before calling the gate.
+    let occurrence = turn_messages
+        .iter()
+        .flat_map(|message| message.tool_calls.iter().flatten())
+        .find(|call| call.function.name == "delete_skill")
+        .unwrap();
+    let wire: serde_json::Value =
+        serde_json::from_slice(&messages_wire_for_test(&messages, &app.turn_tool_errors)).unwrap();
+    let result = wire["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .find(|block| block["type"] == "tool_result" && block["tool_use_id"] == occurrence.id.as_str())
+        .expect("the tool call retains its result slot on the wire");
+    assert_eq!(result["is_error"], true);
+    assert!(
+        result["content"]
+            .as_str()
+            .unwrap()
+            .contains("missing decision_receipt_id")
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn tool_call_round_no_longer_requests_terminal_dedupe() {
     let exec_result = ExecuteToolCallsResult {
         executed_tool_calls: vec![ToolCall {
@@ -21,6 +114,7 @@ fn tool_call_round_no_longer_requests_terminal_dedupe() {
         }],
         cached_hits: vec![false],
         execution_outcomes: Vec::new(),
+        pre_dispatch_error_ids: Default::default(),
         had_error: false,
     };
 
@@ -47,6 +141,7 @@ fn first_use_guidance_is_emitted_once_per_tool_per_turn() {
             .collect(),
         cached_hits: vec![false; calls.len()],
         execution_outcomes: vec![None; calls.len()],
+        pre_dispatch_error_ids: Default::default(),
         had_error: false,
     };
 
@@ -105,6 +200,7 @@ fn reused_tool_call_id_is_rewritten_for_the_whole_occurrence() {
             execution_signature: "signature".to_string(),
             succeeded: true,
         })],
+        pre_dispatch_error_ids: Default::default(),
         had_error: false,
     };
 
@@ -413,6 +509,7 @@ fn fresh_tool_call_ids_do_not_depend_on_saved_history() {
         }],
         cached_hits: vec![false],
         execution_outcomes: vec![None],
+        pre_dispatch_error_ids: Default::default(),
         had_error: false,
     };
     let mut first = result();
@@ -715,6 +812,7 @@ fn evicted_tool_call_id_stays_reserved_by_canonical_turn_history() {
                 execution_signature: "observation-signature".into(),
                 succeeded: true,
             })],
+            pre_dispatch_error_ids: Default::default(),
             had_error: false,
         }
     }
@@ -756,6 +854,7 @@ fn evicted_tool_call_id_stays_reserved_by_canonical_turn_history() {
                             executed_tool_calls: result.executed_tool_calls,
                             cached_hits: result.cached_hits,
                             execution_outcomes: result.execution_outcomes,
+                            pre_dispatch_error_ids: result.pre_dispatch_error_ids,
                             had_error: result.had_error,
                         })
                     })

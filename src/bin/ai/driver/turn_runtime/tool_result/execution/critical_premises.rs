@@ -580,6 +580,7 @@ mod tests {
                 execution_signature: "test-signature".into(),
                 succeeded,
             })],
+            pre_dispatch_error_ids: Default::default(),
             had_error: succeeded == Some(false),
         }
     }
@@ -612,6 +613,9 @@ mod tests {
         first
             .execution_outcomes
             .append(&mut second.execution_outcomes);
+        first
+            .pre_dispatch_error_ids
+            .extend(second.pre_dispatch_error_ids);
         first.had_error |= second.had_error;
         first
     }

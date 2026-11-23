@@ -1,6 +1,8 @@
 pub(crate) mod command_tools;
 mod common;
 pub(in crate::ai) mod critical_premises;
+#[path = "service/decision_receipts.rs"]
+pub(in crate::ai) mod decision_receipts;
 pub(crate) mod enable_tools;
 mod knowledge_tools;
 pub mod os_tools;
@@ -57,6 +59,7 @@ const BASELINE_TOOL_NAMES: &[&str] = &[
     "load_skill",
     "enable_tools",
     "read_file",
+    "decision_receipt",
     "task_spawn",
     "task_retry",
     "task_wait",

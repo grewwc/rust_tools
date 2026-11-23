@@ -352,6 +352,7 @@ impl ToolExecutor for PermissionExecutor {
                 executed_tool_calls,
                 cached_hits,
                 execution_outcomes,
+                pre_dispatch_error_ids,
                 had_error: inner_had_error,
             } = inner_out;
             for (i, result) in tool_results.into_iter().enumerate() {
@@ -389,6 +390,7 @@ impl ToolExecutor for PermissionExecutor {
                 executed_tool_calls: merged_executed,
                 cached_hits: merged_cached,
                 execution_outcomes: merged_outcomes,
+                pre_dispatch_error_ids,
                 // Any blocked call is a turn-level error signal, consistent with
                 // reject_tool_calls setting had_error = true.
                 had_error: inner_had_error || allowed_slots.len() != total,
@@ -580,6 +582,7 @@ mod tests {
                     executed_tool_calls: tool_calls,
                     cached_hits: vec![false; n],
                     execution_outcomes: (0..n).map(|_| None).collect(),
+                    pre_dispatch_error_ids: Default::default(),
                     had_error: false,
                 })
             })
